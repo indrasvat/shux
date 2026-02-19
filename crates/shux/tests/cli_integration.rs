@@ -85,8 +85,8 @@ fn register_session_methods(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let name = match name {
-                        Some(n) if !n.is_empty() => n,
-                        _ => {
+                        Some(n) => n,
+                        None => {
                             let snap = gh.snapshot();
                             let mut idx = snap.sessions.len();
                             loop {

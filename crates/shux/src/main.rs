@@ -233,10 +233,11 @@ fn register_session_methods(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
 
-                    // Auto-generate name if not provided
+                    // Auto-generate name if not provided (None).
+                    // Explicit empty string (Some("")) flows through to validation.
                     let name = match name {
-                        Some(n) if !n.is_empty() => n,
-                        _ => {
+                        Some(n) => n,
+                        None => {
                             let snap = gh.snapshot();
                             let mut idx = snap.sessions.len();
                             loop {

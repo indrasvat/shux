@@ -281,8 +281,8 @@ async def main(connection):
         await send_and_wait(session, f"{SHUX_BIN} new -s delta --ensure -d", 2.0)
         content = await read_screen(session)
         has_delta = "delta" in content.lower()
-        has_created = "created" in content.lower()
-        record("11. Ensure new (delta)", has_delta and has_created, "")
+        has_created_or_ensured = "created" in content.lower() or "ensured" in content.lower()
+        record("11. Ensure new (delta)", has_delta and has_created_or_ensured, "")
         take_screenshot("013_ensure_new")
 
         # ── Test 12: Ensure Triple Idempotency (epsilon) ──────

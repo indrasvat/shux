@@ -92,8 +92,8 @@ fn register_session_methods(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let name = match name {
-                        Some(n) if !n.is_empty() => n,
-                        _ => {
+                        Some(n) => n,
+                        None => {
                             let snap = gh.snapshot();
                             let mut idx = snap.sessions.len();
                             loop {
@@ -870,10 +870,14 @@ async fn test_013_session_name_validation_empty() {
         serde_json::json!({"name": ""}),
     )
     .await;
-    // Empty name should auto-generate, not fail
+    // Explicit empty name should fail validation (auto-generate only when name is absent)
     assert!(
-        resp["error"].is_null(),
-        "empty name should auto-generate: {resp}"
+        resp["error"].is_object(),
+        "empty name should fail validation: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["code"],
+        shux_rpc::ErrorCode::InvalidParams.code()
     );
 
     cancel.cancel();
