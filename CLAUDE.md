@@ -16,21 +16,27 @@ Tiny core, powerful plugin system, first-class support for both humans and AI ag
 ## Build & Test Commands
 
 ```bash
-make build           # Build all crates (debug)
-make release         # Build optimized binary → target/release/shux
-make test            # Run tests with cargo-nextest (all workspace crates)
-make test-verbose    # Run tests with output visible
-make test-lib        # Run library tests only
-make lint            # Run clippy + rustfmt check
-make check           # lint + test (what pre-commit runs)
-make ci              # CI-only target (lint + test-lib + test-doc, fail-fast)
-make install         # Install to ~/.local/bin/shux
-make install-tools   # Install dev dependencies (nextest, llvm-cov, deny, fuzz, lefthook)
-make install-hooks   # Install lefthook git hooks
-make bench           # Run benchmarks
-make doc             # Build documentation
-make clean           # Remove build artifacts
-make deny            # Run license/advisory audit
+make build                 # Build all crates (debug)
+make release               # Build optimized binary → target/release/shux
+make test                  # Run tests with cargo-nextest (all workspace crates)
+make test-verbose          # Run tests with output visible
+make test-lib              # Run library tests only
+make clippy                # Run clippy linter
+make fmt-check             # Check formatting (no changes)
+make fmt                   # Format all code
+make lint                  # clippy + fmt-check
+make check                 # lint + test (what pre-commit runs)
+make ci                    # CI-only target (lint + test-lib + test-doc, fail-fast)
+make deny                  # Run license/advisory audit (strict)
+make deny-soft             # Run license/advisory audit (non-blocking)
+make check-progress        # Verify PROGRESS.md and task Status fields are updated
+make check-progress-active # Verify progress (allows In Progress during active session)
+make install               # Install to ~/.local/bin/shux
+make install-tools         # Install dev dependencies (nextest, llvm-cov, deny, fuzz, lefthook)
+make hooks                 # Install lefthook git hooks
+make bench                 # Run benchmarks
+make doc                   # Build documentation
+make clean                 # Remove build artifacts
 ```
 
 ## Architecture
@@ -63,6 +69,7 @@ crates/shux-ui/        TUI client (crossterm, ratatui for chrome, render composi
 - **Async:** All I/O operations use `tokio`. No blocking in async contexts. Use `tokio::task::spawn_blocking` for CPU-heavy work.
 - **Testing:** `#[cfg(test)]` modules in each file. Integration tests in `tests/`. Property tests with `proptest` where applicable.
 - **Imports:** `use` statements grouped: std → external crates → workspace crates → local modules. Enforced by `rustfmt`.
+- **Makefile is the command interface.** ALWAYS use `make <target>` instead of running raw `cargo`, `lefthook`, or script commands directly. If a task requires a command that has no Makefile target, add one (with proper parameterization) before using it. At the end of each task, audit any new commands discovered during implementation and add them as Makefile targets. All hooks (lefthook, Claude Code) MUST invoke `make` targets, never raw commands.
 
 ## Git Workflow
 

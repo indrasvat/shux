@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/check-progress.sh --active-session",
+            "command": "make -C \"$CLAUDE_PROJECT_DIR\" check-progress-active",
             "timeout": 10,
             "statusMessage": "Checking progress tracking..."
           }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE '^git\\s+push'; then \"$CLAUDE_PROJECT_DIR\"/scripts/check-progress.sh; fi",
+            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE '^git\\s+push'; then make -C \"$CLAUDE_PROJECT_DIR\" check-progress; fi",
             "timeout": 10,
             "statusMessage": "Verifying progress before push..."
           }

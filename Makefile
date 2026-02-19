@@ -51,7 +51,7 @@ help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*##"} /^(test|bench)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Code Quality:$(COLOR_RESET)"
-	@awk 'BEGIN {FS = ":.*##"} /^(lint|fmt|check|ci|deny|fuzz)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"} /^(clippy|lint|fmt|check|ci|deny|fuzz)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Tooling:$(COLOR_RESET)"
 	@awk 'BEGIN {FS = ":.*##"} /^(setup|hooks|doc|clean|version|info)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -133,13 +133,20 @@ bench: ## Run benchmarks
 # Code Quality
 # ══════════════════════════════════════════════════════════════════════════════
 
-.PHONY: lint
-lint: ## Run clippy + rustfmt check
+.PHONY: clippy
+clippy: ## Run clippy linter
 	@echo "$(COLOR_BLUE)▶ Running clippy...$(COLOR_RESET)"
 	@cargo clippy --workspace --all-targets -- -D warnings
+	@echo "$(COLOR_GREEN)✓ Clippy passed$(COLOR_RESET)"
+
+.PHONY: fmt-check
+fmt-check: ## Check formatting (no changes)
 	@echo "$(COLOR_BLUE)▶ Checking formatting...$(COLOR_RESET)"
 	@cargo fmt --all -- --check
-	@echo "$(COLOR_GREEN)✓ Linting passed$(COLOR_RESET)"
+	@echo "$(COLOR_GREEN)✓ Formatting OK$(COLOR_RESET)"
+
+.PHONY: lint
+lint: clippy fmt-check ## Run clippy + rustfmt check
 
 .PHONY: fmt
 fmt: ## Format all code
@@ -160,10 +167,23 @@ ci: lint test-lib test-doc ## Run CI pipeline (lint + test-lib + test-doc)
 	@echo ""
 
 .PHONY: deny
-deny: ## Run license/advisory audit
+deny: ## Run license/advisory audit (strict)
 	@echo "$(COLOR_BLUE)▶ Running cargo-deny...$(COLOR_RESET)"
 	@cargo deny check
 	@echo "$(COLOR_GREEN)✓ Audit passed$(COLOR_RESET)"
+
+.PHONY: deny-soft
+deny-soft: ## Run license/advisory audit (non-blocking)
+	@echo "$(COLOR_BLUE)▶ Running cargo-deny (advisory)...$(COLOR_RESET)"
+	@cargo deny check 2>/dev/null || true
+
+.PHONY: check-progress
+check-progress: ## Verify PROGRESS.md and task Status fields are updated
+	@bash scripts/check-progress.sh
+
+.PHONY: check-progress-active
+check-progress-active: ## Verify progress (active session variant, allows In Progress)
+	@bash scripts/check-progress.sh --active-session
 
 .PHONY: fuzz
 fuzz: ## Show available fuzz targets
