@@ -76,6 +76,34 @@ impl fmt::Display for Styled {
     }
 }
 
+// ── Banner ─────────────────────────────────────────────────────
+
+/// Generate the shux ASCII art banner with a cyan→blue→indigo gradient.
+/// Respects NO_COLOR and terminal detection.
+pub fn banner() -> String {
+    const ART: [&str; 6] = [
+        r"      _               ",
+        r" ___ | |__  _   ___  __",
+        r"/ __|| '_ \| | | \ \/ /",
+        r"\__ \| | | | |_| |>  < ",
+        r"|___/|_| |_|\__,_/_/\_\",
+        "",
+    ];
+
+    if !colors_enabled() {
+        return ART.join("\n");
+    }
+
+    // Cyan → blue → indigo gradient (256-color)
+    const GRADIENT: [u8; 5] = [51, 45, 39, 33, 27];
+
+    let mut out = String::with_capacity(256);
+    for (line, &color) in ART[..5].iter().zip(&GRADIENT) {
+        out.push_str(&format!("\x1b[1;38;5;{color}m{line}\x1b[0m\n"));
+    }
+    out
+}
+
 // ── Public helpers ──────────────────────────────────────────────
 
 /// Brand accent (cyan) — for "shux" name, key identifiers.
@@ -187,5 +215,11 @@ mod tests {
     fn test_muted_display() {
         let text = muted("[abc-123]");
         let _ = text.to_string();
+    }
+
+    #[test]
+    fn test_banner_contains_shux() {
+        let b = banner();
+        assert!(b.contains("___"), "banner should contain ASCII art");
     }
 }

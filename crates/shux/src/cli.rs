@@ -23,8 +23,7 @@ const CLAP_STYLES: Styles = Styles::styled()
     name = "shux",
     version,
     about = "A modern terminal multiplexer",
-    long_about = "shux is a modern, batteries-included terminal multiplexer built in Rust.\n\
-                  Tiny core, powerful plugin system, first-class support for humans and AI agents.",
+    long_about = "A modern terminal multiplexer \u{2014} tiny core \u{2022} powerful plugins \u{2022} built for humans and AI agents",
     after_help = "Run 'shux <command> --help' for more information on a specific command.",
     styles = CLAP_STYLES,
 )]

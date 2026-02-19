@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use tokio::sync::{Notify, mpsc};
 use tracing_subscriber::EnvFilter;
 
@@ -12,7 +12,9 @@ mod style;
 use cli::{Cli, Command, OutputFormat};
 
 fn main() -> anyhow::Result<()> {
-    let args = Cli::parse();
+    let cmd = Cli::command().before_help(style::banner());
+    let matches = cmd.get_matches();
+    let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     // Internal daemon subcommand — called by auto-start
     if matches!(args.command, Some(Command::__daemon)) {
