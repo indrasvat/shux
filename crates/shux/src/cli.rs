@@ -108,7 +108,7 @@ pub enum Command {
     Version,
 
     /// Internal: start the daemon (used by auto-start, not for users)
-    #[command(hide = true)]
+    #[command(name = "__daemon", hide = true)]
     #[allow(non_camel_case_types)]
     __daemon,
 }
@@ -246,10 +246,26 @@ pub async fn handle_ls(
                             .unwrap_or(0);
                         let created = session
                             .get("created_at")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?");
+                            .and_then(|v| {
+                                v.as_str().map(String::from).or_else(|| {
+                                    v.as_u64().map(|ts| {
+                                        let secs = ts;
+                                        let dt = std::time::UNIX_EPOCH
+                                            + std::time::Duration::from_secs(secs);
+                                        let elapsed = dt.elapsed().unwrap_or_default();
+                                        if elapsed.as_secs() < 60 {
+                                            format!("{}s ago", elapsed.as_secs())
+                                        } else if elapsed.as_secs() < 3600 {
+                                            format!("{}m ago", elapsed.as_secs() / 60)
+                                        } else {
+                                            format!("{}h ago", elapsed.as_secs() / 3600)
+                                        }
+                                    })
+                                })
+                            })
+                            .unwrap_or_else(|| "?".to_string());
 
-                        style::print_session_entry(name, windows, created, id);
+                        style::print_session_entry(name, windows, &created, id);
                     }
                 }
             } else {

@@ -175,7 +175,7 @@ fn register_session_methods(
                             "id": s.id.to_string(),
                             "name": s.name,
                             "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                            "created_at": format!("{:?}", s.created_at),
+                            "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                         })
                     })
                     .collect();
@@ -205,7 +205,7 @@ fn register_session_methods(
                                     "id": s.id.to_string(),
                                     "name": s.name,
                                     "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                                    "created_at": format!("{:?}", s.created_at),
+                                    "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                                 }))
                             } else {
                                 Ok(serde_json::json!({
@@ -273,7 +273,7 @@ fn register_session_methods(
                             "id": s.id.to_string(),
                             "name": s.name,
                             "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                            "created_at": format!("{:?}", s.created_at),
+                            "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                             "created": false,
                         }));
                     }
@@ -290,7 +290,7 @@ fn register_session_methods(
                                     "id": s.id.to_string(),
                                     "name": s.name,
                                     "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                                    "created_at": format!("{:?}", s.created_at),
+                                    "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                                     "created": true,
                                 }))
                             } else {
