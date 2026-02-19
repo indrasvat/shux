@@ -62,7 +62,7 @@
 - Added 14 window integration tests (m0_integration.rs): create, auto-name, list, list-missing-session, kill, kill-last-fails, rename, focus, reorder, ensure, new-becomes-active, 3 CLI tests
 - Created `.claude/automations/test_014_window_crud.py`: L4 visual test with 25 tests (Parts A–H: setup, creation, auto-naming, focus, rename, reorder, kill, JSON output), 21 screenshots — all passing
 - 489 tests passing (458 existing + 38 graph unit + 14 integration + 9 CLI parse - some overlap), all make targets pass
-- Learning: When a daemon is running from a stale binary (before new RPC methods were added), `method_not_found` errors occur. Visual tests must kill old daemons before testing to ensure the freshly-built binary is used
+- **Spike fix: stale daemon version handshake** — `ensure_daemon_running_at()` now calls `system.version` after connecting and compares against `env!("CARGO_PKG_VERSION")`. On mismatch, kills old daemon via SIGTERM (PID file), waits for exit, spawns fresh daemon. Prevents `method_not_found` errors after rebuilds.
 - Learning: Improved `rpc_display()` that extracts human-readable messages from RPC error data fields (detail, name+resource, id+resource) makes CLI errors much more user-friendly
 
 **2026-02-19 — Task 013: Session CRUD (API + CLI) — Done**

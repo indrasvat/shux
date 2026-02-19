@@ -1468,3 +1468,27 @@ feat: implement window CRUD via JSON-RPC API and CLI
    - The "last window" guard prevents orphan sessions. To remove everything, kill the session instead.
 4. **After L3 tests pass:** Write and run the L4 visual test script: `.claude/automations/test_014_window_crud.py`. Follow the test matrix above exactly. All 25 tests must pass. Fix any failures found by visual testing (these are real bugs that L3 tests miss).
 5. **After all tests pass:** Run full verification. Update `docs/PROGRESS.md`. Verify task 015 (pane operations) can build on this.
+
+---
+
+## Spike Fix: Stale Daemon Version Handshake
+
+**Problem:** When the shux binary is rebuilt with new RPC methods (e.g., `window.*`), a previously-running daemon (spawned from the old binary) doesn't have those methods. CLI commands fail with `method_not_found` errors, confusing users.
+
+**Root cause:** `ensure_daemon_running()` in `client.rs` only checks whether a daemon is connectable, not whether it's the *right version*.
+
+**Fix (implemented):** Added a version handshake to `ensure_daemon_running_at()`:
+
+1. After connecting to an existing daemon, call `system.version` RPC
+2. Compare the daemon's `version` field against `env!("CARGO_PKG_VERSION")` (the client binary's compile-time version)
+3. If versions match → reconnect and proceed normally
+4. If versions mismatch → kill old daemon via SIGTERM (using PID file), wait for exit, spawn fresh daemon
+
+**Files changed:**
+- `crates/shux/src/client.rs` — `check_daemon_version()`, `kill_stale_daemon()`, `wait_for_daemon_exit()`, updated `ensure_daemon_running_at()`
+
+**Key design decisions:**
+- Uses SIGTERM (not SIGKILL) so the daemon can clean up its PID/socket files gracefully
+- Falls back to manual file cleanup if the process is already gone
+- Version check failure (e.g., unresponsive daemon) also triggers restart as a safety measure
+- Reconnects after version match since the version-check call consumes the first connection
