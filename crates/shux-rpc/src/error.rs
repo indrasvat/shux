@@ -38,6 +38,8 @@ pub enum ErrorCode {
     PermissionDenied,
     /// Rate limit exceeded.
     RateLimited,
+    /// Name conflict (session/window name already exists).
+    NameConflict,
 }
 
 impl ErrorCode {
@@ -55,6 +57,7 @@ impl ErrorCode {
             ErrorCode::NotFound => -32004,
             ErrorCode::PermissionDenied => -32005,
             ErrorCode::RateLimited => -32006,
+            ErrorCode::NameConflict => -32007,
         }
     }
 
@@ -72,6 +75,7 @@ impl ErrorCode {
             ErrorCode::NotFound => "not_found",
             ErrorCode::PermissionDenied => "permission_denied",
             ErrorCode::RateLimited => "rate_limited",
+            ErrorCode::NameConflict => "name_conflict",
         }
     }
 }
@@ -185,6 +189,17 @@ impl RpcError {
                 "expected_version": expected,
                 "actual_version": actual,
                 "hint": "Re-read the resource state and retry with the current version"
+            }),
+        )
+    }
+
+    /// Name conflict error (duplicate name).
+    pub fn name_conflict(resource: &str, name: &str) -> Self {
+        Self::with_data(
+            ErrorCode::NameConflict,
+            serde_json::json!({
+                "resource": resource,
+                "name": name,
             }),
         )
     }

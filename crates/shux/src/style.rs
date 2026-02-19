@@ -185,6 +185,14 @@ pub fn print_session_killed(name: &str) {
     let _ = writeln!(out);
 }
 
+/// Print a session rename confirmation.
+pub fn print_session_renamed(old_name: &str, new_name: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Renamed"));
+    let _ = write!(out, "session '{}' -> '{}'", bold(old_name), bold(new_name));
+    let _ = writeln!(out);
+}
+
 /// Print a styled error message to stderr.
 pub fn print_error(msg: &str) {
     let mut err = io::stderr().lock();

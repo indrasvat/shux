@@ -148,6 +148,53 @@ async fn run_rpc_server(
     Ok(())
 }
 
+/// Map GraphError to appropriate RPC error codes.
+fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
+    use shux_core::graph::GraphError;
+    match e {
+        GraphError::SessionNotFound(_)
+        | GraphError::WindowNotFound(_)
+        | GraphError::PaneNotFound(_) => shux_rpc::RpcError::not_found("session", &e.to_string()),
+        GraphError::SessionNameExists(ref name) => {
+            shux_rpc::RpcError::name_conflict("session", name)
+        }
+        GraphError::EmptySessionName
+        | GraphError::SessionNameTooLong(_)
+        | GraphError::InvalidSessionName(_) => shux_rpc::RpcError::invalid_params(&e.to_string()),
+        GraphError::VersionConflict { expected, actual } => {
+            shux_rpc::RpcError::version_conflict("session", "?", expected, actual)
+        }
+        _ => shux_rpc::RpcError::internal(&e.to_string()),
+    }
+}
+
+/// Build session info JSON from a Session, including window/pane IDs.
+fn session_to_json(
+    s: &shux_core::model::Session,
+    snap: &shux_core::graph::SessionGraphSnapshot,
+) -> serde_json::Value {
+    let window_count = s.windows.len();
+    let active_window_id = s.active_window.to_string();
+
+    // Find window_id and pane_id for the first window
+    let first_window_id = s.windows.first().map(|w| w.to_string());
+    let first_pane_id = s
+        .windows
+        .first()
+        .and_then(|wid| snap.windows.get(wid).map(|w| w.active_pane.to_string()));
+
+    serde_json::json!({
+        "id": s.id.to_string(),
+        "name": s.name,
+        "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        "window_count": window_count,
+        "active_window_id": active_window_id,
+        "window_id": first_window_id,
+        "pane_id": first_pane_id,
+        "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+    })
+}
+
 /// Register session CRUD methods on the router builder.
 ///
 /// These methods use a `GraphHandle` to interact with the SessionGraph.
@@ -161,24 +208,17 @@ fn register_session_methods(
     let g2 = graph.clone();
     let g3 = graph.clone();
     let g4 = graph.clone();
+    let g5 = graph.clone();
 
     builder
         .register("session.list", move |_params: Option<serde_json::Value>| {
             let gh = g1.clone();
             async move {
                 let snap = gh.snapshot();
-                let sessions: Vec<serde_json::Value> = snap
-                    .sessions
-                    .values()
-                    .map(|s| {
-                        serde_json::json!({
-                            "id": s.id.to_string(),
-                            "name": s.name,
-                            "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                            "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-                        })
-                    })
-                    .collect();
+                let mut sessions: Vec<_> = snap.sessions.values().collect();
+                sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                let sessions: Vec<serde_json::Value> =
+                    sessions.iter().map(|s| session_to_json(s, &snap)).collect();
                 Ok(serde_json::json!({ "sessions": sessions }))
             }
         })
@@ -191,32 +231,38 @@ fn register_session_methods(
                     let name = params
                         .get("name")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("default")
-                        .to_string();
+                        .map(|s| s.to_string());
 
-                    let cwd =
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+                    // Auto-generate name if not provided
+                    let name = match name {
+                        Some(n) if !n.is_empty() => n,
+                        _ => {
+                            let snap = gh.snapshot();
+                            let mut idx = snap.sessions.len();
+                            loop {
+                                let candidate = format!("session-{idx}");
+                                if !snap.session_name_exists(&candidate) {
+                                    break candidate;
+                                }
+                                idx += 1;
+                            }
+                        }
+                    };
+
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
                     match gh.create_session(name, cwd).await {
                         Ok(session_id) => {
                             let snap = gh.snapshot();
                             if let Some(s) = snap.sessions.get(&session_id) {
-                                Ok(serde_json::json!({
-                                    "id": s.id.to_string(),
-                                    "name": s.name,
-                                    "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                                    "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-                                }))
+                                Ok(session_to_json(s, &snap))
                             } else {
                                 Ok(serde_json::json!({
                                     "id": session_id.to_string(),
                                 }))
                             }
                         }
-                        Err(e) => Err(shux_rpc::RpcError::with_message(
-                            shux_rpc::ErrorCode::InternalError,
-                            e.to_string(),
-                        )),
+                        Err(e) => Err(graph_error_to_rpc(e)),
                     }
                 }
             },
@@ -225,31 +271,40 @@ fn register_session_methods(
             let gh = g3.clone();
             async move {
                 let params = params.unwrap_or_default();
-                let name = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        shux_rpc::RpcError::with_message(
-                            shux_rpc::ErrorCode::InvalidParams,
-                            "missing 'name' parameter".to_string(),
-                        )
+
+                // Accept name or id — try UUID parse first, fall back to name lookup
+                let session_id = if let Some(id_str) = params.get("id").and_then(|v| v.as_str()) {
+                    let parsed: shux_core::model::SessionId = id_str.parse().map_err(|_| {
+                        shux_rpc::RpcError::invalid_params("invalid session ID format")
                     })?;
+                    // Verify it exists
+                    let snap = gh.snapshot();
+                    if !snap.sessions.contains_key(&parsed) {
+                        return Err(shux_rpc::RpcError::not_found("session", id_str));
+                    }
+                    parsed
+                } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                    let snap = gh.snapshot();
+                    let session = snap
+                        .find_session_by_name(name)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?;
+                    session.id
+                } else {
+                    return Err(shux_rpc::RpcError::invalid_params(
+                        "missing 'name' or 'id' parameter",
+                    ));
+                };
 
                 let snap = gh.snapshot();
-                let session = snap.find_session_by_name(name).ok_or_else(|| {
-                    shux_rpc::RpcError::with_message(
-                        shux_rpc::ErrorCode::InternalError,
-                        format!("session not found: {name}"),
-                    )
-                })?;
-                let session_id = session.id;
+                let name = snap
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
 
-                gh.destroy_session(session_id, None).await.map_err(|e| {
-                    shux_rpc::RpcError::with_message(
-                        shux_rpc::ErrorCode::InternalError,
-                        e.to_string(),
-                    )
-                })?;
+                gh.destroy_session(session_id, None)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
 
                 Ok(serde_json::json!({ "killed": name }))
             }
@@ -269,30 +324,21 @@ fn register_session_methods(
                     // Check if session already exists
                     let snap = gh.snapshot();
                     if let Some(s) = snap.find_session_by_name(&name) {
-                        return Ok(serde_json::json!({
-                            "id": s.id.to_string(),
-                            "name": s.name,
-                            "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                            "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-                            "created": false,
-                        }));
+                        let mut json = session_to_json(s, &snap);
+                        json["created"] = serde_json::Value::Bool(false);
+                        return Ok(json);
                     }
 
                     // Create new session
-                    let cwd =
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
                     match gh.create_session(name, cwd).await {
                         Ok(session_id) => {
                             let snap = gh.snapshot();
                             if let Some(s) = snap.sessions.get(&session_id) {
-                                Ok(serde_json::json!({
-                                    "id": s.id.to_string(),
-                                    "name": s.name,
-                                    "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                                    "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-                                    "created": true,
-                                }))
+                                let mut json = session_to_json(s, &snap);
+                                json["created"] = serde_json::Value::Bool(true);
+                                Ok(json)
                             } else {
                                 Ok(serde_json::json!({
                                     "id": session_id.to_string(),
@@ -300,10 +346,54 @@ fn register_session_methods(
                                 }))
                             }
                         }
-                        Err(e) => Err(shux_rpc::RpcError::with_message(
-                            shux_rpc::ErrorCode::InternalError,
-                            e.to_string(),
-                        )),
+                        Err(e) => Err(graph_error_to_rpc(e)),
+                    }
+                }
+            },
+        )
+        .register(
+            "session.rename",
+            move |params: Option<serde_json::Value>| {
+                let gh = g5.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let new_name = params
+                        .get("new_name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'new_name' parameter")
+                        })?
+                        .to_string();
+
+                    // Resolve session by name or id
+                    let session_id = if let Some(name) = params.get("name").and_then(|v| v.as_str())
+                    {
+                        let snap = gh.snapshot();
+                        let session = snap
+                            .find_session_by_name(name)
+                            .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?;
+                        session.id
+                    } else if let Some(id_str) = params.get("id").and_then(|v| v.as_str()) {
+                        id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid session ID format")
+                        })?
+                    } else {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "missing 'name' or 'id' parameter",
+                        ));
+                    };
+
+                    gh.rename_session(session_id, new_name, None)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
+
+                    let snap = gh.snapshot();
+                    if let Some(s) = snap.sessions.get(&session_id) {
+                        Ok(session_to_json(s, &snap))
+                    } else {
+                        Err(shux_rpc::RpcError::internal(
+                            "session vanished after rename",
+                        ))
                     }
                 }
             },
@@ -380,6 +470,11 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
         Some(Command::Kill { session }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
             cli::handle_kill(&mut stream, &session, args.format).await
+        }
+
+        Some(Command::Rename { session, name }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_rename(&mut stream, &session, &name, args.format).await
         }
 
         Some(Command::Api { method, params }) => {

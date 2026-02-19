@@ -29,6 +29,15 @@ pub enum GraphError {
     #[error("session name already exists: {0}")]
     SessionNameExists(String),
 
+    #[error("session name is empty")]
+    EmptySessionName,
+
+    #[error("session name too long (max 128 characters): {0}")]
+    SessionNameTooLong(String),
+
+    #[error("session name contains invalid characters: {0}")]
+    InvalidSessionName(String),
+
     #[error("version conflict: expected {expected}, found {actual}")]
     VersionConflict { expected: Version, actual: Version },
 
@@ -177,11 +186,29 @@ impl SessionGraph {
         self.state.store(Arc::new(snapshot));
     }
 
+    fn validate_session_name(name: &str) -> Result<(), GraphError> {
+        if name.is_empty() {
+            return Err(GraphError::EmptySessionName);
+        }
+        if name.len() > 128 {
+            return Err(GraphError::SessionNameTooLong(name.to_string()));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(GraphError::InvalidSessionName(name.to_string()));
+        }
+        Ok(())
+    }
+
     pub fn create_session(
         &self,
         name: String,
         cwd: std::path::PathBuf,
     ) -> Result<SessionId, GraphError> {
+        Self::validate_session_name(&name)?;
+
         let current = self.current();
 
         if current.session_name_exists(&name) {
@@ -266,6 +293,8 @@ impl SessionGraph {
         new_name: String,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
+        Self::validate_session_name(&new_name)?;
+
         let current = self.current();
 
         let session = current
@@ -1215,6 +1244,57 @@ mod tests {
 
         token.cancel();
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_validate_session_name_empty() {
+        let (graph, _state) = SessionGraph::new();
+        let err = graph.create_session("".into(), home()).unwrap_err();
+        assert!(matches!(err, GraphError::EmptySessionName));
+    }
+
+    #[test]
+    fn test_validate_session_name_too_long() {
+        let (graph, _state) = SessionGraph::new();
+        let long_name = "a".repeat(129);
+        let err = graph.create_session(long_name, home()).unwrap_err();
+        assert!(matches!(err, GraphError::SessionNameTooLong(_)));
+    }
+
+    #[test]
+    fn test_validate_session_name_invalid_chars() {
+        let (graph, _state) = SessionGraph::new();
+        let err = graph.create_session("bad name".into(), home()).unwrap_err();
+        assert!(matches!(err, GraphError::InvalidSessionName(_)));
+    }
+
+    #[test]
+    fn test_validate_session_name_valid() {
+        let (graph, _state) = SessionGraph::new();
+        // These should all succeed
+        graph.create_session("alpha".into(), home()).unwrap();
+        graph.create_session("my-session".into(), home()).unwrap();
+        graph.create_session("test_123".into(), home()).unwrap();
+        graph.create_session("v1.0.0".into(), home()).unwrap();
+    }
+
+    #[test]
+    fn test_validate_rename_name() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph.create_session("valid".into(), home()).unwrap();
+
+        // Empty name
+        let err = graph.rename_session(sid, "".into(), None).unwrap_err();
+        assert!(matches!(err, GraphError::EmptySessionName));
+
+        // Spaces
+        let err = graph
+            .rename_session(sid, "bad name".into(), None)
+            .unwrap_err();
+        assert!(matches!(err, GraphError::InvalidSessionName(_)));
+
+        // Valid rename
+        graph.rename_session(sid, "good-name".into(), None).unwrap();
     }
 
     #[test]

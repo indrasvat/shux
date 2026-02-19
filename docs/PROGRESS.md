@@ -53,6 +53,23 @@
 
 ## Session Log
 
+**2026-02-19 — Task 013: Session CRUD (API + CLI) — Done**
+- Added `NameConflict` error code (-32007) to `shux-rpc` error types with convenience constructor
+- Added session name validation to `SessionGraph`: non-empty, max 128 chars, alphanumeric + hyphens + underscores + dots. New `GraphError` variants: `EmptySessionName`, `SessionNameTooLong`, `InvalidSessionName`
+- Created `graph_error_to_rpc()` helper mapping `GraphError` → `RpcError` with proper error codes: `SessionNotFound` → `NotFound`, `SessionNameExists` → `NameConflict`, validation errors → `InvalidParams`
+- Created `session_to_json()` helper building consistent JSON responses with `window_count`, `active_window_id`, `window_id`, `pane_id` fields
+- Enhanced `session.list`: sorted by `created_at`, includes `window_count` and `active_window_id`
+- Enhanced `session.create`: returns `window_id` and `pane_id`, auto-generates `session-N` names when no name provided
+- Enhanced `session.kill`: accepts `{name: ".."}` OR `{id: "uuid.."}` — tries UUID parse first, falls back to name lookup
+- Added `session.rename` RPC method: accepts name or id, resolves to session_id, validates new_name, returns updated session
+- Added `Rename` CLI subcommand (`shux rename -s <old> -n <new>`) with `handle_rename()` and `print_session_renamed()` style helper
+- Added `FromStr` implementation to `define_id!` macro for UUID parsing in model.rs
+- Updated `register_session_methods()` in both test files (`m0_integration.rs`, `cli_integration.rs`) with all 5 methods and proper error mapping
+- Created `.claude/automations/test_013_session_crud.py`: L4 visual test with 20 tests (Parts A–F: creation, listing, ensure, rename, kill, error handling), 17 screenshots
+- 458 tests passing (437 existing + 5 graph validation unit + 14 integration + 2 CLI parse), all make targets pass
+- Learning: `graph_error_to_rpc()` centralizes error mapping — keeps RPC handlers clean and ensures consistent error codes across all session methods
+- Learning: Auto-generated session names use `session-N` pattern where N is the count of existing sessions (simple, predictable, avoids conflicts)
+
 **2026-02-19 — Task 012: M0 Integration and Quality Gate — Done**
 - Wired RPC Server + SessionGraph into daemon (`crates/shux/src/main.rs`): replaced bare `UnixListener::bind` stub with real `run_rpc_server()` that creates SessionGraph + graph loop + RPC Server
 - Added `register_session_methods()`: registers `session.list`, `session.create`, `session.kill`, `session.ensure` backed by GraphHandle closures — lives in binary crate since shux-rpc intentionally doesn't depend on shux-core
@@ -166,7 +183,7 @@
 | 010 | Minimal TUI client | M0 | **Done** | 004, 008, 009 |
 | 011 | CLI foundation (clap) | M0 | **Done** | 001, 008 |
 | 012 | M0 integration and quality gate | M0 | **Done** | 001–011 |
-| 013 | Session CRUD (API + CLI) | M1 | Pending | 012 |
+| 013 | Session CRUD (API + CLI) | M1 | **Done** | 012 |
 | 014 | Window CRUD (API + CLI) | M1 | Pending | 013 |
 | 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | Pending | 014, 003 |
 | 016 | Pane I/O (send_keys, run_command, capture) | M1 | Pending | 015, 004 |

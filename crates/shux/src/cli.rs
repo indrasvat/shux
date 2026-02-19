@@ -94,6 +94,17 @@ pub enum Command {
         session: String,
     },
 
+    /// Rename a session
+    Rename {
+        /// Current session name
+        #[arg(short, long)]
+        session: String,
+
+        /// New name for the session
+        #[arg(short, long)]
+        name: String,
+    },
+
     /// Send a raw JSON-RPC call to the daemon (for debugging)
     Api {
         /// JSON-RPC method name (e.g., "system.version", "session.list")
@@ -345,6 +356,37 @@ pub async fn handle_kill(
     Ok(())
 }
 
+/// Handle the `shux rename` command.
+pub async fn handle_rename(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    new_name: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "name".to_string(),
+        serde_json::Value::String(session_name.to_string()),
+    );
+    params.insert(
+        "new_name".to_string(),
+        serde_json::Value::String(new_name.to_string()),
+    );
+
+    let result = rpc_call(stream, "session.rename", serde_json::Value::Object(params)).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            crate::style::print_session_renamed(session_name, new_name);
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle the `shux api <method> <params>` command (raw JSON-RPC for debugging).
 pub async fn handle_api(
     stream: &mut tokio::net::UnixStream,
@@ -547,6 +589,27 @@ mod tests {
     #[test]
     fn test_cli_kill_requires_session() {
         let result = Cli::try_parse_from(["shux", "kill"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_rename() {
+        let cli = Cli::try_parse_from(["shux", "rename", "-s", "old", "-n", "new"]).unwrap();
+        match cli.command {
+            Some(Command::Rename { session, name }) => {
+                assert_eq!(session, "old");
+                assert_eq!(name, "new");
+            }
+            _ => panic!("expected Rename command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rename_requires_both_args() {
+        let result = Cli::try_parse_from(["shux", "rename", "-s", "old"]);
+        assert!(result.is_err());
+
+        let result = Cli::try_parse_from(["shux", "rename", "-n", "new"]);
         assert!(result.is_err());
     }
 }

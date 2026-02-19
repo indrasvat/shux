@@ -16,6 +16,48 @@ use tokio_util::codec::Framed;
 // Test harness
 // ══════════════════════════════════════════════════════════════
 
+/// Map GraphError to appropriate RPC error codes (duplicated from main.rs).
+fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
+    use shux_core::graph::GraphError;
+    match e {
+        GraphError::SessionNotFound(_)
+        | GraphError::WindowNotFound(_)
+        | GraphError::PaneNotFound(_) => shux_rpc::RpcError::not_found("session", &e.to_string()),
+        GraphError::SessionNameExists(ref name) => {
+            shux_rpc::RpcError::name_conflict("session", name)
+        }
+        GraphError::EmptySessionName
+        | GraphError::SessionNameTooLong(_)
+        | GraphError::InvalidSessionName(_) => shux_rpc::RpcError::invalid_params(&e.to_string()),
+        GraphError::VersionConflict { expected, actual } => {
+            shux_rpc::RpcError::version_conflict("session", "?", expected, actual)
+        }
+        _ => shux_rpc::RpcError::internal(&e.to_string()),
+    }
+}
+
+/// Build session info JSON from a Session.
+fn session_to_json(
+    s: &shux_core::model::Session,
+    snap: &shux_core::graph::SessionGraphSnapshot,
+) -> serde_json::Value {
+    let first_window_id = s.windows.first().map(|w| w.to_string());
+    let first_pane_id = s
+        .windows
+        .first()
+        .and_then(|wid| snap.windows.get(wid).map(|w| w.active_pane.to_string()));
+    serde_json::json!({
+        "id": s.id.to_string(),
+        "name": s.name,
+        "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        "window_count": s.windows.len(),
+        "active_window_id": s.active_window.to_string(),
+        "window_id": first_window_id,
+        "pane_id": first_pane_id,
+        "created_at": s.created_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+    })
+}
+
 /// Register session CRUD methods backed by a real GraphHandle.
 fn register_session_methods(
     builder: shux_rpc::RouterBuilder,
@@ -25,24 +67,17 @@ fn register_session_methods(
     let g2 = graph.clone();
     let g3 = graph.clone();
     let g4 = graph.clone();
+    let g5 = graph.clone();
 
     builder
         .register("session.list", move |_params: Option<serde_json::Value>| {
             let gh = g1.clone();
             async move {
                 let snap = gh.snapshot();
-                let sessions: Vec<serde_json::Value> = snap
-                    .sessions
-                    .values()
-                    .map(|s| {
-                        serde_json::json!({
-                            "id": s.id.to_string(),
-                            "name": s.name,
-                            "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                            "created_at": format!("{:?}", s.created_at),
-                        })
-                    })
-                    .collect();
+                let mut sessions: Vec<_> = snap.sessions.values().collect();
+                sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                let sessions: Vec<serde_json::Value> =
+                    sessions.iter().map(|s| session_to_json(s, &snap)).collect();
                 Ok(serde_json::json!({ "sessions": sessions }))
             }
         })
@@ -55,27 +90,32 @@ fn register_session_methods(
                     let name = params
                         .get("name")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("default")
-                        .to_string();
+                        .map(|s| s.to_string());
+                    let name = match name {
+                        Some(n) if !n.is_empty() => n,
+                        _ => {
+                            let snap = gh.snapshot();
+                            let mut idx = snap.sessions.len();
+                            loop {
+                                let candidate = format!("session-{idx}");
+                                if !snap.session_name_exists(&candidate) {
+                                    break candidate;
+                                }
+                                idx += 1;
+                            }
+                        }
+                    };
                     let cwd = PathBuf::from("/tmp");
                     match gh.create_session(name, cwd).await {
                         Ok(session_id) => {
                             let snap = gh.snapshot();
                             if let Some(s) = snap.sessions.get(&session_id) {
-                                Ok(serde_json::json!({
-                                    "id": s.id.to_string(),
-                                    "name": s.name,
-                                    "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                                    "created_at": format!("{:?}", s.created_at),
-                                }))
+                                Ok(session_to_json(s, &snap))
                             } else {
                                 Ok(serde_json::json!({ "id": session_id.to_string() }))
                             }
                         }
-                        Err(e) => Err(shux_rpc::RpcError::with_message(
-                            shux_rpc::ErrorCode::InternalError,
-                            e.to_string(),
-                        )),
+                        Err(e) => Err(graph_error_to_rpc(e)),
                     }
                 }
             },
@@ -84,29 +124,38 @@ fn register_session_methods(
             let gh = g3.clone();
             async move {
                 let params = params.unwrap_or_default();
-                let name = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        shux_rpc::RpcError::with_message(
-                            shux_rpc::ErrorCode::InvalidParams,
-                            "missing 'name' parameter".to_string(),
-                        )
+                let session_id = if let Some(id_str) = params.get("id").and_then(|v| v.as_str()) {
+                    let parsed: shux_core::model::SessionId = id_str.parse().map_err(|_| {
+                        shux_rpc::RpcError::invalid_params("invalid session ID format")
                     })?;
+                    let snap = gh.snapshot();
+                    if !snap.sessions.contains_key(&parsed) {
+                        return Err(shux_rpc::RpcError::not_found("session", id_str));
+                    }
+                    parsed
+                } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                    let snap = gh.snapshot();
+                    let session = snap
+                        .find_session_by_name(name)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?;
+                    session.id
+                } else {
+                    return Err(shux_rpc::RpcError::invalid_params(
+                        "missing 'name' or 'id' parameter",
+                    ));
+                };
+
                 let snap = gh.snapshot();
-                let session = snap.find_session_by_name(name).ok_or_else(|| {
-                    shux_rpc::RpcError::with_message(
-                        shux_rpc::ErrorCode::InternalError,
-                        format!("session not found: {name}"),
-                    )
-                })?;
-                let session_id = session.id;
-                gh.destroy_session(session_id, None).await.map_err(|e| {
-                    shux_rpc::RpcError::with_message(
-                        shux_rpc::ErrorCode::InternalError,
-                        e.to_string(),
-                    )
-                })?;
+                let name = snap
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+
+                gh.destroy_session(session_id, None)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
                 Ok(serde_json::json!({ "killed": name }))
             }
         })
@@ -123,26 +172,18 @@ fn register_session_methods(
                         .to_string();
                     let snap = gh.snapshot();
                     if let Some(s) = snap.find_session_by_name(&name) {
-                        return Ok(serde_json::json!({
-                            "id": s.id.to_string(),
-                            "name": s.name,
-                            "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                            "created_at": format!("{:?}", s.created_at),
-                            "created": false,
-                        }));
+                        let mut json = session_to_json(s, &snap);
+                        json["created"] = serde_json::Value::Bool(false);
+                        return Ok(json);
                     }
                     let cwd = PathBuf::from("/tmp");
                     match gh.create_session(name, cwd).await {
                         Ok(session_id) => {
                             let snap = gh.snapshot();
                             if let Some(s) = snap.sessions.get(&session_id) {
-                                Ok(serde_json::json!({
-                                    "id": s.id.to_string(),
-                                    "name": s.name,
-                                    "windows": s.windows.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-                                    "created_at": format!("{:?}", s.created_at),
-                                    "created": true,
-                                }))
+                                let mut json = session_to_json(s, &snap);
+                                json["created"] = serde_json::Value::Bool(true);
+                                Ok(json)
                             } else {
                                 Ok(serde_json::json!({
                                     "id": session_id.to_string(),
@@ -150,10 +191,53 @@ fn register_session_methods(
                                 }))
                             }
                         }
-                        Err(e) => Err(shux_rpc::RpcError::with_message(
-                            shux_rpc::ErrorCode::InternalError,
-                            e.to_string(),
-                        )),
+                        Err(e) => Err(graph_error_to_rpc(e)),
+                    }
+                }
+            },
+        )
+        .register(
+            "session.rename",
+            move |params: Option<serde_json::Value>| {
+                let gh = g5.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let new_name = params
+                        .get("new_name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'new_name' parameter")
+                        })?
+                        .to_string();
+
+                    let session_id = if let Some(name) = params.get("name").and_then(|v| v.as_str())
+                    {
+                        let snap = gh.snapshot();
+                        let session = snap
+                            .find_session_by_name(name)
+                            .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?;
+                        session.id
+                    } else if let Some(id_str) = params.get("id").and_then(|v| v.as_str()) {
+                        id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid session ID format")
+                        })?
+                    } else {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "missing 'name' or 'id' parameter",
+                        ));
+                    };
+
+                    gh.rename_session(session_id, new_name, None)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
+
+                    let snap = gh.snapshot();
+                    if let Some(s) = snap.sessions.get(&session_id) {
+                        Ok(session_to_json(s, &snap))
+                    } else {
+                        Err(shux_rpc::RpcError::internal(
+                            "session vanished after rename",
+                        ))
                     }
                 }
             },
@@ -695,6 +779,398 @@ async fn test_m0_cli_ls_json() {
         parsed["sessions"].is_array(),
         "JSON ls output should contain sessions array"
     );
+
+    cancel.cancel();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Task 013: Session CRUD tests
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_013_session_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let create_resp = rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "old-name"}),
+    )
+    .await;
+    assert!(create_resp["error"].is_null(), "create should succeed");
+
+    // Rename by name
+    let rename_resp = rpc_raw(
+        &socket_path,
+        "session.rename",
+        serde_json::json!({"name": "old-name", "new_name": "new-name"}),
+    )
+    .await;
+    assert!(
+        rename_resp["error"].is_null(),
+        "rename should succeed: {rename_resp}"
+    );
+    assert_eq!(rename_resp["result"]["name"], "new-name");
+
+    // Verify old name is gone
+    let list_resp = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;
+    let sessions = list_resp["result"]["sessions"].as_array().unwrap();
+    let names: Vec<&str> = sessions.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(names.contains(&"new-name"));
+    assert!(!names.contains(&"old-name"));
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_rename_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "first"}),
+    )
+    .await;
+    rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "second"}),
+    )
+    .await;
+
+    let rename_resp = rpc_raw(
+        &socket_path,
+        "session.rename",
+        serde_json::json!({"name": "second", "new_name": "first"}),
+    )
+    .await;
+    assert!(
+        rename_resp["error"].is_object(),
+        "rename to existing name should fail"
+    );
+    assert_eq!(
+        rename_resp["error"]["code"],
+        shux_rpc::ErrorCode::NameConflict.code()
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_name_validation_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": ""}),
+    )
+    .await;
+    // Empty name should auto-generate, not fail
+    assert!(
+        resp["error"].is_null(),
+        "empty name should auto-generate: {resp}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_name_validation_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "bad name"}),
+    )
+    .await;
+    assert!(
+        resp["error"].is_object(),
+        "name with spaces should fail: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["code"],
+        shux_rpc::ErrorCode::InvalidParams.code()
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_name_validation_too_long() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let long_name = "a".repeat(129);
+    let resp = rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": long_name}),
+    )
+    .await;
+    assert!(
+        resp["error"].is_object(),
+        "name too long should fail: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["code"],
+        shux_rpc::ErrorCode::InvalidParams.code()
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_ensure_idempotency_triple() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let r1 = rpc_raw(
+        &socket_path,
+        "session.ensure",
+        serde_json::json!({"name": "idem"}),
+    )
+    .await;
+    let r2 = rpc_raw(
+        &socket_path,
+        "session.ensure",
+        serde_json::json!({"name": "idem"}),
+    )
+    .await;
+    let r3 = rpc_raw(
+        &socket_path,
+        "session.ensure",
+        serde_json::json!({"name": "idem"}),
+    )
+    .await;
+
+    assert_eq!(r1["result"]["id"], r2["result"]["id"]);
+    assert_eq!(r2["result"]["id"], r3["result"]["id"]);
+    assert_eq!(r1["result"]["created"], true);
+    assert_eq!(r2["result"]["created"], false);
+    assert_eq!(r3["result"]["created"], false);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_kill_nonexistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "session.kill",
+        serde_json::json!({"name": "nonexistent"}),
+    )
+    .await;
+    assert!(
+        resp["error"].is_object(),
+        "killing nonexistent session should fail"
+    );
+    assert_eq!(resp["error"]["code"], shux_rpc::ErrorCode::NotFound.code());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_create_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "dupe"}),
+    )
+    .await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "dupe"}),
+    )
+    .await;
+    assert!(resp["error"].is_object(), "duplicate name should fail");
+    assert_eq!(
+        resp["error"]["code"],
+        shux_rpc::ErrorCode::NameConflict.code()
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_list_sorted_by_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    for name in ["alpha", "beta", "gamma"] {
+        rpc_raw(
+            &socket_path,
+            "session.create",
+            serde_json::json!({"name": name}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let resp = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;
+    let sessions = resp["result"]["sessions"].as_array().unwrap();
+    let names: Vec<&str> = sessions.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_list_has_window_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "counted"}),
+    )
+    .await;
+
+    let resp = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;
+    let sessions = resp["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions[0]["window_count"], 1);
+    assert!(sessions[0]["active_window_id"].is_string());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_create_has_window_pane_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "with-ids"}),
+    )
+    .await;
+
+    assert!(
+        resp["result"]["window_id"].is_string(),
+        "create should return window_id"
+    );
+    assert!(
+        resp["result"]["pane_id"].is_string(),
+        "create should return pane_id"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_auto_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    // Create with no name — should auto-generate
+    let resp = rpc_raw(&socket_path, "session.create", serde_json::json!({})).await;
+    assert!(resp["error"].is_null(), "auto-name create should succeed");
+    let name = resp["result"]["name"].as_str().unwrap();
+    assert!(
+        name.starts_with("session-"),
+        "auto-name should start with 'session-', got: {name}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_session_kill_by_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let create_resp = rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "kill-by-id"}),
+    )
+    .await;
+    let session_id = create_resp["result"]["id"].as_str().unwrap().to_string();
+
+    let kill_resp = rpc_raw(
+        &socket_path,
+        "session.kill",
+        serde_json::json!({"id": session_id}),
+    )
+    .await;
+    assert!(
+        kill_resp["error"].is_null(),
+        "kill by ID should succeed: {kill_resp}"
+    );
+
+    // Verify it is gone
+    let list_resp = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;
+    let sessions = list_resp["result"]["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(sessions.is_empty());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_013_cli_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    // Create via RPC
+    rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "cli-rename-old"}),
+    )
+    .await;
+
+    // Rename via CLI
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "rename",
+            "-s",
+            "cli-rename-old",
+            "-n",
+            "cli-rename-new",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "shux rename should succeed. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Renamed") || stdout.contains("renamed"),
+        "rename output should confirm: {stdout}"
+    );
+
+    // Verify via RPC
+    let list_resp = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;
+    let sessions = list_resp["result"]["sessions"].as_array().unwrap();
+    let names: Vec<&str> = sessions.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(names.contains(&"cli-rename-new"));
+    assert!(!names.contains(&"cli-rename-old"));
 
     cancel.cancel();
 }

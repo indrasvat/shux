@@ -1,6 +1,6 @@
 # 013 — Session CRUD (API + CLI)
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 012
 **Parallelizable With:** 022
 
