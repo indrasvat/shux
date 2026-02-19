@@ -1,6 +1,6 @@
 # 000 — Repository Scaffold and Tooling
 
-**Status:** Pending
+**Status:** In Progress
 **Depends On:** —
 **Parallelizable With:** —
 
