@@ -54,14 +54,16 @@
 ## Session Log
 
 **2026-02-19 — Task 011: CLI Foundation (clap) — Done**
-- Created `crates/shux/src/cli.rs`: Cli struct with clap derive, Command enum (New/Attach/Ls/Kill/Api/Version/__daemon), OutputFormat (Text/Json), RpcClientError, rpc_call() async JSON-RPC client with length-prefix framing, handler functions (handle_ls, handle_new, handle_kill, handle_api, handle_version)
-- Created `crates/shux/src/style.rs`: consistent CLI color palette (accent=cyan, success=green, warning=yellow, error=red, muted=dim), respects NO_COLOR convention and IsTerminal check, crossterm Stylize-based Styled helper, print helpers (print_version, print_session_entry, print_no_sessions, print_session_created, print_session_killed, print_error)
-- Updated `crates/shux/src/main.rs`: real CLI dispatch with clap::Parser, run_daemon() for __daemon subcommand, run_client() with tracing setup, dispatch() routing all subcommands, styled version fallback when daemon not running, styled error output
-- Updated `crates/shux/src/client.rs`: added ensure_daemon_running_at(socket_path) for explicit socket path override
-- Created `crates/shux/tests/cli_integration.rs`: 17 integration tests — 5 in-process RPC tests (version, health, session.list, unknown method, concurrent), 5 CLI binary tests against real RPC server (version, version json, ls, ls json, api raw), 7 smoke tests (help, version flag, invalid subcommand, kill requires session, list alias, version without daemon, version json without daemon)
+- Created `crates/shux/src/cli.rs`: Cli struct with clap derive, Command enum (New/Attach/Ls/Kill/Api/Version/__daemon), OutputFormat (Text/Json), RpcClientError, rpc_call() async JSON-RPC client with length-prefix framing, handler functions (handle_ls, handle_new, handle_kill, handle_api, handle_version), custom clap Styles (cyan headers, green commands, yellow placeholders, red errors)
+- Created `crates/shux/src/style.rs`: consistent CLI color palette (accent=cyan, success=green, warning=yellow, error=red, muted=dim), respects NO_COLOR convention and IsTerminal check, crossterm Stylize-based Styled helper, print helpers (print_version, print_session_entry, print_no_sessions, print_session_created, print_session_killed, print_error), banner() with figlet "shux" ASCII art and cyan→blue→indigo gradient (256-color codes 51→45→39→33→27)
+- Updated `crates/shux/src/main.rs`: real CLI dispatch with CommandFactory+FromArgMatches (for dynamic banner injection), run_daemon() for __daemon subcommand, run_client() with tracing setup + styled error output, dispatch() routing all subcommands, instant version via try_connect() (no daemon auto-start)
+- Updated `crates/shux/src/client.rs`: added ensure_daemon_running_at(socket_path) for explicit socket path override, try_connect() for quick probe without auto-start
+- Created `crates/shux/tests/cli_integration.rs`: 17 integration tests — 5 in-process RPC tests (version, health, session.list, unknown method, concurrent), 5 CLI binary tests against real RPC server using tokio::process::Command (async), 7 smoke tests (help, version flag, invalid subcommand, kill requires session, list alias, version without daemon, version json without daemon)
+- Created `.claude/automations/test_011_cli_styling.py`: L4 visual test with 7 tests (build, help banner, help headers, help commands, version styled, subcommand help, short help) — all passing, 4 screenshots confirming gradient colors and styled output
 - Added crossterm, serde, serde_json, uuid to shux crate deps; bytes, futures to dev-deps
-- 419 tests passing (36 new: 16 unit CLI parsing + 3 style + 17 integration)
+- 420 tests passing (37 new: 16 unit CLI parsing + 4 style + 17 integration)
 - Learning: tokio::process::Command (async) must be used instead of std::process::Command (blocking) in #[tokio::test] to avoid deadlocking the single-threaded runtime when the test also runs a server task
+- Learning: clap's before_help requires CommandFactory+FromArgMatches pattern for dynamic content (banner with terminal detection); the Styles const can use AnsiColor for consistent branded help output
 
 **2026-02-19 — Task 010: Minimal TUI Client — Done**
 - Created `crates/shux-ui/src/terminal.rs`: TerminalGuard (RAII raw mode + alt screen + mouse + Kitty keyboard), install_panic_hook (restores terminal before panic), shutdown_signal (SIGTERM/SIGINT)
