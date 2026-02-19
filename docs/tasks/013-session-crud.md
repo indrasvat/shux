@@ -33,6 +33,7 @@ The `session.ensure` operation is particularly important for AI agent workflows.
 - `crates/shux/src/commands/mod.rs` — Module index for CLI commands
 - `crates/shux-core/src/session.rs` — Session mutation operations on SessionGraph
 - `crates/shux-rpc/tests/session_api.rs` — L3 API contract tests
+- `.claude/automations/test_013_session_crud.py` — L4 iterm2-driver visual tests (20 tests, 17 screenshots)
 
 ## Files to Modify
 
@@ -1299,6 +1300,132 @@ cargo nextest run --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Visual Tests (L4) — iterm2-driver
+
+**Script:** `.claude/automations/test_013_session_crud.py`
+**Run:** `uv run .claude/automations/test_013_session_crud.py`
+
+This is a **mandatory** visual verification gate. All tests below run in a real iTerm2
+session, send real CLI commands, read back screen contents, and capture screenshots
+at every transition. Tests verify **actual rendered output**, not just exit codes.
+
+#### Test Matrix (20 tests)
+
+##### Part A — Session Creation & Styled Output (Tests 1–5)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 1 | Build | `make build` (subprocess) | returncode == 0 | — |
+| 2 | Create Detached | `shux new -s alpha -d` | Screen contains "alpha" AND (contains "created" OR "Created") AND session UUID (8+ hex chars). Verify styled output: screenshot must show green "Created" text. | `013_create_alpha.png` |
+| 3 | Create Second | `shux new -s beta -d` | Screen contains "beta". | `013_create_beta.png` |
+| 4 | Create Third | `shux new -s gamma -d` | Screen contains "gamma". | `013_create_gamma.png` |
+| 5 | Create with Auto-name | `shux new -d` (no `-s`) | Screen contains "session-" or similar auto-generated name. Verify output is not an error. | `013_create_autoname.png` |
+
+##### Part B — Session Listing & Formatting (Tests 6–9)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 6 | List All Sessions | `shux ls` | Screen contains ALL of: "alpha", "beta", "gamma". Count at least 3 session entries (lines with session names). Verify each entry shows window count and timestamp. | `013_ls_all.png` |
+| 7 | List Ordering | (from test 6 screen) | Verify sessions appear in creation order: alpha before beta, beta before gamma (by line number). | — |
+| 8 | List JSON Format | `shux ls --format json` | Screen contains valid JSON: must find `[`, `"name"`, `"alpha"`, `"beta"`, `"gamma"`. Pipe through `jq` or parse inline to verify JSON array with 3+ entries. | `013_ls_json.png` |
+| 9 | List Shows Window Count | (from test 6 screen) | Each session entry contains "1 window" or "windows" text. Verify no session shows 0 windows (every session auto-creates a default window). | — |
+
+##### Part C — Ensure (Idempotent Create) (Tests 10–12)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 10 | Ensure Existing | `shux new -s alpha --ensure -d` | Screen contains "alpha" AND does NOT contain "error" or "Error". Verify output indicates session already existed (e.g., "ensured" or "exists" or same UUID as original). | `013_ensure_existing.png` |
+| 11 | Ensure New | `shux new -s delta --ensure -d` | Screen contains "delta" AND ("created" or "Created"). Verify a new session was actually created. | `013_ensure_new.png` |
+| 12 | Ensure Triple Idempotency | Run `shux new -s epsilon --ensure -d` three times. After all three, run `shux ls`. | `shux ls` shows exactly ONE entry named "epsilon" (not 2 or 3 duplicates). Count occurrences of "epsilon" in list output. | `013_ensure_triple.png` |
+
+##### Part D — Session Rename (Tests 13–14)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 13 | Rename Session | `shux rename -s beta -n beta-renamed` | Screen contains "renamed" or "Renamed". Then run `shux ls` — must contain "beta-renamed" and must NOT contain standalone "beta" (only "beta-renamed"). | `013_rename.png` |
+| 14 | Rename Conflict | `shux rename -s gamma -n alpha` | Screen contains "error" or "Error" or "conflict" or "exists". Verify the error is about name conflict, not a crash. | `013_rename_conflict.png` |
+
+##### Part E — Session Kill & Cleanup (Tests 15–17)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 15 | Kill Session | `shux kill -s gamma` | Screen contains "killed" or "Killed" AND "gamma". | `013_kill_gamma.png` |
+| 16 | Verify Kill Removed | `shux ls` | Screen does NOT contain "gamma". Still contains "alpha" and "beta-renamed". | `013_ls_after_kill.png` |
+| 17 | Kill Nonexistent | `shux kill -s nonexistent-session` | Screen contains "error" or "Error" or "not found". Verify clean error message, not a panic/stack trace. | `013_kill_nonexistent.png` |
+
+##### Part F — Error Handling & Validation (Tests 18–20)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 18 | Create Empty Name | `shux new -s "" -d` | Screen contains "error" or clap validation error. Must not panic or produce empty output. | `013_err_empty_name.png` |
+| 19 | Create Invalid Name (Spaces) | `shux new -s "bad name" -d` | Screen contains "error" or "invalid" or "Error". Verify the daemon returns a validation error, not a crash. | `013_err_invalid_name.png` |
+| 20 | Create Duplicate Name | `shux new -s alpha -d` | Screen contains "error" or "Error" or "exists" or "conflict". Verify error code is surfaced (not just generic failure). | `013_err_duplicate.png` |
+
+#### Implementation Notes for the Test Script
+
+```python
+# Key patterns the script MUST follow:
+
+# 1. Every test clears the screen first for a clean baseline
+await send_and_wait(session, "clear", 0.3)
+
+# 2. Every command result is verified by READING THE SCREEN, not just checking exit code
+content = await read_screen(session)
+assert "alpha" in content, "Session name not found in output"
+
+# 3. Every state-changing test is followed by a verification command
+# After create → verify with ls
+# After rename → verify with ls
+# After kill → verify with ls
+
+# 4. Screenshots are taken at EVERY verification point, not just happy paths
+take_screenshot("013_err_duplicate")  # Error output is screenshotted too
+
+# 5. Screen dumps on failure for debugging
+if not found:
+    await dump_screen(session, "test_N_failure")
+
+# 6. Line-level verification for ordering tests
+lines = content.split("\n")
+alpha_line = next(i for i, l in enumerate(lines) if "alpha" in l)
+beta_line = next(i for i, l in enumerate(lines) if "beta" in l)
+assert alpha_line < beta_line, "Sessions not in creation order"
+
+# 7. Count verification for idempotency
+epsilon_count = content.count("epsilon")
+assert epsilon_count == 1, f"Expected 1 epsilon, found {epsilon_count}"
+
+# 8. Negative assertion — verify something is NOT on screen
+assert "gamma" not in content, "Killed session still appears in list"
+
+# 9. Cleanup kills ALL test sessions in finally: block
+for name in ["alpha", "beta", "beta-renamed", "gamma", "delta", "epsilon"]:
+    subprocess.run([SHUX_BIN, "kill", "-s", name], capture_output=True, timeout=5)
+```
+
+#### Screenshots Produced (14 total)
+
+```
+.claude/screenshots/
+├── 013_create_alpha.png
+├── 013_create_beta.png
+├── 013_create_gamma.png
+├── 013_create_autoname.png
+├── 013_ls_all.png
+├── 013_ls_json.png
+├── 013_ensure_existing.png
+├── 013_ensure_new.png
+├── 013_ensure_triple.png
+├── 013_rename.png
+├── 013_rename_conflict.png
+├── 013_kill_gamma.png
+├── 013_ls_after_kill.png
+├── 013_kill_nonexistent.png
+├── 013_err_empty_name.png
+├── 013_err_invalid_name.png
+└── 013_err_duplicate.png
+```
+
 ---
 
 ## Completion Criteria
@@ -1317,6 +1444,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - [ ] CLI resolves sessions by name or UUID
 - [ ] L3 API contract tests pass: happy path for all 6 methods + error cases (duplicate name, not found, empty name, invalid name)
 - [ ] Event emission tests pass: verify events are received by subscribers
+- [ ] **L4 visual tests pass: `uv run .claude/automations/test_013_session_crud.py` — 20/20 tests pass with screenshots**
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [ ] `cargo nextest run --workspace` passes
 
@@ -1348,4 +1476,5 @@ feat: implement session CRUD via JSON-RPC API and CLI
    - Return `RpcError` with specific error codes: -32002 (not found), -32003 (name conflict), -32602 (invalid params).
    - Emit events via `broadcast::Sender<Event>` after successful mutations, before sending the reply.
    - Use `ArcSwap::load()` for reads (lock-free snapshots).
-4. **After:** Run full verification suite. Update `docs/PROGRESS.md` (mark 013 done, add session log entry). Update `CLAUDE.md` Learnings if anything was discovered. Verify that task 014 (window CRUD) can build on this foundation.
+4. **After L3 tests pass:** Write and run the L4 visual test script: `.claude/automations/test_013_session_crud.py`. Follow the test matrix above exactly. All 20 tests must pass. Fix any failures found by visual testing (these are real bugs that L3 tests miss).
+5. **After all tests pass:** Run full verification suite. Update `docs/PROGRESS.md` (mark 013 done, add session log entry). Update `CLAUDE.md` Learnings if anything was discovered. Verify that task 014 (window CRUD) can build on this foundation.

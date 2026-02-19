@@ -30,6 +30,7 @@ Window reordering is important for muscle memory: a user who knows "window 1 is 
 - `crates/shux/src/commands/window.rs` — CLI window subcommands
 - `crates/shux-core/src/window.rs` — Window mutation operations on SessionGraph
 - `crates/shux-rpc/tests/window_api.rs` — L3 API contract tests
+- `.claude/automations/test_014_window_crud.py` — L4 iterm2-driver visual tests (25 tests, 21 screenshots)
 
 ## Files to Modify
 
@@ -1246,6 +1247,175 @@ cargo nextest run --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Visual Tests (L4) — iterm2-driver
+
+**Script:** `.claude/automations/test_014_window_crud.py`
+**Run:** `uv run .claude/automations/test_014_window_crud.py`
+
+This is a **mandatory** visual verification gate. Every test runs in a real iTerm2
+session, sends real CLI commands, reads back actual screen contents, and captures
+screenshots at every transition. No smoke tests — every assertion reads the terminal.
+
+#### Test Matrix (25 tests)
+
+##### Part A — Setup & Default Window Verification (Tests 1–4)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 1 | Build | `make build` (subprocess) | returncode == 0 | — |
+| 2 | Create Session | `shux new -s ws-test -d` | Screen contains "ws-test" and ("created" or "Created"). | `014_session_created.png` |
+| 3 | Default Window Exists | `shux window list -s ws-test` | Screen shows exactly 1 window entry. Entry shows index 0. Entry shows "1 pane" or "panes". Verify the default window has a name (e.g., "0"). | `014_default_window.png` |
+| 4 | Default Window Has Active Marker | (from test 3 screen) | The single window entry has an active marker (`*` or equivalent). Since it's the only window, it must be active. | — |
+
+##### Part B — Window Creation (Tests 5–9)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 5 | Create Named Window | `shux window create -s ws-test -n editor` | Screen contains "editor" and ("created" or "Window:" or index number). | `014_create_editor.png` |
+| 6 | Create Second Named Window | `shux window create -s ws-test -n server` | Screen contains "server". | `014_create_server.png` |
+| 7 | Create Third Named Window | `shux window create -s ws-test -n logs` | Screen contains "logs". | `014_create_logs.png` |
+| 8 | List Shows All Windows | `shux window list -s ws-test` | Screen contains ALL of: "editor", "server", "logs", plus the default window name. Count exactly 4 window entries (4 lines with index numbers). Verify indices are 0, 1, 2, 3. | `014_list_all_windows.png` |
+| 9 | Newest Window Is Active | (from test 8 screen) | The "logs" window (last created) has the active marker (`*`). Other windows do NOT have the active marker. Parse each line and verify exactly one `*`. | — |
+
+##### Part C — Window Auto-Naming (Tests 10–11)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 10 | Create Unnamed Window | `shux window create -s ws-test` (no `-n`) | Window is created without error. Screen shows a window name that is index-based (e.g., "4") or auto-generated. | `014_create_unnamed.png` |
+| 11 | Verify Auto-Name in List | `shux window list -s ws-test` | Now 5 windows total. The unnamed one has a numeric or auto-generated name. | `014_list_with_unnamed.png` |
+
+##### Part D — Window Focus/Switching (Tests 12–14)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 12 | Focus By Name | `shux window focus -w editor -s ws-test` | Screen indicates focus changed. No error. | `014_focus_editor.png` |
+| 13 | Verify Focus Changed | `shux window list -s ws-test` | The "editor" window now has the active marker (`*`). "logs" no longer has it. Parse all lines and verify exactly one active marker, on the "editor" line. | `014_list_after_focus.png` |
+| 14 | Focus Returns Previous | (from test 12 output) | Output contains the previous window ID or name (the window that was active before focus switched). | — |
+
+##### Part E — Window Rename (Tests 15–17)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 15 | Rename Window | `shux window rename -w server -n backend -s ws-test` | Screen contains "renamed" or "Renamed" or "backend". No error. | `014_rename_backend.png` |
+| 16 | Verify Rename in List | `shux window list -s ws-test` | Screen contains "backend" and does NOT contain standalone "server" (only "backend" where "server" was). All other windows unchanged. | `014_list_after_rename.png` |
+| 17 | Rename Conflict | `shux window rename -w logs -n editor -s ws-test` | Screen contains "error" or "Error" or "conflict" or "exists". Clean error message, not a crash. | `014_rename_conflict.png` |
+
+##### Part F — Window Reorder (Tests 18–20)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 18 | Reorder Window to Front | `shux window reorder -w logs -i 0 -s ws-test` | Screen indicates reorder succeeded. No error. | `014_reorder.png` |
+| 19 | Verify Reorder in List | `shux window list -s ws-test` | "logs" now appears at index 0 (first line of window list). The former index-0 window moved down. Parse line numbers and verify "logs" is on the first window line. | `014_list_after_reorder.png` |
+| 20 | Reorder Out of Range | `shux window reorder -w editor -i 99 -s ws-test` | Screen contains "error" or "Error" or "out of range" or "invalid". | `014_reorder_out_of_range.png` |
+
+##### Part G — Window Kill (Tests 21–24)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 21 | Kill a Window | `shux window kill -w logs -s ws-test` | Screen contains "killed" or "Killed". No error. | `014_kill_logs.png` |
+| 22 | Verify Kill in List | `shux window list -s ws-test` | Screen does NOT contain "logs". Window count decreased by 1 (now 4 windows). | `014_list_after_kill.png` |
+| 23 | Kill Active → Focus Moves | Kill the currently active window (first check which is active via `window list`, then kill it). Run `shux window list -s ws-test` afterward. | A different window now has the active marker. The killed window is gone. Exactly one window has `*`. | `014_kill_active.png` |
+| 24 | Kill Last Window Fails | Kill all but one window (run multiple `window kill`), then try to kill the last one. | Screen contains "error" or "Error" or "last window" or "cannot kill". Verify the last window is NOT killed (run `window list` to confirm 1 window remains). | `014_kill_last_fails.png` |
+
+##### Part H — JSON Output & Cross-Verification (Test 25)
+
+| # | Test | Command | Screen Assertions | Screenshot |
+|---|------|---------|-------------------|------------|
+| 25 | Window List JSON | `shux window list -s ws-test --format json` | Screen contains valid JSON: `[`, `"title"`, `"pane_count"`, `"index"`. Count JSON objects matches the expected remaining window count from previous tests. | `014_list_json.png` |
+
+#### Implementation Notes for the Test Script
+
+```python
+# Key patterns the script MUST follow:
+
+# 1. Session setup in a setup phase — create one session, reuse it for all window tests
+# This avoids the session-creation overhead for each test and tests windows in isolation.
+await send_and_wait(session, f"{SHUX_BIN} new -s ws-test -d", 3.0)
+
+# 2. Active marker parsing — extract which window has the * marker
+def parse_active_window(content):
+    """Parse window list output and return the name of the active window."""
+    for line in content.split("\n"):
+        if "*" in line:
+            # Format: "1*: editor (1 panes)" or "1* editor ..."
+            return line.strip()
+    return None
+
+# 3. Window count verification — count actual window entries, not just string matches
+def count_windows(content):
+    """Count window entries in `window list` output."""
+    count = 0
+    for line in content.split("\n"):
+        line = line.strip()
+        # Window entries start with an index number
+        if line and line[0].isdigit() and ("pane" in line.lower() or ":" in line):
+            count += 1
+    return count
+
+# 4. Index order verification — parse indices and verify monotonic
+def parse_window_indices(content):
+    """Extract (index, name) tuples from window list output."""
+    windows = []
+    for line in content.split("\n"):
+        line = line.strip()
+        if line and line[0].isdigit():
+            # Parse "0 : default (1 pane)" or "0*: editor (1 pane)"
+            idx = int(line[0])
+            windows.append((idx, line))
+    return windows
+
+# 5. Multi-step test with state tracking
+# After reorder, the script must track the new ordering and verify subsequent
+# operations against the reordered state, not the original creation order.
+
+# 6. Progressive kill — for test 24 (kill last window), the script must:
+#    a) Count current windows
+#    b) Kill all but 1 (loop)
+#    c) Attempt to kill the last one
+#    d) Verify error
+#    e) Verify 1 window still exists via `window list`
+remaining = count_windows(await read_screen(session))
+while remaining > 1:
+    # Find a non-active window to kill (or kill any)
+    await send_and_wait(session, f"{SHUX_BIN} window kill -w <target> -s ws-test", 1.5)
+    remaining -= 1
+# Now try killing the last one — should fail
+await send_and_wait(session, f"{SHUX_BIN} window kill -w <last> -s ws-test", 1.5)
+content = await read_screen(session)
+assert "error" in content.lower() or "last window" in content.lower()
+
+# 7. Cleanup kills the entire session, which cascades to all windows
+# in the finally: block
+subprocess.run([SHUX_BIN, "kill", "-s", "ws-test"], capture_output=True, timeout=5)
+```
+
+#### Screenshots Produced (18 total)
+
+```
+.claude/screenshots/
+├── 014_session_created.png
+├── 014_default_window.png
+├── 014_create_editor.png
+├── 014_create_server.png
+├── 014_create_logs.png
+├── 014_list_all_windows.png
+├── 014_create_unnamed.png
+├── 014_list_with_unnamed.png
+├── 014_focus_editor.png
+├── 014_list_after_focus.png
+├── 014_rename_backend.png
+├── 014_list_after_rename.png
+├── 014_rename_conflict.png
+├── 014_reorder.png
+├── 014_list_after_reorder.png
+├── 014_reorder_out_of_range.png
+├── 014_kill_logs.png
+├── 014_list_after_kill.png
+├── 014_kill_active.png
+├── 014_kill_last_fails.png
+└── 014_list_json.png
+```
+
 ---
 
 ## Completion Criteria
@@ -1264,6 +1434,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - [ ] New windows automatically become the active window
 - [ ] Killing the active window focuses the last remaining window
 - [ ] L3 API contract tests pass: happy path + error cases (last window, not found, out of range)
+- [ ] **L4 visual tests pass: `uv run .claude/automations/test_014_window_crud.py` — 25/25 tests pass with screenshots**
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [ ] `cargo nextest run --workspace` passes
 
@@ -1295,4 +1466,5 @@ feat: implement window CRUD via JSON-RPC API and CLI
    - A new window always starts with `LayoutNode::Leaf { pane }` (single pane). Splits come in task 015.
    - When killing a window, collect all pane IDs from the LayoutTree before removing (panes may be in nested splits later).
    - The "last window" guard prevents orphan sessions. To remove everything, kill the session instead.
-4. **After:** Run full verification. Update `docs/PROGRESS.md`. Verify task 015 (pane operations) can build on this.
+4. **After L3 tests pass:** Write and run the L4 visual test script: `.claude/automations/test_014_window_crud.py`. Follow the test matrix above exactly. All 25 tests must pass. Fix any failures found by visual testing (these are real bugs that L3 tests miss).
+5. **After all tests pass:** Run full verification. Update `docs/PROGRESS.md`. Verify task 015 (pane operations) can build on this.
