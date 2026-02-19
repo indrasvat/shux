@@ -10,7 +10,7 @@ mod client;
 mod daemon;
 mod style;
 
-use cli::{Cli, Command, OutputFormat, WindowCommand};
+use cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
 
 fn main() -> anyhow::Result<()> {
     let cmd = Cli::command().before_help(style::banner());
@@ -124,10 +124,13 @@ async fn run_rpc_server(
         shux_core::graph::run_graph_loop(graph, graph_rx, graph_cancel).await;
     });
 
-    // Build router: system builtins + session + window methods backed by GraphHandle
-    let router = register_window_methods(
-        register_session_methods(
-            shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+    // Build router: system builtins + session + window + pane methods backed by GraphHandle
+    let router = register_pane_methods(
+        register_window_methods(
+            register_session_methods(
+                shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+                graph_handle.clone(),
+            ),
             graph_handle.clone(),
         ),
         graph_handle,
@@ -173,6 +176,10 @@ fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
         GraphError::LastWindow | GraphError::LastPane => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
+        GraphError::PaneSwapSelf | GraphError::PaneCrossWindow | GraphError::NoNeighbor(_) => {
+            shux_rpc::RpcError::invalid_params(&e.to_string())
+        }
+        GraphError::LayoutError(_) => shux_rpc::RpcError::internal(&e.to_string()),
         GraphError::VersionConflict { expected, actual } => {
             shux_rpc::RpcError::version_conflict("resource", "?", expected, actual)
         }
@@ -225,6 +232,357 @@ fn window_to_json(
         "is_active": is_active,
         "version": w.version,
     })
+}
+
+/// Build pane info JSON from a Pane.
+fn pane_to_json(
+    p: &shux_core::model::Pane,
+    window: &shux_core::model::Window,
+) -> serde_json::Value {
+    let is_focused = window.active_pane == p.id;
+    let is_zoomed = window.layout.is_zoomed()
+        && window
+            .layout
+            .zoom
+            .as_ref()
+            .is_some_and(|z| z.zoomed_pane == p.id);
+    serde_json::json!({
+        "id": p.id.to_string(),
+        "window_id": p.window_id.to_string(),
+        "title": p.title,
+        "cwd": p.cwd.to_string_lossy(),
+        "command": p.command,
+        "exit_status": p.exit_status,
+        "is_focused": is_focused,
+        "is_zoomed": is_zoomed,
+        "version": p.version,
+    })
+}
+
+/// Register pane operation methods on the router builder.
+fn register_pane_methods(
+    builder: shux_rpc::RouterBuilder,
+    graph: shux_core::graph::GraphHandle,
+) -> shux_rpc::RouterBuilder {
+    let g1 = graph.clone();
+    let g2 = graph.clone();
+    let g3 = graph.clone();
+    let g4 = graph.clone();
+    let g5 = graph.clone();
+    let g6 = graph.clone();
+    let g7 = graph.clone();
+    let g8 = graph.clone();
+
+    builder
+        .register("pane.list", move |params: Option<serde_json::Value>| {
+            let gh = g1.clone();
+            async move {
+                let params = params.unwrap_or_default();
+
+                // Resolve window_id — either provided directly or via session_id + active_window
+                let window_id = resolve_window_id_from_params(&gh, &params)?;
+
+                let snap = gh.snapshot();
+                let window = snap
+                    .windows
+                    .get(&window_id)
+                    .ok_or_else(|| shux_rpc::RpcError::not_found("window", &window_id.to_string()))?;
+
+                let panes: Vec<serde_json::Value> = snap
+                    .panes
+                    .values()
+                    .filter(|p| p.window_id == window_id)
+                    .map(|p| pane_to_json(p, window))
+                    .collect();
+
+                Ok(serde_json::json!(panes))
+            }
+        })
+        .register("pane.split", move |params: Option<serde_json::Value>| {
+            let gh = g2.clone();
+            async move {
+                let params = params.unwrap_or_default();
+
+                // Resolve the target pane — either provided or active pane of window
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                let direction = match params.get("direction").and_then(|v| v.as_str()) {
+                    Some("horizontal") | Some("h") => shux_core::layout::Direction::Horizontal,
+                    Some("vertical") | Some("v") => shux_core::layout::Direction::Vertical,
+                    None | Some("auto") => shux_core::layout::Direction::Vertical, // default to vertical
+                    Some(other) => {
+                        return Err(shux_rpc::RpcError::invalid_params(&format!(
+                            "invalid direction '{other}', expected 'horizontal', 'vertical', or 'auto'"
+                        )));
+                    }
+                };
+
+                let ratio = params
+                    .get("ratio")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5) as f32;
+
+                let new_pane_id = gh
+                    .split_pane(pane_id, direction, ratio)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
+                let snap = gh.snapshot();
+                let new_pane = snap
+                    .panes
+                    .get(&new_pane_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("pane not in snapshot"))?;
+                let window = snap
+                    .windows
+                    .get(&new_pane.window_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
+
+                Ok(serde_json::json!({
+                    "pane": pane_to_json(new_pane, window),
+                    "split_from": pane_id.to_string(),
+                }))
+            }
+        })
+        .register("pane.focus", move |params: Option<serde_json::Value>| {
+            let gh = g3.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id_str = params
+                    .get("pane_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'pane_id' parameter"))?;
+
+                let pane_id: shux_core::model::PaneId = pane_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id format"))?;
+
+                let previous = gh
+                    .focus_pane(pane_id)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
+                Ok(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "previous_pane_id": previous.map(|id| id.to_string()),
+                }))
+            }
+        })
+        .register(
+            "pane.focus_direction",
+            move |params: Option<serde_json::Value>| {
+                let gh = g4.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+
+                    let window_id = resolve_window_id_from_params(&gh, &params)?;
+
+                    let dir_str = params
+                        .get("direction")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'direction' parameter")
+                        })?;
+
+                    let direction = match dir_str.to_lowercase().as_str() {
+                        "up" => shux_core::layout::NavDirection::Up,
+                        "down" => shux_core::layout::NavDirection::Down,
+                        "left" => shux_core::layout::NavDirection::Left,
+                        "right" => shux_core::layout::NavDirection::Right,
+                        other => {
+                            return Err(shux_rpc::RpcError::invalid_params(&format!(
+                                "invalid direction '{other}', expected 'up', 'down', 'left', or 'right'"
+                            )));
+                        }
+                    };
+
+                    // Use a default viewport — the actual viewport would come from the TUI client
+                    let viewport = shux_core::layout::Rect::new(0, 0, 120, 40);
+
+                    let snap = gh.snapshot();
+                    let window = snap
+                        .windows
+                        .get(&window_id)
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("window", &window_id.to_string())
+                        })?;
+                    let previous_pane = window.active_pane;
+
+                    let target = gh
+                        .focus_pane_direction(window_id, direction, viewport)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
+
+                    match target {
+                        Some(pane_id) => Ok(serde_json::json!({
+                            "pane_id": pane_id.to_string(),
+                            "previous_pane_id": previous_pane.to_string(),
+                        })),
+                        None => Err(shux_rpc::RpcError::invalid_params(&format!(
+                            "no neighbor pane in direction {dir_str}"
+                        ))),
+                    }
+                }
+            },
+        )
+        .register("pane.resize", move |params: Option<serde_json::Value>| {
+            let gh = g5.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                let dir_str = params
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        shux_rpc::RpcError::invalid_params("missing 'direction' parameter")
+                    })?;
+
+                let direction = match dir_str.to_lowercase().as_str() {
+                    "horizontal" | "h" => shux_core::layout::Direction::Horizontal,
+                    "vertical" | "v" => shux_core::layout::Direction::Vertical,
+                    other => {
+                        return Err(shux_rpc::RpcError::invalid_params(&format!(
+                            "invalid direction '{other}', expected 'horizontal' or 'vertical'"
+                        )));
+                    }
+                };
+
+                let delta = params
+                    .get("delta")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.1) as f32;
+
+                gh.resize_pane(pane_id, direction, delta)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
+                Ok(serde_json::json!({ "pane_id": pane_id.to_string() }))
+            }
+        })
+        .register("pane.zoom", move |params: Option<serde_json::Value>| {
+            let gh = g6.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                let is_zoomed = gh
+                    .zoom_pane(pane_id)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
+                Ok(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "is_zoomed": is_zoomed,
+                }))
+            }
+        })
+        .register("pane.swap", move |params: Option<serde_json::Value>| {
+            let gh = g7.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id_str = params
+                    .get("pane_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'pane_id' parameter"))?;
+                let target_str = params
+                    .get("target_pane_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        shux_rpc::RpcError::invalid_params("missing 'target_pane_id' parameter")
+                    })?;
+
+                let pane_a: shux_core::model::PaneId = pane_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id format"))?;
+                let pane_b: shux_core::model::PaneId = target_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid target_pane_id format"))?;
+
+                gh.swap_panes(pane_a, pane_b)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
+                Ok(serde_json::json!({
+                    "pane_a": pane_a.to_string(),
+                    "pane_b": pane_b.to_string(),
+                }))
+            }
+        })
+        .register("pane.kill", move |params: Option<serde_json::Value>| {
+            let gh = g8.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id_str = params
+                    .get("pane_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'pane_id' parameter"))?;
+
+                let pane_id: shux_core::model::PaneId = pane_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id format"))?;
+
+                gh.destroy_pane(pane_id)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
+                Ok(serde_json::json!({ "killed": pane_id_str }))
+            }
+        })
+}
+
+/// Resolve a pane_id from params: either explicit `pane_id` or active pane of resolved window.
+fn resolve_pane_id_from_params(
+    gh: &shux_core::graph::GraphHandle,
+    params: &serde_json::Value,
+) -> Result<shux_core::model::PaneId, shux_rpc::RpcError> {
+    if let Some(pane_id_str) = params.get("pane_id").and_then(|v| v.as_str()) {
+        return pane_id_str
+            .parse()
+            .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id format"));
+    }
+
+    // Fall back to active pane of the resolved window
+    let window_id = resolve_window_id_from_params(gh, params)?;
+    let snap = gh.snapshot();
+    let window = snap
+        .windows
+        .get(&window_id)
+        .ok_or_else(|| shux_rpc::RpcError::not_found("window", &window_id.to_string()))?;
+    Ok(window.active_pane)
+}
+
+/// Resolve a window_id from params: either explicit `window_id` or active window of session.
+fn resolve_window_id_from_params(
+    gh: &shux_core::graph::GraphHandle,
+    params: &serde_json::Value,
+) -> Result<shux_core::model::WindowId, shux_rpc::RpcError> {
+    if let Some(wid_str) = params.get("window_id").and_then(|v| v.as_str()) {
+        return wid_str
+            .parse()
+            .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window_id format"));
+    }
+
+    // Resolve from session
+    let session_id_str = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params(
+                "missing 'pane_id' or 'window_id' or 'session_id' parameter",
+            )
+        })?;
+
+    let session_id: shux_core::model::SessionId = session_id_str
+        .parse()
+        .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
+
+    let snap = gh.snapshot();
+    let session = snap
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
+
+    Ok(session.active_window)
 }
 
 /// Register window CRUD methods on the router builder.
@@ -878,6 +1236,124 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 } => {
                     cli::handle_window_reorder(&mut stream, &session, &window, index, args.format)
                         .await
+                }
+            }
+        }
+
+        Some(Command::Pane { command }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            match command {
+                PaneCommand::List { session, window } => {
+                    cli::handle_pane_list(&mut stream, &session, window.as_deref(), args.format)
+                        .await
+                }
+                PaneCommand::Split {
+                    session,
+                    window,
+                    pane,
+                    direction,
+                    ratio,
+                } => {
+                    cli::handle_pane_split(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        direction.as_deref(),
+                        ratio,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Focus {
+                    session,
+                    window,
+                    pane,
+                } => {
+                    cli::handle_pane_focus(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        &pane,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::FocusDir {
+                    session,
+                    window,
+                    direction,
+                } => {
+                    cli::handle_pane_focus_dir(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        &direction,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Resize {
+                    session,
+                    window,
+                    pane,
+                    direction,
+                    delta,
+                } => {
+                    cli::handle_pane_resize(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        &direction,
+                        delta,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Zoom {
+                    session,
+                    window,
+                    pane,
+                } => {
+                    cli::handle_pane_zoom(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Swap {
+                    session,
+                    window,
+                    pane,
+                    target,
+                } => {
+                    cli::handle_pane_swap(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        &pane,
+                        &target,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Kill {
+                    session,
+                    window,
+                    pane,
+                } => {
+                    cli::handle_pane_kill(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        &pane,
+                        args.format,
+                    )
+                    .await
                 }
             }
         }

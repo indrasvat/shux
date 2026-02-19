@@ -200,7 +200,7 @@
 | 012 | M0 integration and quality gate | M0 | **Done** | 001–011 |
 | 013 | Session CRUD (API + CLI) | M1 | **Done** | 012 |
 | 014 | Window CRUD (API + CLI) | M1 | **Done** | 013 |
-| 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | Pending | 014, 003 |
+| 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | **Done** | 014, 003 |
 | 016 | Pane I/O (send_keys, run_command, capture) | M1 | Pending | 015, 004 |
 | 017 | Multi-pane rendering | M1 | Pending | 015, 009 |
 | 018 | Tier 1 keybindings (bare keys) | M1 | Pending | 017 |

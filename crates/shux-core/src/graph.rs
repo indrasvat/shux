@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+use crate::layout::{Direction, NavDirection, Rect};
 use crate::model::*;
 
 /// Errors that can occur during graph mutations.
@@ -55,6 +56,18 @@ pub enum GraphError {
 
     #[error("window index {index} out of range (session has {count} windows)")]
     WindowIndexOutOfRange { index: usize, count: usize },
+
+    #[error("cannot swap pane with itself")]
+    PaneSwapSelf,
+
+    #[error("panes are not in the same window")]
+    PaneCrossWindow,
+
+    #[error("no neighbor pane in direction {0:?}")]
+    NoNeighbor(NavDirection),
+
+    #[error("layout operation failed: {0}")]
+    LayoutError(String),
 
     #[error("graph loop shut down")]
     Shutdown,
@@ -194,6 +207,37 @@ pub enum GraphCommand {
     SetPaneTheme {
         id: PaneId,
         theme: Option<ThemeRef>,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
+    SplitPane {
+        target_pane: PaneId,
+        direction: Direction,
+        ratio: f32,
+        reply: tokio::sync::oneshot::Sender<Result<PaneId, GraphError>>,
+    },
+    FocusPane {
+        id: PaneId,
+        reply: tokio::sync::oneshot::Sender<Result<Option<PaneId>, GraphError>>,
+    },
+    FocusPaneDirection {
+        window_id: WindowId,
+        direction: NavDirection,
+        viewport: Rect,
+        reply: tokio::sync::oneshot::Sender<Result<Option<PaneId>, GraphError>>,
+    },
+    ResizePane {
+        id: PaneId,
+        direction: Direction,
+        delta: f32,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
+    ZoomPane {
+        id: PaneId,
+        reply: tokio::sync::oneshot::Sender<Result<bool, GraphError>>,
+    },
+    SwapPanes {
+        a: PaneId,
+        b: PaneId,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
     Snapshot {
@@ -632,10 +676,20 @@ impl SessionGraph {
         snapshot.panes.remove(&id);
 
         if let Some(w) = snapshot.windows.get_mut(&window_id) {
+            // Remove from layout tree
+            w.layout.remove_pane(id);
+
             if w.active_pane == id {
-                if let Some(remaining) = snapshot.panes.values().find(|p| p.window_id == window_id)
-                {
-                    w.active_pane = remaining.id;
+                // Pick a remaining pane from the layout tree first, then fallback to HashMap
+                let new_active = w.layout.tree.pane_ids().into_iter().next().or_else(|| {
+                    snapshot
+                        .panes
+                        .values()
+                        .find(|p| p.window_id == window_id)
+                        .map(|p| p.id)
+                });
+                if let Some(active) = new_active {
+                    w.active_pane = active;
                 }
             }
             w.version += 1;
@@ -748,6 +802,224 @@ impl SessionGraph {
         self.publish(snapshot);
         Ok(())
     }
+
+    /// Helper: find pane and its window_id.
+    fn find_pane_window(
+        &self,
+        pane_id: PaneId,
+    ) -> Result<(Arc<SessionGraphSnapshot>, WindowId), GraphError> {
+        let current = self.current();
+        let pane = current
+            .panes
+            .get(&pane_id)
+            .ok_or(GraphError::PaneNotFound(pane_id))?;
+        let window_id = pane.window_id;
+        Ok((current, window_id))
+    }
+
+    /// Split a pane: create a new pane alongside the target in the layout tree.
+    pub fn split_pane(
+        &self,
+        target_pane: PaneId,
+        direction: Direction,
+        ratio: f32,
+    ) -> Result<PaneId, GraphError> {
+        let (current, window_id) = self.find_pane_window(target_pane)?;
+
+        let target = current
+            .panes
+            .get(&target_pane)
+            // Safe: find_pane_window just verified it exists
+            .unwrap();
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        let new_pane = Pane::new(window_id, target.cwd.clone());
+        let new_pane_id = new_pane.id;
+
+        let window = snapshot
+            .windows
+            .get_mut(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
+        let ok = window
+            .layout
+            .split_pane(target_pane, new_pane_id, direction, ratio);
+        if !ok {
+            return Err(GraphError::LayoutError("split_pane failed".into()));
+        }
+
+        window.active_pane = new_pane_id;
+        window.version += 1;
+
+        snapshot.panes.insert(new_pane_id, new_pane);
+
+        self.publish(snapshot);
+        info!(%new_pane_id, %target_pane, %window_id, "Pane split");
+        Ok(new_pane_id)
+    }
+
+    /// Focus a specific pane. Returns the previously active pane (or None if already focused).
+    pub fn focus_pane(&self, id: PaneId) -> Result<Option<PaneId>, GraphError> {
+        let (current, window_id) = self.find_pane_window(id)?;
+
+        let window = current
+            .windows
+            .get(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
+        let previous = if window.active_pane != id {
+            Some(window.active_pane)
+        } else {
+            None
+        };
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        if let Some(w) = snapshot.windows.get_mut(&window_id) {
+            w.active_pane = id;
+            w.version += 1;
+        }
+
+        self.publish(snapshot);
+        Ok(previous)
+    }
+
+    /// Focus the nearest pane in a cardinal direction. Returns the newly focused pane.
+    pub fn focus_pane_direction(
+        &self,
+        window_id: WindowId,
+        direction: NavDirection,
+        viewport: Rect,
+    ) -> Result<Option<PaneId>, GraphError> {
+        let current = self.current();
+
+        let window = current
+            .windows
+            .get(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
+        let current_pane = window.active_pane;
+        let neighbor = window
+            .layout
+            .tree
+            .directional_focus(current_pane, direction, viewport);
+
+        match neighbor {
+            Some(target) => {
+                let mut snapshot = (*current).clone();
+                snapshot.version += 1;
+
+                if let Some(w) = snapshot.windows.get_mut(&window_id) {
+                    w.active_pane = target;
+                    w.version += 1;
+                }
+
+                self.publish(snapshot);
+                Ok(Some(target))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Resize a pane by adjusting the ratio of its nearest ancestor split.
+    pub fn resize_pane(
+        &self,
+        id: PaneId,
+        direction: Direction,
+        delta: f32,
+    ) -> Result<(), GraphError> {
+        let (current, window_id) = self.find_pane_window(id)?;
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        let window = snapshot
+            .windows
+            .get_mut(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
+        // Unzoom first if zoomed
+        if window.layout.is_zoomed() {
+            if let Some(zoom) = window.layout.zoom.take() {
+                window.layout.tree = zoom.saved_layout;
+            }
+        }
+
+        if let Some(new_tree) = window.layout.tree.resize_pane(id, direction, delta) {
+            window.layout.tree = new_tree;
+            window.version += 1;
+            self.publish(snapshot);
+            Ok(())
+        } else {
+            // No matching split direction — not an error, just a no-op
+            Ok(())
+        }
+    }
+
+    /// Toggle zoom on a pane. Returns whether the pane is now zoomed.
+    pub fn zoom_pane(&self, id: PaneId) -> Result<bool, GraphError> {
+        let (current, window_id) = self.find_pane_window(id)?;
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        let window = snapshot
+            .windows
+            .get_mut(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
+        window.layout.toggle_zoom(id);
+        let is_zoomed = window.layout.is_zoomed();
+        window.version += 1;
+
+        self.publish(snapshot);
+        Ok(is_zoomed)
+    }
+
+    /// Swap two panes in the layout tree. Both must be in the same window.
+    pub fn swap_panes(&self, a: PaneId, b: PaneId) -> Result<(), GraphError> {
+        if a == b {
+            return Err(GraphError::PaneSwapSelf);
+        }
+
+        let current = self.current();
+
+        let pane_a = current.panes.get(&a).ok_or(GraphError::PaneNotFound(a))?;
+        let pane_b = current.panes.get(&b).ok_or(GraphError::PaneNotFound(b))?;
+
+        if pane_a.window_id != pane_b.window_id {
+            return Err(GraphError::PaneCrossWindow);
+        }
+
+        let window_id = pane_a.window_id;
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        let window = snapshot
+            .windows
+            .get_mut(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
+        // Unzoom first if zoomed
+        if window.layout.is_zoomed() {
+            if let Some(zoom) = window.layout.zoom.take() {
+                window.layout.tree = zoom.saved_layout;
+            }
+        }
+
+        if let Some(new_tree) = window.layout.tree.swap_panes(a, b) {
+            window.layout.tree = new_tree;
+            window.version += 1;
+            self.publish(snapshot);
+            Ok(())
+        } else {
+            Err(GraphError::LayoutError("swap_panes failed".into()))
+        }
+    }
 }
 
 /// Run the graph command processing loop (single-writer task).
@@ -804,6 +1076,24 @@ pub async fn run_graph_loop(
                     }
                     Some(GraphCommand::SetPaneTheme { id, theme, reply }) => {
                         let _ = reply.send(graph.set_pane_theme(id, theme));
+                    }
+                    Some(GraphCommand::SplitPane { target_pane, direction, ratio, reply }) => {
+                        let _ = reply.send(graph.split_pane(target_pane, direction, ratio));
+                    }
+                    Some(GraphCommand::FocusPane { id, reply }) => {
+                        let _ = reply.send(graph.focus_pane(id));
+                    }
+                    Some(GraphCommand::FocusPaneDirection { window_id, direction, viewport, reply }) => {
+                        let _ = reply.send(graph.focus_pane_direction(window_id, direction, viewport));
+                    }
+                    Some(GraphCommand::ResizePane { id, direction, delta, reply }) => {
+                        let _ = reply.send(graph.resize_pane(id, direction, delta));
+                    }
+                    Some(GraphCommand::ZoomPane { id, reply }) => {
+                        let _ = reply.send(graph.zoom_pane(id));
+                    }
+                    Some(GraphCommand::SwapPanes { a, b, reply }) => {
+                        let _ = reply.send(graph.swap_panes(a, b));
                     }
                     Some(GraphCommand::Snapshot { reply }) => {
                         let _ = reply.send(graph.current());
@@ -1078,6 +1368,90 @@ impl GraphHandle {
                 theme,
                 reply: tx,
             })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn split_pane(
+        &self,
+        target_pane: PaneId,
+        direction: Direction,
+        ratio: f32,
+    ) -> Result<PaneId, GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::SplitPane {
+                target_pane,
+                direction,
+                ratio,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn focus_pane(&self, id: PaneId) -> Result<Option<PaneId>, GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::FocusPane { id, reply: tx })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn focus_pane_direction(
+        &self,
+        window_id: WindowId,
+        direction: NavDirection,
+        viewport: Rect,
+    ) -> Result<Option<PaneId>, GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::FocusPaneDirection {
+                window_id,
+                direction,
+                viewport,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn resize_pane(
+        &self,
+        id: PaneId,
+        direction: Direction,
+        delta: f32,
+    ) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::ResizePane {
+                id,
+                direction,
+                delta,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn zoom_pane(&self, id: PaneId) -> Result<bool, GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::ZoomPane { id, reply: tx })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn swap_panes(&self, a: PaneId, b: PaneId) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::SwapPanes { a, b, reply: tx })
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?

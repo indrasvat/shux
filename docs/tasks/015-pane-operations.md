@@ -1,6 +1,6 @@
 # 015 — Pane Operations (split, focus, resize, zoom, swap, kill)
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 014, 003
 **Parallelizable With:** 020
 

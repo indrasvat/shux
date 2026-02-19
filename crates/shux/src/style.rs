@@ -256,6 +256,83 @@ pub fn print_window_reordered(title: &str, new_index: usize) {
     let _ = writeln!(out);
 }
 
+/// Print a pane list entry.
+pub fn print_pane_entry(id: &str, title: &str, is_focused: bool, is_zoomed: bool) {
+    let mut out = io::stdout().lock();
+    if is_focused {
+        let _ = write!(out, "{}", accent("*"));
+    } else {
+        let _ = write!(out, " ");
+    }
+    let _ = write!(out, " {}", muted(format!("[{id}]")));
+    if !title.is_empty() {
+        let _ = write!(out, " {}", bold(title));
+    }
+    if is_zoomed {
+        let _ = write!(out, " {}", warning("[zoomed]"));
+    }
+    let _ = writeln!(out);
+}
+
+/// Print a pane split confirmation.
+pub fn print_pane_split(pane_id: &str, direction: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Split"));
+    let _ = write!(out, "pane ({direction}) ");
+    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
+    let _ = writeln!(out);
+}
+
+/// Print a pane focus confirmation.
+pub fn print_pane_focused(pane_id: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Focused"));
+    let _ = write!(out, "pane ");
+    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
+    let _ = writeln!(out);
+}
+
+/// Print a pane zoom confirmation.
+pub fn print_pane_zoomed(pane_id: &str, is_zoomed: bool) {
+    let mut out = io::stdout().lock();
+    let action = if is_zoomed { "Zoomed" } else { "Unzoomed" };
+    let _ = write!(out, "{} ", success(action));
+    let _ = write!(out, "pane ");
+    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
+    let _ = writeln!(out);
+}
+
+/// Print a pane swap confirmation.
+pub fn print_pane_swapped(pane_a: &str, pane_b: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Swapped"));
+    let _ = write!(
+        out,
+        "pane {} <-> {}",
+        muted(format!("[{pane_a}]")),
+        muted(format!("[{pane_b}]")),
+    );
+    let _ = writeln!(out);
+}
+
+/// Print a pane kill confirmation.
+pub fn print_pane_killed(pane_id: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Killed"));
+    let _ = write!(out, "pane ");
+    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
+    let _ = writeln!(out);
+}
+
+/// Print a pane resize confirmation.
+pub fn print_pane_resized(pane_id: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Resized"));
+    let _ = write!(out, "pane ");
+    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
+    let _ = writeln!(out);
+}
+
 /// Print a styled error message to stderr.
 pub fn print_error(msg: &str) {
     let mut err = io::stderr().lock();

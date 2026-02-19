@@ -125,6 +125,12 @@ pub enum Command {
         command: WindowCommand,
     },
 
+    /// Pane management
+    Pane {
+        #[command(subcommand)]
+        command: PaneCommand,
+    },
+
     /// Internal: start the daemon (used by auto-start, not for users)
     #[command(name = "__daemon", hide = true)]
     #[allow(non_camel_case_types)]
@@ -206,6 +212,147 @@ pub enum WindowCommand {
         /// New index position
         #[arg(short, long)]
         index: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PaneCommand {
+    /// List panes in a window
+    #[command(alias = "ls")]
+    List {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+    },
+
+    /// Split a pane
+    Split {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID to split (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+
+        /// Split direction: vertical, horizontal, or auto
+        #[arg(short, long)]
+        direction: Option<String>,
+
+        /// Split ratio (0.0-1.0, default 0.5)
+        #[arg(short, long)]
+        ratio: Option<f64>,
+    },
+
+    /// Focus a specific pane by UUID
+    Focus {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID to focus
+        #[arg(short, long)]
+        pane: String,
+    },
+
+    /// Move focus in a direction (up/down/left/right)
+    #[command(alias = "focus-dir")]
+    FocusDir {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Direction: up, down, left, right
+        #[arg(short, long)]
+        direction: String,
+    },
+
+    /// Resize a pane
+    Resize {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID to resize (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+
+        /// Resize direction: horizontal or vertical
+        #[arg(short, long)]
+        direction: String,
+
+        /// Resize amount (0.0-1.0, default 0.1)
+        #[arg(long)]
+        delta: Option<f64>,
+    },
+
+    /// Toggle zoom on a pane
+    Zoom {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID to zoom (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+    },
+
+    /// Swap two panes
+    Swap {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// First pane UUID
+        #[arg(short, long)]
+        pane: String,
+
+        /// Second pane UUID (target to swap with)
+        #[arg(short, long)]
+        target: String,
+    },
+
+    /// Kill a pane
+    Kill {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID to kill
+        #[arg(short, long)]
+        pane: String,
     },
 }
 
@@ -765,6 +912,347 @@ pub async fn handle_window_reorder(
         }
         OutputFormat::Text => {
             crate::style::print_window_reordered(&window_title, new_index);
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a pane-related window_id: either explicit window spec or session's active window.
+async fn resolve_pane_window_id(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+) -> Result<(String, String), RpcClientError> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    match window_spec {
+        Some(spec) => {
+            let (wid, _title) = resolve_window_id(stream, &session_id, spec).await?;
+            Ok((session_id, wid))
+        }
+        None => {
+            // Get active window from session
+            let result = rpc_call(stream, "session.list", serde_json::json!({})).await?;
+            let sessions = result
+                .get("sessions")
+                .and_then(|v| v.as_array())
+                .or_else(|| result.as_array());
+            if let Some(sessions) = sessions {
+                for s in sessions {
+                    if s.get("id").and_then(|v| v.as_str()) == Some(&session_id) {
+                        if let Some(aw) = s.get("active_window_id").and_then(|v| v.as_str()) {
+                            return Ok((session_id, aw.to_string()));
+                        }
+                    }
+                }
+            }
+            Err(RpcClientError::Rpc {
+                code: -32004,
+                message: "could not determine active window".to_string(),
+                data: None,
+            })
+        }
+    }
+}
+
+/// Handle the `shux pane list` command.
+pub async fn handle_pane_list(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let result = rpc_call(
+        stream,
+        "pane.list",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            use crate::style;
+            let panes = result.as_array();
+            if let Some(panes) = panes {
+                if panes.is_empty() {
+                    println!("{}", style::muted("no panes"));
+                } else {
+                    for p in panes {
+                        let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                        let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                        let is_focused = p
+                            .get("is_focused")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let is_zoomed = p
+                            .get("is_zoomed")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        style::print_pane_entry(id, title, is_focused, is_zoomed);
+                    }
+                }
+            } else {
+                println!("{}", style::muted("no panes"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane split` command.
+pub async fn handle_pane_split(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    direction: Option<&str>,
+    ratio: Option<f64>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+    });
+
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+    if let Some(dir) = direction {
+        params["direction"] = serde_json::Value::String(dir.to_string());
+    }
+    if let Some(r) = ratio {
+        params["ratio"] = serde_json::json!(r);
+    }
+
+    let result = rpc_call(stream, "pane.split", params).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            let pane_id = result
+                .get("pane")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let dir_label = direction.unwrap_or("vertical");
+            crate::style::print_pane_split(pane_id, dir_label);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane focus` command.
+pub async fn handle_pane_focus(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_id: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    // Resolve window for validation, but pane.focus only needs pane_id
+    let _ = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let result = rpc_call(
+        stream,
+        "pane.focus",
+        serde_json::json!({"pane_id": pane_id}),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            crate::style::print_pane_focused(pane_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane focus-dir` command.
+pub async fn handle_pane_focus_dir(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    direction: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let result = rpc_call(
+        stream,
+        "pane.focus_direction",
+        serde_json::json!({
+            "session_id": session_id,
+            "window_id": window_id,
+            "direction": direction,
+        }),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            let pane_id = result
+                .get("pane_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            crate::style::print_pane_focused(pane_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane resize` command.
+pub async fn handle_pane_resize(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    direction: &str,
+    delta: Option<f64>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+        "direction": direction,
+    });
+
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+    if let Some(d) = delta {
+        params["delta"] = serde_json::json!(d);
+    }
+
+    let result = rpc_call(stream, "pane.resize", params).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            let pane_id = result
+                .get("pane_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            crate::style::print_pane_resized(pane_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane zoom` command.
+pub async fn handle_pane_zoom(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+    });
+
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+
+    let result = rpc_call(stream, "pane.zoom", params).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            let pane_id = result
+                .get("pane_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let is_zoomed = result
+                .get("is_zoomed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            crate::style::print_pane_zoomed(pane_id, is_zoomed);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane swap` command.
+pub async fn handle_pane_swap(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_id: &str,
+    target_id: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    // Resolve window for validation
+    let _ = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let result = rpc_call(
+        stream,
+        "pane.swap",
+        serde_json::json!({"pane_id": pane_id, "target_pane_id": target_id}),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            crate::style::print_pane_swapped(pane_id, target_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane kill` command.
+pub async fn handle_pane_kill(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_id: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    // Resolve window for validation
+    let _ = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let result = rpc_call(stream, "pane.kill", serde_json::json!({"pane_id": pane_id})).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            crate::style::print_pane_killed(pane_id);
         }
     }
 

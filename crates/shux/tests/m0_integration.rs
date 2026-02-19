@@ -38,6 +38,10 @@ fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
         GraphError::LastWindow | GraphError::LastPane => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
+        GraphError::PaneSwapSelf | GraphError::PaneCrossWindow | GraphError::NoNeighbor(_) => {
+            shux_rpc::RpcError::invalid_params(&e.to_string())
+        }
+        GraphError::LayoutError(_) => shux_rpc::RpcError::internal(&e.to_string()),
         GraphError::VersionConflict { expected, actual } => {
             shux_rpc::RpcError::version_conflict("resource", "?", expected, actual)
         }
@@ -568,6 +572,290 @@ fn register_window_methods(
         })
 }
 
+/// Build pane info JSON from a Pane.
+fn pane_to_json(
+    p: &shux_core::model::Pane,
+    window: &shux_core::model::Window,
+) -> serde_json::Value {
+    let is_focused = window.active_pane == p.id;
+    let is_zoomed = window.layout.is_zoomed()
+        && window
+            .layout
+            .zoom
+            .as_ref()
+            .is_some_and(|z| z.zoomed_pane == p.id);
+    serde_json::json!({
+        "id": p.id.to_string(),
+        "window_id": p.window_id.to_string(),
+        "title": p.title,
+        "cwd": p.cwd.to_string_lossy(),
+        "command": p.command,
+        "exit_status": p.exit_status,
+        "is_focused": is_focused,
+        "is_zoomed": is_zoomed,
+        "version": p.version,
+    })
+}
+
+/// Register pane operation methods on the router builder.
+fn register_pane_methods(
+    builder: shux_rpc::RouterBuilder,
+    graph: shux_core::graph::GraphHandle,
+) -> shux_rpc::RouterBuilder {
+    let g1 = graph.clone();
+    let g2 = graph.clone();
+    let g3 = graph.clone();
+    let g4 = graph.clone();
+    let g5 = graph.clone();
+    let g6 = graph.clone();
+    let g7 = graph.clone();
+    let g8 = graph.clone();
+
+    builder
+        .register("pane.list", move |params: Option<serde_json::Value>| {
+            let gh = g1.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let window_id = resolve_window_id_from_params(&gh, &params)?;
+                let snap = gh.snapshot();
+                let window = snap.windows.get(&window_id).ok_or_else(|| {
+                    shux_rpc::RpcError::not_found("window", &window_id.to_string())
+                })?;
+                let panes: Vec<serde_json::Value> = snap
+                    .panes
+                    .values()
+                    .filter(|p| p.window_id == window_id)
+                    .map(|p| pane_to_json(p, window))
+                    .collect();
+                Ok(serde_json::json!(panes))
+            }
+        })
+        .register("pane.split", move |params: Option<serde_json::Value>| {
+            let gh = g2.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                let direction = match params.get("direction").and_then(|v| v.as_str()) {
+                    Some("horizontal") | Some("h") => shux_core::layout::Direction::Horizontal,
+                    Some("vertical") | Some("v") => shux_core::layout::Direction::Vertical,
+                    None | Some("auto") => shux_core::layout::Direction::Vertical,
+                    Some(other) => {
+                        return Err(shux_rpc::RpcError::invalid_params(&format!(
+                            "invalid direction '{other}'"
+                        )));
+                    }
+                };
+                let ratio = params.get("ratio").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+                let new_pane_id = gh
+                    .split_pane(pane_id, direction, ratio)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                let snap = gh.snapshot();
+                let new_pane = snap
+                    .panes
+                    .get(&new_pane_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("pane not in snapshot"))?;
+                let window = snap
+                    .windows
+                    .get(&new_pane.window_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
+                Ok(serde_json::json!({
+                    "pane": pane_to_json(new_pane, window),
+                    "split_from": pane_id.to_string(),
+                }))
+            }
+        })
+        .register("pane.focus", move |params: Option<serde_json::Value>| {
+            let gh = g3.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id_str = params
+                    .get("pane_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'pane_id'"))?;
+                let pane_id: shux_core::model::PaneId = pane_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id"))?;
+                let previous = gh.focus_pane(pane_id).await.map_err(graph_error_to_rpc)?;
+                Ok(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "previous_pane_id": previous.map(|id| id.to_string()),
+                }))
+            }
+        })
+        .register(
+            "pane.focus_direction",
+            move |params: Option<serde_json::Value>| {
+                let gh = g4.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let window_id = resolve_window_id_from_params(&gh, &params)?;
+                    let dir_str = params
+                        .get("direction")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'direction'"))?;
+                    let direction = match dir_str.to_lowercase().as_str() {
+                        "up" => shux_core::layout::NavDirection::Up,
+                        "down" => shux_core::layout::NavDirection::Down,
+                        "left" => shux_core::layout::NavDirection::Left,
+                        "right" => shux_core::layout::NavDirection::Right,
+                        other => {
+                            return Err(shux_rpc::RpcError::invalid_params(&format!(
+                                "invalid direction '{other}'"
+                            )));
+                        }
+                    };
+                    let viewport = shux_core::layout::Rect::new(0, 0, 120, 40);
+                    let snap = gh.snapshot();
+                    let window = snap.windows.get(&window_id).ok_or_else(|| {
+                        shux_rpc::RpcError::not_found("window", &window_id.to_string())
+                    })?;
+                    let previous_pane = window.active_pane;
+                    let target = gh
+                        .focus_pane_direction(window_id, direction, viewport)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
+                    match target {
+                        Some(pane_id) => Ok(serde_json::json!({
+                            "pane_id": pane_id.to_string(),
+                            "previous_pane_id": previous_pane.to_string(),
+                        })),
+                        None => Err(shux_rpc::RpcError::invalid_params(&format!(
+                            "no neighbor pane in direction {dir_str}"
+                        ))),
+                    }
+                }
+            },
+        )
+        .register("pane.resize", move |params: Option<serde_json::Value>| {
+            let gh = g5.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                let dir_str = params
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'direction'"))?;
+                let direction = match dir_str.to_lowercase().as_str() {
+                    "horizontal" | "h" => shux_core::layout::Direction::Horizontal,
+                    "vertical" | "v" => shux_core::layout::Direction::Vertical,
+                    other => {
+                        return Err(shux_rpc::RpcError::invalid_params(&format!(
+                            "invalid direction '{other}'"
+                        )));
+                    }
+                };
+                let delta = params.get("delta").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
+                gh.resize_pane(pane_id, direction, delta)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                Ok(serde_json::json!({ "pane_id": pane_id.to_string() }))
+            }
+        })
+        .register("pane.zoom", move |params: Option<serde_json::Value>| {
+            let gh = g6.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                let is_zoomed = gh.zoom_pane(pane_id).await.map_err(graph_error_to_rpc)?;
+                Ok(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "is_zoomed": is_zoomed,
+                }))
+            }
+        })
+        .register("pane.swap", move |params: Option<serde_json::Value>| {
+            let gh = g7.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id_str = params
+                    .get("pane_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'pane_id'"))?;
+                let target_str = params
+                    .get("target_pane_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        shux_rpc::RpcError::invalid_params("missing 'target_pane_id'")
+                    })?;
+                let pane_a: shux_core::model::PaneId = pane_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id"))?;
+                let pane_b: shux_core::model::PaneId = target_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid target_pane_id"))?;
+                gh.swap_panes(pane_a, pane_b)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                Ok(serde_json::json!({
+                    "pane_a": pane_a.to_string(),
+                    "pane_b": pane_b.to_string(),
+                }))
+            }
+        })
+        .register("pane.kill", move |params: Option<serde_json::Value>| {
+            let gh = g8.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id_str = params
+                    .get("pane_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'pane_id'"))?;
+                let pane_id: shux_core::model::PaneId = pane_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id"))?;
+                gh.destroy_pane(pane_id).await.map_err(graph_error_to_rpc)?;
+                Ok(serde_json::json!({ "killed": pane_id_str }))
+            }
+        })
+}
+
+/// Resolve a pane_id from params: either explicit or active pane of resolved window.
+fn resolve_pane_id_from_params(
+    gh: &shux_core::graph::GraphHandle,
+    params: &serde_json::Value,
+) -> Result<shux_core::model::PaneId, shux_rpc::RpcError> {
+    if let Some(pane_id_str) = params.get("pane_id").and_then(|v| v.as_str()) {
+        return pane_id_str
+            .parse()
+            .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id format"));
+    }
+    let window_id = resolve_window_id_from_params(gh, params)?;
+    let snap = gh.snapshot();
+    let window = snap
+        .windows
+        .get(&window_id)
+        .ok_or_else(|| shux_rpc::RpcError::not_found("window", &window_id.to_string()))?;
+    Ok(window.active_pane)
+}
+
+/// Resolve a window_id from params: either explicit or session's active window.
+fn resolve_window_id_from_params(
+    gh: &shux_core::graph::GraphHandle,
+    params: &serde_json::Value,
+) -> Result<shux_core::model::WindowId, shux_rpc::RpcError> {
+    if let Some(wid_str) = params.get("window_id").and_then(|v| v.as_str()) {
+        return wid_str
+            .parse()
+            .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window_id format"));
+    }
+    let session_id_str = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params("missing 'pane_id' or 'window_id' or 'session_id'")
+        })?;
+    let session_id: shux_core::model::SessionId = session_id_str
+        .parse()
+        .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
+    let snap = gh.snapshot();
+    let session = snap
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
+    Ok(session.active_window)
+}
+
 /// Start a test server (RPC + SessionGraph) on an ephemeral UDS.
 /// Returns (socket_path, cancel_token).
 async fn start_test_server(
@@ -585,9 +873,12 @@ async fn start_test_server(
         shux_core::graph::run_graph_loop(graph, graph_rx, graph_cancel).await;
     });
 
-    let router = register_window_methods(
-        register_session_methods(
-            shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+    let router = register_pane_methods(
+        register_window_methods(
+            register_session_methods(
+                shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+                graph_handle.clone(),
+            ),
             graph_handle.clone(),
         ),
         graph_handle,
@@ -1979,6 +2270,450 @@ async fn test_014_cli_window_list_json() {
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|_| panic!("should be valid JSON: {stdout}"));
     assert!(parsed.is_array(), "JSON window list should be an array");
+
+    cancel.cancel();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Task 015: Pane Operations
+// ══════════════════════════════════════════════════════════════
+
+/// Send a JSON-RPC request and extract the result, panicking on error.
+async fn rpc_ok(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let resp = rpc_raw(socket_path, method, params).await;
+    assert!(resp["error"].is_null(), "{method} should succeed: {resp}");
+    resp["result"].clone()
+}
+
+/// Helper: create a session and return (session_id, window_id, pane_id)
+async fn create_session_full(
+    socket_path: &std::path::Path,
+    name: &str,
+) -> (String, String, String) {
+    let resp = rpc_ok(
+        socket_path,
+        "session.create",
+        serde_json::json!({"name": name}),
+    )
+    .await;
+    let session_id = resp["id"].as_str().unwrap().to_string();
+    let window_id = resp["window_id"].as_str().unwrap().to_string();
+    let pane_id = resp["pane_id"].as_str().unwrap().to_string();
+    (session_id, window_id, pane_id)
+}
+
+#[tokio::test]
+async fn test_015_pane_split_vertical() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, _pane_id) = create_session_full(&socket_path, "psv").await;
+
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id, "direction": "vertical"}),
+    )
+    .await;
+
+    assert!(resp.get("pane").is_some(), "should return new pane");
+    assert!(resp.get("split_from").is_some(), "should return split_from");
+
+    // List panes — should be 2
+    let list = rpc_ok(
+        &socket_path,
+        "pane.list",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        2,
+        "should have 2 panes after split"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_split_horizontal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, _pane_id) = create_session_full(&socket_path, "psh").await;
+
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id, "direction": "horizontal"}),
+    )
+    .await;
+
+    assert!(resp.get("pane").is_some());
+    let new_pane = &resp["pane"];
+    assert!(new_pane.get("id").is_some());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_split_auto_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, _pane_id) = create_session_full(&socket_path, "psa").await;
+
+    // No direction → defaults to vertical
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+
+    assert!(resp.get("pane").is_some());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, pane_id) = create_session_full(&socket_path, "pl").await;
+
+    let list = rpc_ok(
+        &socket_path,
+        "pane.list",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+
+    let panes = list.as_array().unwrap();
+    assert_eq!(panes.len(), 1, "new session has 1 pane");
+    assert_eq!(panes[0]["id"].as_str().unwrap(), pane_id);
+    assert!(panes[0]["is_focused"].as_bool().unwrap());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, original_pane) = create_session_full(&socket_path, "pf").await;
+
+    // Split to get a second pane
+    let split = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    let new_pane_id = split["pane"]["id"].as_str().unwrap().to_string();
+
+    // Focus the original pane (split made the new one active)
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.focus",
+        serde_json::json!({"pane_id": original_pane}),
+    )
+    .await;
+
+    assert_eq!(resp["pane_id"].as_str().unwrap(), original_pane);
+    assert_eq!(
+        resp["previous_pane_id"].as_str().unwrap(),
+        new_pane_id,
+        "previous should be the split pane"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_focus_already_focused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (_session_id, _window_id, pane_id) = create_session_full(&socket_path, "pfaf").await;
+
+    // Focus already-focused pane → previous should be null (same pane)
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.focus",
+        serde_json::json!({"pane_id": pane_id}),
+    )
+    .await;
+
+    assert_eq!(resp["pane_id"].as_str().unwrap(), pane_id);
+    // Previous is null since it was already focused
+    assert!(resp["previous_pane_id"].is_null());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_focus_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, left_pane) = create_session_full(&socket_path, "pfd").await;
+
+    // Split vertically to get left/right panes
+    let split = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id, "direction": "vertical"}),
+    )
+    .await;
+    let right_pane = split["pane"]["id"].as_str().unwrap().to_string();
+
+    // Now focused on right_pane (new pane is active after split)
+    // Focus left
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.focus_direction",
+        serde_json::json!({"session_id": session_id, "window_id": window_id, "direction": "left"}),
+    )
+    .await;
+
+    assert_eq!(resp["pane_id"].as_str().unwrap(), left_pane);
+    assert_eq!(resp["previous_pane_id"].as_str().unwrap(), right_pane);
+
+    // Focus right (back to right_pane)
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.focus_direction",
+        serde_json::json!({"session_id": session_id, "window_id": window_id, "direction": "right"}),
+    )
+    .await;
+
+    assert_eq!(resp["pane_id"].as_str().unwrap(), right_pane);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_resize() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, _pane_id) = create_session_full(&socket_path, "pr").await;
+
+    // Split first (need 2 panes to resize)
+    rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+
+    // Resize the active pane
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.resize",
+        serde_json::json!({"session_id": session_id, "window_id": window_id, "direction": "vertical", "delta": 0.1}),
+    )
+    .await;
+
+    assert!(
+        resp.get("pane_id").is_some(),
+        "resize should return pane_id"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_zoom_toggle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, _pane_id) = create_session_full(&socket_path, "pz").await;
+
+    // Split to get 2 panes (zoom is meaningful with multiple panes)
+    rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+
+    // Zoom in
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.zoom",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+
+    assert!(resp["is_zoomed"].as_bool().unwrap(), "should be zoomed");
+
+    // Zoom out (toggle)
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.zoom",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+
+    assert!(!resp["is_zoomed"].as_bool().unwrap(), "should be unzoomed");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, pane_a) = create_session_full(&socket_path, "ps").await;
+
+    let split = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    let pane_b = split["pane"]["id"].as_str().unwrap().to_string();
+
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.swap",
+        serde_json::json!({"pane_id": pane_a, "target_pane_id": pane_b}),
+    )
+    .await;
+
+    assert_eq!(resp["pane_a"].as_str().unwrap(), pane_a);
+    assert_eq!(resp["pane_b"].as_str().unwrap(), pane_b);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_swap_self_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (_session_id, _window_id, pane_id) = create_session_full(&socket_path, "pssf").await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "pane.swap",
+        serde_json::json!({"pane_id": pane_id, "target_pane_id": pane_id}),
+    )
+    .await;
+
+    assert!(
+        resp.get("error").is_some(),
+        "swapping pane with itself should error"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, _pane_id) = create_session_full(&socket_path, "pk").await;
+
+    // Split to get a second pane
+    let split = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    let new_pane_id = split["pane"]["id"].as_str().unwrap().to_string();
+
+    // Kill the new pane
+    let resp = rpc_ok(
+        &socket_path,
+        "pane.kill",
+        serde_json::json!({"pane_id": new_pane_id}),
+    )
+    .await;
+
+    assert_eq!(resp["killed"].as_str().unwrap(), new_pane_id);
+
+    // Verify only 1 pane left
+    let list = rpc_ok(
+        &socket_path,
+        "pane.list",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_kill_last_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (_session_id, _window_id, pane_id) = create_session_full(&socket_path, "pklf").await;
+
+    // Try to kill the only pane
+    let resp = rpc_raw(
+        &socket_path,
+        "pane.kill",
+        serde_json::json!({"pane_id": pane_id}),
+    )
+    .await;
+
+    assert!(
+        resp.get("error").is_some(),
+        "killing last pane should error"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_015_pane_kill_updates_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let (session_id, window_id, original_pane) = create_session_full(&socket_path, "pkuf").await;
+
+    // Split to get a second pane (which becomes active)
+    let split = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    let new_pane_id = split["pane"]["id"].as_str().unwrap().to_string();
+
+    // Kill the new active pane
+    rpc_ok(
+        &socket_path,
+        "pane.kill",
+        serde_json::json!({"pane_id": new_pane_id}),
+    )
+    .await;
+
+    // Focus should now be back on the original pane — verify via list
+    let list = rpc_ok(
+        &socket_path,
+        "pane.list",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    let panes = list.as_array().unwrap();
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0]["id"].as_str().unwrap(), original_pane);
+    assert!(panes[0]["is_focused"].as_bool().unwrap());
 
     cancel.cancel();
 }
