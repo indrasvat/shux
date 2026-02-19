@@ -1,6 +1,6 @@
 # 001 — Daemon Skeleton and Process Lifecycle
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 000
 **Parallelizable With:** 002, 005, 006
 

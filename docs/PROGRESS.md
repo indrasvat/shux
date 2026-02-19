@@ -53,6 +53,17 @@
 
 ## Session Log
 
+**2026-02-18 — Task 001: Daemon Skeleton and Process Lifecycle**
+- Created `crates/shux-core/src/daemon.rs`: DaemonState, DaemonCommand, ShutdownTokens, run_daemon_state_loop with auto-exit grace timer
+- Created `crates/shux/src/daemon.rs`: runtime_dir, PID file, socket path, double-fork daemonize(), signal handler (SIGTERM/SIGINT/SIGHUP)
+- Created `crates/shux/src/client.rs`: ensure_daemon_running() with UDS probe + exponential backoff + re-exec auto-start
+- Wired up main.rs with __daemon internal subcommand (fork-before-tokio) and client entrypoint
+- 20 tests passing: DaemonState lifecycle, grace timer with tokio::time::pause(), shutdown tokens, PID file round-trip, runtime dir
+- Added nix (user feature), tokio-util, thiserror dependencies
+- Learning: Rust edition 2024 makes `std::env::set_var`/`remove_var` unsafe (process-global mutable state)
+- Learning: nix 0.29 requires explicit `user` feature flag for `getuid()`
+- Learning: Use `tokio::time::pause()` + `advance()` for deterministic timer tests instead of real 5+ second sleeps
+
 **2026-02-18 — Task 000: Repository Scaffold and Tooling**
 - Created Cargo workspace with 7 crates (shux binary + 6 library crates)
 - All crates compile, clippy passes, rustfmt passes, nextest runs (0 tests)
@@ -74,7 +85,7 @@
 | ID | Task | Phase | Status | Depends On |
 |----|------|-------|--------|-----------|
 | 000 | Repository scaffold and tooling | Bootstrap | **Done** | — |
-| 001 | Daemon skeleton and process lifecycle | M0 | Pending | 000 |
+| 001 | Daemon skeleton and process lifecycle | M0 | **Done** | 000 |
 | 002 | Core data model and SessionGraph | M0 | Pending | 000 |
 | 003 | Layout engine (binary split tree) | M0 | Pending | 002 |
 | 004 | PTY manager | M0 | Pending | 001 |

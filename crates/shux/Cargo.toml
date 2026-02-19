@@ -22,6 +22,12 @@ shux-plugin = { path = "../shux-plugin" }
 shux-ui = { path = "../shux-ui" }
 clap.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+nix.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
