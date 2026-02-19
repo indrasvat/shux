@@ -814,7 +814,8 @@ pub async fn handle_version(
                 .get("version")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            crate::style::print_version(version, None);
+            let git_sha = result.get("git_sha").and_then(|v| v.as_str());
+            crate::style::print_version(version, git_sha, None);
         }
     }
 

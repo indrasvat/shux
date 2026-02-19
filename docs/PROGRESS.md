@@ -63,6 +63,9 @@
 - Created `.claude/automations/test_014_window_crud.py`: L4 visual test with 25 tests (Parts A–H: setup, creation, auto-naming, focus, rename, reorder, kill, JSON output), 21 screenshots — all passing
 - 489 tests passing (458 existing + 38 graph unit + 14 integration + 9 CLI parse - some overlap), all make targets pass
 - **Spike fix: stale daemon version handshake** — `ensure_daemon_running_at()` now calls `system.version` after connecting and compares against `env!("CARGO_PKG_VERSION")`. On mismatch, kills old daemon via SIGTERM (PID file), waits for exit, spawns fresh daemon. Prevents `method_not_found` errors after rebuilds.
+- Added `build.rs` to both `shux` and `shux-rpc` crates to capture `git rev-parse --short HEAD` at compile time as `SHUX_GIT_SHA` env var. Version handshake now compares both `CARGO_PKG_VERSION` and `SHUX_GIT_SHA` — catches stale daemons even within the same version (e.g., after code changes without version bump).
+- Updated `system.version` RPC to include `git_sha` field. `shux version` now displays `shux 0.1.0 (abc1234)`.
+- Created `.claude/automations/test_014_version_handshake.py`: 13-test E2E verification of version handshake — builds v1, bumps to 0.1.99, rebuilds, verifies auto-restart (PID changes), verifies git_sha in response, verifies same-version doesn't restart.
 - Learning: Improved `rpc_display()` that extracts human-readable messages from RPC error data fields (detail, name+resource, id+resource) makes CLI errors much more user-friendly
 
 **2026-02-19 — Task 013: Session CRUD (API + CLI) — Done**

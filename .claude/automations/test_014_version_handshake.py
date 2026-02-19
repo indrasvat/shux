@@ -227,14 +227,15 @@ async def main(connection):
                "method_not_found!" if not no_error else "")
         take_screenshot("014_handshake_v1_working")
 
-        # ── Test 5: Version API shows 0.1.0 ────────────────
-        print("Test 5: Version check v1")
+        # ── Test 5: Version API shows version + git_sha ────
+        print("Test 5: Version check v1 (version + git_sha)")
         await send_and_wait(session, "clear", 0.3)
         await send_and_wait(session, f"{SHUX_BIN} api system.version", 2.0)
         content = await read_screen(session)
         has_v1 = original_version in content
-        record("5. Daemon reports v1", has_v1,
-               f"looking for '{original_version}'")
+        has_sha = "git_sha" in content
+        record("5. Daemon reports v1 + git_sha", has_v1 and has_sha,
+               f"version={has_v1}, git_sha={has_sha}")
         take_screenshot("014_handshake_v1_version")
 
         # ══════════════════════════════════════════════════════
@@ -277,14 +278,15 @@ async def main(connection):
         record("9. Daemon PID changed", pid_changed,
                f"v1={pid_v1} → v2={pid_v2}")
 
-        # ── Test 10: Version API now shows 0.1.99 ──────────
-        print("Test 10: Version check v2")
+        # ── Test 10: Version API now shows 0.1.99 + git_sha ─
+        print("Test 10: Version check v2 (0.1.99 + git_sha)")
         await send_and_wait(session, "clear", 0.3)
         await send_and_wait(session, f"{SHUX_BIN} api system.version", 2.0)
         content = await read_screen(session)
         has_v2 = "0.1.99" in content
-        record("10. Daemon reports v2", has_v2,
-               "looking for '0.1.99'")
+        has_sha = "git_sha" in content
+        record("10. Daemon reports v2 + git_sha", has_v2 and has_sha,
+               f"version={has_v2}, git_sha={has_sha}")
         take_screenshot("014_handshake_v2_version")
 
         # ── Test 11: Create session on new daemon ───────────

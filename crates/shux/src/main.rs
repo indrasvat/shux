@@ -894,11 +894,16 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 Err(_) => {
                     match args.format {
                         OutputFormat::Json => {
-                            println!("{{\"version\": \"{}\"}}", env!("CARGO_PKG_VERSION"));
+                            println!(
+                                "{{\"version\": \"{}\", \"git_sha\": \"{}\"}}",
+                                env!("CARGO_PKG_VERSION"),
+                                env!("SHUX_GIT_SHA"),
+                            );
                         }
                         OutputFormat::Text => {
                             style::print_version(
                                 env!("CARGO_PKG_VERSION"),
+                                Some(env!("SHUX_GIT_SHA")),
                                 Some("daemon not running"),
                             );
                         }

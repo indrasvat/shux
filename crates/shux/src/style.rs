@@ -137,12 +137,15 @@ pub fn bold(text: impl fmt::Display) -> impl fmt::Display {
 }
 
 /// Print the shux banner (used for version output).
-pub fn print_version(version: &str, daemon_status: Option<&str>) {
+pub fn print_version(version: &str, git_sha: Option<&str>, daemon_status: Option<&str>) {
     let mut out = io::stdout().lock();
     let _ = write!(out, "{} ", accent("shux"));
     let _ = write!(out, "{}", bold(version));
+    if let Some(sha) = git_sha {
+        let _ = write!(out, " {}", muted(format!("({sha})")));
+    }
     if let Some(status) = daemon_status {
-        let _ = write!(out, " {}", warning(format!("({status})")));
+        let _ = write!(out, " {}", warning(format!("[{status}]")));
     }
     let _ = writeln!(out);
 }

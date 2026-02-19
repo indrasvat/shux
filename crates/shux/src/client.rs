@@ -20,6 +20,9 @@ use crate::daemon::{self, DaemonError};
 /// The version of this binary, baked in at compile time.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The git SHA of this binary, baked in at compile time.
+const CLIENT_GIT_SHA: &str = env!("SHUX_GIT_SHA");
+
 /// Maximum number of retries when waiting for the daemon to start.
 const MAX_CONNECT_RETRIES: u32 = 10;
 
@@ -44,9 +47,14 @@ async fn probe_socket(socket_path: &Path) -> Result<UnixStream, io::Error> {
     UnixStream::connect(socket_path).await
 }
 
+/// Version info returned by the daemon's `system.version` RPC call.
+struct DaemonVersion {
+    version: String,
+    git_sha: String,
+}
+
 /// Check the daemon's version via `system.version` RPC call.
-/// Returns the version string, or None if the check fails.
-async fn check_daemon_version(stream: &mut UnixStream) -> Option<String> {
+async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> {
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": "version-check",
@@ -72,11 +80,14 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<String> {
     stream.read_exact(&mut resp_buf).await.ok()?;
 
     let response: serde_json::Value = serde_json::from_slice(&resp_buf).ok()?;
-    response
-        .get("result")
-        .and_then(|r| r.get("version"))
+    let result = response.get("result")?;
+    let version = result.get("version")?.as_str()?.to_string();
+    let git_sha = result
+        .get("git_sha")
         .and_then(|v| v.as_str())
-        .map(String::from)
+        .unwrap_or("unknown")
+        .to_string();
+    Some(DaemonVersion { version, git_sha })
 }
 
 /// Kill the running daemon by sending SIGTERM to the PID from the PID file.
@@ -129,16 +140,22 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
         Ok(mut stream) => {
             debug!("Connected to existing daemon, checking version...");
 
-            if let Some(daemon_version) = check_daemon_version(&mut stream).await {
-                if daemon_version == CLIENT_VERSION {
-                    debug!(version = CLIENT_VERSION, "Daemon version matches");
+            if let Some(dv) = check_daemon_version(&mut stream).await {
+                if dv.version == CLIENT_VERSION && dv.git_sha == CLIENT_GIT_SHA {
+                    debug!(
+                        version = CLIENT_VERSION,
+                        git_sha = CLIENT_GIT_SHA,
+                        "Daemon version matches"
+                    );
                     // Need a fresh connection since we consumed the first one for version check
                     drop(stream);
                     return probe_socket(socket_path).await.map_err(ClientError::Io);
                 }
                 warn!(
-                    daemon_version,
+                    daemon_version = dv.version,
+                    daemon_sha = dv.git_sha,
                     client_version = CLIENT_VERSION,
+                    client_sha = CLIENT_GIT_SHA,
                     "Daemon version mismatch — restarting daemon"
                 );
             } else {
