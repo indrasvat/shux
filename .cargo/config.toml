@@ -1,0 +1,13 @@
+[build]
+# Use mold linker on Linux for faster linking (if available)
+# Uncomment below for your platform:
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# [target.aarch64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[alias]
+xt = "nextest run"

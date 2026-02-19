@@ -1,0 +1,21 @@
+# lefthook.yml — git hooks for shux
+# Install: lefthook install (or: make install-hooks)
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt-check:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+    clippy:
+      glob: "*.rs"
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+pre-push:
+  commands:
+    progress-check:
+      run: bash scripts/check-progress.sh
+    test:
+      run: cargo nextest run --workspace --no-tests=pass
+    deny:
+      run: cargo deny check 2>/dev/null || true

@@ -29,9 +29,21 @@ dist/
 *.env
 
 .claude/screenshots/
+.claude/automations/screenshots/
 .codemap/
 
 .DS_STORE
 
 # Task runner logs
 .task-runs/
+
+# Coverage
+lcov.info
+tarpaulin-report.html
+
+# Fuzz
+fuzz/artifacts/
+fuzz/corpus/
+
+# Lefthook
+.lefthook-local/

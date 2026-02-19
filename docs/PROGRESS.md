@@ -4,7 +4,7 @@
 
 ## Current Phase
 
-**M0: Architecture Spike** — Not started
+**M0: Architecture Spike** — In progress (bootstrap complete)
 
 ## Status
 
@@ -53,7 +53,19 @@
 
 ## Session Log
 
-*(Dated entries documenting every implementation session — update at end of each session)*
+**2026-02-18 — Task 000: Repository Scaffold and Tooling**
+- Created Cargo workspace with 7 crates (shux binary + 6 library crates)
+- All crates compile, clippy passes, rustfmt passes, nextest runs (0 tests)
+- Created Makefile with self-documenting help, colored output, all required targets
+- Created lefthook.yml with pre-commit (fmt+clippy) and pre-push (progress-check+test+deny)
+- Created CLAUDE.md agent instructions and AGENTS.md redirect
+- Created .github/workflows/ci.yml (check + test on ubuntu/macos + deny)
+- Created deny.toml, clippy.toml, .cargo/config.toml, rust-toolchain.toml
+- Created scripts/setup-dev.sh and scripts/check-progress.sh
+- Created .claude/settings.json with Stop hook (progress gate), PreToolUse hooks (push gate, commit reminder)
+- Created .claude/automations/ directory for iterm2-driver visual tests
+- Learning: `cargo nextest` exits 4 with 0 tests unless `--no-tests=pass` is passed
+- Learning: `edition = "2024"` requires Rust 1.85+; stable channel is 1.93.1 as of Feb 2026
 
 ---
 
@@ -61,7 +73,7 @@
 
 | ID | Task | Phase | Status | Depends On |
 |----|------|-------|--------|-----------|
-| 000 | Repository scaffold and tooling | Bootstrap | Pending | — |
+| 000 | Repository scaffold and tooling | Bootstrap | **Done** | — |
 | 001 | Daemon skeleton and process lifecycle | M0 | Pending | 000 |
 | 002 | Core data model and SessionGraph | M0 | Pending | 000 |
 | 003 | Layout engine (binary split tree) | M0 | Pending | 002 |

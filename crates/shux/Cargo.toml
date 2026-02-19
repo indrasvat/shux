@@ -1,0 +1,27 @@
+[package]
+name = "shux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A modern, batteries-included terminal multiplexer"
+default-run = "shux"
+
+[[bin]]
+name = "shux"
+path = "src/main.rs"
+
+[dependencies]
+shux-core = { path = "../shux-core" }
+shux-pty = { path = "../shux-pty" }
+shux-vt = { path = "../shux-vt" }
+shux-rpc = { path = "../shux-rpc" }
+shux-plugin = { path = "../shux-plugin" }
+shux-ui = { path = "../shux-ui" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
