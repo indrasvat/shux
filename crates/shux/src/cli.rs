@@ -268,7 +268,6 @@ pub enum PaneCommand {
     },
 
     /// Move focus in a direction (up/down/left/right)
-    #[command(alias = "focus-dir")]
     FocusDir {
         /// Session name
         #[arg(short, long)]
