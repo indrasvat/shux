@@ -1,20 +1,26 @@
 use std::sync::Arc;
 
+use clap::Parser;
 use tokio::sync::{Notify, mpsc};
+use tracing_subscriber::EnvFilter;
 
+mod cli;
 mod client;
 mod daemon;
+mod style;
+
+use cli::{Cli, Command, OutputFormat};
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let args = Cli::parse();
 
     // Internal daemon subcommand — called by auto-start
-    if args.get(1).map(|s| s.as_str()) == Some("__daemon") {
+    if matches!(args.command, Some(Command::__daemon)) {
         return run_daemon();
     }
 
     // Normal CLI client mode
-    run_client()
+    run_client(args)
 }
 
 /// Daemon entry point.
@@ -53,7 +59,7 @@ fn run_daemon() -> anyhow::Result<()> {
         daemon::ensure_runtime_dir()?;
         daemon::remove_socket_file()?;
 
-        // TODO (task 008): Bind UDS and start JSON-RPC server
+        // TODO (task 012): Wire up full RPC server with SessionGraph
         // For now, bind UDS so client probe succeeds
         let sock_path = daemon::socket_path()?;
         let _listener = tokio::net::UnixListener::bind(&sock_path)?;
@@ -74,17 +80,125 @@ fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Client entry point — ensure daemon is running, then execute CLI command.
-fn run_client() -> anyhow::Result<()> {
+/// Client entry point — parse CLI args, ensure daemon is running, dispatch.
+fn run_client(args: Cli) -> anyhow::Result<()> {
+    // Set up logging
+    let filter = if args.verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::from_default_env()
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let _stream = client::ensure_daemon_running().await?;
+    let result = rt.block_on(async { dispatch(args).await });
+    if let Err(ref e) = result {
+        style::print_error(&format!("{e:#}"));
+    }
+    result
+}
 
-        // TODO (task 011): Parse CLI args with clap, dispatch JSON-RPC calls
-        println!("shux v{}", env!("CARGO_PKG_VERSION"));
+/// Dispatch CLI subcommands.
+async fn dispatch(args: Cli) -> anyhow::Result<()> {
+    let socket_path = args.socket_path();
 
-        Ok::<(), anyhow::Error>(())
-    })?;
+    match args.command {
+        // No subcommand: attach to last session or create "default"
+        None => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
 
-    Ok(())
+            // For M0, create a default session and attach (stub).
+            // Full "last session" logic comes in M1.
+            let _result = cli::handle_new(
+                &mut stream,
+                Some("default".to_string()),
+                None,
+                false,
+                OutputFormat::Text,
+            )
+            .await;
+
+            // Attach via TUI client (wired in task 012)
+            println!(
+                "{}",
+                style::muted("[TUI attach not yet wired — see task 012]")
+            );
+            Ok(())
+        }
+
+        Some(Command::New {
+            session,
+            ensure,
+            detached,
+            cmd,
+        }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            let _result = cli::handle_new(&mut stream, session, cmd, ensure, args.format).await?;
+
+            if !detached {
+                // Attach via TUI client (wired in task 012)
+                println!(
+                    "{}",
+                    style::muted("[TUI attach not yet wired — see task 012]")
+                );
+            }
+
+            Ok(())
+        }
+
+        Some(Command::Attach { session }) => {
+            let _stream = client::ensure_daemon_running_at(&socket_path).await?;
+            let session_name = session.unwrap_or_else(|| "default".to_string());
+
+            // Attach via TUI client (wired in task 012)
+            println!(
+                "{}",
+                style::muted(format!(
+                    "[TUI attach to '{session_name}' not yet wired — see task 012]"
+                ))
+            );
+            Ok(())
+        }
+
+        Some(Command::Ls) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_ls(&mut stream, args.format).await
+        }
+
+        Some(Command::Kill { session }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_kill(&mut stream, &session, args.format).await
+        }
+
+        Some(Command::Api { method, params }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_api(&mut stream, &method, &params, args.format).await
+        }
+
+        Some(Command::Version) => {
+            // Try to get version from daemon; fall back to local version
+            match client::ensure_daemon_running_at(&socket_path).await {
+                Ok(mut stream) => cli::handle_version(&mut stream, args.format).await,
+                Err(_) => {
+                    match args.format {
+                        OutputFormat::Json => {
+                            println!("{{\"version\": \"{}\"}}", env!("CARGO_PKG_VERSION"));
+                        }
+                        OutputFormat::Text => {
+                            style::print_version(
+                                env!("CARGO_PKG_VERSION"),
+                                Some("daemon not running"),
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        Some(Command::__daemon) => unreachable!("handled above"),
+    }
 }

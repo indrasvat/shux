@@ -53,6 +53,16 @@
 
 ## Session Log
 
+**2026-02-19 — Task 011: CLI Foundation (clap) — Done**
+- Created `crates/shux/src/cli.rs`: Cli struct with clap derive, Command enum (New/Attach/Ls/Kill/Api/Version/__daemon), OutputFormat (Text/Json), RpcClientError, rpc_call() async JSON-RPC client with length-prefix framing, handler functions (handle_ls, handle_new, handle_kill, handle_api, handle_version)
+- Created `crates/shux/src/style.rs`: consistent CLI color palette (accent=cyan, success=green, warning=yellow, error=red, muted=dim), respects NO_COLOR convention and IsTerminal check, crossterm Stylize-based Styled helper, print helpers (print_version, print_session_entry, print_no_sessions, print_session_created, print_session_killed, print_error)
+- Updated `crates/shux/src/main.rs`: real CLI dispatch with clap::Parser, run_daemon() for __daemon subcommand, run_client() with tracing setup, dispatch() routing all subcommands, styled version fallback when daemon not running, styled error output
+- Updated `crates/shux/src/client.rs`: added ensure_daemon_running_at(socket_path) for explicit socket path override
+- Created `crates/shux/tests/cli_integration.rs`: 17 integration tests — 5 in-process RPC tests (version, health, session.list, unknown method, concurrent), 5 CLI binary tests against real RPC server (version, version json, ls, ls json, api raw), 7 smoke tests (help, version flag, invalid subcommand, kill requires session, list alias, version without daemon, version json without daemon)
+- Added crossterm, serde, serde_json, uuid to shux crate deps; bytes, futures to dev-deps
+- 419 tests passing (36 new: 16 unit CLI parsing + 3 style + 17 integration)
+- Learning: tokio::process::Command (async) must be used instead of std::process::Command (blocking) in #[tokio::test] to avoid deadlocking the single-threaded runtime when the test also runs a server task
+
 **2026-02-19 — Task 010: Minimal TUI Client — Done**
 - Created `crates/shux-ui/src/terminal.rs`: TerminalGuard (RAII raw mode + alt screen + mouse + Kitty keyboard), install_panic_hook (restores terminal before panic), shutdown_signal (SIGTERM/SIGINT)
 - Created `crates/shux-ui/src/client.rs`: ClientRequest/DaemonMessage serde types, ClientConfig (prefix key default Ctrl+Space), ExitReason enum, encode_key_event (Ctrl/Alt/arrows/F-keys/nav), parse_key_from_bytes (prefix key detection), parse_resize_event, run_client skeleton (TODOs for daemon wiring in tasks 011/012)
@@ -138,7 +148,7 @@
 | 008 | JSON-RPC server foundation | M0 | **Done** | 001, 002 |
 | 009 | Render compositor (single pane) | M0 | **Done** | 005, 006 |
 | 010 | Minimal TUI client | M0 | **Done** | 004, 008, 009 |
-| 011 | CLI foundation (clap) | M0 | Pending | 001, 008 |
+| 011 | CLI foundation (clap) | M0 | **Done** | 001, 008 |
 | 012 | M0 integration and quality gate | M0 | Pending | 001–011 |
 | 013 | Session CRUD (API + CLI) | M1 | Pending | 012 |
 | 014 | Window CRUD (API + CLI) | M1 | Pending | 013 |

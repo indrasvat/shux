@@ -20,6 +20,7 @@ shux-vt = { path = "../shux-vt" }
 shux-rpc = { path = "../shux-rpc" }
 shux-plugin = { path = "../shux-plugin" }
 shux-ui = { path = "../shux-ui" }
+crossterm.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -28,6 +29,11 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 nix.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+bytes = "1"
+futures = "0.3"

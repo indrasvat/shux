@@ -1,6 +1,6 @@
 # 011 — CLI Foundation (clap)
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 001, 008
 **Parallelizable With:** 010
 

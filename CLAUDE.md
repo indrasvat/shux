@@ -70,6 +70,16 @@ crates/shux-ui/        TUI client (crossterm, ratatui for chrome, render composi
 - **Testing:** `#[cfg(test)]` modules in each file. Integration tests in `tests/`. Property tests with `proptest` where applicable.
 - **Imports:** `use` statements grouped: std → external crates → workspace crates → local modules. Enforced by `rustfmt`.
 - **Makefile is the command interface.** ALWAYS use `make <target>` instead of running raw `cargo`, `lefthook`, or script commands directly. If a task requires a command that has no Makefile target, add one (with proper parameterization) before using it. At the end of each task, audit any new commands discovered during implementation and add them as Makefile targets. All hooks (lefthook, Claude Code) MUST invoke `make` targets, never raw commands.
+- **CLI output styling:** All user-facing CLI text output MUST use the style module (`crates/shux/src/style.rs`). Never use raw `println!` for styled output — use the helpers:
+  - `style::accent(text)` — Cyan bold, for "shux" brand name and key identifiers
+  - `style::success(text)` — Green, for confirmations (created, killed, ensured)
+  - `style::warning(text)` — Yellow, for degraded states (daemon not running)
+  - `style::error(text)` — Red bold, for error messages
+  - `style::muted(text)` — Dim, for secondary info (IDs, timestamps, hints)
+  - `style::bold(text)` — Bold white, for primary content (session names, versions)
+  - `style::print_*()` functions for common output patterns (version, session entry, errors)
+  - Respects `NO_COLOR` env var and `IsTerminal` detection automatically
+  - When adding new CLI commands, add corresponding `print_*` helpers to `style.rs`
 
 ## Git Workflow
 
@@ -147,3 +157,5 @@ Visual test scripts live in `.claude/automations/` and are added per-task as nee
 - **2026-02-18 (task 009):** When `RenderCompositor<W: Write>` borrows `&mut Vec<u8>`, tests needing multiple render passes hit borrow conflicts. Use `Cursor<Vec<u8>>` (owned by compositor) or separate compositor instances per render call. The `Cursor<Vec<u8>>` pattern works well with a `make_compositor()` helper in tests.
 - **2026-02-19 (task 010):** `parse_key_from_bytes` must handle Enter (`\r`=0x0d) and Tab (`\t`=0x09) as specific match arms BEFORE the Ctrl+A-Z range (1..=26), since \r and \t fall within that range but should map to `KeyCode::Enter`/`KeyCode::Tab` rather than `Ctrl+M`/`Ctrl+I`.
 - **2026-02-19 (task 010):** crossterm `enable_raw_mode()` is process-global (not per-thread). For async event loops, use `tokio::task::spawn_blocking` for `crossterm::event::poll()`/`event::read()` to avoid blocking the tokio runtime. The terminal_demo example shows the pattern: poll in main thread with Duration timeout, render after each key.
+- **2026-02-19 (task 011):** `tokio::process::Command` (async) must be used instead of `std::process::Command` (blocking) inside `#[tokio::test]` when the test also runs a server task on the same runtime, otherwise the blocking `.output()` call starves the server and deadlocks.
+- **2026-02-19 (task 011):** CLI output styling lives in `crates/shux/src/style.rs`. All CLI text output MUST use the style helpers (accent/success/warning/error/muted/bold + print_* functions) for consistent aesthetics. Respects NO_COLOR and IsTerminal. Color palette: accent=Cyan, success=Green, warning=Yellow, error=Red, muted=Dim.

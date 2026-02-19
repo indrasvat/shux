@@ -36,16 +36,14 @@ async fn probe_socket(socket_path: &Path) -> Result<UnixStream, io::Error> {
     UnixStream::connect(socket_path).await
 }
 
-/// Ensure the daemon is running and return a connected socket.
+/// Ensure the daemon is running at the given socket path and return a connected socket.
 ///
 /// 1. Try to connect to the UDS
 /// 2. If ConnectionRefused or NotFound, fork the daemon
 /// 3. Retry with exponential backoff until connected or max retries
-pub async fn ensure_daemon_running() -> Result<UnixStream, ClientError> {
-    let sock_path = daemon::socket_path()?;
-
+pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
     // First attempt — maybe daemon is already running
-    match probe_socket(&sock_path).await {
+    match probe_socket(socket_path).await {
         Ok(stream) => {
             debug!("Connected to existing daemon");
             return Ok(stream);
@@ -64,7 +62,7 @@ pub async fn ensure_daemon_running() -> Result<UnixStream, ClientError> {
     for attempt in 1..=MAX_CONNECT_RETRIES {
         tokio::time::sleep(backoff).await;
 
-        match probe_socket(&sock_path).await {
+        match probe_socket(socket_path).await {
             Ok(stream) => {
                 info!(attempt, "Connected to daemon");
                 return Ok(stream);
@@ -82,6 +80,13 @@ pub async fn ensure_daemon_running() -> Result<UnixStream, ClientError> {
     }
 
     Err(ClientError::ConnectionFailed(MAX_CONNECT_RETRIES))
+}
+
+/// Ensure the daemon is running (using default socket path) and return a connected socket.
+#[allow(dead_code)] // Available for backward compatibility
+pub async fn ensure_daemon_running() -> Result<UnixStream, ClientError> {
+    let sock_path = daemon::socket_path()?;
+    ensure_daemon_running_at(&sock_path).await
 }
 
 /// Start the daemon process by re-executing the current binary with
