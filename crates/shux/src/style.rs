@@ -12,6 +12,7 @@ use std::fmt;
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::style::{self, Attribute, Color, Stylize};
+use unicode_width::UnicodeWidthStr;
 
 // ── Terminal Context ────────────────────────────────────────────
 
@@ -202,6 +203,37 @@ pub fn bold(text: impl fmt::Display) -> impl fmt::Display {
     Styled::new(text).bold()
 }
 
+// ── Display Width Helper ──────────────────────────────────────
+
+/// Display width of a string in terminal columns.
+/// Uses the `unicode-width` crate for accurate column counting, handling
+/// wide characters (CJK), zero-width combiners, and other Unicode properly.
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Pad a string to `width` display columns (left-aligned).
+/// Unlike `format!("{:<width$}")` which pads by char count, this uses
+/// display width so wide/zero-width characters are handled correctly.
+fn pad_right(s: &str, width: usize) -> String {
+    let current = display_width(s);
+    if current >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - current))
+    }
+}
+
+/// Pad a string to `width` display columns (right-aligned).
+fn pad_left(s: &str, width: usize) -> String {
+    let current = display_width(s);
+    if current >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", " ".repeat(width - current), s)
+    }
+}
+
 // ── Short ID Helper ────────────────────────────────────────────
 
 /// Truncate a UUID to its 8-char short prefix (like git short SHA).
@@ -231,13 +263,6 @@ impl BoxRenderer {
         }
     }
 
-    /// Set the inner content width (call after measuring columns).
-    pub fn set_width(&mut self, width: usize) {
-        if width > self.inner_width {
-            self.inner_width = width;
-        }
-    }
-
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
@@ -264,9 +289,10 @@ impl BoxRenderer {
                     title.clone()
                 };
                 // Title: ╭─ Title ──...──╮
-                let prefix_visible_len = 2 + 1 + title.len() + 1; // "╭─ Title "
-                let remaining = if self.inner_width + 2 > prefix_visible_len {
-                    self.inner_width + 2 - prefix_visible_len
+                // Between corners: "─ Title ────╮" should fill inner_width + 2
+                let prefix_between_corners = 1 + 1 + display_width(title) + 1; // "─ Title "
+                let remaining = if self.inner_width + 2 > prefix_between_corners {
+                    self.inner_width + 2 - prefix_between_corners
                 } else {
                     1
                 };
@@ -310,7 +336,7 @@ impl BoxRenderer {
                 } else {
                     footer.clone()
                 };
-                let suffix_visible_len = 1 + footer.len() + 1; // " footer ╯"
+                let suffix_visible_len = 1 + display_width(footer) + 1; // " footer ╯"
                 let remaining = if self.inner_width + 2 > suffix_visible_len {
                     self.inner_width + 2 - suffix_visible_len
                 } else {
@@ -363,17 +389,17 @@ impl ColumnLayout {
         self.rows.push(cells);
     }
 
-    /// Calculate the max width for each column.
+    /// Calculate the max display width for each column.
     fn col_widths(&self) -> Vec<usize> {
         self.columns
             .iter()
             .enumerate()
             .map(|(i, col)| {
-                let header_width = col.header.len();
+                let header_width = display_width(&col.header);
                 let max_cell = self
                     .rows
                     .iter()
-                    .map(|row| row.get(i).map(|c| c.len()).unwrap_or(0))
+                    .map(|row| row.get(i).map(|c| display_width(c)).unwrap_or(0))
                     .max()
                     .unwrap_or(0);
                 header_width.max(max_cell).max(col.min_width)
@@ -388,13 +414,13 @@ impl ColumnLayout {
         for (i, col) in self.columns.iter().enumerate() {
             let w = widths[i];
             let cell = match col.align {
-                Align::Left => format!("{:<width$}", col.header, width = w),
-                Align::Right => format!("{:>width$}", col.header, width = w),
+                Align::Left => pad_right(&col.header, w),
+                Align::Right => pad_left(&col.header, w),
             };
             parts.push(cell);
         }
         let line = parts.join(&" ".repeat(self.gap));
-        let visible_len = line.len();
+        let visible_len = self.total_width();
         let styled_line = styled_if(&line, colors, None, false, true);
         (styled_line, visible_len)
     }
@@ -408,27 +434,23 @@ impl ColumnLayout {
     ) -> (String, usize) {
         let widths = self.col_widths();
         let row = &self.rows[row_idx];
-        let mut parts_visible = Vec::new();
         let mut parts_colored = Vec::new();
 
         for (i, col) in self.columns.iter().enumerate() {
             let raw = row.get(i).map(|s| s.as_str()).unwrap_or("");
             let w = widths[i];
             let padded = match col.align {
-                Align::Left => format!("{:<width$}", raw, width = w),
-                Align::Right => format!("{:>width$}", raw, width = w),
+                Align::Left => pad_right(raw, w),
+                Align::Right => pad_left(raw, w),
             };
-            parts_visible.push(padded.clone());
 
-            // Apply coloring to the padded cell
             let colored = color_fn(i, &padded);
             parts_colored.push(colored);
         }
 
         let gap_str = " ".repeat(self.gap);
-        let visible = parts_visible.join(&gap_str);
         let colored = parts_colored.join(&gap_str);
-        (colored, visible.len())
+        (colored, self.total_width())
     }
 
     /// Total visible width of a rendered row.
@@ -522,8 +544,6 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
             }
 
             let content_width = layout.total_width();
-            let min_box_width = 54;
-            let box_width = content_width.max(min_box_width);
 
             let footer_text = format!(
                 "{} session{} \u{00B7} {} window{} total",
@@ -533,9 +553,14 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                 if total_windows == 1 { "" } else { "s" },
             );
 
-            let mut bx = BoxRenderer::new(ctx, box_width);
-            bx.set_width(box_width);
-            let bx = bx.title("Sessions").footer(footer_text);
+            let title_text = "Sessions";
+            let box_width = content_width
+                .max(display_width(title_text) + 4)
+                .max(display_width(&footer_text) + 4);
+
+            let bx = BoxRenderer::new(ctx, box_width)
+                .title(title_text)
+                .footer(footer_text);
 
             let _ = writeln!(out, "{}", bx.header());
             let _ = writeln!(out, "{}", bx.empty_row());
@@ -549,7 +574,7 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                             // Diamond: ◆ cyan bold if active, ◇ dim if not
                             if is_active {
                                 styled_if(cell.trim(), colors, Some(Color::Cyan), true, false)
-                                    + &" ".repeat(cell.len() - cell.trim().len())
+                                    + &" ".repeat(display_width(cell) - display_width(cell.trim()))
                             } else {
                                 styled_if(cell, colors, None, false, true)
                             }
@@ -633,7 +658,6 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
 
             let content_width = layout.total_width();
             let header_text = format!("Windows \u{2500}\u{2500} session: {session_name}");
-            let min_box_width = content_width.max(header_text.len() + 4).max(54);
 
             let footer_text = format!(
                 "{} window{} \u{00B7} {} pane{} \u{2500}\u{2500} {session_name}",
@@ -643,9 +667,13 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
                 if total_panes == 1 { "" } else { "s" },
             );
 
-            let mut bx = BoxRenderer::new(ctx, min_box_width);
-            bx.set_width(min_box_width);
-            let bx = bx.title(header_text).footer(footer_text);
+            let box_width = content_width
+                .max(display_width(&header_text) + 4)
+                .max(display_width(&footer_text) + 4);
+
+            let bx = BoxRenderer::new(ctx, box_width)
+                .title(header_text)
+                .footer(footer_text);
 
             let _ = writeln!(out, "{}", bx.header());
             let _ = writeln!(out, "{}", bx.empty_row());
@@ -727,7 +755,6 @@ pub fn render_pane_list(
                 "Panes \u{2500}\u{2500} window: {window_name} \u{2500}\u{2500} session: {session_name}"
             );
             let footer_ctx = format!("{window_name}:{session_name}");
-            let min_box_width = content_width.max(header_text.len() + 4).max(54);
 
             let footer_text = format!(
                 "{} pane{} \u{2500}\u{2500} {footer_ctx}",
@@ -735,9 +762,13 @@ pub fn render_pane_list(
                 if panes.len() == 1 { "" } else { "s" },
             );
 
-            let mut bx = BoxRenderer::new(ctx, min_box_width);
-            bx.set_width(min_box_width);
-            let bx = bx.title(header_text).footer(footer_text);
+            let box_width = content_width
+                .max(display_width(&header_text) + 4)
+                .max(display_width(&footer_text) + 4);
+
+            let bx = BoxRenderer::new(ctx, box_width)
+                .title(header_text)
+                .footer(footer_text);
 
             let _ = writeln!(out, "{}", bx.header());
             let _ = writeln!(out, "{}", bx.empty_row());
@@ -791,26 +822,19 @@ fn render_empty_state(
     message: &str,
     hint: &str,
 ) {
-    let content_len = message.len().max(hint.len()).max(40);
-    let min_box_width = content_len.max(title.len() + 4);
+    let msg_w = display_width(message);
+    let hint_w = display_width(hint);
+    let title_w = display_width(title);
+    let content_len = msg_w.max(hint_w).max(40);
+    let inner = content_len.max(title_w + 4);
 
-    let mut bx = BoxRenderer::new(ctx, min_box_width);
-    bx.set_width(min_box_width);
-    // Don't chain title since we already have a &mut
-    let title_str = title.to_string();
-    let bx = BoxRenderer::new(ctx, min_box_width).title(title_str);
-    // Recalculate width
-    let inner = min_box_width;
+    let bx = BoxRenderer::new(ctx, inner).title(title.to_string());
 
     let _ = writeln!(out, "{}", bx.header());
     let _ = writeln!(out, "{}", bx.empty_row());
 
     let msg_styled = styled_if(message, ctx.colors, None, false, true);
-    let msg_padding = if inner > message.len() {
-        inner - message.len()
-    } else {
-        0
-    };
+    let msg_padding = inner.saturating_sub(msg_w);
     let v = if ctx.unicode { "│" } else { "|" };
     let _ = writeln!(out, "{v} {msg_styled}{} {v}", " ".repeat(msg_padding));
 
@@ -818,11 +842,7 @@ fn render_empty_state(
 
     if !hint.is_empty() {
         let hint_styled = styled_if(hint, ctx.colors, None, false, true);
-        let hint_padding = if inner > hint.len() {
-            inner - hint.len()
-        } else {
-            0
-        };
+        let hint_padding = inner.saturating_sub(hint_w);
         let _ = writeln!(out, "{v} {hint_styled}{} {v}", " ".repeat(hint_padding));
         let _ = writeln!(out, "{}", bx.empty_row());
     }
