@@ -1,6 +1,6 @@
 # 014 — Window CRUD (API + CLI)
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 013
 **Parallelizable With:** 022
 

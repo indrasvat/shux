@@ -20,20 +20,49 @@ use tokio_util::codec::Framed;
 fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
     use shux_core::graph::GraphError;
     match e {
-        GraphError::SessionNotFound(_)
-        | GraphError::WindowNotFound(_)
-        | GraphError::PaneNotFound(_) => shux_rpc::RpcError::not_found("session", &e.to_string()),
+        GraphError::SessionNotFound(_) => shux_rpc::RpcError::not_found("session", &e.to_string()),
+        GraphError::WindowNotFound(_) => shux_rpc::RpcError::not_found("window", &e.to_string()),
+        GraphError::PaneNotFound(_) => shux_rpc::RpcError::not_found("pane", &e.to_string()),
         GraphError::SessionNameExists(ref name) => {
             shux_rpc::RpcError::name_conflict("session", name)
+        }
+        GraphError::WindowNameConflict(ref name) => {
+            shux_rpc::RpcError::name_conflict("window", name)
         }
         GraphError::EmptySessionName
         | GraphError::SessionNameTooLong(_)
         | GraphError::InvalidSessionName(_) => shux_rpc::RpcError::invalid_params(&e.to_string()),
-        GraphError::VersionConflict { expected, actual } => {
-            shux_rpc::RpcError::version_conflict("session", "?", expected, actual)
+        GraphError::EmptyWindowName | GraphError::WindowIndexOutOfRange { .. } => {
+            shux_rpc::RpcError::invalid_params(&e.to_string())
         }
-        _ => shux_rpc::RpcError::internal(&e.to_string()),
+        GraphError::LastWindow | GraphError::LastPane => {
+            shux_rpc::RpcError::invalid_params(&e.to_string())
+        }
+        GraphError::VersionConflict { expected, actual } => {
+            shux_rpc::RpcError::version_conflict("resource", "?", expected, actual)
+        }
+        GraphError::Shutdown => shux_rpc::RpcError::internal(&e.to_string()),
     }
+}
+
+/// Build window info JSON from a Window.
+fn window_to_json(
+    w: &shux_core::model::Window,
+    index: usize,
+    is_active: bool,
+    snap: &shux_core::graph::SessionGraphSnapshot,
+) -> serde_json::Value {
+    let pane_count = snap.panes.values().filter(|p| p.window_id == w.id).count();
+    serde_json::json!({
+        "id": w.id.to_string(),
+        "session_id": w.session_id.to_string(),
+        "title": w.title,
+        "pane_count": pane_count,
+        "active_pane_id": w.active_pane.to_string(),
+        "index": index,
+        "is_active": is_active,
+        "version": w.version,
+    })
 }
 
 /// Build session info JSON from a Session.
@@ -244,6 +273,301 @@ fn register_session_methods(
         )
 }
 
+/// Register window CRUD methods backed by a real GraphHandle.
+fn register_window_methods(
+    builder: shux_rpc::RouterBuilder,
+    graph: shux_core::graph::GraphHandle,
+) -> shux_rpc::RouterBuilder {
+    let g1 = graph.clone();
+    let g2 = graph.clone();
+    let g3 = graph.clone();
+    let g4 = graph.clone();
+    let g5 = graph.clone();
+    let g6 = graph.clone();
+    let g7 = graph.clone();
+
+    builder
+        .register("window.create", move |params: Option<serde_json::Value>| {
+            let gh = g1.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let session_id_str = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
+                    })?;
+                let session_id: shux_core::model::SessionId = session_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
+                let name = params.get("name").and_then(|v| v.as_str());
+                let title = match name {
+                    Some(n) => n.to_string(),
+                    None => {
+                        let snap = gh.snapshot();
+                        let session = snap.sessions.get(&session_id).ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("session", session_id_str)
+                        })?;
+                        let mut idx = session.windows.len();
+                        loop {
+                            let candidate = format!("{idx}");
+                            if !snap.window_name_exists_in_session(&session_id, &candidate) {
+                                break candidate;
+                            }
+                            idx += 1;
+                        }
+                    }
+                };
+                let cwd = PathBuf::from("/tmp");
+                let window_id = gh
+                    .create_window(session_id, title, cwd)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                let snap = gh.snapshot();
+                let window = snap
+                    .windows
+                    .get(&window_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
+                let session = snap
+                    .sessions
+                    .get(&window.session_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                let index = session
+                    .windows
+                    .iter()
+                    .position(|id| *id == window_id)
+                    .unwrap_or(0);
+                let is_active = session.active_window == window_id;
+                let pane_id = window.active_pane.to_string();
+                let mut result = window_to_json(window, index, is_active, &snap);
+                result["pane_id"] = serde_json::Value::String(pane_id);
+                Ok(result)
+            }
+        })
+        .register("window.list", move |params: Option<serde_json::Value>| {
+            let gh = g2.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let session_id_str = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
+                    })?;
+                let session_id: shux_core::model::SessionId = session_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
+                let snap = gh.snapshot();
+                let session = snap
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
+                let windows: Vec<serde_json::Value> = session
+                    .windows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, wid)| {
+                        snap.windows
+                            .get(wid)
+                            .map(|w| window_to_json(w, index, session.active_window == *wid, &snap))
+                    })
+                    .collect();
+                Ok(serde_json::json!(windows))
+            }
+        })
+        .register("window.ensure", move |params: Option<serde_json::Value>| {
+            let gh = g3.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let session_id_str = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
+                    })?;
+                let session_id: shux_core::model::SessionId = session_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'name' parameter"))?
+                    .to_string();
+                let snap = gh.snapshot();
+                if let Some(w) = snap.find_window_by_name(&session_id, &name) {
+                    let session = snap
+                        .sessions
+                        .get(&session_id)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
+                    let index = session
+                        .windows
+                        .iter()
+                        .position(|id| *id == w.id)
+                        .unwrap_or(0);
+                    let is_active = session.active_window == w.id;
+                    let mut result = window_to_json(w, index, is_active, &snap);
+                    result["created"] = serde_json::Value::Bool(false);
+                    return Ok(result);
+                }
+                let cwd = PathBuf::from("/tmp");
+                let window_id = gh
+                    .create_window(session_id, name, cwd)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                let snap = gh.snapshot();
+                let window = snap
+                    .windows
+                    .get(&window_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
+                let session = snap
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                let index = session
+                    .windows
+                    .iter()
+                    .position(|id| *id == window_id)
+                    .unwrap_or(0);
+                let is_active = session.active_window == window_id;
+                let mut result = window_to_json(window, index, is_active, &snap);
+                result["created"] = serde_json::Value::Bool(true);
+                Ok(result)
+            }
+        })
+        .register("window.rename", move |params: Option<serde_json::Value>| {
+            let gh = g4.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let window_id_str = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'id' parameter"))?;
+                let window_id: shux_core::model::WindowId = window_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
+                let new_title = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'name' parameter"))?
+                    .to_string();
+                gh.rename_window(window_id, new_title)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                let snap = gh.snapshot();
+                let window = snap
+                    .windows
+                    .get(&window_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("window vanished after rename"))?;
+                let session = snap
+                    .sessions
+                    .get(&window.session_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                let index = session
+                    .windows
+                    .iter()
+                    .position(|id| *id == window_id)
+                    .unwrap_or(0);
+                let is_active = session.active_window == window_id;
+                Ok(window_to_json(window, index, is_active, &snap))
+            }
+        })
+        .register("window.focus", move |params: Option<serde_json::Value>| {
+            let gh = g5.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let window_id_str = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'id' parameter"))?;
+                let window_id: shux_core::model::WindowId = window_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
+                let previous = gh
+                    .focus_window(window_id)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                let snap = gh.snapshot();
+                let window = snap
+                    .windows
+                    .get(&window_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("window vanished after focus"))?;
+                let session = snap
+                    .sessions
+                    .get(&window.session_id)
+                    .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                let index = session
+                    .windows
+                    .iter()
+                    .position(|id| *id == window_id)
+                    .unwrap_or(0);
+                let mut result = window_to_json(window, index, true, &snap);
+                result["previous_window_id"] = match previous {
+                    Some(id) => serde_json::Value::String(id.to_string()),
+                    None => serde_json::Value::Null,
+                };
+                Ok(result)
+            }
+        })
+        .register(
+            "window.reorder",
+            move |params: Option<serde_json::Value>| {
+                let gh = g6.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let window_id_str =
+                        params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'id' parameter")
+                        })?;
+                    let window_id: shux_core::model::WindowId =
+                        window_id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid window id format")
+                        })?;
+                    let new_index = params
+                        .get("new_index")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'new_index' parameter")
+                        })? as usize;
+                    gh.reorder_window(window_id, new_index)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
+                    let snap = gh.snapshot();
+                    let window = snap.windows.get(&window_id).ok_or_else(|| {
+                        shux_rpc::RpcError::internal("window vanished after reorder")
+                    })?;
+                    let session = snap
+                        .sessions
+                        .get(&window.session_id)
+                        .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                    let index = session
+                        .windows
+                        .iter()
+                        .position(|id| *id == window_id)
+                        .unwrap_or(0);
+                    let is_active = session.active_window == window_id;
+                    Ok(window_to_json(window, index, is_active, &snap))
+                }
+            },
+        )
+        .register("window.kill", move |params: Option<serde_json::Value>| {
+            let gh = g7.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let window_id_str = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'id' parameter"))?;
+                let window_id: shux_core::model::WindowId = window_id_str
+                    .parse()
+                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
+                gh.destroy_window(window_id, None)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+                Ok(serde_json::json!({ "killed": window_id_str }))
+            }
+        })
+}
+
 /// Start a test server (RPC + SessionGraph) on an ephemeral UDS.
 /// Returns (socket_path, cancel_token).
 async fn start_test_server(
@@ -261,8 +585,11 @@ async fn start_test_server(
         shux_core::graph::run_graph_loop(graph, graph_rx, graph_cancel).await;
     });
 
-    let router = register_session_methods(
-        shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+    let router = register_window_methods(
+        register_session_methods(
+            shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+            graph_handle.clone(),
+        ),
         graph_handle,
     )
     .build();
@@ -1175,6 +1502,483 @@ async fn test_013_cli_rename() {
     let names: Vec<&str> = sessions.iter().filter_map(|s| s["name"].as_str()).collect();
     assert!(names.contains(&"cli-rename-new"));
     assert!(!names.contains(&"cli-rename-old"));
+
+    cancel.cancel();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Task 014: Window CRUD tests
+// ══════════════════════════════════════════════════════════════
+
+/// Helper: create a session and return its ID.
+async fn create_session(socket_path: &std::path::Path, name: &str) -> String {
+    let resp = rpc_raw(
+        socket_path,
+        "session.create",
+        serde_json::json!({"name": name}),
+    )
+    .await;
+    assert!(
+        resp["error"].is_null(),
+        "session.create should succeed: {resp}"
+    );
+    resp["result"]["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn test_014_window_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "win-test").await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id, "name": "editor"}),
+    )
+    .await;
+    assert!(
+        resp["error"].is_null(),
+        "window.create should succeed: {resp}"
+    );
+    assert_eq!(resp["result"]["title"], "editor");
+    assert!(resp["result"]["id"].is_string());
+    assert!(resp["result"]["is_active"].as_bool().unwrap());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_create_auto_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "auto-win").await;
+
+    // Session already has window "0" (default). Creating without name should auto-name.
+    let resp = rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    assert!(
+        resp["error"].is_null(),
+        "auto-name create should succeed: {resp}"
+    );
+    let title = resp["result"]["title"].as_str().unwrap();
+    // Auto-name is index-based; first window is "0", new one should be "1"
+    assert!(!title.is_empty(), "auto-named window should have a title");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "list-win").await;
+
+    // Create a second window
+    rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id, "name": "second"}),
+    )
+    .await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    let windows = resp["result"].as_array().unwrap();
+    assert_eq!(windows.len(), 2, "should have 2 windows");
+
+    // Last created window should be active
+    let active_count = windows
+        .iter()
+        .filter(|w| w["is_active"].as_bool().unwrap_or(false))
+        .count();
+    assert_eq!(active_count, 1, "exactly one window should be active");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_list_missing_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let resp = rpc_raw(
+        &socket_path,
+        "window.list",
+        serde_json::json!({"session_id": "00000000-0000-0000-0000-000000000000"}),
+    )
+    .await;
+    assert!(
+        resp["error"].is_object(),
+        "listing windows for nonexistent session should fail"
+    );
+    assert_eq!(resp["error"]["code"], shux_rpc::ErrorCode::NotFound.code());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "kill-win").await;
+
+    // Create a second window so we can kill one
+    let create_resp = rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id, "name": "doomed"}),
+    )
+    .await;
+    let window_id = create_resp["result"]["id"].as_str().unwrap().to_string();
+
+    let kill_resp = rpc_raw(
+        &socket_path,
+        "window.kill",
+        serde_json::json!({"id": window_id}),
+    )
+    .await;
+    assert!(
+        kill_resp["error"].is_null(),
+        "window.kill should succeed: {kill_resp}"
+    );
+
+    // Verify only 1 window remains
+    let list_resp = rpc_raw(
+        &socket_path,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    let windows = list_resp["result"].as_array().unwrap();
+    assert_eq!(windows.len(), 1, "should have 1 window after kill");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_kill_last_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "last-win").await;
+
+    // Get the only window's ID
+    let list_resp = rpc_raw(
+        &socket_path,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    let window_id = list_resp["result"][0]["id"].as_str().unwrap().to_string();
+
+    // Try to kill the last window — should fail
+    let kill_resp = rpc_raw(
+        &socket_path,
+        "window.kill",
+        serde_json::json!({"id": window_id}),
+    )
+    .await;
+    assert!(
+        kill_resp["error"].is_object(),
+        "killing last window should fail: {kill_resp}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "rename-win").await;
+
+    let list_resp = rpc_raw(
+        &socket_path,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    let window_id = list_resp["result"][0]["id"].as_str().unwrap().to_string();
+
+    let rename_resp = rpc_raw(
+        &socket_path,
+        "window.rename",
+        serde_json::json!({"id": window_id, "name": "renamed-window"}),
+    )
+    .await;
+    assert!(
+        rename_resp["error"].is_null(),
+        "window.rename should succeed: {rename_resp}"
+    );
+    assert_eq!(rename_resp["result"]["title"], "renamed-window");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "focus-win").await;
+
+    // Get the initial window
+    let list_resp = rpc_raw(
+        &socket_path,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    let first_win_id = list_resp["result"][0]["id"].as_str().unwrap().to_string();
+
+    // Create a second window (becomes active)
+    rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id, "name": "second"}),
+    )
+    .await;
+
+    // Focus back to first window
+    let focus_resp = rpc_raw(
+        &socket_path,
+        "window.focus",
+        serde_json::json!({"id": first_win_id}),
+    )
+    .await;
+    assert!(
+        focus_resp["error"].is_null(),
+        "window.focus should succeed: {focus_resp}"
+    );
+    assert!(focus_resp["result"]["is_active"].as_bool().unwrap());
+    assert!(focus_resp["result"]["previous_window_id"].is_string());
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_reorder() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "reorder-win").await;
+
+    // Create 2 more windows (total 3)
+    rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id, "name": "w1"}),
+    )
+    .await;
+    let create_resp = rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id, "name": "w2"}),
+    )
+    .await;
+    let w2_id = create_resp["result"]["id"].as_str().unwrap().to_string();
+
+    // Move w2 to index 0
+    let reorder_resp = rpc_raw(
+        &socket_path,
+        "window.reorder",
+        serde_json::json!({"id": w2_id, "new_index": 0}),
+    )
+    .await;
+    assert!(
+        reorder_resp["error"].is_null(),
+        "window.reorder should succeed: {reorder_resp}"
+    );
+    assert_eq!(reorder_resp["result"]["index"], 0);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_ensure_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "ensure-win").await;
+
+    let resp1 = rpc_raw(
+        &socket_path,
+        "window.ensure",
+        serde_json::json!({"session_id": session_id, "name": "ensured"}),
+    )
+    .await;
+    assert!(resp1["error"].is_null(), "ensure should succeed: {resp1}");
+    assert_eq!(resp1["result"]["title"], "ensured");
+    assert_eq!(resp1["result"]["created"], true);
+
+    // Second ensure returns existing
+    let resp2 = rpc_raw(
+        &socket_path,
+        "window.ensure",
+        serde_json::json!({"session_id": session_id, "name": "ensured"}),
+    )
+    .await;
+    assert_eq!(resp2["result"]["created"], false);
+    assert_eq!(resp2["result"]["id"], resp1["result"]["id"]);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_window_new_becomes_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "active-win").await;
+
+    // Create a second window
+    let create_resp = rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id, "name": "new-active"}),
+    )
+    .await;
+    assert!(create_resp["result"]["is_active"].as_bool().unwrap());
+
+    // Verify via list
+    let list_resp = rpc_raw(
+        &socket_path,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    let windows = list_resp["result"].as_array().unwrap();
+    let active: Vec<_> = windows
+        .iter()
+        .filter(|w| w["is_active"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["title"], "new-active");
+
+    cancel.cancel();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Task 014: Window CLI tests
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_014_cli_window_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let session_id = create_session(&socket_path, "cli-wl").await;
+    rpc_raw(
+        &socket_path,
+        "window.create",
+        serde_json::json!({"session_id": session_id, "name": "editor"}),
+    )
+    .await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "window",
+            "list",
+            "-s",
+            "cli-wl",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("editor"),
+        "window list should show 'editor': {stdout}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_cli_window_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    create_session(&socket_path, "cli-wn").await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "window",
+            "new",
+            "-s",
+            "cli-wn",
+            "-n",
+            "cli-created",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Created") || stdout.contains("created"),
+        "should confirm creation: {stdout}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_014_cli_window_list_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    create_session(&socket_path, "cli-wlj").await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--format",
+            "json",
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "window",
+            "list",
+            "-s",
+            "cli-wlj",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("should be valid JSON: {stdout}"));
+    assert!(parsed.is_array(), "JSON window list should be an array");
 
     cancel.cancel();
 }

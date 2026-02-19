@@ -118,10 +118,95 @@ pub enum Command {
     /// Print version information
     Version,
 
+    /// Window management
+    #[command(alias = "win")]
+    Window {
+        #[command(subcommand)]
+        command: WindowCommand,
+    },
+
     /// Internal: start the daemon (used by auto-start, not for users)
     #[command(name = "__daemon", hide = true)]
     #[allow(non_camel_case_types)]
     __daemon,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WindowCommand {
+    /// List windows in a session
+    #[command(alias = "ls")]
+    List {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+    },
+
+    /// Create a new window in a session
+    New {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name (auto-generated if not provided)
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Create-if-missing semantics (maps to window.ensure)
+        #[arg(long)]
+        ensure: bool,
+    },
+
+    /// Kill a window
+    Kill {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index
+        #[arg(short, long)]
+        window: String,
+    },
+
+    /// Rename a window
+    Rename {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Current window name or index
+        #[arg(short, long)]
+        window: String,
+
+        /// New window name
+        #[arg(short, long)]
+        name: String,
+    },
+
+    /// Focus (select) a window
+    Focus {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index
+        #[arg(short, long)]
+        window: String,
+    },
+
+    /// Reorder (move) a window to a new index
+    Reorder {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index
+        #[arg(short, long)]
+        window: String,
+
+        /// New index position
+        #[arg(short, long)]
+        index: usize,
+    },
 }
 
 impl Cli {
@@ -137,6 +222,33 @@ impl Cli {
     }
 }
 
+/// Format an RPC error, including detail from data if available.
+fn rpc_display(code: i64, message: &str, data: Option<&serde_json::Value>) -> String {
+    if let Some(data) = data {
+        // Try "detail" field (invalid_params, internal errors)
+        if let Some(detail) = data.get("detail").and_then(|v| v.as_str()) {
+            return detail.to_string();
+        }
+        // Try "name" field (name_conflict)
+        if let Some(name) = data.get("name").and_then(|v| v.as_str()) {
+            let resource = data
+                .get("resource")
+                .and_then(|v| v.as_str())
+                .unwrap_or("resource");
+            return format!("{resource} name '{name}' already exists");
+        }
+        // Try "id" field (not_found)
+        if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
+            let resource = data
+                .get("resource")
+                .and_then(|v| v.as_str())
+                .unwrap_or("resource");
+            return format!("{resource} '{id}' not found");
+        }
+    }
+    format!("RPC error {code}: {message}")
+}
+
 /// Errors that can occur during RPC communication.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcClientError {
@@ -146,7 +258,7 @@ pub enum RpcClientError {
     Json(#[from] serde_json::Error),
     #[error("response frame too large: {0} bytes (max 16 MB)")]
     FrameTooLarge(usize),
-    #[error("RPC error {code}: {message}")]
+    #[error("{}", rpc_display(*.code, message, data.as_ref()))]
     Rpc {
         code: i64,
         message: String,
@@ -387,6 +499,278 @@ pub async fn handle_rename(
     Ok(())
 }
 
+/// Resolve a session name to its UUID by querying session.list.
+async fn resolve_session_id(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+) -> Result<String, RpcClientError> {
+    let result = rpc_call(stream, "session.list", serde_json::json!({})).await?;
+    let sessions = result
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .or_else(|| result.as_array());
+
+    if let Some(sessions) = sessions {
+        for s in sessions {
+            if s.get("name").and_then(|v| v.as_str()) == Some(session_name) {
+                if let Some(id) = s.get("id").and_then(|v| v.as_str()) {
+                    return Ok(id.to_string());
+                }
+            }
+        }
+    }
+
+    Err(RpcClientError::Rpc {
+        code: -32004,
+        message: format!("session '{session_name}' not found"),
+        data: None,
+    })
+}
+
+/// Resolve a window specifier (name or index) to (window_id, window_title).
+async fn resolve_window_id(
+    stream: &mut tokio::net::UnixStream,
+    session_id: &str,
+    window_spec: &str,
+) -> Result<(String, String), RpcClientError> {
+    let result = rpc_call(
+        stream,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await?;
+    let windows = result.as_array().ok_or_else(|| RpcClientError::Rpc {
+        code: -32603,
+        message: "unexpected response from window.list".to_string(),
+        data: None,
+    })?;
+
+    // Try as numeric index first
+    if let Ok(idx) = window_spec.parse::<usize>() {
+        if let Some(w) = windows.get(idx) {
+            let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let title = w.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+            return Ok((id.to_string(), title.to_string()));
+        }
+    }
+
+    // Try as window name
+    for w in windows {
+        if w.get("title").and_then(|v| v.as_str()) == Some(window_spec) {
+            let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let title = w.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+            return Ok((id.to_string(), title.to_string()));
+        }
+    }
+
+    Err(RpcClientError::Rpc {
+        code: -32004,
+        message: format!("window '{window_spec}' not found in session"),
+        data: None,
+    })
+}
+
+/// Handle the `shux window list` command.
+pub async fn handle_window_list(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    let result = rpc_call(
+        stream,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            use crate::style;
+
+            let windows = result.as_array();
+            if let Some(windows) = windows {
+                if windows.is_empty() {
+                    println!("{}", style::muted("no windows"));
+                } else {
+                    for w in windows {
+                        let index = w.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let title = w
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("(untitled)");
+                        let pane_count =
+                            w.get("pane_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let is_active = w
+                            .get("is_active")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        style::print_window_entry(index, title, pane_count, is_active);
+                    }
+                }
+            } else {
+                println!("{}", style::muted("no windows"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux window new` command.
+pub async fn handle_window_new(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_name: Option<String>,
+    ensure: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+
+    let method = if ensure {
+        "window.ensure"
+    } else {
+        "window.create"
+    };
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id),
+    );
+    if let Some(name) = &window_name {
+        params.insert("name".to_string(), serde_json::Value::String(name.clone()));
+    }
+
+    let result = rpc_call(stream, method, serde_json::Value::Object(params)).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            let title = result
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
+            let index = result.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+            crate::style::print_window_created(title, index);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux window kill` command.
+pub async fn handle_window_kill(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    let (window_id, window_title) = resolve_window_id(stream, &session_id, window_spec).await?;
+
+    let result = rpc_call(stream, "window.kill", serde_json::json!({"id": window_id})).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            crate::style::print_window_killed(&window_title);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux window rename` command.
+pub async fn handle_window_rename(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: &str,
+    new_name: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    let (window_id, old_title) = resolve_window_id(stream, &session_id, window_spec).await?;
+
+    let result = rpc_call(
+        stream,
+        "window.rename",
+        serde_json::json!({"id": window_id, "name": new_name}),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            crate::style::print_window_renamed(&old_title, new_name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux window focus` command.
+pub async fn handle_window_focus(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    let (window_id, window_title) = resolve_window_id(stream, &session_id, window_spec).await?;
+
+    let result = rpc_call(stream, "window.focus", serde_json::json!({"id": window_id})).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            crate::style::print_window_focused(&window_title);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux window reorder` command.
+pub async fn handle_window_reorder(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: &str,
+    new_index: usize,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    let (window_id, window_title) = resolve_window_id(stream, &session_id, window_spec).await?;
+
+    let result = rpc_call(
+        stream,
+        "window.reorder",
+        serde_json::json!({"id": window_id, "new_index": new_index}),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            crate::style::print_window_reordered(&window_title, new_index);
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle the `shux api <method> <params>` command (raw JSON-RPC for debugging).
 pub async fn handle_api(
     stream: &mut tokio::net::UnixStream,
@@ -611,5 +995,150 @@ mod tests {
 
         let result = Cli::try_parse_from(["shux", "rename", "-n", "new"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_window_list() {
+        let cli = Cli::try_parse_from(["shux", "window", "list", "-s", "work"]).unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command: WindowCommand::List { session },
+            }) => {
+                assert_eq!(session, "work");
+            }
+            _ => panic!("expected Window List command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_window_list_alias() {
+        let cli = Cli::try_parse_from(["shux", "window", "ls", "-s", "work"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Window {
+                command: WindowCommand::List { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_window_alias() {
+        let cli = Cli::try_parse_from(["shux", "win", "list", "-s", "work"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Window {
+                command: WindowCommand::List { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_window_new() {
+        let cli =
+            Cli::try_parse_from(["shux", "window", "new", "-s", "work", "-n", "editor"]).unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command:
+                    WindowCommand::New {
+                        session,
+                        name,
+                        ensure,
+                    },
+            }) => {
+                assert_eq!(session, "work");
+                assert_eq!(name, Some("editor".to_string()));
+                assert!(!ensure);
+            }
+            _ => panic!("expected Window New command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_window_new_ensure() {
+        let cli = Cli::try_parse_from(["shux", "window", "new", "-s", "work", "--ensure"]).unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command: WindowCommand::New { ensure, .. },
+            }) => {
+                assert!(ensure);
+            }
+            _ => panic!("expected Window New command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_window_kill() {
+        let cli =
+            Cli::try_parse_from(["shux", "window", "kill", "-s", "work", "-w", "editor"]).unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command: WindowCommand::Kill { session, window },
+            }) => {
+                assert_eq!(session, "work");
+                assert_eq!(window, "editor");
+            }
+            _ => panic!("expected Window Kill command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_window_rename() {
+        let cli = Cli::try_parse_from([
+            "shux", "window", "rename", "-s", "work", "-w", "old", "-n", "new",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command:
+                    WindowCommand::Rename {
+                        session,
+                        window,
+                        name,
+                    },
+            }) => {
+                assert_eq!(session, "work");
+                assert_eq!(window, "old");
+                assert_eq!(name, "new");
+            }
+            _ => panic!("expected Window Rename command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_window_focus() {
+        let cli =
+            Cli::try_parse_from(["shux", "window", "focus", "-s", "work", "-w", "0"]).unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command: WindowCommand::Focus { session, window },
+            }) => {
+                assert_eq!(session, "work");
+                assert_eq!(window, "0");
+            }
+            _ => panic!("expected Window Focus command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_window_reorder() {
+        let cli = Cli::try_parse_from([
+            "shux", "window", "reorder", "-s", "work", "-w", "editor", "-i", "2",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command:
+                    WindowCommand::Reorder {
+                        session,
+                        window,
+                        index,
+                    },
+            }) => {
+                assert_eq!(session, "work");
+                assert_eq!(window, "editor");
+                assert_eq!(index, 2);
+            }
+            _ => panic!("expected Window Reorder command"),
+        }
     }
 }

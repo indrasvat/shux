@@ -47,6 +47,15 @@ pub enum GraphError {
     #[error("cannot remove last pane from window")]
     LastPane,
 
+    #[error("window name already exists in session: {0}")]
+    WindowNameConflict(String),
+
+    #[error("window name is empty")]
+    EmptyWindowName,
+
+    #[error("window index {index} out of range (session has {count} windows)")]
+    WindowIndexOutOfRange { index: usize, count: usize },
+
     #[error("graph loop shut down")]
     Shutdown,
 }
@@ -89,6 +98,21 @@ impl SessionGraphSnapshot {
     pub fn session_name_exists(&self, name: &str) -> bool {
         self.sessions.values().any(|s| s.name == name)
     }
+
+    /// Find a window by name within a specific session.
+    pub fn find_window_by_name(&self, session_id: &SessionId, name: &str) -> Option<&Window> {
+        let session = self.sessions.get(session_id)?;
+        session
+            .windows
+            .iter()
+            .filter_map(|wid| self.windows.get(wid))
+            .find(|w| w.title == name)
+    }
+
+    /// Check if a window name exists in a session.
+    pub fn window_name_exists_in_session(&self, session_id: &SessionId, name: &str) -> bool {
+        self.find_window_by_name(session_id, name).is_some()
+    }
 }
 
 /// Commands sent to the single-writer graph task via mpsc.
@@ -119,6 +143,20 @@ pub enum GraphCommand {
     DestroyWindow {
         id: WindowId,
         expected_version: Option<Version>,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
+    RenameWindow {
+        id: WindowId,
+        new_title: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
+    FocusWindow {
+        id: WindowId,
+        reply: tokio::sync::oneshot::Sender<Result<Option<WindowId>, GraphError>>,
+    },
+    ReorderWindow {
+        id: WindowId,
+        new_index: usize,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
     CreatePane {
@@ -356,6 +394,7 @@ impl SessionGraph {
 
         if let Some(s) = snapshot.sessions.get_mut(&session_id) {
             s.windows.push(window_id);
+            s.active_window = window_id;
             s.version += 1;
         }
 
@@ -420,6 +459,124 @@ impl SessionGraph {
         snapshot.windows.remove(&id);
 
         self.publish(snapshot);
+        Ok(())
+    }
+
+    pub fn rename_window(&self, id: WindowId, new_title: String) -> Result<(), GraphError> {
+        if new_title.is_empty() {
+            return Err(GraphError::EmptyWindowName);
+        }
+
+        let current = self.current();
+
+        let window = current
+            .windows
+            .get(&id)
+            .ok_or(GraphError::WindowNotFound(id))?;
+        let session_id = window.session_id;
+
+        // Check for name conflict within the same session
+        let session = current
+            .sessions
+            .get(&session_id)
+            .ok_or(GraphError::SessionNotFound(session_id))?;
+
+        for wid in &session.windows {
+            if *wid != id {
+                if let Some(w) = current.windows.get(wid) {
+                    if w.title == new_title {
+                        return Err(GraphError::WindowNameConflict(new_title));
+                    }
+                }
+            }
+        }
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        if let Some(w) = snapshot.windows.get_mut(&id) {
+            w.title = new_title;
+            w.version += 1;
+        }
+
+        self.publish(snapshot);
+        Ok(())
+    }
+
+    /// Focus (activate) a window. Returns the previously active window ID.
+    pub fn focus_window(&self, id: WindowId) -> Result<Option<WindowId>, GraphError> {
+        let current = self.current();
+
+        let window = current
+            .windows
+            .get(&id)
+            .ok_or(GraphError::WindowNotFound(id))?;
+        let session_id = window.session_id;
+
+        let session = current
+            .sessions
+            .get(&session_id)
+            .ok_or(GraphError::SessionNotFound(session_id))?;
+
+        if !session.windows.contains(&id) {
+            return Err(GraphError::WindowNotFound(id));
+        }
+
+        let previous = if session.active_window != id {
+            Some(session.active_window)
+        } else {
+            None
+        };
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        if let Some(s) = snapshot.sessions.get_mut(&session_id) {
+            s.active_window = id;
+            s.version += 1;
+        }
+
+        self.publish(snapshot);
+        info!(%id, %session_id, "Window focused");
+        Ok(previous)
+    }
+
+    /// Reorder a window to a new index position within its session.
+    pub fn reorder_window(&self, id: WindowId, new_index: usize) -> Result<(), GraphError> {
+        let current = self.current();
+
+        let window = current
+            .windows
+            .get(&id)
+            .ok_or(GraphError::WindowNotFound(id))?;
+        let session_id = window.session_id;
+
+        let session = current
+            .sessions
+            .get(&session_id)
+            .ok_or(GraphError::SessionNotFound(session_id))?;
+
+        let window_count = session.windows.len();
+        if new_index >= window_count {
+            return Err(GraphError::WindowIndexOutOfRange {
+                index: new_index,
+                count: window_count,
+            });
+        }
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        if let Some(s) = snapshot.sessions.get_mut(&session_id) {
+            if let Some(current_index) = s.windows.iter().position(|wid| *wid == id) {
+                s.windows.remove(current_index);
+                s.windows.insert(new_index, id);
+                s.version += 1;
+            }
+        }
+
+        self.publish(snapshot);
+        info!(%id, new_index, "Window reordered");
         Ok(())
     }
 
@@ -618,6 +775,15 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::DestroyWindow { id, expected_version, reply }) => {
                         let _ = reply.send(graph.destroy_window(id, expected_version));
                     }
+                    Some(GraphCommand::RenameWindow { id, new_title, reply }) => {
+                        let _ = reply.send(graph.rename_window(id, new_title));
+                    }
+                    Some(GraphCommand::FocusWindow { id, reply }) => {
+                        let _ = reply.send(graph.focus_window(id));
+                    }
+                    Some(GraphCommand::ReorderWindow { id, new_index, reply }) => {
+                        let _ = reply.send(graph.reorder_window(id, new_index));
+                    }
                     Some(GraphCommand::CreatePane { window_id, cwd, command, reply }) => {
                         let _ = reply.send(graph.create_pane(window_id, cwd, command));
                     }
@@ -758,6 +924,41 @@ impl GraphHandle {
             .send(GraphCommand::DestroyWindow {
                 id,
                 expected_version,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn rename_window(&self, id: WindowId, new_title: String) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::RenameWindow {
+                id,
+                new_title,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn focus_window(&self, id: WindowId) -> Result<Option<WindowId>, GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::FocusWindow { id, reply: tx })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn reorder_window(&self, id: WindowId, new_index: usize) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::ReorderWindow {
+                id,
+                new_index,
                 reply: tx,
             })
             .await
@@ -1295,6 +1496,122 @@ mod tests {
 
         // Valid rename
         graph.rename_session(sid, "good-name".into(), None).unwrap();
+    }
+
+    #[test]
+    fn test_rename_window() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph.create_window(sid, "old".into(), home()).unwrap();
+
+        graph.rename_window(wid, "new-title".into()).unwrap();
+
+        let snap = state.load();
+        assert_eq!(snap.windows[&wid].title, "new-title");
+    }
+
+    #[test]
+    fn test_rename_window_conflict() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+
+        // Get default window
+        let snap = state.load();
+        let default_wid = snap.sessions[&sid].windows[0];
+
+        let wid2 = graph.create_window(sid, "second".into(), home()).unwrap();
+
+        // Rename second window to conflict with default
+        let default_title = state.load().windows[&default_wid].title.clone();
+        let err = graph.rename_window(wid2, default_title).unwrap_err();
+        assert!(matches!(err, GraphError::WindowNameConflict(_)));
+    }
+
+    #[test]
+    fn test_rename_window_empty_name() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+
+        let err = graph.rename_window(wid, "".into()).unwrap_err();
+        assert!(matches!(err, GraphError::EmptyWindowName));
+    }
+
+    #[test]
+    fn test_focus_window() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+
+        let snap = state.load();
+        let w1 = snap.sessions[&sid].windows[0];
+
+        let w2 = graph.create_window(sid, "second".into(), home()).unwrap();
+
+        // Focus back to w1
+        let prev = graph.focus_window(w1).unwrap();
+        assert_eq!(prev, Some(w2));
+
+        let snap = state.load();
+        assert_eq!(snap.sessions[&sid].active_window, w1);
+    }
+
+    #[test]
+    fn test_focus_already_focused_window() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+
+        let snap = state.load();
+        let w1 = snap.sessions[&sid].windows[0];
+
+        // Focus the already active window
+        let prev = graph.focus_window(w1).unwrap();
+        assert_eq!(prev, None);
+    }
+
+    #[test]
+    fn test_reorder_window() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let w2 = graph.create_window(sid, "second".into(), home()).unwrap();
+        let w3 = graph.create_window(sid, "third".into(), home()).unwrap();
+
+        // Move w3 to index 0
+        graph.reorder_window(w3, 0).unwrap();
+
+        let snap = state.load();
+        assert_eq!(snap.sessions[&sid].windows[0], w3);
+        assert_eq!(snap.sessions[&sid].windows[2], w2);
+    }
+
+    #[test]
+    fn test_reorder_window_out_of_range() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+
+        let err = graph.reorder_window(wid, 99).unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::WindowIndexOutOfRange { index: 99, .. }
+        ));
+    }
+
+    #[test]
+    fn test_find_window_by_name() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph.create_window(sid, "editor".into(), home()).unwrap();
+
+        let snap = state.load();
+        let found = snap.find_window_by_name(&sid, "editor");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, wid);
+
+        assert!(snap.find_window_by_name(&sid, "nonexistent").is_none());
     }
 
     #[test]

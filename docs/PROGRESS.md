@@ -53,6 +53,18 @@
 
 ## Session Log
 
+**2026-02-19 — Task 014: Window CRUD (API + CLI) — Done**
+- Added window mutation methods to `SessionGraph` (graph.rs): `create_window`, `destroy_window`, `rename_window`, `focus_window`, `reorder_window` with new `GraphCommand` variants and `GraphError` variants (`WindowNameConflict`, `EmptyWindowName`, `WindowIndexOutOfRange`, `LastWindow`)
+- Registered 7 window RPC methods in binary crate (main.rs): `window.list`, `window.create`, `window.kill`, `window.rename`, `window.focus`, `window.reorder`, `window.ensure` — all backed by GraphHandle closures with consistent error mapping via `graph_error_to_rpc()`
+- Added `WindowCommand` enum (6 sub-subcommands) to CLI with `Window` variant (alias "win"): List, New, Kill, Rename, Focus, Reorder — each with session name → UUID resolution via `resolve_session_id()` and window spec → UUID resolution via `resolve_window_id()`
+- Added 6 style helpers: `print_window_entry`, `print_window_created`, `print_window_killed`, `print_window_renamed`, `print_window_focused`, `print_window_reordered`
+- Improved `rpc_display()` in CLI to show human-readable error messages (extracting detail/name/id from RPC data fields) instead of raw "RPC error -32NNN: code_name"
+- Added 14 window integration tests (m0_integration.rs): create, auto-name, list, list-missing-session, kill, kill-last-fails, rename, focus, reorder, ensure, new-becomes-active, 3 CLI tests
+- Created `.claude/automations/test_014_window_crud.py`: L4 visual test with 25 tests (Parts A–H: setup, creation, auto-naming, focus, rename, reorder, kill, JSON output), 21 screenshots — all passing
+- 489 tests passing (458 existing + 38 graph unit + 14 integration + 9 CLI parse - some overlap), all make targets pass
+- Learning: When a daemon is running from a stale binary (before new RPC methods were added), `method_not_found` errors occur. Visual tests must kill old daemons before testing to ensure the freshly-built binary is used
+- Learning: Improved `rpc_display()` that extracts human-readable messages from RPC error data fields (detail, name+resource, id+resource) makes CLI errors much more user-friendly
+
 **2026-02-19 — Task 013: Session CRUD (API + CLI) — Done**
 - Added `NameConflict` error code (-32007) to `shux-rpc` error types with convenience constructor
 - Added session name validation to `SessionGraph`: non-empty, max 128 chars, alphanumeric + hyphens + underscores + dots. New `GraphError` variants: `EmptySessionName`, `SessionNameTooLong`, `InvalidSessionName`
@@ -184,7 +196,7 @@
 | 011 | CLI foundation (clap) | M0 | **Done** | 001, 008 |
 | 012 | M0 integration and quality gate | M0 | **Done** | 001–011 |
 | 013 | Session CRUD (API + CLI) | M1 | **Done** | 012 |
-| 014 | Window CRUD (API + CLI) | M1 | Pending | 013 |
+| 014 | Window CRUD (API + CLI) | M1 | **Done** | 013 |
 | 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | Pending | 014, 003 |
 | 016 | Pane I/O (send_keys, run_command, capture) | M1 | Pending | 015, 004 |
 | 017 | Multi-pane rendering | M1 | Pending | 015, 009 |

@@ -13,19 +13,28 @@ use tokio_util::codec::Framed;
 fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
     use shux_core::graph::GraphError;
     match e {
-        GraphError::SessionNotFound(_)
-        | GraphError::WindowNotFound(_)
-        | GraphError::PaneNotFound(_) => shux_rpc::RpcError::not_found("session", &e.to_string()),
+        GraphError::SessionNotFound(_) => shux_rpc::RpcError::not_found("session", &e.to_string()),
+        GraphError::WindowNotFound(_) => shux_rpc::RpcError::not_found("window", &e.to_string()),
+        GraphError::PaneNotFound(_) => shux_rpc::RpcError::not_found("pane", &e.to_string()),
         GraphError::SessionNameExists(ref name) => {
             shux_rpc::RpcError::name_conflict("session", name)
+        }
+        GraphError::WindowNameConflict(ref name) => {
+            shux_rpc::RpcError::name_conflict("window", name)
         }
         GraphError::EmptySessionName
         | GraphError::SessionNameTooLong(_)
         | GraphError::InvalidSessionName(_) => shux_rpc::RpcError::invalid_params(&e.to_string()),
-        GraphError::VersionConflict { expected, actual } => {
-            shux_rpc::RpcError::version_conflict("session", "?", expected, actual)
+        GraphError::EmptyWindowName | GraphError::WindowIndexOutOfRange { .. } => {
+            shux_rpc::RpcError::invalid_params(&e.to_string())
         }
-        _ => shux_rpc::RpcError::internal(&e.to_string()),
+        GraphError::LastWindow | GraphError::LastPane => {
+            shux_rpc::RpcError::invalid_params(&e.to_string())
+        }
+        GraphError::VersionConflict { expected, actual } => {
+            shux_rpc::RpcError::version_conflict("resource", "?", expected, actual)
+        }
+        GraphError::Shutdown => shux_rpc::RpcError::internal(&e.to_string()),
     }
 }
 
@@ -545,6 +554,7 @@ fn test_cli_help_no_daemon() {
     assert!(stdout.contains("attach"));
     assert!(stdout.contains("ls"));
     assert!(stdout.contains("kill"));
+    assert!(stdout.contains("window"));
     assert!(stdout.contains("api"));
     assert!(stdout.contains("version"));
 }

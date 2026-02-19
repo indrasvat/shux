@@ -193,6 +193,66 @@ pub fn print_session_renamed(old_name: &str, new_name: &str) {
     let _ = writeln!(out);
 }
 
+/// Print a window list entry.
+pub fn print_window_entry(index: usize, title: &str, pane_count: usize, is_active: bool) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{}", index);
+    if is_active {
+        let _ = write!(out, "{}", accent("*"));
+    } else {
+        let _ = write!(out, " ");
+    }
+    let _ = write!(out, ": {}", bold(title));
+    let _ = write!(
+        out,
+        " ({} pane{})",
+        pane_count,
+        if pane_count == 1 { "" } else { "s" }
+    );
+    let _ = writeln!(out);
+}
+
+/// Print a window creation confirmation.
+pub fn print_window_created(title: &str, index: u64) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Created"));
+    let _ = write!(out, "window '{}' ", bold(title));
+    let _ = write!(out, "{}", muted(format!("(index {index})")));
+    let _ = writeln!(out);
+}
+
+/// Print a window kill confirmation.
+pub fn print_window_killed(title: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Killed"));
+    let _ = write!(out, "window '{}'", bold(title));
+    let _ = writeln!(out);
+}
+
+/// Print a window rename confirmation.
+pub fn print_window_renamed(old_name: &str, new_name: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Renamed"));
+    let _ = write!(out, "window '{}' -> '{}'", bold(old_name), bold(new_name));
+    let _ = writeln!(out);
+}
+
+/// Print a window focus confirmation.
+pub fn print_window_focused(title: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Focused"));
+    let _ = write!(out, "window '{}'", bold(title));
+    let _ = writeln!(out);
+}
+
+/// Print a window reorder confirmation.
+pub fn print_window_reordered(title: &str, new_index: usize) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{} ", success("Moved"));
+    let _ = write!(out, "window '{}' to index {}", bold(title), new_index);
+    let _ = writeln!(out);
+}
+
 /// Print a styled error message to stderr.
 pub fn print_error(msg: &str) {
     let mut err = io::stderr().lock();
