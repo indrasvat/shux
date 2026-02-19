@@ -1,6 +1,6 @@
 # 008 — JSON-RPC Server Foundation
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 001, 002
 **Parallelizable With:** 005, 006
 

@@ -1,6 +1,6 @@
 # 006 — Input Decoder
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 000
 **Parallelizable With:** 001, 002, 005
 

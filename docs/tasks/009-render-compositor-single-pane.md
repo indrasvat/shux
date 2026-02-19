@@ -1,6 +1,6 @@
 # 009 — Render Compositor (Single Pane)
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 005, 006
 **Parallelizable With:** 007, 008
 

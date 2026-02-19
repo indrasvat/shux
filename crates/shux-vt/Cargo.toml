@@ -6,4 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-# Added per-task as needed
+vte = { workspace = true }
+unicode-width = "0.2"
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

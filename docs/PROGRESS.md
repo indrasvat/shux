@@ -53,6 +53,25 @@
 
 ## Session Log
 
+**2026-02-18 — Task 009: Render Compositor (Single Pane) — Done**
+- Created `crates/shux-ui/src/buffer.rs`: RenderCell, RenderAttrs, FrameBuffer (double-buffered), DirtyCell, From<&shux_vt::Cell> conversion
+- Created `crates/shux-ui/src/render.rs`: RenderBackend<W: Write> with style tracking, render_diff (synchronized output Mode 2026), render_full, clear/hide/show/set_cursor
+- Created `crates/shux-ui/src/compositor.rs`: RenderCompositor<W: Write> orchestrating compose->diff->render, CompositorConfig (border, status_bar_height), RenderStats, border rendering with Unicode box-drawing chars
+- Created `crates/shux-ui/src/vt_convert.rs`: vt_color_to_crossterm mapping (Default->None, Indexed->AnsiValue, Rgb->Rgb)
+- Updated `crates/shux-ui/Cargo.toml`: added shux-vt dependency
+- Updated `crates/shux-ui/src/lib.rs`: added buffer, compositor, render, vt_convert modules with re-exports
+- 44 new tests (17 buffer, 13 compositor, 11 render, 3 vt_convert), 342 total passing
+- Performance: 80x24 full render completes well under 8ms budget (Vec<u8> sink)
+- Learning: When RenderCompositor borrows `&mut W`, tests that need multiple render passes should use `Cursor<Vec<u8>>` (owned by compositor) instead of `&mut Vec<u8>` to avoid borrow conflicts
+- Learning: crossterm 0.29 `SetAttribute(Attribute::Reset)` resets fg/bg too, so attribute changes must re-emit color sequences afterward
+
+**2026-02-18 — Tasks 005, 006, 007, 008: VT Grid, Input Decoder, Event Bus, JSON-RPC**
+- Completed: all four tasks implemented in parallel
+- Task 005: Virtual terminal grid (shux-vt) — cell, grid, cursor, vte parser, VirtualTerminal API
+- Task 006: Input decoder (shux-ui) — key types, modifiers, crossterm event translation
+- Task 007: Event bus (shux-core) — typed event taxonomy, broadcast pub/sub, sequence numbers, history
+- Task 008: JSON-RPC server (shux-rpc) — error codes, codec, router, UDS/TCP server, builtin methods
+
 **2026-02-18 — Tasks 002, 003, 004: Core Data Model, Layout Engine, PTY Manager**
 - Created `crates/shux-core/src/model.rs`: SessionId, WindowId, PaneId (UUID newtypes via macro), Session, Window, Pane, RestartPolicy with serde kebab-case, Version stamps, Tags
 - Created `crates/shux-core/src/graph.rs`: SessionGraph (single-writer with ArcSwap), SessionGraphSnapshot (immutable reads), GraphCommand (13 mutation variants with oneshot reply), GraphHandle (async convenience methods), run_graph_loop
@@ -101,11 +120,11 @@
 | 002 | Core data model and SessionGraph | M0 | **Done** | 000 |
 | 003 | Layout engine (binary split tree) | M0 | **Done** | 002 |
 | 004 | PTY manager | M0 | **Done** | 001 |
-| 005 | Virtual terminal grid | M0 | Pending | 000 |
-| 006 | Input decoder | M0 | Pending | 000 |
-| 007 | Event bus | M0 | Pending | 002 |
-| 008 | JSON-RPC server foundation | M0 | Pending | 001, 002 |
-| 009 | Render compositor (single pane) | M0 | Pending | 005, 006 |
+| 005 | Virtual terminal grid | M0 | **Done** | 000 |
+| 006 | Input decoder | M0 | **Done** | 000 |
+| 007 | Event bus | M0 | **Done** | 002 |
+| 008 | JSON-RPC server foundation | M0 | **Done** | 001, 002 |
+| 009 | Render compositor (single pane) | M0 | **Done** | 005, 006 |
 | 010 | Minimal TUI client | M0 | Pending | 004, 008, 009 |
 | 011 | CLI foundation (clap) | M0 | Pending | 001, 008 |
 | 012 | M0 integration and quality gate | M0 | Pending | 001–011 |

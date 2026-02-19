@@ -1,6 +1,6 @@
 # 007 — Event Bus
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 002
 **Parallelizable With:** 003, 004
 

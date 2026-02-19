@@ -6,4 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-# Added per-task as needed
+shux-vt = { path = "../shux-vt" }
+crossterm = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

@@ -1,6 +1,6 @@
 # 005 — Virtual Terminal Grid
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 000
 **Parallelizable With:** 001, 002, 006
 
