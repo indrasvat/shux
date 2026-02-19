@@ -4,7 +4,7 @@
 
 ## Current Phase
 
-**M0: Architecture Spike** — In progress (bootstrap complete)
+**M0: Architecture Spike** — **Complete** (all 13 tasks done, 437 tests passing)
 
 ## Status
 
@@ -52,6 +52,20 @@
 ---
 
 ## Session Log
+
+**2026-02-19 — Task 012: M0 Integration and Quality Gate — Done**
+- Wired RPC Server + SessionGraph into daemon (`crates/shux/src/main.rs`): replaced bare `UnixListener::bind` stub with real `run_rpc_server()` that creates SessionGraph + graph loop + RPC Server
+- Added `register_session_methods()`: registers `session.list`, `session.create`, `session.kill`, `session.ensure` backed by GraphHandle closures — lives in binary crate since shux-rpc intentionally doesn't depend on shux-core
+- Removed `session.list` stub from `shux_rpc::server::register_builtin_methods()` — session methods now registered at binary level
+- Updated `crates/shux/tests/cli_integration.rs`: `start_test_server()` now creates SessionGraph + graph loop, all 17 existing tests continue to pass with real data
+- Created `crates/shux/tests/m0_integration.rs`: 17 new M0 integration tests — 10 RPC tests (system.version, system.health, create/list/kill/ensure session, detach-reattach, multiple sessions, invalid method, concurrent connections), 2 PTY tests (spawn echo, exit status), 5 CLI binary tests (version json, ls, new detached, kill, ls json)
+- Created `scripts/bench-baseline.sh`: performance baseline script measuring binary size, test count, make target verification; outputs to `docs/m0-baseline.txt`
+- Added `bench-baseline` Makefile target
+- Created `.claude/automations/test_012_m0_integration.py`: L4 visual test exercising CLI smoke tests (build, new detached, ls, api version, kill, list after kill) with screenshots
+- 437 tests passing (420 existing + 17 new M0 integration), all make targets pass (build, test, lint, check)
+- **M0 Architecture Spike complete:** all 13 tasks (000–012) done, daemon + SessionGraph + RPC + CLI + PTY + VT + compositor + input + event bus all wired and integration-tested
+- Learning: Edition 2024 disallows `unwrap_or(&vec![])` — the temporary `vec![]` is freed while still borrowed. Use `.cloned().unwrap_or_default()` instead.
+- Learning: Session RPC methods must be registered in the binary crate (not shux-rpc) because they need GraphHandle from shux-core, and shux-rpc intentionally has no dependency on shux-core. The `register_session_methods()` function is duplicated in main.rs and test files (acceptable since binary crates aren't importable).
 
 **2026-02-19 — Task 011: CLI Foundation (clap) — Done**
 - Created `crates/shux/src/cli.rs`: Cli struct with clap derive, Command enum (New/Attach/Ls/Kill/Api/Version/__daemon), OutputFormat (Text/Json), RpcClientError, rpc_call() async JSON-RPC client with length-prefix framing, handler functions (handle_ls, handle_new, handle_kill, handle_api, handle_version), custom clap Styles (cyan headers, green commands, yellow placeholders, red errors)
@@ -151,7 +165,7 @@
 | 009 | Render compositor (single pane) | M0 | **Done** | 005, 006 |
 | 010 | Minimal TUI client | M0 | **Done** | 004, 008, 009 |
 | 011 | CLI foundation (clap) | M0 | **Done** | 001, 008 |
-| 012 | M0 integration and quality gate | M0 | Pending | 001–011 |
+| 012 | M0 integration and quality gate | M0 | **Done** | 001–011 |
 | 013 | Session CRUD (API + CLI) | M1 | Pending | 012 |
 | 014 | Window CRUD (API + CLI) | M1 | Pending | 013 |
 | 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | Pending | 014, 003 |

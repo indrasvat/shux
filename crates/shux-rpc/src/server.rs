@@ -363,12 +363,15 @@ fn try_authenticate(
     Ok(token == Some(expected.as_str()))
 }
 
-/// Register the initial built-in methods on a router builder.
+/// Register the system-level built-in methods on a router builder.
 ///
-/// Initial methods (PRD §8.2, M0 scope):
+/// System methods (always available, no state dependency):
 /// - system.version -- returns version info
 /// - system.health -- returns health status
-/// - session.list -- returns list of sessions (stub for M0)
+///
+/// Session methods (session.create, session.list, session.kill, session.ensure)
+/// are registered by the binary crate since they require a GraphHandle which
+/// lives in shux-core (and shux-rpc intentionally does not depend on shux-core).
 pub fn register_builtin_methods(
     builder: crate::router::RouterBuilder,
 ) -> crate::router::RouterBuilder {
@@ -391,12 +394,6 @@ pub fn register_builtin_methods(
                 }))
             },
         )
-        .register("session.list", |_params: Option<serde_json::Value>| async {
-            // Stub -- will be connected to SessionGraph in task 013.
-            Ok(serde_json::json!({
-                "sessions": []
-            }))
-        })
 }
 
 #[cfg(test)]
@@ -472,16 +469,12 @@ mod tests {
 
         assert!(router.has_method("system.version"));
         assert!(router.has_method("system.health"));
-        assert!(router.has_method("session.list"));
 
         let result = router.dispatch("system.version", None).await.unwrap();
         assert_eq!(result["name"], "shux");
 
         let result = router.dispatch("system.health", None).await.unwrap();
         assert_eq!(result["status"], "ok");
-
-        let result = router.dispatch("session.list", None).await.unwrap();
-        assert!(result["sessions"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -129,6 +129,10 @@ bench: ## Run benchmarks
 	@echo "$(COLOR_BLUE)▶ Running benchmarks...$(COLOR_RESET)"
 	@cargo bench --workspace
 
+.PHONY: bench-baseline
+bench-baseline: ## Record M0 performance baseline
+	@./scripts/bench-baseline.sh
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Code Quality
 # ══════════════════════════════════════════════════════════════════════════════

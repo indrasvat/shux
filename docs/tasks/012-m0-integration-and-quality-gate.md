@@ -1,6 +1,6 @@
 # 012 — M0 Integration and Quality Gate
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 001, 002, 003, 004, 005, 006, 007, 008, 009, 010, 011
 **Parallelizable With:** --
 
