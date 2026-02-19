@@ -61,7 +61,7 @@
 
 | ID | Task | Phase | Status | Depends On |
 |----|------|-------|--------|-----------|
-| 000 | Repository scaffold and tooling | Bootstrap | In Progress | — |
+| 000 | Repository scaffold and tooling | Bootstrap | Pending | — |
 | 001 | Daemon skeleton and process lifecycle | M0 | Pending | 000 |
 | 002 | Core data model and SessionGraph | M0 | Pending | 000 |
 | 003 | Layout engine (binary split tree) | M0 | Pending | 002 |
