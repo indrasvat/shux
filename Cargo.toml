@@ -36,7 +36,7 @@ ratatui = "0.30"
 vte = { version = "0.15", features = ["ansi"] }
 
 # PTY
-pty-process = "0.5"
+pty-process = { version = "0.5", features = ["async"] }
 
 # Plugin (Wasm)
 wasmtime = "41"

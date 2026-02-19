@@ -1,6 +1,6 @@
 # 004 — PTY Manager
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 001
 **Parallelizable With:** 002, 003, 005
 

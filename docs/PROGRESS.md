@@ -53,6 +53,18 @@
 
 ## Session Log
 
+**2026-02-18 — Tasks 002, 003, 004: Core Data Model, Layout Engine, PTY Manager**
+- Created `crates/shux-core/src/model.rs`: SessionId, WindowId, PaneId (UUID newtypes via macro), Session, Window, Pane, RestartPolicy with serde kebab-case, Version stamps, Tags
+- Created `crates/shux-core/src/graph.rs`: SessionGraph (single-writer with ArcSwap), SessionGraphSnapshot (immutable reads), GraphCommand (13 mutation variants with oneshot reply), GraphHandle (async convenience methods), run_graph_loop
+- Created `crates/shux-core/src/layout.rs`: LayoutNode (Split/Leaf binary tree), Direction, Rect, NavDirection, WindowLayout with zoom save/restore, smart_split (wider→vertical, taller→horizontal), directional_focus (center-distance heuristic), resize_pane with ratio clamping [0.05, 0.95], 1-cell separator
+- Created `crates/shux-pty/src/handle.rs`: PtyHandle wrapping pty_process::Pty + tokio::process::Child, PtyConfig, PtySize, PtyError (pty_process::Error for Open/Spawn/Resize, std::io::Error for Read/Write), CWD tracking via /proc/pid/cwd (Linux) or initial_cwd fallback (macOS)
+- Created `crates/shux-pty/src/manager.rs`: PtyManager, PtyEvent (Output/Exited/Restarted), run_pty_read_loop with CancellationToken, should_restart, respawn_pty
+- Created `crates/shux-pty/tests/integration.rs`: 7 integration tests (spawn_echo, exit_status, failing_command, write_and_read, resize, initial_cwd, pty_event_output)
+- Updated workspace Cargo.toml: added `async` feature to pty-process
+- 101 tests passing (36 model+graph, 28 layout, 10 pty unit, 7 pty integration, 20 pre-existing)
+- Learning: pty-process 0.5 API differs from docs — `open()` returns `(Pty, Pts)`, Command uses consuming builder pattern, `spawn(pts)` takes Pts arg
+- Learning: tokio::process::Child `kill()` is async; use `start_kill()` for synchronous kill
+
 **2026-02-18 — Task 001: Daemon Skeleton and Process Lifecycle**
 - Created `crates/shux-core/src/daemon.rs`: DaemonState, DaemonCommand, ShutdownTokens, run_daemon_state_loop with auto-exit grace timer
 - Created `crates/shux/src/daemon.rs`: runtime_dir, PID file, socket path, double-fork daemonize(), signal handler (SIGTERM/SIGINT/SIGHUP)
@@ -86,9 +98,9 @@
 |----|------|-------|--------|-----------|
 | 000 | Repository scaffold and tooling | Bootstrap | **Done** | — |
 | 001 | Daemon skeleton and process lifecycle | M0 | **Done** | 000 |
-| 002 | Core data model and SessionGraph | M0 | Pending | 000 |
-| 003 | Layout engine (binary split tree) | M0 | Pending | 002 |
-| 004 | PTY manager | M0 | Pending | 001 |
+| 002 | Core data model and SessionGraph | M0 | **Done** | 000 |
+| 003 | Layout engine (binary split tree) | M0 | **Done** | 002 |
+| 004 | PTY manager | M0 | **Done** | 001 |
 | 005 | Virtual terminal grid | M0 | Pending | 000 |
 | 006 | Input decoder | M0 | Pending | 000 |
 | 007 | Event bus | M0 | Pending | 002 |

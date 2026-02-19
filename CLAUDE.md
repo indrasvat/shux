@@ -80,11 +80,17 @@ crates/shux-ui/        TUI client (crossterm, ratatui for chrome, render composi
 
 ## Session Protocol
 
-> **STRICT RULE:** At the end of every coding session, you MUST:
-> 1. Update `docs/PROGRESS.md` — mark task status, add session log entry
-> 2. Update the task file's `Status:` field (e.g., `**Status:** Done`)
+> **STRICT RULE — When STARTING a task, you MUST:**
+> 1. Set the task file's `Status:` field to `**Status:** In Progress`
+> 2. Set the task's status to `In Progress` in the `docs/PROGRESS.md` task table
+
+> **STRICT RULE — When COMPLETING a task (or at end of session), you MUST:**
+> 1. Update `docs/PROGRESS.md` — mark task status **Done**, add session log entry
+> 2. Update the task file's `Status:` field to `**Status:** Done`
 > 3. Update `CLAUDE.md` Learnings section if anything was discovered
-> A pre-push hook (`scripts/check-progress.sh`) will block pushes if these are missed.
+> 4. **Commit all changes** with a conventional commit message referencing the task(s)
+> 5. **Push to the remote** (`git push`)
+> A pre-push hook (`scripts/check-progress.sh`) will block pushes if progress files are not updated.
 
 ## Key Decisions
 
@@ -133,3 +139,5 @@ Visual test scripts live in `.claude/automations/` and are added per-task as nee
 - **2026-02-18 (task 000):** `edition = "2024"` requires Rust 1.85+. The `rust-toolchain.toml` pins stable which is ≥1.85 as of Feb 2026, but CI should use `dtolnay/rust-toolchain@stable` to stay current.
 - **2026-02-18 (task 001):** Rust edition 2024 makes `std::env::set_var`/`remove_var` unsafe. Wrap in `unsafe {}` with safety comments in tests. Use `tokio::time::pause()` + `advance()` for deterministic timer tests instead of real sleeps.
 - **2026-02-18 (task 001):** nix 0.29 requires explicit feature flags per module: `"user"` for `getuid()`, `"process"` for `fork()`/`setsid()`, `"signal"` for signal handling, `"fs"` for `dup2()`. Grace timer pattern: store `Option<tokio::time::Instant>` deadline and use `sleep_until()` inside `select!` async block to avoid `Pin` complexity.
+- **2026-02-18 (tasks 002-004):** pty-process 0.5 async API: `pty_process::open()` returns `(Pty, Pts)` (not `Pty::new()`); `Command` uses consuming builder pattern; `spawn(pts)` takes `Pts` arg. Error types: `pty_process::Error` for open/spawn/resize, `std::io::Error` for read/write. Use `child.start_kill()` (sync) instead of `child.kill()` (async) in `PtyHandle::kill()`.
+- **2026-02-18 (tasks 002-004):** ArcSwap pattern for single-writer/many-readers: `Arc<ArcSwap<Snapshot>>` shared between GraphHandle (readers) and run_graph_loop (writer). Writer calls `state.store(Arc::new(snapshot))` after each mutation. Readers call `state.load()` for lock-free access. GraphCommand enum with oneshot::Sender reply channels for async request-response.

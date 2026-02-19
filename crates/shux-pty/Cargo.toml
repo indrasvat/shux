@@ -6,4 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-# Added per-task as needed
+pty-process = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
