@@ -53,6 +53,18 @@
 
 ## Session Log
 
+**2026-02-19 — Task 010: Minimal TUI Client — Done**
+- Created `crates/shux-ui/src/terminal.rs`: TerminalGuard (RAII raw mode + alt screen + mouse + Kitty keyboard), install_panic_hook (restores terminal before panic), shutdown_signal (SIGTERM/SIGINT)
+- Created `crates/shux-ui/src/client.rs`: ClientRequest/DaemonMessage serde types, ClientConfig (prefix key default Ctrl+Space), ExitReason enum, encode_key_event (Ctrl/Alt/arrows/F-keys/nav), parse_key_from_bytes (prefix key detection), parse_resize_event, run_client skeleton (TODOs for daemon wiring in tasks 011/012)
+- Created `crates/shux-ui/examples/terminal_demo.rs`: standalone demo exercising TerminalGuard + VirtualTerminal + RenderCompositor + key encoding, with prefix key detach (Ctrl+Space d)
+- Created `.claude/automations/test_010_tui_client.py`: L4 visual test with 9 tests (build, alt screen, banner, key echo, enter, arrows, Ctrl+C handling, detach, terminal restore) — all passing
+- Updated `crates/shux-ui/Cargo.toml`: added tokio, serde, serde_json, anyhow deps; tempfile dev-dep
+- Updated `crates/shux-ui/src/lib.rs`: added client + terminal modules with re-exports
+- Updated `docs/tasks/010-minimal-tui-client.md`: added L4 visual testing section
+- 41 new tests (2 terminal, 39 client), 383 total passing
+- Learning: `parse_key_from_bytes` must handle Enter (0x0d) and Tab (0x09) before the Ctrl range (1..=26), since \r=Ctrl+M and \t=Ctrl+I overlap
+- Learning: `enable_raw_mode()` is global (not per-thread), so `spawn_blocking` for crossterm event polling avoids blocking the async runtime
+
 **2026-02-18 — Task 009: Render Compositor (Single Pane) — Done**
 - Created `crates/shux-ui/src/buffer.rs`: RenderCell, RenderAttrs, FrameBuffer (double-buffered), DirtyCell, From<&shux_vt::Cell> conversion
 - Created `crates/shux-ui/src/render.rs`: RenderBackend<W: Write> with style tracking, render_diff (synchronized output Mode 2026), render_full, clear/hide/show/set_cursor
@@ -125,7 +137,7 @@
 | 007 | Event bus | M0 | **Done** | 002 |
 | 008 | JSON-RPC server foundation | M0 | **Done** | 001, 002 |
 | 009 | Render compositor (single pane) | M0 | **Done** | 005, 006 |
-| 010 | Minimal TUI client | M0 | Pending | 004, 008, 009 |
+| 010 | Minimal TUI client | M0 | **Done** | 004, 008, 009 |
 | 011 | CLI foundation (clap) | M0 | Pending | 001, 008 |
 | 012 | M0 integration and quality gate | M0 | Pending | 001–011 |
 | 013 | Session CRUD (API + CLI) | M1 | Pending | 012 |

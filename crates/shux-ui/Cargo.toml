@@ -8,7 +8,12 @@ license.workspace = true
 [dependencies]
 shux-vt = { path = "../shux-vt" }
 crossterm = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }

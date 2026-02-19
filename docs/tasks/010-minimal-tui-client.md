@@ -1,6 +1,6 @@
 # 010 — Minimal TUI Client
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 004, 008, 009
 **Parallelizable With:** 011
 
@@ -958,6 +958,27 @@ cargo run -p shux -- attach -s test
 # 8. Previous session should still be there
 # 9. Press Ctrl+C in the shell — should send SIGINT to the running process, not exit shux
 ```
+
+### L4 Visual Testing
+
+Visual regression tests using iterm2-driver. Run with:
+
+```bash
+uv run .claude/automations/test_010_tui_client.py
+```
+
+**Test matrix:**
+1. Build: `cargo build --example terminal_demo -p shux-ui` succeeds
+2. Alt screen: demo enters alternate screen (content changes from shell to TUI)
+3. Banner visible: "terminal demo" text appears on screen
+4. Key echo: type "hello" and verify text appears on screen
+5. Enter key: press Enter, verify new prompt line
+6. Arrow keys: send arrow keys, verify screen changes (cursor movement)
+7. Ctrl+C: sends interrupt to shell inside VT (doesn't exit demo)
+8. Detach: send Ctrl+Space (\x00) then "d", demo exits cleanly
+9. Terminal restored: "[detached from demo]" message visible, shell prompt returns
+
+Screenshots are saved to `.claude/screenshots/` (gitignored).
 
 ---
 

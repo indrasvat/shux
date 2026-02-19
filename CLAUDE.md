@@ -128,7 +128,7 @@ Visual tests use iterm2-driver to automate iTerm2 for screenshot-based regressio
 uv run .claude/automations/<test>.py   # Run a visual test script
 ```
 
-Screenshots are saved to `.claude/automations/screenshots/` (gitignored).
+Screenshots are saved to `.claude/screenshots/` (gitignored).
 Visual test scripts live in `.claude/automations/` and are added per-task as needed.
 
 ## Learnings
@@ -145,3 +145,5 @@ Visual test scripts live in `.claude/automations/` and are added per-task as nee
 - **2026-02-18 (task 008):** Rust edition 2024 requires `Send + Sync` bounds on `Box<dyn std::error::Error>` for tokio::spawn contexts. `ref` patterns in match arms are disallowed in edition 2024 — use `&` patterns instead.
 - **2026-02-18 (task 009):** crossterm 0.29 `SetAttribute(Attribute::Reset)` resets fg/bg colors too, so after an attribute change the render backend must re-emit `SetForegroundColor`/`SetBackgroundColor`. Handle attributes before colors in `apply_style()`.
 - **2026-02-18 (task 009):** When `RenderCompositor<W: Write>` borrows `&mut Vec<u8>`, tests needing multiple render passes hit borrow conflicts. Use `Cursor<Vec<u8>>` (owned by compositor) or separate compositor instances per render call. The `Cursor<Vec<u8>>` pattern works well with a `make_compositor()` helper in tests.
+- **2026-02-19 (task 010):** `parse_key_from_bytes` must handle Enter (`\r`=0x0d) and Tab (`\t`=0x09) as specific match arms BEFORE the Ctrl+A-Z range (1..=26), since \r and \t fall within that range but should map to `KeyCode::Enter`/`KeyCode::Tab` rather than `Ctrl+M`/`Ctrl+I`.
+- **2026-02-19 (task 010):** crossterm `enable_raw_mode()` is process-global (not per-thread). For async event loops, use `tokio::task::spawn_blocking` for `crossterm::event::poll()`/`event::read()` to avoid blocking the tokio runtime. The terminal_demo example shows the pattern: poll in main thread with Duration timeout, render after each key.

@@ -921,9 +921,14 @@ dependencies = [
 name = "shux-ui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crossterm",
+ "serde",
+ "serde_json",
  "shux-vt",
+ "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
