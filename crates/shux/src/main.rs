@@ -98,7 +98,9 @@ fn run_client(args: Cli) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async { dispatch(args).await });
     if let Err(ref e) = result {
-        style::print_error(&format!("{e:#}"));
+        // Format error: strip "RPC error" prefix if present, avoid "error: Error:" duplication
+        let msg = format!("{e:#}");
+        style::print_error(&msg);
     }
     result
 }
@@ -1376,7 +1378,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                                 env!("SHUX_GIT_SHA"),
                             );
                         }
-                        OutputFormat::Text => {
+                        OutputFormat::Text | OutputFormat::Plain => {
                             style::print_version(
                                 env!("CARGO_PKG_VERSION"),
                                 Some(env!("SHUX_GIT_SHA")),

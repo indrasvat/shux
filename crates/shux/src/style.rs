@@ -13,9 +13,57 @@ use std::io::{self, IsTerminal, Write};
 
 use crossterm::style::{self, Attribute, Color, Stylize};
 
+// ── Terminal Context ────────────────────────────────────────────
+
+/// Captures terminal capabilities and format preferences for output rendering.
+#[allow(dead_code)]
+pub struct TerminalContext {
+    pub is_tty: bool,
+    pub colors: bool,
+    pub unicode: bool,
+    pub width: u16,
+    pub format: OutputFormat,
+}
+
+/// Output format (mirrors cli::OutputFormat but available in style module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Text,
+    Json,
+    Plain,
+}
+
+impl TerminalContext {
+    /// Detect terminal capabilities from the current environment.
+    pub fn detect(format: OutputFormat) -> Self {
+        let is_tty = io::stdout().is_terminal();
+        let no_color = std::env::var_os("NO_COLOR").is_some();
+        let term = std::env::var("TERM").unwrap_or_default();
+        let is_dumb = term == "dumb";
+
+        // Auto-switch to plain when piped or dumb terminal
+        let effective_format = if (!is_tty || is_dumb) && format == OutputFormat::Text {
+            OutputFormat::Plain
+        } else {
+            format
+        };
+
+        let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+
+        Self {
+            is_tty,
+            colors: !no_color && is_tty,
+            unicode: !is_dumb,
+            width,
+            format: effective_format,
+        }
+    }
+}
+
+// ── Styled Text Helper ─────────────────────────────────────────
+
 /// Whether to emit ANSI color codes. Auto-detects from stderr/stdout.
 fn colors_enabled() -> bool {
-    // Respect NO_COLOR convention (https://no-color.org)
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
@@ -76,6 +124,24 @@ impl fmt::Display for Styled {
     }
 }
 
+/// Styled text with explicit color control (for TerminalContext-aware rendering).
+fn styled_if(text: &str, colors: bool, fg: Option<Color>, is_bold: bool, is_dim: bool) -> String {
+    if !colors {
+        return text.to_string();
+    }
+    let mut s = style::style(text);
+    if let Some(color) = fg {
+        s = s.with(color);
+    }
+    if is_bold {
+        s = s.attribute(Attribute::Bold);
+    }
+    if is_dim {
+        s = s.attribute(Attribute::Dim);
+    }
+    s.to_string()
+}
+
 // ── Banner ─────────────────────────────────────────────────────
 
 /// Generate the shux ASCII art banner with a cyan→blue→indigo gradient.
@@ -104,7 +170,7 @@ pub fn banner() -> String {
     out
 }
 
-// ── Public helpers ──────────────────────────────────────────────
+// ── Public Color Helpers ───────────────────────────────────────
 
 /// Brand accent (cyan) — for "shux" name, key identifiers.
 pub fn accent(text: impl fmt::Display) -> impl fmt::Display {
@@ -136,6 +202,664 @@ pub fn bold(text: impl fmt::Display) -> impl fmt::Display {
     Styled::new(text).bold()
 }
 
+// ── Short ID Helper ────────────────────────────────────────────
+
+/// Truncate a UUID to its 8-char short prefix (like git short SHA).
+pub fn short_id(id: &str) -> &str {
+    if id.len() >= 8 { &id[..8] } else { id }
+}
+
+// ── Box Renderer ───────────────────────────────────────────────
+
+/// Unicode box-drawing frame renderer with dynamic width.
+pub struct BoxRenderer {
+    ctx_colors: bool,
+    ctx_unicode: bool,
+    inner_width: usize,
+    title: Option<String>,
+    footer: Option<String>,
+}
+
+impl BoxRenderer {
+    pub fn new(ctx: &TerminalContext, min_width: usize) -> Self {
+        Self {
+            ctx_colors: ctx.colors,
+            ctx_unicode: ctx.unicode,
+            inner_width: min_width,
+            title: None,
+            footer: None,
+        }
+    }
+
+    /// Set the inner content width (call after measuring columns).
+    pub fn set_width(&mut self, width: usize) {
+        if width > self.inner_width {
+            self.inner_width = width;
+        }
+    }
+
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub fn footer(mut self, footer: impl Into<String>) -> Self {
+        self.footer = Some(footer.into());
+        self
+    }
+
+    /// Render the top border: ╭─ Title ──...──╮
+    pub fn header(&self) -> String {
+        let (tl, h, tr) = if self.ctx_unicode {
+            ("╭", "─", "╮")
+        } else {
+            ("+", "-", "+")
+        };
+
+        match &self.title {
+            Some(title) => {
+                let title_display = if self.ctx_colors {
+                    styled_if(title, true, Some(Color::Cyan), true, false)
+                } else {
+                    title.clone()
+                };
+                // Title: ╭─ Title ──...──╮
+                let prefix_visible_len = 2 + 1 + title.len() + 1; // "╭─ Title "
+                let remaining = if self.inner_width + 2 > prefix_visible_len {
+                    self.inner_width + 2 - prefix_visible_len
+                } else {
+                    1
+                };
+                let pad = h.repeat(remaining);
+                format!("{tl}{h} {title_display} {pad}{tr}",)
+            }
+            None => {
+                let pad = h.repeat(self.inner_width + 2);
+                format!("{tl}{pad}{tr}")
+            }
+        }
+    }
+
+    /// Render a content row: │ content...   │
+    /// `content` is the pre-formatted, possibly colored string.
+    /// `visible_len` is the display width of `content` (without ANSI).
+    pub fn row(&self, content: &str, visible_len: usize) -> String {
+        let v = if self.ctx_unicode { "│" } else { "|" };
+        let padding = self.inner_width.saturating_sub(visible_len);
+        format!("{v} {content}{} {v}", " ".repeat(padding))
+    }
+
+    /// Render an empty row: │               │
+    pub fn empty_row(&self) -> String {
+        let v = if self.ctx_unicode { "│" } else { "|" };
+        format!("{v} {} {v}", " ".repeat(self.inner_width))
+    }
+
+    /// Render the bottom border: ╰──── footer ───╯
+    pub fn footer_line(&self) -> String {
+        let (bl, h, br) = if self.ctx_unicode {
+            ("╰", "─", "╯")
+        } else {
+            ("+", "-", "+")
+        };
+
+        match &self.footer {
+            Some(footer) => {
+                let footer_display = if self.ctx_colors {
+                    styled_if(footer, true, None, false, true)
+                } else {
+                    footer.clone()
+                };
+                let suffix_visible_len = 1 + footer.len() + 1; // " footer ╯"
+                let remaining = if self.inner_width + 2 > suffix_visible_len {
+                    self.inner_width + 2 - suffix_visible_len
+                } else {
+                    1
+                };
+                let pad = h.repeat(remaining);
+                format!("{bl}{pad} {footer_display} {br}")
+            }
+            None => {
+                let pad = h.repeat(self.inner_width + 2);
+                format!("{bl}{pad}{br}")
+            }
+        }
+    }
+}
+
+// ── Column Layout ──────────────────────────────────────────────
+
+/// Column alignment.
+#[derive(Clone, Copy)]
+pub enum Align {
+    Left,
+    Right,
+}
+
+/// Column definition for the layout engine.
+pub struct Column {
+    pub header: String,
+    pub align: Align,
+    pub min_width: usize,
+}
+
+/// A mini column-alignment engine for tabular output.
+pub struct ColumnLayout {
+    columns: Vec<Column>,
+    rows: Vec<Vec<String>>,
+    gap: usize,
+}
+
+impl ColumnLayout {
+    pub fn new(columns: Vec<Column>) -> Self {
+        Self {
+            columns,
+            rows: Vec::new(),
+            gap: 3, // spaces between columns
+        }
+    }
+
+    pub fn add_row(&mut self, cells: Vec<String>) {
+        self.rows.push(cells);
+    }
+
+    /// Calculate the max width for each column.
+    fn col_widths(&self) -> Vec<usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let header_width = col.header.len();
+                let max_cell = self
+                    .rows
+                    .iter()
+                    .map(|row| row.get(i).map(|c| c.len()).unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
+                header_width.max(max_cell).max(col.min_width)
+            })
+            .collect()
+    }
+
+    /// Render the header line (dim/muted).
+    pub fn render_header(&self, colors: bool) -> (String, usize) {
+        let widths = self.col_widths();
+        let mut parts = Vec::new();
+        for (i, col) in self.columns.iter().enumerate() {
+            let w = widths[i];
+            let cell = match col.align {
+                Align::Left => format!("{:<width$}", col.header, width = w),
+                Align::Right => format!("{:>width$}", col.header, width = w),
+            };
+            parts.push(cell);
+        }
+        let line = parts.join(&" ".repeat(self.gap));
+        let visible_len = line.len();
+        let styled_line = styled_if(&line, colors, None, false, true);
+        (styled_line, visible_len)
+    }
+
+    /// Render a data row. Returns (colored_string, visible_length).
+    /// `color_fn` takes (col_index, cell_text) and returns the styled string.
+    pub fn render_row(
+        &self,
+        row_idx: usize,
+        color_fn: &dyn Fn(usize, &str) -> String,
+    ) -> (String, usize) {
+        let widths = self.col_widths();
+        let row = &self.rows[row_idx];
+        let mut parts_visible = Vec::new();
+        let mut parts_colored = Vec::new();
+
+        for (i, col) in self.columns.iter().enumerate() {
+            let raw = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            let w = widths[i];
+            let padded = match col.align {
+                Align::Left => format!("{:<width$}", raw, width = w),
+                Align::Right => format!("{:>width$}", raw, width = w),
+            };
+            parts_visible.push(padded.clone());
+
+            // Apply coloring to the padded cell
+            let colored = color_fn(i, &padded);
+            parts_colored.push(colored);
+        }
+
+        let gap_str = " ".repeat(self.gap);
+        let visible = parts_visible.join(&gap_str);
+        let colored = parts_colored.join(&gap_str);
+        (colored, visible.len())
+    }
+
+    /// Total visible width of a rendered row.
+    pub fn total_width(&self) -> usize {
+        let widths = self.col_widths();
+        if widths.is_empty() {
+            return 0;
+        }
+        let cols_width: usize = widths.iter().sum();
+        cols_width + (widths.len() - 1) * self.gap
+    }
+}
+
+// ── Rich List Renderers ────────────────────────────────────────
+
+/// Render a rich session list with box frame, aligned columns, and summary footer.
+pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
+    let mut out = io::stdout().lock();
+
+    match ctx.format {
+        OutputFormat::Plain => {
+            for s in sessions {
+                let _ = writeln!(
+                    out,
+                    "{}\t{}\t{}\t{}",
+                    s.name,
+                    s.window_count,
+                    s.created,
+                    short_id(&s.id),
+                );
+            }
+        }
+        OutputFormat::Json => unreachable!("JSON handled before render"),
+        OutputFormat::Text => {
+            if sessions.is_empty() {
+                render_empty_state(
+                    &mut out,
+                    ctx,
+                    "Sessions",
+                    "(no sessions)",
+                    "Create one: shux new -s my-project",
+                );
+                return;
+            }
+
+            // Build column data
+            let mut layout = ColumnLayout::new(vec![
+                Column {
+                    header: String::new(),
+                    align: Align::Left,
+                    min_width: 1,
+                }, // diamond
+                Column {
+                    header: String::new(),
+                    align: Align::Left,
+                    min_width: 8,
+                }, // name
+                Column {
+                    header: String::new(),
+                    align: Align::Left,
+                    min_width: 6,
+                }, // windows
+                Column {
+                    header: String::new(),
+                    align: Align::Right,
+                    min_width: 5,
+                }, // created
+                Column {
+                    header: String::new(),
+                    align: Align::Right,
+                    min_width: 8,
+                }, // id
+            ]);
+
+            let mut total_windows: usize = 0;
+            for s in sessions {
+                total_windows += s.window_count;
+                let diamond = if s.is_active { "\u{25C6}" } else { "\u{25C7}" }; // ◆/◇
+                let win_text = format!(
+                    "{} window{}",
+                    s.window_count,
+                    if s.window_count == 1 { "" } else { "s" }
+                );
+                layout.add_row(vec![
+                    diamond.to_string(),
+                    s.name.clone(),
+                    win_text,
+                    s.created.clone(),
+                    short_id(&s.id).to_string(),
+                ]);
+            }
+
+            let content_width = layout.total_width();
+            let min_box_width = 54;
+            let box_width = content_width.max(min_box_width);
+
+            let footer_text = format!(
+                "{} session{} \u{00B7} {} window{} total",
+                sessions.len(),
+                if sessions.len() == 1 { "" } else { "s" },
+                total_windows,
+                if total_windows == 1 { "" } else { "s" },
+            );
+
+            let mut bx = BoxRenderer::new(ctx, box_width);
+            bx.set_width(box_width);
+            let bx = bx.title("Sessions").footer(footer_text);
+
+            let _ = writeln!(out, "{}", bx.header());
+            let _ = writeln!(out, "{}", bx.empty_row());
+
+            for (i, session) in sessions.iter().enumerate() {
+                let is_active = session.is_active;
+                let colors = ctx.colors;
+                let (colored, visible_len) = layout.render_row(i, &|col_idx, cell| {
+                    match col_idx {
+                        0 => {
+                            // Diamond: ◆ cyan bold if active, ◇ dim if not
+                            if is_active {
+                                styled_if(cell.trim(), colors, Some(Color::Cyan), true, false)
+                                    + &" ".repeat(cell.len() - cell.trim().len())
+                            } else {
+                                styled_if(cell, colors, None, false, true)
+                            }
+                        }
+                        1 => {
+                            // Name: bold
+                            styled_if(cell, colors, None, true, false)
+                        }
+                        4 => {
+                            // Short ID: muted
+                            styled_if(cell, colors, None, false, true)
+                        }
+                        _ => cell.to_string(),
+                    }
+                });
+                let _ = writeln!(out, "{}", bx.row(&colored, visible_len));
+            }
+
+            let _ = writeln!(out, "{}", bx.empty_row());
+            let _ = writeln!(out, "{}", bx.footer_line());
+        }
+    }
+}
+
+/// Render a rich window list with box frame, context header, and summary footer.
+pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[WindowInfo]) {
+    let mut out = io::stdout().lock();
+
+    match ctx.format {
+        OutputFormat::Plain => {
+            for w in windows {
+                let _ = writeln!(out, "{}\t{}\t{}", w.index, w.title, w.pane_count,);
+            }
+        }
+        OutputFormat::Json => unreachable!("JSON handled before render"),
+        OutputFormat::Text => {
+            if windows.is_empty() {
+                let title = format!("Windows \u{2500}\u{2500} session: {session_name}");
+                render_empty_state(&mut out, ctx, &title, "(no windows)", "");
+                return;
+            }
+
+            let mut layout = ColumnLayout::new(vec![
+                Column {
+                    header: "#".to_string(),
+                    align: Align::Right,
+                    min_width: 2,
+                },
+                Column {
+                    header: "NAME".to_string(),
+                    align: Align::Left,
+                    min_width: 8,
+                },
+                Column {
+                    header: "PANES".to_string(),
+                    align: Align::Right,
+                    min_width: 5,
+                },
+                Column {
+                    header: String::new(),
+                    align: Align::Left,
+                    min_width: 0,
+                }, // active marker
+            ]);
+
+            let mut total_panes: usize = 0;
+            for w in windows {
+                total_panes += w.pane_count;
+                let marker = if w.is_active {
+                    "\u{25C0} active".to_string() // ◀ active
+                } else {
+                    String::new()
+                };
+                layout.add_row(vec![
+                    w.index.to_string(),
+                    w.title.clone(),
+                    w.pane_count.to_string(),
+                    marker,
+                ]);
+            }
+
+            let content_width = layout.total_width();
+            let header_text = format!("Windows \u{2500}\u{2500} session: {session_name}");
+            let min_box_width = content_width.max(header_text.len() + 4).max(54);
+
+            let footer_text = format!(
+                "{} window{} \u{00B7} {} pane{} \u{2500}\u{2500} {session_name}",
+                windows.len(),
+                if windows.len() == 1 { "" } else { "s" },
+                total_panes,
+                if total_panes == 1 { "" } else { "s" },
+            );
+
+            let mut bx = BoxRenderer::new(ctx, min_box_width);
+            bx.set_width(min_box_width);
+            let bx = bx.title(header_text).footer(footer_text);
+
+            let _ = writeln!(out, "{}", bx.header());
+            let _ = writeln!(out, "{}", bx.empty_row());
+
+            // Column headers
+            let (header_colored, header_len) = layout.render_header(ctx.colors);
+            let _ = writeln!(out, "{}", bx.row(&header_colored, header_len));
+
+            for (i, window) in windows.iter().enumerate() {
+                let is_active = window.is_active;
+                let colors = ctx.colors;
+                let (colored, visible_len) = layout.render_row(i, &|col_idx, cell| {
+                    match col_idx {
+                        1 => styled_if(cell, colors, None, true, false), // name bold
+                        3 if is_active => styled_if(cell, colors, Some(Color::Cyan), true, false), // active marker
+                        _ => cell.to_string(),
+                    }
+                });
+                let _ = writeln!(out, "{}", bx.row(&colored, visible_len));
+            }
+
+            let _ = writeln!(out, "{}", bx.empty_row());
+            let _ = writeln!(out, "{}", bx.footer_line());
+        }
+    }
+}
+
+/// Render a rich pane list with box frame, hierarchy header, and summary footer.
+pub fn render_pane_list(
+    ctx: &TerminalContext,
+    session_name: &str,
+    window_name: &str,
+    panes: &[PaneInfo],
+) {
+    let mut out = io::stdout().lock();
+
+    match ctx.format {
+        OutputFormat::Plain => {
+            for p in panes {
+                let _ = writeln!(out, "{}\t{}\t{}", short_id(&p.id), p.cwd, p.command,);
+            }
+        }
+        OutputFormat::Json => unreachable!("JSON handled before render"),
+        OutputFormat::Text => {
+            if panes.is_empty() {
+                let title = format!(
+                    "Panes \u{2500}\u{2500} window: {window_name} \u{2500}\u{2500} session: {session_name}"
+                );
+                render_empty_state(&mut out, ctx, &title, "(no panes)", "");
+                return;
+            }
+
+            let mut layout = ColumnLayout::new(vec![
+                Column {
+                    header: "ID".to_string(),
+                    align: Align::Left,
+                    min_width: 8,
+                },
+                Column {
+                    header: String::new(),
+                    align: Align::Left,
+                    min_width: 0,
+                }, // focus/zoom marker
+            ]);
+
+            for p in panes {
+                let marker = if p.is_focused && p.is_zoomed {
+                    "\u{25C0} focus [zoomed]".to_string()
+                } else if p.is_focused {
+                    "\u{25C0} focus".to_string()
+                } else {
+                    String::new()
+                };
+                layout.add_row(vec![short_id(&p.id).to_string(), marker]);
+            }
+
+            let content_width = layout.total_width();
+            let header_text = format!(
+                "Panes \u{2500}\u{2500} window: {window_name} \u{2500}\u{2500} session: {session_name}"
+            );
+            let footer_ctx = format!("{window_name}:{session_name}");
+            let min_box_width = content_width.max(header_text.len() + 4).max(54);
+
+            let footer_text = format!(
+                "{} pane{} \u{2500}\u{2500} {footer_ctx}",
+                panes.len(),
+                if panes.len() == 1 { "" } else { "s" },
+            );
+
+            let mut bx = BoxRenderer::new(ctx, min_box_width);
+            bx.set_width(min_box_width);
+            let bx = bx.title(header_text).footer(footer_text);
+
+            let _ = writeln!(out, "{}", bx.header());
+            let _ = writeln!(out, "{}", bx.empty_row());
+
+            // Column headers
+            let (header_colored, header_len) = layout.render_header(ctx.colors);
+            let _ = writeln!(out, "{}", bx.row(&header_colored, header_len));
+
+            for (i, pane) in panes.iter().enumerate() {
+                let is_focused = pane.is_focused;
+                let is_zoomed = pane.is_zoomed;
+                let colors = ctx.colors;
+                let (colored, visible_len) = layout.render_row(i, &|col_idx, cell| {
+                    match col_idx {
+                        0 => styled_if(cell, colors, None, false, true), // ID: muted
+                        1 if is_focused && is_zoomed => {
+                            // Split the marker: "◀ focus" in cyan, "[zoomed]" in yellow
+                            let trimmed = cell.trim_end();
+                            if let Some(pos) = trimmed.find("[zoomed]") {
+                                let focus_part = &trimmed[..pos];
+                                let zoom_part = &trimmed[pos..];
+                                let trail = &cell[trimmed.len()..]; // trailing spaces
+                                format!(
+                                    "{}{}{}",
+                                    styled_if(focus_part, colors, Some(Color::Cyan), true, false),
+                                    styled_if(zoom_part, colors, Some(Color::Yellow), true, false),
+                                    trail,
+                                )
+                            } else {
+                                styled_if(cell, colors, Some(Color::Cyan), true, false)
+                            }
+                        }
+                        1 if is_focused => styled_if(cell, colors, Some(Color::Cyan), true, false),
+                        _ => cell.to_string(),
+                    }
+                });
+                let _ = writeln!(out, "{}", bx.row(&colored, visible_len));
+            }
+
+            let _ = writeln!(out, "{}", bx.empty_row());
+            let _ = writeln!(out, "{}", bx.footer_line());
+        }
+    }
+}
+
+/// Render an empty state inside a box frame.
+fn render_empty_state(
+    out: &mut impl Write,
+    ctx: &TerminalContext,
+    title: &str,
+    message: &str,
+    hint: &str,
+) {
+    let content_len = message.len().max(hint.len()).max(40);
+    let min_box_width = content_len.max(title.len() + 4);
+
+    let mut bx = BoxRenderer::new(ctx, min_box_width);
+    bx.set_width(min_box_width);
+    // Don't chain title since we already have a &mut
+    let title_str = title.to_string();
+    let bx = BoxRenderer::new(ctx, min_box_width).title(title_str);
+    // Recalculate width
+    let inner = min_box_width;
+
+    let _ = writeln!(out, "{}", bx.header());
+    let _ = writeln!(out, "{}", bx.empty_row());
+
+    let msg_styled = styled_if(message, ctx.colors, None, false, true);
+    let msg_padding = if inner > message.len() {
+        inner - message.len()
+    } else {
+        0
+    };
+    let v = if ctx.unicode { "│" } else { "|" };
+    let _ = writeln!(out, "{v} {msg_styled}{} {v}", " ".repeat(msg_padding));
+
+    let _ = writeln!(out, "{}", bx.empty_row());
+
+    if !hint.is_empty() {
+        let hint_styled = styled_if(hint, ctx.colors, None, false, true);
+        let hint_padding = if inner > hint.len() {
+            inner - hint.len()
+        } else {
+            0
+        };
+        let _ = writeln!(out, "{v} {hint_styled}{} {v}", " ".repeat(hint_padding));
+        let _ = writeln!(out, "{}", bx.empty_row());
+    }
+
+    let _ = writeln!(out, "{}", bx.footer_line());
+}
+
+// ── Data Structs for List Rendering ────────────────────────────
+
+/// Session info for list rendering.
+pub struct SessionInfo {
+    pub name: String,
+    pub id: String,
+    pub window_count: usize,
+    pub created: String,
+    pub is_active: bool,
+}
+
+/// Window info for list rendering.
+pub struct WindowInfo {
+    pub title: String,
+    pub index: usize,
+    pub pane_count: usize,
+    pub is_active: bool,
+}
+
+/// Pane info for list rendering.
+pub struct PaneInfo {
+    pub id: String,
+    pub cwd: String,
+    pub command: String,
+    pub is_focused: bool,
+    pub is_zoomed: bool,
+}
+
+// ── Version & Confirmation Printers ────────────────────────────
+
 /// Print the shux banner (used for version output).
 pub fn print_version(version: &str, git_sha: Option<&str>, daemon_status: Option<&str>) {
     let mut out = io::stdout().lock();
@@ -150,195 +874,126 @@ pub fn print_version(version: &str, git_sha: Option<&str>, daemon_status: Option
     let _ = writeln!(out);
 }
 
-/// Print a session list entry.
-pub fn print_session_entry(name: &str, windows: usize, created: &str, id: &str) {
+/// Print a success confirmation with ✓ prefix and short ID.
+pub fn print_success(action: &str, subject: &str, id: Option<&str>) {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{}", bold(name));
-    let _ = write!(
-        out,
-        ": {} window{}",
-        windows,
-        if windows == 1 { "" } else { "s" }
-    );
-    let _ = write!(out, " {}", muted(format!("(created {created})")));
-    let _ = write!(out, " {}", muted(format!("[{id}]")));
+    let _ = write!(out, "{} ", success("\u{2713}")); // ✓
+    let _ = write!(out, "{action} {}", bold(subject));
+    if let Some(id) = id {
+        let _ = write!(out, "  {}", muted(short_id(id)));
+    }
     let _ = writeln!(out);
 }
 
-/// Print a "no sessions" message.
-pub fn print_no_sessions() {
-    println!("{}", muted("no sessions"));
+/// Print an error with ✗ prefix.
+pub fn print_error(msg: &str) {
+    let mut err = io::stderr().lock();
+    let _ = write!(err, "{} ", error("\u{2717}")); // ✗
+    let _ = writeln!(err, "{msg}");
 }
+
+// ── Legacy Confirmation Helpers (now using ✓ prefix + short IDs) ──
 
 /// Print a session creation confirmation.
 pub fn print_session_created(name: &str, id: &str, ensured: bool) {
     let action = if ensured { "Ensured" } else { "Created" };
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success(action));
-    let _ = write!(out, "session '{}'", bold(name));
-    let _ = write!(out, " {}", muted(format!("[{id}]")));
-    let _ = writeln!(out);
+    print_success(action, &format!("session '{name}'"), Some(id));
 }
 
 /// Print a session kill confirmation.
 pub fn print_session_killed(name: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Killed"));
-    let _ = write!(out, "session '{}'", bold(name));
-    let _ = writeln!(out);
+    print_success("Killed", &format!("session '{name}'"), None);
 }
 
 /// Print a session rename confirmation.
 pub fn print_session_renamed(old_name: &str, new_name: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Renamed"));
-    let _ = write!(out, "session '{}' -> '{}'", bold(old_name), bold(new_name));
-    let _ = writeln!(out);
-}
-
-/// Print a window list entry.
-pub fn print_window_entry(index: usize, title: &str, pane_count: usize, is_active: bool) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{}", index);
-    if is_active {
-        let _ = write!(out, "{}", accent("*"));
-    } else {
-        let _ = write!(out, " ");
-    }
-    let _ = write!(out, ": {}", bold(title));
-    let _ = write!(
-        out,
-        " ({} pane{})",
-        pane_count,
-        if pane_count == 1 { "" } else { "s" }
+    print_success(
+        "Renamed",
+        &format!("session '{old_name}' -> '{new_name}'"),
+        None,
     );
-    let _ = writeln!(out);
 }
 
 /// Print a window creation confirmation.
 pub fn print_window_created(title: &str, index: u64) {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Created"));
-    let _ = write!(out, "window '{}' ", bold(title));
+    let _ = write!(out, "{} ", success("\u{2713}"));
+    let _ = write!(out, "Created window '{}' ", bold(title));
     let _ = write!(out, "{}", muted(format!("(index {index})")));
     let _ = writeln!(out);
 }
 
 /// Print a window kill confirmation.
 pub fn print_window_killed(title: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Killed"));
-    let _ = write!(out, "window '{}'", bold(title));
-    let _ = writeln!(out);
+    print_success("Killed", &format!("window '{title}'"), None);
 }
 
 /// Print a window rename confirmation.
 pub fn print_window_renamed(old_name: &str, new_name: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Renamed"));
-    let _ = write!(out, "window '{}' -> '{}'", bold(old_name), bold(new_name));
-    let _ = writeln!(out);
+    print_success(
+        "Renamed",
+        &format!("window '{old_name}' -> '{new_name}'"),
+        None,
+    );
 }
 
 /// Print a window focus confirmation.
 pub fn print_window_focused(title: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Focused"));
-    let _ = write!(out, "window '{}'", bold(title));
-    let _ = writeln!(out);
+    print_success("Focused", &format!("window '{title}'"), None);
 }
 
 /// Print a window reorder confirmation.
 pub fn print_window_reordered(title: &str, new_index: usize) {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Moved"));
-    let _ = write!(out, "window '{}' to index {}", bold(title), new_index);
-    let _ = writeln!(out);
-}
-
-/// Print a pane list entry.
-pub fn print_pane_entry(id: &str, title: &str, is_focused: bool, is_zoomed: bool) {
-    let mut out = io::stdout().lock();
-    if is_focused {
-        let _ = write!(out, "{}", accent("*"));
-    } else {
-        let _ = write!(out, " ");
-    }
-    let _ = write!(out, " {}", muted(format!("[{id}]")));
-    if !title.is_empty() {
-        let _ = write!(out, " {}", bold(title));
-    }
-    if is_zoomed {
-        let _ = write!(out, " {}", warning("[zoomed]"));
-    }
+    let _ = write!(out, "{} ", success("\u{2713}"));
+    let _ = write!(out, "Moved window '{}' to index {}", bold(title), new_index);
     let _ = writeln!(out);
 }
 
 /// Print a pane split confirmation.
 pub fn print_pane_split(pane_id: &str, direction: &str) {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Split"));
-    let _ = write!(out, "pane ({direction}) ");
-    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
+    let _ = write!(out, "{} ", success("\u{2713}"));
+    let _ = write!(out, "Split pane ({direction}) ");
+    let _ = write!(out, "{}", muted(short_id(pane_id)));
     let _ = writeln!(out);
 }
 
 /// Print a pane focus confirmation.
 pub fn print_pane_focused(pane_id: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Focused"));
-    let _ = write!(out, "pane ");
-    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
-    let _ = writeln!(out);
+    print_success("Focused", "pane", Some(pane_id));
 }
 
 /// Print a pane zoom confirmation.
 pub fn print_pane_zoomed(pane_id: &str, is_zoomed: bool) {
-    let mut out = io::stdout().lock();
     let action = if is_zoomed { "Zoomed" } else { "Unzoomed" };
-    let _ = write!(out, "{} ", success(action));
-    let _ = write!(out, "pane ");
-    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
-    let _ = writeln!(out);
+    print_success(action, "pane", Some(pane_id));
 }
 
 /// Print a pane swap confirmation.
 pub fn print_pane_swapped(pane_a: &str, pane_b: &str) {
     let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Swapped"));
+    let _ = write!(out, "{} ", success("\u{2713}"));
     let _ = write!(
         out,
-        "pane {} <-> {}",
-        muted(format!("[{pane_a}]")),
-        muted(format!("[{pane_b}]")),
+        "Swapped pane {} <-> {}",
+        muted(short_id(pane_a)),
+        muted(short_id(pane_b)),
     );
     let _ = writeln!(out);
 }
 
 /// Print a pane kill confirmation.
 pub fn print_pane_killed(pane_id: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Killed"));
-    let _ = write!(out, "pane ");
-    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
-    let _ = writeln!(out);
+    print_success("Killed", "pane", Some(pane_id));
 }
 
 /// Print a pane resize confirmation.
 pub fn print_pane_resized(pane_id: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{} ", success("Resized"));
-    let _ = write!(out, "pane ");
-    let _ = write!(out, "{}", muted(format!("[{pane_id}]")));
-    let _ = writeln!(out);
+    print_success("Resized", "pane", Some(pane_id));
 }
 
-/// Print a styled error message to stderr.
-pub fn print_error(msg: &str) {
-    let mut err = io::stderr().lock();
-    let _ = write!(err, "{}: ", error("error"));
-    let _ = writeln!(err, "{msg}");
-}
+// ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -346,10 +1001,7 @@ mod tests {
 
     #[test]
     fn test_styled_plain_text() {
-        // With NO_COLOR set, should produce plain text
         let styled = Styled::new("hello").fg(Color::Red).bold();
-        // Can't easily test terminal detection in unit tests,
-        // but verify it doesn't panic
         let _ = styled.to_string();
     }
 
@@ -369,5 +1021,91 @@ mod tests {
     fn test_banner_contains_shux() {
         let b = banner();
         assert!(b.contains("___"), "banner should contain ASCII art");
+    }
+
+    #[test]
+    fn test_short_id_truncates() {
+        assert_eq!(short_id("bfdb89fb-dbc5-49cc-b1fc-613a0ca00f66"), "bfdb89fb");
+        assert_eq!(short_id("abcd1234"), "abcd1234");
+        assert_eq!(short_id("abc"), "abc");
+    }
+
+    #[test]
+    fn test_column_layout_widths() {
+        let mut layout = ColumnLayout::new(vec![
+            Column {
+                header: "#".to_string(),
+                align: Align::Right,
+                min_width: 2,
+            },
+            Column {
+                header: "NAME".to_string(),
+                align: Align::Left,
+                min_width: 4,
+            },
+        ]);
+        layout.add_row(vec!["0".to_string(), "editor".to_string()]);
+        layout.add_row(vec!["1".to_string(), "my-very-long-name".to_string()]);
+
+        let widths = layout.col_widths();
+        assert_eq!(widths[0], 2); // max(1, 1, min=2) = 2
+        assert_eq!(widths[1], 17); // max(4, 17, min=4) = 17
+    }
+
+    #[test]
+    fn test_box_renderer_header() {
+        let ctx = TerminalContext {
+            is_tty: false,
+            colors: false,
+            unicode: true,
+            width: 80,
+            format: OutputFormat::Text,
+        };
+        let bx = BoxRenderer::new(&ctx, 20).title("Sessions");
+        let header = bx.header();
+        assert!(header.starts_with("╭─"));
+        assert!(header.contains("Sessions"));
+        assert!(header.ends_with("╮"));
+    }
+
+    #[test]
+    fn test_box_renderer_ascii_fallback() {
+        let ctx = TerminalContext {
+            is_tty: false,
+            colors: false,
+            unicode: false,
+            width: 80,
+            format: OutputFormat::Text,
+        };
+        let bx = BoxRenderer::new(&ctx, 20).title("Sessions");
+        let header = bx.header();
+        assert!(header.starts_with("+-"));
+        assert!(header.contains("Sessions"));
+        assert!(header.ends_with("+"));
+    }
+
+    #[test]
+    fn test_box_renderer_row() {
+        let ctx = TerminalContext {
+            is_tty: false,
+            colors: false,
+            unicode: true,
+            width: 80,
+            format: OutputFormat::Text,
+        };
+        let bx = BoxRenderer::new(&ctx, 20);
+        let row = bx.row("hello", 5);
+        assert!(row.starts_with("│"));
+        assert!(row.ends_with("│"));
+        assert!(row.contains("hello"));
+    }
+
+    #[test]
+    fn test_terminal_context_detect() {
+        // In test environment, stdout is not a terminal
+        let ctx = TerminalContext::detect(OutputFormat::Text);
+        // When not a TTY, should auto-switch to Plain
+        assert_eq!(ctx.format, OutputFormat::Plain);
+        assert!(!ctx.is_tty);
     }
 }

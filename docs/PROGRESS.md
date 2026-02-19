@@ -53,6 +53,18 @@
 
 ## Session Log
 
+**2026-02-19 — Task 060: Rich CLI Output — Beautiful List Commands — Done**
+- Rewrote `crates/shux/src/style.rs` (~1078 lines): added `TerminalContext` (auto-detect TTY, colors, unicode, width), `OutputFormat` (Text/Json/Plain), `BoxRenderer` (Unicode box-drawing frames ╭─╮│╰─╯ with ASCII fallback), `ColumnLayout` (column alignment engine), `SessionInfo`/`WindowInfo`/`PaneInfo` data structs
+- Added `render_session_list()`, `render_window_list()`, `render_pane_list()`: box-framed tabular output with `short_id()` (8-char), active markers (filled diamond `◆` cyan, open diamond `◇` dim, arrow `◀ active`/`◀ focus [zoomed]`), summary footers ("3 sessions · 5 windows total"), context headers ("Windows ── session: alpha")
+- Added `render_empty_state()`: box-framed empty state with hint text ("(no sessions)" + "Create one: shux new -s my-project")
+- Changed all confirmation messages to `✓` prefix with short IDs: `print_success("Created", ...)`, `print_error` now uses `✗` prefix
+- Updated `crates/shux/src/cli.rs`: added `Plain` variant to `OutputFormat`, `to_style_format()` converter, `format_created_at()` helper, rewrote `handle_ls`/`handle_window_list`/`handle_pane_list` to use batch renderers
+- Auto-detection: piped stdout → Plain format (tab-separated, no box, no color), `NO_COLOR` → box preserved but no ANSI codes, `TERM=dumb` → Plain
+- Updated `cli_integration.rs` test assertion for empty session list (piped output is empty in Plain format)
+- Created `.claude/automations/test_060_rich_cli_output.py`: 44 visual tests across 13 parts (A–M) covering box frames, column alignment, active markers, short IDs, empty state, zoom state, confirmations, errors, plain format, piped auto-detect, NO_COLOR, multi-session stress, JSON cross-check — ~30 screenshots
+- Zero new crate dependencies — all hand-rolled (BoxRenderer ~120 lines, ColumnLayout ~90 lines)
+- 510 tests passing, all make targets pass (lint + test)
+
 **2026-02-19 — Task 014: Window CRUD (API + CLI) — Done**
 - Added window mutation methods to `SessionGraph` (graph.rs): `create_window`, `destroy_window`, `rename_window`, `focus_window`, `reorder_window` with new `GraphCommand` variants and `GraphError` variants (`WindowNameConflict`, `EmptyWindowName`, `WindowIndexOutOfRange`, `LastWindow`)
 - Registered 7 window RPC methods in binary crate (main.rs): `window.list`, `window.create`, `window.kill`, `window.rename`, `window.focus`, `window.reorder`, `window.ensure` — all backed by GraphHandle closures with consistent error mapping via `graph_error_to_rpc()`
@@ -245,3 +257,4 @@
 | 057 | Documentation (README, guides, API reference) | M3 | Pending | 052 |
 | 058 | Binary releases and distribution | M3 | Pending | 052 |
 | 059 | M3 final quality gate and v1.0 release | M3 | Pending | 053–058 |
+| 060 | Rich CLI output — beautiful list commands | M1 | **Done** | 011, 015 |

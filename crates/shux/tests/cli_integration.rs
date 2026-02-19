@@ -470,9 +470,10 @@ async fn test_cli_ls_against_server() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // When piped, format auto-switches to Plain; empty list produces no output (Unix convention)
     assert!(
-        stdout.contains("no sessions"),
-        "expected 'no sessions' in output: {stdout}"
+        stdout.trim().is_empty(),
+        "expected empty output for no sessions in plain format: {stdout}"
     );
 
     cancel.cancel();

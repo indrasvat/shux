@@ -53,6 +53,8 @@ pub enum OutputFormat {
     Text,
     /// JSON output for scripting and piping
     Json,
+    /// Plain tab-separated output for scripting (no box, no color)
+    Plain,
 }
 
 #[derive(Subcommand, Debug)]
@@ -473,6 +475,36 @@ pub async fn rpc_call(
         .unwrap_or(serde_json::Value::Null))
 }
 
+/// Convert CLI OutputFormat to style OutputFormat.
+fn to_style_format(format: OutputFormat) -> crate::style::OutputFormat {
+    match format {
+        OutputFormat::Text => crate::style::OutputFormat::Text,
+        OutputFormat::Json => crate::style::OutputFormat::Json,
+        OutputFormat::Plain => crate::style::OutputFormat::Plain,
+    }
+}
+
+/// Format a created_at timestamp as relative time.
+fn format_created_at(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(String::from)
+        .or_else(|| {
+            value.as_u64().map(|ts| {
+                let dt = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts);
+                let elapsed = dt.elapsed().unwrap_or_default();
+                if elapsed.as_secs() < 60 {
+                    format!("{}s ago", elapsed.as_secs())
+                } else if elapsed.as_secs() < 3600 {
+                    format!("{}m ago", elapsed.as_secs() / 60)
+                } else {
+                    format!("{}h ago", elapsed.as_secs() / 3600)
+                }
+            })
+        })
+        .unwrap_or_else(|| "?".to_string())
+}
+
 /// Handle the `shux ls` command.
 pub async fn handle_ls(
     stream: &mut tokio::net::UnixStream,
@@ -489,57 +521,57 @@ pub async fn handle_ls(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             use crate::style;
 
-            // session.list returns {"sessions": [...]}
+            let ctx = style::TerminalContext::detect(to_style_format(format));
+
             let sessions = result
                 .get("sessions")
                 .and_then(|v| v.as_array())
                 .or_else(|| result.as_array());
 
-            if let Some(sessions) = sessions {
-                if sessions.is_empty() {
-                    style::print_no_sessions();
-                } else {
-                    for session in sessions {
-                        let name = session
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("(unnamed)");
-                        let id = session.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                        let windows = session
-                            .get("windows")
-                            .and_then(|v| v.as_array())
-                            .map(|a| a.len())
-                            .unwrap_or(0);
-                        let created = session
-                            .get("created_at")
-                            .and_then(|v| {
-                                v.as_str().map(String::from).or_else(|| {
-                                    v.as_u64().map(|ts| {
-                                        let secs = ts;
-                                        let dt = std::time::UNIX_EPOCH
-                                            + std::time::Duration::from_secs(secs);
-                                        let elapsed = dt.elapsed().unwrap_or_default();
-                                        if elapsed.as_secs() < 60 {
-                                            format!("{}s ago", elapsed.as_secs())
-                                        } else if elapsed.as_secs() < 3600 {
-                                            format!("{}m ago", elapsed.as_secs() / 60)
-                                        } else {
-                                            format!("{}h ago", elapsed.as_secs() / 3600)
-                                        }
-                                    })
+            let session_infos: Vec<style::SessionInfo> = sessions
+                .map(|arr| {
+                    arr.iter()
+                        .map(|s| {
+                            let name = s
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("(unnamed)")
+                                .to_string();
+                            let id = s
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let window_count = s
+                                .get("windows")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .or_else(|| {
+                                    s.get("window_count")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|n| n as usize)
                                 })
-                            })
-                            .unwrap_or_else(|| "?".to_string());
+                                .unwrap_or(0);
+                            let created = s
+                                .get("created_at")
+                                .map(format_created_at)
+                                .unwrap_or_else(|| "?".to_string());
+                            style::SessionInfo {
+                                name,
+                                id,
+                                window_count,
+                                created,
+                                is_active: false, // no attach tracking yet
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
-                        style::print_session_entry(name, windows, &created, id);
-                    }
-                }
-            } else {
-                style::print_no_sessions();
-            }
+            style::render_session_list(&ctx, &session_infos);
         }
     }
 
@@ -573,7 +605,7 @@ pub async fn handle_new(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             use crate::style;
 
             let name = result
@@ -606,7 +638,7 @@ pub async fn handle_kill(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_session_killed(session_name);
         }
     }
@@ -637,7 +669,7 @@ pub async fn handle_rename(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_session_renamed(session_name, new_name);
         }
     }
@@ -734,32 +766,41 @@ pub async fn handle_window_list(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             use crate::style;
 
-            let windows = result.as_array();
-            if let Some(windows) = windows {
-                if windows.is_empty() {
-                    println!("{}", style::muted("no windows"));
-                } else {
-                    for w in windows {
-                        let index = w.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let title = w
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("(untitled)");
-                        let pane_count =
-                            w.get("pane_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let is_active = w
-                            .get("is_active")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        style::print_window_entry(index, title, pane_count, is_active);
-                    }
-                }
-            } else {
-                println!("{}", style::muted("no windows"));
-            }
+            let ctx = style::TerminalContext::detect(to_style_format(format));
+
+            let window_infos: Vec<style::WindowInfo> = result
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .map(|w| {
+                            let index =
+                                w.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let title = w
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("(untitled)")
+                                .to_string();
+                            let pane_count =
+                                w.get("pane_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let is_active = w
+                                .get("is_active")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            style::WindowInfo {
+                                title,
+                                index,
+                                pane_count,
+                                is_active,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            style::render_window_list(&ctx, session_name, &window_infos);
         }
     }
 
@@ -796,7 +837,7 @@ pub async fn handle_window_new(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             let title = result
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -825,7 +866,7 @@ pub async fn handle_window_kill(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_window_killed(&window_title);
         }
     }
@@ -855,7 +896,7 @@ pub async fn handle_window_rename(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_window_renamed(&old_title, new_name);
         }
     }
@@ -879,7 +920,7 @@ pub async fn handle_window_focus(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_window_focused(&window_title);
         }
     }
@@ -909,7 +950,7 @@ pub async fn handle_window_reorder(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_window_reordered(&window_title, new_index);
         }
     }
@@ -970,34 +1011,81 @@ pub async fn handle_pane_list(
     )
     .await?;
 
+    // Resolve the window title for the header
+    let window_title = {
+        let win_result = rpc_call(
+            stream,
+            "window.list",
+            serde_json::json!({"session_id": session_id}),
+        )
+        .await
+        .ok();
+        win_result
+            .and_then(|r| {
+                r.as_array().and_then(|windows| {
+                    windows.iter().find_map(|w| {
+                        let wid = w.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if wid == window_id {
+                            w.get("title").and_then(|v| v.as_str()).map(String::from)
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+            .unwrap_or_else(|| window_id.chars().take(8).collect())
+    };
+
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             use crate::style;
-            let panes = result.as_array();
-            if let Some(panes) = panes {
-                if panes.is_empty() {
-                    println!("{}", style::muted("no panes"));
-                } else {
-                    for p in panes {
-                        let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                        let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                        let is_focused = p
-                            .get("is_focused")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let is_zoomed = p
-                            .get("is_zoomed")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        style::print_pane_entry(id, title, is_focused, is_zoomed);
-                    }
-                }
-            } else {
-                println!("{}", style::muted("no panes"));
-            }
+
+            let ctx = style::TerminalContext::detect(to_style_format(format));
+
+            let pane_infos: Vec<style::PaneInfo> = result
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .map(|p| {
+                            let id = p
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let cwd = p
+                                .get("cwd")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let command = p
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let is_focused = p
+                                .get("is_focused")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let is_zoomed = p
+                                .get("is_zoomed")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            style::PaneInfo {
+                                id,
+                                cwd,
+                                command,
+                                is_focused,
+                                is_zoomed,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            style::render_pane_list(&ctx, session_name, &window_title, &pane_infos);
         }
     }
 
@@ -1037,7 +1125,7 @@ pub async fn handle_pane_split(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             let pane_id = result
                 .get("pane")
                 .and_then(|v| v.get("id"))
@@ -1073,7 +1161,7 @@ pub async fn handle_pane_focus(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_pane_focused(pane_id);
         }
     }
@@ -1106,7 +1194,7 @@ pub async fn handle_pane_focus_dir(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             let pane_id = result
                 .get("pane_id")
                 .and_then(|v| v.as_str())
@@ -1149,7 +1237,7 @@ pub async fn handle_pane_resize(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             let pane_id = result
                 .get("pane_id")
                 .and_then(|v| v.as_str())
@@ -1186,7 +1274,7 @@ pub async fn handle_pane_zoom(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             let pane_id = result
                 .get("pane_id")
                 .and_then(|v| v.as_str())
@@ -1225,7 +1313,7 @@ pub async fn handle_pane_swap(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_pane_swapped(pane_id, target_id);
         }
     }
@@ -1250,7 +1338,7 @@ pub async fn handle_pane_kill(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_pane_killed(pane_id);
         }
     }
@@ -1271,7 +1359,7 @@ pub async fn handle_api(
     let result = rpc_call(stream, method, params).await?;
 
     match format {
-        OutputFormat::Json | OutputFormat::Text => {
+        OutputFormat::Json | OutputFormat::Text | OutputFormat::Plain => {
             // For raw API calls, JSON is always the most useful format
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
@@ -1296,7 +1384,7 @@ pub async fn handle_version(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        OutputFormat::Text => {
+        OutputFormat::Text | OutputFormat::Plain => {
             let version = result
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -1415,6 +1503,12 @@ mod tests {
     fn test_cli_parse_global_format() {
         let cli = Cli::try_parse_from(["shux", "--format", "json", "ls"]).unwrap();
         assert!(matches!(cli.format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn test_cli_parse_format_plain() {
+        let cli = Cli::try_parse_from(["shux", "--format", "plain", "ls"]).unwrap();
+        assert!(matches!(cli.format, OutputFormat::Plain));
     }
 
     #[test]

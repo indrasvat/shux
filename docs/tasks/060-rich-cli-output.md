@@ -1,6 +1,6 @@
 # Task 060: Rich CLI Output — Beautiful List Commands
 
-**Status:** Planned
+**Status:** Done
 **Priority:** High (UX polish, brand identity)
 **Milestone:** M1 (alongside pane/rendering work)
 **Depends on:** 011 (CLI foundation), 015 (pane operations)
