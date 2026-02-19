@@ -111,6 +111,12 @@ fn start_daemon_process() -> Result<(), ClientError> {
     Ok(())
 }
 
+/// Try to connect to an existing daemon without auto-starting.
+/// Returns Ok(stream) if daemon is already running, Err otherwise.
+pub async fn try_connect(socket_path: &Path) -> Result<UnixStream, ClientError> {
+    probe_socket(socket_path).await.map_err(ClientError::Io)
+}
+
 fn is_connection_refused_or_not_found(e: &io::Error) -> bool {
     matches!(
         e.kind(),

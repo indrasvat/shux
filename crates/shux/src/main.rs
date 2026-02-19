@@ -179,8 +179,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
         }
 
         Some(Command::Version) => {
-            // Try to get version from daemon; fall back to local version
-            match client::ensure_daemon_running_at(&socket_path).await {
+            // Quick probe — don't auto-start daemon just for version
+            match client::try_connect(&socket_path).await {
                 Ok(mut stream) => cli::handle_version(&mut stream, args.format).await,
                 Err(_) => {
                     match args.format {

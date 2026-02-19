@@ -5,7 +5,17 @@
 
 use std::path::PathBuf;
 
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
+
+const CLAP_STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Yellow.on_default())
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Red.on_default().effects(Effects::BOLD))
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD));
 
 /// shux — a modern, batteries-included terminal multiplexer
 #[derive(Parser, Debug)]
@@ -15,7 +25,8 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "A modern terminal multiplexer",
     long_about = "shux is a modern, batteries-included terminal multiplexer built in Rust.\n\
                   Tiny core, powerful plugin system, first-class support for humans and AI agents.",
-    after_help = "Run 'shux <command> --help' for more information on a specific command."
+    after_help = "Run 'shux <command> --help' for more information on a specific command.",
+    styles = CLAP_STYLES,
 )]
 pub struct Cli {
     #[command(subcommand)]
