@@ -33,4 +33,5 @@ dist/
 
 .DS_STORE
 
-
+# Task runner logs
+.task-runs/
