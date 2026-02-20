@@ -227,6 +227,7 @@ pub enum EventData {
         exit_code: Option<i32>,
         stdout: String,
         stderr: String,
+        runtime_ms: u64,
     },
 
     /// PTY output from a pane (opt-in, sampled by default).
@@ -576,6 +577,7 @@ mod tests {
                 exit_code: Some(0),
                 stdout: "out".into(),
                 stderr: String::new(),
+                runtime_ms: 42,
             }
             .event_type(),
             "pane.command_completed"
@@ -814,6 +816,7 @@ mod tests {
                 exit_code: Some(0),
                 stdout: "hello world\n".to_string(),
                 stderr: String::new(),
+                runtime_ms: 150,
             },
         };
 

@@ -172,6 +172,39 @@ impl VirtualTerminal {
     pub fn scrollback_len(&self) -> usize {
         self.grid.scrollback_len()
     }
+
+    /// Capture the last N visible rows as plain text.
+    ///
+    /// Iterates visible rows from the bottom, extracts cell characters
+    /// (skipping wide-char continuations), trims trailing whitespace per row,
+    /// and trims trailing empty lines from the result.
+    pub fn capture_text(&self, lines: usize) -> String {
+        let grid = self.grid();
+        let total_rows = grid.rows();
+        let start = total_rows.saturating_sub(lines);
+        let mut output = String::new();
+
+        for row_idx in start..total_rows {
+            let row = grid.visible_row(row_idx);
+            let mut line = String::new();
+            for cell in &row.cells {
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                line.push(cell.ch);
+            }
+            let trimmed = line.trim_end();
+            output.push_str(trimmed);
+            output.push('\n');
+        }
+
+        // Trim trailing empty lines
+        while output.ends_with("\n\n") {
+            output.pop();
+        }
+
+        output
+    }
 }
 
 #[cfg(test)]

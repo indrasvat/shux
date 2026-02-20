@@ -1013,6 +1013,54 @@ pub fn print_pane_resized(pane_id: &str) {
     print_success("Resized", "pane", Some(pane_id));
 }
 
+/// Print a send-keys confirmation.
+pub fn print_send_keys(pane_id: &str, bytes_written: u64) {
+    println!(
+        "{} Sent {} bytes to pane {}",
+        success("✓"),
+        bold(&bytes_written.to_string()),
+        muted(&short_id(pane_id)),
+    );
+}
+
+/// Print a run-command result.
+pub fn print_run_command(result: &serde_json::Value, is_async: bool) {
+    if is_async {
+        let cmd_id = result
+            .get("command_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        println!(
+            "{} Command started {}",
+            success("✓"),
+            muted(&short_id(cmd_id)),
+        );
+    } else {
+        let state = result
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let exit_code = result.get("exit_code").and_then(|v| v.as_i64());
+        let runtime_ms = result
+            .get("runtime_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let stdout = result.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+
+        let status = match (state, exit_code) {
+            ("completed", Some(0)) => format!("{}", success("✓ completed")),
+            ("completed", Some(code)) => format!("{}", error(&format!("✗ exit {code}"))),
+            ("timed_out", _) => format!("{}", warning("⏱ timed out")),
+            ("cancelled", _) => format!("{}", warning("⊘ cancelled")),
+            _ => format!("{}", muted(state)),
+        };
+        println!("{status} {}", muted(&format!("({runtime_ms}ms)")));
+        if !stdout.is_empty() {
+            print!("{stdout}");
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]

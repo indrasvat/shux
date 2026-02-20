@@ -33,6 +33,7 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 unicode-width = "0.2"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true

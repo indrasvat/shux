@@ -1,6 +1,6 @@
 # 016 — Pane I/O (send_keys, run_command, capture)
 
-**Status:** Pending
+**Status:** Done
 **Depends On:** 015, 004
 **Parallelizable With:** 020
 

@@ -355,6 +355,75 @@ pub enum PaneCommand {
         #[arg(short, long)]
         pane: String,
     },
+
+    /// Send keystrokes to a pane
+    SendKeys {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+
+        /// Text to send (mutually exclusive with --data)
+        #[arg(short, long)]
+        text: Option<String>,
+
+        /// Base64-encoded bytes to send (mutually exclusive with --text)
+        #[arg(long)]
+        data: Option<String>,
+    },
+
+    /// Run a command in a pane and capture output
+    Run {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+
+        /// Command to run
+        #[arg(short, long)]
+        command: String,
+
+        /// Timeout in seconds (default: 30)
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+
+        /// Run asynchronously (return command ID immediately)
+        #[arg(long = "async")]
+        is_async: bool,
+    },
+
+    /// Capture the current text content of a pane
+    Capture {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+
+        /// Number of lines to capture (default: 50)
+        #[arg(short, long, default_value = "50")]
+        lines: u64,
+    },
 }
 
 impl Cli {
@@ -1362,6 +1431,133 @@ pub async fn handle_api(
         OutputFormat::Json | OutputFormat::Text | OutputFormat::Plain => {
             // For raw API calls, JSON is always the most useful format
             println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane send-keys` command.
+pub async fn handle_pane_send_keys(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    text: Option<&str>,
+    data: Option<&str>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+    });
+
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+
+    if let Some(t) = text {
+        params["text"] = serde_json::Value::String(t.to_string());
+    } else if let Some(d) = data {
+        params["data"] = serde_json::Value::String(d.to_string());
+    } else {
+        anyhow::bail!("either --text or --data must be provided");
+    }
+
+    let result = rpc_call(stream, "pane.send_keys", params).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text | OutputFormat::Plain => {
+            let bytes = result
+                .get("bytes_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let pane_id = result
+                .get("pane_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            crate::style::print_send_keys(pane_id, bytes);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane run` command.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_pane_run(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    command: &str,
+    timeout: u64,
+    is_async: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+        "command": command,
+        "timeout": timeout,
+        "async": is_async,
+    });
+
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+
+    let result = rpc_call(stream, "pane.run_command", params).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text | OutputFormat::Plain => {
+            crate::style::print_run_command(&result, is_async);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `shux pane capture` command.
+pub async fn handle_pane_capture(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    lines: u64,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+        "lines": lines,
+    });
+
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+
+    let result = rpc_call(stream, "pane.capture", params).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text | OutputFormat::Plain => {
+            let text = result.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            print!("{text}");
         }
     }
 

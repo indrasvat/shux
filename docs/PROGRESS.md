@@ -53,6 +53,21 @@
 
 ## Session Log
 
+**2026-02-19 — Task 016: Pane I/O (send_keys, run_command, capture) — Done**
+- Created `crates/shux-pty/src/command.rs`: `CommandEngine` with marker technique for detecting command completion — `start_command()` generates PTY command with `SHUX_MARKER{marker}EXIT{$?}SHUX_END` pattern, `process_output()` scans per-pane output buffers for markers (handles split-across-chunks), `check_timeouts()`, `cancel_command()`, `get_status()`, `shell_escape_args()` — 13 unit tests
+- Created `crates/shux-pty/src/capture.rs`: `strip_ansi()` removing CSI, OSC, DCS, 8-bit CSI, character set designation sequences — 5 unit tests
+- Added `capture_text(lines)` to `VirtualTerminal` (shux-vt): iterates last N visible rows, extracts cell chars (skipping wide continuations), trims trailing whitespace and empty lines — 2 unit tests
+- Wired PTY/VT subsystems into daemon (`crates/shux/src/main.rs`): `PaneIoState` (shared writers map + VT map + CommandEngine), `run_pane_pty_task()` (per-pane async task with select! for concurrent read/write), `spawn_pane_pty()` (spawn shell + VT + read/write task). Updated all `register_*_methods()` to spawn/cleanup PTY on pane create/kill
+- Registered 5 new pane I/O RPC methods: `pane.send_keys` (text or base64), `pane.run_command` (sync with marker detection + oneshot, or async), `pane.command_status`, `pane.command_cancel` (Ctrl-C + engine cancel), `pane.capture` (VT capture + strip_ansi)
+- Added 3 CLI subcommands: `pane send-keys` (-t text/--data base64), `pane run` (command + args, --timeout, --async), `pane capture` (--lines N)
+- Added style helpers: `print_send_keys()`, `print_run_command()` with state-colored output
+- Created `crates/shux/tests/pane_io_integration.rs`: 9 integration tests with real PTY processes — send_keys text/base64, nonexistent pane error, capture after echo, run_command sync (echo/false), async+poll, cancel, capture with default lines
+- Fixed marker echo bug: shell's PTY input echo contains the literal marker command text, which falsely matches the marker detector before the actual output. Split the echo string (`"SHUX_MAR""KER..."`) so input echo never contains the full pattern
+- Added `runtime_ms: u64` to `PaneCommandCompleted` event variant
+- 546 tests passing (510 existing + 20 command/capture unit + 7 pane_io integration + 9 event), all make targets pass
+- Learning: PTY input echo contains the literal typed command — marker detection must ensure the echo text can't match the marker pattern. Splitting the shell string (`"SHUX_MAR""KER..."`) breaks the echo while shell concatenation produces the correct output.
+- Learning: Channel-based PTY write architecture (mpsc sender per pane, tokio task owns PtyHandle with `select!` for read/write) avoids ownership conflicts between `PtyManager::write(&mut self)` and the read loop.
+
 **2026-02-19 — Task 060: Rich CLI Output — Beautiful List Commands — Done**
 - Rewrote `crates/shux/src/style.rs` (~1078 lines): added `TerminalContext` (auto-detect TTY, colors, unicode, width), `OutputFormat` (Text/Json/Plain), `BoxRenderer` (Unicode box-drawing frames ╭─╮│╰─╯ with ASCII fallback), `ColumnLayout` (column alignment engine), `SessionInfo`/`WindowInfo`/`PaneInfo` data structs
 - Added `render_session_list()`, `render_window_list()`, `render_pane_list()`: box-framed tabular output with `short_id()` (8-char), active markers (filled diamond `◆` cyan, open diamond `◇` dim, arrow `◀ active`/`◀ focus [zoomed]`), summary footers ("3 sessions · 5 windows total"), context headers ("Windows ── session: alpha")
@@ -213,7 +228,7 @@
 | 013 | Session CRUD (API + CLI) | M1 | **Done** | 012 |
 | 014 | Window CRUD (API + CLI) | M1 | **Done** | 013 |
 | 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | **Done** | 014, 003 |
-| 016 | Pane I/O (send_keys, run_command, capture) | M1 | Pending | 015, 004 |
+| 016 | Pane I/O (send_keys, run_command, capture) | M1 | **Done** | 015, 004 |
 | 017 | Multi-pane rendering | M1 | Pending | 015, 009 |
 | 018 | Tier 1 keybindings (bare keys) | M1 | Pending | 017 |
 | 019 | Prefix key system (Tier 2) | M1 | Pending | 018 |

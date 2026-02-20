@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing_subscriber::EnvFilter;
 
 mod cli;
@@ -11,6 +13,113 @@ mod daemon;
 mod style;
 
 use cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
+
+/// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
+///
+/// This is the bridge between the RPC handlers and the per-pane PTY read loops.
+/// Each pane gets a write channel; the read loop is a separate tokio task.
+struct PaneIoState {
+    /// Per-pane write channels: send bytes to the pane's PTY read/write task.
+    writers: HashMap<shux_core::model::PaneId, mpsc::Sender<Vec<u8>>>,
+    /// Per-pane VirtualTerminal instances for capturing output.
+    vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
+    /// Command execution engine for marker-based completion detection.
+    cmd_engine: shux_pty::CommandEngine,
+}
+
+impl PaneIoState {
+    fn new() -> Self {
+        Self {
+            writers: HashMap::new(),
+            vts: HashMap::new(),
+            cmd_engine: shux_pty::CommandEngine::new(),
+        }
+    }
+}
+
+/// Per-pane async task that owns the PtyHandle and handles both reads and writes.
+///
+/// Reads from the PTY and feeds VT + CommandEngine. Receives writes from the channel.
+async fn run_pane_pty_task(
+    pane_id: shux_core::model::PaneId,
+    mut handle: shux_pty::handle::PtyHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    mut write_rx: mpsc::Receiver<Vec<u8>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut buf = vec![0u8; 8192];
+
+    loop {
+        tokio::select! {
+            result = handle.read(&mut buf) => {
+                match result {
+                    Ok(0) => {
+                        tracing::debug!(%pane_id, "PTY read EOF");
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        let mut state = io_state.lock().await;
+                        if let Some(vt) = state.vts.get_mut(&pane_id) {
+                            vt.process(data);
+                        }
+                        let output = String::from_utf8_lossy(data);
+                        let _completed = state.cmd_engine.process_output(pane_id.0, &output);
+                    }
+                    Err(e) => {
+                        tracing::error!(%pane_id, error = %e, "PTY read error");
+                        break;
+                    }
+                }
+            }
+            Some(data) = write_rx.recv() => {
+                if let Err(e) = handle.write(&data).await {
+                    tracing::error!(%pane_id, error = %e, "PTY write error");
+                    break;
+                }
+                if let Err(e) = handle.flush().await {
+                    tracing::error!(%pane_id, error = %e, "PTY flush error");
+                    break;
+                }
+            }
+            _ = shutdown.cancelled() => {
+                tracing::debug!(%pane_id, "PTY task cancelled");
+                break;
+            }
+        }
+    }
+
+    let mut state = io_state.lock().await;
+    state.writers.remove(&pane_id);
+    state.vts.remove(&pane_id);
+}
+
+/// Spawn a PTY process and VT instance for a pane.
+async fn spawn_pane_pty(
+    pane_id: shux_core::model::PaneId,
+    cwd: PathBuf,
+    io_state: Arc<Mutex<PaneIoState>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), shux_rpc::RpcError> {
+    let config = shux_pty::handle::PtyConfig::default_shell(cwd);
+    let handle = shux_pty::handle::PtyHandle::spawn(&config)
+        .map_err(|e| shux_rpc::RpcError::internal(&format!("PTY spawn failed: {e}")))?;
+
+    let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+    let vt = shux_vt::VirtualTerminal::new(24, 80);
+
+    {
+        let mut state = io_state.lock().await;
+        state.writers.insert(pane_id, write_tx);
+        state.vts.insert(pane_id, vt);
+    }
+
+    tokio::spawn(run_pane_pty_task(
+        pane_id, handle, io_state, write_rx, shutdown,
+    ));
+
+    Ok(())
+}
 
 fn main() -> anyhow::Result<()> {
     let cmd = Cli::command().before_help(style::banner());
@@ -126,16 +235,46 @@ async fn run_rpc_server(
         shux_core::graph::run_graph_loop(graph, graph_rx, graph_cancel).await;
     });
 
-    // Build router: system builtins + session + window + pane methods backed by GraphHandle
-    let router = register_pane_methods(
-        register_window_methods(
-            register_session_methods(
-                shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+    // Create shared pane I/O state (PTY writers, VTs, command engine)
+    let io_state = Arc::new(Mutex::new(PaneIoState::new()));
+
+    // Spawn timeout checker (1s interval)
+    let timeout_io = io_state.clone();
+    let timeout_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let mut state = timeout_io.lock().await;
+                    let _timed_out = state.cmd_engine.check_timeouts();
+                }
+                _ = timeout_cancel.cancelled() => break,
+            }
+        }
+    });
+
+    // Build router: system builtins + session + window + pane + pane I/O methods
+    let router = register_pane_io_methods(
+        register_pane_methods(
+            register_window_methods(
+                register_session_methods(
+                    shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+                    graph_handle.clone(),
+                    io_state.clone(),
+                    cancel.clone(),
+                ),
                 graph_handle.clone(),
+                io_state.clone(),
+                cancel.clone(),
             ),
             graph_handle.clone(),
+            io_state.clone(),
+            cancel.clone(),
         ),
         graph_handle,
+        io_state,
+        cancel.clone(),
     )
     .build();
 
@@ -265,6 +404,8 @@ fn pane_to_json(
 fn register_pane_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
@@ -274,6 +415,10 @@ fn register_pane_methods(
     let g6 = graph.clone();
     let g7 = graph.clone();
     let g8 = graph.clone();
+
+    let io_split = io_state.clone();
+    let io_kill = io_state;
+    let cancel_split = cancel;
 
     builder
         .register("pane.list", move |params: Option<serde_json::Value>| {
@@ -302,6 +447,8 @@ fn register_pane_methods(
         })
         .register("pane.split", move |params: Option<serde_json::Value>| {
             let gh = g2.clone();
+            let io = io_split.clone();
+            let ct = cancel_split.clone();
             async move {
                 let params = params.unwrap_or_default();
 
@@ -328,6 +475,10 @@ fn register_pane_methods(
                     .split_pane(pane_id, direction, ratio)
                     .await
                     .map_err(graph_error_to_rpc)?;
+
+                // Spawn PTY for the new pane
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+                let _ = spawn_pane_pty(new_pane_id, cwd, io, ct).await;
 
                 let snap = gh.snapshot();
                 let new_pane = snap
@@ -512,6 +663,7 @@ fn register_pane_methods(
         })
         .register("pane.kill", move |params: Option<serde_json::Value>| {
             let gh = g8.clone();
+            let io = io_kill.clone();
             async move {
                 let params = params.unwrap_or_default();
                 let pane_id_str = params
@@ -522,6 +674,13 @@ fn register_pane_methods(
                 let pane_id: shux_core::model::PaneId = pane_id_str
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id format"))?;
+
+                // Clean up PTY/VT
+                {
+                    let mut state = io.lock().await;
+                    state.writers.remove(&pane_id);
+                    state.vts.remove(&pane_id);
+                }
 
                 gh.destroy_pane(pane_id)
                     .await
@@ -591,6 +750,8 @@ fn resolve_window_id_from_params(
 fn register_window_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
@@ -600,9 +761,17 @@ fn register_window_methods(
     let g6 = graph.clone();
     let g7 = graph.clone();
 
+    let io_create = io_state.clone();
+    let io_ensure = io_state.clone();
+    let io_kill = io_state;
+    let cancel_create = cancel.clone();
+    let cancel_ensure = cancel.clone();
+
     builder
         .register("window.create", move |params: Option<serde_json::Value>| {
             let gh = g1.clone();
+            let io = io_create.clone();
+            let ct = cancel_create.clone();
             async move {
                 let params = params.unwrap_or_default();
                 let session_id_str = params
@@ -646,7 +815,7 @@ fn register_window_methods(
                     });
 
                 let window_id = gh
-                    .create_window(session_id, title, cwd)
+                    .create_window(session_id, title, cwd.clone())
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -666,6 +835,9 @@ fn register_window_methods(
                     .unwrap_or(0);
                 let is_active = session.active_window == window_id;
                 let pane_id = window.active_pane.to_string();
+
+                // Spawn PTY for the new pane
+                let _ = spawn_pane_pty(window.active_pane, cwd, io, ct).await;
 
                 let mut result = window_to_json(window, index, is_active, &snap);
                 // Include pane_id at top level for convenience
@@ -711,6 +883,8 @@ fn register_window_methods(
         })
         .register("window.ensure", move |params: Option<serde_json::Value>| {
             let gh = g3.clone();
+            let io = io_ensure.clone();
+            let ct = cancel_ensure.clone();
             async move {
                 let params = params.unwrap_or_default();
                 let session_id_str = params
@@ -751,7 +925,7 @@ fn register_window_methods(
                 // Create new window
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
                 let window_id = gh
-                    .create_window(session_id, name, cwd)
+                    .create_window(session_id, name, cwd.clone())
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -760,6 +934,10 @@ fn register_window_methods(
                     .windows
                     .get(&window_id)
                     .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
+
+                // Spawn PTY for the new pane
+                let _ = spawn_pane_pty(window.active_pane, cwd, io, ct).await;
+
                 let session = snap
                     .sessions
                     .get(&session_id)
@@ -903,6 +1081,7 @@ fn register_window_methods(
         )
         .register("window.kill", move |params: Option<serde_json::Value>| {
             let gh = g7.clone();
+            let io = io_kill.clone();
             async move {
                 let params = params.unwrap_or_default();
                 let window_id_str = params
@@ -913,6 +1092,22 @@ fn register_window_methods(
                 let window_id: shux_core::model::WindowId = window_id_str
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
+
+                // Clean up PTY/VT for all panes in this window before destroying
+                {
+                    let snap = gh.snapshot();
+                    let pane_ids: Vec<_> = snap
+                        .panes
+                        .values()
+                        .filter(|p| p.window_id == window_id)
+                        .map(|p| p.id)
+                        .collect();
+                    let mut state = io.lock().await;
+                    for pid in pane_ids {
+                        state.writers.remove(&pid);
+                        state.vts.remove(&pid);
+                    }
+                }
 
                 gh.destroy_window(window_id, None)
                     .await
@@ -931,12 +1126,19 @@ fn register_window_methods(
 fn register_session_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
     let g3 = graph.clone();
     let g4 = graph.clone();
     let g5 = graph.clone();
+
+    let io_create = io_state.clone();
+    let io_ensure = io_state;
+    let cancel_create = cancel.clone();
+    let cancel_ensure = cancel;
 
     builder
         .register("session.list", move |_params: Option<serde_json::Value>| {
@@ -954,6 +1156,8 @@ fn register_session_methods(
             "session.create",
             move |params: Option<serde_json::Value>| {
                 let gh = g2.clone();
+                let io = io_create.clone();
+                let ct = cancel_create.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let name = params
@@ -980,10 +1184,16 @@ fn register_session_methods(
 
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
-                    match gh.create_session(name, cwd).await {
+                    match gh.create_session(name, cwd.clone()).await {
                         Ok(session_id) => {
                             let snap = gh.snapshot();
+                            // Spawn PTY for the initial pane
                             if let Some(s) = snap.sessions.get(&session_id) {
+                                if let Some(wid) = s.windows.first() {
+                                    if let Some(w) = snap.windows.get(wid) {
+                                        let _ = spawn_pane_pty(w.active_pane, cwd, io, ct).await;
+                                    }
+                                }
                                 Ok(session_to_json(s, &snap))
                             } else {
                                 Ok(serde_json::json!({
@@ -1042,6 +1252,8 @@ fn register_session_methods(
             "session.ensure",
             move |params: Option<serde_json::Value>| {
                 let gh = g4.clone();
+                let io = io_ensure.clone();
+                let ct = cancel_ensure.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let name = params
@@ -1061,10 +1273,16 @@ fn register_session_methods(
                     // Create new session
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
-                    match gh.create_session(name, cwd).await {
+                    match gh.create_session(name, cwd.clone()).await {
                         Ok(session_id) => {
                             let snap = gh.snapshot();
+                            // Spawn PTY for the initial pane
                             if let Some(s) = snap.sessions.get(&session_id) {
+                                if let Some(wid) = s.windows.first() {
+                                    if let Some(w) = snap.windows.get(wid) {
+                                        let _ = spawn_pane_pty(w.active_pane, cwd, io, ct).await;
+                                    }
+                                }
                                 let mut json = session_to_json(s, &snap);
                                 json["created"] = serde_json::Value::Bool(true);
                                 Ok(json)
@@ -1127,6 +1345,273 @@ fn register_session_methods(
                 }
             },
         )
+}
+
+/// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
+fn register_pane_io_methods(
+    builder: shux_rpc::RouterBuilder,
+    graph: shux_core::graph::GraphHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    _cancel: tokio_util::sync::CancellationToken,
+) -> shux_rpc::RouterBuilder {
+    let g1 = graph.clone();
+    let g2 = graph.clone();
+    let g5 = graph;
+
+    let io1 = io_state.clone();
+    let io2 = io_state.clone();
+    let io3 = io_state.clone();
+    let io4 = io_state.clone();
+    let io5 = io_state;
+
+    builder
+        .register(
+            "pane.send_keys",
+            move |params: Option<serde_json::Value>| {
+                let gh = g1.clone();
+                let io = io1.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                    let bytes = if let Some(text) = params.get("text").and_then(|v| v.as_str()) {
+                        text.as_bytes().to_vec()
+                    } else if let Some(b64) = params.get("data").and_then(|v| v.as_str()) {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .map_err(|e| {
+                                shux_rpc::RpcError::invalid_params(&format!("invalid base64: {e}"))
+                            })?
+                    } else {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "missing 'text' or 'data' parameter",
+                        ));
+                    };
+
+                    let state = io.lock().await;
+                    let writer = state
+                        .writers
+                        .get(&pane_id)
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
+                        })?
+                        .clone();
+                    drop(state);
+
+                    let len = bytes.len();
+                    writer
+                        .send(bytes)
+                        .await
+                        .map_err(|_| shux_rpc::RpcError::internal("PTY write channel closed"))?;
+
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id.to_string(),
+                        "bytes_written": len,
+                    }))
+                }
+            },
+        )
+        .register(
+            "pane.run_command",
+            move |params: Option<serde_json::Value>| {
+                let gh = g2.clone();
+                let io = io2.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                    let command =
+                        params
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::invalid_params("missing 'command' parameter")
+                            })?;
+
+                    let args: Vec<String> = params
+                        .get("args")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+                    let timeout = Duration::from_secs(timeout_secs);
+
+                    let is_async = params
+                        .get("async")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    let (completion_tx, completion_rx) = if !is_async {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        (Some(tx), Some(rx))
+                    } else {
+                        (None, None)
+                    };
+
+                    let (command_id, pty_command) = {
+                        let mut state = io.lock().await;
+                        state.cmd_engine.start_command(
+                            pane_id.0,
+                            command,
+                            &args,
+                            timeout,
+                            completion_tx,
+                        )
+                    };
+
+                    // Write the PTY command
+                    {
+                        let state = io.lock().await;
+                        let writer = state
+                            .writers
+                            .get(&pane_id)
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
+                            })?
+                            .clone();
+                        drop(state);
+
+                        writer.send(pty_command.into_bytes()).await.map_err(|_| {
+                            shux_rpc::RpcError::internal("PTY write channel closed")
+                        })?;
+                    }
+
+                    if is_async {
+                        return Ok(serde_json::json!({
+                            "command_id": command_id.to_string(),
+                            "state": "running",
+                        }));
+                    }
+
+                    // Sync mode: wait for completion
+                    let result = completion_rx
+                        .unwrap() // safe: created above when !is_async
+                        .await
+                        .map_err(|_| {
+                            shux_rpc::RpcError::internal("command completion channel dropped")
+                        })?;
+
+                    // Capture text from VT
+                    let stdout = {
+                        let state = io.lock().await;
+                        state
+                            .vts
+                            .get(&pane_id)
+                            .map(|vt| {
+                                let text = vt.capture_text(50);
+                                shux_pty::strip_ansi(&text)
+                            })
+                            .unwrap_or_default()
+                    };
+
+                    Ok(serde_json::json!({
+                        "command_id": result.command_id.to_string(),
+                        "state": result.state,
+                        "exit_code": result.exit_code,
+                        "stdout": stdout,
+                        "runtime_ms": result.runtime_ms,
+                    }))
+                }
+            },
+        )
+        .register(
+            "pane.command_status",
+            move |params: Option<serde_json::Value>| {
+                let io = io3.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let cmd_id_str = params
+                        .get("command_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'command_id' parameter")
+                        })?;
+
+                    let command_id: uuid::Uuid = cmd_id_str.parse().map_err(|_| {
+                        shux_rpc::RpcError::invalid_params("invalid command_id format")
+                    })?;
+
+                    let state = io.lock().await;
+                    let result = state
+                        .cmd_engine
+                        .get_status(command_id)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
+
+                    Ok(serde_json::json!({
+                        "command_id": result.command_id.to_string(),
+                        "state": result.state,
+                        "exit_code": result.exit_code,
+                        "runtime_ms": result.runtime_ms,
+                    }))
+                }
+            },
+        )
+        .register(
+            "pane.command_cancel",
+            move |params: Option<serde_json::Value>| {
+                let io = io4.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let cmd_id_str = params
+                        .get("command_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'command_id' parameter")
+                        })?;
+
+                    let command_id: uuid::Uuid = cmd_id_str.parse().map_err(|_| {
+                        shux_rpc::RpcError::invalid_params("invalid command_id format")
+                    })?;
+
+                    let mut state = io.lock().await;
+                    let pane_uuid = state
+                        .cmd_engine
+                        .cancel_command(command_id)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
+
+                    // Send Ctrl-C to the pane
+                    let pane_id = shux_core::model::PaneId::from_uuid(pane_uuid);
+                    if let Some(writer) = state.writers.get(&pane_id) {
+                        let _ = writer.send(vec![0x03]).await; // ETX = Ctrl-C
+                    }
+
+                    Ok(serde_json::json!({
+                        "command_id": cmd_id_str,
+                        "state": "cancelled",
+                    }))
+                }
+            },
+        )
+        .register("pane.capture", move |params: Option<serde_json::Value>| {
+            let gh = g5.clone();
+            let io = io5.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                let lines = params.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+
+                let state = io.lock().await;
+                let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                    shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                })?;
+
+                let text = vt.capture_text(lines);
+                let clean = shux_pty::strip_ansi(&text);
+
+                Ok(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "text": clean,
+                    "lines": lines,
+                }))
+            }
+        })
 }
 
 /// Dispatch CLI subcommands.
@@ -1353,6 +1838,60 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         &session,
                         window.as_deref(),
                         &pane,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::SendKeys {
+                    session,
+                    window,
+                    pane,
+                    text,
+                    data,
+                } => {
+                    cli::handle_pane_send_keys(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        text.as_deref(),
+                        data.as_deref(),
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Run {
+                    session,
+                    window,
+                    pane,
+                    command,
+                    timeout,
+                    is_async,
+                } => {
+                    cli::handle_pane_run(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        &command,
+                        timeout,
+                        is_async,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Capture {
+                    session,
+                    window,
+                    pane,
+                    lines,
+                } => {
+                    cli::handle_pane_capture(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        lines,
                         args.format,
                     )
                     .await
