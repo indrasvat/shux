@@ -87,7 +87,11 @@ async fn run_pane_pty_task(
                             state.render_pulse.clone()
                         };
                         // Wake any attach-render loops outside the lock.
-                        pulse.notify_waiters();
+                        // notify_one queues a permit that survives even if
+                        // the renderer happens to be mid-render and not
+                        // yet awaiting; notify_waiters would silently drop
+                        // the wakeup in that window.
+                        pulse.notify_one();
                     }
                     Err(e) => {
                         tracing::error!(%pane_id, error = %e, "PTY read error");
@@ -116,7 +120,7 @@ async fn run_pane_pty_task(
                     }
                     state.render_pulse.clone()
                 };
-                pulse.notify_waiters();
+                pulse.notify_one();
             }
             _ = shutdown.cancelled() => {
                 tracing::debug!(%pane_id, "PTY task cancelled");
@@ -125,13 +129,18 @@ async fn run_pane_pty_task(
         }
     }
 
+    // Best-effort: ensure the child shell is sent SIGTERM. Most exit
+    // paths (EOF, write error, cancel) leave the PtyHandle alive only
+    // until this scope ends — tokio::process::Child does NOT reap on
+    // Drop, so an explicit kill prevents zombie shells.
+    let _ = handle.kill();
     let mut state = io_state.lock().await;
     state.writers.remove(&pane_id);
     state.resizers.remove(&pane_id);
     state.vts.remove(&pane_id);
     let pulse = state.render_pulse.clone();
     drop(state);
-    pulse.notify_waiters();
+    pulse.notify_one();
 }
 
 /// Spawn a PTY process and VT instance for a pane.

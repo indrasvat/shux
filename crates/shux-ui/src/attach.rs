@@ -186,12 +186,19 @@ where
                                 };
                                 let bytes = serde_json::to_vec(&frame)?;
                                 sink.send(Bytes::from(bytes)).await.ok();
-                            } else if matches!(key.code, KeyCode::Char('d')) {
+                                continue;
+                            } else if matches!(key.code, KeyCode::Char('d'))
+                                && key.modifiers == KeyModifiers::NONE
+                            {
                                 let frame = AttachClientFrame::Detach;
                                 let bytes = serde_json::to_vec(&frame)?;
                                 sink.send(Bytes::from(bytes)).await.ok();
+                                continue;
                             }
-                            continue;
+                            // Unbound prefix-key: fall through and forward
+                            // as a normal PTY input so the user doesn't
+                            // lose the keystroke. (e.g. Prefix → Ctrl+C
+                            // sends Ctrl+C to the running process.)
                         }
                         // Prefix activation.
                         if key.code == prefix_key.code && key.modifiers == prefix_key.modifiers {
@@ -246,7 +253,14 @@ where
 }
 
 /// Map a key pressed *after the prefix* into an action, if any.
+///
+/// Only fires for unmodified keys. Prefix + Ctrl+C must NOT trigger
+/// `c → NewWindow` — the user is trying to send a literal SIGINT to
+/// whatever was running before they hit prefix.
 fn key_to_prefix_action(key: KeyEvent) -> Option<ActionKind> {
+    if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
+        return None;
+    }
     Some(match key.code {
         KeyCode::Char('|') | KeyCode::Char('v') => ActionKind::SplitVertical,
         KeyCode::Char('-') | KeyCode::Char('s') => ActionKind::SplitHorizontal,

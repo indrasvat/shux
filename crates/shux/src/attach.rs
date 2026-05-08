@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use shux_core::graph::GraphHandle;
-use shux_core::layout::NavDirection;
+use shux_core::layout::{NavDirection, Rect};
 use shux_core::model::{PaneId, SessionId, WindowId};
 use shux_pty::handle::PtySize;
 use shux_rpc::attach::{
@@ -45,6 +45,22 @@ use shux_ui::{
 };
 
 use crate::PaneIoState;
+
+/// Client-screen dimensions (cols, rows) tracked per attached client.
+/// Used as the authoritative source of size when computing per-pane rects
+/// and PTY winsize — never inferred from the VT grid (which would create
+/// a self-feeding shrink loop).
+type ClientSize = Arc<Mutex<(u16, u16)>>;
+
+/// Status-bar rows reserved at the bottom of the client screen.
+const STATUS_BAR_ROWS: u16 = 1;
+
+/// Total time the daemon will wait for the AttachHello frame before
+/// dropping the connection. Prevents slowloris-style blocking.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the daemon pings the client to detect dead peers.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Run the attach UDS listener. Each accepted connection spawns an
 /// independent attach session task. Runs until `cancel` fires.
@@ -106,15 +122,20 @@ async fn handle_attach_connection(
 ) -> anyhow::Result<()> {
     let mut framed = Framed::new(stream, create_codec());
 
-    // Step 1: Receive the hello frame.
-    let first = match framed.next().await {
-        Some(Ok(buf)) => buf,
-        Some(Err(e)) => {
+    // Step 1: Receive the hello frame, bounded to HELLO_TIMEOUT so a
+    // hung peer cannot tie up a worker forever.
+    let first = match tokio::time::timeout(HELLO_TIMEOUT, framed.next()).await {
+        Ok(Some(Ok(buf))) => buf,
+        Ok(Some(Err(e))) => {
             warn!(error = %e, "attach: bad first frame");
             return Ok(());
         }
-        None => {
+        Ok(None) => {
             debug!("attach: client disconnected before hello");
+            return Ok(());
+        }
+        Err(_) => {
+            warn!("attach: hello timeout — closing");
             return Ok(());
         }
     };
@@ -154,9 +175,11 @@ async fn handle_attach_connection(
     // created sessions can race with the attach if the client hits us
     // before the spawn task finishes).
     {
-        let state = io_state.lock().await;
-        if !state.writers.contains_key(&session.active_pane_id) {
-            drop(state);
+        let writer_present = {
+            let state = io_state.lock().await;
+            state.writers.contains_key(&session.active_pane_id)
+        };
+        if !writer_present {
             crate::spawn_pane_pty(
                 session.active_pane_id,
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")),
@@ -167,23 +190,11 @@ async fn handle_attach_connection(
             .ok();
         }
     }
-    // Always resize all panes in the active window to match the client.
-    // This handles both freshly-spawned panes (which start at 80x24) and
-    // pre-existing panes from `shux new --detached` runs that used a
-    // different terminal size.
-    {
-        let snap = graph.snapshot();
-        if let Some(win) = snap.windows.get(&session.active_window_id) {
-            let state = io_state.lock().await;
-            for pid in win.layout.tree.pane_ids() {
-                if let Some(tx) = state.resizers.get(&pid) {
-                    let _ = tx
-                        .send(PtySize::new(hello.cols, hello.rows.saturating_sub(1)))
-                        .await;
-                }
-            }
-        }
-    }
+    // Resize every pane in the active window to its real layout rect, not
+    // the full client size. Multi-pane TUIs (vim, htop, less) read TIOCGWINSZ
+    // and will lay themselves out wrong if every pane PTY pretends to be
+    // the whole screen.
+    apply_resize_to_window(&graph, &io_state, &session, hello.cols, hello.rows).await;
 
     // Step 3: Send AttachReady::Ok.
     let ready = AttachReady::Ok {
@@ -256,6 +267,61 @@ async fn resolve_or_create_session(
     })
 }
 
+/// Compute per-pane rects given the client size and dispatch each PTY its
+/// real winsize. The compositor's pane viewport is inset by 1 cell on each
+/// side for the border outline, and the bottom row is reserved for the
+/// status bar — apply the same arithmetic here.
+async fn apply_resize_to_window(
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &AttachedSession,
+    cols: u16,
+    rows: u16,
+) {
+    let snap = graph.snapshot();
+    let win = match snap.windows.get(&session.active_window_id) {
+        Some(w) => w,
+        None => return,
+    };
+    let content_h = rows.saturating_sub(STATUS_BAR_ROWS);
+    let content = Rect::new(0, 0, cols, content_h);
+    let viewport = if cols >= 3 && content_h >= 3 {
+        Rect::new(content.x + 1, content.y + 1, cols - 2, content_h - 2)
+    } else {
+        content
+    };
+
+    // Drain the resizer senders out from under the lock so we never await
+    // a channel send while still holding the PaneIoState mutex.
+    let mut to_send: Vec<(mpsc::Sender<PtySize>, PtySize)> = Vec::new();
+
+    if win.layout.is_zoomed() {
+        // Zoomed: every pane in the tree reports the full content area
+        // size so apps in the zoomed pane lay out correctly, while
+        // others stay at the same nominal size (cheap, harmless).
+        let state = io_state.lock().await;
+        for pid in win.layout.tree.pane_ids() {
+            if let Some(tx) = state.resizers.get(&pid) {
+                to_send.push((tx.clone(), PtySize::new(content.width, content.height)));
+            }
+        }
+    } else {
+        let rects = win.layout.tree.compute_rects(viewport);
+        let state = io_state.lock().await;
+        for (pid, rect) in rects {
+            if let Some(tx) = state.resizers.get(&pid) {
+                let r_cols = rect.width.max(2);
+                let r_rows = rect.height.max(2);
+                to_send.push((tx.clone(), PtySize::new(r_cols, r_rows)));
+            }
+        }
+    }
+
+    for (tx, size) in to_send {
+        let _ = tx.send(size).await;
+    }
+}
+
 /// Send an AttachReady::Error and close.
 async fn send_ready_error(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
@@ -308,24 +374,47 @@ async fn run_attach_loop(
         }
     });
 
+    // Authoritative client screen size. Updated only by Resize frames;
+    // the renderer reads but never writes it.
+    let client_size: ClientSize = Arc::new(Mutex::new((hello.cols, hello.rows)));
+
     // Spawn the renderer task.
     let render_cancel = cancel.child_token();
     let render_io = io_state.clone();
     let render_graph = graph.clone();
     let render_tx = out_tx.clone();
-    let initial_size = (hello.cols, hello.rows);
     let render_session = Arc::new(Mutex::new(session.clone()));
     let render_session_for_task = render_session.clone();
+    let render_client_size = client_size.clone();
     let renderer = tokio::spawn(async move {
         run_render_loop(
             render_graph,
             render_io,
             render_session_for_task,
-            initial_size,
+            render_client_size,
             render_tx,
             render_cancel,
         )
         .await;
+    });
+
+    // Periodic ping so a dead client is detected within ~PING_INTERVAL.
+    let ping_tx = out_tx.clone();
+    let ping_cancel = cancel.clone();
+    let pinger = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(PING_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // skip first immediate tick
+        loop {
+            tokio::select! {
+                _ = ping_cancel.cancelled() => break,
+                _ = ticker.tick() => {
+                    if ping_tx.send(AttachServerFrame::Ping).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     });
 
     // Read client frames.
@@ -359,31 +448,44 @@ async fn run_attach_loop(
                             Err(_) => continue,
                         };
                         let target = render_session.lock().await.active_pane_id;
-                        let state = io_state.lock().await;
-                        if let Some(tx) = state.writers.get(&target) {
+                        // Clone the writer Sender out of the map and drop the
+                        // PaneIoState mutex BEFORE awaiting the channel send.
+                        // Otherwise a slow PTY task can deadlock the whole
+                        // session by holding the global mutex while we wait
+                        // for the channel buffer to drain.
+                        let writer = {
+                            let state = io_state.lock().await;
+                            state.writers.get(&target).cloned()
+                        };
+                        if let Some(tx) = writer {
                             let _ = tx.send(bytes).await;
                         }
                     }
                     AttachClientFrame::Resize { cols, rows } => {
-                        // Notify all live panes of new size. We use one less
-                        // row than the host's height so the status bar fits.
-                        let pty_rows = rows.saturating_sub(1).max(1);
-                        let state = io_state.lock().await;
-                        for tx in state.resizers.values() {
-                            let _ = tx.send(PtySize::new(cols, pty_rows)).await;
+                        {
+                            let mut cs = client_size.lock().await;
+                            *cs = (cols, rows);
                         }
-                        state.render_pulse.notify_waiters();
+                        let attached = render_session.lock().await.clone();
+                        apply_resize_to_window(&graph, &io_state, &attached, cols, rows).await;
+                        let pulse = io_state.lock().await.render_pulse.clone();
+                        pulse.notify_one();
                     }
                     AttachClientFrame::Action { kind, .. } => {
-                        if let Err(e) =
-                            handle_action(kind, &graph, &io_state, &render_session, &cancel).await
+                        if let Err(e) = handle_action(
+                            kind,
+                            &graph,
+                            &io_state,
+                            &render_session,
+                            &client_size,
+                            &cancel,
+                        )
+                        .await
                         {
                             warn!(?kind, error = %e, "attach: action failed");
                         }
-                        // Wake renderer immediately so the user sees the
-                        // result of their action without delay.
-                        let st = io_state.lock().await;
-                        st.render_pulse.notify_waiters();
+                        let pulse = io_state.lock().await.render_pulse.clone();
+                        pulse.notify_one();
                     }
                     AttachClientFrame::Detach => {
                         detached = true;
@@ -422,6 +524,7 @@ async fn run_attach_loop(
     drop(out_tx); // closes the writer cleanly
     let _ = writer.await;
     renderer.abort();
+    pinger.abort();
     info!(session = %session.name, "attach session ended");
     Ok(())
 }
@@ -438,14 +541,14 @@ async fn run_render_loop(
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     session: Arc<Mutex<AttachedSession>>,
-    initial_size: (u16, u16),
+    client_size: ClientSize,
     out_tx: mpsc::Sender<AttachServerFrame>,
     cancel: CancellationToken,
 ) {
-    let (mut cols, mut rows) = initial_size;
+    let (mut cols, mut rows) = *client_size.lock().await;
     let cfg = CompositorConfig {
         show_border: false,
-        status_bar_height: 1,
+        status_bar_height: STATUS_BAR_ROWS,
         border_style: BorderStyle::Rounded,
         ..Default::default()
     };
@@ -464,6 +567,10 @@ async fn run_render_loop(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Register notify *before* the first render so we never miss a wakeup.
+    // `notify_one` enqueues a permit even if no listener exists yet, so
+    // the next `notified().await` returns immediately — but we must
+    // re-prime the listener after every wake.
     let pulse = io_state.lock().await.render_pulse.clone();
     let mut pulse_listener = Box::pin(pulse.notified());
 
@@ -476,14 +583,13 @@ async fn run_render_loop(
             _ = tick.tick() => {}
         }
 
-        // Re-read terminal size: client could have resized between cycles.
-        let want_size = current_size_for_session(&graph, &session, &io_state).await;
-        if let Some((c, r)) = want_size {
-            if (c, r) != (cols, rows) {
-                cols = c;
-                rows = r;
-                compositor.resize(cols, rows);
-            }
+        // Resize from authoritative client_size, NOT from VT grid (which
+        // would create a self-feeding shrink loop in split mode).
+        let (new_cols, new_rows) = *client_size.lock().await;
+        if (new_cols, new_rows) != (cols, rows) {
+            cols = new_cols;
+            rows = new_rows;
+            compositor.resize(cols, rows);
         }
 
         // Build a multi-pane frame snapshot.
@@ -533,26 +639,6 @@ async fn run_render_loop(
             }
         }
     }
-}
-
-/// Best-effort current size — the client's most recent resize lives in
-/// the resizer channels, but we don't have direct access to it. As a
-/// proxy, look at any pane's PTY size by inspecting the VT grid; if the
-/// VT was resized via a recent Resize frame, its grid will reflect the
-/// new dimensions.
-async fn current_size_for_session(
-    graph: &GraphHandle,
-    session: &Arc<Mutex<AttachedSession>>,
-    io_state: &Arc<Mutex<PaneIoState>>,
-) -> Option<(u16, u16)> {
-    let snap = graph.snapshot();
-    let attached = session.lock().await.clone();
-    let win = snap.windows.get(&attached.active_window_id)?;
-    let pane_id = win.layout.tree.pane_ids().into_iter().next()?;
-    let state = io_state.lock().await;
-    let vt = state.vts.get(&pane_id)?;
-    let grid = vt.grid();
-    Some((grid.cols() as u16, grid.rows() as u16 + 1)) // +1 for status bar
 }
 
 /// Build the hardcoded status bar for the current session.
@@ -608,24 +694,41 @@ fn build_status_bar(
     bar
 }
 
+/// Compute the actual pane viewport (inset for outline + status bar) at
+/// the current client size. Used by spatial actions (focus_dir, smart
+/// split) so the geometry they reason about matches what the user sees
+/// — not a hardcoded 120x40 fiction.
+async fn current_viewport(client_size: &ClientSize) -> Rect {
+    let (cols, rows) = *client_size.lock().await;
+    let content_h = rows.saturating_sub(STATUS_BAR_ROWS);
+    if cols >= 3 && content_h >= 3 {
+        Rect::new(1, 1, cols - 2, content_h - 2)
+    } else {
+        Rect::new(0, 0, cols, content_h)
+    }
+}
+
 /// Dispatch an Action keybinding from the client.
 async fn handle_action(
     kind: ActionKind,
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     use shux_core::layout::Direction;
     let attached = session.lock().await.clone();
+    let viewport = current_viewport(client_size).await;
 
     match kind {
-        ActionKind::SplitSmart => split(graph, &attached, None, io_state, cancel).await,
+        ActionKind::SplitSmart => split(graph, &attached, None, viewport, io_state, cancel).await,
         ActionKind::SplitVertical => {
             split(
                 graph,
                 &attached,
                 Some(Direction::Vertical),
+                viewport,
                 io_state,
                 cancel,
             )
@@ -636,19 +739,28 @@ async fn handle_action(
                 graph,
                 &attached,
                 Some(Direction::Horizontal),
+                viewport,
                 io_state,
                 cancel,
             )
             .await
         }
-        ActionKind::FocusUp => focus_dir(graph, &attached, NavDirection::Up, session).await,
-        ActionKind::FocusDown => focus_dir(graph, &attached, NavDirection::Down, session).await,
-        ActionKind::FocusLeft => focus_dir(graph, &attached, NavDirection::Left, session).await,
-        ActionKind::FocusRight => focus_dir(graph, &attached, NavDirection::Right, session).await,
+        ActionKind::FocusUp => {
+            focus_dir(graph, &attached, NavDirection::Up, viewport, session).await
+        }
+        ActionKind::FocusDown => {
+            focus_dir(graph, &attached, NavDirection::Down, viewport, session).await
+        }
+        ActionKind::FocusLeft => {
+            focus_dir(graph, &attached, NavDirection::Left, viewport, session).await
+        }
+        ActionKind::FocusRight => {
+            focus_dir(graph, &attached, NavDirection::Right, viewport, session).await
+        }
         ActionKind::FocusNext => focus_relative(graph, &attached, 1, session).await,
         ActionKind::FocusPrev => focus_relative(graph, &attached, -1, session).await,
         ActionKind::ToggleZoom => zoom(graph, &attached).await,
-        ActionKind::KillPane => kill_pane(graph, &attached).await,
+        ActionKind::KillPane => kill_pane(graph, &attached, io_state).await,
         ActionKind::NewWindow => new_window(graph, &attached, io_state, cancel, session).await,
         ActionKind::NextWindow => switch_window(graph, &attached, 1, session).await,
         ActionKind::PrevWindow => switch_window(graph, &attached, -1, session).await,
@@ -664,14 +776,14 @@ async fn split(
     graph: &GraphHandle,
     attached: &AttachedSession,
     dir: Option<shux_core::layout::Direction>,
+    viewport: Rect,
     io_state: &Arc<Mutex<PaneIoState>>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    use shux_core::layout::{Direction, Rect};
+    use shux_core::layout::Direction;
 
-    // Smart split: pick direction based on the focused pane's current
-    // dimensions. Wider → vertical, taller → horizontal. We compute this
-    // from a fresh snapshot.
+    // Smart split: pick direction based on the focused pane's *real*
+    // current dimensions. Wider → vertical, taller → horizontal.
     let direction = match dir {
         Some(d) => d,
         None => {
@@ -680,14 +792,12 @@ async fn split(
                 .windows
                 .get(&attached.active_window_id)
                 .ok_or_else(|| anyhow::anyhow!("active window missing"))?;
-            // Use a reasonable default viewport — exact rect computation
-            // happens on the client. 120x40 keeps the heuristic stable.
-            let rects = win.layout.compute_rects(Rect::new(0, 0, 120, 40));
+            let rects = win.layout.compute_rects(viewport);
             let pane_rect = rects
                 .iter()
                 .find(|(p, _)| *p == attached.active_pane_id)
                 .map(|(_, r)| *r)
-                .unwrap_or(Rect::new(0, 0, 120, 40));
+                .unwrap_or(viewport);
             if pane_rect.width >= pane_rect.height {
                 Direction::Vertical
             } else {
@@ -716,11 +826,21 @@ async fn focus_dir(
     graph: &GraphHandle,
     attached: &AttachedSession,
     nav: NavDirection,
+    viewport: Rect,
     session: &Arc<Mutex<AttachedSession>>,
 ) -> anyhow::Result<()> {
-    use shux_core::layout::Rect;
+    // Refuse to change focus while zoomed — the user wouldn't see the
+    // change and would be typing into a hidden pane. Falls through as
+    // a no-op (the renderer keeps showing the zoomed pane).
+    let snap = graph.snapshot();
+    if let Some(win) = snap.windows.get(&attached.active_window_id) {
+        if win.layout.is_zoomed() {
+            return Ok(());
+        }
+    }
+    drop(snap);
     let new_id = graph
-        .focus_pane_direction(attached.active_window_id, nav, Rect::new(0, 0, 120, 40))
+        .focus_pane_direction(attached.active_window_id, nav, viewport)
         .await
         .map_err(|e| anyhow::anyhow!("focus_dir failed: {e}"))?;
     if let Some(pid) = new_id {
@@ -765,8 +885,37 @@ async fn zoom(graph: &GraphHandle, attached: &AttachedSession) -> anyhow::Result
     Ok(())
 }
 
-async fn kill_pane(graph: &GraphHandle, attached: &AttachedSession) -> anyhow::Result<()> {
-    let _ = graph.destroy_pane(attached.active_pane_id).await;
+async fn kill_pane(
+    graph: &GraphHandle,
+    attached: &AttachedSession,
+    io_state: &Arc<Mutex<PaneIoState>>,
+) -> anyhow::Result<()> {
+    let pane_id = attached.active_pane_id;
+    match graph.destroy_pane(pane_id).await {
+        Ok(()) => {}
+        Err(e) => {
+            // Don't silently swallow LastPane / not-found / version
+            // errors — the user wanted to kill a pane and it didn't
+            // happen. Surface as a tracing warn (a future Notice frame
+            // will surface it to the UI).
+            warn!(error = %e, "kill_pane: destroy_pane failed");
+            return Ok(());
+        }
+    }
+    // Tear down the PTY task: dropping the writer Sender closes the mpsc,
+    // which unblocks the PTY task's write_rx.recv() with None, but our
+    // task's main exit is via PTY EOF / cancel. To make kill prompt and
+    // free the child shell, drop the writer + resizer + vt right away.
+    // The PTY task will get EOF on the next read (since the slave side
+    // is dropped when PtyHandle drops) and exit. We rely on PtyHandle's
+    // tokio::process::Child to reap.
+    {
+        let mut state = io_state.lock().await;
+        state.writers.remove(&pane_id);
+        state.resizers.remove(&pane_id);
+        state.vts.remove(&pane_id);
+        state.render_pulse.notify_one();
+    }
     Ok(())
 }
 

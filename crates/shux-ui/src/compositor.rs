@@ -319,8 +319,15 @@ impl<W: Write> RenderCompositor<W> {
         // ring so the outline never overdraws the first/last column or
         // first/last row of any pane.
         let zoomed = frame.zoom.is_some();
-        let borders_on = !zoomed && self.config.border_style != BorderStyle::None;
-        let pane_viewport = if borders_on && content.width >= 3 && content.height >= 3 {
+        // Borders need at least a 3x3 content area (1 cell of inset on
+        // each side leaves a 1-cell pane). Below that, suppress borders
+        // entirely — drawing the outline would overwrite the pane's
+        // only column/row.
+        let borders_on = !zoomed
+            && self.config.border_style != BorderStyle::None
+            && content.width >= 3
+            && content.height >= 3;
+        let pane_viewport = if borders_on {
             Rect::new(
                 content.x + 1,
                 content.y + 1,
@@ -380,7 +387,10 @@ impl<W: Write> RenderCompositor<W> {
             }
         }
 
-        // 4. Status bar (bottom rows).
+        // 4. Status bar (bottom rows). The bar is rendered in row 0 of
+        // the reserved area; any extra rows above it (when
+        // status_bar_height > 1) are blanked so they don't show stale
+        // pane content. Multi-row bars are a future task.
         if let Some(bar) = frame.status_bar {
             let bar_top = self
                 .buffer
@@ -388,9 +398,16 @@ impl<W: Write> RenderCompositor<W> {
                 .saturating_sub(self.config.status_bar_height);
             for row_offset in 0..self.config.status_bar_height {
                 let row = bar_top + row_offset;
-                let cells = bar.render_row(self.buffer.width());
-                for (col, cell) in cells.into_iter().enumerate() {
-                    self.buffer.set_cell(col as u16, row, cell);
+                if row_offset + 1 == self.config.status_bar_height {
+                    let cells = bar.render_row(self.buffer.width());
+                    for (col, cell) in cells.into_iter().enumerate() {
+                        self.buffer.set_cell(col as u16, row, cell);
+                    }
+                } else {
+                    let blank = RenderCell::default();
+                    for col in 0..self.buffer.width() {
+                        self.buffer.set_cell(col, row, blank.clone());
+                    }
                 }
             }
         }
@@ -414,11 +431,18 @@ impl<W: Write> RenderCompositor<W> {
         self.backend.render_diff(&dirty)?;
 
         // Position the cursor inside the focused pane.
+        // Cursor at the *exact* right edge (col == width) is valid —
+        // that's a "wrap pending" terminal state. Use ≤ on the upper
+        // bound so we don't hide it.
         if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == frame.focused) {
             if let Some(vt) = frame.vts.get(&frame.focused) {
                 let cur = vt.cursor();
-                let sx = rect.x.saturating_add(cur.col as u16);
-                let sy = rect.y.saturating_add(cur.row as u16);
+                let sx = rect
+                    .x
+                    .saturating_add((cur.col as u16).min(rect.width.saturating_sub(1)));
+                let sy = rect
+                    .y
+                    .saturating_add((cur.row as u16).min(rect.height.saturating_sub(1)));
                 if sx < rect.x.saturating_add(rect.width)
                     && sy < rect.y.saturating_add(rect.height)
                     && sx < self.buffer.width()
