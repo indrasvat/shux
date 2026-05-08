@@ -1,6 +1,6 @@
 # 017 — Multi-Pane Rendering
 
-**Status:** Pending
+**Status:** In Progress
 **Depends On:** 015, 009
 **Parallelizable With:** 020
 

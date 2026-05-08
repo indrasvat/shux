@@ -8,11 +8,17 @@
 //! In this task (009) we support single-pane rendering only. Task 017
 //! extends this to multi-pane with borders and layout-aware composition.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Instant;
 
+use shux_core::layout::{LayoutNode, Rect, ZoomState};
+use shux_core::model::PaneId;
+
+use crate::borders::{BorderColors, BorderStyle, compute_borders};
 use crate::buffer::{FrameBuffer, RenderAttrs, RenderCell};
 use crate::render::RenderBackend;
+use crate::statusbar::StatusBar;
 
 /// Statistics from the last render pass, used for performance monitoring
 /// against the PRD section 14.1 budget (p50 <= 8ms).
@@ -33,7 +39,7 @@ pub struct RenderStats {
 }
 
 /// Configuration for the RenderCompositor.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CompositorConfig {
     /// Whether to show a simple border around the single pane.
     /// In single-pane mode this is typically false (the pane fills the
@@ -44,6 +50,43 @@ pub struct CompositorConfig {
     /// Number of rows reserved at the bottom for a status bar.
     /// In M0 this is 0 (no status bar). Task 026 will set this to 1.
     pub status_bar_height: u16,
+
+    /// Border style for multi-pane mode. Default `Rounded`.
+    pub border_style: BorderStyle,
+
+    /// Border colors for focused/unfocused panes.
+    pub border_colors: BorderColors,
+}
+
+impl Default for CompositorConfig {
+    fn default() -> Self {
+        Self {
+            show_border: false,
+            status_bar_height: 0,
+            border_style: BorderStyle::Rounded,
+            border_colors: BorderColors::default(),
+        }
+    }
+}
+
+/// Inputs for one multi-pane render cycle.
+///
+/// The compositor doesn't borrow the SessionGraph directly — that lives in
+/// the daemon. The caller assembles a snapshot of layout + per-pane VTs
+/// and hands it over.
+pub struct MultiPaneFrame<'a> {
+    /// Layout tree for the active window.
+    pub layout: &'a LayoutNode,
+    /// Optional zoom state. If `Some`, the zoomed pane fills the content area.
+    pub zoom: Option<&'a ZoomState>,
+    /// Pane id currently focused (its border is drawn with the accent color
+    /// and the cursor lives inside its rect).
+    pub focused: PaneId,
+    /// Per-pane virtual terminals keyed by pane id.
+    pub vts: &'a HashMap<PaneId, &'a shux_vt::VirtualTerminal>,
+    /// Optional status bar (renders into the rows reserved by
+    /// `CompositorConfig::status_bar_height`).
+    pub status_bar: Option<&'a StatusBar>,
 }
 
 /// The RenderCompositor is responsible for:
@@ -239,6 +282,231 @@ impl<W: Write> RenderCompositor<W> {
         self.force_full_redraw = true;
     }
 
+    /// Borrow the underlying writer. Useful in tests where we capture
+    /// bytes into a `Cursor<Vec<u8>>` and want to assert on them.
+    pub fn inner(&self) -> &W {
+        self.backend.inner()
+    }
+
+    /// Mutably borrow the underlying writer. The daemon's attach loop
+    /// uses this with `Vec<u8>` to drain the rendered ANSI bytes after
+    /// each frame.
+    pub fn inner_mut(&mut self) -> &mut W {
+        self.backend.inner_mut()
+    }
+
+    /// Compute the content rect (everything above the status bar).
+    fn content_rect(&self) -> Rect {
+        let h = self
+            .buffer
+            .height()
+            .saturating_sub(self.config.status_bar_height);
+        Rect::new(0, 0, self.buffer.width(), h)
+    }
+
+    /// Render a full multi-pane frame. Replaces the single-pane path of
+    /// `render_frame` for any window with more than one pane (or one pane
+    /// inside a layout). Honors zoom state and the configured border style.
+    pub fn render_multi_pane(&mut self, frame: MultiPaneFrame<'_>) -> io::Result<RenderStats> {
+        let frame_start = Instant::now();
+        let compose_start = Instant::now();
+
+        let content = self.content_rect();
+        self.buffer.clear_current();
+
+        // The outer 1-cell ring is reserved for the border outline when
+        // borders are enabled. Pane content lives strictly inside this
+        // ring so the outline never overdraws the first/last column or
+        // first/last row of any pane.
+        let zoomed = frame.zoom.is_some();
+        let borders_on = !zoomed && self.config.border_style != BorderStyle::None;
+        let pane_viewport = if borders_on && content.width >= 3 && content.height >= 3 {
+            Rect::new(
+                content.x + 1,
+                content.y + 1,
+                content.width - 2,
+                content.height - 2,
+            )
+        } else {
+            content
+        };
+
+        // 1. Compute pane rects.
+        // When zoomed: only the zoomed pane is shown filling the content
+        // area; we deliberately bypass borders so the pane really fills the
+        // window (matches tmux behavior).
+        let pane_rects: Vec<(PaneId, Rect)> = if let Some(zoom) = frame.zoom {
+            vec![(zoom.zoomed_pane, content)]
+        } else {
+            frame.layout.compute_rects(pane_viewport)
+        };
+
+        // 2. Render each pane's VT cells into the framebuffer.
+        for (pid, rect) in &pane_rects {
+            if let Some(vt) = frame.vts.get(pid) {
+                self.compose_pane(*rect, vt);
+            } else {
+                // Missing VT: render an "(no output)" placeholder so the
+                // pane is visible.
+                self.compose_placeholder(*rect, "(no output)");
+            }
+        }
+
+        // 3. Draw borders unless we're zoomed or borders are disabled.
+        // We pass the OUTER content area (not the inset pane viewport) so
+        // compute_borders can render the outline ring around all panes
+        // while still drawing inter-pane separators in the gaps reserved
+        // by `compute_rects`.
+        if borders_on {
+            let segments = compute_borders(
+                &pane_rects,
+                frame.focused,
+                content,
+                self.config.border_style,
+            );
+            for seg in &segments {
+                let cell = RenderCell {
+                    ch: seg.ch,
+                    fg: Some(if seg.focused {
+                        self.config.border_colors.focused
+                    } else {
+                        self.config.border_colors.unfocused
+                    }),
+                    bg: None,
+                    attrs: RenderAttrs::default(),
+                    wide_continuation: false,
+                };
+                self.buffer.set_cell(seg.x, seg.y, cell);
+            }
+        }
+
+        // 4. Status bar (bottom rows).
+        if let Some(bar) = frame.status_bar {
+            let bar_top = self
+                .buffer
+                .height()
+                .saturating_sub(self.config.status_bar_height);
+            for row_offset in 0..self.config.status_bar_height {
+                let row = bar_top + row_offset;
+                let cells = bar.render_row(self.buffer.width());
+                for (col, cell) in cells.into_iter().enumerate() {
+                    self.buffer.set_cell(col as u16, row, cell);
+                }
+            }
+        }
+
+        let compose_time = compose_start.elapsed();
+
+        // 5. Diff + render.
+        let diff_start = Instant::now();
+        let dirty = if self.force_full_redraw {
+            self.buffer.invalidate();
+            self.force_full_redraw = false;
+            self.buffer.diff()
+        } else {
+            self.buffer.diff()
+        };
+        let dirty_count = dirty.len();
+        let diff_time = diff_start.elapsed();
+
+        let render_start = Instant::now();
+        self.backend.hide_cursor()?;
+        self.backend.render_diff(&dirty)?;
+
+        // Position the cursor inside the focused pane.
+        if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == frame.focused) {
+            if let Some(vt) = frame.vts.get(&frame.focused) {
+                let cur = vt.cursor();
+                let sx = rect.x.saturating_add(cur.col as u16);
+                let sy = rect.y.saturating_add(cur.row as u16);
+                if sx < rect.x.saturating_add(rect.width)
+                    && sy < rect.y.saturating_add(rect.height)
+                    && sx < self.buffer.width()
+                    && sy < self.buffer.height()
+                {
+                    self.backend.set_cursor(sx, sy)?;
+                    self.backend.show_cursor()?;
+                }
+            }
+        }
+
+        let render_time = render_start.elapsed();
+        self.buffer.swap();
+        let total_time = frame_start.elapsed();
+
+        let stats = RenderStats {
+            dirty_cells: dirty_count,
+            total_cells: (self.buffer.width() as usize) * (self.buffer.height() as usize),
+            compose_time_us: compose_time.as_micros() as u64,
+            diff_time_us: diff_time.as_micros() as u64,
+            render_time_us: render_time.as_micros() as u64,
+            total_time_us: total_time.as_micros() as u64,
+        };
+        self.last_stats = Some(stats.clone());
+        Ok(stats)
+    }
+
+    /// Compose a single pane's VT grid into the framebuffer at `rect`.
+    fn compose_pane(&mut self, rect: Rect, vt: &shux_vt::VirtualTerminal) {
+        let grid = vt.grid();
+        let total_rows = grid.rows();
+        let total_cols = grid.cols();
+        let visible_rows = rect.height as usize;
+        let visible_cols = rect.width as usize;
+
+        // VT keeps `rows` visible rows. If the pane rect is smaller than
+        // the VT (because the user resized down), we render the bottom
+        // portion (most recent output).
+        let row_offset = total_rows.saturating_sub(visible_rows);
+
+        for r in 0..visible_rows {
+            let grid_row = row_offset + r;
+            if grid_row >= total_rows {
+                continue;
+            }
+            let row = grid.visible_row(grid_row);
+            for c in 0..visible_cols {
+                if c >= total_cols {
+                    break;
+                }
+                let cell = &row[c];
+                let rcell: RenderCell = cell.into();
+                self.buffer
+                    .set_cell(rect.x + c as u16, rect.y + r as u16, rcell);
+            }
+        }
+    }
+
+    /// Render a placeholder string centered in the rect. Used when a pane
+    /// has no VT (shouldn't happen in practice, but fail-soft is nicer
+    /// than panicking during a render cycle).
+    fn compose_placeholder(&mut self, rect: Rect, text: &str) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        let text_chars: Vec<char> = text.chars().collect();
+        let col = rect
+            .x
+            .saturating_add(((rect.width as usize).saturating_sub(text_chars.len())) as u16 / 2);
+        let row = rect.y + rect.height / 2;
+        for (i, ch) in text_chars.iter().enumerate() {
+            self.buffer.set_cell(
+                col + i as u16,
+                row,
+                RenderCell {
+                    ch: *ch,
+                    fg: None,
+                    bg: None,
+                    attrs: RenderAttrs {
+                        dim: true,
+                        ..Default::default()
+                    },
+                    wide_continuation: false,
+                },
+            );
+        }
+    }
+
     /// Get statistics from the last render pass.
     pub fn last_stats(&self) -> Option<&RenderStats> {
         self.last_stats.as_ref()
@@ -380,6 +648,7 @@ mod tests {
         let config = CompositorConfig {
             show_border: true,
             status_bar_height: 0,
+            ..Default::default()
         };
         let compositor = make_compositor(10, 5, config);
 
@@ -396,6 +665,7 @@ mod tests {
         let config = CompositorConfig {
             show_border: false,
             status_bar_height: 1,
+            ..Default::default()
         };
         let compositor = make_compositor(80, 24, config);
 
@@ -411,6 +681,7 @@ mod tests {
         let config = CompositorConfig {
             show_border: true,
             status_bar_height: 1,
+            ..Default::default()
         };
         let compositor = make_compositor(80, 24, config);
 
@@ -476,6 +747,7 @@ mod tests {
         let config = CompositorConfig {
             show_border: true,
             status_bar_height: 0,
+            ..Default::default()
         };
         let mut compositor = RenderCompositor::new(10, 5, &mut output, config);
 

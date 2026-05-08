@@ -6,20 +6,25 @@
 //! VT-to-render cell conversion, terminal state management, and the
 //! TUI client event loop.
 
+pub mod attach;
+pub mod borders;
 pub mod buffer;
 pub mod client;
 pub mod compositor;
 pub mod input;
 pub mod keys;
 pub mod render;
+pub mod statusbar;
 pub mod terminal;
 pub mod vt_convert;
 
 // Re-export commonly used types.
+pub use borders::{BorderChars, BorderColors, BorderSegment, BorderStyle, compute_borders};
 pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
 pub use client::{ClientConfig, ExitReason};
-pub use compositor::{CompositorConfig, RenderCompositor, RenderStats};
+pub use compositor::{CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats};
 pub use input::{InputEvent, KeyboardProtocol, MouseAction, MouseButton, MouseEvent};
 pub use keys::{KeyPress, KeyValue, Modifiers, NamedKey};
 pub use render::RenderBackend;
+pub use statusbar::{StatusBar, StatusSegment};
 pub use terminal::TerminalGuard;

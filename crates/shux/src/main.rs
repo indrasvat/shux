@@ -7,6 +7,7 @@ use clap::{CommandFactory, FromArgMatches};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing_subscriber::EnvFilter;
 
+mod attach;
 mod cli;
 mod client;
 mod daemon;
@@ -18,33 +19,50 @@ use cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
 ///
 /// This is the bridge between the RPC handlers and the per-pane PTY read loops.
 /// Each pane gets a write channel; the read loop is a separate tokio task.
-struct PaneIoState {
+pub struct PaneIoState {
     /// Per-pane write channels: send bytes to the pane's PTY read/write task.
-    writers: HashMap<shux_core::model::PaneId, mpsc::Sender<Vec<u8>>>,
+    pub writers: HashMap<shux_core::model::PaneId, mpsc::Sender<Vec<u8>>>,
+    /// Per-pane resize channels: send PtySize to trigger TIOCSWINSZ + VT resize.
+    pub resizers: HashMap<shux_core::model::PaneId, mpsc::Sender<shux_pty::handle::PtySize>>,
     /// Per-pane VirtualTerminal instances for capturing output.
-    vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
+    pub vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
     /// Command execution engine for marker-based completion detection.
-    cmd_engine: shux_pty::CommandEngine,
+    pub cmd_engine: shux_pty::CommandEngine,
+    /// Notify any attach-render loops that a pane's VT has new bytes to
+    /// flush. Bumped after every PTY read so the renderer can wake up
+    /// promptly (instead of polling a fixed interval).
+    pub render_pulse: Arc<tokio::sync::Notify>,
+}
+
+impl Default for PaneIoState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PaneIoState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             writers: HashMap::new(),
+            resizers: HashMap::new(),
             vts: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
+            render_pulse: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
 
 /// Per-pane async task that owns the PtyHandle and handles both reads and writes.
 ///
-/// Reads from the PTY and feeds VT + CommandEngine. Receives writes from the channel.
+/// Reads from the PTY and feeds VT + CommandEngine. Receives writes from the
+/// channel. Receives resize requests on a separate channel and applies them
+/// via TIOCSWINSZ + VT resize.
 async fn run_pane_pty_task(
     pane_id: shux_core::model::PaneId,
     mut handle: shux_pty::handle::PtyHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     mut write_rx: mpsc::Receiver<Vec<u8>>,
+    mut resize_rx: mpsc::Receiver<shux_pty::handle::PtySize>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut buf = vec![0u8; 8192];
@@ -59,12 +77,17 @@ async fn run_pane_pty_task(
                     }
                     Ok(n) => {
                         let data = &buf[..n];
-                        let mut state = io_state.lock().await;
-                        if let Some(vt) = state.vts.get_mut(&pane_id) {
-                            vt.process(data);
-                        }
-                        let output = String::from_utf8_lossy(data);
-                        let _completed = state.cmd_engine.process_output(pane_id.0, &output);
+                        let pulse = {
+                            let mut state = io_state.lock().await;
+                            if let Some(vt) = state.vts.get_mut(&pane_id) {
+                                vt.process(data);
+                            }
+                            let output = String::from_utf8_lossy(data);
+                            let _completed = state.cmd_engine.process_output(pane_id.0, &output);
+                            state.render_pulse.clone()
+                        };
+                        // Wake any attach-render loops outside the lock.
+                        pulse.notify_waiters();
                     }
                     Err(e) => {
                         tracing::error!(%pane_id, error = %e, "PTY read error");
@@ -82,6 +105,19 @@ async fn run_pane_pty_task(
                     break;
                 }
             }
+            Some(size) = resize_rx.recv() => {
+                if let Err(e) = handle.resize(size) {
+                    tracing::warn!(%pane_id, error = %e, "PTY resize failed");
+                }
+                let pulse = {
+                    let mut state = io_state.lock().await;
+                    if let Some(vt) = state.vts.get_mut(&pane_id) {
+                        vt.resize(size.rows as usize, size.cols as usize);
+                    }
+                    state.render_pulse.clone()
+                };
+                pulse.notify_waiters();
+            }
             _ = shutdown.cancelled() => {
                 tracing::debug!(%pane_id, "PTY task cancelled");
                 break;
@@ -91,11 +127,15 @@ async fn run_pane_pty_task(
 
     let mut state = io_state.lock().await;
     state.writers.remove(&pane_id);
+    state.resizers.remove(&pane_id);
     state.vts.remove(&pane_id);
+    let pulse = state.render_pulse.clone();
+    drop(state);
+    pulse.notify_waiters();
 }
 
 /// Spawn a PTY process and VT instance for a pane.
-async fn spawn_pane_pty(
+pub(crate) async fn spawn_pane_pty(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
     io_state: Arc<Mutex<PaneIoState>>,
@@ -106,16 +146,18 @@ async fn spawn_pane_pty(
         .map_err(|e| shux_rpc::RpcError::internal(&format!("PTY spawn failed: {e}")))?;
 
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (resize_tx, resize_rx) = mpsc::channel::<shux_pty::handle::PtySize>(16);
     let vt = shux_vt::VirtualTerminal::new(24, 80);
 
     {
         let mut state = io_state.lock().await;
         state.writers.insert(pane_id, write_tx);
+        state.resizers.insert(pane_id, resize_tx);
         state.vts.insert(pane_id, vt);
     }
 
     tokio::spawn(run_pane_pty_task(
-        pane_id, handle, io_state, write_rx, shutdown,
+        pane_id, handle, io_state, write_rx, resize_rx, shutdown,
     ));
 
     Ok(())
@@ -237,6 +279,20 @@ async fn run_rpc_server(
 
     // Create shared pane I/O state (PTY writers, VTs, command engine)
     let io_state = Arc::new(Mutex::new(PaneIoState::new()));
+
+    // Spawn the attach UDS listener (separate socket, dedicated streaming
+    // protocol). The JSON-RPC socket below stays request-response.
+    let attach_path = daemon::attach_socket_path()?;
+    let attach_graph = graph_handle.clone();
+    let attach_io = io_state.clone();
+    let attach_cancel = cancel.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            attach::run_attach_server(attach_path, attach_graph, attach_io, attach_cancel).await
+        {
+            tracing::error!(error = %e, "attach server error");
+        }
+    });
 
     // Spawn timeout checker (1s interval)
     let timeout_io = io_state.clone();
@@ -1614,32 +1670,73 @@ fn register_pane_io_methods(
         })
 }
 
+/// Decide which session `shux` (no args) should attach to.
+///
+/// Strategy: query the daemon for sessions; if any exist, pick the most
+/// recently created. If none, fall through to "default" (which the
+/// daemon-side attach handler will create on demand).
+async fn pick_attach_target(socket_path: &std::path::Path) -> String {
+    if let Ok(mut stream) = client::try_connect(socket_path).await {
+        if let Ok(value) = cli::rpc_call(&mut stream, "session.list", serde_json::json!({})).await {
+            if let Some(arr) = value.get("sessions").and_then(|v| v.as_array()) {
+                if let Some(latest) = arr.iter().filter_map(|s| s.get("name")?.as_str()).next() {
+                    return latest.to_string();
+                }
+            }
+        }
+    }
+    "default".to_string()
+}
+
+fn default_session_name() -> String {
+    "default".to_string()
+}
+
+/// Run the attach TUI client. Translates the daemon's `attach.sock` into
+/// real keystrokes / ANSI bytes on the user's terminal. Restores the
+/// terminal on every exit path via `TerminalGuard`'s Drop.
+async fn run_attach(_jsonrpc_socket: &std::path::Path, session_name: String) -> anyhow::Result<()> {
+    let attach_path = daemon::attach_socket_path()?;
+    let cfg = shux_ui::ClientConfig {
+        socket_path: attach_path.to_string_lossy().to_string(),
+        session_name: session_name.clone(),
+        prefix_key: crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::CONTROL,
+        ),
+    };
+    match shux_ui::attach::run_attach(&attach_path, cfg).await {
+        Ok(reason) => {
+            match reason {
+                shux_ui::ExitReason::Detached => {
+                    println!("[detached from session '{session_name}']");
+                }
+                shux_ui::ExitReason::SessionEnded => {
+                    println!("[session '{session_name}' ended]");
+                }
+                shux_ui::ExitReason::ConnectionLost => {
+                    eprintln!("[connection to daemon lost]");
+                }
+                shux_ui::ExitReason::Error(msg) => {
+                    eprintln!("[attach error: {msg}]");
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Dispatch CLI subcommands.
 async fn dispatch(args: Cli) -> anyhow::Result<()> {
     let socket_path = args.socket_path();
 
     match args.command {
-        // No subcommand: attach to last session or create "default"
+        // No subcommand: attach to last session, or create "default" if none.
         None => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-
-            // For M0, create a default session and attach (stub).
-            // Full "last session" logic comes in M1.
-            let _result = cli::handle_new(
-                &mut stream,
-                Some("default".to_string()),
-                None,
-                false,
-                OutputFormat::Text,
-            )
-            .await;
-
-            // Attach via TUI client (wired in task 012)
-            println!(
-                "{}",
-                style::muted("[TUI attach not yet wired — see task 012]")
-            );
-            Ok(())
+            let _ = client::ensure_daemon_running_at(&socket_path).await?;
+            let session_name = pick_attach_target(&socket_path).await;
+            run_attach(&socket_path, session_name).await
         }
 
         Some(Command::New {
@@ -1649,31 +1746,21 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             cmd,
         }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            let session_name = session.clone().unwrap_or_else(default_session_name);
             let _result = cli::handle_new(&mut stream, session, cmd, ensure, args.format).await?;
+            drop(stream);
 
             if !detached {
-                // Attach via TUI client (wired in task 012)
-                println!(
-                    "{}",
-                    style::muted("[TUI attach not yet wired — see task 012]")
-                );
+                run_attach(&socket_path, session_name).await
+            } else {
+                Ok(())
             }
-
-            Ok(())
         }
 
         Some(Command::Attach { session }) => {
-            let _stream = client::ensure_daemon_running_at(&socket_path).await?;
+            let _ = client::ensure_daemon_running_at(&socket_path).await?;
             let session_name = session.unwrap_or_else(|| "default".to_string());
-
-            // Attach via TUI client (wired in task 012)
-            println!(
-                "{}",
-                style::muted(format!(
-                    "[TUI attach to '{session_name}' not yet wired — see task 012]"
-                ))
-            );
-            Ok(())
+            run_attach(&socket_path, session_name).await
         }
 
         Some(Command::Ls) => {

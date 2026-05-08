@@ -4,7 +4,7 @@
 
 ## Current Phase
 
-**M0: Architecture Spike** — **Complete** (all 13 tasks done, 437 tests passing)
+**M0: Architecture Spike** — **Complete**. Now in M1: tasks 013–016 + 060 done, **Task 017 in progress** (multi-pane rendering + attach client wiring).
 
 ## Status
 
@@ -229,7 +229,7 @@
 | 014 | Window CRUD (API + CLI) | M1 | **Done** | 013 |
 | 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | **Done** | 014, 003 |
 | 016 | Pane I/O (send_keys, run_command, capture) | M1 | **Done** | 015, 004 |
-| 017 | Multi-pane rendering | M1 | Pending | 015, 009 |
+| 017 | Multi-pane rendering | M1 | **In Progress** | 015, 009 |
 | 018 | Tier 1 keybindings (bare keys) | M1 | Pending | 017 |
 | 019 | Prefix key system (Tier 2) | M1 | Pending | 018 |
 | 020 | Mouse support | M1 | Pending | 017 |

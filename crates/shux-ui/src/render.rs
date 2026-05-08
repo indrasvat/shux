@@ -39,6 +39,19 @@ impl<W: Write> RenderBackend<W> {
         }
     }
 
+    /// Borrow the underlying writer (used for inspecting captured bytes
+    /// during tests; production code should not need this).
+    pub fn inner(&self) -> &W {
+        &self.out
+    }
+
+    /// Mutably borrow the underlying writer. Useful when the writer is a
+    /// drainable buffer (e.g., `Vec<u8>`) and the daemon's attach loop
+    /// wants to take and ship the bytes after a render cycle.
+    pub fn inner_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+
     /// Render a list of dirty cells to the terminal. Uses synchronized
     /// output (Mode 2026) to prevent tearing.
     ///

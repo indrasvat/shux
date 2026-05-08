@@ -4,12 +4,17 @@
 //! and optional TCP loopback. Uses length-prefixed framing (4-byte BE +
 //! JSON payload). Includes a method router and error system.
 
+pub mod attach;
 pub mod codec;
 pub mod error;
 pub mod router;
 pub mod server;
 
 // Re-export key types.
+pub use attach::{
+    ATTACH_PROTOCOL_VERSION, ActionArgs, ActionKind, AttachClientFrame, AttachHello, AttachReady,
+    AttachServerFrame,
+};
 pub use codec::{MAX_FRAME_SIZE, create_codec};
 pub use error::{ErrorCode, RpcError};
 pub use router::{Handler, Router, RouterBuilder};

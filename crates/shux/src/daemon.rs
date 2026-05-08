@@ -55,6 +55,13 @@ pub fn socket_path() -> Result<PathBuf, DaemonError> {
     Ok(runtime_dir()?.join("shux.sock"))
 }
 
+/// Full path to the attach-session socket: `$RUNTIME_DIR/attach.sock`.
+/// Distinct from the JSON-RPC socket so the attach loop doesn't have to
+/// multiplex protocols on a single connection.
+pub fn attach_socket_path() -> Result<PathBuf, DaemonError> {
+    Ok(runtime_dir()?.join("attach.sock"))
+}
+
 /// Ensure the runtime directory exists with mode 0700.
 pub fn ensure_runtime_dir() -> Result<PathBuf, DaemonError> {
     let dir = runtime_dir()?;
