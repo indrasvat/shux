@@ -4,7 +4,7 @@
 
 ## Current Phase
 
-**M0: Architecture Spike** — **Complete**. Now in M1: tasks 013–016 + 060 done, **Task 017 in progress** (multi-pane rendering + attach client wiring).
+**M0: Architecture Spike** — **Complete**. M1: tasks 013–017 + 060 done. shux is now a working interactive multiplexer end-to-end (multi-pane render + attach client + Tier-1 keybindings + status bar). 576 tests pass.
 
 ## Status
 
@@ -52,6 +52,23 @@
 ---
 
 ## Session Log
+
+**2026-05-08 — Task 017: Multi-Pane Rendering + Attach Client — Done**
+- shux is now a working interactive multiplexer. The `shux attach` / `shux` / `shux new` (no `--detached`) commands launch a real TUI; the daemon owns rendering, the attach client is a thin keystrokes-up / ANSI-down pipe.
+- shux-ui: new `borders.rs` (BorderStyle: thin/thick/double/rounded/ascii/none + compute_borders with corner/T/cross resolution), `statusbar.rs` (3-zone left/center/right), extended `compositor.rs` with `render_multi_pane()` (layout-aware, diff-based, zoom mode, status bar, focused border, inset pane viewport so outline never overdraws pane content), client `attach.rs` (handshake → run_loop with crossterm event polling thread → forwards keys as Input frames, dumps Render frames to stdout)
+- shux-rpc: new `attach.rs` defining `AttachHello`/`AttachReady`/`AttachServerFrame`/`AttachClientFrame` length-prefix-framed JSON protocol with base64-encoded ANSI binary payloads. Reuses existing codec
+- shux (binary): new `attach.rs` daemon-side session handler — owns one RenderCompositor per attached client, watches PaneIoState, ships ANSI bytes as Render frames at 200ms cadence + on render_pulse notify. Dispatches Action frames to GraphHandle. Pinger task detects dead peers. Hello handshake bounded by 5s timeout
+- main.rs: PaneIoState gains `resizers` (mpsc<PtySize> per pane) and `render_pulse` (tokio Notify); per-pane PTY task gains a third `select!` branch for resize → TIOCSWINSZ + VT resize. handle.kill() called on PTY task exit to reap zombie shells
+- Two rounds of brutal codex+gemini council reviews surfaced and fixed: mutex-held-across-await deadlocks, every-pane-gets-client-size (not its rect), `current_size_for_session` infinite shrink loop, `notify_waiters` lost wakeups (now `notify_one`), hardcoded 120x40 viewport for spatial actions, prefix swallowing unbound keys, `key_to_prefix_action` ignoring modifiers (Ctrl+C → NewWindow!), focus while zoomed routing to hidden pane (both directional + relative), no PTY winsize update on layout changes, `Some(d) = recv()` silently disabling channel branches, prefix-prefix not forwarding literal prefix to PTY, send().await blocking the whole attach on backpressure, no hello timeout (slowloris), borders overdrawing on tiny terminals, cursor hidden at right edge, multi-row status bar duplicating
+- L4 visual tests via iterm2-driver (`test_017_attach_multipane.py`): 13/16 pass, 0 failures. Verified end-to-end: shux attach starts TUI, status bar shows session name + clock, borders draw with rounded corners, vertical/horizontal splits work via Ctrl+Space + |/-, zoom (Ctrl+Space z) collapses splits and unzoom restores, two different commands run side-by-side in two panes, send-keys via API forwards to attached client, detach via Ctrl+Space d returns to shell. Screenshots in `.claude/screenshots/017_*.png`.
+- 576 tests pass (was 567 before — added 17 unit tests in borders/statusbar/attach + 7 integration tests for multi-pane compositor)
+- Learning: `tokio::sync::Notify` — `notify_waiters()` only wakes tasks currently awaiting `.notified()`; if the renderer is mid-CPU it loses the wakeup. Use `notify_one()` which queues a permit consumed by the next `.notified().await`.
+- Learning: `Some(x) = recv()` in `tokio::select!` is a refutable pattern that silently disables the branch when None comes through; you cannot detect channel close that way. Use `res = recv() => match res { Some(x) => ..., None => break }`.
+- Learning: Multi-pane multiplexer must size each pane's PTY to its layout rect, NOT the full client size. apps polling TIOCGWINSZ otherwise lay themselves out for the whole screen. The compositor crops the oversized VT and TUIs render wrong.
+- Learning: Inferring client size from a pane's VT grid creates a self-feeding shrink loop: pane is half-width → grid says 40 cols → resize compositor to 40 → pane is now 18 cols, etc. Track client size as authoritative state, never derive it from the very thing it sizes.
+- Learning: Layout actions (split, zoom, kill) change pane rects; the daemon must re-fan winsize to all PTYs in the active window after every such action so vim/htop/less inside the panes redraw correctly.
+- Learning: Holding the global PaneIoState mutex across `.await` on bounded channel sends can deadlock the entire session if any single PTY task gets slow. Pattern: `let tx = { state.lock().writers.get(&p).cloned() }; tx.send(...).await`.
+- Learning: For interactive input forwarding, `try_send` is right; `send().await` lets one stuck pane freeze the whole client (user can't even detach). Drop the keystroke instead.
 
 **2026-02-19 — Task 016: Pane I/O (send_keys, run_command, capture) — Done**
 - Created `crates/shux-pty/src/command.rs`: `CommandEngine` with marker technique for detecting command completion — `start_command()` generates PTY command with `SHUX_MARKER{marker}EXIT{$?}SHUX_END` pattern, `process_output()` scans per-pane output buffers for markers (handles split-across-chunks), `check_timeouts()`, `cancel_command()`, `get_status()`, `shell_escape_args()` — 13 unit tests
@@ -229,7 +246,7 @@
 | 014 | Window CRUD (API + CLI) | M1 | **Done** | 013 |
 | 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | **Done** | 014, 003 |
 | 016 | Pane I/O (send_keys, run_command, capture) | M1 | **Done** | 015, 004 |
-| 017 | Multi-pane rendering | M1 | **In Progress** | 015, 009 |
+| 017 | Multi-pane rendering | M1 | **Done** | 015, 009 |
 | 018 | Tier 1 keybindings (bare keys) | M1 | Pending | 017 |
 | 019 | Prefix key system (Tier 2) | M1 | Pending | 018 |
 | 020 | Mouse support | M1 | Pending | 017 |
