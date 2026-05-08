@@ -179,6 +179,22 @@ where
                         }
                         if prefix_active {
                             prefix_active = false;
+                            // Prefix-prefix: send the literal prefix key
+                            // (e.g. Ctrl+Space → NUL byte) to the PTY so
+                            // nested shells / vim / emacs can receive it.
+                            if key.code == prefix_key.code
+                                && key.modifiers == prefix_key.modifiers
+                            {
+                                let bytes = encode_key_event(key);
+                                if !bytes.is_empty() {
+                                    let frame = AttachClientFrame::Input {
+                                        data: BASE64.encode(&bytes),
+                                    };
+                                    let payload = serde_json::to_vec(&frame)?;
+                                    sink.send(Bytes::from(payload)).await.ok();
+                                }
+                                continue;
+                            }
                             if let Some(action) = key_to_prefix_action(key) {
                                 let frame = AttachClientFrame::Action {
                                     kind: action,
@@ -199,9 +215,10 @@ where
                             // as a normal PTY input so the user doesn't
                             // lose the keystroke. (e.g. Prefix → Ctrl+C
                             // sends Ctrl+C to the running process.)
-                        }
-                        // Prefix activation.
-                        if key.code == prefix_key.code && key.modifiers == prefix_key.modifiers {
+                        } else if key.code == prefix_key.code
+                            && key.modifiers == prefix_key.modifiers
+                        {
+                            // First tap of the prefix: arm and consume.
                             prefix_active = true;
                             continue;
                         }

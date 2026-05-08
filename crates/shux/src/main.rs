@@ -99,7 +99,16 @@ async fn run_pane_pty_task(
                     }
                 }
             }
-            Some(data) = write_rx.recv() => {
+            res = write_rx.recv() => {
+                let data = match res {
+                    Some(d) => d,
+                    None => {
+                        // Sender dropped -- the pane was destroyed.
+                        // Exit so we can kill() the child shell.
+                        tracing::debug!(%pane_id, "writer channel closed");
+                        break;
+                    }
+                };
                 if let Err(e) = handle.write(&data).await {
                     tracing::error!(%pane_id, error = %e, "PTY write error");
                     break;
@@ -109,7 +118,14 @@ async fn run_pane_pty_task(
                     break;
                 }
             }
-            Some(size) = resize_rx.recv() => {
+            res = resize_rx.recv() => {
+                let size = match res {
+                    Some(s) => s,
+                    None => {
+                        tracing::debug!(%pane_id, "resizer channel closed");
+                        break;
+                    }
+                };
                 if let Err(e) = handle.resize(size) {
                     tracing::warn!(%pane_id, error = %e, "PTY resize failed");
                 }

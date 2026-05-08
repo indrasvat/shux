@@ -449,16 +449,21 @@ async fn run_attach_loop(
                         };
                         let target = render_session.lock().await.active_pane_id;
                         // Clone the writer Sender out of the map and drop the
-                        // PaneIoState mutex BEFORE awaiting the channel send.
-                        // Otherwise a slow PTY task can deadlock the whole
-                        // session by holding the global mutex while we wait
-                        // for the channel buffer to drain.
+                        // PaneIoState mutex BEFORE touching the channel.
                         let writer = {
                             let state = io_state.lock().await;
                             state.writers.get(&target).cloned()
                         };
                         if let Some(tx) = writer {
-                            let _ = tx.send(bytes).await;
+                            // Use try_send rather than send().await: if the
+                            // pane's PTY writer is backpressured (e.g., the
+                            // child stopped reading), blocking the whole
+                            // attach loop would freeze the user out -- they
+                            // wouldn't be able to detach or switch panes.
+                            // Dropping the keystroke is the lesser evil.
+                            if let Err(e) = tx.try_send(bytes) {
+                                tracing::warn!(error = %e, "input dropped (pane backpressured)");
+                            }
                         }
                     }
                     AttachClientFrame::Resize { cols, rows } => {
@@ -483,6 +488,14 @@ async fn run_attach_loop(
                         .await
                         {
                             warn!(?kind, error = %e, "attach: action failed");
+                        }
+                        // Layout-changing actions invalidate per-pane PTY
+                        // sizes. Re-fan the winsizes so vim/htop/etc. inside
+                        // each pane learn their new dimensions.
+                        if action_changes_layout(kind) {
+                            let attached = render_session.lock().await.clone();
+                            let (cols, rows) = *client_size.lock().await;
+                            apply_resize_to_window(&graph, &io_state, &attached, cols, rows).await;
                         }
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.notify_one();
@@ -694,6 +707,27 @@ fn build_status_bar(
     bar
 }
 
+/// True if an action mutates the pane layout in a way that changes the
+/// rect size of one or more visible panes. Used to decide whether to
+/// re-fan PTY winsize after dispatching the action.
+fn action_changes_layout(kind: ActionKind) -> bool {
+    matches!(
+        kind,
+        ActionKind::SplitSmart
+            | ActionKind::SplitVertical
+            | ActionKind::SplitHorizontal
+            | ActionKind::ToggleZoom
+            | ActionKind::KillPane
+            | ActionKind::ResizeLeft
+            | ActionKind::ResizeRight
+            | ActionKind::ResizeUp
+            | ActionKind::ResizeDown
+            | ActionKind::NewWindow
+            | ActionKind::NextWindow
+            | ActionKind::PrevWindow
+    )
+}
+
 /// Compute the actual pane viewport (inset for outline + status bar) at
 /// the current client size. Used by spatial actions (focus_dir, smart
 /// split) so the geometry they reason about matches what the user sees
@@ -861,6 +895,11 @@ async fn focus_relative(
         .windows
         .get(&attached.active_window_id)
         .ok_or_else(|| anyhow::anyhow!("active window missing"))?;
+    // Don't change focus while zoomed -- the user wouldn't see the new
+    // pane and would be typing into a hidden one.
+    if win.layout.is_zoomed() {
+        return Ok(());
+    }
     let panes = win.layout.tree.pane_ids();
     if panes.len() < 2 {
         return Ok(());
