@@ -47,3 +47,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Forward-looking advisory lint pass against the beta toolchain.
+  # Surfaces lints that clippy will warn on once beta lands as stable
+  # (~6 weeks later), so we have time to fix them before they become
+  # blocking. continue-on-error keeps CI green; failures show up as a
+  # yellow advisory annotation on the PR.
+  lint-beta:
+    name: Clippy (beta — advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@beta
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint-beta
+      - name: Print toolchain
+        run: rustc +beta --version && cargo +beta clippy --version
+      - name: Clippy (beta)
+        run: cargo +beta clippy --workspace --all-targets -- -D warnings
