@@ -218,7 +218,7 @@ fn register_session_methods(
             async move {
                 let snap = gh.snapshot();
                 let mut sessions: Vec<_> = snap.sessions.values().collect();
-                sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                sessions.sort_by_key(|s| s.created_at);
                 let sessions: Vec<serde_json::Value> =
                     sessions.iter().map(|s| session_to_json(s, &snap)).collect();
                 Ok(serde_json::json!({ "sessions": sessions }))

@@ -25,12 +25,24 @@ allow = [
     "Zlib",
     "BSL-1.0",
     "OpenSSL",
+    # `notify` (filesystem watcher we use for config hot reload) is
+    # CC0-1.0; FSF-listed Free/Libre. Pure permissive.
+    "CC0-1.0",
+    # Apple-licensed transitive deps (e.g. `objc2` chain) carry
+    # `MIT-0` ("MIT No Attribution"). Functionally MIT minus the
+    # attribution clause.
+    "MIT-0",
 ]
 confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"
+# Deny string-wildcard versions like `version = "*"`, but allow the
+# implicit wildcards that come from path/git deps (our own internal
+# `shux-core = { path = "..." }` style). Without this the wildcard
+# check flags every crate that depends on a workspace sibling.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
