@@ -81,7 +81,13 @@ impl PtyConfig {
     fn resolve_command(&self) -> Vec<String> {
         if self.command.is_empty() {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            vec![shell, "-l".to_string()]
+            // Spawn as both login AND interactive. `-l` alone gets bash to
+            // read `~/.bash_profile` but leaves `$-` without `i`, so any
+            // interactive-only branch (the standard `[[ $- == *i* ]] &&
+            // source ~/.bashrc` bridge, starship init, prompt frameworks)
+            // gets skipped. `-l -i` runs both login and interactive
+            // initialization paths — same flags iTerm2 uses by default.
+            vec![shell, "-l".to_string(), "-i".to_string()]
         } else {
             self.command.clone()
         }
@@ -112,7 +118,24 @@ impl PtyHandle {
         let mut cmd = pty_process::Command::new(program)
             .args(args)
             .current_dir(&config.cwd)
-            .env("TERM", "xterm-256color");
+            .env("TERM", "xterm-256color")
+            // Tell shells / prompts they're running inside shux, mirroring
+            // tmux's TMUX env var. Users can guard config with
+            // `[[ -n $SHUX ]] && ...` if they want shux-specific behavior.
+            .env("SHUX", "1")
+            // Hint truecolor support so colorful prompts (starship,
+            // powerline) pick 24-bit codes by default.
+            .env("COLORTERM", "truecolor")
+            // Claim TERM_PROGRAM so the parent emulator's value (e.g.
+            // "WarpTerminal", "iTerm.app", "Apple_Terminal") does NOT
+            // leak into the spawned shell. User rc files commonly branch
+            // on TERM_PROGRAM (skipping starship under Warp, applying
+            // iTerm-specific settings, etc.); inheriting the parent's
+            // value silently turns those branches the wrong way inside a
+            // shux pane. Setting our own marker is the same pattern tmux
+            // uses (it sets TERM_PROGRAM=tmux).
+            .env("TERM_PROGRAM", "shux")
+            .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
         for (key, value) in &config.env {
             cmd = cmd.env(key, value);

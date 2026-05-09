@@ -53,6 +53,22 @@
 
 ## Session Log
 
+**2026-05-08 — Followup: user dotfiles (starship) load inside shux panes**
+- Root cause: `crates/shux-pty/src/handle.rs::resolve_command` spawned the shell as `bash -l` (login only). User's `~/.bash_profile` sources `~/.bashrc` only when `$- == *i*` (interactive); `-l` alone leaves `$-` without `i`, so `~/.bashrc` never ran and starship never initialized.
+- Secondary cause: even with bashrc running, `TERM_PROGRAM` was inherited from the parent emulator (e.g. `WarpTerminal`). User rc files commonly branch on `TERM_PROGRAM` to skip starship under Warp; that branch fired wrong inside shux panes.
+- Fix: spawn `<shell> -l -i` (login + interactive). Override `TERM_PROGRAM=shux` and `TERM_PROGRAM_VERSION=<pkg ver>` so user rc files see shux as the host emulator. Also set `SHUX=1` (mirrors tmux's `TMUX` env var, lets users guard config) and `COLORTERM=truecolor`.
+- Verified end-to-end via `.claude/automations/test_017_starship.py`: starship prompt with username, path, git branch (with dirty/untracked indicators), Rust + Python version, clock all render correctly inside a shux pane.
+- iterm2-driver best-practices applied to all task-017 automation scripts:
+  - Janitor at start (`cleanup_stale_windows`, prefix=`shux-auto-`) closes orphan windows from crashed prior runs.
+  - Per-script isolated window via `iterm2.Window.async_create()` with stale-object refresh + readiness probe (the #1 iterm2 automation pitfall).
+  - Position-based Quartz screenshot correlation (no focus required, no whole-display capture).
+  - Multi-level try/finally cleanup so the script's window always closes, even on exception.
+  - `\n` instead of `\r` for shell command submit — bypasses readline / ble.sh keymap, avoiding multiline-mode traps in user-customized shells.
+- Shared helpers landed at `.claude/automations/_shux_iterm.py` so future tests don't reinvent the patterns.
+- Learning: `bash -l -i` for spawning users' configured shells, mirrors what iTerm2 does. `bash -l` alone is the silent killer of `~/.bashrc` integrations (starship, atuin, ble.sh).
+- Learning: `TERM_PROGRAM` inheritance from the parent emulator silently mis-routes user rc-file branches; multiplexers should claim their own value (tmux sets `TERM_PROGRAM=tmux`, shux now sets `TERM_PROGRAM=shux`).
+- Learning: `\r` (CR) gets remapped by readline replacements like ble.sh into "insert-newline" within a multiline edit; `\n` (LF) bypasses the readline keymap entirely and is more reliable for automation.
+
 **2026-05-08 — Task 017: Multi-Pane Rendering + Attach Client — Done**
 - shux is now a working interactive multiplexer. The `shux attach` / `shux` / `shux new` (no `--detached`) commands launch a real TUI; the daemon owns rendering, the attach client is a thin keystrokes-up / ANSI-down pipe.
 - shux-ui: new `borders.rs` (BorderStyle: thin/thick/double/rounded/ascii/none + compute_borders with corner/T/cross resolution), `statusbar.rs` (3-zone left/center/right), extended `compositor.rs` with `render_multi_pane()` (layout-aware, diff-based, zoom mode, status bar, focused border, inset pane viewport so outline never overdraws pane content), client `attach.rs` (handshake → run_loop with crossterm event polling thread → forwards keys as Input frames, dumps Render frames to stdout)
