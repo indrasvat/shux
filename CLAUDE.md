@@ -43,29 +43,48 @@ make release-package       # Package staged binaries into per-platform tarballs
 
 ## Releases
 
-shux uses Conventional-Commits-driven `semantic-release`. Pushes to `main`
-analyze commit history, bump the workspace version in `Cargo.toml`,
-update `CHANGELOG.md`, tag, and ship binaries for four targets via
-`.github/workflows/release.yml`:
+shux uses Conventional-Commits-driven `semantic-release`, mirroring the
+pattern used by [`indrasvat/vicaya`](https://github.com/indrasvat/vicaya).
+A single workflow (`.github/workflows/release.yml`) runs on every push
+to `main` against a `macos-latest` runner. Inside the workflow:
 
-| Target                         | Runner             |
-|---|---|
-| `x86_64-unknown-linux-gnu`     | `ubuntu-latest`    |
-| `aarch64-unknown-linux-gnu`    | `ubuntu-24.04-arm` |
-| `x86_64-apple-darwin`          | `macos-13`         |
-| `aarch64-apple-darwin`         | `macos-latest`     |
+1. semantic-release analyzes commit history, computes the next
+   version, bumps `Cargo.toml`, updates `CHANGELOG.md`.
+2. `scripts/build-release.sh` is the `prepareCmd` of
+   `@semantic-release/exec` — it cross-compiles four binaries, all
+   embedding the freshly-bumped `CARGO_PKG_VERSION`:
 
-The same workflow also fires on direct `v*` tag pushes, which is how the
-initial `v0.1.0` was bootstrapped (semantic-release defaults to 1.0.0
-without a prior tag, so the first release is created manually). After
-`v0.1.0`, every `feat:` or `fix:` commit on `main` cuts a fresh release
-automatically.
+   | Target                         | How                              |
+   |---|---|
+   | `aarch64-apple-darwin`         | native cargo build               |
+   | `x86_64-apple-darwin`          | cross via Apple SDK              |
+   | `x86_64-unknown-linux-gnu`     | `cargo zigbuild` (glibc 2.17)    |
+   | `aarch64-unknown-linux-gnu`    | `cargo zigbuild` (glibc 2.17)    |
 
-Local testing of the packaging step (no real cargo build required):
+3. `@semantic-release/git` commits the version bump (`[skip ci]` so this
+   workflow does NOT loop) and pushes a `v<X.Y.Z>` tag.
+4. `@semantic-release/github` creates the GitHub release and uploads the
+   four `.tar.gz` archives plus their `.sha256` sidecars.
+
+### Bootstrap (first-ever release)
+
+semantic-release defaults to `v1.0.0` for the very first release without
+a prior tag. To start at `v0.1.0`, use the manual `workflow_dispatch`
+trigger in `release.yml`:
 
 ```bash
-mkdir -p staging/x86_64-apple-darwin && cp target/release/shux staging/x86_64-apple-darwin/
-./scripts/build-release.sh 0.0.0-dev   # produces artifacts/*.tar.gz
+gh workflow run release.yml -f version=0.1.0
+```
+
+This skips semantic-release, runs `set-version.sh` + `build-release.sh`,
+and creates the `v0.1.0` GitHub release directly. Subsequent `feat:` /
+`fix:` commits on `main` then auto-bump from `v0.1.0`.
+
+### Local testing
+
+```bash
+make release-build      # build host binary into staging/<triple>/shux
+make release-package    # HOST_ONLY=1 → package whatever staging has
 ```
 
 ## Architecture

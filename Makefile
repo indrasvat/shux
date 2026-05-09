@@ -238,19 +238,17 @@ clean: ## Clean build artifacts
 # ══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: release-build
-release-build: ## Build release binary for the current host (no cross-compile)
+release-build: ## Build host-target release binary into target/<triple>/release/
 	@echo "$(COLOR_BLUE)▶ Building release binary for host...$(COLOR_RESET)"
-	@cargo build --release --bin shux
 	@HOST_TRIPLE=$$(rustc -vV | awk '/^host:/{print $$2}'); \
-		mkdir -p staging/$${HOST_TRIPLE} && \
-		cp target/release/shux staging/$${HOST_TRIPLE}/shux && \
-		echo "$(COLOR_GREEN)✓ Staged staging/$${HOST_TRIPLE}/shux$(COLOR_RESET)"
+		cargo build --release --bin shux --target $${HOST_TRIPLE} && \
+		echo "$(COLOR_GREEN)✓ Built target/$${HOST_TRIPLE}/release/shux$(COLOR_RESET)"
 
 .PHONY: release-package
-release-package: ## Package staged binaries (staging/<triple>/shux) into artifacts/
+release-package: ## Package whatever target/<triple>/release/shux exists into artifacts/
 	@VERSION=$$(grep -m1 'version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/'); \
-		echo "$(COLOR_BLUE)▶ Packaging shux v$${VERSION}...$(COLOR_RESET)"; \
-		./scripts/build-release.sh "$${VERSION}"
+		echo "$(COLOR_BLUE)▶ Packaging shux v$${VERSION} (HOST_ONLY)...$(COLOR_RESET)"; \
+		HOST_ONLY=1 ./scripts/build-release.sh "$${VERSION}"
 	@echo "$(COLOR_GREEN)✓ Artifacts in ./artifacts/$(COLOR_RESET)"
 
 .PHONY: version

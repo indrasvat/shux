@@ -1,69 +1,44 @@
 name: Release
 
+# Single-runner release pipeline modelled after indrasvat/vicaya.
+#
+# Trigger paths:
+#   1. push to main → semantic-release analyzes Conventional Commits,
+#      computes the next version, and runs prepareCmd. prepareCmd is
+#      `set-version.sh && build-release.sh`, so all four cross-compiled
+#      binaries embed the freshly-bumped CARGO_PKG_VERSION (no version
+#      skew). The git plugin commits the bump, the github plugin uploads
+#      the artifacts, then a tag is pushed.
+#   2. workflow_dispatch (manual) → bootstrap path used once for v0.1.0.
+#      semantic-release defaults to v1.0.0 on the very first release;
+#      this path lets us create v0.1.0 by hand, after which semantic-
+#      release happily computes v0.1.1+ from there.
+#
+# Why not split into matrix runners? Cross-compiling shux's small set of
+# pure-Rust deps via cargo-zigbuild from a single macOS runner is fast
+# enough (~5 min for 4 targets) and lets the entire release stay
+# atomic — the same prepareCmd both bumps the version AND produces the
+# binaries that match it.
+
 on:
   push:
     branches: [main]
-    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Bootstrap a release at this version (e.g. 0.1.0 or 0.1.0-alpha.1). Skips semantic-release.'
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
 
 permissions:
   contents: write
-  issues: write
-  pull-requests: write
 
 jobs:
-  # Build each binary on its own native runner. No cross-compilation,
-  # no Docker — every triple builds where it natively runs.
-  build:
-    name: Build (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            runner: macos-13
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
-
-      - name: Build release binary
-        env:
-          TARGET: ${{ matrix.target }}
-        run: cargo build --release --bin shux --target "$TARGET"
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: shux-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/shux
-          if-no-files-found: error
-          retention-days: 7
-
-  # Single release job: collects all four binaries, then either runs
-  # semantic-release (push to main) or bootstraps a tag-triggered release.
   release:
-    name: Release
-    needs: build
-    runs-on: ubuntu-latest
+    name: Build and publish
+    runs-on: macos-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -77,67 +52,77 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
+      - name: Install Rust toolchain (with all four targets)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          path: staging
-          pattern: shux-*
-          merge-multiple: false
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu
 
-      - name: Lay binaries out the way build-release.sh expects
-        run: |
-          set -euo pipefail
-          # Artifact downloads land at staging/shux-<target>/shux.
-          # build-release.sh wants staging/<target>/shux, so move them.
-          for d in staging/shux-*; do
-              triple="${d#staging/shux-}"
-              mkdir -p "staging/${triple}"
-              mv "${d}/shux" "staging/${triple}/shux"
-              chmod +x "staging/${triple}/shux"
-              rmdir "$d"
-          done
-          ls -la staging/
-          for d in staging/*/; do
-              echo "--- $d ---"
-              ls -la "$d"
-          done
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Zig (linker for cross-compile)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Install npm dependencies
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: npm ci
 
-      - name: Run semantic-release (auto-versioning on main)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      # ----- Auto path: push to main -----
+      - name: Run semantic-release
+        if: github.event_name == 'push'
         run: npm run release
 
-      # Tag-triggered (e.g. `git push --tags v0.1.0`) bootstrap path: skip
-      # semantic-release entirely, package binaries against the pushed
-      # version, and create the release directly.
-      - name: Extract version from tag
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        id: tag_version
+      # ----- Manual path: workflow_dispatch with version input -----
+      - name: Normalize and validate manual version
+        if: github.event_name == 'workflow_dispatch'
+        id: norm
         env:
-          REF_NAME: ${{ github.ref_name }}
+          RAW: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          TAG="$REF_NAME"
-          VERSION="${TAG#v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ -z "$RAW" ]]; then
+              echo "::error::Empty version input — provide e.g. 0.1.0 or 0.1.0-alpha.1" >&2
+              exit 1
+          fi
+          # Strip leading 'v' if user typed v0.1.0 to avoid `vv0.1.0` tag.
+          V="${RAW#v}"
+          # Mirror the semver shape accepted by scripts/set-version.sh.
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Invalid semver: $RAW" >&2
+              exit 1
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
 
-      - name: Build release tarballs (tag bootstrap)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      - name: Bootstrap version (manual)
+        if: github.event_name == 'workflow_dispatch'
         env:
-          VERSION: ${{ steps.tag_version.outputs.version }}
-        run: ./scripts/build-release.sh "$VERSION"
+          BOOTSTRAP_VERSION: ${{ steps.norm.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/set-version.sh "$BOOTSTRAP_VERSION"
+          ./scripts/build-release.sh "$BOOTSTRAP_VERSION"
 
-      - name: Create GitHub release (tag bootstrap)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      - name: Create GitHub release (manual bootstrap)
+        if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag_version.outputs.tag }}
-          name: ${{ steps.tag_version.outputs.tag }}
+          tag_name: ${{ steps.norm.outputs.tag }}
+          name: ${{ steps.norm.outputs.tag }}
+          # Tag the commit the workflow checked out, NOT the default
+          # branch (action's default behavior). This makes
+          # `gh workflow run release.yml --ref <branch> -f version=...`
+          # land the tag on <branch>'s HEAD.
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(steps.norm.outputs.version, '-') }}
           files: |
             artifacts/*.tar.gz
             artifacts/*.sha256

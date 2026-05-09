@@ -14,8 +14,9 @@ fi
 # Strip leading 'v' if present.
 VERSION="${VERSION#v}"
 
-# Validate semver format (allows pre-release suffix like -rc.1).
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+# Validate semver: MAJOR.MINOR.PATCH with optional `-prerelease` and
+# optional `+build` metadata per https://semver.org/spec/v2.0.0.html.
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
     echo "Invalid semver version: $VERSION" >&2
     exit 1
 fi
@@ -28,9 +29,12 @@ if [[ ! -f "$CARGO_TOML" ]]; then
 fi
 
 # Update version in [workspace.package] section.
-# Cross-platform sed (macOS vs Linux) via temp file.
+# Cross-platform sed (macOS vs Linux) via temp file. The replacement
+# pattern matches MAJOR.MINOR.PATCH plus an optional pre-release suffix
+# AND an optional build-metadata suffix, both of which are dropped when
+# the new version omits them.
 TEMP_FILE=$(mktemp)
-sed -E 's/^(version = ")[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(")/\1'"$VERSION"'\3/' "$CARGO_TOML" > "$TEMP_FILE"
+sed -E 's/^(version = ")[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?(")/\1'"$VERSION"'\4/' "$CARGO_TOML" > "$TEMP_FILE"
 mv "$TEMP_FILE" "$CARGO_TOML"
 
 echo "Updated $CARGO_TOML to version $VERSION"

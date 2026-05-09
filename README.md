@@ -30,6 +30,22 @@ shux pane run -s dev cargo test # idempotent; ensure semantics; safe to retry
 
 ## Install
 
+The fastest path — pre-built binary for macOS and Linux (x86_64 / aarch64),
+verified by SHA-256 and dropped into `~/.local/bin`:
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/indrasvat/shux/main/install.sh | bash
+```
+
+Pin a version or change the install dir:
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/indrasvat/shux/main/install.sh \
+  | bash -s -- --version v0.1.0 --dir ~/.bin
+```
+
+Or build from source:
+
 ```bash
 git clone https://github.com/indrasvat/shux.git
 cd shux
