@@ -849,6 +849,18 @@ async fn run_render_loop(
             compositor.force_redraw();
             last_copy_active = copy_active_now;
         }
+        // Force a full redraw on every frame the copy-mode overlay is
+        // active. Cursor / selection movements only mutate ephemeral
+        // overlay bytes appended after the framebuffer diff — they
+        // never touch the underlying VT cells, so the diff renderer
+        // would otherwise leave stale cursor squares and highlight
+        // bands on screen as the user moves around. Per-iteration
+        // force_redraw is the simplest correct fix; the alternative
+        // would be tracking last cursor/anchor and only forcing
+        // redraws on deltas, which is more code for the same effect.
+        if copy_active_now {
+            compositor.force_redraw();
+        }
 
         let win = match snap.windows.get(&attached.active_window_id) {
             Some(w) => w,
@@ -888,18 +900,24 @@ async fn run_render_loop(
         // content rect. Drawn BEFORE the help overlay so the help
         // sheet wins z-order if both are somehow active.
         if let Some(ref cm) = attached.copy_mode {
+            // When the active window is zoomed, the multipane render
+            // shows ONE pane filling the entire viewport — the saved
+            // split-rectangles aren't on screen. Use the full
+            // viewport as the overlay's pane rect in that case so the
+            // cursor / selection / hint align with what's actually
+            // visible.
             let viewport = current_viewport(&client_size).await;
-            let rects = win.layout.compute_rects(viewport);
-            for (pid, rect) in &rects {
-                if *pid == attached.active_pane_id {
-                    shux_ui::render_copy_overlay_into(
-                        compositor.inner_mut(),
-                        *rect,
-                        cm,
-                        &live_theme,
-                    );
-                    break;
-                }
+            let pane_rect = if win.layout.is_zoomed() {
+                Some(viewport)
+            } else {
+                win.layout
+                    .compute_rects(viewport)
+                    .into_iter()
+                    .find(|(pid, _)| *pid == attached.active_pane_id)
+                    .map(|(_, rect)| rect)
+            };
+            if let Some(rect) = pane_rect {
+                shux_ui::render_copy_overlay_into(compositor.inner_mut(), rect, cm, &live_theme);
             }
         }
 
@@ -1150,6 +1168,11 @@ fn action_changes_layout(kind: ActionKind) -> bool {
 /// copy mode uses to clamp cursor motion. Returns (0, 0) when the
 /// pane is not in the active window's layout, which keeps `handle_key`
 /// safely a no-op rather than panicking.
+///
+/// In a zoomed window the visible pane fills the full viewport, so we
+/// use the viewport's dimensions instead of the saved split-layout
+/// rectangle — otherwise cursor motion would clamp to an unzoomed
+/// rect that no longer matches what's on screen.
 async fn focused_pane_size(
     graph: &GraphHandle,
     _io_state: &Arc<Mutex<PaneIoState>>,
@@ -1163,6 +1186,9 @@ async fn focused_pane_size(
         Some(w) => w,
         None => return (0, 0),
     };
+    if win.layout.is_zoomed() {
+        return (viewport.width, viewport.height);
+    }
     for (pid, rect) in win.layout.compute_rects(viewport) {
         if pid == pane_id {
             return (rect.width, rect.height);
