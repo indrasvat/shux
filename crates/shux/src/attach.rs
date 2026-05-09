@@ -232,6 +232,12 @@ struct AttachedSession {
     name: String,
     active_window_id: WindowId,
     active_pane_id: PaneId,
+    /// Whether the keybinding cheat-sheet overlay is currently visible.
+    /// Toggled by `prefix + ?` (ActionKind::ToggleHelp); dismissed by
+    /// any key while visible (Escape / q most natural). When true, the
+    /// render loop draws the overlay and the input loop swallows raw
+    /// Input frames so typing doesn't reach the focused PTY behind it.
+    help_visible: bool,
 }
 
 /// Find a session by name, or create it (with one window + one pane) if
@@ -253,6 +259,7 @@ async fn resolve_or_create_session(
             name: sess.name.clone(),
             active_window_id: win.id,
             active_pane_id: win.active_pane,
+            help_visible: false,
         });
     }
 
@@ -276,6 +283,7 @@ async fn resolve_or_create_session(
         name: sess.name.clone(),
         active_window_id: win.id,
         active_pane_id: win.active_pane,
+        help_visible: false,
     })
 }
 
@@ -470,6 +478,25 @@ async fn run_attach_loop(
                             Ok(b) => b,
                             Err(_) => continue,
                         };
+                        // Help-overlay capture: while the cheat sheet
+                        // is on screen, every keystroke either dismisses
+                        // (Esc 0x1b, 'q' 0x71) or is swallowed. We must
+                        // not forward to the focused PTY — typing should
+                        // not reach the shell behind the overlay.
+                        {
+                            let mut s = render_session.lock().await;
+                            if s.help_visible {
+                                let dismiss =
+                                    bytes.iter().any(|&b| b == 0x1b || b == b'q' || b == b'Q');
+                                if dismiss {
+                                    s.help_visible = false;
+                                    let pulse =
+                                        io_state.lock().await.render_pulse.clone();
+                                    pulse.notify_one();
+                                }
+                                continue;
+                            }
+                        }
                         let target = render_session.lock().await.active_pane_id;
                         // Clone the writer Sender out of the map and drop the
                         // PaneIoState mutex BEFORE touching the channel.
@@ -556,6 +583,14 @@ async fn run_attach_loop(
             }
         }
         // Detect: did the active session vanish?
+        //
+        // We sync graph-derived fields (active_window_id, active_pane_id)
+        // FROM the graph snapshot INTO the shared render_session, but
+        // never overwrite the whole struct: UI state like
+        // `help_visible` lives only in the shared mutex and would be
+        // clobbered by a `*rs = session.clone()`. Keep the local
+        // `session` in lockstep too so its `session_id` stays valid for
+        // the next iteration's snapshot lookup.
         let still_alive = {
             let snap = graph.snapshot();
             let live = snap.sessions.contains_key(&session.session_id);
@@ -566,7 +601,8 @@ async fn run_attach_loop(
                         session.active_pane_id = w.active_pane;
                     }
                     let mut rs = render_session.lock().await;
-                    *rs = session.clone();
+                    rs.active_window_id = session.active_window_id;
+                    rs.active_pane_id = session.active_pane_id;
                 }
             }
             live
@@ -647,6 +683,7 @@ async fn run_render_loop(
     let mut cfg_listener = Box::pin(cfg_notify.notified());
     let mut last_border_style = initial.appearance.border_style.clone();
     let mut last_theme = initial_theme;
+    let mut last_help_visible = false;
 
     loop {
         tokio::select! {
@@ -688,6 +725,17 @@ async fn run_render_loop(
         // Build a multi-pane frame snapshot.
         let snap = graph.snapshot();
         let attached = session.lock().await.clone();
+
+        // Toggling the help overlay needs a full redraw — the diffing
+        // backend would otherwise leave overlay glyphs on screen after
+        // dismiss (the underlying VT cells didn't change). Force a
+        // redraw on EITHER edge of the toggle so both reveal and hide
+        // produce clean frames.
+        if attached.help_visible != last_help_visible {
+            compositor.force_redraw();
+            last_help_visible = attached.help_visible;
+        }
+
         let win = match snap.windows.get(&attached.active_window_id) {
             Some(w) => w,
             None => continue,
@@ -720,6 +768,16 @@ async fn run_render_loop(
         // Reset the buffer first so we only ship the new frame's bytes.
         compositor.inner_mut().clear();
         let _ = compositor.render_multi_pane(frame);
+
+        // Help-overlay layer: drawn AFTER the diff'd multipane frame so
+        // it covers the cells underneath. Toggling the overlay also
+        // forces a full redraw on the next frame so the underlying
+        // cells return when the overlay closes — otherwise the
+        // compositor's diff would skip those positions because they
+        // didn't change in the VT grid.
+        if attached.help_visible {
+            shux_ui::render_help_overlay_into(compositor.inner_mut(), cols, rows, &live_theme);
+        }
 
         // Take the bytes out (drain) and send them.
         let bytes = std::mem::take(compositor.inner_mut());
@@ -978,6 +1036,27 @@ async fn handle_action(
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     use shux_core::layout::Direction;
+
+    // ToggleHelp is handled before the snapshot — it's a UI-only flip
+    // that doesn't touch the graph or PTYs, and needs to fire even
+    // (especially) while the overlay is already on screen.
+    if matches!(kind, ActionKind::ToggleHelp) {
+        let mut s = session.lock().await;
+        s.help_visible = !s.help_visible;
+        tracing::info!(
+            help_visible = s.help_visible,
+            "attach: toggled help overlay"
+        );
+        return Ok(());
+    }
+
+    // While the overlay is visible, swallow every other action — the
+    // user is meant to read the cheat sheet, not navigate around behind
+    // it. They dismiss with Esc / q (handled in the Input frame path).
+    if session.lock().await.help_visible {
+        return Ok(());
+    }
+
     let attached = session.lock().await.clone();
     let viewport = current_viewport(client_size).await;
 
@@ -1029,6 +1108,10 @@ async fn handle_action(
         ActionKind::ResizeUp => resize_pane(graph, &attached, Direction::Horizontal, -0.05).await,
         ActionKind::ResizeDown => resize_pane(graph, &attached, Direction::Horizontal, 0.05).await,
         ActionKind::Redraw => Ok(()),
+        // Handled above — the early-return keeps this branch unreachable
+        // but the match arm is required so adding new ActionKinds keeps
+        // failing the compile-time exhaustiveness check.
+        ActionKind::ToggleHelp => unreachable!("ToggleHelp short-circuited above"),
     }
 }
 
