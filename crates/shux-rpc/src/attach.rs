@@ -87,10 +87,39 @@ pub enum AttachClientFrame {
         #[serde(default)]
         args: ActionArgs,
     },
+    /// Mouse event from the host terminal. The daemon decides what each
+    /// event means: click → focus the pane under the cursor, drag on a
+    /// border → resize, scroll → scroll the focused pane's scrollback.
+    Mouse {
+        kind: MouseKind,
+        button: MouseButton,
+        col: u16,
+        row: u16,
+    },
     /// Client wants to detach.
     Detach,
     /// Heartbeat reply.
     Pong,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseKind {
+    Down,
+    Up,
+    Drag,
+    ScrollUp,
+    ScrollDown,
+    Move,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    None,
 }
 
 /// Handled actions the client forwards to the daemon. These map 1:1 to

@@ -31,13 +31,14 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use shux_core::config::ConfigHandle;
 use shux_core::graph::GraphHandle;
 use shux_core::layout::{NavDirection, Rect};
 use shux_core::model::{PaneId, SessionId, WindowId};
 use shux_pty::handle::PtySize;
 use shux_rpc::attach::{
     ATTACH_PROTOCOL_VERSION, ActionKind, AttachClientFrame, AttachHello, AttachReady,
-    AttachServerFrame,
+    AttachServerFrame, MouseButton as ProtoMouseButton, MouseKind,
 };
 use shux_rpc::create_codec;
 use shux_ui::{
@@ -68,6 +69,7 @@ pub async fn run_attach_server(
     socket_path: std::path::PathBuf,
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
+    config: ConfigHandle,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     if socket_path.exists() {
@@ -96,9 +98,10 @@ pub async fn run_attach_server(
                     Ok((stream, _)) => {
                         let g = graph.clone();
                         let io = io_state.clone();
+                        let cfg = config.clone();
                         let c = cancel.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_attach_connection(stream, g, io, c).await {
+                            if let Err(e) = handle_attach_connection(stream, g, io, cfg, c).await {
                                 warn!(error = %e, "attach session ended with error");
                             }
                         });
@@ -118,6 +121,7 @@ async fn handle_attach_connection(
     stream: UnixStream,
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
+    config: ConfigHandle,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut framed = Framed::new(stream, create_codec());
@@ -183,6 +187,7 @@ async fn handle_attach_connection(
             crate::spawn_pane_pty(
                 session.active_pane_id,
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")),
+                Vec::new(),
                 io_state.clone(),
                 cancel.clone(),
             )
@@ -211,7 +216,7 @@ async fn handle_attach_connection(
     info!(session = %session.name, "attach session started");
 
     // Step 4: Run the main attach loop.
-    run_attach_loop(framed, graph, io_state, session, hello, cancel).await
+    run_attach_loop(framed, graph, io_state, config, session, hello, cancel).await
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +347,7 @@ async fn run_attach_loop(
     framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
+    config: ConfigHandle,
     mut session: AttachedSession,
     hello: AttachHello,
     cancel: CancellationToken,
@@ -386,10 +392,12 @@ async fn run_attach_loop(
     let render_session = Arc::new(Mutex::new(session.clone()));
     let render_session_for_task = render_session.clone();
     let render_client_size = client_size.clone();
+    let render_config = config.clone();
     let renderer = tokio::spawn(async move {
         run_render_loop(
             render_graph,
             render_io,
+            render_config,
             render_session_for_task,
             render_client_size,
             render_tx,
@@ -419,6 +427,10 @@ async fn run_attach_loop(
 
     // Read client frames.
     let mut detached = false;
+    // Mouse drag state: when a drag starts on a border cell, we remember
+    // which boundary it's grabbing so subsequent Drag events can adjust
+    // the layout split ratio.
+    let mut mouse_drag: Option<DragState> = None;
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -500,6 +512,30 @@ async fn run_attach_loop(
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.notify_one();
                     }
+                    AttachClientFrame::Mouse {
+                        kind,
+                        button,
+                        col,
+                        row,
+                    } => {
+                        if let Err(e) = handle_mouse(
+                            kind,
+                            button,
+                            col,
+                            row,
+                            &graph,
+                            &io_state,
+                            &render_session,
+                            &client_size,
+                            &mut mouse_drag,
+                        )
+                        .await
+                        {
+                            warn!(?kind, error = %e, "attach: mouse handle failed");
+                        }
+                        let pulse = io_state.lock().await.render_pulse.clone();
+                        pulse.notify_one();
+                    }
                     AttachClientFrame::Detach => {
                         detached = true;
                         let _ = out_tx.send(AttachServerFrame::DetachAck).await;
@@ -553,16 +589,18 @@ async fn run_attach_loop(
 async fn run_render_loop(
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
+    config: ConfigHandle,
     session: Arc<Mutex<AttachedSession>>,
     client_size: ClientSize,
     out_tx: mpsc::Sender<AttachServerFrame>,
     cancel: CancellationToken,
 ) {
     let (mut cols, mut rows) = *client_size.lock().await;
+    let initial = config.current();
     let cfg = CompositorConfig {
         show_border: false,
         status_bar_height: STATUS_BAR_ROWS,
-        border_style: BorderStyle::Rounded,
+        border_style: BorderStyle::parse(&initial.appearance.border_style),
         ..Default::default()
     };
     let buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -587,11 +625,25 @@ async fn run_render_loop(
     let pulse = io_state.lock().await.render_pulse.clone();
     let mut pulse_listener = Box::pin(pulse.notified());
 
+    // The config-change notify gives us a fast path for hot-reloads:
+    // when the user saves a new ~/.config/shux/config.toml, the watcher
+    // task fires this Notify and we redraw immediately with the new
+    // appearance / status bar settings.
+    let cfg_notify = config.change_notify();
+    let mut cfg_listener = Box::pin(cfg_notify.notified());
+    let mut last_border_style = initial.appearance.border_style.clone();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = &mut pulse_listener => {
                 pulse_listener = Box::pin(pulse.notified());
+            }
+            _ = &mut cfg_listener => {
+                cfg_listener = Box::pin(cfg_notify.notified());
+                // Force a full redraw so border-style changes etc.
+                // visibly land on the very next frame.
+                compositor.force_redraw();
             }
             _ = tick.tick() => {}
         }
@@ -603,6 +655,14 @@ async fn run_render_loop(
             cols = new_cols;
             rows = new_rows;
             compositor.resize(cols, rows);
+        }
+
+        // Apply any config-driven appearance changes to the compositor.
+        // We re-read here so live edits land without restart.
+        let live_cfg = config.current();
+        if live_cfg.appearance.border_style != last_border_style {
+            last_border_style = live_cfg.appearance.border_style.clone();
+            compositor.set_border_style(BorderStyle::parse(&last_border_style));
         }
 
         // Build a multi-pane frame snapshot.
@@ -705,6 +765,148 @@ fn build_status_bar(
         now.format("%H:%M:%S")
     )));
     bar
+}
+
+/// State held during a left-button drag that started on a pane border.
+/// We snapshot the dragged pane and direction at mouse-down; subsequent
+/// Drag events translate the cursor delta into ResizePane calls.
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    /// The pane whose border the user grabbed (we resize *this* pane).
+    target: PaneId,
+    /// Which axis the border was on. Vertical border → adjust horizontal
+    /// split; horizontal border → adjust vertical split.
+    direction: shux_core::layout::Direction,
+    /// Last cursor position so we can compute deltas.
+    last_col: u16,
+    last_row: u16,
+}
+
+/// Look up which pane contains the cell at `(col, row)`. Returns the
+/// pane and its rect, or None if the click landed on a border cell or
+/// outside the content area.
+fn pane_at(
+    layout_tree: &shux_core::layout::LayoutNode,
+    viewport: Rect,
+    col: u16,
+    row: u16,
+) -> Option<(PaneId, Rect)> {
+    layout_tree
+        .compute_rects(viewport)
+        .into_iter()
+        .find(|(_, r)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
+}
+
+/// Detect that a click landed on a vertical or horizontal border cell
+/// between two adjacent panes. Returns (the pane on the "earlier" side
+/// of the border, axis along which to resize) so the caller can adjust
+/// that pane's split ratio. Border cells are the 1-cell gaps between
+/// rects that `compute_rects` reserves.
+fn border_at(
+    layout_tree: &shux_core::layout::LayoutNode,
+    viewport: Rect,
+    col: u16,
+    row: u16,
+) -> Option<(PaneId, shux_core::layout::Direction)> {
+    use shux_core::layout::Direction;
+    let rects = layout_tree.compute_rects(viewport);
+    // Find a pane whose right edge is at col-1 and (row is inside its
+    // vertical extent) — that's a vertical border between this pane and
+    // the next.
+    for (pid, r) in &rects {
+        if col == r.x + r.width && row >= r.y && row < r.y + r.height {
+            return Some((*pid, Direction::Vertical));
+        }
+        if row == r.y + r.height && col >= r.x && col < r.x + r.width {
+            return Some((*pid, Direction::Horizontal));
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_mouse(
+    kind: MouseKind,
+    button: ProtoMouseButton,
+    col: u16,
+    row: u16,
+    graph: &GraphHandle,
+    _io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+    drag: &mut Option<DragState>,
+) -> anyhow::Result<()> {
+    let viewport = current_viewport(client_size).await;
+    let attached = session.lock().await.clone();
+    let snap = graph.snapshot();
+    let win = match snap.windows.get(&attached.active_window_id) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+    // Don't treat clicks while zoomed as layout edits — there are no
+    // real borders to grab and only one pane to focus.
+    if win.layout.is_zoomed() {
+        return Ok(());
+    }
+    let tree = &win.layout.tree;
+
+    match (kind, button) {
+        // Left click → if it landed on a pane, focus that pane. If it
+        // landed on a border, arm a drag.
+        (MouseKind::Down, ProtoMouseButton::Left) => {
+            if let Some((pid, dir)) = border_at(tree, viewport, col, row) {
+                *drag = Some(DragState {
+                    target: pid,
+                    direction: dir,
+                    last_col: col,
+                    last_row: row,
+                });
+            } else if let Some((pid, _)) = pane_at(tree, viewport, col, row) {
+                if pid != attached.active_pane_id {
+                    let _ = graph.focus_pane(pid).await;
+                    let mut s = session.lock().await;
+                    s.active_pane_id = pid;
+                }
+                *drag = None;
+            }
+        }
+        // Drag while a border-grab is armed → translate delta into a
+        // resize. delta_ratio is approximate (works well enough for
+        // interactive feel; rounding is bounded by clamp_ratio inside
+        // the layout).
+        (MouseKind::Drag, ProtoMouseButton::Left) => {
+            if let Some(state) = *drag {
+                let (delta_axis, span) = match state.direction {
+                    shux_core::layout::Direction::Vertical => {
+                        (col as i32 - state.last_col as i32, viewport.width as i32)
+                    }
+                    shux_core::layout::Direction::Horizontal => {
+                        (row as i32 - state.last_row as i32, viewport.height as i32)
+                    }
+                };
+                if delta_axis != 0 && span > 0 {
+                    let delta_ratio = delta_axis as f32 / span as f32;
+                    let _ = graph
+                        .resize_pane(state.target, state.direction, delta_ratio)
+                        .await;
+                }
+                *drag = Some(DragState {
+                    target: state.target,
+                    direction: state.direction,
+                    last_col: col,
+                    last_row: row,
+                });
+            }
+        }
+        (MouseKind::Up, ProtoMouseButton::Left) => {
+            *drag = None;
+        }
+        // Scroll wheel: future scrollback navigation hook (task 021,
+        // copy mode). For now: noop so the protocol still flows.
+        (MouseKind::ScrollUp, _) | (MouseKind::ScrollDown, _) => {}
+        _ => {}
+    }
+    Ok(())
 }
 
 /// True if an action mutates the pane layout in a way that changes the
@@ -848,6 +1050,7 @@ async fn split(
     crate::spawn_pane_pty(
         new_pane,
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")),
+        Vec::new(),
         io_state.clone(),
         cancel.clone(),
     )
@@ -984,7 +1187,7 @@ async fn new_window(
         .get(&window_id)
         .ok_or_else(|| anyhow::anyhow!("window vanished after create"))?;
     let pane_id = win.active_pane;
-    crate::spawn_pane_pty(pane_id, cwd, io_state.clone(), cancel.clone())
+    crate::spawn_pane_pty(pane_id, cwd, Vec::new(), io_state.clone(), cancel.clone())
         .await
         .ok();
 

@@ -13,7 +13,7 @@ pub mod server;
 // Re-export key types.
 pub use attach::{
     ATTACH_PROTOCOL_VERSION, ActionArgs, ActionKind, AttachClientFrame, AttachHello, AttachReady,
-    AttachServerFrame,
+    AttachServerFrame, MouseButton, MouseKind,
 };
 pub use codec::{MAX_FRAME_SIZE, create_codec};
 pub use error::{ErrorCode, RpcError};

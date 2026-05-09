@@ -160,13 +160,24 @@ async fn run_pane_pty_task(
 }
 
 /// Spawn a PTY process and VT instance for a pane.
+///
+/// When `command` is empty, spawns the user's default login+interactive
+/// shell (via `PtyConfig::default_shell`). When non-empty, runs that
+/// argv directly — this is what `shux new -s X -- vim foo.rs` lands on,
+/// so the pane runs `vim foo.rs` instead of a shell. The pane lifetime
+/// becomes the lifetime of that command (when it exits, the pane EOFs).
 pub(crate) async fn spawn_pane_pty(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
+    command: Vec<String>,
     io_state: Arc<Mutex<PaneIoState>>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), shux_rpc::RpcError> {
-    let config = shux_pty::handle::PtyConfig::default_shell(cwd);
+    let config = if command.is_empty() {
+        shux_pty::handle::PtyConfig::default_shell(cwd)
+    } else {
+        shux_pty::handle::PtyConfig::with_command(command, cwd)
+    };
     let handle = shux_pty::handle::PtyHandle::spawn(&config)
         .map_err(|e| shux_rpc::RpcError::internal(&format!("PTY spawn failed: {e}")))?;
 
@@ -305,15 +316,35 @@ async fn run_rpc_server(
     // Create shared pane I/O state (PTY writers, VTs, command engine)
     let io_state = Arc::new(Mutex::new(PaneIoState::new()));
 
+    // Load user config (~/.config/shux/config.toml). Missing file is
+    // valid — defaults match current hardcoded behavior. Spawn a watcher
+    // task so edits to the file are picked up live.
+    let config_path = shux_core::config::default_config_path();
+    let config_handle = shux_core::config::ConfigHandle::load_or_default(&config_path);
+    let cfg_watcher_handle = config_handle.clone();
+    let cfg_watcher_path = config_path.clone();
+    let cfg_watcher_cancel = cancel.clone();
+    tokio::spawn(async move {
+        shux_core::config::run_hot_reload(cfg_watcher_path, cfg_watcher_handle, cfg_watcher_cancel)
+            .await;
+    });
+
     // Spawn the attach UDS listener (separate socket, dedicated streaming
     // protocol). The JSON-RPC socket below stays request-response.
     let attach_path = daemon::attach_socket_path()?;
     let attach_graph = graph_handle.clone();
     let attach_io = io_state.clone();
     let attach_cancel = cancel.clone();
+    let attach_config = config_handle.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            attach::run_attach_server(attach_path, attach_graph, attach_io, attach_cancel).await
+        if let Err(e) = attach::run_attach_server(
+            attach_path,
+            attach_graph,
+            attach_io,
+            attach_config,
+            attach_cancel,
+        )
+        .await
         {
             tracing::error!(error = %e, "attach server error");
         }
@@ -559,7 +590,7 @@ fn register_pane_methods(
 
                 // Spawn PTY for the new pane
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-                let _ = spawn_pane_pty(new_pane_id, cwd, io, ct).await;
+                let _ = spawn_pane_pty(new_pane_id, cwd, Vec::new(), io, ct).await;
 
                 let snap = gh.snapshot();
                 let new_pane = snap
@@ -918,7 +949,7 @@ fn register_window_methods(
                 let pane_id = window.active_pane.to_string();
 
                 // Spawn PTY for the new pane
-                let _ = spawn_pane_pty(window.active_pane, cwd, io, ct).await;
+                let _ = spawn_pane_pty(window.active_pane, cwd, Vec::new(), io, ct).await;
 
                 let mut result = window_to_json(window, index, is_active, &snap);
                 // Include pane_id at top level for convenience
@@ -1017,7 +1048,7 @@ fn register_window_methods(
                     .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
 
                 // Spawn PTY for the new pane
-                let _ = spawn_pane_pty(window.active_pane, cwd, io, ct).await;
+                let _ = spawn_pane_pty(window.active_pane, cwd, Vec::new(), io, ct).await;
 
                 let session = snap
                     .sessions
@@ -1246,6 +1277,21 @@ fn register_session_methods(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
 
+                    // Optional pane command. Accepts:
+                    //   {"command": ["vim", "foo.rs"]}     — preferred (passthrough)
+                    //   {"command": "top"}                 — convenience: split on whitespace
+                    //   omitted / null                     — spawn the user's default shell
+                    let command: Vec<String> = match params.get("command") {
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect(),
+                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                            s.split_whitespace().map(|s| s.to_string()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+
                     // Auto-generate name if not provided (None).
                     // Explicit empty string (Some("")) flows through to validation.
                     let name = match name {
@@ -1272,7 +1318,14 @@ fn register_session_methods(
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 if let Some(wid) = s.windows.first() {
                                     if let Some(w) = snap.windows.get(wid) {
-                                        let _ = spawn_pane_pty(w.active_pane, cwd, io, ct).await;
+                                        let _ = spawn_pane_pty(
+                                            w.active_pane,
+                                            cwd,
+                                            command.clone(),
+                                            io,
+                                            ct,
+                                        )
+                                        .await;
                                     }
                                 }
                                 Ok(session_to_json(s, &snap))
@@ -1343,6 +1396,18 @@ fn register_session_methods(
                         .unwrap_or("default")
                         .to_string();
 
+                    // Optional pane command (same shape as session.create).
+                    let command: Vec<String> = match params.get("command") {
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect(),
+                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                            s.split_whitespace().map(|s| s.to_string()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+
                     // Check if session already exists
                     let snap = gh.snapshot();
                     if let Some(s) = snap.find_session_by_name(&name) {
@@ -1361,7 +1426,14 @@ fn register_session_methods(
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 if let Some(wid) = s.windows.first() {
                                     if let Some(w) = snap.windows.get(wid) {
-                                        let _ = spawn_pane_pty(w.active_pane, cwd, io, ct).await;
+                                        let _ = spawn_pane_pty(
+                                            w.active_pane,
+                                            cwd,
+                                            command.clone(),
+                                            io,
+                                            ct,
+                                        )
+                                        .await;
                                     }
                                 }
                                 let mut json = session_to_json(s, &snap);
@@ -1769,10 +1841,12 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             ensure,
             detached,
             cmd,
+            argv,
         }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
             let session_name = session.clone().unwrap_or_else(default_session_name);
-            let _result = cli::handle_new(&mut stream, session, cmd, ensure, args.format).await?;
+            let _result =
+                cli::handle_new(&mut stream, session, cmd, argv, ensure, args.format).await?;
             drop(stream);
 
             if !detached {

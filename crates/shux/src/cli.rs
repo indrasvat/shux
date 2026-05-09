@@ -73,9 +73,17 @@ pub enum Command {
         #[arg(short = 'd', long)]
         detached: bool,
 
-        /// Shell command to run in the initial pane
+        /// Shell command to run in the initial pane (single string).
+        /// For an exec-style passthrough use trailing `--` instead:
+        /// `shux new -s vim -- vim foo.rs`.
         #[arg(long)]
         cmd: Option<String>,
+
+        /// Trailing argv for the initial pane. Anything after `--` lands
+        /// here and is exec'd directly (no shell wrapper). Takes
+        /// precedence over `--cmd`.
+        #[arg(last = true, num_args = 0..)]
+        argv: Vec<String>,
     },
 
     /// Attach to an existing session
@@ -652,6 +660,7 @@ pub async fn handle_new(
     stream: &mut tokio::net::UnixStream,
     session_name: Option<String>,
     cmd: Option<String>,
+    argv: Vec<String>,
     ensure: bool,
     format: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
@@ -659,7 +668,13 @@ pub async fn handle_new(
     if let Some(name) = session_name {
         params.insert("name".to_string(), serde_json::Value::String(name));
     }
-    if let Some(command) = cmd {
+    // argv (trailing `--`) wins over --cmd if both are given.
+    if !argv.is_empty() {
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::Array(argv.into_iter().map(serde_json::Value::String).collect()),
+        );
+    } else if let Some(command) = cmd {
         params.insert("command".to_string(), serde_json::Value::String(command));
     }
 
@@ -1650,11 +1665,26 @@ mod tests {
                 ensure,
                 detached,
                 cmd,
+                argv,
             }) => {
                 assert_eq!(session, Some("work".to_string()));
                 assert!(ensure);
                 assert!(detached);
                 assert!(cmd.is_none());
+                assert!(argv.is_empty());
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_new_with_trailing_argv() {
+        // shux new -s vim -- vim foo.rs
+        let cli = Cli::try_parse_from(["shux", "new", "-s", "vim", "--", "vim", "foo.rs"]).unwrap();
+        match cli.command {
+            Some(Command::New { session, argv, .. }) => {
+                assert_eq!(session, Some("vim".to_string()));
+                assert_eq!(argv, vec!["vim".to_string(), "foo.rs".to_string()]);
             }
             _ => panic!("expected New command"),
         }

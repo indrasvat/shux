@@ -282,6 +282,16 @@ impl<W: Write> RenderCompositor<W> {
         self.force_full_redraw = true;
     }
 
+    /// Live-swap the border style. Used by the daemon's attach session
+    /// when the user's config.toml changes on disk: the next frame uses
+    /// the new style without a restart.
+    pub fn set_border_style(&mut self, style: BorderStyle) {
+        if self.config.border_style != style {
+            self.config.border_style = style;
+            self.force_full_redraw = true;
+        }
+    }
+
     /// Borrow the underlying writer. Useful in tests where we capture
     /// bytes into a `Cursor<Vec<u8>>` and want to assert on them.
     pub fn inner(&self) -> &W {

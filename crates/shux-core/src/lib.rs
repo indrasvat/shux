@@ -1,6 +1,7 @@
 //! shux core — daemon, data model, event bus, config, theme engine.
 
 pub mod bus;
+pub mod config;
 pub mod daemon;
 pub mod event;
 pub mod graph;

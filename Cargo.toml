@@ -73,3 +73,6 @@ prost = "0.13"
 
 # Daemonization
 nix = { version = "0.29", features = ["process", "signal", "fs", "user"] }
+
+# Filesystem watching (for config hot reload)
+notify = "8"

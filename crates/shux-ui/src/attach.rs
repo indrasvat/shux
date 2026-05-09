@@ -19,7 +19,10 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton as CtMouseButton,
+    MouseEventKind,
+};
 use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -27,7 +30,7 @@ use tokio_util::codec::Framed;
 
 use shux_rpc::attach::{
     ATTACH_PROTOCOL_VERSION, ActionArgs, ActionKind, AttachClientFrame, AttachHello, AttachReady,
-    AttachServerFrame,
+    AttachServerFrame, MouseButton, MouseKind,
 };
 use shux_rpc::create_codec;
 
@@ -248,8 +251,32 @@ where
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();
                     }
-                    Event::Mouse(_) | Event::Paste(_) | Event::FocusGained | Event::FocusLost => {
-                        // Ignore for now — mouse support arrives in task 020.
+                    Event::Mouse(m) => {
+                        // Translate crossterm's MouseEvent into our protocol
+                        // shape and forward. The daemon decides what each
+                        // event means (click → focus pane, drag on border →
+                        // resize, scroll → scrollback).
+                        let (kind, button) = match m.kind {
+                            MouseEventKind::Down(b) => (MouseKind::Down, ct_button(b)),
+                            MouseEventKind::Up(b) => (MouseKind::Up, ct_button(b)),
+                            MouseEventKind::Drag(b) => (MouseKind::Drag, ct_button(b)),
+                            MouseEventKind::Moved => (MouseKind::Move, MouseButton::None),
+                            MouseEventKind::ScrollUp => (MouseKind::ScrollUp, MouseButton::None),
+                            MouseEventKind::ScrollDown => (MouseKind::ScrollDown, MouseButton::None),
+                            // ScrollLeft / ScrollRight: ignore for now.
+                            _ => continue,
+                        };
+                        let frame = AttachClientFrame::Mouse {
+                            kind,
+                            button,
+                            col: m.column,
+                            row: m.row,
+                        };
+                        let bytes = serde_json::to_vec(&frame)?;
+                        sink.send(Bytes::from(bytes)).await.ok();
+                    }
+                    Event::Paste(_) | Event::FocusGained | Event::FocusLost => {
+                        // Ignore for now.
                     }
                 }
             }
@@ -266,6 +293,14 @@ where
                 }
             }
         }
+    }
+}
+
+fn ct_button(b: CtMouseButton) -> MouseButton {
+    match b {
+        CtMouseButton::Left => MouseButton::Left,
+        CtMouseButton::Right => MouseButton::Right,
+        CtMouseButton::Middle => MouseButton::Middle,
     }
 }
 
