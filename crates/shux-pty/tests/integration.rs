@@ -132,7 +132,20 @@ async fn test_pty_event_output() {
     let (event_tx, mut event_rx) = mpsc::channel(32);
     let shutdown = tokio_util::sync::CancellationToken::new();
 
-    let config = PtyConfig::with_command(vec!["echo".into(), "event test".into()], test_cwd());
+    // Use bash -c with a small sleep after the echo. With a bare `echo`,
+    // the child exits in ~1ms — fast enough on Linux/CI runners that the
+    // master-side read can race with EOF and miss the output entirely.
+    // The sleep keeps the slave open long enough for the kernel to flush
+    // the writes through to the master before the child reaps. Same
+    // pattern is used by tmux / iTerm2 PTY tests for the same reason.
+    let config = PtyConfig::with_command(
+        vec![
+            "bash".into(),
+            "-c".into(),
+            "echo event test; sleep 0.1".into(),
+        ],
+        test_cwd(),
+    );
     let handle = PtyHandle::spawn(&config).unwrap();
 
     let shutdown_clone = shutdown.clone();

@@ -1,14 +1,19 @@
 # deny.toml — cargo-deny configuration
-# Run: cargo deny check
+# Schema for cargo-deny ≥ 0.16. Run: cargo deny check
+#
+# Notes on the new schema (vs. the pre-0.16 file we used to ship):
+# - `vulnerability` / `notice` are no longer configurable in [advisories]
+#   — cargo-deny always denies vulnerabilities and you cannot opt out.
+# - `unmaintained` is now an enum: "all" | "workspace" | "transitive" | "none"
+#   (was "deny"/"warn"/"allow"). "workspace" only flags workspace-level deps,
+#   which is what we want — transitive churn shouldn't fail CI.
+# - `[licenses]` no longer takes `unlicensed`. The allow-list IS the policy.
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+unmaintained = "workspace"
+yanked = "deny"
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -21,6 +26,7 @@ allow = [
     "BSL-1.0",
     "OpenSSL",
 ]
+confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"

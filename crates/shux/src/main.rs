@@ -799,16 +799,25 @@ fn register_pane_methods(
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id format"))?;
 
-                // Clean up PTY/VT
-                {
-                    let mut state = io.lock().await;
-                    state.writers.remove(&pane_id);
-                    state.vts.remove(&pane_id);
-                }
-
+                // Order-of-operations matters: destroy_pane() can return
+                // LastPane (refusing to remove the only pane in a window).
+                // If we tear down writers/resizers/vts FIRST and then the
+                // graph mutation fails, the pane stays in the graph but
+                // its IO state is gone — the session ends up with an
+                // active pane that has no PTY. Mutate the graph first;
+                // only purge IO state on success.
                 gh.destroy_pane(pane_id)
                     .await
                     .map_err(graph_error_to_rpc)?;
+                {
+                    let mut state = io.lock().await;
+                    state.writers.remove(&pane_id);
+                    state.resizers.remove(&pane_id);
+                    state.vts.remove(&pane_id);
+                    let pulse = state.render_pulse.clone();
+                    drop(state);
+                    pulse.notify_one();
+                }
 
                 Ok(serde_json::json!({ "killed": pane_id_str }))
             }
@@ -1260,6 +1269,7 @@ fn register_session_methods(
     let g5 = graph.clone();
 
     let io_create = io_state.clone();
+    let io_kill = io_state.clone();
     let io_ensure = io_state;
     let cancel_create = cancel.clone();
     let cancel_ensure = cancel;
@@ -1354,6 +1364,7 @@ fn register_session_methods(
         )
         .register("session.kill", move |params: Option<serde_json::Value>| {
             let gh = g3.clone();
+            let io = io_kill.clone();
             async move {
                 let params = params.unwrap_or_default();
 
@@ -1380,16 +1391,60 @@ fn register_session_methods(
                     ));
                 };
 
-                let snap = gh.snapshot();
-                let name = snap
+                // Snapshot the session BEFORE destroying it so we know
+                // which panes belong to it. After destroy_session the
+                // graph entries are gone; without this snapshot we'd
+                // have no way to find the orphaned PTY tasks to clean up.
+                let pre_snap = gh.snapshot();
+                let name = pre_snap
                     .sessions
                     .get(&session_id)
                     .map(|s| s.name.clone())
                     .unwrap_or_default();
+                let pane_ids: Vec<shux_core::model::PaneId> = pre_snap
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| {
+                        s.windows
+                            .iter()
+                            .flat_map(|wid| {
+                                pre_snap
+                                    .windows
+                                    .get(wid)
+                                    .map(|w| w.layout.tree.pane_ids())
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                drop(pre_snap);
 
+                // Mutate the graph FIRST. If destroy_session errors, we
+                // leave PTY/VT state untouched (otherwise we'd kill PTYs
+                // for a session that's still in the graph).
                 gh.destroy_session(session_id, None)
                     .await
                     .map_err(graph_error_to_rpc)?;
+
+                // Tear down PTY/VT/writer/resizer entries for every pane
+                // that belonged to the session. Dropping the writer
+                // Sender closes the mpsc on the recv side, which makes
+                // the per-pane PTY task observe `None` from `write_rx
+                // .recv()`, break out of its select loop, and call
+                // `handle.kill()` on its way out — reaping the child
+                // shell. Without this codex-flagged fix (P1), shells
+                // for killed sessions would stay alive but unreachable.
+                {
+                    let mut state = io.lock().await;
+                    for pid in &pane_ids {
+                        state.writers.remove(pid);
+                        state.resizers.remove(pid);
+                        state.vts.remove(pid);
+                    }
+                    let pulse = state.render_pulse.clone();
+                    drop(state);
+                    pulse.notify_one();
+                }
 
                 Ok(serde_json::json!({ "killed": name }))
             }

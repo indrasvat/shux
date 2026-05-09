@@ -226,7 +226,7 @@ impl PtyHandle {
         #[cfg(target_os = "linux")]
         {
             let path = format!("/proc/{}/cwd", self.pid);
-            return std::fs::read_link(path).ok();
+            std::fs::read_link(path).ok()
         }
 
         #[cfg(not(target_os = "linux"))]
