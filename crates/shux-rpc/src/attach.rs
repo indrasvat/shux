@@ -159,6 +159,8 @@ pub enum ActionKind {
     ResizeDown,
     /// Force a full redraw (debug aid).
     Redraw,
+    /// Toggle the keybinding help overlay (prefix + ?).
+    ToggleHelp,
 }
 
 /// Optional per-action arguments. Not all actions use all fields.

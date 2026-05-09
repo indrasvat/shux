@@ -11,6 +11,7 @@ pub mod borders;
 pub mod buffer;
 pub mod client;
 pub mod compositor;
+pub mod help_overlay;
 pub mod input;
 pub mod keys;
 pub mod render;
@@ -23,6 +24,7 @@ pub use borders::{BorderChars, BorderColors, BorderSegment, BorderStyle, compute
 pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
 pub use client::{ClientConfig, ExitReason};
 pub use compositor::{CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats};
+pub use help_overlay::render_help_overlay_into;
 pub use input::{InputEvent, KeyboardProtocol, MouseAction, MouseButton, MouseEvent};
 pub use keys::{KeyPress, KeyValue, Modifiers, NamedKey};
 pub use render::RenderBackend;

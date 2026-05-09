@@ -332,6 +332,7 @@ fn key_to_prefix_action(key: KeyEvent) -> Option<ActionKind> {
         KeyCode::Right => ActionKind::ResizeRight,
         KeyCode::Up => ActionKind::ResizeUp,
         KeyCode::Down => ActionKind::ResizeDown,
+        KeyCode::Char('?') => ActionKind::ToggleHelp,
         _ => return None,
     })
 }
@@ -397,7 +398,18 @@ mod tests {
 
     #[test]
     fn test_unknown_prefix_key_returns_none() {
-        let action = key_to_prefix_action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        // Pick a character that is genuinely unbound today. `?` used to
+        // be unbound but is now ToggleHelp (task 033 / PR 4).
+        let action = key_to_prefix_action(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE));
         assert_eq!(action, None);
+    }
+
+    #[test]
+    fn test_question_mark_maps_to_toggle_help() {
+        let action = key_to_prefix_action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(action, Some(ActionKind::ToggleHelp));
+        // Same with explicit Shift modifier (some terminals send it).
+        let action = key_to_prefix_action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+        assert_eq!(action, Some(ActionKind::ToggleHelp));
     }
 }
