@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/shux-logo.png" alt="shux" width="400">
+  <img src="assets/logo.svg" alt="shux" width="400">
 </p>
 
 <p align="center">

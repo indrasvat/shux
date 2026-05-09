@@ -32,6 +32,7 @@ dist/
 .claude/automations/screenshots/
 .codemap/
 
+.DS_Store
 .DS_STORE
 
 # Task runner logs
