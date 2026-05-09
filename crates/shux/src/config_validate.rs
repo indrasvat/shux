@@ -9,9 +9,97 @@
 
 use std::path::{Path, PathBuf};
 
-use shux_core::config::Config;
-
 use crate::style;
+
+// ─── Strict mirror schema ────────────────────────────────────────────
+//
+// The runtime `Config` in shux-core is intentionally lenient — extra
+// keys are silently ignored so a typo never bricks a user's daemon
+// startup. The validator wants the *opposite* discipline: a field
+// like `[appearence]` (typo) or `borderstyle = "rounded"` (missing
+// underscore) MUST surface, otherwise `shux config validate` cheerfully
+// reports success while the user's intent is being thrown away.
+//
+// We keep the strict mirror here, in the binary crate, so the daemon's
+// schema stays lenient. Both shapes share the toml file format; the
+// strict variant adds `deny_unknown_fields` everywhere AND keeps the
+// same `#[serde(default)]` so missing sections still parse.
+
+// All fields below are populated by the toml deserializer; nothing
+// reads them directly because we discard the typed Config after
+// validation. Suppress the dead-field warnings rather than #[allow]ing
+// each one.
+#[allow(dead_code)]
+mod strict {
+    use serde::Deserialize;
+    use std::collections::HashMap;
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Config {
+        #[serde(default)]
+        pub appearance: Appearance,
+        #[serde(default)]
+        pub keys: Keys,
+        #[serde(default)]
+        pub shell: Shell,
+        #[serde(default)]
+        pub statusbar: StatusBar,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Appearance {
+        #[serde(default)]
+        pub border_style: Option<String>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Keys {
+        #[serde(default)]
+        pub prefix: Option<String>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Shell {
+        #[serde(default)]
+        pub command: Vec<String>,
+        #[serde(default)]
+        pub env: HashMap<String, String>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct StatusBar {
+        #[serde(default)]
+        pub left: Option<String>,
+        #[serde(default)]
+        pub center: Option<String>,
+        #[serde(default)]
+        pub right: Option<String>,
+        #[serde(default)]
+        pub segment: Vec<Segment>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Segment {
+        #[serde(default)]
+        pub zone: Option<String>,
+        #[serde(default)]
+        pub command: Vec<String>,
+        #[serde(default)]
+        pub env: HashMap<String, String>,
+        #[serde(default)]
+        pub starship_config: Option<String>,
+        #[serde(default)]
+        pub interval_ms: Option<u64>,
+        #[serde(default)]
+        pub fallback: Option<String>,
+    }
+}
 
 /// One diagnostic, ready to print.
 #[derive(Debug, Clone)]
@@ -50,35 +138,43 @@ fn byte_to_line_col(content: &str, byte_offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Locate the `starship_config = """..."""` block for `segment_index`
-/// inside the outer config text. Returns the 1-based line on which the
-/// triple-quoted string body STARTS — i.e. the line after the opening
-/// `"""`. Used to lift inner-TOML diagnostics back into outer file
-/// coordinates.
+/// Locate the `starship_config = """..."""` block belonging to the
+/// `segment_index`-th `[[statusbar.segment]]` header in the file.
+/// Returns the 1-based outer line on which the triple-quoted string
+/// body STARTS — i.e. the line after the opening `"""`.
 ///
-/// This is a deliberately small heuristic: a regex/scanner of `"""`
-/// borders rather than a full TOML round-trip. Two consequences:
-///   * It assumes `starship_config = """ ... """` literal syntax (the
-///     style `shux config init` writes). Single-quote / non-multiline
-///     forms return `None`.
-///   * If the user reorders segments, indices still match because we
-///     count occurrences in document order.
+/// This is a deliberately small heuristic — a line scanner rather than
+/// a full TOML round-trip — but it tracks the **segment** index, not
+/// the count of starship blocks. Counting blocks would be wrong when
+/// an earlier segment has no `starship_config`: index 1 would target
+/// the only block in the document instead of returning `None` for an
+/// orphan inner-TOML error.
+///
+/// Returns `None` when the segment has no inline `starship_config` (or
+/// uses a non-multiline form) — the caller falls back to reporting
+/// without an outer line.
 fn find_starship_config_start_line(content: &str, segment_index: usize) -> Option<usize> {
-    let mut count = 0usize;
+    // -1 means "before any [[statusbar.segment]] header has been seen".
+    let mut current_segment: i64 = -1;
     for (line_idx, line) in content.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("starship_config")
-            && let Some(eq_pos) = trimmed.find('=')
-        {
-            let after = trimmed[eq_pos + 1..].trim_start();
-            if after.starts_with("\"\"\"") {
-                if count == segment_index {
-                    // The string's first content line is the line AFTER
-                    // the opening `"""`. lines() is 0-based, errors are
-                    // 1-based, so add 2.
+        let trimmed = line.trim();
+        // A new statusbar.segment table header bumps the segment cursor.
+        if trimmed == "[[statusbar.segment]]" {
+            current_segment += 1;
+            continue;
+        }
+        // `starship_config = """` lines belong to whatever segment we
+        // are currently inside.
+        if current_segment >= 0 && (current_segment as usize) == segment_index {
+            let lstripped = line.trim_start();
+            if lstripped.starts_with("starship_config")
+                && let Some(eq_pos) = lstripped.find('=')
+            {
+                let after = lstripped[eq_pos + 1..].trim_start();
+                if after.starts_with("\"\"\"") {
+                    // 0-based line index → 1-based line + skip opener.
                     return Some(line_idx + 2);
                 }
-                count += 1;
             }
         }
     }
@@ -91,8 +187,8 @@ pub fn validate(path: &Path) -> std::io::Result<Vec<Diagnostic>> {
     let mut diags = Vec::new();
     let content = std::fs::read_to_string(path)?;
 
-    // ----- Stage 1: parse the outer config -----
-    match toml::from_str::<Config>(&content) {
+    // ----- Stage 1: parse the outer config (strict — denies unknown keys) -----
+    match toml::from_str::<strict::Config>(&content) {
         Ok(cfg) => {
             // Stage 2 only runs if the outer parse succeeded — there's
             // no point validating inner snippets when we cannot even
@@ -347,5 +443,59 @@ not = ok
         assert_eq!(find_starship_config_start_line(cfg, 1), Some(9));
         // Out of range
         assert_eq!(find_starship_config_start_line(cfg, 2), None);
+    }
+
+    /// Regression for codex P2 finding: when an EARLIER segment lacks
+    /// `starship_config`, the per-occurrence counting heuristic would
+    /// either point at the wrong segment or return None spuriously. The
+    /// fixed implementation tracks segment index by counting
+    /// `[[statusbar.segment]]` headers, so it correctly resolves the
+    /// later segment's block.
+    #[test]
+    fn find_starship_block_skips_starship_less_segments() {
+        let cfg = "\
+[[statusbar.segment]]
+zone = \"left\"
+command = [\"echo\", \"first\"]
+
+[[statusbar.segment]]
+zone = \"right\"
+command = [\"starship\", \"prompt\"]
+starship_config = \"\"\"
+[character]
+\"\"\"
+";
+        // Segment 0 has no inline starship — should be None.
+        assert_eq!(find_starship_config_start_line(cfg, 0), None);
+        // Segment 1's `"""` opens on line 8 → content starts at line 9.
+        assert_eq!(find_starship_config_start_line(cfg, 1), Some(9));
+    }
+
+    /// Validator must reject typo'd top-level sections, e.g. the user
+    /// types `[appearence]` instead of `[appearance]`. The lenient
+    /// runtime parser silently ignores such keys, so the validator's
+    /// strict mirror is the only thing that catches it.
+    #[test]
+    fn validate_unknown_top_level_section_is_rejected() {
+        let f = write_tmp("[appearence]\nborder_style = \"thick\"\n");
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(diags.len(), 1, "expected one diagnostic");
+        assert!(
+            diags[0].message.contains("appearence"),
+            "diag message should name the offending key: {}",
+            diags[0].message
+        );
+    }
+
+    /// Same as above but for a typo'd field inside a known section
+    /// (`borderstyle` missing the underscore). Without
+    /// `deny_unknown_fields` this would parse cleanly and the daemon
+    /// would silently use the default border style.
+    #[test]
+    fn validate_unknown_field_in_section_is_rejected() {
+        let f = write_tmp("[appearance]\nborderstyle = \"thick\"\n");
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("borderstyle"));
     }
 }
