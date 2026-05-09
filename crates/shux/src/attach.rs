@@ -774,20 +774,20 @@ fn build_status_bar(
             } else {
                 win.title.clone()
             };
-            bar.center.push(StatusSegment::plain(format!(
-                " [{}/{}] {} ",
-                active_idx + 1,
-                win_count,
-                title
-            )));
+            bar.center.push(StatusSegment::styled(
+                format!(" [{}/{}] {} ", active_idx + 1, win_count, title),
+                to_color(theme.status_fg),
+                false,
+            ));
         }
     }
 
     let now = chrono::Local::now();
-    bar.right.push(StatusSegment::plain(format!(
-        " {} ",
-        now.format("%H:%M:%S")
-    )));
+    bar.right.push(StatusSegment::styled(
+        format!(" {} ", now.format("%H:%M:%S")),
+        to_color(theme.status_fg),
+        false,
+    ));
     bar
 }
 
