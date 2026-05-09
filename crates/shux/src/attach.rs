@@ -46,6 +46,7 @@ use shux_ui::{
 };
 
 use crate::PaneIoState;
+use crate::statusbar_runner::{SegmentCache, populate_bar};
 
 /// Client-screen dimensions (cols, rows) tracked per attached client.
 /// Used as the authoritative source of size when computing per-pane rects
@@ -70,6 +71,7 @@ pub async fn run_attach_server(
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
+    segments: SegmentCache,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     if socket_path.exists() {
@@ -99,9 +101,10 @@ pub async fn run_attach_server(
                         let g = graph.clone();
                         let io = io_state.clone();
                         let cfg = config.clone();
+                        let segs = segments.clone();
                         let c = cancel.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_attach_connection(stream, g, io, cfg, c).await {
+                            if let Err(e) = handle_attach_connection(stream, g, io, cfg, segs, c).await {
                                 warn!(error = %e, "attach session ended with error");
                             }
                         });
@@ -122,6 +125,7 @@ async fn handle_attach_connection(
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
+    segments: SegmentCache,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut framed = Framed::new(stream, create_codec());
@@ -216,7 +220,10 @@ async fn handle_attach_connection(
     info!(session = %session.name, "attach session started");
 
     // Step 4: Run the main attach loop.
-    run_attach_loop(framed, graph, io_state, config, session, hello, cancel).await
+    run_attach_loop(
+        framed, graph, io_state, config, segments, session, hello, cancel,
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -343,11 +350,13 @@ async fn send_ready_error(
 
 /// Main attach loop after handshake. Owns the render compositor and
 /// dispatches all client frames.
+#[allow(clippy::too_many_arguments)]
 async fn run_attach_loop(
     framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
+    segments: SegmentCache,
     mut session: AttachedSession,
     hello: AttachHello,
     cancel: CancellationToken,
@@ -393,11 +402,13 @@ async fn run_attach_loop(
     let render_session_for_task = render_session.clone();
     let render_client_size = client_size.clone();
     let render_config = config.clone();
+    let render_segments = segments.clone();
     let renderer = tokio::spawn(async move {
         run_render_loop(
             render_graph,
             render_io,
             render_config,
+            render_segments,
             render_session_for_task,
             render_client_size,
             render_tx,
@@ -586,10 +597,12 @@ async fn run_attach_loop(
 /// it grabs a fresh `SessionGraphSnapshot`, walks all panes in the
 /// active window, runs the multi-pane compositor over a `Vec<u8>`
 /// buffer, then ships the bytes as a `Render` frame.
+#[allow(clippy::too_many_arguments)]
 async fn run_render_loop(
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
+    segments: SegmentCache,
     session: Arc<Mutex<AttachedSession>>,
     client_size: ClientSize,
     out_tx: mpsc::Sender<AttachServerFrame>,
@@ -683,8 +696,12 @@ async fn run_render_loop(
                 vt_refs.insert(pid, vt);
             }
         }
-        // Status bar text.
-        let bar = build_status_bar(&snap, &attached);
+        // Status bar text. Start from the built-in (always-good)
+        // segments so OOTB looks the same even when no script segments
+        // are configured. Then `populate_bar` appends any
+        // `[[statusbar.segment]]` results from the runner cache.
+        let mut bar = build_status_bar(&snap, &attached);
+        populate_bar(&mut bar, &config, &segments).await;
 
         let frame = MultiPaneFrame {
             layout: &win.layout.tree,

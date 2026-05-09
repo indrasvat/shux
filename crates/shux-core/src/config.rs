@@ -101,21 +101,58 @@ pub struct ShellConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatusBarConfig {
-    /// Left zone format string. tmux-like placeholders:
-    ///   #S  session name
-    ///   #I  active window index (1-based)
-    ///   #W  active window title
-    ///   #P  active pane index in current window
-    ///   #{git_branch}  current git branch (cwd-cached)
-    ///   %H:%M:%S       strftime-style for clock
+    /// Left zone format string. tmux-like placeholders (reserved for a
+    /// future format-string interpreter; not yet consumed).
     #[serde(default)]
     pub left: Option<String>,
-    /// Center zone format string.
     #[serde(default)]
     pub center: Option<String>,
-    /// Right zone format string.
     #[serde(default)]
     pub right: Option<String>,
+    /// Script-driven segments. Each entry runs `command` (with optional
+    /// `env`) every `interval_ms` and uses the captured stdout as a
+    /// status-bar segment. Use this with `starship prompt` for
+    /// rich prompts, or with any shell snippet for one-shot info.
+    #[serde(default)]
+    pub segment: Vec<SegmentDef>,
+}
+
+/// One script-driven status-bar segment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentDef {
+    /// Where to place the segment: "left", "center", or "right".
+    #[serde(default = "default_zone")]
+    pub zone: String,
+    /// argv to spawn. e.g. `["starship", "prompt"]` or `["bash", "-c", "..."]`.
+    pub command: Vec<String>,
+    /// Extra env vars for the spawn. Useful for one-off overrides.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Inline starship config (TOML text). When set, the runner writes
+    /// this to a tempfile at startup and exports
+    /// `STARSHIP_CONFIG=<tempfile>` for the spawned command. Lets the
+    /// status-bar starship be configured **inside the same shux config
+    /// file** as everything else — no second `~/.config/shux/statusbar.toml`
+    /// to maintain. The user's actual PS1 starship (`~/.config/starship.toml`)
+    /// is unaffected because shux only sets this env for its own spawns.
+    #[serde(default)]
+    pub starship_config: Option<String>,
+    /// Refresh interval (ms). Lower bound is 100ms; the runner clamps to
+    /// avoid spawn storms. Default 2000.
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+    /// Optional fallback text if the command fails / is missing. Lets
+    /// the bar stay pretty even if starship isn't installed. Defaults
+    /// to empty (segment renders blank).
+    #[serde(default)]
+    pub fallback: Option<String>,
+}
+
+fn default_zone() -> String {
+    "left".to_string()
+}
+fn default_interval_ms() -> u64 {
+    2000
 }
 
 /// A live, hot-reloadable handle to the current config. Cheap to clone.

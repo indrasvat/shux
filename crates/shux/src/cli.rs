@@ -128,6 +128,12 @@ pub enum Command {
     /// Print version information
     Version,
 
+    /// Configuration helpers
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
     /// Window management
     #[command(alias = "win")]
     Window {
@@ -145,6 +151,21 @@ pub enum Command {
     #[command(name = "__daemon", hide = true)]
     #[allow(non_camel_case_types)]
     __daemon,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Write a starter ~/.config/shux/config.toml + statusbar.toml.
+    /// Refuses to overwrite by default; use --force to replace existing files.
+    Init {
+        /// Overwrite existing files.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Print the current effective config path.
+    Path,
+    /// Print the canonical defaults (the same TOML you'd get from `init`).
+    Show,
 }
 
 #[derive(Subcommand, Debug)]
@@ -652,6 +673,148 @@ pub async fn handle_ls(
         }
     }
 
+    Ok(())
+}
+
+/// Default contents written by `shux config init`. ONE file. The
+/// `[[statusbar.segment]]` entries embed their starship config inline
+/// via `starship_config = """..."""` — no separate `statusbar.toml`
+/// to maintain. `shux config show` returns the same bytes.
+pub const DEFAULT_CONFIG_TOML: &str = r##"# ~/.config/shux/config.toml
+#
+# shux user configuration. The daemon hot-reloads this file: edits land
+# in attached sessions on the next render frame, no restart needed.
+
+[appearance]
+# Pane border style: thin | thick | double | rounded | ascii | none
+border_style = "rounded"
+
+[keys]
+# Prefix key (e.g. "ctrl-space", "ctrl-b", "alt-w")
+prefix = "ctrl-space"
+
+# ─────────────────────────────────────────────────────────────────────
+# Status-bar segments. Each entry runs `command` every `interval_ms`
+# and renders the captured stdout (ANSI colors preserved) into the
+# named zone. Fallback text shows when the command is missing or
+# fails — keeps the bar pretty even on machines without the binary.
+#
+# `starship_config` is an INLINE TOML string. shux materialises it to
+# a tempfile per segment and exports `STARSHIP_CONFIG=<tempfile>` for
+# the spawned `starship prompt` invocation. Your shell PS1 (driven by
+# `~/.config/starship.toml`) is unaffected — only the segment spawn
+# sees this override.
+# ─────────────────────────────────────────────────────────────────────
+
+[[statusbar.segment]]
+zone = "right"
+command = ["starship", "prompt"]
+interval_ms = 1000
+fallback = " (starship not installed) "
+starship_config = """
+add_newline = false
+format = '''
+$git_branch\
+$git_status\
+$rust\
+$python\
+$nodejs\
+$cmd_duration\
+$time\
+'''
+
+[time]
+disabled = false
+format = ' [$time](bold #f5a97f) '
+time_format = '%H:%M'
+
+[git_branch]
+format = '[$symbol$branch]($style) '
+style = 'bold #c6a0f6'
+symbol = ' '
+
+[git_status]
+format = '[$all_status$ahead_behind]($style)'
+style = 'bold #ed8796'
+
+[rust]
+format = '[$symbol($version)]($style) '
+style = 'bold #ee99a0'
+symbol = ' '
+
+[python]
+format = '[$symbol${pyenv_prefix}(${version} )(($virtualenv) )]($style)'
+style = 'bold #eed49f'
+symbol = ' '
+
+[nodejs]
+format = '[$symbol($version)]($style) '
+style = 'bold #a6da95'
+symbol = ' '
+
+[cmd_duration]
+min_time = 0
+format = '[ $duration]($style) '
+style = 'bold #91d7e3'
+"""
+"##;
+
+pub const SHELL_HINT: &str = r##"
+SUGGESTED ~/.bashrc / ~/.zshrc snippet:
+
+  # Skip the rich starship PS1 when shux is hosting (the status bar has it).
+  if command -v starship >/dev/null 2>&1; then
+    if [[ -n $SHUX ]]; then
+      PS1='\[\e[36m\]❯\[\e[0m\] '
+    else
+      eval "$(starship init bash)"
+    fi
+  fi
+
+This makes the in-pane prompt a clean cyan chevron, while the status
+bar at the bottom of the screen carries the rich starship segments.
+"##;
+
+/// `shux config init`: scaffold a single ~/.config/shux/config.toml
+/// with an inline starship status-bar config. No second file.
+pub fn handle_config_init(force: bool) -> anyhow::Result<()> {
+    use crate::style;
+
+    let cfg_path = shux_core::config::default_config_path();
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_or_skip(&cfg_path, DEFAULT_CONFIG_TOML, force)?;
+
+    style::print_success(
+        "Config initialised at",
+        cfg_path.display().to_string().as_str(),
+        None,
+    );
+    println!("{}", SHELL_HINT);
+    Ok(())
+}
+
+fn write_or_skip(path: &std::path::Path, contents: &str, force: bool) -> anyhow::Result<()> {
+    if path.exists() && !force {
+        eprintln!(
+            "skip {} (exists; pass --force to overwrite)",
+            path.display()
+        );
+        return Ok(());
+    }
+    std::fs::write(path, contents)?;
+    Ok(())
+}
+
+pub fn handle_config_path() -> anyhow::Result<()> {
+    let p = shux_core::config::default_config_path();
+    println!("{}", p.display());
+    Ok(())
+}
+
+pub fn handle_config_show() -> anyhow::Result<()> {
+    print!("{}", DEFAULT_CONFIG_TOML);
     Ok(())
 }
 

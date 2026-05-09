@@ -11,6 +11,7 @@ mod attach;
 mod cli;
 mod client;
 mod daemon;
+mod statusbar_runner;
 mod style;
 
 use cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
@@ -329,6 +330,15 @@ async fn run_rpc_server(
             .await;
     });
 
+    // Status-bar segment cache + runners. One runner task per
+    // `[[statusbar.segment]]` in config; restarts when config reloads.
+    let segment_cache = statusbar_runner::SegmentCache::new();
+    statusbar_runner::spawn_segment_runners(
+        config_handle.clone(),
+        segment_cache.clone(),
+        cancel.clone(),
+    );
+
     // Spawn the attach UDS listener (separate socket, dedicated streaming
     // protocol). The JSON-RPC socket below stays request-response.
     let attach_path = daemon::attach_socket_path()?;
@@ -336,12 +346,14 @@ async fn run_rpc_server(
     let attach_io = io_state.clone();
     let attach_cancel = cancel.clone();
     let attach_config = config_handle.clone();
+    let attach_segments = segment_cache.clone();
     tokio::spawn(async move {
         if let Err(e) = attach::run_attach_server(
             attach_path,
             attach_graph,
             attach_io,
             attach_config,
+            attach_segments,
             attach_cancel,
         )
         .await
@@ -2115,6 +2127,12 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+
+        Some(Command::Config { command: cfg_cmd }) => match cfg_cmd {
+            cli::ConfigCommand::Init { force } => cli::handle_config_init(force),
+            cli::ConfigCommand::Path => cli::handle_config_path(),
+            cli::ConfigCommand::Show => cli::handle_config_show(),
+        },
 
         Some(Command::__daemon) => unreachable!("handled above"),
     }

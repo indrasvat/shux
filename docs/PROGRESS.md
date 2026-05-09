@@ -53,6 +53,41 @@
 
 ## Session Log
 
+**2026-05-09 — Spike followups: inline starship_config + `shux config init`**
+- Single-file UX: collapsed the spike's two-file layout (config.toml + statusbar.toml) into ONE. New `SegmentDef::starship_config: Option<String>` accepts an inline TOML literal multi-line string (`'''...'''`). At runner startup the daemon materialises it to `$TMPDIR/shux-segment-<idx>.toml` and exports `STARSHIP_CONFIG=<that path>` for the spawn. On runner exit (config reload or daemon shutdown) the tempfile is removed.
+- Critical TOML detail: the OUTER field MUST be triple-single-quoted (TOML literal) so escapes pass through verbatim. Triple-double-quote decodes `\"` → `"` mid-flight and corrupts the inner TOML — starship's parser rejects the materialised file.
+- New CLI: `shux config init` writes a single starter `~/.config/shux/config.toml` with an inline starship segment that uses Catppuccin Macchiato colors. Also `shux config show` (prints the canonical defaults to stdout) and `shux config path` (effective path). The init prints a bashrc snippet that guards `eval "$(starship init bash)"` on `[[ -z $SHUX ]]`, so the user's shell PS1 stays starship-rich outside shux but goes bare (`❯ `) inside, removing the "two starships at once" duplication.
+- Visual proof — `.claude/automations/test_017_statusbar_custom.py`: writes a config with custom load+IP modules in inline starship_config, attaches, screenshots. Result: `◆ sbcustom  [1/1] 1   00:52:39   load 3.95   ip 10.0.0.31   00:52:38` rendered live in the bar with full Catppuccin colors. The user's default starship continues to render at the top of the pane (their `~/.config/starship.toml`), unaffected. Distinct configs, distinct outputs, single shux config file.
+- 7/7 PASS in `test_017_statusbar_segments.py` after fixes (added S6 = "inline config drives the bar, not user PS1 config" using a `${custom.sentinel}` marker).
+- Learning: starship custom modules require `when = true` (boolean) — not `when = 'true'` (string). The string form invokes `true` as a shell command which usually exits 0 too, but quoting in the inner-TOML can break it. Boolean is unambiguous.
+- Learning: starship custom modules use `${custom.<name>}` reference syntax (with curly braces and a dot), NOT `$custom_<name>`. The latter silently produces no output and gives no error.
+- Learning: starship's default `command_timeout` is 500ms — `top -l 1` blows past that. Use `command_timeout = 2000` in the inline config, or use instant alternatives like `sysctl -n vm.loadavg` for CPU load.
+- Learning: `std::env::temp_dir()` returns `$TMPDIR` (`/var/folders/...`) on macOS, not `/tmp`. Tests that grep `/tmp/shux-segment-*` find nothing; use `$TMPDIR` or pass an explicit path.
+- 590 tests pass total (was 586). Lint clean.
+
+**2026-05-09 — Spike: script-driven status-bar segments (starship + fallback)**
+- Goal: validate that we can ship "drop-in starship in the status bar" without porting starship's formatter as a Rust SDK (starship is a `[[bin]]`-only crate; no library API). Result: it works, OOTB, with a real safety net.
+- Schema: extended `[statusbar]` with a `[[statusbar.segment]]` array. Each entry has `zone` (left/center/right), `command: Vec<String>`, optional `env: HashMap<String,String>`, `interval_ms` (clamped to ≥100ms; default 2000), and `fallback: Option<String>`. Lets users wire `command = ["starship", "prompt"]` with `STARSHIP_CONFIG = "..."` to get a separate prompt config for the bar without touching their PS1.
+- Runner: new `crates/shux/src/statusbar_runner.rs`. `spawn_segment_runners` runs once per daemon, spawns a child task per segment, restarts the whole group on `ConfigHandle::change_notify()` (same hot-reload primitive that drives border-style swaps). Each child task runs the command on its interval (1s timeout per spawn so a hung script can't starve the bar), captures stdout, stashes into `SegmentCache (Arc<RwLock<HashMap<usize, Vec<u8>>>>)`. Failure → fallback bytes → still rendered.
+- ANSI → segments: `ansi_to_segments(bytes)` feeds the captured output through a 6-row × 512-col `VirtualTerminal`, scans the first non-blank row, groups runs of cells by (fg/bg/bold) into `StatusSegment`s. Multi-row VT specifically because starship's default prompt is two-line — a 1-row VT would scroll on `\n` and lose the meaningful first line.
+- Wiring: `attach::run_render_loop` calls `populate_bar(&mut bar, &config, &segments)` after the existing `build_status_bar`. Built-in segments still anchor the bar (so a missing/empty config never produces a blank bar); script segments append into their declared zone.
+- Visual + perf verification (`.claude/automations/test_017_statusbar_segments.py`): 6/6 PASS, 0 leaked tabs.
+  - S1 OOTB: built-in bar shows when no segments configured.
+  - S2 starship segment renders in the bar at the bottom of screen with full ANSI colors (verified via Quartz screenshot — capsules/git-branch/Rust+Python versions/clock all visible alongside the built-in segments).
+  - S3 missing-binary (`this-binary-does-not-exist-shux`) → daemon spawns repeatedly without crashing, fallback text `[no-bin] FALLBACK-OK` appears in the bar. Daemon PID still alive after the failed-spawn loop.
+  - S4 hot-add: empty config → write a segment via filesystem → `HOT-ADDED-$RANDOM` lights up live, no restart.
+  - S5 perf: 1Hz `starship prompt` segment, 5s sample of daemon `%CPU` via `ps`. **avg 0.1%** (samples 0.1, 0.1, 0.1, 0.1, 0.1). Way under the 5% threshold.
+- Unit tests (4 new in `statusbar_runner::tests`): SGR red → red segment; mixed RED/GREEN groups by style; empty input; trailing newline stripping.
+- 586 tests pass total (was 582).
+- Open caveats from the spike (next-iteration TODOs, not blockers):
+  - Script segments today *append* into a zone alongside the built-in (e.g. clock + starship both end up in `right`). Probably want a per-segment "replace this zone instead of append" knob, OR drop the built-in segments for a zone when any user segment targets it.
+  - Each spawn fork-execs starship. At 1Hz it's 0.1% CPU; at 5Hz × 5 segments it'd be ~5%. M2 plugin host is the long-lived answer; for now `interval_ms ≥ 1000` recommended.
+  - VT width is 512 cols. Wider configs would need either a wider VT or a layout-aware sizing pass.
+  - No `shux config init` yet — users still hand-write the TOML.
+- Learning: `tokio::sync::Notify::notify_waiters()` only wakes tasks that are *currently* `.notified().await`-ing. The runner's loop creates the listener BEFORE awaiting, but if a notify lands between the `current()` read and `notified()`, it's dropped. The fact that the spike works in practice is because `notify_waiters` is called by the watcher AFTER the runner is already in `select!`. For a tighter race story: switch to `tokio::sync::watch::channel` (every receiver gets every change, no permit semantics).
+- Learning: starship outputs multi-line by default. Render the captured bytes into an N-row VT (not 1-row) and scan the first non-blank row, otherwise the `\n` at the end of starship's status line scrolls the meaningful content off and you get just the chevron `❯`.
+- Learning: when a bash subshell inside a pane has its own starship init from `~/.bashrc`, expect TWO starship prompts on screen — one inside the pane (user's PS1) and one in the multiplexer's status bar (from the `[[statusbar.segment]]` runner). They render independently. Tests that just grep "indrasvat-shux" can mistake one for the other.
+
 **2026-05-08 — M1 follow-up suite: CLI passthrough, mouse, TOML config + hot reload**
 - **CLI passthrough**: `shux new -s X -- python3 -c "..."` (or `-- vim foo.rs`, etc.) exec's the trailing argv directly in the pane instead of dropping into a shell. Wired through clap (`#[arg(last = true)]` on `New::argv`), session.create / session.ensure RPC `command` param (accepts string or array), and `PtyConfig::with_command`. `spawn_pane_pty` signature now takes `command: Vec<String>`.
 - **Mouse support**: Forwarded crossterm `Event::Mouse` as `AttachClientFrame::Mouse { kind, button, col, row }`. Daemon: `pane_at(col, row)` for click-to-focus; `border_at()` detects clicks on a pane separator and arms a `DragState` so subsequent `Drag` events translate cursor deltas into `ResizePane` calls. Scroll variants reserved for task 021 (copy mode).
