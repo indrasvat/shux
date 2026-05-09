@@ -556,6 +556,17 @@ async fn run_attach_loop(
                         col,
                         row,
                     } => {
+                        // Modal guard: swallow mouse events while the
+                        // help overlay is visible. Otherwise a click or
+                        // drag on the cheat sheet would leak through to
+                        // handle_mouse and refocus / resize the pane
+                        // behind it. Also clear any in-flight drag so a
+                        // resize started just before the overlay opened
+                        // doesn't keep ratcheting.
+                        if render_session.lock().await.help_visible {
+                            mouse_drag = None;
+                            continue;
+                        }
                         if let Err(e) = handle_mouse(
                             kind,
                             button,
