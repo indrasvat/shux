@@ -166,6 +166,14 @@ pub enum ConfigCommand {
     Path,
     /// Print the canonical defaults (the same TOML you'd get from `init`).
     Show,
+    /// Parse the user config (and every inline starship_config) and
+    /// emit line:col diagnostics. Exit 0 = clean, 1 = at least one error.
+    Validate {
+        /// Path to validate. Defaults to the user config path
+        /// (`~/.config/shux/config.toml` or `$XDG_CONFIG_HOME/shux/config.toml`).
+        #[arg(short, long)]
+        config: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -816,6 +824,23 @@ pub fn handle_config_path() -> anyhow::Result<()> {
 pub fn handle_config_show() -> anyhow::Result<()> {
     print!("{}", DEFAULT_CONFIG_TOML);
     Ok(())
+}
+
+/// `shux config validate [--config <path>]`. Returns the process exit
+/// code that the caller should propagate (0 clean, 1 had diagnostics).
+pub fn handle_config_validate(config: Option<std::path::PathBuf>) -> anyhow::Result<i32> {
+    let path = config.unwrap_or_else(shux_core::config::default_config_path);
+
+    if !path.exists() {
+        crate::style::print_error(&format!(
+            "config file not found: {} — run `shux config init` to scaffold one",
+            path.display()
+        ));
+        return Ok(1);
+    }
+
+    let diags = crate::config_validate::validate(&path)?;
+    Ok(crate::config_validate::print_diagnostics(&diags, &path))
 }
 
 /// Handle the `shux new` command.

@@ -595,6 +595,106 @@ fn test_cli_list_alias() {
 }
 
 #[test]
+fn test_cli_config_validate_clean() {
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        tmp,
+        "[appearance]\nborder_style = \"rounded\"\n\n[keys]\nprefix = \"ctrl-space\"\n"
+    )
+    .unwrap();
+    let output = shux_bin()
+        .args([
+            "config",
+            "validate",
+            "--config",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Config valid"));
+}
+
+#[test]
+fn test_cli_config_validate_outer_error() {
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    // 42 is not a string — fails type check at line 2 col 16.
+    writeln!(tmp, "[appearance]\nborder_style = 42").unwrap();
+    let output = shux_bin()
+        .args([
+            "config",
+            "validate",
+            "--config",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "expected non-zero exit");
+    assert!(
+        stderr.contains(":2:"),
+        "stderr should include line 2: {stderr}"
+    );
+    assert!(stderr.contains("error found"));
+}
+
+#[test]
+fn test_cli_config_validate_inner_starship_error() {
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    write!(
+        tmp,
+        r#"[[statusbar.segment]]
+zone = "left"
+command = ["echo", "x"]
+starship_config = """
+[character]
+this is not valid toml
+"""
+"#,
+    )
+    .unwrap();
+    let output = shux_bin()
+        .args([
+            "config",
+            "validate",
+            "--config",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("statusbar.segment[0].starship_config"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_config_validate_missing_file() {
+    let output = shux_bin()
+        .args([
+            "config",
+            "validate",
+            "--config",
+            "/tmp/nonexistent-shux-validate-xyz.toml",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("config file not found"));
+}
+
+#[test]
 fn test_cli_version_without_daemon() {
     let output = shux_bin()
         .arg("version")
