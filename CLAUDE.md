@@ -37,6 +37,35 @@ make hooks                 # Install lefthook git hooks
 make bench                 # Run benchmarks
 make doc                   # Build documentation
 make clean                 # Remove build artifacts
+make release-build         # Build release binary for the current host
+make release-package       # Package staged binaries into per-platform tarballs
+```
+
+## Releases
+
+shux uses Conventional-Commits-driven `semantic-release`. Pushes to `main`
+analyze commit history, bump the workspace version in `Cargo.toml`,
+update `CHANGELOG.md`, tag, and ship binaries for four targets via
+`.github/workflows/release.yml`:
+
+| Target                         | Runner             |
+|---|---|
+| `x86_64-unknown-linux-gnu`     | `ubuntu-latest`    |
+| `aarch64-unknown-linux-gnu`    | `ubuntu-24.04-arm` |
+| `x86_64-apple-darwin`          | `macos-13`         |
+| `aarch64-apple-darwin`         | `macos-latest`     |
+
+The same workflow also fires on direct `v*` tag pushes, which is how the
+initial `v0.1.0` was bootstrapped (semantic-release defaults to 1.0.0
+without a prior tag, so the first release is created manually). After
+`v0.1.0`, every `feat:` or `fix:` commit on `main` cuts a fresh release
+automatically.
+
+Local testing of the packaging step (no real cargo build required):
+
+```bash
+mkdir -p staging/x86_64-apple-darwin && cp target/release/shux staging/x86_64-apple-darwin/
+./scripts/build-release.sh 0.0.0-dev   # produces artifacts/*.tar.gz
 ```
 
 ## Architecture

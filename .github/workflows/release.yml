@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  # Build each binary on its own native runner. No cross-compilation,
+  # no Docker — every triple builds where it natively runs.
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --bin shux --target "$TARGET"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shux-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/shux
+          if-no-files-found: error
+          retention-days: 7
+
+  # Single release job: collects all four binaries, then either runs
+  # semantic-release (push to main) or bootstraps a tag-triggered release.
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: staging
+          pattern: shux-*
+          merge-multiple: false
+
+      - name: Lay binaries out the way build-release.sh expects
+        run: |
+          set -euo pipefail
+          # Artifact downloads land at staging/shux-<target>/shux.
+          # build-release.sh wants staging/<target>/shux, so move them.
+          for d in staging/shux-*; do
+              triple="${d#staging/shux-}"
+              mkdir -p "staging/${triple}"
+              mv "${d}/shux" "staging/${triple}/shux"
+              chmod +x "staging/${triple}/shux"
+              rmdir "$d"
+          done
+          ls -la staging/
+          for d in staging/*/; do
+              echo "--- $d ---"
+              ls -la "$d"
+          done
+
+      - name: Install npm dependencies
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: npm ci
+
+      - name: Run semantic-release (auto-versioning on main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: npm run release
+
+      # Tag-triggered (e.g. `git push --tags v0.1.0`) bootstrap path: skip
+      # semantic-release entirely, package binaries against the pushed
+      # version, and create the release directly.
+      - name: Extract version from tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        id: tag_version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="$REF_NAME"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release tarballs (tag bootstrap)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION: ${{ steps.tag_version.outputs.version }}
+        run: ./scripts/build-release.sh "$VERSION"
+
+      - name: Create GitHub release (tag bootstrap)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag_version.outputs.tag }}
+          name: ${{ steps.tag_version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256

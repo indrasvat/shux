@@ -48,3 +48,8 @@ fuzz/corpus/
 
 # Lefthook
 .lefthook-local/
+
+# Release tooling (semantic-release npm tools + binary staging).
+node_modules/
+artifacts/
+staging/
