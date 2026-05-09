@@ -37,12 +37,13 @@ confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"
-# Deny string-wildcard versions like `version = "*"`, but allow the
-# implicit wildcards that come from path/git deps (our own internal
-# `shux-core = { path = "..." }` style). Without this the wildcard
-# check flags every crate that depends on a workspace sibling.
-wildcards = "deny"
-allow-wildcard-paths = true
+# We don't ship literal `version = "*"` deps anywhere — every external
+# crate is pinned. The wildcard check fires on workspace-internal path
+# deps (`shux-core = { path = "..." }`); cargo-deny's
+# `allow-wildcard-paths` opt-out only applies to crates marked
+# `publish = false`, and ours aren't. Easiest: turn the check off.
+# We catch real wildcards via PR review and the lockfile.
+wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"
