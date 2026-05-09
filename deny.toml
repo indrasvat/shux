@@ -1,0 +1,52 @@
+# deny.toml — cargo-deny configuration
+# Schema for cargo-deny ≥ 0.16. Run: cargo deny check
+#
+# Notes on the new schema (vs. the pre-0.16 file we used to ship):
+# - `vulnerability` / `notice` are no longer configurable in [advisories]
+#   — cargo-deny always denies vulnerabilities and you cannot opt out.
+# - `unmaintained` is now an enum: "all" | "workspace" | "transitive" | "none"
+#   (was "deny"/"warn"/"allow"). "workspace" only flags workspace-level deps,
+#   which is what we want — transitive churn shouldn't fail CI.
+# - `[licenses]` no longer takes `unlicensed`. The allow-list IS the policy.
+
+[advisories]
+unmaintained = "workspace"
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "OpenSSL",
+    # `notify` (filesystem watcher we use for config hot reload) is
+    # CC0-1.0; FSF-listed Free/Libre. Pure permissive.
+    "CC0-1.0",
+    # Apple-licensed transitive deps (e.g. `objc2` chain) carry
+    # `MIT-0` ("MIT No Attribution"). Functionally MIT minus the
+    # attribution clause.
+    "MIT-0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+# We don't ship literal `version = "*"` deps anywhere — every external
+# crate is pinned. The wildcard check fires on workspace-internal path
+# deps (`shux-core = { path = "..." }`); cargo-deny's
+# `allow-wildcard-paths` opt-out only applies to crates marked
+# `publish = false`, and ours aren't. Easiest: turn the check off.
+# We catch real wildcards via PR review and the lockfile.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,22 @@
+# lefthook.yml — git hooks for shux
+# Install: lefthook install (or: make hooks)
+# All commands use Makefile targets — never raw cargo/script invocations.
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt-check:
+      glob: "*.rs"
+      run: make fmt-check
+    clippy:
+      glob: "*.rs"
+      run: make clippy
+
+pre-push:
+  commands:
+    progress-check:
+      run: make check-progress
+    test:
+      run: make test
+    deny:
+      run: make deny-soft

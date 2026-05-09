@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "make -C \"$CLAUDE_PROJECT_DIR\" check-progress-active",
+            "timeout": 10,
+            "statusMessage": "Checking progress tracking..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE '^git\\s+push'; then make -C \"$CLAUDE_PROJECT_DIR\" check-progress; fi",
+            "timeout": 10,
+            "statusMessage": "Verifying progress before push..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE 'git\\s+commit'; then echo 'GATE: Verify PROGRESS.md and task Status are updated before committing.' >&2; fi; exit 0",
+            "timeout": 5,
+            "statusMessage": "Commit gate check..."
+          }
+        ]
+      }
+    ]
+  }
+}

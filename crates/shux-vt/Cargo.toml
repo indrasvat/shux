@@ -1,0 +1,15 @@
+[package]
+name = "shux-vt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vte = { workspace = true }
+unicode-width = "0.2"
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

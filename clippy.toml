@@ -1,0 +1,2 @@
+# clippy.toml — Clippy configuration for shux
+msrv = "1.85"
