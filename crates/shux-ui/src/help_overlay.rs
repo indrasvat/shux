@@ -88,6 +88,27 @@ const SECTIONS: &[Section] = &[
         }],
     },
     Section {
+        title: "Copy mode",
+        entries: &[
+            Entry {
+                key: "Prefix [",
+                desc: "Enter copy mode on focused pane",
+            },
+            Entry {
+                key: "hjkl / arrows",
+                desc: "Move cursor (in copy mode)",
+            },
+            Entry {
+                key: "v",
+                desc: "Begin / clear selection",
+            },
+            Entry {
+                key: "y",
+                desc: "Yank to clipboard (OSC 52) and exit",
+            },
+        ],
+    },
+    Section {
         title: "Session & misc",
         entries: &[
             Entry {
@@ -104,7 +125,7 @@ const SECTIONS: &[Section] = &[
             },
             Entry {
                 key: "Esc or q",
-                desc: "Dismiss overlay",
+                desc: "Dismiss overlay / exit copy mode",
             },
         ],
     },
@@ -310,10 +331,13 @@ mod tests {
     #[test]
     fn renders_into_buffer_for_reasonable_size() {
         let mut buf = Vec::new();
-        render_help_overlay_into(&mut buf, 100, 30, &Theme::DEFAULT);
-        // Should contain CSI cursor moves and at least one section title.
+        // 100×40 is comfortably larger than the box: 4 sections + the
+        // copy-mode block grow the body to ~22 lines, plus title and
+        // chrome.
+        render_help_overlay_into(&mut buf, 100, 40, &Theme::DEFAULT);
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("Pane focus"), "missing 'Pane focus' section");
+        assert!(s.contains("Copy mode"), "missing 'Copy mode' section");
         assert!(s.contains("Esc or q"), "missing dismiss hint");
         assert!(s.contains("\x1b["), "missing ANSI escape sequences");
     }

@@ -161,6 +161,8 @@ pub enum ActionKind {
     Redraw,
     /// Toggle the keybinding help overlay (prefix + ?).
     ToggleHelp,
+    /// Enter copy mode on the focused pane (prefix + [).
+    EnterCopyMode,
 }
 
 /// Optional per-action arguments. Not all actions use all fields.
