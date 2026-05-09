@@ -47,6 +47,8 @@ pub struct Config {
     pub shell: ShellConfig,
     #[serde(default)]
     pub statusbar: StatusBarConfig,
+    #[serde(default)]
+    pub theme: crate::theme::ThemeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

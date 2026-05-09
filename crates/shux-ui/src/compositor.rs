@@ -292,6 +292,20 @@ impl<W: Write> RenderCompositor<W> {
         }
     }
 
+    /// Live-swap the border colors. Mirrors `set_border_style` for the
+    /// theme engine (`[theme] border_focused / border_unfocused`).
+    pub fn set_border_colors(&mut self, colors: BorderColors) {
+        // BorderColors is Copy + uses crossterm's Color (PartialEq).
+        if (
+            self.config.border_colors.focused,
+            self.config.border_colors.unfocused,
+        ) != (colors.focused, colors.unfocused)
+        {
+            self.config.border_colors = colors;
+            self.force_full_redraw = true;
+        }
+    }
+
     /// Borrow the underlying writer. Useful in tests where we capture
     /// bytes into a `Cursor<Vec<u8>>` and want to assert on them.
     pub fn inner(&self) -> &W {

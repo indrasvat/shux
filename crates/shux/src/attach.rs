@@ -610,11 +610,12 @@ async fn run_render_loop(
 ) {
     let (mut cols, mut rows) = *client_size.lock().await;
     let initial = config.current();
+    let initial_theme = shux_core::theme::Theme::resolve(&initial.theme);
     let cfg = CompositorConfig {
         show_border: false,
         status_bar_height: STATUS_BAR_ROWS,
         border_style: BorderStyle::parse(&initial.appearance.border_style),
-        ..Default::default()
+        border_colors: shux_ui::BorderColors::from_theme(&initial_theme),
     };
     let buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut compositor: RenderCompositor<Vec<u8>> = RenderCompositor::new(cols, rows, buf, cfg);
@@ -645,6 +646,7 @@ async fn run_render_loop(
     let cfg_notify = config.change_notify();
     let mut cfg_listener = Box::pin(cfg_notify.notified());
     let mut last_border_style = initial.appearance.border_style.clone();
+    let mut last_theme = initial_theme;
 
     loop {
         tokio::select! {
@@ -677,6 +679,11 @@ async fn run_render_loop(
             last_border_style = live_cfg.appearance.border_style.clone();
             compositor.set_border_style(BorderStyle::parse(&last_border_style));
         }
+        let live_theme = shux_core::theme::Theme::resolve(&live_cfg.theme);
+        if live_theme != last_theme {
+            last_theme = live_theme;
+            compositor.set_border_colors(shux_ui::BorderColors::from_theme(&live_theme));
+        }
 
         // Build a multi-pane frame snapshot.
         let snap = graph.snapshot();
@@ -700,7 +707,7 @@ async fn run_render_loop(
         // segments so OOTB looks the same even when no script segments
         // are configured. Then `populate_bar` appends any
         // `[[statusbar.segment]]` results from the runner cache.
-        let mut bar = build_status_bar(&snap, &attached);
+        let mut bar = build_status_bar(&snap, &attached, &live_theme);
         populate_bar(&mut bar, &config, &segments).await;
 
         let frame = MultiPaneFrame {
@@ -731,26 +738,26 @@ async fn run_render_loop(
     }
 }
 
-/// Build the hardcoded status bar for the current session.
+/// Build the status bar for the current session, using the resolved
+/// theme tokens for the background, accent (session-name segment),
+/// and time-segment foreground.
 fn build_status_bar(
     snap: &shux_core::graph::SessionGraphSnapshot,
     attached: &AttachedSession,
+    theme: &shux_core::theme::Theme,
 ) -> StatusBar {
     use crossterm::style::Color;
     let mut bar = StatusBar::new();
-    bar.bg = Some(Color::Rgb {
-        r: 30,
-        g: 32,
-        b: 48,
-    });
+    let to_color = |rgb: shux_core::theme::Rgb| Color::Rgb {
+        r: rgb.r,
+        g: rgb.g,
+        b: rgb.b,
+    };
+    bar.bg = Some(to_color(theme.status_bg));
 
     bar.left.push(StatusSegment::styled(
         format!(" ◆ {} ", attached.name),
-        Color::Rgb {
-            r: 116,
-            g: 199,
-            b: 236,
-        },
+        to_color(theme.status_accent),
         true,
     ));
 
