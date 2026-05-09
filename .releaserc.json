@@ -1,0 +1,35 @@
+{
+  "branches": ["main"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    ["@semantic-release/changelog", { "changelogFile": "CHANGELOG.md" }],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "./scripts/set-version.sh ${nextRelease.version} && ./scripts/build-release.sh ${nextRelease.version}"
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["CHANGELOG.md", "Cargo.toml", "Cargo.lock"],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ],
+    [
+      "@semantic-release/github",
+      {
+        "assets": [
+          { "path": "artifacts/shux-*-x86_64-linux.tar.gz", "label": "shux Linux x86_64 (tar.gz)" },
+          { "path": "artifacts/shux-*-aarch64-linux.tar.gz", "label": "shux Linux aarch64 (tar.gz)" },
+          { "path": "artifacts/shux-*-x86_64-darwin.tar.gz", "label": "shux macOS x86_64 (tar.gz)" },
+          { "path": "artifacts/shux-*-aarch64-darwin.tar.gz", "label": "shux macOS aarch64 (tar.gz)" },
+          { "path": "artifacts/*.sha256", "label": "SHA256 checksums" }
+        ],
+        "successComment": false,
+        "failComment": false
+      }
+    ]
+  ]
+}

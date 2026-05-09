@@ -230,8 +230,26 @@ doc: ## Build documentation
 clean: ## Clean build artifacts
 	@echo "$(COLOR_BLUE)▶ Cleaning...$(COLOR_RESET)"
 	@cargo clean
-	@rm -rf $(COVERAGE_DIR) lcov.info
+	@rm -rf $(COVERAGE_DIR) lcov.info artifacts staging
 	@echo "$(COLOR_GREEN)✓ Cleaned$(COLOR_RESET)"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Release
+# ══════════════════════════════════════════════════════════════════════════════
+
+.PHONY: release-build
+release-build: ## Build host-target release binary into target/<triple>/release/
+	@echo "$(COLOR_BLUE)▶ Building release binary for host...$(COLOR_RESET)"
+	@HOST_TRIPLE=$$(rustc -vV | awk '/^host:/{print $$2}'); \
+		cargo build --release --bin shux --target $${HOST_TRIPLE} && \
+		echo "$(COLOR_GREEN)✓ Built target/$${HOST_TRIPLE}/release/shux$(COLOR_RESET)"
+
+.PHONY: release-package
+release-package: ## Package whatever target/<triple>/release/shux exists into artifacts/
+	@VERSION=$$(grep -m1 'version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/'); \
+		echo "$(COLOR_BLUE)▶ Packaging shux v$${VERSION} (HOST_ONLY)...$(COLOR_RESET)"; \
+		HOST_ONLY=1 ./scripts/build-release.sh "$${VERSION}"
+	@echo "$(COLOR_GREEN)✓ Artifacts in ./artifacts/$(COLOR_RESET)"
 
 .PHONY: version
 version: ## Show version info

@@ -1,0 +1,12 @@
+# Configuration for cargo-release to manage workspace version bumps + tagging.
+allow-branch = ["main"]
+publish = false
+push = true
+consolidate-commits = true
+sign-commit = false
+sign-tag = false
+shared-version = true
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+pre-release-hook = ["cargo", "fmt", "--all"]
+pre-release-replacements = []

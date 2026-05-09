@@ -1,0 +1,128 @@
+name: Release
+
+# Single-runner release pipeline modelled after indrasvat/vicaya.
+#
+# Trigger paths:
+#   1. push to main → semantic-release analyzes Conventional Commits,
+#      computes the next version, and runs prepareCmd. prepareCmd is
+#      `set-version.sh && build-release.sh`, so all four cross-compiled
+#      binaries embed the freshly-bumped CARGO_PKG_VERSION (no version
+#      skew). The git plugin commits the bump, the github plugin uploads
+#      the artifacts, then a tag is pushed.
+#   2. workflow_dispatch (manual) → bootstrap path used once for v0.1.0.
+#      semantic-release defaults to v1.0.0 on the very first release;
+#      this path lets us create v0.1.0 by hand, after which semantic-
+#      release happily computes v0.1.1+ from there.
+#
+# Why not split into matrix runners? Cross-compiling shux's small set of
+# pure-Rust deps via cargo-zigbuild from a single macOS runner is fast
+# enough (~5 min for 4 targets) and lets the entire release stay
+# atomic — the same prepareCmd both bumps the version AND produces the
+# binaries that match it.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Bootstrap a release at this version (e.g. 0.1.0 or 0.1.0-alpha.1). Skips semantic-release.'
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: macos-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust toolchain (with all four targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Zig (linker for cross-compile)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # ----- Auto path: push to main -----
+      - name: Run semantic-release
+        if: github.event_name == 'push'
+        run: npm run release
+
+      # ----- Manual path: workflow_dispatch with version input -----
+      - name: Normalize and validate manual version
+        if: github.event_name == 'workflow_dispatch'
+        id: norm
+        env:
+          RAW: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$RAW" ]]; then
+              echo "::error::Empty version input — provide e.g. 0.1.0 or 0.1.0-alpha.1" >&2
+              exit 1
+          fi
+          # Strip leading 'v' if user typed v0.1.0 to avoid `vv0.1.0` tag.
+          V="${RAW#v}"
+          # Mirror the semver shape accepted by scripts/set-version.sh.
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Invalid semver: $RAW" >&2
+              exit 1
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Bootstrap version (manual)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          BOOTSTRAP_VERSION: ${{ steps.norm.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/set-version.sh "$BOOTSTRAP_VERSION"
+          ./scripts/build-release.sh "$BOOTSTRAP_VERSION"
+
+      - name: Create GitHub release (manual bootstrap)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.norm.outputs.tag }}
+          name: ${{ steps.norm.outputs.tag }}
+          # Tag the commit the workflow checked out, NOT the default
+          # branch (action's default behavior). This makes
+          # `gh workflow run release.yml --ref <branch> -f version=...`
+          # land the tag on <branch>'s HEAD.
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(steps.norm.outputs.version, '-') }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
