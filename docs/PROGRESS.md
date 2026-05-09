@@ -53,6 +53,26 @@
 
 ## Session Log
 
+**2026-05-08 — M1 follow-up suite: CLI passthrough, mouse, TOML config + hot reload**
+- **CLI passthrough**: `shux new -s X -- python3 -c "..."` (or `-- vim foo.rs`, etc.) exec's the trailing argv directly in the pane instead of dropping into a shell. Wired through clap (`#[arg(last = true)]` on `New::argv`), session.create / session.ensure RPC `command` param (accepts string or array), and `PtyConfig::with_command`. `spawn_pane_pty` signature now takes `command: Vec<String>`.
+- **Mouse support**: Forwarded crossterm `Event::Mouse` as `AttachClientFrame::Mouse { kind, button, col, row }`. Daemon: `pane_at(col, row)` for click-to-focus; `border_at()` detects clicks on a pane separator and arms a `DragState` so subsequent `Drag` events translate cursor deltas into `ResizePane` calls. Scroll variants reserved for task 021 (copy mode).
+- **TOML config + hot reload**: New `shux-core::config` module — `Config`/`ConfigHandle` with lock-free `ArcSwap` snapshots and a `Notify` for change events. Loaded from `$XDG_CONFIG_HOME/shux/config.toml` or `$HOME/.config/shux/config.toml`. Sections: `[appearance][keys][shell][statusbar]`. `run_hot_reload()` watches the parent dir via `notify` (parent because editors atomic-rename), debounces 150ms, re-parses, atomically swaps the live snapshot, and fires the change Notify. The attach render loop awaits both the data pulse and the config Notify; changes land on the very next frame. `RenderCompositor::set_border_style()` for the live appearance swap.
+- **iterm2-driver migration**: Refactored `test_017_attach_multipane.py` and `test_017_real_apps.py` to use the shared helpers in `_shux_iterm.py` (janitor at start, own window via `iterm2.Window.async_create()` with refresh, position-based Quartz screenshot correlation, multi-level `try/finally` cleanup). Verified zero leaked tabs.
+- **Comprehensive visual verification suite** (`.claude/automations/test_017_full_verify.py`): 9/9 PASS, 0 FAIL.
+  - V1 splits don't overdraw pane content (LEFT-MARK + RIGHT-MARK both visible)
+  - V2 color isolation (red text at col 71, green at col 1, no bleed)
+  - V3 prefix bindings fire (3-pane layout = 106 │ chars; zoom collapses to 0; unzoom returns)
+  - V4 CLI passthrough — `shux new -- python3 -c "..."` exec'd directly
+  - V5 mouse click-to-focus (synthetic click at col 6 → CLICK-MARK appears at col 8 in left pane)
+  - V6 config hot reload — rounded → thick → ascii observed live (no restart)
+  - V7 broken config doesn't crash daemon
+- **Tests**: 582 pass (was 577) — 5 new config tests, including a real hot-reload test that writes a file and waits for the watcher to land the new value within 2s.
+- **Build artifacts**: `notify = "8"` added to workspace deps; `tempfile` to shux-core dev-deps.
+- Learning: `notify` crate watcher should bind to the **parent directory**, not the file directly — many editors write to a tempfile and atomic-rename, which the file watch misses.
+- Learning: `iterm2.async_set_fullscreen(True)` causes `screencapture -l <window-id>` to fail because macOS native fullscreen creates a new Space and changes the window ID. Switching to `screencapture -x -D 1` (whole main display) is the simple fix; position-based Quartz correlation is preferred for non-fullscreen captures.
+- Learning: For `pane capture`, request `--lines = $rows_of_pane` rather than a small number, otherwise output that lives near row 0 (cursor at top of grid) gets missed and the response looks empty.
+- Learning: `bash -l -i` + `TERM_PROGRAM=shux` are necessary together to load user dotfiles correctly. `-l` alone misses `~/.bashrc`; without `TERM_PROGRAM=shux` user rc files keep branching on the parent emulator's value (e.g. skip starship under Warp).
+
 **2026-05-08 — Followup: user dotfiles (starship) load inside shux panes**
 - Root cause: `crates/shux-pty/src/handle.rs::resolve_command` spawned the shell as `bash -l` (login only). User's `~/.bash_profile` sources `~/.bashrc` only when `$- == *i*` (interactive); `-l` alone leaves `$-` without `i`, so `~/.bashrc` never ran and starship never initialized.
 - Secondary cause: even with bashrc running, `TERM_PROGRAM` was inherited from the parent emulator (e.g. `WarpTerminal`). User rc files commonly branch on `TERM_PROGRAM` to skip starship under Warp; that branch fired wrong inside shux panes.
