@@ -333,6 +333,7 @@ fn key_to_prefix_action(key: KeyEvent) -> Option<ActionKind> {
         KeyCode::Up => ActionKind::ResizeUp,
         KeyCode::Down => ActionKind::ResizeDown,
         KeyCode::Char('?') => ActionKind::ToggleHelp,
+        KeyCode::Char('[') => ActionKind::EnterCopyMode,
         _ => return None,
     })
 }

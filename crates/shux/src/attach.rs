@@ -238,6 +238,13 @@ struct AttachedSession {
     /// render loop draws the overlay and the input loop swallows raw
     /// Input frames so typing doesn't reach the focused PTY behind it.
     help_visible: bool,
+    /// Active copy-mode session, if any. Entered via `prefix + [` →
+    /// `ActionKind::EnterCopyMode`. While `Some(_)`, the input loop
+    /// routes Input-frame bytes through `copy_mode::handle_key`
+    /// instead of forwarding them to the focused PTY, the render
+    /// loop overlays a cursor + selection on the focused pane, and
+    /// `y` triggers an OSC 52 clipboard write before exiting.
+    copy_mode: Option<shux_ui::CopyModeState>,
 }
 
 /// Find a session by name, or create it (with one window + one pane) if
@@ -260,6 +267,7 @@ async fn resolve_or_create_session(
             active_window_id: win.id,
             active_pane_id: win.active_pane,
             help_visible: false,
+            copy_mode: None,
         });
     }
 
@@ -284,6 +292,7 @@ async fn resolve_or_create_session(
         active_window_id: win.id,
         active_pane_id: win.active_pane,
         help_visible: false,
+        copy_mode: None,
     })
 }
 
@@ -497,6 +506,94 @@ async fn run_attach_loop(
                                 continue;
                             }
                         }
+                        // Copy-mode capture: route bytes through the
+                        // copy-mode key handler instead of forwarding
+                        // to the PTY. `y` triggers an OSC 52 yank that
+                        // is shipped DIRECTLY to the client (not via
+                        // the compositor) so it lands as a single
+                        // self-contained terminal sequence — most
+                        // terminals interpret it before any subsequent
+                        // diff bytes overwrite the cursor position.
+                        let copy_action = {
+                            // Snapshot the bits we need under the lock,
+                            // then drop it before computing the pane
+                            // size (which itself takes locks).
+                            let (active_pane, attached_clone, in_copy) = {
+                                let s = render_session.lock().await;
+                                (s.active_pane_id, s.clone(), s.copy_mode.is_some())
+                            };
+                            if in_copy {
+                                let (cols, rows) = focused_pane_size(
+                                    &graph,
+                                    &io_state,
+                                    active_pane,
+                                    &attached_clone,
+                                    &client_size,
+                                )
+                                .await;
+                                let action = {
+                                    let mut s = render_session.lock().await;
+                                    if let Some(ref mut cm) = s.copy_mode {
+                                        shux_ui::copy_mode_key(&bytes, cm, cols, rows)
+                                    } else {
+                                        shux_ui::CopyKey::Ignored
+                                    }
+                                };
+                                Some((action, active_pane, cols, rows))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((action, pane_id, cols, rows)) = copy_action {
+                            match action {
+                                shux_ui::CopyKey::Updated | shux_ui::CopyKey::Ignored => {
+                                    let pulse = io_state.lock().await.render_pulse.clone();
+                                    pulse.notify_one();
+                                }
+                                shux_ui::CopyKey::Exit => {
+                                    let mut s = render_session.lock().await;
+                                    s.copy_mode = None;
+                                    drop(s);
+                                    let pulse = io_state.lock().await.render_pulse.clone();
+                                    pulse.notify_one();
+                                }
+                                shux_ui::CopyKey::Yank => {
+                                    let text = {
+                                        let s = render_session.lock().await;
+                                        let cm = s.copy_mode.clone();
+                                        drop(s);
+                                        match cm {
+                                            Some(cm) => {
+                                                let state = io_state.lock().await;
+                                                state
+                                                    .vts
+                                                    .get(&pane_id)
+                                                    .map(|vt| {
+                                                        shux_ui::copy_mode::extract_selection(
+                                                            vt, &cm, cols, rows,
+                                                        )
+                                                    })
+                                                    .unwrap_or_default()
+                                            }
+                                            None => String::new(),
+                                        }
+                                    };
+                                    if !text.is_empty() {
+                                        let osc = shux_ui::osc52_copy(&text);
+                                        let frame = AttachServerFrame::Render {
+                                            data: BASE64.encode(&osc),
+                                        };
+                                        let _ = out_tx.send(frame).await;
+                                    }
+                                    let mut s = render_session.lock().await;
+                                    s.copy_mode = None;
+                                    drop(s);
+                                    let pulse = io_state.lock().await.render_pulse.clone();
+                                    pulse.notify_one();
+                                }
+                            }
+                            continue;
+                        }
                         let target = render_session.lock().await.active_pane_id;
                         // Clone the writer Sender out of the map and drop the
                         // PaneIoState mutex BEFORE touching the channel.
@@ -695,6 +792,7 @@ async fn run_render_loop(
     let mut last_border_style = initial.appearance.border_style.clone();
     let mut last_theme = initial_theme;
     let mut last_help_visible = false;
+    let mut last_copy_active = false;
 
     loop {
         tokio::select! {
@@ -746,6 +844,23 @@ async fn run_render_loop(
             compositor.force_redraw();
             last_help_visible = attached.help_visible;
         }
+        let copy_active_now = attached.copy_mode.is_some();
+        if copy_active_now != last_copy_active {
+            compositor.force_redraw();
+            last_copy_active = copy_active_now;
+        }
+        // Force a full redraw on every frame the copy-mode overlay is
+        // active. Cursor / selection movements only mutate ephemeral
+        // overlay bytes appended after the framebuffer diff — they
+        // never touch the underlying VT cells, so the diff renderer
+        // would otherwise leave stale cursor squares and highlight
+        // bands on screen as the user moves around. Per-iteration
+        // force_redraw is the simplest correct fix; the alternative
+        // would be tracking last cursor/anchor and only forcing
+        // redraws on deltas, which is more code for the same effect.
+        if copy_active_now {
+            compositor.force_redraw();
+        }
 
         let win = match snap.windows.get(&attached.active_window_id) {
             Some(w) => w,
@@ -779,6 +894,32 @@ async fn run_render_loop(
         // Reset the buffer first so we only ship the new frame's bytes.
         compositor.inner_mut().clear();
         let _ = compositor.render_multi_pane(frame);
+
+        // Copy-mode overlay layer: a cursor block + selection
+        // highlight + status hint, scoped to the focused pane's
+        // content rect. Drawn BEFORE the help overlay so the help
+        // sheet wins z-order if both are somehow active.
+        if let Some(ref cm) = attached.copy_mode {
+            // When the active window is zoomed, the multipane render
+            // shows ONE pane filling the entire viewport — the saved
+            // split-rectangles aren't on screen. Use the full
+            // viewport as the overlay's pane rect in that case so the
+            // cursor / selection / hint align with what's actually
+            // visible.
+            let viewport = current_viewport(&client_size).await;
+            let pane_rect = if win.layout.is_zoomed() {
+                Some(viewport)
+            } else {
+                win.layout
+                    .compute_rects(viewport)
+                    .into_iter()
+                    .find(|(pid, _)| *pid == attached.active_pane_id)
+                    .map(|(_, rect)| rect)
+            };
+            if let Some(rect) = pane_rect {
+                shux_ui::render_copy_overlay_into(compositor.inner_mut(), rect, cm, &live_theme);
+            }
+        }
 
         // Help-overlay layer: drawn AFTER the diff'd multipane frame so
         // it covers the cells underneath. Toggling the overlay also
@@ -1023,6 +1164,39 @@ fn action_changes_layout(kind: ActionKind) -> bool {
     )
 }
 
+/// Compute the focused pane's content rect (cols, rows) — the size
+/// copy mode uses to clamp cursor motion. Returns (0, 0) when the
+/// pane is not in the active window's layout, which keeps `handle_key`
+/// safely a no-op rather than panicking.
+///
+/// In a zoomed window the visible pane fills the full viewport, so we
+/// use the viewport's dimensions instead of the saved split-layout
+/// rectangle — otherwise cursor motion would clamp to an unzoomed
+/// rect that no longer matches what's on screen.
+async fn focused_pane_size(
+    graph: &GraphHandle,
+    _io_state: &Arc<Mutex<PaneIoState>>,
+    pane_id: PaneId,
+    attached: &AttachedSession,
+    client_size: &ClientSize,
+) -> (u16, u16) {
+    let viewport = current_viewport(client_size).await;
+    let snap = graph.snapshot();
+    let win = match snap.windows.get(&attached.active_window_id) {
+        Some(w) => w,
+        None => return (0, 0),
+    };
+    if win.layout.is_zoomed() {
+        return (viewport.width, viewport.height);
+    }
+    for (pid, rect) in win.layout.compute_rects(viewport) {
+        if pid == pane_id {
+            return (rect.width, rect.height);
+        }
+    }
+    (0, 0)
+}
+
 /// Compute the actual pane viewport (inset for outline + status bar) at
 /// the current client size. Used by spatial actions (focus_dir, smart
 /// split) so the geometry they reason about matches what the user sees
@@ -1058,6 +1232,17 @@ async fn handle_action(
             help_visible = s.help_visible,
             "attach: toggled help overlay"
         );
+        return Ok(());
+    }
+
+    // EnterCopyMode is also a UI-only flip — start a fresh copy-mode
+    // session on the currently focused pane. If one is already active
+    // (the user pressed prefix+[ twice), reset it back to (0,0)
+    // without an anchor, matching tmux's behavior.
+    if matches!(kind, ActionKind::EnterCopyMode) {
+        let mut s = session.lock().await;
+        s.copy_mode = Some(shux_ui::CopyModeState::new());
+        tracing::info!("attach: entered copy mode on focused pane");
         return Ok(());
     }
 
@@ -1119,10 +1304,12 @@ async fn handle_action(
         ActionKind::ResizeUp => resize_pane(graph, &attached, Direction::Horizontal, -0.05).await,
         ActionKind::ResizeDown => resize_pane(graph, &attached, Direction::Horizontal, 0.05).await,
         ActionKind::Redraw => Ok(()),
-        // Handled above — the early-return keeps this branch unreachable
-        // but the match arm is required so adding new ActionKinds keeps
-        // failing the compile-time exhaustiveness check.
+        // Handled above — the early-returns keep these branches
+        // unreachable but the match arms are required so adding new
+        // ActionKinds keeps failing the compile-time exhaustiveness
+        // check.
         ActionKind::ToggleHelp => unreachable!("ToggleHelp short-circuited above"),
+        ActionKind::EnterCopyMode => unreachable!("EnterCopyMode short-circuited above"),
     }
 }
 
