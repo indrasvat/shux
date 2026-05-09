@@ -702,6 +702,21 @@ border_style = "rounded"
 prefix = "ctrl-space"
 
 # ─────────────────────────────────────────────────────────────────────
+# Theme: override the built-in Catppuccin Macchiato palette. Every key
+# is optional; missing keys fall through to the defaults so an empty
+# (or absent) [theme] block is equivalent to no [theme] at all. Edits
+# hot-reload like the rest of the file — borders + status bar pick up
+# the new colors on the next render frame.
+# ─────────────────────────────────────────────────────────────────────
+
+# [theme]
+# border_focused   = "#74c7ec"   # Catppuccin Sapphire (default)
+# border_unfocused = "#5b6078"   # Catppuccin Surface2 (default)
+# status_bg        = "#1e2030"   # Catppuccin Crust
+# status_fg        = "#cad3f5"   # Catppuccin Text
+# status_accent    = "#74c7ec"   # Catppuccin Sapphire
+
+# ─────────────────────────────────────────────────────────────────────
 # Status-bar segments. Each entry runs `command` every `interval_ms`
 # and renders the captured stdout (ANSI colors preserved) into the
 # named zone. Fallback text shows when the command is missing or

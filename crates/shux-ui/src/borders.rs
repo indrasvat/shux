@@ -160,30 +160,39 @@ impl BorderStyle {
     }
 }
 
-/// Color palette for borders. Defaults are zero-config tasteful values that
-/// will later be overridden by the theme engine (task 024).
+/// Color palette for borders. Built from the theme engine's resolved
+/// tokens (`shux_core::theme::Theme`); the `Default` impl mirrors
+/// `Theme::DEFAULT` for code paths that don't have a theme yet (tests
+/// + the `terminal_demo` example).
 #[derive(Debug, Clone, Copy)]
 pub struct BorderColors {
     pub focused: Color,
     pub unfocused: Color,
 }
 
+impl BorderColors {
+    /// Build from a resolved theme. Translates `shux_core::theme::Rgb`
+    /// triples into `crossterm::style::Color::Rgb` so the renderer can
+    /// emit them directly.
+    pub fn from_theme(theme: &shux_core::theme::Theme) -> Self {
+        Self {
+            focused: rgb(theme.border_focused),
+            unfocused: rgb(theme.border_unfocused),
+        }
+    }
+}
+
+fn rgb(c: shux_core::theme::Rgb) -> Color {
+    Color::Rgb {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+    }
+}
+
 impl Default for BorderColors {
     fn default() -> Self {
-        Self {
-            // Catppuccin Macchiato Sapphire — accent
-            focused: Color::Rgb {
-                r: 116,
-                g: 199,
-                b: 236,
-            },
-            // Catppuccin Macchiato Surface2 — dim
-            unfocused: Color::Rgb {
-                r: 91,
-                g: 96,
-                b: 120,
-            },
-        }
+        Self::from_theme(&shux_core::theme::Theme::DEFAULT)
     }
 }
 

@@ -45,6 +45,8 @@ mod strict {
         pub shell: Shell,
         #[serde(default)]
         pub statusbar: StatusBar,
+        #[serde(default)]
+        pub theme: Theme,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -98,6 +100,21 @@ mod strict {
         pub interval_ms: Option<u64>,
         #[serde(default)]
         pub fallback: Option<String>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Theme {
+        #[serde(default)]
+        pub border_focused: Option<String>,
+        #[serde(default)]
+        pub border_unfocused: Option<String>,
+        #[serde(default)]
+        pub status_bg: Option<String>,
+        #[serde(default)]
+        pub status_fg: Option<String>,
+        #[serde(default)]
+        pub status_accent: Option<String>,
     }
 }
 
