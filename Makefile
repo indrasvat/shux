@@ -170,6 +170,25 @@ ci: lint test-lib test-doc ## Run CI pipeline (lint + test-lib + test-doc)
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
 
+.PHONY: ci-strict
+ci-strict: ## Force latest stable toolchain, then run fmt+clippy+build+test (closes version-skew gap)
+	@command -v rustup >/dev/null 2>&1 || { echo "$(COLOR_RED)rustup is required for ci-strict (not on PATH)$(COLOR_RESET)" >&2; exit 1; }
+	@echo "$(COLOR_BLUE)▶ Updating stable toolchain to latest...$(COLOR_RESET)"
+	@rustup update stable
+	@echo "$(COLOR_BLUE)▶ Toolchain:$(COLOR_RESET) $$(rustc +stable --version) — $$(cargo +stable clippy --version)"
+	@echo ""
+	@echo "$(COLOR_BLUE)▶ Format check (+stable)$(COLOR_RESET)"
+	@cargo +stable fmt --all -- --check
+	@echo "$(COLOR_BLUE)▶ Clippy --all-targets -D warnings (+stable)$(COLOR_RESET)"
+	@cargo +stable clippy --workspace --all-targets -- -D warnings
+	@echo "$(COLOR_BLUE)▶ Build --all-targets (+stable)$(COLOR_RESET)"
+	@cargo +stable build --workspace --all-targets
+	@echo "$(COLOR_BLUE)▶ Library tests (+stable, nextest)$(COLOR_RESET)"
+	@cargo +stable nextest run --workspace --lib --no-tests=pass
+	@echo ""
+	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ ci-strict passed against $$(rustc +stable --version)$(COLOR_RESET)"
+	@echo ""
+
 .PHONY: deny
 deny: ## Run license/advisory audit (strict)
 	@echo "$(COLOR_BLUE)▶ Running cargo-deny...$(COLOR_RESET)"

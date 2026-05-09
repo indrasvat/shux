@@ -27,6 +27,7 @@ make fmt                   # Format all code
 make lint                  # clippy + fmt-check
 make check                 # lint + test (what pre-commit runs)
 make ci                    # CI-only target (lint + test-lib + test-doc, fail-fast)
+make ci-strict             # Forces latest stable toolchain (closes version-skew gap)
 make deny                  # Run license/advisory audit (strict)
 make deny-soft             # Run license/advisory audit (non-blocking)
 make check-progress        # Verify PROGRESS.md and task Status fields are updated
