@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 mod attach;
 mod cli;
 mod client;
+mod config_validate;
 mod daemon;
 mod statusbar_runner;
 mod style;
@@ -2187,6 +2188,10 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             cli::ConfigCommand::Init { force } => cli::handle_config_init(force),
             cli::ConfigCommand::Path => cli::handle_config_path(),
             cli::ConfigCommand::Show => cli::handle_config_show(),
+            cli::ConfigCommand::Validate { config } => {
+                let code = cli::handle_config_validate(config)?;
+                std::process::exit(code);
+            }
         },
 
         Some(Command::__daemon) => unreachable!("handled above"),
