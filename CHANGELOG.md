@@ -1,3 +1,10 @@
+# [0.4.0](https://github.com/indrasvat/shux/compare/v0.3.0...v0.4.0) (2026-05-10)
+
+
+### Features
+
+* **apply:** state.apply RPC + shux apply CLI (task 030, PR 3a) ([#10](https://github.com/indrasvat/shux/issues/10)) ([95d9417](https://github.com/indrasvat/shux/commit/95d941726766c73be91174cd5a0a5c1f3a39ec2c)), closes [#3](https://github.com/indrasvat/shux/issues/3) [#2](https://github.com/indrasvat/shux/issues/2) [#1](https://github.com/indrasvat/shux/issues/1) [#7](https://github.com/indrasvat/shux/issues/7)
+
 # [0.3.0](https://github.com/indrasvat/shux/compare/v0.2.0...v0.3.0) (2026-05-10)
 
 
