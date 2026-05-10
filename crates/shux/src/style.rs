@@ -1013,6 +1013,19 @@ pub fn print_pane_resized(pane_id: &str) {
     print_success("Resized", "pane", Some(pane_id));
 }
 
+/// Print a pane title-set confirmation (PR 4 / task 027).
+pub fn print_pane_title_set(pane_id: &str, displayed: &str) {
+    let mut out = std::io::stdout();
+    let _ = write!(
+        out,
+        "{} Set title on pane {} → {}",
+        success("✓"),
+        muted(&short_id(pane_id)),
+        bold(displayed),
+    );
+    let _ = writeln!(out);
+}
+
 /// Print a send-keys confirmation.
 pub fn print_send_keys(pane_id: &str, bytes_written: u64) {
     println!(

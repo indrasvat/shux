@@ -67,8 +67,14 @@ async fn run_pane_pty_task(
     mut write_rx: mpsc::Receiver<Vec<u8>>,
     mut resize_rx: mpsc::Receiver<shux_pty::handle::PtySize>,
     shutdown: tokio_util::sync::CancellationToken,
+    graph: shux_core::graph::GraphHandle,
 ) {
     let mut buf = vec![0u8; 8192];
+    // Track the last OSC title we forwarded to the graph so we only
+    // call set_pane_osc_title when it actually changes. bash's
+    // PROMPT_COMMAND re-emits OSC 2 on every prompt; without this
+    // local diff we'd flood the graph + event bus.
+    let mut last_osc_title: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -80,14 +86,17 @@ async fn run_pane_pty_task(
                     }
                     Ok(n) => {
                         let data = &buf[..n];
-                        let pulse = {
+                        let (pulse, vt_title) = {
                             let mut state = io_state.lock().await;
-                            if let Some(vt) = state.vts.get_mut(&pane_id) {
+                            let vt_title = if let Some(vt) = state.vts.get_mut(&pane_id) {
                                 vt.process(data);
-                            }
+                                vt.title().map(|s| s.to_string())
+                            } else {
+                                None
+                            };
                             let output = String::from_utf8_lossy(data);
                             let _completed = state.cmd_engine.process_output(pane_id.0, &output);
-                            state.render_pulse.clone()
+                            (state.render_pulse.clone(), vt_title)
                         };
                         // Wake any attach-render loops outside the lock.
                         // notify_one queues a permit that survives even if
@@ -95,6 +104,28 @@ async fn run_pane_pty_task(
                         // yet awaiting; notify_waiters would silently drop
                         // the wakeup in that window.
                         pulse.notify_one();
+                        // Forward OSC 0/2 title changes to the graph
+                        // (outside the io_state lock). Don't hold the
+                        // mutex across the mpsc send — that's the
+                        // deadlock pattern from PR #7. Skip empty
+                        // titles entirely; some apps clear with OSC 2
+                        // and we don't want a blank border title.
+                        if vt_title != last_osc_title {
+                            if let Some(t) = vt_title.clone() {
+                                if !t.is_empty() {
+                                    if let Err(e) =
+                                        graph.set_pane_osc_title(pane_id, t).await
+                                    {
+                                        tracing::warn!(
+                                            %pane_id,
+                                            error = %e,
+                                            "set_pane_osc_title failed",
+                                        );
+                                    }
+                                }
+                            }
+                            last_osc_title = vt_title;
+                        }
                     }
                     Err(e) => {
                         tracing::error!(%pane_id, error = %e, "PTY read error");
@@ -175,6 +206,7 @@ pub(crate) async fn spawn_pane_pty(
     command: Vec<String>,
     io_state: Arc<Mutex<PaneIoState>>,
     shutdown: tokio_util::sync::CancellationToken,
+    graph: shux_core::graph::GraphHandle,
 ) -> Result<(), shux_rpc::RpcError> {
     let config = if command.is_empty() {
         shux_pty::handle::PtyConfig::default_shell(cwd)
@@ -196,7 +228,7 @@ pub(crate) async fn spawn_pane_pty(
     }
 
     tokio::spawn(run_pane_pty_task(
-        pane_id, handle, io_state, write_rx, resize_rx, shutdown,
+        pane_id, handle, io_state, write_rx, resize_rx, shutdown, graph,
     ));
 
     Ok(())
@@ -534,6 +566,9 @@ fn pane_to_json(
         "id": p.id.to_string(),
         "window_id": p.window_id.to_string(),
         "title": p.title,
+        "manual_title": p.manual_title,
+        "osc_title": p.osc_title,
+        "auto_title": p.auto_title,
         "cwd": p.cwd.to_string_lossy(),
         "command": p.command,
         "exit_status": p.exit_status,
@@ -629,7 +664,9 @@ fn register_state_methods(
                         let command = pane.command.clone();
                         let spawn_io = io.clone();
                         let spawn_ct = ct.clone();
-                        match spawn_pane_pty(pane_id, cwd, command, spawn_io, spawn_ct).await {
+                        match spawn_pane_pty(pane_id, cwd, command, spawn_io, spawn_ct, gh.clone())
+                            .await
+                        {
                             Ok(()) => spawn_results.push(shux_core::apply::SpawnResult {
                                 op_index: output.op_index,
                                 pane_id,
@@ -828,6 +865,7 @@ fn register_pane_methods(
     let g6 = graph.clone();
     let g7 = graph.clone();
     let g8 = graph.clone();
+    let g9 = graph.clone();
 
     let io_split = io_state.clone();
     let io_kill = io_state;
@@ -891,7 +929,7 @@ fn register_pane_methods(
 
                 // Spawn PTY for the new pane
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-                let _ = spawn_pane_pty(new_pane_id, cwd, Vec::new(), io, ct).await;
+                let _ = spawn_pane_pty(new_pane_id, cwd, Vec::new(), io, ct, gh.clone()).await;
 
                 let snap = gh.snapshot();
                 let new_pane = snap
@@ -1120,6 +1158,74 @@ fn register_pane_methods(
                 Ok(serde_json::json!({ "killed": pane_id_str }))
             }
         })
+        .register(
+            "pane.set_title",
+            move |params: Option<serde_json::Value>| {
+                let gh = g9.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                    // `title: null` clears the manual override, letting
+                    // OSC + command-derived auto-titles flow back into
+                    // the displayed pane title. `title: "text"` pins it.
+                    // Omitted entirely leaves the manual title unchanged
+                    // — useful when toggling only `auto`.
+                    let title: Option<Option<String>> = match params.get("title") {
+                        Some(serde_json::Value::Null) => Some(None),
+                        Some(serde_json::Value::String(s)) => Some(Some(s.clone())),
+                        Some(other) => {
+                            return Err(shux_rpc::RpcError::invalid_params(&format!(
+                                "'title' must be string or null, got {other}"
+                            )));
+                        }
+                        None => None,
+                    };
+                    let auto = match params.get("auto") {
+                        Some(serde_json::Value::Bool(b)) => Some(*b),
+                        Some(serde_json::Value::Null) | None => None,
+                        Some(other) => {
+                            return Err(shux_rpc::RpcError::invalid_params(&format!(
+                                "'auto' must be boolean or null, got {other}"
+                            )));
+                        }
+                    };
+                    // If neither was provided, the caller is asking us
+                    // to do nothing — surface that as invalid_params
+                    // rather than a silent success.
+                    if title.is_none() && auto.is_none() {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "must provide at least one of 'title' or 'auto'",
+                        ));
+                    }
+                    // `title: None` (omitted) → don't touch manual_title.
+                    // `title: Some(None)` (explicit null) → clear it.
+                    // `title: Some(Some(...))` → set it.
+                    let title_arg = title.unwrap_or_else(|| {
+                        // Caller only set `auto`; leave manual_title alone.
+                        // Re-read the current value so set_pane_title's
+                        // unconditional set_manual_title doesn't wipe it.
+                        gh.snapshot()
+                            .panes
+                            .get(&pane_id)
+                            .and_then(|p| p.manual_title.clone())
+                    });
+                    gh.set_pane_title(pane_id, title_arg, auto)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
+                    let snap = gh.snapshot();
+                    let pane = snap.panes.get(&pane_id).ok_or_else(|| {
+                        shux_rpc::RpcError::internal("pane vanished after set_title")
+                    })?;
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id.to_string(),
+                        "title": pane.title,
+                        "auto_title": pane.auto_title,
+                        "manual_title": pane.manual_title,
+                        "osc_title": pane.osc_title,
+                    }))
+                }
+            },
+        )
 }
 
 /// Extract optional `expected_version` from RPC params (PR 3b — optimistic
@@ -1285,7 +1391,8 @@ fn register_window_methods(
                 let pane_id = window.active_pane.to_string();
 
                 // Spawn PTY for the new pane
-                let _ = spawn_pane_pty(window.active_pane, cwd, Vec::new(), io, ct).await;
+                let _ =
+                    spawn_pane_pty(window.active_pane, cwd, Vec::new(), io, ct, gh.clone()).await;
 
                 let mut result = window_to_json(window, index, is_active, &snap);
                 // Include pane_id at top level for convenience
@@ -1384,7 +1491,8 @@ fn register_window_methods(
                     .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
 
                 // Spawn PTY for the new pane
-                let _ = spawn_pane_pty(window.active_pane, cwd, Vec::new(), io, ct).await;
+                let _ =
+                    spawn_pane_pty(window.active_pane, cwd, Vec::new(), io, ct, gh.clone()).await;
 
                 let session = snap
                     .sessions
@@ -1675,6 +1783,7 @@ fn register_session_methods(
                                             command.clone(),
                                             io,
                                             ct,
+                                            gh.clone(),
                                         )
                                         .await;
                                     }
@@ -1832,6 +1941,7 @@ fn register_session_methods(
                                             command.clone(),
                                             io,
                                             ct,
+                                            gh.clone(),
                                         )
                                         .await;
                                     }
@@ -2479,6 +2589,28 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         window.as_deref(),
                         &pane,
                         expected_version,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Title {
+                    session,
+                    window,
+                    pane,
+                    title,
+                    clear,
+                    auto,
+                    no_auto,
+                } => {
+                    cli::handle_pane_title(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        title.as_deref(),
+                        clear,
+                        auto,
+                        no_auto,
                         args.format,
                     )
                     .await

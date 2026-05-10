@@ -194,6 +194,7 @@ async fn handle_attach_connection(
                 Vec::new(),
                 io_state.clone(),
                 cancel.clone(),
+                graph.clone(),
             )
             .await
             .ok();
@@ -878,6 +879,19 @@ async fn run_render_loop(
                 vt_refs.insert(pid, vt);
             }
         }
+        // Per-pane titles for the border overlay (PR 4). Read from
+        // the graph snapshot, NOT the VT — Pane.title is the
+        // priority-resolved value (manual > osc > auto-derived),
+        // and the VT only knows about the OSC layer. Skip empty
+        // titles so panes without a title get the clean border.
+        let mut pane_titles: HashMap<PaneId, String> = HashMap::new();
+        for pid in win.layout.tree.pane_ids() {
+            if let Some(p) = snap.panes.get(&pid) {
+                if !p.title.is_empty() {
+                    pane_titles.insert(pid, p.title.clone());
+                }
+            }
+        }
         // Status bar text. Start from the built-in (always-good)
         // segments so OOTB looks the same even when no script segments
         // are configured. Then `populate_bar` appends any
@@ -890,6 +904,7 @@ async fn run_render_loop(
             zoom: win.layout.zoom.as_ref(),
             focused: attached.active_pane_id,
             vts: &vt_refs,
+            titles: Some(&pane_titles),
             status_bar: Some(&bar),
         };
         // Reset the buffer first so we only ship the new frame's bytes.
@@ -1377,6 +1392,7 @@ async fn split(
         Vec::new(),
         io_state.clone(),
         cancel.clone(),
+        graph.clone(),
     )
     .await
     .ok();
@@ -1511,9 +1527,16 @@ async fn new_window(
         .get(&window_id)
         .ok_or_else(|| anyhow::anyhow!("window vanished after create"))?;
     let pane_id = win.active_pane;
-    crate::spawn_pane_pty(pane_id, cwd, Vec::new(), io_state.clone(), cancel.clone())
-        .await
-        .ok();
+    crate::spawn_pane_pty(
+        pane_id,
+        cwd,
+        Vec::new(),
+        io_state.clone(),
+        cancel.clone(),
+        graph.clone(),
+    )
+    .await
+    .ok();
 
     // Focus the new window.
     let _ = graph.focus_window(window_id, None).await;
