@@ -4,33 +4,47 @@
 
 ## Current Phase
 
-**M0: Architecture Spike** — **Complete**. M1: tasks 013–017 + 060 done. shux is now a working interactive multiplexer end-to-end (multi-pane render + attach client + Tier-1 keybindings + status bar). 576 tests pass.
+**M0: Architecture Spike** — **Complete** (000–012).
+**M1: Daily-Driver Core** — In progress, ~75% by task count.
+- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 029, 033, 060.
+- **Partial:** 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet).
+- **Pending:** 025 (per-pane theming), 027 (pane titles), 030 (session templates + `shux apply`), 031 (keybinding config + conflict detection), 032 (command palette), 034 (M1 quality gate).
+
+**M2: API + Plugin System** — not started. The most agent-relevant pieces are tasks 035 (complete RPC surface), **036 (events.watch)**, **037 (optimistic concurrency + state.apply)**, and 038–050 (plugin host + bundled plugins + MCP).
+
+**M3: Polish** — not started. Release pipeline + binary distribution already exist.
+
+590+ tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
 
 ## Status
 
 ### Milestone Targets
 
-- [ ] **M0: Architecture Spike** (tasks 001–012)
-  - [ ] Daemon skeleton with fork-before-tokio daemonization
-  - [ ] PTY manager with async I/O
-  - [ ] Virtual terminal grid (vte + VecDeque)
-  - [ ] Minimal TUI client (single pane)
-  - [ ] JSON-RPC server on UDS (system.version, system.health, session.list)
-  - [ ] Basic input decoder (legacy + Kitty)
-  - [ ] `shux` binary with `new`, `attach`, `ls`
-  - [ ] L1 + L2 tests passing
+- [x] **M0: Architecture Spike** (tasks 001–012)
+  - [x] Daemon skeleton with fork-before-tokio daemonization
+  - [x] PTY manager with async I/O
+  - [x] Virtual terminal grid (vte + VecDeque)
+  - [x] Minimal TUI client (single pane)
+  - [x] JSON-RPC server on UDS (system.version, system.health, session.list)
+  - [x] Basic input decoder (legacy + Kitty)
+  - [x] `shux` binary with `new`, `attach`, `ls`
+  - [x] L1 + L2 tests passing
 
 - [ ] **M1: Daily-Driver Core** (tasks 013–034)
-  - [ ] Full session/window/pane CRUD (API + CLI)
-  - [ ] Splits, directional focus, resize, zoom, swap
-  - [ ] Copy mode with clipboard
-  - [ ] Graded keybindings (Tier 1 + 2), command palette, help overlay
-  - [ ] TOML config with live reload
-  - [ ] Theme engine with per-pane theming
-  - [ ] Mouse support, pane titles, status bar
-  - [ ] Session templates
-  - [ ] L1–L4 tests passing
-  - [ ] Dogfooding begins
+  - [x] Full session/window/pane CRUD (API + CLI)
+  - [x] Splits, directional focus, resize, zoom, swap
+  - [x] Copy mode with clipboard (OSC 52)
+  - [x] Graded keybindings (Tier 1 + 2), help overlay
+  - [ ] Command palette (`Prefix + :`)
+  - [x] TOML config with live reload
+  - [~] Theme engine (border + status bar overrides; full token cascade + per-pane theming pending)
+  - [x] Mouse support
+  - [ ] Pane titles (manual + auto)
+  - [x] Status bar (built-in 3-zone + script-driven `[[statusbar.segment]]`)
+  - [ ] Session templates + `shux apply`
+  - [ ] Keybinding config + conflict detection
+  - [x] L1–L4 tests passing
+  - [x] Dogfooding begins
 
 - [ ] **M2: API + Plugin System** (tasks 035–052)
   - [ ] Complete JSON-RPC API surface
@@ -52,6 +66,16 @@
 ---
 
 ## Session Log
+
+**2026-05-10 — PROGRESS.md sweep + dash retitle ("Road to shux 1.0.0")**
+- Task table was significantly behind reality after the recent PR train (#3–#7). Audited every M1 task against the codebase and recent commits, then updated:
+  - Marked Done: **018** (Tier-1 keybindings, shipped with 017 attach), **019** (Prefix system, shipped with 017), **020** (mouse, 2026-05-08 spike), **021** (copy mode, PR #7), **022** (TOML config + `config validate` PR #4), **023** (live reload, 2026-05-08), **026** (status bar + script-driven segments, 2026-05-09), **029** (Mode 2026 sync output, in compositor since task 009), **033** (help overlay, PR #6).
+  - Marked Partial: **024** (theme — only border + status-bar overrides shipped per PR #5; full token cascade pending), **028** (cap negotiation — TERM_PROGRAM/COLORTERM/SHUX env vars set, but no real DA2/XTVERSION query).
+  - Still Pending: **025** (per-pane theming), **027** (pane titles), **030** (session templates + `shux apply`), **031** (keybinding config + conflict detection), **032** (command palette), **034** (M1 quality gate).
+- Updated each affected task file's `Status:` field with concrete evidence (PR # / spike date / verification script).
+- Refreshed Current Phase header to reflect the M1 ~75% state and to call out the M2 agent-relevant tasks (036 events.watch, 037 optimistic concurrency / state.apply) as the next focus.
+- Renamed `.claude/screenshots/index.html` from "shux task 017 — visual test screenshots" → **"Road to shux 1.0.0"**. Added a roadmap section at the top of the dash that mirrors the milestone state, so the live page (http://indrasvat.tailc7ec16.ts.net:8721/) tracks the journey to v1.0.0 instead of one task. Existing 017 screenshot sections preserved beneath as "M1 milestone evidence".
+- No code changes. PR plan: this sweep ships first, followed by focused PRs for events.watch + optimistic concurrency (036+037), session templates + `shux apply` (030), pane titles (027), and command palette + keybinding config + M1 quality gate (032+031+034) — in that order, prioritised for "agent-first multiplexer that beats tmux".
 
 **2026-05-09 — Spike followups: inline starship_config + `shux config init`**
 - Single-file UX: collapsed the spike's two-file layout (config.toml + statusbar.toml) into ONE. New `SegmentDef::starship_config: Option<String>` accepts an inline TOML literal multi-line string (`'''...'''`). At runner startup the daemon materialises it to `$TMPDIR/shux-segment-<idx>.toml` and exports `STARSHIP_CONFIG=<that path>` for the spawn. On runner exit (config reload or daemon shutdown) the tempfile is removed.
@@ -318,22 +342,22 @@
 | 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | **Done** | 014, 003 |
 | 016 | Pane I/O (send_keys, run_command, capture) | M1 | **Done** | 015, 004 |
 | 017 | Multi-pane rendering | M1 | **Done** | 015, 009 |
-| 018 | Tier 1 keybindings (bare keys) | M1 | Pending | 017 |
-| 019 | Prefix key system (Tier 2) | M1 | Pending | 018 |
-| 020 | Mouse support | M1 | Pending | 017 |
-| 021 | Copy mode | M1 | Pending | 019 |
-| 022 | TOML config system | M1 | Pending | 012 |
-| 023 | Live config reload | M1 | Pending | 022 |
-| 024 | Theme engine and token system | M1 | Pending | 022 |
+| 018 | Tier 1 keybindings (bare keys) | M1 | **Done** | 017 |
+| 019 | Prefix key system (Tier 2) | M1 | **Done** | 018 |
+| 020 | Mouse support | M1 | **Done** | 017 |
+| 021 | Copy mode | M1 | **Done** | 019 |
+| 022 | TOML config system | M1 | **Done** | 012 |
+| 023 | Live config reload | M1 | **Done** | 022 |
+| 024 | Theme engine and token system | M1 | **Partial** ¹ | 022 |
 | 025 | Per-pane theming | M1 | Pending | 024, 017 |
-| 026 | Status bar (hardcoded, pre-plugin) | M1 | Pending | 025 |
+| 026 | Status bar (hardcoded, pre-plugin) | M1 | **Done** | 025 |
 | 027 | Pane titles (manual + auto) | M1 | Pending | 015 |
-| 028 | Capability negotiation (ClientCaps) | M1 | Pending | 010 |
-| 029 | Synchronized output (Mode 2026) | M1 | Pending | 028 |
+| 028 | Capability negotiation (ClientCaps) | M1 | **Partial** ² | 010 |
+| 029 | Synchronized output (Mode 2026) | M1 | **Done** | 028 |
 | 030 | Session templates | M1 | Pending | 022, 015 |
 | 031 | Keybinding configuration and conflict detection | M1 | Pending | 019, 022 |
 | 032 | Command palette | M1 | Pending | 019, 031 |
-| 033 | Help overlay (keybinding cheat sheet) | M1 | Pending | 032 |
+| 033 | Help overlay (keybinding cheat sheet) | M1 | **Done** | 032 |
 | 034 | M1 integration and quality gate | M1 | Pending | 013–033 |
 | 035 | Complete JSON-RPC API surface | M2 | Pending | 034 |
 | 036 | Event stream (events.watch) | M2 | Pending | 035, 007 |
@@ -361,3 +385,9 @@
 | 058 | Binary releases and distribution | M3 | Pending | 052 |
 | 059 | M3 final quality gate and v1.0 release | M3 | Pending | 053–058 |
 | 060 | Rich CLI output — beautiful list commands | M1 | **Done** | 011, 015 |
+
+---
+
+¹ **Task 024 Partial:** `[theme]` config section overrides border colors (focused/unfocused) and status-bar fg/bg colors with hot reload. The full PRD §6.1 token cascade (per-pane themes, theme files in `~/.config/shux/themes/`, ANSI palette overrides, named theme references) is still pending — close-out lives with task 025 and the M1 quality gate (034).
+
+² **Task 028 Partial:** daemon claims `TERM_PROGRAM=shux`, `TERM_PROGRAM_VERSION=<pkg ver>`, `COLORTERM=truecolor`, `SHUX=1` on every PTY spawn. Real cap negotiation (DA2 / XTVERSION / Kitty keyboard query / OSC 4 palette probe stored as a per-client `ClientCaps` and gating Mode 2026, OSC 8, OSC 52, true color) is still pending.

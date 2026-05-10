@@ -1,6 +1,6 @@
 # 024 — Theme Engine and Token System
 
-**Status:** Pending
+**Status:** Partial (PR #5, 2026-05-09). `[theme]` config section overrides border colors (focused/unfocused) and status-bar fg/bg colors; live-reloads via the same hot-reload path as `[appearance]`. The full PRD §6.1 token cascade (per-pane theming, theme files in `~/.config/shux/themes/`, ANSI palette overrides, named theme references) is **not yet shipped** — see task 025 for per-pane theming and the M1 closeout for the full token engine.
 **Depends On:** 022
 **Parallelizable With:** 021, 023
 

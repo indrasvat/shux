@@ -1,6 +1,6 @@
 # 018 — Tier 1 Keybindings (Bare Keys)
 
-**Status:** Pending
+**Status:** Done — implemented as part of the task 017 attach client (Alt+hjkl directional focus, Alt+n/p next/prev window, Alt+z zoom). Verified end-to-end via `.claude/automations/test_017_attach_multipane.py` and `test_017_full_verify.py`.
 **Depends On:** 017
 **Parallelizable With:** 020, 022
 

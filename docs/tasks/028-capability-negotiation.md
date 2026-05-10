@@ -1,6 +1,6 @@
 # 028 — Capability Negotiation (ClientCaps)
 
-**Status:** Pending
+**Status:** Partial. The daemon claims `TERM_PROGRAM=shux` / `TERM_PROGRAM_VERSION=<pkg ver>` / `COLORTERM=truecolor` / `SHUX=1` on every PTY spawn (so user rc files don't mis-route). The active client tracks size via the attach `Resize` frame. The actual cap-query path (DA2, XTVERSION, Kitty keyboard query, OSC 4 palette probe stored as a per-client `ClientCaps`) is **not yet implemented** — synchronized output (Mode 2026) currently fires unconditionally.
 **Depends On:** 010
 **Parallelizable With:** 022, 024
 
