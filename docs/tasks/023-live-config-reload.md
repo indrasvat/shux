@@ -1,6 +1,6 @@
 # 023 — Live Config Reload
 
-**Status:** Pending
+**Status:** Done (2026-05-08 spike). `run_hot_reload()` watches the parent dir via `notify` (parent because editors atomic-rename), debounces 150ms, re-parses, atomically swaps the live snapshot, and fires a change `Notify`. The attach render loop awaits both the data pulse and the config Notify; changes land on the very next frame. Verified via `test_017_full_verify.py` V6 (rounded → thick → ascii observed live, no restart).
 **Depends On:** 022
 **Parallelizable With:** 024
 

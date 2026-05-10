@@ -147,6 +147,16 @@ pub enum Command {
         command: PaneCommand,
     },
 
+    /// Subscribe to typed events from the daemon (agent-friendly stream).
+    ///
+    /// `shux events watch` long-polls the daemon's event bus and prints one
+    /// JSON Line per event to stdout. `shux events history` returns the most
+    /// recent events from the in-memory ring buffer.
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
+
     /// Internal: start the daemon (used by auto-start, not for users)
     #[command(name = "__daemon", hide = true)]
     #[allow(non_camel_case_types)]
@@ -173,6 +183,47 @@ pub enum ConfigCommand {
         /// (`~/.config/shux/config.toml` or `$XDG_CONFIG_HOME/shux/config.toml`).
         #[arg(short, long)]
         config: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EventsCommand {
+    /// Stream events from the daemon. Long-polls in a loop, printing one JSON
+    /// Line per event to stdout. Suitable for piping into jq, grep, or an
+    /// agent harness. Ctrl+C to stop.
+    Watch {
+        /// Filter event types by prefix (repeatable). Examples:
+        /// `--filter pane.` matches all pane events; `--filter session.created`
+        /// matches that exact event. Empty filter list means "all events".
+        #[arg(short, long)]
+        filter: Vec<String>,
+
+        /// Resume from this sequence number. If omitted, starts at the current
+        /// tail (next event published).
+        #[arg(long)]
+        from_seq: Option<u64>,
+
+        /// Per-call long-poll timeout in ms (clamped 100..=30000). The CLI
+        /// reissues the poll on timeout, so this only affects how often the
+        /// daemon sees a fresh request.
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+
+        /// Stop after N events (useful for tests / scripted harnesses).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+
+    /// Print the last N events from the daemon's in-memory ring buffer
+    /// (oldest → newest). Does NOT block.
+    History {
+        /// Filter event types by prefix (repeatable, same semantics as watch).
+        #[arg(short, long)]
+        filter: Vec<String>,
+
+        /// Number of events to return (clamped 1..=1000).
+        #[arg(short = 'n', long, default_value_t = 50)]
+        count: u64,
     },
 }
 
@@ -1779,6 +1830,120 @@ pub async fn handle_pane_capture(
         }
     }
 
+    Ok(())
+}
+
+/// `shux events watch [--filter ...] [--from-seq N] [--limit N]`.
+///
+/// Long-polls `events.watch` on a single shared connection. Each loop:
+///   1. Calls `events.watch` with `from_seq` = next expected seq.
+///   2. Prints every event in the response as one JSON Line on stdout.
+///   3. Updates `from_seq` from the response's `next_seq`.
+///   4. If `lagged: true`, prints `[STREAM_DEGRADED]` to stderr (per the
+///      Codex+Gemini review — clients must know the stream dropped events).
+///   5. If `gap > 0` on the first call (resumption from too-old `from_seq`),
+///      prints `[GAP n]` to stderr.
+///   6. Stops when `--limit N` events have been printed, or on Ctrl+C.
+pub async fn handle_events_watch(
+    stream: &mut tokio::net::UnixStream,
+    filter: Vec<String>,
+    from_seq: Option<u64>,
+    timeout_ms: u64,
+    limit: Option<u64>,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let mut next_seq = from_seq;
+    let mut printed: u64 = 0;
+    let mut first_call = true;
+
+    loop {
+        let mut params = serde_json::Map::new();
+        if let Some(seq) = next_seq {
+            params.insert("from_seq".into(), serde_json::json!(seq));
+        }
+        if !filter.is_empty() {
+            params.insert("filter".into(), serde_json::json!(filter));
+        }
+        params.insert("timeout_ms".into(), serde_json::json!(timeout_ms));
+
+        let result = match rpc_call(stream, "events.watch", serde_json::Value::Object(params)).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{} {e}", style::error("✗ events.watch failed:"));
+                return Err(anyhow::anyhow!(e));
+            }
+        };
+
+        let gap = result.get("gap").and_then(|v| v.as_u64()).unwrap_or(0);
+        let lagged = result
+            .get("lagged")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if first_call && gap > 0 {
+            eprintln!(
+                "{}",
+                style::warning(&format!(
+                    "[GAP {gap}] resumed from a sequence older than the daemon's history; events were lost."
+                ))
+            );
+            first_call = false;
+        } else {
+            first_call = false;
+        }
+
+        if lagged {
+            eprintln!(
+                "{}",
+                style::warning(
+                    "[STREAM_DEGRADED] subscriber lagged; some events were dropped by the daemon."
+                )
+            );
+        }
+
+        if let Some(events) = result.get("events").and_then(|v| v.as_array()) {
+            for ev in events {
+                println!("{}", serde_json::to_string(ev)?);
+                printed += 1;
+                if let Some(n) = limit {
+                    if printed >= n {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        if let Some(ns) = result.get("next_seq").and_then(|v| v.as_u64()) {
+            next_seq = Some(ns);
+        }
+
+        // Loop unconditionally — long-poll cycles immediately when the prior
+        // call returned (Codex + Gemini both warned: do NOT add an artificial
+        // sleep here, it just adds latency for no benefit).
+    }
+}
+
+/// `shux events history [--filter ...] [-n N]`.
+pub async fn handle_events_history(
+    stream: &mut tokio::net::UnixStream,
+    filter: Vec<String>,
+    count: u64,
+) -> anyhow::Result<()> {
+    let mut params = serde_json::Map::new();
+    params.insert("count".into(), serde_json::json!(count));
+    if !filter.is_empty() {
+        params.insert("filter".into(), serde_json::json!(filter));
+    }
+
+    let result = rpc_call(stream, "events.history", serde_json::Value::Object(params)).await?;
+
+    if let Some(events) = result.get("events").and_then(|v| v.as_array()) {
+        for ev in events {
+            println!("{}", serde_json::to_string(ev)?);
+        }
+    }
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 # 020 — Mouse Support
 
-**Status:** Pending
+**Status:** Done (2026-05-08 spike). crossterm `Event::Mouse` forwarded as `AttachClientFrame::Mouse { kind, button, col, row }`. Daemon implements `pane_at(col, row)` for click-to-focus and `border_at()` + `DragState` for drag-to-resize. Scroll variants reserved for copy mode (task 021). Verified via `test_017_full_verify.py` V5 (synthetic SGR-1006 click moves focus across border).
 **Depends On:** 017
 **Parallelizable With:** 018, 019, 022
 

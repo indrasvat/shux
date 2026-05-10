@@ -1,6 +1,6 @@
 # 029 — Synchronized Output (Mode 2026)
 
-**Status:** Pending
+**Status:** Done (already wired in task 009 render compositor). `RenderBackend::render_diff` brackets each frame with crossterm `BeginSynchronizedUpdate` / `EndSynchronizedUpdate` (Mode 2026 / DECSET 2026 / DECRST 2026). Capability gating against `ClientCaps` is deferred until task 028 lands the real DA2/XTVERSION handshake.
 **Depends On:** 028
 **Parallelizable With:** 026, 027
 

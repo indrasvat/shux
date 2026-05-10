@@ -1,6 +1,6 @@
 # 026 — Status Bar (Hardcoded, Pre-Plugin)
 
-**Status:** Pending
+**Status:** Done (2026-05-09 spike). 3-zone (left/center/right) `StatusBar` rendered by the daemon-side compositor. Built-in segments anchor the bar (session name, pane indicator, clock). Extensible via `[[statusbar.segment]]` arrays in config — `command` runs on `interval_ms`, captured via VT, ANSI-grouped into styled segments, with `fallback` text on failure. Validated end-to-end with starship via `inline starship_config = '''...'''`. Hot-add and hot-replace work without daemon restart. Verified via `.claude/automations/test_017_statusbar_segments.py` (6/6 PASS) and `test_017_statusbar_custom.py` (7/7 PASS).
 **Depends On:** 025
 **Parallelizable With:** 027
 

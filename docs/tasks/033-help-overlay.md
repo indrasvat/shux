@@ -1,6 +1,6 @@
 # 033 — Help Overlay (Keybinding Cheat Sheet)
 
-**Status:** Pending
+**Status:** Done (PR #6, 2026-05-09). `Prefix + ?` opens a keybinding cheat-sheet overlay rendered above the active layout. Implementation in `crates/shux-ui/src/help_overlay.rs`. Verified via `.claude/automations/test_033_help_overlay.py`.
 **Depends On:** 032
 **Parallelizable With:** —
 

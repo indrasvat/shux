@@ -1,6 +1,6 @@
 # 019 — Prefix Key System (Tier 2 Keybindings)
 
-**Status:** Pending
+**Status:** Done — Ctrl+Space prefix system shipped with task 017 attach client. Prefix-armed state, Tier-2 actions (split, kill, zoom, detach, new window, copy mode entry, help overlay), prefix-prefix passthrough (sends literal NUL byte to inner shell). Modifier-aware dispatch (Ctrl+C does not trigger NewWindow). Verified via `test_017_attach_multipane.py`.
 **Depends On:** 018
 **Parallelizable With:** 022
 

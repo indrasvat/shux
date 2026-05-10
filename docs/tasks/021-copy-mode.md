@@ -1,6 +1,6 @@
 # 021 — Copy Mode
 
-**Status:** Pending
+**Status:** Done (PR #7, 2026-05-09). `Prefix + [` enters copy mode; selection via cursor + space-mark; OSC 52 yank to host clipboard. Implementation in `crates/shux-ui/src/copy_mode.rs`. Verified via `.claude/automations/test_021_copy_mode.py`.
 **Depends On:** 019
 **Parallelizable With:** 024
 

@@ -1,6 +1,6 @@
 # 022 — TOML Config System
 
-**Status:** Pending
+**Status:** Done (2026-05-08 spike + PR #4). `crates/shux-core/src/config.rs` provides `Config` / `ConfigHandle` with lock-free `ArcSwap` snapshots. Loaded from `$XDG_CONFIG_HOME/shux/config.toml` or `$HOME/.config/shux/config.toml`. Sections: `[appearance]`, `[keys]`, `[shell]`, `[statusbar]`, `[theme]`. PR #4 added `shux config validate` with line:col diagnostics. `shux config init` / `show` / `path` ship the starter starship-integrated config.
 **Depends On:** 012
 **Parallelizable With:** 013, 014, 018, 019
 
