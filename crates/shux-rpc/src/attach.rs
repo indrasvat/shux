@@ -152,6 +152,12 @@ pub enum ActionKind {
     /// Switch window.
     NextWindow,
     PrevWindow,
+    /// Switch to the Nth window in the active session, 1-indexed.
+    /// Window index comes from `ActionArgs.window_index`. Out-of-range
+    /// requests are silently ignored by the daemon (no panic, no
+    /// notice — matches tmux's Alt+1..9 behavior). Used for the bare
+    /// Alt+1..9 Tier-1 keybindings (task 018).
+    SwitchToWindow,
     /// Resize focused pane.
     ResizeLeft,
     ResizeRight,
@@ -166,10 +172,15 @@ pub enum ActionKind {
 }
 
 /// Optional per-action arguments. Not all actions use all fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionArgs {
     #[serde(default)]
     pub name: Option<String>,
+    /// 1-indexed window position for `ActionKind::SwitchToWindow`.
+    /// Out-of-range values are ignored server-side; the client
+    /// doesn't try to be clever about clamping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_index: Option<u16>,
 }
 
 #[cfg(test)]

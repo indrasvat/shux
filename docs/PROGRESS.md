@@ -5,9 +5,10 @@
 ## Current Phase
 
 **M0: Architecture Spike** — **Complete** (000–012).
-**M1: Daily-Driver Core** — In progress, ~75% by task count.
-- **Done:** 013, 014, 015, 016, 017, 019, 020, 021, 022, 023, 026, 029, 033, 060.
-- **Partial:** 018 (Tier-1 keys: Alt+Enter/|/\\/-/arrows/z/x/Tab shipped; bare Alt+h/j/k/l, Alt+n/p, Alt+1..9 still missing — caught by Codex review of PR #8), 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet).
+**M1: Daily-Driver Core** — In progress, ~78% by task count.
+- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 029, 033, 060.
+- **Partial:** 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet).
+- **018 (Tier-1 keys) finalized:** Bare Alt+h/j/k/l → directional focus (mirrors prefix bindings); Alt+n/p → next/prev window cycle; Alt+1..9 → switch directly to Nth window via new `ActionKind::SwitchToWindow` + `ActionArgs.window_index`. `key_to_bare_action` return type bumped from `Option<ActionKind>` to `Option<(ActionKind, ActionArgs)>`. Out-of-range Alt+digit silently ignored (matches tmux). 4 new unit tests in `crates/shux-ui/src/attach.rs`.
 - **Pending:** 025 (per-pane theming), 027 (pane titles), 031 (keybinding config + conflict detection), 032 (command palette), 034 (M1 quality gate). (030 — session templates — moved to M2 group as part of PR 3a since it lands alongside `state.apply`.)
 
 **M2: API + Plugin System** — kicked off.

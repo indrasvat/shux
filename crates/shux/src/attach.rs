@@ -623,9 +623,10 @@ async fn run_attach_loop(
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.notify_one();
                     }
-                    AttachClientFrame::Action { kind, .. } => {
+                    AttachClientFrame::Action { kind, args } => {
                         if let Err(e) = handle_action(
                             kind,
+                            args.clone(),
                             &graph,
                             &io_state,
                             &render_session,
@@ -1161,6 +1162,7 @@ fn action_changes_layout(kind: ActionKind) -> bool {
             | ActionKind::NewWindow
             | ActionKind::NextWindow
             | ActionKind::PrevWindow
+            | ActionKind::SwitchToWindow
     )
 }
 
@@ -1214,6 +1216,7 @@ async fn current_viewport(client_size: &ClientSize) -> Rect {
 /// Dispatch an Action keybinding from the client.
 async fn handle_action(
     kind: ActionKind,
+    args: shux_rpc::attach::ActionArgs,
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
@@ -1299,6 +1302,22 @@ async fn handle_action(
         ActionKind::NewWindow => new_window(graph, &attached, io_state, cancel, session).await,
         ActionKind::NextWindow => switch_window(graph, &attached, 1, session).await,
         ActionKind::PrevWindow => switch_window(graph, &attached, -1, session).await,
+        ActionKind::SwitchToWindow => {
+            // Codex P2 followup from PR #8 — bare Alt+1..9 lands here.
+            // The window_index payload is 1-based; out-of-range
+            // requests are silently dropped (matches tmux).
+            if let Some(idx_1based) = args.window_index {
+                switch_to_window_index(
+                    graph,
+                    &attached,
+                    idx_1based.saturating_sub(1) as usize,
+                    session,
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        }
         ActionKind::ResizeLeft => resize_pane(graph, &attached, Direction::Vertical, -0.05).await,
         ActionKind::ResizeRight => resize_pane(graph, &attached, Direction::Vertical, 0.05).await,
         ActionKind::ResizeUp => resize_pane(graph, &attached, Direction::Horizontal, -0.05).await,
@@ -1502,6 +1521,42 @@ async fn new_window(
     let mut s = session.lock().await;
     s.active_window_id = window_id;
     s.active_pane_id = pane_id;
+    Ok(())
+}
+
+/// Switch directly to the window at `index_0based` in the active
+/// session. Out-of-range indices are silently ignored (matches tmux's
+/// Alt+1..9 behavior — pressing Alt+5 when only 3 windows exist does
+/// nothing rather than wrapping or beeping). Called from the bare
+/// Alt+1..9 keybinding path (Codex P2 followup from PR #8).
+async fn switch_to_window_index(
+    graph: &GraphHandle,
+    attached: &AttachedSession,
+    index_0based: usize,
+    session: &Arc<Mutex<AttachedSession>>,
+) -> anyhow::Result<()> {
+    let snap = graph.snapshot();
+    let sess = snap
+        .sessions
+        .get(&attached.session_id)
+        .ok_or_else(|| anyhow::anyhow!("session missing"))?;
+    let target = match sess.windows.get(index_0based) {
+        Some(&w) => w,
+        None => return Ok(()),
+    };
+    if target == attached.active_window_id {
+        return Ok(());
+    }
+    let _ = graph.focus_window(target).await;
+
+    let new_pane = snap
+        .windows
+        .get(&target)
+        .map(|w| w.active_pane)
+        .unwrap_or(attached.active_pane_id);
+    let mut s = session.lock().await;
+    s.active_window_id = target;
+    s.active_pane_id = new_pane;
     Ok(())
 }
 

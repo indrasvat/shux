@@ -1,6 +1,6 @@
 # 018 — Tier 1 Keybindings (Bare Keys)
 
-**Status:** Partial — `crates/shux-ui/src/attach.rs::key_to_bare_action` ships Alt+Enter (smart split), Alt+| / Alt+\ (vertical split), Alt+- (horizontal split), Alt+arrows (directional focus), Alt+z (toggle zoom), Alt+x (kill pane), Alt+Tab (focus next). **Still missing per PRD §9.1**: bare **Alt+h/j/k/l** (only the prefix-mode `Prefix h/j/k/l` works today), bare **Alt+n/p** for next/prev window, and **Alt+1..9** for window-by-index. Tier-2 prefix bindings (Ctrl+Space + h/j/k/l/n/p) are wired in `key_to_prefix_action` and verified via `test_017_attach_multipane.py`. Closing the bare-key gap is small (one match in `key_to_bare_action`) and rolls into the M1 quality gate (034) or a focused follow-up PR.
+**Status:** Done — Codex P2 followup landed all the bare Tier-1 keys: Alt+h/j/k/l (directional focus), Alt+n/p (next/prev window), Alt+1..9 (switch directly to Nth window via `ActionKind::SwitchToWindow` + `ActionArgs.window_index`). `key_to_bare_action` return type bumped to `Option<(ActionKind, ActionArgs)>` so digit shortcuts can ship their index. Out-of-range Alt+digit silently ignored (matches tmux). Full visual test at `.claude/automations/test_bare_alt_tier1_keys.py` confirms end-to-end Alt+2 → [2/3], Alt+n wrap → [1/3].
 **Depends On:** 017
 **Parallelizable With:** 020, 022
 
