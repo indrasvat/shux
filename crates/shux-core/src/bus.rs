@@ -165,6 +165,13 @@ impl EventBus {
     ///
     /// If no subscribers are listening, the event is still recorded in history.
     pub fn publish(&self, data: EventData) -> u64 {
+        self.publish_with_correlation(data, None)
+    }
+
+    /// Publish an event with a correlation ID linking it to a batch /
+    /// transaction (e.g. a `state.apply` call). Subscribers can group events
+    /// by correlation_id to attribute a burst to a specific apply.
+    pub fn publish_with_correlation(&self, data: EventData, correlation_id: Option<String>) -> u64 {
         let seq = self.inner.seq_counter.fetch_add(1, Ordering::Relaxed);
         let event_type = data.event_type().to_string();
 
@@ -173,6 +180,7 @@ impl EventBus {
                 seq,
                 timestamp: SystemTime::now(),
                 event_type,
+                correlation_id,
             },
             data,
         };
@@ -349,6 +357,7 @@ mod tests {
         EventData::PaneCreated {
             pane_id: PaneId::new(),
             window_id: WindowId::new(),
+            session_id: SessionId::new(),
             command: vec!["bash".to_string()],
         }
     }
@@ -637,11 +646,15 @@ mod tests {
 
         bus.publish(EventData::PaneBell {
             pane_id: PaneId::new(),
+            window_id: WindowId::new(),
+            session_id: SessionId::new(),
         });
         assert_eq!(bus.current_seq(), 2);
 
         bus.publish(EventData::PaneBell {
             pane_id: PaneId::new(),
+            window_id: WindowId::new(),
+            session_id: SessionId::new(),
         });
         assert_eq!(bus.current_seq(), 3);
     }
@@ -698,6 +711,8 @@ mod tests {
 
         bus1.publish(EventData::PaneBell {
             pane_id: PaneId::new(),
+            window_id: WindowId::new(),
+            session_id: SessionId::new(),
         });
 
         // bus2 should see the same history.

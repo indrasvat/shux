@@ -245,6 +245,13 @@ pub enum GraphCommand {
     Snapshot {
         reply: tokio::sync::oneshot::Sender<Arc<SessionGraphSnapshot>>,
     },
+    /// Apply a batch of ops atomically (PR 3a).
+    ApplyBatch {
+        ops: Vec<crate::apply::Op>,
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::apply::BatchResult, crate::apply::BatchError>,
+        >,
+    },
 }
 
 /// The authoritative session graph (single-writer owner of state).
@@ -289,6 +296,170 @@ impl SessionGraph {
         if let Some(bus) = &self.event_bus {
             bus.publish(data);
         }
+    }
+
+    /// Publish a typed event with a correlation ID. Used by `apply_batch` so
+    /// every event in a batch shares the same correlation_id for subscriber
+    /// attribution. Returns the event seq.
+    fn fire_with_correlation(&self, data: EventData, correlation_id: &str) -> u64 {
+        if let Some(bus) = &self.event_bus {
+            bus.publish_with_correlation(data, Some(correlation_id.to_string()))
+        } else {
+            0
+        }
+    }
+
+    /// Apply a batch of operations atomically at the graph level.
+    ///
+    /// Implementation per Codex P0 #3 (PR 3 plan review):
+    ///   1. Clone snapshot once.
+    ///   2. Walk ops in order, validating each against the staged snapshot
+    ///      (with prior ops' mutations already applied) and appending to a
+    ///      collected `Vec<EventData>`. Backrefs to prior op outputs resolved
+    ///      via the running outputs vec.
+    ///   3. If any op fails, return `Err` with no commit and no events fired.
+    ///   4. Commit snapshot ONCE.
+    ///   5. Publish all collected events with a shared `correlation_id` so
+    ///      subscribers can attribute the burst to this apply.
+    ///
+    /// Atomicity is GRAPH-LEVEL ONLY. PTY spawning is the daemon's job
+    /// after this returns; spawn failures land in `BatchResult::spawn_results`
+    /// and do NOT roll back the graph.
+    pub fn apply_batch(
+        &self,
+        ops: Vec<crate::apply::Op>,
+    ) -> Result<crate::apply::BatchResult, crate::apply::BatchError> {
+        use crate::apply::{BatchError, BatchResult, Op, OpOutput, new_correlation_id};
+
+        if ops.is_empty() {
+            return Err(BatchError::Empty);
+        }
+
+        let mut snapshot = (*self.current()).clone();
+        let mut outputs: Vec<OpOutput> = Vec::with_capacity(ops.len());
+        let mut events: Vec<EventData> = Vec::new();
+
+        for (op_index, op) in ops.iter().enumerate() {
+            match op {
+                Op::CreateSession {
+                    name,
+                    cwd,
+                    initial_command,
+                } => {
+                    let resolved_name = match name {
+                        Some(n) => n.clone(),
+                        None => {
+                            // Codex review of PR #10: scan for an unused
+                            // session-N candidate, otherwise we collide with
+                            // existing sessions when older indices have been
+                            // killed and the count no longer maps to a free
+                            // suffix. Mirrors main.rs's create_session pattern.
+                            let mut idx = snapshot.sessions.len() + 1;
+                            loop {
+                                let candidate = format!("session-{idx}");
+                                if !snapshot.session_name_exists(&candidate) {
+                                    break candidate;
+                                }
+                                idx += 1;
+                            }
+                        }
+                    };
+                    let (sid, wid, pid, mut new_events) = stage_create_session(
+                        &mut snapshot,
+                        resolved_name,
+                        cwd.clone(),
+                        initial_command.clone(),
+                    )
+                    .map_err(|source| BatchError::OpFailed { op_index, source })?;
+                    outputs.push(OpOutput {
+                        op_index,
+                        session_id: Some(sid),
+                        window_id: Some(wid),
+                        pane_id: Some(pid),
+                    });
+                    events.append(&mut new_events);
+                }
+                Op::CreateWindow {
+                    session,
+                    title,
+                    cwd,
+                    initial_command,
+                } => {
+                    let session_id = resolve_session_ref(session, &outputs, op_index)?;
+                    let cwd_resolved = cwd
+                        .clone()
+                        .or_else(|| {
+                            snapshot
+                                .panes
+                                .values()
+                                .find(|p| {
+                                    snapshot
+                                        .windows
+                                        .get(&p.window_id)
+                                        .is_some_and(|w| w.session_id == session_id)
+                                })
+                                .map(|p| p.cwd.clone())
+                        })
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let (wid, pid, mut new_events) = stage_create_window(
+                        &mut snapshot,
+                        session_id,
+                        title.clone(),
+                        cwd_resolved,
+                        initial_command.clone(),
+                    )
+                    .map_err(|source| BatchError::OpFailed { op_index, source })?;
+                    outputs.push(OpOutput {
+                        op_index,
+                        session_id: Some(session_id),
+                        window_id: Some(wid),
+                        pane_id: Some(pid),
+                    });
+                    events.append(&mut new_events);
+                }
+                Op::SplitPane {
+                    target,
+                    direction,
+                    ratio,
+                    command,
+                    cwd,
+                } => {
+                    let target_pane = resolve_pane_ref(target, &outputs, op_index)?;
+                    let (new_pid, wid, sid, mut new_events) = stage_split_pane(
+                        &mut snapshot,
+                        target_pane,
+                        *direction,
+                        *ratio,
+                        command.clone(),
+                        cwd.clone(),
+                    )
+                    .map_err(|source| BatchError::OpFailed { op_index, source })?;
+                    outputs.push(OpOutput {
+                        op_index,
+                        session_id: Some(sid),
+                        window_id: Some(wid),
+                        pane_id: Some(new_pid),
+                    });
+                    events.append(&mut new_events);
+                }
+            }
+        }
+
+        // All ops validated + staged successfully. Commit ONCE, then publish
+        // all collected events with the shared correlation_id.
+        self.commit_snapshot(snapshot);
+        let correlation_id = new_correlation_id();
+        let mut last_event_seq = 0u64;
+        for ev in events {
+            last_event_seq = self.fire_with_correlation(ev, &correlation_id);
+        }
+
+        Ok(BatchResult {
+            outputs,
+            correlation_id,
+            last_event_seq,
+            spawn_results: Vec::new(),
+        })
     }
 
     /// Atomically swap in a new state snapshot.
@@ -368,6 +539,7 @@ impl SessionGraph {
         self.fire(EventData::PaneCreated {
             pane_id,
             window_id,
+            session_id,
             command: Vec::new(),
         });
         info!(%session_id, "Session created");
@@ -402,19 +574,17 @@ impl SessionGraph {
 
         let window_ids: Vec<WindowId> = session.windows.clone();
 
-        // Capture per-pane (id, command) pairs BEFORE removal so we can fire
-        // PaneExited events for each child pane after commit. Without this
-        // cascade, agents tracking pane lifecycle via `events.watch
-        // --filter pane.` see panes get created but never see them die when
-        // the whole session is killed (Codex review of PR #9).
-        let panes_to_kill: Vec<(PaneId, Vec<String>)> = snapshot
+        // Capture per-pane (id, window_id, command) tuples BEFORE removal so
+        // we can fire PaneExited events with full routing scope after commit.
+        // session_id is the destroyed session's id (`id`) — captured by closure.
+        let panes_to_kill: Vec<(PaneId, WindowId, Vec<String>)> = snapshot
             .panes
             .values()
             .filter(|p| window_ids.contains(&p.window_id))
-            .map(|p| (p.id, p.command.clone()))
+            .map(|p| (p.id, p.window_id, p.command.clone()))
             .collect();
 
-        for (pid, _) in &panes_to_kill {
+        for (pid, _, _) in &panes_to_kill {
             snapshot.panes.remove(pid);
         }
         for wid in &window_ids {
@@ -428,9 +598,11 @@ impl SessionGraph {
         // arrive from explicit destroy_pane → destroy_window → destroy_session
         // calls. Each PaneExited carries `exit_status: None` since the pane
         // was forcibly killed (mirrors the explicit destroy_pane semantics).
-        for (pid, command) in panes_to_kill.iter() {
+        for (pid, wid, command) in panes_to_kill.iter() {
             self.fire(EventData::PaneExited {
                 pane_id: *pid,
+                window_id: *wid,
+                session_id: id,
                 exit_status: None,
                 command: command.clone(),
             });
@@ -445,7 +617,8 @@ impl SessionGraph {
             session_id: id,
             name: killed_name,
         });
-        info!(%id, panes_removed = panes_to_kill.len(), "Session destroyed");
+        let panes_removed = panes_to_kill.len();
+        info!(%id, panes_removed, "Session destroyed");
         Ok(())
     }
 
@@ -543,6 +716,7 @@ impl SessionGraph {
         self.fire(EventData::PaneCreated {
             pane_id,
             window_id,
+            session_id,
             command: Vec::new(),
         });
         info!(%window_id, %session_id, "Window created");
@@ -614,10 +788,13 @@ impl SessionGraph {
         self.commit_snapshot(snapshot);
         // Fire pane.exited cascade BEFORE window.killed so subscribers
         // observe teardown in the same order as explicit destroy_pane →
-        // destroy_window calls.
+        // destroy_window calls. All panes belong to window `id` (the one
+        // being destroyed); session_id is the parent of that window.
         for (pid, command) in panes_to_kill.iter() {
             self.fire(EventData::PaneExited {
                 pane_id: *pid,
+                window_id: id,
+                session_id: killed_session_id,
                 exit_status: None,
                 command: command.clone(),
             });
@@ -778,12 +955,20 @@ impl SessionGraph {
         };
         let pane_id = pane.id;
 
+        // Resolve session_id from the (validated, exists) window for event scope.
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .expect("window verified to exist above");
+
         snapshot.panes.insert(pane_id, pane);
 
         self.commit_snapshot(snapshot);
         self.fire(EventData::PaneCreated {
             pane_id,
             window_id,
+            session_id,
             command: event_command,
         });
         info!(%pane_id, %window_id, "Pane created");
@@ -807,6 +992,11 @@ impl SessionGraph {
 
         let window_id = pane.window_id;
         let killed_command = pane.command.clone();
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -838,6 +1028,8 @@ impl SessionGraph {
         // mirroring how subscribers consume both natural exits and forced kills.
         self.fire(EventData::PaneExited {
             pane_id: id,
+            window_id,
+            session_id,
             exit_status: None,
             command: killed_command,
         });
@@ -849,6 +1041,12 @@ impl SessionGraph {
 
         let exited_pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
         let exited_command = exited_pane.command.clone();
+        let exited_window_id = exited_pane.window_id;
+        let exited_session_id = current
+            .windows
+            .get(&exited_window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(exited_window_id))?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -861,6 +1059,8 @@ impl SessionGraph {
         self.commit_snapshot(snapshot);
         self.fire(EventData::PaneExited {
             pane_id: id,
+            window_id: exited_window_id,
+            session_id: exited_session_id,
             exit_status: Some(exit_status),
             command: exited_command,
         });
@@ -1004,6 +1204,14 @@ impl SessionGraph {
 
         snapshot.panes.insert(new_pane_id, new_pane);
 
+        // Resolve session_id for event scope before commit (window has been
+        // borrowed mutably above; re-resolve from the current snapshot).
+        let split_session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
         self.commit_snapshot(snapshot);
         // Split spawns a brand-new pane: surface as PaneCreated so subscribers
         // tracking pane lifecycle see the new id arrive in the same event class
@@ -1012,6 +1220,7 @@ impl SessionGraph {
         self.fire(EventData::PaneCreated {
             pane_id: new_pane_id,
             window_id,
+            session_id: split_session_id,
             command: Vec::new(),
         });
         info!(%new_pane_id, %target_pane, %window_id, "Pane split");
@@ -1032,6 +1241,7 @@ impl SessionGraph {
         } else {
             None
         };
+        let session_id = window.session_id;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -1045,6 +1255,7 @@ impl SessionGraph {
         self.fire(EventData::PaneFocused {
             pane_id: id,
             window_id,
+            session_id,
             previous_pane_id: previous,
         });
         Ok(previous)
@@ -1065,6 +1276,7 @@ impl SessionGraph {
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
         let current_pane = window.active_pane;
+        let session_id = window.session_id;
         let neighbor = window
             .layout
             .tree
@@ -1084,6 +1296,7 @@ impl SessionGraph {
                 self.fire(EventData::PaneFocused {
                     pane_id: target,
                     window_id,
+                    session_id,
                     previous_pane_id: Some(current_pane),
                 });
                 Ok(Some(target))
@@ -1131,6 +1344,12 @@ impl SessionGraph {
     pub fn zoom_pane(&self, id: PaneId) -> Result<bool, GraphError> {
         let (current, window_id) = self.find_pane_window(id)?;
 
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
@@ -1146,6 +1365,8 @@ impl SessionGraph {
         self.commit_snapshot(snapshot);
         self.fire(EventData::PaneZoomed {
             pane_id: id,
+            window_id,
+            session_id,
             zoomed: is_zoomed,
         });
         Ok(is_zoomed)
@@ -1190,6 +1411,236 @@ impl SessionGraph {
             Ok(())
         } else {
             Err(GraphError::LayoutError("swap_panes failed".into()))
+        }
+    }
+}
+
+// ── Staged-snapshot helpers (PR 3a, codex P0 #3) ─────────────────────────
+//
+// These free functions mutate a borrowed snapshot in place and return the
+// events that WOULD fire on commit. `apply_batch` collects them across many
+// ops and fires after a single commit_snapshot. The legacy public mutation
+// methods on SessionGraph still exist; they are NOT yet refactored to call
+// these helpers (low-risk follow-up). For now both code paths exist.
+
+/// Stage a CreateSession op against `snapshot`. Returns
+/// `(session_id, window_id, pane_id, events)`.
+fn stage_create_session(
+    snapshot: &mut SessionGraphSnapshot,
+    name: String,
+    cwd: std::path::PathBuf,
+    initial_command: Vec<String>,
+) -> Result<(SessionId, WindowId, PaneId, Vec<EventData>), GraphError> {
+    SessionGraph::validate_session_name(&name)?;
+    if snapshot.session_name_exists(&name) {
+        return Err(GraphError::SessionNameExists(name));
+    }
+    snapshot.version += 1;
+
+    let pane_id = PaneId::new();
+    let window_id = WindowId::new();
+    // Per codex P2 #10: persist initial_command on the Pane so PaneCreated
+    // events tell the truth about what the pane is running. Empty Vec means
+    // "default shell at PTY spawn time".
+    let mut pane = if initial_command.is_empty() {
+        Pane::new(window_id, cwd)
+    } else {
+        Pane::with_command(window_id, cwd, initial_command.clone())
+    };
+    pane.id = pane_id;
+
+    let mut window = Window::new(SessionId::new(), "1", pane_id);
+    window.id = window_id;
+
+    let session_name = name.clone();
+    let session = Session::new(name, window_id);
+    let session_id = session.id;
+    window.session_id = session_id;
+
+    snapshot.panes.insert(pane_id, pane);
+    snapshot.windows.insert(window_id, window);
+    snapshot.sessions.insert(session_id, session);
+
+    let events = vec![
+        EventData::SessionCreated {
+            session_id,
+            name: session_name,
+        },
+        EventData::WindowCreated {
+            window_id,
+            session_id,
+            title: "1".into(),
+        },
+        EventData::PaneCreated {
+            pane_id,
+            window_id,
+            session_id,
+            command: initial_command,
+        },
+    ];
+    Ok((session_id, window_id, pane_id, events))
+}
+
+/// Stage a CreateWindow op against `snapshot`. Returns
+/// `(window_id, pane_id, events)`.
+fn stage_create_window(
+    snapshot: &mut SessionGraphSnapshot,
+    session_id: SessionId,
+    title: String,
+    cwd: std::path::PathBuf,
+    initial_command: Vec<String>,
+) -> Result<(WindowId, PaneId, Vec<EventData>), GraphError> {
+    if !snapshot.sessions.contains_key(&session_id) {
+        return Err(GraphError::SessionNotFound(session_id));
+    }
+    if title.is_empty() {
+        return Err(GraphError::EmptyWindowName);
+    }
+    snapshot.version += 1;
+
+    let pane_id = PaneId::new();
+    let window_id = WindowId::new();
+    let mut pane = if initial_command.is_empty() {
+        Pane::new(window_id, cwd)
+    } else {
+        Pane::with_command(window_id, cwd, initial_command.clone())
+    };
+    pane.id = pane_id;
+
+    let event_title = title.clone();
+    let mut window = Window::new(session_id, title, pane_id);
+    window.id = window_id;
+
+    snapshot.panes.insert(pane_id, pane);
+    snapshot.windows.insert(window_id, window);
+
+    if let Some(s) = snapshot.sessions.get_mut(&session_id) {
+        s.windows.push(window_id);
+        s.active_window = window_id;
+        s.version += 1;
+    }
+
+    let events = vec![
+        EventData::WindowCreated {
+            window_id,
+            session_id,
+            title: event_title,
+        },
+        EventData::PaneCreated {
+            pane_id,
+            window_id,
+            session_id,
+            command: initial_command,
+        },
+    ];
+    Ok((window_id, pane_id, events))
+}
+
+/// Stage a SplitPane op against `snapshot`. Returns
+/// `(new_pane_id, window_id, session_id, events)`. `cwd: None` inherits
+/// from the target pane (matches tmux split-window default behavior).
+fn stage_split_pane(
+    snapshot: &mut SessionGraphSnapshot,
+    target_pane: PaneId,
+    direction: Direction,
+    ratio: f32,
+    command: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+) -> Result<(PaneId, WindowId, SessionId, Vec<EventData>), GraphError> {
+    let target = snapshot
+        .panes
+        .get(&target_pane)
+        .ok_or(GraphError::PaneNotFound(target_pane))?;
+    let window_id = target.window_id;
+    // Codex review of PR #10: honor a caller-supplied cwd; only inherit from
+    // the target pane when no cwd is set on the op.
+    let pane_cwd = cwd.unwrap_or_else(|| target.cwd.clone());
+
+    let session_id = snapshot
+        .windows
+        .get(&window_id)
+        .map(|w| w.session_id)
+        .ok_or(GraphError::WindowNotFound(window_id))?;
+
+    snapshot.version += 1;
+
+    let new_pane = if command.is_empty() {
+        Pane::new(window_id, pane_cwd)
+    } else {
+        Pane::with_command(window_id, pane_cwd, command.clone())
+    };
+    let new_pane_id = new_pane.id;
+
+    let window = snapshot
+        .windows
+        .get_mut(&window_id)
+        .ok_or(GraphError::WindowNotFound(window_id))?;
+    let ok = window
+        .layout
+        .split_pane(target_pane, new_pane_id, direction, ratio);
+    if !ok {
+        return Err(GraphError::LayoutError("split_pane failed".into()));
+    }
+    window.active_pane = new_pane_id;
+    window.version += 1;
+
+    snapshot.panes.insert(new_pane_id, new_pane);
+
+    let events = vec![EventData::PaneCreated {
+        pane_id: new_pane_id,
+        window_id,
+        session_id,
+        command,
+    }];
+    Ok((new_pane_id, window_id, session_id, events))
+}
+
+/// Resolve a SessionRef to a concrete SessionId, looking up backrefs in
+/// the running outputs.
+fn resolve_session_ref(
+    sref: &crate::apply::SessionRef,
+    outputs: &[crate::apply::OpOutput],
+    op_index: usize,
+) -> Result<SessionId, crate::apply::BatchError> {
+    use crate::apply::{BatchError, SessionRef};
+    match sref {
+        SessionRef::Id(id) => Ok(*id),
+        SessionRef::BackRef { op_index: ref_op } => {
+            let prior = outputs.get(*ref_op).ok_or(BatchError::BackRefOutOfRange {
+                op_index,
+                ref_op: *ref_op,
+                prior: outputs.len(),
+            })?;
+            prior.session_id.ok_or(BatchError::BackRefWrongType {
+                op_index,
+                ref_op: *ref_op,
+                expected: "session_id",
+            })
+        }
+    }
+}
+
+/// Resolve a PaneRef to a concrete PaneId, looking up backrefs in the
+/// running outputs.
+fn resolve_pane_ref(
+    pref: &crate::apply::PaneRef,
+    outputs: &[crate::apply::OpOutput],
+    op_index: usize,
+) -> Result<PaneId, crate::apply::BatchError> {
+    use crate::apply::{BatchError, PaneRef};
+    match pref {
+        PaneRef::Id(id) => Ok(*id),
+        PaneRef::BackRef { op_index: ref_op } => {
+            let prior = outputs.get(*ref_op).ok_or(BatchError::BackRefOutOfRange {
+                op_index,
+                ref_op: *ref_op,
+                prior: outputs.len(),
+            })?;
+            prior.pane_id.ok_or(BatchError::BackRefWrongType {
+                op_index,
+                ref_op: *ref_op,
+                expected: "pane_id",
+            })
         }
     }
 }
@@ -1269,6 +1720,9 @@ pub async fn run_graph_loop(
                     }
                     Some(GraphCommand::Snapshot { reply }) => {
                         let _ = reply.send(graph.current());
+                    }
+                    Some(GraphCommand::ApplyBatch { ops, reply }) => {
+                        let _ = reply.send(graph.apply_batch(ops));
                     }
                     None => {
                         debug!("All graph command senders dropped, shutting down graph loop");
@@ -1627,6 +2081,26 @@ impl GraphHandle {
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    /// Apply a batch of operations atomically through the single-writer task.
+    /// Used by `state.apply` RPC.
+    pub async fn apply_batch(
+        &self,
+        ops: Vec<crate::apply::Op>,
+    ) -> Result<crate::apply::BatchResult, crate::apply::BatchError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::ApplyBatch { ops, reply: tx })
+            .await
+            .map_err(|_| crate::apply::BatchError::OpFailed {
+                op_index: 0,
+                source: GraphError::Shutdown,
+            })?;
+        rx.await.map_err(|_| crate::apply::BatchError::OpFailed {
+            op_index: 0,
+            source: GraphError::Shutdown,
+        })?
     }
 }
 
@@ -2419,5 +2893,229 @@ mod tests {
         // Suppress unused-binding warning — the pane id was needed only to
         // verify the split call returned cleanly.
         let _ = extra;
+    }
+
+    // ── apply_batch tests (PR 3a) ─────────────────────────────────────
+
+    use crate::apply::{Op, PaneRef, SessionRef};
+
+    /// Single-op apply: create a session with a custom command. Validates that
+    /// PaneCreated event carries the actual command (codex P2 #10 fix) and
+    /// every event carries the same correlation_id.
+    #[tokio::test]
+    async fn test_apply_batch_create_session_with_command() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+
+        let result = graph
+            .apply_batch(vec![Op::CreateSession {
+                name: Some("agent-conductor".into()),
+                cwd: home(),
+                initial_command: vec!["claude".into(), "-p".into(), "refactor auth".into()],
+            }])
+            .expect("apply succeeds");
+
+        assert_eq!(result.outputs.len(), 1);
+        assert!(result.outputs[0].session_id.is_some());
+        assert!(result.outputs[0].window_id.is_some());
+        assert!(result.outputs[0].pane_id.is_some());
+        assert!(result.correlation_id.starts_with("apply-"));
+        assert!(result.last_event_seq > 0);
+
+        // Drain the bus and verify three events arrive with the shared
+        // correlation_id, in the right order.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            if let Ok(Some(crate::bus::SubscriptionEvent::Event(e))) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv()).await
+            {
+                events.push(e);
+            }
+        }
+        assert_eq!(events.len(), 3, "expected 3 events from CreateSession op");
+        assert_eq!(events[0].event_type(), "session.created");
+        assert_eq!(events[1].event_type(), "window.created");
+        assert_eq!(events[2].event_type(), "pane.created");
+
+        for e in &events {
+            assert_eq!(
+                e.meta.correlation_id.as_deref(),
+                Some(result.correlation_id.as_str()),
+                "every event in the batch must share the apply correlation_id"
+            );
+        }
+
+        // Codex P2 #10 verification: PaneCreated event must carry the
+        // initial_command, NOT an empty Vec.
+        if let EventData::PaneCreated { command, .. } = &events[2].data {
+            assert_eq!(
+                command.as_slice(),
+                ["claude", "-p", "refactor auth"],
+                "PaneCreated event must reflect the actual command, not lie about empty"
+            );
+        } else {
+            panic!("third event was not PaneCreated");
+        }
+    }
+
+    /// Multi-op apply with backrefs: create a session, then a window in
+    /// that session, then split the new window's pane. All three resolved
+    /// via backrefs to prior op outputs.
+    #[tokio::test]
+    async fn test_apply_batch_with_backrefs() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+
+        let result = graph
+            .apply_batch(vec![
+                Op::CreateSession {
+                    name: Some("workspace".into()),
+                    cwd: home(),
+                    initial_command: vec![],
+                },
+                Op::CreateWindow {
+                    session: SessionRef::BackRef { op_index: 0 },
+                    title: "editor".into(),
+                    cwd: None,
+                    initial_command: vec!["nvim".into()],
+                },
+                Op::SplitPane {
+                    target: PaneRef::BackRef { op_index: 1 },
+                    direction: Direction::Vertical,
+                    ratio: 0.4,
+                    command: vec!["bash".into()],
+                    cwd: None,
+                },
+            ])
+            .expect("3-op apply succeeds");
+
+        assert_eq!(result.outputs.len(), 3);
+        // Session from op 0 propagates through op 1 + op 2.
+        let session_id = result.outputs[0].session_id.unwrap();
+        assert_eq!(result.outputs[1].session_id, Some(session_id));
+        assert_eq!(result.outputs[2].session_id, Some(session_id));
+        // Window from op 1 propagates to op 2 (split inside that window).
+        let window_id = result.outputs[1].window_id.unwrap();
+        assert_eq!(result.outputs[2].window_id, Some(window_id));
+
+        // Drain all events. Should be:
+        //   op 0: session.created, window.created, pane.created  (3)
+        //   op 1: window.created, pane.created                   (2)
+        //   op 2: pane.created                                   (1)
+        // = 6 total, all sharing the same correlation_id.
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(std::time::Duration::from_millis(80), sub.recv()).await {
+                Ok(Some(crate::bus::SubscriptionEvent::Event(e))) => events.push(e),
+                _ => break,
+            }
+        }
+        assert_eq!(events.len(), 6, "expected 6 events; got {events:?}");
+        for e in &events {
+            assert_eq!(
+                e.meta.correlation_id.as_deref(),
+                Some(result.correlation_id.as_str())
+            );
+        }
+        // seqs strictly monotonic
+        let seqs: Vec<u64> = events.iter().map(|e| e.meta.seq).collect();
+        for w in seqs.windows(2) {
+            assert!(w[0] < w[1], "seqs must be monotonic: {seqs:?}");
+        }
+    }
+
+    /// Atomicity: if any op fails, no graph state is committed AND no events
+    /// are fired. Codex P0 #3.
+    #[tokio::test]
+    async fn test_apply_batch_atomicity_rollback_on_failure() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+
+        // Pre-populate one session so the second CreateSession in the batch
+        // hits a SessionNameExists error.
+        graph.create_session("existing".into(), home()).unwrap();
+
+        // Drain pre-existing events from the create_session call so the assert
+        // below cleanly checks "no apply events".
+        for _ in 0..5 {
+            if tokio::time::timeout(std::time::Duration::from_millis(20), sub.recv())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let snap_before = state.load_full();
+        let sessions_before = snap_before.sessions.len();
+
+        let result = graph.apply_batch(vec![
+            Op::CreateSession {
+                name: Some("workspace-a".into()),
+                cwd: home(),
+                initial_command: vec![],
+            },
+            Op::CreateSession {
+                name: Some("existing".into()), // will fail: name conflict
+                cwd: home(),
+                initial_command: vec![],
+            },
+        ]);
+
+        assert!(result.is_err(), "expected apply to fail on name conflict");
+        if let Err(crate::apply::BatchError::OpFailed { op_index, .. }) = result {
+            assert_eq!(op_index, 1);
+        } else {
+            panic!("expected OpFailed error, got {result:?}");
+        }
+
+        // No commit on failure: session count must be unchanged, "workspace-a"
+        // must NOT exist.
+        let snap_after = state.load_full();
+        assert_eq!(
+            snap_after.sessions.len(),
+            sessions_before,
+            "no session should have been committed"
+        );
+        assert!(snap_after.find_session_by_name("workspace-a").is_none());
+
+        // No events fired on failure (post-drain).
+        let no_events_during_apply =
+            tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv())
+                .await
+                .is_err();
+        assert!(
+            no_events_during_apply,
+            "no apply events should fire when batch fails"
+        );
+    }
+
+    /// Empty batch is rejected.
+    #[tokio::test]
+    async fn test_apply_batch_empty_rejected() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus));
+        let r = graph.apply_batch(vec![]);
+        assert!(matches!(r, Err(crate::apply::BatchError::Empty)));
+    }
+
+    /// Backref to a future / out-of-range op index is rejected.
+    #[tokio::test]
+    async fn test_apply_batch_backref_out_of_range() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus));
+        let r = graph.apply_batch(vec![Op::CreateWindow {
+            session: SessionRef::BackRef { op_index: 5 },
+            title: "x".into(),
+            cwd: None,
+            initial_command: vec![],
+        }]);
+        assert!(matches!(
+            r,
+            Err(crate::apply::BatchError::BackRefOutOfRange { .. })
+        ));
     }
 }

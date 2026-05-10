@@ -8,11 +8,20 @@
 **M1: Daily-Driver Core** — In progress, ~75% by task count.
 - **Done:** 013, 014, 015, 016, 017, 019, 020, 021, 022, 023, 026, 029, 033, 060.
 - **Partial:** 018 (Tier-1 keys: Alt+Enter/|/\\/-/arrows/z/x/Tab shipped; bare Alt+h/j/k/l, Alt+n/p, Alt+1..9 still missing — caught by Codex review of PR #8), 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet).
-- **Pending:** 025 (per-pane theming), 027 (pane titles), 030 (session templates + `shux apply`), 031 (keybinding config + conflict detection), 032 (command palette), 034 (M1 quality gate).
+- **Pending:** 025 (per-pane theming), 027 (pane titles), 031 (keybinding config + conflict detection), 032 (command palette), 034 (M1 quality gate). (030 — session templates — moved to M2 group as part of PR 3a since it lands alongside `state.apply`.)
 
 **M2: API + Plugin System** — kicked off.
-- **Done:** **036 (events.watch + events.history)** — control-plane events only (PR 2a). EventBus wired into daemon, SessionGraph publishes typed events on every successful mutation (session/window/pane lifecycle, including the implicit window+pane created by `create_session`). New `events.watch` (long-poll) + `events.history` RPC methods registered. New `shux events watch [--filter ...] [--from-seq N] [--limit N]` and `shux events history [--filter ...] [-n N]` CLI subcommands. Subscribe-FIRST / history-SECOND / dedup-by-seq pattern (the load-bearing race fix that codex + gemini both flagged). `lagged` flag surfaced in response so clients can detect dropped events.
-- **Pending:** 035 (complete RPC surface), **037 (optimistic concurrency + state.apply)** — PR 2b queued, version stamps already in event metadata, 038–050 (plugin host + bundled plugins + MCP), and a focused **PR 2c** to add `pane.output` events with proper data-plane separation (per Codex/Gemini brutal review: do NOT put PaneOutput on the main bus — secret leak via `events.history` + DoS for control events under high PTY volume).
+- **Done:**
+  - **036 (events.watch + events.history)** — control-plane events only (PR 2a). EventBus wired, SessionGraph publishes typed events on every successful mutation. `shux events watch`/`history` CLI. Subscribe-FIRST / history-SECOND / dedup-by-seq.
+  - **030 (session templates + `shux apply`)** + the foundational pieces (PR 3a):
+    - Every pane-scoped EventData variant carries `session_id` + `window_id` (taxonomy fix; `events.watch --session` filter now works correctly over historical events).
+    - `EventMetadata.correlation_id: Option<String>` + `EventBus::publish_with_correlation()` so subscribers can attribute event bursts.
+    - **Staged-snapshot transaction primitive** (`SessionGraph::apply_batch`): clone snapshot once, validate all ops against staged, mutate staged, collect events in `Vec`, commit ONCE, then publish events with a shared `correlation_id`. Atomic at graph level; PTY spawn happens after commit and surfaces per-pane outcomes in `BatchResult::spawn_results`.
+    - Generic `Op` enum (`crates/shux-core/src/apply.rs`): `CreateSession` / `CreateWindow` / `SplitPane` with `SessionRef::BackRef{ref_op}` / `PaneRef::BackRef{ref_op}` so templates express "the session I just created" without round-trips.
+    - `state.apply` RPC method — generic delta ops (NOT template-shaped per codex P0 #2; future SDKs / MCP servers target the same primitive).
+    - `shux apply <template.toml>` CLI parses PRD §10.3 TOML, lowers to ops. `--dry-run` and `--watch` flags.
+    - Fixes existing bug (codex P2 #10): graph create APIs persist `initial_command` so PaneCreated events stop lying about empty command.
+- **Pending:** 035 (complete RPC surface), **037 (optimistic concurrency surface)** — PR 3b queued, version stamps + VersionConflict error already exist on the model, just need `expected_version` plumbed through every mutating RPC + CLI. 038–050 (plugin host + bundled plugins + MCP). **PR 2c** for `pane.output` events with proper data-plane separation (deferred from 2a per Codex/Gemini council review).
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
@@ -44,14 +53,15 @@
   - [x] Mouse support
   - [ ] Pane titles (manual + auto)
   - [x] Status bar (built-in 3-zone + script-driven `[[statusbar.segment]]`)
-  - [ ] Session templates + `shux apply`
+  - [x] Session templates + `shux apply` (PR 3a)
   - [ ] Keybinding config + conflict detection
   - [x] L1–L4 tests passing
   - [x] Dogfooding begins
 
 - [ ] **M2: API + Plugin System** (tasks 035–052)
   - [ ] Complete JSON-RPC API surface
-  - [ ] Event stream with filters and sequence numbers
+  - [x] Event stream with filters and sequence numbers (036, PR 2a)
+  - [x] state.apply batch + templates (030, PR 3a)
   - [ ] Plugin host (Wasm + process plugins)
   - [ ] Event interception, command override, overlays
   - [ ] Bundled plugins (status-bar, theme-pack, diagnostics)
@@ -69,6 +79,33 @@
 ---
 
 ## Session Log
+
+**2026-05-10 — PR 3a: `state.apply` + `shux apply <template.toml>` (task 030)**
+- Goal: close the second-biggest agent-relevant gap vs tmux. Combined with PR 2a (events.watch), agents can now declare a workspace in one call and watch the entire lifecycle stream in. The "spawn an Agent Conductor workspace" use case that every tmux-wrapping orchestrator implements as shell scripts is now a single typed RPC.
+- Council review (codex + gemini, log `/tmp/shux_pr3_council.json`) consumed before implementation. Codex's review reshaped the plan substantially:
+  - **P0** Original plan had `state.apply { template: ... }` baking CLI grammar into the daemon API. Wrong shape. Daemon takes a generic `Op` delta; CLI lowers TOML into ops. Future SDKs / MCP servers / raw curl all use the same primitive.
+  - **P0** Naive impl would call existing public mutation methods one-by-one and partial-commit on failure. Right shape: clone snapshot once, validate every op against the staged copy, commit ONCE if all validate, then publish all events with shared correlation_id.
+  - **P0** Atomicity boundary needs to be honest. Graph mutation is all-or-nothing via ArcSwap. PTY spawn is OUTSIDE the transaction; rolling back launched subprocesses has its own side effects. Spawn outcomes per-pane in `BatchResult::spawn_results`; spawn failure does not roll back the graph.
+  - **P1** Subscribers need to attribute event bursts to specific apply calls. Add `EventMetadata.correlation_id`.
+  - **P1** `events.watch --session` would have to dereference the live graph (wrong for historical events). Add `session_id` + `window_id` to every pane-scoped EventData variant.
+  - **P1** Folding 030 + 037 (optimistic concurrency surface) is "PR 2 all over again" — too much surface. Split: PR 3a = templates + apply; PR 3b = expected_version on every mutating RPC + bounded VersionConflict.
+  - **P2** Existing bug: `create_session` emits `PaneCreated{command: Vec::new()}` while RPC then spawns PTY with the real command. Event lies. Fix: graph create APIs accept initial_command.
+- Foundational commits (in order):
+  - `ca64ead` — every pane-scoped EventData variant carries `session_id` + `window_id`.
+  - `d66fded` — `EventMetadata.correlation_id: Option<String>` + `EventBus::publish_with_correlation()`.
+  - `c03bd41` — staged-snapshot transaction primitive (`SessionGraph::apply_batch` + free `stage_*` helpers + `Op` enum + `BatchResult` + `BatchError` in new `crates/shux-core/src/apply.rs`). 5 unit tests including atomicity rollback.
+  - (this commit) — `state.apply` RPC handler + `Direction` lowercase serde + event_to_json includes correlation_id when set.
+  - `shux apply <template.toml>` CLI + new `crates/shux/src/template.rs` parsing PRD §10.3 TOML shape (`[session]` + `[[windows]]` + `[[windows.panes]]`) and lowering to ops with positional back-refs. `--dry-run` and `--watch` flags.
+- Visual + headless test (`.claude/automations/test_030_apply.py`): 5/5 PASS.
+  - A1 — `--dry-run` lowers TOML to ops without touching the daemon.
+  - A2 — apply returns `✓ Applied apply-<uuid>`.
+  - A3 — all batch events share the correlation_id.
+  - A4 — `shux ls` confirms session committed.
+  - A5 — apply with name conflict returns BatchError, NO partial commit, NO events.
+  - Visual demo: 4 fresh screenshots in `.claude/screenshots/030_v1..v4_*.png` showing watcher + apply side-by-side; correlation_id rendered visibly with `jq`.
+- 161 → 166 shux-core tests (5 new); 642 workspace tests pass via `cargo nextest run -E 'not test(test_tcp_auth_required)'`. Lint clean.
+- Dash updated with new "PR 3a — task 030" section pointing at the screenshots.
+- PR 3b (optimistic concurrency surface) and PR 2c (sampled pane.output with data-plane separation) remain queued.
 
 **2026-05-10 — PR 2a: `events.watch` + `events.history` RPC + CLI (control-plane events)**
 - Goal: ship task 036, the single highest-value gap vs tmux for AI agent orchestration. External agents can now subscribe to the daemon's typed event bus and react to lifecycle events in real time, replacing the polling-on-`pane.capture` pattern they were forced into.
@@ -381,7 +418,7 @@
 | 027 | Pane titles (manual + auto) | M1 | Pending | 015 |
 | 028 | Capability negotiation (ClientCaps) | M1 | **Partial** ² | 010 |
 | 029 | Synchronized output (Mode 2026) | M1 | **Done** | 028 |
-| 030 | Session templates | M1 | Pending | 022, 015 |
+| 030 | Session templates | M1 | **Done** ⁵ | 022, 015 |
 | 031 | Keybinding configuration and conflict detection | M1 | Pending | 019, 022 |
 | 032 | Command palette | M1 | Pending | 019, 031 |
 | 033 | Help overlay (keybinding cheat sheet) | M1 | **Done** | 032 |
@@ -422,3 +459,5 @@
 ³ **Task 018 Partial** (caught by Codex review of PR #8): `attach.rs::key_to_bare_action` ships Alt+Enter, Alt+|/\\, Alt+-, Alt+arrows, Alt+z, Alt+x, Alt+Tab. Per PRD §9.1, **bare Alt+h/j/k/l, bare Alt+n/p, and Alt+1..9 are still missing** as Tier-1 bindings (the hjkl/n/p variants today only work after the Ctrl+Space prefix). Small follow-up — one match arm in `key_to_bare_action`. Lives with the M1 quality gate (034) or a focused 018-followup PR.
 
 ⁴ **Task 036 Done (control plane only):** `events.watch` and `events.history` RPC methods + `shux events watch` / `shux events history` CLI subcommands + 14 lifecycle event publish sites in `SessionGraph`. **`PaneOutput` events are explicitly out of scope for this task** — Codex+Gemini council review identified that putting raw PTY bytes on the main `EventBus` is both a secret leak (replayable via `events.history`) and a DoS vector for control events (saturates the broadcast channel under `cat large.log`). Sampled `pane.output` notifications with proper data-plane separation are queued as PR 2c (a follow-up "036b"). Optimistic concurrency on mutating RPCs lives with task 037 (PR 2b — version stamps already in event metadata so PR 2b is small).
+
+⁵ **Task 030 Done:** generic `state.apply` RPC + `shux apply <template.toml>` CLI + the foundational pieces — every pane-scoped EventData variant carries `session_id` + `window_id`; `EventMetadata.correlation_id` for batch attribution; staged-snapshot transaction primitive (`SessionGraph::apply_batch`) with graph-level all-or-nothing atomicity; `Op` enum with `SessionRef::BackRef` / `PaneRef::BackRef`; PRD §10.3 TOML template parser. Includes the codex P2 #10 fix: `create_session` / `create_window` accept `initial_command` so `PaneCreated` events stop lying about empty command. **Optimistic concurrency surface across all RPCs** is split into task 037 / PR 3b per codex's "PR 2 all over again" warning. Atomicity boundary documented: graph mutations all-or-nothing; PTY spawn happens after commit and surfaces per-pane outcomes in `BatchResult::spawn_results` (codex P0 #1: spawn failure does not roll back the graph because killing already-launched subprocesses has its own side effects).
