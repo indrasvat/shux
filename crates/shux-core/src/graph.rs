@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+use crate::bus::EventBus;
+use crate::event::EventData;
 use crate::layout::{Direction, NavDirection, Rect};
 use crate::model::*;
 
@@ -248,14 +250,29 @@ pub enum GraphCommand {
 /// The authoritative session graph (single-writer owner of state).
 pub struct SessionGraph {
     state: Arc<ArcSwap<SessionGraphSnapshot>>,
+    /// Optional event bus. When set, every successful mutation publishes a
+    /// typed event to subscribers. Held as `Option` so legacy unit tests can
+    /// continue to call `SessionGraph::new()` without setting up a bus.
+    event_bus: Option<EventBus>,
 }
 
 impl SessionGraph {
     pub fn new() -> (Self, Arc<ArcSwap<SessionGraphSnapshot>>) {
+        Self::new_with_event_bus(None)
+    }
+
+    /// Construct a SessionGraph with an attached event bus. Every successful
+    /// mutation will publish a typed event to the bus AFTER the snapshot is
+    /// committed (so subscribers that read state on event arrival observe the
+    /// new value).
+    pub fn new_with_event_bus(
+        event_bus: Option<EventBus>,
+    ) -> (Self, Arc<ArcSwap<SessionGraphSnapshot>>) {
         let snapshot = Arc::new(SessionGraphSnapshot::default());
         let state = Arc::new(ArcSwap::from(snapshot));
         let graph = Self {
             state: Arc::clone(&state),
+            event_bus,
         };
         (graph, state)
     }
@@ -264,7 +281,22 @@ impl SessionGraph {
         self.state.load_full()
     }
 
-    fn publish(&self, snapshot: SessionGraphSnapshot) {
+    /// Publish a typed event to the bus, if one is attached.
+    ///
+    /// Always called AFTER `commit_snapshot` so that subscribers reading
+    /// `graph.snapshot()` on event arrival see the post-mutation state.
+    fn fire(&self, data: EventData) {
+        if let Some(bus) = &self.event_bus {
+            bus.publish(data);
+        }
+    }
+
+    /// Atomically swap in a new state snapshot.
+    ///
+    /// Renamed from `publish` (2026-05-10) to free the verb for `EventBus::publish` —
+    /// `SessionGraph` mutations now also publish typed events to the bus, and having
+    /// two unrelated `publish` methods on the same type is a recipe for confusion.
+    fn commit_snapshot(&self, snapshot: SessionGraphSnapshot) {
         self.state.store(Arc::new(snapshot));
     }
 
@@ -309,6 +341,7 @@ impl SessionGraph {
         let mut window = Window::new(SessionId::new(), "1", pane_id);
         window.id = window_id;
 
+        let session_name = name.clone();
         let session = Session::new(name, window_id);
         let session_id = session.id;
 
@@ -318,7 +351,11 @@ impl SessionGraph {
         snapshot.windows.insert(window_id, window);
         snapshot.sessions.insert(session_id, session);
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
+        self.fire(EventData::SessionCreated {
+            session_id,
+            name: session_name,
+        });
         info!(%session_id, "Session created");
         Ok(session_id)
     }
@@ -364,7 +401,7 @@ impl SessionGraph {
         }
         snapshot.sessions.remove(&id);
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         info!(%id, panes_removed = pane_ids_to_remove.len(), "Session destroyed");
         Ok(())
     }
@@ -405,7 +442,7 @@ impl SessionGraph {
             s.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -442,7 +479,7 @@ impl SessionGraph {
             s.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         info!(%window_id, %session_id, "Window created");
         Ok(window_id)
     }
@@ -502,7 +539,7 @@ impl SessionGraph {
 
         snapshot.windows.remove(&id);
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -543,7 +580,7 @@ impl SessionGraph {
             w.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -580,7 +617,7 @@ impl SessionGraph {
             s.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         info!(%id, %session_id, "Window focused");
         Ok(previous)
     }
@@ -619,7 +656,7 @@ impl SessionGraph {
             }
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         info!(%id, new_index, "Window reordered");
         Ok(())
     }
@@ -648,7 +685,7 @@ impl SessionGraph {
 
         snapshot.panes.insert(pane_id, pane);
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         info!(%pane_id, %window_id, "Pane created");
         Ok(pane_id)
     }
@@ -695,7 +732,7 @@ impl SessionGraph {
             w.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -714,7 +751,7 @@ impl SessionGraph {
             p.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -738,7 +775,7 @@ impl SessionGraph {
             s.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -757,7 +794,7 @@ impl SessionGraph {
             p.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -780,7 +817,7 @@ impl SessionGraph {
             s.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -799,7 +836,7 @@ impl SessionGraph {
             p.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(())
     }
 
@@ -855,7 +892,7 @@ impl SessionGraph {
 
         snapshot.panes.insert(new_pane_id, new_pane);
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         info!(%new_pane_id, %target_pane, %window_id, "Pane split");
         Ok(new_pane_id)
     }
@@ -883,7 +920,7 @@ impl SessionGraph {
             w.version += 1;
         }
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(previous)
     }
 
@@ -917,7 +954,7 @@ impl SessionGraph {
                     w.version += 1;
                 }
 
-                self.publish(snapshot);
+                self.commit_snapshot(snapshot);
                 Ok(Some(target))
             }
             None => Ok(None),
@@ -951,7 +988,7 @@ impl SessionGraph {
         if let Some(new_tree) = window.layout.tree.resize_pane(id, direction, delta) {
             window.layout.tree = new_tree;
             window.version += 1;
-            self.publish(snapshot);
+            self.commit_snapshot(snapshot);
             Ok(())
         } else {
             // No matching split direction — not an error, just a no-op
@@ -975,7 +1012,7 @@ impl SessionGraph {
         let is_zoomed = window.layout.is_zoomed();
         window.version += 1;
 
-        self.publish(snapshot);
+        self.commit_snapshot(snapshot);
         Ok(is_zoomed)
     }
 
@@ -1014,7 +1051,7 @@ impl SessionGraph {
         if let Some(new_tree) = window.layout.tree.swap_panes(a, b) {
             window.layout.tree = new_tree;
             window.version += 1;
-            self.publish(snapshot);
+            self.commit_snapshot(snapshot);
             Ok(())
         } else {
             Err(GraphError::LayoutError("swap_panes failed".into()))
