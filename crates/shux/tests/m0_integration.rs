@@ -42,9 +42,12 @@ fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
         GraphError::LayoutError(_) => shux_rpc::RpcError::internal(&e.to_string()),
-        GraphError::VersionConflict { expected, actual } => {
-            shux_rpc::RpcError::version_conflict("resource", "?", expected, actual)
-        }
+        GraphError::VersionConflict {
+            resource,
+            ref id,
+            expected,
+            actual,
+        } => shux_rpc::RpcError::version_conflict(resource, id, expected, actual),
         GraphError::Shutdown => shux_rpc::RpcError::internal(&e.to_string()),
     }
 }
@@ -185,7 +188,9 @@ fn register_session_methods(
                     .map(|s| s.name.clone())
                     .unwrap_or_default();
 
-                gh.destroy_session(session_id, None)
+                let expected_version = parse_expected_version(&params)?;
+
+                gh.destroy_session(session_id, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -260,7 +265,9 @@ fn register_session_methods(
                         ));
                     };
 
-                    gh.rename_session(session_id, new_name, None)
+                    let expected_version = parse_expected_version(&params)?;
+
+                    gh.rename_session(session_id, new_name, expected_version)
                         .await
                         .map_err(graph_error_to_rpc)?;
 
@@ -454,7 +461,9 @@ fn register_window_methods(
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'name' parameter"))?
                     .to_string();
-                gh.rename_window(window_id, new_title)
+                let expected_version = parse_expected_version(&params)?;
+
+                gh.rename_window(window_id, new_title, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
                 let snap = gh.snapshot();
@@ -486,8 +495,10 @@ fn register_window_methods(
                 let window_id: shux_core::model::WindowId = window_id_str
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
+                let expected_version = parse_expected_version(&params)?;
+
                 let previous = gh
-                    .focus_window(window_id)
+                    .focus_window(window_id, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
                 let snap = gh.snapshot();
@@ -532,7 +543,9 @@ fn register_window_methods(
                         .ok_or_else(|| {
                             shux_rpc::RpcError::invalid_params("missing 'new_index' parameter")
                         })? as usize;
-                    gh.reorder_window(window_id, new_index)
+                    let expected_version = parse_expected_version(&params)?;
+
+                    gh.reorder_window(window_id, new_index, expected_version)
                         .await
                         .map_err(graph_error_to_rpc)?;
                     let snap = gh.snapshot();
@@ -564,7 +577,8 @@ fn register_window_methods(
                 let window_id: shux_core::model::WindowId = window_id_str
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
-                gh.destroy_window(window_id, None)
+                let expected_version = parse_expected_version(&params)?;
+                gh.destroy_window(window_id, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
                 Ok(serde_json::json!({ "killed": window_id_str }))
@@ -746,7 +760,8 @@ fn register_pane_methods(
                     }
                 };
                 let delta = params.get("delta").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
-                gh.resize_pane(pane_id, direction, delta)
+                let expected_version = parse_expected_version(&params)?;
+                gh.resize_pane(pane_id, direction, delta, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
                 Ok(serde_json::json!({ "pane_id": pane_id.to_string() }))
@@ -757,7 +772,11 @@ fn register_pane_methods(
             async move {
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
-                let is_zoomed = gh.zoom_pane(pane_id).await.map_err(graph_error_to_rpc)?;
+                let expected_version = parse_expected_version(&params)?;
+                let is_zoomed = gh
+                    .zoom_pane(pane_id, expected_version)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
                 Ok(serde_json::json!({
                     "pane_id": pane_id.to_string(),
                     "is_zoomed": is_zoomed,
@@ -784,7 +803,8 @@ fn register_pane_methods(
                 let pane_b: shux_core::model::PaneId = target_str
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid target_pane_id"))?;
-                gh.swap_panes(pane_a, pane_b)
+                let expected_version = parse_expected_version(&params)?;
+                gh.swap_panes(pane_a, pane_b, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
                 Ok(serde_json::json!({
@@ -804,10 +824,25 @@ fn register_pane_methods(
                 let pane_id: shux_core::model::PaneId = pane_id_str
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id"))?;
-                gh.destroy_pane(pane_id).await.map_err(graph_error_to_rpc)?;
+                let expected_version = parse_expected_version(&params)?;
+                gh.destroy_pane(pane_id, expected_version)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
                 Ok(serde_json::json!({ "killed": pane_id_str }))
             }
         })
+}
+
+/// PR 3b: optional optimistic-concurrency version. Mirrors the
+/// `parse_expected_version` helper in `crates/shux/src/main.rs`.
+fn parse_expected_version(params: &serde_json::Value) -> Result<Option<u64>, shux_rpc::RpcError> {
+    match params.get("expected_version") {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params("'expected_version' must be a non-negative integer")
+        }),
+    }
 }
 
 /// Resolve a pane_id from params: either explicit or active pane of resolved window.
@@ -1246,7 +1281,10 @@ async fn test_m0_cli_version_json() {
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|_| panic!("output should be valid JSON: {stdout}"));
-    assert!(parsed["version"].is_string());
+    // PR 3b: `shux api` now wraps in `{result: ...}` so agents can
+    // also parse the `{error: {code, message, data}}` envelope on
+    // RPC errors. The version field lives under `result`.
+    assert!(parsed["result"]["version"].is_string());
 
     cancel.cancel();
 }
@@ -2675,6 +2713,279 @@ async fn test_015_pane_kill_last_fails() {
         resp.get("error").is_some(),
         "killing last pane should error"
     );
+
+    cancel.cancel();
+}
+
+// ══════════════════════════════════════════════════════════════
+// PR 3b — Optimistic concurrency surface
+//
+// Mutating RPCs now accept an optional `expected_version` (or `None`
+// for human users who don't track versions). Stale versions are
+// rejected with error code -32002 ("version_conflict") and the
+// response carries `data.resource`, `data.id`, `data.expected_version`,
+// `data.actual_version`, and `data.hint` — bounded entity metadata
+// only (no PTY buffers or env), enough for an agent to re-read state
+// and retry. These tests exercise the wire-level error shape and the
+// "read → mutate with current version → retry once if conflicted"
+// pattern that PRD §8.5 prescribes for agents.
+// ══════════════════════════════════════════════════════════════
+
+/// Send a JSON-RPC request expecting an error and return the error object.
+async fn rpc_err(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let resp = rpc_raw(socket_path, method, params).await;
+    assert!(!resp["error"].is_null(), "{method} should fail: {resp:?}");
+    resp["error"].clone()
+}
+
+#[tokio::test]
+async fn test_pr3b_rename_session_stale_version_returns_32002() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    // Read the freshly-created session and its current version.
+    let create = rpc_ok(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "ocp"}),
+    )
+    .await;
+    let session_id = create["id"].as_str().unwrap().to_string();
+
+    // First rename with the current version succeeds. The response
+    // does NOT echo `version` today, so we explicitly look it up via
+    // session.list to read the post-mutation version.
+    rpc_ok(
+        &socket_path,
+        "session.rename",
+        serde_json::json!({
+            "id": session_id,
+            "new_name": "ocp-mid",
+            "expected_version": 1,
+        }),
+    )
+    .await;
+
+    // Now try again with the stale version — must return -32002 with
+    // the bounded current-entity data payload.
+    let err = rpc_err(
+        &socket_path,
+        "session.rename",
+        serde_json::json!({
+            "id": session_id,
+            "new_name": "ocp-new",
+            "expected_version": 1,
+        }),
+    )
+    .await;
+
+    assert_eq!(err["code"].as_i64().unwrap(), -32002);
+    assert_eq!(err["message"].as_str().unwrap(), "version_conflict");
+    assert_eq!(err["data"]["resource"].as_str().unwrap(), "session");
+    assert_eq!(err["data"]["id"].as_str().unwrap(), session_id);
+    assert_eq!(err["data"]["expected_version"].as_u64().unwrap(), 1);
+    // actual_version > expected since the first rename bumped it.
+    assert!(err["data"]["actual_version"].as_u64().unwrap() >= 2);
+    assert!(err["data"]["hint"].as_str().unwrap().contains("Re-read"));
+
+    // State unchanged on conflict — name is still "ocp-mid".
+    let list = rpc_ok(&socket_path, "session.list", serde_json::json!({})).await;
+    let sessions = list["sessions"].as_array().unwrap();
+    let s = sessions
+        .iter()
+        .find(|s| s["id"].as_str() == Some(&session_id))
+        .unwrap();
+    assert_eq!(s["name"].as_str().unwrap(), "ocp-mid");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_pr3b_pane_kill_stale_version_rejected_and_io_preserved() {
+    // The destroy_pane RPC handler tears down PTY/VT state AFTER the
+    // graph mutation succeeds. A stale `expected_version` must short-
+    // circuit BEFORE we touch IO so a rejected kill leaves the pane
+    // fully usable.
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (session_id, window_id, _) = create_session_full(&socket_path, "pks").await;
+
+    // Split so we have a non-last pane to attempt to kill.
+    let split = rpc_ok(
+        &socket_path,
+        "pane.split",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    let new_pane_id = split["pane"]["id"].as_str().unwrap().to_string();
+
+    let err = rpc_err(
+        &socket_path,
+        "pane.kill",
+        serde_json::json!({
+            "pane_id": new_pane_id,
+            "expected_version": 99,
+        }),
+    )
+    .await;
+    assert_eq!(err["code"].as_i64().unwrap(), -32002);
+    assert_eq!(err["data"]["resource"].as_str().unwrap(), "pane");
+
+    // The pane is still listed — kill was rejected.
+    let list = rpc_ok(
+        &socket_path,
+        "pane.list",
+        serde_json::json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await;
+    let panes = list.as_array().unwrap();
+    assert!(panes.iter().any(|p| p["id"].as_str() == Some(&new_pane_id)));
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_pr3b_window_rename_stale_version_response_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let (_session_id, window_id, _) = create_session_full(&socket_path, "wrs").await;
+
+    let err = rpc_err(
+        &socket_path,
+        "window.rename",
+        serde_json::json!({
+            "id": window_id,
+            "name": "renamed",
+            "expected_version": 999,
+        }),
+    )
+    .await;
+    assert_eq!(err["code"].as_i64().unwrap(), -32002);
+    assert_eq!(err["data"]["resource"].as_str().unwrap(), "window");
+    assert_eq!(err["data"]["id"].as_str().unwrap(), window_id);
+    assert_eq!(err["data"]["expected_version"].as_u64().unwrap(), 999);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_pr3b_expected_version_omitted_still_succeeds() {
+    // Backwards-compat: clients that don't pass `expected_version`
+    // continue to mutate unconditionally — this is the human-user
+    // and dumb-script path. Without this, every existing integration
+    // test would have had to be rewritten.
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let create = rpc_ok(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "noev"}),
+    )
+    .await;
+    let session_id = create["id"].as_str().unwrap().to_string();
+
+    // Rename three times in a row with no version — all succeed.
+    for new_name in ["noev1", "noev2", "noev3"] {
+        rpc_ok(
+            &socket_path,
+            "session.rename",
+            serde_json::json!({"id": session_id, "new_name": new_name}),
+        )
+        .await;
+    }
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_pr3b_invalid_expected_version_type_returns_invalid_params() {
+    // Passing a string (or any non-u64 JSON) for `expected_version`
+    // is a client bug and must be rejected at the params-parse layer,
+    // never silently ignored.
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let create = rpc_ok(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "iev"}),
+    )
+    .await;
+    let session_id = create["id"].as_str().unwrap().to_string();
+
+    let err = rpc_err(
+        &socket_path,
+        "session.rename",
+        serde_json::json!({
+            "id": session_id,
+            "new_name": "iev2",
+            "expected_version": "not-a-number",
+        }),
+    )
+    .await;
+    assert_eq!(err["code"].as_i64().unwrap(), -32602);
+    assert!(
+        err["data"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("expected_version")
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_pr3b_retry_with_current_version_pattern() {
+    // The canonical agent pattern from PRD §8.5: read → mutate with
+    // version → on conflict, read the response's actual_version and
+    // retry. This test asserts the retry loop converges in O(1) given
+    // a single writer.
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let create = rpc_ok(
+        &socket_path,
+        "session.create",
+        serde_json::json!({"name": "retry"}),
+    )
+    .await;
+    let session_id = create["id"].as_str().unwrap().to_string();
+
+    // Bump the version a few times to ensure it's not at 1 anymore.
+    for new_name in ["a", "b", "c"] {
+        rpc_ok(
+            &socket_path,
+            "session.rename",
+            serde_json::json!({"id": session_id, "new_name": new_name}),
+        )
+        .await;
+    }
+
+    // Attempt with stale version (1), read actual, retry with actual.
+    let err = rpc_err(
+        &socket_path,
+        "session.rename",
+        serde_json::json!({
+            "id": session_id,
+            "new_name": "final",
+            "expected_version": 1,
+        }),
+    )
+    .await;
+    let actual = err["data"]["actual_version"].as_u64().unwrap();
+    assert!(actual > 1);
+    rpc_ok(
+        &socket_path,
+        "session.rename",
+        serde_json::json!({
+            "id": session_id,
+            "new_name": "final",
+            "expected_version": actual,
+        }),
+    )
+    .await;
 
     cancel.cancel();
 }

@@ -41,8 +41,13 @@ pub enum GraphError {
     #[error("session name contains invalid characters: {0}")]
     InvalidSessionName(String),
 
-    #[error("version conflict: expected {expected}, found {actual}")]
-    VersionConflict { expected: Version, actual: Version },
+    #[error("version conflict on {resource} {id}: expected {expected}, found {actual}")]
+    VersionConflict {
+        resource: &'static str,
+        id: String,
+        expected: Version,
+        actual: Version,
+    },
 
     #[error("cannot remove last window from session")]
     LastWindow,
@@ -163,15 +168,18 @@ pub enum GraphCommand {
     RenameWindow {
         id: WindowId,
         new_title: String,
+        expected_version: Option<Version>,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
     FocusWindow {
         id: WindowId,
+        expected_version: Option<Version>,
         reply: tokio::sync::oneshot::Sender<Result<Option<WindowId>, GraphError>>,
     },
     ReorderWindow {
         id: WindowId,
         new_index: usize,
+        expected_version: Option<Version>,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
     CreatePane {
@@ -182,6 +190,7 @@ pub enum GraphCommand {
     },
     DestroyPane {
         id: PaneId,
+        expected_version: Option<Version>,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
     SetPaneExitStatus {
@@ -231,15 +240,18 @@ pub enum GraphCommand {
         id: PaneId,
         direction: Direction,
         delta: f32,
+        expected_version: Option<Version>,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
     ZoomPane {
         id: PaneId,
+        expected_version: Option<Version>,
         reply: tokio::sync::oneshot::Sender<Result<bool, GraphError>>,
     },
     SwapPanes {
         a: PaneId,
         b: PaneId,
+        expected_version: Option<Version>,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
     Snapshot {
@@ -561,6 +573,8 @@ impl SessionGraph {
         if let Some(ev) = expected_version {
             if session.version != ev {
                 return Err(GraphError::VersionConflict {
+                    resource: "session",
+                    id: id.to_string(),
                     expected: ev,
                     actual: session.version,
                 });
@@ -640,6 +654,8 @@ impl SessionGraph {
         if let Some(ev) = expected_version {
             if session.version != ev {
                 return Err(GraphError::VersionConflict {
+                    resource: "session",
+                    id: id.to_string(),
                     expected: ev,
                     actual: session.version,
                 });
@@ -738,6 +754,8 @@ impl SessionGraph {
         if let Some(ev) = expected_version {
             if window.version != ev {
                 return Err(GraphError::VersionConflict {
+                    resource: "window",
+                    id: id.to_string(),
                     expected: ev,
                     actual: window.version,
                 });
@@ -806,7 +824,12 @@ impl SessionGraph {
         Ok(())
     }
 
-    pub fn rename_window(&self, id: WindowId, new_title: String) -> Result<(), GraphError> {
+    pub fn rename_window(
+        &self,
+        id: WindowId,
+        new_title: String,
+        expected_version: Option<Version>,
+    ) -> Result<(), GraphError> {
         if new_title.is_empty() {
             return Err(GraphError::EmptyWindowName);
         }
@@ -817,6 +840,18 @@ impl SessionGraph {
             .windows
             .get(&id)
             .ok_or(GraphError::WindowNotFound(id))?;
+
+        if let Some(ev) = expected_version {
+            if window.version != ev {
+                return Err(GraphError::VersionConflict {
+                    resource: "window",
+                    id: id.to_string(),
+                    expected: ev,
+                    actual: window.version,
+                });
+            }
+        }
+
         let session_id = window.session_id;
 
         // Check for name conflict within the same session
@@ -856,13 +891,29 @@ impl SessionGraph {
     }
 
     /// Focus (activate) a window. Returns the previously active window ID.
-    pub fn focus_window(&self, id: WindowId) -> Result<Option<WindowId>, GraphError> {
+    pub fn focus_window(
+        &self,
+        id: WindowId,
+        expected_version: Option<Version>,
+    ) -> Result<Option<WindowId>, GraphError> {
         let current = self.current();
 
         let window = current
             .windows
             .get(&id)
             .ok_or(GraphError::WindowNotFound(id))?;
+
+        if let Some(ev) = expected_version {
+            if window.version != ev {
+                return Err(GraphError::VersionConflict {
+                    resource: "window",
+                    id: id.to_string(),
+                    expected: ev,
+                    actual: window.version,
+                });
+            }
+        }
+
         let session_id = window.session_id;
 
         let session = current
@@ -894,13 +945,30 @@ impl SessionGraph {
     }
 
     /// Reorder a window to a new index position within its session.
-    pub fn reorder_window(&self, id: WindowId, new_index: usize) -> Result<(), GraphError> {
+    pub fn reorder_window(
+        &self,
+        id: WindowId,
+        new_index: usize,
+        expected_version: Option<Version>,
+    ) -> Result<(), GraphError> {
         let current = self.current();
 
         let window = current
             .windows
             .get(&id)
             .ok_or(GraphError::WindowNotFound(id))?;
+
+        if let Some(ev) = expected_version {
+            if window.version != ev {
+                return Err(GraphError::VersionConflict {
+                    resource: "window",
+                    id: id.to_string(),
+                    expected: ev,
+                    actual: window.version,
+                });
+            }
+        }
+
         let session_id = window.session_id;
 
         let session = current
@@ -975,10 +1043,25 @@ impl SessionGraph {
         Ok(pane_id)
     }
 
-    pub fn destroy_pane(&self, id: PaneId) -> Result<(), GraphError> {
+    pub fn destroy_pane(
+        &self,
+        id: PaneId,
+        expected_version: Option<Version>,
+    ) -> Result<(), GraphError> {
         let current = self.current();
 
         let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+
+        if let Some(ev) = expected_version {
+            if pane.version != ev {
+                return Err(GraphError::VersionConflict {
+                    resource: "pane",
+                    id: id.to_string(),
+                    expected: ev,
+                    actual: pane.version,
+                });
+            }
+        }
 
         let window_pane_count = current
             .panes
@@ -1311,8 +1394,21 @@ impl SessionGraph {
         id: PaneId,
         direction: Direction,
         delta: f32,
+        expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
         let (current, window_id) = self.find_pane_window(id)?;
+
+        if let Some(ev) = expected_version {
+            let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+            if pane.version != ev {
+                return Err(GraphError::VersionConflict {
+                    resource: "pane",
+                    id: id.to_string(),
+                    expected: ev,
+                    actual: pane.version,
+                });
+            }
+        }
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -1332,6 +1428,22 @@ impl SessionGraph {
         if let Some(new_tree) = window.layout.tree.resize_pane(id, direction, delta) {
             window.layout.tree = new_tree;
             window.version += 1;
+            // Bump version on every pane in the affected window — resize
+            // mutates the layout that contains them, so the version stamp
+            // reflecting "anything visible on this pane changed" must tick.
+            // Without this, expected_version checks on a sibling pane after
+            // a concurrent resize would silently succeed.
+            let pane_ids: Vec<PaneId> = snapshot
+                .panes
+                .values()
+                .filter(|p| p.window_id == window_id)
+                .map(|p| p.id)
+                .collect();
+            for pid in pane_ids {
+                if let Some(p) = snapshot.panes.get_mut(&pid) {
+                    p.version += 1;
+                }
+            }
             self.commit_snapshot(snapshot);
             Ok(())
         } else {
@@ -1341,8 +1453,24 @@ impl SessionGraph {
     }
 
     /// Toggle zoom on a pane. Returns whether the pane is now zoomed.
-    pub fn zoom_pane(&self, id: PaneId) -> Result<bool, GraphError> {
+    pub fn zoom_pane(
+        &self,
+        id: PaneId,
+        expected_version: Option<Version>,
+    ) -> Result<bool, GraphError> {
         let (current, window_id) = self.find_pane_window(id)?;
+
+        if let Some(ev) = expected_version {
+            let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+            if pane.version != ev {
+                return Err(GraphError::VersionConflict {
+                    resource: "pane",
+                    id: id.to_string(),
+                    expected: ev,
+                    actual: pane.version,
+                });
+            }
+        }
 
         let session_id = current
             .windows
@@ -1362,6 +1490,21 @@ impl SessionGraph {
         let is_zoomed = window.layout.is_zoomed();
         window.version += 1;
 
+        // Same rationale as resize_pane: zoom changes what's visible on
+        // every pane in the window (siblings get hidden / restored), so
+        // their version stamps must tick too.
+        let pane_ids: Vec<PaneId> = snapshot
+            .panes
+            .values()
+            .filter(|p| p.window_id == window_id)
+            .map(|p| p.id)
+            .collect();
+        for pid in pane_ids {
+            if let Some(p) = snapshot.panes.get_mut(&pid) {
+                p.version += 1;
+            }
+        }
+
         self.commit_snapshot(snapshot);
         self.fire(EventData::PaneZoomed {
             pane_id: id,
@@ -1373,7 +1516,18 @@ impl SessionGraph {
     }
 
     /// Swap two panes in the layout tree. Both must be in the same window.
-    pub fn swap_panes(&self, a: PaneId, b: PaneId) -> Result<(), GraphError> {
+    ///
+    /// `expected_version` is checked against pane `a` only — clients
+    /// performing a swap pick one anchor pane and compare against the
+    /// state they last observed for it. The check against `a` proxies for
+    /// "no concurrent layout op happened" because any layout op in the
+    /// window bumps every pane's version (see resize/zoom_pane).
+    pub fn swap_panes(
+        &self,
+        a: PaneId,
+        b: PaneId,
+        expected_version: Option<Version>,
+    ) -> Result<(), GraphError> {
         if a == b {
             return Err(GraphError::PaneSwapSelf);
         }
@@ -1385,6 +1539,17 @@ impl SessionGraph {
 
         if pane_a.window_id != pane_b.window_id {
             return Err(GraphError::PaneCrossWindow);
+        }
+
+        if let Some(ev) = expected_version {
+            if pane_a.version != ev {
+                return Err(GraphError::VersionConflict {
+                    resource: "pane",
+                    id: a.to_string(),
+                    expected: ev,
+                    actual: pane_a.version,
+                });
+            }
         }
 
         let window_id = pane_a.window_id;
@@ -1407,6 +1572,19 @@ impl SessionGraph {
         if let Some(new_tree) = window.layout.tree.swap_panes(a, b) {
             window.layout.tree = new_tree;
             window.version += 1;
+            // Bump version on every pane in the window (same rationale as
+            // resize/zoom — layout op affects sibling visibility too).
+            let pane_ids: Vec<PaneId> = snapshot
+                .panes
+                .values()
+                .filter(|p| p.window_id == window_id)
+                .map(|p| p.id)
+                .collect();
+            for pid in pane_ids {
+                if let Some(p) = snapshot.panes.get_mut(&pid) {
+                    p.version += 1;
+                }
+            }
             self.commit_snapshot(snapshot);
             Ok(())
         } else {
@@ -1670,20 +1848,20 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::DestroyWindow { id, expected_version, reply }) => {
                         let _ = reply.send(graph.destroy_window(id, expected_version));
                     }
-                    Some(GraphCommand::RenameWindow { id, new_title, reply }) => {
-                        let _ = reply.send(graph.rename_window(id, new_title));
+                    Some(GraphCommand::RenameWindow { id, new_title, expected_version, reply }) => {
+                        let _ = reply.send(graph.rename_window(id, new_title, expected_version));
                     }
-                    Some(GraphCommand::FocusWindow { id, reply }) => {
-                        let _ = reply.send(graph.focus_window(id));
+                    Some(GraphCommand::FocusWindow { id, expected_version, reply }) => {
+                        let _ = reply.send(graph.focus_window(id, expected_version));
                     }
-                    Some(GraphCommand::ReorderWindow { id, new_index, reply }) => {
-                        let _ = reply.send(graph.reorder_window(id, new_index));
+                    Some(GraphCommand::ReorderWindow { id, new_index, expected_version, reply }) => {
+                        let _ = reply.send(graph.reorder_window(id, new_index, expected_version));
                     }
                     Some(GraphCommand::CreatePane { window_id, cwd, command, reply }) => {
                         let _ = reply.send(graph.create_pane(window_id, cwd, command));
                     }
-                    Some(GraphCommand::DestroyPane { id, reply }) => {
-                        let _ = reply.send(graph.destroy_pane(id));
+                    Some(GraphCommand::DestroyPane { id, expected_version, reply }) => {
+                        let _ = reply.send(graph.destroy_pane(id, expected_version));
                     }
                     Some(GraphCommand::SetPaneExitStatus { id, exit_status, reply }) => {
                         let _ = reply.send(graph.set_pane_exit_status(id, exit_status));
@@ -1709,14 +1887,14 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::FocusPaneDirection { window_id, direction, viewport, reply }) => {
                         let _ = reply.send(graph.focus_pane_direction(window_id, direction, viewport));
                     }
-                    Some(GraphCommand::ResizePane { id, direction, delta, reply }) => {
-                        let _ = reply.send(graph.resize_pane(id, direction, delta));
+                    Some(GraphCommand::ResizePane { id, direction, delta, expected_version, reply }) => {
+                        let _ = reply.send(graph.resize_pane(id, direction, delta, expected_version));
                     }
-                    Some(GraphCommand::ZoomPane { id, reply }) => {
-                        let _ = reply.send(graph.zoom_pane(id));
+                    Some(GraphCommand::ZoomPane { id, expected_version, reply }) => {
+                        let _ = reply.send(graph.zoom_pane(id, expected_version));
                     }
-                    Some(GraphCommand::SwapPanes { a, b, reply }) => {
-                        let _ = reply.send(graph.swap_panes(a, b));
+                    Some(GraphCommand::SwapPanes { a, b, expected_version, reply }) => {
+                        let _ = reply.send(graph.swap_panes(a, b, expected_version));
                     }
                     Some(GraphCommand::Snapshot { reply }) => {
                         let _ = reply.send(graph.current());
@@ -1847,12 +2025,18 @@ impl GraphHandle {
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
-    pub async fn rename_window(&self, id: WindowId, new_title: String) -> Result<(), GraphError> {
+    pub async fn rename_window(
+        &self,
+        id: WindowId,
+        new_title: String,
+        expected_version: Option<Version>,
+    ) -> Result<(), GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(GraphCommand::RenameWindow {
                 id,
                 new_title,
+                expected_version,
                 reply: tx,
             })
             .await
@@ -1860,21 +2044,35 @@ impl GraphHandle {
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
-    pub async fn focus_window(&self, id: WindowId) -> Result<Option<WindowId>, GraphError> {
+    pub async fn focus_window(
+        &self,
+        id: WindowId,
+        expected_version: Option<Version>,
+    ) -> Result<Option<WindowId>, GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
-            .send(GraphCommand::FocusWindow { id, reply: tx })
+            .send(GraphCommand::FocusWindow {
+                id,
+                expected_version,
+                reply: tx,
+            })
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
-    pub async fn reorder_window(&self, id: WindowId, new_index: usize) -> Result<(), GraphError> {
+    pub async fn reorder_window(
+        &self,
+        id: WindowId,
+        new_index: usize,
+        expected_version: Option<Version>,
+    ) -> Result<(), GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(GraphCommand::ReorderWindow {
                 id,
                 new_index,
+                expected_version,
                 reply: tx,
             })
             .await
@@ -1901,10 +2099,18 @@ impl GraphHandle {
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
-    pub async fn destroy_pane(&self, id: PaneId) -> Result<(), GraphError> {
+    pub async fn destroy_pane(
+        &self,
+        id: PaneId,
+        expected_version: Option<Version>,
+    ) -> Result<(), GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
-            .send(GraphCommand::DestroyPane { id, reply: tx })
+            .send(GraphCommand::DestroyPane {
+                id,
+                expected_version,
+                reply: tx,
+            })
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?
@@ -2051,6 +2257,7 @@ impl GraphHandle {
         id: PaneId,
         direction: Direction,
         delta: f32,
+        expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
@@ -2058,6 +2265,7 @@ impl GraphHandle {
                 id,
                 direction,
                 delta,
+                expected_version,
                 reply: tx,
             })
             .await
@@ -2065,19 +2273,37 @@ impl GraphHandle {
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
-    pub async fn zoom_pane(&self, id: PaneId) -> Result<bool, GraphError> {
+    pub async fn zoom_pane(
+        &self,
+        id: PaneId,
+        expected_version: Option<Version>,
+    ) -> Result<bool, GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
-            .send(GraphCommand::ZoomPane { id, reply: tx })
+            .send(GraphCommand::ZoomPane {
+                id,
+                expected_version,
+                reply: tx,
+            })
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
-    pub async fn swap_panes(&self, a: PaneId, b: PaneId) -> Result<(), GraphError> {
+    pub async fn swap_panes(
+        &self,
+        a: PaneId,
+        b: PaneId,
+        expected_version: Option<Version>,
+    ) -> Result<(), GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
-            .send(GraphCommand::SwapPanes { a, b, reply: tx })
+            .send(GraphCommand::SwapPanes {
+                a,
+                b,
+                expected_version,
+                reply: tx,
+            })
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?
@@ -2253,7 +2479,7 @@ mod tests {
         let wid = snap.sessions[&sid].windows[0];
         let pid = snap.windows[&wid].active_pane;
 
-        let err = graph.destroy_pane(pid).unwrap_err();
+        let err = graph.destroy_pane(pid, None).unwrap_err();
         assert!(matches!(err, GraphError::LastPane));
     }
 
@@ -2524,7 +2750,7 @@ mod tests {
         let sid = graph.create_session("work".into(), home()).unwrap();
         let wid = graph.create_window(sid, "old".into(), home()).unwrap();
 
-        graph.rename_window(wid, "new-title".into()).unwrap();
+        graph.rename_window(wid, "new-title".into(), None).unwrap();
 
         let snap = state.load();
         assert_eq!(snap.windows[&wid].title, "new-title");
@@ -2543,7 +2769,7 @@ mod tests {
 
         // Rename second window to conflict with default
         let default_title = state.load().windows[&default_wid].title.clone();
-        let err = graph.rename_window(wid2, default_title).unwrap_err();
+        let err = graph.rename_window(wid2, default_title, None).unwrap_err();
         assert!(matches!(err, GraphError::WindowNameConflict(_)));
     }
 
@@ -2555,7 +2781,7 @@ mod tests {
         let snap = state.load();
         let wid = snap.sessions[&sid].windows[0];
 
-        let err = graph.rename_window(wid, "".into()).unwrap_err();
+        let err = graph.rename_window(wid, "".into(), None).unwrap_err();
         assert!(matches!(err, GraphError::EmptyWindowName));
     }
 
@@ -2570,7 +2796,7 @@ mod tests {
         let w2 = graph.create_window(sid, "second".into(), home()).unwrap();
 
         // Focus back to w1
-        let prev = graph.focus_window(w1).unwrap();
+        let prev = graph.focus_window(w1, None).unwrap();
         assert_eq!(prev, Some(w2));
 
         let snap = state.load();
@@ -2586,7 +2812,7 @@ mod tests {
         let w1 = snap.sessions[&sid].windows[0];
 
         // Focus the already active window
-        let prev = graph.focus_window(w1).unwrap();
+        let prev = graph.focus_window(w1, None).unwrap();
         assert_eq!(prev, None);
     }
 
@@ -2598,7 +2824,7 @@ mod tests {
         let w3 = graph.create_window(sid, "third".into(), home()).unwrap();
 
         // Move w3 to index 0
-        graph.reorder_window(w3, 0).unwrap();
+        graph.reorder_window(w3, 0, None).unwrap();
 
         let snap = state.load();
         assert_eq!(snap.sessions[&sid].windows[0], w3);
@@ -2613,7 +2839,7 @@ mod tests {
         let snap = state.load();
         let wid = snap.sessions[&sid].windows[0];
 
-        let err = graph.reorder_window(wid, 99).unwrap_err();
+        let err = graph.reorder_window(wid, 99, None).unwrap_err();
         assert!(matches!(
             err,
             GraphError::WindowIndexOutOfRange { index: 99, .. }
@@ -2685,7 +2911,7 @@ mod tests {
         graph.focus_pane(pane_in_w).unwrap();
 
         // 6. PaneZoomed (zoom_pane)
-        graph.zoom_pane(pane_in_w).unwrap();
+        graph.zoom_pane(pane_in_w, None).unwrap();
 
         // 7. PaneExited (set_pane_exit_status)
         graph.set_pane_exit_status(new_pane, 0).unwrap();
@@ -2822,7 +3048,7 @@ mod tests {
         }
 
         // 1. rename_window must fire WindowRenamed.
-        graph.rename_window(w2, "scratch".into()).unwrap();
+        graph.rename_window(w2, "scratch".into(), None).unwrap();
 
         // 2. destroy_window must fire PaneExited(*) for each child pane,
         //    THEN WindowKilled. Window 2 has 2 panes (initial + split).
@@ -2893,6 +3119,222 @@ mod tests {
         // Suppress unused-binding warning — the pane id was needed only to
         // verify the split call returned cleanly.
         let _ = extra;
+    }
+
+    // ── Optimistic-concurrency tests (PR 3b) ─────────────────────────
+    //
+    // Every mutation that ticks an entity's `version: Version` must
+    // reject a stale `expected_version` with `GraphError::VersionConflict`
+    // carrying the right `resource` + `id` for the RPC error mapper to
+    // turn into a `-32002` response with bounded current entity metadata.
+    //
+    // The matrix below covers each freshly version-gated method end to
+    // end: stale rejected, current accepted (version then ticks), and the
+    // None case (unconditional, for human users not tracking versions).
+
+    #[test]
+    fn test_destroy_session_version_conflict_carries_resource_and_id() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let err = graph.destroy_session(sid, Some(999)).unwrap_err();
+        match err {
+            GraphError::VersionConflict {
+                resource,
+                id,
+                expected,
+                actual,
+            } => {
+                assert_eq!(resource, "session");
+                assert_eq!(id, sid.to_string());
+                assert_eq!(expected, 999);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected VersionConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rename_session_version_conflict() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("old".into(), home()).unwrap();
+        let current = state.load().sessions[&sid].version;
+        // First rename with the right version succeeds and bumps to current+1.
+        graph
+            .rename_session(sid, "mid".into(), Some(current))
+            .unwrap();
+        // Second rename with the OLD version is stale.
+        let err = graph
+            .rename_session(sid, "new".into(), Some(current))
+            .unwrap_err();
+        assert!(matches!(err, GraphError::VersionConflict { .. }));
+        // State unchanged.
+        assert_eq!(state.load().sessions[&sid].name, "mid");
+    }
+
+    #[test]
+    fn test_rename_window_version_conflict() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph.create_window(sid, "old".into(), home()).unwrap();
+        let v = state.load().windows[&wid].version;
+        let err = graph
+            .rename_window(wid, "new".into(), Some(v + 5))
+            .unwrap_err();
+        match err {
+            GraphError::VersionConflict {
+                resource,
+                id,
+                expected,
+                actual,
+            } => {
+                assert_eq!(resource, "window");
+                assert_eq!(id, wid.to_string());
+                assert_eq!(expected, v + 5);
+                assert_eq!(actual, v);
+            }
+            other => panic!("expected VersionConflict, got {other:?}"),
+        }
+        // Title untouched on conflict.
+        assert_eq!(state.load().windows[&wid].title, "old");
+    }
+
+    #[test]
+    fn test_focus_window_version_conflict() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let w2 = graph.create_window(sid, "second".into(), home()).unwrap();
+        let v = state.load().windows[&w2].version;
+        let err = graph.focus_window(w2, Some(v + 1)).unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::VersionConflict {
+                resource: "window",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reorder_window_version_conflict() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let _w2 = graph.create_window(sid, "second".into(), home()).unwrap();
+        let w3 = graph.create_window(sid, "third".into(), home()).unwrap();
+        let v = state.load().windows[&w3].version;
+        let err = graph.reorder_window(w3, 0, Some(v + 99)).unwrap_err();
+        assert!(matches!(err, GraphError::VersionConflict { .. }));
+    }
+
+    #[test]
+    fn test_destroy_pane_version_conflict() {
+        // Need ≥2 panes per window (destroy_pane refuses LastPane).
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+        let pid = snap.windows[&wid].active_pane;
+        drop(snap);
+        let _ = graph
+            .split_pane(pid, crate::layout::Direction::Vertical, 0.5)
+            .unwrap();
+        let v = state.load().panes[&pid].version;
+        let err = graph.destroy_pane(pid, Some(v + 1)).unwrap_err();
+        match err {
+            GraphError::VersionConflict { resource, id, .. } => {
+                assert_eq!(resource, "pane");
+                assert_eq!(id, pid.to_string());
+            }
+            other => panic!("expected VersionConflict, got {other:?}"),
+        }
+        // Pane still in the graph since destroy was rejected.
+        assert!(state.load().panes.contains_key(&pid));
+    }
+
+    #[test]
+    fn test_resize_pane_version_conflict_and_bumps_siblings() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+        let p1 = snap.windows[&wid].active_pane;
+        drop(snap);
+        let p2 = graph
+            .split_pane(p1, crate::layout::Direction::Vertical, 0.5)
+            .unwrap();
+        let p1_v = state.load().panes[&p1].version;
+        let p2_v = state.load().panes[&p2].version;
+        // Stale version on p1 must reject.
+        let err = graph
+            .resize_pane(p1, crate::layout::Direction::Vertical, 0.1, Some(p1_v + 5))
+            .unwrap_err();
+        assert!(matches!(err, GraphError::VersionConflict { .. }));
+        // Current version succeeds AND ticks p2's version too (sibling bump
+        // — layout ops affect every pane in the window).
+        graph
+            .resize_pane(p1, crate::layout::Direction::Vertical, 0.1, Some(p1_v))
+            .unwrap();
+        let snap = state.load();
+        assert_eq!(snap.panes[&p1].version, p1_v + 1);
+        assert_eq!(snap.panes[&p2].version, p2_v + 1);
+    }
+
+    #[test]
+    fn test_zoom_pane_version_conflict_and_bumps_siblings() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+        let p1 = snap.windows[&wid].active_pane;
+        drop(snap);
+        let p2 = graph
+            .split_pane(p1, crate::layout::Direction::Vertical, 0.5)
+            .unwrap();
+        let p1_v = state.load().panes[&p1].version;
+        let p2_v = state.load().panes[&p2].version;
+        let err = graph.zoom_pane(p1, Some(p1_v + 10)).unwrap_err();
+        assert!(matches!(err, GraphError::VersionConflict { .. }));
+        let was_zoomed = graph.zoom_pane(p1, Some(p1_v)).unwrap();
+        assert!(was_zoomed);
+        let snap = state.load();
+        assert_eq!(snap.panes[&p1].version, p1_v + 1);
+        assert_eq!(snap.panes[&p2].version, p2_v + 1);
+    }
+
+    #[test]
+    fn test_swap_panes_version_conflict_checks_first_pane() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+        let p1 = snap.windows[&wid].active_pane;
+        drop(snap);
+        let p2 = graph
+            .split_pane(p1, crate::layout::Direction::Vertical, 0.5)
+            .unwrap();
+        let p1_v = state.load().panes[&p1].version;
+        // Stale version on p1 (the first pane).
+        let err = graph.swap_panes(p1, p2, Some(p1_v + 7)).unwrap_err();
+        match err {
+            GraphError::VersionConflict { id, .. } => {
+                // Conflict points at p1, the anchor.
+                assert_eq!(id, p1.to_string());
+            }
+            other => panic!("expected VersionConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unconditional_mutation_when_expected_version_is_none() {
+        // Backward-compat path: human users don't track versions, so passing
+        // `None` must always proceed regardless of the entity's current value.
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("a".into(), home()).unwrap();
+        graph.rename_session(sid, "b".into(), None).unwrap();
+        graph.rename_session(sid, "c".into(), None).unwrap();
+        graph.rename_session(sid, "d".into(), None).unwrap();
+        assert_eq!(state.load().sessions[&sid].name, "d");
+        // Version monotonically bumped through every successful rename.
+        assert!(state.load().sessions[&sid].version >= 4);
     }
 
     // ── apply_batch tests (PR 3a) ─────────────────────────────────────

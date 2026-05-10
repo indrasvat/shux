@@ -126,9 +126,12 @@ fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
         GraphError::LayoutError(_) => shux_rpc::RpcError::internal(&e.to_string()),
-        GraphError::VersionConflict { expected, actual } => {
-            shux_rpc::RpcError::version_conflict("resource", "?", expected, actual)
-        }
+        GraphError::VersionConflict {
+            resource,
+            ref id,
+            expected,
+            actual,
+        } => shux_rpc::RpcError::version_conflict(resource, id, expected, actual),
         GraphError::Shutdown => shux_rpc::RpcError::internal(&e.to_string()),
     }
 }
