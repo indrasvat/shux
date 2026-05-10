@@ -86,6 +86,10 @@ pub enum Op {
         ratio: f32,
         #[serde(default)]
         command: Vec<String>,
+        /// Optional cwd for the new pane. None → inherit from target pane
+        /// (matches tmux's split-window default behavior).
+        #[serde(default)]
+        cwd: Option<PathBuf>,
     },
 }
 

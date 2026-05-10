@@ -348,7 +348,21 @@ impl SessionGraph {
                 } => {
                     let resolved_name = match name {
                         Some(n) => n.clone(),
-                        None => format!("session-{}", snapshot.sessions.len() + 1),
+                        None => {
+                            // Codex review of PR #10: scan for an unused
+                            // session-N candidate, otherwise we collide with
+                            // existing sessions when older indices have been
+                            // killed and the count no longer maps to a free
+                            // suffix. Mirrors main.rs's create_session pattern.
+                            let mut idx = snapshot.sessions.len() + 1;
+                            loop {
+                                let candidate = format!("session-{idx}");
+                                if !snapshot.session_name_exists(&candidate) {
+                                    break candidate;
+                                }
+                                idx += 1;
+                            }
+                        }
                     };
                     let (sid, wid, pid, mut new_events) = stage_create_session(
                         &mut snapshot,
@@ -408,6 +422,7 @@ impl SessionGraph {
                     direction,
                     ratio,
                     command,
+                    cwd,
                 } => {
                     let target_pane = resolve_pane_ref(target, &outputs, op_index)?;
                     let (new_pid, wid, sid, mut new_events) = stage_split_pane(
@@ -416,6 +431,7 @@ impl SessionGraph {
                         *direction,
                         *ratio,
                         command.clone(),
+                        cwd.clone(),
                     )
                     .map_err(|source| BatchError::OpFailed { op_index, source })?;
                     outputs.push(OpOutput {
@@ -1521,20 +1537,24 @@ fn stage_create_window(
 }
 
 /// Stage a SplitPane op against `snapshot`. Returns
-/// `(new_pane_id, window_id, session_id, events)`.
+/// `(new_pane_id, window_id, session_id, events)`. `cwd: None` inherits
+/// from the target pane (matches tmux split-window default behavior).
 fn stage_split_pane(
     snapshot: &mut SessionGraphSnapshot,
     target_pane: PaneId,
     direction: Direction,
     ratio: f32,
     command: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
 ) -> Result<(PaneId, WindowId, SessionId, Vec<EventData>), GraphError> {
     let target = snapshot
         .panes
         .get(&target_pane)
         .ok_or(GraphError::PaneNotFound(target_pane))?;
     let window_id = target.window_id;
-    let target_cwd = target.cwd.clone();
+    // Codex review of PR #10: honor a caller-supplied cwd; only inherit from
+    // the target pane when no cwd is set on the op.
+    let pane_cwd = cwd.unwrap_or_else(|| target.cwd.clone());
 
     let session_id = snapshot
         .windows
@@ -1545,9 +1565,9 @@ fn stage_split_pane(
     snapshot.version += 1;
 
     let new_pane = if command.is_empty() {
-        Pane::new(window_id, target_cwd)
+        Pane::new(window_id, pane_cwd)
     } else {
-        Pane::with_command(window_id, target_cwd, command.clone())
+        Pane::with_command(window_id, pane_cwd, command.clone())
     };
     let new_pane_id = new_pane.id;
 
@@ -2966,6 +2986,7 @@ mod tests {
                     direction: Direction::Vertical,
                     ratio: 0.4,
                     command: vec!["bash".into()],
+                    cwd: None,
                 },
             ])
             .expect("3-op apply succeeds");

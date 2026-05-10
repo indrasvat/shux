@@ -194,6 +194,11 @@ fn lower(tpl: Template) -> Result<Vec<Op>, TemplateError> {
                 direction: pane.direction.unwrap_or(Direction::Vertical),
                 ratio: pane.ratio,
                 command: pane.command.clone(),
+                // Codex review of PR #10: thread the per-pane cwd through to
+                // the SplitPane op. Previously it was silently dropped and
+                // stage_split_pane fell back to the target pane's cwd, so
+                // a user-supplied `cwd` on a non-first pane was ignored.
+                cwd: pane.cwd.as_deref().map(expand_string),
             });
             prior_pane_op = split_op_index;
         }
@@ -291,6 +296,7 @@ command = ["bash"]
                 direction,
                 ratio,
                 command,
+                cwd: _, // covered by test_lower_threads_split_pane_cwd
             } => {
                 matches!(target, PaneRef::BackRef { op_index: 1 });
                 assert_eq!(*direction, Direction::Vertical);
@@ -335,6 +341,41 @@ command = ["codex"]
         let tpl: Template = toml::from_str(r#"[session]"#).unwrap();
         let r = lower(tpl);
         assert!(matches!(r, Err(TemplateError::NoWindows)));
+    }
+
+    /// Codex review of PR #10: a per-pane `cwd` on a non-first pane was
+    /// being silently dropped during lowering. Verify it now threads through
+    /// to `Op::SplitPane.cwd`.
+    #[test]
+    fn test_lower_threads_split_pane_cwd() {
+        let tpl: Template = toml::from_str(
+            r#"
+[session]
+name = "cwd-test"
+
+[[windows]]
+title = "editor"
+[[windows.panes]]
+command = ["bash"]
+[[windows.panes]]
+direction = "vertical"
+cwd = "/tmp/explicit-split"
+command = ["bash"]
+"#,
+        )
+        .unwrap();
+        let ops = lower(tpl).unwrap();
+        assert_eq!(ops.len(), 3);
+        match &ops[2] {
+            Op::SplitPane { cwd, .. } => {
+                assert_eq!(
+                    cwd.as_deref().map(|p| p.to_string_lossy().to_string()),
+                    Some("/tmp/explicit-split".to_string()),
+                    "split-pane cwd must be threaded through to the op"
+                );
+            }
+            _ => panic!("op 2 should be SplitPane"),
+        }
     }
 
     #[test]
