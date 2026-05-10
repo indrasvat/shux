@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::PaneId;
 
-/// Split direction for layout nodes.
+/// Split direction for layout nodes. JSON-serialized as `"horizontal"` /
+/// `"vertical"` to match the CLI's existing string convention (apply ops,
+/// attach client, m0 integration tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// Children are stacked top/bottom. `a` is top, `b` is bottom.
     Horizontal,

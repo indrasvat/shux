@@ -245,6 +245,13 @@ pub enum GraphCommand {
     Snapshot {
         reply: tokio::sync::oneshot::Sender<Arc<SessionGraphSnapshot>>,
     },
+    /// Apply a batch of ops atomically (PR 3a).
+    ApplyBatch {
+        ops: Vec<crate::apply::Op>,
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::apply::BatchResult, crate::apply::BatchError>,
+        >,
+    },
 }
 
 /// The authoritative session graph (single-writer owner of state).
@@ -1694,6 +1701,9 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::Snapshot { reply }) => {
                         let _ = reply.send(graph.current());
                     }
+                    Some(GraphCommand::ApplyBatch { ops, reply }) => {
+                        let _ = reply.send(graph.apply_batch(ops));
+                    }
                     None => {
                         debug!("All graph command senders dropped, shutting down graph loop");
                         break;
@@ -2051,6 +2061,26 @@ impl GraphHandle {
             .await
             .map_err(|_| GraphError::Shutdown)?;
         rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    /// Apply a batch of operations atomically through the single-writer task.
+    /// Used by `state.apply` RPC.
+    pub async fn apply_batch(
+        &self,
+        ops: Vec<crate::apply::Op>,
+    ) -> Result<crate::apply::BatchResult, crate::apply::BatchError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::ApplyBatch { ops, reply: tx })
+            .await
+            .map_err(|_| crate::apply::BatchError::OpFailed {
+                op_index: 0,
+                source: GraphError::Shutdown,
+            })?;
+        rx.await.map_err(|_| crate::apply::BatchError::OpFailed {
+            op_index: 0,
+            source: GraphError::Shutdown,
+        })?
     }
 }
 

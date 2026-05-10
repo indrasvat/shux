@@ -385,13 +385,18 @@ async fn run_rpc_server(
         }
     });
 
-    // Build router: system builtins + session + window + pane + pane I/O + events methods
-    let router = register_events_methods(
-        register_pane_io_methods(
-            register_pane_methods(
-                register_window_methods(
-                    register_session_methods(
-                        shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+    // Build router: system builtins + session + window + pane + pane I/O + events + state methods
+    let router = register_state_methods(
+        register_events_methods(
+            register_pane_io_methods(
+                register_pane_methods(
+                    register_window_methods(
+                        register_session_methods(
+                            shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+                            graph_handle.clone(),
+                            io_state.clone(),
+                            cancel.clone(),
+                        ),
                         graph_handle.clone(),
                         io_state.clone(),
                         cancel.clone(),
@@ -404,11 +409,11 @@ async fn run_rpc_server(
                 io_state.clone(),
                 cancel.clone(),
             ),
-            graph_handle,
-            io_state,
-            cancel.clone(),
+            event_bus,
         ),
-        event_bus,
+        graph_handle,
+        io_state,
+        cancel.clone(),
     )
     .build();
 
@@ -538,7 +543,7 @@ fn pane_to_json(
 /// AND meta (seq, timestamp, type) at the top level so consumers can route
 /// without recursing into a nested envelope.
 fn event_to_json(event: &shux_core::event::Event) -> serde_json::Value {
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "seq": event.meta.seq,
         "type": event.meta.event_type,
         "timestamp": event.meta.timestamp
@@ -546,7 +551,14 @@ fn event_to_json(event: &shux_core::event::Event) -> serde_json::Value {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
         "data": &event.data,
-    })
+    });
+    // Include correlation_id ONLY when set, so non-batched events keep
+    // their existing wire shape (consistent with `skip_serializing_if`
+    // on EventMetadata).
+    if let Some(cid) = &event.meta.correlation_id {
+        out["correlation_id"] = serde_json::Value::String(cid.clone());
+    }
+    out
 }
 
 /// Register `events.watch` and `events.history` RPC methods.
@@ -564,6 +576,93 @@ fn event_to_json(event: &shux_core::event::Event) -> serde_json::Value {
 ///      two streams is real — an event published in step 2 might appear in
 ///      both the history snapshot and the subscription receiver buffer).
 ///
+/// Register `state.apply` RPC method.
+///
+/// Takes a generic `Op` delta (NOT a TOML template — codex P0 #2: keeping
+/// the daemon API agnostic to template grammar means future SDKs / MCP
+/// servers / agents can target the same primitive).
+///
+/// Atomicity: graph-level all-or-nothing. PTY spawns happen AFTER the
+/// graph commits and per-pane spawn outcomes are reported in
+/// `BatchResult::spawn_results`. Spawn failure does NOT roll back the
+/// graph (codex P0 #1: rolling back PTY-spawned commands would mean
+/// killing already-launched subprocesses, which has its own side effects;
+/// honest reporting beats dishonest atomicity).
+fn register_state_methods(
+    builder: shux_rpc::RouterBuilder,
+    graph: shux_core::graph::GraphHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> shux_rpc::RouterBuilder {
+    builder.register("state.apply", move |params: Option<serde_json::Value>| {
+        let gh = graph.clone();
+        let io = io_state.clone();
+        let ct = cancel.clone();
+        async move {
+            // Parse `{ ops: [...] }`.
+            let params = params.unwrap_or_default();
+            let ops_value = params
+                .get("ops")
+                .cloned()
+                .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'ops' array"))?;
+            let ops: Vec<shux_core::apply::Op> =
+                serde_json::from_value(ops_value).map_err(|e| {
+                    shux_rpc::RpcError::invalid_params(&format!("ops parse error: {e}"))
+                })?;
+
+            // Run the staged transaction through the single-writer task.
+            let mut result = gh.apply_batch(ops).await.map_err(batch_error_to_rpc)?;
+
+            // Graph commit succeeded. Now spawn PTYs for each new pane.
+            // Per codex P0 #1: spawn outcomes are reported per-pane in
+            // `spawn_results` and do NOT roll back the graph.
+            let snap = gh.snapshot();
+            let mut spawn_results = Vec::new();
+            for output in &result.outputs {
+                if let Some(pane_id) = output.pane_id {
+                    if let Some(pane) = snap.panes.get(&pane_id) {
+                        let cwd = pane.cwd.clone();
+                        let command = pane.command.clone();
+                        let spawn_io = io.clone();
+                        let spawn_ct = ct.clone();
+                        match spawn_pane_pty(pane_id, cwd, command, spawn_io, spawn_ct).await {
+                            Ok(()) => spawn_results.push(shux_core::apply::SpawnResult {
+                                op_index: output.op_index,
+                                pane_id,
+                                spawned: true,
+                                error: None,
+                            }),
+                            Err(e) => spawn_results.push(shux_core::apply::SpawnResult {
+                                op_index: output.op_index,
+                                pane_id,
+                                spawned: false,
+                                error: Some(e.to_string()),
+                            }),
+                        }
+                    }
+                }
+            }
+            result.spawn_results = spawn_results;
+
+            serde_json::to_value(&result).map_err(|e| {
+                shux_rpc::RpcError::internal(&format!("apply result serialize error: {e}"))
+            })
+        }
+    })
+}
+
+/// Map BatchError to an appropriate RPC error.
+fn batch_error_to_rpc(e: shux_core::apply::BatchError) -> shux_rpc::RpcError {
+    use shux_core::apply::BatchError;
+    match e {
+        BatchError::Empty => shux_rpc::RpcError::invalid_params("ops array is empty"),
+        BatchError::BackRefOutOfRange { .. } | BatchError::BackRefWrongType { .. } => {
+            shux_rpc::RpcError::invalid_params(&e.to_string())
+        }
+        BatchError::OpFailed { source, .. } => graph_error_to_rpc(source),
+    }
+}
+
 /// `events.history` is a simple bus.history_filtered() wrapper.
 fn register_events_methods(
     builder: shux_rpc::RouterBuilder,
