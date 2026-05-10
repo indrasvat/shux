@@ -54,6 +54,14 @@ pub struct EventMetadata {
     /// The event type string (e.g., "pane.created", "session.killed").
     /// Used for filtering and routing.
     pub event_type: String,
+    /// Optional correlation ID linking this event to a batch / transaction
+    /// that produced it. Set by `state.apply` so subscribers can attribute
+    /// an event burst to a specific apply call (vs. concurrent mutations).
+    /// `None` for individually-fired mutations. Codex review of PR 3 plan
+    /// flagged this as load-bearing for agent orchestration: without it,
+    /// agents watching events cannot tell which burst belongs to their apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 /// A complete event: metadata + typed payload.
@@ -803,6 +811,7 @@ mod tests {
                 seq: 1,
                 timestamp: SystemTime::now(),
                 event_type: "pane.created".to_string(),
+                correlation_id: None,
             },
             data: EventData::PaneCreated {
                 pane_id: PaneId::new(),
@@ -830,6 +839,7 @@ mod tests {
                 seq: 1,
                 timestamp: SystemTime::now(),
                 event_type: "window.activated".to_string(),
+                correlation_id: None,
             },
             data: EventData::WindowActivated {
                 window_id: WindowId::new(),
@@ -851,6 +861,7 @@ mod tests {
                 seq: 42,
                 timestamp: SystemTime::now(),
                 event_type: "session.created".to_string(),
+                correlation_id: None,
             },
             data: EventData::SessionCreated {
                 session_id: SessionId::new(),
@@ -875,6 +886,7 @@ mod tests {
                 seq: 7,
                 timestamp: SystemTime::now(),
                 event_type: "pane.command_completed".to_string(),
+                correlation_id: None,
             },
             data: EventData::PaneCommandCompleted {
                 pane_id: PaneId::new(),
@@ -914,6 +926,7 @@ mod tests {
                 seq: 3,
                 timestamp: SystemTime::now(),
                 event_type: "pane.bell".to_string(),
+                correlation_id: None,
             },
             data: EventData::PaneBell {
                 pane_id: PaneId::new(),
