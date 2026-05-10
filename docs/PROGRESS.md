@@ -6,8 +6,8 @@
 
 **M0: Architecture Spike** — **Complete** (000–012).
 **M1: Daily-Driver Core** — In progress, ~75% by task count.
-- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 029, 033, 060.
-- **Partial:** 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet).
+- **Done:** 013, 014, 015, 016, 017, 019, 020, 021, 022, 023, 026, 029, 033, 060.
+- **Partial:** 018 (Tier-1 keys: Alt+Enter/|/\\/-/arrows/z/x/Tab shipped; bare Alt+h/j/k/l, Alt+n/p, Alt+1..9 still missing — caught by Codex review of PR #8), 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet).
 - **Pending:** 025 (per-pane theming), 027 (pane titles), 030 (session templates + `shux apply`), 031 (keybinding config + conflict detection), 032 (command palette), 034 (M1 quality gate).
 
 **M2: API + Plugin System** — not started. The most agent-relevant pieces are tasks 035 (complete RPC surface), **036 (events.watch)**, **037 (optimistic concurrency + state.apply)**, and 038–050 (plugin host + bundled plugins + MCP).
@@ -34,7 +34,8 @@
   - [x] Full session/window/pane CRUD (API + CLI)
   - [x] Splits, directional focus, resize, zoom, swap
   - [x] Copy mode with clipboard (OSC 52)
-  - [x] Graded keybindings (Tier 1 + 2), help overlay
+  - [~] Graded keybindings — Tier 2 (prefix) full; Tier 1 (bare) partial (Alt+arrows/Enter/|/\\/-/z/x/Tab; bare Alt+h/j/k/l + Alt+n/p + Alt+1..9 still missing)
+  - [x] Help overlay
   - [ ] Command palette (`Prefix + :`)
   - [x] TOML config with live reload
   - [~] Theme engine (border + status bar overrides; full token cascade + per-pane theming pending)
@@ -342,7 +343,7 @@
 | 015 | Pane operations (split, focus, resize, zoom, swap, kill) | M1 | **Done** | 014, 003 |
 | 016 | Pane I/O (send_keys, run_command, capture) | M1 | **Done** | 015, 004 |
 | 017 | Multi-pane rendering | M1 | **Done** | 015, 009 |
-| 018 | Tier 1 keybindings (bare keys) | M1 | **Done** | 017 |
+| 018 | Tier 1 keybindings (bare keys) | M1 | **Partial** ³ | 017 |
 | 019 | Prefix key system (Tier 2) | M1 | **Done** | 018 |
 | 020 | Mouse support | M1 | **Done** | 017 |
 | 021 | Copy mode | M1 | **Done** | 019 |
@@ -391,3 +392,5 @@
 ¹ **Task 024 Partial:** `[theme]` config section overrides border colors (focused/unfocused) and status-bar fg/bg colors with hot reload. The full PRD §6.1 token cascade (per-pane themes, theme files in `~/.config/shux/themes/`, ANSI palette overrides, named theme references) is still pending — close-out lives with task 025 and the M1 quality gate (034).
 
 ² **Task 028 Partial:** daemon claims `TERM_PROGRAM=shux`, `TERM_PROGRAM_VERSION=<pkg ver>`, `COLORTERM=truecolor`, `SHUX=1` on every PTY spawn. Real cap negotiation (DA2 / XTVERSION / Kitty keyboard query / OSC 4 palette probe stored as a per-client `ClientCaps` and gating Mode 2026, OSC 8, OSC 52, true color) is still pending.
+
+³ **Task 018 Partial** (caught by Codex review of PR #8): `attach.rs::key_to_bare_action` ships Alt+Enter, Alt+|/\\, Alt+-, Alt+arrows, Alt+z, Alt+x, Alt+Tab. Per PRD §9.1, **bare Alt+h/j/k/l, bare Alt+n/p, and Alt+1..9 are still missing** as Tier-1 bindings (the hjkl/n/p variants today only work after the Ctrl+Space prefix). Small follow-up — one match arm in `key_to_bare_action`. Lives with the M1 quality gate (034) or a focused 018-followup PR.
