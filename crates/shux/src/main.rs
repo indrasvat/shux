@@ -14,6 +14,7 @@ mod config_validate;
 mod daemon;
 mod statusbar_runner;
 mod style;
+mod template;
 
 use cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
 
@@ -2493,6 +2494,34 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     cli::handle_events_history(&mut stream, filter, count).await
                 }
             }
+        }
+
+        Some(Command::Apply {
+            template,
+            dry_run,
+            watch,
+        }) => {
+            // Lower the TOML template to apply ops first (no daemon needed
+            // for parse / validate). If --dry-run, print the lowered ops as
+            // pretty JSON and exit.
+            let ops = match template::load_and_lower(&template) {
+                Ok(ops) => ops,
+                Err(e) => {
+                    eprintln!("{} {e}", style::error("✗ template error:"));
+                    std::process::exit(1);
+                }
+            };
+
+            if dry_run {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"ops": ops}))?
+                );
+                return Ok(());
+            }
+
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_apply(&mut stream, ops, watch, &socket_path).await
         }
 
         Some(Command::__daemon) => unreachable!("handled above"),
