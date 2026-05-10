@@ -368,6 +368,7 @@ impl SessionGraph {
         self.fire(EventData::PaneCreated {
             pane_id,
             window_id,
+            session_id,
             command: Vec::new(),
         });
         info!(%session_id, "Session created");
@@ -402,19 +403,17 @@ impl SessionGraph {
 
         let window_ids: Vec<WindowId> = session.windows.clone();
 
-        // Capture per-pane (id, command) pairs BEFORE removal so we can fire
-        // PaneExited events for each child pane after commit. Without this
-        // cascade, agents tracking pane lifecycle via `events.watch
-        // --filter pane.` see panes get created but never see them die when
-        // the whole session is killed (Codex review of PR #9).
-        let panes_to_kill: Vec<(PaneId, Vec<String>)> = snapshot
+        // Capture per-pane (id, window_id, command) tuples BEFORE removal so
+        // we can fire PaneExited events with full routing scope after commit.
+        // session_id is the destroyed session's id (`id`) — captured by closure.
+        let panes_to_kill: Vec<(PaneId, WindowId, Vec<String>)> = snapshot
             .panes
             .values()
             .filter(|p| window_ids.contains(&p.window_id))
-            .map(|p| (p.id, p.command.clone()))
+            .map(|p| (p.id, p.window_id, p.command.clone()))
             .collect();
 
-        for (pid, _) in &panes_to_kill {
+        for (pid, _, _) in &panes_to_kill {
             snapshot.panes.remove(pid);
         }
         for wid in &window_ids {
@@ -428,9 +427,11 @@ impl SessionGraph {
         // arrive from explicit destroy_pane → destroy_window → destroy_session
         // calls. Each PaneExited carries `exit_status: None` since the pane
         // was forcibly killed (mirrors the explicit destroy_pane semantics).
-        for (pid, command) in panes_to_kill.iter() {
+        for (pid, wid, command) in panes_to_kill.iter() {
             self.fire(EventData::PaneExited {
                 pane_id: *pid,
+                window_id: *wid,
+                session_id: id,
                 exit_status: None,
                 command: command.clone(),
             });
@@ -445,7 +446,8 @@ impl SessionGraph {
             session_id: id,
             name: killed_name,
         });
-        info!(%id, panes_removed = panes_to_kill.len(), "Session destroyed");
+        let panes_removed = panes_to_kill.len();
+        info!(%id, panes_removed, "Session destroyed");
         Ok(())
     }
 
@@ -543,6 +545,7 @@ impl SessionGraph {
         self.fire(EventData::PaneCreated {
             pane_id,
             window_id,
+            session_id,
             command: Vec::new(),
         });
         info!(%window_id, %session_id, "Window created");
@@ -614,10 +617,13 @@ impl SessionGraph {
         self.commit_snapshot(snapshot);
         // Fire pane.exited cascade BEFORE window.killed so subscribers
         // observe teardown in the same order as explicit destroy_pane →
-        // destroy_window calls.
+        // destroy_window calls. All panes belong to window `id` (the one
+        // being destroyed); session_id is the parent of that window.
         for (pid, command) in panes_to_kill.iter() {
             self.fire(EventData::PaneExited {
                 pane_id: *pid,
+                window_id: id,
+                session_id: killed_session_id,
                 exit_status: None,
                 command: command.clone(),
             });
@@ -778,12 +784,20 @@ impl SessionGraph {
         };
         let pane_id = pane.id;
 
+        // Resolve session_id from the (validated, exists) window for event scope.
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .expect("window verified to exist above");
+
         snapshot.panes.insert(pane_id, pane);
 
         self.commit_snapshot(snapshot);
         self.fire(EventData::PaneCreated {
             pane_id,
             window_id,
+            session_id,
             command: event_command,
         });
         info!(%pane_id, %window_id, "Pane created");
@@ -807,6 +821,11 @@ impl SessionGraph {
 
         let window_id = pane.window_id;
         let killed_command = pane.command.clone();
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -838,6 +857,8 @@ impl SessionGraph {
         // mirroring how subscribers consume both natural exits and forced kills.
         self.fire(EventData::PaneExited {
             pane_id: id,
+            window_id,
+            session_id,
             exit_status: None,
             command: killed_command,
         });
@@ -849,6 +870,12 @@ impl SessionGraph {
 
         let exited_pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
         let exited_command = exited_pane.command.clone();
+        let exited_window_id = exited_pane.window_id;
+        let exited_session_id = current
+            .windows
+            .get(&exited_window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(exited_window_id))?;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -861,6 +888,8 @@ impl SessionGraph {
         self.commit_snapshot(snapshot);
         self.fire(EventData::PaneExited {
             pane_id: id,
+            window_id: exited_window_id,
+            session_id: exited_session_id,
             exit_status: Some(exit_status),
             command: exited_command,
         });
@@ -1004,6 +1033,14 @@ impl SessionGraph {
 
         snapshot.panes.insert(new_pane_id, new_pane);
 
+        // Resolve session_id for event scope before commit (window has been
+        // borrowed mutably above; re-resolve from the current snapshot).
+        let split_session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
         self.commit_snapshot(snapshot);
         // Split spawns a brand-new pane: surface as PaneCreated so subscribers
         // tracking pane lifecycle see the new id arrive in the same event class
@@ -1012,6 +1049,7 @@ impl SessionGraph {
         self.fire(EventData::PaneCreated {
             pane_id: new_pane_id,
             window_id,
+            session_id: split_session_id,
             command: Vec::new(),
         });
         info!(%new_pane_id, %target_pane, %window_id, "Pane split");
@@ -1032,6 +1070,7 @@ impl SessionGraph {
         } else {
             None
         };
+        let session_id = window.session_id;
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -1045,6 +1084,7 @@ impl SessionGraph {
         self.fire(EventData::PaneFocused {
             pane_id: id,
             window_id,
+            session_id,
             previous_pane_id: previous,
         });
         Ok(previous)
@@ -1065,6 +1105,7 @@ impl SessionGraph {
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
         let current_pane = window.active_pane;
+        let session_id = window.session_id;
         let neighbor = window
             .layout
             .tree
@@ -1084,6 +1125,7 @@ impl SessionGraph {
                 self.fire(EventData::PaneFocused {
                     pane_id: target,
                     window_id,
+                    session_id,
                     previous_pane_id: Some(current_pane),
                 });
                 Ok(Some(target))
@@ -1131,6 +1173,12 @@ impl SessionGraph {
     pub fn zoom_pane(&self, id: PaneId) -> Result<bool, GraphError> {
         let (current, window_id) = self.find_pane_window(id)?;
 
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
@@ -1146,6 +1194,8 @@ impl SessionGraph {
         self.commit_snapshot(snapshot);
         self.fire(EventData::PaneZoomed {
             pane_id: id,
+            window_id,
+            session_id,
             zoomed: is_zoomed,
         });
         Ok(is_zoomed)

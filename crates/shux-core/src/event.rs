@@ -169,10 +169,16 @@ pub enum EventData {
     },
 
     // ── Pane lifecycle ─────────────────────────────────────────
+    //
+    // PR 3a (codex review): every pane-scoped event carries `session_id` and
+    // `window_id` so subscribers can route by session without dereferencing
+    // the live graph (which is wrong for historical events — the pane may
+    // have moved or died since the event fired).
     /// A new pane was created.
     PaneCreated {
         pane_id: PaneId,
         window_id: WindowId,
+        session_id: SessionId,
         command: Vec<String>,
     },
 
@@ -180,22 +186,32 @@ pub enum EventData {
     PaneFocused {
         pane_id: PaneId,
         window_id: WindowId,
+        session_id: SessionId,
         previous_pane_id: Option<PaneId>,
     },
 
     /// A pane was resized.
     PaneResized {
         pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
         cols: u16,
         rows: u16,
     },
 
     /// A pane's zoom state changed.
-    PaneZoomed { pane_id: PaneId, zoomed: bool },
+    PaneZoomed {
+        pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
+        zoomed: bool,
+    },
 
     /// A pane's title changed (via OSC or manual set).
     PaneTitleChanged {
         pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
         old_title: String,
         new_title: String,
     },
@@ -203,6 +219,8 @@ pub enum EventData {
     /// A pane's working directory changed.
     PaneCwdChanged {
         pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
         old_cwd: String,
         new_cwd: String,
     },
@@ -210,6 +228,8 @@ pub enum EventData {
     /// A pane's process exited.
     PaneExited {
         pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
         exit_status: Option<i32>,
         command: Vec<String>,
     },
@@ -217,12 +237,16 @@ pub enum EventData {
     /// A pane was respawned.
     PaneRespawned {
         pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
         command: Vec<String>,
     },
 
     /// An async command completed in a pane (pane.run_command with async=true).
     PaneCommandCompleted {
         pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
         command_id: String,
         exit_code: Option<i32>,
         stdout: String,
@@ -233,6 +257,8 @@ pub enum EventData {
     /// PTY output from a pane (opt-in, sampled by default).
     PaneOutput {
         pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
         /// Base64-encoded bytes (PRD §8.4).
         bytes: String,
         /// Whether this is a sample (true) or lossless (false).
@@ -240,14 +266,25 @@ pub enum EventData {
     },
 
     /// Input sent to a pane (fired on line-submit, not per-keystroke).
-    PaneInput { pane_id: PaneId, data: String },
+    PaneInput {
+        pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
+        data: String,
+    },
 
     /// Bell character received in a pane.
-    PaneBell { pane_id: PaneId },
+    PaneBell {
+        pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
+    },
 
     /// A pane's tag was changed.
     PaneTagChanged {
         pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
         key: String,
         old_value: Option<String>,
         new_value: Option<String>,
@@ -499,11 +536,13 @@ mod tests {
     fn test_event_type_strings_pane() {
         let pid = PaneId::new();
         let wid = WindowId::new();
+        let sid = SessionId::new();
 
         assert_eq!(
             EventData::PaneCreated {
                 pane_id: pid,
                 window_id: wid,
+                session_id: sid,
                 command: vec!["bash".into()],
             }
             .event_type(),
@@ -513,6 +552,7 @@ mod tests {
             EventData::PaneFocused {
                 pane_id: pid,
                 window_id: wid,
+                session_id: sid,
                 previous_pane_id: None,
             }
             .event_type(),
@@ -521,6 +561,8 @@ mod tests {
         assert_eq!(
             EventData::PaneResized {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 cols: 80,
                 rows: 24,
             }
@@ -530,6 +572,8 @@ mod tests {
         assert_eq!(
             EventData::PaneZoomed {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 zoomed: true,
             }
             .event_type(),
@@ -538,6 +582,8 @@ mod tests {
         assert_eq!(
             EventData::PaneTitleChanged {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 old_title: "a".into(),
                 new_title: "b".into(),
             }
@@ -547,6 +593,8 @@ mod tests {
         assert_eq!(
             EventData::PaneCwdChanged {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 old_cwd: "/a".into(),
                 new_cwd: "/b".into(),
             }
@@ -556,6 +604,8 @@ mod tests {
         assert_eq!(
             EventData::PaneExited {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 exit_status: Some(0),
                 command: vec!["bash".into()],
             }
@@ -565,6 +615,8 @@ mod tests {
         assert_eq!(
             EventData::PaneRespawned {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 command: vec!["bash".into()],
             }
             .event_type(),
@@ -573,6 +625,8 @@ mod tests {
         assert_eq!(
             EventData::PaneCommandCompleted {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 command_id: "cmd1".into(),
                 exit_code: Some(0),
                 stdout: "out".into(),
@@ -585,6 +639,8 @@ mod tests {
         assert_eq!(
             EventData::PaneOutput {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 bytes: "dGVzdA==".into(),
                 sample: true,
             }
@@ -594,18 +650,27 @@ mod tests {
         assert_eq!(
             EventData::PaneInput {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 data: "ls\n".into(),
             }
             .event_type(),
             "pane.input"
         );
         assert_eq!(
-            EventData::PaneBell { pane_id: pid }.event_type(),
+            EventData::PaneBell {
+                pane_id: pid,
+                window_id: wid,
+                session_id: sid,
+            }
+            .event_type(),
             "pane.bell"
         );
         assert_eq!(
             EventData::PaneTagChanged {
                 pane_id: pid,
+                window_id: wid,
+                session_id: sid,
                 key: "role".into(),
                 old_value: None,
                 new_value: Some("editor".into()),
@@ -742,6 +807,7 @@ mod tests {
             data: EventData::PaneCreated {
                 pane_id: PaneId::new(),
                 window_id: WindowId::new(),
+                session_id: SessionId::new(),
                 command: vec!["bash".to_string()],
             },
         };
@@ -812,6 +878,8 @@ mod tests {
             },
             data: EventData::PaneCommandCompleted {
                 pane_id: PaneId::new(),
+                window_id: WindowId::new(),
+                session_id: SessionId::new(),
                 command_id: "cmd-123".to_string(),
                 exit_code: Some(0),
                 stdout: "hello world\n".to_string(),
@@ -849,6 +917,8 @@ mod tests {
             },
             data: EventData::PaneBell {
                 pane_id: PaneId::new(),
+                window_id: WindowId::new(),
+                session_id: SessionId::new(),
             },
         };
 

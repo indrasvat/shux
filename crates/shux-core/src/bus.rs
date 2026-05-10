@@ -349,6 +349,7 @@ mod tests {
         EventData::PaneCreated {
             pane_id: PaneId::new(),
             window_id: WindowId::new(),
+            session_id: SessionId::new(),
             command: vec!["bash".to_string()],
         }
     }
@@ -637,11 +638,15 @@ mod tests {
 
         bus.publish(EventData::PaneBell {
             pane_id: PaneId::new(),
+            window_id: WindowId::new(),
+            session_id: SessionId::new(),
         });
         assert_eq!(bus.current_seq(), 2);
 
         bus.publish(EventData::PaneBell {
             pane_id: PaneId::new(),
+            window_id: WindowId::new(),
+            session_id: SessionId::new(),
         });
         assert_eq!(bus.current_seq(), 3);
     }
@@ -698,6 +703,8 @@ mod tests {
 
         bus1.publish(EventData::PaneBell {
             pane_id: PaneId::new(),
+            window_id: WindowId::new(),
+            session_id: SessionId::new(),
         });
 
         // bus2 should see the same history.
