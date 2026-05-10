@@ -402,14 +402,19 @@ impl SessionGraph {
 
         let window_ids: Vec<WindowId> = session.windows.clone();
 
-        let pane_ids_to_remove: Vec<PaneId> = snapshot
+        // Capture per-pane (id, command) pairs BEFORE removal so we can fire
+        // PaneExited events for each child pane after commit. Without this
+        // cascade, agents tracking pane lifecycle via `events.watch
+        // --filter pane.` see panes get created but never see them die when
+        // the whole session is killed (Codex review of PR #9).
+        let panes_to_kill: Vec<(PaneId, Vec<String>)> = snapshot
             .panes
             .values()
             .filter(|p| window_ids.contains(&p.window_id))
-            .map(|p| p.id)
+            .map(|p| (p.id, p.command.clone()))
             .collect();
 
-        for pid in &pane_ids_to_remove {
+        for (pid, _) in &panes_to_kill {
             snapshot.panes.remove(pid);
         }
         for wid in &window_ids {
@@ -418,11 +423,29 @@ impl SessionGraph {
         snapshot.sessions.remove(&id);
 
         self.commit_snapshot(snapshot);
+        // Fire cascade events innermost-out (panes → windows → session) so
+        // subscribers receive teardown events in the same order they would
+        // arrive from explicit destroy_pane → destroy_window → destroy_session
+        // calls. Each PaneExited carries `exit_status: None` since the pane
+        // was forcibly killed (mirrors the explicit destroy_pane semantics).
+        for (pid, command) in panes_to_kill.iter() {
+            self.fire(EventData::PaneExited {
+                pane_id: *pid,
+                exit_status: None,
+                command: command.clone(),
+            });
+        }
+        for wid in &window_ids {
+            self.fire(EventData::WindowKilled {
+                window_id: *wid,
+                session_id: id,
+            });
+        }
         self.fire(EventData::SessionKilled {
             session_id: id,
             name: killed_name,
         });
-        info!(%id, panes_removed = pane_ids_to_remove.len(), "Session destroyed");
+        info!(%id, panes_removed = panes_to_kill.len(), "Session destroyed");
         Ok(())
     }
 
@@ -561,14 +584,19 @@ impl SessionGraph {
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
-        let pane_ids: Vec<PaneId> = snapshot
+        // Capture (id, command) for each child pane BEFORE removal so we can
+        // fire PaneExited events after commit. Without this cascade, agents
+        // tracking pane lifecycle via `events.watch --filter pane.` see panes
+        // get created but never see them die when the window is killed
+        // (Codex review of PR #9).
+        let panes_to_kill: Vec<(PaneId, Vec<String>)> = snapshot
             .panes
             .values()
             .filter(|p| p.window_id == id)
-            .map(|p| p.id)
+            .map(|p| (p.id, p.command.clone()))
             .collect();
 
-        for pid in &pane_ids {
+        for (pid, _) in &panes_to_kill {
             snapshot.panes.remove(pid);
         }
 
@@ -584,6 +612,16 @@ impl SessionGraph {
         snapshot.windows.remove(&id);
 
         self.commit_snapshot(snapshot);
+        // Fire pane.exited cascade BEFORE window.killed so subscribers
+        // observe teardown in the same order as explicit destroy_pane →
+        // destroy_window calls.
+        for (pid, command) in panes_to_kill.iter() {
+            self.fire(EventData::PaneExited {
+                pane_id: *pid,
+                exit_status: None,
+                command: command.clone(),
+            });
+        }
         self.fire(EventData::WindowKilled {
             window_id: id,
             session_id: killed_session_id,
@@ -620,6 +658,9 @@ impl SessionGraph {
             }
         }
 
+        let old_title = window.title.clone();
+        let event_new_title = new_title.clone();
+
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
@@ -629,6 +670,11 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::WindowRenamed {
+            window_id: id,
+            old_title,
+            new_title: event_new_title,
+        });
         Ok(())
     }
 
@@ -2262,5 +2308,116 @@ mod tests {
         );
         assert_eq!(sub_seqs.len(), 2);
         assert!(sub_seqs[1] > sub_seqs[0]);
+    }
+
+    /// Codex review of PR #9 caught three cascade bugs: destroying a session
+    /// removed child windows + panes from state but only fired SessionKilled
+    /// (so subscribers tracking pane lifecycle saw panes get created and
+    /// never die); destroying a window had the same gap for child panes;
+    /// rename_window mutated state without firing WindowRenamed at all.
+    /// This test asserts all three are fixed.
+    #[tokio::test]
+    async fn test_cascade_kill_and_rename_events() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+
+        // Build a session with two windows and an extra pane in window 2.
+        let sid = graph.create_session("demo".into(), home()).unwrap();
+        let w2 = graph.create_window(sid, "editor".into(), home()).unwrap();
+        let snap_after_setup = graph.current();
+        let pane_in_w2 = snap_after_setup
+            .panes
+            .values()
+            .find(|p| p.window_id == w2)
+            .map(|p| p.id)
+            .unwrap();
+        let extra = graph
+            .split_pane(pane_in_w2, Direction::Vertical, 0.5)
+            .unwrap();
+
+        // Drain subscription for setup events; we only care about teardown
+        // and rename below.
+        for _ in 0..16 {
+            if tokio::time::timeout(std::time::Duration::from_millis(20), sub.recv())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        // 1. rename_window must fire WindowRenamed.
+        graph.rename_window(w2, "scratch".into()).unwrap();
+
+        // 2. destroy_window must fire PaneExited(*) for each child pane,
+        //    THEN WindowKilled. Window 2 has 2 panes (initial + split).
+        graph.destroy_window(w2, None).unwrap();
+
+        // 3. destroy_session must cascade: every remaining pane → exited,
+        //    every remaining window → killed, then session.killed.
+        graph.destroy_session(sid, None).unwrap();
+
+        // Drain the rest.
+        let mut after = Vec::new();
+        for _ in 0..32 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await {
+                Ok(Some(crate::bus::SubscriptionEvent::Event(e))) => {
+                    after.push(e.meta.event_type.clone());
+                }
+                _ => break,
+            }
+        }
+
+        // WindowRenamed for the rename_window call.
+        assert!(
+            after.iter().any(|t| t == "window.renamed"),
+            "rename_window must fire WindowRenamed; saw {after:?}"
+        );
+
+        // 2 PaneExited from destroying window 2's two panes.
+        let pane_exited_after_window_kill = after
+            .iter()
+            .take_while(|t| t.as_str() != "window.killed")
+            .filter(|t| t.as_str() == "pane.exited")
+            .count();
+        assert!(
+            pane_exited_after_window_kill >= 2,
+            "destroy_window must fire 2 pane.exited events before window.killed; saw {after:?}"
+        );
+
+        // window.killed for window 2.
+        assert!(
+            after.iter().any(|t| t == "window.killed"),
+            "destroy_window must fire WindowKilled; saw {after:?}"
+        );
+
+        // Cascade from destroy_session: remaining panes exited, remaining
+        // window killed, then session.killed last. We had 1 surviving window
+        // (the implicit one from create_session) with 1 pane, plus the
+        // killed-but-still-tracked extra pane was already removed when
+        // window 2 died; so session kill cascade: 1 pane.exited + 1
+        // window.killed + 1 session.killed.
+        assert!(
+            after.iter().any(|t| t == "session.killed"),
+            "destroy_session must fire SessionKilled; saw {after:?}"
+        );
+        // Session kill cascade ordering: every pane.exited and window.killed
+        // BEFORE the final session.killed.
+        let session_killed_pos = after.iter().position(|t| t == "session.killed").unwrap();
+        let last_window_killed_pos = after
+            .iter()
+            .enumerate()
+            .rfind(|(_, t)| t.as_str() == "window.killed")
+            .map(|(i, _)| i)
+            .unwrap();
+        assert!(
+            last_window_killed_pos < session_killed_pos,
+            "all window.killed must precede session.killed; saw {after:?}"
+        );
+
+        // Suppress unused-binding warning — the pane id was needed only to
+        // verify the split call returned cleanly.
+        let _ = extra;
     }
 }
