@@ -10,7 +10,9 @@
 - **Partial:** 018 (Tier-1 keys: Alt+Enter/|/\\/-/arrows/z/x/Tab shipped; bare Alt+h/j/k/l, Alt+n/p, Alt+1..9 still missing — caught by Codex review of PR #8), 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet).
 - **Pending:** 025 (per-pane theming), 027 (pane titles), 030 (session templates + `shux apply`), 031 (keybinding config + conflict detection), 032 (command palette), 034 (M1 quality gate).
 
-**M2: API + Plugin System** — not started. The most agent-relevant pieces are tasks 035 (complete RPC surface), **036 (events.watch)**, **037 (optimistic concurrency + state.apply)**, and 038–050 (plugin host + bundled plugins + MCP).
+**M2: API + Plugin System** — kicked off.
+- **Done:** **036 (events.watch + events.history)** — control-plane events only (PR 2a). EventBus wired into daemon, SessionGraph publishes typed events on every successful mutation (session/window/pane lifecycle, including the implicit window+pane created by `create_session`). New `events.watch` (long-poll) + `events.history` RPC methods registered. New `shux events watch [--filter ...] [--from-seq N] [--limit N]` and `shux events history [--filter ...] [-n N]` CLI subcommands. Subscribe-FIRST / history-SECOND / dedup-by-seq pattern (the load-bearing race fix that codex + gemini both flagged). `lagged` flag surfaced in response so clients can detect dropped events.
+- **Pending:** 035 (complete RPC surface), **037 (optimistic concurrency + state.apply)** — PR 2b queued, version stamps already in event metadata, 038–050 (plugin host + bundled plugins + MCP), and a focused **PR 2c** to add `pane.output` events with proper data-plane separation (per Codex/Gemini brutal review: do NOT put PaneOutput on the main bus — secret leak via `events.history` + DoS for control events under high PTY volume).
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
@@ -67,6 +69,30 @@
 ---
 
 ## Session Log
+
+**2026-05-10 — PR 2a: `events.watch` + `events.history` RPC + CLI (control-plane events)**
+- Goal: ship task 036, the single highest-value gap vs tmux for AI agent orchestration. External agents can now subscribe to the daemon's typed event bus and react to lifecycle events in real time, replacing the polling-on-`pane.capture` pattern they were forced into.
+- Council review (codex + gemini) consumed before any implementation, log at `/tmp/shux_pr2a_council.json`. Convergent findings drove the architecture:
+  - **Drop `PaneOutput` from PR 2a entirely.** Putting raw PTY bytes in the main `EventBus` is a secret leak (replayable via `events.history`) AND a DoS vector for control events (high-volume `cat large.log` saturates the 4096-cap broadcast in milliseconds, drops lifecycle events for everyone). Deferred to PR 2c with proper data-plane separation.
+  - **Subscribe FIRST, history SECOND, dedup by seq.** The race where a publish lands between snapshot and subscribe IS load-bearing, not overkill. Encoded in the daemon-side `events.watch` handler.
+  - **Publish from inside `SessionGraph` methods**, not the `run_graph_loop` dispatcher. Otherwise non-RPC mutations later silently miss publishing. Adopted from day one.
+  - Long-poll OK if the CLI immediately reissues without artificial sleep; surface `lagged: true` so clients know the stream dropped events.
+  - **Include event seq in metadata from day one** (free side effect of `EventBus::publish` returning seq) — PR 2b (optimistic concurrency) can now ship without forcing clients to migrate the `events.watch` payload shape.
+- Renamed `SessionGraph::publish` (snapshot swap) → `commit_snapshot` to free the verb for `EventBus::publish`. 1 fn def + 20 call sites.
+- `SessionGraph::new_with_event_bus()` constructor; `fire(EventData)` helper. `fire(...)` calls land at the end of every successful mutation in: `create_session` (SessionCreated + WindowCreated + PaneCreated for the implicit window+pane — initial bug missed this until E3 visual test caught it), `destroy_session` (SessionKilled), `rename_session` (SessionRenamed), `create_window` (WindowCreated + PaneCreated for implicit pane), `destroy_window` (WindowKilled), `create_pane` (PaneCreated), `destroy_pane` (PaneExited with no exit_status), `set_pane_exit_status` (PaneExited with exit_status), `split_pane` (PaneCreated), `focus_pane` + `focus_pane_direction` (PaneFocused), `zoom_pane` (PaneZoomed). 14 fire sites total covering the agent-relevant lifecycle.
+- New RPC handlers (`register_events_methods` in `crates/shux/src/main.rs`):
+  - `events.watch { filter?, from_seq?, max_events?, timeout_ms? } → { events, next_seq, gap, lagged }`. Subscribe → history snapshot → drain subscription with timeout → dedup by seq.
+  - `events.history { filter?, count? } → { events, current_seq }`. Wraps `bus.history_filtered`.
+- New CLI: `shux events watch [--filter ...] [--from-seq N] [--limit N] [--timeout-ms N]` reuses one UDS connection in a long-poll loop, prints JSON Lines on stdout, prints `[STREAM_DEGRADED]` to stderr on `lagged: true` and `[GAP n]` on first-call gap. `shux events history [--filter ...] [-n N]` for backfill.
+- 2 new shux-core unit tests (`test_lifecycle_events_fire`, `test_event_seq_consistency`); the latter caught a follow-on bug in my own test when I added the implicit fire calls (had to filter the subscription to compare like-for-like with history).
+- L4 visual + headless test (`.claude/automations/test_036_events_watch.py`): 4/4 PASS.
+  - E1 — `events.history` returns SessionCreated after `shux new`.
+  - E2 — `events.watch --limit 2` blocks until both create + kill events arrive (real live stream).
+  - E3 — `--filter pane.` correctly excludes session events; replays from history with `--from-seq 0` to dodge live-timing flakes.
+  - E4 — Sequence numbers strictly monotonic across multiple mutations.
+  - Visual demo: 5 screenshots showing iTerm window with `shux events watch` on the left and a driver shell on the right; events stream live as the driver does session.create → window.create → pane.split → kill (`036_v1` through `036_v5` in `.claude/screenshots/`).
+- 631 tests pass via `cargo nextest run -E 'not test(test_tcp_auth_required)'` (the 1 skipped test is a pre-existing TOCTOU port-bind race in `shux-rpc::server::tests::test_tcp_auth_required` — unrelated to PR 2a, file an issue separately).
+- Dash updated with new "PR 2a — `events.watch`" section pointing at the 5 fresh screenshots.
 
 **2026-05-10 — PROGRESS.md sweep + dash retitle ("Road to shux 1.0.0")**
 - Task table was significantly behind reality after the recent PR train (#3–#7). Audited every M1 task against the codebase and recent commits, then updated:
@@ -361,7 +387,7 @@
 | 033 | Help overlay (keybinding cheat sheet) | M1 | **Done** | 032 |
 | 034 | M1 integration and quality gate | M1 | Pending | 013–033 |
 | 035 | Complete JSON-RPC API surface | M2 | Pending | 034 |
-| 036 | Event stream (events.watch) | M2 | Pending | 035, 007 |
+| 036 | Event stream (events.watch) | M2 | **Done** ⁴ | 035, 007 |
 | 037 | Optimistic concurrency and ensure operations | M2 | Pending | 035 |
 | 038 | Plugin host: wasmtime integration | M2 | Pending | 034 |
 | 039 | Plugin permissions and sandbox | M2 | Pending | 038 |
@@ -394,3 +420,5 @@
 ² **Task 028 Partial:** daemon claims `TERM_PROGRAM=shux`, `TERM_PROGRAM_VERSION=<pkg ver>`, `COLORTERM=truecolor`, `SHUX=1` on every PTY spawn. Real cap negotiation (DA2 / XTVERSION / Kitty keyboard query / OSC 4 palette probe stored as a per-client `ClientCaps` and gating Mode 2026, OSC 8, OSC 52, true color) is still pending.
 
 ³ **Task 018 Partial** (caught by Codex review of PR #8): `attach.rs::key_to_bare_action` ships Alt+Enter, Alt+|/\\, Alt+-, Alt+arrows, Alt+z, Alt+x, Alt+Tab. Per PRD §9.1, **bare Alt+h/j/k/l, bare Alt+n/p, and Alt+1..9 are still missing** as Tier-1 bindings (the hjkl/n/p variants today only work after the Ctrl+Space prefix). Small follow-up — one match arm in `key_to_bare_action`. Lives with the M1 quality gate (034) or a focused 018-followup PR.
+
+⁴ **Task 036 Done (control plane only):** `events.watch` and `events.history` RPC methods + `shux events watch` / `shux events history` CLI subcommands + 14 lifecycle event publish sites in `SessionGraph`. **`PaneOutput` events are explicitly out of scope for this task** — Codex+Gemini council review identified that putting raw PTY bytes on the main `EventBus` is both a secret leak (replayable via `events.history`) and a DoS vector for control events (saturates the broadcast channel under `cat large.log`). Sampled `pane.output` notifications with proper data-plane separation are queued as PR 2c (a follow-up "036b"). Optimistic concurrency on mutating RPCs lives with task 037 (PR 2b — version stamps already in event metadata so PR 2b is small).

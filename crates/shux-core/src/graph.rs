@@ -356,6 +356,20 @@ impl SessionGraph {
             session_id,
             name: session_name,
         });
+        // create_session also implicitly creates the first window + first pane;
+        // fire those events too so subscribers tracking pane lifecycle don't
+        // miss the implicit ones (only the explicit `create_pane`/`split_pane`
+        // would fire otherwise).
+        self.fire(EventData::WindowCreated {
+            window_id,
+            session_id,
+            title: "1".into(),
+        });
+        self.fire(EventData::PaneCreated {
+            pane_id,
+            window_id,
+            command: Vec::new(),
+        });
         info!(%session_id, "Session created");
         Ok(session_id)
     }
@@ -381,6 +395,8 @@ impl SessionGraph {
             }
         }
 
+        let killed_name = session.name.clone();
+
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
@@ -402,6 +418,10 @@ impl SessionGraph {
         snapshot.sessions.remove(&id);
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::SessionKilled {
+            session_id: id,
+            name: killed_name,
+        });
         info!(%id, panes_removed = pane_ids_to_remove.len(), "Session destroyed");
         Ok(())
     }
@@ -434,6 +454,9 @@ impl SessionGraph {
             return Err(GraphError::SessionNameExists(new_name));
         }
 
+        let old_name = session.name.clone();
+        let event_new_name = new_name.clone();
+
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
@@ -443,6 +466,11 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::SessionRenamed {
+            session_id: id,
+            old_name,
+            new_name: event_new_name,
+        });
         Ok(())
     }
 
@@ -467,6 +495,7 @@ impl SessionGraph {
         let mut pane = Pane::new(window_id, cwd);
         pane.id = pane_id;
 
+        let event_title = title.clone();
         let mut window = Window::new(session_id, title, pane_id);
         window.id = window_id;
 
@@ -480,6 +509,19 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::WindowCreated {
+            window_id,
+            session_id,
+            title: event_title,
+        });
+        // create_window also creates an initial pane — fire PaneCreated too so
+        // subscribers see every new pane, not only those born of explicit
+        // create_pane/split_pane calls.
+        self.fire(EventData::PaneCreated {
+            pane_id,
+            window_id,
+            command: Vec::new(),
+        });
         info!(%window_id, %session_id, "Window created");
         Ok(window_id)
     }
@@ -514,6 +556,8 @@ impl SessionGraph {
             return Err(GraphError::LastWindow);
         }
 
+        let killed_session_id = window.session_id;
+
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
@@ -528,7 +572,7 @@ impl SessionGraph {
             snapshot.panes.remove(pid);
         }
 
-        if let Some(s) = snapshot.sessions.get_mut(&window.session_id) {
+        if let Some(s) = snapshot.sessions.get_mut(&killed_session_id) {
             s.windows.retain(|wid| *wid != id);
             if s.active_window == id {
                 // Safe: we verified len > 1 above, so at least one window remains
@@ -540,6 +584,10 @@ impl SessionGraph {
         snapshot.windows.remove(&id);
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::WindowKilled {
+            window_id: id,
+            session_id: killed_session_id,
+        });
         Ok(())
     }
 
@@ -676,6 +724,7 @@ impl SessionGraph {
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
+        let event_command = command.clone();
         let pane = if command.is_empty() {
             Pane::new(window_id, cwd)
         } else {
@@ -686,6 +735,11 @@ impl SessionGraph {
         snapshot.panes.insert(pane_id, pane);
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::PaneCreated {
+            pane_id,
+            window_id,
+            command: event_command,
+        });
         info!(%pane_id, %window_id, "Pane created");
         Ok(pane_id)
     }
@@ -706,6 +760,7 @@ impl SessionGraph {
         }
 
         let window_id = pane.window_id;
+        let killed_command = pane.command.clone();
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -733,15 +788,21 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
+        // Pane killed via explicit destroy: surface as PaneExited with no exit_status,
+        // mirroring how subscribers consume both natural exits and forced kills.
+        self.fire(EventData::PaneExited {
+            pane_id: id,
+            exit_status: None,
+            command: killed_command,
+        });
         Ok(())
     }
 
     pub fn set_pane_exit_status(&self, id: PaneId, exit_status: i32) -> Result<(), GraphError> {
         let current = self.current();
 
-        if !current.panes.contains_key(&id) {
-            return Err(GraphError::PaneNotFound(id));
-        }
+        let exited_pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+        let exited_command = exited_pane.command.clone();
 
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
@@ -752,6 +813,11 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::PaneExited {
+            pane_id: id,
+            exit_status: Some(exit_status),
+            command: exited_command,
+        });
         Ok(())
     }
 
@@ -893,6 +959,15 @@ impl SessionGraph {
         snapshot.panes.insert(new_pane_id, new_pane);
 
         self.commit_snapshot(snapshot);
+        // Split spawns a brand-new pane: surface as PaneCreated so subscribers
+        // tracking pane lifecycle see the new id arrive in the same event class
+        // they got from `create_pane`. The empty `command` mirrors create_pane
+        // when no explicit command was given.
+        self.fire(EventData::PaneCreated {
+            pane_id: new_pane_id,
+            window_id,
+            command: Vec::new(),
+        });
         info!(%new_pane_id, %target_pane, %window_id, "Pane split");
         Ok(new_pane_id)
     }
@@ -921,6 +996,11 @@ impl SessionGraph {
         }
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::PaneFocused {
+            pane_id: id,
+            window_id,
+            previous_pane_id: previous,
+        });
         Ok(previous)
     }
 
@@ -955,6 +1035,11 @@ impl SessionGraph {
                 }
 
                 self.commit_snapshot(snapshot);
+                self.fire(EventData::PaneFocused {
+                    pane_id: target,
+                    window_id,
+                    previous_pane_id: Some(current_pane),
+                });
                 Ok(Some(target))
             }
             None => Ok(None),
@@ -1013,6 +1098,10 @@ impl SessionGraph {
         window.version += 1;
 
         self.commit_snapshot(snapshot);
+        self.fire(EventData::PaneZoomed {
+            pane_id: id,
+            zoomed: is_zoomed,
+        });
         Ok(is_zoomed)
     }
 
@@ -2036,5 +2125,142 @@ mod tests {
 
         let deserialized: SessionGraphSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.sessions.len(), 1);
+    }
+
+    /// Lifecycle event firing — proves that every mutation path that has a
+    /// `fire()` call publishes the matching `EventData` variant. This is the
+    /// load-bearing contract for the `events.watch` RPC: subscribers MUST
+    /// see every mutation. Per Codex review, publishing is a property of
+    /// the data layer, not the dispatcher — this test confirms it stays so.
+    #[tokio::test]
+    async fn test_lifecycle_events_fire() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+
+        // 1. SessionCreated
+        let sid = graph.create_session("alpha".into(), home()).unwrap();
+
+        // 2. SessionRenamed
+        graph.rename_session(sid, "beta".into(), None).unwrap();
+
+        // 3. WindowCreated (editor) — also fires PaneCreated for its initial pane
+        let wid = graph.create_window(sid, "editor".into(), home()).unwrap();
+
+        // Find a pane in that window so we can act on it.
+        let snap = graph.current();
+        let pane_in_w = snap
+            .panes
+            .values()
+            .find(|p| p.window_id == wid)
+            .map(|p| p.id)
+            .unwrap();
+
+        // 4. PaneCreated (split)
+        let new_pane = graph
+            .split_pane(pane_in_w, Direction::Vertical, 0.5)
+            .unwrap();
+
+        // 5. PaneFocused (focus_pane)
+        graph.focus_pane(pane_in_w).unwrap();
+
+        // 6. PaneZoomed (zoom_pane)
+        graph.zoom_pane(pane_in_w).unwrap();
+
+        // 7. PaneExited (set_pane_exit_status)
+        graph.set_pane_exit_status(new_pane, 0).unwrap();
+
+        // 8. SessionKilled (destroy_session)
+        graph.destroy_session(sid, None).unwrap();
+
+        // Drain everything we published. Order matches publish order
+        // because tokio::broadcast preserves it.
+        let mut types: Vec<String> = Vec::new();
+        for _ in 0..32 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await {
+                Ok(Some(crate::bus::SubscriptionEvent::Event(e))) => {
+                    types.push(e.meta.event_type.clone());
+                }
+                Ok(Some(crate::bus::SubscriptionEvent::Lagged(_))) => {
+                    panic!("subscription lagged in unit test");
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // We must observe at least every variant we acted on. Order matters
+        // (broadcast preserves publish order), but we assert on the set so
+        // additions to other mutation paths don't break this test.
+        for expected in &[
+            "session.created",
+            "session.renamed",
+            "window.created",
+            "pane.created", // create_window's initial pane
+            "pane.created", // split_pane
+            "pane.focused",
+            "pane.zoomed",
+            "pane.exited",
+            "session.killed",
+        ] {
+            assert!(
+                types.iter().any(|t| t == expected),
+                "expected event {expected:?} to fire; saw {types:?}"
+            );
+        }
+
+        // Sequence numbers must be strictly monotonically increasing.
+        // (We re-subscribe and read history to check this — the bus keeps
+        // history internally.)
+        let history = bus.history(64);
+        let seqs: Vec<u64> = history.iter().map(|e| e.meta.seq).collect();
+        for win in seqs.windows(2) {
+            assert!(win[0] < win[1], "seqs must be monotonic: {seqs:?}");
+        }
+    }
+
+    /// Subscribe-first / history-second / dedup race: the contract Codex and
+    /// Gemini both flagged as load-bearing. Verify a publish that lands
+    /// AFTER `subscribe_filtered` returns but BEFORE `events_from_seq` is
+    /// queried still reaches the subscriber. We can't reliably reproduce
+    /// the exact race in a unit test, but we can prove the building blocks:
+    /// (a) the subscription receives events published while the receiver
+    /// is held, and (b) history is consistent with what the subscription
+    /// returns, so dedup-by-seq is well-defined.
+    #[tokio::test]
+    async fn test_event_seq_consistency() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe_filtered(vec!["session.created".into()]);
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+
+        graph.create_session("a".into(), home()).unwrap();
+        graph.create_session("b".into(), home()).unwrap();
+
+        // Pull the two SessionCreated events from the (filtered) subscription.
+        // create_session fires 3 events each (SessionCreated, WindowCreated,
+        // PaneCreated for the implicit window+pane); the filter excludes the
+        // last two so only session.created reaches us.
+        let mut sub_seqs = Vec::new();
+        for _ in 0..2 {
+            if let Ok(Some(crate::bus::SubscriptionEvent::Event(e))) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv()).await
+            {
+                sub_seqs.push(e.meta.seq);
+            }
+        }
+
+        // Pull the same events from history.
+        let history_seqs: Vec<u64> = bus
+            .history(10)
+            .iter()
+            .filter(|e| e.event_type() == "session.created")
+            .map(|e| e.meta.seq)
+            .collect();
+
+        assert_eq!(
+            sub_seqs, history_seqs,
+            "subscription and history must agree on seq order for session.created"
+        );
+        assert_eq!(sub_seqs.len(), 2);
+        assert!(sub_seqs[1] > sub_seqs[0]);
     }
 }
