@@ -1,3 +1,10 @@
+# [0.3.0](https://github.com/indrasvat/shux/compare/v0.2.0...v0.3.0) (2026-05-10)
+
+
+### Features
+
+* **events:** events.watch + events.history RPC + CLI (task 036, PR 2a) ([#9](https://github.com/indrasvat/shux/issues/9)) ([6bc0e04](https://github.com/indrasvat/shux/commit/6bc0e046c61e937e304cfbf2d3406c550ec0b0d2)), closes [3-#7](https://github.com/3-/issues/7) [#7](https://github.com/indrasvat/shux/issues/7) [#4](https://github.com/indrasvat/shux/issues/4) [#6](https://github.com/indrasvat/shux/issues/6) [hi#volume](https://github.com/hi/issues/volume)
+
 # Changelog
 
 All notable changes to shux are documented here. The format follows
