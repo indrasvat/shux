@@ -157,6 +157,23 @@ strong { color: var(--ink); font-weight: 600; }
   border-color: var(--line-paper);
   color: var(--ink-on-paper);
 }
+
+/* Belt-and-braces fallback: some mobile browsers handle `:not(pre code)`
+   inconsistently. Re-state the paper-inline-code colour at the
+   commonly-affected hosts so the cascade can't miss it. */
+.section.invert .kv-list .v,
+.section.invert .versus li,
+.section.invert .lede,
+.section.invert p {
+  color: var(--ink2-on-paper);
+}
+.section.invert .kv-list .v code,
+.section.invert .versus li code,
+.section.invert p code {
+  background: rgba(29,24,19,0.06);
+  border-color: var(--line-paper);
+  color: var(--ink-on-paper);
+}
 .section.invert pre {
   background: #fdf9f0;
   border-color: var(--line-paper);

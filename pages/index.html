@@ -169,11 +169,11 @@
 .kv-list { list-style: none; padding: 0; margin: var(--s-4) 0 0; font-size: 13px; }
 .kv-list li {
   display: flex; gap: var(--s-3); padding: 8px 0;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--line-paper);
 }
 .kv-list li:first-child { border-top: 0; padding-top: 0; }
-.kv-list .k { flex: 0 0 36%; color: var(--ink-3); font-family: var(--font-mono); font-size: 12px; }
-.kv-list .v { color: var(--ink); }
+.kv-list .k { flex: 0 0 36%; color: var(--ink2-on-paper); font-family: var(--font-mono); font-size: 12px; opacity: 0.75; }
+.kv-list .v { color: var(--ink-on-paper); }
 
 /* ── Comparison: shux vs tmux ── */
 .versus {
@@ -213,9 +213,9 @@
 .versus .col.win li::before { color: var(--accent); opacity: 0.9; }
 .versus .respect {
   margin-top: var(--s-4);
-  font-family: var(--font-mono); font-size: 11px;
-  color: var(--ink2-on-paper); opacity: 0.7;
-  letter-spacing: 0.02em;
+  font-family: var(--font-sans); font-size: 13px;
+  font-style: italic; color: var(--ink2-on-paper); opacity: 0.85;
+  line-height: 1.5;
 }
 
 /* ── Showcase gallery ── */
@@ -534,9 +534,9 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
         <ul>
           <li>Length-prefixed JSON-RPC over UDS + TCP. Every CLI verb is a typed call.</li>
           <li>Declarative workspace templates that apply atomically.</li>
-          <li>Optimistic concurrency on every entity. Conflicts surface as <code>-32002</code>.</li>
-          <li>Sealed event bus, sequenced, gap-detectable. Data plane for PTY chunks.</li>
-          <li>Built-in rasterizer. <code>pane.snapshot</code> returns PNG bytes.</li>
+          <li>Optimistic concurrency on every entity — stale writes get rejected with a typed conflict error.</li>
+          <li>Sealed event bus, sequenced, gap-detectable. Separate data plane for PTY chunks.</li>
+          <li>Built-in rasterizer — one RPC returns PNG bytes of any live pane.</li>
           <li>Synchronous resize: the next snapshot sees the new dims, guaranteed.</li>
         </ul>
         <p class="respect">If you're shipping agents, building TUIs, or want headless visual regression, this is for you.</p>
