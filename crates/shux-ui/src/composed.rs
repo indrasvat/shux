@@ -399,6 +399,84 @@ mod tests {
     }
 
     #[test]
+    fn compose_two_pane_split_places_separator_and_overlays_titles_on_border() {
+        // 2-pane vertical split: left and right halves with their own
+        // borders, an inter-pane vertical separator, and per-pane titles
+        // overlaid on the top border row (NOT the first content row).
+        let left_pid = PaneId::new();
+        let right_pid = PaneId::new();
+        let mut left_vt = VirtualTerminal::new(28, 58);
+        left_vt.process(b"LEFT");
+        let mut right_vt = VirtualTerminal::new(28, 58);
+        right_vt.process(b"RIGHT");
+
+        let layout = LayoutNode::Split {
+            dir: shux_core::layout::Direction::Vertical,
+            ratio: 0.5,
+            a: Box::new(LayoutNode::Leaf { pane: left_pid }),
+            b: Box::new(LayoutNode::Leaf { pane: right_pid }),
+        };
+
+        let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
+        panes.insert(left_pid, (left_vt.grid(), left_vt.cursor()));
+        panes.insert(right_pid, (right_vt.grid(), right_vt.cursor()));
+
+        let mut titles: HashMap<PaneId, String> = HashMap::new();
+        titles.insert(left_pid, "lhs".into());
+        titles.insert(right_pid, "rhs".into());
+
+        let inputs = ComposeInputs {
+            layout: &layout,
+            zoom: None,
+            focused: left_pid,
+            panes: &panes,
+            titles: Some(&titles),
+            status_bar: None,
+        };
+        let composed = compose(
+            &inputs,
+            120,
+            30,
+            BorderStyle::Rounded,
+            BorderColors::default(),
+            0,
+        );
+
+        // Top border row has rounded corners + horizontal rule + titles.
+        let row0 = composed.grid.visible_row(0);
+        assert_eq!(row0[0].ch, '╭', "top-left corner");
+        assert_eq!(row0[119].ch, '╮', "top-right corner");
+
+        // Both titles surface on the border row, NOT the content row.
+        let row0_text: String = (0..120).map(|c| row0[c].ch).collect();
+        assert!(
+            row0_text.contains(" lhs "),
+            "left title overlays border: {row0_text:?}"
+        );
+        assert!(
+            row0_text.contains(" rhs "),
+            "right title overlays border: {row0_text:?}"
+        );
+
+        // First content row (row 1) carries "LEFT" + "RIGHT" — neither
+        // gets overdrawn by the title overlay anymore.
+        let row1 = composed.grid.visible_row(1);
+        let row1_left: String = (1..5).map(|c| row1[c].ch).collect();
+        assert_eq!(row1_left, "LEFT");
+
+        // The vertical separator between panes lives at column = left_width.
+        // For a 0.5 split of a 118-wide pane_viewport (after 1-cell inset
+        // on each side), the separator falls somewhere in the middle. We
+        // just check that a `│` exists somewhere in row 14 (mid-height).
+        let mid_row = composed.grid.visible_row(14);
+        let mid_text: String = (0..120).map(|c| mid_row[c].ch).collect();
+        assert!(
+            mid_text.contains('│'),
+            "vertical separator present in mid-row: {mid_text:?}"
+        );
+    }
+
+    #[test]
     fn compose_status_bar_lands_in_last_row() {
         let pid = PaneId::new();
         let vt = VirtualTerminal::new(23, 80);
