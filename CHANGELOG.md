@@ -1,3 +1,10 @@
+## [0.7.1](https://github.com/indrasvat/shux/compare/v0.7.0...v0.7.1) (2026-05-11)
+
+
+### Bug Fixes
+
+* post-merge cleanup — persist session.create command + nextest retries ([#15](https://github.com/indrasvat/shux/issues/15)) ([c5e27a6](https://github.com/indrasvat/shux/commit/c5e27a626a981ca670f4cd2b3d8f1e82794d9323)), closes [#14](https://github.com/indrasvat/shux/issues/14) [#10](https://github.com/indrasvat/shux/issues/10)
+
 # [0.7.0](https://github.com/indrasvat/shux/compare/v0.6.0...v0.7.0) (2026-05-11)
 
 
