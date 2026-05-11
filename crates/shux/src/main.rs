@@ -35,6 +35,11 @@ pub struct PaneIoState {
     /// flush. Bumped after every PTY read so the renderer can wake up
     /// promptly (instead of polling a fixed interval).
     pub render_pulse: Arc<tokio::sync::Notify>,
+    /// PR 2c — data-plane publisher. The per-pane PTY task forwards
+    /// sampled PTY chunks here via `publish_pane_output`. `None` in
+    /// test harnesses that don't wire an event bus. Cheap to clone
+    /// (Arc internally).
+    pub event_bus: Option<shux_core::bus::EventBus>,
 }
 
 impl Default for PaneIoState {
@@ -51,7 +56,13 @@ impl PaneIoState {
             vts: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: Arc::new(tokio::sync::Notify::new()),
+            event_bus: None,
         }
+    }
+
+    pub fn with_event_bus(mut self, bus: shux_core::bus::EventBus) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 }
 
@@ -69,12 +80,28 @@ async fn run_pane_pty_task(
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
 ) {
+    use base64::Engine;
     let mut buf = vec![0u8; 8192];
     // Track the last OSC title we forwarded to the graph so we only
     // call set_pane_osc_title when it actually changes. bash's
     // PROMPT_COMMAND re-emits OSC 2 on every prompt; without this
     // local diff we'd flood the graph + event bus.
     let mut last_osc_title: Option<String> = None;
+
+    // PR 2c — sampled pane.output data-plane publishing.
+    //
+    // Coalesce PTY chunks into a single broadcast per
+    // `output_sample_interval`. Without this rate limit a noisy pane
+    // (npm install, cargo build, tail -F) would saturate the data-plane
+    // channel and lag every subscriber. Trade-off: subscribers see at
+    // most ~10 chunks/sec/pane and `sampled=true` whenever bytes were
+    // dropped between intervals.
+    let output_sample_interval = std::time::Duration::from_millis(100);
+    let mut output_pending: Vec<u8> = Vec::new();
+    let mut output_last_published_at = std::time::Instant::now()
+        .checked_sub(output_sample_interval)
+        .unwrap_or_else(std::time::Instant::now);
+    let mut output_dropped_any = false;
 
     loop {
         tokio::select! {
@@ -86,7 +113,7 @@ async fn run_pane_pty_task(
                     }
                     Ok(n) => {
                         let data = &buf[..n];
-                        let (pulse, vt_title) = {
+                        let (pulse, vt_title, bus_opt) = {
                             let mut state = io_state.lock().await;
                             let vt_title = if let Some(vt) = state.vts.get_mut(&pane_id) {
                                 vt.process(data);
@@ -96,8 +123,64 @@ async fn run_pane_pty_task(
                             };
                             let output = String::from_utf8_lossy(data);
                             let _completed = state.cmd_engine.process_output(pane_id.0, &output);
-                            (state.render_pulse.clone(), vt_title)
+                            (
+                                state.render_pulse.clone(),
+                                vt_title,
+                                state.event_bus.clone(),
+                            )
                         };
+
+                        // Stage these bytes for the next sampled publish.
+                        // We cap the buffered chunk at 64KB to avoid
+                        // unbounded growth if the sampling interval
+                        // races with a huge burst of output — anything
+                        // older gets dropped (sampled=true signals that).
+                        const MAX_PENDING: usize = 64 * 1024;
+                        if output_pending.len() + data.len() > MAX_PENDING {
+                            let overflow =
+                                output_pending.len() + data.len() - MAX_PENDING;
+                            let drop = overflow.min(output_pending.len());
+                            output_pending.drain(..drop);
+                            output_dropped_any = true;
+                        }
+                        output_pending.extend_from_slice(data);
+                        // Publish if the sample interval has elapsed AND
+                        // there's a bus + at least one buffered byte.
+                        if let Some(bus) = bus_opt {
+                            let now = std::time::Instant::now();
+                            if !output_pending.is_empty()
+                                && now.duration_since(output_last_published_at)
+                                    >= output_sample_interval
+                            {
+                                // Resolve (window_id, session_id) outside
+                                // the io_state lock to avoid holding it
+                                // across the broadcast send.
+                                let snap = graph.snapshot();
+                                let pane = snap.panes.get(&pane_id);
+                                if let Some(p) = pane {
+                                    let wid = p.window_id;
+                                    let sid = snap
+                                        .windows
+                                        .get(&wid)
+                                        .map(|w| w.session_id);
+                                    if let Some(sid) = sid {
+                                        let chunk = std::mem::take(&mut output_pending);
+                                        let b64 =
+                                            base64::engine::general_purpose::STANDARD
+                                                .encode(&chunk);
+                                        bus.publish_pane_output(
+                                            pane_id,
+                                            wid,
+                                            sid,
+                                            b64,
+                                            output_dropped_any,
+                                        );
+                                        output_last_published_at = now;
+                                        output_dropped_any = false;
+                                    }
+                                }
+                            }
+                        }
                         // Wake any attach-render loops outside the lock.
                         // notify_one queues a permit that survives even if
                         // the renderer happens to be mid-render and not
@@ -354,8 +437,14 @@ async fn run_rpc_server(
         shux_core::graph::run_graph_loop(graph, graph_rx, graph_cancel).await;
     });
 
-    // Create shared pane I/O state (PTY writers, VTs, command engine)
-    let io_state = Arc::new(Mutex::new(PaneIoState::new()));
+    // Create shared pane I/O state (PTY writers, VTs, command engine,
+    // data-plane publisher). The event bus is the SAME bus the
+    // control-plane events.watch RPC reads — but per-pane output
+    // chunks land on its data plane, separate from
+    // `events.history`. See `docs/PR2c-DESIGN.md`.
+    let io_state = Arc::new(Mutex::new(
+        PaneIoState::new().with_event_bus(event_bus.clone()),
+    ));
 
     // Load user config (~/.config/shux/config.toml). Missing file is
     // valid — defaults match current hardcoded behavior. Spawn a watcher
@@ -710,7 +799,8 @@ fn register_events_methods(
     bus: shux_core::bus::EventBus,
 ) -> shux_rpc::RouterBuilder {
     let bus_watch = bus.clone();
-    let bus_hist = bus;
+    let bus_hist = bus.clone();
+    let bus_pane_output = bus;
 
     builder
         .register("events.watch", move |params: Option<serde_json::Value>| {
@@ -844,6 +934,115 @@ fn register_events_methods(
                     Ok(serde_json::json!({
                         "events": json,
                         "current_seq": bus.current_seq(),
+                    }))
+                }
+            },
+        )
+        .register(
+            "pane.output.watch",
+            // PR 2c — sampled pane.output data-plane watch.
+            //
+            // Long-polls the data-plane broadcast channel for chunks
+            // matching the given `pane_id`. Unlike `events.watch`,
+            // there is no history snapshot — the data plane is
+            // intentionally lossy to prevent secret leak via stored
+            // PTY bytes and to give control-plane subscribers
+            // priority. See `docs/PR2c-DESIGN.md`.
+            move |params: Option<serde_json::Value>| {
+                let bus = bus_pane_output.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id_str =
+                        params
+                            .get("pane_id")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::invalid_params("missing 'pane_id' parameter")
+                            })?;
+                    let pane_id: shux_core::model::PaneId = pane_id_str.parse().map_err(|_| {
+                        shux_rpc::RpcError::invalid_params("invalid pane_id format")
+                    })?;
+                    let from_seq = params.get("from_seq").and_then(|v| v.as_u64());
+                    let timeout_ms = params
+                        .get("timeout_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(5_000)
+                        .clamp(100, 30_000);
+                    let limit = params
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .unwrap_or(50)
+                        .min(500);
+
+                    // Subscribe BEFORE returning any chunks so a chunk
+                    // published while we're parsing params doesn't get
+                    // missed. The data plane has no history, so the
+                    // subscribe-first invariant from events.watch
+                    // applies even more strictly here.
+                    let mut sub = bus.subscribe_pane_output();
+
+                    let mut collected: Vec<shux_core::bus::PaneOutputEvent> = Vec::new();
+                    let mut lagged = false;
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+                    while collected.len() < limit {
+                        let now = tokio::time::Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let remaining = deadline - now;
+                        match tokio::time::timeout(remaining, sub.recv()).await {
+                            Ok(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c))) => {
+                                if c.pane_id != pane_id {
+                                    continue; // not for this subscriber
+                                }
+                                if let Some(s) = from_seq {
+                                    if c.seq < s {
+                                        continue;
+                                    }
+                                }
+                                collected.push(c);
+                            }
+                            Ok(Some(shux_core::bus::PaneOutputSubscriptionEvent::Lagged(_))) => {
+                                lagged = true;
+                                break;
+                            }
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+
+                    let next_seq = collected
+                        .last()
+                        .map(|c| c.seq + 1)
+                        .or(from_seq)
+                        .unwrap_or_else(|| bus.current_data_seq());
+
+                    let chunks: Vec<serde_json::Value> = collected
+                        .into_iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "seq": c.seq,
+                                "pane_id": c.pane_id.to_string(),
+                                "window_id": c.window_id.to_string(),
+                                "session_id": c.session_id.to_string(),
+                                "timestamp": c
+                                    .timestamp
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0),
+                                "bytes": c.bytes,
+                                "sampled": c.sampled,
+                            })
+                        })
+                        .collect();
+
+                    Ok(serde_json::json!({
+                        "chunks": chunks,
+                        "next_seq": next_seq,
+                        "lagged": lagged,
                     }))
                 }
             },
@@ -2611,6 +2810,22 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         clear,
                         auto,
                         no_auto,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Watch {
+                    session,
+                    pane,
+                    timeout_ms,
+                    limit,
+                } => {
+                    cli::handle_pane_watch(
+                        &mut stream,
+                        &session,
+                        &pane,
+                        timeout_ms,
+                        limit,
                         args.format,
                     )
                     .await

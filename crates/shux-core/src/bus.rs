@@ -15,20 +15,56 @@ use std::time::SystemTime;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
+use serde::{Deserialize, Serialize};
+
 use crate::event::{Event, EventData, EventMetadata};
+use crate::model::{PaneId, SessionId, WindowId};
+
+/// A chunk of PTY output for one pane (PR 2c — data plane).
+///
+/// Carries up to `sample_interval`-worth of bytes coalesced into one
+/// payload. Lives ONLY on the data plane — `events.history` and
+/// `events.watch` never see these. See `docs/PR2c-DESIGN.md` for the
+/// design rationale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneOutputEvent {
+    /// Monotonic sequence on the data plane. Independent from
+    /// control-plane `Event.meta.seq`.
+    pub seq: u64,
+    pub pane_id: PaneId,
+    pub window_id: WindowId,
+    pub session_id: SessionId,
+    pub timestamp: SystemTime,
+    /// Base64-encoded raw bytes that landed on the PTY during this
+    /// sampling interval. May include partial UTF-8 sequences —
+    /// callers must decode lossily or buffer.
+    pub bytes: String,
+    /// Whether this chunk dropped bytes between `last_published_at`
+    /// and now (true) or carries every byte verbatim (false).
+    pub sampled: bool,
+}
 
 /// Configuration for the event bus.
 #[derive(Debug, Clone)]
 pub struct EventBusConfig {
-    /// Capacity of the broadcast channel.
+    /// Capacity of the control-plane broadcast channel (lifecycle
+    /// events: session/window/pane created/killed/renamed/etc.).
     /// When exceeded, oldest events are dropped for slow subscribers.
     /// Default: 4096.
     pub broadcast_capacity: usize,
 
-    /// Maximum number of events to keep in the history ring buffer.
-    /// Used for `events.history` API and `from_seq` resumption.
-    /// Default: 8192.
+    /// Maximum number of events to keep in the control-plane history
+    /// ring buffer. Used for `events.history` API and `from_seq`
+    /// resumption. Default: 8192.
     pub history_capacity: usize,
+
+    /// Capacity of the data-plane broadcast channel (PR 2c — sampled
+    /// PTY output chunks). Naturally burstier than the control plane,
+    /// so this is larger. Data plane has NO history (see
+    /// `PR2c-DESIGN.md`): subscribers can only ever read live chunks,
+    /// removing the secret-leak vector.
+    /// Default: 16384.
+    pub data_plane_capacity: usize,
 }
 
 impl Default for EventBusConfig {
@@ -36,6 +72,7 @@ impl Default for EventBusConfig {
         EventBusConfig {
             broadcast_capacity: 4096,
             history_capacity: 8192,
+            data_plane_capacity: 16384,
         }
     }
 }
@@ -50,12 +87,23 @@ pub struct EventBus {
 }
 
 struct EventBusInner {
-    /// The broadcast sender.
+    /// Control-plane broadcast sender. Carries the typed
+    /// `Event` (`session.created`, `pane.exited`, etc.).
     sender: broadcast::Sender<Event>,
-    /// Monotonically increasing sequence counter.
+    /// Monotonically increasing control-plane sequence counter.
     seq_counter: AtomicU64,
-    /// Ring buffer of recent events for history queries and from_seq resumption.
+    /// Ring buffer of recent control-plane events. Backs
+    /// `events.history` API and `from_seq` resumption.
     history: RwLock<EventHistory>,
+
+    /// Data-plane broadcast sender. Carries sampled `PaneOutputEvent`
+    /// chunks (PR 2c). Deliberately NOT mirrored to history — see
+    /// `PR2c-DESIGN.md` for the secret-leak / DoS rationale.
+    data_plane: broadcast::Sender<PaneOutputEvent>,
+    /// Monotonically increasing data-plane sequence counter. Separate
+    /// from control plane so subscribers gap-detect each independently.
+    data_seq_counter: AtomicU64,
+
     /// Configuration (kept for introspection).
     #[allow(dead_code)]
     config: EventBusConfig,
@@ -148,11 +196,14 @@ impl EventBus {
     /// Create a new event bus with custom configuration.
     pub fn with_config(config: EventBusConfig) -> Self {
         let (sender, _) = broadcast::channel(config.broadcast_capacity);
+        let (data_plane, _) = broadcast::channel(config.data_plane_capacity);
         EventBus {
             inner: Arc::new(EventBusInner {
                 sender,
                 seq_counter: AtomicU64::new(1), // Start at 1 so 0 means "no events seen".
                 history: RwLock::new(EventHistory::new(config.history_capacity)),
+                data_plane,
+                data_seq_counter: AtomicU64::new(1),
                 config,
             }),
         }
@@ -255,6 +306,50 @@ impl EventBus {
         self.inner.seq_counter.load(Ordering::Relaxed)
     }
 
+    /// Publish a pane output chunk to the data plane (PR 2c).
+    ///
+    /// Bypasses history entirely. Returns the assigned data-plane seq.
+    /// `bytes_b64` should already be base64-encoded by the caller —
+    /// keeps the bus from imposing a base64 dependency on consumers
+    /// that just want to forward bytes verbatim.
+    pub fn publish_pane_output(
+        &self,
+        pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
+        bytes_b64: String,
+        sampled: bool,
+    ) -> u64 {
+        let seq = self.inner.data_seq_counter.fetch_add(1, Ordering::Relaxed);
+        let event = PaneOutputEvent {
+            seq,
+            pane_id,
+            window_id,
+            session_id,
+            timestamp: SystemTime::now(),
+            bytes: bytes_b64,
+            sampled,
+        };
+        // No subscribers is fine; data plane has NO history so the
+        // chunk is simply dropped (this is the design — see PR2c-DESIGN.md).
+        let _ = self.inner.data_plane.send(event);
+        seq
+    }
+
+    /// Subscribe to the data plane (PR 2c). Each `PaneOutputSubscription`
+    /// is independent; the caller is responsible for filtering by
+    /// `pane_id` if they only care about one pane.
+    pub fn subscribe_pane_output(&self) -> PaneOutputSubscription {
+        PaneOutputSubscription {
+            receiver: self.inner.data_plane.subscribe(),
+        }
+    }
+
+    /// Current data-plane sequence number.
+    pub fn current_data_seq(&self) -> u64 {
+        self.inner.data_seq_counter.load(Ordering::Relaxed)
+    }
+
     /// Get the number of active subscribers.
     pub fn subscriber_count(&self) -> usize {
         self.inner.sender.receiver_count()
@@ -332,14 +427,50 @@ impl Subscription {
         self.filters.iter().any(|f| event.matches_filter(f))
     }
 
-    /// Change the filters for this subscription.
+    /// Update the filters in-place. Used by `events.watch` to swap the
+    /// subscriber's filter list mid-stream.
     pub fn set_filters(&mut self, filters: Vec<String>) {
         self.filters = filters;
     }
 }
 
+/// Subscription to the data plane (PR 2c — PTY output chunks).
+///
+/// Unlike `Subscription`, there's no filter list: data-plane events
+/// are typed `PaneOutputEvent`s, and callers filter by `pane_id`
+/// field directly. This keeps the bus from caring about routing
+/// policy.
+pub struct PaneOutputSubscription {
+    receiver: broadcast::Receiver<PaneOutputEvent>,
+}
+
+#[derive(Debug)]
+pub enum PaneOutputSubscriptionEvent {
+    Chunk(PaneOutputEvent),
+    /// Subscriber fell behind the broadcast channel; the number of
+    /// dropped chunks is reported so callers can decide whether to
+    /// log it or surface it.
+    Lagged(u64),
+}
+
+impl PaneOutputSubscription {
+    /// Receive the next chunk, waiting asynchronously.
+    pub async fn recv(&mut self) -> Option<PaneOutputSubscriptionEvent> {
+        match self.receiver.recv().await {
+            Ok(chunk) => Some(PaneOutputSubscriptionEvent::Chunk(chunk)),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(count = n, "pane-output subscriber lagged");
+                Some(PaneOutputSubscriptionEvent::Lagged(n))
+            }
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::event::EventData;
     use crate::model::{PaneId, SessionId, WindowId};
@@ -576,6 +707,7 @@ mod tests {
         let config = EventBusConfig {
             broadcast_capacity: 16,
             history_capacity: 3,
+            data_plane_capacity: 16,
         };
         let bus = EventBus::with_config(config);
 
@@ -608,6 +740,7 @@ mod tests {
         let config = EventBusConfig {
             broadcast_capacity: 16,
             history_capacity: 5,
+            data_plane_capacity: 16,
         };
         let bus = EventBus::with_config(config);
 
@@ -664,6 +797,7 @@ mod tests {
         let config = EventBusConfig {
             broadcast_capacity: 4,
             history_capacity: 100,
+            data_plane_capacity: 16,
         };
         let bus = EventBus::with_config(config);
         let mut sub = bus.subscribe();
@@ -830,5 +964,130 @@ mod tests {
         // recv() should return None since the channel is closed.
         let result = sub.recv().await;
         assert!(result.is_none());
+    }
+
+    // ── PR 2c — data-plane tests ──────────────────────────────────────
+    //
+    // The whole point of the data plane is that PTY chunks NEVER end up
+    // in `events.history` and NEVER reach `events.watch` subscribers.
+    // If either of those invariants regresses, the secret-leak vector
+    // we were closing reopens. These tests pin it shut.
+
+    fn pane_output_ids() -> (PaneId, WindowId, SessionId) {
+        (PaneId::new(), WindowId::new(), SessionId::new())
+    }
+
+    #[tokio::test]
+    async fn test_pane_output_does_not_appear_in_history() {
+        let bus = EventBus::new();
+        let (pid, wid, sid) = pane_output_ids();
+        for i in 0..20 {
+            bus.publish_pane_output(pid, wid, sid, format!("chunk-{i}"), false);
+        }
+        // History snapshots are control-plane only.
+        let hist = bus.history(100);
+        assert!(hist.is_empty(), "data-plane chunks must not enter history");
+        // events.history filter by "pane." prefix should also return empty.
+        let filtered = bus.history_filtered(100, &["pane.".to_string()]);
+        assert!(
+            filtered.is_empty(),
+            "data plane must not leak through history_filtered",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pane_output_does_not_reach_control_plane_subscribers() {
+        // Bus has both a control-plane and a data-plane subscriber.
+        // We publish one of each and verify each subscriber sees ONLY
+        // its own channel — the data plane is sealed from
+        // `events.watch`.
+        let bus = EventBus::new();
+        let mut control_sub = bus.subscribe();
+        let mut data_sub = bus.subscribe_pane_output();
+        let (pid, wid, sid) = pane_output_ids();
+
+        bus.publish_pane_output(pid, wid, sid, "secret-bytes".into(), false);
+        bus.publish(session_created("not-secret"));
+
+        // Control subscriber sees only the SessionCreated event.
+        let next = tokio::time::timeout(Duration::from_millis(50), control_sub.recv())
+            .await
+            .expect("control plane should yield")
+            .expect("control plane should not be closed");
+        match next {
+            SubscriptionEvent::Event(e) => match e.data {
+                EventData::SessionCreated { ref name, .. } => assert_eq!(name, "not-secret"),
+                other => panic!("expected SessionCreated, got {other:?}"),
+            },
+            SubscriptionEvent::Lagged(_) => panic!("unexpected lag"),
+        }
+        // No further control-plane event.
+        let nothing = tokio::time::timeout(Duration::from_millis(20), control_sub.recv()).await;
+        assert!(
+            nothing.is_err(),
+            "data-plane publish must NOT show up on control subscribers",
+        );
+
+        // Data subscriber sees the chunk.
+        let chunk = tokio::time::timeout(Duration::from_millis(50), data_sub.recv())
+            .await
+            .expect("data plane should yield")
+            .expect("data plane should not be closed");
+        match chunk {
+            PaneOutputSubscriptionEvent::Chunk(c) => {
+                assert_eq!(c.pane_id, pid);
+                assert_eq!(c.bytes, "secret-bytes");
+            }
+            PaneOutputSubscriptionEvent::Lagged(_) => panic!("unexpected lag"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pane_output_seq_is_independent_of_control_seq() {
+        let bus = EventBus::new();
+        let (pid, wid, sid) = pane_output_ids();
+        // Pump some control-plane events first.
+        for i in 0..5 {
+            bus.publish(session_created(&format!("s{i}")));
+        }
+        let control_after = bus.current_seq();
+        // Data-plane sequence starts at 1 regardless of control.
+        let data_seq = bus.publish_pane_output(pid, wid, sid, "x".into(), false);
+        assert_eq!(data_seq, 1, "data-plane seq must start fresh at 1");
+        // Publish more control events — data seq doesn't move.
+        bus.publish(session_created("again"));
+        assert_eq!(bus.current_data_seq(), 2);
+        assert_eq!(bus.current_seq(), control_after + 1);
+    }
+
+    #[tokio::test]
+    async fn test_pane_output_subscriber_receives_chunks() {
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe_pane_output();
+        let (pid, wid, sid) = pane_output_ids();
+        bus.publish_pane_output(pid, wid, sid, "AAA".into(), false);
+        bus.publish_pane_output(pid, wid, sid, "BBB".into(), true);
+        let first = tokio::time::timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .expect("yield")
+            .expect("not closed");
+        match first {
+            PaneOutputSubscriptionEvent::Chunk(c) => {
+                assert_eq!(c.bytes, "AAA");
+                assert!(!c.sampled);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let second = tokio::time::timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .expect("yield")
+            .expect("not closed");
+        match second {
+            PaneOutputSubscriptionEvent::Chunk(c) => {
+                assert_eq!(c.bytes, "BBB");
+                assert!(c.sampled);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
