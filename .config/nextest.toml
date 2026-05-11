@@ -1,0 +1,34 @@
+# cargo-nextest config — repo-scoped.
+#
+# https://nexte.st/book/configuration
+
+[profile.default]
+# Tests that spin up real PTYs are inherently timing-sensitive on
+# shared CI runners (macOS GitHub runners especially — the hypervisor
+# interleaves bursts of latency that look like normal jitter to wall-
+# clock sleeps). Two specific tests below have flaked across multiple
+# runs without any code change: `shux-pty::integration::test_spawn_echo`
+# and `shux::m0_integration::test_m0_pty_spawn_echo`. Both verify the
+# happy path (spawn a child, expect a marker in the PTY output) — a
+# single retry consistently passes.
+#
+# We deliberately scope retries to the PTY tests only via an override
+# rather than globally so a freshly-introduced flake elsewhere stays
+# loud instead of getting silently retried.
+
+# Default: no retries — make new flakes loud.
+retries = 0
+# Allow tests to fail fast so a real regression doesn't get hidden by
+# minutes of subsequent successes.
+fail-fast = false
+
+# Override: tests with known external timing dependencies (PTY
+# spawn jitter, TCP bind→drop→re-bind TOCTOU race) get up to 2
+# retries (3 total attempts). If a test in this list flakes more
+# than ~10% of CI runs, treat that as a signal to harden the test
+# rather than increase the retry budget. Each entry below has a
+# corresponding KNOWN FLAKE comment at the test site explaining why
+# retries are acceptable.
+[[profile.default.overrides]]
+filter = "test(test_spawn_echo) | test(test_m0_pty_spawn_echo) | test(test_tcp_auth_required)"
+retries = 2

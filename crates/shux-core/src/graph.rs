@@ -141,6 +141,11 @@ pub enum GraphCommand {
     CreateSession {
         name: String,
         cwd: std::path::PathBuf,
+        /// Initial-pane command to persist on `Pane.command` (codex P2
+        /// #10 followup — previously this was always empty for the
+        /// session.create path, only apply_batch persisted it). Empty
+        /// vector means "spawn the user's default shell".
+        initial_command: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<SessionId, GraphError>>,
     },
     DestroySession {
@@ -510,10 +515,27 @@ impl SessionGraph {
         Ok(())
     }
 
+    /// Convenience wrapper for `create_session_with_command(name, cwd, vec![])`.
+    /// Used for the common case where the initial pane spawns the user's
+    /// default shell rather than an explicit command.
     pub fn create_session(
         &self,
         name: String,
         cwd: std::path::PathBuf,
+    ) -> Result<SessionId, GraphError> {
+        self.create_session_with_command(name, cwd, Vec::new())
+    }
+
+    /// Create a session and persist the initial pane's command into the
+    /// graph (codex P2 #10 — `apply_batch` already does this; this method
+    /// is the parallel fix for `session.create` so `Pane.command` stops
+    /// being empty for `shux new --cmd vim` and similar). When `command`
+    /// is empty the behavior matches `create_session`.
+    pub fn create_session_with_command(
+        &self,
+        name: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
     ) -> Result<SessionId, GraphError> {
         Self::validate_session_name(&name)?;
 
@@ -529,7 +551,11 @@ impl SessionGraph {
         let pane_id = PaneId::new();
         let window_id = WindowId::new();
 
-        let mut pane = Pane::new(window_id, cwd);
+        let mut pane = if command.is_empty() {
+            Pane::new(window_id, cwd)
+        } else {
+            Pane::with_command(window_id, cwd, command.clone())
+        };
         pane.id = pane_id;
 
         let mut window = Window::new(SessionId::new(), "1", pane_id);
@@ -553,7 +579,8 @@ impl SessionGraph {
         // create_session also implicitly creates the first window + first pane;
         // fire those events too so subscribers tracking pane lifecycle don't
         // miss the implicit ones (only the explicit `create_pane`/`split_pane`
-        // would fire otherwise).
+        // would fire otherwise). The PaneCreated event reflects the actual
+        // command stored on the Pane (codex P2 #10 followup).
         self.fire(EventData::WindowCreated {
             window_id,
             session_id,
@@ -563,7 +590,7 @@ impl SessionGraph {
             pane_id,
             window_id,
             session_id,
-            command: Vec::new(),
+            command,
         });
         info!(%session_id, "Session created");
         Ok(session_id)
@@ -1951,8 +1978,8 @@ pub async fn run_graph_loop(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(GraphCommand::CreateSession { name, cwd, reply }) => {
-                        let _ = reply.send(graph.create_session(name, cwd));
+                    Some(GraphCommand::CreateSession { name, cwd, initial_command, reply }) => {
+                        let _ = reply.send(graph.create_session_with_command(name, cwd, initial_command));
                     }
                     Some(GraphCommand::DestroySession { id, expected_version, reply }) => {
                         let _ = reply.send(graph.destroy_session(id, expected_version));
@@ -2060,16 +2087,35 @@ impl GraphHandle {
         self.state.load_full()
     }
 
+    /// Create a session. Initial pane spawns the user's default shell.
+    /// Use [`Self::create_session_with_command`] to persist an explicit
+    /// command on the initial pane.
     pub async fn create_session(
         &self,
         name: String,
         cwd: std::path::PathBuf,
+    ) -> Result<SessionId, GraphError> {
+        self.create_session_with_command(name, cwd, Vec::new())
+            .await
+    }
+
+    /// Create a session and store `command` on the initial pane (codex
+    /// P2 #10 followup — parallel fix for the `apply_batch` change so
+    /// `Pane.command` is correct regardless of which entrypoint
+    /// created the session). When `command` is empty the behavior
+    /// matches [`Self::create_session`].
+    pub async fn create_session_with_command(
+        &self,
+        name: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
     ) -> Result<SessionId, GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(GraphCommand::CreateSession {
                 name,
                 cwd,
+                initial_command: command,
                 reply: tx,
             })
             .await
@@ -2521,6 +2567,53 @@ mod tests {
         graph.create_session("work".into(), home()).unwrap();
         let err = graph.create_session("work".into(), home()).unwrap_err();
         assert!(matches!(err, GraphError::SessionNameExists(name) if name == "work"));
+    }
+
+    #[test]
+    fn test_create_session_with_command_persists_to_pane() {
+        // Codex P2 #10 followup — before this fix the session.create
+        // path stored an empty `Pane.command` regardless of what the
+        // PTY actually spawned, so `shux new --cmd vim` produced a
+        // pane whose auto-title derived from cwd instead of "vim".
+        let (graph, state) = SessionGraph::new();
+        let sid = graph
+            .create_session_with_command("work".into(), home(), vec!["vim".into(), "foo.rs".into()])
+            .unwrap();
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+        let pid = snap.windows[&wid].active_pane;
+        let pane = &snap.panes[&pid];
+        assert_eq!(pane.command, vec!["vim".to_string(), "foo.rs".to_string()]);
+        // Auto-title derives from the first arg's basename, so the
+        // displayed title is now "vim" instead of the cwd basename.
+        assert_eq!(pane.title, "vim");
+    }
+
+    #[tokio::test]
+    async fn test_create_session_pane_created_event_carries_command() {
+        // PaneCreated event fired during session.create must reflect
+        // the actual command, not Vec::new(). Subscribers using
+        // events.watch to track agent panes rely on this.
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus));
+        graph
+            .create_session_with_command("work".into(), home(), vec!["bash".into()])
+            .unwrap();
+        // Drain SessionCreated + WindowCreated, find PaneCreated.
+        for _ in 0..6 {
+            let next = tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+                .await
+                .expect("event should arrive")
+                .expect("bus not closed");
+            if let crate::bus::SubscriptionEvent::Event(e) = next {
+                if let EventData::PaneCreated { command, .. } = &e.data {
+                    assert_eq!(command, &vec!["bash".to_string()]);
+                    return;
+                }
+            }
+        }
+        panic!("PaneCreated event with non-empty command never arrived");
     }
 
     #[test]
