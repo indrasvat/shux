@@ -17,14 +17,86 @@ const CLAP_STYLES: Styles = Styles::styled()
     .invalid(AnsiColor::Red.on_default().effects(Effects::BOLD))
     .error(AnsiColor::Red.on_default().effects(Effects::BOLD));
 
+/// Extra block appended to `shux --help` (long form). Designed for an
+/// agent pasting the help into context: every CLI verb mapped to its RPC
+/// method, the common 3-call workflow, and a list of tools shux can
+/// stand in for.
+const AGENT_HELP: &str = "\x1b[1;36mCOMMAND → RPC METHOD MAP\x1b[0m
+  shux new        → session.create
+  shux ls         → session.list
+  shux kill       → session.kill / window.kill / pane.kill
+  shux rename     → session.rename
+  shux window     → window.{create,list,focus,kill,ensure,rename}
+  shux pane       → pane.{send_keys,set_size,snapshot,capture,split,focus,zoom,swap,kill,set_title,output.watch}
+  shux apply      → state.apply (atomic batch from a TOML template)
+  shux events     → events.history / pane.output.watch
+  shux api        → any method directly (use this for new methods before a CLI wrapper exists)
+
+\x1b[1;36mTYPICAL AGENT WORKFLOW\x1b[0m
+  # 1. Spawn a session running any command.
+  shux api session.create '{\"name\":\"demo\",\"command\":[\"vivecaka\"]}'
+
+  # 2. Drive it. (Synchronous resize — next snapshot sees new dims.)
+  shux api pane.set_size  '{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}'
+  shux api pane.send_keys '{\"pane_id\":\"$PID\",\"text\":\"j\"}'
+  shux api pane.send_keys '{\"pane_id\":\"$PID\",\"data\":\"Gw==\"}'   # Esc (base64)
+
+  # 3. Pixel feedback (PNG, headless — no terminal emulator in the loop).
+  shux api pane.snapshot  '{\"pane_id\":\"$PID\"}' \\
+    | jq -r .result.png_base64 | base64 -d > frame.png
+
+  # Tear down when done.
+  shux kill -s demo
+
+\x1b[1;36mDECLARATIVE WORKSPACES\x1b[0m
+  echo '[session]
+  name=\"review\"
+  [[windows]]
+  title=\"vivecaka\"
+  [[windows.panes]]
+  command=[\"vivecaka\",\"--repo\",\"cli/cli\"]' > spec.toml
+  shux apply spec.toml       # atomic; --dry-run prints the lowered ops
+
+\x1b[1;36mREPLACES THESE TOOLS\x1b[0m
+  tmux / screen / byobu        → shux apply + shux attach
+  iTerm2 Python SDK            → pane.send_keys + pane.snapshot
+  expect / pexpect / sexpect   → loop of send_keys / wait / snapshot
+  asciinema rec                → pane.output.watch (sealed data plane)
+  vhs / agg / terminalizer     → pane.snapshot loop → ffmpeg
+  termshot / freezeframe       → pane.snapshot
+  iTerm2 broadcast input       → pane.send_keys fan-out
+  ttyrec / termsh              → re-feed VT bytes → pane.snapshot
+  GNU parallel --tmux mode     → template with N panes + RPC orchestrator
+  Bubbletea/ratatui test harness → pane.snapshot + golden-image diff
+
+\x1b[1;36mWHERE TO LEARN MORE\x1b[0m
+  Landing & live demos     https://shux.pages.dev
+  Agent skill (drop-in)    https://github.com/indrasvat/shux/tree/main/skills/shux
+  RPC reference            https://github.com/indrasvat/shux/tree/main/skills/shux/references/api.md
+  Repository               https://github.com/indrasvat/shux
+
+  Every entity carries a 'version' field — pass 'expected_version' on
+  mutating RPCs for optimistic-concurrency rejection (-32002) on stale writes.";
+
 /// shux — a modern, batteries-included terminal multiplexer
+///
+/// `after_long_help` is built lazily so we can show the longer agent
+/// reference (workflows + RPC map + tools-replaced) on `--help` /
+/// `-h --long` without inflating the default help screen.
 #[derive(Parser, Debug)]
 #[command(
     name = "shux",
     version,
-    about = "A modern terminal multiplexer",
-    long_about = "A modern terminal multiplexer \u{2014} tiny core \u{2022} powerful plugins \u{2022} built for humans and AI agents",
-    after_help = "Run 'shux <command> --help' for more information on a specific command.",
+    about = "A modern terminal multiplexer — works for humans, drives like an API",
+    long_about = "shux is a Rust terminal multiplexer (sessions / windows / panes, like \
+        tmux) with a length-prefixed JSON-RPC surface over UDS + TCP, atomic declarative \
+        workspace templates, optimistic concurrency on every entity, sealed PTY-output \
+        events, and a built-in rasterizer that returns PNG bytes for any pane — no \
+        terminal emulator in the loop.\n\n\
+        Every CLI subcommand is a thin wrapper over a JSON-RPC method. Agents and scripts \
+        can target the RPC surface directly via `shux api <method> '<json>'`.",
+    after_long_help = AGENT_HELP,
+    after_help = "See 'shux <command> --help'.  For the full agent reference: 'shux --help'.",
     styles = CLAP_STYLES,
 )]
 pub struct Cli {
