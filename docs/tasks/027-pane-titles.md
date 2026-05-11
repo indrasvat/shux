@@ -1,6 +1,6 @@
 # 027 — Pane Titles (Manual + Auto)
 
-**Status:** Pending
+**Status:** Done (PR 4 — manual + auto + OSC + border render)
 **Depends On:** 015
 **Parallelizable With:** 025, 026
 

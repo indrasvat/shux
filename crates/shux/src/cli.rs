@@ -518,6 +518,45 @@ pub enum PaneCommand {
         expected_version: Option<u64>,
     },
 
+    /// Set or clear a pane title (PR 4 / task 027).
+    ///
+    /// `shux pane title -s work -p <id> -t "build"` pins a manual
+    /// title; `--clear` removes the manual override so OSC + command-
+    /// derived auto-titles flow back into the border. `--no-auto`
+    /// pins whatever is currently displayed and stops automatic
+    /// re-derivation; `--auto` re-enables it.
+    Title {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+
+        /// Pane UUID (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+
+        /// New manual title. Conflicts with `--clear`.
+        #[arg(short, long, conflicts_with = "clear")]
+        title: Option<String>,
+
+        /// Clear the manual title, letting OSC and command-derived
+        /// auto-titles flow back through.
+        #[arg(long)]
+        clear: bool,
+
+        /// Enable auto-title resolution (default state).
+        #[arg(long, conflicts_with = "no_auto")]
+        auto: bool,
+
+        /// Disable auto-title resolution. Pins whatever is currently
+        /// displayed.
+        #[arg(long = "no-auto")]
+        no_auto: bool,
+    },
+
     /// Send keystrokes to a pane
     SendKeys {
         /// Session name
@@ -1774,6 +1813,74 @@ pub async fn handle_pane_swap(
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_pane_swapped(pane_id, target_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle `shux pane title` — set or clear a pane title.
+///
+/// `--title "..."` sets a manual override; `--clear` removes it.
+/// `--auto` / `--no-auto` toggle whether OSC + command-derived
+/// titles flow into the displayed title (orthogonal to the manual
+/// override, so you can pin auto OFF without clearing your manual
+/// title).
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_pane_title(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    title: Option<&str>,
+    clear: bool,
+    auto: bool,
+    no_auto: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    if title.is_some() && clear {
+        anyhow::bail!("--title and --clear are mutually exclusive");
+    }
+    if auto && no_auto {
+        anyhow::bail!("--auto and --no-auto are mutually exclusive");
+    }
+
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+    });
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+    // Title intent: explicit `null` clears, string sets, omitted leaves
+    // manual_title unchanged. clap can't directly emit that tri-state
+    // for us — we synthesize it here.
+    if clear {
+        params["title"] = serde_json::Value::Null;
+    } else if let Some(t) = title {
+        params["title"] = serde_json::Value::String(t.to_string());
+    }
+    if auto {
+        params["auto"] = serde_json::Value::Bool(true);
+    } else if no_auto {
+        params["auto"] = serde_json::Value::Bool(false);
+    }
+
+    let result = rpc_call(stream, "pane.set_title", params).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text | OutputFormat::Plain => {
+            let pid = result
+                .get("pane_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let displayed = result.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            crate::style::print_pane_title_set(pid, displayed);
         }
     }
 

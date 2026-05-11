@@ -220,6 +220,17 @@ pub enum GraphCommand {
         theme: Option<ThemeRef>,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
+    SetPaneTitle {
+        id: PaneId,
+        title: Option<String>,
+        auto: Option<bool>,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
+    SetPaneOscTitle {
+        id: PaneId,
+        title: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
     SplitPane {
         target_pane: PaneId,
         direction: Direction,
@@ -1235,6 +1246,113 @@ impl SessionGraph {
         Ok(())
     }
 
+    /// Set or clear the manual title for a pane, and optionally
+    /// toggle auto-title resolution. Setting `title = None`
+    /// clears the manual override so auto sources (OSC + command)
+    /// flow back into the displayed title. `auto = None` leaves
+    /// the flag unchanged.
+    ///
+    /// Fires `PaneTitleChanged` only if the displayed title (the
+    /// priority-resolved `Pane.title`) actually changed — silent
+    /// no-op when the new manual title matches what was already
+    /// being shown via an OSC update of the same string.
+    pub fn set_pane_title(
+        &self,
+        id: PaneId,
+        title: Option<String>,
+        auto: Option<bool>,
+    ) -> Result<(), GraphError> {
+        let current = self.current();
+        let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+        let window_id = pane.window_id;
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
+        let old_title = pane.title.clone();
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        let new_title = if let Some(p) = snapshot.panes.get_mut(&id) {
+            if let Some(a) = auto {
+                p.set_auto_title(a);
+            }
+            p.set_manual_title(title);
+            p.version += 1;
+            p.title.clone()
+        } else {
+            return Err(GraphError::PaneNotFound(id));
+        };
+
+        self.commit_snapshot(snapshot);
+
+        if old_title != new_title {
+            self.fire(EventData::PaneTitleChanged {
+                pane_id: id,
+                window_id,
+                session_id,
+                old_title,
+                new_title,
+            });
+        }
+        Ok(())
+    }
+
+    /// Set the OSC-derived title for a pane (called from the per-pane
+    /// PTY task when the running app emits an OSC 0/2 sequence). Fires
+    /// `PaneTitleChanged` only when the displayed title actually moves
+    /// (i.e. no manual override is currently active and the value
+    /// differs from before).
+    pub fn set_pane_osc_title(&self, id: PaneId, title: String) -> Result<(), GraphError> {
+        let current = self.current();
+        let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+        let window_id = pane.window_id;
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+
+        let old_title = pane.title.clone();
+
+        // Fast path: no change → skip the clone+commit dance. This is
+        // important because bash's PROMPT_COMMAND often re-issues the
+        // same OSC 2 every prompt, and we don't want to bump versions
+        // (and wake the renderer / publish events) for a no-op.
+        let already = pane.osc_title.as_deref() == Some(title.as_str());
+        let manual_active = pane.manual_title.is_some();
+        if already && (manual_active || !pane.auto_title) {
+            return Ok(());
+        }
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+
+        let (changed, new_title) = if let Some(p) = snapshot.panes.get_mut(&id) {
+            let changed = p.set_osc_title(title);
+            p.version += 1;
+            (changed, p.title.clone())
+        } else {
+            return Err(GraphError::PaneNotFound(id));
+        };
+
+        self.commit_snapshot(snapshot);
+
+        if changed {
+            self.fire(EventData::PaneTitleChanged {
+                pane_id: id,
+                window_id,
+                session_id,
+                old_title,
+                new_title,
+            });
+        }
+        Ok(())
+    }
+
     /// Helper: find pane and its window_id.
     fn find_pane_window(
         &self,
@@ -1878,6 +1996,12 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::SetPaneTheme { id, theme, reply }) => {
                         let _ = reply.send(graph.set_pane_theme(id, theme));
                     }
+                    Some(GraphCommand::SetPaneTitle { id, title, auto, reply }) => {
+                        let _ = reply.send(graph.set_pane_title(id, title, auto));
+                    }
+                    Some(GraphCommand::SetPaneOscTitle { id, title, reply }) => {
+                        let _ = reply.send(graph.set_pane_osc_title(id, title));
+                    }
                     Some(GraphCommand::SplitPane { target_pane, direction, ratio, reply }) => {
                         let _ = reply.send(graph.split_pane(target_pane, direction, ratio));
                     }
@@ -2198,6 +2322,46 @@ impl GraphHandle {
             .send(GraphCommand::SetPaneTheme {
                 id,
                 theme,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    /// Set or clear the manual title for a pane. `title = None`
+    /// clears the manual override; `auto = None` leaves the auto
+    /// flag unchanged.
+    pub async fn set_pane_title(
+        &self,
+        id: PaneId,
+        title: Option<String>,
+        auto: Option<bool>,
+    ) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::SetPaneTitle {
+                id,
+                title,
+                auto,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    /// Record an OSC 0/2 title update from the running app. The
+    /// per-pane PTY task calls this whenever
+    /// `VirtualTerminal::title()` changes; the graph fast-paths
+    /// no-ops to avoid version churn when bash's PROMPT_COMMAND
+    /// re-emits the same OSC 2 every prompt.
+    pub async fn set_pane_osc_title(&self, id: PaneId, title: String) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::SetPaneOscTitle {
+                id,
+                title,
                 reply: tx,
             })
             .await
@@ -3335,6 +3499,152 @@ mod tests {
         assert_eq!(state.load().sessions[&sid].name, "d");
         // Version monotonically bumped through every successful rename.
         assert!(state.load().sessions[&sid].version >= 4);
+    }
+
+    // ── PR 4 / task 027: pane title plumbing ─────────────────────────
+
+    #[tokio::test]
+    async fn test_set_pane_title_manual_fires_event_with_old_and_new() {
+        use std::time::Duration;
+        // Wire a real event bus so we can assert exactly which event
+        // gets published when the displayed title moves.
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let pid = state.load().windows[&wid].active_pane;
+
+        // Drain the SessionCreated / WindowCreated / PaneCreated events
+        // so we only see what set_pane_title fires.
+        for _ in 0..5 {
+            if tokio::time::timeout(Duration::from_millis(20), sub.recv())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        graph
+            .set_pane_title(pid, Some("agent-1".into()), None)
+            .unwrap();
+        let snap = state.load();
+        assert_eq!(snap.panes[&pid].title, "agent-1");
+        assert_eq!(snap.panes[&pid].manual_title.as_deref(), Some("agent-1"));
+
+        // Event must fire with the right scope.
+        let next = tokio::time::timeout(Duration::from_millis(200), sub.recv())
+            .await
+            .expect("PaneTitleChanged should fire within 200ms")
+            .expect("subscription should not be closed");
+        let ev = match next {
+            crate::bus::SubscriptionEvent::Event(e) => e,
+            crate::bus::SubscriptionEvent::Lagged(_) => panic!("unexpected lag"),
+        };
+        match ev.data {
+            EventData::PaneTitleChanged {
+                pane_id,
+                window_id,
+                session_id,
+                ref new_title,
+                ..
+            } => {
+                assert_eq!(pane_id, pid);
+                assert_eq!(window_id, wid);
+                assert_eq!(session_id, sid);
+                assert_eq!(new_title, "agent-1");
+            }
+            other => panic!("expected PaneTitleChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_pane_title_clear_lets_osc_flow_through() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let pid = state.load().windows[&wid].active_pane;
+
+        // Pin manual, then push an OSC update underneath it. OSC
+        // shouldn't show because manual is active.
+        graph
+            .set_pane_title(pid, Some("manual".into()), None)
+            .unwrap();
+        graph.set_pane_osc_title(pid, "osc-value".into()).unwrap();
+        assert_eq!(state.load().panes[&pid].title, "manual");
+
+        // Clear the manual title; the OSC value now takes over.
+        graph.set_pane_title(pid, None, None).unwrap();
+        assert_eq!(state.load().panes[&pid].title, "osc-value");
+    }
+
+    #[test]
+    fn test_set_pane_osc_title_is_no_op_when_manual_set() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let pid = state.load().windows[&wid].active_pane;
+
+        graph
+            .set_pane_title(pid, Some("pinned".into()), None)
+            .unwrap();
+        let v_before = state.load().panes[&pid].version;
+
+        // OSC arrives but is shadowed by manual. The graph still
+        // records osc_title (so a later --clear surfaces it), but the
+        // version is allowed to bump since the underlying state did
+        // change. What MUST NOT happen is the displayed `title`
+        // changing.
+        graph.set_pane_osc_title(pid, "from-app".into()).unwrap();
+        let snap = state.load();
+        assert_eq!(snap.panes[&pid].title, "pinned");
+        assert_eq!(snap.panes[&pid].osc_title.as_deref(), Some("from-app"));
+        // version tick is fine; PaneTitleChanged event MUST NOT fire
+        // (no displayed change). We test the event-not-firing aspect
+        // in the next test.
+        let _ = v_before;
+    }
+
+    #[tokio::test]
+    async fn test_set_pane_osc_title_skips_event_when_no_visible_change() {
+        use std::time::Duration;
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let pid = state.load().windows[&wid].active_pane;
+        // Pin manual; OSC after this MUST NOT fire PaneTitleChanged.
+        graph
+            .set_pane_title(pid, Some("locked".into()), None)
+            .unwrap();
+        // Drain everything fired so far.
+        for _ in 0..10 {
+            if tokio::time::timeout(Duration::from_millis(10), sub.recv())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        graph.set_pane_osc_title(pid, "irrelevant".into()).unwrap();
+        // No new event within a short window.
+        let nothing = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await;
+        assert!(
+            nothing.is_err(),
+            "no PaneTitleChanged event should fire when title is pinned",
+        );
+    }
+
+    #[test]
+    fn test_set_pane_title_unknown_pane_returns_not_found() {
+        let (graph, _state) = SessionGraph::new();
+        let bogus = PaneId::new();
+        let err = graph
+            .set_pane_title(bogus, Some("x".into()), None)
+            .unwrap_err();
+        assert!(matches!(err, GraphError::PaneNotFound(_)));
     }
 
     // ── apply_batch tests (PR 3a) ─────────────────────────────────────
