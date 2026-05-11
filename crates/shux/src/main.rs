@@ -18,6 +18,19 @@ mod template;
 
 use cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
 
+/// A pane-resize message sent through `PaneIoState::resizers`.
+///
+/// Carries the requested `PtySize` and an optional one-shot ack that the
+/// per-pane PTY task fires after applying TIOCSWINSZ + `vt.resize()`.
+/// Synchronous callers (`pane.set_size` RPC) pass `Some(tx)` and await it
+/// so the RPC only returns once `vt.grid().cols/rows` actually reflect the
+/// new size; fire-and-forget producers (attach-client layout fan-out)
+/// pass `None`.
+pub struct ResizeRequest {
+    pub size: shux_pty::handle::PtySize,
+    pub ack: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
 ///
 /// This is the bridge between the RPC handlers and the per-pane PTY read loops.
@@ -25,8 +38,11 @@ use cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
 pub struct PaneIoState {
     /// Per-pane write channels: send bytes to the pane's PTY read/write task.
     pub writers: HashMap<shux_core::model::PaneId, mpsc::Sender<Vec<u8>>>,
-    /// Per-pane resize channels: send PtySize to trigger TIOCSWINSZ + VT resize.
-    pub resizers: HashMap<shux_core::model::PaneId, mpsc::Sender<shux_pty::handle::PtySize>>,
+    /// Per-pane resize channels: send `ResizeRequest` to trigger
+    /// TIOCSWINSZ + VT resize. Use `ResizeRequest { ack: None }` for
+    /// fire-and-forget; `ack: Some(tx)` for synchronous RPCs that must
+    /// see the new dimensions on return.
+    pub resizers: HashMap<shux_core::model::PaneId, mpsc::Sender<ResizeRequest>>,
     /// Per-pane VirtualTerminal instances for capturing output.
     pub vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
     /// Command execution engine for marker-based completion detection.
@@ -76,7 +92,7 @@ async fn run_pane_pty_task(
     mut handle: shux_pty::handle::PtyHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     mut write_rx: mpsc::Receiver<Vec<u8>>,
-    mut resize_rx: mpsc::Receiver<shux_pty::handle::PtySize>,
+    mut resize_rx: mpsc::Receiver<ResizeRequest>,
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
 ) {
@@ -236,24 +252,30 @@ async fn run_pane_pty_task(
                 }
             }
             res = resize_rx.recv() => {
-                let size = match res {
-                    Some(s) => s,
+                let req = match res {
+                    Some(r) => r,
                     None => {
                         tracing::debug!(%pane_id, "resizer channel closed");
                         break;
                     }
                 };
-                if let Err(e) = handle.resize(size) {
+                if let Err(e) = handle.resize(req.size) {
                     tracing::warn!(%pane_id, error = %e, "PTY resize failed");
                 }
                 let pulse = {
                     let mut state = io_state.lock().await;
                     if let Some(vt) = state.vts.get_mut(&pane_id) {
-                        vt.resize(size.rows as usize, size.cols as usize);
+                        vt.resize(req.size.rows as usize, req.size.cols as usize);
                     }
                     state.render_pulse.clone()
                 };
                 pulse.notify_one();
+                // Fire the ack AFTER vt + render_pulse so a synchronous
+                // caller (pane.set_size RPC) is guaranteed that the next
+                // pane.snapshot it issues sees the new dimensions.
+                if let Some(ack) = req.ack {
+                    let _ = ack.send(());
+                }
             }
             _ = shutdown.cancelled() => {
                 tracing::debug!(%pane_id, "PTY task cancelled");
@@ -300,7 +322,7 @@ pub(crate) async fn spawn_pane_pty(
         .map_err(|e| shux_rpc::RpcError::internal(&format!("PTY spawn failed: {e}")))?;
 
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (resize_tx, resize_rx) = mpsc::channel::<shux_pty::handle::PtySize>(16);
+    let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>(16);
     let vt = shux_vt::VirtualTerminal::new(24, 80);
 
     {
@@ -2508,44 +2530,75 @@ fn register_pane_io_methods(
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
 
-                // Render the live grid under lock. `Rasterizer::render` is
-                // CPU-bound (~5-50ms for typical pane sizes) and `tokio::Mutex`
-                // doesn't yield, but `pane.snapshot` is a snapshot RPC called
-                // infrequently — holding the lock keeps every cell's style,
-                // colors, and alternate-screen state intact (the capture_text
-                // replay trick we tried first dropped all SGR attrs and broke
-                // alt-screen TUIs like htop/vim/vivecaka).
-                let (img, snap_cols, snap_rows) = {
+                // Clone the live grid + cursor under lock, then drop the lock
+                // before any CPU-bound work. Rasterizing under the global
+                // PaneIoState mutex would stall every pane's PTY read/write/
+                // resize for tens of ms on a snapshot (codex review).
+                //
+                // Cloning a 200x60 grid is ~192 KB of allocation, which is
+                // cheap compared to the millions of pixels the rasterizer
+                // produces. Cursor is captured as a discrete `(row, col)`
+                // pair AND honors `cursor.visible` — apps that hide the
+                // cursor (vim/less in alt screen) won't get a stray block.
+                let (grid_snapshot, cursor_pos, snap_cols, snap_rows) = {
                     let state = io.lock().await;
                     let vt = state.vts.get(&pane_id).ok_or_else(|| {
                         shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                     })?;
-                    let opts = shux_raster::RasterOptions {
-                        cursor: Some((vt.cursor().row, vt.cursor().col)),
-                        ..Default::default()
-                    };
-                    let img = r.render(vt.grid(), &opts);
-                    (img, vt.grid().cols(), vt.grid().rows())
+                    let cur = vt.cursor();
+                    let cursor_pos = cur.visible.then_some((cur.row, cur.col));
+                    let grid_clone = vt.grid().clone();
+                    let cols = grid_clone.cols();
+                    let rows = grid_clone.rows();
+                    (grid_clone, cursor_pos, cols, rows)
                 };
 
-                let mut png_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-                {
-                    use image::ImageEncoder;
-                    let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
-                    encoder
-                        .write_image(
-                            img.as_raw(),
-                            img.width(),
-                            img.height(),
-                            image::ExtendedColorType::Rgba8,
-                        )
-                        .map_err(|e| {
-                            shux_rpc::RpcError::internal(&format!("PNG encode failed: {e}"))
-                        })?;
+                // Hard guard against pathological dimensions — a 1000x1000
+                // cell grid at 10x22 px/cell is 220 MB of RGBA. Cap at
+                // 16 M output pixels (~64 MB RGBA, ~4000x4000 px).
+                let (cw, ch) = r.cell_size();
+                let pixel_count = (snap_cols as u64)
+                    .saturating_mul(cw as u64)
+                    .saturating_mul(snap_rows as u64)
+                    .saturating_mul(ch as u64);
+                const MAX_PIXELS: u64 = 16_000_000;
+                if pixel_count > MAX_PIXELS {
+                    return Err(shux_rpc::RpcError::invalid_params(&format!(
+                        "snapshot would be {pixel_count} pixels — exceeds cap of {MAX_PIXELS}; \
+                        resize the pane first via pane.set_size"
+                    )));
                 }
+
+                // Rasterize + PNG-encode off the runtime worker. Both are
+                // pure-CPU and don't yield, so we route them to a blocking
+                // worker that won't starve other RPC handlers.
+                let (img, png_buf) = tokio::task::spawn_blocking(move || {
+                    let opts = shux_raster::RasterOptions {
+                        cursor: cursor_pos,
+                        ..Default::default()
+                    };
+                    let img = r.render(&grid_snapshot, &opts);
+                    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+                    {
+                        use image::ImageEncoder;
+                        let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+                        encoder
+                            .write_image(
+                                img.as_raw(),
+                                img.width(),
+                                img.height(),
+                                image::ExtendedColorType::Rgba8,
+                            )
+                            .map_err(|e| format!("PNG encode failed: {e}"))?;
+                    }
+                    Ok::<_, String>((img, buf))
+                })
+                .await
+                .map_err(|e| shux_rpc::RpcError::internal(&format!("rasterize join: {e}")))?
+                .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+
                 use base64::Engine;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
-                let (cw, ch) = r.cell_size();
 
                 Ok(serde_json::json!({
                     "pane_id": pane_id.to_string(),
@@ -2566,22 +2619,33 @@ fn register_pane_io_methods(
             async move {
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
-                let cols = params
+                // Validate in u64-space BEFORE narrowing — `as u16` silently
+                // wraps `cols=66536` to 1000 and lets it through (codex
+                // review). Sanity bounds: 4..=1000 cols, 2..=1000 rows.
+                let cols_u64 = params
                     .get("cols")
                     .and_then(|v| v.as_u64())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'cols'"))?
-                    as u16;
-                let rows = params
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'cols'"))?;
+                let rows_u64 = params
                     .get("rows")
                     .and_then(|v| v.as_u64())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'rows'"))?
-                    as u16;
-                if cols < 4 || rows < 2 || cols > 1000 || rows > 1000 {
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'rows'"))?;
+                if !(4..=1000).contains(&cols_u64) || !(2..=1000).contains(&rows_u64) {
                     return Err(shux_rpc::RpcError::invalid_params(&format!(
-                        "rows/cols out of range (got rows={rows} cols={cols})"
+                        "rows/cols out of range (got rows={rows_u64} cols={cols_u64}; \
+                        valid: 4..=1000 cols, 2..=1000 rows)"
                     )));
                 }
+                let cols = cols_u64 as u16;
+                let rows = rows_u64 as u16;
                 let pty_size = shux_pty::handle::PtySize { rows, cols };
+
+                // Construct a oneshot ack and await it (with a short timeout
+                // so a deadlocked PTY task can't hang the RPC). Synchronous
+                // semantics: when this RPC returns Ok, `vt.grid().cols/rows`
+                // already reflect the new size and a follow-up pane.snapshot
+                // will capture at the requested resolution.
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
                 let resizer = {
                     let state = io.lock().await;
                     state.resizers.get(&pane_id).cloned()
@@ -2590,9 +2654,18 @@ fn register_pane_io_methods(
                     shux_rpc::RpcError::not_found("pane resizer", &pane_id.to_string())
                 })?;
                 resizer
-                    .send(pty_size)
+                    .send(ResizeRequest {
+                        size: pty_size,
+                        ack: Some(ack_tx),
+                    })
                     .await
                     .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
+                tokio::time::timeout(std::time::Duration::from_secs(2), ack_rx)
+                    .await
+                    .map_err(|_| {
+                        shux_rpc::RpcError::internal("pane resize ack timed out after 2s")
+                    })?
+                    .map_err(|_| shux_rpc::RpcError::internal("pane resize ack channel dropped"))?;
                 Ok(serde_json::json!({
                     "pane_id": pane_id.to_string(),
                     "rows": rows,

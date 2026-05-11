@@ -85,7 +85,7 @@ impl Default for GridConfig {
 ///   - visible lines (index scrollback_len..scrollback_len+rows): the current viewport
 ///
 /// The VecDeque allows O(1) push_front (for scrollback) and O(1) push_back (for new lines).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Grid {
     /// All lines: scrollback + visible area.
     raw: VecDeque<Row>,
