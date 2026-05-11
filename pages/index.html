@@ -311,7 +311,16 @@
   align-items: start; margin-top: var(--s-2);
 }
 @media (max-width: 760px) { .snap-proof { grid-template-columns: 1fr; } }
-.snap-proof pre { margin: 0; }
+.snap-proof pre {
+  margin: 0;
+  font-size: 12px;       /* tiny step down — code fits the narrow column without wrapping the pipe-chain awkwardly */
+  padding: 12px;
+  min-width: 0;
+}
+.snap-proof pre code i {
+  font-style: italic;
+  color: var(--accent-ink);
+}
 .snap-out { margin: 0; }
 .snap-out img {
   width: 100%; height: auto; aspect-ratio: 720/440;
@@ -737,7 +746,9 @@ command = ["lazygit"]
 <span style="color:var(--accent)">$ shux api pane.send_keys '{"pane_id":"$PID","text":"j"}'</span>
 <span style="color:var(--ink2-on-paper)"># → navigate down one row.</span>
 
-<span style="color:var(--accent)">$ shux api pane.snapshot '{"pane_id":"$PID"}' | jq -r .result.png_base64 | base64 -d &gt; out.png</span>
+<span style="color:var(--accent)">$ shux api pane.snapshot '{"pane_id":"$PID"}' \
+    | jq -r .result.png_base64 \
+    | base64 -d &gt; out.png</span>
 <span style="color:var(--ink2-on-paper)"># → 1800×1140 PNG of the current pane. No iTerm2 needed.</span></code></pre>
 
       <div class="annot">

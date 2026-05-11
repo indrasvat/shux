@@ -102,6 +102,13 @@ pre {
   overflow-x: auto;
   line-height: 1.55;
   font-size: 13px;
+  /* Soft-wrap long lines instead of horizontally scrolling them off-
+     screen. Backslash continuations + this overflow-wrap rule together
+     keep every line readable at any viewport, no scrollbar required. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  tab-size: 2;
 }
 code:not(pre code) {
   background: var(--bg-3);
