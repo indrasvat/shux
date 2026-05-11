@@ -41,6 +41,31 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
+  # End-to-end smoke: builds shux, runs the daemon, exercises every feature
+  # an agent would actually use (init, apply, wait-for, snapshot, kill) on
+  # both Linux and macOS. The in-process `test` job covers Rust logic; this
+  # catches platform regressions in PTY spawn / daemon UDS / raster that
+  # only show up against a real binary. No untrusted inputs are evaluated;
+  # we only read `runner.os` and run a script committed in the repo.
+  e2e-smoke:
+    name: E2E smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install jq + file (Linux only — macOS runners ship them)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq file
+      - name: Build shux (release)
+        run: cargo build --release -p shux
+      - name: Run end-to-end smoke
+        run: SHUX="$PWD/target/release/shux" bash .shux/scripts/smoke.sh
+
   deny:
     name: Deny
     runs-on: ubuntu-latest
