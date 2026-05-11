@@ -3,42 +3,49 @@
 You're building a TUI in Bubbletea / ratatui / Charm. You want every PR
 to fail if the rendered output drifts. Without shux you'd need iTerm2
 running on a macOS CI runner with the Python SDK — expensive, flaky,
-hard to debug. With shux it's a script.
+hard to debug. With shux it's a script that fits the `.shux/` layout.
+
+## Layout
+
+```
+your-project/
+└── .shux/
+    ├── templates/visual-test.toml   (committed — spawn spec)
+    ├── scripts/scenario.sh          (committed — driver)
+    ├── goldens/01_loaded.png ...    (committed — reference frames)
+    └── out/                         (gitignored — new snapshots & diffs)
+```
+
+`shux init` creates the directories. Add the template + script yourself.
 
 ## What CI runs
 
 ```bash
 # Setup (one-off in the workflow image)
-curl -sSf https://shux.pages.dev/install | sh
+curl -sSfL https://shux.pages.dev/install.sh | sh
 
 # The actual test
-bash tests/visual/scenario.sh
+bash .shux/scripts/scenario.sh
 ```
 
-`tests/visual/scenario.sh` spawns your TUI under shux, drives it through
-the same key sequence on every CI run, snapshots at known points, and
-diffs against checked-in goldens.
-
-## Full example: testing a hypothetical `mytui` PR-review app
+## `.shux/scripts/scenario.sh`
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 SHUX="${SHUX:-shux}"
 SESSION="visual-test"
-OUT="$(mktemp -d)"
-GOLDENS="tests/visual/goldens"
+OUT=".shux/out"
+GOLDENS=".shux/goldens"
+mkdir -p "$OUT"
 
-# Pre-encoded keys we'll send below.
 ENTER=$(printf '\r' | base64)
 TAB=$(printf '\t' | base64)
-ESC=$(printf '\033' | base64)
 
 cleanup () { "$SHUX" kill -s "$SESSION" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-# Spawn under shux. Use a deterministic SOURCE_DATE_EPOCH so any time
-# rendering in the TUI is stable across runs.
+# Spawn. Deterministic clock so any TUI time-rendering stays stable.
 RESP=$(SOURCE_DATE_EPOCH=1700000000 "$SHUX" api session.create '{
   "name": "visual-test",
   "command": ["mytui", "--no-network", "--fixtures-dir=tests/fixtures"]
@@ -50,8 +57,7 @@ PID=$(printf '%s' "$RESP" | jq -r .result.pane_id)
 
 snap () {
   local label="$1"
-  "$SHUX" api pane.snapshot "{\"pane_id\":\"$PID\"}" \
-    | jq -r .result.png_base64 | base64 -d > "$OUT/${label}.png"
+  "$SHUX" snapshot -s visual-test -o "$OUT/${label}.png" --cols 160 --rows 48 >/dev/null
 }
 
 # Drive — same sequence every run.
@@ -70,8 +76,8 @@ import sys, numpy as np
 from PIL import Image
 fails = []
 for label in ["01_loaded","02_after_j","03_detail_open","04_next_tab"]:
-    a = np.asarray(Image.open(f"$OUT/{label}.png"))
-    g = np.asarray(Image.open(f"$GOLDENS/{label}.png"))
+    a = np.asarray(Image.open(f".shux/out/{label}.png"))
+    g = np.asarray(Image.open(f".shux/goldens/{label}.png"))
     if a.shape != g.shape:
         fails.append(f"{label}: shape mismatch {a.shape} vs {g.shape}")
         continue
@@ -90,9 +96,9 @@ PY
 When you intend a visual change:
 
 ```bash
-bash tests/visual/scenario.sh          # fails, saves new PNGs to $OUT
-cp $OUT/*.png tests/visual/goldens/    # accept the new look
-git add tests/visual/goldens/
+bash .shux/scripts/scenario.sh          # fails, saves new PNGs to .shux/out/
+cp .shux/out/*.png .shux/goldens/       # accept the new look
+git add .shux/goldens/
 ```
 
 Commit the new goldens alongside the change. PR review now includes

@@ -139,6 +139,34 @@ Plain-text capture of the last N lines. ANSI stripped.
 { "pane_id": "uuid", "lines": 50 } → { "text": "...", "lines": 50 }
 ```
 
+### `window.snapshot` / `session.snapshot`
+
+Rasterize an entire window (all panes + borders + titles + focus highlight)
+into a single PNG. `session.snapshot` is the same call against the session's
+active window.
+
+```json
+// Request — window.snapshot
+{ "window_id": "uuid",
+  "cols": 200, "rows": 60 }       // optional; defaults 120 × 36 cells
+
+// Request — session.snapshot
+{ "session_id": "uuid-or-name",
+  "cols": 200, "rows": 60 }       // optional
+
+// Response (same shape for both)
+{ "window_id":   "uuid",
+  "png_base64":  "iVBORw0KG...",
+  "width":  1800, "height": 1140,
+  "cell_width":  9, "cell_height": 19,
+  "cols":   200,    "rows":   60,
+  "format": "png" }
+```
+
+Use this for full-window visual regression (single PNG per `shux apply`
+run vs a golden). Use `pane.snapshot` when you only care about one pane
+and want to skip border / status-bar composition.
+
 ### `pane.list`
 
 Enumerate panes in a window (or across all windows of a session).

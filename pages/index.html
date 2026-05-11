@@ -1142,10 +1142,12 @@ PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
 &nbsp;&nbsp;agent — multiplex, send keystrokes, snapshot pixel-perfect<br>
 &nbsp;&nbsp;PNGs of any pane. Replaces tmux / screen / iTerm2 /<br>
 &nbsp;&nbsp;expect/asciinema for agent-driven workflows.<br><br>
+<b>Layout:</b> <code>shux init</code> scaffolds <code>.shux/</code><br>
+&nbsp;&nbsp;(<code>templates/</code>, <code>scripts/</code>, <code>goldens/</code>, gitignored <code>out/</code>).<br><br>
 <b>Quickstart:</b> three RPCs cover 80% of cases —<br>
-&nbsp;&nbsp;1. <code>shux apply spec.toml</code><br>
+&nbsp;&nbsp;1. <code>shux apply .shux/templates/spec.toml</code><br>
 &nbsp;&nbsp;2. <code>shux api pane.send_keys '{...}'</code><br>
-&nbsp;&nbsp;3. <code>shux api pane.snapshot '{...}'</code>
+&nbsp;&nbsp;3. <code>shux snapshot -s NAME -o .shux/out/frame.png</code>
       </div>
     </div>
   </div>

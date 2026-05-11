@@ -10,6 +10,7 @@ pub mod attach;
 pub mod borders;
 pub mod buffer;
 pub mod client;
+pub mod composed;
 pub mod compositor;
 pub mod copy_mode;
 pub mod help_overlay;
@@ -24,6 +25,7 @@ pub mod vt_convert;
 pub use borders::{BorderChars, BorderColors, BorderSegment, BorderStyle, compute_borders};
 pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
 pub use client::{ClientConfig, ExitReason};
+pub use composed::{ComposeInputs, ComposedFrame, compose};
 pub use compositor::{CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats};
 pub use copy_mode::{
     CopyKey, CopyModeState, handle_key as copy_mode_key, osc52_copy, render_copy_overlay_into,

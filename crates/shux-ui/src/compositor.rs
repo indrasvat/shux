@@ -443,7 +443,8 @@ impl<W: Write> RenderCompositor<W> {
                     let truncated: String = title.chars().take(max_chars).collect();
                     let label = format!(" {truncated} ");
                     let mut x = rect.x.saturating_add(1);
-                    let y = rect.y;
+                    // Overlay on the pane's top border row, NOT its first content row.
+                    let y = rect.y.saturating_sub(1);
                     for ch in label.chars() {
                         if x >= rect.x.saturating_add(rect.width).saturating_sub(1) {
                             break;
