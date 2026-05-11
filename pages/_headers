@@ -1,11 +1,8 @@
 # Cloudflare Pages headers — applies to every response served from
 # shux.pages.dev. CF processes this at deploy time.
 #
-# CSP allows: self for everything, fonts.googleapis.com + fonts.gstatic.com
-# for the Inter / JetBrains Mono webfonts. Images allow data: for the
-# inline SVG noise overlay. connect-src is locked to self (release-version
-# metadata is staged into deploy/version.json at deploy-time, not fetched
-# from api.github.com at runtime).
+# CSP: self everywhere, plus fonts.googleapis.com + fonts.gstatic.com
+# for webfonts, and data: for the inline SVG noise overlay.
 
 /*
   X-Content-Type-Options: nosniff

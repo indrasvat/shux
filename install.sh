@@ -204,8 +204,9 @@ parse_first_tag() {
 get_latest_version() {
     local body status tag
 
-    body="$(mktemp)"
-    trap 'rm -f "${body}"' RETURN
+    # RETURN trap leaks past function boundary without `set -T` — write
+    # to the script tmpdir so the EXIT trap sweeps it.
+    body="$(mktemp "${TMPDIR_CREATED}/shux-api-body.XXXXXX")"
 
     status="$(fetch_with_status "${body}" "https://api.github.com/repos/${REPO}/releases/latest")"
 
@@ -337,6 +338,13 @@ main() {
     banner
     parse_args "$@"
 
+    # Set up tmpdir + EXIT trap before any function that mktemp's into it.
+    local tmpdir
+    tmpdir="$(mktemp -d -t shux-install.XXXXXX)" \
+        || error_exit "Could not create temporary directory"
+    TMPDIR_CREATED="${tmpdir}"
+    trap cleanup EXIT INT TERM HUP
+
     step 1 6 "Checking dependencies"
     check_dependencies
 
@@ -352,11 +360,6 @@ main() {
     fi
 
     build_download_url
-
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-    TMPDIR_CREATED="${tmpdir}"
-    trap cleanup EXIT
 
     step 4 6 "Downloading ${BINARY}"
     download_file "${TARBALL_URL}" "${tmpdir}/${TARBALL}" \

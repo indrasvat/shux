@@ -1153,11 +1153,6 @@ fn register_pane_methods(
                     .await
                     .map_err(graph_error_to_rpc)?;
 
-                // Honour optional `command` + `cwd` overrides. Previously
-                // both were silently dropped — the new pane always spawned
-                // the user's default shell regardless of what the RPC asked
-                // for. Apply paths already thread these correctly; this
-                // closes the same gap on the direct `pane.split` RPC.
                 let command: Vec<String> = params
                     .get("command")
                     .and_then(|v| v.as_array())
@@ -1613,11 +1608,6 @@ fn register_window_methods(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
 
-                // Honour optional `command` so callers can request "create
-                // a window running cmd". Same gap-shape as the pane.split
-                // fix: the PTY spawns the requested command; persisting it
-                // onto `Pane.command` in the graph requires a graph-level
-                // method and is tracked as a follow-up.
                 let command: Vec<String> = params
                     .get("command")
                     .and_then(|v| v.as_array())
@@ -1736,8 +1726,6 @@ fn register_window_methods(
                     return Ok(result);
                 }
 
-                // Create new window — honour optional `cwd` + `command`
-                // params for symmetry with window.create.
                 let cwd = params
                     .get("cwd")
                     .and_then(|v| v.as_str())
