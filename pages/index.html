@@ -488,6 +488,54 @@
   display: block;
   image-rendering: -webkit-optimize-contrast;
 }
+
+/* ── Copy-able command — pre + floating copy button, JS-toggled state. ── */
+.copy-cmd {
+  position: relative;
+  display: block;
+}
+.copy-cmd pre {
+  margin: 0;
+  padding-right: 88px;  /* room for the floating copy button */
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  font-size: 13.5px;
+}
+.copy-cmd pre code { color: var(--ink); }
+.copy-cmd .cmd-prompt {
+  color: var(--accent-ink);
+  font-weight: 600;
+  margin-right: 6px;
+  user-select: none;
+}
+.copy-cmd .copy-btn {
+  position: absolute;
+  top: 8px; right: 8px;
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-3);
+  color: var(--ink-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-1);
+  padding: 5px 9px 5px 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+.copy-cmd .copy-btn:hover {
+  color: var(--ink); border-color: var(--ink-3);
+  background: color-mix(in srgb, var(--bg-3) 70%, var(--accent-soft));
+}
+.copy-cmd .copy-btn .check-icon { display: none; color: var(--moss); }
+.copy-cmd .copy-btn[data-copied="true"] .copy-icon { display: none; }
+.copy-cmd .copy-btn[data-copied="true"] .check-icon { display: inline-block; }
+.copy-cmd .copy-btn[data-copied="true"] {
+  color: var(--moss);
+  border-color: rgba(111,154,92,0.4);
+  background: var(--moss-soft);
+}
+.copy-cmd .copy-btn[data-copied="true"] .copy-label::after { content: "ied!"; }
 .gallery-panel img {
   width: 100%; height: auto; display: block;
   background: #0a0810;
@@ -716,7 +764,7 @@ command = ["lazygit"]
           <td data-label="the shux call"><code>shux apply spec.toml</code> · <code>shux attach</code></td>
         </tr>
         <tr>
-          <td data-label="if you'd reach for">iTerm2 Python SDK</td>
+          <td data-label="if you'd reach for">iTerm2 (Python SDK / AppleScript)</td>
           <td data-label="for this job">Drive a terminal app from outside</td>
           <td data-label="the shux call"><code>pane.send_keys</code> + <code>pane.snapshot</code></td>
         </tr>
@@ -1025,11 +1073,24 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
     <div class="skill-block">
       <div>
         <h2>A Claude skill, ready to drop in.</h2>
-        <p class="lede" style="margin-bottom:var(--s-5)">
-          Add <code>skills/shux/</code> to your agent. It teaches the
-          model when to reach for shux instead of tmux, which RPC to
+        <p class="lede" style="margin-bottom:var(--s-4)">
+          One command installs the shux skill globally. The model then
+          knows when to reach for shux instead of tmux, which RPC to
           call, and where the references live for deep dives.
         </p>
+        <div class="copy-cmd" data-copy="npx skills add indrasvat/shux --global --yes" style="margin-bottom:var(--s-5)">
+<pre><code><span class="cmd-prompt">$</span> npx skills add indrasvat/shux --global --yes</code></pre>
+          <button class="copy-btn" type="button" aria-label="copy install command to clipboard">
+            <svg class="copy-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <rect x="4" y="4" width="9" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+              <path d="M3 11.5V3a1 1 0 0 1 1-1h7" fill="none" stroke="currentColor" stroke-width="1.4"/>
+            </svg>
+            <svg class="check-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M3 8.5l3 3 6.5-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span class="copy-label">copy</span>
+          </button>
+        </div>
         <div class="hero-cta">
           <a class="btn primary" href="https://github.com/indrasvat/shux/tree/main/skills/shux">Browse the skill</a>
           <a class="btn secondary" href="https://github.com/indrasvat/shux">All the docs</a>
@@ -1040,7 +1101,7 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
 <b>name:</b> shux<br>
 <b>description:</b> Drive terminal multiplexer sessions from an<br>
 &nbsp;&nbsp;agent — multiplex, send keystrokes, snapshot pixel-perfect<br>
-&nbsp;&nbsp;PNGs of any pane. Replaces tmux/screen/iterm2-driver/<br>
+&nbsp;&nbsp;PNGs of any pane. Replaces tmux / screen / iTerm2 /<br>
 &nbsp;&nbsp;expect/asciinema for agent-driven workflows.<br><br>
 <b>Quickstart:</b> three RPCs cover 80% of cases —<br>
 &nbsp;&nbsp;1. <code>shux apply spec.toml</code><br>
@@ -1074,7 +1135,6 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
       <div>
         <h4>Docs</h4>
         <ul>
-          <li><a href="https://github.com/indrasvat/shux/blob/main/docs/PRD.md">Product spec</a></li>
           <li><a href="https://github.com/indrasvat/shux/tree/main/skills/shux">Agent skill</a></li>
           <li><a href="https://github.com/indrasvat/shux/blob/main/README.md">README</a></li>
         </ul>
@@ -1109,6 +1169,35 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
 </div>
 
 <script>
+  // Copy-to-clipboard buttons.
+  (function () {
+    document.querySelectorAll(".copy-cmd").forEach(function (root) {
+      var btn = root.querySelector(".copy-btn");
+      var text = root.getAttribute("data-copy");
+      if (!btn || !text) return;
+      btn.addEventListener("click", function () {
+        var write = navigator.clipboard && navigator.clipboard.writeText
+          ? navigator.clipboard.writeText(text)
+          : new Promise(function (resolve, reject) {
+              try {
+                var ta = document.createElement("textarea");
+                ta.value = text; ta.setAttribute("readonly", "");
+                ta.style.position = "absolute"; ta.style.left = "-9999px";
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+                resolve();
+              } catch (e) { reject(e); }
+            });
+        write.then(function () {
+          btn.setAttribute("data-copied", "true");
+          setTimeout(function () { btn.removeAttribute("data-copied"); }, 1800);
+        });
+      });
+    });
+  })();
+
   // Lightbox — hijack .zoom-link clicks. No new tabs, no JS framework.
   (function () {
     var lb        = document.getElementById("lightbox");

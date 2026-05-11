@@ -59,7 +59,7 @@ const AGENT_HELP: &str = "\x1b[1;36mCOMMAND → RPC METHOD MAP\x1b[0m
 
 \x1b[1;36mREPLACES THESE TOOLS\x1b[0m
   tmux / screen / byobu        → shux apply + shux attach
-  iTerm2 Python SDK            → pane.send_keys + pane.snapshot
+  iTerm2 (Python SDK / AS)     → pane.send_keys + pane.snapshot
   expect / pexpect / sexpect   → loop of send_keys / wait / snapshot
   asciinema rec                → pane.output.watch (sealed data plane)
   vhs / agg / terminalizer     → pane.snapshot loop → ffmpeg

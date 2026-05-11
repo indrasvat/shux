@@ -1,9 +1,15 @@
 ---
 name: shux
-description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 Python SDK / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, or do headless visual regression on a terminal UI. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "replace tmux", "iterm2 driver", "expect script", "headless terminal test", "agent multiplexer", "asciinema record".
+description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, or do headless visual regression on a terminal UI. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "replace tmux", "iTerm2 automation", "expect script", "headless terminal test", "agent multiplexer", "asciinema record".
 ---
 
 # shux — terminal multiplexer with a JSON-RPC API + pixel snapshotter
+
+## Install
+
+```sh
+npx skills add indrasvat/shux --global --yes
+```
 
 shux is a Rust terminal multiplexer (sessions / windows / panes, like tmux)
 that **also** exposes a length-prefixed JSON-RPC surface over UDS and TCP,
@@ -63,7 +69,7 @@ shux apply spec.toml      # atomic — all or nothing
 | If you'd reach for                              | For this job                                  | Use this shux primitive                                  |
 |--                                                |--                                              |--                                                          |
 | `tmux` · `screen` · `byobu`                      | Multiplex sessions / windows / panes           | `shux apply spec.toml` · `shux attach`                     |
-| iTerm2 Python SDK · AppleScript drive            | Drive a terminal app from outside              | `pane.send_keys` + `pane.snapshot`                         |
+| iTerm2 (Python SDK / AppleScript)                | Drive a terminal app from outside              | `pane.send_keys` + `pane.snapshot`                         |
 | `expect` · `pexpect` · `sexpect`                 | Scripted CLI / REPL interaction                | Loop of `send_keys` / `wait` / `snapshot`                  |
 | `asciinema rec`                                  | Record a terminal session                      | `pane.output.watch` (sealed data-plane stream)             |
 | `vhs` · `agg` · `terminalizer`                   | Generate TUI demo GIFs / WebPs                 | `pane.snapshot` loop → `ffmpeg`                            |
