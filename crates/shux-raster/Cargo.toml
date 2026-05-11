@@ -1,0 +1,17 @@
+[package]
+name = "shux-raster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure-Rust cell-grid rasterizer — turns a shux-vt Grid<Cell> into a PNG without a terminal emulator."
+
+[dependencies]
+fontdue = "0.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
+shux-vt = { path = "../shux-vt" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

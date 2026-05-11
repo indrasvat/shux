@@ -20,6 +20,7 @@ shux-vt = { path = "../shux-vt" }
 shux-rpc = { path = "../shux-rpc" }
 shux-plugin = { path = "../shux-plugin" }
 shux-ui = { path = "../shux-ui" }
+shux-raster = { path = "../shux-raster" }
 crossterm.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -35,6 +36,7 @@ toml.workspace = true
 uuid.workspace = true
 unicode-width = "0.2"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 bytes = "1"
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

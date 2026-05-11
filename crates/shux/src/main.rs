@@ -2233,13 +2233,24 @@ fn register_pane_io_methods(
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
-    let g5 = graph;
+    let g5 = graph.clone();
+    let g6 = graph.clone();
+    let g7 = graph;
 
     let io1 = io_state.clone();
     let io2 = io_state.clone();
     let io3 = io_state.clone();
     let io4 = io_state.clone();
-    let io5 = io_state;
+    let io5 = io_state.clone();
+    let io6 = io_state.clone();
+    let io7 = io_state;
+
+    // Shared rasterizer for `pane.snapshot`. Built once at startup so each
+    // snapshot call doesn't re-parse the 264 KB embedded font.
+    let rasterizer: Arc<shux_raster::Rasterizer> = Arc::new(
+        shux_raster::Rasterizer::new(14.0)
+            .expect("shux-raster: failed to construct rasterizer (bundled font corrupt?)"),
+    );
 
     builder
         .register(
@@ -2486,6 +2497,106 @@ fn register_pane_io_methods(
                     "pane_id": pane_id.to_string(),
                     "text": clean,
                     "lines": lines,
+                }))
+            }
+        })
+        .register("pane.snapshot", move |params: Option<serde_json::Value>| {
+            let gh = g6.clone();
+            let io = io6.clone();
+            let r = rasterizer.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                // Render the live grid under lock. `Rasterizer::render` is
+                // CPU-bound (~5-50ms for typical pane sizes) and `tokio::Mutex`
+                // doesn't yield, but `pane.snapshot` is a snapshot RPC called
+                // infrequently — holding the lock keeps every cell's style,
+                // colors, and alternate-screen state intact (the capture_text
+                // replay trick we tried first dropped all SGR attrs and broke
+                // alt-screen TUIs like htop/vim/vivecaka).
+                let (img, snap_cols, snap_rows) = {
+                    let state = io.lock().await;
+                    let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                        shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                    })?;
+                    let opts = shux_raster::RasterOptions {
+                        cursor: Some((vt.cursor().row, vt.cursor().col)),
+                        ..Default::default()
+                    };
+                    let img = r.render(vt.grid(), &opts);
+                    (img, vt.grid().cols(), vt.grid().rows())
+                };
+
+                let mut png_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+                {
+                    use image::ImageEncoder;
+                    let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
+                    encoder
+                        .write_image(
+                            img.as_raw(),
+                            img.width(),
+                            img.height(),
+                            image::ExtendedColorType::Rgba8,
+                        )
+                        .map_err(|e| {
+                            shux_rpc::RpcError::internal(&format!("PNG encode failed: {e}"))
+                        })?;
+                }
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+                let (cw, ch) = r.cell_size();
+
+                Ok(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "png_base64": b64,
+                    "width": img.width(),
+                    "height": img.height(),
+                    "cell_width": cw,
+                    "cell_height": ch,
+                    "cols": snap_cols,
+                    "rows": snap_rows,
+                    "format": "png",
+                }))
+            }
+        })
+        .register("pane.set_size", move |params: Option<serde_json::Value>| {
+            let gh = g7.clone();
+            let io = io7.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                let cols = params
+                    .get("cols")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'cols'"))?
+                    as u16;
+                let rows = params
+                    .get("rows")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'rows'"))?
+                    as u16;
+                if cols < 4 || rows < 2 || cols > 1000 || rows > 1000 {
+                    return Err(shux_rpc::RpcError::invalid_params(&format!(
+                        "rows/cols out of range (got rows={rows} cols={cols})"
+                    )));
+                }
+                let pty_size = shux_pty::handle::PtySize { rows, cols };
+                let resizer = {
+                    let state = io.lock().await;
+                    state.resizers.get(&pane_id).cloned()
+                };
+                let resizer = resizer.ok_or_else(|| {
+                    shux_rpc::RpcError::not_found("pane resizer", &pane_id.to_string())
+                })?;
+                resizer
+                    .send(pty_size)
+                    .await
+                    .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
+                Ok(serde_json::json!({
+                    "pane_id": pane_id.to_string(),
+                    "rows": rows,
+                    "cols": cols,
                 }))
             }
         })
