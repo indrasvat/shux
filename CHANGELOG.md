@@ -1,3 +1,10 @@
+# [0.8.0](https://github.com/indrasvat/shux/compare/v0.7.1...v0.8.0) (2026-05-11)
+
+
+### Features
+
+* shux-raster — pixel snapshots of any pane, no terminal emulator needed ([#16](https://github.com/indrasvat/shux/issues/16)) ([818c4c6](https://github.com/indrasvat/shux/commit/818c4c6cd4b8d3e6838e5e7d6819a9c5d215e456))
+
 ## [0.7.1](https://github.com/indrasvat/shux/compare/v0.7.0...v0.7.1) (2026-05-11)
 
 
