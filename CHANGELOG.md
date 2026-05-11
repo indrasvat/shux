@@ -1,3 +1,11 @@
+# [0.5.0](https://github.com/indrasvat/shux/compare/v0.4.0...v0.5.0) (2026-05-11)
+
+
+### Features
+
+* **rpc,cli:** optimistic concurrency surface (task 037, PR 3b) ([#11](https://github.com/indrasvat/shux/issues/11)) ([a4b40c5](https://github.com/indrasvat/shux/commit/a4b40c518e474b62b449c81cd81ac5bca9ff80d7))
+* **ui:** bare Alt+h/j/k/l + Alt+n/p + Alt+1..9 Tier-1 bindings (task 018) ([#13](https://github.com/indrasvat/shux/issues/13)) ([4ac7b43](https://github.com/indrasvat/shux/commit/4ac7b433d3aca6443eb3c8f2b68bf01b7dc4c95f)), closes [#8](https://github.com/indrasvat/shux/issues/8)
+
 # [0.4.0](https://github.com/indrasvat/shux/compare/v0.3.0...v0.4.0) (2026-05-10)
 
 
