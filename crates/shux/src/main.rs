@@ -1969,7 +1969,15 @@ fn register_session_methods(
 
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
-                    match gh.create_session(name, cwd.clone()).await {
+                    // PR followup (codex P2 #10): persist `command` onto
+                    // the initial pane so subscribers + auto-title see
+                    // the truth. Pre-followup this RPC stored an empty
+                    // `Pane.command` and only the PTY layer knew about
+                    // the user's --cmd arg.
+                    match gh
+                        .create_session_with_command(name, cwd.clone(), command.clone())
+                        .await
+                    {
                         Ok(session_id) => {
                             let snap = gh.snapshot();
                             // Spawn PTY for the initial pane
@@ -2124,10 +2132,15 @@ fn register_session_methods(
                         return Ok(json);
                     }
 
-                    // Create new session
+                    // Create new session — `command` persisted onto the
+                    // initial pane (codex P2 #10 followup, same fix as
+                    // session.create above).
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
-                    match gh.create_session(name, cwd.clone()).await {
+                    match gh
+                        .create_session_with_command(name, cwd.clone(), command.clone())
+                        .await
+                    {
                         Ok(session_id) => {
                             let snap = gh.snapshot();
                             // Spawn PTY for the initial pane

@@ -569,6 +569,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_tcp_auth_required() {
+        // KNOWN FLAKE: bind→drop→re-bind TOCTOU race on the auto-
+        // assigned port. Between `drop(tcp_listener)` and the Server's
+        // own `TcpListener::bind`, another process can grab the port
+        // (CI runners with parallel jobs are most likely; locally
+        // this almost never trips). Tracked in
+        // .config/nextest.toml's flake list; a proper fix would
+        // hand the listener directly to Server::new instead of
+        // round-tripping through a port string. For now the test
+        // re-runs on retry per the nextest override.
+        //
         // TCP connections with a configured token must authenticate first.
         let cancel = tokio_util::sync::CancellationToken::new();
         let router = register_builtin_methods(Router::builder()).build();
