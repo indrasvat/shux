@@ -226,11 +226,8 @@ where
                             continue;
                         }
                         // Bare-key Tier-1 actions (Alt+key etc.).
-                        if let Some(action) = key_to_bare_action(key) {
-                            let frame = AttachClientFrame::Action {
-                                kind: action,
-                                args: ActionArgs::default(),
-                            };
+                        if let Some((kind, args)) = key_to_bare_action(key) {
+                            let frame = AttachClientFrame::Action { kind, args };
                             let bytes = serde_json::to_vec(&frame)?;
                             sink.send(Bytes::from(bytes)).await.ok();
                             continue;
@@ -338,29 +335,56 @@ fn key_to_prefix_action(key: KeyEvent) -> Option<ActionKind> {
     })
 }
 
-/// Map a *bare* (non-prefixed) key into an action.
+/// Map a *bare* (non-prefixed) key into an action and (optionally)
+/// its arguments.
 ///
 /// We support Alt-prefixed shortcuts as well as the dedicated prefix
 /// system. This makes the multiplexer feel modern (no need to "leader
 /// then key" every action) while still respecting the legacy tmux
 /// muscle memory of users who like Ctrl+Space first.
-fn key_to_bare_action(key: KeyEvent) -> Option<ActionKind> {
+///
+/// Bare bindings (Codex P2 followup from PR #8):
+/// - Alt+h/j/k/l: directional focus (mirrors the prefix-key bindings)
+/// - Alt+n / Alt+p: cycle to next/prev window
+/// - Alt+1..9: switch directly to the Nth window (1-indexed)
+///
+/// Closes the gap that demoted task 018 to Partial.
+fn key_to_bare_action(key: KeyEvent) -> Option<(ActionKind, ActionArgs)> {
     if !key.modifiers.contains(KeyModifiers::ALT) {
         return None;
     }
-    Some(match key.code {
+    // Alt+1..9 — switch to window N. Handled before the catch-all so a
+    // user-defined `KeyModifiers::ALT + KeyCode::Char('1')` doesn't fall
+    // through to "no match".
+    if let KeyCode::Char(c) = key.code {
+        if let Some(d) = c.to_digit(10) {
+            if (1..=9).contains(&d) {
+                return Some((
+                    ActionKind::SwitchToWindow,
+                    ActionArgs {
+                        window_index: Some(d as u16),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    }
+    let kind = match key.code {
         KeyCode::Enter => ActionKind::SplitSmart,
         KeyCode::Char('|') | KeyCode::Char('\\') => ActionKind::SplitVertical,
         KeyCode::Char('-') => ActionKind::SplitHorizontal,
-        KeyCode::Left => ActionKind::FocusLeft,
-        KeyCode::Right => ActionKind::FocusRight,
-        KeyCode::Up => ActionKind::FocusUp,
-        KeyCode::Down => ActionKind::FocusDown,
+        KeyCode::Left | KeyCode::Char('h') => ActionKind::FocusLeft,
+        KeyCode::Right | KeyCode::Char('l') => ActionKind::FocusRight,
+        KeyCode::Up | KeyCode::Char('k') => ActionKind::FocusUp,
+        KeyCode::Down | KeyCode::Char('j') => ActionKind::FocusDown,
         KeyCode::Char('z') => ActionKind::ToggleZoom,
         KeyCode::Char('x') => ActionKind::KillPane,
         KeyCode::Tab => ActionKind::FocusNext,
+        KeyCode::Char('n') => ActionKind::NextWindow,
+        KeyCode::Char('p') => ActionKind::PrevWindow,
         _ => return None,
-    })
+    };
+    Some((kind, ActionArgs::default()))
 }
 
 #[cfg(test)]
@@ -386,14 +410,69 @@ mod tests {
     #[test]
     fn test_bare_alt_actions() {
         let action = key_to_bare_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
-        assert_eq!(action, Some(ActionKind::SplitSmart));
+        assert_eq!(
+            action,
+            Some((ActionKind::SplitSmart, ActionArgs::default()))
+        );
         let action = key_to_bare_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT));
-        assert_eq!(action, Some(ActionKind::FocusNext));
+        assert_eq!(action, Some((ActionKind::FocusNext, ActionArgs::default())));
     }
 
     #[test]
     fn test_bare_without_alt_returns_none() {
         let action = key_to_bare_action(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(action, None);
+    }
+
+    // ── Codex P2 followup from PR #8 — bare Alt+h/j/k/l + Alt+n/p + Alt+1..9 ──
+    //
+    // Closes the gap that demoted task 018 to Partial. tmux + zellij
+    // both ship these by default; without them shux feels broken to
+    // anyone with muscle memory who expects Alt+1 to switch to window 1.
+
+    #[test]
+    fn test_bare_alt_hjkl_directional_focus() {
+        for (ch, expected) in [
+            ('h', ActionKind::FocusLeft),
+            ('j', ActionKind::FocusDown),
+            ('k', ActionKind::FocusUp),
+            ('l', ActionKind::FocusRight),
+        ] {
+            let action = key_to_bare_action(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT));
+            assert_eq!(action, Some((expected, ActionArgs::default())), "Alt+{ch}",);
+        }
+    }
+
+    #[test]
+    fn test_bare_alt_n_p_cycle_windows() {
+        let action = key_to_bare_action(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT));
+        assert_eq!(
+            action,
+            Some((ActionKind::NextWindow, ActionArgs::default()))
+        );
+        let action = key_to_bare_action(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(
+            action,
+            Some((ActionKind::PrevWindow, ActionArgs::default()))
+        );
+    }
+
+    #[test]
+    fn test_bare_alt_digits_switch_to_window_n() {
+        for d in 1..=9u8 {
+            let ch = char::from_digit(d as u32, 10).unwrap();
+            let action = key_to_bare_action(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT));
+            let (kind, args) = action.expect("Alt+digit must map");
+            assert_eq!(kind, ActionKind::SwitchToWindow, "Alt+{ch}");
+            assert_eq!(args.window_index, Some(d as u16), "Alt+{ch} → window_index",);
+        }
+    }
+
+    #[test]
+    fn test_bare_alt_zero_unbound() {
+        // 0 is intentionally not a switch shortcut (would conflict with
+        // tmux's Alt+0 meaning the 10th window, which we don't have).
+        let action = key_to_bare_action(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
         assert_eq!(action, None);
     }
 
