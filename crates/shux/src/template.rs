@@ -150,21 +150,51 @@ fn lower(tpl: Template) -> Result<Vec<Op>, TemplateError> {
     }
 
     let mut ops: Vec<Op> = Vec::new();
-
     let session_cwd = expand_cwd(tpl.session.cwd.as_deref());
 
-    // op[0] — CreateSession. We do NOT seed an initial_command here because
-    // the session's auto-created "1" window is going to be detitled / left
-    // alone; the user's first window comes from windows[0] below as a real
-    // CreateWindow op so the title in the template is honored. The auto
-    // window's initial pane runs the default shell.
+    // Fold `windows[0]` into the CreateSession op: the session's
+    // auto-created initial window inherits the user's first-window title
+    // and its initial pane runs the user's first command. Closes the
+    // pre-existing apply gap where `shux apply foo.toml` ended up creating
+    // a phantom default-shell auto-window AND the user's first window
+    // alongside it.
+    let first_window = &tpl.windows[0];
+    let first_pane = &first_window.panes[0];
+    let window0_cwd_fallback = first_window
+        .cwd
+        .as_deref()
+        .map(expand_string)
+        .unwrap_or_else(|| session_cwd.clone());
+    let first_pane_cwd = first_pane
+        .cwd
+        .as_deref()
+        .map(expand_string)
+        .unwrap_or_else(|| window0_cwd_fallback.clone());
     ops.push(Op::CreateSession {
         name: tpl.session.name.clone(),
-        cwd: session_cwd.clone(),
-        initial_command: vec![],
+        cwd: first_pane_cwd,
+        initial_command: first_pane.command.clone(),
+        initial_window_title: Some(first_window.title.clone()),
     });
 
-    for window in &tpl.windows {
+    // windows[0].panes[1..]: split off the session's initial pane (op 0).
+    let mut prior_pane_op = 0usize;
+    for pane in first_window.panes.iter().skip(1) {
+        let split_op_index = ops.len();
+        ops.push(Op::SplitPane {
+            target: PaneRef::BackRef {
+                op_index: prior_pane_op,
+            },
+            direction: pane.direction.unwrap_or(Direction::Vertical),
+            ratio: pane.ratio,
+            command: pane.command.clone(),
+            cwd: pane.cwd.as_deref().map(expand_string),
+        });
+        prior_pane_op = split_op_index;
+    }
+
+    // windows[1..]: emit CreateWindow + chained SplitPane as before.
+    for window in tpl.windows.iter().skip(1) {
         let window_cwd = window
             .cwd
             .as_deref()
@@ -174,7 +204,6 @@ fn lower(tpl: Template) -> Result<Vec<Op>, TemplateError> {
         let first_pane = &window.panes[0];
         let first_pane_cwd = first_pane.cwd.as_deref().map(expand_string);
 
-        // CreateWindow op for this window with the FIRST pane as its initial.
         let create_window_index = ops.len();
         ops.push(Op::CreateWindow {
             session: SessionRef::BackRef { op_index: 0 },
@@ -183,7 +212,6 @@ fn lower(tpl: Template) -> Result<Vec<Op>, TemplateError> {
             initial_command: first_pane.command.clone(),
         });
 
-        // Subsequent panes: split off the most recent pane in this window.
         let mut prior_pane_op = create_window_index;
         for pane in window.panes.iter().skip(1) {
             let split_op_index = ops.len();
@@ -236,6 +264,8 @@ mod tests {
 
     #[test]
     fn test_lower_minimal_template() {
+        // After folding windows[0] into CreateSession, a single-window
+        // single-pane template lowers to ONE op (no phantom auto-window).
         let tpl: Template = toml::from_str(
             r#"
 [session]
@@ -249,28 +279,30 @@ command = ["nvim"]
         )
         .unwrap();
         let ops = lower(tpl).unwrap();
-        assert_eq!(ops.len(), 2); // CreateSession + CreateWindow
+        assert_eq!(
+            ops.len(),
+            1,
+            "minimal template should fold to a single CreateSession op"
+        );
         match &ops[0] {
-            Op::CreateSession { name, .. } => assert_eq!(name.as_deref(), Some("ws")),
-            _ => panic!("op 0 should be CreateSession"),
-        }
-        match &ops[1] {
-            Op::CreateWindow {
-                title,
+            Op::CreateSession {
+                name,
                 initial_command,
-                session,
+                initial_window_title,
                 ..
             } => {
-                assert_eq!(title, "editor");
+                assert_eq!(name.as_deref(), Some("ws"));
                 assert_eq!(initial_command, &vec!["nvim".to_string()]);
-                matches!(session, SessionRef::BackRef { op_index: 0 });
+                assert_eq!(initial_window_title.as_deref(), Some("editor"));
             }
-            _ => panic!("op 1 should be CreateWindow"),
+            _ => panic!("op 0 should be CreateSession"),
         }
     }
 
     #[test]
     fn test_lower_window_with_split() {
+        // windows[0] folds into CreateSession; the second pane in the same
+        // window is a SplitPane against op[0].
         let tpl: Template = toml::from_str(
             r#"
 [session]
@@ -288,27 +320,33 @@ command = ["bash"]
         )
         .unwrap();
         let ops = lower(tpl).unwrap();
-        assert_eq!(ops.len(), 3); // session + window + split
+        assert_eq!(
+            ops.len(),
+            2,
+            "single window + 2 panes lowers to CreateSession + SplitPane"
+        );
 
-        match &ops[2] {
+        match &ops[1] {
             Op::SplitPane {
                 target,
                 direction,
                 ratio,
                 command,
-                cwd: _, // covered by test_lower_threads_split_pane_cwd
+                cwd: _,
             } => {
-                matches!(target, PaneRef::BackRef { op_index: 1 });
+                assert!(matches!(target, PaneRef::BackRef { op_index: 0 }));
                 assert_eq!(*direction, Direction::Vertical);
                 assert!((ratio - 0.4).abs() < 1e-6);
                 assert_eq!(command, &vec!["bash".to_string()]);
             }
-            _ => panic!("op 2 should be SplitPane"),
+            _ => panic!("op 1 should be SplitPane"),
         }
     }
 
     #[test]
     fn test_lower_three_window_workspace() {
+        // windows[0] folds into CreateSession; windows[1..] still emit
+        // CreateWindow with their titles preserved.
         let tpl: Template = toml::from_str(
             r#"
 [session]
@@ -333,7 +371,37 @@ command = ["codex"]
         )
         .unwrap();
         let ops = lower(tpl).unwrap();
-        assert_eq!(ops.len(), 4); // session + 3 windows
+        assert_eq!(
+            ops.len(),
+            3,
+            "session + 2 follow-up windows (windows[0] folded)"
+        );
+        match &ops[0] {
+            Op::CreateSession {
+                initial_command,
+                initial_window_title,
+                ..
+            } => {
+                assert_eq!(initial_command, &vec!["nvim".to_string()]);
+                assert_eq!(initial_window_title.as_deref(), Some("editor"));
+            }
+            _ => panic!("op 0 should be CreateSession"),
+        }
+        match &ops[1] {
+            Op::CreateWindow {
+                title,
+                initial_command,
+                ..
+            } => {
+                assert_eq!(title, "agent-1");
+                assert_eq!(initial_command, &vec!["claude".to_string()]);
+            }
+            _ => panic!("op 1 should be CreateWindow for agent-1"),
+        }
+        match &ops[2] {
+            Op::CreateWindow { title, .. } => assert_eq!(title, "agent-2"),
+            _ => panic!("op 2 should be CreateWindow for agent-2"),
+        }
     }
 
     #[test]
@@ -365,8 +433,9 @@ command = ["bash"]
         )
         .unwrap();
         let ops = lower(tpl).unwrap();
-        assert_eq!(ops.len(), 3);
-        match &ops[2] {
+        // windows[0] folds into CreateSession, so the second pane is op[1].
+        assert_eq!(ops.len(), 2);
+        match &ops[1] {
             Op::SplitPane { cwd, .. } => {
                 assert_eq!(
                     cwd.as_deref().map(|p| p.to_string_lossy().to_string()),
@@ -374,7 +443,7 @@ command = ["bash"]
                     "split-pane cwd must be threaded through to the op"
                 );
             }
-            _ => panic!("op 2 should be SplitPane"),
+            _ => panic!("op 1 should be SplitPane"),
         }
     }
 

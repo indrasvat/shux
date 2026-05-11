@@ -1,0 +1,18 @@
+# shux session template — single pane running `vivecaka` against a
+# configurable repo. Used by `.claude/automations/raster_drive_vivecaka.sh`
+# as a model for repeatable scripted-interaction + visual-regression tests.
+#
+# Apply with:
+#   target/release/shux apply .claude/templates/vivecaka.toml
+#
+# The session named "raster_demo" can then be driven via `pane.send_keys`
+# and snapshotted via `pane.snapshot` — see the driver script next door.
+
+[session]
+name = "raster_demo"
+
+[[windows]]
+title = "vivecaka"
+
+[[windows.panes]]
+command = ["/Users/indrasvat/.local/bin/vivecaka", "--repo", "indrasvat/kartaa"]

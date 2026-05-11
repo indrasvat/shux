@@ -67,6 +67,12 @@ pub enum Op {
         /// subscribers see what the pane is actually running.
         #[serde(default)]
         initial_command: Vec<String>,
+        /// Title for the auto-created initial window. None → default `"1"`.
+        /// Lets template lowering fold `windows[0]` into the session so
+        /// `shux apply foo.toml` doesn't leave a phantom default-shell
+        /// window behind the user's actual first window.
+        #[serde(default)]
+        initial_window_title: Option<String>,
     },
     /// Create a window inside a session, with an initial pane.
     CreateWindow {
