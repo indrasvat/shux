@@ -17,8 +17,8 @@
 
   --ink:       #ece4d2;    /* body text on dark */
   --ink-2:     #b9b0a0;    /* secondary */
-  --ink-3:     #7a7263;    /* muted */
-  --ink-4:     #4a443d;    /* faint */
+  --ink-3:     #928a78;    /* muted — bumped from #7a7263 to clear 4.5:1 vs --bg per codex review */
+  --ink-4:     #5a5347;    /* faint — also bumped to keep relative contrast */
   --ink-on-paper:  #1d1813;
   --ink2-on-paper: #56504a;
 

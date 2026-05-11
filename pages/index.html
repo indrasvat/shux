@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>shux — a terminal multiplexer built for agents</title>
-<meta name="description" content="shux is a Rust terminal multiplexer with a JSON-RPC API, atomic declarative workspace templates, sealed PTY-output events, optimistic concurrency, and a pixel snapshotter. Drive sessions and get PNG-perfect screenshots back, all without a terminal emulator in the loop.">
+<meta name="theme-color" content="#15120e">
+<title>shux — a terminal multiplexer with an API, not a keyboard assumption</title>
+<meta name="description" content="shux is a Rust terminal multiplexer with a JSON-RPC API. Spawn panes, type into them, snapshot them as PNG — all over RPC. Designed for agents, CI jobs, and external automation. Keep tmux for your shell.">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12,14 +13,14 @@
 <link rel="stylesheet" href="/styles/site.css">
 
 <meta property="og:type" content="website">
-<meta property="og:title" content="shux — a terminal multiplexer built for agents">
-<meta property="og:description" content="JSON-RPC API. Atomic templates. Pixel snapshots. Headless visual regression for TUIs.">
+<meta property="og:title" content="shux — a terminal multiplexer with an API, not a keyboard assumption">
+<meta property="og:description" content="JSON-RPC. Atomic templates. Pixel snapshots. The terminal multiplexer for everything tmux's contract doesn't reach.">
 <meta property="og:url" content="https://shux.pages.dev/">
-<meta property="og:image" content="https://shux.pages.dev/assets/og.png">
+<meta property="og:image" content="https://shux.pages.dev/screenshots/06-raster-hello.png">
 
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="shux — a terminal multiplexer built for agents">
-<meta name="twitter:description" content="JSON-RPC API. Atomic templates. Pixel snapshots. Headless visual regression for TUIs.">
+<meta name="twitter:title" content="shux — a terminal multiplexer with an API, not a keyboard assumption">
+<meta name="twitter:description" content="JSON-RPC. Atomic templates. Pixel snapshots. The terminal multiplexer for everything tmux's contract doesn't reach.">
 
 <style>
 /* ── Page-specific (hero composition + showcase grid) ── */
@@ -279,9 +280,179 @@
 .target {
   display: inline-flex; align-items: center; gap: 6px;
   font-family: var(--font-mono); font-size: 11px;
-  color: var(--ink-3); letter-spacing: 0.05em;
+  color: var(--ink2-on-paper); letter-spacing: 0.05em; opacity: 0.7;
 }
-.target::before { content: "▸"; color: var(--accent-ink); }
+.target::before { content: "▸"; color: var(--accent); opacity: 1; }
+
+/* ── Quickstart snapshot proof — code on the left, real PNG on the right. ── */
+.snap-proof {
+  display: grid; gap: var(--s-4);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  align-items: start; margin-top: var(--s-2);
+}
+@media (max-width: 760px) { .snap-proof { grid-template-columns: 1fr; } }
+.snap-proof pre { margin: 0; }
+.snap-out { margin: 0; }
+.snap-out img {
+  width: 100%; height: auto; aspect-ratio: 720/440;
+  border: 1px solid var(--line-paper);
+  border-radius: var(--r-3);
+  background: #0a0810;
+  display: block;
+}
+.snap-out figcaption {
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink2-on-paper); opacity: 0.85;
+  margin-top: var(--s-2);
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.snap-out .dot.mossy {
+  width: 7px; height: 7px;
+  background: var(--moss); border-radius: 50%;
+}
+
+/* ── Replaces table → stacked cards on mobile (≤720px). ── */
+@media (max-width: 720px) {
+  .replaces-table thead { display: none; }
+  .replaces-table tr {
+    display: block;
+    border: 1px solid var(--line);
+    border-radius: var(--r-2);
+    background: var(--bg-2);
+    padding: var(--s-3) var(--s-4);
+    margin: 0 0 var(--s-3);
+  }
+  .replaces-table td {
+    display: block;
+    border-bottom: 0;
+    padding: 6px 0;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .replaces-table td:not(:last-child) {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 10px;
+    margin-bottom: 4px;
+  }
+  .replaces-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--ink-3);
+    opacity: 0.85;
+  }
+  .replaces-table td code { white-space: normal; }
+}
+
+/* ── Tabbed gallery — left rail of tabs + big stage on the right. ── */
+.gallery {
+  display: grid; gap: var(--s-5);
+  grid-template-columns: 280px minmax(0, 1fr);
+  align-items: stretch;
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  background: var(--bg-2);
+  padding: var(--s-4);
+}
+.gallery-tabs {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.gallery-tab {
+  position: relative;
+  display: grid; grid-template-columns: 14px 1fr; column-gap: 10px;
+  row-gap: 2px;
+  align-items: center; align-content: center;
+  text-align: left; padding: var(--s-3) var(--s-3);
+  background: transparent; border: 1px solid transparent;
+  border-radius: var(--r-2);
+  color: var(--ink-2); font-family: var(--font-sans); font-size: 13.5px;
+  cursor: pointer; transition: background 140ms ease, color 140ms ease,
+                                border-color 140ms ease;
+}
+.gallery-tab:hover { background: var(--bg-3); color: var(--ink); }
+.gallery-tab.is-active {
+  background: var(--bg-3);
+  border-color: var(--line-2);
+  color: var(--ink);
+}
+.gallery-tab.is-active .g-dot,
+.gallery-tab .g-dot.live { background: var(--moss); }
+.gallery-tab .g-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ink-4);
+  grid-row: 1 / span 2;
+}
+.gallery-tab .g-name { font-weight: 600; font-size: 14px; line-height: 1.2; }
+.gallery-tab .g-meta {
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--ink-3); letter-spacing: 0.04em;
+}
+.gallery-stage {
+  position: relative;
+  border-radius: var(--r-2);
+  background: #0a0810;
+  border: 1px solid var(--line);
+  overflow: hidden;
+  display: flex; align-items: stretch;
+}
+.gallery-panel {
+  display: none; margin: 0;
+  width: 100%;
+}
+.gallery-panel.is-active { display: block; }
+.gallery-panel img {
+  width: 100%; height: auto; display: block;
+  background: #0a0810;
+}
+.gallery-panel figcaption {
+  padding: var(--s-3) var(--s-4) var(--s-4);
+  background: var(--bg-2);
+  border-top: 1px solid var(--line);
+  font-size: 13px; line-height: 1.55;
+  color: var(--ink-2);
+}
+.gallery-panel figcaption b { color: var(--ink); display: inline; }
+.gallery-panel figcaption code {
+  background: var(--bg-3); border: 1px solid var(--line);
+  padding: 0 5px; border-radius: var(--r-1); font-size: 12px;
+}
+
+@media (max-width: 920px) {
+  .gallery { grid-template-columns: 1fr; }
+  .gallery-tabs {
+    flex-direction: row;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x mandatory;
+    margin: 0 calc(-1 * var(--s-4));
+    padding: 0 var(--s-4) 4px;
+  }
+  .gallery-tab {
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+    min-width: 200px;
+  }
+}
+
+/* ── Mobile hero typography — narrower viewport, calmer headline. ── */
+@media (max-width: 720px) {
+  .hero-headline {
+    font-size: clamp(34px, 9.5vw, 44px);
+    line-height: 1.04;
+    letter-spacing: -0.018em;
+  }
+  .hero-headline em {
+    /* Tighten the slab so it doesn't dominate the wrapped block. */
+    background: linear-gradient(180deg, transparent 78%, var(--accent-soft) 78%);
+    padding: 0 4px;
+    margin: 0 -2px;
+  }
+  .hero-sub { font-size: 16px; max-width: 100%; }
+}
 </style>
 </head>
 <body>
@@ -303,13 +474,12 @@
   <div class="wrap hero-grid">
     <div>
       <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span>v0.8.0 · stable · written in Rust</p>
-      <h1 class="hero-headline">A terminal multiplexer<br>that <em>agents can drive</em>.</h1>
+      <h1 class="hero-headline">A terminal multiplexer<br>with <em>an API</em>, not a<br>keyboard assumption.</h1>
       <p class="hero-sub">
-        shux runs sessions, windows, and panes like tmux. It also has a
-        JSON-RPC API, atomic declarative templates, sealed PTY-output
-        events, optimistic concurrency, and a built-in rasterizer that
-        returns pixel-perfect PNGs of any pane — no terminal emulator
-        in the loop.
+        Spawn panes. Type into them. Get back a PNG of what they
+        look like. All over JSON-RPC. Keep <b>tmux</b> for your shell;
+        use <b>shux</b> where another process — a CI job, an agent, a
+        test — needs to operate the terminal.
       </p>
       <div class="hero-cta">
         <a class="btn primary" href="#quickstart">Install</a>
@@ -328,11 +498,14 @@
         <div class="url"></div>
       </div>
       <div class="device-screen" id="screen">
-        <img src="/screenshots/01-vivecaka-pr-list.png" alt="vivecaka PR triage view, rasterized from a live pane" class="active">
-        <img src="/screenshots/02-vivecaka-pr-detail.png" alt="vivecaka PR detail view with tabs">
-        <img src="/screenshots/03-vivecaka-help.png" alt="vivecaka help overlay">
-        <img src="/screenshots/04-vivecaka-splash.png" alt="vivecaka splash logo">
-        <div class="device-tag" id="screenTag">pane.snapshot → PR list view</div>
+        <!-- Strongest proof frame first (per codex): the two-tone block-art
+             splash reads instantly. Subsequent frames cycle through real
+             agent-driven states. width/height for layout stability. -->
+        <img src="/screenshots/04-vivecaka-splash.png" alt="vivecaka splash logo (two-tone block art) rasterized by shux-raster" width="1800" height="1140" class="active">
+        <img src="/screenshots/01-vivecaka-pr-list.png" alt="vivecaka PR triage view, rasterized from a live pane" width="1800" height="1140" loading="lazy">
+        <img src="/screenshots/02-vivecaka-pr-detail.png" alt="vivecaka PR detail view with tabs" width="1800" height="1140" loading="lazy">
+        <img src="/screenshots/03-vivecaka-help.png" alt="vivecaka help overlay" width="1800" height="1140" loading="lazy">
+        <div class="device-tag" id="screenTag">pane.snapshot → vivecaka splash</div>
       </div>
     </div>
   </div>
@@ -402,7 +575,7 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
 <span style="color:var(--ink2-on-paper)"># → session created atomically.</span>
 
 <span style="color:var(--accent)">$ shux api pane.set_size '{"pane_id":"$PID","cols":200,"rows":60}'</span>
-<span style="color:var(--ink2-on-paper"># → synchronous resize (VT + PTY).</span>
+<span style="color:var(--ink2-on-paper)"># → synchronous resize (VT + PTY).</span>
 
 <span style="color:var(--accent)">$ shux api pane.send_keys '{"pane_id":"$PID","text":"j"}'</span>
 <span style="color:var(--ink2-on-paper)"># → navigate down one row.</span>
@@ -439,11 +612,12 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
     <p class="eyebrow">replaces these</p>
     <h2 class="measure">If you'd reach for one of these, reach for shux.</h2>
     <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
-      Each row is a job a tool is good at. shux does the same job via
-      one primitive, without leaving the JSON-RPC surface.
+      shux collapses orchestration, scripted input, output capture, and
+      pixel screenshots into one RPC surface. Same primitive, no extra
+      tools.
     </p>
 
-    <table>
+    <table class="replaces-table">
       <thead>
         <tr>
           <th style="width:32%">If you'd reach for</th>
@@ -453,54 +627,54 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
       </thead>
       <tbody>
         <tr>
-          <td><code>tmux</code> · <code>screen</code> · <code>byobu</code></td>
-          <td>Multiplex sessions / windows / panes</td>
-          <td><code>shux apply spec.toml</code> · <code>shux attach</code></td>
+          <td data-label="if you'd reach for"><code>tmux</code> · <code>screen</code> · <code>byobu</code></td>
+          <td data-label="for this job">Multiplex sessions / windows / panes</td>
+          <td data-label="the shux call"><code>shux apply spec.toml</code> · <code>shux attach</code></td>
         </tr>
         <tr>
-          <td>iTerm2 Python SDK</td>
-          <td>Drive a terminal app from outside</td>
-          <td><code>pane.send_keys</code> + <code>pane.snapshot</code></td>
+          <td data-label="if you'd reach for">iTerm2 Python SDK</td>
+          <td data-label="for this job">Drive a terminal app from outside</td>
+          <td data-label="the shux call"><code>pane.send_keys</code> + <code>pane.snapshot</code></td>
         </tr>
         <tr>
-          <td><code>expect</code> · <code>pexpect</code> · <code>sexpect</code></td>
-          <td>Scripted CLI / REPL interaction</td>
-          <td>Scenario array of <code>send / wait / snap</code> rows</td>
+          <td data-label="if you'd reach for"><code>expect</code> · <code>pexpect</code> · <code>sexpect</code></td>
+          <td data-label="for this job">Scripted CLI / REPL interaction</td>
+          <td data-label="the shux call"><code>pane.send_keys</code> loop with <code>pane.capture</code> assertions <span class="muted">— workflow</span></td>
         </tr>
         <tr>
-          <td><code>asciinema rec</code></td>
-          <td>Record a terminal session</td>
-          <td><code>pane.output.watch</code> data-plane stream</td>
+          <td data-label="if you'd reach for"><code>asciinema rec</code></td>
+          <td data-label="for this job">Record a terminal session</td>
+          <td data-label="the shux call"><code>pane.output.watch</code> data-plane stream</td>
         </tr>
         <tr>
-          <td><code>vhs</code> · <code>agg</code> · <code>terminalizer</code></td>
-          <td>Generate TUI demo GIFs / WebPs</td>
-          <td><code>pane.snapshot</code> loop → <code>ffmpeg</code></td>
+          <td data-label="if you'd reach for"><code>vhs</code> · <code>agg</code> · <code>terminalizer</code></td>
+          <td data-label="for this job">Generate TUI demo GIFs / WebPs</td>
+          <td data-label="the shux call"><code>pane.snapshot</code> loop → <code>ffmpeg</code></td>
         </tr>
         <tr>
-          <td><code>termshot</code> · <code>freezeframe</code></td>
-          <td>Still PNG of a terminal frame</td>
-          <td><code>pane.snapshot</code></td>
+          <td data-label="if you'd reach for"><code>termshot</code> · <code>freezeframe</code></td>
+          <td data-label="for this job">Still PNG of a terminal frame</td>
+          <td data-label="the shux call"><code>pane.snapshot</code></td>
         </tr>
         <tr>
-          <td>iTerm2 broadcast input</td>
-          <td>Send keystrokes to many panes at once</td>
-          <td><code>pane.send_keys</code> fan-out</td>
+          <td data-label="if you'd reach for">iTerm2 broadcast input</td>
+          <td data-label="for this job">Send keystrokes to many panes at once</td>
+          <td data-label="the shux call"><code>pane.send_keys</code> fan-out across pane IDs</td>
         </tr>
         <tr>
-          <td><code>ttyrec</code> · <code>termsh</code></td>
-          <td>Replay a recorded session</td>
-          <td>Re-feed VT bytes → <code>pane.snapshot</code> per frame</td>
+          <td data-label="if you'd reach for"><code>ttyrec</code> · <code>termsh</code></td>
+          <td data-label="for this job">Replay a recorded session</td>
+          <td data-label="the shux call">Feed captured bytes back into a pane <span class="muted">— workflow</span></td>
         </tr>
         <tr>
-          <td>GNU parallel <code>--tmux</code> mode</td>
-          <td>Run N tasks in N panes, watch in one place</td>
-          <td>Templated workspace + RPC orchestrator</td>
+          <td data-label="if you'd reach for">GNU parallel <code>--tmux</code> mode</td>
+          <td data-label="for this job">Run N tasks in N panes, watch in one place</td>
+          <td data-label="the shux call"><code>shux apply</code> a multi-pane template <span class="muted">— workflow</span></td>
         </tr>
         <tr>
-          <td>Custom Bubbletea test harness</td>
-          <td>Visual regression for your TUI</td>
-          <td><code>pane.snapshot</code> + golden-image diff</td>
+          <td data-label="if you'd reach for">Custom Bubbletea / ratatui test harness</td>
+          <td data-label="for this job">Visual regression for your TUI</td>
+          <td data-label="the shux call"><code>pane.snapshot</code> + golden-image diff</td>
         </tr>
       </tbody>
     </table>
@@ -545,48 +719,102 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
   </div>
 </section>
 
-<!-- ─── Showcase ────────────────────────────────────── -->
+<!-- ─── Gallery (tabbed) ──────────────────────────────
+     Single tabbed surface that walks a visitor through every demo
+     worth seeing — an animated agent-drive replay, syntax-highlight
+     proof, the self-documenting --help, the 692-test sweep, and the
+     attribute / colour coverage. Every artefact is real
+     `pane.snapshot` output.
+─────────────────────────────────────────────────── -->
 <section class="section">
   <div class="wrap">
     <p class="eyebrow">in the wild</p>
-    <h2 class="measure">Every screenshot below is a real <code>pane.snapshot</code> output.</h2>
+    <h2 class="measure">Five tabs. Five real <code>pane.snapshot</code> outputs.</h2>
     <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
-      No mockups. No "rendered in After Effects". Each PNG was
-      generated by driving a live shux daemon over JSON-RPC.
+      No mockups. No "rendered in After Effects". Pick a tab to see
+      what shux's rasterizer produces when an agent drives a real TUI.
     </p>
 
-    <div class="shots">
-      <!-- Row 1: hero splash full-width — gives the cyan/purple block-art real estate to breathe. -->
-      <div class="shot span-6">
-        <img src="/screenshots/04-vivecaka-splash.png" alt="vivecaka splash logo rendered in two-tone block-art (cyan + purple) by shux-raster">
-        <div class="cap"><b>vivecaka splash</b><span>rasterized in pure Rust · 200×60</span></div>
+    <div class="gallery" data-active="0">
+      <div class="gallery-tabs" role="tablist" aria-label="shux gallery">
+        <button role="tab" class="gallery-tab is-active" data-i="0" aria-selected="true">
+          <span class="g-dot live"></span>
+          <span class="g-name">Agent driving a TUI</span>
+          <span class="g-meta">animated · 9 frames</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="1" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Syntax-highlighted source</span>
+          <span class="g-meta">bat · rust</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Self-documenting CLI</span>
+          <span class="g-meta">shux --help</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">CI test sweep</span>
+          <span class="g-meta">cargo nextest · 692/692</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Pixel + attribute coverage</span>
+          <span class="g-meta">shux-raster</span>
+        </button>
       </div>
-      <!-- Row 2: paired states. -->
-      <div class="shot span-3">
-        <img src="/screenshots/01-vivecaka-pr-list.png" alt="vivecaka PR triage table showing 6 open dependabot PRs in indrasvat/kartaa">
-        <div class="cap"><b>PR list</b><span>after PR fetch settles</span></div>
-      </div>
-      <div class="shot span-3">
-        <img src="/screenshots/07-vivecaka-search.png" alt="vivecaka PR list filtered with '/actions' search query, 4 of 6 PRs match">
-        <div class="cap"><b>live search filter</b><span>typed via pane.send_keys</span></div>
-      </div>
-      <!-- Row 3: PR detail + Help overlay. -->
-      <div class="shot span-3">
-        <img src="/screenshots/02-vivecaka-pr-detail.png" alt="vivecaka PR detail view, Checks tab active, navigated via Tab keystroke">
-        <div class="cap"><b>PR detail · Checks tab</b><span>after Tab × 1</span></div>
-      </div>
-      <div class="shot span-3">
-        <img src="/screenshots/03-vivecaka-help.png" alt="vivecaka help overlay with Navigation + Global keybindings">
-        <div class="cap"><b>help overlay</b><span>? key</span></div>
-      </div>
-      <!-- Row 4: shux-specific evidence. -->
-      <div class="shot span-3">
-        <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests with green PASS rows">
-        <div class="cap"><b>cargo nextest</b><span>692/692 passing</span></div>
-      </div>
-      <div class="shot span-3">
-        <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough, 256-color palette, truecolor RGB">
-        <div class="cap"><b>shux-raster</b><span>full attribute coverage</span></div>
+
+      <div class="gallery-stage">
+        <figure class="gallery-panel is-active" data-i="0" role="tabpanel">
+          <img src="/screenshots/anim-vivecaka-drive.png" alt="9-frame animated replay of an agent driving vivecaka: splash → PR list → cursor moves → search opens → list filters → help overlay → PR detail → tab changes → back to list" width="900" height="570" loading="lazy">
+          <figcaption>
+            <b>One scenario, scripted entirely through JSON-RPC.</b>
+            Spawn vivecaka, resize, type <code>j</code> to navigate, <code>/</code> to search,
+            <code>?</code> for help, <kbd>Enter</kbd> to open, <kbd>Tab</kbd> to cycle tabs,
+            <kbd>Esc</kbd> to back out. Every frame is a real <code>pane.snapshot</code> call —
+            this is the asciinema-style record you get for free with shux.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="1" role="tabpanel" hidden>
+          <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy">
+          <figcaption>
+            <b><code>bat crates/shux-raster/src/lib.rs</code></b> — Rust syntax
+            highlighting, line numbers, TwoDark palette. Every colour in the source
+            survives the round-trip through shux-vt's SGR parser and shux-raster's
+            glyph emitter. No re-rendering, no theme remap.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
+          <img src="/screenshots/09-help.png" alt="shux --help showing the command→RPC method map, typical agent workflow, replaces-these-tools table, and where-to-learn-more block" width="1080" height="1057" loading="lazy">
+          <figcaption>
+            <b><code>shux --help</code></b> — the long-form help is a paste-able agent
+            reference: every CLI verb mapped to its RPC method, a 3-call workflow, the
+            replaces-these-tools list, and cross-links. Captured here straight from the
+            CLI, rendered by the same rasterizer that snapshotted the splash above.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
+          <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] 692 tests run: 692 passed, 0 skipped'" width="1620" height="912" loading="lazy">
+          <figcaption>
+            <b><code>cargo nextest run --workspace</code></b> — 692 tests cover the
+            whole workspace (core, VT parser, PTY, RPC, UI compositor, raster, plugin
+            host, CLI). PASS rows captured mid-run, summary at the bottom.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
+          <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy">
+          <figcaption>
+            <b>shux-raster's hello banner.</b> Bold, dim, inverse, underline,
+            strikethrough. ANSI 16, the 256-cube, truecolor RGB. Cursor rendered as an
+            inverse cell. JetBrains Mono Regular bundled and rasterized in pure Rust
+            via <code>fontdue</code>. No terminal emulator was involved in producing
+            this PNG.
+          </figcaption>
+        </figure>
       </div>
     </div>
   </div>
@@ -630,11 +858,18 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
         <div class="num">03</div>
         <div>
           <h3>Snapshot</h3>
-          <p>Send a base64-encoded PNG back to stdout. Decode and pipe
-          it anywhere — a CI golden, a vision LLM, a webhook.</p>
-<pre><code>shux api pane.snapshot '{"pane_id":"<i>$PID</i>"}' \
+          <p>One RPC returns a base64-encoded PNG of the live pane.
+          Decode and pipe it anywhere — a CI golden, a vision LLM, a
+          webhook.</p>
+          <div class="snap-proof">
+            <pre><code>shux api pane.snapshot '{"pane_id":"<i>$PID</i>"}' \
   | jq -r .result.png_base64 \
-  | base64 -d &gt; htop.png</code></pre>
+  | base64 -d &gt; frame.png</code></pre>
+            <figure class="snap-out">
+              <img src="/screenshots/06-raster-hello.png" alt="example frame.png produced by pane.snapshot — shux-raster's attribute showcase" width="720" height="440" loading="lazy">
+              <figcaption><span class="dot mossy"></span> <code>frame.png</code> — what came back. Real output, no mockup.</figcaption>
+            </figure>
+          </div>
         </div>
       </div>
     </div>
@@ -719,17 +954,53 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
 </footer>
 
 <script>
+  // Gallery tab switcher — vanilla, no framework.
+  (function () {
+    var tabs = document.querySelectorAll(".gallery-tab");
+    var panels = document.querySelectorAll(".gallery-panel");
+    if (!tabs.length) return;
+    function activate (i) {
+      tabs.forEach(function (t, ti) {
+        var on = ti === i;
+        t.classList.toggle("is-active", on);
+        t.setAttribute("aria-selected", on ? "true" : "false");
+      });
+      panels.forEach(function (p, pi) {
+        var on = pi === i;
+        p.classList.toggle("is-active", on);
+        if (on) p.removeAttribute("hidden");
+        else    p.setAttribute("hidden", "");
+      });
+    }
+    tabs.forEach(function (t, i) {
+      t.addEventListener("click", function () { activate(i); });
+      t.addEventListener("keydown", function (e) {
+        if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+          var next = (i + 1) % tabs.length;
+          tabs[next].focus(); activate(next); e.preventDefault();
+        } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+          var prev = (i - 1 + tabs.length) % tabs.length;
+          tabs[prev].focus(); activate(prev); e.preventDefault();
+        }
+      });
+    });
+  })();
+
   // Hero device — rotate snapshots. Pause if reduced-motion.
+  //
+  // First frame in the markup is the splash (strongest proof per codex
+  // review — instantly readable as "rasterized terminal art"). Subsequent
+  // frames cycle through agent-driven states.
   (function () {
     var screen = document.getElementById("screen");
     if (!screen) return;
     var imgs = screen.querySelectorAll("img");
     var tag = document.getElementById("screenTag");
     var labels = [
+      "pane.snapshot → vivecaka splash",
       "pane.snapshot → PR list view",
       "pane.snapshot → PR detail · Checks tab",
-      "pane.snapshot → help overlay (? key)",
-      "pane.snapshot → vivecaka splash"
+      "pane.snapshot → help overlay (? key)"
     ];
     if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       return;
@@ -743,18 +1014,19 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
     }, 4200);
   })();
 
-  // Pull the latest release tag and stamp it into the nav.
-  fetch("https://api.github.com/repos/indrasvat/shux/releases/latest")
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (j) {
-      if (!j || !j.tag_name) return;
-      var t = j.tag_name.replace(/^v/, "v");
-      var nav = document.getElementById("ver");
-      var ftr = document.getElementById("ver-footer");
-      if (nav) nav.textContent = t;
-      if (ftr) ftr.textContent = t;
-    })
-    .catch(function () { /* offline / CSP / rate-limited — leave the static label */ });
+  // Version label is stamped at build/deploy time (we ship a static
+  // string in the markup rather than fetch api.github.com on every page
+  // load — codex review pointed out the rate-limit risk on a traffic
+  // spike, and the cosmetic chip isn't worth the foot-gun).
+  (function () {
+    var nav = document.getElementById("ver");
+    var ftr = document.getElementById("ver-footer");
+    // The deploy workflow can rewrite this constant on each release; for
+    // now it tracks the latest published tag.
+    var v = "v0.8";
+    if (nav) nav.textContent = v;
+    if (ftr) ftr.textContent = v;
+  })();
 </script>
 
 </body>
