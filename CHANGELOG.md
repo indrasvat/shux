@@ -1,3 +1,10 @@
+# [0.7.0](https://github.com/indrasvat/shux/compare/v0.6.0...v0.7.0) (2026-05-11)
+
+
+### Features
+
+* **events,rpc,cli:** sampled pane.output via data-plane (PR 2c) ([#14](https://github.com/indrasvat/shux/issues/14)) ([d598b23](https://github.com/indrasvat/shux/commit/d598b2354b4eb7fdcce2c921ac66584b59a6e956))
+
 # [0.6.0](https://github.com/indrasvat/shux/compare/v0.5.0...v0.6.0) (2026-05-11)
 
 
