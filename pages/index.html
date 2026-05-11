@@ -729,7 +729,7 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
 <section class="section">
   <div class="wrap">
     <p class="eyebrow">in the wild</p>
-    <h2 class="measure">Five tabs. Five real <code>pane.snapshot</code> outputs.</h2>
+    <h2 class="measure">Six tabs. Real <code>pane.snapshot</code> outputs, no mockups.</h2>
     <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
       No mockups. No "rendered in After Effects". Pick a tab to see
       what shux's rasterizer produces when an agent drives a real TUI.
@@ -744,20 +744,25 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
         </button>
         <button role="tab" class="gallery-tab" data-i="1" aria-selected="false">
           <span class="g-dot"></span>
+          <span class="g-name">Multi-pane workspace</span>
+          <span class="g-meta">animated · 5 frames · tmux-style</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
+          <span class="g-dot"></span>
           <span class="g-name">Syntax-highlighted source</span>
           <span class="g-meta">bat · rust</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Self-documenting CLI</span>
           <span class="g-meta">shux --help</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">CI test sweep</span>
           <span class="g-meta">cargo nextest · 692/692</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Pixel + attribute coverage</span>
           <span class="g-meta">shux-raster</span>
@@ -777,6 +782,21 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
         </figure>
 
         <figure class="gallery-panel" data-i="1" role="tabpanel" hidden>
+          <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy">
+          <figcaption>
+            <b>One <code>shux apply</code> spawns a 4-pane workspace</b> —
+            <code>bat</code> on the editor, <code>cargo nextest</code> running tests,
+            <code>shux --help</code> on the reference pane, a clock + git-log loop on
+            the watch pane. The replay then sends arrow-down keystrokes
+            (<code>pane.send_keys</code>), resizes the tests pane
+            (<code>pane.set_size</code>, synchronous), and swaps the editor and tests
+            quadrants (<code>pane.swap</code>) — the same verbs as
+            <code>tmux send-keys</code>, <code>tmux resize-pane</code>,
+            <code>tmux swap-pane</code>, but typed.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
           <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy">
           <figcaption>
             <b><code>bat crates/shux-raster/src/lib.rs</code></b> — Rust syntax
@@ -786,7 +806,7 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
           <img src="/screenshots/09-help.png" alt="shux --help showing the command→RPC method map, typical agent workflow, replaces-these-tools table, and where-to-learn-more block" width="1080" height="1057" loading="lazy">
           <figcaption>
             <b><code>shux --help</code></b> — the long-form help is a paste-able agent
@@ -796,7 +816,7 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
           <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] 692 tests run: 692 passed, 0 skipped'" width="1620" height="912" loading="lazy">
           <figcaption>
             <b><code>cargo nextest run --workspace</code></b> — 692 tests cover the
@@ -805,7 +825,7 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
           <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy">
           <figcaption>
             <b>shux-raster's hello banner.</b> Bold, dim, inverse, underline,
