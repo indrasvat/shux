@@ -102,6 +102,12 @@ pub enum Command {
         /// Session name to kill
         #[arg(short, long)]
         session: String,
+
+        /// Optimistic concurrency: only succeed if the session is at
+        /// this version. Stale versions return error -32002 with the
+        /// current version in `data.actual_version`.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Rename a session
@@ -113,6 +119,12 @@ pub enum Command {
         /// New name for the session
         #[arg(short, long)]
         name: String,
+
+        /// Optimistic concurrency: only succeed if the session is at
+        /// this version. Stale versions return error -32002 with the
+        /// current version in `data.actual_version`.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Send a raw JSON-RPC call to the daemon (for debugging)
@@ -282,6 +294,11 @@ pub enum WindowCommand {
         /// Window name or index
         #[arg(short, long)]
         window: String,
+
+        /// Optimistic concurrency: only succeed if the window is at
+        /// this version. See `shux session kill --help` for details.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Rename a window
@@ -297,6 +314,11 @@ pub enum WindowCommand {
         /// New window name
         #[arg(short, long)]
         name: String,
+
+        /// Optimistic concurrency: only succeed if the window is at
+        /// this version.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Focus (select) a window
@@ -308,6 +330,11 @@ pub enum WindowCommand {
         /// Window name or index
         #[arg(short, long)]
         window: String,
+
+        /// Optimistic concurrency: only succeed if the window is at
+        /// this version.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Reorder (move) a window to a new index
@@ -323,6 +350,11 @@ pub enum WindowCommand {
         /// New index position
         #[arg(short, long)]
         index: usize,
+
+        /// Optimistic concurrency: only succeed if the window is at
+        /// this version.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 }
 
@@ -414,6 +446,12 @@ pub enum PaneCommand {
         /// Resize amount (0.0-1.0, default 0.1)
         #[arg(long)]
         delta: Option<f64>,
+
+        /// Optimistic concurrency: only succeed if the pane is at
+        /// this version. Layout ops (resize/zoom/swap) bump the version
+        /// of every pane in the affected window.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Toggle zoom on a pane
@@ -429,6 +467,11 @@ pub enum PaneCommand {
         /// Pane UUID to zoom (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
+
+        /// Optimistic concurrency: only succeed if the pane is at
+        /// this version.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Swap two panes
@@ -448,6 +491,11 @@ pub enum PaneCommand {
         /// Second pane UUID (target to swap with)
         #[arg(short, long)]
         target: String,
+
+        /// Optimistic concurrency: only succeed if pane (first) is at
+        /// this version.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Kill a pane
@@ -463,6 +511,11 @@ pub enum PaneCommand {
         /// Pane UUID to kill
         #[arg(short, long)]
         pane: String,
+
+        /// Optimistic concurrency: only succeed if the pane is at
+        /// this version.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
 
     /// Send keystrokes to a pane
@@ -983,6 +1036,7 @@ pub async fn handle_new(
 pub async fn handle_kill(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let mut params = serde_json::Map::new();
@@ -990,6 +1044,9 @@ pub async fn handle_kill(
         "name".to_string(),
         serde_json::Value::String(session_name.to_string()),
     );
+    if let Some(ev) = expected_version {
+        params.insert("expected_version".to_string(), serde_json::Value::from(ev));
+    }
 
     let result = rpc_call(stream, "session.kill", serde_json::Value::Object(params)).await?;
 
@@ -1010,6 +1067,7 @@ pub async fn handle_rename(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
     new_name: &str,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let mut params = serde_json::Map::new();
@@ -1021,6 +1079,9 @@ pub async fn handle_rename(
         "new_name".to_string(),
         serde_json::Value::String(new_name.to_string()),
     );
+    if let Some(ev) = expected_version {
+        params.insert("expected_version".to_string(), serde_json::Value::from(ev));
+    }
 
     let result = rpc_call(stream, "session.rename", serde_json::Value::Object(params)).await?;
 
@@ -1214,12 +1275,18 @@ pub async fn handle_window_kill(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
     window_spec: &str,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(stream, session_name).await?;
     let (window_id, window_title) = resolve_window_id(stream, &session_id, window_spec).await?;
 
-    let result = rpc_call(stream, "window.kill", serde_json::json!({"id": window_id})).await?;
+    let mut params = serde_json::Map::new();
+    params.insert("id".to_string(), serde_json::Value::String(window_id));
+    if let Some(ev) = expected_version {
+        params.insert("expected_version".to_string(), serde_json::Value::from(ev));
+    }
+    let result = rpc_call(stream, "window.kill", serde_json::Value::Object(params)).await?;
 
     match format {
         OutputFormat::Json => {
@@ -1239,17 +1306,22 @@ pub async fn handle_window_rename(
     session_name: &str,
     window_spec: &str,
     new_name: &str,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(stream, session_name).await?;
     let (window_id, old_title) = resolve_window_id(stream, &session_id, window_spec).await?;
 
-    let result = rpc_call(
-        stream,
-        "window.rename",
-        serde_json::json!({"id": window_id, "name": new_name}),
-    )
-    .await?;
+    let mut params = serde_json::Map::new();
+    params.insert("id".to_string(), serde_json::Value::String(window_id));
+    params.insert(
+        "name".to_string(),
+        serde_json::Value::String(new_name.to_string()),
+    );
+    if let Some(ev) = expected_version {
+        params.insert("expected_version".to_string(), serde_json::Value::from(ev));
+    }
+    let result = rpc_call(stream, "window.rename", serde_json::Value::Object(params)).await?;
 
     match format {
         OutputFormat::Json => {
@@ -1268,12 +1340,18 @@ pub async fn handle_window_focus(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
     window_spec: &str,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(stream, session_name).await?;
     let (window_id, window_title) = resolve_window_id(stream, &session_id, window_spec).await?;
 
-    let result = rpc_call(stream, "window.focus", serde_json::json!({"id": window_id})).await?;
+    let mut params = serde_json::Map::new();
+    params.insert("id".to_string(), serde_json::Value::String(window_id));
+    if let Some(ev) = expected_version {
+        params.insert("expected_version".to_string(), serde_json::Value::from(ev));
+    }
+    let result = rpc_call(stream, "window.focus", serde_json::Value::Object(params)).await?;
 
     match format {
         OutputFormat::Json => {
@@ -1293,17 +1371,22 @@ pub async fn handle_window_reorder(
     session_name: &str,
     window_spec: &str,
     new_index: usize,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(stream, session_name).await?;
     let (window_id, window_title) = resolve_window_id(stream, &session_id, window_spec).await?;
 
-    let result = rpc_call(
-        stream,
-        "window.reorder",
-        serde_json::json!({"id": window_id, "new_index": new_index}),
-    )
-    .await?;
+    let mut params = serde_json::Map::new();
+    params.insert("id".to_string(), serde_json::Value::String(window_id));
+    params.insert(
+        "new_index".to_string(),
+        serde_json::Value::from(new_index as u64),
+    );
+    if let Some(ev) = expected_version {
+        params.insert("expected_version".to_string(), serde_json::Value::from(ev));
+    }
+    let result = rpc_call(stream, "window.reorder", serde_json::Value::Object(params)).await?;
 
     match format {
         OutputFormat::Json => {
@@ -1566,6 +1649,7 @@ pub async fn handle_pane_focus_dir(
 }
 
 /// Handle the `shux pane resize` command.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_resize(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -1573,6 +1657,7 @@ pub async fn handle_pane_resize(
     pane_spec: Option<&str>,
     direction: &str,
     delta: Option<f64>,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
@@ -1588,6 +1673,9 @@ pub async fn handle_pane_resize(
     }
     if let Some(d) = delta {
         params["delta"] = serde_json::json!(d);
+    }
+    if let Some(ev) = expected_version {
+        params["expected_version"] = serde_json::Value::from(ev);
     }
 
     let result = rpc_call(stream, "pane.resize", params).await?;
@@ -1614,6 +1702,7 @@ pub async fn handle_pane_zoom(
     session_name: &str,
     window_spec: Option<&str>,
     pane_spec: Option<&str>,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
@@ -1625,6 +1714,9 @@ pub async fn handle_pane_zoom(
 
     if let Some(pid) = pane_spec {
         params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+    if let Some(ev) = expected_version {
+        params["expected_version"] = serde_json::Value::from(ev);
     }
 
     let result = rpc_call(stream, "pane.zoom", params).await?;
@@ -1656,17 +1748,25 @@ pub async fn handle_pane_swap(
     window_spec: Option<&str>,
     pane_id: &str,
     target_id: &str,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     // Resolve window for validation
     let _ = resolve_pane_window_id(stream, session_name, window_spec).await?;
 
-    let result = rpc_call(
-        stream,
-        "pane.swap",
-        serde_json::json!({"pane_id": pane_id, "target_pane_id": target_id}),
-    )
-    .await?;
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "pane_id".to_string(),
+        serde_json::Value::String(pane_id.to_string()),
+    );
+    params.insert(
+        "target_pane_id".to_string(),
+        serde_json::Value::String(target_id.to_string()),
+    );
+    if let Some(ev) = expected_version {
+        params.insert("expected_version".to_string(), serde_json::Value::from(ev));
+    }
+    let result = rpc_call(stream, "pane.swap", serde_json::Value::Object(params)).await?;
 
     match format {
         OutputFormat::Json => {
@@ -1686,12 +1786,21 @@ pub async fn handle_pane_kill(
     session_name: &str,
     window_spec: Option<&str>,
     pane_id: &str,
+    expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     // Resolve window for validation
     let _ = resolve_pane_window_id(stream, session_name, window_spec).await?;
 
-    let result = rpc_call(stream, "pane.kill", serde_json::json!({"pane_id": pane_id})).await?;
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "pane_id".to_string(),
+        serde_json::Value::String(pane_id.to_string()),
+    );
+    if let Some(ev) = expected_version {
+        params.insert("expected_version".to_string(), serde_json::Value::from(ev));
+    }
+    let result = rpc_call(stream, "pane.kill", serde_json::Value::Object(params)).await?;
 
     match format {
         OutputFormat::Json => {
@@ -1715,16 +1824,41 @@ pub async fn handle_api(
     let params: serde_json::Value = serde_json::from_str(params_str)
         .map_err(|e| anyhow::anyhow!("Invalid JSON params: {e}"))?;
 
-    let result = rpc_call(stream, method, params).await?;
-
-    match format {
-        OutputFormat::Json | OutputFormat::Text | OutputFormat::Plain => {
-            // For raw API calls, JSON is always the most useful format
-            println!("{}", serde_json::to_string_pretty(&result)?);
+    // PR 3b: surface RPC errors as part of the JSON-RPC envelope on
+    // stdout, not as a human-readable anyhow error on stderr. Callers
+    // of `shux api` are debug tools / agents that expect to parse the
+    // raw `{result | error}` shape — including bounded `data` fields
+    // like `expected_version` / `actual_version` for retry loops.
+    match rpc_call(stream, method, params).await {
+        Ok(result) => {
+            let envelope = serde_json::json!({"result": result});
+            match format {
+                OutputFormat::Json | OutputFormat::Text | OutputFormat::Plain => {
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+            }
+            Ok(())
         }
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => {
+            let mut err_obj = serde_json::json!({
+                "code": code,
+                "message": message,
+            });
+            if let Some(d) = data {
+                err_obj["data"] = d;
+            }
+            let envelope = serde_json::json!({"error": err_obj});
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
+            // Non-zero exit so shell pipelines can branch, but the
+            // structured error is still on stdout for parsers.
+            std::process::exit(2);
+        }
+        Err(other) => Err(other.into()),
     }
-
-    Ok(())
 }
 
 /// Handle the `shux pane send-keys` command.
@@ -2185,7 +2319,7 @@ mod tests {
     fn test_cli_parse_kill() {
         let cli = Cli::try_parse_from(["shux", "kill", "-s", "mytest"]).unwrap();
         match cli.command {
-            Some(Command::Kill { session }) => {
+            Some(Command::Kill { session, .. }) => {
                 assert_eq!(session, "mytest");
             }
             _ => panic!("expected Kill command"),
@@ -2279,7 +2413,7 @@ mod tests {
     fn test_cli_parse_rename() {
         let cli = Cli::try_parse_from(["shux", "rename", "-s", "old", "-n", "new"]).unwrap();
         match cli.command {
-            Some(Command::Rename { session, name }) => {
+            Some(Command::Rename { session, name, .. }) => {
                 assert_eq!(session, "old");
                 assert_eq!(name, "new");
             }
@@ -2371,7 +2505,10 @@ mod tests {
             Cli::try_parse_from(["shux", "window", "kill", "-s", "work", "-w", "editor"]).unwrap();
         match cli.command {
             Some(Command::Window {
-                command: WindowCommand::Kill { session, window },
+                command:
+                    WindowCommand::Kill {
+                        session, window, ..
+                    },
             }) => {
                 assert_eq!(session, "work");
                 assert_eq!(window, "editor");
@@ -2393,6 +2530,7 @@ mod tests {
                         session,
                         window,
                         name,
+                        ..
                     },
             }) => {
                 assert_eq!(session, "work");
@@ -2409,7 +2547,10 @@ mod tests {
             Cli::try_parse_from(["shux", "window", "focus", "-s", "work", "-w", "0"]).unwrap();
         match cli.command {
             Some(Command::Window {
-                command: WindowCommand::Focus { session, window },
+                command:
+                    WindowCommand::Focus {
+                        session, window, ..
+                    },
             }) => {
                 assert_eq!(session, "work");
                 assert_eq!(window, "0");
@@ -2431,6 +2572,7 @@ mod tests {
                         session,
                         window,
                         index,
+                        ..
                     },
             }) => {
                 assert_eq!(session, "work");

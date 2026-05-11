@@ -461,9 +461,12 @@ fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
         GraphError::LayoutError(_) => shux_rpc::RpcError::internal(&e.to_string()),
-        GraphError::VersionConflict { expected, actual } => {
-            shux_rpc::RpcError::version_conflict("resource", "?", expected, actual)
-        }
+        GraphError::VersionConflict {
+            resource,
+            ref id,
+            expected,
+            actual,
+        } => shux_rpc::RpcError::version_conflict(resource, id, expected, actual),
         GraphError::Shutdown => shux_rpc::RpcError::internal(&e.to_string()),
     }
 }
@@ -1015,7 +1018,9 @@ fn register_pane_methods(
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.1) as f32;
 
-                gh.resize_pane(pane_id, direction, delta)
+                let expected_version = parse_expected_version(&params)?;
+
+                gh.resize_pane(pane_id, direction, delta, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -1027,9 +1032,10 @@ fn register_pane_methods(
             async move {
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                let expected_version = parse_expected_version(&params)?;
 
                 let is_zoomed = gh
-                    .zoom_pane(pane_id)
+                    .zoom_pane(pane_id, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -1061,7 +1067,9 @@ fn register_pane_methods(
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid target_pane_id format"))?;
 
-                gh.swap_panes(pane_a, pane_b)
+                let expected_version = parse_expected_version(&params)?;
+
+                gh.swap_panes(pane_a, pane_b, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -1085,14 +1093,18 @@ fn register_pane_methods(
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid pane_id format"))?;
 
+                let expected_version = parse_expected_version(&params)?;
+
                 // Order-of-operations matters: destroy_pane() can return
                 // LastPane (refusing to remove the only pane in a window).
                 // If we tear down writers/resizers/vts FIRST and then the
                 // graph mutation fails, the pane stays in the graph but
                 // its IO state is gone — the session ends up with an
                 // active pane that has no PTY. Mutate the graph first;
-                // only purge IO state on success.
-                gh.destroy_pane(pane_id)
+                // only purge IO state on success. Same reason
+                // expected_version is checked inside destroy_pane — a stale
+                // version must error out BEFORE we touch IO state.
+                gh.destroy_pane(pane_id, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
                 {
@@ -1108,6 +1120,23 @@ fn register_pane_methods(
                 Ok(serde_json::json!({ "killed": pane_id_str }))
             }
         })
+}
+
+/// Extract optional `expected_version` from RPC params (PR 3b — optimistic
+/// concurrency). Returns `Ok(None)` when the field is absent or null,
+/// `Ok(Some(v))` when it's a valid non-negative integer, and an
+/// `invalid_params` RpcError if it's the wrong type or out of range. The
+/// daemon then plumbs the Option through to SessionGraph mutations, which
+/// reject the request with `version_conflict` (-32002) if the entity has
+/// moved since the client last read it.
+fn parse_expected_version(params: &serde_json::Value) -> Result<Option<u64>, shux_rpc::RpcError> {
+    match params.get("expected_version") {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params("'expected_version' must be a non-negative integer")
+        }),
+    }
 }
 
 /// Resolve a pane_id from params: either explicit `pane_id` or active pane of resolved window.
@@ -1391,7 +1420,9 @@ fn register_window_methods(
                     .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'name' parameter"))?
                     .to_string();
 
-                gh.rename_window(window_id, new_title)
+                let expected_version = parse_expected_version(&params)?;
+
+                gh.rename_window(window_id, new_title, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -1426,8 +1457,10 @@ fn register_window_methods(
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
 
+                let expected_version = parse_expected_version(&params)?;
+
                 let previous = gh
-                    .focus_window(window_id)
+                    .focus_window(window_id, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -1476,7 +1509,9 @@ fn register_window_methods(
                             shux_rpc::RpcError::invalid_params("missing 'new_index' parameter")
                         })? as usize;
 
-                    gh.reorder_window(window_id, new_index)
+                    let expected_version = parse_expected_version(&params)?;
+
+                    gh.reorder_window(window_id, new_index, expected_version)
                         .await
                         .map_err(graph_error_to_rpc)?;
 
@@ -1512,25 +1547,33 @@ fn register_window_methods(
                     .parse()
                     .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
 
-                // Clean up PTY/VT for all panes in this window before destroying
-                {
+                let expected_version = parse_expected_version(&params)?;
+
+                // Snapshot pane IDs BEFORE mutation so we can tear down IO
+                // after the destroy succeeds. Mutate the graph first so a
+                // stale `expected_version` (or LastWindow refusal) errors
+                // out without leaving the window with orphaned VTs/PTYs.
+                let pane_ids: Vec<_> = {
                     let snap = gh.snapshot();
-                    let pane_ids: Vec<_> = snap
-                        .panes
+                    snap.panes
                         .values()
                         .filter(|p| p.window_id == window_id)
                         .map(|p| p.id)
-                        .collect();
+                        .collect()
+                };
+
+                gh.destroy_window(window_id, expected_version)
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
+                {
                     let mut state = io.lock().await;
                     for pid in pane_ids {
                         state.writers.remove(&pid);
+                        state.resizers.remove(&pid);
                         state.vts.remove(&pid);
                     }
                 }
-
-                gh.destroy_window(window_id, None)
-                    .await
-                    .map_err(graph_error_to_rpc)?;
 
                 Ok(serde_json::json!({ "killed": window_id_str }))
             }
@@ -1705,10 +1748,14 @@ fn register_session_methods(
                     .unwrap_or_default();
                 drop(pre_snap);
 
+                let expected_version = parse_expected_version(&params)?;
+
                 // Mutate the graph FIRST. If destroy_session errors, we
                 // leave PTY/VT state untouched (otherwise we'd kill PTYs
-                // for a session that's still in the graph).
-                gh.destroy_session(session_id, None)
+                // for a session that's still in the graph). Same applies
+                // to a stale `expected_version` — the check inside
+                // destroy_session rejects the request before IO teardown.
+                gh.destroy_session(session_id, expected_version)
                     .await
                     .map_err(graph_error_to_rpc)?;
 
@@ -1836,7 +1883,9 @@ fn register_session_methods(
                         ));
                     };
 
-                    gh.rename_session(session_id, new_name, None)
+                    let expected_version = parse_expected_version(&params)?;
+
+                    gh.rename_session(session_id, new_name, expected_version)
                         .await
                         .map_err(graph_error_to_rpc)?;
 
@@ -2220,14 +2269,21 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             cli::handle_ls(&mut stream, args.format).await
         }
 
-        Some(Command::Kill { session }) => {
+        Some(Command::Kill {
+            session,
+            expected_version,
+        }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_kill(&mut stream, &session, args.format).await
+            cli::handle_kill(&mut stream, &session, expected_version, args.format).await
         }
 
-        Some(Command::Rename { session, name }) => {
+        Some(Command::Rename {
+            session,
+            name,
+            expected_version,
+        }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_rename(&mut stream, &session, &name, args.format).await
+            cli::handle_rename(&mut stream, &session, &name, expected_version, args.format).await
         }
 
         Some(Command::Window { command }) => {
@@ -2241,27 +2297,65 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     name,
                     ensure,
                 } => cli::handle_window_new(&mut stream, &session, name, ensure, args.format).await,
-                WindowCommand::Kill { session, window } => {
-                    cli::handle_window_kill(&mut stream, &session, &window, args.format).await
+                WindowCommand::Kill {
+                    session,
+                    window,
+                    expected_version,
+                } => {
+                    cli::handle_window_kill(
+                        &mut stream,
+                        &session,
+                        &window,
+                        expected_version,
+                        args.format,
+                    )
+                    .await
                 }
                 WindowCommand::Rename {
                     session,
                     window,
                     name,
+                    expected_version,
                 } => {
-                    cli::handle_window_rename(&mut stream, &session, &window, &name, args.format)
-                        .await
+                    cli::handle_window_rename(
+                        &mut stream,
+                        &session,
+                        &window,
+                        &name,
+                        expected_version,
+                        args.format,
+                    )
+                    .await
                 }
-                WindowCommand::Focus { session, window } => {
-                    cli::handle_window_focus(&mut stream, &session, &window, args.format).await
+                WindowCommand::Focus {
+                    session,
+                    window,
+                    expected_version,
+                } => {
+                    cli::handle_window_focus(
+                        &mut stream,
+                        &session,
+                        &window,
+                        expected_version,
+                        args.format,
+                    )
+                    .await
                 }
                 WindowCommand::Reorder {
                     session,
                     window,
                     index,
+                    expected_version,
                 } => {
-                    cli::handle_window_reorder(&mut stream, &session, &window, index, args.format)
-                        .await
+                    cli::handle_window_reorder(
+                        &mut stream,
+                        &session,
+                        &window,
+                        index,
+                        expected_version,
+                        args.format,
+                    )
+                    .await
                 }
             }
         }
@@ -2325,6 +2419,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     pane,
                     direction,
                     delta,
+                    expected_version,
                 } => {
                     cli::handle_pane_resize(
                         &mut stream,
@@ -2333,6 +2428,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         pane.as_deref(),
                         &direction,
                         delta,
+                        expected_version,
                         args.format,
                     )
                     .await
@@ -2341,12 +2437,14 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     session,
                     window,
                     pane,
+                    expected_version,
                 } => {
                     cli::handle_pane_zoom(
                         &mut stream,
                         &session,
                         window.as_deref(),
                         pane.as_deref(),
+                        expected_version,
                         args.format,
                     )
                     .await
@@ -2356,6 +2454,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     window,
                     pane,
                     target,
+                    expected_version,
                 } => {
                     cli::handle_pane_swap(
                         &mut stream,
@@ -2363,6 +2462,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         window.as_deref(),
                         &pane,
                         &target,
+                        expected_version,
                         args.format,
                     )
                     .await
@@ -2371,12 +2471,14 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     session,
                     window,
                     pane,
+                    expected_version,
                 } => {
                     cli::handle_pane_kill(
                         &mut stream,
                         &session,
                         window.as_deref(),
                         &pane,
+                        expected_version,
                         args.format,
                     )
                     .await

@@ -22,11 +22,12 @@
     - `state.apply` RPC method — generic delta ops (NOT template-shaped per codex P0 #2; future SDKs / MCP servers target the same primitive).
     - `shux apply <template.toml>` CLI parses PRD §10.3 TOML, lowers to ops. `--dry-run` and `--watch` flags.
     - Fixes existing bug (codex P2 #10): graph create APIs persist `initial_command` so PaneCreated events stop lying about empty command.
-- **Pending:** 035 (complete RPC surface), **037 (optimistic concurrency surface)** — PR 3b queued, version stamps + VersionConflict error already exist on the model, just need `expected_version` plumbed through every mutating RPC + CLI. 038–050 (plugin host + bundled plugins + MCP). **PR 2c** for `pane.output` events with proper data-plane separation (deferred from 2a per Codex/Gemini council review).
+  - **037 (optimistic concurrency surface)** — Done (PR 3b). `expected_version: Option<u64>` plumbed through every mutating RPC (session.rename/kill, window.kill/rename/focus/reorder, pane.kill/resize/zoom/swap). `GraphError::VersionConflict` now carries `resource` + `id` so `RpcError::version_conflict` produces the full `data` shape (resource, id, expected_version, actual_version, hint) per PRD §8.3. Layout ops (resize/zoom/swap) bump the version of every pane in the affected window so `pane.version` is a monotonic stamp for "anything visible on this pane changed". `--expected-version` CLI flag on session/window/pane subcommands. `shux api` now wraps the JSON-RPC response in `{result | error}` envelope so agents can parse structured errors. 16 new tests; 660 total (up from 644). L4 visual test in `.claude/automations/test_pr3b_optimistic_concurrency.py`.
+- **Pending:** 035 (complete RPC surface). 038–050 (plugin host + bundled plugins + MCP). **PR 2c** for `pane.output` events with proper data-plane separation (deferred from 2a per Codex/Gemini council review).
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
-590+ tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
+660+ tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
 
 ## Status
 

@@ -1,6 +1,6 @@
 # 037 — Optimistic Concurrency and Ensure Operations
 
-**Status:** Pending
+**Status:** Done (PR 3b — optimistic concurrency surface; ensure ops already shipped in 013/014/015)
 **Depends On:** 035
 **Parallelizable With:** 036, 038
 

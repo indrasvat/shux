@@ -1122,7 +1122,7 @@ async fn handle_mouse(
                 if delta_axis != 0 && span > 0 {
                     let delta_ratio = delta_axis as f32 / span as f32;
                     let _ = graph
-                        .resize_pane(state.target, state.direction, delta_ratio)
+                        .resize_pane(state.target, state.direction, delta_ratio, None)
                         .await;
                 }
                 *drag = Some(DragState {
@@ -1445,7 +1445,7 @@ async fn focus_relative(
 
 async fn zoom(graph: &GraphHandle, attached: &AttachedSession) -> anyhow::Result<()> {
     let _ = graph
-        .zoom_pane(attached.active_pane_id)
+        .zoom_pane(attached.active_pane_id, None)
         .await
         .map_err(|e| anyhow::anyhow!("zoom failed: {e}"))?;
     Ok(())
@@ -1457,7 +1457,7 @@ async fn kill_pane(
     io_state: &Arc<Mutex<PaneIoState>>,
 ) -> anyhow::Result<()> {
     let pane_id = attached.active_pane_id;
-    match graph.destroy_pane(pane_id).await {
+    match graph.destroy_pane(pane_id, None).await {
         Ok(()) => {}
         Err(e) => {
             // Don't silently swallow LastPane / not-found / version
@@ -1516,7 +1516,7 @@ async fn new_window(
         .ok();
 
     // Focus the new window.
-    let _ = graph.focus_window(window_id).await;
+    let _ = graph.focus_window(window_id, None).await;
 
     let mut s = session.lock().await;
     s.active_window_id = window_id;
@@ -1547,7 +1547,7 @@ async fn switch_to_window_index(
     if target == attached.active_window_id {
         return Ok(());
     }
-    let _ = graph.focus_window(target).await;
+    let _ = graph.focus_window(target, None).await;
 
     let new_pane = snap
         .windows
@@ -1581,7 +1581,7 @@ async fn switch_window(
         .unwrap_or(0);
     let next_idx = ((cur_idx as i32 + direction).rem_euclid(sess.windows.len() as i32)) as usize;
     let target = sess.windows[next_idx];
-    let _ = graph.focus_window(target).await;
+    let _ = graph.focus_window(target, None).await;
 
     let new_pane = snap
         .windows
@@ -1601,7 +1601,7 @@ async fn resize_pane(
     delta: f32,
 ) -> anyhow::Result<()> {
     let _ = graph
-        .resize_pane(attached.active_pane_id, direction, delta)
+        .resize_pane(attached.active_pane_id, direction, delta, None)
         .await;
     Ok(())
 }

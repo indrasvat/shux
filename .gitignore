@@ -30,6 +30,7 @@ dist/
 
 .claude/screenshots/
 .claude/automations/screenshots/
+.claude/RESUME.md
 .codemap/
 
 .DS_Store
