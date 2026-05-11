@@ -32,16 +32,18 @@ If you're a human at a keyboard and tmux works for you, keep using tmux. shux ex
 ## 80% quickstart (three RPCs)
 
 ```bash
-# 1. Spawn a session running any command (or shell). Returns pane_id.
-shux api session.create '{"name":"demo","command":["vivecaka","--repo","cli/cli"]}'
+# 1. Spawn a session running any command (or shell). Capture the pane_id
+#    from the response so the next calls can target it.
+RESP=$(shux api session.create '{"name":"demo","command":["lazygit"]}')
+PID=$(echo "$RESP" | jq -r .result.pane_id)
 
 # 2. Drive it.
-shux api pane.set_size  '{"pane_id":"$PID","cols":200,"rows":60}'
-shux api pane.send_keys '{"pane_id":"$PID","text":"j"}'                  # text input
-shux api pane.send_keys '{"pane_id":"$PID","data":"Gw=="}'               # base64 control (here: Esc)
+shux api pane.set_size  "{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}"
+shux api pane.send_keys "{\"pane_id\":\"$PID\",\"text\":\"j\"}"                  # text input
+shux api pane.send_keys "{\"pane_id\":\"$PID\",\"data\":\"Gw==\"}"               # base64 control (here: Esc)
 
 # 3. Get a PNG back.
-shux api pane.snapshot  '{"pane_id":"$PID"}' \
+shux api pane.snapshot  "{\"pane_id\":\"$PID\"}" \
   | jq -r .result.png_base64 | base64 -d > frame.png
 
 # Tear down when done.
@@ -79,10 +81,12 @@ shux apply spec.toml      # atomic — all or nothing
 | GNU parallel `--tmux` mode                       | Run N tasks in N panes, watch in one place     | Template with N panes + RPC orchestrator                   |
 | Custom Bubbletea / ratatui test harness          | Visual regression for your TUI                 | `pane.snapshot` + golden-image diff (SSIM or raw RGBA)     |
 
-## The full RPC surface (compact)
+## The common RPC surface
 
 Each method maps 1:1 to a `shux` CLI subcommand. All accept JSON in,
-return JSON out, on stdin/stdout.
+return JSON out, on stdin/stdout. `references/api.md` lists request/response
+shapes and additional methods (`pane.list`, `pane.focus_direction`,
+`pane.resize`, `pane.run_command`, `window.rename`, `window.reorder`).
 
 | Category | Methods                                                                          |
 |--        |--                                                                                |

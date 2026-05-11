@@ -3,8 +3,9 @@
 #
 # CSP allows: self for everything, fonts.googleapis.com + fonts.gstatic.com
 # for the Inter / JetBrains Mono webfonts. Images allow data: for the
-# inline SVG noise overlay. connect-src allows api.github.com for the
-# version-bump fetch at the bottom of index.html.
+# inline SVG noise overlay. connect-src is locked to self (release-version
+# metadata is staged into deploy/version.json at deploy-time, not fetched
+# from api.github.com at runtime).
 
 /*
   X-Content-Type-Options: nosniff

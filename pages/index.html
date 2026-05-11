@@ -738,15 +738,17 @@ title = "git"
 command = ["lazygit"]
 
 <span style="color:var(--accent)">$ shux apply review.toml</span>
-<span style="color:var(--ink2-on-paper)"># → session created atomically.</span>
+<span style="color:var(--ink2-on-paper)"># → session created atomically. Pluck the first pane id:</span>
+<span style="color:var(--accent)">$ PID=$(shux api session.list \
+        | jq -r '.result.sessions[0].pane_id')</span>
 
-<span style="color:var(--accent)">$ shux api pane.set_size '{"pane_id":"$PID","cols":200,"rows":60}'</span>
+<span style="color:var(--accent)">$ shux api pane.set_size "{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}"</span>
 <span style="color:var(--ink2-on-paper)"># → synchronous resize (VT + PTY).</span>
 
-<span style="color:var(--accent)">$ shux api pane.send_keys '{"pane_id":"$PID","text":"j"}'</span>
+<span style="color:var(--accent)">$ shux api pane.send_keys "{\"pane_id\":\"$PID\",\"text\":\"j\"}"</span>
 <span style="color:var(--ink2-on-paper)"># → navigate down one row.</span>
 
-<span style="color:var(--accent)">$ shux api pane.snapshot '{"pane_id":"$PID"}' \
+<span style="color:var(--accent)">$ shux api pane.snapshot "{\"pane_id\":\"$PID\"}" \
     | jq -r .result.png_base64 \
     | base64 -d &gt; out.png</span>
 <span style="color:var(--ink2-on-paper)"># → 1800×1140 PNG of the current pane. No iTerm2 needed.</span></code></pre>
@@ -1009,7 +1011,7 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/09-help.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/09-help.png" alt="shux --help rendered in shux's brand colours — every `shux <verb>` in bold terracotta, RPC method names in green, dim arrows and comments, underlined terracotta URLs" width="1080" height="1292" loading="lazy"></a>
           <figcaption>
@@ -1020,7 +1022,7 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] 692 tests run: 692 passed, 0 skipped'" width="1620" height="912" loading="lazy"></a>
           <figcaption>
@@ -1030,7 +1032,7 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="6" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/06-raster-hello.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy"></a>
           <figcaption>
@@ -1073,10 +1075,11 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
           <h3>Spawn a session</h3>
           <p>One RPC creates an atomic session + initial window + pane,
           with the command of your choice running in it.</p>
-<pre><code>shux api session.create '{
+<pre><code>RESP=$(shux api session.create '{
   "name": "demo",
   "command": ["htop"]
-}'</code></pre>
+}')
+PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
         </div>
       </div>
 
@@ -1088,7 +1091,7 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
           Decode and pipe it anywhere — a CI golden, a vision LLM, a
           webhook.</p>
           <div class="snap-proof">
-            <pre><code>shux api pane.snapshot '{"pane_id":"<i>$PID</i>"}' \
+            <pre><code>shux api pane.snapshot "{\"pane_id\":\"$PID\"}" \
   | jq -r .result.png_base64 \
   | base64 -d &gt; frame.png</code></pre>
             <figure class="snap-out">

@@ -139,6 +139,18 @@ Plain-text capture of the last N lines. ANSI stripped.
 { "pane_id": "uuid", "lines": 50 } → { "text": "...", "lines": 50 }
 ```
 
+### `pane.list`
+
+Enumerate panes in a window (or across all windows of a session).
+
+```json
+{ "window_id": "uuid" }                  // panes of one window
+{ "session_id": "uuid-or-name" }         // panes of all windows in a session
+  → { "panes": [{ "id": "...", "window_id": "...", "title": "...",
+                  "command": [...], "cwd": "...",
+                  "exit_status": null|0, "version": N }, ...] }
+```
+
 ### `pane.output.watch`
 
 Subscribe to the data-plane stream of sampled PTY chunks. Returns a list

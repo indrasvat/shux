@@ -27,7 +27,14 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    # workflow_run trigger fires for Release completions on ANY branch — gate
+    # on head_branch=main so a manual `workflow_dispatch` of Release on a feature
+    # branch can never publish to production. Other triggers (push to main,
+    # workflow_dispatch on this workflow itself) are already main-scoped above.
+    if: >-
+      ${{ github.event_name != 'workflow_run'
+          || (github.event.workflow_run.conclusion == 'success'
+              && github.event.workflow_run.head_branch == 'main') }}
     env:
       REPO: ${{ github.repository }}
     steps:

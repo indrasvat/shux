@@ -1613,6 +1613,21 @@ fn register_window_methods(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
 
+                // Honour optional `command` so callers can request "create
+                // a window running cmd". Same gap-shape as the pane.split
+                // fix: the PTY spawns the requested command; persisting it
+                // onto `Pane.command` in the graph requires a graph-level
+                // method and is tracked as a follow-up.
+                let command: Vec<String> = params
+                    .get("command")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str().map(|x| x.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 let window_id = gh
                     .create_window(session_id, title, cwd.clone())
                     .await
@@ -1636,8 +1651,7 @@ fn register_window_methods(
                 let pane_id = window.active_pane.to_string();
 
                 // Spawn PTY for the new pane
-                let _ =
-                    spawn_pane_pty(window.active_pane, cwd, Vec::new(), io, ct, gh.clone()).await;
+                let _ = spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
 
                 let mut result = window_to_json(window, index, is_active, &snap);
                 // Include pane_id at top level for convenience
@@ -1722,8 +1736,24 @@ fn register_window_methods(
                     return Ok(result);
                 }
 
-                // Create new window
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+                // Create new window — honour optional `cwd` + `command`
+                // params for symmetry with window.create.
+                let cwd = params
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+                    });
+                let command: Vec<String> = params
+                    .get("command")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str().map(|x| x.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let window_id = gh
                     .create_window(session_id, name, cwd.clone())
                     .await
@@ -1736,8 +1766,7 @@ fn register_window_methods(
                     .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
 
                 // Spawn PTY for the new pane
-                let _ =
-                    spawn_pane_pty(window.active_pane, cwd, Vec::new(), io, ct, gh.clone()).await;
+                let _ = spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
 
                 let session = snap
                     .sessions
@@ -2013,7 +2042,13 @@ fn register_session_methods(
                         }
                     };
 
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+                    let cwd = params
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+                        });
 
                     // PR followup (codex P2 #10): persist `command` onto
                     // the initial pane so subscribers + auto-title see

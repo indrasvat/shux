@@ -169,7 +169,11 @@ fn render_agent_help(colorize: bool) -> String {
     ));
     s.push_str(&row(
         "expect / pexpect / sexpect",
-        &format!("loop of {} / wait / {}", m("send_keys"), m("snapshot")),
+        &format!(
+            "loop of {} / wait / {}",
+            m("pane.send_keys"),
+            m("pane.snapshot")
+        ),
     ));
     s.push_str(&row(
         "asciinema rec",
