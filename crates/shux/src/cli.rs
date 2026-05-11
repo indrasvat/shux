@@ -557,6 +557,35 @@ pub enum PaneCommand {
         no_auto: bool,
     },
 
+    /// Watch sampled PTY output from a pane (PR 2c).
+    ///
+    /// Long-polls `pane.output.watch` and prints each base64-decoded
+    /// chunk to stdout. Pipes cleanly:
+    /// `shux pane watch -p X | tee log`. Output is rate-limited at
+    /// the source to ~10 chunks/sec/pane to prevent noisy panes from
+    /// drowning subscribers. Bytes that arrived before the first
+    /// poll are UNREACHABLE — the data plane is intentionally lossy
+    /// to keep terminal secrets out of any history.
+    Watch {
+        /// Session name (used to validate the pane belongs to a
+        /// live session; the daemon also enforces this).
+        #[arg(short, long)]
+        session: String,
+
+        /// Pane UUID to watch.
+        #[arg(short, long)]
+        pane: String,
+
+        /// Per-poll long-poll timeout in ms (clamped 100..=30000).
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+
+        /// Stop after N chunks (useful for tests / scripted harnesses).
+        /// Each chunk is one sample interval's worth of bytes.
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+
     /// Send keystrokes to a pane
     SendKeys {
         /// Session name
@@ -1885,6 +1914,86 @@ pub async fn handle_pane_title(
     }
 
     Ok(())
+}
+
+/// Handle `shux pane watch` — long-poll `pane.output.watch` and write
+/// each chunk's bytes to stdout. Pipes cleanly into `tee log` etc.
+/// PR 2c / data-plane consumer.
+pub async fn handle_pane_watch(
+    stream: &mut tokio::net::UnixStream,
+    _session_name: &str,
+    pane_id: &str,
+    timeout_ms: u64,
+    limit: Option<u64>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use base64::Engine;
+    use std::io::Write;
+
+    // Validate the UUID early so we fail fast on typos instead of
+    // round-tripping to the daemon to discover an invalid_params.
+    let _: uuid::Uuid = pane_id
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid pane uuid: {e}"))?;
+
+    let mut next_seq: Option<u64> = None;
+    let mut delivered: u64 = 0;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    loop {
+        let mut params = serde_json::json!({
+            "pane_id": pane_id,
+            "timeout_ms": timeout_ms,
+            // 50 chunks per poll is plenty given the 10/s/pane source
+            // rate; smaller bounds just mean more RPC round-trips.
+            "limit": 50,
+        });
+        if let Some(s) = next_seq {
+            params["from_seq"] = serde_json::json!(s);
+        }
+        let resp = rpc_call(stream, "pane.output.watch", params).await?;
+
+        if let Some(arr) = resp.get("chunks").and_then(|v| v.as_array()) {
+            for chunk in arr {
+                let bytes_b64 = chunk.get("bytes").and_then(|v| v.as_str()).unwrap_or("");
+                match format {
+                    OutputFormat::Json => {
+                        let _ = writeln!(out, "{}", serde_json::to_string(chunk)?);
+                    }
+                    OutputFormat::Text | OutputFormat::Plain => {
+                        if let Ok(raw) =
+                            base64::engine::general_purpose::STANDARD.decode(bytes_b64.as_bytes())
+                        {
+                            let _ = out.write_all(&raw);
+                        }
+                    }
+                }
+                delivered += 1;
+                if let Some(lim) = limit {
+                    if delivered >= lim {
+                        let _ = out.flush();
+                        return Ok(());
+                    }
+                }
+            }
+            let _ = out.flush();
+        }
+        if let Some(s) = resp.get("next_seq").and_then(|v| v.as_u64()) {
+            next_seq = Some(s);
+        }
+        // `lagged`: surface to stderr so pipes stay clean.
+        if resp
+            .get("lagged")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "{} subscriber lagged behind data plane — some chunks dropped",
+                crate::style::warning("!"),
+            );
+        }
+    }
 }
 
 /// Handle the `shux pane kill` command.
