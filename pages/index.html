@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#15120e">
-<title>shux — a terminal multiplexer with an API, not a keyboard assumption</title>
-<meta name="description" content="shux is a Rust terminal multiplexer with a JSON-RPC API. Spawn panes, type into them, snapshot them as PNG — all over RPC. Designed for agents, CI jobs, and external automation. Keep tmux for your shell.">
+<title>shux — tmux for the agentic age</title>
+<meta name="description" content="shux is tmux for the agentic age — a Rust terminal multiplexer with a JSON-RPC API and a built-in pixel snapshotter. Spawn panes, type into them, get back PNG screenshots, all over RPC. For agents, CI jobs, and any process that needs to operate the terminal.">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -13,14 +13,14 @@
 <link rel="stylesheet" href="/styles/site.css">
 
 <meta property="og:type" content="website">
-<meta property="og:title" content="shux — a terminal multiplexer with an API, not a keyboard assumption">
-<meta property="og:description" content="JSON-RPC. Atomic templates. Pixel snapshots. The terminal multiplexer for everything tmux's contract doesn't reach.">
+<meta property="og:title" content="shux — tmux for the agentic age">
+<meta property="og:description" content="JSON-RPC. Atomic templates. Pixel snapshots. Built for agents, CI jobs, and any process that needs to operate the terminal.">
 <meta property="og:url" content="https://shux.pages.dev/">
 <meta property="og:image" content="https://shux.pages.dev/screenshots/06-raster-hello.png">
 
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="shux — a terminal multiplexer with an API, not a keyboard assumption">
-<meta name="twitter:description" content="JSON-RPC. Atomic templates. Pixel snapshots. The terminal multiplexer for everything tmux's contract doesn't reach.">
+<meta name="twitter:title" content="shux — tmux for the agentic age">
+<meta name="twitter:description" content="JSON-RPC. Atomic templates. Pixel snapshots. Built for agents, CI jobs, and any process that needs to operate the terminal.">
 
 <style>
 /* ── Page-specific (hero composition + showcase grid) ── */
@@ -40,18 +40,38 @@
 }
 
 .hero-headline {
-  font-size: clamp(40px, 6vw, 68px);
-  line-height: 0.98;
-  letter-spacing: -0.025em;
-  font-weight: 650;
+  font-size: clamp(40px, 6.6vw, 76px);
+  line-height: 1.02;
+  letter-spacing: -0.028em;
+  font-weight: 700;
   margin: var(--s-5) 0 var(--s-4);
 }
 .hero-headline em {
-  font-style: normal;
-  background: linear-gradient(180deg, transparent 60%, var(--accent-soft) 60%);
-  padding: 0 6px;
-  margin: 0 -3px;
+  font-style: italic;
   color: var(--accent-ink);
+  font-weight: 700;
+}
+/* Brand chip — `shux` rendered as a high-contrast slab. JetBrains Mono
+   for the brand wordmark to echo the daemon's own typesetting; baseline
+   nudge so it sits flush with the surrounding grotesque headline. */
+.hero-headline .brand-chip {
+  display: inline-block;
+  background: var(--accent);
+  color: #fdf9f0;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.92em;
+  letter-spacing: -0.015em;
+  padding: 0.04em 0.20em 0.10em;
+  border-radius: 7px;
+  margin-right: 0.04em;
+  position: relative;
+  top: -0.06em;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.10),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.18),
+    0 6px 16px -8px rgba(199, 90, 42, 0.45);
+  /* Tiny inner glyph hint of the brand mark.  */
 }
 .hero-sub {
   font-size: 19px;
@@ -606,11 +626,16 @@
   <div class="wrap hero-grid">
     <div>
       <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span>v0.8.0 · stable · written in Rust</p>
-      <h1 class="hero-headline">A terminal multiplexer<br>with <em>an API</em>, not a<br>keyboard assumption.</h1>
+      <h1 class="hero-headline">
+        <span class="brand-chip">shux</span>:<br>
+        tmux for the<br>
+        <em>agentic age.</em>
+      </h1>
       <p class="hero-sub">
-        Spawn panes. Type into them. Get back a PNG of what they
-        look like. All over JSON-RPC. Keep <b>tmux</b> for your shell;
-        use <b>shux</b> where another process — a CI job, an agent, a
+        A Rust terminal multiplexer with a JSON-RPC API and a built-in
+        pixel snapshotter. Spawn panes. Type into them. Get back a PNG
+        of what they look like. Keep <b>tmux</b> for your shell; use
+        <b>shux</b> wherever another process — an agent, a CI job, a
         test — needs to operate the terminal.
       </p>
       <div class="hero-cta">
