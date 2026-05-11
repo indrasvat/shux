@@ -18,6 +18,32 @@ pub fn vt_color_to_crossterm(color: VtColor) -> Option<CtColor> {
     }
 }
 
+/// Inverse of `vt_color_to_crossterm`. Named ANSI colours fold into their
+/// indexed equivalents; unknown / impossible colours fall back to default.
+pub fn crossterm_to_vt(color: CtColor) -> VtColor {
+    match color {
+        CtColor::Reset => VtColor::Default,
+        CtColor::Black => VtColor::Indexed(0),
+        CtColor::DarkRed => VtColor::Indexed(1),
+        CtColor::DarkGreen => VtColor::Indexed(2),
+        CtColor::DarkYellow => VtColor::Indexed(3),
+        CtColor::DarkBlue => VtColor::Indexed(4),
+        CtColor::DarkMagenta => VtColor::Indexed(5),
+        CtColor::DarkCyan => VtColor::Indexed(6),
+        CtColor::Grey => VtColor::Indexed(7),
+        CtColor::DarkGrey => VtColor::Indexed(8),
+        CtColor::Red => VtColor::Indexed(9),
+        CtColor::Green => VtColor::Indexed(10),
+        CtColor::Yellow => VtColor::Indexed(11),
+        CtColor::Blue => VtColor::Indexed(12),
+        CtColor::Magenta => VtColor::Indexed(13),
+        CtColor::Cyan => VtColor::Indexed(14),
+        CtColor::White => VtColor::Indexed(15),
+        CtColor::AnsiValue(n) => VtColor::Indexed(n),
+        CtColor::Rgb { r, g, b } => VtColor::Rgb(r, g, b),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

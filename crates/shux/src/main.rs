@@ -1540,6 +1540,143 @@ fn resolve_window_id_from_params(
     Ok(session.active_window)
 }
 
+/// Parse optional `cols` / `rows` from snapshot params. Defaults: 120x36.
+/// Same range guard as `pane.set_size`.
+fn parse_snapshot_dims(params: &serde_json::Value) -> Result<(u16, u16), shux_rpc::RpcError> {
+    let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(120);
+    let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(36);
+    if !(4..=1000).contains(&cols) || !(2..=1000).contains(&rows) {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "rows/cols out of range (got rows={rows} cols={cols}; \
+             valid: 4..=1000 cols, 2..=1000 rows)"
+        )));
+    }
+    Ok((cols as u16, rows as u16))
+}
+
+/// Compose every pane in `window_id` into a single ComposedFrame at
+/// `cols × rows`, rasterize it, and return the JSON `pane.snapshot`-shaped
+/// response (with `window_id` in place of `pane_id`).
+async fn snapshot_window(
+    gh: &shux_core::graph::GraphHandle,
+    io: &Arc<Mutex<PaneIoState>>,
+    window_id: shux_core::model::WindowId,
+    cols: u16,
+    rows: u16,
+    rasterizer: Arc<shux_raster::Rasterizer>,
+) -> Result<serde_json::Value, shux_rpc::RpcError> {
+    let (cw, ch) = rasterizer.cell_size();
+    let pixel_count = (cols as u64)
+        .saturating_mul(cw as u64)
+        .saturating_mul(rows as u64)
+        .saturating_mul(ch as u64);
+    const MAX_PIXELS: u64 = 16_000_000;
+    if pixel_count > MAX_PIXELS {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "snapshot would be {pixel_count} pixels — exceeds cap of {MAX_PIXELS}"
+        )));
+    }
+
+    let snap = gh.snapshot();
+    let window = snap
+        .windows
+        .get(&window_id)
+        .ok_or_else(|| shux_rpc::RpcError::not_found("window", &window_id.to_string()))?;
+
+    // Build per-pane title map from the graph (priority-resolved values).
+    let mut titles: std::collections::HashMap<shux_core::model::PaneId, String> =
+        std::collections::HashMap::new();
+    for pid in window.layout.tree.pane_ids() {
+        if let Some(p) = snap.panes.get(&pid) {
+            if !p.title.is_empty() {
+                titles.insert(pid, p.title.clone());
+            }
+        }
+    }
+
+    // Snapshot just the (Grid, Cursor) per pane under the io lock — VT itself
+    // isn't Clone and we want to release the lock before rasterizing.
+    let pane_data: Vec<(shux_core::model::PaneId, shux_vt::Grid, shux_vt::Cursor)> = {
+        let state = io.lock().await;
+        window
+            .layout
+            .tree
+            .pane_ids()
+            .into_iter()
+            .filter_map(|pid| {
+                state
+                    .vts
+                    .get(&pid)
+                    .map(|vt| (pid, vt.grid().clone(), vt.cursor().clone()))
+            })
+            .collect()
+    };
+
+    let focused = window.active_pane;
+    let layout_tree = window.layout.tree.clone();
+    let zoom_state = window.layout.zoom.clone();
+
+    let (img, png_buf) = tokio::task::spawn_blocking(move || {
+        let panes: std::collections::HashMap<
+            shux_core::model::PaneId,
+            (&shux_vt::Grid, &shux_vt::Cursor),
+        > = pane_data.iter().map(|(p, g, c)| (*p, (g, c))).collect();
+        let inputs = shux_ui::ComposeInputs {
+            layout: &layout_tree,
+            zoom: zoom_state.as_ref(),
+            focused,
+            panes: &panes,
+            titles: Some(&titles),
+            status_bar: None,
+        };
+        let composed = shux_ui::compose(
+            &inputs,
+            cols,
+            rows,
+            shux_ui::BorderStyle::Rounded,
+            shux_ui::BorderColors::default(),
+            0,
+        );
+        let opts = shux_raster::RasterOptions {
+            cursor: composed.cursor,
+            ..Default::default()
+        };
+        let img = rasterizer.render(&composed.grid, &opts);
+        let mut buf: Vec<u8> = Vec::with_capacity(128 * 1024);
+        {
+            use image::ImageEncoder;
+            let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+            encoder
+                .write_image(
+                    img.as_raw(),
+                    img.width(),
+                    img.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|e| format!("PNG encode failed: {e}"))?;
+        }
+        Ok::<_, String>((img, buf))
+    })
+    .await
+    .map_err(|e| shux_rpc::RpcError::internal(&format!("rasterize join: {e}")))?
+    .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+
+    Ok(serde_json::json!({
+        "window_id": window_id.to_string(),
+        "png_base64": b64,
+        "width": img.width(),
+        "height": img.height(),
+        "cell_width": cw,
+        "cell_height": ch,
+        "cols": cols,
+        "rows": rows,
+        "format": "png",
+    }))
+}
+
 /// Register window CRUD methods on the router builder.
 fn register_window_methods(
     builder: shux_rpc::RouterBuilder,
@@ -2304,7 +2441,9 @@ fn register_pane_io_methods(
     let g2 = graph.clone();
     let g5 = graph.clone();
     let g6 = graph.clone();
-    let g7 = graph;
+    let g7 = graph.clone();
+    let g8 = graph.clone();
+    let g9 = graph;
 
     let io1 = io_state.clone();
     let io2 = io_state.clone();
@@ -2312,14 +2451,18 @@ fn register_pane_io_methods(
     let io4 = io_state.clone();
     let io5 = io_state.clone();
     let io6 = io_state.clone();
-    let io7 = io_state;
+    let io7 = io_state.clone();
+    let io8 = io_state.clone();
+    let io9 = io_state;
 
-    // Shared rasterizer for `pane.snapshot`. Built once at startup so each
-    // snapshot call doesn't re-parse the 264 KB embedded font.
-    let rasterizer: Arc<shux_raster::Rasterizer> = Arc::new(
+    // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
+    // Built once at startup so each snapshot call doesn't re-parse the 264 KB embedded font.
+    let rasterizer_pane: Arc<shux_raster::Rasterizer> = Arc::new(
         shux_raster::Rasterizer::new(14.0)
             .expect("shux-raster: failed to construct rasterizer (bundled font corrupt?)"),
     );
+    let rasterizer_window = rasterizer_pane.clone();
+    let rasterizer_session = rasterizer_pane.clone();
 
     builder
         .register(
@@ -2572,7 +2715,7 @@ fn register_pane_io_methods(
         .register("pane.snapshot", move |params: Option<serde_json::Value>| {
             let gh = g6.clone();
             let io = io6.clone();
-            let r = rasterizer.clone();
+            let r = rasterizer_pane.clone();
             async move {
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -2655,6 +2798,49 @@ fn register_pane_io_methods(
                 }))
             }
         })
+        .register(
+            "window.snapshot",
+            move |params: Option<serde_json::Value>| {
+                let gh = g8.clone();
+                let io = io8.clone();
+                let r = rasterizer_window.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let window_id = resolve_window_id_from_params(&gh, &params)?;
+                    let (cols, rows) = parse_snapshot_dims(&params)?;
+                    snapshot_window(&gh, &io, window_id, cols, rows, r).await
+                }
+            },
+        )
+        .register(
+            "session.snapshot",
+            move |params: Option<serde_json::Value>| {
+                let gh = g9.clone();
+                let io = io9.clone();
+                let r = rasterizer_session.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let session_id_str = params
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
+                        })?;
+                    let session_id: shux_core::model::SessionId =
+                        session_id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid session_id format")
+                        })?;
+                    let snap = gh.snapshot();
+                    let session = snap
+                        .sessions
+                        .get(&session_id)
+                        .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
+                    let window_id = session.active_window;
+                    let (cols, rows) = parse_snapshot_dims(&params)?;
+                    snapshot_window(&gh, &io, window_id, cols, rows, r).await
+                }
+            },
+        )
         .register("pane.set_size", move |params: Option<serde_json::Value>| {
             let gh = g7.clone();
             let io = io7.clone();
@@ -3182,6 +3368,31 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     cli::handle_events_history(&mut stream, filter, count).await
                 }
             }
+        }
+
+        Some(Command::Snapshot {
+            session,
+            window,
+            output,
+            cols,
+            rows,
+        }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_snapshot(
+                &mut stream,
+                session.as_deref(),
+                window.as_deref(),
+                output,
+                cols,
+                rows,
+                args.format,
+            )
+            .await
+        }
+
+        Some(Command::Init { dir }) => {
+            let root = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
+            cli::handle_init(&root, args.format)
         }
 
         Some(Command::Apply {

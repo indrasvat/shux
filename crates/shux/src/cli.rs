@@ -395,6 +395,42 @@ pub enum Command {
         command: EventsCommand,
     },
 
+    /// Rasterize a window (or session's active window) to a PNG.
+    ///
+    /// Composes every pane in the target window — same picture you'd see in
+    /// `shux attach` — and rasterizes it via shux-raster. Writes the PNG to
+    /// `--output`, or prints base64 to stdout if omitted.
+    Snapshot {
+        /// Session to snapshot (defaults to the active window of this session).
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Explicit window id or index. If omitted, the session's active
+        /// window is used.
+        #[arg(short, long)]
+        window: Option<String>,
+        /// Output PNG path. If omitted, base64 is printed to stdout.
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+        /// Snapshot grid width in cells (4..=1000). Default: 120.
+        #[arg(long, default_value_t = 120)]
+        cols: u16,
+        /// Snapshot grid height in cells (2..=1000). Default: 36.
+        #[arg(long, default_value_t = 36)]
+        rows: u16,
+    },
+
+    /// Scaffold a `.shux/` directory in the current project.
+    ///
+    /// Creates `.shux/{templates,scripts,goldens,out}/` and `.shux/.gitignore`
+    /// (gitignoring `out/`). Drops a starter `templates/review.toml` if no
+    /// templates exist yet. Re-running is idempotent — never overwrites
+    /// existing files.
+    Init {
+        /// Target directory (default: cwd).
+        #[arg(short, long)]
+        dir: Option<std::path::PathBuf>,
+    },
+
     /// Apply a declarative workspace template (TOML) atomically.
     ///
     /// Reads a session/windows/panes definition (PRD §10.3 shape), lowers
@@ -1385,6 +1421,142 @@ pub async fn handle_rename(
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_session_renamed(session_name, new_name);
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn handle_snapshot(
+    stream: &mut tokio::net::UnixStream,
+    session: Option<&str>,
+    window: Option<&str>,
+    output: Option<std::path::PathBuf>,
+    cols: u16,
+    rows: u16,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use base64::Engine;
+
+    let mut params = serde_json::Map::new();
+    params.insert("cols".into(), serde_json::Value::from(cols));
+    params.insert("rows".into(), serde_json::Value::from(rows));
+
+    let method = match (session, window) {
+        (_, Some(w)) => {
+            params.insert("window_id".into(), serde_json::Value::String(w.to_string()));
+            if let Some(s) = session {
+                let sid = resolve_session_id(stream, s).await?;
+                params.insert("session_id".into(), serde_json::Value::String(sid));
+            }
+            "window.snapshot"
+        }
+        (Some(s), None) => {
+            let sid = resolve_session_id(stream, s).await?;
+            params.insert("session_id".into(), serde_json::Value::String(sid));
+            "session.snapshot"
+        }
+        (None, None) => {
+            anyhow::bail!("provide --session and/or --window");
+        }
+    };
+
+    let result = rpc_call(stream, method, serde_json::Value::Object(params)).await?;
+
+    let b64 = result
+        .get("png_base64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("daemon response missing png_base64"))?;
+    let png = base64::engine::general_purpose::STANDARD.decode(b64)?;
+
+    match (output, format) {
+        (Some(path), _) => {
+            std::fs::write(&path, &png)?;
+            if !matches!(format, OutputFormat::Json) {
+                let w = result.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+                let h = result.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!(
+                    "{} {} ({}×{} px, {} bytes)",
+                    crate::style::success("✓ snapshot →"),
+                    crate::style::bold(path.display().to_string().as_str()),
+                    w,
+                    h,
+                    png.len(),
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+        }
+        (None, OutputFormat::Json) => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        (None, _) => {
+            use std::io::Write;
+            std::io::stdout().write_all(&png)?;
+        }
+    }
+
+    Ok(())
+}
+
+const STARTER_TEMPLATE: &str = r#"# `shux apply review.toml` — atomic, dry-run-able with `--dry-run`.
+[session]
+name = "review"
+
+[[windows]]
+title = "git"
+[[windows.panes]]
+command = ["lazygit"]
+"#;
+
+pub fn handle_init(root: &std::path::Path, format: OutputFormat) -> anyhow::Result<()> {
+    let shux_dir = root.join(".shux");
+    for sub in ["templates", "scripts", "goldens", "out"] {
+        std::fs::create_dir_all(shux_dir.join(sub))?;
+    }
+
+    let gitignore_path = shux_dir.join(".gitignore");
+    let mut created = Vec::new();
+    if !gitignore_path.exists() {
+        std::fs::write(&gitignore_path, "out/\n*.log\n")?;
+        created.push(gitignore_path.clone());
+    }
+
+    let template_path = shux_dir.join("templates").join("review.toml");
+    let templates_dir = shux_dir.join("templates");
+    let templates_empty = std::fs::read_dir(&templates_dir)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(true);
+    if templates_empty && !template_path.exists() {
+        std::fs::write(&template_path, STARTER_TEMPLATE)?;
+        created.push(template_path.clone());
+    }
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "shux_dir": shux_dir.display().to_string(),
+                    "created": created.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                }))?
+            );
+        }
+        _ => {
+            println!(
+                "{} {}",
+                crate::style::success("✓ scaffolded"),
+                crate::style::bold(shux_dir.display().to_string().as_str()),
+            );
+            for path in &created {
+                println!("  {} {}", crate::style::muted("+"), path.display(),);
+            }
+            if created.is_empty() {
+                println!(
+                    "  {}",
+                    crate::style::muted("(already present — nothing to do)")
+                );
+            }
         }
     }
 
