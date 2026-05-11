@@ -404,6 +404,24 @@
   width: 100%;
 }
 .gallery-panel.is-active { display: block; }
+.gallery-panel .zoom-link {
+  display: block; position: relative; line-height: 0;
+  border: 0; cursor: zoom-in;
+}
+.gallery-panel .zoom-link::after {
+  content: "↗ open full-size";
+  position: absolute; top: 10px; right: 10px;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink); background: rgba(14,12,8,0.78);
+  border: 1px solid rgba(236,228,210,0.16);
+  padding: 4px 9px; border-radius: var(--r-1);
+  letter-spacing: 0.02em;
+  opacity: 0; transition: opacity 140ms ease;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+.gallery-panel .zoom-link:hover::after,
+.gallery-panel .zoom-link:focus-visible::after { opacity: 1; }
 .gallery-panel img {
   width: 100%; height: auto; display: block;
   background: #0a0810;
@@ -498,14 +516,14 @@
         <div class="url"></div>
       </div>
       <div class="device-screen" id="screen">
-        <!-- Strongest proof frame first (per codex): the two-tone block-art
-             splash reads instantly. Subsequent frames cycle through real
-             agent-driven states. width/height for layout stability. -->
-        <img src="/screenshots/04-vivecaka-splash.png" alt="vivecaka splash logo (two-tone block art) rasterized by shux-raster" width="1800" height="1140" class="active">
-        <img src="/screenshots/01-vivecaka-pr-list.png" alt="vivecaka PR triage view, rasterized from a live pane" width="1800" height="1140" loading="lazy">
-        <img src="/screenshots/02-vivecaka-pr-detail.png" alt="vivecaka PR detail view with tabs" width="1800" height="1140" loading="lazy">
-        <img src="/screenshots/03-vivecaka-help.png" alt="vivecaka help overlay" width="1800" height="1140" loading="lazy">
-        <div class="device-tag" id="screenTag">pane.snapshot → vivecaka splash</div>
+        <!-- Hero rotator cycles four universally-recognizable TUIs, each a
+             real pane.snapshot. Order picked for visual rhythm: dense diff
+             → branches → help overlay → htop. -->
+        <img src="/screenshots/lg-03.png" alt="lazygit showing a diff in the Bubbletea repo — green additions, red removals, commit message in the panel header" width="1800" height="1064" class="active">
+        <img src="/screenshots/lg-04.png" alt="lazygit branches view with the full commit history panel on the right" width="1800" height="1064" loading="lazy">
+        <img src="/screenshots/lg-06.png" alt="lazygit global help overlay listing every keybinding" width="1800" height="1064" loading="lazy">
+        <img src="/screenshots/htop-header.png" alt="htop CPU + memory bars: 10 cores with rainbow utilization bars, memory at 23.16/32G, uptime 20:01:55" width="1440" height="180" loading="lazy">
+        <div class="device-tag" id="screenTag">pane.snapshot → lazygit · diff view</div>
       </div>
     </div>
   </div>
@@ -564,12 +582,12 @@
 <span style="color:var(--ink2-on-paper)"># Same spec a human <code>shux apply</code>'s — same one an agent ships.</span>
 
 [session]
-name = "review-pr-1234"
+name = "review"
 
 [[windows]]
-title = "vivecaka"
+title = "git"
 [[windows.panes]]
-command = ["vivecaka", "--repo", "indrasvat/shux"]
+command = ["lazygit"]
 
 <span style="color:var(--accent)">$ shux apply review.toml</span>
 <span style="color:var(--ink2-on-paper)"># → session created atomically.</span>
@@ -771,18 +789,25 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
 
       <div class="gallery-stage">
         <figure class="gallery-panel is-active" data-i="0" role="tabpanel">
-          <img src="/screenshots/anim-vivecaka-drive.png" alt="9-frame animated replay of an agent driving vivecaka: splash → PR list → cursor moves → search opens → list filters → help overlay → PR detail → tab changes → back to list" width="900" height="570" loading="lazy">
+          <a class="zoom-link" href="/screenshots/anim-lazygit-drive.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+            <img src="/screenshots/anim-lazygit-drive.png" alt="7-frame animated replay of an agent driving lazygit: opening view → commits log → diff of one commit → branches → remotes → help overlay → back to files. Pointed at a freshly-cloned charmbracelet/bubbletea repo." width="880" height="520" loading="lazy">
+          </a>
           <figcaption>
             <b>One scenario, scripted entirely through JSON-RPC.</b>
-            Spawn vivecaka, resize, type <code>j</code> to navigate, <code>/</code> to search,
-            <code>?</code> for help, <kbd>Enter</kbd> to open, <kbd>Tab</kbd> to cycle tabs,
-            <kbd>Esc</kbd> to back out. Every frame is a real <code>pane.snapshot</code> call —
-            this is the asciinema-style record you get for free with shux.
+            <code>shux api session.create</code> spawns
+            <code>lazygit</code> in a freshly-cloned public repo. Then
+            navigate the commit log, open a diff with <kbd>Enter</kbd>,
+            press <kbd>?</kbd> for the help overlay, cycle panels with
+            number keys — each input is a <code>pane.send_keys</code>
+            call, each frame is a real <code>pane.snapshot</code>. No
+            mockup, no recording trickery. This is the asciinema-with-
+            pixels record you get for free with shux.
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="1" role="tabpanel" hidden>
-          <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy">
+          <a class="zoom-link" href="/screenshots/anim-multipane.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy"></a>
           <figcaption>
             <b>One <code>shux apply</code> spawns a 4-pane workspace</b> —
             <code>bat</code> on the editor, <code>cargo nextest</code> running tests,
@@ -792,12 +817,18 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
             (<code>pane.set_size</code>, synchronous), and swaps the editor and tests
             quadrants (<code>pane.swap</code>) — the same verbs as
             <code>tmux send-keys</code>, <code>tmux resize-pane</code>,
-            <code>tmux swap-pane</code>, but typed.
+            <code>tmux swap-pane</code>, but typed.<br><br>
+            <span class="muted">Run <code>shux attach</code> on the same session and
+            you get the interactive multiplexer view — focus-highlighted borders, a
+            three-zone status bar (session · window · clock), mouse-aware pane focus,
+            and Alt+h/j/k/l keyboard navigation. The headless RPC primitives you see
+            here are the <i>same</i> primitives that drive the attached client.</span>
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
-          <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy">
+          <a class="zoom-link" href="/screenshots/08-bat.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy"></a>
           <figcaption>
             <b><code>bat crates/shux-raster/src/lib.rs</code></b> — Rust syntax
             highlighting, line numbers, TwoDark palette. Every colour in the source
@@ -807,7 +838,8 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
         </figure>
 
         <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
-          <img src="/screenshots/09-help.png" alt="shux --help showing the command→RPC method map, typical agent workflow, replaces-these-tools table, and where-to-learn-more block" width="1080" height="1057" loading="lazy">
+          <a class="zoom-link" href="/screenshots/09-help.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/09-help.png" alt="shux --help showing the command→RPC method map, typical agent workflow, replaces-these-tools table, and where-to-learn-more block" width="1080" height="1057" loading="lazy"></a>
           <figcaption>
             <b><code>shux --help</code></b> — the long-form help is a paste-able agent
             reference: every CLI verb mapped to its RPC method, a 3-call workflow, the
@@ -817,7 +849,8 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
         </figure>
 
         <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
-          <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] 692 tests run: 692 passed, 0 skipped'" width="1620" height="912" loading="lazy">
+          <a class="zoom-link" href="/screenshots/05-tests.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] 692 tests run: 692 passed, 0 skipped'" width="1620" height="912" loading="lazy"></a>
           <figcaption>
             <b><code>cargo nextest run --workspace</code></b> — 692 tests cover the
             whole workspace (core, VT parser, PTY, RPC, UI compositor, raster, plugin
@@ -826,7 +859,8 @@ command = ["vivecaka", "--repo", "indrasvat/shux"]
         </figure>
 
         <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
-          <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy">
+          <a class="zoom-link" href="/screenshots/06-raster-hello.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy"></a>
           <figcaption>
             <b>shux-raster's hello banner.</b> Bold, dim, inverse, underline,
             strikethrough. ANSI 16, the 256-cube, truecolor RGB. Cursor rendered as an
@@ -1007,20 +1041,17 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
   })();
 
   // Hero device — rotate snapshots. Pause if reduced-motion.
-  //
-  // First frame in the markup is the splash (strongest proof per codex
-  // review — instantly readable as "rasterized terminal art"). Subsequent
-  // frames cycle through agent-driven states.
+  // Four real pane.snapshot outputs of universally-recognizable TUIs.
   (function () {
     var screen = document.getElementById("screen");
     if (!screen) return;
     var imgs = screen.querySelectorAll("img");
     var tag = document.getElementById("screenTag");
     var labels = [
-      "pane.snapshot → vivecaka splash",
-      "pane.snapshot → PR list view",
-      "pane.snapshot → PR detail · Checks tab",
-      "pane.snapshot → help overlay (? key)"
+      "pane.snapshot → lazygit · diff view",
+      "pane.snapshot → lazygit · branches",
+      "pane.snapshot → lazygit · ? help overlay",
+      "pane.snapshot → htop · CPU + memory bars"
     ];
     if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       return;
