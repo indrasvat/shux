@@ -2530,44 +2530,39 @@ fn register_pane_io_methods(
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
 
-                // Clone the live grid + cursor under lock, then drop the lock
-                // before any CPU-bound work. Rasterizing under the global
-                // PaneIoState mutex would stall every pane's PTY read/write/
-                // resize for tens of ms on a snapshot (codex review).
-                //
-                // Cloning a 200x60 grid is ~192 KB of allocation, which is
-                // cheap compared to the millions of pixels the rasterizer
-                // produces. Cursor is captured as a discrete `(row, col)`
-                // pair AND honors `cursor.visible` — apps that hide the
-                // cursor (vim/less in alt screen) won't get a stray block.
+                // Read visible dims FIRST, validate the pixel budget BEFORE
+                // any allocation, then clone only the visible viewport (not
+                // scrollback). Codex review (PR #16): cloning the full Grid
+                // under lock paid hundreds of MB of allocations even on
+                // snapshots that were about to be rejected by the cap,
+                // because the default 5000-line scrollback was being copied
+                // unconditionally.
+                let (cw, ch) = r.cell_size();
                 let (grid_snapshot, cursor_pos, snap_cols, snap_rows) = {
                     let state = io.lock().await;
                     let vt = state.vts.get(&pane_id).ok_or_else(|| {
                         shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                     })?;
+                    let cols = vt.grid().cols();
+                    let rows = vt.grid().rows();
+                    // 16 M output pixels (~64 MB RGBA, ~4000x4000 px).
+                    let pixel_count = (cols as u64)
+                        .saturating_mul(cw as u64)
+                        .saturating_mul(rows as u64)
+                        .saturating_mul(ch as u64);
+                    const MAX_PIXELS: u64 = 16_000_000;
+                    if pixel_count > MAX_PIXELS {
+                        return Err(shux_rpc::RpcError::invalid_params(&format!(
+                            "snapshot would be {pixel_count} pixels — exceeds cap of \
+                            {MAX_PIXELS}; resize the pane first via pane.set_size"
+                        )));
+                    }
                     let cur = vt.cursor();
                     let cursor_pos = cur.visible.then_some((cur.row, cur.col));
-                    let grid_clone = vt.grid().clone();
-                    let cols = grid_clone.cols();
-                    let rows = grid_clone.rows();
+                    // Visible-only clone — does NOT copy scrollback.
+                    let grid_clone = vt.grid().clone_visible();
                     (grid_clone, cursor_pos, cols, rows)
                 };
-
-                // Hard guard against pathological dimensions — a 1000x1000
-                // cell grid at 10x22 px/cell is 220 MB of RGBA. Cap at
-                // 16 M output pixels (~64 MB RGBA, ~4000x4000 px).
-                let (cw, ch) = r.cell_size();
-                let pixel_count = (snap_cols as u64)
-                    .saturating_mul(cw as u64)
-                    .saturating_mul(snap_rows as u64)
-                    .saturating_mul(ch as u64);
-                const MAX_PIXELS: u64 = 16_000_000;
-                if pixel_count > MAX_PIXELS {
-                    return Err(shux_rpc::RpcError::invalid_params(&format!(
-                        "snapshot would be {pixel_count} pixels — exceeds cap of {MAX_PIXELS}; \
-                        resize the pane first via pane.set_size"
-                    )));
-                }
 
                 // Rasterize + PNG-encode off the runtime worker. Both are
                 // pure-CPU and don't yield, so we route them to a blocking
