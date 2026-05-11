@@ -121,8 +121,19 @@ kbd {
   color: var(--ink);
 }
 
-/* Selection. */
-::selection { background: var(--accent-soft); color: var(--ink); }
+/* Selection. Solid terracotta with a warm-white forced fg works on both
+   the warm-charcoal and paper-cream sections — the 12% accent-soft
+   wash we had before bleached dark text into illegible pink-on-cream. */
+::selection {
+  background: var(--accent);
+  color: #fdf9f0;
+  text-shadow: none;
+}
+::-moz-selection {
+  background: var(--accent);
+  color: #fdf9f0;
+  text-shadow: none;
+}
 
 /* ─── Headlines ─────────────────────────────────────────── */
 h1, h2, h3, h4 {

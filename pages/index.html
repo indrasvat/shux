@@ -409,7 +409,7 @@
   border: 0; cursor: zoom-in;
 }
 .gallery-panel .zoom-link::after {
-  content: "↗ open full-size";
+  content: "⤢ click to zoom";
   position: absolute; top: 10px; right: 10px;
   font-family: var(--font-mono); font-size: 11px;
   color: var(--ink); background: rgba(14,12,8,0.78);
@@ -422,6 +422,72 @@
 }
 .gallery-panel .zoom-link:hover::after,
 .gallery-panel .zoom-link:focus-visible::after { opacity: 1; }
+
+/* ── Lightbox modal — in-page, no new tab. Click backdrop / × / Esc to close. ── */
+.lightbox {
+  position: fixed; inset: 0; z-index: 100;
+  display: none;
+  align-items: center; justify-content: center;
+  padding: var(--s-5) var(--s-4);
+  background: rgba(8, 6, 4, 0.88);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+  animation: lb-fade 180ms ease;
+}
+.lightbox[data-open="true"] { display: flex; }
+@keyframes lb-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.lightbox-frame {
+  position: relative;
+  max-width: min(96vw, 1500px);
+  max-height: 94vh;
+  display: flex; flex-direction: column;
+  background: var(--bg-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-3);
+  box-shadow: 0 80px 120px -30px rgba(0,0,0,0.75),
+              0 0 0 1px rgba(236,228,210,0.04);
+  overflow: hidden;
+  animation: lb-rise 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+@keyframes lb-rise {
+  from { transform: translateY(14px) scale(0.985); opacity: 0; }
+  to   { transform: translateY(0)    scale(1);    opacity: 1; }
+}
+.lightbox-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-3);
+  font-family: var(--font-mono); font-size: 12px; color: var(--ink-3);
+}
+.lightbox-bar .lb-caption { color: var(--ink-2); }
+.lightbox-bar .lb-caption b { color: var(--ink); font-weight: 600; }
+.lightbox-close {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px;
+  background: transparent;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-1);
+  color: var(--ink); font-size: 16px; line-height: 1;
+  cursor: pointer; transition: all 120ms ease;
+}
+.lightbox-close:hover { background: var(--bg-3); border-color: var(--ink-3); }
+.lightbox-stage {
+  flex: 1; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: #0a0810;
+  padding: var(--s-3);
+  overflow: auto;
+}
+.lightbox-img {
+  max-width: 100%; max-height: 84vh;
+  width: auto; height: auto;
+  display: block;
+  image-rendering: -webkit-optimize-contrast;
+}
 .gallery-panel img {
   width: 100%; height: auto; display: block;
   background: #0a0810;
@@ -747,7 +813,7 @@ command = ["lazygit"]
 <section class="section">
   <div class="wrap">
     <p class="eyebrow">in the wild</p>
-    <h2 class="measure">Six tabs. Real <code>pane.snapshot</code> outputs, no mockups.</h2>
+    <h2 class="measure">Seven tabs. Real <code>pane.snapshot</code> outputs, no mockups.</h2>
     <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
       No mockups. No "rendered in After Effects". Pick a tab to see
       what shux's rasterizer produces when an agent drives a real TUI.
@@ -758,7 +824,7 @@ command = ["lazygit"]
         <button role="tab" class="gallery-tab is-active" data-i="0" aria-selected="true">
           <span class="g-dot live"></span>
           <span class="g-name">Agent driving a TUI</span>
-          <span class="g-meta">animated · 9 frames</span>
+          <span class="g-meta">animated · 7 frames</span>
         </button>
         <button role="tab" class="gallery-tab" data-i="1" aria-selected="false">
           <span class="g-dot"></span>
@@ -767,20 +833,25 @@ command = ["lazygit"]
         </button>
         <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
           <span class="g-dot"></span>
+          <span class="g-name">Inside <code>shux attach</code></span>
+          <span class="g-meta">status bar + borders · live</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
+          <span class="g-dot"></span>
           <span class="g-name">Syntax-highlighted source</span>
           <span class="g-meta">bat · rust</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Self-documenting CLI</span>
           <span class="g-meta">shux --help</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">CI test sweep</span>
           <span class="g-meta">cargo nextest · 692/692</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="6" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Pixel + attribute coverage</span>
           <span class="g-meta">shux-raster</span>
@@ -789,7 +860,7 @@ command = ["lazygit"]
 
       <div class="gallery-stage">
         <figure class="gallery-panel is-active" data-i="0" role="tabpanel">
-          <a class="zoom-link" href="/screenshots/anim-lazygit-drive.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <a class="zoom-link" href="/screenshots/anim-lazygit-drive.png" rel="noopener" aria-label="open image at full size in a new tab">
             <img src="/screenshots/anim-lazygit-drive.png" alt="7-frame animated replay of an agent driving lazygit: opening view → commits log → diff of one commit → branches → remotes → help overlay → back to files. Pointed at a freshly-cloned charmbracelet/bubbletea repo." width="880" height="520" loading="lazy">
           </a>
           <figcaption>
@@ -806,7 +877,7 @@ command = ["lazygit"]
         </figure>
 
         <figure class="gallery-panel" data-i="1" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/anim-multipane.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <a class="zoom-link" href="/screenshots/anim-multipane.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy"></a>
           <figcaption>
             <b>One <code>shux apply</code> spawns a 4-pane workspace</b> —
@@ -827,7 +898,24 @@ command = ["lazygit"]
         </figure>
 
         <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/08-bat.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <a class="zoom-link" href="/screenshots/statusbar-demo.png" rel="noopener" aria-label="open image at full size">
+            <img src="/screenshots/statusbar-demo.png" alt="shux attached to a 2-pane session named 'demo' showing lazygit (left) and bat rendering bubbletea's README (right), with focus-highlighted borders and shux's own three-zone status bar at the bottom" width="1620" height="912" loading="lazy">
+          </a>
+          <figcaption>
+            <b>shux running shux.</b> The outer pane is a <code>pane.snapshot</code> of
+            an attached client running <code>shux attach -s demo</code> against a
+            separate 2-pane session. What you see — focus-highlighted borders, the
+            <code>demo · 11/11 · ?</code> status bar across the bottom, the per-pane
+            title overlays — is shux's own <code>RenderCompositor</code> output.
+            Mouse-click events on the attached client move focus between panes;
+            Alt+h/j/k/l navigates by direction; <kbd>Ctrl+Space</kbd> is the prefix.
+            All of this works in any modern terminal emulator — and produces this
+            exact PNG without one.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
+          <a class="zoom-link" href="/screenshots/08-bat.png" rel="noopener" aria-label="open image at full size">
           <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy"></a>
           <figcaption>
             <b><code>bat crates/shux-raster/src/lib.rs</code></b> — Rust syntax
@@ -838,7 +926,7 @@ command = ["lazygit"]
         </figure>
 
         <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/09-help.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <a class="zoom-link" href="/screenshots/09-help.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/09-help.png" alt="shux --help showing the command→RPC method map, typical agent workflow, replaces-these-tools table, and where-to-learn-more block" width="1080" height="1057" loading="lazy"></a>
           <figcaption>
             <b><code>shux --help</code></b> — the long-form help is a paste-able agent
@@ -849,7 +937,7 @@ command = ["lazygit"]
         </figure>
 
         <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/05-tests.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] 692 tests run: 692 passed, 0 skipped'" width="1620" height="912" loading="lazy"></a>
           <figcaption>
             <b><code>cargo nextest run --workspace</code></b> — 692 tests cover the
@@ -859,7 +947,7 @@ command = ["lazygit"]
         </figure>
 
         <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/06-raster-hello.png" target="_blank" rel="noopener" aria-label="open image at full size in a new tab">
+          <a class="zoom-link" href="/screenshots/06-raster-hello.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy"></a>
           <figcaption>
             <b>shux-raster's hello banner.</b> Bold, dim, inverse, underline,
@@ -1007,12 +1095,72 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
   </div>
 </footer>
 
+<!-- ─── Lightbox modal — single instance, populated on .zoom-link click. ─── -->
+<div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-labelledby="lb-caption-text">
+  <div class="lightbox-frame">
+    <div class="lightbox-bar">
+      <span class="lb-caption" id="lb-caption-text">image preview</span>
+      <button class="lightbox-close" id="lb-close" aria-label="close (Esc)">×</button>
+    </div>
+    <div class="lightbox-stage">
+      <img class="lightbox-img" id="lb-img" alt="">
+    </div>
+  </div>
+</div>
+
 <script>
-  // Gallery tab switcher — vanilla, no framework.
+  // Lightbox — hijack .zoom-link clicks. No new tabs, no JS framework.
+  (function () {
+    var lb        = document.getElementById("lightbox");
+    if (!lb) return;
+    var lbImg     = document.getElementById("lb-img");
+    var lbCaption = document.getElementById("lb-caption-text");
+    var lbClose   = document.getElementById("lb-close");
+    var lastFocus = null;
+    function open (src, alt) {
+      lastFocus = document.activeElement;
+      lbImg.src = src;
+      lbImg.alt = alt || "";
+      lbCaption.textContent = alt || "image preview";
+      lb.setAttribute("data-open", "true");
+      document.documentElement.style.overflow = "hidden";
+      lbClose.focus();
+    }
+    function close () {
+      lb.removeAttribute("data-open");
+      lbImg.src = "";
+      document.documentElement.style.overflow = "";
+      if (lastFocus && typeof lastFocus.focus === "function") lastFocus.focus();
+    }
+    document.querySelectorAll(".zoom-link").forEach(function (a) {
+      a.addEventListener("click", function (e) {
+        e.preventDefault();
+        var img = a.querySelector("img");
+        open(a.getAttribute("href"), img ? img.alt : "");
+      });
+    });
+    lb.addEventListener("click", function (e) {
+      // Click backdrop (the .lightbox element itself, not its frame) → close.
+      if (e.target === lb) close();
+    });
+    lbClose.addEventListener("click", close);
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && lb.getAttribute("data-open") === "true") close();
+    });
+  })();
+
+  // Gallery tab switcher + slow auto-loop. Vanilla, no framework.
   (function () {
     var tabs = document.querySelectorAll(".gallery-tab");
     var panels = document.querySelectorAll(".gallery-panel");
     if (!tabs.length) return;
+
+    var DWELL_MS = 7000;       // 7 s on each tab before auto-advancing
+    var loopTimer = null;
+    var userPaused = false;
+    var prefersReduced = window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
     function activate (i) {
       tabs.forEach(function (t, ti) {
         var on = ti === i;
@@ -1026,18 +1174,50 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
         else    p.setAttribute("hidden", "");
       });
     }
+    function currentIndex () {
+      for (var i = 0; i < tabs.length; i++) {
+        if (tabs[i].classList.contains("is-active")) return i;
+      }
+      return 0;
+    }
+    function tick () {
+      if (userPaused) return;
+      activate((currentIndex() + 1) % tabs.length);
+    }
+    function startLoop () {
+      if (prefersReduced || userPaused || loopTimer) return;
+      loopTimer = setInterval(tick, DWELL_MS);
+    }
+    function stopLoop () {
+      if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
+    }
+    function pauseFromUser () {
+      userPaused = true;
+      stopLoop();
+    }
+
     tabs.forEach(function (t, i) {
-      t.addEventListener("click", function () { activate(i); });
+      t.addEventListener("click", function () { pauseFromUser(); activate(i); });
       t.addEventListener("keydown", function (e) {
         if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+          pauseFromUser();
           var next = (i + 1) % tabs.length;
           tabs[next].focus(); activate(next); e.preventDefault();
         } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+          pauseFromUser();
           var prev = (i - 1 + tabs.length) % tabs.length;
           tabs[prev].focus(); activate(prev); e.preventDefault();
         }
       });
     });
+
+    // Pause the auto-loop when the tab isn't visible (no point cycling).
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) stopLoop();
+      else                 startLoop();
+    });
+
+    startLoop();
   })();
 
   // Hero device — rotate snapshots. Pause if reduced-motion.
