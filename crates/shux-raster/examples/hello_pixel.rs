@@ -7,10 +7,15 @@ use shux_raster::{RasterOptions, Rasterizer};
 use shux_vt::VirtualTerminal;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Banner avoids ┌─┐│└┘ box-drawing — those rely on every interior
+    // cell being exactly 1 column wide, and even one stray wide glyph
+    // (em-dash, soft-hyphen, an unintentional emoji) misaligns the right
+    // edge. A simple double rule above + below the title is robust at
+    // any cell count.
     let mut vt = VirtualTerminal::new(20, 72);
-    let banner = "\x1b[1;36m  ┌──────────────────────────────────────────────────────────────────┐\r\n\
-\x1b[1;36m  │  \x1b[1;33mshux-raster\x1b[0;1;36m — pixels without a terminal emulator                 │\r\n\
-\x1b[1;36m  └──────────────────────────────────────────────────────────────────┘\x1b[0m\r\n\
+    let banner = "\x1b[1;36m  ══════════════════════════════════════════════════════════════════\r\n\
+\x1b[1;36m   \x1b[1;33mshux-raster\x1b[0;1;36m  ·  pixels without a terminal emulator\r\n\
+\x1b[1;36m  ══════════════════════════════════════════════════════════════════\x1b[0m\r\n\
 \r\n\
   Hello, \x1b[1;31mshux!\x1b[0m  This PNG was produced by \x1b[1;35mshux-raster\x1b[0m,\r\n\
   not by iTerm2, not by Alacritty — just shux-vt + fontdue + image.\r\n\

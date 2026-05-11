@@ -17,14 +17,240 @@ const CLAP_STYLES: Styles = Styles::styled()
     .invalid(AnsiColor::Red.on_default().effects(Effects::BOLD))
     .error(AnsiColor::Red.on_default().effects(Effects::BOLD));
 
+/// Render the long-form agent reference block appended to `shux --help`.
+///
+/// The same content is emitted twice — once with shux's brand colours
+/// baked in via ANSI escapes (terracotta accent for headers + `shux`
+/// commands, green for RPC methods, dim for inline comments), and once
+/// as plain text with all escapes stripped. The colour decision honours
+/// `NO_COLOR=…` (any value) and falls back to plain when stdout isn't
+/// a TTY, matching the same `IsTerminal` check the rest of the CLI uses.
+pub fn agent_help() -> String {
+    use std::io::IsTerminal;
+    let colorize = std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
+    render_agent_help(colorize)
+}
+
+fn render_agent_help(colorize: bool) -> String {
+    // Brand palette in 24-bit truecolor — matches the landing page.
+    let acc = if colorize {
+        "\x1b[1;38;2;215;108;58m"
+    } else {
+        ""
+    }; // bold terracotta — section headers, `shux` brand
+    let acc_dim = if colorize { "\x1b[38;2;199;90;42m" } else { "" }; // terracotta — `shux <verb>` ledes & URLs
+    let cmd = if colorize {
+        "\x1b[1;38;2;215;108;58m"
+    } else {
+        ""
+    }; // bold terracotta — `shux` token
+    let verb = if colorize { "\x1b[1;32m" } else { "" }; // bold green — subcommand verb
+    let rpc = if colorize { "\x1b[32m" } else { "" }; // green — RPC method names
+    let arrow = if colorize {
+        "\x1b[38;2;146;138;120m"
+    } else {
+        ""
+    }; // muted warm gray — →
+    let dim = if colorize { "\x1b[2m" } else { "" }; // dim — inline comments
+    let underline = if colorize { "\x1b[4m" } else { "" }; // underline — URLs
+    let r = if colorize { "\x1b[0m" } else { "" }; // reset
+
+    // Helper to render a `shux <verb>` token in two-tone colour.
+    let shux = |v: &str| format!("{cmd}shux{r} {verb}{v}{r}");
+    // Helper to render a section header.
+    let h = |s: &str| format!("{acc}{s}{r}");
+    // Helper to render an RPC method name.
+    let m = |s: &str| format!("{rpc}{s}{r}");
+    // Helper for arrows.
+    let a = format!("{arrow}→{r}");
+    // Helper for `shux` brand-name only.
+    let sx = format!("{cmd}shux{r}");
+
+    let mut s = String::with_capacity(4096);
+    s.push_str(&format!("{}\n", h("COMMAND → RPC METHOD MAP")));
+    s.push_str(&format!(
+        "  {:14} {a} {}\n",
+        shux("new"),
+        m("session.create")
+    ));
+    s.push_str(&format!("  {:14} {a} {}\n", shux("ls"), m("session.list")));
+    s.push_str(&format!(
+        "  {:14} {a} {} / {} / {}\n",
+        shux("kill"),
+        m("session.kill"),
+        m("window.kill"),
+        m("pane.kill")
+    ));
+    s.push_str(&format!(
+        "  {:14} {a} {}\n",
+        shux("rename"),
+        m("session.rename")
+    ));
+    s.push_str(&format!(
+        "  {:14} {a} {}\n",
+        shux("window"),
+        m("window.{create,list,focus,kill,ensure,rename}")
+    ));
+    s.push_str(&format!("  {:14} {a} {}\n", shux("pane"),   m("pane.{send_keys,set_size,snapshot,capture,split,focus,zoom,swap,kill,set_title,output.watch}")));
+    s.push_str(&format!(
+        "  {:14} {a} {} {dim}(atomic batch from a TOML template){r}\n",
+        shux("apply"),
+        m("state.apply")
+    ));
+    s.push_str(&format!(
+        "  {:14} {a} {} / {}\n",
+        shux("events"),
+        m("events.history"),
+        m("pane.output.watch")
+    ));
+    s.push_str(&format!("  {:14} {a} any method directly  {dim}(use for new methods before a CLI wrapper exists){r}\n\n",
+                       shux("api")));
+
+    s.push_str(&format!("{}\n", h("TYPICAL AGENT WORKFLOW")));
+    s.push_str(&format!(
+        "  {dim}# 1. Spawn a session running any command.{r}\n"
+    ));
+    s.push_str(&format!(
+        "  {} {} '{{\"name\":\"demo\",\"command\":[\"lazygit\"]}}'\n\n",
+        shux("api"),
+        m("session.create")
+    ));
+    s.push_str(&format!(
+        "  {dim}# 2. Drive it. (Synchronous resize — next snapshot sees new dims.){r}\n"
+    ));
+    s.push_str(&format!(
+        "  {} {}  '{{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}}'\n",
+        shux("api"),
+        m("pane.set_size")
+    ));
+    s.push_str(&format!(
+        "  {} {} '{{\"pane_id\":\"$PID\",\"text\":\"j\"}}'\n",
+        shux("api"),
+        m("pane.send_keys")
+    ));
+    s.push_str(&format!(
+        "  {} {} '{{\"pane_id\":\"$PID\",\"data\":\"Gw==\"}}'   {dim}# Esc (base64){r}\n\n",
+        shux("api"),
+        m("pane.send_keys")
+    ));
+    s.push_str(&format!(
+        "  {dim}# 3. Pixel feedback (PNG, headless — no terminal emulator in the loop).{r}\n"
+    ));
+    s.push_str(&format!(
+        "  {} {}  '{{\"pane_id\":\"$PID\"}}' \\\n",
+        shux("api"),
+        m("pane.snapshot")
+    ));
+    s.push_str("    | jq -r .result.png_base64 | base64 -d > frame.png\n\n");
+    s.push_str(&format!("  {dim}# Tear down when done.{r}\n"));
+    s.push_str(&format!("  {} -s demo\n\n", shux("kill")));
+
+    s.push_str(&format!("{}\n", h("DECLARATIVE WORKSPACES")));
+    s.push_str("  echo '[session]\n");
+    s.push_str("  name=\"review\"\n");
+    s.push_str("  [[windows]]\n");
+    s.push_str("  title=\"git\"\n");
+    s.push_str("  [[windows.panes]]\n");
+    s.push_str("  command=[\"lazygit\"]' > spec.toml\n");
+    s.push_str(&format!(
+        "  {} spec.toml       {dim}# atomic; --dry-run prints the lowered ops{r}\n\n",
+        shux("apply")
+    ));
+
+    s.push_str(&format!("{}\n", h("REPLACES THESE TOOLS")));
+    let row = |tool: &str, with: &str| format!("  {tool:30} {a} {with}\n");
+    s.push_str(&row(
+        "tmux / screen / byobu",
+        &format!("{} + {}", shux("apply"), shux("attach")),
+    ));
+    s.push_str(&row(
+        "iTerm2 (Python SDK / AS)",
+        &format!("{} + {}", m("pane.send_keys"), m("pane.snapshot")),
+    ));
+    s.push_str(&row(
+        "expect / pexpect / sexpect",
+        &format!(
+            "loop of {} / wait / {}",
+            m("pane.send_keys"),
+            m("pane.snapshot")
+        ),
+    ));
+    s.push_str(&row(
+        "asciinema rec",
+        &format!("{} {dim}(sealed data plane){r}", m("pane.output.watch")),
+    ));
+    s.push_str(&row(
+        "vhs / agg / terminalizer",
+        &format!("{} loop {a} ffmpeg", m("pane.snapshot")),
+    ));
+    s.push_str(&row("termshot / freezeframe", &m("pane.snapshot")));
+    s.push_str(&row(
+        "iTerm2 broadcast input",
+        &format!("{} fan-out", m("pane.send_keys")),
+    ));
+    s.push_str(&row(
+        "ttyrec / termsh",
+        &format!("re-feed VT bytes {a} {}", m("pane.snapshot")),
+    ));
+    s.push_str(&row(
+        "GNU parallel --tmux mode",
+        "template with N panes + RPC orchestrator",
+    ));
+    s.push_str(&row(
+        "Bubbletea/ratatui test harness",
+        &format!("{} + golden-image diff", m("pane.snapshot")),
+    ));
+    s.push('\n');
+
+    let url = |u: &str| format!("{acc_dim}{underline}{u}{r}");
+    s.push_str(&format!("{}\n", h("WHERE TO LEARN MORE")));
+    s.push_str(&format!(
+        "  Landing & live demos     {}\n",
+        url("https://shux.pages.dev")
+    ));
+    s.push_str(&format!(
+        "  Agent skill (drop-in)    {}\n",
+        url("https://github.com/indrasvat/shux/tree/main/skills/shux")
+    ));
+    s.push_str(&format!(
+        "  RPC reference            {}\n",
+        url("https://github.com/indrasvat/shux/tree/main/skills/shux/references/api.md")
+    ));
+    s.push_str(&format!(
+        "  Repository               {}\n\n",
+        url("https://github.com/indrasvat/shux")
+    ));
+
+    s.push_str(&format!(
+        "  Every entity in {sx} carries a 'version' field — pass 'expected_version' on\n"
+    ));
+    s.push_str(&format!(
+        "  mutating RPCs for optimistic-concurrency rejection ({rpc}-32002{r}) on stale writes."
+    ));
+
+    s
+}
+
 /// shux — a modern, batteries-included terminal multiplexer
+///
+/// `after_long_help` is built lazily so we can show the longer agent
+/// reference (workflows + RPC map + tools-replaced) on `--help` /
+/// `-h --long` without inflating the default help screen.
 #[derive(Parser, Debug)]
 #[command(
     name = "shux",
     version,
-    about = "A modern terminal multiplexer",
-    long_about = "A modern terminal multiplexer \u{2014} tiny core \u{2022} powerful plugins \u{2022} built for humans and AI agents",
-    after_help = "Run 'shux <command> --help' for more information on a specific command.",
+    about = "A modern terminal multiplexer — works for humans, drives like an API",
+    long_about = "shux is a Rust terminal multiplexer (sessions / windows / panes, like \
+        tmux) with a length-prefixed JSON-RPC surface over UDS + TCP, atomic declarative \
+        workspace templates, optimistic concurrency on every entity, sealed PTY-output \
+        events, and a built-in rasterizer that returns PNG bytes for any pane — no \
+        terminal emulator in the loop.\n\n\
+        Every CLI subcommand is a thin wrapper over a JSON-RPC method. Agents and scripts \
+        can target the RPC surface directly via `shux api <method> '<json>'`.",
+    // after_long_help is injected at runtime in main() so it can adapt
+    // to NO_COLOR / non-TTY stdout. See `agent_help()`.
+    after_help = "See 'shux <command> --help'.  For the full agent reference: 'shux --help'.",
     styles = CLAP_STYLES,
 )]
 pub struct Cli {

@@ -1,0 +1,16 @@
+# Cloudflare Pages redirects for shux.pages.dev.
+#
+# Operator-friendly short URLs for sharing. Resolve to canonical paths.
+
+# Install script (built by the deploy workflow per release).
+/install              /install.sh                               200
+
+# Docs / source shortcuts → GitHub.
+/docs                 https://github.com/indrasvat/shux/tree/main/docs   302
+/api                  https://github.com/indrasvat/shux/blob/main/docs/PRD.md  302
+/skill                https://github.com/indrasvat/shux/tree/main/skills/shux 302
+/source               https://github.com/indrasvat/shux                 302
+/repo                 https://github.com/indrasvat/shux                 302
+/issues               https://github.com/indrasvat/shux/issues          302
+/changelog            https://github.com/indrasvat/shux/blob/main/CHANGELOG.md 302
+/releases             https://github.com/indrasvat/shux/releases        302

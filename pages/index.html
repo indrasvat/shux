@@ -1,0 +1,1392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#15120e">
+<title>shux — tmux for the agentic age</title>
+<meta name="description" content="shux is tmux for the agentic age — a Rust terminal multiplexer with a JSON-RPC API and a built-in pixel snapshotter. Spawn panes, type into them, get back PNG screenshots, all over RPC. For agents, CI jobs, and any process that needs to operate the terminal.">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/styles/site.css">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="shux — tmux for the agentic age">
+<meta property="og:description" content="JSON-RPC. Atomic templates. Pixel snapshots. Built for agents, CI jobs, and any process that needs to operate the terminal.">
+<meta property="og:url" content="https://shux.pages.dev/">
+<meta property="og:image" content="https://shux.pages.dev/screenshots/06-raster-hello.png">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="shux — tmux for the agentic age">
+<meta name="twitter:description" content="JSON-RPC. Atomic templates. Pixel snapshots. Built for agents, CI jobs, and any process that needs to operate the terminal.">
+
+<style>
+/* ── Page-specific (hero composition + showcase grid) ── */
+
+.hero {
+  padding: var(--s-9) 0 var(--s-8);
+  position: relative; overflow: hidden;
+}
+.hero-grid {
+  display: grid; gap: var(--s-7);
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  align-items: center;
+}
+@media (max-width: 960px) {
+  .hero { padding: var(--s-7) 0 var(--s-6); }
+  .hero-grid { grid-template-columns: 1fr; gap: var(--s-6); }
+}
+
+.hero-headline {
+  font-size: clamp(40px, 6.6vw, 76px);
+  line-height: 1.02;
+  letter-spacing: -0.028em;
+  font-weight: 700;
+  margin: var(--s-5) 0 var(--s-4);
+}
+.hero-headline em {
+  font-style: italic;
+  color: var(--accent-ink);
+  font-weight: 700;
+}
+/* Brand chip — `shux` rendered as a high-contrast slab. JetBrains Mono
+   for the brand wordmark to echo the daemon's own typesetting; baseline
+   nudge so it sits flush with the surrounding grotesque headline. */
+.hero-headline .brand-chip {
+  display: inline-block;
+  background: var(--accent);
+  color: #fdf9f0;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.92em;
+  letter-spacing: -0.015em;
+  padding: 0.04em 0.20em 0.10em;
+  border-radius: 7px;
+  margin-right: 0.04em;
+  position: relative;
+  top: -0.06em;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.10),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.18),
+    0 6px 16px -8px rgba(199, 90, 42, 0.45);
+  /* Tiny inner glyph hint of the brand mark.  */
+}
+.hero-sub {
+  font-size: 19px;
+  line-height: 1.55;
+  color: var(--ink-2);
+  max-width: 38ch;
+  margin: 0 0 var(--s-6);
+}
+.hero-cta {
+  display: flex; gap: var(--s-3); flex-wrap: wrap;
+  align-items: center;
+}
+.hero-meta {
+  margin-top: var(--s-5);
+  display: flex; flex-wrap: wrap; gap: var(--s-5);
+  color: var(--ink-3); font-size: 12px;
+  font-family: var(--font-mono); letter-spacing: 0.02em;
+}
+.hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
+.hero-meta .moss-dot { width: 7px; height: 7px; background: var(--moss); border-radius: 50%; }
+
+/* Hero device frame — a rendered "monitor" showing rotating snapshots. */
+.device {
+  position: relative;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-3);
+  background: #0e0c08;
+  padding: 8px 8px 14px;
+  box-shadow: 0 60px 80px -40px rgba(0,0,0,0.6),
+              0 8px 24px -12px rgba(0,0,0,0.5),
+              inset 0 1px 0 rgba(236,228,210,0.05);
+}
+.device-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px 8px;
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--ink-3);
+  letter-spacing: 0.04em;
+}
+.device-bar .pills { display: flex; gap: 5px; margin-right: 6px; }
+.device-bar .pills span {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--ink-4); opacity: 0.6;
+}
+.device-bar .pills span:first-child { background: #d4524b; }
+.device-bar .pills span:nth-child(2) { background: #d8a93b; }
+.device-bar .pills span:nth-child(3) { background: var(--moss); }
+.device-bar .url {
+  flex: 1; text-align: center; opacity: 0.65;
+}
+.device-bar .url::before { content: "shux api pane.snapshot"; }
+.device-screen {
+  position: relative;
+  aspect-ratio: 1800 / 1140;
+  border-radius: var(--r-2);
+  overflow: hidden;
+  background: #0a0810;
+  border: 1px solid #000;
+}
+.device-screen img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%; object-fit: cover;
+  opacity: 0; transition: opacity 600ms ease;
+}
+.device-screen img.active { opacity: 1; }
+
+.device-tag {
+  position: absolute; bottom: 16px; left: 16px;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink); background: rgba(14,12,8,0.78);
+  padding: 6px 10px; border-radius: var(--r-1);
+  border: 1px solid rgba(236,228,210,0.14);
+  letter-spacing: 0.02em;
+  backdrop-filter: blur(6px);
+}
+
+/* ── Section: the structural difference ── */
+.diff-flow {
+  display: grid; grid-template-columns: 1fr auto 1fr; gap: var(--s-5);
+  align-items: stretch; margin-top: var(--s-5);
+}
+@media (max-width: 820px) { .diff-flow { grid-template-columns: 1fr; } .diff-flow .arrow { display: none; } }
+.diff-flow .col h4 { color: var(--ink-3); margin-bottom: var(--s-3); }
+.diff-flow .arrow {
+  align-self: center; color: var(--ink-3); font-family: var(--font-mono);
+  letter-spacing: 0.1em; font-size: 12px; padding: 0 var(--s-2);
+}
+
+.diff-bullets { list-style: none; padding: 0; margin: 0; }
+.diff-bullets li {
+  padding: 10px 0; border-top: 1px solid var(--line);
+  display: flex; gap: var(--s-3); color: var(--ink-2);
+  font-size: 14px; line-height: 1.5;
+}
+.diff-bullets li:first-child { border-top: 0; padding-top: 0; }
+.diff-bullets .marker {
+  flex: 0 0 18px; font-family: var(--font-mono);
+  font-size: 12px; color: var(--ink-3); padding-top: 2px;
+}
+.diff-bullets li.win .marker { color: var(--accent-ink); }
+
+/* ── Agent-first code panel ── */
+.code-panel {
+  display: grid; gap: var(--s-5);
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  align-items: stretch;
+}
+@media (max-width: 920px) { .code-panel { grid-template-columns: 1fr; } }
+.code-panel pre {
+  margin: 0; height: 100%;
+  font-size: 12.5px; line-height: 1.65;
+}
+.code-panel .annot h3 { margin-bottom: var(--s-2); }
+.code-panel .annot p { color: var(--ink2-on-paper); margin: 0 0 var(--s-3); font-size: 14.5px; }
+
+.kv-list { list-style: none; padding: 0; margin: var(--s-4) 0 0; font-size: 13px; }
+.kv-list li {
+  display: flex; gap: var(--s-3); padding: 8px 0;
+  border-top: 1px solid var(--line-paper);
+}
+.kv-list li:first-child { border-top: 0; padding-top: 0; }
+.kv-list .k { flex: 0 0 36%; color: var(--ink2-on-paper); font-family: var(--font-mono); font-size: 12px; opacity: 0.75; }
+.kv-list .v { color: var(--ink-on-paper); }
+
+/* ── Comparison: shux vs tmux ── */
+.versus {
+  display: grid; gap: 0;
+  grid-template-columns: 1fr 1fr;
+  border: 1px solid var(--line-paper);
+  border-radius: var(--r-3);
+  overflow: hidden;
+  background: #fbf6ea;
+}
+@media (max-width: 760px) { .versus { grid-template-columns: 1fr; } }
+.versus .col {
+  padding: var(--s-5);
+  border-right: 1px solid var(--line-paper);
+}
+.versus .col:last-child { border-right: 0; }
+@media (max-width: 760px) {
+  .versus .col { border-right: 0; border-bottom: 1px solid var(--line-paper); }
+  .versus .col:last-child { border-bottom: 0; }
+}
+.versus h3 {
+  display: flex; align-items: center; gap: var(--s-2);
+  font-family: var(--font-mono); font-size: 13px;
+  letter-spacing: 0.04em; font-weight: 600;
+}
+.versus h3 .tag { font-family: var(--font-mono); font-size: 10px; }
+.versus ul { list-style: none; padding: 0; margin: var(--s-4) 0 0; }
+.versus li {
+  font-size: 14px; color: var(--ink2-on-paper); padding: 8px 0;
+  border-top: 1px solid var(--line-paper); display: flex; gap: var(--s-3);
+}
+.versus li:first-child { border-top: 0; padding-top: 0; }
+.versus li::before {
+  content: "→"; font-family: var(--font-mono);
+  color: var(--ink2-on-paper); opacity: 0.5; flex: 0 0 14px;
+}
+.versus .col.win li::before { color: var(--accent); opacity: 0.9; }
+.versus .respect {
+  margin-top: var(--s-4);
+  font-family: var(--font-sans); font-size: 13px;
+  font-style: italic; color: var(--ink2-on-paper); opacity: 0.85;
+  line-height: 1.5;
+}
+
+/* ── Showcase gallery ── */
+.shots {
+  display: grid; gap: var(--s-4);
+  grid-template-columns: repeat(6, 1fr);
+}
+.shot {
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  background: var(--bg-2);
+  overflow: hidden;
+  position: relative;
+}
+.shot.span-3 { grid-column: span 3; }
+.shot.span-4 { grid-column: span 4; }
+.shot.span-6 { grid-column: span 6; }
+@media (max-width: 960px) {
+  .shot.span-3, .shot.span-4, .shot.span-6 { grid-column: span 6; }
+  .shots { grid-template-columns: 1fr; }
+}
+.shot img { width: 100%; display: block; aspect-ratio: 1800/1140; object-fit: cover; }
+.shot .cap {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; border-top: 1px solid var(--line);
+  font-family: var(--font-mono); font-size: 12px; color: var(--ink-3);
+  background: var(--bg-3);
+}
+.shot .cap b { color: var(--ink); font-weight: 500; }
+
+/* ── Quickstart steps ── */
+.steps { display: grid; gap: var(--s-5); }
+.steps .step {
+  display: grid; grid-template-columns: 32px 1fr;
+  gap: var(--s-4); align-items: start;
+}
+.steps .step .num {
+  font-family: var(--font-mono); font-size: 13px;
+  color: var(--ink2-on-paper); padding-top: 4px; opacity: 0.6;
+}
+.steps .step h3 { margin-bottom: 6px; }
+.steps .step p { color: var(--ink2-on-paper); margin: 0 0 var(--s-3); font-size: 14.5px; }
+.steps .step pre { font-size: 12.5px; margin: 0; }
+
+/* ── Skill block ── */
+.skill-block {
+  display: grid; gap: var(--s-5);
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  align-items: center;
+}
+@media (max-width: 920px) { .skill-block { grid-template-columns: 1fr; } }
+.skill-block .well {
+  background: var(--bg-3); border: 1px solid var(--line);
+  padding: var(--s-5); border-radius: var(--r-3);
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55;
+  color: var(--ink-2);
+}
+.skill-block .well b { color: var(--ink); font-weight: 600; }
+
+/* ── Inline focus / target ── */
+.target {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink2-on-paper); letter-spacing: 0.05em; opacity: 0.7;
+}
+.target::before { content: "▸"; color: var(--accent); opacity: 1; }
+
+/* ── Quickstart snapshot proof — code on the left, real PNG on the right. ── */
+.snap-proof {
+  display: grid; gap: var(--s-4);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  align-items: start; margin-top: var(--s-2);
+}
+@media (max-width: 760px) { .snap-proof { grid-template-columns: 1fr; } }
+.snap-proof pre {
+  margin: 0;
+  font-size: 12px;       /* tiny step down — code fits the narrow column without wrapping the pipe-chain awkwardly */
+  padding: 12px;
+  min-width: 0;
+}
+.snap-proof pre code i {
+  font-style: italic;
+  color: var(--accent-ink);
+}
+.snap-out { margin: 0; }
+.snap-out img {
+  width: 100%; height: auto; aspect-ratio: 720/440;
+  border: 1px solid var(--line-paper);
+  border-radius: var(--r-3);
+  background: #0a0810;
+  display: block;
+}
+.snap-out figcaption {
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink2-on-paper); opacity: 0.85;
+  margin-top: var(--s-2);
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.snap-out .dot.mossy {
+  width: 7px; height: 7px;
+  background: var(--moss); border-radius: 50%;
+}
+
+/* ── Replaces table → stacked cards on mobile (≤720px). ── */
+@media (max-width: 720px) {
+  .replaces-table thead { display: none; }
+  .replaces-table tr {
+    display: block;
+    border: 1px solid var(--line);
+    border-radius: var(--r-2);
+    background: var(--bg-2);
+    padding: var(--s-3) var(--s-4);
+    margin: 0 0 var(--s-3);
+  }
+  .replaces-table td {
+    display: block;
+    border-bottom: 0;
+    padding: 6px 0;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .replaces-table td:not(:last-child) {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 10px;
+    margin-bottom: 4px;
+  }
+  .replaces-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--ink-3);
+    opacity: 0.85;
+  }
+  .replaces-table td code { white-space: normal; }
+}
+
+/* ── Tabbed gallery — left rail of tabs + big stage on the right. ── */
+.gallery {
+  display: grid; gap: var(--s-5);
+  grid-template-columns: 280px minmax(0, 1fr);
+  align-items: stretch;
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  background: var(--bg-2);
+  padding: var(--s-4);
+}
+.gallery-tabs {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.gallery-tab {
+  position: relative;
+  display: grid; grid-template-columns: 14px 1fr; column-gap: 10px;
+  row-gap: 2px;
+  align-items: center; align-content: center;
+  text-align: left; padding: var(--s-3) var(--s-3);
+  background: transparent; border: 1px solid transparent;
+  border-radius: var(--r-2);
+  color: var(--ink-2); font-family: var(--font-sans); font-size: 13.5px;
+  cursor: pointer; transition: background 140ms ease, color 140ms ease,
+                                border-color 140ms ease;
+}
+.gallery-tab:hover { background: var(--bg-3); color: var(--ink); }
+.gallery-tab.is-active {
+  background: var(--bg-3);
+  border-color: var(--line-2);
+  color: var(--ink);
+}
+.gallery-tab.is-active .g-dot,
+.gallery-tab .g-dot.live { background: var(--moss); }
+.gallery-tab .g-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ink-4);
+  grid-row: 1 / span 2;
+}
+.gallery-tab .g-name { font-weight: 600; font-size: 14px; line-height: 1.2; }
+.gallery-tab .g-meta {
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--ink-3); letter-spacing: 0.04em;
+}
+.gallery-stage {
+  position: relative;
+  border-radius: var(--r-2);
+  background: #0a0810;
+  border: 1px solid var(--line);
+  overflow: hidden;
+  display: flex; align-items: stretch;
+}
+.gallery-panel {
+  display: none; margin: 0;
+  width: 100%;
+}
+.gallery-panel.is-active { display: block; }
+.gallery-panel .zoom-link {
+  display: block; position: relative; line-height: 0;
+  border: 0; cursor: zoom-in;
+}
+.gallery-panel .zoom-link::after {
+  content: "⤢ click to zoom";
+  position: absolute; top: 10px; right: 10px;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink); background: rgba(14,12,8,0.78);
+  border: 1px solid rgba(236,228,210,0.16);
+  padding: 4px 9px; border-radius: var(--r-1);
+  letter-spacing: 0.02em;
+  opacity: 0; transition: opacity 140ms ease;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+.gallery-panel .zoom-link:hover::after,
+.gallery-panel .zoom-link:focus-visible::after { opacity: 1; }
+
+/* ── Lightbox modal — in-page, no new tab. Click backdrop / × / Esc to close. ── */
+.lightbox {
+  position: fixed; inset: 0; z-index: 100;
+  display: none;
+  align-items: center; justify-content: center;
+  padding: var(--s-5) var(--s-4);
+  background: rgba(8, 6, 4, 0.88);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+  animation: lb-fade 180ms ease;
+}
+.lightbox[data-open="true"] { display: flex; }
+@keyframes lb-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.lightbox-frame {
+  position: relative;
+  max-width: min(96vw, 1500px);
+  max-height: 94vh;
+  display: flex; flex-direction: column;
+  background: var(--bg-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-3);
+  box-shadow: 0 80px 120px -30px rgba(0,0,0,0.75),
+              0 0 0 1px rgba(236,228,210,0.04);
+  overflow: hidden;
+  animation: lb-rise 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+@keyframes lb-rise {
+  from { transform: translateY(14px) scale(0.985); opacity: 0; }
+  to   { transform: translateY(0)    scale(1);    opacity: 1; }
+}
+.lightbox-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-3);
+  font-family: var(--font-mono); font-size: 12px; color: var(--ink-3);
+}
+.lightbox-bar .lb-caption { color: var(--ink-2); }
+.lightbox-bar .lb-caption b { color: var(--ink); font-weight: 600; }
+.lightbox-close {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px;
+  background: transparent;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-1);
+  color: var(--ink); font-size: 16px; line-height: 1;
+  cursor: pointer; transition: all 120ms ease;
+}
+.lightbox-close:hover { background: var(--bg-3); border-color: var(--ink-3); }
+.lightbox-stage {
+  flex: 1; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: #0a0810;
+  padding: var(--s-3);
+  overflow: auto;
+}
+.lightbox-img {
+  max-width: 100%; max-height: 84vh;
+  width: auto; height: auto;
+  display: block;
+  image-rendering: -webkit-optimize-contrast;
+}
+
+/* ── Copy-able command — pre + floating copy button, JS-toggled state. ── */
+.copy-cmd {
+  position: relative;
+  display: block;
+}
+.copy-cmd pre {
+  margin: 0;
+  padding-right: 88px;  /* room for the floating copy button */
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  font-size: 13.5px;
+}
+.copy-cmd pre code { color: var(--ink); }
+.copy-cmd .cmd-prompt {
+  color: var(--accent-ink);
+  font-weight: 600;
+  margin-right: 6px;
+  user-select: none;
+}
+.copy-cmd .copy-btn {
+  position: absolute;
+  top: 8px; right: 8px;
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-3);
+  color: var(--ink-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-1);
+  padding: 5px 9px 5px 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+.copy-cmd .copy-btn:hover {
+  color: var(--ink); border-color: var(--ink-3);
+  background: color-mix(in srgb, var(--bg-3) 70%, var(--accent-soft));
+}
+.copy-cmd .copy-btn .check-icon { display: none; color: var(--moss); }
+.copy-cmd .copy-btn[data-copied="true"] .copy-icon { display: none; }
+.copy-cmd .copy-btn[data-copied="true"] .check-icon { display: inline-block; }
+.copy-cmd .copy-btn[data-copied="true"] {
+  color: var(--moss);
+  border-color: rgba(111,154,92,0.4);
+  background: var(--moss-soft);
+}
+.copy-cmd .copy-btn[data-copied="true"] .copy-label::after { content: "ied!"; }
+.gallery-panel img {
+  width: 100%; height: auto; display: block;
+  background: #0a0810;
+}
+.gallery-panel figcaption {
+  padding: var(--s-3) var(--s-4) var(--s-4);
+  background: var(--bg-2);
+  border-top: 1px solid var(--line);
+  font-size: 13px; line-height: 1.55;
+  color: var(--ink-2);
+}
+.gallery-panel figcaption b { color: var(--ink); display: inline; }
+.gallery-panel figcaption code {
+  background: var(--bg-3); border: 1px solid var(--line);
+  padding: 0 5px; border-radius: var(--r-1); font-size: 12px;
+}
+
+@media (max-width: 920px) {
+  .gallery { grid-template-columns: 1fr; }
+  .gallery-tabs {
+    flex-direction: row;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x mandatory;
+    margin: 0 calc(-1 * var(--s-4));
+    padding: 0 var(--s-4) 4px;
+  }
+  .gallery-tab {
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+    min-width: 200px;
+  }
+}
+
+/* ── Mobile hero typography — narrower viewport, calmer headline. ── */
+@media (max-width: 720px) {
+  .hero-headline {
+    font-size: clamp(34px, 9.5vw, 44px);
+    line-height: 1.04;
+    letter-spacing: -0.018em;
+  }
+  .hero-headline em {
+    /* Tighten the slab so it doesn't dominate the wrapped block. */
+    background: linear-gradient(180deg, transparent 78%, var(--accent-soft) 78%);
+    padding: 0 4px;
+    margin: 0 -2px;
+  }
+  .hero-sub { font-size: 16px; max-width: 100%; }
+}
+</style>
+</head>
+<body>
+
+<!-- ─── Nav ─────────────────────────────────────────── -->
+<nav class="nav">
+  <a class="nav-mark" href="/">shux<span class="ver" id="ver">v0.8</span></a>
+  <div class="nav-links">
+    <a href="#difference"><span class="lbl">why</span></a>
+    <a href="#agents"><span class="lbl">agents</span></a>
+    <a href="#replaces"><span class="lbl">replaces</span></a>
+    <a href="#quickstart"><span class="lbl">install</span></a>
+    <a class="cta" href="https://github.com/indrasvat/shux">GitHub →</a>
+  </div>
+</nav>
+
+<!-- ─── Hero ────────────────────────────────────────── -->
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span>v0.8.0 · stable · written in Rust</p>
+      <h1 class="hero-headline">
+        <span class="brand-chip">shux</span>:<br>
+        tmux for the<br>
+        <em>agentic age.</em>
+      </h1>
+      <p class="hero-sub">
+        A Rust terminal multiplexer with a JSON-RPC API and a built-in
+        pixel snapshotter. Spawn panes. Type into them. Get back a PNG
+        of what they look like. Keep <b>tmux</b> for your shell; use
+        <b>shux</b> wherever another process — an agent, a CI job, a
+        test — needs to operate the terminal.
+      </p>
+      <div class="hero-cta">
+        <a class="btn primary" href="#quickstart">Install</a>
+        <a class="btn secondary" href="#agents">Read the API</a>
+      </div>
+      <div class="hero-meta">
+        <span><span class="moss-dot"></span> 692 tests passing</span>
+        <span>macOS · Linux · arm64/amd64</span>
+        <span>MIT</span>
+      </div>
+    </div>
+
+    <div class="device" aria-label="Live shux pane.snapshot output">
+      <div class="device-bar">
+        <div class="pills"><span></span><span></span><span></span></div>
+        <div class="url"></div>
+      </div>
+      <div class="device-screen" id="screen">
+        <!-- Hero rotator cycles four universally-recognizable TUIs, each a
+             real pane.snapshot. Order picked for visual rhythm: dense diff
+             → branches → help overlay → htop. -->
+        <img src="/screenshots/lg-03.png" alt="lazygit showing a diff in the Bubbletea repo — green additions, red removals, commit message in the panel header" width="1800" height="1064" class="active">
+        <img src="/screenshots/lg-04.png" alt="lazygit branches view with the full commit history panel on the right" width="1800" height="1064" loading="lazy">
+        <img src="/screenshots/lg-06.png" alt="lazygit global help overlay listing every keybinding" width="1800" height="1064" loading="lazy">
+        <img src="/screenshots/htop-header.png" alt="htop CPU + memory bars: 10 cores with rainbow utilization bars, memory at 23.16/32G, uptime 20:01:55" width="1440" height="180" loading="lazy">
+        <div class="device-tag" id="screenTag">pane.snapshot → lazygit · diff view</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── The structural difference ───────────────────── -->
+<section class="section snug" id="difference">
+  <div class="wrap">
+    <p class="eyebrow">why this exists</p>
+    <h2 class="measure">tmux ends at the byte stream.<br>shux owns the whole pipeline.</h2>
+    <p class="lede" style="margin-top:var(--s-3)">
+      tmux is great. It's also from before agents existed. Its job ends
+      where the terminal emulator's job begins — and a human at a
+      keyboard is always assumed. shux assumes nothing of the sort.
+    </p>
+
+    <div class="diff-flow">
+      <div class="col card">
+        <h4>tmux</h4>
+        <ul class="diff-bullets">
+          <li><span class="marker">·</span><span>Plain-text control commands over a UDS socket.</span></li>
+          <li><span class="marker">·</span><span>Output is bytes; the emulator paints them.</span></li>
+          <li><span class="marker">·</span><span>Snapshots require a human-attached emulator + a screen capture tool.</span></li>
+          <li><span class="marker">·</span><span>State mutations are sequential and best-effort.</span></li>
+          <li><span class="marker">·</span><span>No structured event log; output is fire-and-forget.</span></li>
+        </ul>
+      </div>
+      <div class="arrow">— vs —</div>
+      <div class="col card">
+        <h4>shux</h4>
+        <ul class="diff-bullets">
+          <li class="win"><span class="marker">▸</span><span>Length-prefixed JSON-RPC over UDS + TCP. Every <code>shux</code> subcommand is a thin RPC call.</span></li>
+          <li class="win"><span class="marker">▸</span><span>Owns the byte-to-pixel pipeline. Returns PNG bytes via <code>pane.snapshot</code>.</span></li>
+          <li class="win"><span class="marker">▸</span><span>Headless visual regression with no GUI, no display server, no emulator SDK.</span></li>
+          <li class="win"><span class="marker">▸</span><span>Atomic <code>state.apply</code> batches. Optimistic concurrency on every entity.</span></li>
+          <li class="win"><span class="marker">▸</span><span>Sealed, sequenced event bus with a separate data plane for PTY chunks.</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Agent-first ─────────────────────────────────── -->
+<section class="section invert" id="agents">
+  <div class="wrap">
+    <p class="eyebrow">agent-first, by construction</p>
+    <h2 class="measure">Everything an agent needs to drive a TUI is one RPC call away.</h2>
+    <p class="lede" style="margin-top:var(--s-3)">
+      Spawn a session. Resize. Send keystrokes. Get a PNG back. Tear
+      down. The same primitives a human uses are the same primitives an
+      agent uses — no SDK, no screen-reading, no AppleScript bridge.
+    </p>
+
+    <div class="code-panel" style="margin-top:var(--s-6)">
+      <pre><code><span style="color:var(--ink2-on-paper)"># 1 — declarative session spec (TOML).</span>
+<span style="color:var(--ink2-on-paper)"># Same spec a human <code>shux apply</code>'s — same one an agent ships.</span>
+
+[session]
+name = "review"
+
+[[windows]]
+title = "git"
+[[windows.panes]]
+command = ["lazygit"]
+
+<span style="color:var(--accent)">$ shux apply review.toml</span>
+<span style="color:var(--ink2-on-paper)"># → session created atomically. Pluck the first pane id:</span>
+<span style="color:var(--accent)">$ PID=$(shux api session.list \
+        | jq -r '.result.sessions[0].pane_id')</span>
+
+<span style="color:var(--accent)">$ shux api pane.set_size "{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}"</span>
+<span style="color:var(--ink2-on-paper)"># → synchronous resize (VT + PTY).</span>
+
+<span style="color:var(--accent)">$ shux api pane.send_keys "{\"pane_id\":\"$PID\",\"text\":\"j\"}"</span>
+<span style="color:var(--ink2-on-paper)"># → navigate down one row.</span>
+
+<span style="color:var(--accent)">$ shux api pane.snapshot "{\"pane_id\":\"$PID\"}" \
+    | jq -r .result.png_base64 \
+    | base64 -d &gt; out.png</span>
+<span style="color:var(--ink2-on-paper)"># → 1800×1140 PNG of the current pane. No iTerm2 needed.</span></code></pre>
+
+      <div class="annot">
+        <h3>The full surface</h3>
+        <p>
+          Twelve RPC methods cover session/window/pane lifecycle,
+          synchronous resize, scripted input, sampled PTY output, and
+          pixel snapshots. Each maps 1:1 to a CLI subcommand.
+        </p>
+        <ul class="kv-list">
+          <li><span class="k">session.*</span><span class="v">create / list / rename / kill / ensure</span></li>
+          <li><span class="k">window.*</span><span class="v">create / list / focus / kill / ensure</span></li>
+          <li><span class="k">pane.send_keys</span><span class="v">text or base64 control bytes</span></li>
+          <li><span class="k">pane.set_size</span><span class="v">synchronous, ack via oneshot</span></li>
+          <li><span class="k">pane.snapshot</span><span class="v">PNG, off-lock, budget-checked</span></li>
+          <li><span class="k">pane.output.watch</span><span class="v">sealed event-bus stream</span></li>
+          <li><span class="k">state.apply</span><span class="v">atomic batch of typed Ops</span></li>
+          <li><span class="k">events.history</span><span class="v">sequenced, gap-detectable</span></li>
+        </ul>
+        <p class="target" style="margin-top:var(--s-4)">All methods accept JSON in, return JSON out, on stdin/stdout.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Replaces ─────────────────────────────────────── -->
+<section class="section" id="replaces">
+  <div class="wrap">
+    <p class="eyebrow">replaces these</p>
+    <h2 class="measure">If you'd reach for one of these, reach for shux.</h2>
+    <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
+      shux collapses orchestration, scripted input, output capture, and
+      pixel screenshots into one RPC surface. Same primitive, no extra
+      tools.
+    </p>
+
+    <table class="replaces-table">
+      <thead>
+        <tr>
+          <th style="width:32%">If you'd reach for</th>
+          <th style="width:30%">For this job</th>
+          <th>The shux call</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td data-label="if you'd reach for"><code>tmux</code> · <code>screen</code> · <code>byobu</code></td>
+          <td data-label="for this job">Multiplex sessions / windows / panes</td>
+          <td data-label="the shux call"><code>shux apply spec.toml</code> · <code>shux attach</code></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for">iTerm2 (Python SDK / AppleScript)</td>
+          <td data-label="for this job">Drive a terminal app from outside</td>
+          <td data-label="the shux call"><code>pane.send_keys</code> + <code>pane.snapshot</code></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for"><code>expect</code> · <code>pexpect</code> · <code>sexpect</code></td>
+          <td data-label="for this job">Scripted CLI / REPL interaction</td>
+          <td data-label="the shux call"><code>pane.send_keys</code> loop with <code>pane.capture</code> assertions <span class="muted">— workflow</span></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for"><code>asciinema rec</code></td>
+          <td data-label="for this job">Record a terminal session</td>
+          <td data-label="the shux call"><code>pane.output.watch</code> data-plane stream</td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for"><code>vhs</code> · <code>agg</code> · <code>terminalizer</code></td>
+          <td data-label="for this job">Generate TUI demo GIFs / WebPs</td>
+          <td data-label="the shux call"><code>pane.snapshot</code> loop → <code>ffmpeg</code></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for"><code>termshot</code> · <code>freezeframe</code></td>
+          <td data-label="for this job">Still PNG of a terminal frame</td>
+          <td data-label="the shux call"><code>pane.snapshot</code></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for">iTerm2 broadcast input</td>
+          <td data-label="for this job">Send keystrokes to many panes at once</td>
+          <td data-label="the shux call"><code>pane.send_keys</code> fan-out across pane IDs</td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for"><code>ttyrec</code> · <code>termsh</code></td>
+          <td data-label="for this job">Replay a recorded session</td>
+          <td data-label="the shux call">Feed captured bytes back into a pane <span class="muted">— workflow</span></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for">GNU parallel <code>--tmux</code> mode</td>
+          <td data-label="for this job">Run N tasks in N panes, watch in one place</td>
+          <td data-label="the shux call"><code>shux apply</code> a multi-pane template <span class="muted">— workflow</span></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for">Custom Bubbletea / ratatui test harness</td>
+          <td data-label="for this job">Visual regression for your TUI</td>
+          <td data-label="the shux call"><code>pane.snapshot</code> + golden-image diff</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ─── Comparison ──────────────────────────────────── -->
+<section class="section invert">
+  <div class="wrap">
+    <p class="eyebrow">side by side</p>
+    <h2 class="measure">tmux is great. shux is different.</h2>
+    <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6); max-width:62ch">
+      Both spawn PTYs and arrange them on screen. The contract beneath
+      that is the part that diverges.
+    </p>
+
+    <div class="versus">
+      <div class="col">
+        <h3>tmux <span class="tag">v3.x · 18 years</span></h3>
+        <ul>
+          <li>Ubiquitous. Pre-installed on most servers.</li>
+          <li>Huge plugin ecosystem (tpm, oh-my-tmux, dozens of statuslines).</li>
+          <li>Mature key-binding model your fingers already know.</li>
+          <li>Battle-tested under decades of weird PTY behaviour.</li>
+          <li>Plain-text control protocol over a UDS socket.</li>
+        </ul>
+        <p class="respect">If you're a human at a keyboard and tmux works, keep using tmux.</p>
+      </div>
+      <div class="col win">
+        <h3>shux <span class="tag accent">v0.8 · Rust</span></h3>
+        <ul>
+          <li>Length-prefixed JSON-RPC over UDS + TCP. Every CLI verb is a typed call.</li>
+          <li>Declarative workspace templates that apply atomically.</li>
+          <li>Optimistic concurrency on every entity — stale writes get rejected with a typed conflict error.</li>
+          <li>Sealed event bus, sequenced, gap-detectable. Separate data plane for PTY chunks.</li>
+          <li>Built-in rasterizer — one RPC returns PNG bytes of any live pane.</li>
+          <li>Synchronous resize: the next snapshot sees the new dims, guaranteed.</li>
+        </ul>
+        <p class="respect">If you're shipping agents, building TUIs, or want headless visual regression, this is for you.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Gallery (tabbed) ──────────────────────────────
+     Single tabbed surface that walks a visitor through every demo
+     worth seeing — an animated agent-drive replay, syntax-highlight
+     proof, the self-documenting --help, the 692-test sweep, and the
+     attribute / colour coverage. Every artefact is real
+     `pane.snapshot` output.
+─────────────────────────────────────────────────── -->
+<section class="section">
+  <div class="wrap">
+    <p class="eyebrow">in the wild</p>
+    <h2 class="measure">Seven tabs. Real <code>pane.snapshot</code> outputs, no mockups.</h2>
+    <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
+      No mockups. No "rendered in After Effects". Pick a tab to see
+      what shux's rasterizer produces when an agent drives a real TUI.
+    </p>
+
+    <div class="gallery" data-active="0">
+      <div class="gallery-tabs" role="tablist" aria-label="shux gallery">
+        <button role="tab" class="gallery-tab is-active" data-i="0" aria-selected="true">
+          <span class="g-dot live"></span>
+          <span class="g-name">Agent driving a TUI</span>
+          <span class="g-meta">animated · 7 frames</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="1" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Multi-pane workspace</span>
+          <span class="g-meta">animated · 5 frames · tmux-style</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Inside <code>shux attach</code></span>
+          <span class="g-meta">status bar + borders · live</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Syntax-highlighted source</span>
+          <span class="g-meta">bat · rust</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Self-documenting CLI</span>
+          <span class="g-meta">shux --help</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">CI test sweep</span>
+          <span class="g-meta">cargo nextest · 692/692</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="6" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Pixel + attribute coverage</span>
+          <span class="g-meta">shux-raster</span>
+        </button>
+      </div>
+
+      <div class="gallery-stage">
+        <figure class="gallery-panel is-active" data-i="0" role="tabpanel">
+          <a class="zoom-link" href="/screenshots/anim-lazygit-drive.png" rel="noopener" aria-label="open image at full size in a new tab">
+            <img src="/screenshots/anim-lazygit-drive.png" alt="7-frame animated replay of an agent driving lazygit: opening view → commits log → diff of one commit → branches → remotes → help overlay → back to files. Pointed at a freshly-cloned charmbracelet/bubbletea repo." width="880" height="520" loading="lazy">
+          </a>
+          <figcaption>
+            <b>One scenario, scripted entirely through JSON-RPC.</b>
+            <code>shux api session.create</code> spawns
+            <code>lazygit</code> in a freshly-cloned public repo. Then
+            navigate the commit log, open a diff with <kbd>Enter</kbd>,
+            press <kbd>?</kbd> for the help overlay, cycle panels with
+            number keys — each input is a <code>pane.send_keys</code>
+            call, each frame is a real <code>pane.snapshot</code>. No
+            mockup, no recording trickery. This is the asciinema-with-
+            pixels record you get for free with shux.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="1" role="tabpanel" hidden>
+          <a class="zoom-link" href="/screenshots/anim-multipane.png" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy"></a>
+          <figcaption>
+            <b>One <code>shux apply</code> spawns a 4-pane workspace</b> —
+            <code>bat</code> on the editor, <code>cargo nextest</code> running tests,
+            <code>shux --help</code> on the reference pane, a clock + git-log loop on
+            the watch pane. The replay then sends arrow-down keystrokes
+            (<code>pane.send_keys</code>), resizes the tests pane
+            (<code>pane.set_size</code>, synchronous), and swaps the editor and tests
+            quadrants (<code>pane.swap</code>) — the same verbs as
+            <code>tmux send-keys</code>, <code>tmux resize-pane</code>,
+            <code>tmux swap-pane</code>, but typed.<br><br>
+            <span class="muted">Run <code>shux attach</code> on the same session and
+            you get the interactive multiplexer view — focus-highlighted borders, a
+            three-zone status bar (session · window · clock), mouse-aware pane focus,
+            and Alt+h/j/k/l keyboard navigation. The headless RPC primitives you see
+            here are the <i>same</i> primitives that drive the attached client.</span>
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
+          <a class="zoom-link" href="/screenshots/statusbar-demo.png" rel="noopener" aria-label="open image at full size">
+            <img src="/screenshots/statusbar-demo.png" alt="shux attached to a 2-pane session named 'demo' showing lazygit (left) and bat rendering bubbletea's README (right), with focus-highlighted borders and shux's own three-zone status bar at the bottom" width="1620" height="912" loading="lazy">
+          </a>
+          <figcaption>
+            <b>shux running shux.</b> The outer pane is a <code>pane.snapshot</code> of
+            an attached client running <code>shux attach -s demo</code> against a
+            separate 2-pane session. What you see — focus-highlighted borders, the
+            <code>demo · 11/11 · ?</code> status bar across the bottom, the per-pane
+            title overlays — is shux's own <code>RenderCompositor</code> output.
+            Mouse-click events on the attached client move focus between panes;
+            Alt+h/j/k/l navigates by direction; <kbd>Ctrl+Space</kbd> is the prefix.
+            All of this works in any modern terminal emulator — and produces this
+            exact PNG without one.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
+          <a class="zoom-link" href="/screenshots/08-bat.png" rel="noopener" aria-label="open image at full size">
+          <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy"></a>
+          <figcaption>
+            <b><code>bat crates/shux-raster/src/lib.rs</code></b> — Rust syntax
+            highlighting, line numbers, TwoDark palette. Every colour in the source
+            survives the round-trip through shux-vt's SGR parser and shux-raster's
+            glyph emitter. No re-rendering, no theme remap.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
+          <a class="zoom-link" href="/screenshots/09-help.png" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/09-help.png" alt="shux --help rendered in shux's brand colours — every `shux <verb>` in bold terracotta, RPC method names in green, dim arrows and comments, underlined terracotta URLs" width="1080" height="1292" loading="lazy"></a>
+          <figcaption>
+            <b><code>shux --help</code></b> — the long-form help is a paste-able agent
+            reference: every CLI verb mapped to its RPC method, a 3-call workflow, the
+            replaces-these-tools list, and cross-links. Captured here straight from the
+            CLI, rendered by the same rasterizer that snapshotted the splash above.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
+          <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] 692 tests run: 692 passed, 0 skipped'" width="1620" height="912" loading="lazy"></a>
+          <figcaption>
+            <b><code>cargo nextest run --workspace</code></b> — 692 tests cover the
+            whole workspace (core, VT parser, PTY, RPC, UI compositor, raster, plugin
+            host, CLI). PASS rows captured mid-run, summary at the bottom.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="6" role="tabpanel" hidden>
+          <a class="zoom-link" href="/screenshots/06-raster-hello.png" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy"></a>
+          <figcaption>
+            <b>shux-raster's hello banner.</b> Bold, dim, inverse, underline,
+            strikethrough. ANSI 16, the 256-cube, truecolor RGB. Cursor rendered as an
+            inverse cell. JetBrains Mono Regular bundled and rasterized in pure Rust
+            via <code>fontdue</code>. No terminal emulator was involved in producing
+            this PNG.
+          </figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Quickstart ──────────────────────────────────── -->
+<section class="section invert" id="quickstart">
+  <div class="wrap-narrow">
+    <p class="eyebrow">three calls from zero</p>
+    <h2>Quickstart</h2>
+    <p class="lede" style="margin-bottom:var(--s-6)">
+      Install the binary. Spawn a session. Snapshot it. That's the loop.
+    </p>
+
+    <div class="steps">
+      <div class="step">
+        <div class="num">01</div>
+        <div>
+          <h3>Install</h3>
+          <p>One pre-built binary per platform. No daemons to register,
+          no plugins to vendor. The daemon auto-starts on first use.</p>
+<pre><code><span style="color:var(--ink2-on-paper)"># macOS / Linux, arm64 or amd64</span>
+curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/install</a> | sh</code></pre>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="num">02</div>
+        <div>
+          <h3>Spawn a session</h3>
+          <p>One RPC creates an atomic session + initial window + pane,
+          with the command of your choice running in it.</p>
+<pre><code>RESP=$(shux api session.create '{
+  "name": "demo",
+  "command": ["htop"]
+}')
+PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="num">03</div>
+        <div>
+          <h3>Snapshot</h3>
+          <p>One RPC returns a base64-encoded PNG of the live pane.
+          Decode and pipe it anywhere — a CI golden, a vision LLM, a
+          webhook.</p>
+          <div class="snap-proof">
+            <pre><code>shux api pane.snapshot "{\"pane_id\":\"$PID\"}" \
+  | jq -r .result.png_base64 \
+  | base64 -d &gt; frame.png</code></pre>
+            <figure class="snap-out">
+              <img src="/screenshots/06-raster-hello.png" alt="example frame.png produced by pane.snapshot — shux-raster's attribute showcase" width="720" height="440" loading="lazy">
+              <figcaption><span class="dot mossy"></span> <code>frame.png</code> — what came back. Real output, no mockup.</figcaption>
+            </figure>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Skill drop-in ───────────────────────────────── -->
+<section class="section">
+  <div class="wrap">
+    <p class="eyebrow">for agents</p>
+    <div class="skill-block">
+      <div>
+        <h2>A Claude skill, ready to drop in.</h2>
+        <p class="lede" style="margin-bottom:var(--s-4)">
+          One command installs the shux skill globally. The model then
+          knows when to reach for shux instead of tmux, which RPC to
+          call, and where the references live for deep dives.
+        </p>
+        <div class="copy-cmd" data-copy="npx skills add indrasvat/shux --global --yes" style="margin-bottom:var(--s-5)">
+<pre><code><span class="cmd-prompt">$</span> npx skills add indrasvat/shux --global --yes</code></pre>
+          <button class="copy-btn" type="button" aria-label="copy install command to clipboard">
+            <svg class="copy-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <rect x="4" y="4" width="9" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+              <path d="M3 11.5V3a1 1 0 0 1 1-1h7" fill="none" stroke="currentColor" stroke-width="1.4"/>
+            </svg>
+            <svg class="check-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M3 8.5l3 3 6.5-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span class="copy-label">copy</span>
+          </button>
+        </div>
+        <div class="hero-cta">
+          <a class="btn primary" href="https://github.com/indrasvat/shux/tree/main/skills/shux">Browse the skill</a>
+          <a class="btn secondary" href="https://github.com/indrasvat/shux">All the docs</a>
+        </div>
+      </div>
+      <div class="well">
+<b># shux skill — top-of-file (≤30 lines)</b><br><br>
+<b>name:</b> shux<br>
+<b>description:</b> Drive terminal multiplexer sessions from an<br>
+&nbsp;&nbsp;agent — multiplex, send keystrokes, snapshot pixel-perfect<br>
+&nbsp;&nbsp;PNGs of any pane. Replaces tmux / screen / iTerm2 /<br>
+&nbsp;&nbsp;expect/asciinema for agent-driven workflows.<br><br>
+<b>Quickstart:</b> three RPCs cover 80% of cases —<br>
+&nbsp;&nbsp;1. <code>shux apply spec.toml</code><br>
+&nbsp;&nbsp;2. <code>shux api pane.send_keys '{...}'</code><br>
+&nbsp;&nbsp;3. <code>shux api pane.snapshot '{...}'</code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Footer ──────────────────────────────────────── -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="row">
+      <div>
+        <a class="nav-mark" href="/">shux<span class="ver" id="ver-footer">v0.8</span></a>
+        <p style="margin-top:var(--s-3); max-width:32ch; color:var(--ink-3); font-size:13px">
+          A modern, batteries-included terminal multiplexer built in
+          Rust. First-class support for both humans and agents.
+        </p>
+      </div>
+      <div>
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/indrasvat/shux">GitHub</a></li>
+          <li><a href="https://github.com/indrasvat/shux/releases">Releases</a></li>
+          <li><a href="https://github.com/indrasvat/shux/blob/main/CHANGELOG.md">Changelog</a></li>
+          <li><a href="https://github.com/indrasvat/shux/issues">Issues</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Docs</h4>
+        <ul>
+          <li><a href="https://github.com/indrasvat/shux/tree/main/skills/shux">Agent skill</a></li>
+          <li><a href="https://github.com/indrasvat/shux/blob/main/README.md">README</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Compare</h4>
+        <ul>
+          <li><a href="#difference">vs tmux</a></li>
+          <li><a href="#replaces">Tools replaced</a></li>
+          <li><a href="#agents">Agent surface</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="sig">
+      <span>built on the open road</span>
+      <span>MIT · © indrasvat</span>
+    </div>
+  </div>
+</footer>
+
+<!-- ─── Lightbox modal — single instance, populated on .zoom-link click. ─── -->
+<div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-labelledby="lb-caption-text">
+  <div class="lightbox-frame">
+    <div class="lightbox-bar">
+      <span class="lb-caption" id="lb-caption-text">image preview</span>
+      <button class="lightbox-close" id="lb-close" aria-label="close (Esc)">×</button>
+    </div>
+    <div class="lightbox-stage">
+      <img class="lightbox-img" id="lb-img" alt="">
+    </div>
+  </div>
+</div>
+
+<script>
+  // Copy-to-clipboard buttons.
+  (function () {
+    document.querySelectorAll(".copy-cmd").forEach(function (root) {
+      var btn = root.querySelector(".copy-btn");
+      var text = root.getAttribute("data-copy");
+      if (!btn || !text) return;
+      btn.addEventListener("click", function () {
+        var write = navigator.clipboard && navigator.clipboard.writeText
+          ? navigator.clipboard.writeText(text)
+          : new Promise(function (resolve, reject) {
+              try {
+                var ta = document.createElement("textarea");
+                ta.value = text; ta.setAttribute("readonly", "");
+                ta.style.position = "absolute"; ta.style.left = "-9999px";
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+                resolve();
+              } catch (e) { reject(e); }
+            });
+        write.then(function () {
+          btn.setAttribute("data-copied", "true");
+          setTimeout(function () { btn.removeAttribute("data-copied"); }, 1800);
+        });
+      });
+    });
+  })();
+
+  // Lightbox — hijack .zoom-link clicks. No new tabs, no JS framework.
+  (function () {
+    var lb        = document.getElementById("lightbox");
+    if (!lb) return;
+    var lbImg     = document.getElementById("lb-img");
+    var lbCaption = document.getElementById("lb-caption-text");
+    var lbClose   = document.getElementById("lb-close");
+    var lastFocus = null;
+    function open (src, alt) {
+      lastFocus = document.activeElement;
+      lbImg.src = src;
+      lbImg.alt = alt || "";
+      lbCaption.textContent = alt || "image preview";
+      lb.setAttribute("data-open", "true");
+      document.documentElement.style.overflow = "hidden";
+      lbClose.focus();
+    }
+    function close () {
+      lb.removeAttribute("data-open");
+      lbImg.src = "";
+      document.documentElement.style.overflow = "";
+      if (lastFocus && typeof lastFocus.focus === "function") lastFocus.focus();
+    }
+    document.querySelectorAll(".zoom-link").forEach(function (a) {
+      a.addEventListener("click", function (e) {
+        e.preventDefault();
+        var img = a.querySelector("img");
+        open(a.getAttribute("href"), img ? img.alt : "");
+      });
+    });
+    lb.addEventListener("click", function (e) {
+      // Click backdrop (the .lightbox element itself, not its frame) → close.
+      if (e.target === lb) close();
+    });
+    lbClose.addEventListener("click", close);
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && lb.getAttribute("data-open") === "true") close();
+    });
+  })();
+
+  // Gallery tab switcher + slow auto-loop. Vanilla, no framework.
+  (function () {
+    var tabs = document.querySelectorAll(".gallery-tab");
+    var panels = document.querySelectorAll(".gallery-panel");
+    if (!tabs.length) return;
+
+    var DWELL_MS = 7000;       // 7 s on each tab before auto-advancing
+    var loopTimer = null;
+    var userPaused = false;
+    var prefersReduced = window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    function activate (i) {
+      tabs.forEach(function (t, ti) {
+        var on = ti === i;
+        t.classList.toggle("is-active", on);
+        t.setAttribute("aria-selected", on ? "true" : "false");
+      });
+      panels.forEach(function (p, pi) {
+        var on = pi === i;
+        p.classList.toggle("is-active", on);
+        if (on) p.removeAttribute("hidden");
+        else    p.setAttribute("hidden", "");
+      });
+    }
+    function currentIndex () {
+      for (var i = 0; i < tabs.length; i++) {
+        if (tabs[i].classList.contains("is-active")) return i;
+      }
+      return 0;
+    }
+    function tick () {
+      if (userPaused) return;
+      activate((currentIndex() + 1) % tabs.length);
+    }
+    function startLoop () {
+      if (prefersReduced || userPaused || loopTimer) return;
+      loopTimer = setInterval(tick, DWELL_MS);
+    }
+    function stopLoop () {
+      if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
+    }
+    function pauseFromUser () {
+      userPaused = true;
+      stopLoop();
+    }
+
+    tabs.forEach(function (t, i) {
+      t.addEventListener("click", function () { pauseFromUser(); activate(i); });
+      t.addEventListener("keydown", function (e) {
+        if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+          pauseFromUser();
+          var next = (i + 1) % tabs.length;
+          tabs[next].focus(); activate(next); e.preventDefault();
+        } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+          pauseFromUser();
+          var prev = (i - 1 + tabs.length) % tabs.length;
+          tabs[prev].focus(); activate(prev); e.preventDefault();
+        }
+      });
+    });
+
+    // Pause the auto-loop when the tab isn't visible (no point cycling).
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) stopLoop();
+      else                 startLoop();
+    });
+
+    startLoop();
+  })();
+
+  // Hero device — rotate snapshots. Pause if reduced-motion.
+  // Four real pane.snapshot outputs of universally-recognizable TUIs.
+  (function () {
+    var screen = document.getElementById("screen");
+    if (!screen) return;
+    var imgs = screen.querySelectorAll("img");
+    var tag = document.getElementById("screenTag");
+    var labels = [
+      "pane.snapshot → lazygit · diff view",
+      "pane.snapshot → lazygit · branches",
+      "pane.snapshot → lazygit · ? help overlay",
+      "pane.snapshot → htop · CPU + memory bars"
+    ];
+    if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      return;
+    }
+    var i = 0;
+    setInterval(function () {
+      imgs[i].classList.remove("active");
+      i = (i + 1) % imgs.length;
+      imgs[i].classList.add("active");
+      if (tag) tag.textContent = labels[i] || "";
+    }, 4200);
+  })();
+
+  // Version label is stamped at build/deploy time (we ship a static
+  // string in the markup rather than fetch api.github.com on every page
+  // load — codex review pointed out the rate-limit risk on a traffic
+  // spike, and the cosmetic chip isn't worth the foot-gun).
+  (function () {
+    var nav = document.getElementById("ver");
+    var ftr = document.getElementById("ver-footer");
+    // The deploy workflow can rewrite this constant on each release; for
+    // now it tracks the latest published tag.
+    var v = "v0.8";
+    if (nav) nav.textContent = v;
+    if (ftr) ftr.textContent = v;
+  })();
+</script>
+
+</body>
+</html>

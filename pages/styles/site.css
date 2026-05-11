@@ -1,0 +1,382 @@
+/* ──────────────────────────────────────────────────────────
+   shux.pages.dev — design tokens + reset + shared chrome.
+   Page-specific styles live in each page's inline <style>.
+
+   Palette: muted Teenage-Engineering. Warm charcoal base,
+   single terracotta accent used sparingly, deep moss for
+   "live"/"ok" states. No neon, no gradients, no AI slop.
+   ────────────────────────────────────────────────────────── */
+
+:root {
+  /* Warm charcoal neutrals (no blue cast — the warmth matters). */
+  --bg:        #15120e;
+  --bg-2:      #1c1814;    /* surface */
+  --bg-3:      #251f1a;    /* elevated */
+  --paper:     #f3ede0;    /* inverted blocks, hero-card panels */
+  --paper-2:   #e6dfd0;
+
+  --ink:       #ece4d2;    /* body text on dark */
+  --ink-2:     #b9b0a0;    /* secondary */
+  --ink-3:     #928a78;    /* muted — bumped from #7a7263 to clear 4.5:1 vs --bg per codex review */
+  --ink-4:     #5a5347;    /* faint — also bumped to keep relative contrast */
+  --ink-on-paper:  #1d1813;
+  --ink2-on-paper: #56504a;
+
+  --line:      rgba(236, 228, 210, 0.08);
+  --line-2:    rgba(236, 228, 210, 0.14);
+  --line-paper: rgba(29, 24, 19, 0.10);
+
+  /* The one accent. Used for one link colour + one CTA. */
+  --accent:        #c75a2a;
+  --accent-ink:    #d96c3a;   /* slightly brighter when on dark bg */
+  --accent-soft:   rgba(199, 90, 42, 0.12);
+  --accent-line:   rgba(199, 90, 42, 0.28);
+
+  /* Status. */
+  --moss:      #6f9a5c;   /* "ok" / "live" — readable on dark + paper */
+  --moss-soft: rgba(111, 154, 92, 0.14);
+  --crit:      #d4524b;
+
+  /* Type. */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+               system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular",
+               Menlo, monospace;
+
+  /* Rhythm. 8-base scale + 4-base half steps. */
+  --s-1:  4px;
+  --s-2:  8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+  --s-8: 72px;
+  --s-9: 112px;
+
+  /* Sharp corners. TE casework is mostly squared. */
+  --r-1: 2px;
+  --r-2: 4px;
+  --r-3: 8px;
+
+  --max-w: 1120px;
+  --max-w-narrow: 760px;
+}
+
+/* ─── Reset ─────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-rendering: optimizeLegibility; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.55;
+  font-feature-settings: "ss01", "cv11";  /* Inter stylistic tweaks */
+  /* Paper-grain noise. A 96x96 SVG inlined as data URI, 4% opacity, fixed. */
+  background-image:
+    radial-gradient(1200px 600px at 50% -200px, rgba(199,90,42,0.05), transparent 70%),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='96' height='96'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.92' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.93 0 0 0 0 0.89 0 0 0 0 0.82 0 0 0 0.06 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  background-attachment: fixed;
+}
+
+img, svg { display: block; max-width: 100%; height: auto; }
+a {
+  color: var(--accent-ink);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent-line);
+  transition: border-color 120ms ease, color 120ms ease;
+}
+a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+hr { border: 0; border-top: 1px solid var(--line); margin: var(--s-7) 0; }
+code, pre, kbd, samp {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+pre {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  padding: var(--s-4);
+  overflow-x: auto;
+  line-height: 1.55;
+  font-size: 13px;
+  /* Soft-wrap long lines instead of horizontally scrolling them off-
+     screen. Backslash continuations + this overflow-wrap rule together
+     keep every line readable at any viewport, no scrollbar required. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  tab-size: 2;
+}
+code:not(pre code) {
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  padding: 1px 6px;
+  border-radius: var(--r-1);
+  font-size: 0.88em;
+  color: var(--ink);
+}
+kbd {
+  background: var(--bg-3);
+  border: 1px solid var(--line-2);
+  border-bottom-width: 2px;
+  padding: 1px 6px;
+  border-radius: var(--r-1);
+  font-size: 0.82em;
+  color: var(--ink);
+}
+
+/* Selection. Solid terracotta with a warm-white forced fg works on both
+   the warm-charcoal and paper-cream sections — the 12% accent-soft
+   wash we had before bleached dark text into illegible pink-on-cream. */
+::selection {
+  background: var(--accent);
+  color: #fdf9f0;
+  text-shadow: none;
+}
+::-moz-selection {
+  background: var(--accent);
+  color: #fdf9f0;
+  text-shadow: none;
+}
+
+/* ─── Headlines ─────────────────────────────────────────── */
+h1, h2, h3, h4 {
+  margin: 0 0 var(--s-3);
+  letter-spacing: -0.012em;
+  font-weight: 600;
+  color: var(--ink);
+}
+h1 { font-size: clamp(36px, 5.2vw, 60px); line-height: 1.05; letter-spacing: -0.022em; font-weight: 650; }
+h2 { font-size: clamp(24px, 2.8vw, 32px); line-height: 1.15; letter-spacing: -0.018em; }
+h3 { font-size: 18px; line-height: 1.25; }
+h4 { font-size: 14px; line-height: 1.25; text-transform: uppercase; letter-spacing: 0.08em;
+     font-weight: 600; color: var(--ink-3); }
+
+p { margin: 0 0 var(--s-4); color: var(--ink-2); }
+strong { color: var(--ink); font-weight: 600; }
+
+/* ─── Layout helpers ────────────────────────────────────── */
+.wrap     { max-width: var(--max-w);        margin: 0 auto; padding: 0 var(--s-5); }
+.wrap-narrow { max-width: var(--max-w-narrow); margin: 0 auto; padding: 0 var(--s-5); }
+.section  { padding: var(--s-8) 0; }
+.section.tight { padding: var(--s-6) 0; }
+.section.snug  { padding: var(--s-7) 0; }
+.section.invert { background: var(--paper); color: var(--ink-on-paper); }
+.section.invert p { color: var(--ink2-on-paper); }
+.section.invert h1, .section.invert h2,
+.section.invert h3, .section.invert h4 { color: var(--ink-on-paper); }
+.section.invert h4 { color: var(--ink2-on-paper); }
+.section.invert a { color: var(--accent); border-bottom-color: var(--accent-line); }
+.section.invert code:not(pre code) {
+  background: rgba(29,24,19,0.06);
+  border-color: var(--line-paper);
+  color: var(--ink-on-paper);
+}
+
+/* Belt-and-braces fallback: some mobile browsers handle `:not(pre code)`
+   inconsistently. Re-state the paper-inline-code colour at the
+   commonly-affected hosts so the cascade can't miss it. */
+.section.invert .kv-list .v,
+.section.invert .versus li,
+.section.invert .lede,
+.section.invert p {
+  color: var(--ink2-on-paper);
+}
+.section.invert .kv-list .v code,
+.section.invert .versus li code,
+.section.invert p code {
+  background: rgba(29,24,19,0.06);
+  border-color: var(--line-paper);
+  color: var(--ink-on-paper);
+}
+.section.invert pre {
+  background: #fdf9f0;
+  border-color: var(--line-paper);
+  color: var(--ink-on-paper);
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 var(--s-3);
+}
+.section.invert .eyebrow { color: var(--ink2-on-paper); }
+
+.lede { font-size: 18px; line-height: 1.55; color: var(--ink-2); max-width: 62ch; }
+.section.invert .lede { color: var(--ink2-on-paper); }
+
+/* ─── Nav ───────────────────────────────────────────────── */
+.nav {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--s-3) var(--s-5);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(140%) blur(10px);
+  -webkit-backdrop-filter: saturate(140%) blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+.nav-mark {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  font-size: 15px;
+  color: var(--ink);
+  border-bottom: 0;
+  display: inline-flex; align-items: center; gap: var(--s-2);
+}
+.nav-mark::before {
+  content: ""; width: 8px; height: 8px;
+  background: var(--accent); border-radius: 1px;
+  transform: rotate(45deg);
+}
+.nav-mark .ver {
+  font-size: 11px; color: var(--ink-3); font-weight: 400;
+  letter-spacing: 0.05em; margin-left: 2px;
+}
+.nav-links { display: flex; gap: var(--s-5); align-items: center; }
+.nav-links a {
+  color: var(--ink-2); border-bottom: 0; font-size: 14px;
+  display: inline-flex; align-items: center; gap: var(--s-1);
+}
+.nav-links a:hover { color: var(--ink); }
+.nav-links a.cta {
+  background: var(--accent); color: #1a0e07;
+  padding: 6px 14px; border-radius: var(--r-2);
+  font-weight: 600; font-size: 13px;
+}
+.nav-links a.cta:hover { background: var(--accent-ink); color: #1a0e07; }
+
+@media (max-width: 720px) {
+  .nav-links .lbl { display: none; }
+  .nav { padding: var(--s-2) var(--s-4); }
+}
+
+/* ─── Buttons ───────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; gap: var(--s-2);
+  padding: 10px 18px; border-radius: var(--r-2);
+  font-family: var(--font-sans); font-weight: 600; font-size: 14px;
+  letter-spacing: 0.01em; border: 1px solid transparent;
+  cursor: pointer; transition: all 140ms ease;
+  border-bottom: 1px solid transparent;
+}
+.btn.primary    { background: var(--accent); color: #1a0e07; }
+.btn.primary:hover { background: var(--accent-ink); }
+.btn.secondary  {
+  background: transparent; color: var(--ink);
+  border: 1px solid var(--line-2);
+}
+.btn.secondary:hover { border-color: var(--ink-3); color: var(--ink); }
+.section.invert .btn.secondary { color: var(--ink-on-paper); border-color: var(--line-paper); }
+.section.invert .btn.secondary:hover { border-color: rgba(29,24,19,0.3); }
+
+/* ─── Cards & utility ───────────────────────────────────── */
+.card {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  padding: var(--s-5);
+}
+.card.flush { padding: 0; overflow: hidden; }
+.card .card-cap {
+  padding: var(--s-3) var(--s-4);
+  border-top: 1px solid var(--line);
+  background: var(--bg-3);
+  font-family: var(--font-mono);
+  font-size: 12px; color: var(--ink-3);
+}
+.section.invert .card { background: #fbf6ea; border-color: var(--line-paper); }
+.section.invert .card .card-cap { background: #f5eddc; border-color: var(--line-paper); color: var(--ink2-on-paper); }
+
+.tag {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px; letter-spacing: 0.04em; color: var(--ink-2);
+  background: var(--bg-3); border: 1px solid var(--line);
+  padding: 3px 8px; border-radius: var(--r-1);
+}
+.tag.live { color: var(--moss); background: var(--moss-soft); border-color: rgba(111,154,92,0.28); }
+.tag.accent { color: var(--accent-ink); background: var(--accent-soft); border-color: var(--accent-line); }
+
+.dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+/* Two/three-column grid. */
+.cols-2, .cols-3 { display: grid; gap: var(--s-5); }
+.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 840px) {
+  .cols-2 { grid-template-columns: 1fr; }
+  .cols-3 { grid-template-columns: 1fr; }
+}
+
+/* Tables for the "replaces" matrix. */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  font-family: var(--font-sans);
+}
+th, td {
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+th {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-3);
+  font-weight: 500;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line-2);
+}
+td code { white-space: nowrap; }
+.section.invert th { background: #f5eddc; color: var(--ink2-on-paper); border-color: var(--line-paper); }
+.section.invert td { border-color: var(--line-paper); }
+
+/* ─── Footer ────────────────────────────────────────────── */
+.footer {
+  border-top: 1px solid var(--line);
+  padding: var(--s-7) 0 var(--s-6);
+  color: var(--ink-3);
+  font-size: 13px;
+}
+.footer .row {
+  display: flex; flex-wrap: wrap; gap: var(--s-6);
+  align-items: flex-start; justify-content: space-between;
+}
+.footer h4 { font-size: 11px; }
+.footer ul { list-style: none; padding: 0; margin: 0; }
+.footer li { margin: 0 0 6px; }
+.footer a { color: var(--ink-2); border-bottom: 0; font-size: 13px; }
+.footer a:hover { color: var(--ink); }
+.footer .sig {
+  margin-top: var(--s-6);
+  padding-top: var(--s-4);
+  border-top: 1px solid var(--line);
+  display: flex; gap: var(--s-4); justify-content: space-between;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--ink-4); letter-spacing: 0.04em;
+}
+
+/* ─── Misc ──────────────────────────────────────────────── */
+.mono { font-family: var(--font-mono); }
+.muted { color: var(--ink-3); }
+.measure { max-width: 62ch; }
+.divider { height: 1px; background: var(--line); margin: var(--s-6) 0; }
+
+/* Reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

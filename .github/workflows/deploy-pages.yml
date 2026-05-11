@@ -1,0 +1,113 @@
+name: Deploy Pages
+
+# Production deploy path for shux.pages.dev. Triggers on Release
+# workflow completion, on pages/** pushes to main, and via manual
+# dispatch. Pages production_branch is the "production" sentinel —
+# git pushes only create preview deploys; this workflow's
+# `wrangler pages deploy --branch=production` is the sole production
+# path. No race with git auto-deploy.
+#
+# Only `github.repository` (non-attacker-controlled) is read from the
+# github context — no event payloads are interpolated into shell.
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  push:
+    branches: [main]
+    paths:
+      - 'pages/**'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # workflow_run fires regardless of branch — gate head_branch=main.
+    if: >-
+      ${{ github.event_name != 'workflow_run'
+          || (github.event.workflow_run.conclusion == 'success'
+              && github.event.workflow_run.head_branch == 'main') }}
+    env:
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage pages content
+        run: |
+          mkdir -p deploy
+          cp -r pages/. deploy/
+
+      - name: Stage install script + version marker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest="$(gh release list --repo "$REPO" --limit 1 \
+                     --json tagName --jq '.[0].tagName // ""')"
+          if [[ -n "$latest" ]]; then
+            published_at="$(gh release view "$latest" --repo "$REPO" \
+                            --json publishedAt --jq '.publishedAt')"
+            {
+              printf '{\n'
+              printf '  "version": "%s",\n' "$latest"
+              printf '  "published_at": "%s",\n' "$published_at"
+              printf '  "release_url": "https://github.com/%s/releases/tag/%s"\n' "$REPO" "$latest"
+              printf '}\n'
+            } > deploy/version.json
+            echo "Stamped deploy/version.json for $latest."
+          fi
+
+          cat > deploy/install.sh <<'INSTALL'
+          #!/usr/bin/env sh
+          # shux installer — fetches the latest release binary for the
+          # detected platform from GitHub Releases.
+          set -eu
+          REPO="indrasvat/shux"
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64|amd64) arch="x86_64" ;;
+            aarch64|arm64) arch="aarch64" ;;
+            *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+          esac
+          case "$os" in
+            darwin) triple="${arch}-apple-darwin" ;;
+            linux)  triple="${arch}-unknown-linux-gnu" ;;
+            *) echo "unsupported os: $os" >&2; exit 1 ;;
+          esac
+          tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+                  | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+          [ -n "$tag" ] || { echo "no release tag found" >&2; exit 1; }
+          url="https://github.com/${REPO}/releases/download/${tag}/shux-${tag}-${triple}.tar.gz"
+          echo "Downloading shux ${tag} (${triple})..."
+          tmp="$(mktemp -d)"
+          curl -fL --progress-bar "$url" -o "${tmp}/shux.tar.gz"
+          tar -xzf "${tmp}/shux.tar.gz" -C "$tmp"
+          dest="${HOME}/.local/bin"
+          mkdir -p "$dest"
+          mv "${tmp}/shux" "${dest}/shux"
+          chmod +x "${dest}/shux"
+          rm -rf "$tmp"
+          echo "✓ Installed to ${dest}/shux"
+          echo "  Add ${dest} to your PATH if it isn't already."
+          "${dest}/shux" --version || true
+          INSTALL
+          chmod +x deploy/install.sh
+
+      - name: Stage CHANGELOG
+        run: |
+          if [[ -f CHANGELOG.md ]]; then
+            cp CHANGELOG.md deploy/CHANGELOG.md
+          fi
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy deploy --project-name=shux --branch=production
