@@ -1594,6 +1594,24 @@ fn build_snapshot_status_bar(
     bar
 }
 
+/// Tail-clip captured text for inclusion in wait_for response previews.
+/// Keeps the LAST `n` chars (matches are usually near the bottom of the
+/// captured viewport) and trims leading whitespace.
+fn preview_for_log(s: &str, n: usize) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() <= n {
+        return s.trim_start().to_string();
+    }
+    let start = bytes.len() - n;
+    let mut s = std::str::from_utf8(&bytes[start..])
+        .unwrap_or("")
+        .to_string();
+    if let Some(idx) = s.find('\n') {
+        s = s.split_off(idx + 1);
+    }
+    s.trim_start().to_string()
+}
+
 /// Parse optional `cols` / `rows` from snapshot params. Defaults: 120x36.
 /// Same range guard as `pane.set_size`.
 fn parse_snapshot_dims(params: &serde_json::Value) -> Result<(u16, u16), shux_rpc::RpcError> {
@@ -2503,7 +2521,8 @@ fn register_pane_io_methods(
     let g6 = graph.clone();
     let g7 = graph.clone();
     let g8 = graph.clone();
-    let g9 = graph;
+    let g9 = graph.clone();
+    let g10 = graph;
 
     let io1 = io_state.clone();
     let io2 = io_state.clone();
@@ -2513,7 +2532,8 @@ fn register_pane_io_methods(
     let io6 = io_state.clone();
     let io7 = io_state.clone();
     let io8 = io_state.clone();
-    let io9 = io_state;
+    let io9 = io_state.clone();
+    let io10 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
     // Built once at startup so each snapshot call doesn't re-parse the 264 KB embedded font.
@@ -2770,6 +2790,97 @@ fn register_pane_io_methods(
                     "text": clean,
                     "lines": lines,
                 }))
+            }
+        })
+        .register("pane.wait_for", move |params: Option<serde_json::Value>| {
+            let gh = g10.clone();
+            let io = io10.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                let needle_text = params
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let needle_regex_raw = params.get("regex").and_then(|v| v.as_str());
+                let absent = params
+                    .get("absent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let lines = params.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                let timeout_ms = params
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10_000)
+                    .min(60_000);
+                let poll_ms = params
+                    .get("poll_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(100)
+                    .clamp(20, 1_000);
+
+                if needle_text.is_none() && needle_regex_raw.is_none() {
+                    return Err(shux_rpc::RpcError::invalid_params(
+                        "missing 'text' or 'regex' parameter",
+                    ));
+                }
+                let needle_regex = match needle_regex_raw {
+                    Some(r) => Some(regex::Regex::new(r).map_err(|e| {
+                        shux_rpc::RpcError::invalid_params(&format!("invalid regex: {e}"))
+                    })?),
+                    None => None,
+                };
+
+                let start = std::time::Instant::now();
+                let deadline = start + std::time::Duration::from_millis(timeout_ms);
+                let mut last_capture;
+
+                loop {
+                    last_capture = {
+                        let state = io.lock().await;
+                        let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                        })?;
+                        let raw = vt.capture_text(lines);
+                        shux_pty::strip_ansi(&raw)
+                    };
+
+                    let hit = if let Some(re) = needle_regex.as_ref() {
+                        re.is_match(&last_capture)
+                    } else if let Some(t) = needle_text.as_ref() {
+                        last_capture.contains(t.as_str())
+                    } else {
+                        false
+                    };
+                    let matched = if absent { !hit } else { hit };
+
+                    if matched {
+                        let elapsed = start.elapsed().as_millis() as u64;
+                        return Ok(serde_json::json!({
+                            "pane_id": pane_id.to_string(),
+                            "matched": true,
+                            "elapsed_ms": elapsed,
+                            "absent": absent,
+                            "text_preview": preview_for_log(&last_capture, 240),
+                        }));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        return Err(shux_rpc::RpcError::with_message_and_data(
+                            shux_rpc::ErrorCode::NotFound,
+                            "wait_for timed out".to_string(),
+                            serde_json::json!({
+                                "pane_id": pane_id.to_string(),
+                                "absent": absent,
+                                "timeout_ms": timeout_ms,
+                                "elapsed_ms": start.elapsed().as_millis() as u64,
+                                "last_capture_preview": preview_for_log(&last_capture, 480),
+                            }),
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+                }
             }
         })
         .register("pane.snapshot", move |params: Option<serde_json::Value>| {
@@ -3428,6 +3539,34 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     cli::handle_events_history(&mut stream, filter, count).await
                 }
             }
+        }
+
+        Some(Command::WaitFor {
+            session,
+            window,
+            pane,
+            text,
+            regex,
+            absent,
+            lines,
+            timeout_ms,
+            poll_ms,
+        }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_wait_for(
+                &mut stream,
+                session.as_deref(),
+                window.as_deref(),
+                pane.as_deref(),
+                text.as_deref(),
+                regex.as_deref(),
+                absent,
+                lines,
+                timeout_ms,
+                poll_ms,
+                args.format,
+            )
+            .await
         }
 
         Some(Command::Snapshot {

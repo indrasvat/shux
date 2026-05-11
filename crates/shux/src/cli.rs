@@ -395,6 +395,43 @@ pub enum Command {
         command: EventsCommand,
     },
 
+    /// Block until a pane's captured text matches (or stops matching) a needle.
+    ///
+    /// Polls `pane.capture` on the daemon every `--poll-ms`, returns success
+    /// when the match condition holds, or exits non-zero on timeout. Replaces
+    /// the iTerm2 `wait_for_text` / `wait_for_absent` pattern across TUIs.
+    #[command(name = "wait-for")]
+    WaitFor {
+        /// Session id-or-name. Combined with --window / --pane to resolve a pane.
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Window id or index within the session.
+        #[arg(short, long)]
+        window: Option<String>,
+        /// Explicit pane id (UUID).
+        #[arg(short, long)]
+        pane: Option<String>,
+        /// Plain-text needle. The pane's last N lines (see --lines) are
+        /// `contains()`-checked. Mutually exclusive with --regex.
+        #[arg(short, long, conflicts_with = "regex")]
+        text: Option<String>,
+        /// Rust regex. Mutually exclusive with --text.
+        #[arg(long)]
+        regex: Option<String>,
+        /// Wait for the needle to be ABSENT instead of present.
+        #[arg(long)]
+        absent: bool,
+        /// How many recent lines to capture each poll. Default 200.
+        #[arg(long, default_value_t = 200)]
+        lines: u64,
+        /// Total timeout in milliseconds. Default 10000, max 60000.
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u64,
+        /// Poll interval in milliseconds. Default 100, range 20..=1000.
+        #[arg(long, default_value_t = 100)]
+        poll_ms: u64,
+    },
+
     /// Rasterize a window (or session's active window) to a PNG.
     ///
     /// Composes every pane in the target window — same picture you'd see in
@@ -1421,6 +1458,100 @@ pub async fn handle_rename(
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_session_renamed(session_name, new_name);
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_wait_for(
+    stream: &mut tokio::net::UnixStream,
+    session: Option<&str>,
+    window: Option<&str>,
+    pane: Option<&str>,
+    text: Option<&str>,
+    regex: Option<&str>,
+    absent: bool,
+    lines: u64,
+    timeout_ms: u64,
+    poll_ms: u64,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    if text.is_none() && regex.is_none() {
+        anyhow::bail!("provide --text or --regex");
+    }
+
+    let mut params = serde_json::Map::new();
+    if let Some(p) = pane {
+        params.insert("pane_id".into(), serde_json::Value::String(p.to_string()));
+    } else if let Some(s) = session {
+        let sid = resolve_session_id(stream, s).await?;
+        params.insert("session_id".into(), serde_json::Value::String(sid.clone()));
+        if let Some(w) = window {
+            let (wid, _t) = resolve_window_id(stream, &sid, w).await?;
+            params.insert("window_id".into(), serde_json::Value::String(wid));
+        }
+    } else {
+        anyhow::bail!("provide --pane or --session [--window]");
+    }
+    if let Some(t) = text {
+        params.insert("text".into(), serde_json::Value::String(t.to_string()));
+    }
+    if let Some(r) = regex {
+        params.insert("regex".into(), serde_json::Value::String(r.to_string()));
+    }
+    params.insert("absent".into(), serde_json::Value::Bool(absent));
+    params.insert("lines".into(), serde_json::Value::from(lines));
+    params.insert("timeout_ms".into(), serde_json::Value::from(timeout_ms));
+    params.insert("poll_ms".into(), serde_json::Value::from(poll_ms));
+
+    let result = match rpc_call(stream, "pane.wait_for", serde_json::Value::Object(params)).await {
+        Ok(v) => v,
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => {
+            match format {
+                OutputFormat::Json => {
+                    let env = serde_json::json!({
+                        "error": { "code": code, "message": message, "data": data }
+                    });
+                    println!("{}", serde_json::to_string_pretty(&env)?);
+                }
+                _ => {
+                    eprintln!("{} {message}", crate::style::error("✗ wait-for:"));
+                    if let Some(d) = data
+                        .as_ref()
+                        .and_then(|v| v.get("last_capture_preview"))
+                        .and_then(|v| v.as_str())
+                    {
+                        eprintln!("{}", crate::style::muted("  last captured:"));
+                        for line in d.lines().take(8) {
+                            eprintln!("    {line}");
+                        }
+                    }
+                }
+            }
+            std::process::exit(2);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        _ => {
+            let elapsed = result
+                .get("elapsed_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let abs = if absent { " (absent)" } else { "" };
+            println!(
+                "{} matched after {}ms{abs}",
+                crate::style::success("✓ wait-for"),
+                elapsed,
+            );
         }
     }
 
