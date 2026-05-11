@@ -1,3 +1,10 @@
+# [0.10.0](https://github.com/indrasvat/shux/compare/v0.9.0...v0.10.0) (2026-05-11)
+
+
+### Features
+
+* window.snapshot — composed multi-pane PNGs, .shux/ DX, agent-self-test pattern ([#19](https://github.com/indrasvat/shux/issues/19)) ([9c5145a](https://github.com/indrasvat/shux/commit/9c5145a17f6945901b2a0473ec04495d5097b957))
+
 # [0.9.0](https://github.com/indrasvat/shux/compare/v0.8.0...v0.9.0) (2026-05-11)
 
 
