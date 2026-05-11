@@ -1443,12 +1443,17 @@ pub async fn handle_snapshot(
     params.insert("rows".into(), serde_json::Value::from(rows));
 
     let method = match (session, window) {
-        (_, Some(w)) => {
+        (Some(s), Some(w)) => {
+            // Resolve --window which may be a UUID, a name, or a numeric index.
+            let sid = resolve_session_id(stream, s).await?;
+            let (wid, _title) = resolve_window_id(stream, &sid, w).await?;
+            params.insert("session_id".into(), serde_json::Value::String(sid));
+            params.insert("window_id".into(), serde_json::Value::String(wid));
+            "window.snapshot"
+        }
+        (None, Some(w)) => {
+            // No session — `w` must be a UUID (daemon resolves directly).
             params.insert("window_id".into(), serde_json::Value::String(w.to_string()));
-            if let Some(s) = session {
-                let sid = resolve_session_id(stream, s).await?;
-                params.insert("session_id".into(), serde_json::Value::String(sid));
-            }
             "window.snapshot"
         }
         (Some(s), None) => {
@@ -1491,8 +1496,11 @@ pub async fn handle_snapshot(
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         (None, _) => {
-            use std::io::Write;
-            std::io::stdout().write_all(&png)?;
+            // Default no-`--output` behaviour: print base64 to stdout so the
+            // command is pipe-/jq-friendly and never dumps binary control
+            // bytes into a TTY. Use `--output -.png > frame.png` (or just
+            // `--output frame.png`) for raw bytes.
+            println!("{b64}");
         }
     }
 

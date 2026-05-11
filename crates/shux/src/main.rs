@@ -1540,6 +1540,60 @@ fn resolve_window_id_from_params(
     Ok(session.active_window)
 }
 
+/// Build a 3-zone status bar matching `shux attach`'s built-in segments
+/// (session name · `[i/n] window` · clock) from a graph snapshot. Used by
+/// `window.snapshot` / `session.snapshot` so the resulting PNG includes
+/// the same bottom row a live attached client would render.
+fn build_snapshot_status_bar(
+    snap: &shux_core::graph::SessionGraphSnapshot,
+    session_id: &shux_core::model::SessionId,
+    window_id: shux_core::model::WindowId,
+) -> shux_ui::StatusBar {
+    use crossterm::style::Color;
+    let theme = shux_core::theme::Theme::DEFAULT;
+    let to_color = |rgb: shux_core::theme::Rgb| Color::Rgb {
+        r: rgb.r,
+        g: rgb.g,
+        b: rgb.b,
+    };
+    let mut bar = shux_ui::StatusBar::new();
+    bar.bg = Some(to_color(theme.status_bg));
+
+    if let Some(sess) = snap.sessions.get(session_id) {
+        bar.left.push(shux_ui::StatusSegment::styled(
+            format!(" ◆ {} ", sess.name),
+            to_color(theme.status_accent),
+            true,
+        ));
+        let win_count = sess.windows.len();
+        let active_idx = sess
+            .windows
+            .iter()
+            .position(|w| *w == window_id)
+            .unwrap_or(0);
+        if let Some(win) = snap.windows.get(&window_id) {
+            let title = if win.title.is_empty() {
+                "shell".to_string()
+            } else {
+                win.title.clone()
+            };
+            bar.center.push(shux_ui::StatusSegment::styled(
+                format!(" [{}/{}] {} ", active_idx + 1, win_count, title),
+                to_color(theme.status_fg),
+                false,
+            ));
+        }
+    }
+
+    let now = chrono::Local::now();
+    bar.right.push(shux_ui::StatusSegment::styled(
+        format!(" {} ", now.format("%H:%M:%S")),
+        to_color(theme.status_fg),
+        false,
+    ));
+    bar
+}
+
 /// Parse optional `cols` / `rows` from snapshot params. Defaults: 120x36.
 /// Same range guard as `pane.set_size`.
 fn parse_snapshot_dims(params: &serde_json::Value) -> Result<(u16, u16), shux_rpc::RpcError> {
@@ -1616,6 +1670,12 @@ async fn snapshot_window(
     let layout_tree = window.layout.tree.clone();
     let zoom_state = window.layout.zoom.clone();
 
+    // Build the same status bar `shux attach` would render so the snapshot
+    // matches what a user sees attached. We don't have the live attached
+    // state here, so we synthesize from the snapshot.
+    let status_bar = build_snapshot_status_bar(&snap, &window.session_id, window_id);
+    const STATUS_BAR_ROWS: u16 = 1;
+
     let (img, png_buf) = tokio::task::spawn_blocking(move || {
         let panes: std::collections::HashMap<
             shux_core::model::PaneId,
@@ -1627,7 +1687,7 @@ async fn snapshot_window(
             focused,
             panes: &panes,
             titles: Some(&titles),
-            status_bar: None,
+            status_bar: Some(&status_bar),
         };
         let composed = shux_ui::compose(
             &inputs,
@@ -1635,7 +1695,7 @@ async fn snapshot_window(
             rows,
             shux_ui::BorderStyle::Rounded,
             shux_ui::BorderColors::default(),
-            0,
+            STATUS_BAR_ROWS,
         );
         let opts = shux_raster::RasterOptions {
             cursor: composed.cursor,
