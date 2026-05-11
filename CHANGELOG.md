@@ -1,3 +1,10 @@
+# [0.6.0](https://github.com/indrasvat/shux/compare/v0.5.0...v0.6.0) (2026-05-11)
+
+
+### Features
+
+* **ui,rpc,cli:** pane titles — manual + OSC + auto-derived (task 027, PR 4) ([#12](https://github.com/indrasvat/shux/issues/12)) ([059b38a](https://github.com/indrasvat/shux/commit/059b38ab03d8edbaa3f96d74f362c677777c90a0)), closes [#7](https://github.com/indrasvat/shux/issues/7)
+
 # [0.5.0](https://github.com/indrasvat/shux/compare/v0.4.0...v0.5.0) (2026-05-11)
 
 
