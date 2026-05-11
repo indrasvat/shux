@@ -1148,9 +1148,28 @@ fn register_pane_methods(
                     .await
                     .map_err(graph_error_to_rpc)?;
 
-                // Spawn PTY for the new pane
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-                let _ = spawn_pane_pty(new_pane_id, cwd, Vec::new(), io, ct, gh.clone()).await;
+                // Honour optional `command` + `cwd` overrides. Previously
+                // both were silently dropped — the new pane always spawned
+                // the user's default shell regardless of what the RPC asked
+                // for. Apply paths already thread these correctly; this
+                // closes the same gap on the direct `pane.split` RPC.
+                let command: Vec<String> = params
+                    .get("command")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str().map(|x| x.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cwd = params
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+                    });
+                let _ = spawn_pane_pty(new_pane_id, cwd, command, io, ct, gh.clone()).await;
 
                 let snap = gh.snapshot();
                 let new_pane = snap
