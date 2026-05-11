@@ -340,7 +340,12 @@ pub(crate) async fn spawn_pane_pty(
 }
 
 fn main() -> anyhow::Result<()> {
-    let cmd = Cli::command().before_help(style::banner());
+    // Inject the colorised agent reference at runtime so it honours
+    // NO_COLOR + the IsTerminal piped-stdout check. clap's derive macro
+    // only accepts a `&'static str` literal there, so we set it here.
+    let cmd = Cli::command()
+        .before_help(style::banner())
+        .after_long_help(cli::agent_help());
     let matches = cmd.get_matches();
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
