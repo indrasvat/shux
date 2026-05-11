@@ -1,3 +1,10 @@
+# [0.9.0](https://github.com/indrasvat/shux/compare/v0.8.0...v0.9.0) (2026-05-11)
+
+
+### Features
+
+* landing page + agent skill + agent-friendly --help ([#17](https://github.com/indrasvat/shux/issues/17)) ([dc2ab74](https://github.com/indrasvat/shux/commit/dc2ab7495563df830915b5361b25b836f5171667)), closes [#15120e](https://github.com/indrasvat/shux/issues/15120e) [#c75a2a](https://github.com/indrasvat/shux/issues/c75a2a) [#16](https://github.com/indrasvat/shux/issues/16) [#16](https://github.com/indrasvat/shux/issues/16) [#2](https://github.com/indrasvat/shux/issues/2) [#d76c3a](https://github.com/indrasvat/shux/issues/d76c3a) [#928a78](https://github.com/indrasvat/shux/issues/928a78) [hi#contrast](https://github.com/hi/issues/contrast)
+
 # [0.8.0](https://github.com/indrasvat/shux/compare/v0.7.1...v0.8.0) (2026-05-11)
 
 
