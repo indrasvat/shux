@@ -32,6 +32,13 @@ allow = [
     # `MIT-0` ("MIT No Attribution"). Functionally MIT minus the
     # attribution clause.
     "MIT-0",
+    # `shux-raster` bundles JetBrains Mono Regular as an embedded font
+    # asset under the SIL Open Font License 1.1 (see
+    # `crates/shux-raster/assets/OFL.txt`). The crate's own code stays
+    # MIT; cargo-deny matches on the SPDX expression on the Cargo
+    # manifest, so it sees `MIT AND OFL-1.1` and needs OFL-1.1 allowed
+    # here. OFL 1.1 is OSI-approved and FSF Free/Libre.
+    "OFL-1.1",
 ]
 confidence-threshold = 0.93
 

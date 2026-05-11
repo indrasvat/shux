@@ -85,7 +85,7 @@ impl Default for GridConfig {
 ///   - visible lines (index scrollback_len..scrollback_len+rows): the current viewport
 ///
 /// The VecDeque allows O(1) push_front (for scrollback) and O(1) push_back (for new lines).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Grid {
     /// All lines: scrollback + visible area.
     raw: VecDeque<Row>,
@@ -136,6 +136,27 @@ impl Grid {
     pub fn visible_row(&self, row: usize) -> &Row {
         let idx = self.scrollback_len() + row;
         &self.raw[idx]
+    }
+
+    /// Clone just the visible viewport into a fresh `Grid` with no
+    /// scrollback. Intended for `pane.snapshot` — `Clone` on the full
+    /// grid would copy the entire scrollback (default 5000 rows) under
+    /// the daemon's pane-IO mutex even though the rasterizer only ever
+    /// reads `visible_row(0..rows)`. Codex review: the cost was paid
+    /// even on snapshots later rejected by the pixel-count cap.
+    pub fn clone_visible(&self) -> Grid {
+        let mut raw = VecDeque::with_capacity(self.rows);
+        for r in 0..self.rows {
+            raw.push_back(self.visible_row(r).clone());
+        }
+        Grid {
+            raw,
+            rows: self.rows,
+            cols: self.cols,
+            // Snapshot grids never need scrollback — the parser isn't
+            // going to feed them more rows.
+            config: GridConfig { max_scrollback: 0 },
+        }
     }
 
     /// Mutably access a visible row (0 = top of visible area).
@@ -511,5 +532,33 @@ mod tests {
         assert_eq!(grid.total_lines(), 3);
         grid.scroll_up(0, 2);
         assert_eq!(grid.total_lines(), 4);
+    }
+
+    #[test]
+    fn test_clone_visible_drops_scrollback() {
+        // Push scrollback in, then confirm clone_visible() keeps the
+        // visible rows but discards the scrollback.
+        let mut grid = Grid::new(3, 4, GridConfig::default());
+        // Push scrollback via full-screen scroll-ups (the (0, rows-1)
+        // shape is what hits the scrollback branch). Five iterations →
+        // five scrollback rows on top of the three visible rows.
+        for _ in 0..5 {
+            grid.scroll_up(0, grid.rows() - 1);
+        }
+        assert!(grid.scrollback_len() >= 5, "scrollback was set up");
+        // Mark a visible row so we can verify it survives the clone.
+        grid.visible_row_mut(2).cells[0].ch = 'V';
+
+        let snap = grid.clone_visible();
+        assert_eq!(snap.rows(), 3);
+        assert_eq!(snap.cols(), 4);
+        assert_eq!(
+            snap.scrollback_len(),
+            0,
+            "snapshot must not copy scrollback"
+        );
+        assert_eq!(snap.total_lines(), 3);
+        // Visible content is preserved across the clone.
+        assert_eq!(snap.visible_row(2).cells[0].ch, 'V');
     }
 }

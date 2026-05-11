@@ -373,6 +373,7 @@ impl SessionGraph {
                     name,
                     cwd,
                     initial_command,
+                    initial_window_title,
                 } => {
                     let resolved_name = match name {
                         Some(n) => n.clone(),
@@ -397,6 +398,7 @@ impl SessionGraph {
                         resolved_name,
                         cwd.clone(),
                         initial_command.clone(),
+                        initial_window_title.clone(),
                     )
                     .map_err(|source| BatchError::OpFailed { op_index, source })?;
                     outputs.push(OpOutput {
@@ -1753,6 +1755,7 @@ fn stage_create_session(
     name: String,
     cwd: std::path::PathBuf,
     initial_command: Vec<String>,
+    initial_window_title: Option<String>,
 ) -> Result<(SessionId, WindowId, PaneId, Vec<EventData>), GraphError> {
     SessionGraph::validate_session_name(&name)?;
     if snapshot.session_name_exists(&name) {
@@ -1772,7 +1775,8 @@ fn stage_create_session(
     };
     pane.id = pane_id;
 
-    let mut window = Window::new(SessionId::new(), "1", pane_id);
+    let title = initial_window_title.unwrap_or_else(|| "1".to_string());
+    let mut window = Window::new(SessionId::new(), &title, pane_id);
     window.id = window_id;
 
     let session_name = name.clone();
@@ -1792,7 +1796,7 @@ fn stage_create_session(
         EventData::WindowCreated {
             window_id,
             session_id,
-            title: "1".into(),
+            title,
         },
         EventData::PaneCreated {
             pane_id,
@@ -3758,6 +3762,7 @@ mod tests {
                 name: Some("agent-conductor".into()),
                 cwd: home(),
                 initial_command: vec!["claude".into(), "-p".into(), "refactor auth".into()],
+                initial_window_title: None,
             }])
             .expect("apply succeeds");
 
@@ -3819,6 +3824,7 @@ mod tests {
                     name: Some("workspace".into()),
                     cwd: home(),
                     initial_command: vec![],
+                    initial_window_title: None,
                 },
                 Op::CreateWindow {
                     session: SessionRef::BackRef { op_index: 0 },
@@ -3902,11 +3908,13 @@ mod tests {
                 name: Some("workspace-a".into()),
                 cwd: home(),
                 initial_command: vec![],
+                initial_window_title: None,
             },
             Op::CreateSession {
                 name: Some("existing".into()), // will fail: name conflict
                 cwd: home(),
                 initial_command: vec![],
+                initial_window_title: None,
             },
         ]);
 

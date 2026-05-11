@@ -8,6 +8,7 @@ members = [
     "crates/shux-rpc",
     "crates/shux-plugin",
     "crates/shux-ui",
+    "crates/shux-raster",
 ]
 
 [workspace.package]

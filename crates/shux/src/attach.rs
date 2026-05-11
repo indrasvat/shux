@@ -322,8 +322,10 @@ async fn apply_resize_to_window(
     };
 
     // Drain the resizer senders out from under the lock so we never await
-    // a channel send while still holding the PaneIoState mutex.
-    let mut to_send: Vec<(mpsc::Sender<PtySize>, PtySize)> = Vec::new();
+    // a channel send while still holding the PaneIoState mutex. Attach
+    // fan-out is fire-and-forget (ack=None); the synchronous path is
+    // `pane.set_size` RPC which constructs its own oneshot.
+    let mut to_send: Vec<(mpsc::Sender<crate::ResizeRequest>, PtySize)> = Vec::new();
 
     if win.layout.is_zoomed() {
         // Zoomed: every pane in the tree reports the full content area
@@ -348,7 +350,7 @@ async fn apply_resize_to_window(
     }
 
     for (tx, size) in to_send {
-        let _ = tx.send(size).await;
+        let _ = tx.send(crate::ResizeRequest { size, ack: None }).await;
     }
 }
 

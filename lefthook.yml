@@ -12,11 +12,21 @@ pre-commit:
       glob: "*.rs"
       run: make clippy
 
+# pre-push mirrors CI exactly so a clean local push survives CI:
+#   - `make test`       → matches CI Test job (`cargo nextest run --workspace`)
+#   - `make test-doc`   → matches CI Test job's doc-test step
+#   - `make deny`       → matches CI Deny job (strict — was `deny-soft` until
+#                         a license issue slipped through to CI; pushes now
+#                         block on cargo-deny rejections).
+#   - `make check-progress` is local-only (CI doesn't gate on PROGRESS.md
+#     updates but the team policy does).
 pre-push:
   commands:
     progress-check:
       run: make check-progress
     test:
       run: make test
+    test-doc:
+      run: make test-doc
     deny:
-      run: make deny-soft
+      run: make deny
