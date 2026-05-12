@@ -928,6 +928,7 @@ impl SessionGraph {
         self.commit_snapshot(snapshot);
         self.fire(EventData::WindowRenamed {
             window_id: id,
+            session_id,
             old_title,
             new_title: event_new_title,
         });

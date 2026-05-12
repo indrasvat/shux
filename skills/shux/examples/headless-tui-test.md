@@ -42,31 +42,28 @@ mkdir -p "$OUT"
 ENTER=$(printf '\r' | base64)
 TAB=$(printf '\t' | base64)
 
-cleanup () { "$SHUX" kill -s "$SESSION" >/dev/null 2>&1 || true; }
+cleanup () { "$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 # Spawn. Deterministic clock so any TUI time-rendering stays stable.
-RESP=$(SOURCE_DATE_EPOCH=1700000000 "$SHUX" api session.create '{
-  "name": "visual-test",
-  "command": ["mytui", "--no-network", "--fixtures-dir=tests/fixtures"]
-}')
-PID=$(printf '%s' "$RESP" | jq -r .result.pane_id)
+SOURCE_DATE_EPOCH=1700000000 \
+  "$SHUX" session create "$SESSION" -d -- mytui --no-network --fixtures-dir=tests/fixtures
 
 # Fixed dims so snapshots are byte-comparable.
-"$SHUX" api pane.set_size "{\"pane_id\":\"$PID\",\"cols\":160,\"rows\":48}" >/dev/null
+"$SHUX" pane set-size -s "$SESSION" --cols 160 --rows 48 >/dev/null
 
 snap () {
   local label="$1"
-  "$SHUX" snapshot -s visual-test -o "$OUT/${label}.png" --cols 160 --rows 48 >/dev/null
+  "$SHUX" pane snapshot -s "$SESSION" -o "$OUT/${label}.png" --cols 160 --rows 48 >/dev/null
 }
 
 # Drive — same sequence every run.
 sleep 3                                 ; snap 01_loaded
-"$SHUX" api pane.send_keys "{\"pane_id\":\"$PID\",\"text\":\"j\"}" >/dev/null
+"$SHUX" pane send-keys -s "$SESSION" --text 'j' >/dev/null
 sleep 0.5                               ; snap 02_after_j
-"$SHUX" api pane.send_keys "{\"pane_id\":\"$PID\",\"data\":\"$ENTER\"}" >/dev/null
+"$SHUX" pane send-keys -s "$SESSION" --data "$ENTER" >/dev/null
 sleep 2                                 ; snap 03_detail_open
-"$SHUX" api pane.send_keys "{\"pane_id\":\"$PID\",\"data\":\"$TAB\"}" >/dev/null
+"$SHUX" pane send-keys -s "$SESSION" --data "$TAB" >/dev/null
 sleep 0.5                               ; snap 04_next_tab
 
 # Diff. The comparator below is from references/scenarios.md — feel free

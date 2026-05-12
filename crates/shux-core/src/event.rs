@@ -186,6 +186,13 @@ pub enum EventData {
     /// A window was renamed.
     WindowRenamed {
         window_id: WindowId,
+        /// Owning session — populated so plugins reacting to a
+        /// rename can address the session without an extra
+        /// `session.list` round-trip. Codex v5 dogfood: this was
+        /// the loudest "what was painful" — recovering session_id
+        /// for a preexisting window required an async correlation
+        /// inside the plugin loop.
+        session_id: SessionId,
         old_title: String,
         new_title: String,
     },
@@ -543,6 +550,7 @@ mod tests {
         assert_eq!(
             EventData::WindowRenamed {
                 window_id: wid,
+                session_id: sid,
                 old_title: "a".into(),
                 new_title: "b".into(),
             }

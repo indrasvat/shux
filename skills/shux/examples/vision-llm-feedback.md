@@ -32,17 +32,16 @@ while [ $iteration -lt 10 ]; do
 
   go build -o ./mytui ./cmd/mytui
 
-  $SHUX kill -s "$SESSION" >/dev/null 2>&1 || true
-  RESP=$($SHUX api session.create "{\"name\":\"$SESSION\",\"command\":[\"./mytui\"]}")
-  PID=$(printf '%s' "$RESP" | jq -r .result.pane_id)
-  $SHUX api pane.set_size "{\"pane_id\":\"$PID\",\"cols\":160,\"rows\":48}" >/dev/null
+  $SHUX session kill "$SESSION" >/dev/null 2>&1 || true
+  $SHUX session create "$SESSION" -d -- ./mytui
+  $SHUX pane set-size -s "$SESSION" --cols 160 --rows 48 >/dev/null
   sleep 2
 
   snap_path="iter_${iteration}.png"
-  $SHUX api pane.snapshot "{\"pane_id\":\"$PID\"}" \
-    | jq -r .result.png_base64 | base64 -d > "$snap_path"
+  $SHUX --format json pane snapshot -s "$SESSION" \
+    | jq -r .png_base64 | base64 -d > "$snap_path"
 
-  $SHUX kill -s "$SESSION" >/dev/null
+  $SHUX session kill "$SESSION" >/dev/null
 
   # Hand the snapshot to your vision model.
   critique=$(claude --vision "$snap_path" "$(cat <<'EOF'

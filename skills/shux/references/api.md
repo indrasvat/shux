@@ -182,7 +182,7 @@ active window.
   "format": "png" }
 ```
 
-Use this for full-window visual regression (single PNG per `shux apply`
+Use this for full-window visual regression (single PNG per `shux state apply`
 run vs a golden). Use `pane.snapshot` when you only care about one pane
 and want to skip border / status-bar composition.
 

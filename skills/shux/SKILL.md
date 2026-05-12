@@ -44,7 +44,7 @@ Run `shux init` once per project. It creates a top-level `.shux/` dir:
 
 When you write code that produces shux artifacts:
 
-- Put **templates** under `.shux/templates/` (apply with `shux apply .shux/templates/<name>.toml`).
+- Put **templates** under `.shux/templates/` (apply with `shux state apply .shux/templates/<name>.toml`).
 - Put **driver scripts** under `.shux/scripts/`.
 - Write **snapshots, diffs, debug logs** into `.shux/out/` (gitignored by default).
 - Commit **golden images** to `.shux/goldens/` so visual-regression diffs have a ground truth.
@@ -202,6 +202,6 @@ shutdown grace, UUID vs name rule, what's not in v0 — lives in
 - `pane.set_size` is synchronous (oneshot ack). The next `pane.snapshot` sees the new dims. No sleep needed between them.
 - `pane.snapshot` caps the output at 16M pixels (~4000×4000). Resize first if you'd exceed.
 - `pane.send_keys --text` is JSON-quoted text. For raw control bytes (Esc/Enter/Tab/Ctrl+letter), use `--data` with base64.
-- `shux apply foo.toml` atomically commits the graph but PTY spawn outcomes are reported per-pane in `spawn_results`. A spawn failure does not roll back the graph.
+- `shux state apply foo.toml` atomically commits the graph but PTY spawn outcomes are reported per-pane in `spawn_results`. A spawn failure does not roll back the graph.
 - The first pane of the first template window is folded into the session's auto-created initial window — there is no phantom default-shell pane.
 - The bundled font (JetBrains Mono Regular, OFL-1.1) is monochrome. Color emoji and CJK glyphs render as `.notdef` tofu in the current rasterizer (P2 roadmap).
