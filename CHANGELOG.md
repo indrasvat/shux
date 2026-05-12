@@ -1,3 +1,10 @@
+# [0.14.0](https://github.com/indrasvat/shux/compare/v0.13.0...v0.14.0) (2026-05-12)
+
+
+### Features
+
+* **plugin:** process plugin host v0 — Pi-style agent-authored extensions ([#23](https://github.com/indrasvat/shux/issues/23)) ([e5ee857](https://github.com/indrasvat/shux/commit/e5ee857905ea4970bcf6b8e9f063da386d6b45b7)), closes [#plugins](https://github.com/indrasvat/shux/issues/plugins)
+
 # [0.13.0](https://github.com/indrasvat/shux/compare/v0.12.0...v0.13.0) (2026-05-12)
 
 
