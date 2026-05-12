@@ -904,7 +904,7 @@ command = ["lazygit"]
 <section class="section">
   <div class="wrap">
     <p class="eyebrow">in the wild</p>
-    <h2 class="measure">Seven tabs. Real <code>pane.snapshot</code> outputs, no mockups.</h2>
+    <h2 class="measure">Eight tabs. Real <code>pane.snapshot</code> outputs, no mockups.</h2>
     <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
       No mockups. No "rendered in After Effects". Pick a tab to see
       what shux's rasterizer produces when an agent drives a real TUI.
@@ -914,35 +914,40 @@ command = ["lazygit"]
       <div class="gallery-tabs" role="tablist" aria-label="shux gallery">
         <button role="tab" class="gallery-tab is-active" data-i="0" aria-selected="true">
           <span class="g-dot live"></span>
+          <span class="g-name">Three agents, one rasterizer</span>
+          <span class="g-meta">claude · codex · opencode</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="1" aria-selected="false">
+          <span class="g-dot"></span>
           <span class="g-name">Agent driving a TUI</span>
           <span class="g-meta">animated · 7 frames</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="1" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Multi-pane workspace</span>
           <span class="g-meta">animated · 5 frames · tmux-style</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Inside <code>shux attach</code></span>
           <span class="g-meta">status bar + borders · live</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Syntax-highlighted source</span>
           <span class="g-meta">bat · rust</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Self-documenting CLI</span>
           <span class="g-meta">shux --help</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="6" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Agent drives a REPL</span>
           <span class="g-meta">python3 · pyrepl</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="6" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="7" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Pixel + attribute coverage</span>
           <span class="g-meta">shux-raster</span>
@@ -951,6 +956,26 @@ command = ["lazygit"]
 
       <div class="gallery-stage">
         <figure class="gallery-panel is-active" data-i="0" role="tabpanel">
+          <a class="zoom-link" href="/screenshots/multi-agent.png" rel="noopener" aria-label="open image at full size in a new tab">
+            <img src="/screenshots/multi-agent.png" alt="Three real pane.snapshot frames stitched horizontally — Claude Code v2.1.139 with the prompt 'Refactor this Rust Fibonacci impl for clarity'; OpenAI Codex v0.130.0 showing model line, a /fast tip, and a hooks-review notice with 'Find the memory leak in this Node.js worker' queued; opencode's big block-letter splash with 'Audit this Python for thread-safety risks' and a live MCP indicator. All three rendered by the same shux-raster." width="2514" height="627" loading="lazy">
+          </a>
+          <figcaption>
+            <b>One rasterizer. Three of the agents you actually use.</b>
+            Claude Code, OpenAI Codex, and opencode each spawned in a
+            fresh ephemeral cwd via <code>shux api session.create</code>,
+            a demo prompt typed in via <code>pane.send_keys</code>, then
+            snapshotted with <code>shux snapshot</code>. The trust dialog
+            on Codex was dismissed with a raw <code>\r</code> over the
+            same RPC — no terminal emulator in the loop, no screen
+            scraping, no fragile <code>expect</code>. Stitched into one
+            PNG with <code>magick montage</code> for the gallery; each
+            frame is a real <code>pane.snapshot</code> on its own. This
+            is the surface area an agent harness gets: spawn any TUI
+            agent, drive it like a UI, get pixels back.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="1" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/anim-lazygit-drive.png" rel="noopener" aria-label="open image at full size in a new tab">
             <img src="/screenshots/anim-lazygit-drive.png" alt="7-frame animated replay of an agent driving lazygit: opening view → commits log → diff of one commit → branches → remotes → help overlay → back to files. Pointed at a freshly-cloned charmbracelet/bubbletea repo." width="880" height="520" loading="lazy">
           </a>
@@ -967,7 +992,7 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="1" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/anim-multipane.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy"></a>
           <figcaption>
@@ -988,7 +1013,7 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/statusbar-demo.png" rel="noopener" aria-label="open image at full size">
             <img src="/screenshots/statusbar-demo.png" alt="shux attached to a 2-pane session named 'demo' showing lazygit (left) and bat rendering bubbletea's README (right), with focus-highlighted borders and shux's own three-zone status bar at the bottom" width="1620" height="912" loading="lazy">
           </a>
@@ -1005,7 +1030,7 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/08-bat.png" rel="noopener" aria-label="open image at full size">
           <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy"></a>
           <figcaption>
@@ -1016,9 +1041,9 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/09-help.png" rel="noopener" aria-label="open image at full size in a new tab">
-          <img src="/screenshots/09-help.png" alt="shux --help rendered in shux's brand colours — every `shux <verb>` in bold terracotta, RPC method names in green, dim arrows and comments, underlined terracotta URLs" width="1080" height="1292" loading="lazy"></a>
+          <img src="/screenshots/09-help.png" alt="shux --help rendered in shux's brand colours — terracotta banner, terracotta shux brand token, bold section header, dim bullets listing the four core features, green Usage and Commands headers, green subcommand verbs" width="1080" height="684" loading="lazy"></a>
           <figcaption>
             <b><code>shux --help</code></b> — the long-form help is a paste-able agent
             reference: every CLI verb mapped to its RPC method, a 3-call workflow, the
@@ -1027,7 +1052,7 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="6" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/05-tests.png" alt="A Python 3.13 REPL session with PyREPL syntax highlighting, showing an agent progressively driving the REPL through computations: importing math/statistics, computing roots, fitting a tiny dataset, defining a primes lambda, and inspecting the result list" width="1620" height="912" loading="lazy"></a>
           <figcaption>
@@ -1040,7 +1065,7 @@ command = ["lazygit"]
           </figcaption>
         </figure>
 
-        <figure class="gallery-panel" data-i="6" role="tabpanel" hidden>
+        <figure class="gallery-panel" data-i="7" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/06-raster-hello.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy"></a>
           <figcaption>
