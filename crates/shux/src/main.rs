@@ -345,6 +345,7 @@ fn main() -> anyhow::Result<()> {
     // only accepts a `&'static str` literal there, so we set it here.
     let cmd = Cli::command()
         .before_help(style::banner())
+        .long_about(cli::long_about())
         .after_long_help(cli::agent_help());
     let matches = cmd.get_matches();
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());

@@ -94,14 +94,15 @@ shux apply spec.toml      # atomic — all or nothing
 |--                                                |--                                              |--                                                          |
 | `tmux` · `screen` · `byobu`                      | Multiplex sessions / windows / panes           | `shux apply spec.toml` · `shux attach`                     |
 | iTerm2 (Python SDK / AppleScript)                | Drive a terminal app from outside              | `pane.send_keys` + `pane.snapshot`                         |
-| `expect` · `pexpect` · `sexpect`                 | Scripted CLI / REPL interaction                | Loop of `send_keys` / `wait` / `snapshot`                  |
-| `asciinema rec`                                  | Record a terminal session                      | `pane.output.watch` (sealed data-plane stream)             |
-| `vhs` · `agg` · `terminalizer`                   | Generate TUI demo GIFs / WebPs                 | `pane.snapshot` loop → `ffmpeg`                            |
-| `termshot` · `freezeframe`                       | Still PNG of a terminal frame                  | `pane.snapshot`                                            |
+| `expect` · `pexpect` · `sexpect`                 | Scripted CLI / REPL interaction                | `pane.send_keys` → `pane.wait_for` → `pane.capture`        |
+| iTerm2 `wait_for_text` / `wait_for_absent`       | Block until screen contains (or stops containing) a needle | `pane.wait_for` (text · regex · `--absent`)                |
+| `asciinema rec` · `script(1)`                    | Record a terminal session                      | `pane.output.watch` (sealed data-plane stream)             |
+| `vhs` · `agg` · `terminalizer`                   | Generate TUI demo GIFs / WebPs                 | `window.snapshot` loop → `ffmpeg`                          |
+| `termshot` · `freezeframe`                       | Still PNG of a terminal frame                  | `pane.snapshot` or `window.snapshot`                       |
 | iTerm2 broadcast input                           | Send keystrokes to many panes at once          | `pane.send_keys` fan-out (one RPC per pane)                |
 | `ttyrec` · `termsh`                              | Replay a recorded session                      | Re-feed VT bytes through a fresh pane → `pane.snapshot`    |
 | GNU parallel `--tmux` mode                       | Run N tasks in N panes, watch in one place     | Template with N panes + RPC orchestrator                   |
-| Custom Bubbletea / ratatui test harness          | Visual regression for your TUI                 | `pane.snapshot` + golden-image diff (SSIM or raw RGBA)     |
+| Custom Bubbletea / ratatui test harness          | Visual regression for your TUI                 | `window.snapshot` + golden-image diff (SSIM or raw RGBA)   |
 
 ## The common RPC surface
 

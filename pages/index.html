@@ -809,22 +809,27 @@ command = ["lazygit"]
         <tr>
           <td data-label="if you'd reach for"><code>expect</code> · <code>pexpect</code> · <code>sexpect</code></td>
           <td data-label="for this job">Scripted CLI / REPL interaction</td>
-          <td data-label="the shux call"><code>pane.send_keys</code> loop with <code>pane.capture</code> assertions <span class="muted">— workflow</span></td>
+          <td data-label="the shux call"><code>pane.send_keys</code> → <code>pane.wait_for</code> → <code>pane.capture</code></td>
         </tr>
         <tr>
-          <td data-label="if you'd reach for"><code>asciinema rec</code></td>
+          <td data-label="if you'd reach for">iTerm2 <code>wait_for_text</code> / <code>wait_for_absent</code></td>
+          <td data-label="for this job">Block until screen contains (or stops containing) a needle</td>
+          <td data-label="the shux call"><code>pane.wait_for</code> <span class="muted">— text · regex · <code>--absent</code></span></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for"><code>asciinema rec</code> · <code>script(1)</code></td>
           <td data-label="for this job">Record a terminal session</td>
           <td data-label="the shux call"><code>pane.output.watch</code> data-plane stream</td>
         </tr>
         <tr>
           <td data-label="if you'd reach for"><code>vhs</code> · <code>agg</code> · <code>terminalizer</code></td>
           <td data-label="for this job">Generate TUI demo GIFs / WebPs</td>
-          <td data-label="the shux call"><code>pane.snapshot</code> loop → <code>ffmpeg</code></td>
+          <td data-label="the shux call"><code>window.snapshot</code> loop → <code>ffmpeg</code></td>
         </tr>
         <tr>
           <td data-label="if you'd reach for"><code>termshot</code> · <code>freezeframe</code></td>
           <td data-label="for this job">Still PNG of a terminal frame</td>
-          <td data-label="the shux call"><code>pane.snapshot</code></td>
+          <td data-label="the shux call"><code>pane.snapshot</code> <span class="muted">or</span> <code>window.snapshot</code></td>
         </tr>
         <tr>
           <td data-label="if you'd reach for">iTerm2 broadcast input</td>
@@ -844,7 +849,7 @@ command = ["lazygit"]
         <tr>
           <td data-label="if you'd reach for">Custom Bubbletea / ratatui test harness</td>
           <td data-label="for this job">Visual regression for your TUI</td>
-          <td data-label="the shux call"><code>pane.snapshot</code> + golden-image diff</td>
+          <td data-label="the shux call"><code>window.snapshot</code> + golden-image diff</td>
         </tr>
       </tbody>
     </table>
