@@ -462,7 +462,7 @@ async fn test_cli_ls_against_server() {
     let (socket_path, cancel) = start_test_server(dir.path()).await;
 
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
-        .args(["--socket", socket_path.to_str().unwrap(), "ls"])
+        .args(["--socket", socket_path.to_str().unwrap(), "session", "list"])
         .output()
         .await
         .unwrap();
@@ -493,7 +493,8 @@ async fn test_cli_ls_json_against_server() {
             "json",
             "--socket",
             socket_path.to_str().unwrap(),
-            "ls",
+            "session",
+            "list",
         ])
         .output()
         .await
@@ -524,7 +525,8 @@ async fn test_cli_api_raw_against_server() {
         .args([
             "--socket",
             socket_path.to_str().unwrap(),
-            "api",
+            "rpc",
+            "call",
             "system.health",
         ])
         .output()
@@ -559,12 +561,16 @@ fn test_cli_help_no_daemon() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("terminal multiplexer"));
-    assert!(stdout.contains("new"));
-    assert!(stdout.contains("attach"));
-    assert!(stdout.contains("ls"));
-    assert!(stdout.contains("kill"));
-    assert!(stdout.contains("window"));
-    assert!(stdout.contains("api"));
+    // After the May 2026 CLI overhaul every noun is namespaced.
+    // No more top-level `new/ls/kill/rename/attach/api/apply`.
+    for namespace in [
+        "session", "window", "pane", "plugin", "events", "state", "rpc",
+    ] {
+        assert!(
+            stdout.contains(namespace),
+            "expected `{namespace}` namespace in --help output, got: {stdout}"
+        );
+    }
     assert!(stdout.contains("version"));
 }
 
@@ -585,16 +591,25 @@ fn test_cli_invalid_subcommand() {
 }
 
 #[test]
-fn test_cli_kill_requires_session() {
-    let output = shux_bin().arg("kill").output().unwrap();
+fn test_cli_session_kill_requires_target() {
+    // `shux session kill` with no positional/--session must fail.
+    let output = shux_bin().args(["session", "kill"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("--session"));
+    // Either clap rejects (no required), or dispatch reports missing.
+    assert!(
+        stderr.contains("session") || stderr.contains("required") || stderr.contains("missing"),
+        "expected clear error for missing session target, got: {stderr}"
+    );
 }
 
 #[test]
-fn test_cli_list_alias() {
-    let output = shux_bin().args(["list", "--help"]).output().unwrap();
+fn test_cli_session_ls_alias_help() {
+    // `shux session ls` is the documented alias for `session list`.
+    let output = shux_bin()
+        .args(["session", "ls", "--help"])
+        .output()
+        .unwrap();
     assert!(output.status.success());
 }
 

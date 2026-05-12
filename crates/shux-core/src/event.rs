@@ -170,6 +170,10 @@ pub enum EventData {
         window_id: WindowId,
         session_id: SessionId,
         title: String,
+        /// Position in the session's window list at creation time.
+        /// Plugins use this to render `[index]` prefixes without
+        /// having to call `window.list` for round-trip context.
+        index: u32,
     },
 
     /// A window became the active window in its session.
@@ -182,6 +186,13 @@ pub enum EventData {
     /// A window was renamed.
     WindowRenamed {
         window_id: WindowId,
+        /// Owning session — populated so plugins reacting to a
+        /// rename can address the session without an extra
+        /// `session.list` round-trip. Codex v5 dogfood: this was
+        /// the loudest "what was painful" — recovering session_id
+        /// for a preexisting window required an async correlation
+        /// inside the plugin loop.
+        session_id: SessionId,
         old_title: String,
         new_title: String,
     },
@@ -522,6 +533,7 @@ mod tests {
                 window_id: wid,
                 session_id: sid,
                 title: "t".into(),
+                index: 0,
             }
             .event_type(),
             "window.created"
@@ -538,6 +550,7 @@ mod tests {
         assert_eq!(
             EventData::WindowRenamed {
                 window_id: wid,
+                session_id: sid,
                 old_title: "a".into(),
                 new_title: "b".into(),
             }

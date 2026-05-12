@@ -122,7 +122,7 @@
 .device-bar .url {
   flex: 1; text-align: center; opacity: 0.65;
 }
-.device-bar .url::before { content: "shux api pane.snapshot"; }
+.device-bar .url::before { content: "shux pane snapshot"; }
 .device-screen {
   position: relative;
   aspect-ratio: 1800 / 1140;
@@ -728,7 +728,7 @@
 
     <div class="code-panel" style="margin-top:var(--s-6)">
       <pre><code><span style="color:var(--ink2-on-paper)"># 1 — declarative session spec (TOML).</span>
-<span style="color:var(--ink2-on-paper)"># Same spec a human <code>shux apply</code>'s — same one an agent ships.</span>
+<span style="color:var(--ink2-on-paper)"># Same spec a human <code>shux state apply</code>'s — same one an agent ships.</span>
 
 [session]
 name = "review"
@@ -738,21 +738,25 @@ title = "git"
 [[windows.panes]]
 command = ["lazygit"]
 
-<span style="color:var(--accent)">$ shux apply review.toml</span>
+<span style="color:var(--accent)">$ shux state apply review.toml</span>
 <span style="color:var(--ink2-on-paper)"># → session created atomically. Pluck the first pane id:</span>
-<span style="color:var(--accent)">$ PID=$(shux api session.list \
-        | jq -r '.result.sessions[0].pane_id')</span>
+<span style="color:var(--accent)">$ PID=$(shux --format json session list \
+        | jq -r '.sessions[0].pane_id')</span>
 
-<span style="color:var(--accent)">$ shux api pane.set_size "{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}"</span>
+<span style="color:var(--accent)">$ shux pane set-size  -s review --cols 200 --rows 60</span>
 <span style="color:var(--ink2-on-paper)"># → synchronous resize (VT + PTY).</span>
 
-<span style="color:var(--accent)">$ shux api pane.send_keys "{\"pane_id\":\"$PID\",\"text\":\"j\"}"</span>
+<span style="color:var(--accent)">$ shux pane send-keys -s review --text 'j'</span>
 <span style="color:var(--ink2-on-paper)"># → navigate down one row.</span>
 
-<span style="color:var(--accent)">$ shux api pane.snapshot "{\"pane_id\":\"$PID\"}" \
-    | jq -r .result.png_base64 \
+<span style="color:var(--accent)">$ shux --format json pane snapshot -s review \
+    | jq -r .png_base64 \
     | base64 -d &gt; out.png</span>
-<span style="color:var(--ink2-on-paper)"># → 1800×1140 PNG of the current pane. No iTerm2 needed.</span></code></pre>
+<span style="color:var(--ink2-on-paper)"># → 1800×1140 PNG of the current pane. No iTerm2 needed.</span>
+
+<span style="color:var(--ink2-on-paper)"># Or drop to raw RPC for any registered method — no shell-escaping bait.</span>
+<span style="color:var(--accent)">$ shux rpc call pane.send_keys --params @keys.json</span>
+<span style="color:var(--accent)">$ echo '{"pane_id":"'$PID'","text":"j"}' | shux rpc call pane.send_keys --params -</span></code></pre>
 
       <div class="annot">
         <h3>The full surface</h3>
@@ -800,7 +804,7 @@ command = ["lazygit"]
         <tr>
           <td data-label="if you'd reach for"><code>tmux</code> · <code>screen</code> · <code>byobu</code></td>
           <td data-label="for this job">Multiplex sessions / windows / panes</td>
-          <td data-label="the shux call"><code>shux apply spec.toml</code> · <code>shux attach</code></td>
+          <td data-label="the shux call"><code>shux state apply spec.toml</code> · <code>shux session attach</code></td>
         </tr>
         <tr>
           <td data-label="if you'd reach for">iTerm2 (Python SDK / AppleScript)</td>
@@ -963,7 +967,7 @@ command = ["lazygit"]
           <figcaption>
             <b>One rasterizer. Three of the agents you actually use.</b>
             Claude Code, OpenAI Codex, and opencode each spawned in a
-            fresh ephemeral cwd via <code>shux api session.create</code>,
+            fresh ephemeral cwd via <code>shux session create</code>,
             a demo prompt typed in via <code>pane.send_keys</code>, then
             snapshotted with <code>shux snapshot</code>. The trust dialog
             on Codex was dismissed with a raw <code>\r</code> over the
@@ -982,7 +986,7 @@ command = ["lazygit"]
           </a>
           <figcaption>
             <b>One scenario, scripted entirely through JSON-RPC.</b>
-            <code>shux api session.create</code> spawns
+            <code>shux session create</code> spawns
             <code>lazygit</code> in a freshly-cloned public repo. Then
             navigate the commit log, open a diff with <kbd>Enter</kbd>,
             press <kbd>?</kbd> for the help overlay, cycle panels with
@@ -997,7 +1001,7 @@ command = ["lazygit"]
           <a class="zoom-link" href="/screenshots/anim-multipane.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy"></a>
           <figcaption>
-            <b>One <code>shux apply</code> spawns a 4-pane workspace</b> —
+            <b>One <code>shux state apply</code> spawns a 4-pane workspace</b> —
             <code>bat</code> on the editor, <code>cargo nextest</code> running tests,
             <code>shux --help</code> on the reference pane, a clock + git-log loop on
             the watch pane. The replay then sends arrow-down keystrokes
@@ -1006,7 +1010,7 @@ command = ["lazygit"]
             quadrants (<code>pane.swap</code>) — the same verbs as
             <code>tmux send-keys</code>, <code>tmux resize-pane</code>,
             <code>tmux swap-pane</code>, but typed.<br><br>
-            <span class="muted">Run <code>shux attach</code> on the same session and
+            <span class="muted">Run <code>shux session attach</code> on the same session and
             you get the interactive multiplexer view — focus-highlighted borders, a
             three-zone status bar (session · window · clock), mouse-aware pane focus,
             and Alt+h/j/k/l keyboard navigation. The headless RPC primitives you see
@@ -1020,7 +1024,7 @@ command = ["lazygit"]
           </a>
           <figcaption>
             <b>shux running shux.</b> The outer pane is a <code>pane.snapshot</code> of
-            an attached client running <code>shux attach -s demo</code> against a
+            an attached client running <code>shux session attach demo</code> against a
             separate 2-pane session. What you see — focus-highlighted borders, the
             <code>demo · 11/11 · ?</code> status bar across the bottom, the per-pane
             title overlays — is shux's own <code>RenderCompositor</code> output.
@@ -1107,13 +1111,10 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
         <div class="num">02</div>
         <div>
           <h3>Spawn a session</h3>
-          <p>One RPC creates an atomic session + initial window + pane,
+          <p>One verb creates an atomic session + initial window + pane,
           with the command of your choice running in it.</p>
-<pre><code>RESP=$(shux api session.create '{
-  "name": "demo",
-  "command": ["htop"]
-}')
-PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
+<pre><code>shux --format json session create demo -d -- htop \
+  | jq -r .pane_id  <span style="color:var(--ink2-on-paper)"># save PID for next step</span></code></pre>
         </div>
       </div>
 
@@ -1121,12 +1122,12 @@ PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
         <div class="num">03</div>
         <div>
           <h3>Snapshot</h3>
-          <p>One RPC returns a base64-encoded PNG of the live pane.
+          <p>One verb returns a base64-encoded PNG of the live pane.
           Decode and pipe it anywhere — a CI golden, a vision LLM, a
           webhook.</p>
           <div class="snap-proof">
-            <pre><code>shux api pane.snapshot "{\"pane_id\":\"$PID\"}" \
-  | jq -r .result.png_base64 \
+            <pre><code>shux --format json pane snapshot -s demo \
+  | jq -r .png_base64 \
   | base64 -d &gt; frame.png</code></pre>
             <figure class="snap-out">
               <img src="/screenshots/06-raster-hello.png" alt="example frame.png produced by pane.snapshot — shux-raster's attribute showcase" width="720" height="440" loading="lazy">
@@ -1178,10 +1179,10 @@ PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
 &nbsp;&nbsp;expect/asciinema for agent-driven workflows.<br><br>
 <b>Layout:</b> <code>shux init</code> scaffolds <code>.shux/</code><br>
 &nbsp;&nbsp;(<code>templates/</code>, <code>scripts/</code>, <code>goldens/</code>, gitignored <code>out/</code>).<br><br>
-<b>Quickstart:</b> three RPCs cover 80% of cases —<br>
-&nbsp;&nbsp;1. <code>shux apply .shux/templates/spec.toml</code><br>
-&nbsp;&nbsp;2. <code>shux api pane.send_keys '{...}'</code><br>
-&nbsp;&nbsp;3. <code>shux snapshot -s NAME -o .shux/out/frame.png</code>
+<b>Quickstart:</b> three verbs cover 80% of cases —<br>
+&nbsp;&nbsp;1. <code>shux state apply .shux/templates/spec.toml</code><br>
+&nbsp;&nbsp;2. <code>shux pane send-keys -s NAME --text '...'</code><br>
+&nbsp;&nbsp;3. <code>shux pane snapshot -s NAME -o .shux/out/frame.png</code>
       </div>
     </div>
   </div>

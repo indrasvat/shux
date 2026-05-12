@@ -153,12 +153,12 @@ Wants a stable, versioned API surface. Clear extension points. Good docs. Fast i
 shux ships as a **single binary** (`shux`) with subcommands. The daemon starts automatically on first use (like tmux's invisible server) and stays running. No separate `shuxd` install or management.
 
 ```text
-$ shux                     # attach to last session, or create "default"
-$ shux new -s work         # create session named "work"
-$ shux split -d v          # vertical split in current pane
-$ shux ls                  # list sessions
-$ shux attach -s work      # attach to "work"
-$ shux api serve           # explicitly start daemon (for systemd/launchd)
+$ shux                              # attach last session (TTY-only); JSON help otherwise
+$ shux session create work          # create session named "work"
+$ shux pane split -s work -d v      # vertical split in current pane
+$ shux session list                 # list sessions (alias: shux ses ls)
+$ shux session attach work          # attach to "work"
+$ shux rpc call system.version      # raw RPC fallthrough
 ```
 
 The daemon auto-exits when the last session is destroyed (configurable, with a 5-second grace timer to prevent flapping).
@@ -373,7 +373,7 @@ These are the features that make shux a usable daily-driver multiplexer AND a ca
 | **Panes** | Split (H/V), directional focus (up/down/left/right), resize (step + mouse drag), zoom/unzoom, close, swap. |
 | **Copy mode** | Enter, scroll (keyboard + mouse wheel), search (incremental forward/backward), line selection, copy to system clipboard. |
 | **Pane titles** | Manual set/unset, auto-title from running command/cwd (toggleable per pane). |
-| **Session templates** | Declarative TOML files defining layout + commands + themes. `shux apply <template>`. Parameterizable (cwd, env). |
+| **Session templates** | Declarative TOML files defining layout + commands + themes. `shux state apply <template>`. Parameterizable (cwd, env). |
 
 #### UX & keybindings
 
@@ -1259,38 +1259,48 @@ Event types: See Appendix A for complete taxonomy.
 
 ### 8.6 CLI ↔ API mapping
 
+**Invariant: RPC dots become CLI spaces.** Every noun is namespaced
+(`session`/`window`/`pane`/`plugin`/`events`/`state`); top-level
+shortcut verbs do not exist. Established May 2026 after a codex
+dogfood loop established repeated misprediction friction.
+
 ```bash
 # Sessions
-shux ls                                    # → session.list
-shux new -s work                           # → session.create {name: "work"}
-shux new -s work --ensure                  # → session.ensure {name: "work"}
-shux kill -s work                          # → session.kill
-shux attach -s work                        # → session.attach (starts TUI client)
+shux session list                            # → session.list (alias: ses ls)
+shux session create work                     # → session.create {name: "work"}
+shux session create --ensure work            # → session.ensure {name: "work"}
+shux session kill work                       # → session.kill
+shux session attach work                     # → (client-side TUI attach)
+
+# Windows
+shux window create -s work -n editor         # → window.create
+shux window list -s work                     # → window.list
+shux window snapshot -s work                 # → window.snapshot
 
 # Panes
-shux split -d v                            # → pane.split {direction: "vertical"}
-shux split -d h --cmd 'nvim'              # → pane.split {direction: "horizontal", command: ["nvim"]}
-shux run -p <id> -- make test              # → pane.run_command (waits; returns exit code + output)
-shux capture -p <id> --lines 100           # → pane.capture
-
-# Theming
-shux theme ls                              # → theme.list
-shux theme set -p <id> prod                # → pane.set_theme {theme: "prod"}
+shux pane split -s work -d vertical          # → pane.split
+shux pane split -s work -d horizontal -- nvim  # → pane.split {command: ["nvim"]}
+shux pane send-keys -s work --text 'j'       # → pane.send_keys
+shux pane capture -s work --lines 100        # → pane.capture
+shux pane snapshot -s work                   # → pane.snapshot
+shux pane wait-for -s work --text 'ready'    # → pane.wait_for
 
 # Events
-shux events watch                          # → events.watch (all events, JSON lines)
-shux events watch --filter pane.output     # → events.watch (filtered)
+shux events watch                            # → events.watch (all events, JSON lines)
+shux events watch --filter pane.output       # → events.watch (filtered)
+shux events history --count 50               # → events.history
 
 # Plugins
-shux plugin ls                             # → plugin.list
-shux plugin enable com.example.git-status  # → plugin.enable
-shux plugin reload com.example.git-status  # → plugin.reload
+shux plugin install ./plugin.py              # → plugin.install (hot reload on)
+shux plugin list                             # → plugin.list
+shux plugin reload <name>                    # → plugin.reload
+shux plugin kill <name>                      # → plugin.kill
 
-# Templates
-shux apply ./my-project.toml               # → state.apply (from template file)
+# State (atomic batch operations)
+shux state apply ./my-project.toml           # → state.apply (from template)
 
-# Diagnostics
-shux doctor                                # → diagnose.run
+# Raw RPC fallthrough (any registered method)
+shux rpc call <method> --params @file        # inline JSON, @file, or - (stdin)
 
 # All non-interactive commands support:
 #   --format json|text     (default: text for humans, json for piping)
@@ -1645,7 +1655,7 @@ At client attach time, build a `ClientCaps` struct:
 
 **Test layers**: L1, L2
 
-**Done when**: `shux new -s test` → starts daemon, creates session, attaches TUI. Typing works. Detach/reattach works. `shux api system.version --format json` works.
+**Done when**: `shux session create test` → starts daemon, creates session, attaches TUI. Typing works. Detach/reattach works. `shux --format json rpc call system.version` works.
 
 ### M1: Daily-driver core (weeks 4-7)
 

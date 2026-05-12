@@ -1,8 +1,10 @@
 //! shux plugin host — process plugins, JSON-RPC over stdin/stdout.
 //!
-//! Task 044a (phase 0): protocol + spawn + manual install. No hot
-//! reload, no override-by-name, no event interception, no sandbox.
-//! See docs/tasks/044a-process-plugins-v0.md for the full plan.
+//! Task 044a (phase 0): protocol + spawn + install + hot reload via
+//! a filesystem watcher (debounced kill+respawn on every save). No
+//! override-by-name, no event interception, no sandbox yet — those
+//! land in subsequent phases. See `docs/tasks/044a-process-plugins-v0.md`
+//! for the full plan.
 //!
 //! Wire model:
 //! - Daemon → plugin: lines on the child's stdin.
@@ -61,6 +63,11 @@ pub struct PluginInfo {
     pub subscribes: Vec<String>,
     pub provides: Vec<String>,
     pub last_error: Option<String>,
+    /// `true` if the plugin's source file is being watched for
+    /// changes; on every save the daemon kills and respawns the
+    /// process so the edit lands in <500ms.
+    #[serde(default)]
+    pub watching: bool,
 }
 
 /// How to spawn a plugin executable.
@@ -69,6 +76,10 @@ pub struct PluginSource {
     pub path: PathBuf,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    /// Watch `path` for modifications and respawn the plugin on
+    /// every save. Default `false` for backwards compatibility;
+    /// `shux plugin install` sets it `true` unless `--no-watch`.
+    pub watch: bool,
 }
 
 impl PluginSource {
@@ -77,7 +88,13 @@ impl PluginSource {
             path: path.into(),
             args: Vec::new(),
             cwd: None,
+            watch: false,
         }
+    }
+
+    pub fn with_watch(mut self, watch: bool) -> Self {
+        self.watch = watch;
+        self
     }
 }
 
@@ -104,6 +121,10 @@ struct Running {
     pid: Option<u32>,
     last_error: Arc<Mutex<Option<String>>>,
     _join: JoinHandle<()>,
+    /// Cancellation flag for the file-watcher task (when `source.watch`
+    /// is true). Set to `true` on kill/reload to stop the watcher
+    /// before it triggers another reload on the now-dead plugin.
+    watch_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Plugin host. Cheap to clone (Arc internally).
@@ -242,6 +263,29 @@ impl PluginManager {
             subscribes: manifest.subscribes.clone(),
             provides: manifest.provides.clone(),
             last_error: None,
+            watching: false,
+        };
+
+        // Hot reload: if `source.watch` is true, spawn a filesystem
+        // watcher that drops + reinstalls the plugin on every save.
+        // Cancellation flag lives in the Running entry so kill() and
+        // reload() can stop the watcher before triggering a respawn
+        // on a dead plugin entry.
+        let watch_cancel = if source.watch {
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            spawn_reload_watcher(
+                self.clone(),
+                manifest.name.clone(),
+                source.clone(),
+                cancel.clone(),
+            );
+            Some(cancel)
+        } else {
+            None
+        };
+        let info = PluginInfo {
+            watching: watch_cancel.is_some(),
+            ..info
         };
 
         let running = Running {
@@ -253,12 +297,57 @@ impl PluginManager {
             pid,
             last_error,
             _join: join,
+            watch_cancel,
         };
 
         inner.insert(manifest.name.clone(), running);
         drop(inner);
         info!(plugin = %manifest.name, "plugin installed");
         Ok(info)
+    }
+
+    /// Drop the currently-installed plugin named `name` and respawn
+    /// it from the same source. The watch task calls this on every
+    /// save; users can also call it directly via `shux plugin
+    /// reload <name>` for a manual hot-reload.
+    pub async fn reload(&self, name: &str) -> Result<PluginInfo, PluginError> {
+        // Pull the source out under lock; the kill below also needs
+        // the lock so we drop it first.
+        let source = {
+            let inner = self.inner.lock().await;
+            inner
+                .get(name)
+                .ok_or_else(|| PluginError::NotFound(name.to_string()))?
+                .source
+                .clone()
+        };
+        self.kill(name).await?;
+        // Brief delay so the child reaps cleanly before respawn.
+        // Without this, `install` can race the old child's stdin
+        // close, and the new child sometimes inherits a stale
+        // file descriptor on macOS.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        match self.install(source.clone()).await {
+            Ok(info) => Ok(info),
+            Err(e) => {
+                // Install failed (handshake error, syntax error in the
+                // edited source, …) — but if the original was being
+                // watched, restart a fresh watcher so the next save can
+                // retry. Without this, `kill()`'s cancel-flag write
+                // tears down the watcher, the registry entry is gone,
+                // and the loop is dead even though the user is still
+                // saving the file. (Codex bot review, May 2026.)
+                if source.watch {
+                    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    spawn_reload_watcher(self.clone(), name.to_string(), source.clone(), cancel);
+                    info!(
+                        plugin = %name,
+                        "install failed during reload; watcher re-armed for next save"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Snapshot every running plugin.
@@ -281,6 +370,7 @@ impl PluginManager {
                 subscribes: r.manifest.subscribes.clone(),
                 provides: r.manifest.provides.clone(),
                 last_error: last,
+                watching: r.watch_cancel.is_some(),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -296,6 +386,13 @@ impl PluginManager {
             .remove(name)
             .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
 
+        // Stop any active file watcher BEFORE the kill so a save
+        // racing with `shux plugin kill` doesn't respawn a plugin
+        // that's already been removed from the registry.
+        if let Some(cancel) = &running.watch_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
         let shutdown = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "plugin.shutdown",
@@ -307,6 +404,132 @@ impl PluginManager {
         }
         Ok(())
     }
+}
+
+/// Spawn a filesystem watcher that triggers `mgr.reload(name)` on
+/// every save of `source.path`. Uses notify's recommended_watcher
+/// (FSEvents on macOS, inotify on Linux) wrapped to forward events
+/// onto a tokio channel so the reload runs in the right runtime.
+/// Self-debounces at 250ms so rapid saves coalesce into one respawn.
+fn spawn_reload_watcher(
+    mgr: PluginManager,
+    name: String,
+    source: PluginSource,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    use std::sync::atomic::Ordering;
+
+    let path = source.path.clone();
+    let (tx, mut rx) = mpsc::channel::<()>(16);
+
+    let watcher_name = name.clone();
+    let watcher_cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        let name = watcher_name;
+        let cancel = watcher_cancel;
+        // Build the watcher inside the blocking thread so the notify
+        // backend's lifetime is tied to the watcher loop; dropping it
+        // tears down the OS-level handle. Watch the parent directory
+        // rather than the file itself — editors that atomic-rename
+        // (vim, neovim with `backupcopy=auto`) replace the inode
+        // entirely, which a file-level watcher would miss.
+        let parent = match path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                warn!(plugin = %name, "watcher: path has no parent dir; disabling watch");
+                return;
+            }
+        };
+        let watched_name = match path.file_name().map(|s| s.to_owned()) {
+            Some(n) => n,
+            None => {
+                warn!(plugin = %name, "watcher: path has no filename; disabling watch");
+                return;
+            }
+        };
+
+        let watcher_tx = tx.clone();
+        let mut watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                // Only respawn on modify-ish events that touch our
+                // file. Skip Access events (open/close/read) which
+                // would otherwise fire on every `cat plugin.sh`.
+                let interesting = matches!(
+                    event.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                );
+                if !interesting {
+                    return;
+                }
+                let hits_us = event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name().map(|f| f == watched_name).unwrap_or(false));
+                if !hits_us {
+                    return;
+                }
+                // Non-blocking send — if the channel is full the
+                // debouncer is already going to reload, so this
+                // save folds into that pass.
+                let _ = watcher_tx.try_send(());
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!(plugin = %name, error = %e, "watcher: failed to create");
+                    return;
+                }
+            };
+        if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
+            warn!(plugin = %name, error = %e, "watcher: failed to start");
+            return;
+        }
+        // Park until cancel — the watcher object itself holds the OS
+        // handle, dropping when this block exits.
+        while !cancel.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        drop(watcher);
+        debug!(plugin = %name, "watcher: cancelled, exiting");
+    });
+
+    // Debouncer / reload trigger lives in the tokio runtime so the
+    // reload itself can await the manager. If the plugin is currently
+    // registered we call `reload(name)` (kill + respawn from the same
+    // source). If it's NOT registered — which happens after a failed
+    // reload in the "save broken file → save fixed file" loop — we
+    // fall back to `install(source.clone())` so the next save can
+    // recover. (Codex bot review, May 2026.)
+    let reload_name = name.clone();
+    let source_for_reinstall = source.clone();
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            // Coalesce a burst of saves into one reload by draining
+            // anything that arrives within the next 250ms.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            while let Ok(()) = rx.try_recv() {}
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            info!(plugin = %reload_name, "watcher: file changed, reloading");
+            let registered = mgr.inner.lock().await.contains_key(&reload_name);
+            let outcome = if registered {
+                mgr.reload(&reload_name).await
+            } else {
+                mgr.install(source_for_reinstall.clone()).await
+            };
+            match outcome {
+                Ok(_) => info!(plugin = %reload_name, "watcher: reload OK"),
+                Err(e) => warn!(
+                    plugin = %reload_name,
+                    error = %e,
+                    "watcher: reload failed — keeping watcher armed for next save"
+                ),
+            }
+        }
+        debug!(plugin = %reload_name, "watcher: debouncer exiting");
+    });
 }
 
 fn parse_manifest(line: &str) -> Result<PluginManifest, PluginError> {

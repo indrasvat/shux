@@ -1,6 +1,6 @@
 # Templates — declarative workspace specs
 
-`shux apply foo.toml` ships an atomic batch of typed Ops to `state.apply`.
+`shux state apply foo.toml` ships an atomic batch of typed Ops to `state.apply`.
 The template file describes what the workspace should look like; the
 lowerer (`crates/shux/src/template.rs`) turns it into back-ref'd ops.
 
@@ -96,7 +96,7 @@ fails to spawn its command, panes 0–2 still exist.
 ## Validation
 
 ```bash
-shux apply spec.toml --dry-run            # prints the lowered ops, no commit
+shux state apply spec.toml --dry-run            # prints the lowered ops, no commit
 ```
 
 The dry-run output is the exact `{ops: [...]}` payload sent to

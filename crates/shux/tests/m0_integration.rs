@@ -1265,7 +1265,8 @@ async fn test_m0_cli_version_json() {
             "json",
             "--socket",
             socket_path.to_str().unwrap(),
-            "api",
+            "rpc",
+            "call",
             "system.version",
         ])
         .output()
@@ -1275,7 +1276,7 @@ async fn test_m0_cli_version_json() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "shux api system.version should succeed. stderr: {}",
+        "shux rpc call system.version should succeed. stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -1303,7 +1304,7 @@ async fn test_m0_cli_ls() {
     .await;
 
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
-        .args(["--socket", socket_path.to_str().unwrap(), "ls"])
+        .args(["--socket", socket_path.to_str().unwrap(), "session", "list"])
         .output()
         .await
         .unwrap();
@@ -1316,14 +1317,14 @@ async fn test_m0_cli_ls() {
     );
     assert!(
         stdout.contains("cli-ls-test"),
-        "ls output should contain session name. Got: {stdout}"
+        "session list output should contain session name. Got: {stdout}"
     );
 
     cancel.cancel();
 }
 
 #[tokio::test]
-async fn test_m0_cli_new_detached() {
+async fn test_m0_cli_session_create_detached() {
     let dir = tempfile::tempdir().unwrap();
     let (socket_path, cancel) = start_test_server(dir.path()).await;
 
@@ -1331,7 +1332,8 @@ async fn test_m0_cli_new_detached() {
         .args([
             "--socket",
             socket_path.to_str().unwrap(),
-            "new",
+            "session",
+            "create",
             "-s",
             "cli-new-test",
             "-d",
@@ -1342,11 +1344,10 @@ async fn test_m0_cli_new_detached() {
 
     assert!(
         output.status.success(),
-        "shux new should succeed. stderr: {}",
+        "shux session create should succeed. stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify session exists via RPC
     let response = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;
     let sessions = response["result"]["sessions"].as_array().unwrap();
     let found = sessions
@@ -1357,12 +1358,51 @@ async fn test_m0_cli_new_detached() {
     cancel.cancel();
 }
 
+/// `shux session create <NAME>` — positional NAME parses correctly
+/// end-to-end via the daemon. Regression test for the codex-exec
+/// dogfood finding ("CLI/docs paper cut" in v1).
 #[tokio::test]
-async fn test_m0_cli_kill() {
+async fn test_m0_cli_session_create_positional_name() {
     let dir = tempfile::tempdir().unwrap();
     let (socket_path, cancel) = start_test_server(dir.path()).await;
 
-    // Create a session via RPC
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "session",
+            "create",
+            "positional-name-test",
+            "-d",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "shux session create <NAME> should succeed. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let response = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;
+    let sessions = response["result"]["sessions"].as_array().unwrap();
+    let found = sessions
+        .iter()
+        .any(|s| s["name"].as_str() == Some("positional-name-test"));
+    assert!(
+        found,
+        "session created via positional CLI should appear in list"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_m0_cli_session_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
     rpc_raw(
         &socket_path,
         "session.create",
@@ -1374,6 +1414,7 @@ async fn test_m0_cli_kill() {
         .args([
             "--socket",
             socket_path.to_str().unwrap(),
+            "session",
             "kill",
             "-s",
             "cli-kill-test",
@@ -1420,7 +1461,8 @@ async fn test_m0_cli_ls_json() {
             "json",
             "--socket",
             socket_path.to_str().unwrap(),
-            "ls",
+            "session",
+            "list",
         ])
         .output()
         .await
@@ -1429,11 +1471,12 @@ async fn test_m0_cli_ls_json() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|_| panic!("ls --format json should return valid JSON: {stdout}"));
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        panic!("session list --format json should return valid JSON: {stdout}")
+    });
     assert!(
         parsed["sessions"].is_array(),
-        "JSON ls output should contain sessions array"
+        "JSON session list output should contain sessions array"
     );
 
     cancel.cancel();
@@ -1803,6 +1846,7 @@ async fn test_013_cli_rename() {
         .args([
             "--socket",
             socket_path.to_str().unwrap(),
+            "session",
             "rename",
             "-s",
             "cli-rename-old",
@@ -2246,7 +2290,7 @@ async fn test_014_cli_window_list() {
 }
 
 #[tokio::test]
-async fn test_014_cli_window_new() {
+async fn test_014_cli_window_create() {
     let dir = tempfile::tempdir().unwrap();
     let (socket_path, cancel) = start_test_server(dir.path()).await;
 
@@ -2257,7 +2301,7 @@ async fn test_014_cli_window_new() {
             "--socket",
             socket_path.to_str().unwrap(),
             "window",
-            "new",
+            "create",
             "-s",
             "cli-wn",
             "-n",

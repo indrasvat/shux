@@ -20,36 +20,34 @@ ENTER=$(printf '\r' | base64)
 TAB=$(printf '\t' | base64)
 
 # 1 — spawn
-"$SHUX" kill -s "$SESSION" >/dev/null 2>&1 || true
-RESP=$("$SHUX" api session.create \
-  "{\"name\":\"$SESSION\",\"command\":[\"vivecaka\",\"--repo\",\"cli/cli\"]}")
-PID=$(printf '%s' "$RESP" | jq -r .result.pane_id)
+"$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
+"$SHUX" session create "$SESSION" -d -- vivecaka --repo cli/cli
 
 # 2 — resize (synchronous)
-"$SHUX" api pane.set_size "{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}" >/dev/null
+"$SHUX" pane set-size -s "$SESSION" --cols 200 --rows 60 >/dev/null
 
 # 3 — helpers
 snap () {
   local label="$1"
-  "$SHUX" api pane.snapshot "{\"pane_id\":\"$PID\"}" \
-    | jq -r .result.png_base64 | base64 -d > "$OUT_DIR/${label}.png"
+  "$SHUX" --format json pane snapshot -s "$SESSION" \
+    | jq -r .png_base64 | base64 -d > "$OUT_DIR/${label}.png"
   echo "→ ${label}.png"
 }
-send_text () { "$SHUX" api pane.send_keys "{\"pane_id\":\"$PID\",\"text\":$1}" >/dev/null; }
-send_b64  () { "$SHUX" api pane.send_keys "{\"pane_id\":\"$PID\",\"data\":\"$1\"}" >/dev/null; }
+send_text () { "$SHUX" pane send-keys -s "$SESSION" --text "$1" >/dev/null; }
+send_b64  () { "$SHUX" pane send-keys -s "$SESSION" --data "$1" >/dev/null; }
 sleep_for () { sleep "$1"; }
 
 # 4 — the scenario
 sleep_for 6 ; snap "01_loaded"
-send_text "\"j\"" ; sleep_for 1 ; snap "02_after_j"
-send_text "\"/\"" ; sleep_for 1
-send_text "\"actions\"" ; sleep_for 1 ; snap "03_searched"
+send_text "j" ; sleep_for 1 ; snap "02_after_j"
+send_text "/" ; sleep_for 1
+send_text "actions" ; sleep_for 1 ; snap "03_searched"
 send_b64 "$ESC" ; sleep_for 1
 send_b64 "$ENTER" ; sleep_for 3 ; snap "04_pr_detail"
 send_b64 "$TAB" ; sleep_for 1 ; snap "05_tab_checks"
 
 # 5 — teardown
-"$SHUX" kill -s "$SESSION" >/dev/null
+"$SHUX" session kill "$SESSION" >/dev/null
 ```
 
 ## Declarative scenario array (the pattern that scales)
@@ -149,8 +147,9 @@ Send the same keystroke to every pane in a session at once
 (iTerm2-broadcast-input equivalent):
 
 ```bash
-for pid in $("$SHUX" api pane.list "{\"session_id\":\"$SID\"}" | jq -r '.result[].id'); do
-  "$SHUX" api pane.send_keys "{\"pane_id\":\"$pid\",\"text\":\"ls\\n\"}" >/dev/null &
+for pid in $("$SHUX" --format json pane list -s "$SESSION" | jq -r '.[].id'); do
+  "$SHUX" rpc call pane.send_keys \
+    --params "{\"pane_id\":\"$pid\",\"text\":\"ls\\n\"}" >/dev/null &
 done
 wait
 ```
