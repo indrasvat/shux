@@ -345,7 +345,13 @@ pub enum OutputFormat {
 pub enum Command {
     /// Create a new session (and optionally attach)
     New {
-        /// Session name (auto-generated if not provided)
+        /// Session name as a positional argument. Equivalent to `-s NAME`.
+        /// If both forms are passed, this one wins.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+
+        /// Session name. Same field as the positional `NAME`; either form
+        /// works. Auto-generated if neither is supplied.
         #[arg(short, long)]
         session: Option<String>,
 
@@ -3300,17 +3306,49 @@ mod tests {
         let cli = Cli::try_parse_from(["shux", "new", "-s", "work", "-d", "--ensure"]).unwrap();
         match cli.command {
             Some(Command::New {
+                name,
                 session,
                 ensure,
                 detached,
                 cmd,
                 argv,
             }) => {
+                assert!(name.is_none());
                 assert_eq!(session, Some("work".to_string()));
                 assert!(ensure);
                 assert!(detached);
                 assert!(cmd.is_none());
                 assert!(argv.is_empty());
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    /// `shux new <name>` — positional form must parse and populate
+    /// the new `name` field (not `session`). Codex-exec doc gap.
+    #[test]
+    fn test_cli_parse_new_positional_name() {
+        let cli = Cli::try_parse_from(["shux", "new", "work"]).unwrap();
+        match cli.command {
+            Some(Command::New { name, session, .. }) => {
+                assert_eq!(name, Some("work".to_string()));
+                assert!(session.is_none(), "flag form should remain empty");
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    /// Both forms passed: positional wins.
+    #[test]
+    fn test_cli_parse_new_positional_wins_over_flag() {
+        let cli =
+            Cli::try_parse_from(["shux", "new", "from-positional", "-s", "from-flag"]).unwrap();
+        match cli.command {
+            Some(Command::New { name, session, .. }) => {
+                assert_eq!(name, Some("from-positional".to_string()));
+                assert_eq!(session, Some("from-flag".to_string()));
+                // Merge logic in main.rs picks `name.or(session)`,
+                // which is the positional form.
             }
             _ => panic!("expected New command"),
         }

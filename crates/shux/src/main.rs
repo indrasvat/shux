@@ -3255,6 +3255,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
         }
 
         Some(Command::New {
+            name,
             session,
             ensure,
             detached,
@@ -3262,9 +3263,12 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             argv,
         }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            let session_name = session.clone().unwrap_or_else(default_session_name);
+            // Positional NAME takes precedence over -s/--session; falls
+            // back to it; both falling through generates a default.
+            let resolved = name.or(session);
+            let session_name = resolved.clone().unwrap_or_else(default_session_name);
             let _result =
-                cli::handle_new(&mut stream, session, cmd, argv, ensure, args.format).await?;
+                cli::handle_new(&mut stream, resolved, cmd, argv, ensure, args.format).await?;
             drop(stream);
 
             if !detached {

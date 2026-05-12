@@ -149,6 +149,42 @@ shux pane send-keys --help     # describes the pane.send_keys params
 daemon — useful for prototyping a plugin call by hand before wiring
 it into the plugin loop.
 
+### Common plugin RPC calls — params at a glance
+
+These are the methods plugins reach for most often. Every params
+example uses the UUID fields the event payload already carries.
+For optional fields the omitted form is the default. All mutating
+methods also accept `expected_version: u64` for optimistic
+concurrency (omit it on first call).
+
+| Method | Required params | Notes |
+|---|---|---|
+| `window.rename` | `{"id": "<window UUID>", "name": "<new title>"}` | `id` (not `window_id`). `name: null` clears a manual title and falls back to OSC / command / cwd. |
+| `window.focus` | `{"id": "<window UUID>"}` | Activates the window inside its session. |
+| `window.list` | `{"session_id": "<session UUID>"}` | Returns `windows: [{window_id, title, index, pane_count, is_active, active_pane_id}]`. |
+| `pane.send_keys` | `{"pane_id": "<pane UUID>", "text": "..."}` | Or `data: "<base64 bytes>"` for control bytes. Accepts `session_id` / `window_id` instead of `pane_id` to send to the resolved active pane. |
+| `pane.set_size` | `{"pane_id": "<UUID>", "cols": 200, "rows": 60}` | Synchronous; next snapshot reflects new dims. |
+| `pane.snapshot` | `{"pane_id": "<UUID>"}` | Returns `{png_base64: "..."}`. Capped at 16M pixels. |
+| `pane.capture` | `{"pane_id": "<UUID>"}` | Returns `{text: "..."}` — ANSI-stripped grid contents. |
+| `pane.split` | `{"pane_id": "<UUID>", "direction": "horizontal" \| "vertical"}` | Returns the new pane's UUID. |
+| `pane.kill` | `{"pane_id": "<UUID>"}` | The window survives if it has other panes. |
+| `session.create` | `{"name": "<unique>"}` | Optional `command: ["bash","-l"]` and `cwd: "/path"`. Returns `session_id` + initial `pane_id`. |
+| `session.list` | `{}` | Returns `sessions: [...]`. |
+| `session.kill` | `{"id": "<session UUID>"}` | Reaps all panes. |
+| `state.apply` | `{"ops": [<Op>, ...]}` | Atomic batch — all ops commit or none. See `references/templates.md` for the `Op` shape. |
+| `events.history` | `{"count": 50, "filter": ["session."]}` | Pull recent events; useful at plugin start to catch up. |
+
+**Identifier resolution chain.** When you only have a session id but
+need a pane, `pane.send_keys` accepts `session_id` and resolves to
+the session's active window's active pane. Similarly,
+`window_id` → active pane of that window. Use the longest-known
+identifier to be explicit; rely on the chain when you can't.
+
+**Discovering an unlisted method.** Run `shux <subcommand> --help` —
+the CLI handler is the canonical source of truth for which JSON
+fields each method accepts. If a method is callable via the CLI it
+is callable from a plugin with the same params.
+
 ## Phase 4: shutdown
 
 `shux plugin kill <name>` causes the daemon to:

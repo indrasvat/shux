@@ -85,6 +85,12 @@
 
 ## Session Log
 
+**2026-05-12 — PR #24: plugin DX paper cuts from the codex-exec dogfood (task 044a phase 0 follow-up)**
+- Goal: close the two practical gaps codex-exec hit on its cold-context plugin-authoring dogfood of PR #23 (score 7/10).
+- `shux new <NAME>` positional form. Every doc shows `shux new my-session` but clap insisted on `-s <name>`. Added an `Option<String>` positional `name` field on the `New` subcommand; main.rs resolves `name.or(session)`. Tests: `test_m0_cli_new_positional_name` (end-to-end via daemon), `test_cli_parse_new_positional_name` + `test_cli_parse_new_positional_wins_over_flag` (clap parsing). Backwards-compatible — the `-s` form still works.
+- "Common plugin RPC calls — params at a glance" table added to `skills/shux/references/plugins.md`. Covers `window.rename`, `window.focus`, `window.list`, `pane.send_keys/set_size/snapshot/capture/split/kill`, `session.create/list/kill`, `state.apply`, `events.history`. Each row shows the exact params shape (including the `id` vs `window_id` distinction that bit codex), the identifier-resolution chain (`pane_id` → window's active pane → session's active window's active pane), and the discovery pattern (`shux <subcommand> --help`). The next codex run should not need to grep Rust source to learn that `window.rename` takes `params.id`.
+- Wire-shape flatten (`data.data.*` → `data.*`) deliberately deferred to its own breaking-change PR — needs `test_036_events_watch.py` and any other event consumer updated in lockstep.
+
 **2026-05-10 — PR 3a: `state.apply` + `shux apply <template.toml>` (task 030)**
 - Goal: close the second-biggest agent-relevant gap vs tmux. Combined with PR 2a (events.watch), agents can now declare a workspace in one call and watch the entire lifecycle stream in. The "spawn an Agent Conductor workspace" use case that every tmux-wrapping orchestrator implements as shell scripts is now a single typed RPC.
 - Council review (codex + gemini, log `/tmp/shux_pr3_council.json`) consumed before implementation. Codex's review reshaped the plan substantially:

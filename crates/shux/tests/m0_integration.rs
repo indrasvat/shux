@@ -1357,6 +1357,46 @@ async fn test_m0_cli_new_detached() {
     cancel.cancel();
 }
 
+/// `shux new <name>` (positional) should work identically to
+/// `shux new -s <name>`. Every doc/README/skill uses the positional
+/// form, so the CLI has to accept it. Regression test for the
+/// codex-exec dogfood finding ("CLI/docs paper cut").
+#[tokio::test]
+async fn test_m0_cli_new_positional_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "new",
+            "positional-name-test",
+            "-d",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "shux new <name> should succeed. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let response = rpc_raw(&socket_path, "session.list", serde_json::json!({})).await;
+    let sessions = response["result"]["sessions"].as_array().unwrap();
+    let found = sessions
+        .iter()
+        .any(|s| s["name"].as_str() == Some("positional-name-test"));
+    assert!(
+        found,
+        "session created via positional CLI should appear in list"
+    );
+
+    cancel.cancel();
+}
+
 #[tokio::test]
 async fn test_m0_cli_kill() {
     let dir = tempfile::tempdir().unwrap();
