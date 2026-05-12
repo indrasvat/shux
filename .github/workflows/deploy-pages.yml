@@ -42,9 +42,25 @@ jobs:
           mkdir -p deploy
           cp -r pages/. deploy/
 
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      - name: Count workspace tests (stamped into version.json so the
+          landing page can show a live "N tests passing" chip)
+        id: testcount
+        run: |
+          set -euo pipefail
+          count=$(cargo nextest list --workspace --message-format json 2>/dev/null \
+                  | jq '."test-count"')
+          [[ "$count" =~ ^[0-9]+$ ]] || { echo "couldn't parse test count"; count=0; }
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Workspace test count: $count"
+
       - name: Stage install script + version marker
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TEST_COUNT: ${{ steps.testcount.outputs.count }}
         run: |
           set -euo pipefail
           latest="$(gh release list --repo "$REPO" --limit 1 \
@@ -56,10 +72,11 @@ jobs:
               printf '{\n'
               printf '  "version": "%s",\n' "$latest"
               printf '  "published_at": "%s",\n' "$published_at"
-              printf '  "release_url": "https://github.com/%s/releases/tag/%s"\n' "$REPO" "$latest"
+              printf '  "release_url": "https://github.com/%s/releases/tag/%s",\n' "$REPO" "$latest"
+              printf '  "tests_passing": %s\n' "$TEST_COUNT"
               printf '}\n'
             } > deploy/version.json
-            echo "Stamped deploy/version.json for $latest."
+            echo "Stamped deploy/version.json for $latest ($TEST_COUNT tests)."
           fi
 
           cat > deploy/install.sh <<'INSTALL'

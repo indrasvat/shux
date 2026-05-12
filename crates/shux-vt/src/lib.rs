@@ -173,18 +173,37 @@ impl VirtualTerminal {
         self.grid.scrollback_len()
     }
 
-    /// Capture the last N visible rows as plain text.
+    /// Capture visible-viewport text, matching iTerm2 `get_screen_contents`.
     ///
-    /// Iterates visible rows from the bottom, extracts cell characters
-    /// (skipping wide-char continuations), trims trailing whitespace per row,
-    /// and trims trailing empty lines from the result.
-    pub fn capture_text(&self, lines: usize) -> String {
+    /// - `lines = None` → entire visible viewport, with trailing blank rows
+    ///   trimmed (matches iTerm2's behaviour: get the whole screen, drop
+    ///   the always-empty tail).
+    /// - `lines = Some(N)` → up to N most-recent non-blank rows. Walks
+    ///   back from the LAST non-blank row, picking that row and up to
+    ///   N-1 preceding ones. Empty rows below the cursor are never
+    ///   counted toward N.
+    ///
+    /// Returns `"\n"` when the viewport is entirely blank.
+    pub fn capture_text(&self, lines: Option<usize>) -> String {
         let grid = self.grid();
         let total_rows = grid.rows();
-        let start = total_rows.saturating_sub(lines);
-        let mut output = String::new();
+        if total_rows == 0 {
+            return String::new();
+        }
 
-        for row_idx in start..total_rows {
+        let last_content = (0..total_rows)
+            .rev()
+            .find(|&r| !grid.visible_row(r).is_blank())
+            .unwrap_or(0);
+        let end = last_content + 1;
+        let start = match lines {
+            Some(0) => return String::new(),
+            Some(n) => end.saturating_sub(n),
+            None => 0,
+        };
+
+        let mut output = String::new();
+        for row_idx in start..end {
             let row = grid.visible_row(row_idx);
             let mut line = String::new();
             for cell in &row.cells {
@@ -193,16 +212,9 @@ impl VirtualTerminal {
                 }
                 line.push(cell.ch);
             }
-            let trimmed = line.trim_end();
-            output.push_str(trimmed);
+            output.push_str(line.trim_end());
             output.push('\n');
         }
-
-        // Trim trailing empty lines
-        while output.ends_with("\n\n") {
-            output.pop();
-        }
-
         output
     }
 }
@@ -210,6 +222,38 @@ impl VirtualTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_text_skips_trailing_blank_rows_below_content() {
+        // Regression: pane.capture {lines:N} used to take the literal
+        // bottom-N visible rows, returning blank output when the cursor
+        // sat near the top of a 24-row viewport. capture_text now walks
+        // back from the LAST non-blank row.
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"first line\r\nsecond line\r\n");
+        // Cursor is now on row 2; rows 3..23 are blank.
+        let text = vt.capture_text(Some(1));
+        assert_eq!(text.trim_end(), "second line");
+
+        let text = vt.capture_text(Some(5));
+        // Should pick up the two content lines, not blanks 19..23.
+        assert!(text.contains("first line"), "first line missing: {text:?}");
+        assert!(
+            text.contains("second line"),
+            "second line missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn capture_text_empty_viewport_returns_single_newline() {
+        let vt = VirtualTerminal::new(24, 80);
+        // Fresh VT has only blank rows.
+        let text = vt.capture_text(Some(5));
+        assert_eq!(
+            text, "\n",
+            "expected single newline for blank pane, got {text:?}"
+        );
+    }
 
     #[test]
     fn test_process_plain_text() {

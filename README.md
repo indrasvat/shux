@@ -5,6 +5,9 @@
 <p align="center">
   <strong>The terminal multiplexer built for AI coding agents</strong><br>
   <em>Typed API. Deterministic state. Zero wrappers needed.</em><br>
+  <a href="https://github.com/indrasvat/shux/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/indrasvat/shux/ci.yml?branch=main&style=flat&labelColor=1a1a1a&label=CI" alt="CI"></a>
+  <a href="https://app.codecov.io/gh/indrasvat/shux"><img src="https://img.shields.io/codecov/c/github/indrasvat/shux?style=flat&labelColor=1a1a1a" alt="coverage"></a>
+  <a href="https://github.com/indrasvat/shux/releases/latest"><img src="https://img.shields.io/github/v/release/indrasvat/shux?style=flat&labelColor=1a1a1a" alt="release"></a>
   <img src="https://img.shields.io/badge/lang-Rust-DEA584?style=flat&labelColor=1a1a1a" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat&labelColor=1a1a1a" alt="MIT">
 </p>

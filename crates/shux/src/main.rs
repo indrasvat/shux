@@ -345,6 +345,7 @@ fn main() -> anyhow::Result<()> {
     // only accepts a `&'static str` literal there, so we set it here.
     let cmd = Cli::command()
         .before_help(style::banner())
+        .long_about(cli::long_about())
         .after_long_help(cli::agent_help());
     let matches = cmd.get_matches();
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
@@ -2684,7 +2685,7 @@ fn register_pane_io_methods(
                             .vts
                             .get(&pane_id)
                             .map(|vt| {
-                                let text = vt.capture_text(50);
+                                let text = vt.capture_text(Some(50));
                                 shux_pty::strip_ansi(&text)
                             })
                             .unwrap_or_default()
@@ -2775,7 +2776,12 @@ fn register_pane_io_methods(
                 let params = params.unwrap_or_default();
                 let pane_id = resolve_pane_id_from_params(&gh, &params)?;
 
-                let lines = params.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                // None → entire visible viewport (iTerm2 get_screen_contents
+                // shape). Some(N) → tail N non-blank rows.
+                let lines = params
+                    .get("lines")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
 
                 let state = io.lock().await;
                 let vt = state.vts.get(&pane_id).ok_or_else(|| {
@@ -2784,12 +2790,26 @@ fn register_pane_io_methods(
 
                 let text = vt.capture_text(lines);
                 let clean = shux_pty::strip_ansi(&text);
+                let cursor = vt.cursor();
+                let cols = vt.grid().cols();
+                let rows = vt.grid().rows();
 
-                Ok(serde_json::json!({
+                let mut body = serde_json::json!({
                     "pane_id": pane_id.to_string(),
                     "text": clean,
-                    "lines": lines,
-                }))
+                    "lines": clean.lines().count(),
+                    "cols": cols,
+                    "rows": rows,
+                    "cursor": {
+                        "row": cursor.row,
+                        "col": cursor.col,
+                        "visible": cursor.visible,
+                    },
+                });
+                if let Some(requested) = lines {
+                    body["requested_lines"] = serde_json::Value::from(requested);
+                }
+                Ok(body)
             }
         })
         .register("pane.wait_for", move |params: Option<serde_json::Value>| {
@@ -2842,7 +2862,7 @@ fn register_pane_io_methods(
                         let vt = state.vts.get(&pane_id).ok_or_else(|| {
                             shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                         })?;
-                        let raw = vt.capture_text(lines);
+                        let raw = vt.capture_text(Some(lines));
                         shux_pty::strip_ansi(&raw)
                     };
 

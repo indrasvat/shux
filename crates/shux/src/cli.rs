@@ -25,6 +25,58 @@ const CLAP_STYLES: Styles = Styles::styled()
 /// as plain text with all escapes stripped. The colour decision honours
 /// `NO_COLOR=…` (any value) and falls back to plain when stdout isn't
 /// a TTY, matching the same `IsTerminal` check the rest of the CLI uses.
+/// Long-form `about` text shown at the top of `shux --help`. Adapts to
+/// NO_COLOR + IsTerminal so plain piped output stays clean; brand-tinted
+/// when emitted to a real terminal. Returns plain text with optional ANSI
+/// escapes embedded.
+pub fn long_about() -> String {
+    use std::io::IsTerminal;
+    let force =
+        std::env::var_os("CLICOLOR_FORCE").is_some() || std::env::var_os("FORCE_COLOR").is_some();
+    let no_color = std::env::var_os("NO_COLOR").is_some();
+    let colorize = !no_color && (force || std::io::stdout().is_terminal());
+    render_long_about(colorize)
+}
+
+fn render_long_about(colorize: bool) -> String {
+    let acc = if colorize {
+        "\x1b[1;38;2;215;108;58m"
+    } else {
+        ""
+    }; // bold terracotta
+    let dim = if colorize { "\x1b[2m" } else { "" };
+    let bold = if colorize { "\x1b[1m" } else { "" };
+    let mono = if colorize {
+        "\x1b[38;2;180;175;160m"
+    } else {
+        ""
+    }; // warm pale gray for inline code
+    let r = if colorize { "\x1b[0m" } else { "" };
+
+    let sx = format!("{acc}shux{r}");
+    let bul = format!("{dim}·{r}");
+
+    let mut s = String::with_capacity(512);
+    s.push_str(&format!(
+        "{sx} is a terminal multiplexer (sessions / windows / panes, like tmux) \
+        for humans and AI agents.\n\n"
+    ));
+    s.push_str(&format!(
+        "{bold}Typed JSON-RPC surface (UDS + TCP) with:{r}\n"
+    ));
+    s.push_str(&format!("  {bul} atomic declarative workspace templates\n"));
+    s.push_str(&format!("  {bul} optimistic concurrency on every entity\n"));
+    s.push_str(&format!("  {bul} sealed PTY-output event bus\n"));
+    s.push_str(&format!(
+        "  {bul} built-in PNG rasterizer {dim}— any pane, no terminal in the loop{r}\n\n"
+    ));
+    s.push_str(&format!(
+        "Every CLI subcommand is a thin RPC wrapper. Drive the surface directly via \
+        {mono}`shux api <method> '<json>'`{r}.",
+    ));
+    s
+}
+
 pub fn agent_help() -> String {
     use std::io::IsTerminal;
     let colorize = std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
@@ -170,20 +222,28 @@ fn render_agent_help(colorize: bool) -> String {
     s.push_str(&row(
         "expect / pexpect / sexpect",
         &format!(
-            "loop of {} / wait / {}",
+            "{} {a} {} {a} {}",
             m("pane.send_keys"),
-            m("pane.snapshot")
+            m("pane.wait_for"),
+            m("pane.capture")
         ),
     ));
     s.push_str(&row(
-        "asciinema rec",
+        "iTerm2 wait_for_text / _absent",
+        &format!("{} {dim}(text · regex · --absent){r}", m("pane.wait_for")),
+    ));
+    s.push_str(&row(
+        "asciinema rec / script(1)",
         &format!("{} {dim}(sealed data plane){r}", m("pane.output.watch")),
     ));
     s.push_str(&row(
         "vhs / agg / terminalizer",
-        &format!("{} loop {a} ffmpeg", m("pane.snapshot")),
+        &format!("{} loop {a} ffmpeg", m("window.snapshot")),
     ));
-    s.push_str(&row("termshot / freezeframe", &m("pane.snapshot")));
+    s.push_str(&row(
+        "termshot / freezeframe",
+        &format!("{} {dim}or{r} {}", m("pane.snapshot"), m("window.snapshot")),
+    ));
     s.push_str(&row(
         "iTerm2 broadcast input",
         &format!("{} fan-out", m("pane.send_keys")),
@@ -197,8 +257,8 @@ fn render_agent_help(colorize: bool) -> String {
         "template with N panes + RPC orchestrator",
     ));
     s.push_str(&row(
-        "Bubbletea/ratatui test harness",
-        &format!("{} + golden-image diff", m("pane.snapshot")),
+        "Bubbletea / ratatui test harness",
+        &format!("{} + golden-image diff", m("window.snapshot")),
     ));
     s.push('\n');
 
@@ -241,13 +301,11 @@ fn render_agent_help(colorize: bool) -> String {
     name = "shux",
     version,
     about = "A modern terminal multiplexer — works for humans, drives like an API",
-    long_about = "shux is a Rust terminal multiplexer (sessions / windows / panes, like \
-        tmux) with a length-prefixed JSON-RPC surface over UDS + TCP, atomic declarative \
-        workspace templates, optimistic concurrency on every entity, sealed PTY-output \
-        events, and a built-in rasterizer that returns PNG bytes for any pane — no \
-        terminal emulator in the loop.\n\n\
-        Every CLI subcommand is a thin wrapper over a JSON-RPC method. Agents and scripts \
-        can target the RPC surface directly via `shux api <method> '<json>'`.",
+    // long_about is injected at runtime in main() via cli::long_about() so it
+    // can adapt to NO_COLOR / non-TTY stdout — clap's derive macro only
+    // accepts a `&'static str` literal here. The plain-text fallback below
+    // is what shows if someone uses Cli's derive output directly (e.g. tests).
+    long_about = "shux is a terminal multiplexer for humans and AI agents.",
     // after_long_help is injected at runtime in main() so it can adapt
     // to NO_COLOR / non-TTY stdout. See `agent_help()`.
     after_help = "See 'shux <command> --help'.  For the full agent reference: 'shux --help'.",
