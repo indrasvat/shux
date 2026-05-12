@@ -1,3 +1,10 @@
+# [0.15.0](https://github.com/indrasvat/shux/compare/v0.14.0...v0.15.0) (2026-05-12)
+
+
+### Features
+
+* agent-first CLI overhaul + plugin hot reload + event-payload fixes ([#24](https://github.com/indrasvat/shux/issues/24)) ([c2cd69f](https://github.com/indrasvat/shux/commit/c2cd69f3b184e3030ca69e0e12c01affa0752332))
+
 # [0.14.0](https://github.com/indrasvat/shux/compare/v0.13.0...v0.14.0) (2026-05-12)
 
 
