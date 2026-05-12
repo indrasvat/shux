@@ -1,3 +1,10 @@
+# [0.12.0](https://github.com/indrasvat/shux/compare/v0.11.0...v0.12.0) (2026-05-12)
+
+
+### Features
+
+* 12-scenario integration suite + coverage + dynamic page + brand banner ([#21](https://github.com/indrasvat/shux/issues/21)) ([3021f2e](https://github.com/indrasvat/shux/commit/3021f2eec756123c82e5335008e947f027e832d2)), closes [#20](https://github.com/indrasvat/shux/issues/20)
+
 # [0.11.0](https://github.com/indrasvat/shux/compare/v0.10.0...v0.11.0) (2026-05-11)
 
 
