@@ -363,6 +363,7 @@ pub enum OutputFormat {
 pub enum Command {
     /// Session lifecycle. Mirrors the `session.*` RPC namespace
     /// (`session.create` ↔ `shux session create`, etc.).
+    #[command(visible_aliases = ["ses", "sess"])]
     Session {
         #[command(subcommand)]
         command: SessionCommand,
