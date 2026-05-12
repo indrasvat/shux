@@ -1,72 +1,73 @@
 # Example: common tmux patterns → shux equivalents
 
 Quick translation table for moving a tmux-based workflow over.
+Every shux verb mirrors an RPC method — RPC dots become CLI spaces.
 
 ## `tmux new-session -d -s name 'cmd'`
 
 ```bash
-shux api session.create '{"name":"name","command":["cmd"]}'
+shux session create name -d -- cmd
 ```
 
 ## `tmux send-keys -t name 'hello' Enter`
 
 ```bash
 # Text first, then Enter as a base64-encoded control byte.
-shux api pane.send_keys '{"pane_id":"$PID","text":"hello"}'
-shux api pane.send_keys '{"pane_id":"$PID","data":"DQ=="}'        # \r
+shux pane send-keys -s name --text 'hello'
+shux pane send-keys -s name --data 'DQ=='     # \r
 ```
 
 Or one shot:
 
 ```bash
-shux api pane.send_keys '{"pane_id":"$PID","text":"hello\n"}'      # JSON-encoded \n
+# JSON-encoded \n in --text
+shux pane send-keys -s name --text $'hello\n'
 ```
 
 ## `tmux capture-pane -t name -p`
 
 ```bash
-shux api pane.capture '{"pane_id":"$PID","lines":50}' | jq -r .result.text
+shux --format json pane capture -s name --lines 50 | jq -r .text
 ```
 
 For a PNG of the same pane instead:
 
 ```bash
-shux api pane.snapshot '{"pane_id":"$PID"}' \
-  | jq -r .result.png_base64 | base64 -d > pane.png
+shux --format json pane snapshot -s name | jq -r .png_base64 | base64 -d > pane.png
 ```
 
 ## `tmux kill-session -t name`
 
 ```bash
-shux kill -s name
+shux session kill name
 ```
 
 ## `tmux split-window -t name -h 'cmd'`
 
 ```bash
-shux api pane.split '{"pane_id":"$PID","direction":"vertical","ratio":0.5,"command":["cmd"]}'
+shux pane split -s name --direction vertical -- cmd
 ```
 
 Direction in shux uses *axis* names (`vertical` = left/right split,
-`horizontal` = top/bottom split). This matches the split-line orientation,
-not the resulting pane positions.
+`horizontal` = top/bottom split). This matches the split-line
+orientation, not the resulting pane positions.
 
 ## `tmux resize-pane -t name -x 200 -y 60`
 
 ```bash
-shux api pane.set_size '{"pane_id":"$PID","cols":200,"rows":60}'
+shux pane set-size -s name --cols 200 --rows 60
 ```
 
-Synchronous — the next `pane.snapshot` is guaranteed to see the new
+Synchronous — the next `pane snapshot` is guaranteed to see the new
 dims (no race).
 
 ## `tmux list-sessions`
 
 ```bash
-shux api session.list '{}' | jq '.result.sessions'
+shux --format json session list | jq '.sessions'
 ```
 
-## `~/.tmux.conf` declarative workspace → shux apply template
+## `~/.tmux.conf` declarative workspace → `shux state apply` template
 
 A tmux session you'd otherwise script with `new-session ; send-keys ;
 split-window ; ...` becomes a TOML the daemon commits atomically:
@@ -93,40 +94,53 @@ command = ["claude", "--repo", "indrasvat/shux"]
 ```
 
 ```bash
-shux apply my-workspace.toml
-shux attach review                  # human attach (interactive multiplexer)
+shux state apply my-workspace.toml
+shux session attach review          # human attach (interactive multiplexer)
 ```
 
 ## tmux `prefix + arrow` to navigate panes
 
-shux's attached client uses Alt+h/j/k/l for directional pane focus by
-default. From outside the attached client, drive it programmatically:
+shux's attached client uses Alt+h/j/k/l for directional pane focus
+by default. From outside the attached client, drive programmatically:
 
 ```bash
-shux api pane.focus_direction '{"session_id":"name","direction":"right"}'
+shux pane focus -s name --direction right
 ```
 
 ## tmux `prefix + z` to zoom
 
 ```bash
-shux api pane.zoom '{"pane_id":"$PID"}'        # toggles
+shux pane zoom -s name        # toggles
 ```
 
 ## tmux mouse mode
 
-shux has mouse support in the attached client. From outside, programmatic
-mouse events aren't part of the public RPC surface yet — drive via
-keystrokes instead, which is more deterministic for tests anyway.
+shux has mouse support in the attached client. From outside,
+programmatic mouse events aren't part of the public RPC surface yet
+— drive via keystrokes instead, which is more deterministic for
+tests anyway.
 
 ## tmux `if-shell` / hooks
 
-shux doesn't have a tmux-style hook system. Instead, subscribe to
-`events.history` (sequenced events) or `pane.output.watch` (sampled PTY
-chunks) and react in your driver script. Cleaner contract, no embedded
-shell evaluation.
+shux doesn't have a tmux-style hook system. Instead, write a
+process plugin (see [`references/plugins.md`](../references/plugins.md))
+or subscribe to `events.history` / `pane.output.watch` and react in
+your driver script. Cleaner contract, no embedded shell evaluation.
 
 ## tmux plugins
 
-shux has its own plugin system (Wasm-based, `shux-plugin` crate). Not a
-tmux-plugin equivalent — closer in spirit to VS Code extensions.
-Different design space, document separately.
+shux has its own plugin system — process plugins that speak
+line-delimited JSON-RPC on stdin/stdout. Install with
+`shux plugin install <path>`. Hot reload on save is the default;
+see [`references/plugins.md`](../references/plugins.md).
+
+## Raw RPC fallthrough
+
+When a CLI verb doesn't exist for a method you want to call, or
+you'd rather write the params as JSON, use `shux rpc call`:
+
+```bash
+shux rpc call session.create --params '{"name":"demo"}'
+shux rpc call pane.send_keys --params @keys.json
+echo '{"pane_id":"...","text":"j"}' | shux rpc call pane.send_keys --params -
+```

@@ -104,6 +104,16 @@
 - **Round 4 dogfood (score 8/10, verification passed, no Rust grep, no hot reload missed — one remaining friction):**
   - Codex flagged that "the docs should explicitly map session.create/session.rename/session.kill to shux new/shux rename/shux kill" because the CLI doesn't mirror the RPC namespace for sessions (top-level verbs vs `session.*`). Added a "CLI ↔ RPC namespace mapping" table to `references/plugins.md` covering every method plugins reach for. Lowest-effort fix possible — the structural CLI choice (sessions at top level, windows/panes nested) is deliberate ergonomics for humans.
 - Wire-shape flatten (`data.data.*` → `data.*`) remains deferred to its own breaking-change PR — needs `test_036_events_watch.py` and any other event consumer updated in lockstep.
+- **Round 5 — CLI consistency overhaul (greenfield, no back-compat) — LANDED.** Codex council May 2026 established the invariant `RPC namespace.method → CLI noun verb` (dots become spaces, no top-level shortcuts). Implementation:
+  - Removed top-level `shux new/ls/kill/rename/attach/api/apply/wait-for/snapshot` from the `Command` enum. Replaced with namespaced forms: `shux session create/list/kill/rename/attach`, `shux rpc call <method> --params <JSON|@FILE|->`, `shux state apply <template>`, `shux pane wait-for`, `shux window snapshot`.
+  - `WindowCommand::New` → `WindowCommand::Create` for symmetry with `window.create` RPC.
+  - `shux` no-args TTY-guard: piped/non-TTY now prints structured JSON help instead of trying to attach (Codex council finding — piped scripts must not deadlock).
+  - `shux session` accepts `ses` / `sess` aliases.
+  - Updated agent_help (the "COMMAND → RPC METHOD MAP" + "TYPICAL AGENT WORKFLOW" + "DECLARATIVE WORKSPACES" + "REPLACES THESE TOOLS" sections in `crates/shux/src/cli.rs`) to use the new shape end-to-end.
+  - Tests rewritten: 14 new clap parse tests for the namespaced forms + a rejection test that every removed top-level verb errors out cleanly. Integration tests in `m0_integration.rs` and `cli_integration.rs` updated to call the new verbs.
+  - Docs synced: `README.md`, `skills/shux/SKILL.md`, `skills/shux/references/{api,plugins,templates}.md`, `skills/shux/examples/replace-tmux-workflow.md`, `docs/PRD.md` (§8.6 CLI ↔ API mapping rewritten), `pages/index.html` (every code-panel + replaces-table updated). Codex global skill at `~/.codex/skills/shux/` synced.
+  - All CI green locally.
+- **Round 6+ planned**: re-run cold-context codex dogfood with the new CLI shape to verify the friction is gone. Extensive automation tests using shux itself (not iTerm2) to expand the suite is queued as a follow-up (user request).
 
 **2026-05-10 — PR 3a: `state.apply` + `shux apply <template.toml>` (task 030)**
 - Goal: close the second-biggest agent-relevant gap vs tmux. Combined with PR 2a (events.watch), agents can now declare a workspace in one call and watch the entire lifecycle stream in. The "spawn an Agent Conductor workspace" use case that every tmux-wrapping orchestrator implements as shell scripts is now a single typed RPC.

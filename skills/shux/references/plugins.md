@@ -185,9 +185,10 @@ shux window rename --help      # describes the window.rename params
 shux pane send-keys --help     # describes the pane.send_keys params
 ```
 
-`shux api <method> '<json>'` is also available from outside the
-daemon — useful for prototyping a plugin call by hand before wiring
-it into the plugin loop.
+`shux rpc call <method> [--params <PARAMS>]` is the raw fallthrough
+from outside the daemon — useful for prototyping a plugin call by
+hand before wiring it into the plugin loop. `--params` accepts
+inline JSON, `@<file>`, or `-` (stdin).
 
 ### CLI ↔ RPC namespace mapping
 
@@ -196,33 +197,43 @@ live at the top level** because they're what a human runs most;
 window and pane ops nest under their nouns. The plugin always
 calls the RPC name (left column).
 
+**The mapping is mechanical: RPC dots become CLI spaces.** Every
+noun is namespaced — no top-level shortcut verbs. Aliases (e.g.
+`session ls` for `session list`) are listed in parens.
+
 | RPC method | CLI command |
 |---|---|
-| `session.create` | `shux new <NAME>` (or `shux new -s <NAME>`) |
-| `session.list` | `shux ls` |
-| `session.rename` | `shux rename -s <OLD> -n <NEW>` |
-| `session.kill` | `shux kill -s <NAME>` |
-| `session.ensure` | `shux new --ensure -s <NAME>` |
-| `window.create` | `shux window new -s <SESSION> -n <NAME>` |
-| `window.list` | `shux window list -s <SESSION>` (alias `ls`) |
+| `session.create` | `shux session create <NAME>` (or `-s <NAME>`) |
+| `session.list` | `shux session list` (alias `session ls`) |
+| `session.rename` | `shux session rename -s <OLD> -n <NEW>` |
+| `session.kill` | `shux session kill <NAME>` (or `-s <NAME>`) |
+| `session.ensure` | `shux session create --ensure <NAME>` |
+| `(attach, client-side)` | `shux session attach <NAME>` |
+| `window.create` | `shux window create -s <SESSION> -n <NAME>` |
+| `window.list` | `shux window list -s <SESSION>` |
 | `window.rename` | `shux window rename -s <SESSION> -w <CURRENT> -n <NEW>` |
 | `window.focus` | `shux window focus -s <SESSION> -w <NAME>` |
 | `window.kill` | `shux window kill -s <SESSION> -w <NAME>` |
+| `window.snapshot` | `shux window snapshot -s <SESSION>` |
 | `pane.send_keys` | `shux pane send-keys -s <SESSION> --text "..."` |
 | `pane.list` | `shux pane list -s <SESSION>` |
 | `pane.split` | `shux pane split -s <SESSION>` |
 | `pane.kill` | `shux pane kill -s <SESSION>` |
-| `pane.snapshot` | `shux snapshot -s <SESSION> -o frame.png` |
-| `state.apply` | `shux apply <template.toml>` |
+| `pane.snapshot` | `shux pane snapshot -s <SESSION>` |
+| `pane.capture` | `shux pane capture -s <SESSION>` |
+| `pane.wait_for` | `shux pane wait-for -s <SESSION> --text "..."` |
+| `state.apply` | `shux state apply <template.toml>` |
 | `events.history` | `shux events history` |
 | `events.watch` | `shux events watch` |
 | `plugin.install` | `shux plugin install <path>` |
-| `plugin.list` | `shux plugin list` (alias `ls`) |
+| `plugin.list` | `shux plugin list` |
 | `plugin.reload` | `shux plugin reload <name>` |
 | `plugin.kill` | `shux plugin kill <name>` |
+| _(any method)_ | `shux rpc call <method> --params <JSON\|@FILE\|->` |
 
-When in doubt, `shux --help` shows every top-level subcommand; each
-subcommand has its own `--help` listing every accepted flag.
+When in doubt: `shux --help` lists every namespace, then each
+subcommand has its own `--help` with every accepted flag. The
+`session` namespace also accepts `ses` / `sess` aliases.
 
 ### Common plugin RPC calls — params + result shapes
 
@@ -261,9 +272,10 @@ the CLI handler is the canonical source of truth for which JSON
 fields each method accepts. If a method is callable via the CLI it
 is callable from a plugin with the same params.
 
-**Verifying a response shape on the fly.** `shux api <method> '<json>'`
-prints `{result: ...}` (or `{error: ...}`) to stdout. Pipe it through
-`jq '.result | keys'` to see exactly which fields come back.
+**Verifying a response shape on the fly.**
+`shux rpc call <method> [--params <JSON|@FILE|->]` prints `{result: ...}`
+(or `{error: ...}`) to stdout. Pipe through `jq '.result | keys'`
+to see exactly which fields come back.
 
 ### Common gotchas plugins hit
 

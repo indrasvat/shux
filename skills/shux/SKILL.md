@@ -54,25 +54,30 @@ Never pollute `.claude/`, `~/`, or the project root with shux output.
 ## 80% quickstart (three RPCs)
 
 ```bash
-# 1. Spawn a session running any command (or shell). Capture the pane_id
-#    from the response so the next calls can target it.
-RESP=$(shux api session.create '{"name":"demo","command":["lazygit"]}')
-PID=$(echo "$RESP" | jq -r .result.pane_id)
+# 1. Spawn a session running any command (or shell). Capture the
+#    pane_id from the response so the next calls can target it.
+RESP=$(shux --format json session create demo -d -- lazygit)
+PID=$(echo "$RESP" | jq -r .pane_id)
 
 # 2. Drive it.
-shux api pane.set_size  "{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}"
-shux api pane.send_keys "{\"pane_id\":\"$PID\",\"text\":\"j\"}"                  # text input
-shux api pane.send_keys "{\"pane_id\":\"$PID\",\"data\":\"Gw==\"}"               # base64 control (here: Esc)
+shux pane set-size  -s demo --cols 200 --rows 60
+shux pane send-keys -s demo --text 'j'           # text input
+shux pane send-keys -s demo --data 'Gw=='        # base64 control (here: Esc)
 
 # 3. Get a PNG back.
-shux api pane.snapshot  "{\"pane_id\":\"$PID\"}" \
-  | jq -r .result.png_base64 | base64 -d > frame.png
+shux --format json pane snapshot -s demo \
+  | jq -r .png_base64 | base64 -d > frame.png
 
 # Tear down when done.
-shux kill -s demo
+shux session kill demo
 ```
 
-That covers a huge chunk of real workflows. For declarative multi-pane workspaces, use a template:
+Every CLI verb maps 1:1 to an RPC method (RPC dots become CLI spaces —
+`session.create` ↔ `shux session create`). Drop to the raw form with
+`shux rpc call <method> --params @file` whenever you'd rather write
+the payload in JSON directly. `--params -` reads from stdin.
+
+For declarative multi-pane workspaces, use a template:
 
 ```toml
 # spec.toml
@@ -85,31 +90,32 @@ command = ["vivecaka", "--repo", "cli/cli"]
 ```
 
 ```bash
-shux apply spec.toml      # atomic — all or nothing
+shux state apply spec.toml      # atomic — all or nothing
 ```
 
 ## Tools shux replaces
 
 | If you'd reach for                              | For this job                                  | Use this shux primitive                                  |
 |--                                                |--                                              |--                                                          |
-| `tmux` · `screen` · `byobu`                      | Multiplex sessions / windows / panes           | `shux apply spec.toml` · `shux attach`                     |
-| iTerm2 (Python SDK / AppleScript)                | Drive a terminal app from outside              | `pane.send_keys` + `pane.snapshot`                         |
-| `expect` · `pexpect` · `sexpect`                 | Scripted CLI / REPL interaction                | `pane.send_keys` → `pane.wait_for` → `pane.capture`        |
-| iTerm2 `wait_for_text` / `wait_for_absent`       | Block until screen contains (or stops containing) a needle | `pane.wait_for` (text · regex · `--absent`)                |
+| `tmux` · `screen` · `byobu`                      | Multiplex sessions / windows / panes           | `shux state apply spec.toml` · `shux session attach`       |
+| iTerm2 (Python SDK / AppleScript)                | Drive a terminal app from outside              | `shux pane send-keys` + `shux pane snapshot`               |
+| `expect` · `pexpect` · `sexpect`                 | Scripted CLI / REPL interaction                | `pane send-keys` → `pane wait-for` → `pane capture`        |
+| iTerm2 `wait_for_text` / `wait_for_absent`       | Block until screen contains (or stops containing) a needle | `shux pane wait-for` (text · regex · `--absent`)           |
 | `asciinema rec` · `script(1)`                    | Record a terminal session                      | `pane.output.watch` (sealed data-plane stream)             |
-| `vhs` · `agg` · `terminalizer`                   | Generate TUI demo GIFs / WebPs                 | `window.snapshot` loop → `ffmpeg`                          |
-| `termshot` · `freezeframe`                       | Still PNG of a terminal frame                  | `pane.snapshot` or `window.snapshot`                       |
-| iTerm2 broadcast input                           | Send keystrokes to many panes at once          | `pane.send_keys` fan-out (one RPC per pane)                |
-| `ttyrec` · `termsh`                              | Replay a recorded session                      | Re-feed VT bytes through a fresh pane → `pane.snapshot`    |
+| `vhs` · `agg` · `terminalizer`                   | Generate TUI demo GIFs / WebPs                 | `shux window snapshot` loop → `ffmpeg`                     |
+| `termshot` · `freezeframe`                       | Still PNG of a terminal frame                  | `shux pane snapshot` or `shux window snapshot`             |
+| iTerm2 broadcast input                           | Send keystrokes to many panes at once          | `shux pane send-keys` fan-out (one RPC per pane)           |
+| `ttyrec` · `termsh`                              | Replay a recorded session                      | Re-feed VT bytes through a fresh pane → `pane snapshot`    |
 | GNU parallel `--tmux` mode                       | Run N tasks in N panes, watch in one place     | Template with N panes + RPC orchestrator                   |
-| Custom Bubbletea / ratatui test harness          | Visual regression for your TUI                 | `window.snapshot` + golden-image diff (SSIM or raw RGBA)   |
+| Custom Bubbletea / ratatui test harness          | Visual regression for your TUI                 | `shux window snapshot` + golden-image diff (SSIM or raw RGBA) |
 
 ## The common RPC surface
 
-Each method maps 1:1 to a `shux` CLI subcommand. All accept JSON in,
-return JSON out, on stdin/stdout. `references/api.md` lists request/response
-shapes and additional methods (`pane.list`, `pane.focus_direction`,
-`pane.resize`, `pane.run_command`, `window.rename`, `window.reorder`).
+Every CLI verb maps 1:1 to an RPC method — RPC dots become CLI spaces
+(`session.create` ↔ `shux session create`, `pane.send_keys` ↔
+`shux pane send-keys`). All RPCs accept JSON in, return JSON out, on
+stdin/stdout. `references/api.md` lists the full request/response
+shape per method.
 
 | Category | Methods                                                                          |
 |--        |--                                                                                |
@@ -142,14 +148,16 @@ The `text` field sends raw text. For control characters, use `data` (base64).
 ## Decide which method to use
 
 ```
-Need to spawn something?           → session.create (with `command`)
-Need a multi-pane workspace?       → state.apply or shux apply spec.toml
-Need to type into a TUI?           → pane.send_keys (text= or data=)
-Need pixel feedback of one pane?   → pane.snapshot (returns base64 PNG)
-Need a snapshot of the whole window
-(borders, titles, status bar)?     → window.snapshot or session.snapshot
-Need plain text of the screen?     → pane.capture (returns ANSI-stripped text)
-Need a stream of PTY output?       → pane.output.watch (event-bus stream)
+Need to spawn something?           → session.create  (shux session create -- <cmd>)
+Need a multi-pane workspace?       → state.apply     (shux state apply spec.toml)
+Need to type into a TUI?           → pane.send_keys  (shux pane send-keys --text|--data)
+Need pixel feedback of one pane?   → pane.snapshot   (shux pane snapshot)
+Need a snapshot of the whole
+window (borders, titles, status)?  → window.snapshot (shux window snapshot)
+Need plain text of the screen?     → pane.capture    (shux pane capture)
+Need to block until text appears?  → pane.wait_for   (shux pane wait-for --text|--regex)
+Need a stream of PTY output?       → pane.output.watch (event-bus, sealed)
+Want raw RPC for a new method?     → shux rpc call <method> --params @file
 ```
 
 ## Extend shux with a process plugin

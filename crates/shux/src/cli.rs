@@ -71,8 +71,10 @@ fn render_long_about(colorize: bool) -> String {
         "  {bul} built-in PNG rasterizer {dim}— any pane, no terminal in the loop{r}\n\n"
     ));
     s.push_str(&format!(
-        "Every CLI subcommand is a thin RPC wrapper. Drive the surface directly via \
-        {mono}`shux api <method> '<json>'`{r}.",
+        "Every CLI subcommand mirrors an RPC method 1:1 — RPC dots become CLI \
+         spaces ({mono}session.create{r} → {mono}shux session create{r}). Drive raw \
+         RPCs directly via {mono}`shux rpc call <method> --params @file`{r} \
+         (also accepts {mono}-{r} for stdin and inline JSON).",
     ));
     s
 }
@@ -121,81 +123,97 @@ fn render_agent_help(colorize: bool) -> String {
     let mut s = String::with_capacity(4096);
     s.push_str(&format!("{}\n", h("COMMAND → RPC METHOD MAP")));
     s.push_str(&format!(
-        "  {:14} {a} {}\n",
-        shux("new"),
+        "  {dim}RPC dots become CLI spaces. Every noun is namespaced.{r}\n\n"
+    ));
+    s.push_str(&format!(
+        "  {:24} {a} {}\n",
+        shux("session create"),
         m("session.create")
     ));
-    s.push_str(&format!("  {:14} {a} {}\n", shux("ls"), m("session.list")));
     s.push_str(&format!(
-        "  {:14} {a} {} / {} / {}\n",
-        shux("kill"),
-        m("session.kill"),
-        m("window.kill"),
-        m("pane.kill")
+        "  {:24} {a} {}\n",
+        shux("session list"),
+        m("session.list")
     ));
     s.push_str(&format!(
-        "  {:14} {a} {}\n",
-        shux("rename"),
+        "  {:24} {a} {}\n",
+        shux("session kill"),
+        m("session.kill")
+    ));
+    s.push_str(&format!(
+        "  {:24} {a} {}\n",
+        shux("session rename"),
         m("session.rename")
     ));
     s.push_str(&format!(
-        "  {:14} {a} {}\n",
-        shux("window"),
-        m("window.{create,list,focus,kill,ensure,rename}")
+        "  {:24} {a} {} {dim}(client-side, not RPC){r}\n",
+        shux("session attach"),
+        m("(attach)")
     ));
-    s.push_str(&format!("  {:14} {a} {}\n", shux("pane"),   m("pane.{send_keys,set_size,snapshot,capture,split,focus,zoom,swap,kill,set_title,output.watch}")));
     s.push_str(&format!(
-        "  {:14} {a} {} {dim}(atomic batch from a TOML template){r}\n",
-        shux("apply"),
+        "  {:24} {a} {}\n",
+        shux("window <verb>"),
+        m("window.{create,list,focus,kill,rename,reorder,ensure,snapshot}")
+    ));
+    s.push_str(&format!("  {:24} {a} {}\n", shux("pane <verb>"), m("pane.{send-keys,set-size,snapshot,capture,split,focus,zoom,swap,kill,set-title,resize,wait-for,output.watch,run}")));
+    s.push_str(&format!(
+        "  {:24} {a} {}\n",
+        shux("plugin <verb>"),
+        m("plugin.{install,list,kill,reload}")
+    ));
+    s.push_str(&format!(
+        "  {:24} {a} {} / {}\n",
+        shux("events <verb>"),
+        m("events.history"),
+        m("events.watch")
+    ));
+    s.push_str(&format!(
+        "  {:24} {a} {} {dim}(atomic batch from a TOML template){r}\n",
+        shux("state apply"),
         m("state.apply")
     ));
     s.push_str(&format!(
-        "  {:14} {a} {} / {}\n",
-        shux("events"),
-        m("events.history"),
-        m("pane.output.watch")
+        "  {:24} {a} any method directly  {dim}(`--params @file` / `-` / inline){r}\n\n",
+        shux("rpc call")
     ));
-    s.push_str(&format!("  {:14} {a} any method directly  {dim}(use for new methods before a CLI wrapper exists){r}\n\n",
-                       shux("api")));
 
     s.push_str(&format!("{}\n", h("TYPICAL AGENT WORKFLOW")));
     s.push_str(&format!(
         "  {dim}# 1. Spawn a session running any command.{r}\n"
     ));
     s.push_str(&format!(
-        "  {} {} '{{\"name\":\"demo\",\"command\":[\"lazygit\"]}}'\n\n",
-        shux("api"),
-        m("session.create")
+        "  {} --params '{{\"name\":\"demo\",\"command\":[\"lazygit\"]}}'\n",
+        shux("rpc call session.create"),
     ));
+    s.push_str(&format!(
+        "  {dim}# Or the noun-verb form (identical effect):{r}\n"
+    ));
+    s.push_str(&format!("  {} demo -- lazygit\n\n", shux("session create"),));
     s.push_str(&format!(
         "  {dim}# 2. Drive it. (Synchronous resize — next snapshot sees new dims.){r}\n"
     ));
     s.push_str(&format!(
-        "  {} {}  '{{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}}'\n",
-        shux("api"),
-        m("pane.set_size")
+        "  {} --params '{{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}}'\n",
+        shux("rpc call pane.set_size"),
     ));
     s.push_str(&format!(
-        "  {} {} '{{\"pane_id\":\"$PID\",\"text\":\"j\"}}'\n",
-        shux("api"),
-        m("pane.send_keys")
+        "  {} -s demo --text 'j'\n",
+        shux("pane send-keys"),
     ));
     s.push_str(&format!(
-        "  {} {} '{{\"pane_id\":\"$PID\",\"data\":\"Gw==\"}}'   {dim}# Esc (base64){r}\n\n",
-        shux("api"),
-        m("pane.send_keys")
+        "  {} -s demo --data 'Gw=='   {dim}# Esc (base64){r}\n\n",
+        shux("pane send-keys"),
     ));
     s.push_str(&format!(
         "  {dim}# 3. Pixel feedback (PNG, headless — no terminal emulator in the loop).{r}\n"
     ));
     s.push_str(&format!(
-        "  {} {}  '{{\"pane_id\":\"$PID\"}}' \\\n",
-        shux("api"),
-        m("pane.snapshot")
+        "  {} --params '{{\"pane_id\":\"$PID\"}}' \\\n",
+        shux("rpc call pane.snapshot"),
     ));
     s.push_str("    | jq -r .result.png_base64 | base64 -d > frame.png\n\n");
     s.push_str(&format!("  {dim}# Tear down when done.{r}\n"));
-    s.push_str(&format!("  {} -s demo\n\n", shux("kill")));
+    s.push_str(&format!("  {} demo\n\n", shux("session kill")));
 
     s.push_str(&format!("{}\n", h("DECLARATIVE WORKSPACES")));
     s.push_str("  echo '[session]\n");
@@ -205,15 +223,15 @@ fn render_agent_help(colorize: bool) -> String {
     s.push_str("  [[windows.panes]]\n");
     s.push_str("  command=[\"lazygit\"]' > spec.toml\n");
     s.push_str(&format!(
-        "  {} spec.toml       {dim}# atomic; --dry-run prints the lowered ops{r}\n\n",
-        shux("apply")
+        "  {} spec.toml   {dim}# atomic; --dry-run prints the lowered ops{r}\n\n",
+        shux("state apply"),
     ));
 
     s.push_str(&format!("{}\n", h("REPLACES THESE TOOLS")));
     let row = |tool: &str, with: &str| format!("  {tool:30} {a} {with}\n");
     s.push_str(&row(
         "tmux / screen / byobu",
-        &format!("{} + {}", shux("apply"), shux("attach")),
+        &format!("{} + {}", shux("state apply"), shux("session attach")),
     ));
     s.push_str(&row(
         "iTerm2 (Python SDK / AS)",
@@ -343,88 +361,60 @@ pub enum OutputFormat {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create a new session (and optionally attach)
-    New {
-        /// Session name as a positional argument. Equivalent to `-s NAME`.
-        /// If both forms are passed, this one wins.
-        #[arg(value_name = "NAME")]
-        name: Option<String>,
-
-        /// Session name. Same field as the positional `NAME`; either form
-        /// works. Auto-generated if neither is supplied.
-        #[arg(short, long)]
-        session: Option<String>,
-
-        /// Create-if-missing semantics (maps to session.ensure)
-        #[arg(long)]
-        ensure: bool,
-
-        /// Do not attach after creating the session
-        #[arg(short = 'd', long)]
-        detached: bool,
-
-        /// Shell command to run in the initial pane (single string).
-        /// For an exec-style passthrough use trailing `--` instead:
-        /// `shux new -s vim -- vim foo.rs`.
-        #[arg(long)]
-        cmd: Option<String>,
-
-        /// Trailing argv for the initial pane. Anything after `--` lands
-        /// here and is exec'd directly (no shell wrapper). Takes
-        /// precedence over `--cmd`.
-        #[arg(last = true, num_args = 0..)]
-        argv: Vec<String>,
+    /// Session lifecycle. Mirrors the `session.*` RPC namespace
+    /// (`session.create` ↔ `shux session create`, etc.).
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
     },
 
-    /// Attach to an existing session
-    Attach {
-        /// Session name (attaches to most recent if not provided)
-        #[arg(short, long)]
-        session: Option<String>,
+    /// Window lifecycle and layout. Mirrors `window.*` RPC.
+    #[command(alias = "win")]
+    Window {
+        #[command(subcommand)]
+        command: WindowCommand,
     },
 
-    /// List sessions
-    #[command(alias = "list")]
-    Ls,
-
-    /// Kill a session
-    Kill {
-        /// Session name to kill
-        #[arg(short, long)]
-        session: String,
-
-        /// Optimistic concurrency: only succeed if the session is at
-        /// this version. Stale versions return error -32002 with the
-        /// current version in `data.actual_version`.
-        #[arg(long)]
-        expected_version: Option<u64>,
+    /// Pane I/O, layout, and capture. Mirrors `pane.*` RPC.
+    Pane {
+        #[command(subcommand)]
+        command: PaneCommand,
     },
 
-    /// Rename a session
-    Rename {
-        /// Current session name
-        #[arg(short, long)]
-        session: String,
-
-        /// New name for the session
-        #[arg(short, long)]
-        name: String,
-
-        /// Optimistic concurrency: only succeed if the session is at
-        /// this version. Stale versions return error -32002 with the
-        /// current version in `data.actual_version`.
-        #[arg(long)]
-        expected_version: Option<u64>,
+    /// Process plugins (task 044a phase 0).
+    ///
+    /// `shux plugin install <path>` spawns an executable that speaks
+    /// shux's line-delimited JSON-RPC dialect (see
+    /// docs/tasks/044a-process-plugins-v0.md). The plugin can call
+    /// any registered shux RPC method and subscribe to events
+    /// declared in its `subscribes` manifest. Hot reload on file
+    /// save is on by default.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
     },
 
-    /// Send a raw JSON-RPC call to the daemon (for debugging)
-    Api {
-        /// JSON-RPC method name (e.g., "system.version", "session.list")
-        method: String,
+    /// Typed bus events — `shux events watch` long-polls, `shux events
+    /// history` returns the ring buffer. Mirrors `events.*` RPC.
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
 
-        /// JSON-RPC params as a JSON string. Example: '{"name": "work"}'
-        #[arg(default_value = "{}")]
-        params: String,
+    /// State mutations beyond single-entity ops (atomic batch, etc.).
+    /// Mirrors `state.*` RPC.
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
+
+    /// Raw JSON-RPC fallthrough — `shux rpc call <method>` posts to
+    /// the daemon and prints the structured `{result|error}` envelope.
+    /// Use when a CLI wrapper doesn't exist yet for a method, or when
+    /// scripting against newly-shipped RPC surface.
+    Rpc {
+        #[command(subcommand)]
+        command: RpcCommand,
     },
 
     /// Print version information
@@ -434,102 +424,6 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
-    },
-
-    /// Window management
-    #[command(alias = "win")]
-    Window {
-        #[command(subcommand)]
-        command: WindowCommand,
-    },
-
-    /// Pane management
-    Pane {
-        #[command(subcommand)]
-        command: PaneCommand,
-    },
-
-    /// Plugin management (task 044a phase 0 — process plugins).
-    ///
-    /// `shux plugin install <path>` spawns an executable that speaks
-    /// shux's line-delimited JSON-RPC dialect (see
-    /// docs/tasks/044a-process-plugins-v0.md). The plugin can call
-    /// any registered shux RPC method and subscribe to events
-    /// declared in its `subscribes` manifest.
-    Plugin {
-        #[command(subcommand)]
-        command: PluginCommand,
-    },
-
-    /// Subscribe to typed events from the daemon (agent-friendly stream).
-    ///
-    /// `shux events watch` long-polls the daemon's event bus and prints one
-    /// JSON Line per event to stdout. `shux events history` returns the most
-    /// recent events from the in-memory ring buffer.
-    Events {
-        #[command(subcommand)]
-        command: EventsCommand,
-    },
-
-    /// Block until a pane's captured text matches (or stops matching) a needle.
-    ///
-    /// Polls `pane.capture` on the daemon every `--poll-ms`, returns success
-    /// when the match condition holds, or exits non-zero on timeout. Replaces
-    /// the iTerm2 `wait_for_text` / `wait_for_absent` pattern across TUIs.
-    #[command(name = "wait-for")]
-    WaitFor {
-        /// Session id-or-name. Combined with --window / --pane to resolve a pane.
-        #[arg(short, long)]
-        session: Option<String>,
-        /// Window id or index within the session.
-        #[arg(short, long)]
-        window: Option<String>,
-        /// Explicit pane id (UUID).
-        #[arg(short, long)]
-        pane: Option<String>,
-        /// Plain-text needle. The pane's last N lines (see --lines) are
-        /// `contains()`-checked. Mutually exclusive with --regex.
-        #[arg(short, long, conflicts_with = "regex")]
-        text: Option<String>,
-        /// Rust regex. Mutually exclusive with --text.
-        #[arg(long)]
-        regex: Option<String>,
-        /// Wait for the needle to be ABSENT instead of present.
-        #[arg(long)]
-        absent: bool,
-        /// How many recent lines to capture each poll. Default 200.
-        #[arg(long, default_value_t = 200)]
-        lines: u64,
-        /// Total timeout in milliseconds. Default 10000, max 60000.
-        #[arg(long, default_value_t = 10_000)]
-        timeout_ms: u64,
-        /// Poll interval in milliseconds. Default 100, range 20..=1000.
-        #[arg(long, default_value_t = 100)]
-        poll_ms: u64,
-    },
-
-    /// Rasterize a window (or session's active window) to a PNG.
-    ///
-    /// Composes every pane in the target window — same picture you'd see in
-    /// `shux attach` — and rasterizes it via shux-raster. Writes the PNG to
-    /// `--output`, or prints base64 to stdout if omitted.
-    Snapshot {
-        /// Session to snapshot (defaults to the active window of this session).
-        #[arg(short, long)]
-        session: Option<String>,
-        /// Explicit window id or index. If omitted, the session's active
-        /// window is used.
-        #[arg(short, long)]
-        window: Option<String>,
-        /// Output PNG path. If omitted, base64 is printed to stdout.
-        #[arg(short, long)]
-        output: Option<std::path::PathBuf>,
-        /// Snapshot grid width in cells (4..=1000). Default: 120.
-        #[arg(long, default_value_t = 120)]
-        cols: u16,
-        /// Snapshot grid height in cells (2..=1000). Default: 36.
-        #[arg(long, default_value_t = 36)]
-        rows: u16,
     },
 
     /// Scaffold a `.shux/` directory in the current project.
@@ -544,13 +438,22 @@ pub enum Command {
         dir: Option<std::path::PathBuf>,
     },
 
+    /// Internal: start the daemon (used by auto-start, not for users)
+    #[command(name = "__daemon", hide = true)]
+    #[allow(non_camel_case_types)]
+    __daemon,
+}
+
+/// `shux state <verb>` — bulk state operations. Mirrors `state.*` RPC.
+#[derive(Subcommand, Debug)]
+pub enum StateCommand {
     /// Apply a declarative workspace template (TOML) atomically.
     ///
-    /// Reads a session/windows/panes definition (PRD §10.3 shape), lowers
-    /// it to a `state.apply` batch, and ships it to the daemon in a single
-    /// RPC. All graph mutations land atomically (all or nothing); per-pane
-    /// PTY spawn outcomes are reported in the response. Use `--dry-run` to
-    /// validate + see the planned ops without committing.
+    /// Reads a session/windows/panes definition (PRD §10.3 shape),
+    /// lowers it to a `state.apply` batch, and ships it to the daemon
+    /// in one RPC. All graph mutations commit atomically; per-pane PTY
+    /// spawn outcomes come back in the response. `--dry-run` validates
+    /// + prints the planned ops without committing.
     Apply {
         /// Path to the TOML template (e.g. `./agent-conductor.toml`).
         template: std::path::PathBuf,
@@ -559,16 +462,107 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
 
-        /// After a successful apply, open `events watch` filtered to the
-        /// new session and stream lifecycle events until Ctrl+C.
+        /// After a successful apply, open `events watch` filtered to
+        /// the new session and stream lifecycle events until Ctrl+C.
         #[arg(long)]
         watch: bool,
     },
+}
 
-    /// Internal: start the daemon (used by auto-start, not for users)
-    #[command(name = "__daemon", hide = true)]
-    #[allow(non_camel_case_types)]
-    __daemon,
+/// `shux rpc call <method>` — raw JSON-RPC. Supports inline JSON,
+/// `--params @<file>`, and `--params -` (stdin). Codex council May 2026
+/// asked for these to eliminate shell-escaping bait on inline JSON.
+#[derive(Subcommand, Debug)]
+pub enum RpcCommand {
+    /// Send one JSON-RPC request and print the structured response.
+    Call {
+        /// JSON-RPC method name (e.g., `session.create`, `window.list`).
+        method: String,
+
+        /// Params as one of: inline JSON (`'{"name":"work"}'`),
+        /// `@<path>` (reads the file as JSON), or `-` (reads stdin
+        /// as JSON). Defaults to `{}` for no-arg methods.
+        #[arg(long, default_value = "{}", value_name = "JSON|@FILE|-")]
+        params: String,
+    },
+}
+
+/// Aliases for the top-level session verbs. Every variant
+/// dispatches to the same handler as the corresponding top-level
+/// command — `shux session create` is `shux new`, `shux session ls`
+/// is `shux ls`. Mirrors the `window`/`pane` subcommand pattern
+/// and the `session.*` RPC namespace so agents that learned the
+/// RPC method names can type them directly as CLI words.
+#[derive(Subcommand, Debug)]
+pub enum SessionCommand {
+    /// Create a new session (alias for `shux new`).
+    Create {
+        /// Session name as a positional argument. Equivalent to `-s NAME`.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+
+        /// Session name. Same field as the positional `NAME`.
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// Create-if-missing semantics (maps to `session.ensure`).
+        #[arg(long)]
+        ensure: bool,
+
+        /// Do not attach after creating the session.
+        #[arg(short = 'd', long)]
+        detached: bool,
+
+        /// Shell command to run in the initial pane (single string).
+        #[arg(long)]
+        cmd: Option<String>,
+
+        /// Trailing argv after `--` — exec'd directly (no shell wrapper).
+        #[arg(last = true, num_args = 0..)]
+        argv: Vec<String>,
+    },
+
+    /// List sessions (alias for `shux ls`).
+    #[command(alias = "ls")]
+    List,
+
+    /// Kill a session (alias for `shux kill`).
+    Kill {
+        /// Session name (positional or `-s/--session`).
+        #[arg(value_name = "NAME")]
+        name_pos: Option<String>,
+
+        #[arg(short, long, conflicts_with = "name_pos")]
+        session: Option<String>,
+
+        /// Optimistic concurrency on the session version.
+        #[arg(long)]
+        expected_version: Option<u64>,
+    },
+
+    /// Rename a session (alias for `shux rename`).
+    Rename {
+        /// Current session name.
+        #[arg(short, long)]
+        session: String,
+
+        /// New name for the session.
+        #[arg(short, long)]
+        name: String,
+
+        #[arg(long)]
+        expected_version: Option<u64>,
+    },
+
+    /// Attach to an existing session (alias for `shux attach`).
+    Attach {
+        /// Session name (positional or `-s/--session`).
+        #[arg(value_name = "NAME")]
+        name_pos: Option<String>,
+
+        #[arg(short, long, conflicts_with = "name_pos")]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -694,8 +688,8 @@ pub enum WindowCommand {
         session: String,
     },
 
-    /// Create a new window in a session
-    New {
+    /// Create a new window in a session. Mirrors `window.create` RPC.
+    Create {
         /// Session name
         #[arg(short, long)]
         session: String,
@@ -712,7 +706,7 @@ pub enum WindowCommand {
         /// Shell command to run in the new window's initial pane.
         /// Empty / omitted spawns the user's login+interactive shell.
         /// For exec-style passthrough use trailing `--` instead:
-        /// `shux window new -s X -n W -- vim foo.rs`.
+        /// `shux window create -s X -n W -- vim foo.rs`.
         #[arg(long)]
         cmd: Option<String>,
 
@@ -797,6 +791,31 @@ pub enum WindowCommand {
         /// this version.
         #[arg(long)]
         expected_version: Option<u64>,
+    },
+
+    /// Rasterize a window's composed panes to a PNG. Mirrors `window.snapshot` RPC.
+    ///
+    /// Composes every pane in the target window — same picture you'd
+    /// see in `shux session attach` — and rasterizes via shux-raster.
+    /// Writes the PNG to `--output`, or prints base64 to stdout if
+    /// omitted.
+    Snapshot {
+        /// Session to snapshot (defaults to the session's active window).
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Explicit window id or index. If omitted, the session's
+        /// active window is used.
+        #[arg(short, long)]
+        window: Option<String>,
+        /// Output PNG path. If omitted, base64 is printed to stdout.
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+        /// Snapshot grid width in cells (4..=1000). Default: 120.
+        #[arg(long, default_value_t = 120)]
+        cols: u16,
+        /// Snapshot grid height in cells (2..=1000). Default: 36.
+        #[arg(long, default_value_t = 36)]
+        rows: u16,
     },
 }
 
@@ -1095,6 +1114,42 @@ pub enum PaneCommand {
         /// Number of lines to capture (default: 50)
         #[arg(short, long, default_value = "50")]
         lines: u64,
+    },
+
+    /// Block until a pane's captured text matches (or stops matching)
+    /// a needle. Mirrors `pane.wait_for` RPC. Replaces the iTerm2
+    /// `wait_for_text` / `wait_for_absent` pattern across TUIs.
+    #[command(name = "wait-for")]
+    WaitFor {
+        /// Session id-or-name. Combined with --window / --pane to
+        /// resolve a pane.
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Window id or index within the session.
+        #[arg(short, long)]
+        window: Option<String>,
+        /// Explicit pane id (UUID).
+        #[arg(short, long)]
+        pane: Option<String>,
+        /// Plain-text needle. The pane's last N lines (see --lines) are
+        /// `contains()`-checked. Mutually exclusive with --regex.
+        #[arg(short, long, conflicts_with = "regex")]
+        text: Option<String>,
+        /// Rust regex. Mutually exclusive with --text.
+        #[arg(long)]
+        regex: Option<String>,
+        /// Wait for the needle to be ABSENT instead of present.
+        #[arg(long)]
+        absent: bool,
+        /// How many recent lines to capture each poll. Default 200.
+        #[arg(long, default_value_t = 200)]
+        lines: u64,
+        /// Total timeout in milliseconds. Default 10000, max 60000.
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u64,
+        /// Poll interval in milliseconds. Default 100, range 20..=1000.
+        #[arg(long, default_value_t = 100)]
+        poll_ms: u64,
     },
 }
 
@@ -3403,23 +3458,51 @@ mod tests {
         assert!(matches!(format, OutputFormat::Text));
     }
 
+    // ───── Session namespace ─────
+    //
+    // Top-level `shux new/ls/kill/rename/attach` was removed in
+    // the May 2026 CLI consistency overhaul. Codex council
+    // verdict: RPC dots become CLI spaces, no top-level shortcut
+    // verbs. Every session op now lives under `shux session`.
+
     #[test]
-    fn test_cli_parse_ls() {
-        let cli = Cli::try_parse_from(["shux", "ls"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Ls)));
+    fn test_cli_parse_session_list() {
+        let cli = Cli::try_parse_from(["shux", "session", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::List
+            })
+        ));
     }
 
     #[test]
-    fn test_cli_parse_new_with_options() {
-        let cli = Cli::try_parse_from(["shux", "new", "-s", "work", "-d", "--ensure"]).unwrap();
+    fn test_cli_parse_session_list_alias_ls() {
+        let cli = Cli::try_parse_from(["shux", "session", "ls"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::List
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_parse_session_create_with_options() {
+        let cli =
+            Cli::try_parse_from(["shux", "session", "create", "-s", "work", "-d", "--ensure"])
+                .unwrap();
         match cli.command {
-            Some(Command::New {
-                name,
-                session,
-                ensure,
-                detached,
-                cmd,
-                argv,
+            Some(Command::Session {
+                command:
+                    SessionCommand::Create {
+                        name,
+                        session,
+                        ensure,
+                        detached,
+                        cmd,
+                        argv,
+                    },
             }) => {
                 assert!(name.is_none());
                 assert_eq!(session, Some("work".to_string()));
@@ -3428,116 +3511,257 @@ mod tests {
                 assert!(cmd.is_none());
                 assert!(argv.is_empty());
             }
-            _ => panic!("expected New command"),
+            _ => panic!("expected session create command"),
         }
     }
 
-    /// `shux new <name>` — positional form must parse and populate
-    /// the new `name` field (not `session`). Codex-exec doc gap.
+    /// `shux session create <NAME>` — positional NAME parses into
+    /// the dedicated `name` field, not `--session`.
     #[test]
-    fn test_cli_parse_new_positional_name() {
-        let cli = Cli::try_parse_from(["shux", "new", "work"]).unwrap();
+    fn test_cli_parse_session_create_positional_name() {
+        let cli = Cli::try_parse_from(["shux", "session", "create", "work"]).unwrap();
         match cli.command {
-            Some(Command::New { name, session, .. }) => {
+            Some(Command::Session {
+                command: SessionCommand::Create { name, session, .. },
+            }) => {
                 assert_eq!(name, Some("work".to_string()));
                 assert!(session.is_none(), "flag form should remain empty");
             }
-            _ => panic!("expected New command"),
+            _ => panic!("expected session create command"),
         }
     }
 
-    /// Both forms passed: positional wins.
+    /// Trailing argv after `--` lands on `argv`.
     #[test]
-    fn test_cli_parse_new_positional_wins_over_flag() {
-        let cli =
-            Cli::try_parse_from(["shux", "new", "from-positional", "-s", "from-flag"]).unwrap();
+    fn test_cli_parse_session_create_trailing_argv() {
+        let cli = Cli::try_parse_from([
+            "shux", "session", "create", "-s", "vim", "--", "vim", "foo.rs",
+        ])
+        .unwrap();
         match cli.command {
-            Some(Command::New { name, session, .. }) => {
-                assert_eq!(name, Some("from-positional".to_string()));
-                assert_eq!(session, Some("from-flag".to_string()));
-                // Merge logic in main.rs picks `name.or(session)`,
-                // which is the positional form.
-            }
-            _ => panic!("expected New command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parse_new_with_trailing_argv() {
-        // shux new -s vim -- vim foo.rs
-        let cli = Cli::try_parse_from(["shux", "new", "-s", "vim", "--", "vim", "foo.rs"]).unwrap();
-        match cli.command {
-            Some(Command::New { session, argv, .. }) => {
+            Some(Command::Session {
+                command: SessionCommand::Create { session, argv, .. },
+            }) => {
                 assert_eq!(session, Some("vim".to_string()));
                 assert_eq!(argv, vec!["vim".to_string(), "foo.rs".to_string()]);
             }
-            _ => panic!("expected New command"),
+            _ => panic!("expected session create command"),
         }
     }
 
     #[test]
-    fn test_cli_parse_kill() {
-        let cli = Cli::try_parse_from(["shux", "kill", "-s", "mytest"]).unwrap();
+    fn test_cli_parse_session_kill() {
+        let cli = Cli::try_parse_from(["shux", "session", "kill", "-s", "mytest"]).unwrap();
         match cli.command {
-            Some(Command::Kill { session, .. }) => {
-                assert_eq!(session, "mytest");
+            Some(Command::Session {
+                command:
+                    SessionCommand::Kill {
+                        session, name_pos, ..
+                    },
+            }) => {
+                assert_eq!(session, Some("mytest".to_string()));
+                assert!(name_pos.is_none());
             }
-            _ => panic!("expected Kill command"),
+            _ => panic!("expected session kill command"),
+        }
+    }
+
+    /// Positional NAME on `session kill` (mirrors `session create`).
+    #[test]
+    fn test_cli_parse_session_kill_positional() {
+        let cli = Cli::try_parse_from(["shux", "session", "kill", "mytest"]).unwrap();
+        match cli.command {
+            Some(Command::Session {
+                command: SessionCommand::Kill { name_pos, .. },
+            }) => {
+                assert_eq!(name_pos, Some("mytest".to_string()));
+            }
+            _ => panic!("expected session kill command"),
         }
     }
 
     #[test]
-    fn test_cli_parse_api() {
+    fn test_cli_parse_session_rename() {
         let cli =
-            Cli::try_parse_from(["shux", "api", "system.version", r#"{"key":"val"}"#]).unwrap();
+            Cli::try_parse_from(["shux", "session", "rename", "-s", "old", "-n", "new"]).unwrap();
         match cli.command {
-            Some(Command::Api { method, params }) => {
+            Some(Command::Session {
+                command: SessionCommand::Rename { session, name, .. },
+            }) => {
+                assert_eq!(session, "old");
+                assert_eq!(name, "new");
+            }
+            _ => panic!("expected session rename command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_session_attach_positional() {
+        let cli = Cli::try_parse_from(["shux", "session", "attach", "dev"]).unwrap();
+        match cli.command {
+            Some(Command::Session {
+                command: SessionCommand::Attach { name_pos, session },
+            }) => {
+                assert_eq!(name_pos, Some("dev".to_string()));
+                assert!(session.is_none());
+            }
+            _ => panic!("expected session attach command"),
+        }
+    }
+
+    /// Session aliases `ses` and `sess` parse identically.
+    #[test]
+    fn test_cli_parse_session_alias() {
+        let cli = Cli::try_parse_from(["shux", "ses", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::List
+            })
+        ));
+        let cli = Cli::try_parse_from(["shux", "sess", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::List
+            })
+        ));
+    }
+
+    /// Old top-level forms are gone. Make sure they fail loudly
+    /// (clap will return an error, not silently match something).
+    #[test]
+    fn test_cli_old_top_level_verbs_rejected() {
+        for old in [
+            "new", "ls", "list", "kill", "rename", "attach", "api", "apply",
+        ] {
+            let result = Cli::try_parse_from(["shux", old]);
+            assert!(
+                result.is_err(),
+                "old top-level `shux {old}` should error after CLI overhaul"
+            );
+        }
+    }
+
+    // ───── RPC namespace (replaces top-level `api`) ─────
+
+    #[test]
+    fn test_cli_parse_rpc_call() {
+        let cli = Cli::try_parse_from([
+            "shux",
+            "rpc",
+            "call",
+            "system.version",
+            "--params",
+            r#"{"key":"val"}"#,
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Rpc {
+                command: RpcCommand::Call { method, params },
+            }) => {
                 assert_eq!(method, "system.version");
                 assert_eq!(params, r#"{"key":"val"}"#);
             }
-            _ => panic!("expected Api command"),
+            _ => panic!("expected rpc call command"),
         }
     }
 
+    /// `shux rpc call <method>` — no `--params` defaults to `{}`.
     #[test]
-    fn test_cli_parse_api_default_params() {
-        let cli = Cli::try_parse_from(["shux", "api", "system.health"]).unwrap();
+    fn test_cli_parse_rpc_call_default_params() {
+        let cli = Cli::try_parse_from(["shux", "rpc", "call", "system.health"]).unwrap();
         match cli.command {
-            Some(Command::Api { params, .. }) => {
+            Some(Command::Rpc {
+                command: RpcCommand::Call { params, .. },
+            }) => {
                 assert_eq!(params, "{}");
             }
-            _ => panic!("expected Api command"),
+            _ => panic!("expected rpc call command"),
         }
     }
+
+    /// `--params @file` and `--params -` should parse as their
+    /// literal strings (resolved at dispatch time, not at parse).
+    #[test]
+    fn test_cli_parse_rpc_call_params_file_or_stdin() {
+        let cli = Cli::try_parse_from([
+            "shux",
+            "rpc",
+            "call",
+            "session.create",
+            "--params",
+            "@/tmp/p.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Rpc {
+                command: RpcCommand::Call { params, .. },
+            }) => {
+                assert_eq!(params, "@/tmp/p.json");
+            }
+            _ => panic!("expected rpc call command"),
+        }
+
+        let cli = Cli::try_parse_from(["shux", "rpc", "call", "session.create", "--params", "-"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Rpc {
+                command: RpcCommand::Call { params, .. },
+            }) => {
+                assert_eq!(params, "-");
+            }
+            _ => panic!("expected rpc call command"),
+        }
+    }
+
+    // ───── State namespace (replaces top-level `apply`) ─────
+
+    #[test]
+    fn test_cli_parse_state_apply() {
+        let cli = Cli::try_parse_from(["shux", "state", "apply", "./spec.toml"]).unwrap();
+        match cli.command {
+            Some(Command::State {
+                command:
+                    StateCommand::Apply {
+                        template,
+                        dry_run,
+                        watch,
+                    },
+            }) => {
+                assert_eq!(template, std::path::PathBuf::from("./spec.toml"));
+                assert!(!dry_run);
+                assert!(!watch);
+            }
+            _ => panic!("expected state apply command"),
+        }
+    }
+
+    // ───── Global flags + edge cases ─────
 
     #[test]
     fn test_cli_parse_global_format() {
-        let cli = Cli::try_parse_from(["shux", "--format", "json", "ls"]).unwrap();
+        let cli = Cli::try_parse_from(["shux", "--format", "json", "session", "list"]).unwrap();
         assert!(matches!(cli.format, OutputFormat::Json));
     }
 
     #[test]
     fn test_cli_parse_format_plain() {
-        let cli = Cli::try_parse_from(["shux", "--format", "plain", "ls"]).unwrap();
+        let cli = Cli::try_parse_from(["shux", "--format", "plain", "session", "list"]).unwrap();
         assert!(matches!(cli.format, OutputFormat::Plain));
     }
 
     #[test]
     fn test_cli_parse_global_socket() {
-        let cli = Cli::try_parse_from(["shux", "--socket", "/tmp/my.sock", "ls"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["shux", "--socket", "/tmp/my.sock", "session", "list"]).unwrap();
         assert_eq!(cli.socket, Some(PathBuf::from("/tmp/my.sock")));
     }
 
     #[test]
     fn test_cli_parse_verbose() {
-        let cli = Cli::try_parse_from(["shux", "-v", "ls"]).unwrap();
+        let cli = Cli::try_parse_from(["shux", "-v", "session", "list"]).unwrap();
         assert!(cli.verbose);
-    }
-
-    #[test]
-    fn test_cli_list_alias() {
-        let cli = Cli::try_parse_from(["shux", "list"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Ls)));
     }
 
     #[test]
@@ -3547,46 +3771,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_attach_with_session() {
-        let cli = Cli::try_parse_from(["shux", "attach", "-s", "dev"]).unwrap();
-        match cli.command {
-            Some(Command::Attach { session }) => {
-                assert_eq!(session, Some("dev".to_string()));
-            }
-            _ => panic!("expected Attach command"),
-        }
-    }
-
-    #[test]
     fn test_cli_version_subcommand() {
         let cli = Cli::try_parse_from(["shux", "version"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Version)));
     }
 
     #[test]
-    fn test_cli_kill_requires_session() {
-        let result = Cli::try_parse_from(["shux", "kill"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_cli_parse_rename() {
-        let cli = Cli::try_parse_from(["shux", "rename", "-s", "old", "-n", "new"]).unwrap();
-        match cli.command {
-            Some(Command::Rename { session, name, .. }) => {
-                assert_eq!(session, "old");
-                assert_eq!(name, "new");
-            }
-            _ => panic!("expected Rename command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_rename_requires_both_args() {
-        let result = Cli::try_parse_from(["shux", "rename", "-s", "old"]);
+    fn test_cli_session_rename_requires_both_args() {
+        let result = Cli::try_parse_from(["shux", "session", "rename", "-s", "old"]);
         assert!(result.is_err());
 
-        let result = Cli::try_parse_from(["shux", "rename", "-n", "new"]);
+        let result = Cli::try_parse_from(["shux", "session", "rename", "-n", "new"]);
         assert!(result.is_err());
     }
 
@@ -3627,12 +3822,12 @@ mod tests {
 
     #[test]
     fn test_cli_window_new() {
-        let cli =
-            Cli::try_parse_from(["shux", "window", "new", "-s", "work", "-n", "editor"]).unwrap();
+        let cli = Cli::try_parse_from(["shux", "window", "create", "-s", "work", "-n", "editor"])
+            .unwrap();
         match cli.command {
             Some(Command::Window {
                 command:
-                    WindowCommand::New {
+                    WindowCommand::Create {
                         session,
                         name,
                         cwd,
@@ -3658,13 +3853,13 @@ mod tests {
     #[test]
     fn test_cli_window_new_cwd_and_cmd() {
         let cli = Cli::try_parse_from([
-            "shux", "window", "new", "-s", "work", "-n", "editor", "--cwd", "/tmp", "--cmd",
+            "shux", "window", "create", "-s", "work", "-n", "editor", "--cwd", "/tmp", "--cmd",
             "vim foo",
         ])
         .unwrap();
         match cli.command {
             Some(Command::Window {
-                command: WindowCommand::New { cwd, cmd, argv, .. },
+                command: WindowCommand::Create { cwd, cmd, argv, .. },
             }) => {
                 assert_eq!(cwd, Some(std::path::PathBuf::from("/tmp")));
                 assert_eq!(cmd, Some("vim foo".to_string()));
@@ -3679,12 +3874,12 @@ mod tests {
     #[test]
     fn test_cli_window_new_trailing_argv() {
         let cli = Cli::try_parse_from([
-            "shux", "window", "new", "-s", "work", "-n", "editor", "--", "vim", "foo.rs",
+            "shux", "window", "create", "-s", "work", "-n", "editor", "--", "vim", "foo.rs",
         ])
         .unwrap();
         match cli.command {
             Some(Command::Window {
-                command: WindowCommand::New { argv, .. },
+                command: WindowCommand::Create { argv, .. },
             }) => {
                 assert_eq!(argv, vec!["vim".to_string(), "foo.rs".to_string()]);
             }
@@ -3694,10 +3889,11 @@ mod tests {
 
     #[test]
     fn test_cli_window_new_ensure() {
-        let cli = Cli::try_parse_from(["shux", "window", "new", "-s", "work", "--ensure"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["shux", "window", "create", "-s", "work", "--ensure"]).unwrap();
         match cli.command {
             Some(Command::Window {
-                command: WindowCommand::New { ensure, .. },
+                command: WindowCommand::Create { ensure, .. },
             }) => {
                 assert!(ensure);
             }

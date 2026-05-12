@@ -24,11 +24,14 @@ queryable, deterministic, and streamable.
 
 ```bash
 # As a human
-shux                            # attach to last session, or create "default"
+shux                                    # attach to last session, or create "default"
 
-# As an agent
-shux api session.list '{}'      # typed, JSON, no screen scraping
-shux pane run -s dev cargo test # idempotent; ensure semantics; safe to retry
+# As an agent — every CLI verb mirrors an RPC method 1:1.
+# RPC dots become CLI spaces. No top-level shortcuts to memorize.
+shux session create work                # → session.create RPC
+shux session list                       # → session.list
+shux pane send-keys -s work --text 'j'  # → pane.send_keys
+shux rpc call <method> --params @file   # raw fallthrough for any method
 ```
 
 ## Install
@@ -61,11 +64,17 @@ Requires Rust 1.93+ and a Unix-like OS (macOS, Linux). For dev setup, see
 ## Quickstart
 
 ```bash
-shux                    # opens a session, attaches the TUI
-shux new -s work        # create a named session
-shux pane split -s work # split the active pane
-shux config init        # scaffold ~/.config/shux/config.toml
+shux                              # attach last session (TTY-only)
+shux session create work          # create + attach a named session
+shux pane split -s work           # split the active pane
+shux pane snapshot -s work        # PNG of the current frame
+shux config init                  # scaffold ~/.config/shux/config.toml
 ```
+
+Every command mirrors an RPC method: `shux session create` is the same
+RPC as `session.create`. Drop to the raw form with
+`shux rpc call session.create --params @spec.json` when you'd rather
+write the payload in a file.
 
 Inside the TUI, the prefix key is `Ctrl+Space` by default:
 

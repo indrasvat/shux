@@ -9,7 +9,22 @@ concurrency.
 The shell wrapper:
 
 ```bash
-shux api <method> '<json>'                # one-shot RPC, prints {result:...} or {error:...} on stdout
+shux rpc call <method> [--params <JSON|@FILE|->]   # one-shot RPC.
+                                                    # Prints {result:...} or {error:...} on stdout.
+                                                    # --params accepts inline JSON, @file, or - (stdin).
+                                                    # Defaults to {} for no-arg methods.
+```
+
+Or use the noun-namespaced verbs (every RPC method has a 1:1 CLI
+form: dots become spaces, underscores become kebabs):
+
+```bash
+shux session create demo -- lazygit       # → session.create
+shux session list                          # → session.list
+shux pane send-keys -s demo --text 'j'     # → pane.send_keys
+shux pane snapshot -s demo                 # → pane.snapshot
+shux state apply spec.toml                 # → state.apply
+shux events watch --filter 'session.'      # → events.watch
 ```
 
 ## Session

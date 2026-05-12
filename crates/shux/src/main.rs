@@ -3302,64 +3302,100 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
     let socket_path = args.socket_path();
 
     match args.command {
-        // No subcommand: attach to last session, or create "default" if none.
+        // No subcommand: attach to last session (TTY only). On a
+        // non-TTY stdout (piped, CI, no tty), don't block — print
+        // structured help so scripts get a deterministic response.
+        // Codex council May 2026: piped `shux` should never deadlock.
         None => {
+            use std::io::IsTerminal;
+            if !std::io::stdout().is_terminal() {
+                let help = serde_json::json!({
+                    "shux": env!("CARGO_PKG_VERSION"),
+                    "help": "Run `shux --help` to see commands. \
+                             `shux` with no args attaches to the last session — \
+                             but only when stdout is a TTY. Try `shux session list` \
+                             or `shux rpc call session.list`.",
+                    "common_commands": [
+                        "shux session create <NAME>",
+                        "shux session list",
+                        "shux session attach <NAME>",
+                        "shux session kill <NAME>",
+                        "shux window create -s <SESSION>",
+                        "shux pane send-keys -s <SESSION> --text '...'",
+                        "shux pane snapshot",
+                        "shux plugin install <PATH>",
+                        "shux state apply <template.toml>",
+                        "shux rpc call <method> --params @file"
+                    ]
+                });
+                println!("{}", serde_json::to_string_pretty(&help)?);
+                return Ok(());
+            }
             let _ = client::ensure_daemon_running_at(&socket_path).await?;
             let session_name = pick_attach_target(&socket_path).await;
             run_attach(&socket_path, session_name).await
         }
 
-        Some(Command::New {
-            name,
-            session,
-            ensure,
-            detached,
-            cmd,
-            argv,
-        }) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            // Positional NAME takes precedence over -s/--session; falls
-            // back to it; both falling through generates a default.
-            let resolved = name.or(session);
-            let session_name = resolved.clone().unwrap_or_else(default_session_name);
-            let _result =
-                cli::handle_new(&mut stream, resolved, cmd, argv, ensure, args.format).await?;
-            drop(stream);
-
-            if !detached {
-                run_attach(&socket_path, session_name).await
-            } else {
-                Ok(())
+        // `shux session <verb>` — canonical session lifecycle.
+        // Mirrors `session.*` RPC namespace (`session.create` ↔
+        // `shux session create`, etc.). Codex council May 2026
+        // established this as the agent-first invariant: RPC dots
+        // become CLI spaces, no top-level shortcut verbs.
+        Some(Command::Session { command: sc }) => match sc {
+            cli::SessionCommand::Create {
+                name,
+                session,
+                ensure,
+                detached,
+                cmd,
+                argv,
+            } => {
+                let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+                let resolved = name.or(session);
+                let session_name = resolved.clone().unwrap_or_else(default_session_name);
+                let _ =
+                    cli::handle_new(&mut stream, resolved, cmd, argv, ensure, args.format).await?;
+                drop(stream);
+                if !detached {
+                    run_attach(&socket_path, session_name).await
+                } else {
+                    Ok(())
+                }
             }
-        }
-
-        Some(Command::Attach { session }) => {
-            let _ = client::ensure_daemon_running_at(&socket_path).await?;
-            let session_name = session.unwrap_or_else(|| "default".to_string());
-            run_attach(&socket_path, session_name).await
-        }
-
-        Some(Command::Ls) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_ls(&mut stream, args.format).await
-        }
-
-        Some(Command::Kill {
-            session,
-            expected_version,
-        }) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_kill(&mut stream, &session, expected_version, args.format).await
-        }
-
-        Some(Command::Rename {
-            session,
-            name,
-            expected_version,
-        }) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_rename(&mut stream, &session, &name, expected_version, args.format).await
-        }
+            cli::SessionCommand::List => {
+                let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+                cli::handle_ls(&mut stream, args.format).await
+            }
+            cli::SessionCommand::Kill {
+                name_pos,
+                session,
+                expected_version,
+            } => {
+                let resolved = name_pos.or(session).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing session name: pass it as a positional or via -s/--session"
+                    )
+                })?;
+                let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+                cli::handle_kill(&mut stream, &resolved, expected_version, args.format).await
+            }
+            cli::SessionCommand::Rename {
+                session,
+                name,
+                expected_version,
+            } => {
+                let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+                cli::handle_rename(&mut stream, &session, &name, expected_version, args.format)
+                    .await
+            }
+            cli::SessionCommand::Attach { name_pos, session } => {
+                let _ = client::ensure_daemon_running_at(&socket_path).await?;
+                let session_name = name_pos
+                    .or(session)
+                    .unwrap_or_else(|| "default".to_string());
+                run_attach(&socket_path, session_name).await
+            }
+        },
 
         Some(Command::Window { command }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
@@ -3367,7 +3403,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 WindowCommand::List { session } => {
                     cli::handle_window_list(&mut stream, &session, args.format).await
                 }
-                WindowCommand::New {
+                WindowCommand::Create {
                     session,
                     name,
                     cwd,
@@ -3443,6 +3479,24 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         &window,
                         index,
                         expected_version,
+                        args.format,
+                    )
+                    .await
+                }
+                WindowCommand::Snapshot {
+                    session,
+                    window,
+                    output,
+                    cols,
+                    rows,
+                } => {
+                    cli::handle_snapshot(
+                        &mut stream,
+                        session.as_deref(),
+                        window.as_deref(),
+                        output,
+                        cols,
+                        rows,
                         args.format,
                     )
                     .await
@@ -3665,12 +3719,51 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     )
                     .await
                 }
+                PaneCommand::WaitFor {
+                    session,
+                    window,
+                    pane,
+                    text,
+                    regex,
+                    absent,
+                    lines,
+                    timeout_ms,
+                    poll_ms,
+                } => {
+                    cli::handle_wait_for(
+                        &mut stream,
+                        session.as_deref(),
+                        window.as_deref(),
+                        pane.as_deref(),
+                        text.as_deref(),
+                        regex.as_deref(),
+                        absent,
+                        lines,
+                        timeout_ms,
+                        poll_ms,
+                        args.format,
+                    )
+                    .await
+                }
             }
         }
 
-        Some(Command::Api { method, params }) => {
+        Some(Command::Rpc {
+            command: cli::RpcCommand::Call { method, params },
+        }) => {
+            // Resolve `--params` source: inline JSON, `@<file>`, or `-` (stdin).
+            // Codex council May 2026: eliminate shell-escaping bait for JSON.
+            let resolved = if params == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else if let Some(path) = params.strip_prefix('@') {
+                std::fs::read_to_string(path)?
+            } else {
+                params
+            };
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_api(&mut stream, &method, &params, args.format).await
+            cli::handle_api(&mut stream, &method, &resolved, args.format).await
         }
 
         Some(Command::Version) => {
@@ -3755,63 +3848,13 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Some(Command::WaitFor {
-            session,
-            window,
-            pane,
-            text,
-            regex,
-            absent,
-            lines,
-            timeout_ms,
-            poll_ms,
-        }) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_wait_for(
-                &mut stream,
-                session.as_deref(),
-                window.as_deref(),
-                pane.as_deref(),
-                text.as_deref(),
-                regex.as_deref(),
-                absent,
-                lines,
-                timeout_ms,
-                poll_ms,
-                args.format,
-            )
-            .await
-        }
-
-        Some(Command::Snapshot {
-            session,
-            window,
-            output,
-            cols,
-            rows,
-        }) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_snapshot(
-                &mut stream,
-                session.as_deref(),
-                window.as_deref(),
-                output,
-                cols,
-                rows,
-                args.format,
-            )
-            .await
-        }
-
-        Some(Command::Init { dir }) => {
-            let root = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
-            cli::handle_init(&root, args.format)
-        }
-
-        Some(Command::Apply {
-            template,
-            dry_run,
-            watch,
+        Some(Command::State {
+            command:
+                cli::StateCommand::Apply {
+                    template,
+                    dry_run,
+                    watch,
+                },
         }) => {
             // Lower the TOML template to apply ops first (no daemon needed
             // for parse / validate). If --dry-run, print the lowered ops as
@@ -3834,6 +3877,11 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
 
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
             cli::handle_apply(&mut stream, ops, watch, &socket_path).await
+        }
+
+        Some(Command::Init { dir }) => {
+            let root = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
+            cli::handle_init(&root, args.format)
         }
 
         Some(Command::__daemon) => unreachable!("handled above"),
