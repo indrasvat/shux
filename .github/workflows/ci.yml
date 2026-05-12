@@ -63,8 +63,34 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq file
       - name: Build shux (release)
         run: cargo build --release -p shux
-      - name: Run end-to-end smoke
+      - name: Run end-to-end smoke (happy path)
         run: SHUX="$PWD/target/release/shux" bash .shux/scripts/smoke.sh
+      - name: Run integration regressions (12 deterministic scenarios)
+        run: SHUX="$PWD/target/release/shux" bash .shux/scripts/integration.sh
+
+  # Workspace test coverage via cargo-llvm-cov. Uploads lcov to codecov.io;
+  # the README badge tracks this metric. Linux-only (codecov uploader
+  # works fine cross-platform but llvm-cov on macOS pulls in xcode tools
+  # that slow CI and don't change the % materially).
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      - name: Generate lcov.info
+        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          # CODECOV_TOKEN is optional for public repos but recommended.
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   deny:
     name: Deny

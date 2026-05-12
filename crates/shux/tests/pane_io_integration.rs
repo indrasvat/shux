@@ -411,7 +411,7 @@ fn register_pane_io_methods(
                             .vts
                             .get(&pane_id)
                             .map(|vt| {
-                                let text = vt.capture_text(50);
+                                let text = vt.capture_text(Some(50));
                                 shux_pty::strip_ansi(&text)
                             })
                             .unwrap_or_default()
@@ -507,7 +507,7 @@ fn register_pane_io_methods(
                     shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                 })?;
 
-                let text = vt.capture_text(lines);
+                let text = vt.capture_text(Some(lines));
                 let clean = shux_pty::strip_ansi(&text);
 
                 Ok(serde_json::json!({

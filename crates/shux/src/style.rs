@@ -63,10 +63,16 @@ impl TerminalContext {
 
 // ── Styled Text Helper ─────────────────────────────────────────
 
-/// Whether to emit ANSI color codes. Auto-detects from stderr/stdout.
+/// Whether to emit ANSI color codes. NO_COLOR wins; CLICOLOR_FORCE
+/// (or FORCE_COLOR, the npm convention) forces on even when stdout is
+/// piped — useful for capturing the banner into a file or screenshot
+/// pipeline; otherwise auto-detects from stdout.
 fn colors_enabled() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
+    }
+    if std::env::var_os("CLICOLOR_FORCE").is_some() || std::env::var_os("FORCE_COLOR").is_some() {
+        return true;
     }
     io::stdout().is_terminal()
 }
@@ -145,7 +151,8 @@ fn styled_if(text: &str, colors: bool, fg: Option<Color>, is_bold: bool, is_dim:
 
 // ── Banner ─────────────────────────────────────────────────────
 
-/// Generate the shux ASCII art banner with a cyan→blue→indigo gradient.
+/// Generate the shux ASCII art banner with a warm terracotta→amber gradient
+/// (matches the landing-page logo + accent palette: #c75a2a → #d97c4a → #e69561).
 /// Respects NO_COLOR and terminal detection.
 pub fn banner() -> String {
     const ART: [&str; 6] = [
@@ -161,12 +168,20 @@ pub fn banner() -> String {
         return ART.join("\n");
     }
 
-    // Cyan → blue → indigo gradient (256-color)
-    const GRADIENT: [u8; 5] = [51, 45, 39, 33, 27];
+    // Warm terracotta → amber gradient using truecolor RGB. Matches the
+    // landing-page accent palette (--accent #c75a2a) shading lighter
+    // toward the bottom of the wordmark.
+    const GRADIENT: [(u8, u8, u8); 5] = [
+        (199, 90, 42),   // #c75a2a — accent
+        (213, 105, 55),  // warmer
+        (224, 124, 75),  // brighter
+        (232, 145, 100), // softer
+        (240, 168, 128), // softest
+    ];
 
-    let mut out = String::with_capacity(256);
-    for (line, &color) in ART[..5].iter().zip(&GRADIENT) {
-        out.push_str(&format!("\x1b[1;38;5;{color}m{line}\x1b[0m\n"));
+    let mut out = String::with_capacity(384);
+    for (line, &(r, g, b)) in ART[..5].iter().zip(&GRADIENT) {
+        out.push_str(&format!("\x1b[1;38;2;{r};{g};{b}m{line}\x1b[0m\n"));
     }
     out
 }

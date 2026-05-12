@@ -133,7 +133,11 @@ Implementation notes:
 
 ### `pane.capture`
 
-Plain-text capture of the last N lines. ANSI stripped.
+Plain-text capture of up to N most-recent **non-blank** lines, ANSI
+stripped. The walk starts from the last row that has content and goes
+back N rows — blank rows below the cursor (the typical case for any TUI
+that doesn't fill the whole viewport) are skipped. Returns `"\n"` when
+the viewport is entirely blank.
 
 ```json
 { "pane_id": "uuid", "lines": 50 } → { "text": "...", "lines": 50 }

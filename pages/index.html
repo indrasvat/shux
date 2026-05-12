@@ -620,7 +620,7 @@
 
 <!-- ─── Nav ─────────────────────────────────────────── -->
 <nav class="nav">
-  <a class="nav-mark" href="/">shux<span class="ver" id="ver">v0.8</span></a>
+  <a class="nav-mark" href="/">shux<span class="ver" id="ver" data-dyn="version">v0.8</span></a>
   <div class="nav-links">
     <a href="#difference"><span class="lbl">why</span></a>
     <a href="#agents"><span class="lbl">agents</span></a>
@@ -634,7 +634,7 @@
 <section class="hero">
   <div class="wrap hero-grid">
     <div>
-      <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span>v0.8.0 · stable · written in Rust</p>
+      <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span><span data-dyn="version">v0.8</span>.0 · stable · written in Rust</p>
       <h1 class="hero-headline">
         <span class="brand-chip">shux</span>:<br>
         tmux for the<br>
@@ -652,7 +652,7 @@
         <a class="btn secondary" href="#agents">Read the API</a>
       </div>
       <div class="hero-meta">
-        <span><span class="moss-dot"></span> 692 tests passing</span>
+        <span><span class="moss-dot"></span> <span data-dyn="test-count">692</span> tests passing</span>
         <span>macOS · Linux · arm64/amd64</span>
         <span>MIT</span>
       </div>
@@ -874,7 +874,7 @@ command = ["lazygit"]
         <p class="respect">If you're a human at a keyboard and tmux works, keep using tmux.</p>
       </div>
       <div class="col win">
-        <h3>shux <span class="tag accent">v0.8 · Rust</span></h3>
+        <h3>shux <span class="tag accent" data-dyn="version">v0.8</span><span class="tag accent"> · Rust</span></h3>
         <ul>
           <li>Length-prefixed JSON-RPC over UDS + TCP. Every CLI verb is a typed call.</li>
           <li>Declarative workspace templates that apply atomically.</li>
@@ -935,7 +935,7 @@ command = ["lazygit"]
         <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">CI test sweep</span>
-          <span class="g-meta">cargo nextest · 692/692</span>
+          <span class="g-meta">cargo nextest · <span data-dyn="test-count">692</span>/692</span>
         </button>
         <button role="tab" class="gallery-tab" data-i="6" aria-selected="false">
           <span class="g-dot"></span>
@@ -1024,9 +1024,9 @@ command = ["lazygit"]
 
         <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
-          <img src="/screenshots/05-tests.png" alt="cargo nextest running 692 tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] 692 tests run: 692 passed, 0 skipped'" width="1620" height="912" loading="lazy"></a>
+          <img src="/screenshots/05-tests.png" alt="cargo nextest running <span data-dyn="test-count">692</span> tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] <span data-dyn="test-count">692</span> tests run: <span data-dyn="test-count">692</span> passed, 0 skipped'" width="1620" height="912" loading="lazy"></a>
           <figcaption>
-            <b><code>cargo nextest run --workspace</code></b> — 692 tests cover the
+            <b><code>cargo nextest run --workspace</code></b> — <span data-dyn="test-count">692</span> tests cover the
             whole workspace (core, VT parser, PTY, RPC, UI compositor, raster, plugin
             host, CLI). PASS rows captured mid-run, summary at the bottom.
           </figcaption>
@@ -1158,7 +1158,7 @@ PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
   <div class="wrap">
     <div class="row">
       <div>
-        <a class="nav-mark" href="/">shux<span class="ver" id="ver-footer">v0.8</span></a>
+        <a class="nav-mark" href="/">shux<span class="ver" id="ver-footer" data-dyn="version">v0.8</span></a>
         <p style="margin-top:var(--s-3); max-width:32ch; color:var(--ink-3); font-size:13px">
           A modern, batteries-included terminal multiplexer built in
           Rust. First-class support for both humans and agents.
@@ -1375,18 +1375,26 @@ PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
     }, 4200);
   })();
 
-  // Version label is stamped at build/deploy time (we ship a static
-  // string in the markup rather than fetch api.github.com on every page
-  // load — codex review pointed out the rate-limit risk on a traffic
-  // spike, and the cosmetic chip isn't worth the foot-gun).
+  // Substitute version + test count from /version.json (stamped at
+  // deploy time by .github/workflows/deploy-pages.yml — no runtime fetch
+  // to api.github.com, no rate-limit footgun). Falls back to the literal
+  // markup if the JSON is unreachable.
   (function () {
-    var nav = document.getElementById("ver");
-    var ftr = document.getElementById("ver-footer");
-    // The deploy workflow can rewrite this constant on each release; for
-    // now it tracks the latest published tag.
-    var v = "v0.8";
-    if (nav) nav.textContent = v;
-    if (ftr) ftr.textContent = v;
+    fetch("/version.json", { cache: "no-cache" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j) return;
+        var compact = (j.version || "").replace(/\.\d+$/, ""); // "v0.10.1" → "v0.10"
+        document.querySelectorAll('[data-dyn="version"]').forEach(function (el) {
+          el.textContent = compact || j.version;
+        });
+        if (typeof j.tests_passing === "number") {
+          document.querySelectorAll('[data-dyn="test-count"]').forEach(function (el) {
+            el.textContent = j.tests_passing;
+          });
+        }
+      })
+      .catch(function () { /* keep markup defaults */ });
   })();
 </script>
 
