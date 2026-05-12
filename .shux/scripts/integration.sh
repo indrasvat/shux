@@ -30,11 +30,11 @@ WORKDIR="${WORKDIR:-$(mktemp -d -t shux-integration.XXXXXX)}"
 PFX="shux-it"
 
 cleanup() {
-    "$SHUX" api session.list 2>/dev/null \
+    "$SHUX" rpc call session.list 2>/dev/null \
         | jq -r --arg pfx "$PFX" \
             '.result.sessions[]? | select(.name | startswith($pfx)) | .id' \
         | while read -r sid; do
-            "$SHUX" api session.kill "{\"id\":\"$sid\"}" >/dev/null 2>&1 || true
+            "$SHUX" rpc call session.kill --params "{\"id\":\"$sid\"}" >/dev/null 2>&1 || true
           done
 }
 trap cleanup EXIT
@@ -49,7 +49,7 @@ fail () { echo "    ✗ $*" >&2; exit 1; }
 # name-vs-id resolution quirks.
 mk_session () {
     local name="$1" cmd="$2"
-    "$SHUX" api session.create "{\"name\":\"$name\",\"command\":[\"bash\",\"-c\",\"$cmd\"]}" \
+    "$SHUX" rpc call session.create --params "{\"name\":\"$name\",\"command\":[\"bash\",\"-c\",\"$cmd\"]}" \
         | jq -r .result.id
 }
 
@@ -61,14 +61,14 @@ sid_a=$(mk_session "${PFX}-life" "sleep 9000")
 
 # CLI `rename` (uses dual-resolution: name → uuid). Asserts the CLI
 # wrapper path, not just the raw RPC.
-"$SHUX" rename -s "${PFX}-life" -n "${PFX}-life-renamed" >/dev/null
+"$SHUX" session rename -s "${PFX}-life" -n "${PFX}-life-renamed" >/dev/null
 
-after=$("$SHUX" api session.list \
+after=$("$SHUX" rpc call session.list \
         | jq -r --arg id "$sid_a" '.result.sessions[] | select(.id==$id) | .name')
 [ "$after" = "${PFX}-life-renamed" ] || fail "rename didn't take effect (got: $after)"
 
-"$SHUX" api session.kill "{\"id\":\"$sid_a\"}" >/dev/null
-gone=$("$SHUX" api session.list \
+"$SHUX" rpc call session.kill --params "{\"id\":\"$sid_a\"}" >/dev/null
+gone=$("$SHUX" rpc call session.list \
        | jq --arg id "$sid_a" '.result.sessions[] | select(.id==$id) | .id')
 [ -z "$gone" ] || fail "killed session still in list (got: $gone)"
 ok "create → rename → kill via UUIDs"
@@ -77,19 +77,19 @@ ok "create → rename → kill via UUIDs"
 echo "==> [ 2/12] window.create / window.list / window.kill"
 # ──────────────────────────────────────────────────────────────
 sid_w=$(mk_session "${PFX}-wins" "sleep 9000")
-"$SHUX" api window.create "{\"session_id\":\"$sid_w\",\"name\":\"second\"}" >/dev/null
-"$SHUX" api window.create "{\"session_id\":\"$sid_w\",\"name\":\"third\"}" >/dev/null
+"$SHUX" rpc call window.create --params "{\"session_id\":\"$sid_w\",\"name\":\"second\"}" >/dev/null
+"$SHUX" rpc call window.create --params "{\"session_id\":\"$sid_w\",\"name\":\"third\"}" >/dev/null
 
-count=$("$SHUX" api window.list "{\"session_id\":\"$sid_w\"}" \
+count=$("$SHUX" rpc call window.list --params "{\"session_id\":\"$sid_w\"}" \
         | jq '.result | length')
 [ "$count" = "3" ] || fail "expected 3 windows, got $count"
 
 # Kill the middle one, assert remaining two are correct titles.
-mid_id=$("$SHUX" api window.list "{\"session_id\":\"$sid_w\"}" \
+mid_id=$("$SHUX" rpc call window.list --params "{\"session_id\":\"$sid_w\"}" \
          | jq -r '.result[] | select(.title=="second") | .id')
-"$SHUX" api window.kill "{\"session_id\":\"$sid_w\",\"id\":\"$mid_id\"}" >/dev/null
+"$SHUX" rpc call window.kill --params "{\"session_id\":\"$sid_w\",\"id\":\"$mid_id\"}" >/dev/null
 
-titles=$("$SHUX" api window.list "{\"session_id\":\"$sid_w\"}" \
+titles=$("$SHUX" rpc call window.list --params "{\"session_id\":\"$sid_w\"}" \
          | jq -r '[.result[].title] | sort | join(",")')
 echo "$titles" | grep -q 'second' \
     && fail "killed window 'second' still in list (got: $titles)"
@@ -100,34 +100,34 @@ ok "create × 3 → list = 3 → kill middle → list = 2"
 echo "==> [ 3/12] pane.split / pane.list / pane.zoom / pane.swap / pane.kill"
 # ──────────────────────────────────────────────────────────────
 sid_p=$(mk_session "${PFX}-panes" "sleep 9000")
-pane0=$("$SHUX" api session.list \
+pane0=$("$SHUX" rpc call session.list \
         | jq -r --arg id "$sid_p" '.result.sessions[] | select(.id==$id) | .pane_id')
-win0=$("$SHUX" api session.list \
+win0=$("$SHUX" rpc call session.list \
        | jq -r --arg id "$sid_p" '.result.sessions[] | select(.id==$id) | .active_window_id')
 
 # Split twice → 3 panes in the window.
-pane1=$("$SHUX" api pane.split "{\"pane_id\":\"$pane0\",\"direction\":\"vertical\"}" \
+pane1=$("$SHUX" rpc call pane.split --params "{\"pane_id\":\"$pane0\",\"direction\":\"vertical\"}" \
         | jq -r .result.pane.id)
-pane2=$("$SHUX" api pane.split "{\"pane_id\":\"$pane1\",\"direction\":\"horizontal\"}" \
+pane2=$("$SHUX" rpc call pane.split --params "{\"pane_id\":\"$pane1\",\"direction\":\"horizontal\"}" \
         | jq -r .result.pane.id)
 
 # pane.list isn't implemented yet across both `window_id` and `session_id`
 # shapes uniformly — use window.list and inspect pane_count which IS
 # part of the contracted response (see api.md, window_to_json).
-pane_count=$("$SHUX" api window.list "{\"session_id\":\"$sid_p\"}" \
+pane_count=$("$SHUX" rpc call window.list --params "{\"session_id\":\"$sid_p\"}" \
              | jq --arg w "$win0" '.result[] | select(.id==$w) | .pane_count')
 [ "$pane_count" = "3" ] || fail "expected 3 panes after 2 splits, got $pane_count"
 
 # Zoom + unzoom (zoom acts as a toggle).
-"$SHUX" api pane.zoom "{\"pane_id\":\"$pane1\"}" >/dev/null
-"$SHUX" api pane.zoom "{\"pane_id\":\"$pane1\"}" >/dev/null
+"$SHUX" rpc call pane.zoom --params "{\"pane_id\":\"$pane1\"}" >/dev/null
+"$SHUX" rpc call pane.zoom --params "{\"pane_id\":\"$pane1\"}" >/dev/null
 
 # Swap pane0 ↔ pane2 (pane.swap takes both ids). Verify both still exist.
-"$SHUX" api pane.swap "{\"pane_id\":\"$pane0\",\"target_pane_id\":\"$pane2\"}" >/dev/null
+"$SHUX" rpc call pane.swap --params "{\"pane_id\":\"$pane0\",\"target_pane_id\":\"$pane2\"}" >/dev/null
 
 # Kill the middle pane.
-"$SHUX" api pane.kill "{\"pane_id\":\"$pane1\"}" >/dev/null
-pane_count=$("$SHUX" api window.list "{\"session_id\":\"$sid_p\"}" \
+"$SHUX" rpc call pane.kill --params "{\"pane_id\":\"$pane1\"}" >/dev/null
+pane_count=$("$SHUX" rpc call window.list --params "{\"session_id\":\"$sid_p\"}" \
              | jq --arg w "$win0" '.result[] | select(.id==$w) | .pane_count')
 [ "$pane_count" = "2" ] || fail "expected 2 panes after kill, got $pane_count"
 ok "split×2 / zoom / unzoom / swap / kill — pane count stays consistent"
@@ -136,14 +136,14 @@ ok "split×2 / zoom / unzoom / swap / kill — pane count stays consistent"
 echo "==> [ 4/12] send_keys → wait-for → capture (PTY round-trip)"
 # ──────────────────────────────────────────────────────────────
 sid_io=$(mk_session "${PFX}-io" "read x; echo GOT:\$x; sleep 9000")
-pane_io=$("$SHUX" api session.list \
+pane_io=$("$SHUX" rpc call session.list \
           | jq -r --arg id "$sid_io" '.result.sessions[] | select(.id==$id) | .pane_id')
 
-"$SHUX" api pane.send_keys \
+"$SHUX" rpc call pane.send_keys --params \
     "{\"pane_id\":\"$pane_io\",\"text\":\"hello-from-test\\n\"}" >/dev/null
-"$SHUX" wait-for -p "$pane_io" -t 'GOT:hello-from-test' --timeout-ms 5000 >/dev/null
+"$SHUX" pane wait-for -p "$pane_io" -t 'GOT:hello-from-test' --timeout-ms 5000 >/dev/null
 
-cap=$("$SHUX" api pane.capture "{\"pane_id\":\"$pane_io\",\"lines\":5}" \
+cap=$("$SHUX" rpc call pane.capture --params "{\"pane_id\":\"$pane_io\",\"lines\":5}" \
       | jq -r .result.text)
 echo "$cap" | grep -q 'GOT:hello-from-test' \
     || fail "pane.capture missing echoed text (got: $cap)"
@@ -160,13 +160,13 @@ title = "w0"
 [[windows.panes]]
 command = ["bash", "-c", "sleep 9000"]
 TOML
-"$SHUX" apply base.toml >/dev/null
-before=$("$SHUX" api session.list | jq '.result.sessions | length')
+"$SHUX" state apply base.toml >/dev/null
+before=$("$SHUX" rpc call session.list | jq '.result.sessions | length')
 
-if "$SHUX" apply base.toml >/dev/null 2>&1; then
+if "$SHUX" state apply base.toml >/dev/null 2>&1; then
     fail "second apply of same session.name unexpectedly succeeded"
 fi
-after=$("$SHUX" api session.list | jq '.result.sessions | length')
+after=$("$SHUX" rpc call session.list | jq '.result.sessions | length')
 [ "$before" = "$after" ] \
     || fail "session count changed ($before → $after) after a failed apply"
 ok "name-conflict apply rejected; graph unchanged"
@@ -175,7 +175,7 @@ ok "name-conflict apply rejected; graph unchanged"
 echo "==> [ 6/12] events.history — monotonic seq + lifecycle event types"
 # ──────────────────────────────────────────────────────────────
 mk_session "${PFX}-ev" "sleep 9000" >/dev/null
-events=$("$SHUX" api events.history '{"count":30}')
+events=$("$SHUX" rpc call events.history --params '{"count":30}')
 seqs=$(echo "$events" | jq -r '.result.events[].seq')
 prev=-1
 for s in $seqs; do
@@ -194,7 +194,7 @@ ok "event seqs strictly increasing; session/window/pane.created all present"
 echo "==> [ 7/12] snapshot dimension fidelity (80×24 → 720×456)"
 # ──────────────────────────────────────────────────────────────
 sid_sd=$(mk_session "${PFX}-snap" "sleep 9000")
-"$SHUX" snapshot -s "${PFX}-snap" -o "$WORKDIR/dim.png" --cols 80 --rows 24 >/dev/null
+"$SHUX" window snapshot -s "${PFX}-snap" -o "$WORKDIR/dim.png" --cols 80 --rows 24 >/dev/null
 
 # PNG IHDR width is at byte offset 16, big-endian u32.
 w=$(python3 -c "
@@ -210,22 +210,22 @@ ok "PNG header reports 720×456 for an 80×24 request"
 # ──────────────────────────────────────────────────────────────
 echo "==> [ 8/12] session.snapshot ≡ window.snapshot for single-window session"
 # ──────────────────────────────────────────────────────────────
-win_sd=$("$SHUX" api session.list \
+win_sd=$("$SHUX" rpc call session.list \
          | jq -r --arg id "$sid_sd" '.result.sessions[] | select(.id==$id) | .active_window_id')
 
-a=$("$SHUX" api session.snapshot \
+a=$("$SHUX" rpc call session.snapshot --params \
     "{\"session_id\":\"$sid_sd\",\"cols\":80,\"rows\":24}" \
     | jq -r .result.png_base64)
-b=$("$SHUX" api window.snapshot \
+b=$("$SHUX" rpc call window.snapshot --params \
     "{\"window_id\":\"$win_sd\",\"cols\":80,\"rows\":24}" \
     | jq -r .result.png_base64)
 # Status bar contains a live clock, so the two responses sit in
 # different ticks. We assert the IMAGE DIMENSIONS, CELL DIMENSIONS, AND
 # REPORTED COLS/ROWS agree — the contracted invariant. Pixel parity
 # would require freezing the clock.
-ja=$("$SHUX" api session.snapshot \
+ja=$("$SHUX" rpc call session.snapshot --params \
      "{\"session_id\":\"$sid_sd\",\"cols\":80,\"rows\":24}")
-jb=$("$SHUX" api window.snapshot \
+jb=$("$SHUX" rpc call window.snapshot --params \
      "{\"window_id\":\"$win_sd\",\"cols\":80,\"rows\":24}")
 for field in width height cell_width cell_height cols rows format; do
     va=$(echo "$ja" | jq -r ".result.$field")
@@ -243,14 +243,14 @@ sid_oc=$(mk_session "${PFX}-oc" "sleep 9000")
 # kill with bogus version → should return version_conflict (-32002).
 # shux api exits 2 on RPC error; capture-then-parse so pipefail doesn't bite.
 set +e
-ocjson=$("$SHUX" api session.kill "{\"id\":\"$sid_oc\",\"expected_version\":999}" 2>&1)
+ocjson=$("$SHUX" rpc call session.kill --params "{\"id\":\"$sid_oc\",\"expected_version\":999}" 2>&1)
 set -e
 err=$(echo "$ocjson" | jq -r '.error.code // "ok"')
 [ "$err" = "-32002" ] \
     || fail "expected -32002 on stale version, got $err (full: $ocjson)"
 
 # Session still alive — kill without expected_version succeeds.
-still=$("$SHUX" api session.list \
+still=$("$SHUX" rpc call session.list \
         | jq -r --arg id "$sid_oc" '.result.sessions[] | select(.id==$id) | .id')
 [ "$still" = "$sid_oc" ] || fail "session disappeared after a rejected kill"
 ok "stale expected_version → -32002; entity untouched"
@@ -259,11 +259,11 @@ ok "stale expected_version → -32002; entity untouched"
 echo "==> [10/12] wait-for timeout — never-matching pattern exits 2"
 # ──────────────────────────────────────────────────────────────
 sid_wt=$(mk_session "${PFX}-wt" "sleep 9000")
-pane_wt=$("$SHUX" api session.list \
+pane_wt=$("$SHUX" rpc call session.list \
           | jq -r --arg id "$sid_wt" '.result.sessions[] | select(.id==$id) | .pane_id')
 
 set +e
-"$SHUX" wait-for -p "$pane_wt" -t NEVER-PRESENT-XYZ --timeout-ms 300 >/dev/null 2>&1
+"$SHUX" pane wait-for -p "$pane_wt" -t NEVER-PRESENT-XYZ --timeout-ms 300 >/dev/null 2>&1
 rc=$?
 set -e
 [ "$rc" = "2" ] || fail "wait-for timeout should exit 2, got $rc"
@@ -272,13 +272,13 @@ ok "wait-for timeout returns exit 2"
 # ──────────────────────────────────────────────────────────────
 echo "==> [11/12] wait-for --absent + --regex modes"
 # ──────────────────────────────────────────────────────────────
-"$SHUX" wait-for -p "$pane_wt" -t NEVER-PRESENT-XYZ --absent --timeout-ms 300 >/dev/null
+"$SHUX" pane wait-for -p "$pane_wt" -t NEVER-PRESENT-XYZ --absent --timeout-ms 300 >/dev/null
 ok "--absent succeeds immediately when text is not present"
 
 sid_re=$(mk_session "${PFX}-re" "echo READY-NOW; sleep 9000")
-pane_re=$("$SHUX" api session.list \
+pane_re=$("$SHUX" rpc call session.list \
           | jq -r --arg id "$sid_re" '.result.sessions[] | select(.id==$id) | .pane_id')
-"$SHUX" wait-for -p "$pane_re" --regex 'READY-NO[A-Z]+' --timeout-ms 3000 >/dev/null
+"$SHUX" pane wait-for -p "$pane_re" --regex 'READY-NO[A-Z]+' --timeout-ms 3000 >/dev/null
 ok "--regex matches against captured text"
 
 # ──────────────────────────────────────────────────────────────

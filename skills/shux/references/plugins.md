@@ -245,7 +245,7 @@ daemon — if you find a drift, that is a bug, file it.
 
 | Method | Params | Result shape |
 |---|---|---|
-| `window.rename` | `{"id": "<window UUID>", "name": "<new title>"}` | Returns the full updated window object: `{id, title, index, pane_count, is_active, active_pane_id, session_id, version}`. `name: null` clears a manual title and falls back to OSC / command / cwd. |
+| `window.rename` | `{"id": "<window UUID>", "name": "<new title>"}` | Returns the full updated window object: `{id, title, index, pane_count, is_active, active_pane_id, session_id, version}`. `name` is required and must be a non-null string — pass `null` and you get `invalid_params: "missing 'name' parameter"`. (To clear a manual override use `pane.set_title --clear` on a pane; windows have no manual-override-clear path.) |
 | `window.focus` | `{"id": "<window UUID>"}` | `{...window, previous_window_id: <UUID or null>}`. |
 | `window.list` | `{"session_id": "<session UUID>"}` | **Bare array** `[{id, title, index, pane_count, is_active, active_pane_id, session_id, version}, ...]` — NOT wrapped in `{windows: [...]}`. The window UUID field is `id`, not `window_id`. |
 | `pane.send_keys` | `{"pane_id": "<UUID>", "text": "..."}` — or `data: "<base64>"` for control bytes. Accepts `session_id` / `window_id` instead of `pane_id` to target the resolved active pane (see chain below). | `{bytes_written, pane_id}`. |
