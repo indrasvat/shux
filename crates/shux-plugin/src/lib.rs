@@ -195,16 +195,18 @@ impl PluginManager {
             ));
         }
 
-        {
-            let inner = self.inner.lock().await;
-            if inner.contains_key(&manifest.name) {
-                let _ = child.kill().await;
-                return Err(PluginError::NameConflict(manifest.name.clone()));
-            }
+        // Stage 2: dedup + spawn + register atomically. Held across
+        // the spawn so two concurrent installs of plugins reporting
+        // the same manifest name can't both pass the contains_key
+        // check and overwrite each other's `Running` entry, which
+        // would orphan one of the child processes. Spawn itself is
+        // non-blocking, so the lock window stays in microseconds.
+        let mut inner = self.inner.lock().await;
+        if inner.contains_key(&manifest.name) {
+            let _ = child.start_kill();
+            return Err(PluginError::NameConflict(manifest.name.clone()));
         }
 
-        // Stage 2: spawn the long-running I/O task that owns
-        // stdin/stdout for the rest of the plugin's lifetime.
         let (inbox_tx, inbox_rx) = mpsc::channel::<String>(64);
         let (kill_tx, kill_rx) = oneshot::channel::<()>();
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -253,8 +255,8 @@ impl PluginManager {
             _join: join,
         };
 
-        let mut inner = self.inner.lock().await;
         inner.insert(manifest.name.clone(), running);
+        drop(inner);
         info!(plugin = %manifest.name, "plugin installed");
         Ok(info)
     }
@@ -351,6 +353,19 @@ async fn run_plugin_io(
             biased;
 
             _ = &mut kill_rx => {
+                // Drain any frames already queued on inbox — notably the
+                // `plugin.shutdown` notification that `PluginManager::kill`
+                // pushes immediately before signaling us. The biased
+                // `select!` would otherwise jump straight to the grace
+                // wait without ever writing those bytes, force-killing
+                // plugins that expected the documented 2s graceful window.
+                while let Ok(line) = inbox_rx.try_recv() {
+                    if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                        *last_error.lock().await = Some(format!("stdin write (drain): {e}"));
+                        break;
+                    }
+                }
+                let _ = stdin.flush().await;
                 debug!(plugin = %name, "kill signal received; draining grace");
                 let _ = tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await;
                 let _ = child.start_kill();
@@ -414,14 +429,17 @@ async fn run_plugin_io(
 
 /// Read one event from a (possibly absent) subscription. Returns
 /// `None` if there's no subscription (suspended forever), the
-/// receiver lagged, or the bus closed.
+/// receiver lagged, or the bus closed. Events flatten via
+/// `Event::to_wire_json()` so plugins see the same shape as
+/// `events.watch` / `events.history` consumers (top-level `type`,
+/// `seq`, `timestamp`, plus payload under `data`).
 async fn next_event(sub: &mut Option<Subscription>) -> Option<serde_json::Value> {
     let Some(s) = sub.as_mut() else {
         std::future::pending::<()>().await;
         return None;
     };
     match s.recv().await {
-        Some(SubscriptionEvent::Event(e)) => serde_json::to_value(&e).ok(),
+        Some(SubscriptionEvent::Event(e)) => Some(e.to_wire_json()),
         Some(SubscriptionEvent::Lagged(skipped)) => {
             warn!("plugin event subscription lagged: skipped {skipped}");
             None

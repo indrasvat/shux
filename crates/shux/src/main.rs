@@ -715,22 +715,7 @@ fn pane_to_json(
 /// AND meta (seq, timestamp, type) at the top level so consumers can route
 /// without recursing into a nested envelope.
 fn event_to_json(event: &shux_core::event::Event) -> serde_json::Value {
-    let mut out = serde_json::json!({
-        "seq": event.meta.seq,
-        "type": event.meta.event_type,
-        "timestamp": event.meta.timestamp
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-        "data": &event.data,
-    });
-    // Include correlation_id ONLY when set, so non-batched events keep
-    // their existing wire shape (consistent with `skip_serializing_if`
-    // on EventMetadata).
-    if let Some(cid) = &event.meta.correlation_id {
-        out["correlation_id"] = serde_json::Value::String(cid.clone());
-    }
-    out
+    event.to_wire_json()
 }
 
 /// Register `events.watch` and `events.history` RPC methods.

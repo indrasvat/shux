@@ -96,6 +96,30 @@ impl Event {
         }
         self.meta.event_type.starts_with(filter)
     }
+
+    /// Wire shape used by every external consumer (`events.watch`,
+    /// `events.history`, and the plugin event channel). Lifts `seq`,
+    /// `type`, `timestamp`, and `correlation_id` (when set) to the
+    /// top level so handlers can route on them without recursing
+    /// into the serde-tagged `EventData` envelope. Payload fields
+    /// live under `data` (e.g. `data.session_id`).
+    pub fn to_wire_json(&self) -> serde_json::Value {
+        let mut out = serde_json::json!({
+            "seq": self.meta.seq,
+            "type": self.meta.event_type,
+            "timestamp": self
+                .meta
+                .timestamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            "data": &self.data,
+        });
+        if let Some(cid) = &self.meta.correlation_id {
+            out["correlation_id"] = serde_json::Value::String(cid.clone());
+        }
+        out
+    }
 }
 
 impl fmt::Display for Event {
