@@ -1029,11 +1029,14 @@ command = ["lazygit"]
 
         <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
-          <img src="/screenshots/05-tests.png" alt="cargo nextest running shux's full workspace test suite, scrolling green PASS rows with timestamps, ending with a Summary line showing all tests passed and zero skipped" width="1620" height="912" loading="lazy"></a>
+          <img src="/screenshots/05-tests.png" alt="A Python 3.13 REPL session with PyREPL syntax highlighting, showing an agent progressively driving the REPL through computations: importing math/statistics, computing roots, fitting a tiny dataset, defining a primes lambda, and inspecting the result list" width="1620" height="912" loading="lazy"></a>
           <figcaption>
-            <b><code>cargo nextest run --workspace</code></b> — <span data-dyn="test-count">692</span> tests cover the
-            whole workspace (core, VT parser, PTY, RPC, UI compositor, raster, plugin
-            host, CLI). PASS rows captured mid-run, summary at the bottom.
+            <b>An agent driving Python's REPL</b> end-to-end — <code>pane.send_keys</code>
+            to type each statement, <code>pane.wait_for</code> to block on the response,
+            <code>pane.capture</code> to pull the result back for the next step. This is
+            the replacement for <code>expect</code> / <code>pexpect</code> / iTerm2
+            <code>wait_for_text</code>: a typed contract instead of timing assumptions.
+            PyREPL 3.13's native syntax highlighting comes for free.
           </figcaption>
         </figure>
 
