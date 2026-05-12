@@ -327,7 +327,27 @@ impl PluginManager {
         // close, and the new child sometimes inherits a stale
         // file descriptor on macOS.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        self.install(source).await
+        match self.install(source.clone()).await {
+            Ok(info) => Ok(info),
+            Err(e) => {
+                // Install failed (handshake error, syntax error in the
+                // edited source, …) — but if the original was being
+                // watched, restart a fresh watcher so the next save can
+                // retry. Without this, `kill()`'s cancel-flag write
+                // tears down the watcher, the registry entry is gone,
+                // and the loop is dead even though the user is still
+                // saving the file. (Codex bot review, May 2026.)
+                if source.watch {
+                    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    spawn_reload_watcher(self.clone(), name.to_string(), source.clone(), cancel);
+                    info!(
+                        plugin = %name,
+                        "install failed during reload; watcher re-armed for next save"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Snapshot every running plugin.
@@ -475,8 +495,14 @@ fn spawn_reload_watcher(
     });
 
     // Debouncer / reload trigger lives in the tokio runtime so the
-    // reload itself can await the manager.
+    // reload itself can await the manager. If the plugin is currently
+    // registered we call `reload(name)` (kill + respawn from the same
+    // source). If it's NOT registered — which happens after a failed
+    // reload in the "save broken file → save fixed file" loop — we
+    // fall back to `install(source.clone())` so the next save can
+    // recover. (Codex bot review, May 2026.)
     let reload_name = name.clone();
+    let source_for_reinstall = source.clone();
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             // Coalesce a burst of saves into one reload by draining
@@ -487,15 +513,19 @@ fn spawn_reload_watcher(
                 break;
             }
             info!(plugin = %reload_name, "watcher: file changed, reloading");
-            match mgr.reload(&reload_name).await {
-                Ok(_) => {
-                    info!(plugin = %reload_name, "watcher: reload OK");
-                }
-                Err(e) => {
-                    warn!(plugin = %reload_name, error = %e, "watcher: reload failed");
-                    // Don't break — keep watching so a subsequent
-                    // save (fixing the syntax error) can retry.
-                }
+            let registered = mgr.inner.lock().await.contains_key(&reload_name);
+            let outcome = if registered {
+                mgr.reload(&reload_name).await
+            } else {
+                mgr.install(source_for_reinstall.clone()).await
+            };
+            match outcome {
+                Ok(_) => info!(plugin = %reload_name, "watcher: reload OK"),
+                Err(e) => warn!(
+                    plugin = %reload_name,
+                    error = %e,
+                    "watcher: reload failed — keeping watcher armed for next save"
+                ),
             }
         }
         debug!(plugin = %reload_name, "watcher: debouncer exiting");

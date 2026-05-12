@@ -3303,18 +3303,21 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
 
     match args.command {
         // No subcommand: attach to last session (TTY only). On a
-        // non-TTY stdout (piped, CI, no tty), don't block — print
-        // structured help so scripts get a deterministic response.
-        // Codex council May 2026: piped `shux` should never deadlock.
+        // non-TTY stdin OR stdout (piped, CI, redirected), don't
+        // block — print structured help so scripts get a deterministic
+        // response. Attach drives crossterm raw-mode keyboard input,
+        // so `shux </dev/null` (stdout-tty + stdin-piped) would
+        // hang on the input thread. Guard on BOTH. (Codex council
+        // May 2026 + codex bot review of PR #24.)
         None => {
             use std::io::IsTerminal;
-            if !std::io::stdout().is_terminal() {
+            if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
                 let help = serde_json::json!({
                     "shux": env!("CARGO_PKG_VERSION"),
                     "help": "Run `shux --help` to see commands. \
                              `shux` with no args attaches to the last session — \
-                             but only when stdout is a TTY. Try `shux session list` \
-                             or `shux rpc call session.list`.",
+                             but only when BOTH stdin and stdout are a TTY. Try \
+                             `shux session list` or `shux rpc call session.list`.",
                     "common_commands": [
                         "shux session create <NAME>",
                         "shux session list",
