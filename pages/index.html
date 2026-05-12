@@ -634,7 +634,7 @@
 <section class="hero">
   <div class="wrap hero-grid">
     <div>
-      <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span><span data-dyn="version">v0.8</span>.0 · stable · written in Rust</p>
+      <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span><span data-dyn="version-full">v0.8.0</span> · stable · written in Rust</p>
       <h1 class="hero-headline">
         <span class="brand-chip">shux</span>:<br>
         tmux for the<br>
@@ -1029,7 +1029,7 @@ command = ["lazygit"]
 
         <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
-          <img src="/screenshots/05-tests.png" alt="cargo nextest running <span data-dyn="test-count">692</span> tests, scrolling green PASS rows with timestamps, ending with 'Summary [2.310s] <span data-dyn="test-count">692</span> tests run: <span data-dyn="test-count">692</span> passed, 0 skipped'" width="1620" height="912" loading="lazy"></a>
+          <img src="/screenshots/05-tests.png" alt="cargo nextest running shux's full workspace test suite, scrolling green PASS rows with timestamps, ending with a Summary line showing all tests passed and zero skipped" width="1620" height="912" loading="lazy"></a>
           <figcaption>
             <b><code>cargo nextest run --workspace</code></b> — <span data-dyn="test-count">692</span> tests cover the
             whole workspace (core, VT parser, PTY, RPC, UI compositor, raster, plugin
@@ -1389,9 +1389,13 @@ PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) {
         if (!j) return;
-        var compact = (j.version || "").replace(/\.\d+$/, ""); // "v0.10.1" → "v0.10"
+        var full = j.version || "";
+        var compact = full.replace(/\.\d+$/, ""); // "v0.10.1" → "v0.10"
         document.querySelectorAll('[data-dyn="version"]').forEach(function (el) {
-          el.textContent = compact || j.version;
+          el.textContent = compact || full;
+        });
+        document.querySelectorAll('[data-dyn="version-full"]').forEach(function (el) {
+          el.textContent = full;
         });
         if (typeof j.tests_passing === "number") {
           document.querySelectorAll('[data-dyn="test-count"]').forEach(function (el) {
