@@ -443,6 +443,18 @@ pub enum Command {
         command: PaneCommand,
     },
 
+    /// Plugin management (task 044a phase 0 — process plugins).
+    ///
+    /// `shux plugin install <path>` spawns an executable that speaks
+    /// shux's line-delimited JSON-RPC dialect (see
+    /// docs/tasks/044a-process-plugins-v0.md). The plugin can call
+    /// any registered shux RPC method and subscribe to events
+    /// declared in its `subscribes` manifest.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+
     /// Subscribe to typed events from the daemon (agent-friendly stream).
     ///
     /// `shux events watch` long-polls the daemon's event bus and prints one
@@ -614,6 +626,39 @@ pub enum EventsCommand {
         /// Number of events to return (clamped 1..=1000).
         #[arg(short = 'n', long, default_value_t = 50)]
         count: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginCommand {
+    /// Spawn a plugin process, perform the JSON-RPC handshake, and
+    /// register it under the name reported in its manifest. The
+    /// executable must speak shux's line-delimited dialect — see
+    /// `docs/tasks/044a-process-plugins-v0.md` and the
+    /// `examples/plugins/hello/` reference plugin.
+    Install {
+        /// Path to the plugin executable.
+        path: std::path::PathBuf,
+
+        /// Extra argv passed to the plugin on spawn.
+        #[arg(long, value_delimiter = ' ', num_args = 0..)]
+        args: Vec<String>,
+
+        /// Working directory for the plugin process.
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+    },
+
+    /// List running plugins (name, version, source, pid, status,
+    /// uptime, declared subscriptions).
+    #[command(alias = "ls")]
+    List,
+
+    /// Send a plugin a `plugin.shutdown` notification, then terminate
+    /// the child process after the grace window.
+    Kill {
+        /// Plugin name (as reported in its manifest).
+        name: String,
     },
 }
 
@@ -2909,6 +2954,164 @@ pub async fn handle_events_history(
         for ev in events {
             println!("{}", serde_json::to_string(ev)?);
         }
+    }
+    Ok(())
+}
+
+/// `shux plugin install <path>` — register a plugin executable
+/// with the daemon. Spawns a `plugin.install` RPC and reports the
+/// resolved manifest.
+pub async fn handle_plugin_install(
+    stream: &mut tokio::net::UnixStream,
+    path: &std::path::Path,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "path".into(),
+        serde_json::Value::String(path.display().to_string()),
+    );
+    if !args.is_empty() {
+        params.insert("args".into(), serde_json::json!(args));
+    }
+    if let Some(cwd) = cwd {
+        params.insert(
+            "cwd".into(),
+            serde_json::Value::String(cwd.display().to_string()),
+        );
+    }
+
+    let result = rpc_call(stream, "plugin.install", serde_json::Value::Object(params)).await?;
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Plain => {
+            let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let ver = result
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let pid = result.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("{name}\t{ver}\t{pid}");
+        }
+        OutputFormat::Text => {
+            let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let ver = result
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let pid = result.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let subs: Vec<String> = result
+                .get("subscribes")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let sub_str = if subs.is_empty() {
+                String::from("∅")
+            } else {
+                subs.join(",")
+            };
+            println!(
+                "{} {} {} (pid {}, subscribes: {})",
+                style::success("✓ installed plugin"),
+                style::bold(name),
+                style::muted(&format!("v{ver}")),
+                pid,
+                style::muted(&sub_str),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `shux plugin list` — print every running plugin in a small box.
+pub async fn handle_plugin_list(
+    stream: &mut tokio::net::UnixStream,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let result = rpc_call(stream, "plugin.list", serde_json::json!({})).await?;
+    let plugins = result
+        .get("plugins")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Plain => {
+            for p in &plugins {
+                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+                let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let up_ms = p.get("uptime_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("{name}\t{ver}\t{status}\t{pid}\t{up_ms}");
+            }
+        }
+        OutputFormat::Text => {
+            if plugins.is_empty() {
+                println!("{}", style::muted("no plugins installed"));
+                return Ok(());
+            }
+            println!("{}", style::muted(&format!("{} plugin(s)", plugins.len())));
+            for p in &plugins {
+                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+                let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let up_ms = p.get("uptime_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let up_s = up_ms / 1000;
+                let dot = if status == "running" {
+                    style::success("●").to_string()
+                } else {
+                    style::warning("○").to_string()
+                };
+                println!(
+                    "  {} {} {} {} (pid {}, up {}s)",
+                    dot,
+                    style::bold(name),
+                    style::muted(&format!("v{ver}")),
+                    style::muted(status),
+                    pid,
+                    up_s
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `shux plugin kill <name>` — send shutdown + reap.
+pub async fn handle_plugin_kill(
+    stream: &mut tokio::net::UnixStream,
+    name: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let params = serde_json::json!({ "name": name });
+    let result = rpc_call(stream, "plugin.kill", params).await?;
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Plain => println!("{name}\tkilled"),
+        OutputFormat::Text => println!(
+            "{} {}",
+            style::success("✓ killed plugin"),
+            style::bold(name)
+        ),
     }
     Ok(())
 }

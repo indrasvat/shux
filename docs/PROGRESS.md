@@ -438,6 +438,7 @@
 | 042 | Event interception chain | M2 | Pending | 041, 036 |
 | 043 | Command override system | M2 | Pending | 041 |
 | 044 | Process plugin protocol | M2 | Pending | 041 |
+| 044a | Process plugins v0 (Pi-style DX, WASM-free) — phase 0 done | M2 | **Done (phase 0)** | 035, 036 |
 | 045 | Plugin API extensions | M2 | Pending | 041, 035 |
 | 046 | Overlay system (z-ordered stack) | M2 | Pending | 041 |
 | 047 | Inter-plugin event bus | M2 | Pending | 041, 036 |

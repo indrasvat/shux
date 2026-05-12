@@ -1203,6 +1203,18 @@ dependencies = [
 [[package]]
 name = "shux-plugin"
 version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "shux-core",
+ "shux-rpc",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "shux-pty"

@@ -625,6 +625,7 @@
     <a href="#difference"><span class="lbl">why</span></a>
     <a href="#agents"><span class="lbl">agents</span></a>
     <a href="#replaces"><span class="lbl">replaces</span></a>
+    <a href="#plugins"><span class="lbl">plugins</span></a>
     <a href="#quickstart"><span class="lbl">install</span></a>
     <a class="cta" href="https://github.com/indrasvat/shux">GitHub →</a>
   </div>
@@ -1186,6 +1187,51 @@ PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
   </div>
 </section>
 
+<!-- ─── Plugins ─────────────────────────────────────── -->
+<section class="section" id="plugins">
+  <div class="wrap-narrow">
+    <p class="eyebrow">extend, don't fork</p>
+    <h2 class="measure">Agent-authored plugins. Any language. ~30 lines.</h2>
+    <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
+      A plugin is any executable that speaks shux's line-delimited
+      JSON-RPC dialect on stdin/stdout. It subscribes to bus events
+      and calls the same RPC methods you use from outside —
+      <code>window.rename</code>, <code>pane.send_keys</code>,
+      <code>state.apply</code>. Bash, python, node, anything.
+    </p>
+
+    <div class="code-panel">
+      <pre><code><span style="color:var(--ink2-on-paper)"># Install, list, kill — the whole CLI surface for v0.</span>
+<span style="color:var(--accent)">$ shux plugin install ./my-plugin.sh</span>
+<span style="color:var(--ink2-on-paper)"># → spawned, handshook (5s budget), registered under manifest name</span>
+
+<span style="color:var(--accent)">$ shux plugin list</span>
+<span style="color:var(--ink2-on-paper)"># name · version · pid · subscribes · status · uptime</span>
+
+<span style="color:var(--accent)">$ shux plugin kill hello</span>
+<span style="color:var(--ink2-on-paper)"># → plugin.shutdown sent, 2s graceful window, SIGKILL fallback</span></code></pre>
+
+      <div class="annot">
+        <h3>The protocol, in four lines</h3>
+        <ul class="kv-list">
+          <li><span class="k">handshake</span><span class="v">one line in, one manifest line out (≤5 s)</span></li>
+          <li><span class="k">events</span><span class="v">one JSON line per matching bus event on stdin</span></li>
+          <li><span class="k">rpc out</span><span class="v">write any registered method to stdout, response comes back on stdin</span></li>
+          <li><span class="k">shutdown</span><span class="v">plugin.shutdown frame, 2 s grace, then SIGKILL</span></li>
+        </ul>
+        <p class="target" style="margin-top:var(--s-4)">
+          Same trust model as a shell function — no sandbox in v0.
+          Hot reload, sandboxing, and WASM all queued for later.
+        </p>
+        <div class="hero-cta" style="margin-top:var(--s-5)">
+          <a class="btn primary" href="https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh">The 30-line example</a>
+          <a class="btn secondary" href="https://github.com/indrasvat/shux/blob/main/skills/shux/references/plugins.md">Protocol reference</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- ─── Footer ──────────────────────────────────────── -->
 <footer class="footer">
   <div class="wrap">
@@ -1219,6 +1265,7 @@ PID=$(echo "$RESP" | jq -r .result.pane_id)</code></pre>
           <li><a href="#difference">vs tmux</a></li>
           <li><a href="#replaces">Tools replaced</a></li>
           <li><a href="#agents">Agent surface</a></li>
+          <li><a href="#plugins">Plugins</a></li>
         </ul>
       </div>
     </div>

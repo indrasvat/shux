@@ -535,14 +535,27 @@ async fn run_rpc_server(
         }
     });
 
-    // Build router: system builtins + session + window + pane + pane I/O + events + state methods
-    let router = register_state_methods(
-        register_events_methods(
-            register_pane_io_methods(
-                register_pane_methods(
-                    register_window_methods(
-                        register_session_methods(
-                            shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+    // Plugin host (task 044a phase 0). One PluginManager shared by
+    // the plugin RPC handlers and every spawned plugin's I/O task.
+    // We set the router on it AFTER `.build()` below, breaking the
+    // circular dependency (manager holds Arc<OnceCell<Router>>).
+    let plugins = shux_plugin::PluginManager::new(event_bus.clone());
+
+    // Build router: system builtins + session + window + pane + pane I/O + events + state + plugin methods
+    let router = register_plugin_methods(
+        register_state_methods(
+            register_events_methods(
+                register_pane_io_methods(
+                    register_pane_methods(
+                        register_window_methods(
+                            register_session_methods(
+                                shux_rpc::server::register_builtin_methods(
+                                    shux_rpc::Router::builder(),
+                                ),
+                                graph_handle.clone(),
+                                io_state.clone(),
+                                cancel.clone(),
+                            ),
                             graph_handle.clone(),
                             io_state.clone(),
                             cancel.clone(),
@@ -555,17 +568,20 @@ async fn run_rpc_server(
                     io_state.clone(),
                     cancel.clone(),
                 ),
-                graph_handle.clone(),
-                io_state.clone(),
-                cancel.clone(),
+                event_bus,
             ),
-            event_bus,
+            graph_handle,
+            io_state,
+            cancel.clone(),
         ),
-        graph_handle,
-        io_state,
-        cancel.clone(),
+        plugins.clone(),
     )
     .build();
+
+    // Plugin → daemon RPC calls dispatch through this router clone.
+    // Setting it now (post-build) is what lets plugins call any
+    // method registered above.
+    plugins.set_router(router.clone());
 
     let config = shux_rpc::ServerConfig {
         socket_path,
@@ -699,22 +715,7 @@ fn pane_to_json(
 /// AND meta (seq, timestamp, type) at the top level so consumers can route
 /// without recursing into a nested envelope.
 fn event_to_json(event: &shux_core::event::Event) -> serde_json::Value {
-    let mut out = serde_json::json!({
-        "seq": event.meta.seq,
-        "type": event.meta.event_type,
-        "timestamp": event.meta.timestamp
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-        "data": &event.data,
-    });
-    // Include correlation_id ONLY when set, so non-batched events keep
-    // their existing wire shape (consistent with `skip_serializing_if`
-    // on EventMetadata).
-    if let Some(cid) = &event.meta.correlation_id {
-        out["correlation_id"] = serde_json::Value::String(cid.clone());
-    }
-    out
+    event.to_wire_json()
 }
 
 /// Register `events.watch` and `events.history` RPC methods.
@@ -819,6 +820,96 @@ fn batch_error_to_rpc(e: shux_core::apply::BatchError) -> shux_rpc::RpcError {
         }
         BatchError::OpFailed { source, .. } => graph_error_to_rpc(source),
     }
+}
+
+/// Map PluginError → RpcError so plugin RPC handlers report
+/// human-readable failures (NotFound + NameConflict reuse the
+/// canonical PRD §8.3 error envelopes, everything else is
+/// internal).
+fn plugin_error_to_rpc(e: shux_plugin::PluginError) -> shux_rpc::RpcError {
+    use shux_plugin::PluginError;
+    match e {
+        PluginError::NotFound(ref name) => shux_rpc::RpcError::not_found("plugin", name),
+        PluginError::NameConflict(ref name) => shux_rpc::RpcError::name_conflict("plugin", name),
+        PluginError::HandshakeFailed(_) | PluginError::Proto(_) => {
+            shux_rpc::RpcError::invalid_params(&e.to_string())
+        }
+        PluginError::Io(_) => shux_rpc::RpcError::internal(&e.to_string()),
+    }
+}
+
+/// Plugin RPC surface (task 044a, phase 0).
+///
+/// - `plugin.install` — spawn a plugin from a `path` (+ optional
+///   `args`, `cwd`). Performs the handshake synchronously and
+///   returns the resolved `PluginInfo`.
+/// - `plugin.list` — snapshot of every running plugin.
+/// - `plugin.kill` — graceful shutdown + child cleanup.
+fn register_plugin_methods(
+    builder: shux_rpc::RouterBuilder,
+    plugins: shux_plugin::PluginManager,
+) -> shux_rpc::RouterBuilder {
+    let p1 = plugins.clone();
+    let p2 = plugins.clone();
+    let p3 = plugins;
+
+    builder
+        .register(
+            "plugin.install",
+            move |params: Option<serde_json::Value>| {
+                let mgr = p1.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let path = params
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'path'"))?;
+                    let args: Vec<String> = params
+                        .get("args")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let cwd = params
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from);
+
+                    let source = shux_plugin::PluginSource {
+                        path: PathBuf::from(path),
+                        args,
+                        cwd,
+                    };
+                    let info = mgr.install(source).await.map_err(plugin_error_to_rpc)?;
+                    serde_json::to_value(&info).map_err(|e| {
+                        shux_rpc::RpcError::internal(&format!("plugin info serialize: {e}"))
+                    })
+                }
+            },
+        )
+        .register("plugin.list", move |_params: Option<serde_json::Value>| {
+            let mgr = p2.clone();
+            async move {
+                let infos = mgr.list().await;
+                Ok(serde_json::json!({ "plugins": infos }))
+            }
+        })
+        .register("plugin.kill", move |params: Option<serde_json::Value>| {
+            let mgr = p3.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'name'"))?
+                    .to_string();
+                mgr.kill(&name).await.map_err(plugin_error_to_rpc)?;
+                Ok(serde_json::json!({ "killed": name }))
+            }
+        })
 }
 
 /// `events.history` is a simple bus.history_filtered() wrapper.
@@ -3543,6 +3634,30 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
         },
+
+        Some(Command::Plugin { command: pl_cmd }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            match pl_cmd {
+                cli::PluginCommand::Install {
+                    path,
+                    args: pargs,
+                    cwd,
+                } => {
+                    cli::handle_plugin_install(
+                        &mut stream,
+                        &path,
+                        &pargs,
+                        cwd.as_deref(),
+                        args.format,
+                    )
+                    .await
+                }
+                cli::PluginCommand::List => cli::handle_plugin_list(&mut stream, args.format).await,
+                cli::PluginCommand::Kill { name } => {
+                    cli::handle_plugin_kill(&mut stream, &name, args.format).await
+                }
+            }
+        }
 
         Some(Command::Events { command: ev_cmd }) => {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;

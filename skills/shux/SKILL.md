@@ -1,6 +1,6 @@
 ---
 name: shux
-description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, or do headless visual regression on a terminal UI. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "replace tmux", "iTerm2 automation", "expect script", "headless terminal test", "agent multiplexer", "asciinema record".
+description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane, and extend shux itself with line-delimited JSON-RPC plugins in any language. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, do headless visual regression on a terminal UI, or write a process plugin that subscribes to the shux event bus and calls back through `window.rename`, `pane.send_keys`, `state.apply`, etc. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "replace tmux", "iTerm2 automation", "expect script", "headless terminal test", "agent multiplexer", "asciinema record", "write a shux plugin", "extend shux", "shux plugin install".
 ---
 
 # shux — terminal multiplexer with a JSON-RPC API + pixel snapshotter
@@ -152,6 +152,25 @@ Need plain text of the screen?     → pane.capture (returns ANSI-stripped text)
 Need a stream of PTY output?       → pane.output.watch (event-bus stream)
 ```
 
+## Extend shux with a process plugin
+
+shux has a process-plugin host. A plugin is any executable that speaks
+shux's line-delimited JSON-RPC dialect on stdin/stdout — bash, python,
+node, anything. It subscribes to bus events and can call the same RPC
+methods you use from outside (`window.rename`, `pane.send_keys`,
+`state.apply`, …) to react in real time.
+
+```bash
+shux plugin install ./my-plugin.sh   # spawn, handshake, register
+shux plugin list                      # name · version · pid · subscribes · status
+shux plugin kill <name>               # graceful shutdown (2s) → SIGKILL
+```
+
+Smallest working example (~30 lines of bash): [`examples/plugins/hello/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh).
+Full protocol — handshake, event payload shape, RPC-out direction,
+shutdown grace, UUID vs name rule, what's not in v0 — lives in
+[references/plugins.md](references/plugins.md).
+
 ## Deep dives
 
 | Topic | Where |
@@ -159,6 +178,7 @@ Need a stream of PTY output?       → pane.output.watch (event-bus stream)
 | Full RPC inventory + JSON request/response shapes | [references/api.md](references/api.md) |
 | Apply-template TOML shape, lowering rules, multi-window workspaces | [references/templates.md](references/templates.md) |
 | Scenario-driver patterns (send/wait/snap loops, golden-image diff) | [references/scenarios.md](references/scenarios.md) |
+| Process plugins — protocol, manifest, event/RPC shapes, gotchas | [references/plugins.md](references/plugins.md) |
 
 ## Worked examples
 

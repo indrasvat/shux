@@ -78,6 +78,27 @@ Inside the TUI, the prefix key is `Ctrl+Space` by default:
 | click any pane | focus it |
 | drag a border | resize |
 
+## Extend shux with a process plugin
+
+A plugin is any executable that speaks shux's line-delimited
+JSON-RPC dialect on stdin/stdout. It subscribes to bus events and can
+call the same RPC methods you use from outside (`window.rename`,
+`pane.send_keys`, `state.apply`, …). Any language — bash, python,
+node — same trust model as a shell function.
+
+```bash
+shux plugin install ./my-plugin.sh   # spawn, handshake, register
+shux plugin list                      # what's running
+shux plugin kill <name>               # graceful shutdown (2s) → SIGKILL
+```
+
+The smallest correct shape is
+[`examples/plugins/hello/plugin.sh`](examples/plugins/hello/plugin.sh)
+(~30 lines of bash). Full protocol is documented in
+[`skills/shux/references/plugins.md`](skills/shux/references/plugins.md)
+and the task design doc
+[`docs/tasks/044a-process-plugins-v0.md`](docs/tasks/044a-process-plugins-v0.md).
+
 ## Documentation
 
 Read in this order:

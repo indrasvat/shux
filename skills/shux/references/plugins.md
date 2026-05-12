@@ -1,0 +1,217 @@
+# shux process plugins — protocol reference (v0)
+
+A process plugin is any executable that speaks shux's line-delimited
+JSON-RPC dialect on stdin/stdout. The daemon spawns it on
+`shux plugin install`, performs a one-line handshake, then multiplexes
+three streams on the same pair of pipes:
+
+1. **Daemon → plugin** events (bus notifications) and RPC responses on
+   the plugin's stdin.
+2. **Plugin → daemon** RPC requests on the plugin's stdout.
+3. **Plugin diagnostics** on stderr — relayed to daemon `debug!()`
+   logs, tagged with the plugin name. No separate log file.
+
+Framing: **one JSON value per line**, terminated with `\n`. Not the
+length-prefixed framing the public daemon RPC uses on UDS/TCP — the
+plugin pipe is line-delimited because pipes don't need length prefixes
+to find frame boundaries.
+
+## CLI surface
+
+```bash
+shux plugin install <path> [--args ...] [--cwd <dir>]
+shux plugin list                  # alias: ls
+shux plugin kill <name>
+```
+
+`name` is what the plugin reports in its manifest, not the script
+filename. Two plugins reporting the same `name` is a `NameConflict`
+on install — the second loses, the first stays running.
+
+## Phase 1: handshake
+
+Daemon writes one line on stdin within 5 seconds of spawn:
+
+```json
+{"jsonrpc":"2.0","method":"plugin.init","id":"init","params":{}}
+```
+
+Plugin must reply with one line on stdout within the 5 s budget:
+
+```json
+{"jsonrpc":"2.0","id":"init","result":{
+  "name":"my-plugin",
+  "version":"0.1.0",
+  "subscribes":["session.created","window.created"],
+  "provides":[],
+  "capabilities":[]
+}}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string, required | Must be non-empty and unique across installed plugins. |
+| `version` | string, required | Free-form (semver suggested). |
+| `subscribes` | array of strings | Event-type prefixes. `"session."` matches `session.created`, `session.killed`, etc. `[]` means "no events" (plugin receives only RPC responses). |
+| `provides` | array of strings | Reserved for phase 1+; currently informational. |
+| `capabilities` | array of strings | Reserved for phase 1+; currently informational. |
+
+If the manifest doesn't arrive in 5 s, or if `name` is empty, or if
+the line isn't valid JSON, the daemon kills the child and returns
+`HandshakeFailed` to the install caller. Long plugin init should
+happen *after* sending the manifest, not before.
+
+## Phase 2: event delivery (daemon → plugin)
+
+For every bus event whose `type` matches one of the plugin's
+`subscribes` prefixes, the daemon writes one line to the plugin's
+stdin:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method":  "event",
+  "params": {
+    "type":      "session.created",
+    "seq":       42,
+    "timestamp": 1715553600000,
+    "data": {
+      "type": "SessionCreated",
+      "data": {
+        "session_id": "f0a1...UUID",
+        "name":       "alpha"
+      }
+    }
+  }
+}
+```
+
+- Filter on `params.type` (top-level, from `EventMetadata.event_type`).
+  This is the canonical event-type string — `session.created`,
+  `pane.exited`, `window.renamed`, etc.
+- Payload fields live at `params.data.data.*`. Read
+  `params.data.data.session_id`, not `params.session_id`. The
+  outer `params.data.type` is the Rust enum variant name
+  (`SessionCreated`) and is NOT part of the stable contract — use
+  `params.type` for routing.
+- The `params.data.data.*` re-wrap is an inherited ergonomics wart
+  from the bus envelope and is documented as a future breaking-change
+  flatten. Don't depend on it forever, but until then, navigate it.
+
+## Phase 3: plugin → daemon RPC
+
+The plugin can call any registered shux RPC method (`window.rename`,
+`pane.send_keys`, `state.apply`, `session.create`, …) by writing a
+request line to **stdout**:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method":  "window.rename",
+  "params":  {"id": "<window UUID from event>", "name": "🚀 alpha"},
+  "id":      1001
+}
+```
+
+The daemon writes the response back to **stdin** as another line,
+with the same `id`:
+
+```json
+{"jsonrpc":"2.0","id":1001,"result":{"window_id":"...","new_title":"🚀 alpha"}}
+```
+
+or an error:
+
+```json
+{"jsonrpc":"2.0","id":1001,"error":{"code":-32004,"message":"window not found","data":{"resource":"window","id":"..."}}}
+```
+
+### Identifiers are UUIDs, not human names
+
+`pane.send_keys`, `window.rename`, `window.focus`, `session.kill`,
+etc. all expect the UUID fields (`session_id` / `window_id` /
+`pane_id`) directly. The CLI's name → UUID resolution lives in the
+CLI, not the RPC layer, so a plugin that passes `{"session":"alpha"}`
+gets `invalid_params` back. The good news: event payloads carry the
+UUIDs, so use those directly.
+
+### RPC method discovery
+
+Every `shux` CLI subcommand maps 1:1 to an RPC method. The CLI
+itself is the most up-to-date schema reference:
+
+```bash
+shux window rename --help      # describes the window.rename params
+shux pane send-keys --help     # describes the pane.send_keys params
+```
+
+`shux api <method> '<json>'` is also available from outside the
+daemon — useful for prototyping a plugin call by hand before wiring
+it into the plugin loop.
+
+## Phase 4: shutdown
+
+`shux plugin kill <name>` causes the daemon to:
+
+1. Write `{"jsonrpc":"2.0","method":"plugin.shutdown","params":{}}`
+   to the plugin's stdin.
+2. Wait up to 2 s for the child to exit on its own.
+3. SIGKILL if it's still running.
+
+A well-behaved plugin loops reading lines from stdin and exits 0 on
+seeing `plugin.shutdown`. If it ignores the frame, the SIGKILL still
+reaps it — `kill_on_drop(true)` is set on the child handle.
+
+## Minimum-correct skeleton (bash)
+
+```bash
+#!/usr/bin/env bash
+set -u
+# 1. Handshake.
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{
+  "name":"hello","version":"0.1.0",
+  "subscribes":["session.created"],"provides":[],"capabilities":[]
+}}'
+
+# 2. Event + response loop.
+rpc_id=1000
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"session.created"'*)
+      sid=$(printf '%s' "$line" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' | head -1)
+      [ -n "$sid" ] || continue
+      rpc_id=$((rpc_id + 1))
+      printf '{"jsonrpc":"2.0","method":"pane.send_keys","params":{"session_id":"%s","text":"echo from plugin\n"},"id":%d}\n' \
+        "$sid" "$rpc_id"
+      ;;
+  esac
+done
+```
+
+That's the full shape. See
+[`examples/plugins/hello/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh)
+for the same plugin with comments.
+
+## Out of scope for v0
+
+- **Hot reload** (edit-on-save → respawn). The lifecycle plumbing is
+  in place (oneshot kill signal, 2 s grace, `kill_on_drop`), but no
+  watcher. For now, the iteration loop is
+  `shux plugin kill <name> && shux plugin install <path>`.
+- **Sandboxing.** Plugins run with the same uid and filesystem access
+  as the `shux` daemon. Same trust model as a shell function.
+- **WASM plugins.** Process plugins ship first; the sandboxed-
+  distribution layer (WASM + WASI Preview 2) is queued for a later
+  milestone.
+- **Plugin-to-plugin events.** A plugin can call daemon RPCs but
+  cannot directly publish to the bus. Use `state.apply` to indirectly
+  fire lifecycle events.
+
+## Where to learn more
+
+- The task design doc: [`docs/tasks/044a-process-plugins-v0.md`](https://github.com/indrasvat/shux/blob/main/docs/tasks/044a-process-plugins-v0.md).
+- The host source: [`crates/shux-plugin/src/lib.rs`](https://github.com/indrasvat/shux/blob/main/crates/shux-plugin/src/lib.rs).
+- The integration tests (which exercise every flow in this doc):
+  [`crates/shux-plugin/tests/plugin_lifecycle.rs`](https://github.com/indrasvat/shux/blob/main/crates/shux-plugin/tests/plugin_lifecycle.rs).
