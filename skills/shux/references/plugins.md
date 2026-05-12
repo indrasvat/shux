@@ -19,14 +19,37 @@ to find frame boundaries.
 ## CLI surface
 
 ```bash
-shux plugin install <path> [--args ...] [--cwd <dir>]
-shux plugin list                  # alias: ls
+shux plugin install <path> [--args ...] [--cwd <dir>] [--no-watch]
+shux plugin list                  # alias: ls — shows `watching` column
+shux plugin reload <name>         # manual kill + respawn
 shux plugin kill <name>
 ```
 
 `name` is what the plugin reports in its manifest, not the script
 filename. Two plugins reporting the same `name` is a `NameConflict`
 on install — the second loses, the first stays running.
+
+### Hot reload (default on)
+
+`shux plugin install` watches the plugin's source file. On every
+save the daemon kills the running child and reinstalls from the
+same source — debounced ~250ms so a burst of saves coalesces into
+one respawn. The new manifest takes effect immediately; subscribed
+events resume with the new code in <500ms.
+
+```bash
+shux plugin install ./my-plugin.py   # watching=true
+$EDITOR ./my-plugin.py               # edit, save
+# → daemon log: "watcher: file changed, reloading"
+# → next event hits the new code
+
+shux plugin install ./my-plugin.py --no-watch   # opt out for CI / prod
+shux plugin reload my-plugin                    # manual tick when --no-watch
+```
+
+The watcher uses `notify` (FSEvents on macOS, inotify on Linux).
+It watches the parent directory so editors that atomic-rename on
+save (vim, neovim with `backupcopy=auto`) still trigger.
 
 ## Phase 1: handshake
 
@@ -86,6 +109,23 @@ stdin:
 }
 ```
 
+Selected payload fields by event type (the part nested under
+`params.data.data`):
+
+| Event type | Payload |
+|---|---|
+| `session.created` | `session_id`, `name` |
+| `session.killed` | `session_id`, `name` |
+| `session.renamed` | `session_id`, `old_name`, `new_name` |
+| `window.created` | `window_id`, `session_id`, `title`, `index` |
+| `window.renamed` | `window_id`, `old_title`, `new_title` |
+| `window.killed` | `window_id`, `session_id` |
+| `window.activated` | `window_id`, `session_id`, `previous_window_id` |
+| `pane.created` | `pane_id`, `window_id`, `session_id`, `command` |
+| `pane.exited` | `pane_id`, `window_id`, `session_id`, `command`, `exit_status` *(numeric when the child self-exits; null when destroyed via `pane.kill` / `window.kill` / `session.kill`)* |
+| `pane.focused` | `pane_id`, `window_id`, `session_id`, `previous_pane_id` |
+| `pane.title_changed` | `pane_id`, `window_id`, `session_id`, `old_title`, `new_title` |
+
 - Filter on `params.type` (top-level, from `EventMetadata.event_type`).
   This is the canonical event-type string — `session.created`,
   `pane.exited`, `window.renamed`, etc.
@@ -137,8 +177,8 @@ UUIDs, so use those directly.
 
 ### RPC method discovery
 
-Every `shux` CLI subcommand maps 1:1 to an RPC method. The CLI
-itself is the most up-to-date schema reference:
+The CLI is the most up-to-date schema reference for every RPC
+method:
 
 ```bash
 shux window rename --help      # describes the window.rename params
@@ -149,41 +189,112 @@ shux pane send-keys --help     # describes the pane.send_keys params
 daemon — useful for prototyping a plugin call by hand before wiring
 it into the plugin loop.
 
-### Common plugin RPC calls — params at a glance
+### CLI ↔ RPC namespace mapping
 
-These are the methods plugins reach for most often. Every params
-example uses the UUID fields the event payload already carries.
-For optional fields the omitted form is the default. All mutating
-methods also accept `expected_version: u64` for optimistic
-concurrency (omit it on first call).
+The CLI doesn't mirror the RPC namespace exactly. **Session ops
+live at the top level** because they're what a human runs most;
+window and pane ops nest under their nouns. The plugin always
+calls the RPC name (left column).
 
-| Method | Required params | Notes |
+| RPC method | CLI command |
+|---|---|
+| `session.create` | `shux new <NAME>` (or `shux new -s <NAME>`) |
+| `session.list` | `shux ls` |
+| `session.rename` | `shux rename -s <OLD> -n <NEW>` |
+| `session.kill` | `shux kill -s <NAME>` |
+| `session.ensure` | `shux new --ensure -s <NAME>` |
+| `window.create` | `shux window new -s <SESSION> -n <NAME>` |
+| `window.list` | `shux window list -s <SESSION>` (alias `ls`) |
+| `window.rename` | `shux window rename -s <SESSION> -w <CURRENT> -n <NEW>` |
+| `window.focus` | `shux window focus -s <SESSION> -w <NAME>` |
+| `window.kill` | `shux window kill -s <SESSION> -w <NAME>` |
+| `pane.send_keys` | `shux pane send-keys -s <SESSION> --text "..."` |
+| `pane.list` | `shux pane list -s <SESSION>` |
+| `pane.split` | `shux pane split -s <SESSION>` |
+| `pane.kill` | `shux pane kill -s <SESSION>` |
+| `pane.snapshot` | `shux snapshot -s <SESSION> -o frame.png` |
+| `state.apply` | `shux apply <template.toml>` |
+| `events.history` | `shux events history` |
+| `events.watch` | `shux events watch` |
+| `plugin.install` | `shux plugin install <path>` |
+| `plugin.list` | `shux plugin list` (alias `ls`) |
+| `plugin.reload` | `shux plugin reload <name>` |
+| `plugin.kill` | `shux plugin kill <name>` |
+
+When in doubt, `shux --help` shows every top-level subcommand; each
+subcommand has its own `--help` listing every accepted flag.
+
+### Common plugin RPC calls — params + result shapes
+
+These are the methods plugins reach for most often. Every example
+uses the UUID fields the event payload already carries. All
+mutating methods also accept `expected_version: u64` for optimistic
+concurrency (omit on first call). Shapes verified against the live
+daemon — if you find a drift, that is a bug, file it.
+
+| Method | Params | Result shape |
 |---|---|---|
-| `window.rename` | `{"id": "<window UUID>", "name": "<new title>"}` | `id` (not `window_id`). `name: null` clears a manual title and falls back to OSC / command / cwd. |
-| `window.focus` | `{"id": "<window UUID>"}` | Activates the window inside its session. |
-| `window.list` | `{"session_id": "<session UUID>"}` | Returns `windows: [{window_id, title, index, pane_count, is_active, active_pane_id}]`. |
-| `pane.send_keys` | `{"pane_id": "<pane UUID>", "text": "..."}` | Or `data: "<base64 bytes>"` for control bytes. Accepts `session_id` / `window_id` instead of `pane_id` to send to the resolved active pane. |
-| `pane.set_size` | `{"pane_id": "<UUID>", "cols": 200, "rows": 60}` | Synchronous; next snapshot reflects new dims. |
-| `pane.snapshot` | `{"pane_id": "<UUID>"}` | Returns `{png_base64: "..."}`. Capped at 16M pixels. |
-| `pane.capture` | `{"pane_id": "<UUID>"}` | Returns `{text: "..."}` — ANSI-stripped grid contents. |
-| `pane.split` | `{"pane_id": "<UUID>", "direction": "horizontal" \| "vertical"}` | Returns the new pane's UUID. |
-| `pane.kill` | `{"pane_id": "<UUID>"}` | The window survives if it has other panes. |
-| `session.create` | `{"name": "<unique>"}` | Optional `command: ["bash","-l"]` and `cwd: "/path"`. Returns `session_id` + initial `pane_id`. |
-| `session.list` | `{}` | Returns `sessions: [...]`. |
-| `session.kill` | `{"id": "<session UUID>"}` | Reaps all panes. |
-| `state.apply` | `{"ops": [<Op>, ...]}` | Atomic batch — all ops commit or none. See `references/templates.md` for the `Op` shape. |
-| `events.history` | `{"count": 50, "filter": ["session."]}` | Pull recent events; useful at plugin start to catch up. |
+| `window.rename` | `{"id": "<window UUID>", "name": "<new title>"}` | Returns the full updated window object: `{id, title, index, pane_count, is_active, active_pane_id, session_id, version}`. `name: null` clears a manual title and falls back to OSC / command / cwd. |
+| `window.focus` | `{"id": "<window UUID>"}` | `{...window, previous_window_id: <UUID or null>}`. |
+| `window.list` | `{"session_id": "<session UUID>"}` | **Bare array** `[{id, title, index, pane_count, is_active, active_pane_id, session_id, version}, ...]` — NOT wrapped in `{windows: [...]}`. The window UUID field is `id`, not `window_id`. |
+| `pane.send_keys` | `{"pane_id": "<UUID>", "text": "..."}` — or `data: "<base64>"` for control bytes. Accepts `session_id` / `window_id` instead of `pane_id` to target the resolved active pane (see chain below). | `{bytes_written, pane_id}`. |
+| `pane.set_size` | `{"pane_id": "<UUID>", "cols": 200, "rows": 60}` | `{pane_id, cols, rows}`. Synchronous — the next snapshot reflects the new dims. |
+| `pane.snapshot` | `{"pane_id": "<UUID>"}` | `{pane_id, png_base64, format, width, height, cols, rows, cell_width, cell_height}`. Capped at 16M pixels. |
+| `pane.capture` | `{"pane_id": "<UUID>"}` | `{pane_id, cols, rows, cursor, text, lines}` — `text` is ANSI-stripped, `lines` is per-row. |
+| `pane.split` | `{"pane_id": "<UUID>", "direction": "horizontal" \| "vertical"}` | `{pane: {id, command, cwd, exit_status, ...}}` — the new pane's UUID lives at `result.pane.id`. |
+| `pane.kill` | `{"pane_id": "<UUID>"}` | `{killed: "<UUID>"}`. **Returns `invalid_params` with `"cannot remove last pane from window"` if it's the only pane.** Use `window.kill` or `session.kill` for those cases. |
+| `session.create` | `{"name": "<unique>"}`. Optional `command: ["bash","-l"]`, `cwd: "/path"`. | `{id, name, window_id, pane_id, windows, window_count, active_window_id, created_at}`. |
+| `session.list` | `{}` | `{sessions: [{id, name, active_window_id, windows, window_count, ...}, ...]}` — the `sessions` wrapper is present here. |
+| `session.kill` | Either `{"id": "<session UUID>"}` OR `{"name": "<session name>"}`. | `{killed: "<name>"}`. Reaps all windows and panes. |
+| `state.apply` | `{"ops": [<Op>, ...]}` | `{batch_id, correlation_id, spawn_results}`. Atomic — all graph ops commit or none. See `references/templates.md` for the `Op` shape. |
+| `events.history` | `{"count": 50, "filter": ["session."]}` | `{current_seq, events: [...]}` — the events array is **inside the result object**, not the result itself. |
 
 **Identifier resolution chain.** When you only have a session id but
-need a pane, `pane.send_keys` accepts `session_id` and resolves to
-the session's active window's active pane. Similarly,
-`window_id` → active pane of that window. Use the longest-known
-identifier to be explicit; rely on the chain when you can't.
+need a pane, `pane.send_keys` (and other pane methods) accept
+`session_id` and resolve to the session's active window's active
+pane. Similarly, `window_id` → active pane of that window. Use the
+longest-known identifier to be explicit; rely on the chain when you
+can't.
 
 **Discovering an unlisted method.** Run `shux <subcommand> --help` —
 the CLI handler is the canonical source of truth for which JSON
 fields each method accepts. If a method is callable via the CLI it
 is callable from a plugin with the same params.
+
+**Verifying a response shape on the fly.** `shux api <method> '<json>'`
+prints `{result: ...}` (or `{error: ...}`) to stdout. Pipe it through
+`jq '.result | keys'` to see exactly which fields come back.
+
+### Common gotchas plugins hit
+
+- **Single-pane sessions auto-collapse.** When the only pane in a
+  session exits, the session is destroyed (tmux parity). A plugin
+  that reacts to `pane.exited` and tries to `window.rename` the
+  source session will hit "session not found". Either subscribe to
+  a longer-lived session (one with ≥ 2 panes / ≥ 2 windows) or
+  pick a different target window in the same agent's workspace.
+- **`pane.send_keys` to an exited pane returns "pane VT not found".**
+  Once a pane exits, its VT is torn down even though the graph still
+  carries the `Pane` entry briefly. If you need to bell or signal on
+  exit, target a sibling pane in the same session, not the one that
+  just died.
+- **`pane.kill` rejects the last pane in a window.** The daemon
+  refuses to leave a window paneless. Either split first or kill
+  the window directly.
+- **`pane.exited.exit_status` is `null` only for API destruction.**
+  When a pane is destroyed via `pane.kill` / `window.kill` /
+  `session.kill`, the event fires with `exit_status: null`. When
+  the child command exits on its own (the PTY hits EOF), the
+  daemon reaps it and populates the actual exit code — even for
+  signal-killed children, `.code()` returns the integer when the
+  shell wraps it (e.g. `sh -c 'exit 7'` → `exit_status: 7`).
+  Filter on `null` for "destroyed via API"; filter on numeric for
+  "command exited on its own with status N".
+- **Events flow through a double envelope.** `params.type` is the
+  flat event type (route on this). The payload fields live at
+  `params.data.data.*` — see [Phase 2](#phase-2-event-delivery-daemon--plugin)
+  above. A future PR will flatten this; until then, navigate the
+  double-nest.
 
 ## Phase 4: shutdown
 
@@ -232,10 +343,6 @@ for the same plugin with comments.
 
 ## Out of scope for v0
 
-- **Hot reload** (edit-on-save → respawn). The lifecycle plumbing is
-  in place (oneshot kill signal, 2 s grace, `kill_on_drop`), but no
-  watcher. For now, the iteration loop is
-  `shux plugin kill <name> && shux plugin install <path>`.
 - **Sandboxing.** Plugins run with the same uid and filesystem access
   as the `shux` daemon. Same trust model as a shell function.
 - **WASM plugins.** Process plugins ship first; the sandboxed-

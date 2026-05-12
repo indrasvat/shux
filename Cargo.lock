@@ -1205,6 +1205,7 @@ name = "shux-plugin"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "notify",
  "serde",
  "serde_json",
  "shux-core",

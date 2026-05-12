@@ -587,6 +587,7 @@ impl SessionGraph {
             window_id,
             session_id,
             title: "1".into(),
+            index: 0,
         });
         self.fire(EventData::PaneCreated {
             pane_id,
@@ -754,10 +755,12 @@ impl SessionGraph {
         snapshot.panes.insert(pane_id, pane);
         snapshot.windows.insert(window_id, window);
 
+        let mut event_index: u32 = 0;
         if let Some(s) = snapshot.sessions.get_mut(&session_id) {
             s.windows.push(window_id);
             s.active_window = window_id;
             s.version += 1;
+            event_index = (s.windows.len() - 1) as u32;
         }
 
         self.commit_snapshot(snapshot);
@@ -765,6 +768,7 @@ impl SessionGraph {
             window_id,
             session_id,
             title: event_title,
+            index: event_index,
         });
         // create_window also creates an initial pane — fire PaneCreated too so
         // subscribers see every new pane, not only those born of explicit
@@ -1797,6 +1801,7 @@ fn stage_create_session(
             window_id,
             session_id,
             title,
+            index: 0,
         },
         EventData::PaneCreated {
             pane_id,
@@ -1841,10 +1846,12 @@ fn stage_create_window(
     snapshot.panes.insert(pane_id, pane);
     snapshot.windows.insert(window_id, window);
 
+    let mut event_index: u32 = 0;
     if let Some(s) = snapshot.sessions.get_mut(&session_id) {
         s.windows.push(window_id);
         s.active_window = window_id;
         s.version += 1;
+        event_index = (s.windows.len() - 1) as u32;
     }
 
     let events = vec![
@@ -1852,6 +1859,7 @@ fn stage_create_window(
             window_id,
             session_id,
             title: event_title,
+            index: event_index,
         },
         EventData::PaneCreated {
             pane_id,

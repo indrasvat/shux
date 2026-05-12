@@ -284,11 +284,42 @@ async fn run_pane_pty_task(
         }
     }
 
-    // Best-effort: ensure the child shell is sent SIGTERM. Most exit
-    // paths (EOF, write error, cancel) leave the PtyHandle alive only
-    // until this scope ends — tokio::process::Child does NOT reap on
-    // Drop, so an explicit kill prevents zombie shells.
-    let _ = handle.kill();
+    // Reap the child cleanly so plugins and `events.history` see the
+    // real exit code on `pane.exited`. The loop exits for several
+    // reasons (EOF, read error, channel close, shutdown cancel); only
+    // the EOF / read-error paths leave a still-alive child needing a
+    // proper wait, while the channel-close and shutdown paths require
+    // an explicit kill before waiting will return. Bound both stages
+    // with timeouts so a wedged child can't stall pane teardown.
+    let exit_code =
+        match tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait()).await {
+            Ok(Ok(status)) => status.code(),
+            Ok(Err(e)) => {
+                tracing::warn!(%pane_id, error = %e, "PTY child wait failed");
+                None
+            }
+            Err(_) => {
+                // Still alive after 2s — SIGTERM and try once more.
+                let _ = handle.kill();
+                match tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait()).await {
+                    Ok(Ok(status)) => status.code(),
+                    _ => None,
+                }
+            }
+        };
+
+    // Propagate the captured exit code so the daemon's PaneExited
+    // event carries it. set_pane_exit_status both updates the pane
+    // and fires the lifecycle event with the populated field — the
+    // alternative path (graph.destroy_pane via API) fires PaneExited
+    // with None, which is the right thing for "killed by user", and
+    // the cascade paths in destroy_session/destroy_window do the same.
+    if let Some(code) = exit_code {
+        if let Err(e) = graph.set_pane_exit_status(pane_id, code).await {
+            tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
+        }
+    }
+
     let mut state = io_state.lock().await;
     state.writers.remove(&pane_id);
     state.resizers.remove(&pane_id);
@@ -851,7 +882,8 @@ fn register_plugin_methods(
 ) -> shux_rpc::RouterBuilder {
     let p1 = plugins.clone();
     let p2 = plugins.clone();
-    let p3 = plugins;
+    let p3 = plugins.clone();
+    let p4 = plugins;
 
     builder
         .register(
@@ -877,11 +909,19 @@ fn register_plugin_methods(
                         .get("cwd")
                         .and_then(|v| v.as_str())
                         .map(PathBuf::from);
+                    // Watch defaults to ON — the dogfood loop showed
+                    // every iteration without hot reload felt long.
+                    // Callers opt out with `"watch": false`.
+                    let watch = params
+                        .get("watch")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
 
                     let source = shux_plugin::PluginSource {
                         path: PathBuf::from(path),
                         args,
                         cwd,
+                        watch,
                     };
                     let info = mgr.install(source).await.map_err(plugin_error_to_rpc)?;
                     serde_json::to_value(&info).map_err(|e| {
@@ -908,6 +948,21 @@ fn register_plugin_methods(
                     .to_string();
                 mgr.kill(&name).await.map_err(plugin_error_to_rpc)?;
                 Ok(serde_json::json!({ "killed": name }))
+            }
+        })
+        .register("plugin.reload", move |params: Option<serde_json::Value>| {
+            let mgr = p4.clone();
+            async move {
+                let params = params.unwrap_or_default();
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'name'"))?
+                    .to_string();
+                let info = mgr.reload(&name).await.map_err(plugin_error_to_rpc)?;
+                serde_json::to_value(&info).map_err(|e| {
+                    shux_rpc::RpcError::internal(&format!("plugin info serialize: {e}"))
+                })
             }
         })
 }
@@ -3315,8 +3370,23 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 WindowCommand::New {
                     session,
                     name,
+                    cwd,
+                    cmd,
                     ensure,
-                } => cli::handle_window_new(&mut stream, &session, name, ensure, args.format).await,
+                    argv,
+                } => {
+                    cli::handle_window_new(
+                        &mut stream,
+                        &session,
+                        name,
+                        cwd,
+                        cmd,
+                        argv,
+                        ensure,
+                        args.format,
+                    )
+                    .await
+                }
                 WindowCommand::Kill {
                     session,
                     window,
@@ -3646,12 +3716,14 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     path,
                     args: pargs,
                     cwd,
+                    no_watch,
                 } => {
                     cli::handle_plugin_install(
                         &mut stream,
                         &path,
                         &pargs,
                         cwd.as_deref(),
+                        !no_watch,
                         args.format,
                     )
                     .await
@@ -3659,6 +3731,9 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 cli::PluginCommand::List => cli::handle_plugin_list(&mut stream, args.format).await,
                 cli::PluginCommand::Kill { name } => {
                     cli::handle_plugin_kill(&mut stream, &name, args.format).await
+                }
+                cli::PluginCommand::Reload { name } => {
+                    cli::handle_plugin_reload(&mut stream, &name, args.format).await
                 }
             }
         }

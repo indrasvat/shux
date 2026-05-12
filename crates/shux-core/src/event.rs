@@ -170,6 +170,10 @@ pub enum EventData {
         window_id: WindowId,
         session_id: SessionId,
         title: String,
+        /// Position in the session's window list at creation time.
+        /// Plugins use this to render `[index]` prefixes without
+        /// having to call `window.list` for round-trip context.
+        index: u32,
     },
 
     /// A window became the active window in its session.
@@ -522,6 +526,7 @@ mod tests {
                 window_id: wid,
                 session_id: sid,
                 title: "t".into(),
+                index: 0,
             }
             .event_type(),
             "window.created"

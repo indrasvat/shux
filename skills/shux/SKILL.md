@@ -161,8 +161,11 @@ methods you use from outside (`window.rename`, `pane.send_keys`,
 `state.apply`, …) to react in real time.
 
 ```bash
-shux plugin install ./my-plugin.sh   # spawn, handshake, register
-shux plugin list                      # name · version · pid · subscribes · status
+shux plugin install ./my-plugin.sh   # spawn, handshake, register. Hot reload ON
+                                      #   by default — saves respawn the plugin
+                                      #   in <500ms. Use `--no-watch` to opt out.
+shux plugin list                      # name · version · pid · subscribes · watching
+shux plugin reload <name>             # manual hot-reload tick (kill + respawn)
 shux plugin kill <name>               # graceful shutdown (2s) → SIGKILL
 ```
 

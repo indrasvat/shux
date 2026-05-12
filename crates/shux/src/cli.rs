@@ -653,16 +653,32 @@ pub enum PluginCommand {
         /// Working directory for the plugin process.
         #[arg(long)]
         cwd: Option<std::path::PathBuf>,
+
+        /// Disable hot reload. By default the daemon watches the
+        /// plugin's source file and respawns it on every save
+        /// (debounced ~250ms). Pass this to install the plugin
+        /// without that watcher — useful for production / CI runs.
+        #[arg(long)]
+        no_watch: bool,
     },
 
     /// List running plugins (name, version, source, pid, status,
-    /// uptime, declared subscriptions).
+    /// uptime, declared subscriptions, watching).
     #[command(alias = "ls")]
     List,
 
     /// Send a plugin a `plugin.shutdown` notification, then terminate
     /// the child process after the grace window.
     Kill {
+        /// Plugin name (as reported in its manifest).
+        name: String,
+    },
+
+    /// Manually kill+respawn a running plugin from the same source.
+    /// Equivalent to a single hot-reload tick. Useful when a plugin
+    /// was installed with `--no-watch` and you still want to bump it
+    /// after editing the script.
+    Reload {
         /// Plugin name (as reported in its manifest).
         name: String,
     },
@@ -688,9 +704,27 @@ pub enum WindowCommand {
         #[arg(short, long)]
         name: Option<String>,
 
+        /// Working directory for the new window's initial pane.
+        /// Defaults to the daemon's current working directory.
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+
+        /// Shell command to run in the new window's initial pane.
+        /// Empty / omitted spawns the user's login+interactive shell.
+        /// For exec-style passthrough use trailing `--` instead:
+        /// `shux window new -s X -n W -- vim foo.rs`.
+        #[arg(long)]
+        cmd: Option<String>,
+
         /// Create-if-missing semantics (maps to window.ensure)
         #[arg(long)]
         ensure: bool,
+
+        /// Trailing argv for the initial pane. Anything after `--`
+        /// lands here and is exec'd directly (no shell wrapper).
+        /// Takes precedence over `--cmd`.
+        #[arg(last = true, num_args = 0..)]
+        argv: Vec<String>,
     },
 
     /// Kill a window
@@ -1942,10 +1976,14 @@ pub async fn handle_window_list(
 }
 
 /// Handle the `shux window new` command.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_window_new(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
     window_name: Option<String>,
+    cwd: Option<std::path::PathBuf>,
+    cmd: Option<String>,
+    argv: Vec<String>,
     ensure: bool,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
@@ -1963,6 +2001,32 @@ pub async fn handle_window_new(
     );
     if let Some(name) = &window_name {
         params.insert("name".to_string(), serde_json::Value::String(name.clone()));
+    }
+    if let Some(c) = &cwd {
+        params.insert(
+            "cwd".to_string(),
+            serde_json::Value::String(c.display().to_string()),
+        );
+    }
+    // Trailing argv (after `--`) wins over --cmd, matching the
+    // `shux new` behavior so muscle memory carries over.
+    let command_vec: Vec<String> = if !argv.is_empty() {
+        argv
+    } else if let Some(c) = cmd {
+        vec!["sh".into(), "-c".into(), c]
+    } else {
+        Vec::new()
+    };
+    if !command_vec.is_empty() {
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::Array(
+                command_vec
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
     }
 
     let result = rpc_call(stream, method, serde_json::Value::Object(params)).await?;
@@ -2972,6 +3036,7 @@ pub async fn handle_plugin_install(
     path: &std::path::Path,
     args: &[String],
     cwd: Option<&std::path::Path>,
+    watch: bool,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     use crate::style;
@@ -2990,6 +3055,7 @@ pub async fn handle_plugin_install(
             serde_json::Value::String(cwd.display().to_string()),
         );
     }
+    params.insert("watch".into(), serde_json::Value::Bool(watch));
 
     let result = rpc_call(stream, "plugin.install", serde_json::Value::Object(params)).await?;
 
@@ -3011,6 +3077,10 @@ pub async fn handle_plugin_install(
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let pid = result.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let watching = result
+                .get("watching")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let subs: Vec<String> = result
                 .get("subscribes")
                 .and_then(|v| v.as_array())
@@ -3025,13 +3095,51 @@ pub async fn handle_plugin_install(
             } else {
                 subs.join(",")
             };
+            let watch_str = if watching { ", watching" } else { "" };
+            // Strip a leading "v" the plugin manifest may have
+            // already supplied so we don't end up with "vv1".
+            let display_ver = ver.strip_prefix('v').unwrap_or(ver);
             println!(
-                "{} {} {} (pid {}, subscribes: {})",
+                "{} {} {} (pid {}, subscribes: {}{})",
                 style::success("✓ installed plugin"),
                 style::bold(name),
-                style::muted(&format!("v{ver}")),
+                style::muted(&format!("v{display_ver}")),
                 pid,
                 style::muted(&sub_str),
+                style::muted(watch_str),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `shux plugin reload <name>` — manual hot-reload tick. The daemon
+/// kills + respawns the plugin from the same source. Equivalent to
+/// what the file watcher does automatically when `--no-watch` was
+/// not passed.
+pub async fn handle_plugin_reload(
+    stream: &mut tokio::net::UnixStream,
+    name: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let params = serde_json::json!({ "name": name });
+    let result = rpc_call(stream, "plugin.reload", params).await?;
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Plain => {
+            let pid = result.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("{name}\t{pid}");
+        }
+        OutputFormat::Text => {
+            let pid = result.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!(
+                "{} {} (pid {})",
+                style::success("✓ reloaded plugin"),
+                style::bold(name),
+                pid,
             );
         }
     }
@@ -3527,12 +3635,58 @@ mod tests {
                     WindowCommand::New {
                         session,
                         name,
+                        cwd,
+                        cmd,
                         ensure,
+                        argv,
                     },
             }) => {
                 assert_eq!(session, "work");
                 assert_eq!(name, Some("editor".to_string()));
+                assert!(cwd.is_none());
+                assert!(cmd.is_none());
                 assert!(!ensure);
+                assert!(argv.is_empty());
+            }
+            _ => panic!("expected Window New command"),
+        }
+    }
+
+    /// `shux window new -s X -n Y --cwd /tmp --cmd "vim foo"` exposes
+    /// every RPC param `window.create` accepts. Codex v3 dogfood:
+    /// CLI --help hid these and forced prototyping via `shux api`.
+    #[test]
+    fn test_cli_window_new_cwd_and_cmd() {
+        let cli = Cli::try_parse_from([
+            "shux", "window", "new", "-s", "work", "-n", "editor", "--cwd", "/tmp", "--cmd",
+            "vim foo",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command: WindowCommand::New { cwd, cmd, argv, .. },
+            }) => {
+                assert_eq!(cwd, Some(std::path::PathBuf::from("/tmp")));
+                assert_eq!(cmd, Some("vim foo".to_string()));
+                assert!(argv.is_empty());
+            }
+            _ => panic!("expected Window New command"),
+        }
+    }
+
+    /// Trailing argv after `--` lands on `argv` and takes precedence
+    /// over `--cmd` (matches `shux new` behavior).
+    #[test]
+    fn test_cli_window_new_trailing_argv() {
+        let cli = Cli::try_parse_from([
+            "shux", "window", "new", "-s", "work", "-n", "editor", "--", "vim", "foo.rs",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Window {
+                command: WindowCommand::New { argv, .. },
+            }) => {
+                assert_eq!(argv, vec!["vim".to_string(), "foo.rs".to_string()]);
             }
             _ => panic!("expected Window New command"),
         }
