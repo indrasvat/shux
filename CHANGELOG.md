@@ -1,3 +1,10 @@
+# [0.11.0](https://github.com/indrasvat/shux/compare/v0.10.0...v0.11.0) (2026-05-11)
+
+
+### Features
+
+* **rpc,cli,ci:** pane.wait_for + Linux e2e smoke in CI ([#20](https://github.com/indrasvat/shux/issues/20)) ([cb586fd](https://github.com/indrasvat/shux/commit/cb586fdc57baf7236443847384ba43fbc7cff1bb))
+
 # [0.10.0](https://github.com/indrasvat/shux/compare/v0.9.0...v0.10.0) (2026-05-11)
 
 
