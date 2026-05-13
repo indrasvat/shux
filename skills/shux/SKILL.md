@@ -154,6 +154,8 @@ Need to type into a TUI?           → pane.send_keys  (shux pane send-keys --te
 Need pixel feedback of one pane?   → pane.snapshot   (shux pane snapshot)
 Need a snapshot of the whole
 window (borders, titles, status)?  → window.snapshot (shux window snapshot)
+Need a snapshot of the session's
+active window?                     → session.snapshot (shux session snapshot)
 Need plain text of the screen?     → pane.capture    (shux pane capture)
 Need to block until text appears?  → pane.wait_for   (shux pane wait-for --text|--regex)
 Need a stream of PTY output?       → pane.output.watch (event-bus, sealed)

@@ -19,12 +19,16 @@ Or use the noun-namespaced verbs (every RPC method has a 1:1 CLI
 form: dots become spaces, underscores become kebabs):
 
 ```bash
-shux session create demo -- lazygit       # → session.create
-shux session list                          # → session.list
-shux pane send-keys -s demo --text 'j'     # → pane.send_keys
-shux pane snapshot -s demo                 # → pane.snapshot
-shux state apply spec.toml                 # → state.apply
-shux events watch --filter 'session.'      # → events.watch
+shux session create demo -- lazygit        # → session.create
+shux session list                           # → session.list
+shux pane send-keys -s demo --text 'j'      # → pane.send_keys
+shux pane set-size -s demo --cols 200 --rows 60  # → pane.set_size
+shux pane snapshot -s demo -o frame.png     # → pane.snapshot (one pane, no chrome)
+shux window snapshot -s demo -o frame.png   # → window.snapshot (composed)
+shux session snapshot -s demo -o frame.png  # → session.snapshot (session's active window)
+shux state apply spec.toml                  # → state.apply
+shux events watch --filter 'session.'       # → events.watch
+shux config validate ./my-config.toml       # → CLI-only: positional path
 ```
 
 ## Session
