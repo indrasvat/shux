@@ -7,6 +7,7 @@
 pub mod attach;
 pub mod codec;
 pub mod error;
+pub mod policy;
 pub mod router;
 pub mod server;
 
@@ -17,5 +18,6 @@ pub use attach::{
 };
 pub use codec::{MAX_FRAME_SIZE, create_codec};
 pub use error::{ErrorCode, RpcError};
+pub use policy::{Policy, Sensitivity};
 pub use router::{Handler, Router, RouterBuilder};
 pub use server::{Server, ServerConfig};

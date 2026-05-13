@@ -1257,9 +1257,15 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
         </ul>
         <p style="margin-top:var(--s-4); color:var(--ink-2); font-size:13.5px; line-height:1.55;">
           <span class="target" style="margin-right:6px;">trust model</span>
-          Same as a shell function — no sandbox in v0. Hot reload
-          ships today (FSEvents/inotify watcher, debounced ~250ms);
-          sandboxing and WASM are queued for later.
+          v0.19 ships a default-deny permission model on every plugin
+          RPC frame: per-method sensitivity tiers, ownership-based
+          auto-grant for entities the plugin created,
+          <code>shux plugin grant &lt;name&gt; &lt;method&gt;</code>
+          for the rest, NDJSON audit log per plugin. Identity is a
+          per-install UUID — reinstalling with the same name does
+          NOT inherit the predecessor's grants. Sandboxing of the
+          plugin's own filesystem / network access (the WASM
+          milestone) is still queued for later.
         </p>
         <div class="hero-cta" style="margin-top:var(--s-5)">
           <a class="btn primary" href="https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh">The 30-line example</a>

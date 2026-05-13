@@ -23,6 +23,12 @@ shux plugin install <path> [--args ...] [--cwd <dir>] [--no-watch]
 shux plugin list                  # alias: ls — shows `watching` column
 shux plugin reload <name>         # manual kill + respawn
 shux plugin kill <name>
+
+# permission management (default-deny model — see Permissions section)
+shux plugin grant <name> <method>[--target <id>] [--subscribe]
+shux plugin revoke <name> <method> [--target <id>] [--subscribe]
+shux plugin grants <name>         # show method + subscribe allow-set
+shux plugin audit <name> [--tail N]   # tail NDJSON audit log
 ```
 
 `name` is what the plugin reports in its manifest, not the script
@@ -457,20 +463,101 @@ That's the full shape. See
 [`examples/plugins/hello/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh)
 for the same plugin with comments.
 
+## Permissions (default-deny)
+
+From v0.19 every plugin RPC frame passes through a permission check
+before it reaches the router. The full design lives at
+[`docs/designs/permissions/README.md`](https://github.com/indrasvat/shux/blob/main/docs/designs/permissions/README.md);
+the short version:
+
+- **Identity is a per-install UUID**, not the plugin name. Reinstalling
+  with the same name does NOT inherit the predecessor's grants or
+  entity ownership. Look up the UUID with `shux plugin list --format json`.
+- **Sensitivity tiers**:
+  - `Public` — `session.list`, `window.list`, `pane.list`, `plugin.list`,
+    `system.version`, `system.health`. Always allowed.
+  - `ContentRead` — `pane.capture`, `pane.snapshot`, `pane.output.watch`,
+    `pane.command_status`, `pane.wait_for`, `session.snapshot`,
+    `window.snapshot`, `events.history`, `events.watch` (when not
+    self-scoped). Default-deny; auto-allowed for entities the plugin
+    created; explicit grant otherwise.
+  - `OwnedMutation` — `pane.send_keys`, `pane.kill`, `pane.split`,
+    `pane.resize`, `pane.set_title`, `window.create`, `session.create`,
+    every other mutation. Same ownership-or-grant rule.
+  - `Grantable` — `state.apply` only. No ownership shortcut; needs
+    `shux plugin grant <name> state.apply` (blanket) to call at all.
+  - `PluginsForbidden` — `plugin.install`, `plugin.kill`, `plugin.reload`,
+    `plugin.grant`, `plugin.revoke`, `plugin.grants`, `plugin.audit`.
+    Flat-deny to plugins (only the user / CLI may call). No grant path.
+- **`events.watch` is param-aware**: a filter starting with
+  `plugin.<self>.` is treated as `Public` (a plugin can always watch its
+  own events). Broader filters are `ContentRead`.
+- **Manifest `subscribes:` is locked after first install.** Hot reload
+  fails handshake if the new manifest adds a filter that the user
+  hasn't allowed via `shux plugin grant <name> <filter> --subscribe`.
+- **Audit log is unconditional.** Every parsed plugin RPC frame
+  appends one NDJSON line to `.shux/plugins/by-id/<uuid>/audit.log`,
+  rotated at 1 MiB (keeps `.log.{1..5}`).
+- **Files are atomic + symlink-rejecting.** Grants and audit writes
+  use temp + `rename(2)`; both refuse to follow a symlink at the target
+  path.
+
+### Granting + revoking
+
+```bash
+shux plugin grant conductor pane.snapshot                       # blanket
+shux plugin grant conductor pane.send_keys --target <pane-uuid> # scoped
+shux plugin grant conductor state.apply                         # Grantable
+shux plugin grant conductor pane.input.keystroke --subscribe    # widen
+                                                                # manifest
+
+shux plugin revoke conductor pane.snapshot
+shux plugin revoke conductor pane.send_keys --target <pane-uuid>
+
+shux plugin grants conductor    # human view
+shux plugin grants conductor --format json
+```
+
+A denied call returns JSON-RPC error `-32004` with
+`data.reason` ∈ {`plugins_forbidden`, `no_grant_and_not_owned`,
+`no_grant`}. Plugins should surface this to the user — the council
+review explicitly rejected a "prompt-on-first-use" channel for v0,
+so errors are the only signal.
+
+### Reference: enforcement chokepoint
+
+`dispatch_plugin_frame` in `crates/shux-plugin/src/lib.rs` runs
+`permissions::check` + `audit::record` on every plugin RPC frame
+BEFORE forwarding to the router. The plugin-only intercepts
+(`event.publish`, `plugin.state.*`) are audited with
+`reason: "plugin_self_namespace"` and skip the check (they only
+touch the plugin's own namespace).
+
 ## Out of scope for v0
 
 - **Sandboxing.** Plugins run with the same uid and filesystem access
-  as the `shux` daemon. Same trust model as a shell function.
+  as the `shux` daemon. Same trust model as a shell function — the
+  permission model gates the RPC surface, NOT direct filesystem or
+  network access.
 - **WASM plugins.** Process plugins ship first; the sandboxed-
   distribution layer (WASM + WASI Preview 2) is queued for a later
   milestone.
-- **Plugin-to-plugin events.** A plugin can call daemon RPCs but
-  cannot directly publish to the bus. Use `state.apply` to indirectly
-  fire lifecycle events.
+- **`plugin.audit` RPC for plugins themselves.** Only the user/CLI
+  can read another plugin's audit log; plugins inspecting their own
+  log can `tail` the file directly. Tracked as a v0.next gap (the
+  CLI == API principle wants every CLI verb to have a corresponding
+  RPC — currently `plugin.audit` exists, but plugins are forbidden
+  to call it).
+- **Prompt-on-first-use** UX (browser-style permission prompts). The
+  enforcement model can grow this later without changing the on-disk
+  grant format.
 
 ## Where to learn more
 
 - The task design doc: [`docs/tasks/044a-process-plugins-v0.md`](https://github.com/indrasvat/shux/blob/main/docs/tasks/044a-process-plugins-v0.md).
+- Permission model design + council review:
+  [`docs/designs/permissions/README.md`](https://github.com/indrasvat/shux/blob/main/docs/designs/permissions/README.md).
 - The host source: [`crates/shux-plugin/src/lib.rs`](https://github.com/indrasvat/shux/blob/main/crates/shux-plugin/src/lib.rs).
 - The integration tests (which exercise every flow in this doc):
-  [`crates/shux-plugin/tests/plugin_lifecycle.rs`](https://github.com/indrasvat/shux/blob/main/crates/shux-plugin/tests/plugin_lifecycle.rs).
+  [`crates/shux-plugin/tests/plugin_lifecycle.rs`](https://github.com/indrasvat/shux/blob/main/crates/shux-plugin/tests/plugin_lifecycle.rs)
+  + [`tests/permissions.rs`](https://github.com/indrasvat/shux/blob/main/crates/shux-plugin/tests/permissions.rs).

@@ -702,6 +702,68 @@ pub enum PluginCommand {
         /// Plugin name (as reported in its manifest).
         name: String,
     },
+
+    /// Grant a plugin authority to call a sensitive RPC method.
+    /// See `docs/designs/permissions/README.md` for the model.
+    ///
+    /// Examples:
+    ///   shux plugin grant conductor pane.snapshot
+    ///   shux plugin grant conductor pane.send_keys --target a1b2c3d4-...
+    ///   shux plugin grant watcher --subscribe pane.input.keystroke
+    Grant {
+        /// Plugin name.
+        plugin: String,
+        /// RPC method to grant (e.g. `pane.snapshot`), or — with
+        /// `--subscribe` — an event filter to add to the manifest
+        /// subscribes allow-set.
+        method: String,
+        /// Restrict the grant to a single target entity UUID. Without
+        /// this flag the grant is blanket (`*`), covering any entity
+        /// the method might be called against.
+        #[arg(long)]
+        target: Option<String>,
+        /// Treat `method` as an event filter rather than an RPC
+        /// method. Use this to widen the plugin's
+        /// `manifest.subscribes` allow-set after hot reload — needed
+        /// when the plugin author adds a new subscribe filter mid-
+        /// session.
+        #[arg(long)]
+        subscribe: bool,
+    },
+
+    /// Revoke a previously-issued grant. Mirror of `grant`.
+    Revoke {
+        /// Plugin name.
+        plugin: String,
+        /// Method (or subscribe filter, with `--subscribe`) to remove.
+        method: String,
+        /// Single target UUID to drop from a target-scoped grant.
+        /// Omit to drop the entire entry.
+        #[arg(long)]
+        target: Option<String>,
+        /// Match `grant --subscribe` — operate on the subscribes
+        /// allow-set rather than the grants table.
+        #[arg(long)]
+        subscribe: bool,
+    },
+
+    /// Show the grants for a plugin (method → scope, plus the
+    /// manifest-subscribe allow-set).
+    Grants {
+        /// Plugin name.
+        plugin: String,
+    },
+
+    /// Tail the per-plugin audit log (NDJSON, one entry per RPC
+    /// frame). Reads
+    /// `.shux/plugins/by-id/<uuid>/audit.log` for the plugin.
+    Audit {
+        /// Plugin name.
+        plugin: String,
+        /// Number of trailing lines to show (default 50, 0 = all).
+        #[arg(long, short, default_value_t = 50)]
+        tail: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3521,6 +3583,223 @@ pub async fn handle_plugin_kill(
             style::success("✓ killed plugin"),
             style::bold(name)
         ),
+    }
+    Ok(())
+}
+
+pub async fn handle_plugin_grant(
+    stream: &mut tokio::net::UnixStream,
+    plugin: &str,
+    method: &str,
+    target: Option<&str>,
+    subscribe: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let mut params = serde_json::Map::new();
+    params.insert("plugin".into(), plugin.into());
+    params.insert("method".into(), method.into());
+    if let Some(t) = target {
+        params.insert("target".into(), t.into());
+    }
+    if subscribe {
+        params.insert("subscribe".into(), true.into());
+    }
+    let result = rpc_call(stream, "plugin.grant", serde_json::Value::Object(params)).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Plain => {
+            let scope = target.unwrap_or("*");
+            let kind = if subscribe { "subscribe" } else { "method" };
+            println!("{plugin}\t{kind}\t{method}\t{scope}\tgranted");
+        }
+        OutputFormat::Text => {
+            let scope = target.map(|t| format!(" → {t}")).unwrap_or_default();
+            let kind = if subscribe { " (subscribe)" } else { "" };
+            println!(
+                "{} {} {} {}{}",
+                style::success("✓ granted"),
+                style::bold(plugin),
+                style::accent(method),
+                style::muted(&scope),
+                kind
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_plugin_revoke(
+    stream: &mut tokio::net::UnixStream,
+    plugin: &str,
+    method: &str,
+    target: Option<&str>,
+    subscribe: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let mut params = serde_json::Map::new();
+    params.insert("plugin".into(), plugin.into());
+    params.insert("method".into(), method.into());
+    if let Some(t) = target {
+        params.insert("target".into(), t.into());
+    }
+    if subscribe {
+        params.insert("subscribe".into(), true.into());
+    }
+    let result = rpc_call(stream, "plugin.revoke", serde_json::Value::Object(params)).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Plain => {
+            let scope = target.unwrap_or("*");
+            let kind = if subscribe { "subscribe" } else { "method" };
+            println!("{plugin}\t{kind}\t{method}\t{scope}\trevoked");
+        }
+        OutputFormat::Text => {
+            let scope = target.map(|t| format!(" → {t}")).unwrap_or_default();
+            let kind = if subscribe { " (subscribe)" } else { "" };
+            println!(
+                "{} {} {} {}{}",
+                style::success("✓ revoked"),
+                style::bold(plugin),
+                style::accent(method),
+                style::muted(&scope),
+                kind
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_plugin_grants(
+    stream: &mut tokio::net::UnixStream,
+    plugin: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let params = serde_json::json!({"plugin": plugin});
+    let result = rpc_call(stream, "plugin.grants", params).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Plain => {
+            if let Some(g) = result.get("grants").and_then(|v| v.as_object()) {
+                for (method, scope) in g {
+                    let scope_str = match scope {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Array(a) => a
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        _ => "?".into(),
+                    };
+                    println!("grant\t{method}\t{scope_str}");
+                }
+            }
+            if let Some(allowed) = result
+                .get("subscribes")
+                .and_then(|s| s.get("allowed"))
+                .and_then(|a| a.as_array())
+            {
+                for f in allowed.iter().filter_map(|v| v.as_str()) {
+                    println!("subscribe\t{f}");
+                }
+            }
+        }
+        OutputFormat::Text => {
+            println!("{} {}", style::accent("plugin"), style::bold(plugin));
+            let g_map = result.get("grants").and_then(|v| v.as_object());
+            let empty = g_map.map(|m| m.is_empty()).unwrap_or(true);
+            if empty {
+                println!("  {}", style::muted("(no grants)"));
+            } else if let Some(g) = g_map {
+                println!("  {}", style::bold("methods:"));
+                for (method, scope) in g {
+                    let scope_str = match scope {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Array(a) => format!(
+                            "[{}]",
+                            a.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        _ => "?".into(),
+                    };
+                    println!(
+                        "    {} → {}",
+                        style::accent(method),
+                        style::muted(&scope_str)
+                    );
+                }
+            }
+            if let Some(allowed) = result
+                .get("subscribes")
+                .and_then(|s| s.get("allowed"))
+                .and_then(|a| a.as_array())
+                && !allowed.is_empty()
+            {
+                println!("  {}", style::bold("subscribes:"));
+                for f in allowed.iter().filter_map(|v| v.as_str()) {
+                    println!("    {}", style::accent(f));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_plugin_audit(
+    stream: &mut tokio::net::UnixStream,
+    plugin: &str,
+    tail: usize,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let params = serde_json::json!({"plugin": plugin, "tail": tail});
+    let result = rpc_call(stream, "plugin.audit", params).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Plain => {
+            if let Some(entries) = result.get("entries").and_then(|v| v.as_array()) {
+                for e in entries {
+                    println!("{}", serde_json::to_string(e)?);
+                }
+            }
+        }
+        OutputFormat::Text => {
+            let path = result
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            println!("{} {}", style::muted("audit log:"), style::muted(path));
+            let entries = result
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if entries.is_empty() {
+                println!("  {}", style::muted("(empty)"));
+            }
+            for e in entries {
+                let ts = e.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+                let m = e.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+                let d = e.get("decision").and_then(|v| v.as_str()).unwrap_or("?");
+                let r = e.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                let stamp = style::muted(ts);
+                let method = style::accent(m);
+                let decision = if d == "allow" {
+                    style::success(d).to_string()
+                } else {
+                    style::error(d).to_string()
+                };
+                println!("  {} {} {} {}", stamp, decision, method, style::muted(r));
+            }
+        }
     }
     Ok(())
 }

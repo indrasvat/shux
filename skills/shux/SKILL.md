@@ -189,6 +189,17 @@ shux plugin install ./my-plugin.sh   # spawn, handshake, register. Hot reload ON
 shux plugin list                      # name · version · pid · subscribes · watching
 shux plugin reload <name>             # manual hot-reload tick (kill + respawn)
 shux plugin kill <name>               # graceful shutdown (2s) → SIGKILL
+
+shux plugin grant <name> <method>     # opt the plugin in to a sensitive RPC.
+                                      #   Default-deny model: every plugin RPC
+                                      #   passes through a permission check
+                                      #   before reaching the daemon router
+                                      #   (v0.19+).
+shux plugin grant <name> <method> --target <id>   # scoped to one entity
+shux plugin grant <name> <filter> --subscribe     # widen manifest subscribes
+shux plugin revoke <name> <method>    # mirror of grant
+shux plugin grants <name>             # show the allow-set
+shux plugin audit <name> --tail 50    # tail NDJSON audit log
 ```
 
 Reference plugins:

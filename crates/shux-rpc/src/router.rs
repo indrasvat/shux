@@ -12,6 +12,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::error::RpcError;
+use crate::policy::Policy;
 
 /// The result type for RPC method handlers.
 pub type HandlerResult = Result<Value, RpcError>;
@@ -53,6 +54,7 @@ where
 #[derive(Clone)]
 pub struct Router {
     methods: Arc<HashMap<String, Arc<dyn Handler>>>,
+    policies: Arc<HashMap<String, Policy>>,
 }
 
 impl Router {
@@ -60,6 +62,7 @@ impl Router {
     pub fn new() -> Self {
         Router {
             methods: Arc::new(HashMap::new()),
+            policies: Arc::new(HashMap::new()),
         }
     }
 
@@ -67,6 +70,7 @@ impl Router {
     pub fn builder() -> RouterBuilder {
         RouterBuilder {
             methods: HashMap::new(),
+            policies: HashMap::new(),
         }
     }
 
@@ -95,6 +99,32 @@ impl Router {
     pub fn has_method(&self, method: &str) -> bool {
         self.methods.contains_key(method)
     }
+
+    /// Per-method sensitivity policy, if declared. Consumed by the
+    /// plugin permission enforcer; direct CLI clients ignore this.
+    pub fn policy(&self, method: &str) -> Option<&Policy> {
+        self.policies.get(method)
+    }
+
+    /// Panic on boot if any registered handler has no declared policy.
+    /// Catches "added a new RPC, forgot to classify its sensitivity"
+    /// at startup rather than letting a fresh method silently inherit
+    /// permissive defaults.
+    pub fn assert_every_route_has_policy(&self) {
+        let missing: Vec<&str> = self
+            .methods
+            .keys()
+            .filter(|m| !self.policies.contains_key(*m))
+            .map(|s| s.as_str())
+            .collect();
+        if !missing.is_empty() {
+            panic!(
+                "RPC method(s) registered without a sensitivity policy: {missing:?}. \
+                 Use `register_with_policy(...)` or document a deliberate \
+                 `Sensitivity::Public` classification."
+            );
+        }
+    }
 }
 
 impl Default for Router {
@@ -118,12 +148,33 @@ impl std::fmt::Debug for Router {
 /// an immutable Router.
 pub struct RouterBuilder {
     methods: HashMap<String, Arc<dyn Handler>>,
+    policies: HashMap<String, Policy>,
 }
 
 impl RouterBuilder {
-    /// Register a method handler.
+    /// Register a method handler. Use this for routes that don't
+    /// participate in the plugin permission model (test-only routes,
+    /// development scaffolding). For production routes, prefer
+    /// [`Self::register_with_policy`] so the startup assertion can
+    /// catch missing classifications.
     pub fn register(mut self, method: impl Into<String>, handler: impl Handler) -> Self {
         self.methods.insert(method.into(), Arc::new(handler));
+        self
+    }
+
+    /// Register a method handler with an explicit sensitivity policy.
+    /// The plugin dispatcher consults this policy on every plugin
+    /// RPC frame to decide allow/deny. CLI clients bypass policy
+    /// checks (they are the user).
+    pub fn register_with_policy(
+        mut self,
+        method: impl Into<String>,
+        policy: Policy,
+        handler: impl Handler,
+    ) -> Self {
+        let m: String = method.into();
+        self.policies.insert(m.clone(), policy);
+        self.methods.insert(m, Arc::new(handler));
         self
     }
 
@@ -131,6 +182,7 @@ impl RouterBuilder {
     pub fn build(self) -> Router {
         Router {
             methods: Arc::new(self.methods),
+            policies: Arc::new(self.policies),
         }
     }
 }
