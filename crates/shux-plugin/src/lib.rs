@@ -216,6 +216,20 @@ impl PluginManager {
                 "plugin manifest missing 'name'".into(),
             ));
         }
+        // Names must be filter-safe — they're concatenated verbatim
+        // into the `plugin.<name>.<type>` namespace used by
+        // `event.publish`. Codex bot review on PR #31: a manifest
+        // name like `git-status.evil` would let it publish events
+        // matching subscribers filtering for the legitimate
+        // `plugin.git-status.` prefix.
+        if manifest.name.contains('.') || manifest.name.contains(char::is_whitespace) {
+            let _ = child.kill().await;
+            return Err(PluginError::HandshakeFailed(format!(
+                "plugin name {:?} must not contain '.' or whitespace \
+                 (used verbatim in the plugin.<name>.<type> event namespace)",
+                manifest.name
+            )));
+        }
 
         // Stage 2: dedup + spawn + register atomically. Held across
         // the spawn so two concurrent installs of plugins reporting

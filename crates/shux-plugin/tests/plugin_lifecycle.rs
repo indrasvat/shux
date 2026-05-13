@@ -368,6 +368,33 @@ done
     mgr.kill("emitter").await.unwrap();
 }
 
+/// Install rejects a plugin whose manifest name contains a `.` — the
+/// name is used verbatim in the `plugin.<name>.<type>` event
+/// namespace, so a name like `git-status.evil` would let it publish
+/// events under another plugin's filter prefix
+/// (`plugin.git-status.`). (codex bot P1 review on PR #31.)
+#[tokio::test]
+async fn install_rejects_dotted_plugin_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"git-status.evil","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r _; do :; done
+"#;
+    let script_path = write_script(tmp.path(), "dotted.sh", script);
+    let mgr = PluginManager::new(EventBus::new());
+    let err = mgr
+        .install(PluginSource::from_path(&script_path))
+        .await
+        .expect_err("install must reject dotted manifest name");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must not contain '.'"),
+        "diagnostic must mention dot rule: {msg}"
+    );
+}
+
 /// `event.publish` rejects an event_type with embedded dots, because
 /// that would let a plugin synthesise an event under a sibling's
 /// namespace (`plugin.emitter.other.evil`).
