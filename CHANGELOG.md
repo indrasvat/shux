@@ -1,3 +1,10 @@
+# [0.18.0](https://github.com/indrasvat/shux/compare/v0.17.0...v0.18.0) (2026-05-13)
+
+
+### Features
+
+* **plugin:** event.publish — plugins can emit namespaced events ([#31](https://github.com/indrasvat/shux/issues/31)) ([2ca5ecc](https://github.com/indrasvat/shux/commit/2ca5ecc2041453ba7b629364e120e4ceca4228bd))
+
 # [0.17.0](https://github.com/indrasvat/shux/compare/v0.16.1...v0.17.0) (2026-05-13)
 
 
