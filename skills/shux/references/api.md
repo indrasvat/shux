@@ -277,6 +277,27 @@ flow through the data-plane sealed bus, not the event history).
 {} → { "name": "shux", "version": "0.8.0", "git_sha": "..." }
 ```
 
+### `event.publish` — plugin-only
+
+```json
+{ "event_type": "branch_changed", "data": {"branch": "main"} } →
+  { "seq": 1042 }
+```
+
+Callable only from inside a process plugin (the daemon takes the
+plugin's identity from the spawn context, not from params).
+Published events land on the bus as
+`plugin.<plugin_id>.<event_type>` and are filterable like any other
+event (`shux events watch --filter plugin.git-status.`). External
+RPC clients calling this method receive `method_not_found`.
+
+Rules:
+
+- `event_type` is required, non-empty, and **must not contain `.`**.
+- `data` is any JSON value.
+
+Full plugin-side documentation lives in [plugins.md](plugins.md).
+
 ## Error envelope
 
 ```json
