@@ -425,8 +425,8 @@ main() {
     check_path
 
     info "Run ${BOLD}shux${RESET}${TEXT} to attach to (or create) the default session"
-    info "List sessions: ${BOLD}shux ls${RESET}"
-    info "JSON-RPC API:  ${BOLD}shux api session.list '{}'${RESET}"
+    info "List sessions: ${BOLD}shux session list${RESET}"
+    info "JSON-RPC API:  ${BOLD}shux rpc call session.list --params '{}'${RESET}"
     printf '\n'
 }
 
