@@ -206,6 +206,7 @@ Reference plugins:
 
 - [`examples/plugins/hello/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh) — smallest working example (~50 lines): handshake + PTY output + state mutation.
 - [`examples/plugins/watcher/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/watcher/plugin.sh) — subscribes to `pane.exited`, emits a namespaced `plugin.watcher.command_exit` via `event.publish` for downstream plugins.
+- [`examples/plugins/conductor/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/conductor/plugin.sh) — VT-poll watchdog for coding-agent panes (claude / codex / opencode / gemini). Identifies the agent on `pane.created`, polls `pane.capture` every 2 s, classifies state, updates the pane border title (`agent · ○|●|✓|!`), auto-dismisses trust prompts via `pane.send_keys`. First worked example of a multi-RPC plugin that needs explicit grants under v0.20+'s default-deny model.
 
 Full protocol — handshake, event payload shape, RPC-out direction,
 `event.publish`, shutdown grace, UUID vs name rule, what's not in v0 — lives in
