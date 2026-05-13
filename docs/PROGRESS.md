@@ -85,6 +85,58 @@
 
 ## Session Log
 
+**2026-05-13 — PR #33: default-deny plugin permission model (v0.20.0)**
+- Goal: third (and last) plugin daemon FR identified in the parked
+  conductor design review. Predecessors landed earlier today
+  (#31 `event.publish` → v0.18, #32 `plugin.state.*` → v0.19).
+- Council-first pass: wrote `docs/designs/permissions/README.md`,
+  ran `dootsabha council --agents claude,codex` (gemini parked on
+  `indrasvat/dootsabha#14`), iterated. Locked deltas captured in §9.
+  Council caught the **predecessor-inheritance attack** before any
+  code was written: keying grants/ownership on plugin name lets a
+  reinstall under the same name inherit the predecessor's authority.
+  Fix landed: per-install UUID is the primary key; name is a
+  display-only by-name link to the UUID. `Pane.created_by_plugin`
+  typed `Option<PluginId>` (UUID), not `Option<String>`.
+- Five-tier sensitivity classification declared per-route:
+  `Public` / `ContentRead` / `OwnedMutation` / `Grantable` /
+  `PluginsForbidden`. New `RouterBuilder::register_with_policy` +
+  startup `assert_every_route_has_policy()` panic if any route
+  dodges classification. `events.watch` is parameter-aware
+  (self-namespaced filters Public, broader filters ContentRead).
+- Ownership auto-grant for `ContentRead`/`OwnedMutation`; explicit
+  `shux plugin grant <name> <method>[--target <id>]` for the rest.
+  `state.apply` Grantable (council carved it out of flat-deny so
+  conductor v0.7 atomic multi-pane updates remain possible).
+  `plugin.install|kill|reload|grant|revoke|grants|audit` flat-deny.
+- Manifest `subscribes:` locked after first install — hot reload
+  fails handshake if it widens the set without
+  `shux plugin grant <name> <filter> --subscribe` first.
+- Audit log: append-only NDJSON per plugin
+  (`.shux/plugins/by-id/<uuid>/audit.log`), atomic writes, symlink
+  rejection, 1 MiB rotation × 5 files. Audits BOTH router-bound
+  RPCs AND plugin-only intercepts (`event.publish`,
+  `plugin.state.*`) — the latter with reason `plugin_self_namespace`.
+- Four new CLI verbs (`grant`/`revoke`/`grants`/`audit`) + matching
+  RPC methods. Atomic `temp + rename` writes for grants.toml mirror
+  the pattern from `plugin.state.set`.
+- 6 new integration tests in `crates/shux-plugin/tests/permissions.rs`
+  exercising deny→grant→allow, `plugins_forbidden` denial even with
+  blanket grant, audit recording for plugin-only methods,
+  manifest-subscribes lock across reload, UUID stability across
+  kill+reinstall. Full suite: 747/747 green.
+- Visual proof: `pages/screenshots/plugin-permissions-demo.png`
+  shows a real audit entry from the `hello` plugin's `window.rename`
+  call being denied with reason `no_grant_and_not_owned`.
+- Doc-sync in lock-step: SKILL.md, references/plugins.md, PRD §13
+  (security mitigations table + new T7–T10 threats), pages/index.html
+  (plugins section trust-model paragraph).
+- **All three plugin daemon FRs now landed. Conductor v0.1–v0.4 are
+  unblocked.** The parked design lives at
+  `feat/conductor-plugin-design`; v0.1–v0.3 (VT-poll watchdog,
+  settle-snapshot archive, multi-pane notifications) don't need the
+  permission model; v0.4 (worktree-per-pane) does and now can ship.
+
 **2026-05-12 — PR #24: plugin DX paper cuts from the codex-exec dogfood loop (task 044a phase 0 follow-up)**
 - Goal: close every practical gap codex-exec surfaces across repeated cold-context plugin-authoring dogfoods of PR #23 until a run completes with no perceivable friction. Loop = fix → manually verify → re-run codex with a different plugin idea & no hints → repeat.
 - **Round 1 fixes (from v1 dogfood, score 7/10, gap = "had to grep Rust source"):**
