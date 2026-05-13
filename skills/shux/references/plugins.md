@@ -259,8 +259,19 @@ On-disk layout (per project, gitignored by default via
 `.shux/.gitignore`):
 
 ```
-<daemon-cwd>/.shux/plugins/<plugin_name>/state.json
+<project-root>/.shux/plugins/<plugin_name>/state.json
 ```
+
+Where **project root** is resolved by the CLI at install time:
+
+1. Start from the user's `cwd` when `shux plugin install` was run.
+2. Walk up looking for an existing `.shux/` directory — that's the
+   project root.
+3. If none found, anchor at the cwd itself.
+
+This means a daemon shared across multiple project checkouts keeps
+each project's plugin state isolated. The daemon's own cwd is **not**
+used for path resolution.
 
 Rules:
 

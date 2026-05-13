@@ -568,6 +568,71 @@ done
     mgr.kill("reloader").await.unwrap();
 }
 
+/// Per-install `state_root` override: when `PluginSource.state_root`
+/// is set, `plugin.state.set` writes under THAT path, not the
+/// daemon-wide default. Mirrors the CLI's behaviour of pinning
+/// state to the calling client's project cwd. (codex P2 review on
+/// PR #32.)
+#[tokio::test]
+async fn plugin_state_honours_per_install_state_root_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon_root = tmp.path().join("daemon_default");
+    let project_root = tmp.path().join("project_a");
+    let resp_capture = tmp.path().join("resp.jsonl");
+
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+OUT={out}
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"projscoped","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.set","params":{{"value":{{"marker":"project_a"}}}},"id":1}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"id":1'*) printf '%s\n' "$line" >> "$OUT" ;;
+  esac
+done
+"#,
+        out = resp_capture.display()
+    );
+    let script_path = write_script(tmp.path(), "projscoped.sh", &script);
+
+    let mgr = PluginManager::with_state_root(EventBus::new(), daemon_root.clone());
+
+    // Install with an explicit per-source state_root override.
+    let mut source = PluginSource::from_path(&script_path);
+    source.state_root = Some(project_root.clone());
+    mgr.install(source).await.expect("install");
+
+    for _ in 0..50 {
+        if resp_capture.exists()
+            && std::fs::metadata(&resp_capture)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The file must live under PROJECT root, not the daemon default.
+    let project_path = project_root.join("projscoped").join("state.json");
+    let daemon_path = daemon_root.join("projscoped").join("state.json");
+    assert!(
+        project_path.exists(),
+        "state.json must land under the per-install override: {}",
+        project_path.display()
+    );
+    assert!(
+        !daemon_path.exists(),
+        "state.json must NOT land under the daemon default when override is set: {}",
+        daemon_path.display()
+    );
+
+    mgr.kill("projscoped").await.unwrap();
+}
+
 /// `plugin.state.set` rejects payloads over the 256 KiB cap.
 #[tokio::test]
 async fn plugin_state_set_rejects_oversized_payload() {

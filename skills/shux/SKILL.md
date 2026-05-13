@@ -176,9 +176,11 @@ node, anything. It:
   plugins (or `shux events watch --filter plugin.<id>.`) can
   subscribe to them cleanly — see [references/plugins.md](references/plugins.md).
 - **Persists** its own state across hot reload via
-  `plugin.state.get/set/delete`. The daemon stores it at
-  `<daemon-cwd>/.shux/plugins/<name>/state.json` (atomic writes,
-  256 KiB cap, per-plugin isolation).
+  `plugin.state.get/set/delete`. The CLI pins it to the calling
+  project's root at install time (walks up from cwd for `.shux/`,
+  anchors there) — so a daemon shared across checkouts keeps each
+  project's state isolated. Atomic writes, 256 KiB cap, per-plugin
+  isolation. Path: `<project-root>/.shux/plugins/<name>/state.json`.
 
 ```bash
 shux plugin install ./my-plugin.sh   # spawn, handshake, register. Hot reload ON

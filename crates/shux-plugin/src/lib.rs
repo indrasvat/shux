@@ -81,6 +81,13 @@ pub struct PluginSource {
     /// every save. Default `false` for backwards compatibility;
     /// `shux plugin install` sets it `true` unless `--no-watch`.
     pub watch: bool,
+    /// Per-install override for the plugin's persisted-state root.
+    /// When set, `plugin.state.*` calls from this plugin land under
+    /// `<state_root>/<plugin_name>/state.json` instead of the
+    /// daemon-wide default. The CLI resolves this from the calling
+    /// CLIENT's cwd so a daemon shared across projects keeps each
+    /// project's plugin state isolated. (codex P2 review on PR #32.)
+    pub state_root: Option<PathBuf>,
 }
 
 impl PluginSource {
@@ -90,6 +97,7 @@ impl PluginSource {
             args: Vec::new(),
             cwd: None,
             watch: false,
+            state_root: None,
         }
     }
 
@@ -268,6 +276,16 @@ impl PluginManager {
             Some(self.event_bus.subscribe_filtered(sub_filters))
         };
 
+        // Per-plugin state root resolution: use the install-time
+        // override from `source.state_root` if the CLI gave us one
+        // (resolved from the calling client's cwd). Falls back to the
+        // daemon-wide default so existing tests + bare RPC callers
+        // still work. (codex P2 review on PR #32.)
+        let resolved_state_root: Arc<PathBuf> = match &source.state_root {
+            Some(path) => Arc::new(path.clone()),
+            None => self.state_root.clone(),
+        };
+
         let join = tokio::spawn(run_plugin_io(
             manifest.name.clone(),
             child,
@@ -278,7 +296,7 @@ impl PluginManager {
             sub,
             self.router.clone(),
             self.event_bus.clone(),
-            self.state_root.clone(),
+            resolved_state_root.clone(),
             last_error.clone(),
         ));
 
