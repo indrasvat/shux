@@ -1,3 +1,10 @@
+# [0.21.0](https://github.com/indrasvat/shux/compare/v0.20.0...v0.21.0) (2026-05-13)
+
+
+### Features
+
+* **conductor:** v0.1 — VT-poll watchdog for coding-agent panes ([#35](https://github.com/indrasvat/shux/issues/35)) ([1517bbc](https://github.com/indrasvat/shux/commit/1517bbc6f48d9cc442eb8d4efcb1b3166d94d86c)), closes [#33](https://github.com/indrasvat/shux/issues/33)
+
 # [0.20.0](https://github.com/indrasvat/shux/compare/v0.19.0...v0.20.0) (2026-05-13)
 
 
