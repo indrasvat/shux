@@ -233,6 +233,67 @@ See the reference plugin at
 [`examples/plugins/watcher/`](https://github.com/indrasvat/shux/blob/main/examples/plugins/watcher/plugin.sh)
 for a tiny working example.
 
+### Persist state across hot reload: `plugin.state.*`
+
+Hot reload kills the running plugin process and respawns it from the
+(possibly updated) source — all in-memory state is lost. To keep
+counters, last-seen markers, per-project preferences, etc., a plugin
+persists them to a small daemon-managed store.
+
+```json
+// read (returns null if nothing's been written yet)
+{"jsonrpc":"2.0","method":"plugin.state.get","params":{},"id":3001}
+// → {"jsonrpc":"2.0","id":3001,"result":{"value": null}}
+
+// write (atomic — tempfile + rename)
+{"jsonrpc":"2.0","method":"plugin.state.set",
+ "params":{"value":{"hits":42,"branch":"main"}},"id":3002}
+// → {"jsonrpc":"2.0","id":3002,"result":{"bytes_written":34}}
+
+// delete (returns whether a file actually existed)
+{"jsonrpc":"2.0","method":"plugin.state.delete","params":{},"id":3003}
+// → {"jsonrpc":"2.0","id":3003,"result":{"deleted":true}}
+```
+
+On-disk layout (per project, gitignored by default via
+`.shux/.gitignore`):
+
+```
+<project-root>/.shux/plugins/<plugin_name>/state.json
+```
+
+Where **project root** is resolved by the CLI at install time:
+
+1. Start from the user's `cwd` when `shux plugin install` was run.
+2. Walk up looking for an existing `.shux/` directory — that's the
+   project root.
+3. If none found, anchor at the cwd itself.
+
+This means a daemon shared across multiple project checkouts keeps
+each project's plugin state isolated. The daemon's own cwd is **not**
+used for path resolution.
+
+Rules:
+
+- `value` is any JSON value (object / array / string / number /
+  null). Plain `null` deletes nothing — use `plugin.state.delete`.
+- Total serialized state is capped at **256 KiB**. Larger blobs
+  should go to your own path under `<state_root>/<plugin_name>/`
+  directly.
+- The store is **per-plugin**: a plugin reads/writes ONLY its own
+  state, never another's. Identity is taken from the spawn context.
+- Survives `plugin reload`, `plugin kill` + re-install, daemon
+  restart. Wiped only by `plugin.state.delete` or by removing the
+  file on disk.
+
+A plugin that wants to restore its in-memory state after a hot
+reload typically does this first, right after the handshake:
+
+```bash
+printf '{"jsonrpc":"2.0","method":"plugin.state.get","params":{},"id":1}\n'
+# read one line back from stdin — that's the response; parse .result.value
+```
+
 ### CLI ↔ RPC namespace mapping
 
 The CLI doesn't mirror the RPC namespace exactly. **Session ops

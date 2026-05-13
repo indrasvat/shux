@@ -1,1 +1,6 @@
 out/
+# Per-plugin persisted state (shipped in v0.18+ via plugin.state.*).
+# Plugins may legitimately store secrets / tokens / per-project
+# preferences here; gitignored by default.
+plugins/
+

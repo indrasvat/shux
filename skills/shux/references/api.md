@@ -277,6 +277,29 @@ flow through the data-plane sealed bus, not the event history).
 {} → { "name": "shux", "version": "0.8.0", "git_sha": "..." }
 ```
 
+### `plugin.state.{get,set,delete}` — plugin-only
+
+```json
+// get
+{} → { "value": <JSON or null> }
+
+// set
+{ "value": <JSON> } → { "bytes_written": N }
+
+// delete
+{} → { "deleted": <bool> }
+```
+
+Per-plugin persisted state, survives hot reload + daemon restart.
+On disk at `<daemon-cwd>/.shux/plugins/<plugin_name>/state.json`
+(atomic writes via tempfile+rename). Cap: 256 KiB serialized.
+
+Callable only from inside a process plugin — the daemon takes the
+plugin's identity from the spawn context, so a plugin reads/writes
+only its own state.
+
+Full plugin-side documentation in [plugins.md](plugins.md).
+
 ### `event.publish` — plugin-only
 
 ```json

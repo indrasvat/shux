@@ -395,6 +395,304 @@ while IFS= read -r _; do :; done
     );
 }
 
+/// `plugin.state.set` followed by `plugin.state.get` round-trips a
+/// value through the on-disk store. The first `get` (before any
+/// `set`) returns `null` rather than an error.
+#[tokio::test]
+async fn plugin_state_round_trips_through_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let resp_capture = tmp.path().join("resp.jsonl");
+    let state_root = tmp.path().join("plugins");
+
+    // Plugin: read initial state (expect null) → write a value → read
+    // it back. Capture all daemon responses to a file.
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+OUT={out}
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"persist","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.get","params":{{}},"id":1}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.set","params":{{"value":{{"hits":42,"branch":"main"}}}},"id":2}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.get","params":{{}},"id":3}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"id":1'*|*'"id":2'*|*'"id":3'*) printf '%s\n' "$line" >> "$OUT" ;;
+  esac
+done
+"#,
+        out = resp_capture.display()
+    );
+    let script_path = write_script(tmp.path(), "persist.sh", &script);
+
+    let mgr = PluginManager::with_state_root(EventBus::new(), state_root.clone());
+    mgr.install(PluginSource::from_path(&script_path))
+        .await
+        .expect("install");
+
+    for _ in 0..80 {
+        let count = std::fs::read_to_string(&resp_capture)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if count >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let body = std::fs::read_to_string(&resp_capture).expect("captured responses");
+    let lines: Vec<&str> = body.lines().collect();
+    assert!(
+        lines.len() >= 3,
+        "want 3 responses, got {}: {body}",
+        lines.len()
+    );
+    let by_id: std::collections::HashMap<i64, serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .map(|v| (v["id"].as_i64().unwrap(), v))
+        .collect();
+
+    // id=1: get before set → null.
+    assert_eq!(by_id[&1]["result"]["value"], serde_json::Value::Null);
+    // id=2: set → bytes_written > 0.
+    assert!(by_id[&2]["result"]["bytes_written"].as_u64().unwrap() > 0);
+    // id=3: get after set → the value we wrote.
+    assert_eq!(by_id[&3]["result"]["value"]["hits"], serde_json::json!(42));
+    assert_eq!(
+        by_id[&3]["result"]["value"]["branch"],
+        serde_json::json!("main")
+    );
+
+    // The on-disk file actually exists at the expected path.
+    let expected = state_root.join("persist").join("state.json");
+    assert!(
+        expected.exists(),
+        "state.json must land at {}",
+        expected.display()
+    );
+
+    mgr.kill("persist").await.unwrap();
+}
+
+/// State persists across a plugin's hot reload — the file lives
+/// outside the plugin process so a respawned instance reads back
+/// what its predecessor wrote.
+#[tokio::test]
+async fn plugin_state_survives_reload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_root = tmp.path().join("plugins");
+    let resp_capture = tmp.path().join("resp.jsonl");
+    let phase_file = tmp.path().join("phase");
+    std::fs::write(&phase_file, "1").unwrap();
+
+    // The plugin reads PHASE: in phase 1 it writes state and exits;
+    // in phase 2 it reads state and dumps the result.
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+OUT={out}
+PHASE_FILE={phase}
+PHASE=$(cat "$PHASE_FILE")
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"reloader","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+if [ "$PHASE" = "1" ]; then
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.set","params":{{"value":{{"phase1":true}}}},"id":1}}'
+else
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.get","params":{{}},"id":2}}'
+fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"id":1'*|*'"id":2'*) printf '%s\n' "$line" >> "$OUT" ;;
+  esac
+done
+"#,
+        out = resp_capture.display(),
+        phase = phase_file.display()
+    );
+    let script_path = write_script(tmp.path(), "reloader.sh", &script);
+
+    let mgr = PluginManager::with_state_root(EventBus::new(), state_root.clone());
+
+    // Phase 1: install, let it write, kill.
+    mgr.install(PluginSource::from_path(&script_path))
+        .await
+        .expect("install phase 1");
+    for _ in 0..50 {
+        if std::fs::read_to_string(&resp_capture)
+            .map(|s| s.contains("\"id\":1"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    mgr.kill("reloader").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Phase 2: flip the phase marker, re-install, plugin should
+    // now READ the value back.
+    std::fs::write(&phase_file, "2").unwrap();
+    mgr.install(PluginSource::from_path(&script_path))
+        .await
+        .expect("install phase 2");
+    for _ in 0..80 {
+        if std::fs::read_to_string(&resp_capture)
+            .map(|s| s.contains("\"id\":2"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let body = std::fs::read_to_string(&resp_capture).unwrap();
+    let id2 = body
+        .lines()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["id"].as_i64() == Some(2))
+        .or_else(|| {
+            body.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|v| v["id"].as_i64() == Some(2))
+        })
+        .expect("phase 2 response captured");
+    assert_eq!(
+        id2["result"]["value"]["phase1"],
+        serde_json::json!(true),
+        "respawned plugin must read what its predecessor wrote: {id2}"
+    );
+
+    mgr.kill("reloader").await.unwrap();
+}
+
+/// Per-install `state_root` override: when `PluginSource.state_root`
+/// is set, `plugin.state.set` writes under THAT path, not the
+/// daemon-wide default. Mirrors the CLI's behaviour of pinning
+/// state to the calling client's project cwd. (codex P2 review on
+/// PR #32.)
+#[tokio::test]
+async fn plugin_state_honours_per_install_state_root_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon_root = tmp.path().join("daemon_default");
+    let project_root = tmp.path().join("project_a");
+    let resp_capture = tmp.path().join("resp.jsonl");
+
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+OUT={out}
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"projscoped","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.set","params":{{"value":{{"marker":"project_a"}}}},"id":1}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"id":1'*) printf '%s\n' "$line" >> "$OUT" ;;
+  esac
+done
+"#,
+        out = resp_capture.display()
+    );
+    let script_path = write_script(tmp.path(), "projscoped.sh", &script);
+
+    let mgr = PluginManager::with_state_root(EventBus::new(), daemon_root.clone());
+
+    // Install with an explicit per-source state_root override.
+    let mut source = PluginSource::from_path(&script_path);
+    source.state_root = Some(project_root.clone());
+    mgr.install(source).await.expect("install");
+
+    for _ in 0..50 {
+        if resp_capture.exists()
+            && std::fs::metadata(&resp_capture)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The file must live under PROJECT root, not the daemon default.
+    let project_path = project_root.join("projscoped").join("state.json");
+    let daemon_path = daemon_root.join("projscoped").join("state.json");
+    assert!(
+        project_path.exists(),
+        "state.json must land under the per-install override: {}",
+        project_path.display()
+    );
+    assert!(
+        !daemon_path.exists(),
+        "state.json must NOT land under the daemon default when override is set: {}",
+        daemon_path.display()
+    );
+
+    mgr.kill("projscoped").await.unwrap();
+}
+
+/// `plugin.state.set` rejects payloads over the 256 KiB cap.
+#[tokio::test]
+async fn plugin_state_set_rejects_oversized_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let resp_capture = tmp.path().join("resp.jsonl");
+    let state_root = tmp.path().join("plugins");
+
+    // Build a 300 KiB string literal in JSON (so total exceeds the
+    // 256 KiB cap once serialized).
+    let big = "a".repeat(300 * 1024);
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+OUT={out}
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"big","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"plugin.state.set","params":{{"value":"{big}"}},"id":99}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"id":99'*) printf '%s\n' "$line" >> "$OUT" ;;
+  esac
+done
+"#,
+        out = resp_capture.display(),
+        big = big,
+    );
+    let script_path = write_script(tmp.path(), "big.sh", &script);
+
+    let mgr = PluginManager::with_state_root(EventBus::new(), state_root);
+    mgr.install(PluginSource::from_path(&script_path))
+        .await
+        .expect("install");
+
+    for _ in 0..50 {
+        if resp_capture.exists()
+            && std::fs::metadata(&resp_capture)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let body = std::fs::read_to_string(&resp_capture).expect("response captured");
+    let resp: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert_eq!(resp["id"], 99);
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602));
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds cap"),
+        "diagnostic must mention size cap: {resp}"
+    );
+
+    mgr.kill("big").await.unwrap();
+}
+
 /// `event.publish` rejects an event_type with embedded dots, because
 /// that would let a plugin synthesise an event under a sibling's
 /// namespace (`plugin.emitter.other.evil`).

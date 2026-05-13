@@ -1,13 +1,16 @@
-# shux-watcher — `event.publish` reference plugin
+# shux-watcher — reference plugin for `event.publish` + `plugin.state.*`
 
-Tiny but real. ~50 lines of bash, demonstrates the v0.16+ plugin
-primitive `event.publish` end-to-end:
+Tiny but real. ~60 lines of bash, demonstrates **two** plugin
+primitives in one coherent feature:
 
-1. Subscribe to `pane.exited` from the daemon's event bus.
+1. **Subscribe** to `pane.exited` from the daemon's event bus.
 2. Optionally filter by exit-status regex (`EXIT_RE='[1-9]'` → only
    non-zero exits).
-3. Re-emit each as a `plugin.watcher.command_exit` event with the
-   useful subset — `session_id`, `pane_id`, `exit_status`, `command`.
+3. **Publish** each match as a `plugin.watcher.command_exit` event,
+   tagged with a cumulative `emit_count`.
+4. **Persist** `emit_count` via `plugin.state.set` so the counter
+   survives every hot reload + daemon restart. On startup the plugin
+   restores it via `plugin.state.get`.
 
 The daemon namespaces every published event under
 `plugin.<plugin_id>.<type>`, so subscribers can target this exact

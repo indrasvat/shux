@@ -916,12 +916,22 @@ fn register_plugin_methods(
                         .get("watch")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
+                    // Per-install state root (codex P2 review on PR #32):
+                    // a daemon shared across project checkouts must
+                    // pin each plugin's state to the calling client's
+                    // project, not to the daemon's own cwd. The CLI
+                    // passes the resolved `.shux/plugins` path here.
+                    let state_root = params
+                        .get("state_root")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from);
 
                     let source = shux_plugin::PluginSource {
                         path: PathBuf::from(path),
                         args,
                         cwd,
                         watch,
+                        state_root,
                     };
                     let info = mgr.install(source).await.map_err(plugin_error_to_rpc)?;
                     serde_json::to_value(&info).map_err(|e| {

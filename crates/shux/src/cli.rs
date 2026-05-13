@@ -3293,6 +3293,25 @@ pub async fn handle_events_history(
 /// `shux plugin install <path>` — register a plugin executable
 /// with the daemon. Spawns a `plugin.install` RPC and reports the
 /// resolved manifest.
+/// Resolve the per-install plugin-state root from a starting cwd.
+/// Walks up looking for an existing `.shux/` ancestor (so a plugin
+/// installed from a subdirectory of a project still lands its state
+/// in the project's `.shux/plugins/`). Falls back to anchoring at
+/// the cwd itself when no `.shux/` is found in any ancestor.
+fn resolve_plugin_state_root(start: &std::path::Path) -> std::path::PathBuf {
+    let mut cur = start;
+    loop {
+        if cur.join(".shux").is_dir() {
+            return cur.join(".shux").join("plugins");
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    start.join(".shux").join("plugins")
+}
+
 pub async fn handle_plugin_install(
     stream: &mut tokio::net::UnixStream,
     path: &std::path::Path,
@@ -3318,6 +3337,20 @@ pub async fn handle_plugin_install(
         );
     }
     params.insert("watch".into(), serde_json::Value::Bool(watch));
+
+    // Pin the plugin's persisted-state root to the CLIENT's cwd so a
+    // daemon shared across multiple project checkouts keeps each
+    // project's plugin state isolated (codex P2 review on PR #32).
+    // Walks up from cwd to find an existing `.shux/` ancestor; if
+    // none found, anchors at the cwd itself. The daemon creates the
+    // `<state_root>/<plugin_name>/` dir lazily on first `state.set`.
+    if let Ok(cwd) = std::env::current_dir() {
+        let state_root = resolve_plugin_state_root(&cwd);
+        params.insert(
+            "state_root".into(),
+            serde_json::Value::String(state_root.display().to_string()),
+        );
+    }
 
     let result = rpc_call(stream, "plugin.install", serde_json::Value::Object(params)).await?;
 
