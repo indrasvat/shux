@@ -426,9 +426,29 @@ pub struct ConfigChange {
 }
 
 impl EventData {
+    /// Full, filter-ready event type string. For most variants this is
+    /// identical to `event_type()`. For `PluginEvent` it includes the
+    /// per-plugin namespace: `plugin.<plugin_id>.<event_type>`.
+    ///
+    /// Use this when building filterable strings for the bus
+    /// (`EventMetadata.event_type`) so subscribers can target a specific
+    /// plugin's events (`--filter "plugin.git-status."`).
+    pub fn full_event_type(&self) -> String {
+        match self {
+            EventData::PluginEvent {
+                plugin_id,
+                event_type,
+                ..
+            } => format!("plugin.{}.{}", plugin_id, event_type),
+            other => other.event_type().to_string(),
+        }
+    }
+
     /// Get the event type string for this data variant.
     ///
     /// Returns the dotted event type string as specified in PRD §21.
+    /// For `PluginEvent` returns the bare `"plugin.event"` discriminant;
+    /// for the filterable namespaced form use [`Self::full_event_type`].
     pub fn event_type(&self) -> &'static str {
         match self {
             EventData::SessionCreated { .. } => "session.created",

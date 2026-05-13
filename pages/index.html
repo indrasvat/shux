@@ -1224,10 +1224,13 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
     <h2 class="measure">Agent-authored plugins. Any language. ~30 lines.</h2>
     <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
       A plugin is any executable that speaks shux's line-delimited
-      JSON-RPC dialect on stdin/stdout. It subscribes to bus events
-      and calls the same RPC methods you use from outside —
-      <code>window.rename</code>, <code>pane.send_keys</code>,
-      <code>state.apply</code>. Bash, python, node, anything.
+      JSON-RPC dialect on stdin/stdout. It <b>subscribes</b> to bus
+      events, <b>calls</b> the same RPC methods you use from outside
+      (<code>window.rename</code>, <code>pane.send_keys</code>,
+      <code>state.apply</code>), and <b>publishes</b> its own events
+      via <code>event.publish</code> — namespaced
+      <code>plugin.&lt;id&gt;.&lt;type&gt;</code> so downstream plugins
+      can subscribe cleanly. Bash, python, node, anything.
     </p>
 
     <div class="code-panel">
@@ -1242,11 +1245,12 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
 <span style="color:var(--ink-3)"># → plugin.shutdown sent, 2s graceful window, SIGKILL fallback</span></code></pre>
 
       <div class="annot">
-        <h3>The protocol, in four lines</h3>
+        <h3>The protocol, in five lines</h3>
         <ul class="kv-list">
           <li><span class="k">handshake</span><span class="v">one line in, one manifest line out (≤5 s)</span></li>
-          <li><span class="k">events</span><span class="v">one JSON line per matching bus event on stdin</span></li>
+          <li><span class="k">events in</span><span class="v">one JSON line per matching bus event on stdin</span></li>
           <li><span class="k">rpc out</span><span class="v">write any registered method to stdout, response comes back on stdin</span></li>
+          <li><span class="k">events out</span><span class="v"><code>event.publish</code> emits <code>plugin.&lt;id&gt;.&lt;type&gt;</code> events for other plugins</span></li>
           <li><span class="k">shutdown</span><span class="v">plugin.shutdown frame, 2 s grace, then SIGKILL</span></li>
         </ul>
         <p style="margin-top:var(--s-4); color:var(--ink-2); font-size:13.5px; line-height:1.55;">

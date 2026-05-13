@@ -299,3 +299,159 @@ done
         "plugin never received plugin.shutdown before being killed"
     );
 }
+
+/// `event.publish` from a plugin lands on the bus as a
+/// `PluginEvent` whose filterable type is `plugin.<id>.<event_type>`.
+/// Other subscribers using a prefix filter pick it up exactly.
+#[tokio::test]
+async fn plugin_can_publish_namespaced_events() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // A plugin that emits one event on startup (no subscribes
+    // needed — uses the existing inbox/RPC channel to publish).
+    let script = r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"emitter","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"event.publish","params":{"event_type":"hello","data":{"answer":42}},"id":1}'
+# Block until shutdown so the manager keeps the io task alive long
+# enough for the publish to flow.
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+  esac
+done
+"#;
+    let script_path = write_script(tmp.path(), "emitter.sh", script);
+
+    let bus = EventBus::new();
+    // Subscribe BEFORE installing so the publish from the plugin's
+    // first read-loop iteration lands on a live receiver.
+    let mut sub = bus.subscribe_filtered(vec!["plugin.emitter.".into()]);
+
+    let mgr = PluginManager::new(bus.clone());
+    mgr.install(PluginSource::from_path(&script_path))
+        .await
+        .expect("install");
+
+    // Wait for the namespaced event with a bounded poll.
+    let mut got = None;
+    for _ in 0..100 {
+        match tokio::time::timeout(Duration::from_millis(20), sub.recv()).await {
+            Ok(Some(shux_core::bus::SubscriptionEvent::Event(ev))) => {
+                got = Some(ev);
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    let ev = got.expect("plugin event never landed on the bus");
+    assert_eq!(
+        ev.meta.event_type, "plugin.emitter.hello",
+        "namespaced filterable type"
+    );
+
+    match ev.data {
+        shux_core::event::EventData::PluginEvent {
+            ref plugin_id,
+            ref event_type,
+            ref data,
+        } => {
+            assert_eq!(plugin_id, "emitter");
+            assert_eq!(event_type, "hello");
+            assert_eq!(data["answer"], serde_json::json!(42));
+        }
+        other => panic!("expected PluginEvent, got {other:?}"),
+    }
+
+    mgr.kill("emitter").await.unwrap();
+}
+
+/// Install rejects a plugin whose manifest name contains a `.` — the
+/// name is used verbatim in the `plugin.<name>.<type>` event
+/// namespace, so a name like `git-status.evil` would let it publish
+/// events under another plugin's filter prefix
+/// (`plugin.git-status.`). (codex bot P1 review on PR #31.)
+#[tokio::test]
+async fn install_rejects_dotted_plugin_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"git-status.evil","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r _; do :; done
+"#;
+    let script_path = write_script(tmp.path(), "dotted.sh", script);
+    let mgr = PluginManager::new(EventBus::new());
+    let err = mgr
+        .install(PluginSource::from_path(&script_path))
+        .await
+        .expect_err("install must reject dotted manifest name");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must not contain '.'"),
+        "diagnostic must mention dot rule: {msg}"
+    );
+}
+
+/// `event.publish` rejects an event_type with embedded dots, because
+/// that would let a plugin synthesise an event under a sibling's
+/// namespace (`plugin.emitter.other.evil`).
+#[tokio::test]
+async fn plugin_event_publish_rejects_dotted_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let resp_capture = tmp.path().join("resp.jsonl");
+
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+OUT={out}
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"badnames","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"event.publish","params":{{"event_type":"a.b","data":{{}}}},"id":42}}'
+# capture the daemon's response on stdin and exit
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+    *'"id":42'*) printf '%s\n' "$line" >> "$OUT" ;;
+  esac
+done
+"#,
+        out = resp_capture.display()
+    );
+    let script_path = write_script(tmp.path(), "badnames.sh", &script);
+
+    let mgr = PluginManager::new(EventBus::new());
+    mgr.install(PluginSource::from_path(&script_path))
+        .await
+        .expect("install");
+
+    for _ in 0..50 {
+        if resp_capture.exists()
+            && std::fs::metadata(&resp_capture)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let body = std::fs::read_to_string(&resp_capture).expect("response captured");
+    let resp: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert_eq!(resp["id"], 42);
+    assert!(
+        resp["error"]["code"].as_i64() == Some(-32602),
+        "want invalid_params: {resp}"
+    );
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must not contain '.'"),
+        "diagnostic must mention dot rule: {resp}"
+    );
+
+    mgr.kill("badnames").await.unwrap();
+}

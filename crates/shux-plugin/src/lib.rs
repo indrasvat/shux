@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use shux_core::bus::{EventBus, Subscription, SubscriptionEvent};
+use shux_core::event::EventData;
 use shux_rpc::router::Router;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -215,6 +216,20 @@ impl PluginManager {
                 "plugin manifest missing 'name'".into(),
             ));
         }
+        // Names must be filter-safe — they're concatenated verbatim
+        // into the `plugin.<name>.<type>` namespace used by
+        // `event.publish`. Codex bot review on PR #31: a manifest
+        // name like `git-status.evil` would let it publish events
+        // matching subscribers filtering for the legitimate
+        // `plugin.git-status.` prefix.
+        if manifest.name.contains('.') || manifest.name.contains(char::is_whitespace) {
+            let _ = child.kill().await;
+            return Err(PluginError::HandshakeFailed(format!(
+                "plugin name {:?} must not contain '.' or whitespace \
+                 (used verbatim in the plugin.<name>.<type> event namespace)",
+                manifest.name
+            )));
+        }
 
         // Stage 2: dedup + spawn + register atomically. Held across
         // the spawn so two concurrent installs of plugins reporting
@@ -250,6 +265,7 @@ impl PluginManager {
             kill_rx,
             sub,
             self.router.clone(),
+            self.event_bus.clone(),
             last_error.clone(),
         ));
 
@@ -564,6 +580,7 @@ async fn run_plugin_io(
     mut kill_rx: oneshot::Receiver<()>,
     mut sub: Option<Subscription>,
     router: Arc<tokio::sync::OnceCell<Router>>,
+    event_bus: EventBus,
     last_error: Arc<Mutex<Option<String>>>,
 ) {
     // Plugin→daemon RPC dispatches run in spawned tasks so a slow
@@ -631,7 +648,13 @@ async fn run_plugin_io(
                 match res {
                     Ok(Some(line)) if line.is_empty() => continue,
                     Ok(Some(line)) => {
-                        dispatch_plugin_frame(&name, line, &router, resp_tx.clone());
+                        dispatch_plugin_frame(
+                            &name,
+                            line,
+                            &router,
+                            &event_bus,
+                            resp_tx.clone(),
+                        );
                     }
                     Ok(None) => {
                         debug!(plugin = %name, "plugin closed stdout; exiting io task");
@@ -671,10 +694,56 @@ async fn next_event(sub: &mut Option<Subscription>) -> Option<serde_json::Value>
     }
 }
 
+/// Validate + publish a plugin-emitted event. Returns the sequence
+/// number assigned by the bus, or a JSON-RPC error tuple on bad
+/// input. The `plugin_id` is supplied by the caller (the I/O loop
+/// knows which child wrote the frame) — plugins cannot spoof it.
+///
+/// Param shape:
+///
+/// ```json
+/// {"event_type": "branch_changed", "data": {"branch": "main"}}
+/// ```
+///
+/// The published filterable type is `plugin.<plugin_id>.<event_type>`
+/// (see `EventData::full_event_type`). Subscribers target a specific
+/// plugin's events with `--filter "plugin.<plugin_id>."`.
+fn publish_plugin_event(
+    plugin_id: &str,
+    params: Option<&Value>,
+    event_bus: &EventBus,
+) -> Result<u64, (i64, String)> {
+    let p = params.ok_or((-32602, "missing params".to_string()))?;
+    let event_type = p
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .ok_or((-32602, "missing 'event_type' string".to_string()))?;
+    if event_type.is_empty() {
+        return Err((-32602, "'event_type' must be non-empty".to_string()));
+    }
+    // Block embedded dots so a plugin can't synthesise a fake
+    // `plugin.<id>.<a>.<b>` event that fans out under a sibling prefix.
+    if event_type.contains('.') {
+        return Err((
+            -32602,
+            "'event_type' must not contain '.' (the daemon namespaces it under plugin.<id>.)"
+                .to_string(),
+        ));
+    }
+    let data = p.get("data").cloned().unwrap_or(Value::Null);
+    let seq = event_bus.publish(EventData::PluginEvent {
+        plugin_id: plugin_id.to_string(),
+        event_type: event_type.to_string(),
+        data,
+    });
+    Ok(seq)
+}
+
 fn dispatch_plugin_frame(
     plugin: &str,
     line: String,
     router: &Arc<tokio::sync::OnceCell<Router>>,
+    event_bus: &EventBus,
     resp_tx: mpsc::Sender<String>,
 ) {
     let parsed: Value = match serde_json::from_str(&line) {
@@ -700,6 +769,29 @@ fn dispatch_plugin_frame(
 
     if id.is_none() {
         // Notification from plugin (none defined in v0).
+        return;
+    }
+
+    // Plugin-only method: emit a namespaced PluginEvent onto the bus.
+    // Intercept BEFORE the router dispatch so the plugin's identity is
+    // captured from the caller context (the `plugin: &str` here) and
+    // can't be spoofed via params. Result envelope is the published
+    // sequence number, mirroring `state.apply`'s response shape.
+    if method == "event.publish" {
+        let resp = publish_plugin_event(plugin, params.as_ref(), event_bus);
+        let frame = match resp {
+            Ok(seq) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {"seq": seq},
+                "id": id,
+            }),
+            Err((code, msg)) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": {"code": code, "message": msg},
+                "id": id,
+            }),
+        };
+        let _ = resp_tx.try_send(format!("{frame}\n"));
         return;
     }
 

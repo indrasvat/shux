@@ -166,9 +166,15 @@ Want raw RPC for a new method?     → shux rpc call <method> --params @file
 
 shux has a process-plugin host. A plugin is any executable that speaks
 shux's line-delimited JSON-RPC dialect on stdin/stdout — bash, python,
-node, anything. It subscribes to bus events and can call the same RPC
-methods you use from outside (`window.rename`, `pane.send_keys`,
-`state.apply`, …) to react in real time.
+node, anything. It:
+
+- **Subscribes** to bus events listed in its manifest.
+- **Calls** any registered shux RPC method (`window.rename`,
+  `pane.send_keys`, `state.apply`, …) to react.
+- **Publishes** its own events via `event.publish`. The daemon
+  namespaces them under `plugin.<plugin_id>.<type>` so other
+  plugins (or `shux events watch --filter plugin.<id>.`) can
+  subscribe to them cleanly — see [references/plugins.md](references/plugins.md).
 
 ```bash
 shux plugin install ./my-plugin.sh   # spawn, handshake, register. Hot reload ON
@@ -179,9 +185,13 @@ shux plugin reload <name>             # manual hot-reload tick (kill + respawn)
 shux plugin kill <name>               # graceful shutdown (2s) → SIGKILL
 ```
 
-Smallest working example (~30 lines of bash): [`examples/plugins/hello/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh).
+Reference plugins:
+
+- [`examples/plugins/hello/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh) — smallest working example (~50 lines): handshake + PTY output + state mutation.
+- [`examples/plugins/watcher/plugin.sh`](https://github.com/indrasvat/shux/blob/main/examples/plugins/watcher/plugin.sh) — subscribes to `pane.exited`, emits a namespaced `plugin.watcher.command_exit` via `event.publish` for downstream plugins.
+
 Full protocol — handshake, event payload shape, RPC-out direction,
-shutdown grace, UUID vs name rule, what's not in v0 — lives in
+`event.publish`, shutdown grace, UUID vs name rule, what's not in v0 — lives in
 [references/plugins.md](references/plugins.md).
 
 ## Deep dives

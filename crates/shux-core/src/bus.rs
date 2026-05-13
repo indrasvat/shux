@@ -224,7 +224,9 @@ impl EventBus {
     /// by correlation_id to attribute a burst to a specific apply.
     pub fn publish_with_correlation(&self, data: EventData, correlation_id: Option<String>) -> u64 {
         let seq = self.inner.seq_counter.fetch_add(1, Ordering::Relaxed);
-        let event_type = data.event_type().to_string();
+        // Use the full (namespaced) form so PluginEvent variants land
+        // under `plugin.<id>.<type>` and can be filtered per-plugin.
+        let event_type = data.full_event_type();
 
         let event = Event {
             meta: EventMetadata {

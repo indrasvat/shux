@@ -1824,7 +1824,11 @@ plugin.disabled        {plugin_id, reason}
 plugin.reloaded        {plugin_id, version}
 plugin.error           {plugin_id, error, context}
 
-# Inter-plugin (namespaced)
+# Inter-plugin (namespaced — shipped in v0.16+)
+# Plugins publish via `event.publish`; daemon brands them
+# `plugin.<plugin_id>.<event_type>` so subscribers can filter by
+# plugin identity. The `plugin_id` is captured server-side from the
+# calling plugin's manifest name and cannot be spoofed via params.
 plugin.event           {plugin_id, event_type, data}  # e.g., "git.branch_changed"
 
 # Keybinding

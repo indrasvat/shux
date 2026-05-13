@@ -190,6 +190,49 @@ from outside the daemon — useful for prototyping a plugin call by
 hand before wiring it into the plugin loop. `--params` accepts
 inline JSON, `@<file>`, or `-` (stdin).
 
+### Publish your own events: `event.publish`
+
+A plugin can emit events onto the daemon's bus so other plugins (or
+external `events watch` consumers) can subscribe to them.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method":  "event.publish",
+  "params":  {"event_type": "branch_changed", "data": {"branch": "main"}},
+  "id":      2001
+}
+```
+
+Response (success):
+
+```json
+{"jsonrpc":"2.0","id":2001,"result":{"seq":<u64>}}
+```
+
+The daemon namespaces every plugin-emitted event under
+**`plugin.<plugin_id>.<event_type>`** so the plugin's identity is
+locked in and subscribers can target a specific plugin's stream:
+
+```bash
+shux events watch --filter plugin.git-status.            # only this plugin's events
+shux events watch --filter plugin.git-status.branch_     # one type
+shux events watch --filter plugin.                       # ALL plugin events
+```
+
+Rules:
+
+- `event_type` is required, non-empty, and **must not contain `.`**
+  (the daemon owns the `plugin.<id>.` namespace; embedded dots would
+  let a plugin synthesise events under a sibling's prefix).
+- `data` is any JSON value (object / array / string / number / null).
+- `plugin_id` is taken from the calling plugin's manifest name — it
+  cannot be spoofed via params.
+
+See the reference plugin at
+[`examples/plugins/watcher/`](https://github.com/indrasvat/shux/blob/main/examples/plugins/watcher/plugin.sh)
+for a tiny working example.
+
 ### CLI ↔ RPC namespace mapping
 
 The CLI doesn't mirror the RPC namespace exactly. **Session ops
