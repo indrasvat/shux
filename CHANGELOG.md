@@ -1,3 +1,10 @@
+# [0.16.0](https://github.com/indrasvat/shux/compare/v0.15.0...v0.16.0) (2026-05-13)
+
+
+### Features
+
+* **pages,plugin:** asciinema-style 3-agent demo + hot-reload showcase + skill installer ([#26](https://github.com/indrasvat/shux/issues/26)) ([ee75a7d](https://github.com/indrasvat/shux/commit/ee75a7da579fb25fa802482c4a2ca0d784e4a59f)), closes [#plugins](https://github.com/indrasvat/shux/issues/plugins) [#agents](https://github.com/indrasvat/shux/issues/agents)
+
 # [0.15.0](https://github.com/indrasvat/shux/compare/v0.14.0...v0.15.0) (2026-05-12)
 
 
