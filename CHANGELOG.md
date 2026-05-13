@@ -1,3 +1,10 @@
+# [0.20.0](https://github.com/indrasvat/shux/compare/v0.19.0...v0.20.0) (2026-05-13)
+
+
+### Features
+
+* **plugin:** default-deny permission model with grants + audit log ([#33](https://github.com/indrasvat/shux/issues/33)) ([3121369](https://github.com/indrasvat/shux/commit/3121369da6953f562e6fb232643b6d78970e76c1)), closes [#14](https://github.com/indrasvat/shux/issues/14) [#31](https://github.com/indrasvat/shux/issues/31) [#32](https://github.com/indrasvat/shux/issues/32)
+
 # [0.19.0](https://github.com/indrasvat/shux/compare/v0.18.0...v0.19.0) (2026-05-13)
 
 
