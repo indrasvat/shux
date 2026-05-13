@@ -1,3 +1,10 @@
+## [0.16.1](https://github.com/indrasvat/shux/compare/v0.16.0...v0.16.1) (2026-05-13)
+
+
+### Bug Fixes
+
+* agent test-drive rough edges (issue [#25](https://github.com/indrasvat/shux/issues/25)) + RPC↔CLI parity audit ([#27](https://github.com/indrasvat/shux/issues/27)) ([cad0e96](https://github.com/indrasvat/shux/commit/cad0e9636ff98d349b925908451357d001bcb721)), closes [#26](https://github.com/indrasvat/shux/issues/26) [#26](https://github.com/indrasvat/shux/issues/26)
+
 # [0.16.0](https://github.com/indrasvat/shux/compare/v0.15.0...v0.16.0) (2026-05-13)
 
 
