@@ -175,6 +175,10 @@ node, anything. It:
   namespaces them under `plugin.<plugin_id>.<type>` so other
   plugins (or `shux events watch --filter plugin.<id>.`) can
   subscribe to them cleanly — see [references/plugins.md](references/plugins.md).
+- **Persists** its own state across hot reload via
+  `plugin.state.get/set/delete`. The daemon stores it at
+  `<daemon-cwd>/.shux/plugins/<name>/state.json` (atomic writes,
+  256 KiB cap, per-plugin isolation).
 
 ```bash
 shux plugin install ./my-plugin.sh   # spawn, handshake, register. Hot reload ON

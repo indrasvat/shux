@@ -134,14 +134,26 @@ pub struct PluginManager {
     inner: Arc<Mutex<HashMap<String, Running>>>,
     router: Arc<tokio::sync::OnceCell<Router>>,
     event_bus: EventBus,
+    /// Root for per-plugin persisted state. Each plugin's state lives at
+    /// `<state_root>/<plugin_name>/state.json` and survives hot reload.
+    state_root: Arc<std::path::PathBuf>,
 }
 
 impl PluginManager {
+    /// Build a host with the default state root (`<cwd>/.shux/plugins`).
     pub fn new(event_bus: EventBus) -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        Self::with_state_root(event_bus, cwd.join(".shux").join("plugins"))
+    }
+
+    /// Build a host with an explicit state root. Used by tests so they
+    /// can point each test at a fresh tempdir.
+    pub fn with_state_root(event_bus: EventBus, state_root: std::path::PathBuf) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             router: Arc::new(tokio::sync::OnceCell::new()),
             event_bus,
+            state_root: Arc::new(state_root),
         }
     }
 
@@ -266,6 +278,7 @@ impl PluginManager {
             sub,
             self.router.clone(),
             self.event_bus.clone(),
+            self.state_root.clone(),
             last_error.clone(),
         ));
 
@@ -581,6 +594,7 @@ async fn run_plugin_io(
     mut sub: Option<Subscription>,
     router: Arc<tokio::sync::OnceCell<Router>>,
     event_bus: EventBus,
+    state_root: Arc<std::path::PathBuf>,
     last_error: Arc<Mutex<Option<String>>>,
 ) {
     // Plugin→daemon RPC dispatches run in spawned tasks so a slow
@@ -653,6 +667,7 @@ async fn run_plugin_io(
                             line,
                             &router,
                             &event_bus,
+                            &state_root,
                             resp_tx.clone(),
                         );
                     }
@@ -739,11 +754,95 @@ fn publish_plugin_event(
     Ok(seq)
 }
 
+/// Cap per-plugin persisted state at 256 KiB. Plugins that want
+/// larger blobs should write to their own paths under
+/// `<state_root>/<plugin_name>/` directly.
+const PLUGIN_STATE_MAX_BYTES: usize = 256 * 1024;
+
+/// Resolve the on-disk path for a plugin's state.json. Validates
+/// that `plugin_id` is filter-safe (no dots / whitespace — the
+/// install path already enforces this, defence in depth here).
+fn plugin_state_path(
+    root: &std::path::Path,
+    plugin_id: &str,
+) -> Result<std::path::PathBuf, (i64, String)> {
+    if plugin_id.is_empty()
+        || plugin_id.contains('.')
+        || plugin_id.contains('/')
+        || plugin_id.contains(char::is_whitespace)
+    {
+        return Err((-32603, "invalid plugin name for state path".to_string()));
+    }
+    Ok(root.join(plugin_id).join("state.json"))
+}
+
+fn read_plugin_state(root: &std::path::Path, plugin_id: &str) -> Result<Value, (i64, String)> {
+    let path = plugin_state_path(root, plugin_id)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Ok(v),
+            Err(e) => Err((
+                -32603,
+                format!("state.json at {} is corrupt: {e}", path.display()),
+            )),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+        Err(e) => Err((-32603, format!("read state.json: {e}"))),
+    }
+}
+
+fn write_plugin_state(
+    root: &std::path::Path,
+    plugin_id: &str,
+    value: &Value,
+) -> Result<usize, (i64, String)> {
+    let serialised =
+        serde_json::to_vec_pretty(value).map_err(|e| (-32603, format!("serialise state: {e}")))?;
+    if serialised.len() > PLUGIN_STATE_MAX_BYTES {
+        return Err((
+            -32602,
+            format!(
+                "state would be {} bytes — exceeds cap of {} bytes; persist large blobs to your own path",
+                serialised.len(),
+                PLUGIN_STATE_MAX_BYTES
+            ),
+        ));
+    }
+    let path = plugin_state_path(root, plugin_id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| (-32603, format!("mkdir {}: {e}", parent.display())))?;
+    }
+    // Atomic write: temp file in the same dir, then rename. Same-fs
+    // rename is atomic on POSIX so readers either see the old or the
+    // new content, never partial.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &serialised)
+        .map_err(|e| (-32603, format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        (
+            -32603,
+            format!("rename {} -> {}: {e}", tmp.display(), path.display()),
+        )
+    })?;
+    Ok(serialised.len())
+}
+
+fn delete_plugin_state(root: &std::path::Path, plugin_id: &str) -> Result<bool, (i64, String)> {
+    let path = plugin_state_path(root, plugin_id)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err((-32603, format!("delete {}: {e}", path.display()))),
+    }
+}
+
 fn dispatch_plugin_frame(
     plugin: &str,
     line: String,
     router: &Arc<tokio::sync::OnceCell<Router>>,
     event_bus: &EventBus,
+    state_root: &std::path::Path,
     resp_tx: mpsc::Sender<String>,
 ) {
     let parsed: Value = match serde_json::from_str(&line) {
@@ -772,17 +871,40 @@ fn dispatch_plugin_frame(
         return;
     }
 
-    // Plugin-only method: emit a namespaced PluginEvent onto the bus.
-    // Intercept BEFORE the router dispatch so the plugin's identity is
-    // captured from the caller context (the `plugin: &str` here) and
-    // can't be spoofed via params. Result envelope is the published
-    // sequence number, mirroring `state.apply`'s response shape.
-    if method == "event.publish" {
-        let resp = publish_plugin_event(plugin, params.as_ref(), event_bus);
+    // Plugin-only methods: intercept BEFORE the router dispatch so
+    // the plugin's identity is captured from the caller context
+    // (the `plugin: &str` here) and can't be spoofed via params.
+    let plugin_only_result: Option<Result<Value, (i64, String)>> = match method.as_str() {
+        "event.publish" => Some(
+            publish_plugin_event(plugin, params.as_ref(), event_bus)
+                .map(|seq| serde_json::json!({"seq": seq})),
+        ),
+        "plugin.state.get" => Some(
+            read_plugin_state(state_root, plugin).map(|value| serde_json::json!({"value": value})),
+        ),
+        "plugin.state.set" => Some({
+            let value = params
+                .as_ref()
+                .and_then(|p| p.get("value"))
+                .cloned()
+                .ok_or((-32602, "missing 'value' parameter".to_string()));
+            value.and_then(|v| {
+                write_plugin_state(state_root, plugin, &v)
+                    .map(|n| serde_json::json!({"bytes_written": n}))
+            })
+        }),
+        "plugin.state.delete" => Some(
+            delete_plugin_state(state_root, plugin)
+                .map(|deleted| serde_json::json!({"deleted": deleted})),
+        ),
+        _ => None,
+    };
+
+    if let Some(resp) = plugin_only_result {
         let frame = match resp {
-            Ok(seq) => serde_json::json!({
+            Ok(result) => serde_json::json!({
                 "jsonrpc": "2.0",
-                "result": {"seq": seq},
+                "result": result,
                 "id": id,
             }),
             Err((code, msg)) => serde_json::json!({

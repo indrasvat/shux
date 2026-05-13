@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-# shux-watcher — pane-exit notifier (~50 lines, jq + bash).
+# shux-watcher — pane-exit notifier (~60 lines, jq + bash).
 #
-# Demonstrates the v0.16+ `event.publish` plugin primitive:
-#   - subscribes to pane.exited events from the bus
-#   - re-emits each as a derived `plugin.watcher.command_exit`
-#     event with the useful subset (session/pane/command/exit_status)
-#   - the daemon namespaces every published event under
-#     `plugin.<id>.<type>`, so other plugins (or `events watch
-#     --filter plugin.watcher.`) can target this stream exactly.
+# Demonstrates TWO v0.16+/v0.18+ plugin primitives:
+#
+#   event.publish      → re-emit pane.exited as
+#                        plugin.watcher.command_exit so other plugins
+#                        can subscribe cleanly.
+#   plugin.state.*     → persist a cumulative emit counter across
+#                        hot reload + daemon restart.
 #
 # Try it:
 #   shux plugin install ./examples/plugins/watcher/plugin.sh
-#   shux events history --filter plugin.watcher. --count 20
-#   # in another terminal — fires a pane.exited event:
+#   shux events watch --filter plugin.watcher.    # one terminal
 #   shux session create demo -d -- bash -lc 'echo hi && exit 7'
-#   # → watcher's derived event appears in events.history.
+#     # → watcher emits plugin.watcher.command_exit with seq=1
+#   # Edit this file (save) — hot reload triggers. The next emit
+#   # carries seq=2 because the counter survived in state.json.
 #
 # Optional filter: only re-emit when exit_status matches a regex.
 # Set EXIT_RE='[1-9]' to fan out only on non-zero exits.
@@ -26,7 +27,14 @@ set -u
 EXIT_RE="${EXIT_RE:-}"
 
 IFS= read -r _ || exit 1
-printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"watcher","version":"0.1.0","subscribes":["pane.exited"],"provides":[],"capabilities":[]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"watcher","version":"0.2.0","subscribes":["pane.exited"],"provides":[],"capabilities":[]}}'
+
+# Restore persisted counter (survives hot reload). The plugin host
+# replies on stdin; one read pulls the response back.
+printf '{"jsonrpc":"2.0","method":"plugin.state.get","params":{},"id":1}\n'
+IFS= read -r state_line
+emit_count=$(printf '%s' "$state_line" | jq -r '.result.value.emit_count // 0' 2>/dev/null)
+emit_count=${emit_count:-0}
 
 rpc_id=1000
 while IFS= read -r line; do
@@ -48,9 +56,18 @@ while IFS= read -r line; do
         if ! printf '%s' "$es" | grep -qE "$EXIT_RE"; then continue; fi
       fi
 
+      emit_count=$((emit_count + 1))
+      enriched=$(printf '%s' "$payload" | jq -c --argjson n "$emit_count" '. + {emit_count: $n}')
+
       rpc_id=$((rpc_id + 1))
       printf '{"jsonrpc":"2.0","method":"event.publish","params":{"event_type":"command_exit","data":%s},"id":%d}\n' \
-        "$payload" "$rpc_id"
+        "$enriched" "$rpc_id"
+
+      # Persist the new counter so a hot reload picks up where we left
+      # off. Best-effort — we don't wait for the response.
+      rpc_id=$((rpc_id + 1))
+      printf '{"jsonrpc":"2.0","method":"plugin.state.set","params":{"value":{"emit_count":%d}},"id":%d}\n' \
+        "$emit_count" "$rpc_id"
       ;;
   esac
 done
