@@ -1,0 +1,29 @@
+<svg width="100%" viewBox="0 0 680 680" role="img" xmlns="http://www.w3.org/2000/svg" style="">
+<title style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">shux</title>
+<desc style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">Round logo for shux, a Rust-based modern terminal multiplexer. Terracotta disc with a dominant cream screen showing three-pane terminal geometry, and a heavy shux wordmark below — shu in cream, x rendered in terracotta inside an inverted cream highlight cell properly aligned to the lowercase letterform body. Self-contained for use on light or dark README backgrounds.</desc>
+
+<!-- main disc -->
+<circle cx="340" cy="340" r="300" fill="#BC4E2D" style="fill:rgb(188, 78, 45);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<!-- inset cream screen -->
+<rect x="140" y="180" width="400" height="240" rx="4" fill="#EFE3CC" style="fill:rgb(239, 227, 204);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<!-- pane dividers -->
+<g stroke="#2A1A0F" stroke-width="1.2" fill="none" style="fill:none;stroke:rgb(42, 26, 15);color:rgb(255, 255, 255);stroke-width:1.2px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+  <line x1="380" y1="180" x2="380" y2="420" style="fill:none;stroke:rgb(42, 26, 15);color:rgb(255, 255, 255);stroke-width:1.2px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <line x1="380" y1="300" x2="540" y2="300" style="fill:none;stroke:rgb(42, 26, 15);color:rgb(255, 255, 255);stroke-width:1.2px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+</g>
+
+<!-- cursor block in active pane -->
+<rect x="162" y="392" width="16" height="20" fill="#BC4E2D" style="fill:rgb(188, 78, 45);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<!-- shu in cream -->
+<text x="377" y="520" text-anchor="end" font-family="'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-weight="800" font-size="78" fill="#EFE3CC" letter-spacing="-3" style="fill:rgb(239, 227, 204);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:Inter, &quot;Helvetica Neue&quot;, Helvetica, Arial, sans-serif;font-size:78px;font-weight:800;text-anchor:end;dominant-baseline:auto">shu</text>
+
+<!-- inverted cream highlight cell, aligned to lowercase x-height + baseline -->
+<rect x="380" y="478" width="54" height="46" fill="#EFE3CC" style="fill:rgb(239, 227, 204);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, &quot;system-ui&quot;, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<!-- terracotta x inside cell -->
+<text x="407" y="520" text-anchor="middle" font-family="'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-weight="800" font-size="78" fill="#BC4E2D" letter-spacing="-3" style="fill:rgb(188, 78, 45);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:Inter, &quot;Helvetica Neue&quot;, Helvetica, Arial, sans-serif;font-size:78px;font-weight:800;text-anchor:middle;dominant-baseline:auto">x</text>
+
+</svg>
