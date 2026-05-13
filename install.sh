@@ -8,6 +8,7 @@ set -euo pipefail
 REPO="indrasvat/shux"
 BINARY="shux"
 DEFAULT_DIR="${HOME}/.local/bin"
+SKILL_PACKAGE="indrasvat/shux"
 
 # --- Colors (Catppuccin-leaning palette: cyan accent on warm subtext) ---------
 
@@ -80,6 +81,7 @@ usage() {
     printf '%sOptions:%s\n' "${SUBTEXT}" "${RESET}"
     printf '  %s--version VERSION%s  Install specific version (e.g. v0.1.0)\n' "${TEXT}" "${RESET}"
     printf '  %s--dir DIRECTORY%s    Install directory (default: %s)\n' "${TEXT}" "${RESET}" "${DEFAULT_DIR}"
+    printf '  %s--no-skill%s         Skip the agent skill install (npx skills add ...)\n' "${TEXT}" "${RESET}"
     printf '  %s--help%s             Show this help\n' "${TEXT}" "${RESET}"
     exit 0
 }
@@ -87,6 +89,7 @@ usage() {
 parse_args() {
     VERSION=""
     INSTALL_DIR="${DEFAULT_DIR}"
+    INSTALL_SKILL=1
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -99,6 +102,10 @@ parse_args() {
                 if [[ $# -lt 2 ]]; then error_exit "--dir requires a value"; fi
                 INSTALL_DIR="$2"
                 shift 2
+                ;;
+            --no-skill)
+                INSTALL_SKILL=0
+                shift
                 ;;
             --help)
                 usage
@@ -301,6 +308,33 @@ install_binary() {
     install -m 755 "${src}" "${INSTALL_DIR}/${BINARY}"
 }
 
+# --- Agent skill (optional) ---------------------------------------------------
+
+# install_skill installs the shux agent skill globally via npx so
+# agents (Claude Code, Codex, etc.) can discover it. Best-effort:
+# no npx → friendly skip; install fails → warn and keep going. The
+# binary is the source of truth, the skill is just the agent
+# onboarding sugar.
+install_skill() {
+    if [[ "${INSTALL_SKILL}" -ne 1 ]]; then
+        info "Skipping agent skill install (--no-skill)"
+        return
+    fi
+
+    if ! command -v npx >/dev/null 2>&1; then
+        warn "npx not found — skipping agent skill"
+        info "Install later with: ${BOLD}npx skills add ${SKILL_PACKAGE} --global --yes${RESET}"
+        return
+    fi
+
+    info "Running: npx skills add ${SKILL_PACKAGE} --global --yes"
+    if npx --yes skills add "${SKILL_PACKAGE}" --global --yes >/dev/null 2>&1; then
+        success "Agent skill installed (use 'shux' from any AI agent)"
+    else
+        warn "npx skills add failed — install later with the same command"
+    fi
+}
+
 check_path() {
     case ":${PATH}:" in
         *":${INSTALL_DIR}:"*) return ;;
@@ -345,13 +379,13 @@ main() {
     TMPDIR_CREATED="${tmpdir}"
     trap cleanup EXIT INT TERM HUP
 
-    step 1 6 "Checking dependencies"
+    step 1 7 "Checking dependencies"
     check_dependencies
 
-    step 2 6 "Detecting platform"
+    step 2 7 "Detecting platform"
     detect_platform
 
-    step 3 6 "Finding release"
+    step 3 7 "Finding release"
     if [[ -n "${VERSION}" ]]; then
         success "Version: ${VERSION} (requested)"
     else
@@ -361,18 +395,18 @@ main() {
 
     build_download_url
 
-    step 4 6 "Downloading ${BINARY}"
+    step 4 7 "Downloading ${BINARY}"
     download_file "${TARBALL_URL}" "${tmpdir}/${TARBALL}" \
         || error_exit "Download failed. Check that ${VERSION} exists at github.com/${REPO}/releases"
     success "Downloaded ${TARBALL}"
 
-    step 5 6 "Verifying checksum"
+    step 5 7 "Verifying checksum"
     download_file "${CHECKSUM_URL}" "${tmpdir}/${TARBALL}.sha256" \
         || error_exit "Failed to download ${TARBALL}.sha256"
     verify_checksum "${tmpdir}/${TARBALL}.sha256" "${tmpdir}/${TARBALL}"
     success "Checksum verified (SHA-256)"
 
-    step 6 6 "Installing to ${INSTALL_DIR}"
+    step 6 7 "Installing to ${INSTALL_DIR}"
     install_binary "${tmpdir}"
     success "Installed ${BINARY} ${VERSION}"
 
@@ -382,6 +416,9 @@ main() {
         xattr -d com.apple.quarantine "${INSTALL_DIR}/${BINARY}" 2>/dev/null || true
         success "Cleared macOS quarantine flag"
     fi
+
+    step 7 7 "Agent skill"
+    install_skill
 
     printf '\n  %s✓%s %s%sInstallation complete!%s\n\n' "${GREEN}" "${RESET}" "${BOLD}" "${TEXT}" "${RESET}"
 
