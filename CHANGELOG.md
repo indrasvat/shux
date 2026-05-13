@@ -1,3 +1,10 @@
+# [0.22.0](https://github.com/indrasvat/shux/compare/v0.21.0...v0.22.0) (2026-05-13)
+
+
+### Features
+
+* **conductor:** v0.2 settle-snapshot archive + v0.3 multi-pane notifications ([#36](https://github.com/indrasvat/shux/issues/36)) ([cd0f0aa](https://github.com/indrasvat/shux/commit/cd0f0aa8a73ea0e3cadd995c6c5cdfdf5685900e)), closes [#33](https://github.com/indrasvat/shux/issues/33) [#35](https://github.com/indrasvat/shux/issues/35)
+
 # [0.21.0](https://github.com/indrasvat/shux/compare/v0.20.0...v0.21.0) (2026-05-13)
 
 
