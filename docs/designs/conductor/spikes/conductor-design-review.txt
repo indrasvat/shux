@@ -1,0 +1,138 @@
+
+========== claude (252959ms, $0.4551942) ==========
+Done reading. Here's the full critique.
+
+---
+
+## 1. ARCHITECTURE (§3)
+
+**1.** `opencode acp` is a headless server mode, not the same process as `opencode` (TUI) — spawning both means two separate agent instances with independent context windows, so the ACP "Thinking…" signals in v0.5 describe a different process than what the user sees in the visual pane; fix: either run agents headless-only via ACP (no visual TUI pane) or accept that v0.5 is ACP-only and the "visual pane still mirrors the TUI" claim is dropped.
+
+**2.** `plugins.md` explicitly states plugins cannot publish to the event bus; §5 v0.5 says "Re-publish `session/update` events onto shux's bus as `plugin.conductor.agent_message_chunk`… so other plugins can subscribe" — this primitive does not exist; fix: file a daemon feature request for `event.publish` or rewrite that sentence to say conductor re-emits state by calling `pane.set_title` only (no cross-plugin fan-out until the primitive lands).
+
+**3.** Per-pane background subshells in bash have no shared memory — the "all panes in window → settled" logic in v0.3 requires aggregating state across `N` backgrounded loops, which has no mechanism; fix: use a single central poll loop that iterates a pane list and writes per-pane FSM state to tmp-files (`.shux/conductor/state/<pane_id>.fsm`), avoiding background subshells entirely.
+
+**4.** Hot-reload on plugin file save kills the running conductor process — all in-memory FSM state, tracked pane IDs, and ACP child PIDs are lost; after respawn, conductor has no knowledge of currently-running agents; fix: persist FSM state to `.shux/conductor/state.json` on every transition and reload it at startup before subscribing to events.
+
+**5.** `pane.created` carries `command` as a JSON array; the hello plugin's `sed`-based UUID extraction pattern doesn't safely parse arrays like `["claude", "--dangerously-skip-permissions"]`; fix: declare `jq` as a hard dependency from v0.1, not an optional one.
+
+**6.** Single-pane session auto-collapse (documented gotcha in `plugins.md`) means if an agent pane is the only pane in its session and exits, the session is destroyed before `pane.snapshot` fires — the settle-snapshot is silently dropped; fix: conductor must spawn agent sessions with at least one sentinel pane so auto-collapse never triggers.
+
+---
+
+## 2. PHASING
+
+**7.** v0.4 says "create a worktree and `cd` the pane into it" but there's no safe `cd` after spawn — `pane.send_keys "cd <path>\n"` is fragile (agent may be mid-command) and agents that start immediately won't respect a deferred CWD; fix: worktrees must be provisioned before spawn and passed as `cwd` to `session.create`; remove retroactive-`cd` from the design.
+
+**8.** The "≤ 600 lines, zero non-bash deps" constraint (§9) is incompatible with v0.5+ — managing ACP child processes with bidirectional stdio, auth flow, and event routing requires `coproc` or named pipes in bash, which blows past 600 lines while remaining brittle; fix: declare Python 3.8+ as the runtime from v0.5 onward and update §9 to say "v0.1–v0.4: bash ≤ 600 lines; v0.5+: Python, no line constraint."
+
+**9.** v0.7 cross-agent message delivery via `pane.send_keys` to all panes will corrupt any agent that's currently processing — text lands in the active input buffer mid-turn; fix: defer injection until the target pane is in `idle` state, or use a file-drop mechanism (append to `notes.md`) and let the agent's next natural read pick it up.
+
+**10.** v0.8 `read_file` routed through "a transient pane running `cat`" is a layering violation — conductor already has the same filesystem access as the daemon, VT capture introduces line-length limits and ANSI noise; fix: implement `read_file` as a direct `fs::read` call, not via a PTY intermediary.
+
+**11.** Gemini ACP is listed as a v0.5 first-class target but the spike probe hung and was never resolved; fix: scope v0.5 to opencode-only ACP, push gemini to v0.5.1 gated on a successful auth-verified spike.
+
+---
+
+## 3. DOD
+
+**12.** v0.1 DoD says "verified visually via `pane.snapshot`" — this requires a human; it's not an automated criterion; fix: specify a concrete automation script that asserts `pane.capture` output contains `· ⚡` within 10s of agent start and `· ✓` within 30s of agent idle, and asserts a PNG exists in `snapshots/`.
+
+**13.** v0.3 DoD says "exactly one `osascript`/`notify-send` invocation fires" — there's no mechanism to count subprocess invocations in a test; fix: add a `notify_cmd` config override pointing tests at a stub script that appends to a log file; the DoD checks that log has exactly one entry.
+
+**14.** v0.5 DoD says "p99 latency < 100 ms (measured)" but doesn't define measurement boundaries (from ACP event emission? from daemon delivery? to title update?); fix: specify "timestamp at ACP frame receipt and at `pane.set_title` call; p99 across 20 prompted completions."
+
+**15.** v0.8 DoD says "agent gets a real PNG… as an embedded image in its next turn" — there's no automated assertion for what the agent "got"; fix: check the ACP session transcript for a message frame with `type: "image"` content block and assert `base64_decode(png_base64)[0:8]` matches the PNG magic bytes.
+
+---
+
+## 4. "SHUX-UNIQUE" CLAIMS
+
+**16.** The PTY transcript claim is not unique — `tmux pipe-pane` has been streaming raw PTY output to files since 2007; what IS actually unique is the sequence numbers and monotonic ordering guarantees; fix: rewrite §1 claim to "Sequence-numbered PTY streams with gap detection (`pane.output.watch`) — not raw byte capture, which any tool can do."
+
+**17.** "A feature literally impossible in any tool that doesn't own its own rasterizer" is false — any tool could embed a headless VT renderer (Alacritty's `vte` + pixel rendering stack is open source); the real differentiator is zero-dependency headless RPC with no display server; fix: soften to "Only shux exposes VT rasterization as a first-class headless RPC — no display server, no screenshot driver, no Electron."
+
+---
+
+## 5. ACP ECOSYSTEM
+
+**18.** The design has no auth flow before `session/new` — the spike explicitly observed that opencode hangs if auth hasn't happened, and the opencode initialize response shows `authMethods: non-empty`; fix: add to v0.5 implementation: check `authMethods` on initialize; if non-empty, emit a human-readable error and refuse to proceed rather than silently hanging.
+
+**19.** `acp_adapter = "npx -y @agentclientprotocol/claude-agent-acp"` uses `-y` which auto-installs from npm on every conductor startup without a version pin — this is a live supply chain risk for a plugin that mediates agent permissions; fix: pin to a specific semver in the config default and document an offline-install path.
+
+**20.** ACP protocol version negotiation is absent — `protocolVersion: 1` is what opencode currently returns; version 2 (a likely future bump) will silently break conductor; fix: check `result.protocolVersion` on initialize and fall back to VT-poll if > 1 rather than crashing or misinterpreting responses.
+
+**21.** The `@agentclientprotocol/claude-agent-acp` adapter is Zed-maintained and is already listed as renamed once — its maintenance cadence and security posture relative to Anthropic's claude releases are unknown; the design treats it as a reliable dependency; fix: add to §8 risks: "adapter may lag claude releases by days to weeks; VT-poll is the production path for claude until the adapter achieves N consecutive releases of parity."
+
+---
+
+## 6. CONFIG SURFACE (§6)
+
+**22.** `auto_dismiss = true` as a default auto-accepts all agent trust prompts via Enter — Claude Code's trust prompts gate file writes, shell execution, and network access; this is a security landmine in shared or CI environments; fix: default `false`; make the field an array of specific regex patterns to dismiss rather than a boolean.
+
+**23.** `auto_compact` is claude-specific (the `/compact` slash command exists only in claude) but lives in the global `[conductor]` block — opencode and gemini will receive spurious `/compact` keystrokes; fix: move it to `[agents.claude]` with a `compact_trigger_re` and `compact_command` pair.
+
+**24.** Pattern files live inside the plugin source tree (`plugins/conductor/lib/patterns/`) — for a packaged install, these files are read-only and can't be "hot-patched" as §8 claims; fix: first look for patterns in `.shux/conductor/patterns/<agent>.toml` (project-local, editable), fall back to bundled patterns.
+
+---
+
+## 7. RISKS (§8)
+
+**25.** ACP dual-process divergence is not listed as a risk at all — it's the most load-bearing architectural flaw for v0.5+; add: "ACP child and visual TUI pane are separate processes; their state signals are independent. Mitigation: document that v0.5 is ACP-only (headless); visual pane is a separate concern."
+
+**26.** Hot-reload state loss is not listed — every file save wipes conductor's in-memory FSM; add to §8 with mitigation: persist FSM to disk on every transition, reload on startup.
+
+**27.** `pane.send_keys` mid-execution corruption for v0.7 is not listed — broadcasting to an active agent pane corrupts its input buffer; add with mitigation: hold injection until target pane enters `idle` state before sending.
+
+---
+
+## 8. ANYTHING ELSE
+
+**28.** `pane.wait-for --regex` exists precisely for event-driven state detection without polling — the VT-poll design ignores it in favor of 2s `pane.capture` loops, burning CPU for no benefit; fix: use `pane.wait-for --regex "$thinking_re" --timeout 60` as the primary mechanism for transition detection; use timed polls only for "idle" (absence of activity).
+
+**29.** Multi-file plugin layout is undocumented relative to the plugin install contract — `shux plugin install` takes a single executable; the `lib/patterns/` directory must be co-located, but there's no stated convention for how conductor finds it at runtime; fix: specify that conductor resolves patterns relative to `$(dirname "$(readlink -f "$0")")` and that install must be run with `--cwd plugins/conductor/`, with a note in §9.
+
+**30.** Agents have no discovery mechanism for `notes.md` and `board.toml` — the design says "any agent can append" and "agents claim tasks" but nothing tells the agents these files exist; fix: specify that conductor injects a brief task context into each agent pane on startup via `pane.send_keys` (or a `.conductor.md` sidebar file) that includes paths, protocols, and flock usage — without this, v0.7 is conductor writing to files only conductor reads.
+
+========== codex (73579ms, $0) ==========
+1. §3 assumes conductor can “re-publish” ACP events onto the shux bus, but process plugins currently cannot publish plugin-to-plugin events. Add an explicit dependency on inter-plugin events, or make v0.5 write state/files and expose `conductor tail` instead.
+
+2. §3 treats `pane.created` as enough state discovery, but hot reload and already-running sessions will miss every existing pane. Add startup reconciliation via `session.list`/`pane.list` plus `events.history` before subscribing.
+
+3. §3 says ACP can be a side-channel while the visual pane mirrors the same agent TUI, but spawning a separate ACP child creates a second agent session. Pick one owner per agent: either pane-owned VT observation or conductor-owned ACP session with a rendered proxy pane.
+
+4. v0.4 “cd the pane into a worktree” is structurally wrong once the agent process has already started. Move worktree creation before pane spawn, and make conductor own `session.create`/`pane.split` with `cwd`.
+
+5. The artifact layout fights the existing shux contract: `.shux/out/` is gitignored output, while `.shux/conductor/snapshots` and transcripts are described as root siblings. Put ephemeral archives under `.shux/out/conductor/` and commit only config/templates/board/notes.
+
+6. §1 conflates sealed PTY byte transcripts with v0.6 ACP-frame transcripts. Make transcripts two streams with different names: `pty.ndjson` from `pane.output.watch` and `acp.ndjson` from ACP JSON-RPC.
+
+7. v0.1’s DoD is visual and subjective, so regressions will pass if someone squints. Require an unattended script that drives a pane, asserts exact FSM transitions, asserts title RPC state, and stores the proof PNG.
+
+8. v0.2’s DoD says “sane filenames,” which is not testable. Define exact filename grammar, collision behavior, index columns, retention policy, and a script that validates all of them.
+
+9. v0.3 notification semantics are underspecified around flapping, exited panes, hidden windows, and initial idle panes. Add a state-machine test matrix and debounce/window-generation IDs so “exactly one notification” is enforceable.
+
+10. v0.5 is too late for ACP auth/capability negotiation, because the spikes already show auth can hang before `session/new`. Add a v0.5a spike/fixture for `initialize`, `authenticate`, timeout, cancellation, and capability-gated behavior before tool/state logic.
+
+11. v0.5’s p99 `<100 ms` claim is probably meaningless if the baseline poll interval is 2 s and ACP events vary by agent. Define measured endpoints, sample count, machines, and acceptance thresholds, or remove the latency claim.
+
+12. v0.6 “replay through a fresh agent” is not credible for ACP transcripts because model output, tools, permissions, auth, and environment are nondeterministic. Reframe replay as deterministic viewer/regression against recorded frames, not re-execution equivalence.
+
+13. v0.7 notes broadcasting via `pane.send_keys` will corrupt active prompts, paste into shells, and create prompt-injection paths between agents. Use an explicit inbox command/pane or ACP message channel, and require opt-in per recipient.
+
+14. v0.7 board claims with `flock` on TOML are fragile across macOS/Linux and easy to corrupt under concurrent writes. Use SQLite or append-only NDJSON plus compaction; if TOML stays, specify lock path, fsync, atomic rename, and recovery.
+
+15. v0.8 maps `read_file` to a transient pane running `cat`, which is slower, less safe, and worse than a normal filesystem read. Implement filesystem tools in conductor with path allowlists, symlink checks, size limits, and audit logging.
+
+16. ACP permission flow is under-modeled: `session/request_permission` can have multiple options and cancellation requires pending permissions to be answered as cancelled per the ACP schema. Model it as a blocking request lifecycle with timeout, cancel propagation, option selection, and audit records.
+
+17. The Claude ACP adapter should be treated as experimental, not a configured default: current reports include API-key-only behavior versus Claude Max OAuth and platform spawn issues. Keep Claude on VT baseline until a pinned adapter version passes auth, prompt, tool, and cancel fixtures.
+
+18. The “shux-unique” claim is overstated: cmux has browser screenshots/snapshots and a socket API, but I did not find evidence of cmux/dmux/amux/Superset shipping sealed per-pane raster plus byte-level PTY settle archives. Narrow the claim to “terminal-pane settle archive combining shux-rendered PNG and resumable PTY byte stream,” not generic screenshots or transcripts.
+
+19. Risks underweight security: plugins run with the daemon user’s filesystem access, so conductor becomes a high-privilege local automation broker. Add threat model, trust boundary, secret redaction, per-project allowlists, and default-deny tool routing before v0.8.
+
+20. Six-month regret: a single bash file through v0.4 then Python for ACP will become an untestable protocol router. Start with a small typed implementation or at least a shell wrapper plus Python core, golden JSON fixtures, and contract tests from v0.1.
+
+Sources checked: local design/spikes/plugin docs plus current public docs for [cmux](https://cmux.com/docs/browser-automation), [dmux](https://github.com/standardagents/dmux), [amux](https://github.com/mixpeek/amux), [Superset](https://superset.sh/), and [ACP schema](https://agentclientprotocol.com/protocol/schema).
