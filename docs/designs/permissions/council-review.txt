@@ -1,0 +1,64 @@
+
+## Unified synthesis
+
+Both agents align on most decisions; the cross-reviews surface a handful of real gaps. Here is the merged verdict.
+
+---
+
+### Option F — confirmed, with one carve-out
+
+Option F is right. The cross-reviews correctly note that Claude's "no changes" claim is inconsistent — the very next paragraph proposes making `state.apply` grantable, which *is* a change to Option F's Tier 3 boundary. Call it what it is: a deliberate modification, not an endorsement of the status quo.
+
+---
+
+### Open questions — final positions
+
+**Q1 — Tier 3 absolutism:**  
+Split the category. `plugin.install` / `plugin.kill` / `plugin.reload` are flat-deny forever — no legitimate plugin use case, no grant path. `state.apply` is different: the conductor use case (atomic multi-pane update) is real and "call `pane.set_title` N times" destroys the atomicity the conductor actually needs. Make `state.apply` grantable under Tier 3.5 with a mandatory loud warning in docs. Codex's `state.apply_owned` idea is underspecified and punts the hard question — skip it for now.
+
+**Q2 — Hot-reload expansion:**  
+No prompt channel. Return `-32004` with a structured error body; the plugin author's logs catch it. Prompting breaks headless automation determinism before the core model is proven.
+
+**Q3 — Audit log location:**  
+Per-plugin as primary. Daemon-wide aggregation is a future feature if cross-plugin forensics become necessary. The `cat .../*/audit.log | sort` approach is adequate for now, though not forensics-grade — note that rotation, malformed lines, and project-specific state roots are real concerns for later.
+
+**Q5 — `events.watch` policy:**  
+Manifest-driven subscriptions stay open; post-handshake `events.watch` needs a grant unless scoped to `plugin.<self>.`. **Critical gap from codex, missed by claude:** hot reload must re-evaluate manifest subscriptions and compare old vs. new — otherwise T6 leaks back through `subscribes` on reload. The current design discusses T6 in the threat table but does not close this specific loop.
+
+**Q6 — Sensitivity tier placement:**  
+Tier in `register()` signature with a startup assertion that every route carries a policy. Note that some policies are parameter-dependent — `events.watch` scoped to `plugin.<self>.` is categorically different from a firehose subscription — so the signature should be method metadata plus an optional policy classifier, not a flat enum.
+
+**Q8 — Grants survive uninstall:**  
+Clean-slate default. `--keep-grants` as an explicit opt-in. Install should surface "existing grants found for this name" when applicable.
+
+---
+
+### Missed threats — consolidated
+
+**Name-based grant identity (both agents, partially).** Grants keyed by plugin name survive reinstall — a reinstalled plugin inherits ownership over all entities created by its predecessor. The "timing-race install" example Claude raised is stale (duplicate names are already rejected at install), but reinstall/name-reuse is the real attack surface. A random install-time UUID as the primary identity key, with name as a display alias, is the fix. **Neither agent flagged** the corollary: the design's own `created_by_plugin: Option<String>` field on graph entities has the identical problem. Ownership checks via that field would grant the reinstalled plugin access to its predecessor's panes.
+
+**TOCTOU on grants.toml write.** `shux plugin grant` writes, `permissions::check` reads. Without atomic write (write temp → `rename(2)`), a half-written file produces malformed parse = implicit deny or panic. The repo already uses this pattern for plugin state; grant writes must follow it.
+
+**Plugin-only intercepts skip audit** (both agents agree). `event.publish` and `plugin.state.*` are intercepted before `router.dispatch` and return early. If audit is placed after that block, these calls are invisible. `plugin.state.set` in a tight loop is disk churn even under namespace confinement; `plugin.state.get` is still evidence. Move `audit::record` to before the early-return so it covers every parsed request unconditionally.
+
+**Grant-file integrity.** Symlink attacks and world-writable plugin dirs are real. Reject symlinked grant/audit paths. The atomic-write pattern above addresses partial writes; document the chmod expectations explicitly.
+
+---
+
+### `plugin.audit` RPC — explicit tradeoff acknowledgment
+
+Both agents recommend cutting the `plugin.audit` RPC in v0. However, both cross-reviews correctly flag that this violates the project's CLI == API principle (`feedback_agent_first_cli.md`, `CLAUDE.md:99`) — agents can't `tail` a file. The cut is still worth making in v0 because the implementation complexity is real and the use case is narrow. Call it explicitly: cut now, restore as a proper RPC in v0.next when the audit schema is stable. Do not present it as free.
+
+---
+
+### Implementation checklist
+
+1. `dispatch_plugin_frame` (lib.rs:858) is the correct chokepoint — after method/params/id parse, before router.dispatch (lib.rs:950).
+2. `audit::record` called unconditionally *before* the plugin-only early-return block at lib.rs:895.
+3. Grant file writes: atomic temp + `rename(2)`, reject symlinked paths.
+4. Hot reload: diff old/new `manifest.subscribes`; gate net-new subscriptions through the grant system.
+5. Install-time UUID stored alongside plugin name; grants file keyed by UUID.
+6. Startup assertion: every registered route has a declared policy tier — no orphan routes.
+
+  357.2s │ $0.727 │ 398,335 in · 15,073 out
+  * claude OK · * codex OK

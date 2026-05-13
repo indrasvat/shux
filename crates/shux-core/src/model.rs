@@ -62,6 +62,7 @@ macro_rules! define_id {
 define_id!(SessionId);
 define_id!(WindowId);
 define_id!(PaneId);
+define_id!(PluginId);
 
 /// Restart policy for a pane's child process (PRD 5.1, 6.2).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +96,12 @@ pub struct Session {
     pub theme: Option<ThemeRef>,
     pub tags: Tags,
     pub version: Version,
+    /// Plugin that created this entity, if any. `None` for entities
+    /// created by user CLI / RPC calls. Used by the permission model
+    /// to grant a plugin authority over its own entities without an
+    /// explicit grant (see `docs/designs/permissions/README.md` §5.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_plugin: Option<PluginId>,
 }
 
 impl Session {
@@ -109,6 +116,7 @@ impl Session {
             theme: None,
             tags: HashMap::new(),
             version: 1,
+            created_by_plugin: None,
         }
     }
 }
@@ -125,6 +133,9 @@ pub struct Window {
     pub theme: Option<ThemeRef>,
     pub tags: Tags,
     pub version: Version,
+    /// Plugin that created this entity. See [`Session::created_by_plugin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_plugin: Option<PluginId>,
 }
 
 impl Window {
@@ -139,6 +150,7 @@ impl Window {
             theme: None,
             tags: HashMap::new(),
             version: 1,
+            created_by_plugin: None,
         }
     }
 }
@@ -183,6 +195,9 @@ pub struct Pane {
     pub theme: Option<ThemeRef>,
     pub tags: Tags,
     pub version: Version,
+    /// Plugin that created this entity. See [`Session::created_by_plugin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_plugin: Option<PluginId>,
 }
 
 impl Pane {
@@ -201,6 +216,7 @@ impl Pane {
             theme: None,
             tags: HashMap::new(),
             version: 1,
+            created_by_plugin: None,
         };
         pane.recalculate_title();
         pane

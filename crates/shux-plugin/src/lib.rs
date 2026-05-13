@@ -28,12 +28,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use shux_core::bus::{EventBus, Subscription, SubscriptionEvent};
 use shux_core::event::EventData;
+use shux_core::graph::GraphHandle;
+use shux_core::model::{PaneId, PluginId, SessionId, WindowId};
 use shux_rpc::router::Router;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+pub mod audit;
+pub mod grants;
+pub mod permissions;
+
+use crate::audit::AuditEntry;
+use crate::grants::Grants;
+use crate::permissions::{CheckCtx, Decision, TargetOwners, Targets};
 
 pub const PROTOCOL_VERSION: &str = "1";
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,6 +79,13 @@ pub struct PluginInfo {
     /// process so the edit lands in <500ms.
     #[serde(default)]
     pub watching: bool,
+    /// Stable per-install UUID. Identifies the plugin across hot
+    /// reload AND daemon restart for permission purposes (grants are
+    /// keyed on UUID, not name). `None` only on legacy plugins
+    /// installed before the permission model landed; new installs
+    /// always populate this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<PluginId>,
 }
 
 /// How to spawn a plugin executable.
@@ -134,6 +151,13 @@ struct Running {
     /// is true). Set to `true` on kill/reload to stop the watcher
     /// before it triggers another reload on the now-dead plugin.
     watch_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Stable install-time identity. Used as the permission key
+    /// (grants + entity ownership). Survives hot reload because the
+    /// reload path re-uses the existing `Running`'s id; does NOT
+    /// survive uninstall + reinstall — the by-id directory is purged
+    /// unless `--keep-grants` is passed.
+    /// See `docs/designs/permissions/README.md` §9.2.
+    plugin_id: PluginId,
 }
 
 /// Plugin host. Cheap to clone (Arc internally).
@@ -145,6 +169,10 @@ pub struct PluginManager {
     /// Root for per-plugin persisted state. Each plugin's state lives at
     /// `<state_root>/<plugin_name>/state.json` and survives hot reload.
     state_root: Arc<std::path::PathBuf>,
+    /// Optional graph handle, used by the permission enforcer to look
+    /// up entity ownership. `None` in test harnesses that don't need
+    /// ownership checks (they only exercise grant-based decisions).
+    graph: Arc<tokio::sync::OnceCell<GraphHandle>>,
 }
 
 impl PluginManager {
@@ -162,7 +190,34 @@ impl PluginManager {
             router: Arc::new(tokio::sync::OnceCell::new()),
             event_bus,
             state_root: Arc::new(state_root),
+            graph: Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    /// Root for grant + audit files (`<state_root>/by-id/<uuid>/`).
+    /// Co-located with state so a single by-id dir holds everything
+    /// tied to one plugin install.
+    pub fn permissions_root(&self, plugin_id: &PluginId) -> std::path::PathBuf {
+        self.state_root.join("by-id").join(plugin_id.to_string())
+    }
+
+    /// Convenience: by-id name link target. We persist
+    /// `<state_root>/by-name/<plugin_name>` as a tiny file containing
+    /// the UUID string so users can map between the two without
+    /// crawling the by-id tree. Symlinks would be cleaner but symlink
+    /// rejection in the audit path makes them awkward; a plain file
+    /// is enough.
+    pub fn name_link_path(&self, plugin_name: &str) -> std::path::PathBuf {
+        self.state_root.join("by-name").join(plugin_name)
+    }
+
+    /// Wire in the graph handle for ownership lookups. Called once
+    /// during daemon startup, after the graph is built. Without this
+    /// call, plugin RPC checks treat every entity as user-owned (so
+    /// any ownership-gated method needs an explicit grant) — the
+    /// safe default for test harnesses.
+    pub async fn set_graph(&self, graph: GraphHandle) {
+        let _ = self.graph.set(graph);
     }
 
     /// Wire in the daemon's RPC router. Called once during daemon
@@ -170,6 +225,27 @@ impl PluginManager {
     /// requests dispatch through this.
     pub fn set_router(&self, router: Router) {
         let _ = self.router.set(router);
+    }
+
+    /// Resolve a plugin's stable install-time UUID. Reads
+    /// `<state_root>/by-name/<plugin_name>` if present; otherwise
+    /// returns `None` (caller generates a new UUID + persists).
+    fn resolve_plugin_id_for_name(&self, name: &str) -> Option<PluginId> {
+        let link = self.name_link_path(name);
+        let raw = std::fs::read_to_string(&link).ok()?;
+        raw.trim().parse::<PluginId>().ok()
+    }
+
+    /// Persist `<state_root>/by-name/<name>` = `<uuid>` so the same
+    /// install across daemon restart maps back to the same UUID.
+    fn persist_name_link(&self, name: &str, id: &PluginId) -> std::io::Result<()> {
+        let link = self.name_link_path(name);
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = link.with_extension("tmp");
+        std::fs::write(&tmp, id.to_string())?;
+        std::fs::rename(&tmp, &link)
     }
 
     /// Spawn a plugin from a source. Performs the handshake, registers
@@ -263,6 +339,70 @@ impl PluginManager {
             return Err(PluginError::NameConflict(manifest.name.clone()));
         }
 
+        // Stage 2a: resolve stable PluginId. Re-use the by-name link's
+        // UUID if it exists (so reload + daemon restart preserve the
+        // identity that grants are keyed on); otherwise generate +
+        // persist. See `docs/designs/permissions/README.md` §9.2.
+        let plugin_id = self
+            .resolve_plugin_id_for_name(&manifest.name)
+            .unwrap_or_default();
+        if let Err(e) = self.persist_name_link(&manifest.name, &plugin_id) {
+            warn!(
+                plugin = %manifest.name,
+                "could not persist by-name link: {e} — grants may not survive restart"
+            );
+        }
+
+        // Stage 2b: enforce hot-reload manifest.subscribes diff (§9.4).
+        // First install with no grants file: every initial subscribe
+        // is implicitly granted (persisted into grants.subscribes).
+        // Subsequent installs may only widen the set if the user has
+        // already added the new filter via `shux plugin grant ... subscribe`.
+        let perm_root = self.permissions_root(&plugin_id);
+        let grants_path = perm_root.join("grants.toml");
+        let existed = grants_path.exists();
+        let mut grants = match Grants::load(&grants_path) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = child.start_kill();
+                return Err(PluginError::HandshakeFailed(format!(
+                    "could not load grants at {}: {e}",
+                    grants_path.display()
+                )));
+            }
+        };
+        if !existed {
+            // Fresh install: snapshot the initial subscribes as the
+            // baseline allow-set.
+            for filter in &manifest.subscribes {
+                grants.add_subscribe(filter);
+            }
+            if let Err(e) = grants.save(&grants_path) {
+                let _ = child.start_kill();
+                return Err(PluginError::HandshakeFailed(format!(
+                    "could not initialise grants at {}: {e}",
+                    grants_path.display()
+                )));
+            }
+        } else {
+            // Reload / re-install: net-new entries must already be
+            // present in grants.subscribes.allowed.
+            let unauthorised: Vec<String> = manifest
+                .subscribes
+                .iter()
+                .filter(|f| !grants.subscribes_allows(f))
+                .cloned()
+                .collect();
+            if !unauthorised.is_empty() {
+                let _ = child.start_kill();
+                return Err(PluginError::HandshakeFailed(format!(
+                    "manifest.subscribes added unauthorised filters since last install: {unauthorised:?}. \
+                     Run `shux plugin grant {} subscribe <filter>` for each, then retry.",
+                    manifest.name
+                )));
+            }
+        }
+
         let (inbox_tx, inbox_rx) = mpsc::channel::<String>(64);
         let (kill_tx, kill_rx) = oneshot::channel::<()>();
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -288,6 +428,7 @@ impl PluginManager {
 
         let join = tokio::spawn(run_plugin_io(
             manifest.name.clone(),
+            plugin_id,
             child,
             stdin,
             reader,
@@ -297,6 +438,8 @@ impl PluginManager {
             self.router.clone(),
             self.event_bus.clone(),
             resolved_state_root.clone(),
+            Arc::new(perm_root.clone()),
+            self.graph.clone(),
             last_error.clone(),
         ));
 
@@ -311,6 +454,7 @@ impl PluginManager {
             provides: manifest.provides.clone(),
             last_error: None,
             watching: false,
+            plugin_id: Some(plugin_id),
         };
 
         // Hot reload: if `source.watch` is true, spawn a filesystem
@@ -345,6 +489,7 @@ impl PluginManager {
             last_error,
             _join: join,
             watch_cancel,
+            plugin_id,
         };
 
         inner.insert(manifest.name.clone(), running);
@@ -418,10 +563,106 @@ impl PluginManager {
                 provides: r.manifest.provides.clone(),
                 last_error: last,
                 watching: r.watch_cancel.is_some(),
+                plugin_id: Some(r.plugin_id),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Grant a plugin authority to call `method`, optionally scoped
+    /// to a specific entity ID (`target`). `subscribe == true` adds
+    /// `method` to the manifest-subscribes allow-set instead (for
+    /// post-handshake additions to `subscribes:`).
+    pub async fn grant(
+        &self,
+        plugin_name: &str,
+        method: &str,
+        target: Option<&str>,
+        subscribe: bool,
+    ) -> Result<(), PluginError> {
+        let plugin_id = self
+            .plugin_id_for_name(plugin_name)
+            .await
+            .ok_or_else(|| PluginError::NotFound(plugin_name.to_string()))?;
+        let path = self.permissions_root(&plugin_id).join("grants.toml");
+        let mut g = Grants::load(&path).map_err(|e| {
+            PluginError::HandshakeFailed(format!("load grants {}: {e}", path.display()))
+        })?;
+        if subscribe {
+            g.add_subscribe(method);
+        } else {
+            g.add(method, target);
+        }
+        g.save(&path).map_err(|e| {
+            PluginError::HandshakeFailed(format!("save grants {}: {e}", path.display()))
+        })?;
+        info!(plugin = %plugin_name, method, target, subscribe, "grant added");
+        Ok(())
+    }
+
+    /// Drop a previously-issued grant. Inverse of [`Self::grant`].
+    pub async fn revoke(
+        &self,
+        plugin_name: &str,
+        method: &str,
+        target: Option<&str>,
+        subscribe: bool,
+    ) -> Result<(), PluginError> {
+        let plugin_id = self
+            .plugin_id_for_name(plugin_name)
+            .await
+            .ok_or_else(|| PluginError::NotFound(plugin_name.to_string()))?;
+        let path = self.permissions_root(&plugin_id).join("grants.toml");
+        let mut g = Grants::load(&path).map_err(|e| {
+            PluginError::HandshakeFailed(format!("load grants {}: {e}", path.display()))
+        })?;
+        if subscribe {
+            g.subscribes.allowed.retain(|s| s != method);
+        } else {
+            g.remove(method, target);
+        }
+        g.save(&path).map_err(|e| {
+            PluginError::HandshakeFailed(format!("save grants {}: {e}", path.display()))
+        })?;
+        info!(plugin = %plugin_name, method, target, subscribe, "grant revoked");
+        Ok(())
+    }
+
+    /// Snapshot of the grants file for `plugin_name`. Returns an
+    /// empty `Grants` for a plugin that exists but has never had
+    /// any grant issued; errors if the plugin is unknown.
+    pub async fn grants_for(&self, plugin_name: &str) -> Result<Grants, PluginError> {
+        let plugin_id = self
+            .plugin_id_for_name(plugin_name)
+            .await
+            .ok_or_else(|| PluginError::NotFound(plugin_name.to_string()))?;
+        let path = self.permissions_root(&plugin_id).join("grants.toml");
+        Grants::load(&path).map_err(|e| {
+            PluginError::HandshakeFailed(format!("load grants {}: {e}", path.display()))
+        })
+    }
+
+    /// Path to the audit log for `plugin_name`. Returns `Err(NotFound)`
+    /// for unknown plugins. The file may not exist if no RPC frames
+    /// have arrived yet — callers should treat that as "empty audit".
+    pub async fn audit_path(&self, plugin_name: &str) -> Result<PathBuf, PluginError> {
+        let plugin_id = self
+            .plugin_id_for_name(plugin_name)
+            .await
+            .ok_or_else(|| PluginError::NotFound(plugin_name.to_string()))?;
+        Ok(self.permissions_root(&plugin_id).join("audit.log"))
+    }
+
+    /// Resolve plugin name → install-time UUID. Checks the in-memory
+    /// registry first (fast path for running plugins) then falls back
+    /// to the persisted by-name file (so users can grant before /
+    /// after the plugin is running).
+    async fn plugin_id_for_name(&self, plugin_name: &str) -> Option<PluginId> {
+        if let Some(r) = self.inner.lock().await.get(plugin_name) {
+            return Some(r.plugin_id);
+        }
+        self.resolve_plugin_id_for_name(plugin_name)
     }
 
     /// Tear down a plugin. Sends `plugin.shutdown`, triggers the
@@ -604,6 +845,7 @@ async fn relay_stderr(name: String, stderr: ChildStderr) {
 #[allow(clippy::too_many_arguments)]
 async fn run_plugin_io(
     name: String,
+    plugin_id: PluginId,
     mut child: Child,
     mut stdin: ChildStdin,
     mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
@@ -613,6 +855,8 @@ async fn run_plugin_io(
     router: Arc<tokio::sync::OnceCell<Router>>,
     event_bus: EventBus,
     state_root: Arc<std::path::PathBuf>,
+    perm_root: Arc<std::path::PathBuf>,
+    graph: Arc<tokio::sync::OnceCell<GraphHandle>>,
     last_error: Arc<Mutex<Option<String>>>,
 ) {
     // Plugin→daemon RPC dispatches run in spawned tasks so a slow
@@ -682,10 +926,13 @@ async fn run_plugin_io(
                     Ok(Some(line)) => {
                         dispatch_plugin_frame(
                             &name,
+                            &plugin_id,
                             line,
                             &router,
                             &event_bus,
                             &state_root,
+                            &perm_root,
+                            &graph,
                             resp_tx.clone(),
                         );
                     }
@@ -855,12 +1102,16 @@ fn delete_plugin_state(root: &std::path::Path, plugin_id: &str) -> Result<bool, 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_plugin_frame(
     plugin: &str,
+    plugin_id: &PluginId,
     line: String,
     router: &Arc<tokio::sync::OnceCell<Router>>,
     event_bus: &EventBus,
     state_root: &std::path::Path,
+    perm_root: &std::path::Path,
+    graph: &Arc<tokio::sync::OnceCell<GraphHandle>>,
     resp_tx: mpsc::Sender<String>,
 ) {
     let parsed: Value = match serde_json::from_str(&line) {
@@ -889,9 +1140,30 @@ fn dispatch_plugin_frame(
         return;
     }
 
+    // §9.3: Audit EVERY parsed plugin RPC frame, including the
+    // plugin-only intercepts (`event.publish`, `plugin.state.*`),
+    // BEFORE the early-return that handles them. Otherwise those
+    // calls are invisible to the audit log.
+    let targets = permissions::extract_targets(params.as_ref());
+    let audit_now = || -> AuditEntry<'_> {
+        AuditEntry {
+            ts: audit::iso_now(),
+            plugin,
+            method: method.as_str(),
+            params_hash: audit::params_hash(params.as_ref()),
+            target_pane: targets.pane_id.as_deref(),
+            target_window: targets.window_id.as_deref(),
+            target_session: targets.session_id.as_deref(),
+            decision: "allow",
+            reason: "plugin_self_namespace",
+        }
+    };
+
     // Plugin-only methods: intercept BEFORE the router dispatch so
     // the plugin's identity is captured from the caller context
     // (the `plugin: &str` here) and can't be spoofed via params.
+    // These calls are scoped to the plugin's own namespace; we audit
+    // them and skip the permission check.
     let plugin_only_result: Option<Result<Value, (i64, String)>> = match method.as_str() {
         "event.publish" => Some(
             publish_plugin_event(plugin, params.as_ref(), event_bus)
@@ -918,7 +1190,13 @@ fn dispatch_plugin_frame(
         _ => None,
     };
 
+    let audit_path = perm_root.join("audit.log");
+
     if let Some(resp) = plugin_only_result {
+        // Best-effort audit; failure here must not block the response.
+        if let Err(e) = audit::append(&audit_path, &audit_now()) {
+            warn!(plugin, "audit write failed: {e}");
+        }
         let frame = match resp {
             Ok(result) => serde_json::json!({
                 "jsonrpc": "2.0",
@@ -935,6 +1213,7 @@ fn dispatch_plugin_frame(
         return;
     }
 
+    // Router-bound RPC: check permissions before dispatch.
     let Some(router) = router.get().cloned() else {
         let err = serde_json::json!({
             "jsonrpc": "2.0",
@@ -944,6 +1223,65 @@ fn dispatch_plugin_frame(
         let _ = resp_tx.try_send(format!("{err}\n"));
         return;
     };
+
+    let grants_path = perm_root.join("grants.toml");
+    let grants = Grants::load(&grants_path).unwrap_or_else(|e| {
+        warn!(
+            plugin,
+            "could not load grants at {} ({}); defaulting to empty (deny-all)",
+            grants_path.display(),
+            e
+        );
+        Grants::default()
+    });
+    let owners = if let Some(g) = graph.get() {
+        resolve_owners(g, &targets)
+    } else {
+        TargetOwners::default()
+    };
+    let decision = permissions::check(&CheckCtx {
+        plugin_id,
+        plugin_name: plugin,
+        method: &method,
+        policy: router.policy(&method),
+        params: params.as_ref(),
+        targets: &targets,
+        owners: &owners,
+        grants: &grants,
+    });
+
+    let entry = AuditEntry {
+        ts: audit::iso_now(),
+        plugin,
+        method: method.as_str(),
+        params_hash: audit::params_hash(params.as_ref()),
+        target_pane: targets.pane_id.as_deref(),
+        target_window: targets.window_id.as_deref(),
+        target_session: targets.session_id.as_deref(),
+        decision: decision.label(),
+        reason: decision.reason_str(),
+    };
+    if let Err(e) = audit::append(&audit_path, &entry) {
+        warn!(plugin, "audit write failed: {e}");
+    }
+
+    if let Decision::Deny { .. } = &decision {
+        let err = serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32004,
+                "message": "permission denied",
+                "data": {
+                    "plugin": plugin,
+                    "method": method,
+                    "reason": decision.reason_str(),
+                }
+            },
+            "id": id,
+        });
+        let _ = resp_tx.try_send(format!("{err}\n"));
+        return;
+    }
 
     let plugin = plugin.to_string();
     tokio::spawn(async move {
@@ -968,6 +1306,32 @@ fn dispatch_plugin_frame(
             warn!(plugin, "couldn't deliver response to plugin: {send_err}");
         }
     });
+}
+
+/// Look up `created_by_plugin` for each target named in `targets`
+/// from the current graph snapshot.
+fn resolve_owners(graph: &GraphHandle, targets: &Targets) -> TargetOwners {
+    let snap = graph.snapshot();
+    let pane_owner = targets
+        .pane_id
+        .as_ref()
+        .and_then(|s| s.parse::<PaneId>().ok())
+        .and_then(|id| snap.panes.get(&id).and_then(|p| p.created_by_plugin));
+    let window_owner = targets
+        .window_id
+        .as_ref()
+        .and_then(|s| s.parse::<WindowId>().ok())
+        .and_then(|id| snap.windows.get(&id).and_then(|w| w.created_by_plugin));
+    let session_owner = targets
+        .session_id
+        .as_ref()
+        .and_then(|s| s.parse::<SessionId>().ok())
+        .and_then(|id| snap.sessions.get(&id).and_then(|s| s.created_by_plugin));
+    TargetOwners {
+        pane_owner,
+        window_owner,
+        session_owner,
+    }
 }
 
 #[cfg(test)]

@@ -1517,7 +1517,8 @@ At client attach time, build a `ClientCaps` struct:
 |--------|-----------|
 | Cross-user socket access | UDS with `0700` permissions |
 | Malicious TCP access | Token-based auth; TCP off by default |
-| Plugin filesystem access | WASI sandbox; `ResourceLimiter`; declared permissions |
+| Plugin RPC over-reach (v0.19+) | Default-deny permission model on every plugin RPC frame: per-method sensitivity tiers (`Public`/`ContentRead`/`OwnedMutation`/`Grantable`/`PluginsForbidden`), ownership-based auto-grant for entities the plugin created, per-install UUID identity (so name re-use doesn't inherit grants), CLI grant/revoke (`shux plugin grant ...`). NDJSON audit log per plugin. See `docs/designs/permissions/README.md`. |
+| Plugin filesystem access | WASI sandbox; `ResourceLimiter`; declared permissions (v1+ WASM milestone — process plugins ship with permission model above first) |
 | Plugin CPU abuse | Epoch interruption (~10% overhead); 100ms kill threshold |
 | Plugin memory abuse | `ResourceLimiter` trait (e.g., 16 MB cap per plugin) |
 | Plugin network access | Disabled by default; requires explicit grant |
@@ -1525,6 +1526,7 @@ At client attach time, build a `ClientCaps` struct:
 | Plugin subprocess escape (`exec`) | Scrubbed environment (allowlist: PATH, HOME, TERM, LANG), CWD restriction, 30s timeout. On Linux: rlimits applied (RLIMIT_NPROC, RLIMIT_FSIZE). Does not use shell — invokes command directly (no shell injection). |
 | Oversized payloads | 16 MB max frame size on all transports; reject and close on violation |
 | Plugin API extension squatting | Registered API methods must use `<plugin-id>.` prefix (e.g., `com.example.my-plugin.my-method`). Built-in method names cannot be overridden via `register-api-method`; use `register-command-override` with explicit permission instead. |
+| Grant-file TOCTOU / symlink swap | Atomic temp+rename writes; symlink target rejected on read and write. |
 
 ---
 

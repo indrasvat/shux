@@ -375,9 +375,11 @@ fn try_authenticate(
 pub fn register_builtin_methods(
     builder: crate::router::RouterBuilder,
 ) -> crate::router::RouterBuilder {
+    use crate::policy::{Policy, Sensitivity};
     builder
-        .register(
+        .register_with_policy(
             "system.version",
+            Policy::fixed(Sensitivity::Public),
             |_params: Option<serde_json::Value>| async {
                 Ok(serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
@@ -386,8 +388,9 @@ pub fn register_builtin_methods(
                 }))
             },
         )
-        .register(
+        .register_with_policy(
             "system.health",
+            Policy::fixed(Sensitivity::Public),
             |_params: Option<serde_json::Value>| async {
                 Ok(serde_json::json!({
                     "status": "ok",

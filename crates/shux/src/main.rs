@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches};
+use shux_rpc::{Policy, Sensitivity};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing_subscriber::EnvFilter;
 
@@ -601,7 +602,7 @@ async fn run_rpc_server(
                 ),
                 event_bus,
             ),
-            graph_handle,
+            graph_handle.clone(),
             io_state,
             cancel.clone(),
         ),
@@ -609,10 +610,18 @@ async fn run_rpc_server(
     )
     .build();
 
+    // Startup assertion: every registered RPC method must declare a
+    // sensitivity policy. Catches "added a new method, forgot to
+    // classify it" at boot. See
+    // `docs/designs/permissions/README.md` §9.6.
+    router.assert_every_route_has_policy();
+
     // Plugin → daemon RPC calls dispatch through this router clone.
     // Setting it now (post-build) is what lets plugins call any
-    // method registered above.
+    // method registered above. Also wire in the graph handle so the
+    // permission enforcer can look up entity ownership.
     plugins.set_router(router.clone());
+    plugins.set_graph(graph_handle.clone()).await;
 
     let config = shux_rpc::ServerConfig {
         socket_path,
@@ -782,63 +791,74 @@ fn register_state_methods(
     io_state: Arc<Mutex<PaneIoState>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> shux_rpc::RouterBuilder {
-    builder.register("state.apply", move |params: Option<serde_json::Value>| {
-        let gh = graph.clone();
-        let io = io_state.clone();
-        let ct = cancel.clone();
-        async move {
-            // Parse `{ ops: [...] }`.
-            let params = params.unwrap_or_default();
-            let ops_value = params
-                .get("ops")
-                .cloned()
-                .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'ops' array"))?;
-            let ops: Vec<shux_core::apply::Op> =
-                serde_json::from_value(ops_value).map_err(|e| {
-                    shux_rpc::RpcError::invalid_params(&format!("ops parse error: {e}"))
-                })?;
+    builder.register_with_policy(
+        "state.apply",
+        Policy::fixed(Sensitivity::Grantable),
+        move |params: Option<serde_json::Value>| {
+            let gh = graph.clone();
+            let io = io_state.clone();
+            let ct = cancel.clone();
+            async move {
+                // Parse `{ ops: [...] }`.
+                let params = params.unwrap_or_default();
+                let ops_value = params
+                    .get("ops")
+                    .cloned()
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'ops' array"))?;
+                let ops: Vec<shux_core::apply::Op> =
+                    serde_json::from_value(ops_value).map_err(|e| {
+                        shux_rpc::RpcError::invalid_params(&format!("ops parse error: {e}"))
+                    })?;
 
-            // Run the staged transaction through the single-writer task.
-            let mut result = gh.apply_batch(ops).await.map_err(batch_error_to_rpc)?;
+                // Run the staged transaction through the single-writer task.
+                let mut result = gh.apply_batch(ops).await.map_err(batch_error_to_rpc)?;
 
-            // Graph commit succeeded. Now spawn PTYs for each new pane.
-            // Per codex P0 #1: spawn outcomes are reported per-pane in
-            // `spawn_results` and do NOT roll back the graph.
-            let snap = gh.snapshot();
-            let mut spawn_results = Vec::new();
-            for output in &result.outputs {
-                if let Some(pane_id) = output.pane_id {
-                    if let Some(pane) = snap.panes.get(&pane_id) {
-                        let cwd = pane.cwd.clone();
-                        let command = pane.command.clone();
-                        let spawn_io = io.clone();
-                        let spawn_ct = ct.clone();
-                        match spawn_pane_pty(pane_id, cwd, command, spawn_io, spawn_ct, gh.clone())
+                // Graph commit succeeded. Now spawn PTYs for each new pane.
+                // Per codex P0 #1: spawn outcomes are reported per-pane in
+                // `spawn_results` and do NOT roll back the graph.
+                let snap = gh.snapshot();
+                let mut spawn_results = Vec::new();
+                for output in &result.outputs {
+                    if let Some(pane_id) = output.pane_id {
+                        if let Some(pane) = snap.panes.get(&pane_id) {
+                            let cwd = pane.cwd.clone();
+                            let command = pane.command.clone();
+                            let spawn_io = io.clone();
+                            let spawn_ct = ct.clone();
+                            match spawn_pane_pty(
+                                pane_id,
+                                cwd,
+                                command,
+                                spawn_io,
+                                spawn_ct,
+                                gh.clone(),
+                            )
                             .await
-                        {
-                            Ok(()) => spawn_results.push(shux_core::apply::SpawnResult {
-                                op_index: output.op_index,
-                                pane_id,
-                                spawned: true,
-                                error: None,
-                            }),
-                            Err(e) => spawn_results.push(shux_core::apply::SpawnResult {
-                                op_index: output.op_index,
-                                pane_id,
-                                spawned: false,
-                                error: Some(e.to_string()),
-                            }),
+                            {
+                                Ok(()) => spawn_results.push(shux_core::apply::SpawnResult {
+                                    op_index: output.op_index,
+                                    pane_id,
+                                    spawned: true,
+                                    error: None,
+                                }),
+                                Err(e) => spawn_results.push(shux_core::apply::SpawnResult {
+                                    op_index: output.op_index,
+                                    pane_id,
+                                    spawned: false,
+                                    error: Some(e.to_string()),
+                                }),
+                            }
                         }
                     }
                 }
-            }
-            result.spawn_results = spawn_results;
+                result.spawn_results = spawn_results;
 
-            serde_json::to_value(&result).map_err(|e| {
-                shux_rpc::RpcError::internal(&format!("apply result serialize error: {e}"))
-            })
-        }
-    })
+                serde_json::to_value(&result).map_err(|e| {
+                    shux_rpc::RpcError::internal(&format!("apply result serialize error: {e}"))
+                })
+            }
+        },
+    )
 }
 
 /// Map BatchError to an appropriate RPC error.
@@ -883,11 +903,16 @@ fn register_plugin_methods(
     let p1 = plugins.clone();
     let p2 = plugins.clone();
     let p3 = plugins.clone();
-    let p4 = plugins;
+    let p4 = plugins.clone();
+    let p5 = plugins.clone();
+    let p6 = plugins.clone();
+    let p7 = plugins.clone();
+    let p8 = plugins;
 
     builder
-        .register(
+        .register_with_policy(
             "plugin.install",
+            Policy::fixed(Sensitivity::PluginsForbidden),
             move |params: Option<serde_json::Value>| {
                 let mgr = p1.clone();
                 async move {
@@ -940,14 +965,14 @@ fn register_plugin_methods(
                 }
             },
         )
-        .register("plugin.list", move |_params: Option<serde_json::Value>| {
+        .register_with_policy("plugin.list", Policy::fixed(Sensitivity::Public), move |_params: Option<serde_json::Value>| {
             let mgr = p2.clone();
             async move {
                 let infos = mgr.list().await;
                 Ok(serde_json::json!({ "plugins": infos }))
             }
         })
-        .register("plugin.kill", move |params: Option<serde_json::Value>| {
+        .register_with_policy("plugin.kill", Policy::fixed(Sensitivity::PluginsForbidden), move |params: Option<serde_json::Value>| {
             let mgr = p3.clone();
             async move {
                 let params = params.unwrap_or_default();
@@ -960,7 +985,7 @@ fn register_plugin_methods(
                 Ok(serde_json::json!({ "killed": name }))
             }
         })
-        .register("plugin.reload", move |params: Option<serde_json::Value>| {
+        .register_with_policy("plugin.reload", Policy::fixed(Sensitivity::PluginsForbidden), move |params: Option<serde_json::Value>| {
             let mgr = p4.clone();
             async move {
                 let params = params.unwrap_or_default();
@@ -975,6 +1000,72 @@ fn register_plugin_methods(
                 })
             }
         })
+        .register_with_policy("plugin.grant", Policy::fixed(Sensitivity::PluginsForbidden), move |params: Option<serde_json::Value>| {
+            let mgr = p5.clone();
+            async move {
+                let p = params.unwrap_or_default();
+                let plugin = p.get("plugin").and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'plugin'"))?.to_string();
+                let method = p.get("method").and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'method'"))?.to_string();
+                let target = p.get("target").and_then(|v| v.as_str()).map(String::from);
+                let subscribe = p.get("subscribe").and_then(|v| v.as_bool()).unwrap_or(false);
+                mgr.grant(&plugin, &method, target.as_deref(), subscribe).await.map_err(plugin_error_to_rpc)?;
+                Ok(serde_json::json!({"granted": true, "plugin": plugin, "method": method, "target": target, "subscribe": subscribe}))
+            }
+        })
+        .register_with_policy("plugin.revoke", Policy::fixed(Sensitivity::PluginsForbidden), move |params: Option<serde_json::Value>| {
+            let mgr = p6.clone();
+            async move {
+                let p = params.unwrap_or_default();
+                let plugin = p.get("plugin").and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'plugin'"))?.to_string();
+                let method = p.get("method").and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'method'"))?.to_string();
+                let target = p.get("target").and_then(|v| v.as_str()).map(String::from);
+                let subscribe = p.get("subscribe").and_then(|v| v.as_bool()).unwrap_or(false);
+                mgr.revoke(&plugin, &method, target.as_deref(), subscribe).await.map_err(plugin_error_to_rpc)?;
+                Ok(serde_json::json!({"revoked": true, "plugin": plugin, "method": method, "target": target, "subscribe": subscribe}))
+            }
+        })
+        .register_with_policy("plugin.grants", Policy::fixed(Sensitivity::PluginsForbidden), move |params: Option<serde_json::Value>| {
+            let mgr = p7.clone();
+            async move {
+                let p = params.unwrap_or_default();
+                let plugin = p.get("plugin").and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'plugin'"))?.to_string();
+                let grants = mgr.grants_for(&plugin).await.map_err(plugin_error_to_rpc)?;
+                serde_json::to_value(&grants).map_err(|e| shux_rpc::RpcError::internal(&format!("grants serialize: {e}")))
+            }
+        })
+        .register_with_policy("plugin.audit", Policy::fixed(Sensitivity::PluginsForbidden), move |params: Option<serde_json::Value>| {
+            let mgr = p8.clone();
+            async move {
+                let p = params.unwrap_or_default();
+                let plugin = p.get("plugin").and_then(|v| v.as_str())
+                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'plugin'"))?.to_string();
+                let tail = p.get("tail").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                let path = mgr.audit_path(&plugin).await.map_err(plugin_error_to_rpc)?;
+                let body = match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => return Err(shux_rpc::RpcError::internal(&format!("read audit log {}: {e}", path.display()))),
+                };
+                let mut entries: Vec<serde_json::Value> = body
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .collect();
+                if tail > 0 && entries.len() > tail {
+                    entries = entries.split_off(entries.len() - tail);
+                }
+                Ok(serde_json::json!({
+                    "plugin": plugin,
+                    "path": path.display().to_string(),
+                    "entries": entries,
+                }))
+            }
+        })
 }
 
 /// `events.history` is a simple bus.history_filtered() wrapper.
@@ -987,111 +1078,140 @@ fn register_events_methods(
     let bus_pane_output = bus;
 
     builder
-        .register("events.watch", move |params: Option<serde_json::Value>| {
-            let bus = bus_watch.clone();
-            async move {
-                let params = params.unwrap_or_default();
-
-                let from_seq = params.get("from_seq").and_then(|v| v.as_u64());
-                let max_events = params
-                    .get("max_events")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(100)
-                    .min(1000);
-                let timeout_ms = params
-                    .get("timeout_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5_000)
-                    .min(30_000);
-                let filters: Vec<String> = params
-                    .get("filter")
+        .register_with_policy(
+            "events.watch",
+            Policy::param_aware(|params, plugin_id| {
+                // Self-namespaced filters are Public — a plugin can
+                // always watch its own published events. Anything broader
+                // (firehose or other plugins' namespaces) is ContentRead
+                // and needs an explicit grant.
+                let prefix = format!("plugin.{plugin_id}.");
+                let filters = params
+                    .and_then(|p| p.get("filters"))
                     .and_then(|v| v.as_array())
                     .map(|a| {
                         a.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
+                            .filter_map(|f| f.as_str())
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                if !filters.is_empty() && filters.iter().all(|f| f.starts_with(&prefix)) {
+                    Sensitivity::Public
+                } else {
+                    Sensitivity::ContentRead
+                }
+            }),
+            move |params: Option<serde_json::Value>| {
+                let bus = bus_watch.clone();
+                async move {
+                    let params = params.unwrap_or_default();
 
-                // 1. Subscribe FIRST so any publish during step 2 lands in the
-                //    receiver buffer, not the void.
-                let mut sub = bus.subscribe_filtered(filters.clone());
-
-                // 2. Snapshot history from from_seq.
-                let (history, gap) = match from_seq {
-                    Some(s) => {
-                        let (events, gap) = bus.events_from_seq(s);
-                        let filtered: Vec<_> = if filters.is_empty() {
-                            events
-                        } else {
-                            events
-                                .into_iter()
-                                .filter(|e| filters.iter().any(|f| e.matches_filter(f)))
+                    let from_seq = params.get("from_seq").and_then(|v| v.as_u64());
+                    let max_events = params
+                        .get("max_events")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .unwrap_or(100)
+                        .min(1000);
+                    let timeout_ms = params
+                        .get("timeout_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(5_000)
+                        .min(30_000);
+                    let filters: Vec<String> = params
+                        .get("filter")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
                                 .collect()
-                        };
-                        (filtered, gap)
-                    }
-                    None => (Vec::new(), 0),
-                };
+                        })
+                        .unwrap_or_default();
 
-                let mut collected: Vec<shux_core::event::Event> = history;
-                let mut lagged = false;
+                    // 1. Subscribe FIRST so any publish during step 2 lands in the
+                    //    receiver buffer, not the void.
+                    let mut sub = bus.subscribe_filtered(filters.clone());
 
-                // 3. Tail: drain up to (max_events - history_len) events from
-                //    the subscription with timeout. If from_seq was None and
-                //    we have no history, block until at least one event or
-                //    timeout. If we already have history, just opportunistically
-                //    grab anything queued without blocking past the deadline.
-                let deadline =
-                    tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-                while collected.len() < max_events {
-                    let now = tokio::time::Instant::now();
-                    if now >= deadline {
-                        break;
-                    }
-                    let remaining = deadline - now;
-                    match tokio::time::timeout(remaining, sub.recv()).await {
-                        Ok(Some(shux_core::bus::SubscriptionEvent::Event(e))) => collected.push(e),
-                        Ok(Some(shux_core::bus::SubscriptionEvent::Lagged(_))) => {
-                            // Subscriber fell behind broadcast capacity. Surface
-                            // to the client so it knows the stream is degraded.
-                            lagged = true;
+                    // 2. Snapshot history from from_seq.
+                    let (history, gap) = match from_seq {
+                        Some(s) => {
+                            let (events, gap) = bus.events_from_seq(s);
+                            let filtered: Vec<_> = if filters.is_empty() {
+                                events
+                            } else {
+                                events
+                                    .into_iter()
+                                    .filter(|e| filters.iter().any(|f| e.matches_filter(f)))
+                                    .collect()
+                            };
+                            (filtered, gap)
+                        }
+                        None => (Vec::new(), 0),
+                    };
+
+                    let mut collected: Vec<shux_core::event::Event> = history;
+                    let mut lagged = false;
+
+                    // 3. Tail: drain up to (max_events - history_len) events from
+                    //    the subscription with timeout. If from_seq was None and
+                    //    we have no history, block until at least one event or
+                    //    timeout. If we already have history, just opportunistically
+                    //    grab anything queued without blocking past the deadline.
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                    while collected.len() < max_events {
+                        let now = tokio::time::Instant::now();
+                        if now >= deadline {
                             break;
                         }
-                        Ok(None) => break, // bus shut down
-                        Err(_) => break,   // deadline reached
+                        let remaining = deadline - now;
+                        match tokio::time::timeout(remaining, sub.recv()).await {
+                            Ok(Some(shux_core::bus::SubscriptionEvent::Event(e))) => {
+                                collected.push(e)
+                            }
+                            Ok(Some(shux_core::bus::SubscriptionEvent::Lagged(_))) => {
+                                // Subscriber fell behind broadcast capacity. Surface
+                                // to the client so it knows the stream is degraded.
+                                lagged = true;
+                                break;
+                            }
+                            Ok(None) => break, // bus shut down
+                            Err(_) => break,   // deadline reached
+                        }
                     }
+
+                    // 4. Dedup by seq. History + subscription tail can legitimately
+                    //    overlap; the subscription started before history was
+                    //    snapshotted, so any event published in between can land in
+                    //    both streams.
+                    collected.sort_by_key(|e| e.meta.seq);
+                    collected.dedup_by_key(|e| e.meta.seq);
+                    if collected.len() > max_events {
+                        collected.truncate(max_events);
+                    }
+
+                    let next_seq = collected
+                        .last()
+                        .map(|e| e.meta.seq + 1)
+                        .or(from_seq)
+                        .unwrap_or_else(|| bus.current_seq());
+
+                    let events: Vec<serde_json::Value> =
+                        collected.iter().map(event_to_json).collect();
+
+                    Ok(serde_json::json!({
+                        "events": events,
+                        "next_seq": next_seq,
+                        "gap": gap,
+                        "lagged": lagged,
+                    }))
                 }
-
-                // 4. Dedup by seq. History + subscription tail can legitimately
-                //    overlap; the subscription started before history was
-                //    snapshotted, so any event published in between can land in
-                //    both streams.
-                collected.sort_by_key(|e| e.meta.seq);
-                collected.dedup_by_key(|e| e.meta.seq);
-                if collected.len() > max_events {
-                    collected.truncate(max_events);
-                }
-
-                let next_seq = collected
-                    .last()
-                    .map(|e| e.meta.seq + 1)
-                    .or(from_seq)
-                    .unwrap_or_else(|| bus.current_seq());
-
-                let events: Vec<serde_json::Value> = collected.iter().map(event_to_json).collect();
-
-                Ok(serde_json::json!({
-                    "events": events,
-                    "next_seq": next_seq,
-                    "gap": gap,
-                    "lagged": lagged,
-                }))
-            }
-        })
-        .register(
+            },
+        )
+        .register_with_policy(
             "events.history",
+            Policy::fixed(Sensitivity::ContentRead),
             move |params: Option<serde_json::Value>| {
                 let bus = bus_hist.clone();
                 async move {
@@ -1122,8 +1242,9 @@ fn register_events_methods(
                 }
             },
         )
-        .register(
+        .register_with_policy(
             "pane.output.watch",
+            Policy::fixed(Sensitivity::ContentRead),
             // PR 2c — sampled pane.output data-plane watch.
             //
             // Long-polls the data-plane broadcast channel for chunks
@@ -1255,7 +1376,7 @@ fn register_pane_methods(
     let cancel_split = cancel;
 
     builder
-        .register("pane.list", move |params: Option<serde_json::Value>| {
+        .register_with_policy("pane.list", Policy::fixed(Sensitivity::Public), move |params: Option<serde_json::Value>| {
             let gh = g1.clone();
             async move {
                 let params = params.unwrap_or_default();
@@ -1279,7 +1400,7 @@ fn register_pane_methods(
                 Ok(serde_json::json!(panes))
             }
         })
-        .register("pane.split", move |params: Option<serde_json::Value>| {
+        .register_with_policy("pane.split", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g2.clone();
             let io = io_split.clone();
             let ct = cancel_split.clone();
@@ -1344,7 +1465,7 @@ fn register_pane_methods(
                 }))
             }
         })
-        .register("pane.focus", move |params: Option<serde_json::Value>| {
+        .register_with_policy("pane.focus", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g3.clone();
             async move {
                 let params = params.unwrap_or_default();
@@ -1368,8 +1489,9 @@ fn register_pane_methods(
                 }))
             }
         })
-        .register(
+        .register_with_policy(
             "pane.focus_direction",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g4.clone();
                 async move {
@@ -1425,7 +1547,7 @@ fn register_pane_methods(
                 }
             },
         )
-        .register("pane.resize", move |params: Option<serde_json::Value>| {
+        .register_with_policy("pane.resize", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g5.clone();
             async move {
                 let params = params.unwrap_or_default();
@@ -1462,7 +1584,7 @@ fn register_pane_methods(
                 Ok(serde_json::json!({ "pane_id": pane_id.to_string() }))
             }
         })
-        .register("pane.zoom", move |params: Option<serde_json::Value>| {
+        .register_with_policy("pane.zoom", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g6.clone();
             async move {
                 let params = params.unwrap_or_default();
@@ -1480,7 +1602,7 @@ fn register_pane_methods(
                 }))
             }
         })
-        .register("pane.swap", move |params: Option<serde_json::Value>| {
+        .register_with_policy("pane.swap", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g7.clone();
             async move {
                 let params = params.unwrap_or_default();
@@ -1514,7 +1636,7 @@ fn register_pane_methods(
                 }))
             }
         })
-        .register("pane.kill", move |params: Option<serde_json::Value>| {
+        .register_with_policy("pane.kill", Policy::fixed(Sensitivity::OwnedMutation), move |params: Option<serde_json::Value>| {
             let gh = g8.clone();
             let io = io_kill.clone();
             async move {
@@ -1555,8 +1677,9 @@ fn register_pane_methods(
                 Ok(serde_json::json!({ "killed": pane_id_str }))
             }
         })
-        .register(
+        .register_with_policy(
             "pane.set_title",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g9.clone();
                 async move {
@@ -1934,302 +2057,331 @@ fn register_window_methods(
     let cancel_ensure = cancel.clone();
 
     builder
-        .register("window.create", move |params: Option<serde_json::Value>| {
-            let gh = g1.clone();
-            let io = io_create.clone();
-            let ct = cancel_create.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let session_id_str = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
-                    })?;
-
-                let session_id: shux_core::model::SessionId = session_id_str
-                    .parse()
-                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
-
-                let name = params.get("name").and_then(|v| v.as_str());
-
-                // Auto-generate window name if not provided
-                let title = match name {
-                    Some(n) => n.to_string(),
-                    None => {
-                        let snap = gh.snapshot();
-                        let session = snap.sessions.get(&session_id).ok_or_else(|| {
-                            shux_rpc::RpcError::not_found("session", session_id_str)
+        .register_with_policy(
+            "window.create",
+            Policy::fixed(Sensitivity::OwnedMutation),
+            move |params: Option<serde_json::Value>| {
+                let gh = g1.clone();
+                let io = io_create.clone();
+                let ct = cancel_create.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let session_id_str = params
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
                         })?;
-                        let mut idx = session.windows.len();
-                        loop {
-                            let candidate = format!("{idx}");
-                            if !snap.window_name_exists_in_session(&session_id, &candidate) {
-                                break candidate;
+
+                    let session_id: shux_core::model::SessionId =
+                        session_id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid session_id format")
+                        })?;
+
+                    let name = params.get("name").and_then(|v| v.as_str());
+
+                    // Auto-generate window name if not provided
+                    let title = match name {
+                        Some(n) => n.to_string(),
+                        None => {
+                            let snap = gh.snapshot();
+                            let session = snap.sessions.get(&session_id).ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("session", session_id_str)
+                            })?;
+                            let mut idx = session.windows.len();
+                            loop {
+                                let candidate = format!("{idx}");
+                                if !snap.window_name_exists_in_session(&session_id, &candidate) {
+                                    break candidate;
+                                }
+                                idx += 1;
                             }
-                            idx += 1;
                         }
-                    }
-                };
+                    };
 
-                let cwd = params
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
-                    });
+                    let cwd = params
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+                        });
 
-                let command: Vec<String> = params
-                    .get("command")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| s.as_str().map(|x| x.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                    let command: Vec<String> = params
+                        .get("command")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|s| s.as_str().map(|x| x.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
-                let window_id = gh
-                    .create_window(session_id, title, cwd.clone())
-                    .await
-                    .map_err(graph_error_to_rpc)?;
+                    let window_id = gh
+                        .create_window(session_id, title, cwd.clone())
+                        .await
+                        .map_err(graph_error_to_rpc)?;
 
-                let snap = gh.snapshot();
-                let window = snap
-                    .windows
-                    .get(&window_id)
-                    .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
-                let session = snap
-                    .sessions
-                    .get(&window.session_id)
-                    .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
-                let index = session
-                    .windows
-                    .iter()
-                    .position(|id| *id == window_id)
-                    .unwrap_or(0);
-                let is_active = session.active_window == window_id;
-                let pane_id = window.active_pane.to_string();
+                    let snap = gh.snapshot();
+                    let window = snap
+                        .windows
+                        .get(&window_id)
+                        .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
+                    let session = snap
+                        .sessions
+                        .get(&window.session_id)
+                        .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                    let index = session
+                        .windows
+                        .iter()
+                        .position(|id| *id == window_id)
+                        .unwrap_or(0);
+                    let is_active = session.active_window == window_id;
+                    let pane_id = window.active_pane.to_string();
 
-                // Spawn PTY for the new pane
-                let _ = spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
+                    // Spawn PTY for the new pane
+                    let _ =
+                        spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
 
-                let mut result = window_to_json(window, index, is_active, &snap);
-                // Include pane_id at top level for convenience
-                result["pane_id"] = serde_json::Value::String(pane_id);
+                    let mut result = window_to_json(window, index, is_active, &snap);
+                    // Include pane_id at top level for convenience
+                    result["pane_id"] = serde_json::Value::String(pane_id);
 
-                Ok(result)
-            }
-        })
-        .register("window.list", move |params: Option<serde_json::Value>| {
-            let gh = g2.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let session_id_str = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
-                    })?;
+                    Ok(result)
+                }
+            },
+        )
+        .register_with_policy(
+            "window.list",
+            Policy::fixed(Sensitivity::Public),
+            move |params: Option<serde_json::Value>| {
+                let gh = g2.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let session_id_str = params
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
+                        })?;
 
-                let session_id: shux_core::model::SessionId = session_id_str
-                    .parse()
-                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
+                    let session_id: shux_core::model::SessionId =
+                        session_id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid session_id format")
+                        })?;
 
-                let snap = gh.snapshot();
-                let session = snap
-                    .sessions
-                    .get(&session_id)
-                    .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
-
-                let windows: Vec<serde_json::Value> = session
-                    .windows
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, wid)| {
-                        snap.windows
-                            .get(wid)
-                            .map(|w| window_to_json(w, index, session.active_window == *wid, &snap))
-                    })
-                    .collect();
-
-                Ok(serde_json::json!(windows))
-            }
-        })
-        .register("window.ensure", move |params: Option<serde_json::Value>| {
-            let gh = g3.clone();
-            let io = io_ensure.clone();
-            let ct = cancel_ensure.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let session_id_str = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
-                    })?;
-
-                let session_id: shux_core::model::SessionId = session_id_str
-                    .parse()
-                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session_id format"))?;
-
-                let name = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'name' parameter"))?
-                    .to_string();
-
-                // Check if window with this name already exists
-                let snap = gh.snapshot();
-                if let Some(w) = snap.find_window_by_name(&session_id, &name) {
+                    let snap = gh.snapshot();
                     let session = snap
                         .sessions
                         .get(&session_id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
+
+                    let windows: Vec<serde_json::Value> = session
+                        .windows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, wid)| {
+                            snap.windows.get(wid).map(|w| {
+                                window_to_json(w, index, session.active_window == *wid, &snap)
+                            })
+                        })
+                        .collect();
+
+                    Ok(serde_json::json!(windows))
+                }
+            },
+        )
+        .register_with_policy(
+            "window.ensure",
+            Policy::fixed(Sensitivity::OwnedMutation),
+            move |params: Option<serde_json::Value>| {
+                let gh = g3.clone();
+                let io = io_ensure.clone();
+                let ct = cancel_ensure.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let session_id_str = params
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
+                        })?;
+
+                    let session_id: shux_core::model::SessionId =
+                        session_id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid session_id format")
+                        })?;
+
+                    let name = params
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'name' parameter")
+                        })?
+                        .to_string();
+
+                    // Check if window with this name already exists
+                    let snap = gh.snapshot();
+                    if let Some(w) = snap.find_window_by_name(&session_id, &name) {
+                        let session = snap.sessions.get(&session_id).ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("session", session_id_str)
+                        })?;
+                        let index = session
+                            .windows
+                            .iter()
+                            .position(|id| *id == w.id)
+                            .unwrap_or(0);
+                        let is_active = session.active_window == w.id;
+                        let mut result = window_to_json(w, index, is_active, &snap);
+                        result["created"] = serde_json::Value::Bool(false);
+                        return Ok(result);
+                    }
+
+                    let cwd = params
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+                        });
+                    let command: Vec<String> = params
+                        .get("command")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|s| s.as_str().map(|x| x.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let window_id = gh
+                        .create_window(session_id, name, cwd.clone())
+                        .await
+                        .map_err(graph_error_to_rpc)?;
+
+                    let snap = gh.snapshot();
+                    let window = snap
+                        .windows
+                        .get(&window_id)
+                        .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
+
+                    // Spawn PTY for the new pane
+                    let _ =
+                        spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
+
+                    let session = snap
+                        .sessions
+                        .get(&session_id)
+                        .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
                     let index = session
                         .windows
                         .iter()
-                        .position(|id| *id == w.id)
+                        .position(|id| *id == window_id)
                         .unwrap_or(0);
-                    let is_active = session.active_window == w.id;
-                    let mut result = window_to_json(w, index, is_active, &snap);
-                    result["created"] = serde_json::Value::Bool(false);
-                    return Ok(result);
+                    let is_active = session.active_window == window_id;
+                    let mut result = window_to_json(window, index, is_active, &snap);
+                    result["created"] = serde_json::Value::Bool(true);
+                    Ok(result)
                 }
+            },
+        )
+        .register_with_policy(
+            "window.rename",
+            Policy::fixed(Sensitivity::OwnedMutation),
+            move |params: Option<serde_json::Value>| {
+                let gh = g4.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let window_id_str =
+                        params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'id' parameter")
+                        })?;
 
-                let cwd = params
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
-                    });
-                let command: Vec<String> = params
-                    .get("command")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| s.as_str().map(|x| x.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let window_id = gh
-                    .create_window(session_id, name, cwd.clone())
-                    .await
-                    .map_err(graph_error_to_rpc)?;
+                    let window_id: shux_core::model::WindowId =
+                        window_id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid window id format")
+                        })?;
 
-                let snap = gh.snapshot();
-                let window = snap
-                    .windows
-                    .get(&window_id)
-                    .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
+                    let new_title = params
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'name' parameter")
+                        })?
+                        .to_string();
 
-                // Spawn PTY for the new pane
-                let _ = spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
+                    let expected_version = parse_expected_version(&params)?;
 
-                let session = snap
-                    .sessions
-                    .get(&session_id)
-                    .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
-                let index = session
-                    .windows
-                    .iter()
-                    .position(|id| *id == window_id)
-                    .unwrap_or(0);
-                let is_active = session.active_window == window_id;
-                let mut result = window_to_json(window, index, is_active, &snap);
-                result["created"] = serde_json::Value::Bool(true);
-                Ok(result)
-            }
-        })
-        .register("window.rename", move |params: Option<serde_json::Value>| {
-            let gh = g4.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let window_id_str = params
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'id' parameter"))?;
+                    gh.rename_window(window_id, new_title, expected_version)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
 
-                let window_id: shux_core::model::WindowId = window_id_str
-                    .parse()
-                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
+                    let snap = gh.snapshot();
+                    let window = snap.windows.get(&window_id).ok_or_else(|| {
+                        shux_rpc::RpcError::internal("window vanished after rename")
+                    })?;
+                    let session = snap
+                        .sessions
+                        .get(&window.session_id)
+                        .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                    let index = session
+                        .windows
+                        .iter()
+                        .position(|id| *id == window_id)
+                        .unwrap_or(0);
+                    let is_active = session.active_window == window_id;
+                    Ok(window_to_json(window, index, is_active, &snap))
+                }
+            },
+        )
+        .register_with_policy(
+            "window.focus",
+            Policy::fixed(Sensitivity::OwnedMutation),
+            move |params: Option<serde_json::Value>| {
+                let gh = g5.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let window_id_str =
+                        params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'id' parameter")
+                        })?;
 
-                let new_title = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'name' parameter"))?
-                    .to_string();
+                    let window_id: shux_core::model::WindowId =
+                        window_id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid window id format")
+                        })?;
 
-                let expected_version = parse_expected_version(&params)?;
+                    let expected_version = parse_expected_version(&params)?;
 
-                gh.rename_window(window_id, new_title, expected_version)
-                    .await
-                    .map_err(graph_error_to_rpc)?;
+                    let previous = gh
+                        .focus_window(window_id, expected_version)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
 
-                let snap = gh.snapshot();
-                let window = snap
-                    .windows
-                    .get(&window_id)
-                    .ok_or_else(|| shux_rpc::RpcError::internal("window vanished after rename"))?;
-                let session = snap
-                    .sessions
-                    .get(&window.session_id)
-                    .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
-                let index = session
-                    .windows
-                    .iter()
-                    .position(|id| *id == window_id)
-                    .unwrap_or(0);
-                let is_active = session.active_window == window_id;
-                Ok(window_to_json(window, index, is_active, &snap))
-            }
-        })
-        .register("window.focus", move |params: Option<serde_json::Value>| {
-            let gh = g5.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let window_id_str = params
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'id' parameter"))?;
-
-                let window_id: shux_core::model::WindowId = window_id_str
-                    .parse()
-                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
-
-                let expected_version = parse_expected_version(&params)?;
-
-                let previous = gh
-                    .focus_window(window_id, expected_version)
-                    .await
-                    .map_err(graph_error_to_rpc)?;
-
-                let snap = gh.snapshot();
-                let window = snap
-                    .windows
-                    .get(&window_id)
-                    .ok_or_else(|| shux_rpc::RpcError::internal("window vanished after focus"))?;
-                let session = snap
-                    .sessions
-                    .get(&window.session_id)
-                    .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
-                let index = session
-                    .windows
-                    .iter()
-                    .position(|id| *id == window_id)
-                    .unwrap_or(0);
-                let mut result = window_to_json(window, index, true, &snap);
-                result["previous_window_id"] = match previous {
-                    Some(id) => serde_json::Value::String(id.to_string()),
-                    None => serde_json::Value::Null,
-                };
-                Ok(result)
-            }
-        })
-        .register(
+                    let snap = gh.snapshot();
+                    let window = snap.windows.get(&window_id).ok_or_else(|| {
+                        shux_rpc::RpcError::internal("window vanished after focus")
+                    })?;
+                    let session = snap
+                        .sessions
+                        .get(&window.session_id)
+                        .ok_or_else(|| shux_rpc::RpcError::internal("session not in snapshot"))?;
+                    let index = session
+                        .windows
+                        .iter()
+                        .position(|id| *id == window_id)
+                        .unwrap_or(0);
+                    let mut result = window_to_json(window, index, true, &snap);
+                    result["previous_window_id"] = match previous {
+                        Some(id) => serde_json::Value::String(id.to_string()),
+                        None => serde_json::Value::Null,
+                    };
+                    Ok(result)
+                }
+            },
+        )
+        .register_with_policy(
             "window.reorder",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g6.clone();
                 async move {
@@ -2275,51 +2427,56 @@ fn register_window_methods(
                 }
             },
         )
-        .register("window.kill", move |params: Option<serde_json::Value>| {
-            let gh = g7.clone();
-            let io = io_kill.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let window_id_str = params
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'id' parameter"))?;
+        .register_with_policy(
+            "window.kill",
+            Policy::fixed(Sensitivity::OwnedMutation),
+            move |params: Option<serde_json::Value>| {
+                let gh = g7.clone();
+                let io = io_kill.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let window_id_str =
+                        params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'id' parameter")
+                        })?;
 
-                let window_id: shux_core::model::WindowId = window_id_str
-                    .parse()
-                    .map_err(|_| shux_rpc::RpcError::invalid_params("invalid window id format"))?;
+                    let window_id: shux_core::model::WindowId =
+                        window_id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid window id format")
+                        })?;
 
-                let expected_version = parse_expected_version(&params)?;
+                    let expected_version = parse_expected_version(&params)?;
 
-                // Snapshot pane IDs BEFORE mutation so we can tear down IO
-                // after the destroy succeeds. Mutate the graph first so a
-                // stale `expected_version` (or LastWindow refusal) errors
-                // out without leaving the window with orphaned VTs/PTYs.
-                let pane_ids: Vec<_> = {
-                    let snap = gh.snapshot();
-                    snap.panes
-                        .values()
-                        .filter(|p| p.window_id == window_id)
-                        .map(|p| p.id)
-                        .collect()
-                };
+                    // Snapshot pane IDs BEFORE mutation so we can tear down IO
+                    // after the destroy succeeds. Mutate the graph first so a
+                    // stale `expected_version` (or LastWindow refusal) errors
+                    // out without leaving the window with orphaned VTs/PTYs.
+                    let pane_ids: Vec<_> = {
+                        let snap = gh.snapshot();
+                        snap.panes
+                            .values()
+                            .filter(|p| p.window_id == window_id)
+                            .map(|p| p.id)
+                            .collect()
+                    };
 
-                gh.destroy_window(window_id, expected_version)
-                    .await
-                    .map_err(graph_error_to_rpc)?;
+                    gh.destroy_window(window_id, expected_version)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
 
-                {
-                    let mut state = io.lock().await;
-                    for pid in pane_ids {
-                        state.writers.remove(&pid);
-                        state.resizers.remove(&pid);
-                        state.vts.remove(&pid);
+                    {
+                        let mut state = io.lock().await;
+                        for pid in pane_ids {
+                            state.writers.remove(&pid);
+                            state.resizers.remove(&pid);
+                            state.vts.remove(&pid);
+                        }
                     }
-                }
 
-                Ok(serde_json::json!({ "killed": window_id_str }))
-            }
-        })
+                    Ok(serde_json::json!({ "killed": window_id_str }))
+                }
+            },
+        )
 }
 
 /// Register session CRUD methods on the router builder.
@@ -2346,19 +2503,24 @@ fn register_session_methods(
     let cancel_ensure = cancel;
 
     builder
-        .register("session.list", move |_params: Option<serde_json::Value>| {
-            let gh = g1.clone();
-            async move {
-                let snap = gh.snapshot();
-                let mut sessions: Vec<_> = snap.sessions.values().collect();
-                sessions.sort_by_key(|s| s.created_at);
-                let sessions: Vec<serde_json::Value> =
-                    sessions.iter().map(|s| session_to_json(s, &snap)).collect();
-                Ok(serde_json::json!({ "sessions": sessions }))
-            }
-        })
-        .register(
+        .register_with_policy(
+            "session.list",
+            Policy::fixed(Sensitivity::Public),
+            move |_params: Option<serde_json::Value>| {
+                let gh = g1.clone();
+                async move {
+                    let snap = gh.snapshot();
+                    let mut sessions: Vec<_> = snap.sessions.values().collect();
+                    sessions.sort_by_key(|s| s.created_at);
+                    let sessions: Vec<serde_json::Value> =
+                        sessions.iter().map(|s| session_to_json(s, &snap)).collect();
+                    Ok(serde_json::json!({ "sessions": sessions }))
+                }
+            },
+        )
+        .register_with_policy(
             "session.create",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g2.clone();
                 let io = io_create.clone();
@@ -2448,99 +2610,105 @@ fn register_session_methods(
                 }
             },
         )
-        .register("session.kill", move |params: Option<serde_json::Value>| {
-            let gh = g3.clone();
-            let io = io_kill.clone();
-            async move {
-                let params = params.unwrap_or_default();
+        .register_with_policy(
+            "session.kill",
+            Policy::fixed(Sensitivity::OwnedMutation),
+            move |params: Option<serde_json::Value>| {
+                let gh = g3.clone();
+                let io = io_kill.clone();
+                async move {
+                    let params = params.unwrap_or_default();
 
-                // Accept name or id — try UUID parse first, fall back to name lookup
-                let session_id = if let Some(id_str) = params.get("id").and_then(|v| v.as_str()) {
-                    let parsed: shux_core::model::SessionId = id_str.parse().map_err(|_| {
-                        shux_rpc::RpcError::invalid_params("invalid session ID format")
-                    })?;
-                    // Verify it exists
-                    let snap = gh.snapshot();
-                    if !snap.sessions.contains_key(&parsed) {
-                        return Err(shux_rpc::RpcError::not_found("session", id_str));
+                    // Accept name or id — try UUID parse first, fall back to name lookup
+                    let session_id = if let Some(id_str) = params.get("id").and_then(|v| v.as_str())
+                    {
+                        let parsed: shux_core::model::SessionId = id_str.parse().map_err(|_| {
+                            shux_rpc::RpcError::invalid_params("invalid session ID format")
+                        })?;
+                        // Verify it exists
+                        let snap = gh.snapshot();
+                        if !snap.sessions.contains_key(&parsed) {
+                            return Err(shux_rpc::RpcError::not_found("session", id_str));
+                        }
+                        parsed
+                    } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                        let snap = gh.snapshot();
+                        let session = snap
+                            .find_session_by_name(name)
+                            .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?;
+                        session.id
+                    } else {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "missing 'name' or 'id' parameter",
+                        ));
+                    };
+
+                    // Snapshot the session BEFORE destroying it so we know
+                    // which panes belong to it. After destroy_session the
+                    // graph entries are gone; without this snapshot we'd
+                    // have no way to find the orphaned PTY tasks to clean up.
+                    let pre_snap = gh.snapshot();
+                    let name = pre_snap
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    let pane_ids: Vec<shux_core::model::PaneId> = pre_snap
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| {
+                            s.windows
+                                .iter()
+                                .flat_map(|wid| {
+                                    pre_snap
+                                        .windows
+                                        .get(wid)
+                                        .map(|w| w.layout.tree.pane_ids())
+                                        .unwrap_or_default()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    drop(pre_snap);
+
+                    let expected_version = parse_expected_version(&params)?;
+
+                    // Mutate the graph FIRST. If destroy_session errors, we
+                    // leave PTY/VT state untouched (otherwise we'd kill PTYs
+                    // for a session that's still in the graph). Same applies
+                    // to a stale `expected_version` — the check inside
+                    // destroy_session rejects the request before IO teardown.
+                    gh.destroy_session(session_id, expected_version)
+                        .await
+                        .map_err(graph_error_to_rpc)?;
+
+                    // Tear down PTY/VT/writer/resizer entries for every pane
+                    // that belonged to the session. Dropping the writer
+                    // Sender closes the mpsc on the recv side, which makes
+                    // the per-pane PTY task observe `None` from `write_rx
+                    // .recv()`, break out of its select loop, and call
+                    // `handle.kill()` on its way out — reaping the child
+                    // shell. Without this codex-flagged fix (P1), shells
+                    // for killed sessions would stay alive but unreachable.
+                    {
+                        let mut state = io.lock().await;
+                        for pid in &pane_ids {
+                            state.writers.remove(pid);
+                            state.resizers.remove(pid);
+                            state.vts.remove(pid);
+                        }
+                        let pulse = state.render_pulse.clone();
+                        drop(state);
+                        pulse.notify_one();
                     }
-                    parsed
-                } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
-                    let snap = gh.snapshot();
-                    let session = snap
-                        .find_session_by_name(name)
-                        .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?;
-                    session.id
-                } else {
-                    return Err(shux_rpc::RpcError::invalid_params(
-                        "missing 'name' or 'id' parameter",
-                    ));
-                };
 
-                // Snapshot the session BEFORE destroying it so we know
-                // which panes belong to it. After destroy_session the
-                // graph entries are gone; without this snapshot we'd
-                // have no way to find the orphaned PTY tasks to clean up.
-                let pre_snap = gh.snapshot();
-                let name = pre_snap
-                    .sessions
-                    .get(&session_id)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_default();
-                let pane_ids: Vec<shux_core::model::PaneId> = pre_snap
-                    .sessions
-                    .get(&session_id)
-                    .map(|s| {
-                        s.windows
-                            .iter()
-                            .flat_map(|wid| {
-                                pre_snap
-                                    .windows
-                                    .get(wid)
-                                    .map(|w| w.layout.tree.pane_ids())
-                                    .unwrap_or_default()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                drop(pre_snap);
-
-                let expected_version = parse_expected_version(&params)?;
-
-                // Mutate the graph FIRST. If destroy_session errors, we
-                // leave PTY/VT state untouched (otherwise we'd kill PTYs
-                // for a session that's still in the graph). Same applies
-                // to a stale `expected_version` — the check inside
-                // destroy_session rejects the request before IO teardown.
-                gh.destroy_session(session_id, expected_version)
-                    .await
-                    .map_err(graph_error_to_rpc)?;
-
-                // Tear down PTY/VT/writer/resizer entries for every pane
-                // that belonged to the session. Dropping the writer
-                // Sender closes the mpsc on the recv side, which makes
-                // the per-pane PTY task observe `None` from `write_rx
-                // .recv()`, break out of its select loop, and call
-                // `handle.kill()` on its way out — reaping the child
-                // shell. Without this codex-flagged fix (P1), shells
-                // for killed sessions would stay alive but unreachable.
-                {
-                    let mut state = io.lock().await;
-                    for pid in &pane_ids {
-                        state.writers.remove(pid);
-                        state.resizers.remove(pid);
-                        state.vts.remove(pid);
-                    }
-                    let pulse = state.render_pulse.clone();
-                    drop(state);
-                    pulse.notify_one();
+                    Ok(serde_json::json!({ "killed": name }))
                 }
-
-                Ok(serde_json::json!({ "killed": name }))
-            }
-        })
-        .register(
+            },
+        )
+        .register_with_policy(
             "session.ensure",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g4.clone();
                 let io = io_ensure.clone();
@@ -2614,8 +2782,9 @@ fn register_session_methods(
                 }
             },
         )
-        .register(
+        .register_with_policy(
             "session.rename",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g5.clone();
                 async move {
@@ -2702,8 +2871,9 @@ fn register_pane_io_methods(
     let rasterizer_session = rasterizer_pane.clone();
 
     builder
-        .register(
+        .register_with_policy(
             "pane.send_keys",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g1.clone();
                 let io = io1.clone();
@@ -2749,8 +2919,9 @@ fn register_pane_io_methods(
                 }
             },
         )
-        .register(
+        .register_with_policy(
             "pane.run_command",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let gh = g2.clone();
                 let io = io2.clone();
@@ -2857,8 +3028,9 @@ fn register_pane_io_methods(
                 }
             },
         )
-        .register(
+        .register_with_policy(
             "pane.command_status",
+            Policy::fixed(Sensitivity::ContentRead),
             move |params: Option<serde_json::Value>| {
                 let io = io3.clone();
                 async move {
@@ -2889,8 +3061,9 @@ fn register_pane_io_methods(
                 }
             },
         )
-        .register(
+        .register_with_policy(
             "pane.command_cancel",
+            Policy::fixed(Sensitivity::OwnedMutation),
             move |params: Option<serde_json::Value>| {
                 let io = io4.clone();
                 async move {
@@ -2925,228 +3098,242 @@ fn register_pane_io_methods(
                 }
             },
         )
-        .register("pane.capture", move |params: Option<serde_json::Value>| {
-            let gh = g5.clone();
-            let io = io5.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+        .register_with_policy(
+            "pane.capture",
+            Policy::fixed(Sensitivity::ContentRead),
+            move |params: Option<serde_json::Value>| {
+                let gh = g5.clone();
+                let io = io5.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
 
-                // None → entire visible viewport (iTerm2 get_screen_contents
-                // shape). Some(N) → tail N non-blank rows.
-                let lines = params
-                    .get("lines")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
+                    // None → entire visible viewport (iTerm2 get_screen_contents
+                    // shape). Some(N) → tail N non-blank rows.
+                    let lines = params
+                        .get("lines")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize);
 
-                let state = io.lock().await;
-                let vt = state.vts.get(&pane_id).ok_or_else(|| {
-                    shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
-                })?;
-
-                let text = vt.capture_text(lines);
-                let clean = shux_pty::strip_ansi(&text);
-                let cursor = vt.cursor();
-                let cols = vt.grid().cols();
-                let rows = vt.grid().rows();
-
-                let mut body = serde_json::json!({
-                    "pane_id": pane_id.to_string(),
-                    "text": clean,
-                    "lines": clean.lines().count(),
-                    "cols": cols,
-                    "rows": rows,
-                    "cursor": {
-                        "row": cursor.row,
-                        "col": cursor.col,
-                        "visible": cursor.visible,
-                    },
-                });
-                if let Some(requested) = lines {
-                    body["requested_lines"] = serde_json::Value::from(requested);
-                }
-                Ok(body)
-            }
-        })
-        .register("pane.wait_for", move |params: Option<serde_json::Value>| {
-            let gh = g10.clone();
-            let io = io10.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
-
-                let needle_text = params
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let needle_regex_raw = params.get("regex").and_then(|v| v.as_str());
-                let absent = params
-                    .get("absent")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let lines = params.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
-                let timeout_ms = params
-                    .get("timeout_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10_000)
-                    .min(60_000);
-                let poll_ms = params
-                    .get("poll_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(100)
-                    .clamp(20, 1_000);
-
-                if needle_text.is_none() && needle_regex_raw.is_none() {
-                    return Err(shux_rpc::RpcError::invalid_params(
-                        "missing 'text' or 'regex' parameter",
-                    ));
-                }
-                let needle_regex = match needle_regex_raw {
-                    Some(r) => Some(regex::Regex::new(r).map_err(|e| {
-                        shux_rpc::RpcError::invalid_params(&format!("invalid regex: {e}"))
-                    })?),
-                    None => None,
-                };
-
-                let start = std::time::Instant::now();
-                let deadline = start + std::time::Duration::from_millis(timeout_ms);
-                let mut last_capture;
-
-                loop {
-                    last_capture = {
-                        let state = io.lock().await;
-                        let vt = state.vts.get(&pane_id).ok_or_else(|| {
-                            shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
-                        })?;
-                        let raw = vt.capture_text(Some(lines));
-                        shux_pty::strip_ansi(&raw)
-                    };
-
-                    let hit = if let Some(re) = needle_regex.as_ref() {
-                        re.is_match(&last_capture)
-                    } else if let Some(t) = needle_text.as_ref() {
-                        last_capture.contains(t.as_str())
-                    } else {
-                        false
-                    };
-                    let matched = if absent { !hit } else { hit };
-
-                    if matched {
-                        let elapsed = start.elapsed().as_millis() as u64;
-                        return Ok(serde_json::json!({
-                            "pane_id": pane_id.to_string(),
-                            "matched": true,
-                            "elapsed_ms": elapsed,
-                            "absent": absent,
-                            "text_preview": preview_for_log(&last_capture, 240),
-                        }));
-                    }
-
-                    if std::time::Instant::now() >= deadline {
-                        return Err(shux_rpc::RpcError::with_message_and_data(
-                            shux_rpc::ErrorCode::NotFound,
-                            "wait_for timed out".to_string(),
-                            serde_json::json!({
-                                "pane_id": pane_id.to_string(),
-                                "absent": absent,
-                                "timeout_ms": timeout_ms,
-                                "elapsed_ms": start.elapsed().as_millis() as u64,
-                                "last_capture_preview": preview_for_log(&last_capture, 480),
-                            }),
-                        ));
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
-                }
-            }
-        })
-        .register("pane.snapshot", move |params: Option<serde_json::Value>| {
-            let gh = g6.clone();
-            let io = io6.clone();
-            let r = rasterizer_pane.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
-
-                // Read visible dims FIRST, validate the pixel budget BEFORE
-                // any allocation, then clone only the visible viewport (not
-                // scrollback). Codex review (PR #16): cloning the full Grid
-                // under lock paid hundreds of MB of allocations even on
-                // snapshots that were about to be rejected by the cap,
-                // because the default 5000-line scrollback was being copied
-                // unconditionally.
-                let (cw, ch) = r.cell_size();
-                let (grid_snapshot, cursor_pos, snap_cols, snap_rows) = {
                     let state = io.lock().await;
                     let vt = state.vts.get(&pane_id).ok_or_else(|| {
                         shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                     })?;
+
+                    let text = vt.capture_text(lines);
+                    let clean = shux_pty::strip_ansi(&text);
+                    let cursor = vt.cursor();
                     let cols = vt.grid().cols();
                     let rows = vt.grid().rows();
-                    // 16 M output pixels (~64 MB RGBA, ~4000x4000 px).
-                    let pixel_count = (cols as u64)
-                        .saturating_mul(cw as u64)
-                        .saturating_mul(rows as u64)
-                        .saturating_mul(ch as u64);
-                    const MAX_PIXELS: u64 = 16_000_000;
-                    if pixel_count > MAX_PIXELS {
-                        return Err(shux_rpc::RpcError::invalid_params(&format!(
-                            "snapshot would be {pixel_count} pixels — exceeds cap of \
-                            {MAX_PIXELS}; resize the pane first via pane.set_size"
-                        )));
-                    }
-                    let cur = vt.cursor();
-                    let cursor_pos = cur.visible.then_some((cur.row, cur.col));
-                    // Visible-only clone — does NOT copy scrollback.
-                    let grid_clone = vt.grid().clone_visible();
-                    (grid_clone, cursor_pos, cols, rows)
-                };
 
-                // Rasterize + PNG-encode off the runtime worker. Both are
-                // pure-CPU and don't yield, so we route them to a blocking
-                // worker that won't starve other RPC handlers.
-                let (img, png_buf) = tokio::task::spawn_blocking(move || {
-                    let opts = shux_raster::RasterOptions {
-                        cursor: cursor_pos,
-                        ..Default::default()
+                    let mut body = serde_json::json!({
+                        "pane_id": pane_id.to_string(),
+                        "text": clean,
+                        "lines": clean.lines().count(),
+                        "cols": cols,
+                        "rows": rows,
+                        "cursor": {
+                            "row": cursor.row,
+                            "col": cursor.col,
+                            "visible": cursor.visible,
+                        },
+                    });
+                    if let Some(requested) = lines {
+                        body["requested_lines"] = serde_json::Value::from(requested);
+                    }
+                    Ok(body)
+                }
+            },
+        )
+        .register_with_policy(
+            "pane.wait_for",
+            Policy::fixed(Sensitivity::ContentRead),
+            move |params: Option<serde_json::Value>| {
+                let gh = g10.clone();
+                let io = io10.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                    let needle_text = params
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let needle_regex_raw = params.get("regex").and_then(|v| v.as_str());
+                    let absent = params
+                        .get("absent")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let lines =
+                        params.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                    let timeout_ms = params
+                        .get("timeout_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(10_000)
+                        .min(60_000);
+                    let poll_ms = params
+                        .get("poll_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(100)
+                        .clamp(20, 1_000);
+
+                    if needle_text.is_none() && needle_regex_raw.is_none() {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "missing 'text' or 'regex' parameter",
+                        ));
+                    }
+                    let needle_regex = match needle_regex_raw {
+                        Some(r) => Some(regex::Regex::new(r).map_err(|e| {
+                            shux_rpc::RpcError::invalid_params(&format!("invalid regex: {e}"))
+                        })?),
+                        None => None,
                     };
-                    let img = r.render(&grid_snapshot, &opts);
-                    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-                    {
-                        use image::ImageEncoder;
-                        let encoder = image::codecs::png::PngEncoder::new(&mut buf);
-                        encoder
-                            .write_image(
-                                img.as_raw(),
-                                img.width(),
-                                img.height(),
-                                image::ExtendedColorType::Rgba8,
-                            )
-                            .map_err(|e| format!("PNG encode failed: {e}"))?;
+
+                    let start = std::time::Instant::now();
+                    let deadline = start + std::time::Duration::from_millis(timeout_ms);
+                    let mut last_capture;
+
+                    loop {
+                        last_capture = {
+                            let state = io.lock().await;
+                            let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                            })?;
+                            let raw = vt.capture_text(Some(lines));
+                            shux_pty::strip_ansi(&raw)
+                        };
+
+                        let hit = if let Some(re) = needle_regex.as_ref() {
+                            re.is_match(&last_capture)
+                        } else if let Some(t) = needle_text.as_ref() {
+                            last_capture.contains(t.as_str())
+                        } else {
+                            false
+                        };
+                        let matched = if absent { !hit } else { hit };
+
+                        if matched {
+                            let elapsed = start.elapsed().as_millis() as u64;
+                            return Ok(serde_json::json!({
+                                "pane_id": pane_id.to_string(),
+                                "matched": true,
+                                "elapsed_ms": elapsed,
+                                "absent": absent,
+                                "text_preview": preview_for_log(&last_capture, 240),
+                            }));
+                        }
+
+                        if std::time::Instant::now() >= deadline {
+                            return Err(shux_rpc::RpcError::with_message_and_data(
+                                shux_rpc::ErrorCode::NotFound,
+                                "wait_for timed out".to_string(),
+                                serde_json::json!({
+                                    "pane_id": pane_id.to_string(),
+                                    "absent": absent,
+                                    "timeout_ms": timeout_ms,
+                                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                                    "last_capture_preview": preview_for_log(&last_capture, 480),
+                                }),
+                            ));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
                     }
-                    Ok::<_, String>((img, buf))
-                })
-                .await
-                .map_err(|e| shux_rpc::RpcError::internal(&format!("rasterize join: {e}")))?
-                .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+                }
+            },
+        )
+        .register_with_policy(
+            "pane.snapshot",
+            Policy::fixed(Sensitivity::ContentRead),
+            move |params: Option<serde_json::Value>| {
+                let gh = g6.clone();
+                let io = io6.clone();
+                let r = rasterizer_pane.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
 
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+                    // Read visible dims FIRST, validate the pixel budget BEFORE
+                    // any allocation, then clone only the visible viewport (not
+                    // scrollback). Codex review (PR #16): cloning the full Grid
+                    // under lock paid hundreds of MB of allocations even on
+                    // snapshots that were about to be rejected by the cap,
+                    // because the default 5000-line scrollback was being copied
+                    // unconditionally.
+                    let (cw, ch) = r.cell_size();
+                    let (grid_snapshot, cursor_pos, snap_cols, snap_rows) = {
+                        let state = io.lock().await;
+                        let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                        })?;
+                        let cols = vt.grid().cols();
+                        let rows = vt.grid().rows();
+                        // 16 M output pixels (~64 MB RGBA, ~4000x4000 px).
+                        let pixel_count = (cols as u64)
+                            .saturating_mul(cw as u64)
+                            .saturating_mul(rows as u64)
+                            .saturating_mul(ch as u64);
+                        const MAX_PIXELS: u64 = 16_000_000;
+                        if pixel_count > MAX_PIXELS {
+                            return Err(shux_rpc::RpcError::invalid_params(&format!(
+                                "snapshot would be {pixel_count} pixels — exceeds cap of \
+                            {MAX_PIXELS}; resize the pane first via pane.set_size"
+                            )));
+                        }
+                        let cur = vt.cursor();
+                        let cursor_pos = cur.visible.then_some((cur.row, cur.col));
+                        // Visible-only clone — does NOT copy scrollback.
+                        let grid_clone = vt.grid().clone_visible();
+                        (grid_clone, cursor_pos, cols, rows)
+                    };
 
-                Ok(serde_json::json!({
-                    "pane_id": pane_id.to_string(),
-                    "png_base64": b64,
-                    "width": img.width(),
-                    "height": img.height(),
-                    "cell_width": cw,
-                    "cell_height": ch,
-                    "cols": snap_cols,
-                    "rows": snap_rows,
-                    "format": "png",
-                }))
-            }
-        })
-        .register(
+                    // Rasterize + PNG-encode off the runtime worker. Both are
+                    // pure-CPU and don't yield, so we route them to a blocking
+                    // worker that won't starve other RPC handlers.
+                    let (img, png_buf) = tokio::task::spawn_blocking(move || {
+                        let opts = shux_raster::RasterOptions {
+                            cursor: cursor_pos,
+                            ..Default::default()
+                        };
+                        let img = r.render(&grid_snapshot, &opts);
+                        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+                        {
+                            use image::ImageEncoder;
+                            let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+                            encoder
+                                .write_image(
+                                    img.as_raw(),
+                                    img.width(),
+                                    img.height(),
+                                    image::ExtendedColorType::Rgba8,
+                                )
+                                .map_err(|e| format!("PNG encode failed: {e}"))?;
+                        }
+                        Ok::<_, String>((img, buf))
+                    })
+                    .await
+                    .map_err(|e| shux_rpc::RpcError::internal(&format!("rasterize join: {e}")))?
+                    .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id.to_string(),
+                        "png_base64": b64,
+                        "width": img.width(),
+                        "height": img.height(),
+                        "cell_width": cw,
+                        "cell_height": ch,
+                        "cols": snap_cols,
+                        "rows": snap_rows,
+                        "format": "png",
+                    }))
+                }
+            },
+        )
+        .register_with_policy(
             "window.snapshot",
+            Policy::fixed(Sensitivity::ContentRead),
             move |params: Option<serde_json::Value>| {
                 let gh = g8.clone();
                 let io = io8.clone();
@@ -3159,8 +3346,9 @@ fn register_pane_io_methods(
                 }
             },
         )
-        .register(
+        .register_with_policy(
             "session.snapshot",
+            Policy::fixed(Sensitivity::ContentRead),
             move |params: Option<serde_json::Value>| {
                 let gh = g9.clone();
                 let io = io9.clone();
@@ -3188,66 +3376,72 @@ fn register_pane_io_methods(
                 }
             },
         )
-        .register("pane.set_size", move |params: Option<serde_json::Value>| {
-            let gh = g7.clone();
-            let io = io7.clone();
-            async move {
-                let params = params.unwrap_or_default();
-                let pane_id = resolve_pane_id_from_params(&gh, &params)?;
-                // Validate in u64-space BEFORE narrowing — `as u16` silently
-                // wraps `cols=66536` to 1000 and lets it through (codex
-                // review). Sanity bounds: 4..=1000 cols, 2..=1000 rows.
-                let cols_u64 = params
-                    .get("cols")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'cols'"))?;
-                let rows_u64 = params
-                    .get("rows")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'rows'"))?;
-                if !(4..=1000).contains(&cols_u64) || !(2..=1000).contains(&rows_u64) {
-                    return Err(shux_rpc::RpcError::invalid_params(&format!(
-                        "rows/cols out of range (got rows={rows_u64} cols={cols_u64}; \
+        .register_with_policy(
+            "pane.set_size",
+            Policy::fixed(Sensitivity::OwnedMutation),
+            move |params: Option<serde_json::Value>| {
+                let gh = g7.clone();
+                let io = io7.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                    // Validate in u64-space BEFORE narrowing — `as u16` silently
+                    // wraps `cols=66536` to 1000 and lets it through (codex
+                    // review). Sanity bounds: 4..=1000 cols, 2..=1000 rows.
+                    let cols_u64 = params
+                        .get("cols")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'cols'"))?;
+                    let rows_u64 = params
+                        .get("rows")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| shux_rpc::RpcError::invalid_params("missing 'rows'"))?;
+                    if !(4..=1000).contains(&cols_u64) || !(2..=1000).contains(&rows_u64) {
+                        return Err(shux_rpc::RpcError::invalid_params(&format!(
+                            "rows/cols out of range (got rows={rows_u64} cols={cols_u64}; \
                         valid: 4..=1000 cols, 2..=1000 rows)"
-                    )));
-                }
-                let cols = cols_u64 as u16;
-                let rows = rows_u64 as u16;
-                let pty_size = shux_pty::handle::PtySize { rows, cols };
+                        )));
+                    }
+                    let cols = cols_u64 as u16;
+                    let rows = rows_u64 as u16;
+                    let pty_size = shux_pty::handle::PtySize { rows, cols };
 
-                // Construct a oneshot ack and await it (with a short timeout
-                // so a deadlocked PTY task can't hang the RPC). Synchronous
-                // semantics: when this RPC returns Ok, `vt.grid().cols/rows`
-                // already reflect the new size and a follow-up pane.snapshot
-                // will capture at the requested resolution.
-                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
-                let resizer = {
-                    let state = io.lock().await;
-                    state.resizers.get(&pane_id).cloned()
-                };
-                let resizer = resizer.ok_or_else(|| {
-                    shux_rpc::RpcError::not_found("pane resizer", &pane_id.to_string())
-                })?;
-                resizer
-                    .send(ResizeRequest {
-                        size: pty_size,
-                        ack: Some(ack_tx),
-                    })
-                    .await
-                    .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
-                tokio::time::timeout(std::time::Duration::from_secs(2), ack_rx)
-                    .await
-                    .map_err(|_| {
-                        shux_rpc::RpcError::internal("pane resize ack timed out after 2s")
-                    })?
-                    .map_err(|_| shux_rpc::RpcError::internal("pane resize ack channel dropped"))?;
-                Ok(serde_json::json!({
-                    "pane_id": pane_id.to_string(),
-                    "rows": rows,
-                    "cols": cols,
-                }))
-            }
-        })
+                    // Construct a oneshot ack and await it (with a short timeout
+                    // so a deadlocked PTY task can't hang the RPC). Synchronous
+                    // semantics: when this RPC returns Ok, `vt.grid().cols/rows`
+                    // already reflect the new size and a follow-up pane.snapshot
+                    // will capture at the requested resolution.
+                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+                    let resizer = {
+                        let state = io.lock().await;
+                        state.resizers.get(&pane_id).cloned()
+                    };
+                    let resizer = resizer.ok_or_else(|| {
+                        shux_rpc::RpcError::not_found("pane resizer", &pane_id.to_string())
+                    })?;
+                    resizer
+                        .send(ResizeRequest {
+                            size: pty_size,
+                            ack: Some(ack_tx),
+                        })
+                        .await
+                        .map_err(|_| shux_rpc::RpcError::internal("pane resize channel closed"))?;
+                    tokio::time::timeout(std::time::Duration::from_secs(2), ack_rx)
+                        .await
+                        .map_err(|_| {
+                            shux_rpc::RpcError::internal("pane resize ack timed out after 2s")
+                        })?
+                        .map_err(|_| {
+                            shux_rpc::RpcError::internal("pane resize ack channel dropped")
+                        })?;
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id.to_string(),
+                        "rows": rows,
+                        "cols": cols,
+                    }))
+                }
+            },
+        )
 }
 
 /// Decide which session `shux` (no args) should attach to.
@@ -3896,6 +4090,44 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 }
                 cli::PluginCommand::Reload { name } => {
                     cli::handle_plugin_reload(&mut stream, &name, args.format).await
+                }
+                cli::PluginCommand::Grant {
+                    plugin,
+                    method,
+                    target,
+                    subscribe,
+                } => {
+                    cli::handle_plugin_grant(
+                        &mut stream,
+                        &plugin,
+                        &method,
+                        target.as_deref(),
+                        subscribe,
+                        args.format,
+                    )
+                    .await
+                }
+                cli::PluginCommand::Revoke {
+                    plugin,
+                    method,
+                    target,
+                    subscribe,
+                } => {
+                    cli::handle_plugin_revoke(
+                        &mut stream,
+                        &plugin,
+                        &method,
+                        target.as_deref(),
+                        subscribe,
+                        args.format,
+                    )
+                    .await
+                }
+                cli::PluginCommand::Grants { plugin } => {
+                    cli::handle_plugin_grants(&mut stream, &plugin, args.format).await
+                }
+                cli::PluginCommand::Audit { plugin, tail } => {
+                    cli::handle_plugin_audit(&mut stream, &plugin, tail, args.format).await
                 }
             }
         }
