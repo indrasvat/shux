@@ -1,3 +1,10 @@
+# [0.19.0](https://github.com/indrasvat/shux/compare/v0.18.0...v0.19.0) (2026-05-13)
+
+
+### Features
+
+* **plugin:** plugin.state.{get,set,delete} — persisted, survives hot reload ([#32](https://github.com/indrasvat/shux/issues/32)) ([df62790](https://github.com/indrasvat/shux/commit/df62790ad4d4221ac0038cca563a6ecad6359c61))
+
 # [0.18.0](https://github.com/indrasvat/shux/compare/v0.17.0...v0.18.0) (2026-05-13)
 
 
