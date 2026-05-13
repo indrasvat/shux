@@ -1,3 +1,10 @@
+# [0.17.0](https://github.com/indrasvat/shux/compare/v0.16.1...v0.17.0) (2026-05-13)
+
+
+### Features
+
+* **pages:** ship favicon + correct stale 'hot reload queued for later' claim ([#30](https://github.com/indrasvat/shux/issues/30)) ([c8c03c9](https://github.com/indrasvat/shux/commit/c8c03c9ac52b578717a0836ccf50f62913510a88)), closes [#23](https://github.com/indrasvat/shux/issues/23)
+
 ## [0.16.1](https://github.com/indrasvat/shux/compare/v0.16.0...v0.16.1) (2026-05-13)
 
 
