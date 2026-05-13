@@ -186,6 +186,8 @@
 }
 .code-panel .annot h3 { margin-bottom: var(--s-2); }
 .code-panel .annot p { color: var(--ink2-on-paper); margin: 0 0 var(--s-3); font-size: 14.5px; }
+/* Dark-section override — defaults above target paper sections (#agents). */
+.section:not(.invert) .code-panel .annot p { color: var(--ink-2); }
 
 .kv-list { list-style: none; padding: 0; margin: var(--s-4) 0 0; font-size: 13px; }
 .kv-list li {
@@ -195,6 +197,11 @@
 .kv-list li:first-child { border-top: 0; padding-top: 0; }
 .kv-list .k { flex: 0 0 36%; color: var(--ink2-on-paper); font-family: var(--font-mono); font-size: 12px; opacity: 0.75; }
 .kv-list .v { color: var(--ink-on-paper); }
+/* Dark-section overrides — same component reused inside #plugins on
+   the dark theme; flip key/value/divider tokens to dark-friendly ones. */
+.section:not(.invert) .kv-list li { border-top-color: var(--line); }
+.section:not(.invert) .kv-list .k { color: var(--ink-3); opacity: 1; }
+.section:not(.invert) .kv-list .v { color: var(--ink); }
 
 /* ── Comparison: shux vs tmux ── */
 .versus {
@@ -303,6 +310,9 @@
   color: var(--ink2-on-paper); letter-spacing: 0.05em; opacity: 0.7;
 }
 .target::before { content: "▸"; color: var(--accent); opacity: 1; }
+/* Dark-section override — also used in #plugins (`.target`
+   "trust model" footnote) where the paper colour is invisible. */
+.section:not(.invert) .target { color: var(--ink-3); opacity: 1; }
 
 /* ── Quickstart snapshot proof — code on the left, real PNG on the right. ── */
 .snap-proof {
@@ -430,9 +440,15 @@
 }
 .gallery-panel {
   display: none; margin: 0;
-  width: 100%;
+  width: 100%; height: 100%;
+  flex-direction: column;
+  background: var(--bg-2);
 }
-.gallery-panel.is-active { display: block; }
+.gallery-panel.is-active { display: flex; }
+/* Wide-and-short images (e.g. the 3-up agent montage) leave the
+   stage bg showing through underneath; let the figcaption flex-grow
+   into that gap so the panel paints uniformly. */
+.gallery-panel figcaption { flex: 1 1 auto; }
 .gallery-panel .zoom-link {
   display: block; position: relative; line-height: 0;
   border: 0; cursor: zoom-in;
@@ -909,7 +925,7 @@ command = ["lazygit"]
 <section class="section">
   <div class="wrap">
     <p class="eyebrow">in the wild</p>
-    <h2 class="measure">Eight tabs. Real <code>pane.snapshot</code> outputs, no mockups.</h2>
+    <h2 class="measure">Nine tabs. Real <code>pane.snapshot</code> outputs, no mockups.</h2>
     <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
       No mockups. No "rendered in After Effects". Pick a tab to see
       what shux's rasterizer produces when an agent drives a real TUI.
@@ -919,40 +935,45 @@ command = ["lazygit"]
       <div class="gallery-tabs" role="tablist" aria-label="shux gallery">
         <button role="tab" class="gallery-tab is-active" data-i="0" aria-selected="true">
           <span class="g-dot live"></span>
-          <span class="g-name">Three agents, one rasterizer</span>
-          <span class="g-meta">claude · codex · opencode</span>
+          <span class="g-name">Three agents, one window</span>
+          <span class="g-meta">split panes · per-pane titles · status bar</span>
         </button>
         <button role="tab" class="gallery-tab" data-i="1" aria-selected="false">
+          <span class="g-dot"></span>
+          <span class="g-name">Plugin hot reload</span>
+          <span class="g-meta">edit · save · live in &lt;500ms</span>
+        </button>
+        <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Agent driving a TUI</span>
           <span class="g-meta">animated · 7 frames</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="2" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Multi-pane workspace</span>
           <span class="g-meta">animated · 5 frames · tmux-style</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="3" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Inside <code>shux attach</code></span>
           <span class="g-meta">status bar + borders · live</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="4" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Syntax-highlighted source</span>
           <span class="g-meta">bat · rust</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="5" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="6" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Self-documenting CLI</span>
           <span class="g-meta">shux --help</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="6" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="7" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Agent drives a REPL</span>
           <span class="g-meta">python3 · pyrepl</span>
         </button>
-        <button role="tab" class="gallery-tab" data-i="7" aria-selected="false">
+        <button role="tab" class="gallery-tab" data-i="8" aria-selected="false">
           <span class="g-dot"></span>
           <span class="g-name">Pixel + attribute coverage</span>
           <span class="g-meta">shux-raster</span>
@@ -962,123 +983,125 @@ command = ["lazygit"]
       <div class="gallery-stage">
         <figure class="gallery-panel is-active" data-i="0" role="tabpanel">
           <a class="zoom-link" href="/screenshots/multi-agent.png" rel="noopener" aria-label="open image at full size in a new tab">
-            <img src="/screenshots/multi-agent.png" alt="Three real pane.snapshot frames stitched horizontally — Claude Code v2.1.139 with the prompt 'Refactor this Rust Fibonacci impl for clarity'; OpenAI Codex v0.130.0 showing model line, a /fast tip, and a hooks-review notice with 'Find the memory leak in this Node.js worker' queued; opencode's big block-letter splash with 'Audit this Python for thread-safety risks' and a live MCP indicator. All three rendered by the same shux-raster." width="2514" height="627" loading="lazy">
+            <img src="/screenshots/multi-agent.png" alt="One shux window with three real agent CLIs running side-by-side as split panes: Claude Code on the left with the prompt 'Refactor this Rust Fibonacci impl for clarity' typed into its input box; OpenAI Codex in the middle with 'Find the memory leak in this Node.js worker' queued; opencode on the right with 'Audit this Python for thread-safety risks' staged. Each pane has its own title overlay (claude · refactor / codex · find leak / opencode · audit) and shux's three-zone status bar runs across the bottom (session name · window indicator · clock). One composed window.snapshot, no stitching." width="1980" height="950" loading="lazy">
           </a>
           <figcaption>
-            <b>One rasterizer. Three of the agents you actually use.</b>
-            Claude Code, OpenAI Codex, and opencode each spawned in a
-            fresh ephemeral cwd via <code>shux session create</code>,
-            a demo prompt typed in via <code>pane.send_keys</code>, then
-            snapshotted with <code>shux snapshot</code>. The trust dialog
-            on Codex was dismissed with a raw <code>\r</code> over the
-            same RPC — no terminal emulator in the loop, no screen
-            scraping, no fragile <code>expect</code>. Stitched into one
-            PNG with <code>magick montage</code> for the gallery; each
-            frame is a real <code>pane.snapshot</code> on its own. This
-            is the surface area an agent harness gets: spawn any TUI
-            agent, drive it like a UI, get pixels back.
+            <b>Three agent CLIs, one shux window.</b>
+            One <code>state.apply</code> spawns claude · codex · opencode
+            into three vertical splits; <code>pane.send_keys</code> types
+            each prompt; <code>pane.set_title</code> pins the per-pane
+            label. The whole frame — borders, title overlays, status
+            bar — comes back as a single <code>window.snapshot</code>.
+            No terminal emulator, no screen scraping, no stitching.
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="1" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/anim-lazygit-drive.png" rel="noopener" aria-label="open image at full size in a new tab">
-            <img src="/screenshots/anim-lazygit-drive.png" alt="7-frame animated replay of an agent driving lazygit: opening view → commits log → diff of one commit → branches → remotes → help overlay → back to files. Pointed at a freshly-cloned charmbracelet/bubbletea repo." width="880" height="520" loading="lazy">
+          <a class="zoom-link" href="/screenshots/plugin-hot-reload.png" rel="noopener" aria-label="open image at full size in a new tab">
+            <img src="/screenshots/plugin-hot-reload.png" alt="Three-section terminal scrollback inside one shux pane: BEFORE shows shux window list -s hr-target with one window 'demo·1' (renamed by the hello plugin); EDIT shows a sed -i swap of demo· to hot· in examples/plugins/hello/plugin.sh and a 'daemon log: watcher fired → plugin respawned' note; AFTER creates a new window which the just-respawned plugin renames to 'hot·1'. shux's three-zone status bar at the bottom shows the snapshot session 'hr-shoot · hot-reload'." width="864" height="798" loading="lazy">
           </a>
           <figcaption>
-            <b>One scenario, scripted entirely through JSON-RPC.</b>
-            <code>shux session create</code> spawns
-            <code>lazygit</code> in a freshly-cloned public repo. Then
-            navigate the commit log, open a diff with <kbd>Enter</kbd>,
-            press <kbd>?</kbd> for the help overlay, cycle panels with
-            number keys — each input is a <code>pane.send_keys</code>
-            call, each frame is a real <code>pane.snapshot</code>. No
-            mockup, no recording trickery. This is the asciinema-with-
-            pixels record you get for free with shux.
+            <b>Edit a plugin, save, see new code in &lt;500ms.</b>
+            <code>shux plugin install</code> watches the source by
+            default. A <code>sed</code> swap of <code>demo·</code> →
+            <code>hot·</code> in the running plugin triggers FSEvents
+            (<code>~250ms</code> debounce) → plugin respawn. The very
+            next <code>window.create</code> goes through the new code,
+            tagged <code>hot·1</code>. Same daemon, same session, no
+            reconnect.
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="2" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/anim-multipane.png" rel="noopener" aria-label="open image at full size in a new tab">
-          <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy"></a>
+          <a class="zoom-link" href="/screenshots/anim-lazygit-drive.png" rel="noopener" aria-label="open image at full size in a new tab">
+            <img src="/screenshots/anim-lazygit-drive.png" alt="7-frame animated replay of an agent driving lazygit: opening view → commits log → diff of one commit → branches → remotes → help overlay → back to files. Pointed at a freshly-cloned charmbracelet/bubbletea repo." width="880" height="520" loading="lazy">
+          </a>
           <figcaption>
-            <b>One <code>shux state apply</code> spawns a 4-pane workspace</b> —
-            <code>bat</code> on the editor, <code>cargo nextest</code> running tests,
-            <code>shux --help</code> on the reference pane, a clock + git-log loop on
-            the watch pane. The replay then sends arrow-down keystrokes
-            (<code>pane.send_keys</code>), resizes the tests pane
-            (<code>pane.set_size</code>, synchronous), and swaps the editor and tests
-            quadrants (<code>pane.swap</code>) — the same verbs as
-            <code>tmux send-keys</code>, <code>tmux resize-pane</code>,
-            <code>tmux swap-pane</code>, but typed.<br><br>
-            <span class="muted">Run <code>shux session attach</code> on the same session and
-            you get the interactive multiplexer view — focus-highlighted borders, a
-            three-zone status bar (session · window · clock), mouse-aware pane focus,
-            and Alt+h/j/k/l keyboard navigation. The headless RPC primitives you see
-            here are the <i>same</i> primitives that drive the attached client.</span>
+            <b>An agent driving lazygit, scripted over JSON-RPC.</b>
+            Navigate the commit log, open a diff with <kbd>Enter</kbd>,
+            <kbd>?</kbd> for help, number keys to cycle panels. Each
+            input is a <code>pane.send_keys</code>; each of the 7 frames
+            is a real <code>pane.snapshot</code>. Asciinema with pixels
+            instead of escape sequences.
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="3" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/statusbar-demo.png" rel="noopener" aria-label="open image at full size">
-            <img src="/screenshots/statusbar-demo.png" alt="shux attached to a 2-pane session named 'demo' showing lazygit (left) and bat rendering bubbletea's README (right), with focus-highlighted borders and shux's own three-zone status bar at the bottom" width="1620" height="912" loading="lazy">
-          </a>
+          <a class="zoom-link" href="/screenshots/anim-multipane.png" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/anim-multipane.png" alt="4-pane shux workspace running bat, cargo nextest, shux --help, and a clock+git-log loop. 5 frames cycle through: initial spawn → settled → arrow-down sent to editor → tests pane resized → editor and tests swapped" width="950" height="618" loading="lazy"></a>
           <figcaption>
-            <b>shux running shux.</b> The outer pane is a <code>pane.snapshot</code> of
-            an attached client running <code>shux session attach demo</code> against a
-            separate 2-pane session. What you see — focus-highlighted borders, the
-            <code>demo · 11/11 · ?</code> status bar across the bottom, the per-pane
-            title overlays — is shux's own <code>RenderCompositor</code> output.
-            Mouse-click events on the attached client move focus between panes;
-            Alt+h/j/k/l navigates by direction; <kbd>Ctrl+Space</kbd> is the prefix.
-            All of this works in any modern terminal emulator — and produces this
-            exact PNG without one.
+            <b>One <code>state.apply</code> spawns a 4-pane workspace.</b>
+            <code>bat</code> · <code>cargo nextest</code> ·
+            <code>shux --help</code> · clock+git-log loop. Then 5 frames:
+            arrow-down via <code>pane.send_keys</code>, resize via
+            <code>pane.set_size</code>, swap quadrants via
+            <code>pane.swap</code>. Same verbs as
+            <code>tmux send-keys</code> / <code>resize-pane</code> /
+            <code>swap-pane</code> — typed, sync, JSON-shaped.
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="4" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/08-bat.png" rel="noopener" aria-label="open image at full size">
-          <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy"></a>
+          <a class="zoom-link" href="/screenshots/statusbar-demo.png" rel="noopener" aria-label="open image at full size">
+            <img src="/screenshots/statusbar-demo.png" alt="shux attached to a 2-pane session named 'demo' showing lazygit (left) and bat rendering bubbletea's README (right), with focus-highlighted borders and shux's own three-zone status bar at the bottom" width="1620" height="912" loading="lazy">
+          </a>
           <figcaption>
-            <b><code>bat crates/shux-raster/src/lib.rs</code></b> — Rust syntax
-            highlighting, line numbers, TwoDark palette. Every colour in the source
-            survives the round-trip through shux-vt's SGR parser and shux-raster's
-            glyph emitter. No re-rendering, no theme remap.
+            <b>shux running shux.</b> A <code>pane.snapshot</code> of
+            one client running <code>shux session attach</code> against
+            a 2-pane session. Borders, the
+            <code>demo · 11/11 · ?</code> status bar, per-pane title
+            overlays — all <code>RenderCompositor</code> output.
+            Mouse-click moves focus, <kbd>Alt+hjkl</kbd> navigates,
+            <kbd>Ctrl+Space</kbd> is the prefix. This PNG was produced
+            without a terminal emulator.
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="5" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/09-help.png" rel="noopener" aria-label="open image at full size in a new tab">
-          <img src="/screenshots/09-help.png" alt="shux --help rendered in shux's brand colours — terracotta banner, terracotta shux brand token, bold section header, dim bullets listing the four core features, green Usage and Commands headers, green subcommand verbs" width="1080" height="684" loading="lazy"></a>
+          <a class="zoom-link" href="/screenshots/08-bat.png" rel="noopener" aria-label="open image at full size">
+          <img src="/screenshots/08-bat.png" alt="bat rendering shux-raster's lib.rs test module — Rust syntax highlighting with line numbers and a soft TwoDark palette" width="1620" height="912" loading="lazy"></a>
           <figcaption>
-            <b><code>shux --help</code></b> — the long-form help is a paste-able agent
-            reference: every CLI verb mapped to its RPC method, a 3-call workflow, the
-            replaces-these-tools list, and cross-links. Captured here straight from the
-            CLI, rendered by the same rasterizer that snapshotted the splash above.
+            <b><code>bat crates/shux-raster/src/lib.rs</code></b> in a
+            shux pane. Every TwoDark colour survives the round-trip
+            through <code>shux-vt</code>'s SGR parser and
+            <code>shux-raster</code>'s glyph emitter — no re-render, no
+            theme remap.
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="6" role="tabpanel" hidden>
-          <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
-          <img src="/screenshots/05-tests.png" alt="A Python 3.13 REPL session with PyREPL syntax highlighting, showing an agent progressively driving the REPL through computations: importing math/statistics, computing roots, fitting a tiny dataset, defining a primes lambda, and inspecting the result list" width="1620" height="912" loading="lazy"></a>
+          <a class="zoom-link" href="/screenshots/09-help.png" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/09-help.png" alt="shux --help rendered in shux's brand colours — terracotta banner, terracotta shux brand token, bold section header, dim bullets listing the four core features, green Usage and Commands headers, green subcommand verbs" width="1080" height="684" loading="lazy"></a>
           <figcaption>
-            <b>An agent driving Python's REPL</b> end-to-end — <code>pane.send_keys</code>
-            to type each statement, <code>pane.wait_for</code> to block on the response,
-            <code>pane.capture</code> to pull the result back for the next step. This is
-            the replacement for <code>expect</code> / <code>pexpect</code> / iTerm2
-            <code>wait_for_text</code>: a typed contract instead of timing assumptions.
-            PyREPL 3.13's native syntax highlighting comes for free.
+            <b><code>shux --help</code></b> — paste-able agent reference.
+            Every CLI verb maps to its RPC method, a 3-call workflow,
+            and a replaces-these-tools table. Same rasterizer that
+            snapshotted everything above.
           </figcaption>
         </figure>
 
         <figure class="gallery-panel" data-i="7" role="tabpanel" hidden>
+          <a class="zoom-link" href="/screenshots/05-tests.png" rel="noopener" aria-label="open image at full size in a new tab">
+          <img src="/screenshots/05-tests.png" alt="A Python 3.13 REPL session with PyREPL syntax highlighting, showing an agent progressively driving the REPL through computations: importing math/statistics, computing roots, fitting a tiny dataset, defining a primes lambda, and inspecting the result list" width="1620" height="912" loading="lazy"></a>
+          <figcaption>
+            <b>An agent driving Python's REPL.</b>
+            <code>pane.send_keys</code> types each statement,
+            <code>pane.wait_for</code> blocks on the response,
+            <code>pane.capture</code> pulls the result back. Replaces
+            <code>expect</code> / <code>pexpect</code> / iTerm2
+            <code>wait_for_text</code>. PyREPL 3.13 highlighting is free.
+          </figcaption>
+        </figure>
+
+        <figure class="gallery-panel" data-i="8" role="tabpanel" hidden>
           <a class="zoom-link" href="/screenshots/06-raster-hello.png" rel="noopener" aria-label="open image at full size in a new tab">
           <img src="/screenshots/06-raster-hello.png" alt="shux-raster attribute showcase: bold, dim, inverse, underline, strikethrough; 256-color palette ramp; truecolor RGB blocks; bottom-left cursor as an inverse cell" width="720" height="440" loading="lazy"></a>
           <figcaption>
-            <b>shux-raster's hello banner.</b> Bold, dim, inverse, underline,
-            strikethrough. ANSI 16, the 256-cube, truecolor RGB. Cursor rendered as an
-            inverse cell. JetBrains Mono Regular bundled and rasterized in pure Rust
-            via <code>fontdue</code>. No terminal emulator was involved in producing
-            this PNG.
+            <b>shux-raster's hello banner.</b> Bold · dim · inverse ·
+            underline · strikethrough. ANSI 16, 256-cube, truecolor RGB.
+            Cursor as an inverse cell. JetBrains Mono Regular bundled
+            and rasterized in pure Rust via <code>fontdue</code>. No
+            terminal emulator in the loop.
           </figcaption>
         </figure>
       </div>
@@ -1202,15 +1225,15 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
     </p>
 
     <div class="code-panel">
-      <pre><code><span style="color:var(--ink2-on-paper)"># Install, list, kill — the whole CLI surface for v0.</span>
-<span style="color:var(--accent)">$ shux plugin install ./my-plugin.sh</span>
-<span style="color:var(--ink2-on-paper)"># → spawned, handshook (5s budget), registered under manifest name</span>
+      <pre><code><span style="color:var(--ink-3)"># Install, list, kill — the whole CLI surface for v0.</span>
+<span style="color:var(--accent-ink)">$ shux plugin install ./my-plugin.sh</span>
+<span style="color:var(--ink-3)"># → spawned, handshook (5s budget), registered under manifest name</span>
 
-<span style="color:var(--accent)">$ shux plugin list</span>
-<span style="color:var(--ink2-on-paper)"># name · version · pid · subscribes · status · uptime</span>
+<span style="color:var(--accent-ink)">$ shux plugin list</span>
+<span style="color:var(--ink-3)"># name · version · pid · subscribes · status · uptime</span>
 
-<span style="color:var(--accent)">$ shux plugin kill hello</span>
-<span style="color:var(--ink2-on-paper)"># → plugin.shutdown sent, 2s graceful window, SIGKILL fallback</span></code></pre>
+<span style="color:var(--accent-ink)">$ shux plugin kill hello</span>
+<span style="color:var(--ink-3)"># → plugin.shutdown sent, 2s graceful window, SIGKILL fallback</span></code></pre>
 
       <div class="annot">
         <h3>The protocol, in four lines</h3>
@@ -1220,9 +1243,10 @@ curl -sSf <a href="https://shux.pages.dev/install">https://shux.pages.dev/instal
           <li><span class="k">rpc out</span><span class="v">write any registered method to stdout, response comes back on stdin</span></li>
           <li><span class="k">shutdown</span><span class="v">plugin.shutdown frame, 2 s grace, then SIGKILL</span></li>
         </ul>
-        <p class="target" style="margin-top:var(--s-4)">
-          Same trust model as a shell function — no sandbox in v0.
-          Hot reload, sandboxing, and WASM all queued for later.
+        <p style="margin-top:var(--s-4); color:var(--ink-2); font-size:13.5px; line-height:1.55;">
+          <span class="target" style="margin-right:6px;">trust model</span>
+          Same as a shell function — no sandbox in v0. Hot reload,
+          sandboxing, and WASM all queued for later.
         </p>
         <div class="hero-cta" style="margin-top:var(--s-5)">
           <a class="btn primary" href="https://github.com/indrasvat/shux/blob/main/examples/plugins/hello/plugin.sh">The 30-line example</a>

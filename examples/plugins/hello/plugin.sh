@@ -1,44 +1,51 @@
 #!/usr/bin/env bash
-# shux-hello — reference process plugin (task 044a, phase 0).
+# shux-hello — reference process plugin (~50 lines, zero deps).
 #
-# A ~30-line POSIX shell plugin that:
-#   1. Performs the JSON-RPC handshake (reads plugin.init from stdin,
-#      writes its manifest to stdout).
-#   2. Subscribes to session.created events.
-#   3. For every new session, sends an `echo` line via pane.send_keys
-#      so you can see the plugin's footprint in the session's pane.
+# Demonstrates BOTH plugin reaction patterns:
+#   1. PTY output     — on session.created, type a tiny tour into the
+#                       new session's first pane via pane.send_keys.
+#   2. State mutation — on every new window, rename it to `demo·N`
+#                       so the plugin's footprint shows up in the
+#                       window list / status bar.
 #
-# Zero runtime dependencies beyond bash + sed. The protocol is
-# documented in docs/tasks/044a-process-plugins-v0.md.
+# Protocol: docs/tasks/044a-process-plugins-v0.md
+# Hot-reload safe: edit + save, daemon respawns within 500ms.
 
 set -u
 
-# Handshake: wait for plugin.init from the daemon, then emit our
-# manifest. The id MUST echo "init" back — v0 only sends one init.
+# Phase 1 — handshake. Daemon writes plugin.init within 5s; we MUST
+# reply with the manifest within the same budget. Long init goes
+# AFTER the manifest, never before.
 IFS= read -r _ || exit 1
-printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"hello","version":"0.1.0","subscribes":["session.created"],"provides":[],"capabilities":[]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"hello","version":"0.2.0","subscribes":["session.created","window.created"],"provides":[],"capabilities":[]}}'
 
-# Main loop: one JSON frame per line on stdin. Plugin→daemon RPC
-# requests are written to stdout with a unique id; the daemon writes
-# responses back as additional lines on stdin.
+# Phase 2 — main loop. One JSON frame per stdin line. Plugin→daemon
+# RPC requests are written to stdout with a unique id.
 rpc_id=1000
+window_seq=0
+
 while IFS= read -r line; do
   case "$line" in
     *'"plugin.shutdown"'*)
       exit 0
       ;;
     *'"session.created"'*)
-      # pane.send_keys requires a UUID identifier (session_id /
-      # window_id / pane_id), not a human name. The event payload
-      # carries `session_id` — use that directly.
+      # session.created carries `session_id` in its payload (UUIDs,
+      # not human names — that's what the RPC layer expects).
       sid=$(printf '%s' "$line" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' | head -1)
       [ -n "$sid" ] || continue
       rpc_id=$((rpc_id + 1))
-      # Give the daemon a beat to attach the initial pane's PTY
-      # before we type into it. A real plugin would subscribe to a
-      # pane.spawned event instead.
-      sleep 0.5
-      printf '{"jsonrpc":"2.0","method":"pane.send_keys","params":{"session_id":"%s","text":"echo from shux-hello\n"},"id":%d}\n' "$sid" "$rpc_id"
+      sleep 0.5  # let the initial pane's PTY finish attaching
+      printf '{"jsonrpc":"2.0","method":"pane.send_keys","params":{"session_id":"%s","text":"echo \\"\\xf0\\x9f\\x91\\x8b shux: Ctrl+Space c (window) | %% (vsplit) | shux plugin list (here)\\"\n"},"id":%d}\n' "$sid" "$rpc_id"
+      ;;
+    *'"window.created"'*)
+      # window.created → rename via window.rename (graph mutation).
+      wid=$(printf '%s' "$line" | sed -n 's/.*"window_id":"\([^"]*\)".*/\1/p' | head -1)
+      [ -n "$wid" ] || continue
+      window_seq=$((window_seq + 1))
+      rpc_id=$((rpc_id + 1))
+      printf '{"jsonrpc":"2.0","method":"window.rename","params":{"id":"%s","name":"demo·%d"},"id":%d}\n' \
+        "$wid" "$window_seq" "$rpc_id"
       ;;
   esac
 done

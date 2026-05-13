@@ -1,0 +1,37 @@
+# Three real agent CLIs, side-by-side in one shux window — claude on
+# the left, codex in the middle, opencode on the right. Used by
+# .claude/automations/three_agent_split_shoot.sh to produce the
+# landing-page gallery's first tile (pages/screenshots/multi-agent.png).
+#
+# Layout reasoning: shux split ratios apply to the FIRST child of the
+# split, so to land on three equal columns we:
+#   • create pane 0 (full width)
+#   • split off pane 1 with ratio 0.333  → pane 0 = 33% L, pane 1 = 67% R
+#   • split off pane 2 from pane 1 with ratio 0.5 → pane 1 = 33% mid, pane 2 = 33% R
+# Apply with: shux state apply .shux/templates/three-agents.toml
+# Driver:     .claude/automations/three_agent_split_shoot.sh
+
+[session]
+name = "three-agents"
+
+[[windows]]
+title = "agents"
+
+# Pane 0 — claude (left third). IS_DEMO=1 strips email + org from the
+# splash. bash -lc so the env-prefix actually takes effect inside the
+# daemon-spawned PTY.
+[[windows.panes]]
+command = ["bash", "-lc", "IS_DEMO=1 exec claude"]
+
+# Pane 1 — codex (middle third). First-run trust dialog gets dismissed
+# by the driver script via pane.send_keys CR.
+[[windows.panes]]
+direction = "vertical"
+ratio = 0.333
+command = ["bash", "-lc", "exec codex"]
+
+# Pane 2 — opencode (right third).
+[[windows.panes]]
+direction = "vertical"
+ratio = 0.5
+command = ["bash", "-lc", "exec opencode"]
