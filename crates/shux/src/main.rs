@@ -3773,8 +3773,6 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     window,
                     pane,
                     output,
-                    cols,
-                    rows,
                 } => {
                     cli::handle_pane_snapshot(
                         &mut stream,
@@ -3782,8 +3780,6 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         window.as_deref(),
                         pane.as_deref(),
                         output,
-                        cols,
-                        rows,
                         args.format,
                     )
                     .await

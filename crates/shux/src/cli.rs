@@ -1146,6 +1146,11 @@ pub enum PaneCommand {
     ///
     /// One pane only — for the composed multi-pane window image
     /// (with borders + titles + status bar) use `shux window snapshot`.
+    ///
+    /// Snapshot dimensions come from the pane's CURRENT size, not
+    /// from flags here (`pane.snapshot` reads `vt.grid().cols/rows`).
+    /// Use `shux pane set-size --cols N --rows M` first if you need
+    /// the snapshot wider/taller.
     Snapshot {
         /// Session name
         #[arg(short, long)]
@@ -1159,12 +1164,6 @@ pub enum PaneCommand {
         /// Output PNG path. If omitted, base64 is printed to stdout.
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
-        /// Snapshot grid width in cells (4..=1000). Default: 120.
-        #[arg(long, default_value_t = 120)]
-        cols: u16,
-        /// Snapshot grid height in cells (2..=1000). Default: 36.
-        #[arg(long, default_value_t = 36)]
-        rows: u16,
     },
 
     /// Resize a pane's PTY + VT grid to absolute (cols, rows).
@@ -3047,18 +3046,14 @@ pub async fn handle_pane_run(
 
 /// Handle the `shux pane capture` command.
 /// `shux pane snapshot` — rasterize a single pane (no chrome) via
-/// `pane.snapshot` RPC. Same output shape as `window snapshot`.
-// Args mirror the user-facing CLI flags 1:1; collapsing them into a
-// struct just to placate clippy would hurt readability at no benefit.
-#[allow(clippy::too_many_arguments)]
+/// `pane.snapshot` RPC. Snapshot dimensions come from the pane's
+/// current VT grid size; use `pane.set_size` first to change them.
 pub async fn handle_pane_snapshot(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
     window_spec: Option<&str>,
     pane_spec: Option<&str>,
     output: Option<std::path::PathBuf>,
-    cols: u16,
-    rows: u16,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     use base64::Engine;
@@ -3067,8 +3062,6 @@ pub async fn handle_pane_snapshot(
     let mut params = serde_json::json!({
         "session_id": session_id,
         "window_id": window_id,
-        "cols": cols,
-        "rows": rows,
     });
     if let Some(pid) = pane_spec {
         params["pane_id"] = serde_json::Value::String(pid.to_string());

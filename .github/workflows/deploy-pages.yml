@@ -19,6 +19,11 @@ on:
     paths:
       - 'pages/**'
       - '.github/workflows/deploy-pages.yml'
+      # Now that this workflow copies the repo-root installer into
+      # `deploy/install.sh`, an install.sh change on main must redeploy
+      # Pages too — otherwise shux.pages.dev/install drifts from the
+      # canonical script (codex review on PR #27).
+      - 'install.sh'
   workflow_dispatch:
 
 permissions:
