@@ -19,6 +19,11 @@ on:
     paths:
       - 'pages/**'
       - '.github/workflows/deploy-pages.yml'
+      # Now that this workflow copies the repo-root installer into
+      # `deploy/install.sh`, an install.sh change on main must redeploy
+      # Pages too — otherwise shux.pages.dev/install drifts from the
+      # canonical script (codex review on PR #27).
+      - 'install.sh'
   workflow_dispatch:
 
 permissions:
@@ -79,41 +84,12 @@ jobs:
             echo "Stamped deploy/version.json for $latest ($TEST_COUNT tests)."
           fi
 
-          cat > deploy/install.sh <<'INSTALL'
-          #!/usr/bin/env sh
-          # shux installer — fetches the latest release binary for the
-          # detected platform from GitHub Releases.
-          set -eu
-          REPO="indrasvat/shux"
-          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-          arch="$(uname -m)"
-          case "$arch" in
-            x86_64|amd64) arch="x86_64" ;;
-            aarch64|arm64) arch="aarch64" ;;
-            *) echo "unsupported arch: $arch" >&2; exit 1 ;;
-          esac
-          case "$os" in
-            darwin) triple="${arch}-apple-darwin" ;;
-            linux)  triple="${arch}-unknown-linux-gnu" ;;
-            *) echo "unsupported os: $os" >&2; exit 1 ;;
-          esac
-          tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-                  | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-          [ -n "$tag" ] || { echo "no release tag found" >&2; exit 1; }
-          url="https://github.com/${REPO}/releases/download/${tag}/shux-${tag}-${triple}.tar.gz"
-          echo "Downloading shux ${tag} (${triple})..."
-          tmp="$(mktemp -d)"
-          curl -fL --progress-bar "$url" -o "${tmp}/shux.tar.gz"
-          tar -xzf "${tmp}/shux.tar.gz" -C "$tmp"
-          dest="${HOME}/.local/bin"
-          mkdir -p "$dest"
-          mv "${tmp}/shux" "${dest}/shux"
-          chmod +x "${dest}/shux"
-          rm -rf "$tmp"
-          echo "✓ Installed to ${dest}/shux"
-          echo "  Add ${dest} to your PATH if it isn't already."
-          "${dest}/shux" --version || true
-          INSTALL
+          # Ship the canonical, repo-root install.sh — single source of
+          # truth, exercised by the e2e suite. Issue #25 traced a
+          # Linux asset-name mismatch (`x86_64-unknown-linux-gnu` vs
+          # the actual `x86_64-linux`) to a previous inline shim that
+          # had drifted from the real installer's naming.
+          cp install.sh deploy/install.sh
           chmod +x deploy/install.sh
 
       - name: Stage CHANGELOG

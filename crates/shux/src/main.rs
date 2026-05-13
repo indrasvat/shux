@@ -3398,6 +3398,26 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     .unwrap_or_else(|| "default".to_string());
                 run_attach(&socket_path, session_name).await
             }
+            cli::SessionCommand::Snapshot {
+                session,
+                output,
+                cols,
+                rows,
+            } => {
+                let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+                // session.snapshot dispatch: (Some(session), None) → handle_snapshot
+                // routes to session.snapshot RPC.
+                cli::handle_snapshot(
+                    &mut stream,
+                    Some(&session),
+                    None,
+                    output,
+                    cols,
+                    rows,
+                    args.format,
+                )
+                .await
+            }
         },
 
         Some(Command::Window { command }) => {
@@ -3748,6 +3768,40 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     )
                     .await
                 }
+                PaneCommand::Snapshot {
+                    session,
+                    window,
+                    pane,
+                    output,
+                } => {
+                    cli::handle_pane_snapshot(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        output,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::SetSize {
+                    session,
+                    window,
+                    pane,
+                    cols,
+                    rows,
+                } => {
+                    cli::handle_pane_set_size(
+                        &mut stream,
+                        &session,
+                        window.as_deref(),
+                        pane.as_deref(),
+                        cols,
+                        rows,
+                        args.format,
+                    )
+                    .await
+                }
             }
         }
 
@@ -3799,8 +3853,10 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             cli::ConfigCommand::Init { force } => cli::handle_config_init(force),
             cli::ConfigCommand::Path => cli::handle_config_path(),
             cli::ConfigCommand::Show => cli::handle_config_show(),
-            cli::ConfigCommand::Validate { config } => {
-                let code = cli::handle_config_validate(config)?;
+            cli::ConfigCommand::Validate { path, config } => {
+                // Either positional or `--config` (mutually exclusive at the
+                // clap layer); fold to a single Option for the handler.
+                let code = cli::handle_config_validate(path.or(config))?;
                 std::process::exit(code);
             }
         },

@@ -564,6 +564,25 @@ pub enum SessionCommand {
         #[arg(short, long, conflicts_with = "name_pos")]
         session: Option<String>,
     },
+
+    /// Rasterize a session's active window to a composed PNG.
+    /// Mirrors `session.snapshot` RPC. Equivalent to
+    /// `shux window snapshot -s NAME` without `-w`, but namespaced
+    /// under `session` per the "RPC dots become CLI spaces" invariant.
+    Snapshot {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+        /// Output PNG path. If omitted, base64 is printed to stdout.
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+        /// Snapshot grid width in cells (4..=1000). Default: 120.
+        #[arg(long, default_value_t = 120)]
+        cols: u16,
+        /// Snapshot grid height in cells (2..=1000). Default: 36.
+        #[arg(long, default_value_t = 36)]
+        rows: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -582,7 +601,13 @@ pub enum ConfigCommand {
     /// Parse the user config (and every inline starship_config) and
     /// emit line:col diagnostics. Exit 0 = clean, 1 = at least one error.
     Validate {
-        /// Path to validate. Defaults to the user config path
+        /// Path to validate (positional). Same as `--config`. Defaults
+        /// to the user config path. Lets agent / CI flows validate a
+        /// staged config without writing to `~/.config/shux/config.toml`.
+        #[arg(value_name = "PATH", conflicts_with = "config")]
+        path: Option<std::path::PathBuf>,
+
+        /// Path to validate (flag form). Defaults to the user config path
         /// (`~/.config/shux/config.toml` or `$XDG_CONFIG_HOME/shux/config.toml`).
         #[arg(short, long)]
         config: Option<std::path::PathBuf>,
@@ -1117,19 +1142,73 @@ pub enum PaneCommand {
         lines: u64,
     },
 
+    /// Rasterize a pane to a PNG. Mirrors `pane.snapshot` RPC.
+    ///
+    /// One pane only — for the composed multi-pane window image
+    /// (with borders + titles + status bar) use `shux window snapshot`.
+    ///
+    /// Snapshot dimensions come from the pane's CURRENT size, not
+    /// from flags here (`pane.snapshot` reads `vt.grid().cols/rows`).
+    /// Use `shux pane set-size --cols N --rows M` first if you need
+    /// the snapshot wider/taller.
+    Snapshot {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+        /// Pane UUID (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+        /// Output PNG path. If omitted, base64 is printed to stdout.
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+
+    /// Resize a pane's PTY + VT grid to absolute (cols, rows).
+    /// Mirrors `pane.set_size` RPC. Synchronous — the next snapshot
+    /// sees the new dims. Use this BEFORE driving keystrokes when
+    /// you need the pane wider/taller than the daemon default.
+    #[command(name = "set-size")]
+    SetSize {
+        /// Session name
+        #[arg(short, long)]
+        session: String,
+        /// Window name or index (uses active window if not provided)
+        #[arg(short, long)]
+        window: Option<String>,
+        /// Pane UUID (uses active pane if not provided)
+        #[arg(short, long)]
+        pane: Option<String>,
+        /// New width in cells (4..=1000).
+        #[arg(long)]
+        cols: u16,
+        /// New height in cells (2..=1000).
+        #[arg(long)]
+        rows: u16,
+    },
+
     /// Block until a pane's captured text matches (or stops matching)
     /// a needle. Mirrors `pane.wait_for` RPC. Replaces the iTerm2
     /// `wait_for_text` / `wait_for_absent` pattern across TUIs.
+    ///
+    /// Default targeting: with --session only, the wait runs against
+    /// the session's *active pane* — typically the last-spawned pane
+    /// in a multi-pane window. For multi-pane templates, pass an
+    /// explicit `--pane <UUID>` (from `pane list` or `state.apply`'s
+    /// spawn_results) so the wait targets the right pane.
     #[command(name = "wait-for")]
     WaitFor {
         /// Session id-or-name. Combined with --window / --pane to
-        /// resolve a pane.
+        /// resolve a pane. With session alone, targets the active pane.
         #[arg(short, long)]
         session: Option<String>,
         /// Window id or index within the session.
         #[arg(short, long)]
         window: Option<String>,
-        /// Explicit pane id (UUID).
+        /// Explicit pane id (UUID). REQUIRED for multi-pane workspaces
+        /// — the active pane is rarely the one you want to wait on.
         #[arg(short, long)]
         pane: Option<String>,
         /// Plain-text needle. The pane's last N lines (see --lines) are
@@ -1167,31 +1246,56 @@ impl Cli {
     }
 }
 
-/// Format an RPC error, including detail from data if available.
+/// Format an RPC error for human display. Dispatch on the JSON-RPC
+/// CODE first — `version_conflict` (-32002) carries the same
+/// `id`+`resource` envelope as `not_found` (-32004), so a
+/// presence-of-fields heuristic mis-reports concurrency conflicts as
+/// "not found" (issue #25 §3).
 fn rpc_display(code: i64, message: &str, data: Option<&serde_json::Value>) -> String {
-    if let Some(data) = data {
-        // Try "detail" field (invalid_params, internal errors)
-        if let Some(detail) = data.get("detail").and_then(|v| v.as_str()) {
-            return detail.to_string();
+    let resource = data
+        .and_then(|d| d.get("resource"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("resource");
+    let id_field = data.and_then(|d| d.get("id")).and_then(|v| v.as_str());
+
+    match code {
+        // not_found
+        -32004 => match id_field {
+            Some(id) => format!("{resource} '{id}' not found"),
+            None => format!("{resource} not found"),
+        },
+        // version_conflict
+        -32002 => {
+            let expected = data
+                .and_then(|d| d.get("expected_version"))
+                .and_then(|v| v.as_u64());
+            let actual = data
+                .and_then(|d| d.get("actual_version"))
+                .and_then(|v| v.as_u64());
+            match (id_field, expected, actual) {
+                (Some(id), Some(e), Some(a)) => format!(
+                    "{resource} '{id}' version_conflict: expected {e}, actual {a} \
+                     (re-read state and retry with the current version)"
+                ),
+                _ => format!("{resource} version_conflict — re-read state and retry"),
+            }
         }
-        // Try "name" field (name_conflict)
-        if let Some(name) = data.get("name").and_then(|v| v.as_str()) {
-            let resource = data
-                .get("resource")
-                .and_then(|v| v.as_str())
-                .unwrap_or("resource");
-            return format!("{resource} name '{name}' already exists");
+        // name_conflict — `data.name` carries the colliding name
+        -32003 => {
+            if let Some(name) = data.and_then(|d| d.get("name")).and_then(|v| v.as_str()) {
+                format!("{resource} name '{name}' already exists")
+            } else {
+                format!("{resource} name_conflict")
+            }
         }
-        // Try "id" field (not_found)
-        if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
-            let resource = data
-                .get("resource")
-                .and_then(|v| v.as_str())
-                .unwrap_or("resource");
-            return format!("{resource} '{id}' not found");
+        // invalid_params / internal — use `detail` when present
+        _ => {
+            if let Some(detail) = data.and_then(|d| d.get("detail")).and_then(|v| v.as_str()) {
+                return detail.to_string();
+            }
+            format!("RPC error {code}: {message}")
         }
     }
-    format!("RPC error {code}: {message}")
 }
 
 /// Errors that can occur during RPC communication.
@@ -1532,21 +1636,27 @@ pub fn handle_config_show() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `shux config validate [--config <path>]`. Returns the process exit
-/// code that the caller should propagate (0 clean, 1 had diagnostics).
-pub fn handle_config_validate(config: Option<std::path::PathBuf>) -> anyhow::Result<i32> {
-    let path = config.unwrap_or_else(shux_core::config::default_config_path);
+/// `shux config validate [PATH | --config <path>]`. Returns the process
+/// exit code that the caller should propagate (0 clean, 1 had diagnostics).
+pub fn handle_config_validate(path: Option<std::path::PathBuf>) -> anyhow::Result<i32> {
+    let resolved = path.unwrap_or_else(shux_core::config::default_config_path);
+    let used_default = resolved == shux_core::config::default_config_path();
 
-    if !path.exists() {
-        crate::style::print_error(&format!(
-            "config file not found: {} — run `shux config init` to scaffold one",
-            path.display()
-        ));
+    if !resolved.exists() {
+        if used_default {
+            crate::style::print_error(&format!(
+                "config file not found: {} — run `shux config init` to scaffold one, \
+                 or pass a path: `shux config validate <PATH>`",
+                resolved.display()
+            ));
+        } else {
+            crate::style::print_error(&format!("config file not found: {}", resolved.display()));
+        }
         return Ok(1);
     }
 
-    let diags = crate::config_validate::validate(&path)?;
-    Ok(crate::config_validate::print_diagnostics(&diags, &path))
+    let diags = crate::config_validate::validate(&resolved)?;
+    Ok(crate::config_validate::print_diagnostics(&diags, &resolved))
 }
 
 /// Handle the `shux new` command.
@@ -2935,6 +3045,102 @@ pub async fn handle_pane_run(
 }
 
 /// Handle the `shux pane capture` command.
+/// `shux pane snapshot` — rasterize a single pane (no chrome) via
+/// `pane.snapshot` RPC. Snapshot dimensions come from the pane's
+/// current VT grid size; use `pane.set_size` first to change them.
+pub async fn handle_pane_snapshot(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    output: Option<std::path::PathBuf>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use base64::Engine;
+
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+    });
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+
+    let result = rpc_call(stream, "pane.snapshot", params).await?;
+    let b64 = result
+        .get("png_base64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("daemon response missing png_base64"))?;
+    let png = base64::engine::general_purpose::STANDARD.decode(b64)?;
+
+    match (output, format) {
+        (Some(path), _) => {
+            std::fs::write(&path, &png)?;
+            if !matches!(format, OutputFormat::Json) {
+                let w = result.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+                let h = result.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!(
+                    "{} {} ({}×{} px, {} bytes)",
+                    crate::style::success("✓ snapshot →"),
+                    crate::style::bold(path.display().to_string().as_str()),
+                    w,
+                    h,
+                    png.len(),
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+        }
+        (None, OutputFormat::Json) => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        (None, _) => {
+            println!("{b64}");
+        }
+    }
+    Ok(())
+}
+
+/// `shux pane set-size` — call `pane.set_size` RPC with absolute dims.
+pub async fn handle_pane_set_size(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    window_spec: Option<&str>,
+    pane_spec: Option<&str>,
+    cols: u16,
+    rows: u16,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "window_id": window_id,
+        "cols": cols,
+        "rows": rows,
+    });
+    if let Some(pid) = pane_spec {
+        params["pane_id"] = serde_json::Value::String(pid.to_string());
+    }
+
+    let result = rpc_call(stream, "pane.set_size", params).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text | OutputFormat::Plain => {
+            println!(
+                "{} pane resized to {}×{}",
+                crate::style::success("✓"),
+                cols,
+                rows,
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn handle_pane_capture(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
