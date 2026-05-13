@@ -38,7 +38,11 @@ new code is live in <500ms (~250ms FSEvents/inotify debounce +
 respawn).
 
 ```sh
-sed -i '' 's/demo/hot/g' examples/plugins/hello/plugin.sh
+# Portable across BSD/macOS sed and GNU sed — `-i` semantics differ
+# between the two, but `-i.tmp` works on both, so we just delete the
+# backup file afterwards.
+sed -i.tmp 's/demo/hot/g' examples/plugins/hello/plugin.sh && \
+  rm examples/plugins/hello/plugin.sh.tmp
 # → daemon log: "watcher: file changed, reloading"
 
 shux window create -s demo           # → new window tagged "hot·3"
