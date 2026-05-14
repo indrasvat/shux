@@ -1,18 +1,42 @@
 name: CI
 
+# Trigger model (post-2026-05-14 rework):
+#
+# - `pull_request: [main]` fires for every PR push. This is the primary
+#   per-commit gate.
+# - `push: [main]` fires once after merge — used to run the heavier signals
+#   we skip on PRs (coverage upload, clippy-beta).
+# - NO `push: [feat/**, fix/**, refactor/**]`. Previously this doubled
+#   CI runs on every PR-branch push (both `push` AND `pull_request` would
+#   fire on the same commit).
+# - `schedule:` runs the advisory refresh (cargo-deny against a changing
+#   advisory db, clippy-beta against a moving stable target).
+#
+# `concurrency.cancel-in-progress` kills superseded in-flight PR runs when
+# you push a fixup, but never cancels main-branch runs (those may be
+# release-bump commits we want to complete atomically).
+
 on:
   push:
-    branches: [main, "feat/**", "fix/**", "refactor/**"]
+    branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Mondays 09:00 UTC — advisory refresh.
+    - cron: '0 9 * * 1'
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   check:
     name: Check
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,41 +49,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test:
-    name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  test-ubuntu:
+    name: Test (ubuntu)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # macOS runner image macos-15-arm64/20260511.0048+ ships a Homebrew-
-      # managed rustup at /opt/homebrew/bin AND a stub rustup at
-      # $HOME/.cargo/bin/rustup with NO matching cargo/rustc proxy shims.
-      # dtolnay/rust-toolchain detects "rustup is on PATH" and skips its
-      # curl|sh install, so `cargo` ends up nowhere on PATH (exit 127).
-      # Nuke every rust* binary from both locations, then run rustup-init
-      # explicitly so the full proxy suite (cargo/rustc/rustdoc) lands in
-      # $HOME/.cargo/bin. dtolnay then becomes a no-op `rustup default stable`.
-      - name: Force clean rustup install on macOS
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -eux
-          brew uninstall --ignore-dependencies --force rustup rustup-init rust 2>/dev/null || true
-          # Wipe every trace of rust*: brew bin entries, ~/.cargo/bin shims,
-          # AND ~/.rustup/. Without removing ~/.rustup, rustup-init detects
-          # the leftover settings.toml and short-circuits with "skipping
-          # toolchain installation" — never planting the cargo proxy shims.
-          sudo rm -rf /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc \
-            /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init \
-            /opt/homebrew/bin/rustdoc /opt/homebrew/bin/rust-gdb \
-            /opt/homebrew/bin/rust-lldb \
-            "$HOME/.cargo/bin" "$HOME/.rustup" 2>/dev/null || true
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
-            --location --silent --show-error --fail https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain none --no-modify-path
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -68,35 +63,15 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
-  # End-to-end smoke: builds shux, runs the daemon, exercises every feature
-  # an agent would actually use (init, apply, wait-for, snapshot, kill) on
-  # both Linux and macOS. The in-process `test` job covers Rust logic; this
-  # catches platform regressions in PTY spawn / daemon UDS / raster that
-  # only show up against a real binary. No untrusted inputs are evaluated;
-  # we only read `runner.os` and run a script committed in the repo.
-  e2e-smoke:
-    name: E2E smoke
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  e2e-ubuntu:
+    name: E2E smoke (ubuntu)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # See `test` job above — same Homebrew rustup conflict on macos-15.
-      - name: Workaround broken Homebrew rustup on macOS
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          brew uninstall --ignore-dependencies --force rustup rustup-init 2>/dev/null || true
-          sudo rm -f /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc \
-            /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init \
-            /opt/homebrew/bin/rustdoc /opt/homebrew/bin/rust-gdb \
-            /opt/homebrew/bin/rust-lldb 2>/dev/null || true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install jq + file (Linux only — macOS runners ship them)
-        if: runner.os == 'Linux'
+      - name: Install jq + file
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq file
       - name: Build shux (release)
         run: cargo build --release -p shux
@@ -105,12 +80,56 @@ jobs:
       - name: Run integration regressions (12 deterministic scenarios)
         run: SHUX="$PWD/target/release/shux" bash .shux/scripts/integration.sh
 
-  # Workspace test coverage via cargo-llvm-cov. Uploads lcov to codecov.io;
-  # the README badge tracks this metric. Linux-only (codecov uploader
-  # works fine cross-platform but llvm-cov on macOS pulls in xcode tools
-  # that slow CI and don't change the % materially).
+  # Combined macOS job: unit tests + doc tests + e2e smoke + integration
+  # all on a single runner. macOS pricing is ~10x Linux; deduping setup
+  # (checkout/toolchain install/cache restore) saves ~30% vs running
+  # `Test (macos)` and `E2E smoke (macos)` as two parallel jobs.
+  #
+  # Toolchain note: the macos-15-arm64 runner image (20260511.0048+)
+  # ships a Homebrew-managed rustup whose cargo/rustc proxy shims are
+  # broken — see Homebrew/homebrew-core#178311. dtolnay/rust-toolchain
+  # detects rustup on PATH via `command -v rustup`, skips its curl
+  # install, and we end up with no working cargo.
+  #
+  # Fix: pin CARGO_HOME and RUSTUP_HOME into `runner.temp` and run
+  # rustup-init into that isolated location BEFORE dtolnay runs. dtolnay
+  # then finds OUR rustup on PATH, installs the stable toolchain into
+  # our isolated dirs, and everything works without touching the broken
+  # Homebrew install or any stale ~/.rustup state on the image.
+  macos:
+    name: macOS (test + smoke)
+    if: github.event_name != 'schedule'
+    runs-on: macos-latest
+    env:
+      CARGO_HOME: ${{ runner.temp }}/cargo
+      RUSTUP_HOME: ${{ runner.temp }}/rustup
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install isolated rustup
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
+            -fsSL https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Unit tests (nextest + doc)
+        run: |
+          cargo nextest run --workspace
+          cargo test --workspace --doc
+      - name: Build shux (release)
+        run: cargo build --release -p shux
+      - name: End-to-end smoke (happy path)
+        run: SHUX="$PWD/target/release/shux" bash .shux/scripts/smoke.sh
+      - name: Integration regressions (12 deterministic scenarios)
+        run: SHUX="$PWD/target/release/shux" bash .shux/scripts/integration.sh
+
+  # Codecov tracks the release line, not per-PR gates. Main-only.
   coverage:
     name: Coverage
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -129,6 +148,9 @@ jobs:
           # CODECOV_TOKEN is optional for public repos but recommended.
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # License + advisory audit. Cheap on Linux (~45s), so kept on every
+  # PR. The weekly schedule re-runs it so advisories that drop against
+  # unchanged dependencies are caught even if no PR touches Cargo files.
   deny:
     name: Deny
     runs-on: ubuntu-latest
@@ -136,13 +158,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # Forward-looking advisory lint pass against the beta toolchain.
-  # Surfaces lints that clippy will warn on once beta lands as stable
-  # (~6 weeks later), so we have time to fix them before they become
-  # blocking. continue-on-error keeps CI green; failures show up as a
-  # yellow advisory annotation on the PR.
+  # Beta-toolchain clippy — forward-looking lint pass. continue-on-error
+  # means it never blocks; signal is purely advisory. Weekly + main-push
+  # cadence is plenty (the stable target shifts every ~6 weeks).
   lint-beta:
     name: Clippy (beta — advisory)
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
