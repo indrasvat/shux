@@ -74,12 +74,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install jq + file
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq file
-      - name: Build shux (release)
-        run: cargo build --release -p shux
+      # Build shux unoptimized — smoke/integration scripts verify behavior,
+      # not perf, and reusing the test step's compilation (or starting from
+      # debug-profile cache) is ~50–70s faster than a separate release
+      # build. The release-profile binary is built by release.yml on
+      # push: main, not here.
+      - name: Build shux (debug, for smoke)
+        run: cargo build -p shux
       - name: Run end-to-end smoke (happy path)
-        run: SHUX="$PWD/target/release/shux" bash .shux/scripts/smoke.sh
+        run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/smoke.sh
       - name: Run integration regressions (12 deterministic scenarios)
-        run: SHUX="$PWD/target/release/shux" bash .shux/scripts/integration.sh
+        run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/integration.sh
 
   # Combined macOS job: unit tests + doc tests + e2e smoke + integration
   # all on a single runner. macOS pricing is ~10x Linux; deduping setup
@@ -127,12 +132,14 @@ jobs:
         run: |
           cargo nextest run --workspace
           cargo test --workspace --doc
-      - name: Build shux (release)
-        run: cargo build --release -p shux
+      # See E2E smoke (ubuntu) note: smoke/integration are correctness
+      # tests; release-mode validation lives in release.yml.
+      - name: Build shux (debug, for smoke)
+        run: cargo build -p shux
       - name: End-to-end smoke (happy path)
-        run: SHUX="$PWD/target/release/shux" bash .shux/scripts/smoke.sh
+        run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/smoke.sh
       - name: Integration regressions (12 deterministic scenarios)
-        run: SHUX="$PWD/target/release/shux" bash .shux/scripts/integration.sh
+        run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/integration.sh
 
   # Codecov tracks the release line, not per-PR gates. Main-only.
   coverage:
