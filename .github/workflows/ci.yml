@@ -34,19 +34,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # macOS runner image macos-15-arm64/20260511.0048+ ships a Homebrew-
-      # managed rustup whose cargo/rustc shims dispatch as rustup-init
-      # instead of cargo, breaking every cargo invocation. Wipe the brew
-      # rustup so dtolnay/rust-toolchain does a clean rustup-init install
-      # into $HOME/.cargo/bin (which it then prepends to PATH).
-      - name: Workaround broken Homebrew rustup on macOS
+      # managed rustup at /opt/homebrew/bin AND a stub rustup at
+      # $HOME/.cargo/bin/rustup with NO matching cargo/rustc proxy shims.
+      # dtolnay/rust-toolchain detects "rustup is on PATH" and skips its
+      # curl|sh install, so `cargo` ends up nowhere on PATH (exit 127).
+      # Nuke every rust* binary from both locations, then run rustup-init
+      # explicitly so the full proxy suite (cargo/rustc/rustdoc) lands in
+      # $HOME/.cargo/bin. dtolnay then becomes a no-op `rustup default stable`.
+      - name: Force clean rustup install on macOS
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          brew uninstall --ignore-dependencies --force rustup rustup-init 2>/dev/null || true
-          sudo rm -f /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc \
+          set -eux
+          brew uninstall --ignore-dependencies --force rustup rustup-init rust 2>/dev/null || true
+          sudo rm -rf /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc \
             /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init \
             /opt/homebrew/bin/rustdoc /opt/homebrew/bin/rust-gdb \
-            /opt/homebrew/bin/rust-lldb 2>/dev/null || true
+            /opt/homebrew/bin/rust-lldb \
+            "$HOME/.cargo/bin/rustup" "$HOME/.cargo/bin/rustup-init" \
+            "$HOME/.cargo/bin/cargo" "$HOME/.cargo/bin/rustc" \
+            "$HOME/.cargo/bin/rustdoc" 2>/dev/null || true
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
+            --location --silent --show-error --fail https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
