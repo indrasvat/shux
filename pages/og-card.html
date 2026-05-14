@@ -67,7 +67,7 @@
     position: absolute;
     left: 50%; top: 50%;
     transform: translate(-50%, -50%);
-    width: 820px;
+    width: 960px;            /* widened from 820 so the 3 pills fit one row */
     background: linear-gradient(180deg, #211b15 0%, #1a1611 100%);
     border: 1px solid rgba(236, 228, 210, 0.10);
     border-radius: 22px;
@@ -133,43 +133,41 @@
 
   .keywords {
     display: flex;
-    flex-wrap: wrap;
     gap: 10px;
     margin-top: 6px;
-    font-size: 16px;
+    font-size: 15px;          /* trim 1px so all 3 pills clear one row */
     color: var(--ink-3);
     letter-spacing: 0.01em;
   }
   .keywords .pill {
-    padding: 5px 12px;
-    border: 1px solid rgba(236, 228, 210, 0.18);
+    padding: 6px 12px;
+    border: 1px solid rgba(236, 228, 210, 0.32);
     border-radius: 999px;
-    background: rgba(236, 228, 210, 0.04);
+    background: rgba(236, 228, 210, 0.10);
     color: var(--ink);
-    white-space: nowrap;   /* keep "JSON-RPC" on one line */
+    white-space: nowrap;       /* keep each pill's text on one line */
+    font-weight: 500;
   }
   /* Each pill rides one brand color so the row reads as a chord, not
      a whisper. Order is intentional: neutral → moss (status / "live")
      → accent (terracotta, the wordmark color). Visually the row
      ascends in saturation toward the value-prop pill on the right. */
   .keywords .pill.moss {
-    border-color: rgba(111, 154, 92, 0.42);
-    color: var(--moss);
-    background: rgba(111, 154, 92, 0.08);
+    border-color: rgba(140, 195, 110, 0.62);
+    color: #a4d889;
+    background: rgba(140, 195, 110, 0.18);
   }
   .keywords .pill.accent {
-    border-color: rgba(217, 108, 58, 0.42);
-    color: var(--accent-ink);
-    background: rgba(217, 108, 58, 0.08);
+    border-color: rgba(232, 124, 76, 0.62);
+    color: #ff8a5c;
+    background: rgba(232, 124, 76, 0.20);
   }
 
-  /* Tiny ✓ next to the wordmark — mirrors the conductor `agent · ✓`
-     visual that the rest of the site leans on. */
-  .tick {
-    color: var(--moss);
-    font-size: 26px;
-    margin-left: 12px;
-    vertical-align: 22px;
+  /* Italic span inside the tagline — picks out "agentic age" so the
+     phrase reads as a coined-term rather than another descriptor. */
+  .tagline em {
+    font-style: italic;
+    color: var(--ink);
   }
 </style>
 </head>
@@ -183,12 +181,12 @@
       <img src="/assets/logo.svg" alt="shux logo">
     </div>
     <div class="copy">
-      <div class="wordmark">shu<span class="x">x</span><span class="tick">✓</span></div>
-      <div class="tagline">tmux for the agentic age</div>
+      <div class="wordmark">shu<span class="x">x</span></div>
+      <div class="tagline">tmux for the <em>agentic age</em></div>
       <div class="keywords">
         <span class="pill">JSON-RPC</span>
         <span class="pill moss">polyglot plugins</span>
-        <span class="pill accent">build pixel-perfect TUIs</span>
+        <span class="pill accent">pixel-perfect TUIs</span>
       </div>
     </div>
   </div>
