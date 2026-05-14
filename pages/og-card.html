@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>shux — og card</title>
+<style>
+  /* Mirror the landing-page tokens so this card never visually drifts
+     from shux.pages.dev. Update site.css → re-render og-card.png. */
+  :root {
+    --bg:        #15120e;
+    --paper:     #f3ede0;
+    --ink:       #ece4d2;
+    --ink-2:     #b9b0a0;
+    --ink-3:     #928a78;
+    --accent:    #c75a2a;
+    --accent-ink:#d96c3a;
+    --moss:      #6f9a5c;
+    --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular",
+                 Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    width: 1200px; height: 630px;
+    background: var(--bg);
+    font-family: var(--font-mono);
+    color: var(--ink);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: geometricPrecision;
+  }
+
+  /* ── Background plate: dimmed + softly blurred terminal scene ──── */
+  .bg {
+    position: absolute; inset: 0;
+    background: url("/screenshots/multi-agent.png") center / cover no-repeat;
+    opacity: 0.36;
+    filter: blur(3px) brightness(0.55) saturate(0.85);
+  }
+  /* Vignette to push focus toward the center notification. */
+  .vignette {
+    position: absolute; inset: 0;
+    background: radial-gradient(
+      ellipse at center,
+      rgba(21, 18, 14, 0.25) 0%,
+      rgba(21, 18, 14, 0.92) 78%,
+      rgba(21, 18, 14, 0.98) 100%);
+  }
+
+  /* Subtle warm rim + scan-line texture so the bg reads "terminal"
+     even when the underlying image is blurred to abstraction. */
+  .grain {
+    position: absolute; inset: 0;
+    background-image:
+      repeating-linear-gradient(
+        to bottom,
+        rgba(255, 255, 255, 0.012) 0px,
+        rgba(255, 255, 255, 0.012) 1px,
+        transparent 1px,
+        transparent 3px);
+    pointer-events: none;
+  }
+
+  /* ── The notification slab ─────────────────────────────────────── */
+  .notif {
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    width: 820px;
+    background: linear-gradient(180deg, #211b15 0%, #1a1611 100%);
+    border: 1px solid rgba(236, 228, 210, 0.10);
+    border-radius: 22px;
+    box-shadow:
+      0 24px 80px rgba(0, 0, 0, 0.55),
+      0 4px 14px rgba(0, 0, 0, 0.40),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    padding: 36px 44px 36px 36px;
+    display: grid;
+    grid-template-columns: 168px 1fr;
+    gap: 36px;
+    align-items: center;
+  }
+
+  /* Top edge — small "shux notification" chrome (mirrors macOS slab) */
+  .notif::before {
+    content: "shux  ·  notification";
+    position: absolute;
+    top: 14px; left: 24px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--ink-3);
+    opacity: 0.78;
+    text-transform: lowercase;
+  }
+  .notif::after {
+    content: "now";
+    position: absolute;
+    top: 14px; right: 24px;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    color: var(--ink-3);
+    opacity: 0.78;
+  }
+
+  .logo {
+    width: 168px; height: 168px;
+    display: grid; place-items: center;
+    background: transparent;
+  }
+  .logo img { width: 100%; height: 100%; display: block; }
+
+  .copy { display: flex; flex-direction: column; gap: 12px; }
+
+  .wordmark {
+    font-size: 92px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    line-height: 1.0;
+    color: var(--ink);
+    margin-top: -8px; /* visually align with logo center */
+  }
+  .wordmark .x {
+    color: var(--accent-ink);
+  }
+
+  .tagline {
+    font-size: 26px;
+    font-weight: 500;
+    color: var(--ink-2);
+    letter-spacing: -0.01em;
+  }
+
+  .keywords {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 6px;
+    font-size: 16px;
+    color: var(--ink-3);
+    letter-spacing: 0.01em;
+  }
+  .keywords .pill {
+    padding: 5px 12px;
+    border: 1px solid rgba(236, 228, 210, 0.18);
+    border-radius: 999px;
+    background: rgba(236, 228, 210, 0.04);
+    color: var(--ink);
+    white-space: nowrap;   /* keep "JSON-RPC" on one line */
+  }
+  /* Each pill rides one brand color so the row reads as a chord, not
+     a whisper. Order is intentional: neutral → moss (status / "live")
+     → accent (terracotta, the wordmark color). Visually the row
+     ascends in saturation toward the value-prop pill on the right. */
+  .keywords .pill.moss {
+    border-color: rgba(111, 154, 92, 0.42);
+    color: var(--moss);
+    background: rgba(111, 154, 92, 0.08);
+  }
+  .keywords .pill.accent {
+    border-color: rgba(217, 108, 58, 0.42);
+    color: var(--accent-ink);
+    background: rgba(217, 108, 58, 0.08);
+  }
+
+  /* Tiny ✓ next to the wordmark — mirrors the conductor `agent · ✓`
+     visual that the rest of the site leans on. */
+  .tick {
+    color: var(--moss);
+    font-size: 26px;
+    margin-left: 12px;
+    vertical-align: 22px;
+  }
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="vignette"></div>
+  <div class="grain"></div>
+
+  <div class="notif">
+    <div class="logo">
+      <img src="/assets/logo.svg" alt="shux logo">
+    </div>
+    <div class="copy">
+      <div class="wordmark">shu<span class="x">x</span><span class="tick">✓</span></div>
+      <div class="tagline">tmux for the agentic age</div>
+      <div class="keywords">
+        <span class="pill">JSON-RPC</span>
+        <span class="pill moss">polyglot plugins</span>
+        <span class="pill accent">build pixel-perfect TUIs</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
