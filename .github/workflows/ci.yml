@@ -47,13 +47,15 @@ jobs:
         run: |
           set -eux
           brew uninstall --ignore-dependencies --force rustup rustup-init rust 2>/dev/null || true
+          # Wipe every trace of rust*: brew bin entries, ~/.cargo/bin shims,
+          # AND ~/.rustup/. Without removing ~/.rustup, rustup-init detects
+          # the leftover settings.toml and short-circuits with "skipping
+          # toolchain installation" — never planting the cargo proxy shims.
           sudo rm -rf /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc \
             /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init \
             /opt/homebrew/bin/rustdoc /opt/homebrew/bin/rust-gdb \
             /opt/homebrew/bin/rust-lldb \
-            "$HOME/.cargo/bin/rustup" "$HOME/.cargo/bin/rustup-init" \
-            "$HOME/.cargo/bin/cargo" "$HOME/.cargo/bin/rustc" \
-            "$HOME/.cargo/bin/rustdoc" 2>/dev/null || true
+            "$HOME/.cargo/bin" "$HOME/.rustup" 2>/dev/null || true
           curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
             --location --silent --show-error --fail https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain none --no-modify-path
