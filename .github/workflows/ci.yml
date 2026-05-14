@@ -101,14 +101,21 @@ jobs:
     name: macOS (test + smoke)
     if: github.event_name != 'schedule'
     runs-on: macos-latest
-    env:
-      CARGO_HOME: ${{ runner.temp }}/cargo
-      RUSTUP_HOME: ${{ runner.temp }}/rustup
     steps:
       - uses: actions/checkout@v4
+      # Pin Rust to per-job temp dirs (RUNNER_TEMP is set by the runner)
+      # and install rustup-init there. Sidesteps the broken Homebrew rustup
+      # at /opt/homebrew/bin AND any stale ~/.rustup state. We promote
+      # CARGO_HOME/RUSTUP_HOME via $GITHUB_ENV so all subsequent steps
+      # (dtolnay/rust-toolchain, Swatinem/rust-cache, nextest, cargo build)
+      # use the same isolated location.
       - name: Install isolated rustup
         shell: bash
         run: |
+          export CARGO_HOME="$RUNNER_TEMP/cargo"
+          export RUSTUP_HOME="$RUNNER_TEMP/rustup"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
             -fsSL https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
