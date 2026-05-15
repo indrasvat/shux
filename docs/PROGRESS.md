@@ -85,6 +85,72 @@
 
 ## Session Log
 
+**2026-05-15 — feat(statusbar): delightful OOB experience + onboarding**
+- Bare `shux` (no config, no `shux config init`) used to show a
+  3-segment hardcoded bar: `◆ <session>` / `[i/n] <window>` / clock.
+  No onboarding hint, no project context, looked indistinguishable
+  from a "started but not configured" state. User flagged this as
+  "bare bones" and asked for delight OOTB.
+- Council-first design (dootsabha → codex). Codex's pushbacks shaped
+  the design: ship in two releases (not one) — R1 = better bar +
+  onboarding, R2 = async project intelligence. No imaginary REC
+  indicator. Nerd fonts default OFF (the embedded rasterizer doesn't
+  have NF glyphs → tofu = trust-killer for first PNG). Static hint,
+  not animated. Big first-attach toast does more for discoverability
+  than tweaking the bar. Progressive disclosure by width tier.
+- Built R1 in this PR:
+  - **LEFT zone**: `◆ <session>  ± <branch>  @ ssh` — session identity
+    plus auto-detected git branch from the session's spawn cwd plus
+    SSH host indicator when daemon is over SSH. Cached per-session
+    in a new `SessionMetaCache`; populated once at session-create
+    via spawn_blocking, no synchronous IO in the render path. No
+    refresh loop (Codex was clear: timeouts > cadence; punt to R2).
+  - **CENTER zone**: `Z Y ▶ #i/n <title> · N panes` — mode flags
+    (zoom/copy) then window navigation + pane count. Pane count
+    omitted at <80 cols.
+  - **CENTER transient overlay**: ~1.5s post-action feedback —
+    `[pane split]`, `[zoom toggled]`, `[pane closed]` etc. Only
+    fires for actions whose effect is otherwise ambiguous (no
+    `[focused right]` flash on every nudge — that'd be noisy).
+  - **RIGHT zone**: `^Sp ?  help · ^Sp d  detach` until the user
+    taps the prefix even once → permanently dismissed; replaced by
+    `up Nh Nm` daemon-uptime at ≥120 cols. Dismissal state persists
+    to `$XDG_STATE_HOME/shux/onboarding.json` (single boolean).
+  - **First-attach welcome toast**: centered Catppuccin-bordered box
+    for 3s on the user's very first attach, showing `prefix is ^Sp`
+    plus three core shortcuts. Auto-dismisses, marks
+    `welcome_toast_seen: true` in the state file, never shows again.
+  - **Progressive width tiers**: 60 cols (identity + hint only),
+    80 cols (+ branch + pane count), 120 cols (+ uptime
+    post-dismissal), 160 cols (room for future multi-client signal).
+  - **Distinct from starship**: bar shows session-level
+    (multiplexer) signal; starship shows per-pane (PS1) signal. No
+    duplicated dir / git / lang / clock.
+- Two new modules: `crates/shux/src/session_meta.rs` (git-branch
+  detection + SSH detection + cache) and `crates/shux/src/onboarding.rs`
+  (state-file load/save with spawn_blocking persistence).
+- Shared builder in `crates/shux/src/statusbar_build.rs` used by both
+  the live attach renderer AND `window.snapshot` / `session.snapshot`
+  so PNGs faithfully reflect the OOTB experience. Earlier the snapshot
+  path had drifted to render the v0.22.0 hardcoded bar; consolidated.
+- New `appearance.nerd_fonts` config field (default false). Unicode
+  fallback uses `◆ ± ▶ @` — clean Catppuccin glyphs. `shux config
+  init`'s template enables NF since users opting into the config file
+  almost certainly run a modern dev terminal.
+- Five Catppuccin color tokens in the theme schema: status_bg /
+  status_fg / status_accent / **status_muted** (new) /
+  **status_branch** (new). All overridable in `[theme]`.
+- Tests: 7 new unit tests in `statusbar_build` covering width tiers,
+  prefix label rendering, uptime formatting, action labels, post-
+  dismissal right-zone. Plus iTerm-driver live test asserting toast +
+  dismissal lifecycle + flag rendering.
+- Dogfooded via shux's own pixel-perfect rasterizer (no iTerm
+  needed for most evidence): captured 8 snapshots at widths
+  60/80/120/160/200, pre+post dismissal, single+multi+zoomed pane.
+  Live iTerm capture of the welcome toast confirmed the Catppuccin-
+  bordered box renders cleanly with the prefix + 3 shortcuts.
+- 768 Rust tests pass, clippy + fmt clean.
+
 **2026-05-15 — fix(attach): pane kill cascade + recursive-shux guard**
 - Two interactive bugs caught while dogfooding shux.
 - (1) `Ctrl+Space x` was a silent no-op on a fresh `shux` session

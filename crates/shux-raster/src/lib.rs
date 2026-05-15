@@ -16,9 +16,20 @@ use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
 use shux_vt::{Cell, CellFlags, Color, Grid};
 
-/// Embedded font asset. JetBrains Mono Regular is shipped under the SIL Open
-/// Font License (see `assets/OFL.txt`).
+/// Embedded text font. JetBrains Mono Regular under the SIL Open Font
+/// License (see `assets/OFL.txt`).
 const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
+
+/// Embedded Nerd Font symbols. Subsetted from
+/// `SymbolsNerdFontMono-Regular.ttf` (Nerd Fonts project, OFL) to just
+/// the ~20 codepoints the shux status bar uses today plus a curated
+/// future-proofing set (folder/file/clock/etc). Subset costs ~5 KB —
+/// negligible vs. bundling the full 2.4 MB symbols font, while still
+/// giving us NF coverage out of the box.
+///
+/// To regenerate after adding new icon codepoints: see
+/// `crates/shux-raster/REGENERATE_SYMBOLS_SUBSET.md`.
+const SYMBOLS_FONT_BYTES: &[u8] = include_bytes!("../assets/SymbolsNerdFontSubset.ttf");
 
 /// Rasterizer errors.
 #[derive(Debug, thiserror::Error)]
@@ -53,9 +64,17 @@ impl Default for RasterOptions {
     }
 }
 
-/// Owning rasterizer. Holds the parsed font + derived cell metrics.
+/// Owning rasterizer. Holds an ordered font fallback chain plus
+/// derived cell metrics. The first font that has a glyph for the
+/// requested character wins; this lets us pair a clean text font
+/// (JetBrains Mono Regular) with a small Nerd-Font symbols subset
+/// so status-bar glyphs render correctly without bundling the full
+/// 2.4 MB NF-patched font.
 pub struct Rasterizer {
-    font: Font,
+    /// Fallback chain: try fonts[0] first, then [1], etc. Metrics
+    /// (cell_w / cell_h / ascent) are derived from fonts[0] only —
+    /// the primary text font dominates the grid geometry.
+    fonts: Vec<Font>,
     font_size: f32,
     cell_w: u32,
     cell_h: u32,
@@ -63,27 +82,67 @@ pub struct Rasterizer {
 }
 
 impl Rasterizer {
-    /// Construct a rasterizer at the given font size (in pixels).
+    /// Construct a rasterizer at the given font size (in pixels)
+    /// using the bundled text font plus the bundled Nerd-Font symbols
+    /// subset as fallback. Use this for the OOTB experience.
     pub fn new(font_size: f32) -> Result<Self, RasterError> {
+        Self::with_fonts(font_size, [FONT_BYTES, SYMBOLS_FONT_BYTES])
+    }
+
+    /// Construct a rasterizer with a user-supplied primary font and
+    /// the bundled NF-symbols subset as fallback. Lets users override
+    /// the typeface via `appearance.font` in shux config while still
+    /// getting Nerd-Font icons in status-bar segments.
+    pub fn with_primary_font(font_size: f32, primary: &[u8]) -> Result<Self, RasterError> {
+        Self::with_fonts(font_size, [primary, SYMBOLS_FONT_BYTES])
+    }
+
+    /// Construct a rasterizer from an explicit fallback chain.
+    /// `fonts[0]` is the primary text font; later entries are
+    /// consulted for codepoints not present in earlier ones.
+    pub fn with_fonts<'a, I>(font_size: f32, fonts: I) -> Result<Self, RasterError>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
         let settings = FontSettings {
             scale: font_size,
             ..FontSettings::default()
         };
-        let font =
-            Font::from_bytes(FONT_BYTES, settings).map_err(|e| RasterError::Font(e.into()))?;
-        let line = font
+        let mut parsed: Vec<Font> = Vec::new();
+        for bytes in fonts {
+            let f = Font::from_bytes(bytes, settings).map_err(|e| RasterError::Font(e.into()))?;
+            parsed.push(f);
+        }
+        if parsed.is_empty() {
+            return Err(RasterError::Font("no fonts provided".into()));
+        }
+        let primary = &parsed[0];
+        let line = primary
             .horizontal_line_metrics(font_size)
             .ok_or(RasterError::NoMetrics(font_size))?;
-        let m = font.metrics('M', font_size);
+        let m = primary.metrics('M', font_size);
         let cell_w = m.advance_width.ceil().max(1.0) as u32;
         let cell_h = line.new_line_size.ceil().max(1.0) as u32;
         Ok(Self {
-            font,
+            fonts: parsed,
             font_size,
             cell_w,
             cell_h,
             ascent: line.ascent,
         })
+    }
+
+    /// Pick which font in the fallback chain has a glyph for `ch`.
+    /// Returns the primary font if no fallback has the glyph (so the
+    /// caller still gets fontdue's "missing glyph" rendering — better
+    /// than panicking or skipping the cell).
+    fn font_for(&self, ch: char) -> &Font {
+        for f in &self.fonts {
+            if f.lookup_glyph_index(ch) != 0 {
+                return f;
+            }
+        }
+        &self.fonts[0]
     }
 
     /// Cell dimensions in pixels.
@@ -164,7 +223,7 @@ impl Rasterizer {
 
         let ch = cell.ch;
         if ch != ' ' && ch != '\0' {
-            let (metrics, bitmap) = self.font.rasterize(ch, self.font_size);
+            let (metrics, bitmap) = self.font_for(ch).rasterize(ch, self.font_size);
             let baseline_y = y as i32 + self.ascent.round() as i32;
             let glyph_x = x as i32 + metrics.xmin;
             let glyph_y = baseline_y - metrics.height as i32 - metrics.ymin;
@@ -365,5 +424,57 @@ mod tests {
         assert_eq!(rgb[0], 0);
         assert!(rgb[1] > 200);
         assert_eq!(rgb[2], 0);
+    }
+
+    // ── font fallback ──────────────────────────────────────────────
+
+    #[test]
+    fn primary_font_renders_ascii() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        // 'A' is in JetBrains Mono → primary font wins.
+        let f = r.font_for('A');
+        assert!(f.lookup_glyph_index('A') != 0);
+    }
+
+    #[test]
+    fn nf_symbol_falls_back_to_subset_font() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        // U+F489 (nf-cod-terminal) isn't in JetBrains Mono Regular but
+        // IS in the bundled NF subset — fallback must pick it up so
+        // the OOTB status bar's terminal icon renders correctly.
+        let f = r.font_for('\u{f489}');
+        assert!(
+            f.lookup_glyph_index('\u{f489}') != 0,
+            "NF terminal icon must be reachable via the fallback chain"
+        );
+    }
+
+    #[test]
+    fn nf_git_branch_present_in_subset() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        let f = r.font_for('\u{e0a0}');
+        assert!(
+            f.lookup_glyph_index('\u{e0a0}') != 0,
+            "NF git-branch icon must be reachable via fallback chain"
+        );
+    }
+
+    #[test]
+    fn unknown_codepoint_returns_a_font_not_panic() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        // U+10000 (Linear B) is in neither bundled font — the fallback
+        // returns the primary so callers get fontdue's notdef
+        // rendering instead of a panic.
+        let _f = r.font_for('\u{10000}');
+    }
+
+    #[test]
+    fn with_primary_font_keeps_symbols_fallback() {
+        // Using the bundled NF subset itself as a synthetic "primary"
+        // text font: ASCII won't be in it (no letters), but the symbol
+        // is. The fallback chain should still find the symbol.
+        let r = Rasterizer::with_primary_font(14.0, SYMBOLS_FONT_BYTES).expect("rasterizer");
+        let f = r.font_for('\u{f489}');
+        assert!(f.lookup_glyph_index('\u{f489}') != 0);
     }
 }

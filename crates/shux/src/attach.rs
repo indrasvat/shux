@@ -41,9 +41,7 @@ use shux_rpc::attach::{
     AttachServerFrame, MouseButton as ProtoMouseButton, MouseKind,
 };
 use shux_rpc::create_codec;
-use shux_ui::{
-    BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor, StatusBar, StatusSegment,
-};
+use shux_ui::{BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor};
 
 use crate::PaneIoState;
 use crate::statusbar_runner::{SegmentCache, populate_bar};
@@ -66,12 +64,16 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Run the attach UDS listener. Each accepted connection spawns an
 /// independent attach session task. Runs until `cancel` fires.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_attach_server(
     socket_path: std::path::PathBuf,
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
     segments: SegmentCache,
+    meta_cache: crate::session_meta::SessionMetaCache,
+    onboarding: crate::onboarding::OnboardingHandle,
+    daemon_start: std::time::Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     if socket_path.exists() {
@@ -102,9 +104,15 @@ pub async fn run_attach_server(
                         let io = io_state.clone();
                         let cfg = config.clone();
                         let segs = segments.clone();
+                        let meta = meta_cache.clone();
+                        let onb = onboarding.clone();
                         let c = cancel.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_attach_connection(stream, g, io, cfg, segs, c).await {
+                            if let Err(e) = handle_attach_connection(
+                                stream, g, io, cfg, segs, meta, onb, daemon_start, c,
+                            )
+                            .await
+                            {
                                 warn!(error = %e, "attach session ended with error");
                             }
                         });
@@ -120,12 +128,16 @@ pub async fn run_attach_server(
 }
 
 /// Handle one attach connection: handshake, then run the streaming loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_attach_connection(
     stream: UnixStream,
     graph: GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
     segments: SegmentCache,
+    meta_cache: crate::session_meta::SessionMetaCache,
+    onboarding: crate::onboarding::OnboardingHandle,
+    daemon_start: std::time::Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut framed = Framed::new(stream, create_codec());
@@ -170,7 +182,7 @@ async fn handle_attach_connection(
     }
 
     // Step 2: Resolve the target session.
-    let resolved = resolve_or_create_session(&graph, &hello.session_name).await;
+    let resolved = resolve_or_create_session(&graph, &hello.session_name, &meta_cache).await;
     let session = match resolved {
         Ok(s) => s,
         Err(e) => {
@@ -222,7 +234,17 @@ async fn handle_attach_connection(
 
     // Step 4: Run the main attach loop.
     run_attach_loop(
-        framed, graph, io_state, config, segments, session, hello, cancel,
+        framed,
+        graph,
+        io_state,
+        config,
+        segments,
+        meta_cache,
+        onboarding,
+        daemon_start,
+        session,
+        hello,
+        cancel,
     )
     .await
 }
@@ -246,13 +268,31 @@ struct AttachedSession {
     /// loop overlays a cursor + selection on the focused pane, and
     /// `y` triggers an OSC 52 clipboard write before exiting.
     copy_mode: Option<shux_ui::CopyModeState>,
+    /// Most recent prefix-action label, with the wallclock instant it
+    /// fired. The status bar renders `[<label>]` in the center zone for
+    /// ~1.5s, then it auto-clears. Gives the user immediate "yes, that
+    /// action took effect" feedback for ambiguous keystrokes (zoom,
+    /// kill, copy). None at attach start. Cleared either by the render
+    /// loop or by another action overwriting it.
+    last_action: Option<(String, std::time::Instant)>,
+    /// True until the welcome toast has been rendered for its full
+    /// dwell (~3s). Render loop flips this to false; we then persist
+    /// `welcome_toast_seen: true` via the OnboardingHandle so the next
+    /// attach skips the toast.
+    show_welcome_toast: bool,
 }
 
 /// Find a session by name, or create it (with one window + one pane) if
-/// missing. Mirrors `shux new -s <name>` semantics.
+/// missing. Mirrors `shux new -s <name>` semantics. When a new session
+/// is created here, kicks off the `SessionMetaCache` population that
+/// the `session.create` / `session.ensure` RPC handlers would have
+/// done — without this, bare `shux` on first run (which lands here
+/// because there's no existing session) skips git/SSH decoration in
+/// the OOTB status bar. Codex review P2 of PR #43.
 async fn resolve_or_create_session(
     graph: &GraphHandle,
     name: &Option<String>,
+    meta_cache: &crate::session_meta::SessionMetaCache,
 ) -> anyhow::Result<AttachedSession> {
     let snap = graph.snapshot();
     let target_name = name.clone().unwrap_or_else(|| "default".to_string());
@@ -269,15 +309,37 @@ async fn resolve_or_create_session(
             active_pane_id: win.active_pane,
             help_visible: false,
             copy_mode: None,
+            last_action: None,
+            // Whether the toast actually renders is decided at attach
+            // time by reading the onboarding state file; this stays
+            // true here so the render loop can flip it off after dwell.
+            show_welcome_toast: true,
         });
     }
 
     drop(snap);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
     let session_id = graph
-        .create_session(target_name.clone(), cwd)
+        .create_session(target_name.clone(), cwd.clone())
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // Populate the meta cache exactly like the session.create RPC
+    // handler does (spawn_blocking so the synchronous git probe doesn't
+    // stall the attach acceptor task on a slow filesystem / NFS).
+    let cache_for_blocking = meta_cache.clone();
+    let cwd_for_blocking = cwd.clone();
+    tokio::task::spawn_blocking(move || {
+        let branch = crate::session_meta::detect_git_branch(&cwd_for_blocking);
+        let over_ssh = crate::session_meta::detect_over_ssh();
+        let snapshot = crate::session_meta::SessionMeta {
+            git_branch: branch,
+            over_ssh,
+        };
+        tokio::runtime::Handle::current().block_on(async move {
+            cache_for_blocking.set(session_id, snapshot).await;
+        });
+    });
     let snap = graph.snapshot();
     let sess = snap
         .sessions
@@ -294,6 +356,8 @@ async fn resolve_or_create_session(
         active_pane_id: win.active_pane,
         help_visible: false,
         copy_mode: None,
+        last_action: None,
+        show_welcome_toast: true,
     })
 }
 
@@ -377,6 +441,9 @@ async fn run_attach_loop(
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
     segments: SegmentCache,
+    meta_cache: crate::session_meta::SessionMetaCache,
+    onboarding: crate::onboarding::OnboardingHandle,
+    daemon_start: std::time::Instant,
     mut session: AttachedSession,
     hello: AttachHello,
     cancel: CancellationToken,
@@ -423,12 +490,17 @@ async fn run_attach_loop(
     let render_client_size = client_size.clone();
     let render_config = config.clone();
     let render_segments = segments.clone();
+    let render_meta = meta_cache.clone();
+    let render_onboarding = onboarding.clone();
     let renderer = tokio::spawn(async move {
         run_render_loop(
             render_graph,
             render_io,
             render_config,
             render_segments,
+            render_meta,
+            render_onboarding,
+            daemon_start,
             render_session_for_task,
             render_client_size,
             render_tx,
@@ -627,6 +699,11 @@ async fn run_attach_loop(
                         pulse.notify_one();
                     }
                     AttachClientFrame::Action { kind, args } => {
+                        // The user pressed prefix + key — onboarding hint
+                        // can dismiss. Cheap idempotent write; first call
+                        // persists, subsequent ones short-circuit.
+                        onboarding.mark_prefix_discovered().await;
+
                         if let Err(e) = handle_action(
                             kind,
                             args.clone(),
@@ -639,6 +716,15 @@ async fn run_attach_loop(
                         .await
                         {
                             warn!(?kind, error = %e, "attach: action failed");
+                        }
+
+                        // Transient command-feedback overlay in the status
+                        // bar's center zone. Resolves the "did my keystroke
+                        // do anything?" UX gap for actions whose effect
+                        // isn't immediately obvious (kill, zoom, copy).
+                        if let Some(label) = action_feedback_label(kind) {
+                            let mut s = render_session.lock().await;
+                            s.last_action = Some((label.into(), std::time::Instant::now()));
                         }
                         // Layout-changing actions invalidate per-pane PTY
                         // sizes. Re-fan the winsizes so vim/htop/etc. inside
@@ -687,8 +773,17 @@ async fn run_attach_loop(
                         pulse.notify_one();
                     }
                     AttachClientFrame::Detach => {
+                        // Detach implies the user found the prefix too.
+                        onboarding.mark_prefix_discovered().await;
                         detached = true;
                         let _ = out_tx.send(AttachServerFrame::DetachAck).await;
+                    }
+                    AttachClientFrame::PrefixTapped => {
+                        // Authoritative signal: user has discovered the
+                        // prefix even if they bail without sending an
+                        // Action (Ctrl+Space → Escape, etc). The OOTB
+                        // hint dismisses forever.
+                        onboarding.mark_prefix_discovered().await;
                     }
                     AttachClientFrame::Pong => {}
                 }
@@ -751,6 +846,9 @@ async fn run_render_loop(
     io_state: Arc<Mutex<PaneIoState>>,
     config: ConfigHandle,
     segments: SegmentCache,
+    meta_cache: crate::session_meta::SessionMetaCache,
+    onboarding: crate::onboarding::OnboardingHandle,
+    daemon_start: std::time::Instant,
     session: Arc<Mutex<AttachedSession>>,
     client_size: ClientSize,
     out_tx: mpsc::Sender<AttachServerFrame>,
@@ -786,6 +884,11 @@ async fn run_render_loop(
     // re-prime the listener after every wake.
     let pulse = io_state.lock().await.render_pulse.clone();
     let mut pulse_listener = Box::pin(pulse.notified());
+
+    // Welcome toast: lazily-initialised first-render instant. Stays
+    // None until the first render iteration where we actually start
+    // drawing the toast; from there it ages out after WELCOME_TOAST_DWELL.
+    let mut welcome_toast_started: Option<std::time::Instant> = None;
 
     // The config-change notify gives us a fast path for hot-reloads:
     // when the user saves a new ~/.config/shux/config.toml, the watcher
@@ -898,8 +1001,35 @@ async fn run_render_loop(
         // segments so OOTB looks the same even when no script segments
         // are configured. Then `populate_bar` appends any
         // `[[statusbar.segment]]` results from the runner cache.
-        let mut bar = build_status_bar(&snap, &attached, &live_theme);
+        let live_cfg = config.current();
+        let nerd_fonts = live_cfg.appearance.nerd_fonts;
+        let prefix_label = prefix_display(&live_cfg.keys.prefix);
+        let session_meta = meta_cache.get(attached.session_id).await;
+        let onboarding_state = onboarding.current().await;
+        let daemon_uptime = daemon_start.elapsed();
+        let last_action_ref = attached.last_action.as_ref().map(|(s, i)| (s.as_str(), *i));
+        let render_ctx = StatusBarCtx {
+            session_id: attached.session_id,
+            session_name: &attached.name,
+            active_window_id: attached.active_window_id,
+            active_pane_id: attached.active_pane_id,
+            session_meta: &session_meta,
+            onboarding: &onboarding_state,
+            daemon_uptime,
+            nerd_fonts,
+            prefix_label: &prefix_label,
+            client_cols: cols,
+            copy_mode_active: attached.copy_mode.is_some(),
+            last_action: last_action_ref,
+        };
+        let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
         populate_bar(&mut bar, &config, &segments).await;
+
+        // Welcome-toast lifecycle: if it's still showing and the
+        // first-render-tick has passed, mark seen on the daemon side.
+        // The renderer flips `show_welcome_toast = false` and persists
+        // `welcome_toast_seen: true` ~3s after first attach via the
+        // toast layer below.
 
         let frame = MultiPaneFrame {
             layout: &win.layout.tree,
@@ -949,6 +1079,37 @@ async fn run_render_loop(
             shux_ui::render_help_overlay_into(compositor.inner_mut(), cols, rows, &live_theme);
         }
 
+        // Welcome toast (first-attach onboarding). Only fires when the
+        // user has never seen it (per the onboarding state file).
+        // Dwells WELCOME_TOAST_DWELL after first render, then auto-
+        // dismisses and marks seen on disk so the next attach is clean.
+        if !onboarding_state.welcome_toast_seen && attached.show_welcome_toast {
+            let elapsed = welcome_toast_started
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed();
+            if elapsed < WELCOME_TOAST_DWELL {
+                render_welcome_toast(
+                    compositor.inner_mut(),
+                    cols,
+                    rows,
+                    &live_theme,
+                    &prefix_label,
+                    nerd_fonts,
+                );
+            } else {
+                // One-shot persist + flag-flip.
+                let onb = onboarding.clone();
+                tokio::spawn(async move {
+                    onb.mark_welcome_toast_seen().await;
+                });
+                {
+                    let mut s = session.lock().await;
+                    s.show_welcome_toast = false;
+                }
+                compositor.force_redraw();
+            }
+        }
+
         // Take the bytes out (drain) and send them.
         let bytes = std::mem::take(compositor.inner_mut());
         // Re-establish capacity for next frame.
@@ -966,57 +1127,104 @@ async fn run_render_loop(
     }
 }
 
-/// Build the status bar for the current session, using the resolved
-/// theme tokens for the background, accent (session-name segment),
-/// and time-segment foreground.
-fn build_status_bar(
-    snap: &shux_core::graph::SessionGraphSnapshot,
-    attached: &AttachedSession,
+/// How long the first-attach welcome toast stays on screen before
+/// auto-dismissing. Tuned for "long enough to read, short enough to
+/// not get in the way".
+const WELCOME_TOAST_DWELL: Duration = Duration::from_secs(3);
+
+// build_status_bar + StatusBarCtx + helpers (action_feedback_label,
+// prefix_display, format_uptime) all live in `crate::statusbar_build`
+// so the snapshot path (window.snapshot / session.snapshot) can call
+// the identical renderer and PNG output matches what an attached
+// client sees.
+use crate::statusbar_build::{
+    StatusBarCtx, action_feedback_label, build as build_status_bar_shared, prefix_display,
+};
+
+/// Draw the first-attach welcome toast: a small centered box with
+/// the prefix key and three core shortcuts. Renders into the
+/// compositor's output buffer using direct ANSI so it sits ON TOP of
+/// the multi-pane frame already composited there. Auto-dismisses
+/// after `WELCOME_TOAST_DWELL` (see run_render_loop).
+fn render_welcome_toast(
+    out: &mut Vec<u8>,
+    cols: u16,
+    rows: u16,
     theme: &shux_core::theme::Theme,
-) -> StatusBar {
-    use crossterm::style::Color;
-    let mut bar = StatusBar::new();
-    let to_color = |rgb: shux_core::theme::Rgb| Color::Rgb {
-        r: rgb.r,
-        g: rgb.g,
-        b: rgb.b,
-    };
-    bar.bg = Some(to_color(theme.status_bg));
+    prefix_label: &str,
+    nerd_fonts: bool,
+) {
+    use std::io::Write;
+    if cols < 50 || rows < 8 {
+        return; // not enough room
+    }
+    let icon = if nerd_fonts { "\u{f489}" } else { "◆" };
+    let title = format!(" {icon} welcome to shux ");
+    let lines: Vec<String> = vec![
+        title.clone(),
+        String::new(),
+        format!("prefix is {prefix_label}"),
+        String::new(),
+        format!("{prefix_label} ?    open help (every shortcut)"),
+        format!("{prefix_label} d    detach (session keeps running)"),
+        format!("{prefix_label} |    split vertical"),
+        String::new(),
+        " press any key to dismiss ".to_string(),
+    ];
+    let box_w: u16 = (lines
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))
+        .max()
+        .unwrap_or(0) as u16)
+        + 4;
+    let box_h: u16 = lines.len() as u16 + 2;
+    let x = (cols.saturating_sub(box_w)) / 2;
+    let y = (rows.saturating_sub(box_h)) / 2;
 
-    bar.left.push(StatusSegment::styled(
-        format!(" ◆ {} ", attached.name),
-        to_color(theme.status_accent),
-        true,
-    ));
+    // Catppuccin-anchored colors via the resolved theme.
+    let accent = format!(
+        "\x1b[38;2;{};{};{}m",
+        theme.status_accent.r, theme.status_accent.g, theme.status_accent.b
+    );
+    let muted = format!(
+        "\x1b[38;2;{};{};{}m",
+        theme.status_muted.r, theme.status_muted.g, theme.status_muted.b
+    );
+    let bg = format!(
+        "\x1b[48;2;{};{};{}m",
+        theme.status_bg.r, theme.status_bg.g, theme.status_bg.b
+    );
+    let reset = "\x1b[0m";
 
-    if let Some(sess) = snap.sessions.get(&attached.session_id) {
-        let win_count = sess.windows.len();
-        let active_idx = sess
-            .windows
-            .iter()
-            .position(|w| *w == sess.active_window)
-            .unwrap_or(0);
-        if let Some(win) = snap.windows.get(&sess.active_window) {
-            let title = if win.title.is_empty() {
-                "shell".to_string()
-            } else {
-                win.title.clone()
-            };
-            bar.center.push(StatusSegment::styled(
-                format!(" [{}/{}] {} ", active_idx + 1, win_count, title),
-                to_color(theme.status_fg),
-                false,
-            ));
+    // Top border.
+    let _ = write!(out, "\x1b[{};{}H{accent}{bg}╭", y + 1, x + 1);
+    for _ in 0..(box_w.saturating_sub(2)) {
+        let _ = write!(out, "─");
+    }
+    let _ = write!(out, "╮{reset}");
+
+    // Body rows.
+    for (i, line) in lines.iter().enumerate() {
+        let row = y + 2 + i as u16;
+        let w = unicode_width::UnicodeWidthStr::width(line.as_str()) as u16;
+        let pad_right = box_w.saturating_sub(2).saturating_sub(w).saturating_sub(2); // leave 1-cell pad either side
+        let color = if i == 0 { &accent } else { &muted };
+        let style = if i == 0 { "\x1b[1m" } else { "" };
+        let _ = write!(out, "\x1b[{};{}H{accent}{bg}│{reset}{bg} ", row, x + 1);
+        let _ = write!(out, "{color}{style}{line}{reset}{bg}");
+        for _ in 0..pad_right {
+            let _ = write!(out, " ");
         }
+        let _ = write!(out, " {accent}│{reset}");
     }
 
-    let now = chrono::Local::now();
-    bar.right.push(StatusSegment::styled(
-        format!(" {} ", now.format("%H:%M:%S")),
-        to_color(theme.status_fg),
-        false,
-    ));
-    bar
+    // Bottom border.
+    let bottom_row = y + box_h;
+    let _ = write!(out, "\x1b[{};{}H{accent}{bg}╰", bottom_row, x + 1);
+    for _ in 0..(box_w.saturating_sub(2)) {
+        let _ = write!(out, "─");
+    }
+    let _ = write!(out, "╯{reset}");
 }
 
 /// State held during a left-button drag that started on a pane border.

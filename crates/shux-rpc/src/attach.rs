@@ -98,6 +98,14 @@ pub enum AttachClientFrame {
     },
     /// Client wants to detach.
     Detach,
+    /// First time the client armed the prefix in this attach. Drives
+    /// the OOTB onboarding-hint dismissal: the original design only
+    /// marked discovery on `Action` frames, but tapping the prefix and
+    /// then hitting Escape (or any unbound key) consumes the prefix
+    /// locally without sending an Action — so the hint would persist
+    /// even though the user clearly found the prefix. Sent at most
+    /// once per attach.
+    PrefixTapped,
     /// Heartbeat reply.
     Pong,
 }

@@ -104,6 +104,9 @@ where
     let (mut sink, mut stream) = framed.split();
     let mut stdout = tokio::io::stdout();
     let mut prefix_active = false;
+    // True once we've sent a PrefixTapped frame for this attach.
+    // One-shot — no need to spam the wire on every prefix-arm.
+    let mut prefix_announced = false;
     let mut last_size = TerminalGuard::size().unwrap_or((80, 24));
 
     // Spawn input reader: poll crossterm events on a blocking thread,
@@ -222,6 +225,19 @@ where
                             && key.modifiers == prefix_key.modifiers
                         {
                             // First tap of the prefix: arm and consume.
+                            // Tell the daemon the first time we arm so
+                            // the OOTB onboarding hint dismisses even
+                            // if the user immediately hits Escape /
+                            // unbound key (no Action frame would have
+                            // fired in that case — see codex review of
+                            // PR #43).
+                            if !prefix_announced {
+                                prefix_announced = true;
+                                let frame = AttachClientFrame::PrefixTapped;
+                                if let Ok(bytes) = serde_json::to_vec(&frame) {
+                                    sink.send(Bytes::from(bytes)).await.ok();
+                                }
+                            }
                             prefix_active = true;
                             continue;
                         }

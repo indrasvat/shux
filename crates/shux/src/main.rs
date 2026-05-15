@@ -13,6 +13,9 @@ mod cli;
 mod client;
 mod config_validate;
 mod daemon;
+mod onboarding;
+mod session_meta;
+mod statusbar_build;
 mod statusbar_runner;
 mod style;
 mod template;
@@ -533,6 +536,19 @@ async fn run_rpc_server(
         cancel.clone(),
     );
 
+    // Per-session decorations (git branch, SSH context). Non-persisted,
+    // populated on session.create / .ensure, cleared on session.kill.
+    // The OOTB status bar reads this on every render — must stay cheap.
+    let session_meta_cache = session_meta::SessionMetaCache::new();
+
+    // First-run onboarding state (prefix-discovered, welcome-toast-seen).
+    // Single state file under XDG_STATE_HOME loaded once at daemon start.
+    let onboarding = onboarding::OnboardingHandle::load();
+
+    // Daemon start instant — drives the "up Nh Nm" segment in the right
+    // zone post-hint-dismissal.
+    let daemon_start = std::time::Instant::now();
+
     // Spawn the attach UDS listener (separate socket, dedicated streaming
     // protocol). The JSON-RPC socket below stays request-response.
     let attach_path = daemon::attach_socket_path()?;
@@ -541,6 +557,8 @@ async fn run_rpc_server(
     let attach_cancel = cancel.clone();
     let attach_config = config_handle.clone();
     let attach_segments = segment_cache.clone();
+    let attach_meta = session_meta_cache.clone();
+    let attach_onboarding = onboarding.clone();
     tokio::spawn(async move {
         if let Err(e) = attach::run_attach_server(
             attach_path,
@@ -548,6 +566,9 @@ async fn run_rpc_server(
             attach_io,
             attach_config,
             attach_segments,
+            attach_meta,
+            attach_onboarding,
+            daemon_start,
             attach_cancel,
         )
         .await
@@ -592,6 +613,7 @@ async fn run_rpc_server(
                                 graph_handle.clone(),
                                 io_state.clone(),
                                 cancel.clone(),
+                                session_meta_cache.clone(),
                             ),
                             graph_handle.clone(),
                             io_state.clone(),
@@ -604,6 +626,9 @@ async fn run_rpc_server(
                     graph_handle.clone(),
                     io_state.clone(),
                     cancel.clone(),
+                    config_handle.clone(),
+                    session_meta_cache.clone(),
+                    onboarding.clone(),
                 ),
                 event_bus,
             ),
@@ -1825,58 +1850,63 @@ fn resolve_window_id_from_params(
     Ok(session.active_window)
 }
 
-/// Build a 3-zone status bar matching `shux attach`'s built-in segments
-/// (session name · `[i/n] window` · clock) from a graph snapshot. Used by
-/// `window.snapshot` / `session.snapshot` so the resulting PNG includes
-/// the same bottom row a live attached client would render.
-fn build_snapshot_status_bar(
+/// Build the OOTB status bar for a snapshot frame, using the same
+/// `statusbar_build::build` renderer the live attach path uses so the
+/// PNG matches what a fresh attached client would see.
+///
+/// The snapshot path doesn't have a live attach context, so we
+/// synthesize a `StatusBarCtx` with defaults that mirror "fresh OOTB
+/// experience": onboarding state read from the daemon-loaded handle,
+/// session_meta read from the cache, no live `last_action`, no
+/// copy-mode flag, no daemon-uptime (snapshots are stateless).
+async fn build_snapshot_status_bar(
     snap: &shux_core::graph::SessionGraphSnapshot,
     session_id: &shux_core::model::SessionId,
     window_id: shux_core::model::WindowId,
+    cols: u16,
+    config: &shux_core::config::ConfigHandle,
+    meta_cache: &session_meta::SessionMetaCache,
+    onboarding: &onboarding::OnboardingHandle,
 ) -> shux_ui::StatusBar {
-    use crossterm::style::Color;
-    let theme = shux_core::theme::Theme::DEFAULT;
-    let to_color = |rgb: shux_core::theme::Rgb| Color::Rgb {
-        r: rgb.r,
-        g: rgb.g,
-        b: rgb.b,
+    let theme = {
+        let cfg = config.current();
+        shux_core::theme::Theme::resolve(&cfg.theme)
     };
-    let mut bar = shux_ui::StatusBar::new();
-    bar.bg = Some(to_color(theme.status_bg));
+    let live_cfg = config.current();
+    let nerd_fonts = live_cfg.appearance.nerd_fonts;
+    let prefix_label = statusbar_build::prefix_display(&live_cfg.keys.prefix);
+    let session_meta = meta_cache.get(*session_id).await;
+    let onboarding_state = onboarding.current().await;
 
-    if let Some(sess) = snap.sessions.get(session_id) {
-        bar.left.push(shux_ui::StatusSegment::styled(
-            format!(" ◆ {} ", sess.name),
-            to_color(theme.status_accent),
-            true,
-        ));
-        let win_count = sess.windows.len();
-        let active_idx = sess
-            .windows
-            .iter()
-            .position(|w| *w == window_id)
-            .unwrap_or(0);
-        if let Some(win) = snap.windows.get(&window_id) {
-            let title = if win.title.is_empty() {
-                "shell".to_string()
-            } else {
-                win.title.clone()
-            };
-            bar.center.push(shux_ui::StatusSegment::styled(
-                format!(" [{}/{}] {} ", active_idx + 1, win_count, title),
-                to_color(theme.status_fg),
-                false,
-            ));
-        }
-    }
+    // The active pane id is what the live attach path would show as
+    // the focus. For the snapshot we read from the graph.
+    let active_pane_id = snap
+        .windows
+        .get(&window_id)
+        .map(|w| w.active_pane)
+        .unwrap_or_default();
 
-    let now = chrono::Local::now();
-    bar.right.push(shux_ui::StatusSegment::styled(
-        format!(" {} ", now.format("%H:%M:%S")),
-        to_color(theme.status_fg),
-        false,
-    ));
-    bar
+    let session_name = snap
+        .sessions
+        .get(session_id)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+
+    let ctx = statusbar_build::StatusBarCtx {
+        session_id: *session_id,
+        session_name: &session_name,
+        active_window_id: window_id,
+        active_pane_id,
+        session_meta: &session_meta,
+        onboarding: &onboarding_state,
+        daemon_uptime: std::time::Duration::from_secs(0),
+        nerd_fonts,
+        prefix_label: &prefix_label,
+        client_cols: cols,
+        copy_mode_active: false,
+        last_action: None,
+    };
+    statusbar_build::build(snap, &theme, &ctx)
 }
 
 /// Tail-clip captured text for inclusion in wait_for response previews.
@@ -1914,6 +1944,7 @@ fn parse_snapshot_dims(params: &serde_json::Value) -> Result<(u16, u16), shux_rp
 /// Compose every pane in `window_id` into a single ComposedFrame at
 /// `cols × rows`, rasterize it, and return the JSON `pane.snapshot`-shaped
 /// response (with `window_id` in place of `pane_id`).
+#[allow(clippy::too_many_arguments)]
 async fn snapshot_window(
     gh: &shux_core::graph::GraphHandle,
     io: &Arc<Mutex<PaneIoState>>,
@@ -1921,6 +1952,9 @@ async fn snapshot_window(
     cols: u16,
     rows: u16,
     rasterizer: Arc<shux_raster::Rasterizer>,
+    config: &shux_core::config::ConfigHandle,
+    meta_cache: &session_meta::SessionMetaCache,
+    onboarding: &onboarding::OnboardingHandle,
 ) -> Result<serde_json::Value, shux_rpc::RpcError> {
     let (cw, ch) = rasterizer.cell_size();
     let pixel_count = (cols as u64)
@@ -1975,8 +2009,20 @@ async fn snapshot_window(
 
     // Build the same status bar `shux attach` would render so the snapshot
     // matches what a user sees attached. We don't have the live attached
-    // state here, so we synthesize from the snapshot.
-    let status_bar = build_snapshot_status_bar(&snap, &window.session_id, window_id);
+    // state here, so we synthesize the StatusBarCtx with snapshot-time
+    // defaults — every signal that does have a daemon-side source
+    // (git branch, onboarding hint, theme, nerd-fonts toggle) IS still
+    // populated, so PNGs honestly reflect the OOTB experience.
+    let status_bar = build_snapshot_status_bar(
+        &snap,
+        &window.session_id,
+        window_id,
+        cols,
+        config,
+        meta_cache,
+        onboarding,
+    )
+    .await;
     const STATUS_BAR_ROWS: u16 = 1;
 
     let (img, png_buf) = tokio::task::spawn_blocking(move || {
@@ -2494,6 +2540,7 @@ fn register_session_methods(
     graph: shux_core::graph::GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     cancel: tokio_util::sync::CancellationToken,
+    meta_cache: session_meta::SessionMetaCache,
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
@@ -2506,6 +2553,10 @@ fn register_session_methods(
     let io_ensure = io_state;
     let cancel_create = cancel.clone();
     let cancel_ensure = cancel;
+
+    let meta_create = meta_cache.clone();
+    let meta_kill = meta_cache.clone();
+    let meta_ensure = meta_cache;
 
     builder
         .register_with_policy(
@@ -2530,6 +2581,7 @@ fn register_session_methods(
                 let gh = g2.clone();
                 let io = io_create.clone();
                 let ct = cancel_create.clone();
+                let meta = meta_create.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let name = params
@@ -2587,6 +2639,28 @@ fn register_session_methods(
                         .await
                     {
                         Ok(session_id) => {
+                            // Populate session-meta cache: git branch from
+                            // the spawn cwd, SSH context from the daemon
+                            // env. spawn_blocking because detect_git_branch
+                            // shells out to `git`; using async tokio for
+                            // this would force the runtime to wait for git.
+                            let meta_cache_clone = meta.clone();
+                            let cwd_for_meta = cwd.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let branch = session_meta::detect_git_branch(&cwd_for_meta);
+                                let over_ssh = session_meta::detect_over_ssh();
+                                let snapshot = session_meta::SessionMeta {
+                                    git_branch: branch,
+                                    over_ssh,
+                                };
+                                // Tiny tokio block to write the cache —
+                                // SessionMetaCache.set is async because the
+                                // inner RwLock is tokio::sync.
+                                tokio::runtime::Handle::current().block_on(async move {
+                                    meta_cache_clone.set(session_id, snapshot).await;
+                                });
+                            });
+
                             let snap = gh.snapshot();
                             // Spawn PTY for the initial pane
                             if let Some(s) = snap.sessions.get(&session_id) {
@@ -2621,6 +2695,7 @@ fn register_session_methods(
             move |params: Option<serde_json::Value>| {
                 let gh = g3.clone();
                 let io = io_kill.clone();
+                let meta = meta_kill.clone();
                 async move {
                     let params = params.unwrap_or_default();
 
@@ -2707,6 +2782,8 @@ fn register_session_methods(
                         pulse.notify_one();
                     }
 
+                    meta.remove(session_id).await;
+
                     Ok(serde_json::json!({ "killed": name }))
                 }
             },
@@ -2718,6 +2795,7 @@ fn register_session_methods(
                 let gh = g4.clone();
                 let io = io_ensure.clone();
                 let ct = cancel_ensure.clone();
+                let meta = meta_ensure.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let name = params
@@ -2756,6 +2834,22 @@ fn register_session_methods(
                         .await
                     {
                         Ok(session_id) => {
+                            // Populate session-meta cache (git branch, SSH).
+                            // Same pattern as session.create above.
+                            let meta_cache_clone = meta.clone();
+                            let cwd_for_meta = cwd.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let branch = session_meta::detect_git_branch(&cwd_for_meta);
+                                let over_ssh = session_meta::detect_over_ssh();
+                                let snapshot = session_meta::SessionMeta {
+                                    git_branch: branch,
+                                    over_ssh,
+                                };
+                                tokio::runtime::Handle::current().block_on(async move {
+                                    meta_cache_clone.set(session_id, snapshot).await;
+                                });
+                            });
+
                             let snap = gh.snapshot();
                             // Spawn PTY for the initial pane
                             if let Some(s) = snap.sessions.get(&session_id) {
@@ -2840,11 +2934,15 @@ fn register_session_methods(
 }
 
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
+#[allow(clippy::too_many_arguments)]
 fn register_pane_io_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
     _cancel: tokio_util::sync::CancellationToken,
+    config: shux_core::config::ConfigHandle,
+    meta_cache: session_meta::SessionMetaCache,
+    onboarding: onboarding::OnboardingHandle,
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
@@ -2867,11 +2965,38 @@ fn register_pane_io_methods(
     let io10 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
-    // Built once at startup so each snapshot call doesn't re-parse the 264 KB embedded font.
-    let rasterizer_pane: Arc<shux_raster::Rasterizer> = Arc::new(
-        shux_raster::Rasterizer::new(14.0)
-            .expect("shux-raster: failed to construct rasterizer (bundled font corrupt?)"),
-    );
+    // Built once at startup so each snapshot call doesn't re-parse the
+    // bundled fonts. When `appearance.font` is set, the user's font
+    // becomes the primary text font and the bundled NF symbols subset
+    // stays as the icon fallback. Font-config changes need a daemon
+    // restart to take effect (hot reload only re-renders, doesn't
+    // rebuild the rasterizer); documented in the config TOML.
+    let rasterizer_pane: Arc<shux_raster::Rasterizer> =
+        {
+            let cfg_snap = config.current();
+            let custom_font: Option<Vec<u8>> = cfg_snap.appearance.font.as_ref().and_then(|p| {
+                match std::fs::read(p) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %p.display(),
+                            error = %e,
+                            "appearance.font: read failed, falling back to bundled JetBrains Mono"
+                        );
+                        None
+                    }
+                }
+            });
+            let raster = match custom_font {
+                Some(bytes) => shux_raster::Rasterizer::with_primary_font(14.0, &bytes)
+                    .or_else(|_| shux_raster::Rasterizer::new(14.0)),
+                None => shux_raster::Rasterizer::new(14.0),
+            };
+            Arc::new(
+                raster
+                    .expect("shux-raster: failed to construct rasterizer (bundled font corrupt?)"),
+            )
+        };
     let rasterizer_window = rasterizer_pane.clone();
     let rasterizer_session = rasterizer_pane.clone();
 
@@ -3339,45 +3464,60 @@ fn register_pane_io_methods(
         .register_with_policy(
             "window.snapshot",
             Policy::fixed(Sensitivity::ContentRead),
-            move |params: Option<serde_json::Value>| {
-                let gh = g8.clone();
-                let io = io8.clone();
-                let r = rasterizer_window.clone();
-                async move {
-                    let params = params.unwrap_or_default();
-                    let window_id = resolve_window_id_from_params(&gh, &params)?;
-                    let (cols, rows) = parse_snapshot_dims(&params)?;
-                    snapshot_window(&gh, &io, window_id, cols, rows, r).await
+            {
+                let cfg = config.clone();
+                let meta = meta_cache.clone();
+                let onb = onboarding.clone();
+                move |params: Option<serde_json::Value>| {
+                    let gh = g8.clone();
+                    let io = io8.clone();
+                    let r = rasterizer_window.clone();
+                    let cfg = cfg.clone();
+                    let meta = meta.clone();
+                    let onb = onb.clone();
+                    async move {
+                        let params = params.unwrap_or_default();
+                        let window_id = resolve_window_id_from_params(&gh, &params)?;
+                        let (cols, rows) = parse_snapshot_dims(&params)?;
+                        snapshot_window(&gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb).await
+                    }
                 }
             },
         )
         .register_with_policy(
             "session.snapshot",
             Policy::fixed(Sensitivity::ContentRead),
-            move |params: Option<serde_json::Value>| {
-                let gh = g9.clone();
-                let io = io9.clone();
-                let r = rasterizer_session.clone();
-                async move {
-                    let params = params.unwrap_or_default();
-                    let session_id_str = params
-                        .get("session_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
+            {
+                let cfg = config.clone();
+                let meta = meta_cache.clone();
+                let onb = onboarding.clone();
+                move |params: Option<serde_json::Value>| {
+                    let gh = g9.clone();
+                    let io = io9.clone();
+                    let r = rasterizer_session.clone();
+                    let cfg = cfg.clone();
+                    let meta = meta.clone();
+                    let onb = onb.clone();
+                    async move {
+                        let params = params.unwrap_or_default();
+                        let session_id_str = params
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::invalid_params("missing 'session_id' parameter")
+                            })?;
+                        let session_id: shux_core::model::SessionId =
+                            session_id_str.parse().map_err(|_| {
+                                shux_rpc::RpcError::invalid_params("invalid session_id format")
+                            })?;
+                        let snap = gh.snapshot();
+                        let session = snap.sessions.get(&session_id).ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("session", session_id_str)
                         })?;
-                    let session_id: shux_core::model::SessionId =
-                        session_id_str.parse().map_err(|_| {
-                            shux_rpc::RpcError::invalid_params("invalid session_id format")
-                        })?;
-                    let snap = gh.snapshot();
-                    let session = snap
-                        .sessions
-                        .get(&session_id)
-                        .ok_or_else(|| shux_rpc::RpcError::not_found("session", session_id_str))?;
-                    let window_id = session.active_window;
-                    let (cols, rows) = parse_snapshot_dims(&params)?;
-                    snapshot_window(&gh, &io, window_id, cols, rows, r).await
+                        let window_id = session.active_window;
+                        let (cols, rows) = parse_snapshot_dims(&params)?;
+                        snapshot_window(&gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb).await
+                    }
                 }
             },
         )
@@ -4070,6 +4210,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
 
         Some(Command::Config { command: cfg_cmd }) => match cfg_cmd {
             cli::ConfigCommand::Init { force } => cli::handle_config_init(force),
+            cli::ConfigCommand::ResetHints => cli::handle_config_reset_hints(),
             cli::ConfigCommand::Path => cli::handle_config_path(),
             cli::ConfigCommand::Show => cli::handle_config_show(),
             cli::ConfigCommand::Validate { path, config } => {
