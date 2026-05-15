@@ -1,3 +1,11 @@
+## [0.22.1](https://github.com/indrasvat/shux/compare/v0.22.0...v0.22.1) (2026-05-15)
+
+
+### Bug Fixes
+
+* agent friction (pane.capture after exit, --text hyphen values, POSIX installer) ([#40](https://github.com/indrasvat/shux/issues/40)) ([76f6843](https://github.com/indrasvat/shux/commit/76f6843f5fdde8ad786258a8e592a10756e92d32))
+* **install:** avoid GitHub API rate limit + propagate wget status ([#41](https://github.com/indrasvat/shux/issues/41)) ([8b4da00](https://github.com/indrasvat/shux/commit/8b4da00c367567a5a32ae4818ab20ba17a3e0914))
+
 # [0.22.0](https://github.com/indrasvat/shux/compare/v0.21.0...v0.22.0) (2026-05-13)
 
 
