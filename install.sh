@@ -195,12 +195,18 @@ fetch_with_status() {
         code=$(curl -sSL -o "${outfile}" -w '%{http_code}' "${url}" 2>/dev/null) || code=""
         echo "${code:-000}"
     else
-        # wget swallows status. Treat success as 200, failure as 000.
-        if wget -qO "${outfile}" "${url}" 2>/dev/null; then
-            echo "200"
-        else
-            echo "000"
-        fi
+        # wget doesn't expose %{http_code} directly. -S prints the
+        # response status line to stderr ("HTTP/1.1 403 Forbidden");
+        # capture that and parse out the code. We can't use -q with -S
+        # because -q would suppress -S's output. Fall through to "000"
+        # if we couldn't extract a code (genuine network failure).
+        # GNU wget and busybox wget both support -S since ~2016.
+        wget_stderr=$(wget -S -O "${outfile}" "${url}" 2>&1 1>/dev/null) || true
+        code=$(printf '%s\n' "${wget_stderr}" | awk '
+            /^[[:space:]]*HTTP\// { last = $2 }
+            END { print (last ? last : "000") }
+        ')
+        echo "${code:-000}"
     fi
 }
 
@@ -211,11 +217,53 @@ parse_first_tag() {
     grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
 }
 
-# get_latest_version sets VERSION. Falls back from /releases/latest to
-# /releases?per_page=1 ONLY on a 404 (no stable release yet). Network
-# errors and rate-limiting (403/5xx) abort with a clear message instead
-# of silently installing a prerelease.
+# get_latest_tag_from_web resolves "the latest stable release" via the
+# `https://github.com/<repo>/releases/latest` web redirect — NOT the
+# rate-limited api.github.com endpoint. The web URL 302's to
+# /releases/tag/v<X.Y.Z> for the latest stable; we grab the redirect
+# target with curl's `-w '%{redirect_url}'` (no HTTP parsing, no awk,
+# no sed) and pull the tag out with POSIX parameter expansion. Web
+# traffic has much more generous rate limits than the API, so this
+# is the right primary path for anonymous installs.
+#
+# Returns the tag on stdout (e.g. `v0.22.0`), or exits non-zero with
+# no output when the lookup can't yield a tag (curl failure, 404
+# because the repo has no stable release yet, unexpected URL shape).
+# The caller falls back to the API in that case.
+#
+# wget doesn't expose `redirect_url` cleanly, so this is curl-only;
+# wget users skip straight to the API path.
+get_latest_tag_from_web() {
+    [ "${DOWNLOADER}" = "curl" ] || return 1
+    url=$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
+        "https://github.com/${REPO}/releases/latest" 2>/dev/null) || return 1
+    case "$url" in
+        */tag/*) ;;
+        *) return 1 ;;
+    esac
+    tag=${url##*/tag/}
+    # Strip any trailing CR / whitespace / non-tag noise. POSIX
+    # parameter expansion: longest suffix match of "one non-tag char
+    # followed by anything" — gives `v0.22.0` from `v0.22.0\r`.
+    tag=${tag%%[!A-Za-z0-9._+-]*}
+    [ -n "$tag" ] || return 1
+    printf '%s\n' "$tag"
+}
+
+# get_latest_version sets VERSION. Primary path is the web redirect
+# (no API quota burned). Falls back to api.github.com only when the
+# web lookup yields nothing — that's the prerelease case (repo has
+# no stable release yet) or wget users. Then within the API path,
+# /releases/latest falls back to /releases?per_page=1 on 404 to
+# surface prereleases. Network errors and API rate-limiting (403/5xx)
+# abort with a clear message pointing at --version vX.Y.Z.
 get_latest_version() {
+    web_tag=$(get_latest_tag_from_web 2>/dev/null) || web_tag=""
+    if [ -n "$web_tag" ]; then
+        VERSION="$web_tag"
+        return
+    fi
+
     body="$(mktemp "${TMPDIR_CREATED}/shux-api-body.XXXXXX")"
 
     status="$(fetch_with_status "${body}" "https://api.github.com/repos/${REPO}/releases/latest")"
