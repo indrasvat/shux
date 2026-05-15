@@ -1561,6 +1561,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# ~/.config/shux/config.toml
 [appearance]
 # Pane border style: thin | thick | double | rounded | ascii | none
 border_style = "rounded"
+# Render the status bar with Nerd Font glyphs (terminal icon, git
+# branch, window icon, ssh host). Set to false if your terminal /
+# font doesn't have NF — the bar falls back to ◆ ± ▶ @.
+nerd_fonts = true
 
 [keys]
 # Prefix key (e.g. "ctrl-space", "ctrl-b", "alt-w")
