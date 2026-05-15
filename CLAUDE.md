@@ -172,7 +172,12 @@ crates/shux-ui/        TUI client (crossterm, ratatui for chrome, render composi
 >    Don't wait for codex-bot on the PR to find issues. The goal is the PR
 >    shows up *already solid* — codex should react 👍, not write P2 reviews.
 > 6. **Visual evidence per (render path × config state) cell.** Save under
->    `.claude/screenshots/<feature>/`, name `v<N>_<width>_<config-state>.png`.
+>    `.claude/screenshots/<feature>/`, name
+>    `v<N>_<render-path>_<width>_<config-state>.png` (e.g.
+>    `v1_attach_120_default.png`, `v1_window_snapshot_120_max.png`). Render
+>    path is mandatory in the filename — two cells from different paths
+>    at the same width + state would otherwise collide and silently
+>    overwrite each other, making the matrix unauditable.
 > 7. **Cross-path consistency assertion.** At least one test that asserts the
 >    same logical output across render paths (e.g., snapshot at width W matches
 >    the attach renderer's bar at width W). Prevents future drift.
@@ -191,6 +196,8 @@ crates/shux-ui/        TUI client (crossterm, ratatui for chrome, render composi
 > - [ ] default-config state
 > - [ ] `shux config init` state
 > - [ ] feature-maxed config state
+> - [ ] malformed-config state (gracefully ignored / clear error)
+> - [ ] hot-reload state (config edit mid-session takes effect)
 > - [ ] cross-path consistency test
 > - [ ] `make check` (lint + tests)
 > - [ ] visual evidence for every relevant (path × state) cell
