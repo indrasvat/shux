@@ -1,3 +1,10 @@
+## [0.23.1](https://github.com/indrasvat/shux/compare/v0.23.0...v0.23.1) (2026-05-15)
+
+
+### Bug Fixes
+
+* **statusbar:** include script segments in PNG snapshots ([#45](https://github.com/indrasvat/shux/issues/45)) ([7d93b4a](https://github.com/indrasvat/shux/commit/7d93b4aa074248d134b4c40bc611e10ebdb554ec)), closes [#43](https://github.com/indrasvat/shux/issues/43) [#43](https://github.com/indrasvat/shux/issues/43)
+
 # [0.23.0](https://github.com/indrasvat/shux/compare/v0.22.2...v0.23.0) (2026-05-15)
 
 
