@@ -321,10 +321,15 @@ async fn run_pane_pty_task(
         }
     }
 
+    // Drop only the PTY-bound handles. The VT (grid + scrollback) stays
+    // until the pane is explicitly destroyed via pane.kill / window.kill
+    // / session.kill — agents and humans alike need pane.capture and
+    // pane.snapshot to keep working against the frozen output of a
+    // short-lived command. The Pane's exit_status is the "dead" flag;
+    // tmux does the same with its `remain-on-exit` model.
     let mut state = io_state.lock().await;
     state.writers.remove(&pane_id);
     state.resizers.remove(&pane_id);
-    state.vts.remove(&pane_id);
     let pulse = state.render_pulse.clone();
     drop(state);
     pulse.notify_one();

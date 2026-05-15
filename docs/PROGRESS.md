@@ -85,6 +85,37 @@
 
 ## Session Log
 
+**2026-05-14 — fix: pane.capture after exit + --text/--regex hyphen values**
+- Two friction points flagged by Codex while using shux to verify a
+  Textual TUI (independently confirmed in a separate LLM review):
+  1. `pane wait-for --text '--search'` failed — clap was treating
+     `--search` as an unknown flag. Workaround was `--text=--search`,
+     which isn't obvious. Same issue would have hit `--regex` and
+     `pane send-keys --text`.
+  2. Short-lived commands inside a pane exited before the agent could
+     call `pane.capture` — the VT was evicted from `io_state` the
+     moment the PTY task observed EOF, so capture returned
+     `not_found: pane VT` for a pane the user could still see in
+     `pane list`. Codex's workaround was wrapping commands in `sleep`.
+- Fixes:
+  1. Added `allow_hyphen_values = true` to `wait-for --text/--regex`
+     and `send-keys --text`. Documented the tradeoff in code comments
+     — these args require values, so the ambiguity surface is bounded.
+  2. PTY task cleanup at `main.rs:323` now drops only `writers` and
+     `resizers` (PTY-bound). The `VT` lingers until pane is explicitly
+     destroyed via `pane.kill` / `window.kill` cascade / `session.kill`
+     cascade — same model tmux uses (`remain-on-exit`). `Pane.exit_status`
+     is the "dead" flag. `send_keys` / `set_size` to an exited pane now
+     fail with `not_found: pane writer` instead of silently working.
+- Red→green TDD: 3 new clap parser tests for hyphen values + 1 new
+  integration test (`test_capture_works_after_pane_process_exits`)
+  that spawns a shell, runs `echo X && exit 0`, waits, then asserts
+  `pane.capture` still returns the marker. All four failed pre-fix.
+- 751 tests pass, clippy + fmt clean.
+- Files: `crates/shux/src/cli.rs` (3 args + 3 tests),
+  `crates/shux/src/main.rs` (PTY-exit cleanup),
+  `crates/shux/tests/pane_io_integration.rs` (scaffold mirror + 1 test).
+
 **2026-05-13 — PR #33: default-deny plugin permission model (v0.20.0)**
 - Goal: third (and last) plugin daemon FR identified in the parked
   conductor design review. Predecessors landed earlier today

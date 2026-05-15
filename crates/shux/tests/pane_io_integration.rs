@@ -67,9 +67,11 @@ async fn run_pane_pty_task(
             _ = shutdown.cancelled() => break,
         }
     }
+    // Mirrors main.rs: drop the PTY-bound writer, keep the VT around
+    // so pane.capture / pane.snapshot still work after the pane process
+    // exits. The VT is only purged via the explicit-destroy paths.
     let mut state = io_state.lock().await;
     state.writers.remove(&pane_id);
-    state.vts.remove(&pane_id);
 }
 
 async fn spawn_pane_pty(
@@ -918,6 +920,56 @@ async fn test_capture_lines_default() {
 
     assert!(result.get("text").is_some());
     assert_eq!(result["lines"].as_u64().unwrap(), 50);
+
+    cancel.cancel();
+}
+
+// Codex hit this in May 2026: short-lived commands inside a shux pane
+// exit before the agent can call pane.capture, and the VT used to be
+// evicted from io_state the moment the PTY task observed EOF. The pane
+// stays in the graph (with exit_status set), but capture returns "pane
+// VT not found". tmux keeps screen+grid until the user explicitly kills
+// the pane; we should too — exit_status already plays the "dead" flag.
+#[tokio::test]
+async fn test_capture_works_after_pane_process_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (session_id, _pane_id) = create_test_session(&mut stream).await;
+
+    // Print a marker, then exit the shell. After this, the PTY task
+    // sees EOF, reaps the child, and tears its loop down. The Pane
+    // remains in the graph with exit_status=Some(0).
+    rpc_call(
+        &mut stream,
+        "pane.send_keys",
+        serde_json::json!({
+            "session_id": session_id,
+            "text": "echo SHUX_LIVES_AFTER_EXIT && exit 0\n",
+        }),
+    )
+    .await;
+
+    // Give the shell time to: render the echo, exit cleanly, and let
+    // the PTY task drain. 2s is overkill but tests should be sturdy.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = rpc_call(
+        &mut stream,
+        "pane.capture",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+
+    let text = result["text"].as_str().expect(
+        "pane.capture must keep returning text after the pane process exits — \
+         the VT should linger until the pane is explicitly destroyed",
+    );
+    assert!(
+        text.contains("SHUX_LIVES_AFTER_EXIT"),
+        "captured text after exit should contain the marker, got: {text}"
+    );
 
     cancel.cancel();
 }
