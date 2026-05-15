@@ -58,6 +58,22 @@ impl OnboardingHandle {
         self.inner.read().await.clone()
     }
 
+    /// Test-only constructor that bypasses disk and `XDG_STATE_HOME`
+    /// entirely. The `path` is a unique-per-construction location
+    /// under `temp_dir()`; nothing is written there unless a test
+    /// calls `mark_*` (which would trigger `persist()` and create the
+    /// file). Lets snapshot/render unit tests build a handle with
+    /// known state without racing other tests that mutate the env
+    /// (process env is shared mutable state across `cargo test`
+    /// threads).
+    #[cfg(test)]
+    pub fn from_state_for_test(state: OnboardingState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(state)),
+            path: std::env::temp_dir().join(format!("shux-onb-test-{}.json", uuid::Uuid::new_v4())),
+        }
+    }
+
     /// Mark the prefix as discovered and persist. Subsequent attaches
     /// will see the hint dismissed.
     pub async fn mark_prefix_discovered(&self) {

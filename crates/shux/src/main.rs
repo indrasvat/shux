@@ -629,6 +629,7 @@ async fn run_rpc_server(
                     config_handle.clone(),
                     session_meta_cache.clone(),
                     onboarding.clone(),
+                    segment_cache.clone(),
                 ),
                 event_bus,
             ),
@@ -1859,6 +1860,12 @@ fn resolve_window_id_from_params(
 /// experience": onboarding state read from the daemon-loaded handle,
 /// session_meta read from the cache, no live `last_action`, no
 /// copy-mode flag, no daemon-uptime (snapshots are stateless).
+///
+/// `segments` carries the latest script-driven `[[statusbar.segment]]`
+/// outputs; `populate_bar` appends them into the same StatusBar the
+/// attach loop assembles, so PNG snapshots match what an attached
+/// client renders.
+#[allow(clippy::too_many_arguments)]
 async fn build_snapshot_status_bar(
     snap: &shux_core::graph::SessionGraphSnapshot,
     session_id: &shux_core::model::SessionId,
@@ -1867,6 +1874,7 @@ async fn build_snapshot_status_bar(
     config: &shux_core::config::ConfigHandle,
     meta_cache: &session_meta::SessionMetaCache,
     onboarding: &onboarding::OnboardingHandle,
+    segments: &statusbar_runner::SegmentCache,
 ) -> shux_ui::StatusBar {
     let theme = {
         let cfg = config.current();
@@ -1906,7 +1914,13 @@ async fn build_snapshot_status_bar(
         copy_mode_active: false,
         last_action: None,
     };
-    statusbar_build::build(snap, &theme, &ctx)
+    let mut bar = statusbar_build::build(snap, &theme, &ctx);
+    // Append script-driven `[[statusbar.segment]]` outputs the same
+    // way the attach render loop does. Without this, PNG snapshots
+    // would only show the built-in OOTB segments and silently drop
+    // every user-configured segment.
+    statusbar_runner::populate_bar(&mut bar, config, segments).await;
+    bar
 }
 
 /// Tail-clip captured text for inclusion in wait_for response previews.
@@ -1955,6 +1969,7 @@ async fn snapshot_window(
     config: &shux_core::config::ConfigHandle,
     meta_cache: &session_meta::SessionMetaCache,
     onboarding: &onboarding::OnboardingHandle,
+    segments: &statusbar_runner::SegmentCache,
 ) -> Result<serde_json::Value, shux_rpc::RpcError> {
     let (cw, ch) = rasterizer.cell_size();
     let pixel_count = (cols as u64)
@@ -2021,6 +2036,7 @@ async fn snapshot_window(
         config,
         meta_cache,
         onboarding,
+        segments,
     )
     .await;
     const STATUS_BAR_ROWS: u16 = 1;
@@ -2943,6 +2959,7 @@ fn register_pane_io_methods(
     config: shux_core::config::ConfigHandle,
     meta_cache: session_meta::SessionMetaCache,
     onboarding: onboarding::OnboardingHandle,
+    segments: statusbar_runner::SegmentCache,
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
@@ -3468,6 +3485,7 @@ fn register_pane_io_methods(
                 let cfg = config.clone();
                 let meta = meta_cache.clone();
                 let onb = onboarding.clone();
+                let segs = segments.clone();
                 move |params: Option<serde_json::Value>| {
                     let gh = g8.clone();
                     let io = io8.clone();
@@ -3475,11 +3493,15 @@ fn register_pane_io_methods(
                     let cfg = cfg.clone();
                     let meta = meta.clone();
                     let onb = onb.clone();
+                    let segs = segs.clone();
                     async move {
                         let params = params.unwrap_or_default();
                         let window_id = resolve_window_id_from_params(&gh, &params)?;
                         let (cols, rows) = parse_snapshot_dims(&params)?;
-                        snapshot_window(&gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb).await
+                        snapshot_window(
+                            &gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
+                        )
+                        .await
                     }
                 }
             },
@@ -3491,6 +3513,7 @@ fn register_pane_io_methods(
                 let cfg = config.clone();
                 let meta = meta_cache.clone();
                 let onb = onboarding.clone();
+                let segs = segments.clone();
                 move |params: Option<serde_json::Value>| {
                     let gh = g9.clone();
                     let io = io9.clone();
@@ -3498,6 +3521,7 @@ fn register_pane_io_methods(
                     let cfg = cfg.clone();
                     let meta = meta.clone();
                     let onb = onb.clone();
+                    let segs = segs.clone();
                     async move {
                         let params = params.unwrap_or_default();
                         let session_id_str = params
@@ -3516,7 +3540,10 @@ fn register_pane_io_methods(
                         })?;
                         let window_id = session.active_window;
                         let (cols, rows) = parse_snapshot_dims(&params)?;
-                        snapshot_window(&gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb).await
+                        snapshot_window(
+                            &gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
+                        )
+                        .await
                     }
                 }
             },
@@ -4342,5 +4369,119 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
         }
 
         Some(Command::__daemon) => unreachable!("handled above"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Snapshot-path regression tests.
+    //!
+    //! These exercise the seam between `snapshot_window` and the
+    //! script-driven `[[statusbar.segment]]` runner: PR #43 shipped the
+    //! attach path with `populate_bar` but the snapshot path silently
+    //! dropped every user segment. The test below pre-populates a
+    //! `SegmentCache` and drives `build_snapshot_status_bar` directly,
+    //! asserting the segment text survives into the rendered StatusBar.
+    //! If anyone removes the `populate_bar` call from
+    //! `build_snapshot_status_bar` it breaks here.
+    use super::*;
+    use shux_core::config::{Config, ConfigHandle, SegmentDef, StatusBarConfig};
+    use shux_core::graph::SessionGraphSnapshot;
+    use shux_core::model::{Pane, Session, Window};
+
+    fn config_with_segment(zone: &str) -> ConfigHandle {
+        let cfg = Config {
+            statusbar: StatusBarConfig {
+                left: None,
+                center: None,
+                right: None,
+                segment: vec![SegmentDef {
+                    zone: zone.to_string(),
+                    command: vec!["echo".to_string()],
+                    env: Default::default(),
+                    starship_config: None,
+                    interval_ms: 1_000,
+                    fallback: None,
+                }],
+            },
+            ..Default::default()
+        };
+        // The cache is pre-populated by the test so the command never
+        // runs; we only need `handle.current()` to return our cfg. Use
+        // `replace()` to seed it directly — avoids round-tripping a
+        // tempfile through TOML serialize/parse just to exercise an
+        // in-memory accessor. Pass a never-existing path so
+        // `load_or_default` takes the NotFound branch on every platform.
+        let nonexistent = std::env::temp_dir().join("__shux_test_no_such_config__.toml");
+        let handle = ConfigHandle::load_or_default(&nonexistent);
+        handle.replace(cfg);
+        handle
+    }
+
+    fn snap_with_one_session() -> (
+        SessionGraphSnapshot,
+        shux_core::model::SessionId,
+        shux_core::model::WindowId,
+    ) {
+        let pane = Pane::new(shux_core::model::WindowId::new(), "/");
+        let mut window = Window::new(shux_core::model::SessionId::new(), "0", pane.id);
+        // Fix up cross-refs: Window::new and Pane::new each minted their
+        // own ids; pane.window_id must match window.id, window.session_id
+        // must match session.id.
+        let session_id = shux_core::model::SessionId::new();
+        window.session_id = session_id;
+        let mut pane = pane;
+        pane.window_id = window.id;
+        let session = Session::new("test", window.id);
+        let session = Session {
+            id: session_id,
+            ..session
+        };
+
+        let mut snap = SessionGraphSnapshot::default();
+        snap.sessions.insert(session.id, session);
+        snap.windows.insert(window.id, window.clone());
+        snap.panes.insert(pane.id, pane);
+        (snap, session_id, window.id)
+    }
+
+    #[tokio::test]
+    async fn snapshot_statusbar_includes_script_segments() {
+        // Use the test-only OnboardingHandle constructor — no env
+        // mutation, no filesystem. Process env is shared mutable state
+        // across `cargo test` threads, so any env-mutating test risks
+        // racing every other env-mutating test in the same binary
+        // (codex round-2 P1: this would race
+        // `onboarding::tests::round_trip_dismissal`).
+        let onb = onboarding::OnboardingHandle::from_state_for_test(
+            onboarding::OnboardingState::default(),
+        );
+        let config = config_with_segment("right");
+        let meta = session_meta::SessionMetaCache::new();
+        let segments = statusbar_runner::SegmentCache::new();
+        segments
+            .set_for_test(0, b"shux-test-sentinel".to_vec())
+            .await;
+
+        let (snap, session_id, window_id) = snap_with_one_session();
+
+        let bar = build_snapshot_status_bar(
+            &snap,
+            &session_id,
+            window_id,
+            120,
+            &config,
+            &meta,
+            &onb,
+            &segments,
+        )
+        .await;
+
+        let right_text: String = bar.right.iter().map(|s| s.text.clone()).collect();
+        assert!(
+            right_text.contains("shux-test-sentinel"),
+            "expected snapshot status bar's right zone to contain the \
+             segment sentinel, got: {right_text:?}"
+        );
     }
 }

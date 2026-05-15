@@ -85,6 +85,40 @@
 
 ## Session Log
 
+**2026-05-15 — fix(statusbar): include script segments in PNG snapshots (post-#43 followup)**
+- PR #43 (v0.23.0) wired `populate_bar(&mut bar, &config, &segments)`
+  into the attach render loop but the snapshot path
+  (`window.snapshot` / `session.snapshot`) only called the first
+  half of the bar assembly. Result: user-defined
+  `[[statusbar.segment]]` entries (starship prompt, kubectl context,
+  AWS profile, disk, battery, …) fired correctly on a live attach
+  but silently vanished from PNG snapshots — a parity gap, since
+  the rasterizer is a defining shux capability ("pixel-perfect
+  snapshots = terminal as artifact").
+- Threaded `SegmentCache` through
+  `register_pane_io_methods` → `snapshot_window` →
+  `build_snapshot_status_bar` and called
+  `statusbar_runner::populate_bar` after the OOTB bar is built, matching
+  what the attach loop already does. Three callsites updated:
+  `run_rpc_server` (the `register_pane_io_methods` invocation),
+  `window.snapshot` RPC, `session.snapshot` RPC.
+- `pane.snapshot` is single-pane rasterize with no status-bar
+  chrome by design — not a render path for this feature.
+- Tests: new `#[cfg(test)]` regression test
+  `snapshot_statusbar_includes_script_segments` in `main.rs` pre-populates
+  the cache via a `#[cfg(test)] pub set_for_test` setter and asserts
+  segment text reaches the rendered StatusBar. Production `set` stays
+  module-private (single writer property preserved). 771/771 tests
+  pass via `make test`.
+- Visual matrix under `.claude/screenshots/oob_bar/`:
+  `v23_post_fix_no_segments_200x28.png` (OOTB-only control),
+  `v23_post_fix_200x28.png` (window.snapshot × rich segments — starship +
+  kubectl visible), `v23_post_fix_session_snapshot_200x28.png`
+  (session.snapshot × rich segments — same as window).
+- HANDOFF.md moved from repo root to `.local/HANDOFF.md` (gitignored).
+- Local dootsabha council ran on the implementation diff per
+  `feedback_full_feature_protocol.md` before pushing.
+
 **2026-05-15 — feat(statusbar): delightful OOB experience + onboarding**
 - Bare `shux` (no config, no `shux config init`) used to show a
   3-segment hardcoded bar: `◆ <session>` / `[i/n] <window>` / clock.

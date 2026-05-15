@@ -54,6 +54,14 @@ impl SegmentCache {
     async fn set(&self, idx: usize, bytes: Vec<u8>) {
         self.inner.write().await.insert(idx, bytes);
     }
+
+    /// Test-only setter so other modules can pre-populate the cache.
+    /// Keeps the production `set` module-private (only the runner task
+    /// writes to the cache in real builds).
+    #[cfg(test)]
+    pub async fn set_for_test(&self, idx: usize, bytes: Vec<u8>) {
+        self.set(idx, bytes).await;
+    }
 }
 
 /// Spawn one runner task per segment in the current config; restart
