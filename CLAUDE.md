@@ -151,6 +151,56 @@ crates/shux-ui/        TUI client (crossterm, ratatui for chrome, render composi
 > 5. **Push to the remote** (`git push`)
 > A pre-push hook (`scripts/check-progress.sh`) will block pushes if progress files are not updated.
 
+## Feature Protocol
+
+> **STRICT RULE — Every feature PR follows this protocol. Skipping steps is
+> how gaps ship (see PR #43 — snapshot path silently dropped script segments
+> because only the default render path was verified).**
+>
+> 1. **Council-first design.** `dootsabha council --json` on the proposal BEFORE
+>    coding. Iterate until critique converges. Use `~/.config/dootsabha/config.yaml`;
+>    no CLI agent/chair/model overrides.
+> 2. **Build with tests** — unit + integration coverage for every new code path.
+> 3. **Verify EVERY render path the feature touches.** Enumerate the full matrix
+>    at design time: live `attach` render loop, `window.snapshot` /
+>    `session.snapshot` / `pane.snapshot` PNG rasterizer, `events.watch`
+>    payloads, web preview, anything else. Drift between paths is the failure mode.
+> 4. **Verify EVERY config state.** Not just defaults — also `shux config init`
+>    output, feature-maxed config (every `[[...]]` entry populated), malformed
+>    config, mid-session hot-reload. The user-configured path is where bugs hide.
+> 5. **Local `dootsabha council` review of the implementation diff BEFORE pushing.**
+>    Don't wait for codex-bot on the PR to find issues. The goal is the PR
+>    shows up *already solid* — codex should react 👍, not write P2 reviews.
+> 6. **Visual evidence per (render path × config state) cell.** Save under
+>    `.claude/screenshots/<feature>/`, name `v<N>_<width>_<config-state>.png`.
+> 7. **Cross-path consistency assertion.** At least one test that asserts the
+>    same logical output across render paths (e.g., snapshot at width W matches
+>    the attach renderer's bar at width W). Prevents future drift.
+> 8. **`gh-ghent` post-push, background only** (per memory `feedback-ghent-background`).
+> 9. **Post-merge `curl|sh` smoke** (per memory `feedback-post-merge-smoke-test`) —
+>    verify against the *publicly-installed* binary, not local `target/release/`.
+>
+> **Paste this into every feature PR description:**
+>
+> ```
+> ## Verification matrix
+> - [ ] dootsabha council on design — converged
+> - [ ] dootsabha council on implementation diff — clean
+> - [ ] live attach render path
+> - [ ] window.snapshot / session.snapshot / pane.snapshot PNG paths
+> - [ ] default-config state
+> - [ ] `shux config init` state
+> - [ ] feature-maxed config state
+> - [ ] cross-path consistency test
+> - [ ] `make check` (lint + tests)
+> - [ ] visual evidence for every relevant (path × state) cell
+> ```
+>
+> If a cell can't be filled for a *good* reason (e.g., welcome toast doesn't
+> render in snapshots by design), call it out explicitly in the PR description.
+> Empty cells without explanation are gaps. **Gaps are what the user is going
+> to find.**
+
 ## Key Decisions
 
 | Decision | Rationale | Date |
