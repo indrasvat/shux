@@ -117,7 +117,23 @@
   (session.snapshot × rich segments — same as window).
 - HANDOFF.md moved from repo root to `.local/HANDOFF.md` (gitignored).
 - Local dootsabha council ran on the implementation diff per
-  `feedback_full_feature_protocol.md` before pushing.
+  `feedback_full_feature_protocol.md` before pushing. Three rounds
+  converged: P1 (env-var leak in test) → fixed via
+  `OnboardingHandle::from_state_for_test`; final verdict
+  `approve_with_nits` zero findings.
+- PR #45 opened, CI green 7/7. GitHub Codex bot flagged P2 cold-start
+  race: a snapshot fired immediately after daemon start (or config
+  reload) could observe an empty `SegmentCache` because the runner
+  tasks hadn't completed their first tick yet — `populate_bar` would
+  then silently emit no segments and the one-shot PNG had no later
+  redraw to recover. Fix: added
+  `SegmentCache::wait_for_first_outputs(expected_count, timeout)`
+  (polls 25 ms until cache has ≥ expected_count entries) and call it
+  from `build_snapshot_status_bar` with a 1 s budget (matches the
+  runner's per-command timeout) before `populate_bar`. 4 new unit
+  tests on the wait helper (zero-expected / already-populated /
+  timeout / unblock-on-late-write). Cold-start visual verified
+  with `.claude/screenshots/oob_bar/v23_post_fix_cold_start_200x28.png`.
 
 **2026-05-15 — feat(statusbar): delightful OOB experience + onboarding**
 - Bare `shux` (no config, no `shux config init`) used to show a

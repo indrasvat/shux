@@ -55,6 +55,38 @@ impl SegmentCache {
         self.inner.write().await.insert(idx, bytes);
     }
 
+    /// Wait until each segment index in `0..expected_count` has a
+    /// cache entry, or `timeout` elapses. Returns true on success,
+    /// false on timeout. Used by the snapshot RPC path to bridge a
+    /// cold-start race: when a snapshot fires right after daemon
+    /// start (or a config reload), the runner tasks may not have
+    /// completed their first tick yet, so `populate_bar` would see
+    /// an empty cache and silently emit no segments. The exact-key
+    /// check (not a length check) matches what `populate_bar`
+    /// actually reads, so a sparse cache where index 1 is present
+    /// but index 0 is missing keeps us waiting — codex round-4 nit.
+    /// Polling at 25 ms is cheap; the timeout should slightly exceed
+    /// the runner's per-command budget (1 s) so the runner's
+    /// fallback write has room to land before we give up.
+    pub async fn wait_for_first_outputs(&self, expected_count: usize, timeout: Duration) -> bool {
+        if expected_count == 0 {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let g = self.inner.read().await;
+                if (0..expected_count).all(|i| g.contains_key(&i)) {
+                    return true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Test-only setter so other modules can pre-populate the cache.
     /// Keeps the production `set` module-private (only the runner task
     /// writes to the cache in real builds).
@@ -383,5 +415,71 @@ mod tests {
         let segs = ansi_to_segments(bytes);
         let combined: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(combined.trim(), "hi");
+    }
+
+    #[tokio::test]
+    async fn wait_for_first_outputs_returns_true_immediately_when_zero_expected() {
+        let cache = SegmentCache::new();
+        assert!(
+            cache
+                .wait_for_first_outputs(0, Duration::from_millis(10))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_first_outputs_returns_true_when_already_populated() {
+        let cache = SegmentCache::new();
+        cache.set(0, b"x".to_vec()).await;
+        assert!(
+            cache
+                .wait_for_first_outputs(1, Duration::from_millis(10))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_first_outputs_times_out_when_missing() {
+        let cache = SegmentCache::new();
+        // Expect two entries, only one present → must timeout.
+        cache.set(0, b"x".to_vec()).await;
+        assert!(
+            !cache
+                .wait_for_first_outputs(2, Duration::from_millis(100))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_first_outputs_requires_exact_indices_not_just_len() {
+        // Sparse cache: index 1 populated, index 0 missing. `len() >= 1`
+        // would falsely succeed; the exact-key check must keep waiting.
+        let cache = SegmentCache::new();
+        cache.set(1, b"y".to_vec()).await;
+        assert!(
+            !cache
+                .wait_for_first_outputs(1, Duration::from_millis(100))
+                .await,
+            "wait should fail when index 0 is missing, even though len()>=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_first_outputs_unblocks_on_late_write() {
+        let cache = SegmentCache::new();
+        let c2 = cache.clone();
+        // Background task writes the cache entry after a short delay.
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c2.set(0, b"late".to_vec()).await;
+        });
+        let start = tokio::time::Instant::now();
+        assert!(
+            cache
+                .wait_for_first_outputs(1, Duration::from_millis(500))
+                .await
+        );
+        assert!(start.elapsed() < Duration::from_millis(300));
+        writer.await.unwrap();
     }
 }

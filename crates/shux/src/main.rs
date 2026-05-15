@@ -1914,6 +1914,22 @@ async fn build_snapshot_status_bar(
         copy_mode_active: false,
         last_action: None,
     };
+    // Bridge the cold-start race the attach path doesn't suffer from:
+    // when a snapshot fires right after daemon start or a config reload,
+    // the runner tasks may not have completed their first tick yet, so
+    // `populate_bar` would read an empty cache and silently emit no
+    // segments. Wait up to 1.2s for every configured segment index to
+    // have a cache entry; on timeout we proceed anyway so a slow / hung
+    // command can't wedge the RPC. The 1.2s budget slightly exceeds the
+    // runner's per-command 1s timeout so the runner's fallback-bytes
+    // write has room to land before we give up (codex round-4 nit).
+    // Codex-bot P2, PR #45.
+    let segment_count = live_cfg.statusbar.segment.len();
+    if segment_count > 0 {
+        let _ = segments
+            .wait_for_first_outputs(segment_count, std::time::Duration::from_millis(1200))
+            .await;
+    }
     let mut bar = statusbar_build::build(snap, &theme, &ctx);
     // Append script-driven `[[statusbar.segment]]` outputs the same
     // way the attach render loop does. Without this, PNG snapshots
