@@ -85,6 +85,64 @@
 
 ## Session Log
 
+**2026-05-14 — fix: pane.capture after exit + --text/--regex hyphen values**
+- Two friction points flagged by Codex while using shux to verify a
+  Textual TUI (independently confirmed in a separate LLM review):
+  1. `pane wait-for --text '--search'` failed — clap was treating
+     `--search` as an unknown flag. Workaround was `--text=--search`,
+     which isn't obvious. Same issue would have hit `--regex` and
+     `pane send-keys --text`.
+  2. Short-lived commands inside a pane exited before the agent could
+     call `pane.capture` — the VT was evicted from `io_state` the
+     moment the PTY task observed EOF, so capture returned
+     `not_found: pane VT` for a pane the user could still see in
+     `pane list`. Codex's workaround was wrapping commands in `sleep`.
+- Fixes:
+  1. Added `allow_hyphen_values = true` to `wait-for --text/--regex`
+     and `send-keys --text`. Documented the tradeoff in code comments
+     — these args require values, so the ambiguity surface is bounded.
+  2. PTY task cleanup at `main.rs:323` now drops only `writers` and
+     `resizers` (PTY-bound). The `VT` lingers until pane is explicitly
+     destroyed via `pane.kill` / `window.kill` cascade / `session.kill`
+     cascade — same model tmux uses (`remain-on-exit`). `Pane.exit_status`
+     is the "dead" flag. `send_keys` / `set_size` to an exited pane now
+     fail with `not_found: pane writer` instead of silently working.
+- Red→green TDD: 3 new clap parser tests for hyphen values + 1 new
+  integration test (`test_capture_works_after_pane_process_exits`)
+  that spawns a shell, runs `echo X && exit 0`, waits, then asserts
+  `pane.capture` still returns the marker. All four failed pre-fix.
+- 751 tests pass, clippy + fmt clean.
+- Files: `crates/shux/src/cli.rs` (3 args + 3 tests),
+  `crates/shux/src/main.rs` (PTY-exit cleanup),
+  `crates/shux/tests/pane_io_integration.rs` (scaffold mirror + 1 test).
+- Bundled installer fix (same PR): the landing page advertised
+  `curl ... | sh` but `install.sh` was bash-only (`[[ ]]`,
+  `$'\033[...'` ANSI-C quoting, `set -o pipefail`). On
+  Debian/Ubuntu/Alpine where `/bin/sh` is dash or busybox ash, the
+  script blew up early. First instinct was to gate the script to bash;
+  on reflection, shux itself has no shell restriction (fish, zsh,
+  dash, nu all work fine as pane shells), so the installer shouldn't
+  either. Ported `install.sh` to POSIX `#!/bin/sh`:
+  - `[[ ]]` → `[ ]`, `==` → `=` (~19 sites)
+  - `$'\033[...'` → `ESC=$(printf '\033')` then `${ESC}[...]` (~10 sites)
+  - `set -euo pipefail` → `set -eu` (script's error handling is
+    already explicit; no pipefail needed)
+  - Hardened `mktemp` for portability: `mktemp -d -t shux-install.XXXXXX
+    2>/dev/null || mktemp -d` (busybox `mktemp -t` differs from GNU)
+  - Kept `local` (de-facto-universal in dash/ash/ksh/bash/zsh)
+  Canonical URL now `/install.sh` instead of `/install` — the redirect
+  hid the extension which mattered when piping to `sh`. Old `/install`
+  alias kept as a backward-compat 200-rewrite in `pages/_redirects`.
+- Verification: `shellcheck --shell=sh install.sh` clean. End-to-end
+  `--help` smoke test green in 6 shells: macOS bash, macOS dash,
+  macOS zsh, Debian dash (Docker), Ubuntu dash (Docker), Alpine
+  busybox ash (Docker). Full install path (`--version v0.22.0
+  --no-skill --dir /tmp/shux`) green under Debian dash AND Alpine
+  busybox ash, exercising dependency probe → platform detect →
+  GitHub release download → SHA-256 verify → file install → PATH
+  check. Error path (`GitHub API rate-limited`) also renders cleanly
+  under dash.
+
 **2026-05-13 — PR #33: default-deny plugin permission model (v0.20.0)**
 - Goal: third (and last) plugin daemon FR identified in the parked
   conductor design review. Predecessors landed earlier today

@@ -1149,8 +1149,12 @@ pub enum PaneCommand {
         #[arg(short, long)]
         pane: Option<String>,
 
-        /// Text to send (mutually exclusive with --data)
-        #[arg(short, long)]
+        /// Text to send (mutually exclusive with --data).
+        ///
+        /// `allow_hyphen_values` so agents can send literal flag-shaped
+        /// strings (e.g. `--help`, `--version`) without resorting to
+        /// `--text=--help` or base64 via `--data`.
+        #[arg(short, long, allow_hyphen_values = true)]
         text: Option<String>,
 
         /// Base64-encoded bytes to send (mutually exclusive with --text)
@@ -1275,10 +1279,14 @@ pub enum PaneCommand {
         pane: Option<String>,
         /// Plain-text needle. The pane's last N lines (see --lines) are
         /// `contains()`-checked. Mutually exclusive with --regex.
-        #[arg(short, long, conflicts_with = "regex")]
+        ///
+        /// `allow_hyphen_values` is set because agents commonly wait
+        /// for `--`-prefixed strings (CLI help output, flag names) and
+        /// shouldn't have to know about the `--text=VAL` workaround.
+        #[arg(short, long, conflicts_with = "regex", allow_hyphen_values = true)]
         text: Option<String>,
         /// Rust regex. Mutually exclusive with --text.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         regex: Option<String>,
         /// Wait for the needle to be ABSENT instead of present.
         #[arg(long)]
@@ -4501,6 +4509,64 @@ mod tests {
                 assert_eq!(index, 2);
             }
             _ => panic!("expected Window Reorder command"),
+        }
+    }
+
+    // Codex hit this in May 2026: `shux pane wait-for --text --search` failed
+    // because clap saw `--search` as a flag. Agents matching CLI help output
+    // (or any `--`-prefixed needle) shouldn't have to know to write
+    // `--text=--search`. Same applies to `--regex` and `pane send-keys`.
+    #[test]
+    fn test_cli_wait_for_text_accepts_hyphen_value() {
+        let cli = Cli::try_parse_from([
+            "shux", "pane", "wait-for", "-s", "work", "--text", "--search",
+        ])
+        .expect("--text should accept a value beginning with --");
+        match cli.command {
+            Some(Command::Pane {
+                command: PaneCommand::WaitFor { text, .. },
+            }) => assert_eq!(text.as_deref(), Some("--search")),
+            _ => panic!("expected Pane WaitFor command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_wait_for_regex_accepts_hyphen_value() {
+        let cli = Cli::try_parse_from([
+            "shux",
+            "pane",
+            "wait-for",
+            "-s",
+            "work",
+            "--regex",
+            "--help\\b",
+        ])
+        .expect("--regex should accept a value beginning with --");
+        match cli.command {
+            Some(Command::Pane {
+                command: PaneCommand::WaitFor { regex, .. },
+            }) => assert_eq!(regex.as_deref(), Some("--help\\b")),
+            _ => panic!("expected Pane WaitFor command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_send_keys_text_accepts_hyphen_value() {
+        let cli = Cli::try_parse_from([
+            "shux",
+            "pane",
+            "send-keys",
+            "-s",
+            "work",
+            "--text",
+            "--help",
+        ])
+        .expect("send-keys --text should accept a value beginning with --");
+        match cli.command {
+            Some(Command::Pane {
+                command: PaneCommand::SendKeys { text, .. },
+            }) => assert_eq!(text.as_deref(), Some("--help")),
+            _ => panic!("expected Pane SendKeys command"),
         }
     }
 }
