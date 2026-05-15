@@ -4183,6 +4183,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
 
         Some(Command::Config { command: cfg_cmd }) => match cfg_cmd {
             cli::ConfigCommand::Init { force } => cli::handle_config_init(force),
+            cli::ConfigCommand::ResetHints => cli::handle_config_reset_hints(),
             cli::ConfigCommand::Path => cli::handle_config_path(),
             cli::ConfigCommand::Show => cli::handle_config_show(),
             cli::ConfigCommand::Validate { path, config } => {

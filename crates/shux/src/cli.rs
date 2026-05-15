@@ -612,6 +612,11 @@ pub enum ConfigCommand {
         #[arg(short, long)]
         config: Option<std::path::PathBuf>,
     },
+    /// Reset onboarding state (welcome toast + prefix-discovery hint).
+    /// Restores the first-launch experience. Useful for demos, recording
+    /// walkthroughs, or just rediscovering the hint after running
+    /// dogfood / iTerm tests that dismissed it.
+    ResetHints,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1703,6 +1708,55 @@ pub fn handle_config_path() -> anyhow::Result<()> {
     let p = shux_core::config::default_config_path();
     println!("{}", p.display());
     Ok(())
+}
+
+/// `shux config reset-hints` — wipe the onboarding state file so the
+/// next attach shows the welcome toast and right-zone hint again.
+/// Idempotent: silently succeeds if the file isn't there.
+pub fn handle_config_reset_hints() -> anyhow::Result<()> {
+    let path = onboarding_state_path();
+    let existed = path.exists();
+    if existed {
+        std::fs::remove_file(&path)?;
+    }
+    if existed {
+        crate::style::print_success(
+            "Reset onboarding hints",
+            path.display().to_string().as_str(),
+            None,
+        );
+    } else {
+        crate::style::print_success(
+            "Onboarding state already clear",
+            path.display().to_string().as_str(),
+            None,
+        );
+    }
+    println!(
+        "  {} the welcome toast and right-zone hint will show again on the next `shux` attach.",
+        crate::style::muted("→")
+    );
+    Ok(())
+}
+
+/// Where onboarding.json lives. Matches `onboarding::state_file_path`
+/// but lives here too because the cli layer can't import the bin-only
+/// `onboarding` module (Rust's privacy rules mean the path logic is
+/// duplicated, but it's 5 lines and changes never).
+fn onboarding_state_path() -> std::path::PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        return std::path::PathBuf::from(xdg)
+            .join("shux")
+            .join("onboarding.json");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("shux")
+            .join("onboarding.json");
+    }
+    std::path::PathBuf::from("onboarding.json")
 }
 
 pub fn handle_config_show() -> anyhow::Result<()> {

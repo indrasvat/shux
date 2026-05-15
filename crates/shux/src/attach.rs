@@ -182,7 +182,7 @@ async fn handle_attach_connection(
     }
 
     // Step 2: Resolve the target session.
-    let resolved = resolve_or_create_session(&graph, &hello.session_name).await;
+    let resolved = resolve_or_create_session(&graph, &hello.session_name, &meta_cache).await;
     let session = match resolved {
         Ok(s) => s,
         Err(e) => {
@@ -283,10 +283,16 @@ struct AttachedSession {
 }
 
 /// Find a session by name, or create it (with one window + one pane) if
-/// missing. Mirrors `shux new -s <name>` semantics.
+/// missing. Mirrors `shux new -s <name>` semantics. When a new session
+/// is created here, kicks off the `SessionMetaCache` population that
+/// the `session.create` / `session.ensure` RPC handlers would have
+/// done — without this, bare `shux` on first run (which lands here
+/// because there's no existing session) skips git/SSH decoration in
+/// the OOTB status bar. Codex review P2 of PR #43.
 async fn resolve_or_create_session(
     graph: &GraphHandle,
     name: &Option<String>,
+    meta_cache: &crate::session_meta::SessionMetaCache,
 ) -> anyhow::Result<AttachedSession> {
     let snap = graph.snapshot();
     let target_name = name.clone().unwrap_or_else(|| "default".to_string());
@@ -314,9 +320,26 @@ async fn resolve_or_create_session(
     drop(snap);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
     let session_id = graph
-        .create_session(target_name.clone(), cwd)
+        .create_session(target_name.clone(), cwd.clone())
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // Populate the meta cache exactly like the session.create RPC
+    // handler does (spawn_blocking so the synchronous git probe doesn't
+    // stall the attach acceptor task on a slow filesystem / NFS).
+    let cache_for_blocking = meta_cache.clone();
+    let cwd_for_blocking = cwd.clone();
+    tokio::task::spawn_blocking(move || {
+        let branch = crate::session_meta::detect_git_branch(&cwd_for_blocking);
+        let over_ssh = crate::session_meta::detect_over_ssh();
+        let snapshot = crate::session_meta::SessionMeta {
+            git_branch: branch,
+            over_ssh,
+        };
+        tokio::runtime::Handle::current().block_on(async move {
+            cache_for_blocking.set(session_id, snapshot).await;
+        });
+    });
     let snap = graph.snapshot();
     let sess = snap
         .sessions
@@ -754,6 +777,13 @@ async fn run_attach_loop(
                         onboarding.mark_prefix_discovered().await;
                         detached = true;
                         let _ = out_tx.send(AttachServerFrame::DetachAck).await;
+                    }
+                    AttachClientFrame::PrefixTapped => {
+                        // Authoritative signal: user has discovered the
+                        // prefix even if they bail without sending an
+                        // Action (Ctrl+Space → Escape, etc). The OOTB
+                        // hint dismisses forever.
+                        onboarding.mark_prefix_discovered().await;
                     }
                     AttachClientFrame::Pong => {}
                 }
