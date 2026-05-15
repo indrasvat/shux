@@ -1,3 +1,10 @@
+# [0.23.0](https://github.com/indrasvat/shux/compare/v0.22.2...v0.23.0) (2026-05-15)
+
+
+### Features
+
+* **statusbar:** delightful OOB experience + onboarding ([#43](https://github.com/indrasvat/shux/issues/43)) ([fa16ffa](https://github.com/indrasvat/shux/commit/fa16ffa6d292d83c9ac6dff39110109faa987ea4))
+
 ## [0.22.2](https://github.com/indrasvat/shux/compare/v0.22.1...v0.22.2) (2026-05-15)
 
 
