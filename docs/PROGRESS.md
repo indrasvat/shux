@@ -85,6 +85,38 @@
 
 ## Session Log
 
+**2026-05-15 — fix(attach): pane kill cascade + recursive-shux guard**
+- Two interactive bugs caught while dogfooding shux.
+- (1) `Ctrl+Space x` was a silent no-op on a fresh `shux` session
+  (single pane, single window). `graph.destroy_pane` returns `LastPane`
+  on the only pane, the attach handler logged a `warn!` and returned
+  `Ok(())` — the user saw nothing. Now does tmux-style cascade in
+  `crates/shux/src/attach.rs`: try `destroy_pane`; on `LastPane`, try
+  `destroy_window`; on `LastWindow`, `destroy_session`. The render loop
+  notices `sessions.contains_key` flips false on next tick, sends
+  `SessionEnded`, client detaches cleanly. Graph API stays strict for
+  programmatic clients (pinned LastPane/LastWindow semantics); only
+  the human-interactive `Ctrl+Space x` cascades.
+- (2) Bare `shux` inside an existing shux pane → infinite render-loop
+  recursion ("hall of mirrors"). Every pane shux spawns already gets
+  `SHUX=1` injected (mirrors tmux's `TMUX`); now bare-shux invocations
+  check it and refuse with the tmux-identical terse error:
+  `sessions should be nested with care, unset $SHUX to force` (exit 1).
+- Auditied every other keyboard shortcut for silent-swallow regressions:
+  splits, focus, zoom, resize, window cycle, Alt+1..9 bare bindings,
+  help overlay, copy mode, redraw, detach. Only `KillPane` had the
+  user-impactful bug. Others either propagate errors via `map_err`
+  (split, focus_dir, zoom, new_window) or swallow on benign no-ops
+  (focus_window on single-pane, resize on already-correct ratio).
+- Tests: 3 new graph-level cascade invariant tests in
+  `crates/shux-core/src/graph.rs::tests` proving the underlying
+  destroy-pane/window/session sequence the attach handler relies on
+  (deterministic, 0ms, CI-friendly). Existing iTerm visual audit script
+  (`.claude/automations/test_kill_pane_cascade_all_shortcuts.py`)
+  exercises 18 distinct shortcuts end-to-end including the cascade
+  itself — all 18 functional asserts pass against the new binary.
+- 754 Rust tests pass, clippy + fmt clean.
+
 **2026-05-14 — fix: pane.capture after exit + --text/--regex hyphen values**
 - Two friction points flagged by Codex while using shux to verify a
   Textual TUI (independently confirmed in a separate LLM review):

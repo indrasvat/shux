@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use shux_core::config::ConfigHandle;
-use shux_core::graph::GraphHandle;
+use shux_core::graph::{GraphError, GraphHandle};
 use shux_core::layout::{NavDirection, Rect};
 use shux_core::model::{PaneId, SessionId, WindowId};
 use shux_pty::handle::PtySize;
@@ -1475,32 +1475,115 @@ async fn kill_pane(
     io_state: &Arc<Mutex<PaneIoState>>,
 ) -> anyhow::Result<()> {
     let pane_id = attached.active_pane_id;
+
+    // Resolve the pane's window + session BEFORE we mutate anything, so
+    // the cascade fallbacks have valid IDs even after destroy_pane bumps
+    // the snapshot. Without this, a fresh `shux` session (single pane,
+    // single window) silently no-op'd on Ctrl+Space x — destroy_pane
+    // returned LastPane, the warn-log went nowhere, the user saw nothing.
+    let snap = graph.snapshot();
+    let (window_id, session_id) = match snap.panes.get(&pane_id) {
+        Some(p) => {
+            let sid = snap.windows.get(&p.window_id).map(|w| w.session_id);
+            match sid {
+                Some(s) => (p.window_id, s),
+                None => {
+                    warn!(%pane_id, "kill_pane: pane's window has no session");
+                    return Ok(());
+                }
+            }
+        }
+        None => {
+            warn!(%pane_id, "kill_pane: active pane not in snapshot");
+            return Ok(());
+        }
+    };
+    drop(snap);
+
+    // tmux-style cascade: pane → window → session. The graph API stays
+    // strict (LastPane/LastWindow are real errors for programmatic
+    // clients that want pinned semantics); the human-interactive
+    // Ctrl+Space x action cascades so the user can always kill what's
+    // in front of them. When the cascade reaches destroy_session, the
+    // attach render loop notices the session is gone on its next tick
+    // and sends SessionEnded — the client detaches naturally.
     match graph.destroy_pane(pane_id, None).await {
-        Ok(()) => {}
+        Ok(()) => {
+            cleanup_pane_io(io_state, &[pane_id]).await;
+            return Ok(());
+        }
+        Err(GraphError::LastPane) => {
+            // Fall through to window kill.
+        }
         Err(e) => {
-            // Don't silently swallow LastPane / not-found / version
-            // errors — the user wanted to kill a pane and it didn't
-            // happen. Surface as a tracing warn (a future Notice frame
-            // will surface it to the UI).
             warn!(error = %e, "kill_pane: destroy_pane failed");
             return Ok(());
         }
     }
-    // Tear down the PTY task: dropping the writer Sender closes the mpsc,
-    // which unblocks the PTY task's write_rx.recv() with None, but our
-    // task's main exit is via PTY EOF / cancel. To make kill prompt and
-    // free the child shell, drop the writer + resizer + vt right away.
-    // The PTY task will get EOF on the next read (since the slave side
-    // is dropped when PtyHandle drops) and exit. We rely on PtyHandle's
-    // tokio::process::Child to reap.
-    {
-        let mut state = io_state.lock().await;
-        state.writers.remove(&pane_id);
-        state.resizers.remove(&pane_id);
-        state.vts.remove(&pane_id);
-        state.render_pulse.notify_one();
+
+    let window_pane_ids: Vec<PaneId> = {
+        let snap = graph.snapshot();
+        snap.panes
+            .values()
+            .filter(|p| p.window_id == window_id)
+            .map(|p| p.id)
+            .collect()
+    };
+
+    match graph.destroy_window(window_id, None).await {
+        Ok(()) => {
+            cleanup_pane_io(io_state, &window_pane_ids).await;
+            return Ok(());
+        }
+        Err(GraphError::LastWindow) => {
+            // Fall through to session kill.
+        }
+        Err(e) => {
+            warn!(error = %e, "kill_pane: destroy_window failed");
+            return Ok(());
+        }
     }
+
+    let session_pane_ids: Vec<PaneId> = {
+        let snap = graph.snapshot();
+        let win_ids: std::collections::HashSet<WindowId> = snap
+            .sessions
+            .get(&session_id)
+            .map(|s| s.windows.iter().copied().collect())
+            .unwrap_or_default();
+        snap.panes
+            .values()
+            .filter(|p| win_ids.contains(&p.window_id))
+            .map(|p| p.id)
+            .collect()
+    };
+
+    if let Err(e) = graph.destroy_session(session_id, None).await {
+        warn!(error = %e, "kill_pane: destroy_session failed");
+        return Ok(());
+    }
+    cleanup_pane_io(io_state, &session_pane_ids).await;
     Ok(())
+}
+
+/// Drop the PTY-bound writer + resizer entries for `pane_ids`, plus
+/// their VTs, then poke the renderer so the disappearance shows up
+/// promptly. Kept separate so all three cascade arms (pane / window /
+/// session) share the exact same teardown semantics. VT eviction here
+/// is explicit-destroy (intentional kill); contrast with the PTY
+/// natural-exit path which now lets the VT linger so pane.capture
+/// still works for a finished short-lived command.
+async fn cleanup_pane_io(io_state: &Arc<Mutex<PaneIoState>>, pane_ids: &[PaneId]) {
+    if pane_ids.is_empty() {
+        return;
+    }
+    let mut state = io_state.lock().await;
+    for id in pane_ids {
+        state.writers.remove(id);
+        state.resizers.remove(id);
+        state.vts.remove(id);
+    }
+    state.render_pulse.notify_one();
 }
 
 async fn new_window(

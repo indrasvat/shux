@@ -3543,6 +3543,16 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&help)?);
                 return Ok(());
             }
+            // Recursion guard. Every pane shux spawns gets `SHUX=1`
+            // injected (mirrors tmux's `TMUX` env var, see
+            // crates/shux-pty defaults). Without a guard here, bare
+            // `shux` inside a pane attaches the current TTY to its own
+            // daemon — instant render-loop hall-of-mirrors. Mirrors
+            // tmux's terse refusal: one line, suggest the env unset.
+            if std::env::var_os("SHUX").is_some() {
+                eprintln!("sessions should be nested with care, unset $SHUX to force");
+                std::process::exit(1);
+            }
             let _ = client::ensure_daemon_running_at(&socket_path).await?;
             let session_name = pick_attach_target(&socket_path).await;
             run_attach(&socket_path, session_name).await

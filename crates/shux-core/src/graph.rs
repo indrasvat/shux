@@ -2753,6 +2753,101 @@ mod tests {
         assert!(matches!(err, GraphError::LastPane));
     }
 
+    /// Mirrors the tmux-style cascade the attach handler performs on
+    /// Ctrl+Space x: pane → window → session. The graph keeps its strict
+    /// LastPane / LastWindow rejections for programmatic clients, but
+    /// the human-interactive kill-pane action chains through them. This
+    /// test pins the underlying invariants the cascade relies on:
+    /// destroy_pane returns LastPane on the only pane, destroy_window
+    /// returns LastWindow on the only window, destroy_session always
+    /// succeeds and removes everything.
+    ///
+    /// Without this test, a future change that (say) made destroy_pane
+    /// return a different error on the last pane would silently break
+    /// the attach handler's `Err(LastPane) → fall through` match arm
+    /// and reintroduce the original silent-no-op bug.
+    #[test]
+    fn test_kill_pane_cascade_invariants() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+        let pid = snap.windows[&wid].active_pane;
+        drop(snap);
+
+        // Step 1: pane.destroy on the only pane in the window rejects.
+        let err = graph.destroy_pane(pid, None).unwrap_err();
+        assert!(
+            matches!(err, GraphError::LastPane),
+            "first cascade step must yield LastPane, got {err:?}"
+        );
+
+        // Step 2: window.destroy on the only window in the session rejects.
+        let err = graph.destroy_window(wid, None).unwrap_err();
+        assert!(
+            matches!(err, GraphError::LastWindow),
+            "second cascade step must yield LastWindow, got {err:?}"
+        );
+
+        // Step 3: session.destroy always succeeds and removes the
+        // whole subtree.
+        graph.destroy_session(sid, None).unwrap();
+        let snap = state.load();
+        assert!(!snap.sessions.contains_key(&sid), "session should be gone");
+        assert!(!snap.windows.contains_key(&wid), "window cascade missed");
+        assert!(!snap.panes.contains_key(&pid), "pane cascade missed");
+    }
+
+    /// Cascade with a window that has multiple panes: pane.destroy
+    /// succeeds (no cascade needed). Pins the first-arm-success path
+    /// of the attach handler's match.
+    #[test]
+    fn test_kill_pane_multi_pane_window_no_cascade() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let snap = state.load();
+        let wid = snap.sessions[&sid].windows[0];
+        let pid_a = snap.windows[&wid].active_pane;
+        drop(snap);
+        let pid_b = graph.create_pane(wid, home(), vec![]).unwrap();
+
+        graph.destroy_pane(pid_a, None).unwrap();
+
+        let snap = state.load();
+        assert!(snap.sessions.contains_key(&sid), "session must stay");
+        assert!(snap.windows.contains_key(&wid), "window must stay");
+        assert!(
+            !snap.panes.contains_key(&pid_a),
+            "killed pane should be gone"
+        );
+        assert!(snap.panes.contains_key(&pid_b), "sibling pane must stay");
+    }
+
+    /// Cascade with a session that has multiple windows: pane.destroy
+    /// rejects (LastPane on this window), then window.destroy succeeds
+    /// (other windows exist). Pins the middle-arm-success path.
+    #[test]
+    fn test_kill_pane_last_in_window_cascades_to_window_only() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let snap = state.load();
+        let wid_a = snap.sessions[&sid].windows[0];
+        let pid_a = snap.windows[&wid_a].active_pane;
+        drop(snap);
+        let wid_b = graph.create_window(sid, "scratch".into(), home()).unwrap();
+
+        let err = graph.destroy_pane(pid_a, None).unwrap_err();
+        assert!(matches!(err, GraphError::LastPane));
+        graph.destroy_window(wid_a, None).unwrap();
+
+        let snap = state.load();
+        assert!(snap.sessions.contains_key(&sid), "session must stay");
+        assert!(!snap.windows.contains_key(&wid_a), "killed window gone");
+        assert!(snap.windows.contains_key(&wid_b), "sibling window stays");
+        assert!(!snap.panes.contains_key(&pid_a), "pane gone with window");
+    }
+
     #[test]
     fn test_pane_exit_status() {
         let (graph, state) = SessionGraph::new();
