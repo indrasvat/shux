@@ -1567,16 +1567,36 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# ~/.config/shux/config.toml
 # Pane border style: thin | thick | double | rounded | ascii | none
 border_style = "rounded"
 # Render the status bar with Nerd Font glyphs (terminal icon, git
-# branch, window icon, ssh host). Default true — shux bundles a 4.8 KB
-# NF symbols subset so the PNG rasterizer renders correctly OOTB. In a
-# live attach, your terminal's font decides; set to false here if you
-# see tofu (◻) — the ASCII fallback (◆ ± ▶ @) works in any font.
+# branch, window icon, ssh host). Default true — shux bundles the
+# full JetBrains Mono Nerd Font (2.4 MB) so the PNG rasterizer
+# resolves every NF codepoint OOTB, no tofu. In a live attach, your
+# terminal's font decides; set to false here if your terminal lacks
+# NF — the ASCII fallback (◆ ± ▶ @) works in any font.
 nerd_fonts = true
-# Optional custom primary text font for the PNG rasterizer (the bundled
-# Nerd Font symbols stay as a fallback for icons regardless). Doesn't
+# Optional custom primary text font for the PNG rasterizer. The
+# bundled NF JetBrains Mono stays in the fallback chain so any glyph
+# your font lacks (typical for plain non-patched typefaces) still
+# resolves through the NF fallback — no tofu either way. Doesn't
 # affect live attach (your terminal font controls that). Daemon
 # restart needed for font changes — hot-reload only re-renders.
 # font = "/path/to/your-font.ttf"
+#
+# Caveat for status-bar segments: stick to ASCII + Nerd Font
+# private-use codepoints in script segment output. Obscure BMP
+# glyphs like ⎈ (U+2388, kubectl helm) and ⎇ (U+2387, alt-branch)
+# are NOT in JetBrains Mono or any Nerd Font — they'll tofu in
+# PNG snapshots. Use NF equivalents instead. Paste either the
+# literal glyph (UTF-8) into a single-quoted TOML string, or use
+# TOML's escape inside a double-quoted string. Note TOML uses
+# bare \uXXXX (4-hex BMP) or \UXXXXXXXX (8-hex, supplementary
+# plane) — NOT Rust's \u{XXXX} form:
+#   nf-pl-branch      U+E0A0   ''  or  "\uE0A0"
+#   nf-md-kubernetes  U+F10FE  '󱃾'  or  "\U000F10FE"
+#   nf-md-ship_wheel  U+F124A  '󱉊'  or  "\U000F124A"
+# Color emoji (🦀 etc.) require a color-emoji font; configure your
+# starship language modules with `symbol = "<NF glyph>"` to use NF
+# glyphs instead. Example for rust: symbol = ' ' (or
+# symbol = "\uE7A8 " using TOML escape syntax).
 
 [keys]
 # Prefix key (e.g. "ctrl-space", "ctrl-b", "alt-w")
@@ -1635,7 +1655,8 @@ time_format = '%H:%M'
 [git_branch]
 format = '[$symbol$branch]($style) '
 style = 'bold #c6a0f6'
-symbol = ' '
+# nf-pl-branch (U+E0A0).
+symbol = " "
 
 [git_status]
 format = '[$all_status$ahead_behind]($style)'
@@ -1644,17 +1665,20 @@ style = 'bold #ed8796'
 [rust]
 format = '[$symbol($version)]($style) '
 style = 'bold #ee99a0'
-symbol = ' '
+# nf-dev-rust (U+E7A8).
+symbol = " "
 
 [python]
 format = '[$symbol${pyenv_prefix}(${version} )(($virtualenv) )]($style)'
 style = 'bold #eed49f'
-symbol = ' '
+# nf-dev-python (U+E73C).
+symbol = " "
 
 [nodejs]
 format = '[$symbol($version)]($style) '
 style = 'bold #a6da95'
-symbol = ' '
+# nf-dev-nodejs (U+E718).
+symbol = " "
 
 [cmd_duration]
 min_time = 0

@@ -57,20 +57,23 @@ pub struct AppearanceConfig {
     #[serde(default = "default_border_style")]
     pub border_style: String,
     /// Whether the status bar uses Nerd Font icons (true) or a curated
-    /// Unicode-only set (false). Default ON — shux bundles a 4.8 KB
-    /// Nerd-Font symbols subset so the PNG rasterizer renders NF glyphs
-    /// correctly out of the box. In live attach mode the user's
-    /// terminal font is what decides; if you see tofu (◻), flip to
-    /// false here for the ASCII fallback (◆ ± ▶ @).
+    /// Unicode-only set (false). Default ON — shux bundles the full
+    /// JetBrains Mono Nerd Font Mono Regular (2.4 MB) so the PNG
+    /// rasterizer resolves every NF codepoint out of the box. In live
+    /// attach mode the user's terminal font is what decides; if you
+    /// see tofu (◻) in your terminal because your terminal font lacks
+    /// NF coverage, flip this to false here for the ASCII fallback
+    /// (◆ ± ▶ @).
     #[serde(default = "default_nerd_fonts")]
     pub nerd_fonts: bool,
 
     /// Optional path to a custom primary text font (`.ttf` or `.otf`)
     /// used by the PNG rasterizer (window.snapshot / pane.snapshot /
-    /// session.snapshot). When unset, shux uses the bundled JetBrains
-    /// Mono Regular. Either way the bundled Nerd-Font symbols subset
-    /// fallback stays in the rasterizer's font chain so status-bar
-    /// icons keep working with any primary text font.
+    /// session.snapshot). When unset, shux uses the bundled
+    /// JetBrains Mono Nerd Font Mono Regular. When set, your font
+    /// becomes primary and the bundled NF JBM stays in the fallback
+    /// chain so any NF glyph your font lacks still resolves via the
+    /// bundled font.
     ///
     /// Doesn't affect live attach rendering (that's whatever font your
     /// terminal is configured to use).

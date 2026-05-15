@@ -129,11 +129,62 @@
   redraw to recover. Fix: added
   `SegmentCache::wait_for_first_outputs(expected_count, timeout)`
   (polls 25 ms until cache has ≥ expected_count entries) and call it
-  from `build_snapshot_status_bar` with a 1 s budget (matches the
-  runner's per-command timeout) before `populate_bar`. 4 new unit
-  tests on the wait helper (zero-expected / already-populated /
-  timeout / unblock-on-late-write). Cold-start visual verified
-  with `.claude/screenshots/oob_bar/v23_post_fix_cold_start_200x28.png`.
+  from `build_snapshot_status_bar` with a 1.2 s budget (slightly
+  above the runner's 1 s per-command timeout so fallback writes have
+  room to land) before `populate_bar`. Exact-key check (not `len()`)
+  matches what `populate_bar` actually reads. 5 unit tests on the
+  wait helper.
+- User reported tofu in PNG snapshots of the rich-config bar. Deep
+  diagnosis: the OOTB rasterizer bundled `JetBrainsMono-Regular.ttf`
+  (270 KB) plus a hand-curated 4.8 KB `SymbolsNerdFontSubset.ttf`.
+  The subset covered only the ~20 codepoints shux's own statusbar
+  builder emits — NOT the much wider set users' script segments
+  (starship rust/node/python/go, kubectl, etc.) actually emit.
+  Hidden defect that had been silently failing since PR #43; the
+  rust 🦀 emoji and nodejs  glyph and most others were all tofu,
+  just visually small enough to look like part of the design.
+- Decision: scrap the subset, bundle the full 2.4 MB
+  `JetBrainsMonoNerdFontMono-Regular.ttf` (upstream Nerd Fonts
+  patched JetBrains Mono Mono Regular, OFL). One asset, complete NF
+  coverage, no subset-regen ritual. Net +2.1 MB on the release
+  binary (~11.8 MB → previously ~9.7 MB) is an acceptable trade
+  for "no tofu OOTB on the rasterizer, which is shux's defining
+  feature." Deleted `assets/SymbolsNerdFontSubset.ttf`,
+  `assets/JetBrainsMono-Regular.ttf`, and
+  `REGENERATE_SYMBOLS_SUBSET.md`. Simplified `Rasterizer::new` to
+  a single-font chain. `Rasterizer::with_primary_font(primary)`
+  keeps the bundled NF JBM as a fallback so user-supplied
+  plain (non-patched) fonts still get NF coverage via the chain.
+- Deterministic verification (no vision dependence):
+  - `Rasterizer::has_glyph(ch)` — exposes the fontdue `cmap` lookup.
+  - `Rasterizer::glyph_pixel_count(ch)` — rasterizes the glyph and
+    counts non-zero coverage pixels. Catches "font has the codepoint
+    but the outline is empty" (visually tofu even though
+    `glyph_id != 0`).
+  - New tests in `crates/shux-raster/src/lib.rs`:
+    `bundled_font_covers_ascii`,
+    `bundled_font_covers_important_nf_and_unicode_glyphs`,
+    `bundled_font_renders_important_glyphs_as_non_empty_bitmaps`,
+    `with_primary_font_keeps_bundled_fallback`,
+    `alt_nf_fonts_load_and_resolve_important_glyphs_when_staged`
+    (local-only: skipped when `.local/fonts/` not staged).
+  - "Important glyphs" contract pins 16 codepoints: shux's own
+    NF chrome (terminal/branch/home), starship language modules
+    (rust/node/python/go/ruby), kubectl/cluster (NF kubernetes /
+    ship-wheel / docker), plus the Unicode fallback set used when
+    `nerd_fonts=false`.
+  - Deliberately excluded from contract (documented in source):
+    obscure BMP `⎈` U+2388 (helm) and `⎇` U+2387 (alt-branch) —
+    NEITHER JetBrains Mono nor the upstream Symbols Nerd Font has
+    them. Steered users to NF equivalents (`nf-md-kubernetes` etc.)
+    in `shux config init`'s template comments. Color emoji (🦀)
+    also out — steered users to `[rust] symbol = ""` (NF rust logo).
+- Visual matrix captured under
+  `.claude/screenshots/oob_bar/fonts_<font>_window_<width>.png` for
+  {default JBM-NF, FiraCode NF Mono, Hack NF Mono} × {200×24, 120×24}.
+  Alt fonts staged under `.local/fonts/` (gitignored).
+- 12/12 shux-raster tests pass, 777/777 total. Cargo.toml license
+  updated to reflect new asset filename.
 
 **2026-05-15 — feat(statusbar): delightful OOB experience + onboarding**
 - Bare `shux` (no config, no `shux config init`) used to show a

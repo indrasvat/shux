@@ -80,6 +80,14 @@ package_target() {
     cp "$bin_path" "$pkg_dir/shux"
     cp README.md "$pkg_dir/README.md" 2>/dev/null || true
     cp CHANGELOG.md "$pkg_dir/CHANGELOG.md" 2>/dev/null || true
+    # OFL attribution: the binary embeds the SIL-OFL-licensed
+    # JetBrains Mono Nerd Font Mono Regular asset. Each release
+    # artifact MUST ship the OFL text + attribution so downstream
+    # packagers + end users have the full license trail. Hard-fail
+    # on missing files — silently shipping a license-incomplete
+    # tarball is worse than failing the build (codex review P2).
+    cp crates/shux-raster/assets/OFL.txt "$pkg_dir/OFL-FONT.txt"
+    cp crates/shux-raster/assets/NOTICE.md "$pkg_dir/NOTICE-FONT.md"
 
     tar -czvf "${OUT}/${tar_name}" -C "$work" "shux-v${VERSION}-${suffix}"
 

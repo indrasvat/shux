@@ -1,35 +1,35 @@
 //! shux-raster — turn a `shux-vt` Grid<Cell> into a PNG without any terminal emulator.
 //!
-//! This is the P1 (spike) rasterizer:
-//! - One bundled monospace font (JetBrains Mono Regular, OFL).
+//! - One bundled monospace font: **JetBrains Mono Nerd Font Mono Regular**
+//!   (Nerd Fonts patched, OFL). The full NF-patched build replaces the
+//!   prior 270 KB JBM Regular + 5 KB curated symbols subset combo. Every
+//!   Nerd Font codepoint (rust, node, python, helm, branch, …) resolves
+//!   out of the box — no subset-regen ritual, no tofu when a user's
+//!   `[[statusbar.segment]]` script (starship, kubectl, …) emits NF
+//!   glyphs we didn't anticipate.
 //! - Per-cell glyph rendering via `fontdue` (pure Rust, no system deps).
 //! - 16-color ANSI + 256-indexed + truecolor RGB palette.
 //! - Bold (synthetic offset), dim, underline, strikethrough, inverse.
 //! - Block cursor (inverse cell).
 //! - PNG output via the `image` crate.
 //!
-//! Out of scope for the spike (deferred to P2/P3): emoji color glyphs,
-//! ligatures via shaping, italics with a real italic face, OSC 8 hyperlink
-//! styling, RTL text, GPU acceleration.
+//! Out of scope: color emoji (e.g. `🦀` U+1F980 from starship's default
+//! rust prompt). Set `[rust] symbol = ""` in starship config to use the
+//! NF rust logo instead — see `shux config init`'s emitted template.
+//! Other deferred: ligatures via shaping, italics with a real italic
+//! face, OSC 8 hyperlink styling, RTL text, GPU acceleration.
 
 use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
 use shux_vt::{Cell, CellFlags, Color, Grid};
 
-/// Embedded text font. JetBrains Mono Regular under the SIL Open Font
-/// License (see `assets/OFL.txt`).
-const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
-
-/// Embedded Nerd Font symbols. Subsetted from
-/// `SymbolsNerdFontMono-Regular.ttf` (Nerd Fonts project, OFL) to just
-/// the ~20 codepoints the shux status bar uses today plus a curated
-/// future-proofing set (folder/file/clock/etc). Subset costs ~5 KB —
-/// negligible vs. bundling the full 2.4 MB symbols font, while still
-/// giving us NF coverage out of the box.
-///
-/// To regenerate after adding new icon codepoints: see
-/// `crates/shux-raster/REGENERATE_SYMBOLS_SUBSET.md`.
-const SYMBOLS_FONT_BYTES: &[u8] = include_bytes!("../assets/SymbolsNerdFontSubset.ttf");
+/// Embedded text font. JetBrains Mono Nerd Font Mono Regular, the
+/// upstream Nerd Fonts patched build (2.4 MB) under SIL Open Font
+/// License (see `assets/OFL.txt`). Bundles the full NF glyph set so
+/// every codepoint a user's script-driven status segment can emit
+/// renders correctly OOTB. To update: pull the latest from
+/// <https://github.com/ryanoasis/nerd-fonts/releases/latest/>.
+const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMonoNerdFontMono-Regular.ttf");
 
 /// Rasterizer errors.
 #[derive(Debug, thiserror::Error)]
@@ -66,10 +66,11 @@ impl Default for RasterOptions {
 
 /// Owning rasterizer. Holds an ordered font fallback chain plus
 /// derived cell metrics. The first font that has a glyph for the
-/// requested character wins; this lets us pair a clean text font
-/// (JetBrains Mono Regular) with a small Nerd-Font symbols subset
-/// so status-bar glyphs render correctly without bundling the full
-/// 2.4 MB NF-patched font.
+/// requested character wins. With the full NF-patched bundled font
+/// the chain typically has exactly one entry; user-supplied
+/// `appearance.font` puts the user's font first and the bundled NF
+/// font as a fallback so any glyph the user's font lacks (e.g. NF
+/// icons in a plain non-patched typeface) still resolves.
 pub struct Rasterizer {
     /// Fallback chain: try fonts[0] first, then [1], etc. Metrics
     /// (cell_w / cell_h / ascent) are derived from fonts[0] only —
@@ -83,18 +84,19 @@ pub struct Rasterizer {
 
 impl Rasterizer {
     /// Construct a rasterizer at the given font size (in pixels)
-    /// using the bundled text font plus the bundled Nerd-Font symbols
-    /// subset as fallback. Use this for the OOTB experience.
+    /// using the bundled NF-patched JetBrains Mono. Single-font chain
+    /// — full NF coverage included.
     pub fn new(font_size: f32) -> Result<Self, RasterError> {
-        Self::with_fonts(font_size, [FONT_BYTES, SYMBOLS_FONT_BYTES])
+        Self::with_fonts(font_size, [FONT_BYTES])
     }
 
-    /// Construct a rasterizer with a user-supplied primary font and
-    /// the bundled NF-symbols subset as fallback. Lets users override
-    /// the typeface via `appearance.font` in shux config while still
-    /// getting Nerd-Font icons in status-bar segments.
+    /// Construct a rasterizer with a user-supplied primary font, plus
+    /// the bundled NF-patched JBM as a fallback for codepoints the
+    /// user's font lacks. Lets users override the typeface via
+    /// `appearance.font` in shux config while still getting Nerd-Font
+    /// icons OOTB even if their chosen font is plain (non-patched).
     pub fn with_primary_font(font_size: f32, primary: &[u8]) -> Result<Self, RasterError> {
-        Self::with_fonts(font_size, [primary, SYMBOLS_FONT_BYTES])
+        Self::with_fonts(font_size, [primary, FONT_BYTES])
     }
 
     /// Construct a rasterizer from an explicit fallback chain.
@@ -143,6 +145,46 @@ impl Rasterizer {
             }
         }
         &self.fonts[0]
+    }
+
+    /// Number of fonts in the fallback chain. Exposed for tests + the
+    /// glyph-coverage assertion suite.
+    pub fn font_count(&self) -> usize {
+        self.fonts.len()
+    }
+
+    /// Does the fallback chain resolve `ch` to a real glyph?
+    /// `false` means every font would render the missing-glyph box.
+    /// Exposed for deterministic coverage tests so we can assert
+    /// "the bundled font has a glyph for every codepoint the shux
+    /// statusbar might emit" without inspecting pixels.
+    pub fn has_glyph(&self, ch: char) -> bool {
+        self.fonts.iter().any(|f| f.lookup_glyph_index(ch) != 0)
+    }
+
+    /// Diagnostic helper: count non-empty (coverage > 0) pixels
+    /// fontdue would emit when rasterizing `ch` at the rasterizer's
+    /// current font size, using the first font in the fallback chain
+    /// that has the glyph.
+    ///
+    /// `has_glyph` only confirms the font's `cmap` has an entry for
+    /// the codepoint — but some fonts ship "stub" glyphs whose outline
+    /// is empty (the box would render blank pixels, indistinguishable
+    /// from tofu). This pixel-coverage check catches those: an outline
+    /// that should render a visible glyph has at least a handful of
+    /// non-zero coverage samples.
+    ///
+    /// **Not a hot-path API.** Allocates a fresh bitmap on every call.
+    /// Intended for the deterministic tofu-free assertion suite and
+    /// future debug commands like `shux raster probe <codepoint>`.
+    /// Production `render()` also calls `font.rasterize()` per cell
+    /// (no glyph cache today; one is a documented future
+    /// optimisation), so don't lean on this for production rendering
+    /// either — it's diagnostic-only.
+    pub fn glyph_pixel_count(&self, ch: char) -> usize {
+        let font = self.font_for(ch);
+        let (_metrics, bitmap) = font.rasterize(ch, self.font_size);
+        bitmap.iter().filter(|&&px| px > 0).count()
     }
 
     /// Cell dimensions in pixels.
@@ -437,25 +479,66 @@ mod tests {
     }
 
     #[test]
-    fn nf_symbol_falls_back_to_subset_font() {
+    fn bundled_font_covers_ascii() {
         let r = Rasterizer::new(14.0).expect("rasterizer");
-        // U+F489 (nf-cod-terminal) isn't in JetBrains Mono Regular but
-        // IS in the bundled NF subset — fallback must pick it up so
-        // the OOTB status bar's terminal icon renders correctly.
-        let f = r.font_for('\u{f489}');
+        for ch in 0x21u32..=0x7eu32 {
+            let c = char::from_u32(ch).unwrap();
+            assert!(
+                r.has_glyph(c),
+                "ASCII {c:?} ({ch:#x}) missing from bundled font"
+            );
+        }
+    }
+
+    /// Deterministic codepoint-coverage assertion — the bundled NF
+    /// JetBrains Mono MUST resolve every codepoint shux's own status
+    /// bar emits AND every commonly-seen NF codepoint from external
+    /// status-segment scripts (starship language modules, kubectl
+    /// helm, etc.). If a future asset update drops one of these
+    /// glyphs we want a hard test failure, not silent tofu in PNGs.
+    /// Alt fonts (loaded via `with_primary_font`) satisfy the same
+    /// contract via the chain — the bundled NF JBM stays as fallback
+    /// so any glyph the alt font lacks resolves through it. See
+    /// `alt_nf_fonts_load_and_resolve_important_glyphs_when_staged`.
+    #[test]
+    fn bundled_font_covers_important_nf_and_unicode_glyphs() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        let missing: Vec<String> = important_glyphs_for_bundled_font()
+            .iter()
+            .filter(|(_, ch)| !r.has_glyph(*ch))
+            .map(|(label, ch)| format!("  - {label} ({:#x})", *ch as u32))
+            .collect();
         assert!(
-            f.lookup_glyph_index('\u{f489}') != 0,
-            "NF terminal icon must be reachable via the fallback chain"
+            missing.is_empty(),
+            "bundled NF JBM missing glyphs — tofu regression:\n{}",
+            missing.join("\n")
         );
     }
 
+    /// Stronger than `has_glyph`: confirm each important codepoint
+    /// rasterizes to a non-empty bitmap. Catches the case where a
+    /// font's `cmap` has an entry but the outline is blank (would
+    /// render as visual tofu even though `glyph_id != 0`). 8 non-zero
+    /// pixels is well below the smallest legitimate icon and well
+    /// above the empty-outline baseline.
     #[test]
-    fn nf_git_branch_present_in_subset() {
+    fn bundled_font_renders_important_glyphs_as_non_empty_bitmaps() {
         let r = Rasterizer::new(14.0).expect("rasterizer");
-        let f = r.font_for('\u{e0a0}');
+        let mut empties: Vec<String> = Vec::new();
+        for (label, ch) in important_glyphs_for_bundled_font() {
+            let n = r.glyph_pixel_count(*ch);
+            if n < 8 {
+                empties.push(format!(
+                    "  - {label} ({:#x}) rendered only {n} non-zero pixels",
+                    *ch as u32
+                ));
+            }
+        }
         assert!(
-            f.lookup_glyph_index('\u{e0a0}') != 0,
-            "NF git-branch icon must be reachable via fallback chain"
+            empties.is_empty(),
+            "bundled NF JBM rasterizes these glyphs as empty / near-empty bitmaps \
+             (would visually tofu):\n{}",
+            empties.join("\n")
         );
     }
 
@@ -466,15 +549,153 @@ mod tests {
         // returns the primary so callers get fontdue's notdef
         // rendering instead of a panic.
         let _f = r.font_for('\u{10000}');
+        assert!(!r.has_glyph('\u{10000}'));
     }
 
     #[test]
-    fn with_primary_font_keeps_symbols_fallback() {
-        // Using the bundled NF subset itself as a synthetic "primary"
-        // text font: ASCII won't be in it (no letters), but the symbol
-        // is. The fallback chain should still find the symbol.
-        let r = Rasterizer::with_primary_font(14.0, SYMBOLS_FONT_BYTES).expect("rasterizer");
-        let f = r.font_for('\u{f489}');
-        assert!(f.lookup_glyph_index('\u{f489}') != 0);
+    fn with_primary_font_keeps_bundled_fallback() {
+        // Use a font that is monochrome-emoji-only (synthetic test:
+        // pass the same bundled NF JBM bytes as "primary" — every
+        // glyph the chain ever needs is here). The fallback chain
+        // length must be 2 so a real "plain non-patched font" used
+        // as primary still gets NF coverage from the bundled fallback.
+        let r = Rasterizer::with_primary_font(14.0, FONT_BYTES).expect("rasterizer");
+        assert_eq!(r.font_count(), 2, "user-primary + bundled-fallback");
+        // Sanity: both ASCII and NF resolve.
+        assert!(r.has_glyph('A'));
+        assert!(r.has_glyph('\u{e0a0}')); // git branch
+        assert!(r.has_glyph('\u{e7a8}')); // rust logo
+    }
+
+    /// Local-only test: when alternative NF fonts staged under
+    /// `.local/fonts/` are present, verify each loads via
+    /// `with_primary_font`, the rasterizer ends up with a 2-font
+    /// chain, and the SAME important-glyph set resolves AND
+    /// rasterizes to a non-empty bitmap (not the silent
+    /// has-cmap-entry-but-blank-outline tofu mode).
+    ///
+    /// CI doesn't stage these fonts (they're 2.6 MB binaries not in
+    /// git), so the test must remain CI-safe. To make the skip
+    /// visible rather than silent, the test PRINTS the exercise count
+    /// to stdout (nextest captures stdout) and the absent-paths list
+    /// is included in the panic message if any pass fails.
+    /// To force a hard failure when nothing exercised, set
+    /// `SHUX_RASTER_REQUIRE_ALT_FONTS=1` — dev workflow can opt in.
+    #[test]
+    fn alt_nf_fonts_load_and_resolve_important_glyphs_when_staged() {
+        let mut exercised: Vec<std::path::PathBuf> = Vec::new();
+        let mut absent: Vec<std::path::PathBuf> = Vec::new();
+        for alt in alt_font_paths() {
+            let Ok(bytes) = std::fs::read(&alt) else {
+                absent.push(alt);
+                continue;
+            };
+            let r = Rasterizer::with_primary_font(14.0, &bytes)
+                .unwrap_or_else(|e| panic!("alt font {} failed to load: {e}", alt.display()));
+            assert_eq!(r.font_count(), 2);
+            let mut tofus: Vec<String> = Vec::new();
+            for (label, ch) in important_glyphs_for_bundled_font() {
+                let c = *ch;
+                let has = r.has_glyph(c);
+                let pixels = r.glyph_pixel_count(c);
+                if !has || pixels < 8 {
+                    tofus.push(format!(
+                        "  - {label} ({:#x}) has_glyph={has} pixels={pixels}",
+                        c as u32
+                    ));
+                }
+            }
+            assert!(
+                tofus.is_empty(),
+                "alt font chain ({}) would tofu these glyphs:\n{}",
+                alt.display(),
+                tofus.join("\n")
+            );
+            exercised.push(alt);
+        }
+        println!(
+            "alt_nf_fonts: exercised {} font(s); absent: {}",
+            exercised.len(),
+            if absent.is_empty() {
+                "none".to_string()
+            } else {
+                absent
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+        if std::env::var_os("SHUX_RASTER_REQUIRE_ALT_FONTS").is_some() {
+            assert!(
+                !exercised.is_empty(),
+                "SHUX_RASTER_REQUIRE_ALT_FONTS=1 but no alt fonts staged under .local/fonts/"
+            );
+        }
+    }
+
+    /// The full contract: every codepoint listed here MUST resolve via
+    /// the bundled NF JBM. Keep sorted by category. Adding entries is
+    /// fine; removing one means "shux silently accepts tofu for this
+    /// codepoint" — review carefully.
+    ///
+    /// Deliberately excluded (don't add unless you also add a font
+    /// that has them):
+    ///   - `⎈` U+2388 (kubectl helm), `⎇` U+2387 (alt-branch) — these
+    ///     are obscure Miscellaneous-Technical-block BMP glyphs that
+    ///     JetBrains Mono does NOT include, and Nerd Fonts patching
+    ///     adds private-use-area glyphs only. The upstream
+    ///     `SymbolsNerdFontMono-Regular.ttf` also lacks them. The
+    ///     remedy is to use NF equivalents (`nf-md-kubernetes` U+F10FE
+    ///     for the helm wheel, `nf-pl-branch` U+E0A0 for git-style
+    ///     branch). `shux config init` emits a kubectl segment that
+    ///     uses U+F10FE for exactly this reason.
+    ///   - Color emoji (e.g. 🦀 U+1F980) — requires a color emoji
+    ///     font and a glyph-rendering pipeline that handles SVG/CBDT.
+    ///     `shux config init`'s starship template sets `[rust]
+    ///     symbol = ""` so the NF rust logo is used instead.
+    fn important_glyphs_for_bundled_font() -> &'static [(&'static str, char)] {
+        &[
+            // ── shux's own statusbar chrome (statusbar_build.rs) ──
+            ("nf-cod-terminal U+F489", '\u{f489}'),
+            ("nf-pl-branch U+E0A0", '\u{e0a0}'),
+            ("nf-fa-home U+F015", '\u{f015}'),
+            // ── ssh-host indicator (often used in cwd / session left zone) ──
+            ("nf-fa-server U+F233", '\u{f233}'),
+            // ── starship language module defaults (NF codepoints) ──
+            ("nf-dev-rust U+E7A8", '\u{e7a8}'),
+            ("nf-dev-nodejs U+E718", '\u{e718}'),
+            ("nf-dev-python U+E73C", '\u{e73c}'),
+            ("nf-dev-go U+E626", '\u{e626}'),
+            ("nf-dev-ruby U+E739", '\u{e739}'),
+            // ── kubectl / cluster ops — NF kubernetes (not BMP helm) ──
+            ("nf-md-kubernetes U+F10FE", '\u{f10fe}'),
+            ("nf-md-ship_wheel U+F124A", '\u{f124a}'),
+            ("nf-md-docker U+F308", '\u{f308}'),
+            // ── shux unicode fallback set (when nerd_fonts=false) ──
+            ("diamond U+25C6", '\u{25c6}'),
+            ("right-triangle U+25B6", '\u{25b6}'),
+            ("plus-minus U+00B1", '\u{00b1}'),
+            ("middle-dot U+00B7", '\u{00b7}'),
+        ]
+    }
+
+    fn alt_font_paths() -> Vec<std::path::PathBuf> {
+        // `.local/fonts/<…>.ttf` is gitignored and only present on
+        // dev machines that ran the override-test fetch step.
+        // Walk up from the crate root to find the workspace root.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(manifest_dir);
+        let fonts_dir = workspace_root.join(".local").join("fonts");
+        [
+            "FiraCodeNerdFontMono-Regular.ttf",
+            "HackNerdFontMono-Regular.ttf",
+        ]
+        .iter()
+        .map(|name| fonts_dir.join(name))
+        .collect()
     }
 }
