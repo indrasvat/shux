@@ -1567,9 +1567,16 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# ~/.config/shux/config.toml
 # Pane border style: thin | thick | double | rounded | ascii | none
 border_style = "rounded"
 # Render the status bar with Nerd Font glyphs (terminal icon, git
-# branch, window icon, ssh host). Set to false if your terminal /
-# font doesn't have NF — the bar falls back to ◆ ± ▶ @.
+# branch, window icon, ssh host). Default true — shux bundles a 4.8 KB
+# NF symbols subset so the PNG rasterizer renders correctly OOTB. In a
+# live attach, your terminal's font decides; set to false here if you
+# see tofu (◻) — the ASCII fallback (◆ ± ▶ @) works in any font.
 nerd_fonts = true
+# Optional custom primary text font for the PNG rasterizer (the bundled
+# Nerd Font symbols stay as a fallback for icons regardless). Doesn't
+# affect live attach (your terminal font controls that). Daemon
+# restart needed for font changes — hot-reload only re-renders.
+# font = "/path/to/your-font.ttf"
 
 [keys]
 # Prefix key (e.g. "ctrl-space", "ctrl-b", "alt-w")

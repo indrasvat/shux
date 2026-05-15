@@ -57,16 +57,25 @@ pub struct AppearanceConfig {
     #[serde(default = "default_border_style")]
     pub border_style: String,
     /// Whether the status bar uses Nerd Font icons (true) or a curated
-    /// Unicode-only set (false). Default OFF — NF glyphs render as
-    /// tofu in any terminal/font that doesn't have them, which is a
-    /// trust-killer for a first-launch impression. The Unicode fallback
-    /// (◆ ± ▶ @) is Catppuccin-friendly and looks clean everywhere.
-    /// Flip to true in `~/.config/shux/config.toml` when you have a
-    /// NF installed — `shux config init`'s generated template enables
-    /// it by default because users opting into the config file are
-    /// almost certainly running a modern dev terminal.
+    /// Unicode-only set (false). Default ON — shux bundles a 4.8 KB
+    /// Nerd-Font symbols subset so the PNG rasterizer renders NF glyphs
+    /// correctly out of the box. In live attach mode the user's
+    /// terminal font is what decides; if you see tofu (◻), flip to
+    /// false here for the ASCII fallback (◆ ± ▶ @).
     #[serde(default = "default_nerd_fonts")]
     pub nerd_fonts: bool,
+
+    /// Optional path to a custom primary text font (`.ttf` or `.otf`)
+    /// used by the PNG rasterizer (window.snapshot / pane.snapshot /
+    /// session.snapshot). When unset, shux uses the bundled JetBrains
+    /// Mono Regular. Either way the bundled Nerd-Font symbols subset
+    /// fallback stays in the rasterizer's font chain so status-bar
+    /// icons keep working with any primary text font.
+    ///
+    /// Doesn't affect live attach rendering (that's whatever font your
+    /// terminal is configured to use).
+    #[serde(default)]
+    pub font: Option<std::path::PathBuf>,
 }
 
 impl Default for AppearanceConfig {
@@ -74,6 +83,7 @@ impl Default for AppearanceConfig {
         Self {
             border_style: default_border_style(),
             nerd_fonts: default_nerd_fonts(),
+            font: None,
         }
     }
 }
@@ -82,7 +92,7 @@ fn default_border_style() -> String {
     "rounded".to_string()
 }
 fn default_nerd_fonts() -> bool {
-    false
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

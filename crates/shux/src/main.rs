@@ -2965,11 +2965,38 @@ fn register_pane_io_methods(
     let io10 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
-    // Built once at startup so each snapshot call doesn't re-parse the 264 KB embedded font.
-    let rasterizer_pane: Arc<shux_raster::Rasterizer> = Arc::new(
-        shux_raster::Rasterizer::new(14.0)
-            .expect("shux-raster: failed to construct rasterizer (bundled font corrupt?)"),
-    );
+    // Built once at startup so each snapshot call doesn't re-parse the
+    // bundled fonts. When `appearance.font` is set, the user's font
+    // becomes the primary text font and the bundled NF symbols subset
+    // stays as the icon fallback. Font-config changes need a daemon
+    // restart to take effect (hot reload only re-renders, doesn't
+    // rebuild the rasterizer); documented in the config TOML.
+    let rasterizer_pane: Arc<shux_raster::Rasterizer> =
+        {
+            let cfg_snap = config.current();
+            let custom_font: Option<Vec<u8>> = cfg_snap.appearance.font.as_ref().and_then(|p| {
+                match std::fs::read(p) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %p.display(),
+                            error = %e,
+                            "appearance.font: read failed, falling back to bundled JetBrains Mono"
+                        );
+                        None
+                    }
+                }
+            });
+            let raster = match custom_font {
+                Some(bytes) => shux_raster::Rasterizer::with_primary_font(14.0, &bytes)
+                    .or_else(|_| shux_raster::Rasterizer::new(14.0)),
+                None => shux_raster::Rasterizer::new(14.0),
+            };
+            Arc::new(
+                raster
+                    .expect("shux-raster: failed to construct rasterizer (bundled font corrupt?)"),
+            )
+        };
     let rasterizer_window = rasterizer_pane.clone();
     let rasterizer_session = rasterizer_pane.clone();
 
