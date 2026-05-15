@@ -3,6 +3,9 @@
 # Operator-friendly short URLs for sharing. Resolve to canonical paths.
 
 # Install script (built by the deploy workflow per release).
+# /install.sh is the canonical URL — the extension communicates what's
+# being piped to the user's shell. /install kept as a back-compat alias
+# for any old links that have it.
 /install              /install.sh                               200
 
 # Docs / source shortcuts → GitHub.

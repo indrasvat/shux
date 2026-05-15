@@ -115,6 +115,33 @@
 - Files: `crates/shux/src/cli.rs` (3 args + 3 tests),
   `crates/shux/src/main.rs` (PTY-exit cleanup),
   `crates/shux/tests/pane_io_integration.rs` (scaffold mirror + 1 test).
+- Bundled installer fix (same PR): the landing page advertised
+  `curl ... | sh` but `install.sh` was bash-only (`[[ ]]`,
+  `$'\033[...'` ANSI-C quoting, `set -o pipefail`). On
+  Debian/Ubuntu/Alpine where `/bin/sh` is dash or busybox ash, the
+  script blew up early. First instinct was to gate the script to bash;
+  on reflection, shux itself has no shell restriction (fish, zsh,
+  dash, nu all work fine as pane shells), so the installer shouldn't
+  either. Ported `install.sh` to POSIX `#!/bin/sh`:
+  - `[[ ]]` → `[ ]`, `==` → `=` (~19 sites)
+  - `$'\033[...'` → `ESC=$(printf '\033')` then `${ESC}[...]` (~10 sites)
+  - `set -euo pipefail` → `set -eu` (script's error handling is
+    already explicit; no pipefail needed)
+  - Hardened `mktemp` for portability: `mktemp -d -t shux-install.XXXXXX
+    2>/dev/null || mktemp -d` (busybox `mktemp -t` differs from GNU)
+  - Kept `local` (de-facto-universal in dash/ash/ksh/bash/zsh)
+  Canonical URL now `/install.sh` instead of `/install` — the redirect
+  hid the extension which mattered when piping to `sh`. Old `/install`
+  alias kept as a backward-compat 200-rewrite in `pages/_redirects`.
+- Verification: `shellcheck --shell=sh install.sh` clean. End-to-end
+  `--help` smoke test green in 6 shells: macOS bash, macOS dash,
+  macOS zsh, Debian dash (Docker), Ubuntu dash (Docker), Alpine
+  busybox ash (Docker). Full install path (`--version v0.22.0
+  --no-skill --dir /tmp/shux`) green under Debian dash AND Alpine
+  busybox ash, exercising dependency probe → platform detect →
+  GitHub release download → SHA-256 verify → file install → PATH
+  check. Error path (`GitHub API rate-limited`) also renders cleanly
+  under dash.
 
 **2026-05-13 — PR #33: default-deny plugin permission model (v0.20.0)**
 - Goal: third (and last) plugin daemon FR identified in the parked

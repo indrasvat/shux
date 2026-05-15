@@ -1,9 +1,11 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# shux installer
-# Usage: curl -sSfL https://raw.githubusercontent.com/indrasvat/shux/main/install.sh | bash
-#        curl ... | bash -s -- --version v0.1.0 --dir ~/.local/bin
+#!/bin/sh
+# shux installer — POSIX-portable so `curl ... | sh` works under any
+# POSIX shell (bash, dash, ash, busybox sh, ksh, zsh). shux itself
+# imposes no shell requirements on its users; the installer matches.
+#
+# Usage: curl -sSfL https://shux.pages.dev/install.sh | sh
+#        curl ... | sh -s -- --version v0.1.0 --dir ~/.local/bin
+set -eu
 
 REPO="indrasvat/shux"
 BINARY="shux"
@@ -11,9 +13,13 @@ DEFAULT_DIR="${HOME}/.local/bin"
 SKILL_PACKAGE="indrasvat/shux"
 
 # --- Colors (Catppuccin-leaning palette: cyan accent on warm subtext) ---------
+#
+# POSIX shells lack `$'\033[...'` ANSI-C quoting, so we build the ESC
+# char once via `printf` and concatenate. Works identically across
+# bash, dash, ash, busybox sh.
 
 setup_colors() {
-    if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]; then
+    if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
         BOLD=""
         RESET=""
         ACCENT=""
@@ -24,29 +30,29 @@ setup_colors() {
         TEXT=""
         SUBTEXT=""
     else
-        BOLD=$'\033[1m'
-        RESET=$'\033[0m'
+        ESC=$(printf '\033')
+        BOLD="${ESC}[1m"
+        RESET="${ESC}[0m"
         # Catppuccin Macchiato Sapphire (#74c7ec) — primary accent
-        ACCENT=$'\033[38;2;116;199;236m'
+        ACCENT="${ESC}[38;2;116;199;236m"
         # Catppuccin Macchiato Teal (#8bd5ca)
-        TEAL=$'\033[38;2;139;213;202m'
+        TEAL="${ESC}[38;2;139;213;202m"
         # Catppuccin Macchiato Green (#a6da95)
-        GREEN=$'\033[38;2;166;218;149m'
+        GREEN="${ESC}[38;2;166;218;149m"
         # Catppuccin Macchiato Red (#ed8796)
-        RED=$'\033[38;2;237;135;150m'
+        RED="${ESC}[38;2;237;135;150m"
         # Catppuccin Macchiato Yellow (#eed49f)
-        YELLOW=$'\033[38;2;238;212;159m'
+        YELLOW="${ESC}[38;2;238;212;159m"
         # Catppuccin Macchiato Text (#cad3f5)
-        TEXT=$'\033[38;2;202;211;245m'
+        TEXT="${ESC}[38;2;202;211;245m"
         # Catppuccin Macchiato Subtext1 (#b8c0e0)
-        SUBTEXT=$'\033[38;2;91;96;120m'
+        SUBTEXT="${ESC}[38;2;91;96;120m"
     fi
 }
 
 banner() {
-    local cols
     cols=$(tput cols 2>/dev/null || echo 80)
-    if [[ "${cols}" -lt 60 ]]; then
+    if [ "${cols}" -lt 60 ]; then
         return
     fi
     printf '\n'
@@ -67,7 +73,9 @@ warn()       { printf '  %s! %s%s\n' "${YELLOW}" "$1" "${RESET}"; }
 error_exit() { printf '  %s✗ %s%s\n' "${RED}" "$1" "${RESET}" >&2; exit 1; }
 
 step() {
-    local n="$1" total="$2" msg="$3"
+    n="$1"
+    total="$2"
+    msg="$3"
     printf '\n%s%s[%s/%s]%s %s%s%s%s\n' "${BOLD}" "${ACCENT}" "${n}" "${total}" "${RESET}" "${BOLD}" "${TEXT}" "${msg}" "${RESET}"
 }
 
@@ -76,8 +84,8 @@ step() {
 usage() {
     printf '%s%sshux installer%s\n\n' "${BOLD}" "${TEXT}" "${RESET}"
     printf '%sUsage:%s\n' "${SUBTEXT}" "${RESET}"
-    printf '  curl -sSfL https://raw.githubusercontent.com/%s/main/install.sh | bash\n' "${REPO}"
-    printf '  curl ... | bash -s -- [OPTIONS]\n\n'
+    printf '  curl -sSfL https://shux.pages.dev/install.sh | sh\n'
+    printf '  curl ... | sh -s -- [OPTIONS]\n\n'
     printf '%sOptions:%s\n' "${SUBTEXT}" "${RESET}"
     printf '  %s--version VERSION%s  Install specific version (e.g. v0.1.0)\n' "${TEXT}" "${RESET}"
     printf '  %s--dir DIRECTORY%s    Install directory (default: %s)\n' "${TEXT}" "${RESET}" "${DEFAULT_DIR}"
@@ -91,15 +99,15 @@ parse_args() {
     INSTALL_DIR="${DEFAULT_DIR}"
     INSTALL_SKILL=1
 
-    while [[ $# -gt 0 ]]; do
+    while [ $# -gt 0 ]; do
         case "$1" in
             --version)
-                if [[ $# -lt 2 ]]; then error_exit "--version requires a value"; fi
+                if [ $# -lt 2 ]; then error_exit "--version requires a value"; fi
                 VERSION="$2"
                 shift 2
                 ;;
             --dir)
-                if [[ $# -lt 2 ]]; then error_exit "--dir requires a value"; fi
+                if [ $# -lt 2 ]; then error_exit "--dir requires a value"; fi
                 INSTALL_DIR="$2"
                 shift 2
                 ;;
@@ -148,8 +156,6 @@ check_dependencies() {
 # --- Platform detection -------------------------------------------------------
 
 detect_platform() {
-    local os arch
-
     os="$(uname -s)"
     case "${os}" in
         Darwin) OS="darwin" ;;
@@ -182,9 +188,10 @@ detect_platform() {
 # capture the substitution into a variable so we never duplicate the
 # "000" with a fallback.
 fetch_with_status() {
-    local outfile="$1" url="$2"
-    local code=""
-    if [[ "${DOWNLOADER}" == "curl" ]]; then
+    outfile="$1"
+    url="$2"
+    code=""
+    if [ "${DOWNLOADER}" = "curl" ]; then
         code=$(curl -sSL -o "${outfile}" -w '%{http_code}' "${url}" 2>/dev/null) || code=""
         echo "${code:-000}"
     else
@@ -209,10 +216,6 @@ parse_first_tag() {
 # errors and rate-limiting (403/5xx) abort with a clear message instead
 # of silently installing a prerelease.
 get_latest_version() {
-    local body status tag
-
-    # RETURN trap leaks past function boundary without `set -T` — write
-    # to the script tmpdir so the EXIT trap sweeps it.
     body="$(mktemp "${TMPDIR_CREATED}/shux-api-body.XXXXXX")"
 
     status="$(fetch_with_status "${body}" "https://api.github.com/repos/${REPO}/releases/latest")"
@@ -224,11 +227,11 @@ get_latest_version() {
         404)
             # No stable release yet — try the prerelease endpoint.
             status="$(fetch_with_status "${body}" "https://api.github.com/repos/${REPO}/releases?per_page=1")"
-            if [[ "${status}" != "200" ]]; then
+            if [ "${status}" != "200" ]; then
                 error_exit "GitHub API returned HTTP ${status} fetching prereleases. Pin a version with --version vX.Y.Z."
             fi
             tag="$(parse_first_tag < "${body}" || true)"
-            if [[ -n "${tag}" ]]; then
+            if [ -n "${tag}" ]; then
                 warn "No stable release yet — installing pre-release ${tag}"
             fi
             ;;
@@ -243,7 +246,7 @@ get_latest_version() {
             ;;
     esac
 
-    if [[ -z "${tag:-}" ]]; then
+    if [ -z "${tag:-}" ]; then
         error_exit "Could not find a release at github.com/${REPO}/releases. Pin a version with --version vX.Y.Z if a tag exists."
     fi
     VERSION="${tag}"
@@ -255,7 +258,7 @@ build_download_url() {
     # Asset names produced by scripts/build-release.sh:
     #   shux-v<version>-<arch>-<os>.tar.gz
     #   shux-v<version>-<arch>-<os>.tar.gz.sha256
-    local version_no_v="${VERSION#v}"
+    version_no_v="${VERSION#v}"
     TARBALL="shux-v${version_no_v}-${ARCH}-${OS}.tar.gz"
     TARBALL_URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
     CHECKSUM_URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}.sha256"
@@ -263,8 +266,9 @@ build_download_url() {
 }
 
 download_file() {
-    local url="$1" dest="$2"
-    if [[ "${DOWNLOADER}" == "curl" ]]; then
+    url="$1"
+    dest="$2"
+    if [ "${DOWNLOADER}" = "curl" ]; then
         curl -sSfL -o "${dest}" "${url}" 2>/dev/null
     else
         wget -q -O "${dest}" "${url}" 2>/dev/null
@@ -274,21 +278,21 @@ download_file() {
 # --- Checksum verification ----------------------------------------------------
 
 verify_checksum() {
-    local checksum_file="$1" tarball_file="$2"
-    local expected actual
+    checksum_file="$1"
+    tarball_file="$2"
 
     expected="$(awk '{print $1}' < "${checksum_file}" | head -1)"
-    if [[ -z "${expected}" ]]; then
+    if [ -z "${expected}" ]; then
         error_exit "Could not parse checksum from ${checksum_file}"
     fi
 
-    if [[ "${HASHER}" == "shasum" ]]; then
+    if [ "${HASHER}" = "shasum" ]; then
         actual="$(shasum -a 256 "${tarball_file}" | awk '{print $1}')"
     else
         actual="$(sha256sum "${tarball_file}" | awk '{print $1}')"
     fi
 
-    if [[ "${expected}" != "${actual}" ]]; then
+    if [ "${expected}" != "${actual}" ]; then
         error_exit "Checksum mismatch! Expected ${expected}, got ${actual}"
     fi
 }
@@ -296,11 +300,11 @@ verify_checksum() {
 # --- Installation -------------------------------------------------------------
 
 install_binary() {
-    local tmpdir="$1"
+    tmpdir="$1"
     tar -xzf "${tmpdir}/${TARBALL}" -C "${tmpdir}"
 
-    local src="${tmpdir}/${EXTRACTED_DIR}/${BINARY}"
-    if [[ ! -f "${src}" ]]; then
+    src="${tmpdir}/${EXTRACTED_DIR}/${BINARY}"
+    if [ ! -f "${src}" ]; then
         error_exit "Binary not found in tarball at ${EXTRACTED_DIR}/${BINARY}"
     fi
 
@@ -316,7 +320,7 @@ install_binary() {
 # binary is the source of truth, the skill is just the agent
 # onboarding sugar.
 install_skill() {
-    if [[ "${INSTALL_SKILL}" -ne 1 ]]; then
+    if [ "${INSTALL_SKILL}" -ne 1 ]; then
         info "Skipping agent skill install (--no-skill)"
         return
     fi
@@ -342,8 +346,7 @@ check_path() {
 
     warn "${INSTALL_DIR} is not in your PATH"
 
-    local shell_name rc_file
-    shell_name="$(basename "${SHELL:-/bin/bash}")"
+    shell_name="$(basename "${SHELL:-/bin/sh}")"
     # shellcheck disable=SC2088  # tilde is intentional for display in `info` message
     case "${shell_name}" in
         zsh)  rc_file="~/.zshrc" ;;
@@ -360,7 +363,7 @@ check_path() {
 # --- Cleanup ------------------------------------------------------------------
 
 cleanup() {
-    if [[ -n "${TMPDIR_CREATED:-}" ]]; then
+    if [ -n "${TMPDIR_CREATED:-}" ]; then
         rm -rf "${TMPDIR_CREATED}"
     fi
 }
@@ -373,8 +376,7 @@ main() {
     parse_args "$@"
 
     # Set up tmpdir + EXIT trap before any function that mktemp's into it.
-    local tmpdir
-    tmpdir="$(mktemp -d -t shux-install.XXXXXX)" \
+    tmpdir="$(mktemp -d -t shux-install.XXXXXX 2>/dev/null || mktemp -d)" \
         || error_exit "Could not create temporary directory"
     TMPDIR_CREATED="${tmpdir}"
     trap cleanup EXIT INT TERM HUP
@@ -386,7 +388,7 @@ main() {
     detect_platform
 
     step 3 7 "Finding release"
-    if [[ -n "${VERSION}" ]]; then
+    if [ -n "${VERSION}" ]; then
         success "Version: ${VERSION} (requested)"
     else
         get_latest_version
@@ -412,7 +414,7 @@ main() {
 
     # macOS: clear Gatekeeper quarantine flag from a downloaded binary so
     # users don't have to right-click → Open the first time.
-    if [[ "${OS}" == "darwin" ]]; then
+    if [ "${OS}" = "darwin" ]; then
         xattr -d com.apple.quarantine "${INSTALL_DIR}/${BINARY}" 2>/dev/null || true
         success "Cleared macOS quarantine flag"
     fi
