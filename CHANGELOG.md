@@ -1,3 +1,10 @@
+## [0.22.2](https://github.com/indrasvat/shux/compare/v0.22.1...v0.22.2) (2026-05-15)
+
+
+### Bug Fixes
+
+* **attach:** pane kill cascade + recursive-shux guard ([#42](https://github.com/indrasvat/shux/issues/42)) ([107ca3a](https://github.com/indrasvat/shux/commit/107ca3a94d9d86e8252b7b310a549b4b90cb79ec))
+
 ## [0.22.1](https://github.com/indrasvat/shux/compare/v0.22.0...v0.22.1) (2026-05-15)
 
 
