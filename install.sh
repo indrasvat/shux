@@ -316,11 +316,49 @@ build_download_url() {
 download_file() {
     url="$1"
     dest="$2"
+    # IMPORTANT: do NOT redirect stderr to /dev/null here. When this fails
+    # (sandbox network restriction, asset renamed upstream, transient 5xx,
+    # TLS handshake error), the user needs to see WHAT failed — not a
+    # generic "Download failed". Codex hit a sandbox install failure where
+    # the error was invisible and they had to guess at root cause; their
+    # guess (installer asset-name mismatch) was wrong. PR-fix on top of #40.
     if [ "${DOWNLOADER}" = "curl" ]; then
-        curl -sSfL -o "${dest}" "${url}" 2>/dev/null
+        curl -fSL -o "${dest}" "${url}"
     else
-        wget -q -O "${dest}" "${url}" 2>/dev/null
+        wget -O "${dest}" "${url}"
     fi
+}
+
+# list_release_assets fetches the release page HTML (web URL, no API
+# rate limits) and prints one asset filename per line. Used in download
+# failure diagnostics so the user can see what's actually published vs
+# what the installer tried to fetch — catches name-mismatch bugs at the
+# install site rather than after the fact.
+list_release_assets() {
+    rel_url="https://github.com/${REPO}/releases/expanded_assets/${VERSION}"
+    [ "${DOWNLOADER}" = "curl" ] || return 0
+    curl -fsSL "${rel_url}" 2>/dev/null \
+        | grep -oE 'shux-v[^"<]+\.tar\.gz(\.sha256)?' \
+        | sort -u
+}
+
+# download_failure_diagnostic prints a structured post-mortem when a
+# release-asset download fails. Shows the URL, the constructed asset
+# name, and the actual asset names published on the release page so a
+# name-mismatch is immediately obvious instead of needing manual repo
+# inspection. Quiet about its own failure — diagnostics shouldn't mask
+# the real error.
+download_failure_diagnostic() {
+    failed_url="$1"
+    printf '\n' >&2
+    printf '  diagnostic: failed URL = %s\n' "${failed_url}" >&2
+    printf '  diagnostic: expected   = %s\n' "${TARBALL}" >&2
+    assets="$(list_release_assets 2>/dev/null || true)"
+    if [ -n "${assets}" ]; then
+        printf '  diagnostic: published assets on %s:\n' "${VERSION}" >&2
+        printf '%s\n' "${assets}" | sed 's/^/    - /' >&2
+    fi
+    printf '\n' >&2
 }
 
 # --- Checksum verification ----------------------------------------------------
@@ -446,13 +484,17 @@ main() {
     build_download_url
 
     step 4 7 "Downloading ${BINARY}"
-    download_file "${TARBALL_URL}" "${tmpdir}/${TARBALL}" \
-        || error_exit "Download failed. Check that ${VERSION} exists at github.com/${REPO}/releases"
+    if ! download_file "${TARBALL_URL}" "${tmpdir}/${TARBALL}"; then
+        download_failure_diagnostic "${TARBALL_URL}"
+        error_exit "Download failed. See diagnostic above; if assets exist with a different name on the release, the installer needs a fix in build_download_url()."
+    fi
     success "Downloaded ${TARBALL}"
 
     step 5 7 "Verifying checksum"
-    download_file "${CHECKSUM_URL}" "${tmpdir}/${TARBALL}.sha256" \
-        || error_exit "Failed to download ${TARBALL}.sha256"
+    if ! download_file "${CHECKSUM_URL}" "${tmpdir}/${TARBALL}.sha256"; then
+        download_failure_diagnostic "${CHECKSUM_URL}"
+        error_exit "Failed to download ${TARBALL}.sha256"
+    fi
     verify_checksum "${tmpdir}/${TARBALL}.sha256" "${tmpdir}/${TARBALL}"
     success "Checksum verified (SHA-256)"
 
