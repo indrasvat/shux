@@ -1,3 +1,10 @@
+## [0.24.1](https://github.com/indrasvat/shux/compare/v0.24.0...v0.24.1) (2026-05-16)
+
+
+### Bug Fixes
+
+* **install:** expose curl/wget errors + list actual release assets on download failure ([#49](https://github.com/indrasvat/shux/issues/49)) ([ea1a32a](https://github.com/indrasvat/shux/commit/ea1a32ae0e9764f5df986cfc9618743d1921e9d4))
+
 # [0.24.0](https://github.com/indrasvat/shux/compare/v0.23.1...v0.24.0) (2026-05-16)
 
 
