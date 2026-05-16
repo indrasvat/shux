@@ -54,6 +54,10 @@ mod strict {
     pub struct Appearance {
         #[serde(default)]
         pub border_style: Option<String>,
+        #[serde(default)]
+        pub nerd_fonts: Option<bool>,
+        #[serde(default)]
+        pub font: Option<String>,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -90,7 +94,11 @@ mod strict {
     pub struct Segment {
         #[serde(default)]
         pub zone: Option<String>,
-        #[serde(default)]
+        // `command` is REQUIRED in the runtime schema
+        // (`SegmentDef::command: Vec<String>` with no `#[serde(default)]`),
+        // so a strict-mirror default would let `shux config validate`
+        // pass a config the daemon rejects at startup. Council review,
+        // PR #46.
         pub command: Vec<String>,
         #[serde(default)]
         pub env: HashMap<String, String>,
@@ -115,6 +123,10 @@ mod strict {
         pub status_fg: Option<String>,
         #[serde(default)]
         pub status_accent: Option<String>,
+        #[serde(default)]
+        pub status_muted: Option<String>,
+        #[serde(default)]
+        pub status_branch: Option<String>,
     }
 }
 
@@ -338,6 +350,101 @@ interval_ms = 2000
         );
         let diags = validate(f.path()).unwrap();
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// End-to-end regression: the exact bytes emitted by
+    /// `shux config init` (via `cli::DEFAULT_CONFIG_TOML`) must validate
+    /// cleanly. Caught the original PR #46 drift where `nerd_fonts` was
+    /// in the template + runtime schema but missing from the strict
+    /// mirror, so users running `shux config validate` against an
+    /// `init`-generated file saw spurious "unknown field" errors.
+    /// Future fields added to the template MUST also be added to
+    /// `strict::Appearance` or this test fails.
+    #[test]
+    fn validate_emitted_default_config_is_ok() {
+        let f = write_tmp(crate::cli::DEFAULT_CONFIG_TOML);
+        let diags = validate(f.path()).unwrap();
+        assert!(
+            diags.is_empty(),
+            "DEFAULT_CONFIG_TOML emitted by `shux config init` failed validation. \
+             Strict mirror in config_validate.rs has drifted from the template. \
+             Diagnostics: {diags:?}",
+        );
+    }
+
+    /// Feature-maxed `[appearance]`: every documented key set. Asserts
+    /// the strict mirror accepts the full schema surface, not just the
+    /// minimal happy path.
+    #[test]
+    fn validate_maximal_appearance_block_is_ok() {
+        let f = write_tmp(
+            r#"
+[appearance]
+border_style = "rounded"
+nerd_fonts = true
+font = "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf"
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+    }
+
+    /// Same audit for `[theme]`: `status_muted` and `status_branch`
+    /// landed in the runtime schema after the strict mirror was
+    /// written and silently drifted.
+    #[test]
+    fn validate_maximal_theme_block_is_ok() {
+        let f = write_tmp(
+            r##"
+[theme]
+border_focused   = "#74c7ec"
+border_unfocused = "#5b6078"
+status_bg        = "#1e2030"
+status_fg        = "#cad3f5"
+status_accent    = "#74c7ec"
+status_muted     = "#6e738d"
+status_branch    = "#c6a0f6"
+"##,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+    }
+
+    /// Council review caught: the strict mirror had
+    /// `#[serde(default)] command: Vec<String>` but the runtime
+    /// `SegmentDef::command: Vec<String>` is REQUIRED (no default).
+    /// `shux config validate` was accepting segments the daemon would
+    /// reject at startup. With the default removed, a segment missing
+    /// `command` must now fail validation.
+    #[test]
+    fn validate_rejects_segment_without_required_command() {
+        let f = write_tmp(
+            r#"
+[[statusbar.segment]]
+zone = "left"
+interval_ms = 2000
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(
+            diags.len(),
+            1,
+            "missing `command` should produce exactly one diagnostic, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nerd_fonts_type_error() {
+        // Defensive: validator must still catch wrong types, not just
+        // accept any value under the now-known field name.
+        let f = write_tmp(
+            r#"
+[appearance]
+nerd_fonts = "yes"
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(diags.len(), 1, "diags: {diags:?}");
     }
 
     #[test]

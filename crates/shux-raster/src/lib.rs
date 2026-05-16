@@ -7,17 +7,26 @@
 //!   out of the box — no subset-regen ritual, no tofu when a user's
 //!   `[[statusbar.segment]]` script (starship, kubectl, …) emits NF
 //!   glyphs we didn't anticipate.
+//! - **Monochrome emoji fallback**: bundled Noto Emoji Regular
+//!   (~860 KB OFL) as the final entry in the font chain. Standalone
+//!   emoji (🍺 🧩 🦀 🚀 ⚡ …) resolve to legible monochrome glyphs in
+//!   PNG snapshots; the live `attach` path is unaffected (your
+//!   terminal's font stack handles it there).
 //! - Per-cell glyph rendering via `fontdue` (pure Rust, no system deps).
 //! - 16-color ANSI + 256-indexed + truecolor RGB palette.
 //! - Bold (synthetic offset), dim, underline, strikethrough, inverse.
 //! - Block cursor (inverse cell).
 //! - PNG output via the `image` crate.
 //!
-//! Out of scope: color emoji (e.g. `🦀` U+1F980 from starship's default
-//! rust prompt). Set `[rust] symbol = ""` in starship config to use the
-//! NF rust logo instead — see `shux config init`'s emitted template.
-//! Other deferred: ligatures via shaping, italics with a real italic
-//! face, OSC 8 hyperlink styling, RTL text, GPU acceleration.
+//! Out of scope (v1): **colour** emoji and **composed** emoji. Colour
+//! requires a COLRv1/CBDT-aware rasterizer (fontdue is grayscale-only).
+//! Composed emoji (ZWJ sequences like `👨‍💻`, skin-tone modifiers,
+//! regional-indicator flag pairs, VS16 like `🛠️`) are gated on
+//! grapheme-cluster storage in `shux-vt`, which today keys cells on a
+//! single `char` — even a swap to swash would not reconstruct what the
+//! parser split apart. Tracked as future work. Also deferred: ligatures
+//! via shaping, italics with a real italic face, OSC 8 hyperlink
+//! styling, RTL text, GPU acceleration.
 
 use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
@@ -30,6 +39,15 @@ use shux_vt::{Cell, CellFlags, Color, Grid};
 /// renders correctly OOTB. To update: pull the latest from
 /// <https://github.com/ryanoasis/nerd-fonts/releases/latest/>.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMonoNerdFontMono-Regular.ttf");
+
+/// Embedded monochrome emoji fallback. Noto Emoji Regular (~860 KB
+/// under the same SIL OFL v1.1; license text in `assets/OFL.txt`).
+/// Appended to every rasterizer's font chain so standalone emoji
+/// codepoints resolve to legible glyphs in PNG snapshots instead of
+/// rendering as tofu. Composed emoji (ZWJ / VS16 / regional-indicator
+/// flag pairs) are out of scope until `shux-vt` gains grapheme-cluster
+/// storage. See `assets/NOTICE.md` for re-fetch instructions.
+const EMOJI_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
 
 /// Rasterizer errors.
 #[derive(Debug, thiserror::Error)]
@@ -66,15 +84,17 @@ impl Default for RasterOptions {
 
 /// Owning rasterizer. Holds an ordered font fallback chain plus
 /// derived cell metrics. The first font that has a glyph for the
-/// requested character wins. With the full NF-patched bundled font
-/// the chain typically has exactly one entry; user-supplied
-/// `appearance.font` puts the user's font first and the bundled NF
-/// font as a fallback so any glyph the user's font lacks (e.g. NF
-/// icons in a plain non-patched typeface) still resolves.
+/// requested character wins. The chain always ends with the bundled
+/// NF JetBrains Mono and the bundled monochrome Noto Emoji so PNG
+/// snapshots never tofu on common glyphs; user-supplied
+/// `appearance.font` slots in front of those builtins.
 pub struct Rasterizer {
     /// Fallback chain: try fonts[0] first, then [1], etc. Metrics
     /// (cell_w / cell_h / ascent) are derived from fonts[0] only —
-    /// the primary text font dominates the grid geometry.
+    /// the primary text font dominates the grid geometry. Fallback
+    /// glyphs from later entries are size-fitted and centered within
+    /// each cell's bounding box (see `draw_cell`) so emoji rendered
+    /// from Noto Emoji don't spill into adjacent columns.
     fonts: Vec<Font>,
     font_size: f32,
     cell_w: u32,
@@ -84,19 +104,23 @@ pub struct Rasterizer {
 
 impl Rasterizer {
     /// Construct a rasterizer at the given font size (in pixels)
-    /// using the bundled NF-patched JetBrains Mono. Single-font chain
-    /// — full NF coverage included.
+    /// using the bundled NF-patched JetBrains Mono as primary, with
+    /// the bundled monochrome Noto Emoji as the emoji fallback. The
+    /// resulting chain is `[JBM_NF, NotoEmoji]`.
     pub fn new(font_size: f32) -> Result<Self, RasterError> {
-        Self::with_fonts(font_size, [FONT_BYTES])
+        Self::with_fonts(font_size, [FONT_BYTES, EMOJI_FONT_BYTES])
     }
 
     /// Construct a rasterizer with a user-supplied primary font, plus
-    /// the bundled NF-patched JBM as a fallback for codepoints the
-    /// user's font lacks. Lets users override the typeface via
-    /// `appearance.font` in shux config while still getting Nerd-Font
-    /// icons OOTB even if their chosen font is plain (non-patched).
+    /// the bundled NF-patched JBM (for NF / unicode coverage the
+    /// user's font may lack) and the bundled monochrome Noto Emoji
+    /// (for standalone emoji codepoints) as final fallbacks. The
+    /// resulting chain is `[primary, JBM_NF, NotoEmoji]`. Lets users
+    /// override the typeface via `appearance.font` while still getting
+    /// NF icons + non-tofu emoji in PNG snapshots regardless of their
+    /// chosen primary's coverage.
     pub fn with_primary_font(font_size: f32, primary: &[u8]) -> Result<Self, RasterError> {
-        Self::with_fonts(font_size, [primary, FONT_BYTES])
+        Self::with_fonts(font_size, [primary, FONT_BYTES, EMOJI_FONT_BYTES])
     }
 
     /// Construct a rasterizer from an explicit fallback chain.
@@ -139,12 +163,24 @@ impl Rasterizer {
     /// caller still gets fontdue's "missing glyph" rendering — better
     /// than panicking or skipping the cell).
     fn font_for(&self, ch: char) -> &Font {
-        for f in &self.fonts {
+        &self.fonts[self.font_idx_for(ch)]
+    }
+
+    /// Index of the font in the fallback chain that has a glyph for
+    /// `ch`. Returns 0 (primary) if no entry has the glyph. The
+    /// renderer uses this to distinguish "primary glyph, position by
+    /// baseline metrics" from "fallback glyph, size-fit + center
+    /// inside the cell box" — fallback fonts (especially Noto Emoji)
+    /// have native advance widths that don't match the primary text
+    /// font's cell metric, so blitting them at the primary's geometry
+    /// would spill across cell boundaries.
+    fn font_idx_for(&self, ch: char) -> usize {
+        for (i, f) in self.fonts.iter().enumerate() {
             if f.lookup_glyph_index(ch) != 0 {
-                return f;
+                return i;
             }
         }
-        &self.fonts[0]
+        0
     }
 
     /// Number of fonts in the fallback chain. Exposed for tests + the
@@ -265,10 +301,29 @@ impl Rasterizer {
 
         let ch = cell.ch;
         if ch != ' ' && ch != '\0' {
-            let (metrics, bitmap) = self.font_for(ch).rasterize(ch, self.font_size);
-            let baseline_y = y as i32 + self.ascent.round() as i32;
-            let glyph_x = x as i32 + metrics.xmin;
-            let glyph_y = baseline_y - metrics.height as i32 - metrics.ymin;
+            let idx = self.font_idx_for(ch);
+            let font = &self.fonts[idx];
+            let (metrics, bitmap, glyph_x, glyph_y) = if idx == 0 {
+                // Primary font: cell metrics were derived from it, so
+                // baseline positioning aligns by construction.
+                let (m, bmp) = font.rasterize(ch, self.font_size);
+                let baseline_y = y as i32 + self.ascent.round() as i32;
+                let gx = x as i32 + m.xmin;
+                let gy = baseline_y - m.height as i32 - m.ymin;
+                (m, bmp, gx, gy)
+            } else {
+                // Fallback font (e.g. Noto Emoji): its native advance
+                // and ascent don't match the primary's, so naively
+                // blitting at primary baseline would spill into the
+                // next cell or float far above the row. Re-rasterize
+                // at a font size that fits inside the cell box, then
+                // center both axes within `cell_pixels_w * cell_h`.
+                let (m, bmp) =
+                    fit_and_rasterize(font, ch, self.font_size, cell_pixels_w, self.cell_h);
+                let gx = x as i32 + (cell_pixels_w as i32 - m.width as i32).max(0) / 2;
+                let gy = y as i32 + (self.cell_h as i32 - m.height as i32).max(0) / 2;
+                (m, bmp, gx, gy)
+            };
             blit_glyph(
                 img,
                 glyph_x,
@@ -316,6 +371,35 @@ impl Rasterizer {
             }
         }
     }
+}
+
+/// Re-rasterize a glyph at a font size that fits inside a target box
+/// (`box_w × box_h`). Used for fallback-font glyphs whose native
+/// advance / height don't match the primary font's cell metric.
+///
+/// Strategy: probe at the primary font size first. If the result
+/// already fits, use it. Otherwise scale the font size down by the
+/// tighter of the two dimensions (`box_w / probe_w` vs `box_h / probe_h`)
+/// and re-rasterize once. Never enlarges — a small emoji glyph stays
+/// small, so the user gets the proportionally-correct visual weight
+/// instead of a smeared upscale. Floors at 6pt so even an absurdly
+/// small cell still gets something legible.
+fn fit_and_rasterize(
+    font: &Font,
+    ch: char,
+    primary_size: f32,
+    box_w: u32,
+    box_h: u32,
+) -> (fontdue::Metrics, Vec<u8>) {
+    let (probe_metrics, probe_bitmap) = font.rasterize(ch, primary_size);
+    if probe_metrics.width <= box_w as usize && probe_metrics.height <= box_h as usize {
+        return (probe_metrics, probe_bitmap);
+    }
+    let scale_w = box_w as f32 / probe_metrics.width.max(1) as f32;
+    let scale_h = box_h as f32 / probe_metrics.height.max(1) as f32;
+    let scale = scale_w.min(scale_h).min(1.0);
+    let fit_size = (primary_size * scale).max(6.0);
+    font.rasterize(ch, fit_size)
 }
 
 fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, rgb: Rgb) {
@@ -554,17 +638,119 @@ mod tests {
 
     #[test]
     fn with_primary_font_keeps_bundled_fallback() {
-        // Use a font that is monochrome-emoji-only (synthetic test:
-        // pass the same bundled NF JBM bytes as "primary" — every
-        // glyph the chain ever needs is here). The fallback chain
-        // length must be 2 so a real "plain non-patched font" used
-        // as primary still gets NF coverage from the bundled fallback.
+        // Pass the same bundled NF JBM bytes as "primary" — every
+        // glyph the chain ever needs is here. The chain length must
+        // be 3 so a real "plain non-patched font" used as primary
+        // still gets NF coverage from the JBM fallback and emoji
+        // coverage from the Noto Emoji fallback.
         let r = Rasterizer::with_primary_font(14.0, FONT_BYTES).expect("rasterizer");
-        assert_eq!(r.font_count(), 2, "user-primary + bundled-fallback");
-        // Sanity: both ASCII and NF resolve.
+        assert_eq!(r.font_count(), 3, "user-primary + JBM-NF + emoji");
+        // Sanity: ASCII, NF private-use, and an emoji codepoint all resolve.
         assert!(r.has_glyph('A'));
         assert!(r.has_glyph('\u{e0a0}')); // git branch
         assert!(r.has_glyph('\u{e7a8}')); // rust logo
+        assert!(r.has_glyph('\u{1F37A}')); // 🍺 beer mug — resolves via Noto Emoji
+    }
+
+    /// Default chain (no user-supplied primary): just NF JBM + emoji.
+    /// Verifies `Rasterizer::new()` picks up the emoji fallback so
+    /// snapshots produced by daemons that never see `appearance.font`
+    /// still render emoji legibly.
+    #[test]
+    fn default_chain_has_emoji_fallback() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        assert_eq!(r.font_count(), 2, "JBM-NF + emoji");
+        assert!(r.has_glyph('\u{1F37A}')); // 🍺
+        assert!(r.has_glyph('\u{1F9E9}')); // 🧩
+        assert!(r.has_glyph('\u{1F680}')); // 🚀
+        assert_eq!(r.font_idx_for('A'), 0, "ASCII resolves at primary (JBM)");
+        assert_eq!(
+            r.font_idx_for('\u{1F37A}'),
+            1,
+            "emoji resolves at the emoji fallback"
+        );
+    }
+
+    /// Tofu-free assertion for the curated emoji set. Mirrors the NF
+    /// glyph contract but lives in a SEPARATE list — if a future emoji
+    /// font swap drops one of these the failure is targeted at the
+    /// emoji asset, not the text font. Adding entries is fine;
+    /// removing one means "shux silently accepts tofu for this emoji
+    /// codepoint" — review carefully.
+    #[test]
+    fn bundled_emoji_font_covers_important_emoji_glyphs() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        let mut problems: Vec<String> = Vec::new();
+        for (label, ch) in important_emoji_glyphs() {
+            let has = r.has_glyph(*ch);
+            let n = r.glyph_pixel_count(*ch);
+            if !has || n < 8 {
+                problems.push(format!(
+                    "  - {label} ({:#x}) has_glyph={has} pixels={n}",
+                    *ch as u32
+                ));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "bundled emoji fallback would tofu these codepoints:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    /// Fallback-font glyphs are size-fitted and centered within the
+    /// cell box. Drive the VT parser with a wide emoji and assert the
+    /// rendered glyph straddles both halves of the 2-column wide cell —
+    /// the council-flagged "uncentered, spilling into next cell"
+    /// failure mode would put all pixels in one half (or worse, past
+    /// the right edge into a phantom 3rd cell).
+    #[test]
+    fn fallback_emoji_glyph_stays_inside_wide_cell_bounds() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        let (cw, _ch) = r.cell_size();
+
+        // 1×3 grid: emoji at col 0..1 (wide), space at col 2. The
+        // space column gives us an empty bg-only region to confirm
+        // the emoji isn't spilling past the wide-cell box.
+        let mut vt = VirtualTerminal::new(1, 3);
+        vt.process("🍺 ".as_bytes()); // emoji + trailing space
+
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            cursor: None,
+        };
+        let img = r.render(vt.grid(), &opts);
+        assert_eq!(img.width(), 3 * cw);
+
+        let mut left_pixels = 0u32;
+        let mut right_pixels = 0u32;
+        let mut spillover_pixels = 0u32;
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let p = img.get_pixel(x, y);
+                if (p[0], p[1], p[2]) == (0, 0, 0) {
+                    continue;
+                }
+                if x < cw {
+                    left_pixels += 1;
+                } else if x < 2 * cw {
+                    right_pixels += 1;
+                } else {
+                    spillover_pixels += 1;
+                }
+            }
+        }
+        assert!(
+            left_pixels > 0 && right_pixels > 0,
+            "wide emoji should straddle both columns of its 2-cell box: \
+             left={left_pixels} right={right_pixels}"
+        );
+        assert_eq!(
+            spillover_pixels, 0,
+            "wide emoji glyph spilled past the 2-cell box into col 3 \
+             ({spillover_pixels} px) — centering / clipping regression"
+        );
     }
 
     /// Local-only test: when alternative NF fonts staged under
@@ -592,7 +778,7 @@ mod tests {
             };
             let r = Rasterizer::with_primary_font(14.0, &bytes)
                 .unwrap_or_else(|e| panic!("alt font {} failed to load: {e}", alt.display()));
-            assert_eq!(r.font_count(), 2);
+            assert_eq!(r.font_count(), 3, "alt-primary + JBM-NF + emoji");
             let mut tofus: Vec<String> = Vec::new();
             for (label, ch) in important_glyphs_for_bundled_font() {
                 let c = *ch;
@@ -677,6 +863,38 @@ mod tests {
             ("right-triangle U+25B6", '\u{25b6}'),
             ("plus-minus U+00B1", '\u{00b1}'),
             ("middle-dot U+00B7", '\u{00b7}'),
+        ]
+    }
+
+    /// Curated emoji codepoint set the bundled Noto Emoji fallback
+    /// MUST cover. Kept separate from `important_glyphs_for_bundled_font`
+    /// because the contract is different: emoji codepoints land in
+    /// standard Unicode blocks (Misc Symbols & Pictographs, Supplemental
+    /// Symbols & Pictographs, …), not Nerd Fonts' private-use area.
+    ///
+    /// Scope: only **standalone** scalar codepoints. Variation selectors
+    /// (VS16 / U+FE0F) and ZWJ sequences are deliberately excluded —
+    /// `shux-vt` stores one `char` per cell so the parser splits them
+    /// before the rasterizer sees them, and even a colour-emoji
+    /// rasterizer wouldn't be able to reconstruct the cluster. That's a
+    /// VT-layer change tracked as future work.
+    fn important_emoji_glyphs() -> &'static [(&'static str, char)] {
+        &[
+            ("beer_mug U+1F37A", '\u{1F37A}'),      // 🍺
+            ("jigsaw U+1F9E9", '\u{1F9E9}'),        // 🧩
+            ("hammer_wrench U+1F6E0", '\u{1F6E0}'), // 🛠 (no VS16)
+            ("rocket U+1F680", '\u{1F680}'),        // 🚀
+            ("crab U+1F980", '\u{1F980}'),          // 🦀
+            ("package U+1F4E6", '\u{1F4E6}'),       // 📦
+            ("party_popper U+1F389", '\u{1F389}'),  // 🎉
+            ("lock U+1F512", '\u{1F512}'),          // 🔒
+            ("fire U+1F525", '\u{1F525}'),          // 🔥
+            ("magnifier U+1F50D", '\u{1F50D}'),     // 🔍
+            ("thumbsup U+1F44D", '\u{1F44D}'),      // 👍
+            ("high_voltage U+26A1", '\u{26A1}'),    // ⚡
+            ("warning_sign U+26A0", '\u{26A0}'),    // ⚠
+            ("heart U+2764", '\u{2764}'),           // ❤
+            ("star_medium U+2B50", '\u{2B50}'),     // ⭐
         ]
     }
 
