@@ -2965,6 +2965,46 @@ fn register_session_methods(
         )
 }
 
+/// Build the snapshot rasterizer from current config.
+///
+/// - `appearance.font` unset → bundled JBM-NF + Noto Emoji chain.
+/// - `appearance.font` set + file readable + font parseable → that
+///   font as primary, then JBM-NF + Noto Emoji as fallbacks.
+/// - `appearance.font` set BUT unreadable or unparseable → returns
+///   `Err`. The hot-reload caller's `Err` branch keeps the last-good
+///   rasterizer; the initial-build call surfaces the error so users
+///   see a clear startup failure rather than a silent downgrade.
+///
+/// Council review (PR #46): the previous behaviour silently fell back
+/// to the bundled chain on bad custom-font paths, contradicting the
+/// "keep last good rasterizer" comment in the hot-reload spawn and
+/// making the `Err` branch of the reload loop unreachable for the
+/// most common failure mode.
+fn build_snapshot_rasterizer(
+    cfg: &shux_core::config::Config,
+) -> Result<shux_raster::Rasterizer, shux_raster::RasterError> {
+    match cfg.appearance.font.as_ref() {
+        None => shux_raster::Rasterizer::new(14.0),
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|e| {
+                shux_raster::RasterError::Font(format!(
+                    "appearance.font: read {} failed: {e}",
+                    path.display()
+                ))
+            })?;
+            shux_raster::Rasterizer::with_primary_font(14.0, &bytes)
+        }
+    }
+}
+
+/// Cheap equality-key for the subset of config that affects the
+/// rasterizer chain. Returning the same value across two config
+/// reloads means we can skip the rebuild — most reloads (border
+/// styles, theme tweaks, statusbar segments) don't touch fonts.
+fn snapshot_font_key(cfg: &shux_core::config::Config) -> Option<std::path::PathBuf> {
+    cfg.appearance.font.clone()
+}
+
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
 #[allow(clippy::too_many_arguments)]
 fn register_pane_io_methods(
@@ -2998,40 +3038,90 @@ fn register_pane_io_methods(
     let io10 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
-    // Built once at startup so each snapshot call doesn't re-parse the
-    // bundled fonts. When `appearance.font` is set, the user's font
-    // becomes the primary text font and the bundled NF symbols subset
-    // stays as the icon fallback. Font-config changes need a daemon
-    // restart to take effect (hot reload only re-renders, doesn't
-    // rebuild the rasterizer); documented in the config TOML.
-    let rasterizer_pane: Arc<shux_raster::Rasterizer> =
-        {
-            let cfg_snap = config.current();
-            let custom_font: Option<Vec<u8>> = cfg_snap.appearance.font.as_ref().and_then(|p| {
-                match std::fs::read(p) {
-                    Ok(bytes) => Some(bytes),
+    // Wrapped in an `ArcSwap` so the snapshot handlers can pick up
+    // `appearance.font` changes via the existing config hot-reload
+    // signal without a daemon restart. On reload failure (bad font
+    // path, corrupt file) the last-good rasterizer is kept and the
+    // error logged — snapshots never produce blank PNGs because of a
+    // misconfiguration. PR #46.
+    //
+    // Race-window note (council review, PR #46): we capture the
+    // build-time config snapshot ONCE here and pass it INTO the reload
+    // task. The task starts from that exact same snapshot's font key
+    // and re-checks the current config before entering its `notified`
+    // loop. This closes the TOCTOU between (a) the initial build and
+    // (b) the spawned task starting to await — without it, a config
+    // change in that gap would be silently lost because
+    // `ConfigHandle::replace` uses `notify_waiters()` which only wakes
+    // tasks ALREADY parked on `notified()`.
+    let build_snap = config.current();
+    let initial_font_key = snapshot_font_key(&build_snap);
+    let rasterizer: Arc<arc_swap::ArcSwap<shux_raster::Rasterizer>> =
+        Arc::new(arc_swap::ArcSwap::from(Arc::new(
+            build_snapshot_rasterizer(&build_snap).unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "appearance.font invalid at startup, falling back to bundled chain"
+                );
+                shux_raster::Rasterizer::new(14.0)
+                    .expect("shux-raster: bundled font corrupt — should be unreachable")
+            }),
+        )));
+    {
+        let raster_handle = rasterizer.clone();
+        let config_for_reload = config.clone();
+        let notify = config_for_reload.change_notify();
+        tokio::spawn(async move {
+            let mut last_font_key = initial_font_key;
+            // Catch any change that landed between the initial build
+            // and this task taking its first scheduling slot. Without
+            // this, the racing change is silently swallowed and the
+            // user sees a stale rasterizer until they edit the config
+            // again. Council review (PR #46).
+            let bootstrap_snap = config_for_reload.current();
+            let bootstrap_key = snapshot_font_key(&bootstrap_snap);
+            if bootstrap_key != last_font_key {
+                match build_snapshot_rasterizer(&bootstrap_snap) {
+                    Ok(new_raster) => {
+                        raster_handle.store(Arc::new(new_raster));
+                        last_font_key = bootstrap_key;
+                        tracing::info!(
+                            "snapshot rasterizer caught a config change \
+                             that raced the daemon startup"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "snapshot rasterizer bootstrap reload failed; keeping initial"
+                    ),
+                }
+            }
+            loop {
+                notify.notified().await;
+                let cfg_snap = config_for_reload.current();
+                let new_key = snapshot_font_key(&cfg_snap);
+                if new_key == last_font_key {
+                    continue;
+                }
+                match build_snapshot_rasterizer(&cfg_snap) {
+                    Ok(new_raster) => {
+                        raster_handle.store(Arc::new(new_raster));
+                        last_font_key = new_key;
+                        tracing::info!("snapshot rasterizer rebuilt after config change");
+                    }
                     Err(e) => {
                         tracing::warn!(
-                            path = %p.display(),
                             error = %e,
-                            "appearance.font: read failed, falling back to bundled JetBrains Mono"
+                            "snapshot rasterizer rebuild failed; keeping last good"
                         );
-                        None
                     }
                 }
-            });
-            let raster = match custom_font {
-                Some(bytes) => shux_raster::Rasterizer::with_primary_font(14.0, &bytes)
-                    .or_else(|_| shux_raster::Rasterizer::new(14.0)),
-                None => shux_raster::Rasterizer::new(14.0),
-            };
-            Arc::new(
-                raster
-                    .expect("shux-raster: failed to construct rasterizer (bundled font corrupt?)"),
-            )
-        };
-    let rasterizer_window = rasterizer_pane.clone();
-    let rasterizer_session = rasterizer_pane.clone();
+            }
+        });
+    }
+    let rasterizer_pane = rasterizer.clone();
+    let rasterizer_window = rasterizer.clone();
+    let rasterizer_session = rasterizer.clone();
 
     builder
         .register_with_policy(
@@ -3410,7 +3500,7 @@ fn register_pane_io_methods(
             move |params: Option<serde_json::Value>| {
                 let gh = g6.clone();
                 let io = io6.clone();
-                let r = rasterizer_pane.clone();
+                let r = rasterizer_pane.load_full();
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -3505,7 +3595,7 @@ fn register_pane_io_methods(
                 move |params: Option<serde_json::Value>| {
                     let gh = g8.clone();
                     let io = io8.clone();
-                    let r = rasterizer_window.clone();
+                    let r = rasterizer_window.load_full();
                     let cfg = cfg.clone();
                     let meta = meta.clone();
                     let onb = onb.clone();
@@ -3533,7 +3623,7 @@ fn register_pane_io_methods(
                 move |params: Option<serde_json::Value>| {
                     let gh = g9.clone();
                     let io = io9.clone();
-                    let r = rasterizer_session.clone();
+                    let r = rasterizer_session.load_full();
                     let cfg = cfg.clone();
                     let meta = meta.clone();
                     let onb = onb.clone();

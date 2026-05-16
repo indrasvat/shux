@@ -1574,11 +1574,13 @@ border_style = "rounded"
 # NF — the ASCII fallback (◆ ± ▶ @) works in any font.
 nerd_fonts = true
 # Optional custom primary text font for the PNG rasterizer. The
-# bundled NF JetBrains Mono stays in the fallback chain so any glyph
-# your font lacks (typical for plain non-patched typefaces) still
-# resolves through the NF fallback — no tofu either way. Doesn't
-# affect live attach (your terminal font controls that). Daemon
-# restart needed for font changes — hot-reload only re-renders.
+# bundled NF JetBrains Mono and Noto Emoji stay in the fallback chain
+# so any glyph your font lacks (typical for plain non-patched
+# typefaces, or any standalone emoji) still resolves — no tofu either
+# way. Doesn't affect live attach (your terminal font controls that).
+# Font changes hot-reload: edit this line and the next snapshot uses
+# the new font. On a bad path the last-good rasterizer is retained
+# and a warning is logged.
 # font = "/path/to/your-font.ttf"
 #
 # Caveat for status-bar segments: stick to ASCII + Nerd Font
@@ -1593,9 +1595,14 @@ nerd_fonts = true
 #   nf-pl-branch      U+E0A0   ''  or  "\uE0A0"
 #   nf-md-kubernetes  U+F10FE  '󱃾'  or  "\U000F10FE"
 #   nf-md-ship_wheel  U+F124A  '󱉊'  or  "\U000F124A"
-# Color emoji (🦀 etc.) require a color-emoji font; configure your
-# starship language modules with `symbol = "<NF glyph>"` to use NF
-# glyphs instead. Example for rust: symbol = ' ' (or
+# Standalone monochrome emoji (🍺 🧩 🦀 🚀 ⚡ …) render correctly in
+# PNG snapshots via the bundled Noto Emoji fallback — no extra
+# configuration needed. Colour emoji and composed emoji (ZWJ
+# sequences like 👨‍💻, VS16 like 🛠️, regional-indicator flag pairs,
+# skin-tone modifiers) are not yet supported — the parser splits
+# them into separate cells. For composed glyphs in status bars,
+# configure your starship language modules with the NF equivalent.
+# Example for rust: symbol = ' ' (or
 # symbol = "\uE7A8 " using TOML escape syntax).
 
 [keys]

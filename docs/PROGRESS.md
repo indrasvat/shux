@@ -85,6 +85,58 @@
 
 ## Session Log
 
+**2026-05-15 — feat(snapshot): emoji glyph fallback in PNG rasterizer (issue #46)**
+- Issue #46: PNG snapshots dropped emoji glyphs (rendered as tofu /
+  blank). Bug surfaced repeatedly across shux dev work — user
+  explicitly asked for a *proper* fix, not a stopgap.
+- `dootsabha council` review on the design proposal (codex + gemini,
+  chair = claude per `~/.config/dootsabha/config.yaml`). Convergence:
+  swap to swash for colour emoji is the wrong v1 — `shux-vt::Cell`
+  stores one `char` per cell, so the parser already splits ZWJ
+  sequences (`👨‍💻`), VS16 (`🛠️`), regional-indicator flag pairs, and
+  skin-tone modifiers BEFORE the rasterizer sees them. Even with the
+  best COLRv1 rasterizer you can't reconstruct what was split. v1
+  lands monochrome standalone emoji via fontdue + bundled Noto Emoji;
+  colour + composed emoji deferred to a future `shux-vt`
+  grapheme-cluster PR.
+- Bundled `crates/shux-raster/assets/NotoEmoji-Regular.ttf` (Noto Emoji
+  Version 3.005, monochrome variable-weight, ~860 KB, SIL OFL-1.1).
+  Append as final entry in every rasterizer's font chain:
+  `Rasterizer::new()` → `[JBM_NF, NotoEmoji]`,
+  `Rasterizer::with_primary_font(p)` → `[primary, JBM_NF, NotoEmoji]`.
+- Wide-cell math fix: when the glyph is from a fallback font (not the
+  primary text font), re-rasterize at a font size that fits inside
+  `cell_w * (is_wide ? 2 : 1)` (never enlarging, floored at 6pt) and
+  center within the cell box. Without this, Noto Emoji's wider native
+  advance spilled the emoji bitmap into the adjacent column.
+- Hot-reload via `Arc<arc_swap::ArcSwap<Rasterizer>>`. Spawned task
+  subscribes to `ConfigHandle::change_notify()`, rebuilds the
+  rasterizer on `appearance.font` change, keeps the last-good on
+  rebuild failure. Snapshot RPC handlers `.load_full()` per call.
+  Closes "font config requires daemon restart" UX gap.
+- Validator strict-mirror audit: `strict::Appearance` was missing
+  `nerd_fonts` + `font`; same audit surfaced `strict::Theme` missing
+  `status_muted` + `status_branch`. Added all four. New regression
+  test `validate_emitted_default_config_is_ok` round-trips
+  `cli::DEFAULT_CONFIG_TOML` so any future template field that lands
+  in runtime but not the strict mirror trips a hard test failure.
+- Tests added: `default_chain_has_emoji_fallback`,
+  `bundled_emoji_font_covers_important_emoji_glyphs` (curated 15-emoji
+  tofu-free set, parallel to existing NF set),
+  `fallback_emoji_glyph_stays_inside_wide_cell_bounds` (renders
+  `"🍺 "` into a 1×3 grid and asserts zero non-bg pixels in column 3),
+  `validate_maximal_appearance_block_is_ok`,
+  `validate_maximal_theme_block_is_ok`,
+  `validate_rejects_nerd_fonts_type_error`. Updated
+  `with_primary_font_keeps_bundled_fallback` (chain length 2 → 3).
+- Visual evidence at `.claude/screenshots/font-fallback/`:
+  5 cells (pane/window/session snapshot at default config, plus
+  pane snapshot at malformed-font-path and hot-reload states).
+  All show emoji rendering legibly; malformed state confirms
+  graceful fallback to bundled chain.
+- Learning entry added to `CLAUDE.md` (will migrate to
+  `docs/agents/learnings.md` once PR #47 merges).
+
 **2026-05-15 — fix(statusbar): include script segments in PNG snapshots (post-#43 followup)**
 - PR #43 (v0.23.0) wired `populate_bar(&mut bar, &config, &segments)`
   into the attach render loop but the snapshot path
