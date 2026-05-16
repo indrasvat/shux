@@ -1,3 +1,10 @@
+# [0.24.0](https://github.com/indrasvat/shux/compare/v0.23.1...v0.24.0) (2026-05-16)
+
+
+### Features
+
+* **snapshot:** emoji glyph fallback in PNG rasterizer (closes [#46](https://github.com/indrasvat/shux/issues/46)) ([#48](https://github.com/indrasvat/shux/issues/48)) ([36877e8](https://github.com/indrasvat/shux/commit/36877e899c6d65819a3914c3b36b293e0ad0e9ad))
+
 ## [0.23.1](https://github.com/indrasvat/shux/compare/v0.23.0...v0.23.1) (2026-05-15)
 
 
