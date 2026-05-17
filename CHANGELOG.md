@@ -1,3 +1,10 @@
+## [0.24.2](https://github.com/indrasvat/shux/compare/v0.24.1...v0.24.2) (2026-05-17)
+
+
+### Bug Fixes
+
+* **session:** default create cwd to caller ([f14571b](https://github.com/indrasvat/shux/commit/f14571b0ff8c62f9d4573b72e7ef4e4019f66c23))
+
 ## [0.24.1](https://github.com/indrasvat/shux/compare/v0.24.0...v0.24.1) (2026-05-16)
 
 
