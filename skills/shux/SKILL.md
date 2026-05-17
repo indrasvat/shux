@@ -58,7 +58,7 @@ Never pollute `.claude/`, `~/`, or the project root with shux output.
 #    pane_id from the response so the next calls can target it. CLI
 #    session creation starts in the caller's current directory unless
 #    you pass --cwd.
-RESP=$(shux --format json session create demo -d -- lazygit)
+RESP=$(shux --format json session create demo -d --title demo -- lazygit)
 PID=$(echo "$RESP" | jq -r .pane_id)
 
 # 2. Drive it.
@@ -150,7 +150,7 @@ The `text` field sends raw text. For control characters, use `data` (base64).
 ## Decide which method to use
 
 ```
-Need to spawn something?           → session.create  (shux session create -- <cmd>)
+Need to spawn something?           → session.create  (shux session create --title <label> -- <cmd>)
 Need a multi-pane workspace?       → state.apply     (shux state apply spec.toml)
 Need to type into a TUI?           → pane.send_keys  (shux pane send-keys --text|--data)
 Need pixel feedback of one pane?   → pane.snapshot   (shux pane snapshot)

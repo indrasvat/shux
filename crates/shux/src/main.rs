@@ -1796,6 +1796,72 @@ fn parse_expected_version(params: &serde_json::Value) -> Result<Option<u64>, shu
     }
 }
 
+/// Extract optional initial pane title from session.create/session.ensure params.
+fn parse_initial_pane_title(
+    params: &serde_json::Value,
+) -> Result<Option<String>, shux_rpc::RpcError> {
+    match params.get("pane_title") {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(v) => {
+            let title = v.as_str().ok_or_else(|| {
+                shux_rpc::RpcError::invalid_params("'pane_title' must be a string")
+            })?;
+            if title.trim().is_empty() {
+                return Err(shux_rpc::RpcError::invalid_params(
+                    "'pane_title' must not be empty",
+                ));
+            }
+            Ok(Some(title.to_string()))
+        }
+    }
+}
+
+fn initial_pane_id_for_session(
+    snap: &shux_core::graph::SessionGraphSnapshot,
+    session_id: shux_core::model::SessionId,
+) -> Result<shux_core::model::PaneId, shux_rpc::RpcError> {
+    let session = snap
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| shux_rpc::RpcError::internal("session vanished after create"))?;
+    let window_id = session
+        .windows
+        .first()
+        .ok_or_else(|| shux_rpc::RpcError::internal("created session has no windows"))?;
+    let window = snap
+        .windows
+        .get(window_id)
+        .ok_or_else(|| shux_rpc::RpcError::internal("initial window vanished after create"))?;
+
+    window
+        .layout
+        .tree
+        .pane_ids()
+        .into_iter()
+        .next()
+        .ok_or_else(|| shux_rpc::RpcError::internal("initial window has no panes"))
+}
+
+async fn set_initial_pane_title(
+    gh: &shux_core::graph::GraphHandle,
+    session_id: shux_core::model::SessionId,
+    title: Option<String>,
+) -> Result<(), shux_rpc::RpcError> {
+    let Some(title) = title else {
+        return Ok(());
+    };
+
+    let pane_id = {
+        let snap = gh.snapshot();
+        initial_pane_id_for_session(&snap, session_id)?
+    };
+
+    gh.set_pane_title(pane_id, Some(title), None)
+        .await
+        .map_err(graph_error_to_rpc)
+}
+
 /// Resolve a pane_id from params: either explicit `pane_id` or active pane of resolved window.
 fn resolve_pane_id_from_params(
     gh: &shux_core::graph::GraphHandle,
@@ -2635,6 +2701,7 @@ fn register_session_methods(
                         }
                         _ => Vec::new(),
                     };
+                    let pane_title = parse_initial_pane_title(&params)?;
 
                     // Auto-generate name if not provided (None).
                     // Explicit empty string (Some("")) flows through to validation.
@@ -2671,6 +2738,8 @@ fn register_session_methods(
                         .await
                     {
                         Ok(session_id) => {
+                            set_initial_pane_title(&gh, session_id, pane_title).await?;
+
                             // Populate session-meta cache: git branch from
                             // the spawn cwd, SSH context from the daemon
                             // env. spawn_blocking because detect_git_branch
@@ -2847,6 +2916,7 @@ fn register_session_methods(
                         }
                         _ => Vec::new(),
                     };
+                    let pane_title = parse_initial_pane_title(&params)?;
 
                     // Check if session already exists
                     let snap = gh.snapshot();
@@ -2869,6 +2939,8 @@ fn register_session_methods(
                         .await
                     {
                         Ok(session_id) => {
+                            set_initial_pane_title(&gh, session_id, pane_title).await?;
+
                             // Populate session-meta cache (git branch, SSH).
                             // Same pattern as session.create above.
                             let meta_cache_clone = meta.clone();
@@ -3846,14 +3918,26 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 ensure,
                 detached,
                 cwd,
+                title,
                 cmd,
                 argv,
             } => {
                 let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
                 let resolved = name.or(session);
                 let session_name = resolved.clone().unwrap_or_else(default_session_name);
-                let _ = cli::handle_new(&mut stream, resolved, cwd, cmd, argv, ensure, args.format)
-                    .await?;
+                let _ = cli::handle_new(
+                    &mut stream,
+                    cli::SessionCreateOptions {
+                        session_name: resolved,
+                        cwd,
+                        title,
+                        cmd,
+                        argv,
+                        ensure,
+                    },
+                    args.format,
+                )
+                .await?;
                 drop(stream);
                 if !detached {
                     run_attach(&socket_path, session_name).await
@@ -4496,8 +4580,11 @@ mod tests {
     //! `build_snapshot_status_bar` it breaks here.
     use super::*;
     use shux_core::config::{Config, ConfigHandle, SegmentDef, StatusBarConfig};
-    use shux_core::graph::SessionGraphSnapshot;
+    use shux_core::graph::{GraphHandle, SessionGraph, SessionGraphSnapshot, run_graph_loop};
+    use shux_core::layout::Direction;
     use shux_core::model::{Pane, Session, Window};
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     fn config_with_segment(zone: &str) -> ConfigHandle {
         let cfg = Config {
@@ -4593,5 +4680,50 @@ mod tests {
             "expected snapshot status bar's right zone to contain the \
              segment sentinel, got: {right_text:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn set_initial_pane_title_targets_original_pane_after_focus_changes() {
+        let (graph, state) = SessionGraph::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move {
+            run_graph_loop(graph, cmd_rx, token_clone).await;
+        });
+        let gh = GraphHandle::new(cmd_tx, state);
+
+        let session_id = gh
+            .create_session_with_command(
+                "title-race".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                vec!["codex".to_string(), "--yolo".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let original_pane = {
+            let snap = gh.snapshot();
+            initial_pane_id_for_session(&snap, session_id).unwrap()
+        };
+        let new_active = gh
+            .split_pane(original_pane, Direction::Vertical, 0.5)
+            .await
+            .unwrap();
+
+        set_initial_pane_title(&gh, session_id, Some("aww-shux".to_string()))
+            .await
+            .unwrap();
+
+        let snap = gh.snapshot();
+        assert_eq!(
+            snap.panes[&original_pane].manual_title.as_deref(),
+            Some("aww-shux")
+        );
+        assert_eq!(snap.panes[&original_pane].title, "aww-shux");
+        assert_eq!(snap.panes[&new_active].manual_title, None);
+
+        token.cancel();
+        handle.await.unwrap();
     }
 }

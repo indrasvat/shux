@@ -181,7 +181,10 @@ fn render_agent_help(colorize: bool) -> String {
     s.push_str(&format!(
         "  {dim}# 1. Spawn a session in the caller's cwd running any command.{r}\n"
     ));
-    s.push_str(&format!("  {} demo -- lazygit\n", shux("session create"),));
+    s.push_str(&format!(
+        "  {} demo --title demo -- lazygit\n",
+        shux("session create"),
+    ));
     s.push_str(&format!(
         "  {dim}# Raw RPC callers should pass cwd explicitly.{r}\n"
     ));
@@ -514,6 +517,10 @@ pub enum SessionCommand {
         /// Working directory for the initial pane (default: current directory).
         #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,
+
+        /// Manual title for the initial pane border.
+        #[arg(long, value_name = "TITLE")]
+        title: Option<String>,
 
         /// Shell command to run in the initial pane (single string).
         #[arg(long)]
@@ -1831,21 +1838,28 @@ pub fn handle_config_validate(path: Option<std::path::PathBuf>) -> anyhow::Resul
 }
 
 /// Handle the `shux session create` command.
+#[derive(Debug)]
+pub struct SessionCreateOptions {
+    pub session_name: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub title: Option<String>,
+    pub cmd: Option<String>,
+    pub argv: Vec<String>,
+    pub ensure: bool,
+}
+
 pub async fn handle_new(
     stream: &mut tokio::net::UnixStream,
-    session_name: Option<String>,
-    cwd: Option<std::path::PathBuf>,
-    cmd: Option<String>,
-    argv: Vec<String>,
-    ensure: bool,
+    opts: SessionCreateOptions,
     format: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
     let invocation_cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to determine current directory: {e}"))?;
-    let cwd = resolve_session_create_cwd(cwd, &invocation_cwd);
-    let params = build_session_create_params(session_name, cwd, cmd, argv);
+    let cwd = resolve_session_create_cwd(opts.cwd, &invocation_cwd);
+    let params =
+        build_session_create_params(opts.session_name, cwd, opts.title, opts.cmd, opts.argv);
 
-    let method = if ensure {
+    let method = if opts.ensure {
         "session.ensure"
     } else {
         "session.create"
@@ -1864,7 +1878,7 @@ pub async fn handle_new(
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unnamed)");
             let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            style::print_session_created(name, id, ensure);
+            style::print_session_created(name, id, opts.ensure);
         }
     }
 
@@ -1886,6 +1900,7 @@ fn resolve_session_create_cwd(
 fn build_session_create_params(
     session_name: Option<String>,
     cwd: std::path::PathBuf,
+    title: Option<String>,
     cmd: Option<String>,
     argv: Vec<String>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1897,6 +1912,9 @@ fn build_session_create_params(
         "cwd".to_string(),
         serde_json::Value::String(cwd.display().to_string()),
     );
+    if let Some(title) = title {
+        params.insert("pane_title".to_string(), serde_json::Value::String(title));
+    }
     // argv (trailing `--`) wins over --cmd if both are given.
     if !argv.is_empty() {
         params.insert(
@@ -4159,6 +4177,7 @@ mod tests {
                         ensure,
                         detached,
                         cwd,
+                        title,
                         cmd,
                         argv,
                     },
@@ -4168,6 +4187,7 @@ mod tests {
                 assert!(ensure);
                 assert!(detached);
                 assert!(cwd.is_none());
+                assert!(title.is_none());
                 assert!(cmd.is_none());
                 assert!(argv.is_empty());
             }
@@ -4184,6 +4204,20 @@ mod tests {
                 command: SessionCommand::Create { cwd, .. },
             }) => {
                 assert_eq!(cwd, Some(std::path::PathBuf::from("/tmp/demo")));
+            }
+            _ => panic!("expected session create command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_session_create_title() {
+        let cli = Cli::try_parse_from(["shux", "session", "create", "work", "--title", "agent"]);
+        let cli = cli.unwrap();
+        match cli.command {
+            Some(Command::Session {
+                command: SessionCommand::Create { title, .. },
+            }) => {
+                assert_eq!(title, Some("agent".to_string()));
             }
             _ => panic!("expected session create command"),
         }
@@ -4258,6 +4292,7 @@ mod tests {
         let params = build_session_create_params(
             Some("demo".to_string()),
             std::path::PathBuf::from("/tmp/shux-demo"),
+            Some("aww-shux".to_string()),
             None,
             vec!["pwd".to_string()],
         );
@@ -4266,6 +4301,10 @@ mod tests {
         assert_eq!(
             params.get("cwd").and_then(|v| v.as_str()),
             Some("/tmp/shux-demo")
+        );
+        assert_eq!(
+            params.get("pane_title").and_then(|v| v.as_str()),
+            Some("aww-shux")
         );
         assert_eq!(params.get("command"), Some(&serde_json::json!(["pwd"])));
     }

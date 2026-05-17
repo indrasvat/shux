@@ -46,6 +46,7 @@ Spawn a new session with an initial window + pane.
 // Request
 { "name": "demo",                       // optional; auto-generates "session-N" if omitted
   "cwd":  "/path/to/dir",               // recommended; CLI fills caller cwd by default
+  "pane_title": "demo",                 // optional; pins initial pane border title
   "command": ["bash", "-l"] }           // optional; defaults to user shell
 
 // Response
@@ -72,7 +73,7 @@ Spawn a new session with an initial window + pane.
 { "id": "name-or-uuid", "new_name": "demo2", "expected_version": 5 }
 
 // session.ensure — create-if-missing
-{ "name": "demo", "cwd": "/path/to/dir", "command": [...] }
+{ "name": "demo", "cwd": "/path/to/dir", "pane_title": "demo", "command": [...] }
 ```
 
 ## Window

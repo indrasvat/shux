@@ -30,7 +30,7 @@
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
-796 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
+799 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
 
 ## Status
 
@@ -84,6 +84,26 @@
 ---
 
 ## Session Log
+
+**2026-05-17 — fix(session): add initial pane title flag**
+- User dogfood finding: `shux session create -s aww-shux --cmd "codex
+  --yolo"` correctly named the session, but the top pane border still
+  showed the cwd-derived/OSC title (`shux-demo`). That is technically
+  consistent with pane title priority, but it is confusing for
+  one-pane interactive sessions where the visible border should be
+  easy to pin at creation time.
+- Fix: `shux session create --title TITLE` now sends `pane_title` on
+  `session.create` / `session.ensure`. The daemon applies it as the
+  initial pane's manual title before spawning the PTY, so later OSC
+  titles emitted by shells or agent apps do not overwrite it.
+- Regression coverage: CLI parsing/param-building asserts `--title`
+  becomes `pane_title`; the M0 RPC integration test creates a session
+  with `pane_title` and verifies the initial pane has both `title` and
+  `manual_title` set while preserving its command metadata. A follow-up
+  regression test covers the review-found race where a watcher/plugin
+  changes the active pane before the helper pins the initial title.
+- Verification: focused CLI and M0 tests, `cargo check -p shux`, `make
+  fmt`, `make fmt-check`, `make test` (799/799), and `git diff --check`.
 
 **2026-05-17 — fix(statusbar): default Starship segments to raw ANSI**
 - User hit literal `\[\]23:46\[\]` around the right statusbar clock

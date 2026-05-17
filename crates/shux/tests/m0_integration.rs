@@ -141,9 +141,36 @@ fn register_session_methods(
                             }
                         }
                     };
+                    let command: Vec<String> = match params.get("command") {
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect(),
+                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                            s.split_whitespace().map(|s| s.to_string()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let pane_title = params
+                        .get("pane_title")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let cwd = PathBuf::from("/tmp");
-                    match gh.create_session(name, cwd).await {
+                    match gh.create_session_with_command(name, cwd, command).await {
                         Ok(session_id) => {
+                            if let Some(title) = pane_title {
+                                let snap = gh.snapshot();
+                                let pane_id = snap
+                                    .sessions
+                                    .get(&session_id)
+                                    .and_then(|s| s.windows.first())
+                                    .and_then(|wid| snap.windows.get(wid))
+                                    .and_then(|w| w.layout.tree.pane_ids().first().copied())
+                                    .expect("created session should have active pane");
+                                gh.set_pane_title(pane_id, Some(title), None)
+                                    .await
+                                    .map_err(graph_error_to_rpc)?;
+                            }
                             let snap = gh.snapshot();
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 Ok(session_to_json(s, &snap))
@@ -214,9 +241,36 @@ fn register_session_methods(
                         json["created"] = serde_json::Value::Bool(false);
                         return Ok(json);
                     }
+                    let command: Vec<String> = match params.get("command") {
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect(),
+                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                            s.split_whitespace().map(|s| s.to_string()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let pane_title = params
+                        .get("pane_title")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let cwd = PathBuf::from("/tmp");
-                    match gh.create_session(name, cwd).await {
+                    match gh.create_session_with_command(name, cwd, command).await {
                         Ok(session_id) => {
+                            if let Some(title) = pane_title {
+                                let snap = gh.snapshot();
+                                let pane_id = snap
+                                    .sessions
+                                    .get(&session_id)
+                                    .and_then(|s| s.windows.first())
+                                    .and_then(|wid| snap.windows.get(wid))
+                                    .and_then(|w| w.layout.tree.pane_ids().first().copied())
+                                    .expect("created session should have active pane");
+                                gh.set_pane_title(pane_id, Some(title), None)
+                                    .await
+                                    .map_err(graph_error_to_rpc)?;
+                            }
                             let snap = gh.snapshot();
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 let mut json = session_to_json(s, &snap);
@@ -602,6 +656,7 @@ fn pane_to_json(
         "id": p.id.to_string(),
         "window_id": p.window_id.to_string(),
         "title": p.title,
+        "manual_title": p.manual_title,
         "cwd": p.cwd.to_string_lossy(),
         "command": p.command,
         "exit_status": p.exit_status,
@@ -1012,6 +1067,42 @@ async fn test_m0_create_session() {
         "session.create should return id"
     );
     assert_eq!(response["result"]["name"], "test");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_m0_create_session_sets_initial_pane_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let response = rpc_raw(
+        &socket_path,
+        "session.create",
+        serde_json::json!({
+            "name": "title-test",
+            "pane_title": "aww-shux",
+            "command": ["codex", "--yolo"]
+        }),
+    )
+    .await;
+
+    assert!(
+        response["error"].is_null(),
+        "session.create should succeed: {response}"
+    );
+    let session_id = response["result"]["id"].as_str().unwrap();
+
+    let panes = rpc_raw(
+        &socket_path,
+        "pane.list",
+        serde_json::json!({ "session_id": session_id }),
+    )
+    .await;
+    let pane = panes["result"].as_array().unwrap().first().unwrap();
+    assert_eq!(pane["title"], "aww-shux");
+    assert_eq!(pane["manual_title"], "aww-shux");
+    assert_eq!(pane["command"], serde_json::json!(["codex", "--yolo"]));
 
     cancel.cancel();
 }
