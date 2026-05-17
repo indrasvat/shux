@@ -65,8 +65,8 @@ print(rpc(s, "system.version"))
 | `system.version` | Daemon version + git SHA | `shux version` |
 | `system.health` | Daemon health probe | — |
 | `session.list` | All sessions, sorted by created_at | `shux session list` |
-| `session.create` | Create session, optionally with a command. CLI mirror sends caller cwd by default. | `shux session create X` |
-| `session.ensure` | Create-if-missing. CLI mirror sends caller cwd when creating. | `shux session create X --ensure` |
+| `session.create` | Create session, optionally with a command and initial pane title. CLI mirror sends caller cwd by default. | `shux session create X --title X` |
+| `session.ensure` | Create-if-missing. CLI mirror sends caller cwd when creating. | `shux session create X --ensure --title X` |
 | `session.kill` | Destroy session, reap PTYs | `shux session kill X` |
 | `window.list` / `.create` / `.kill` / `.focus` / `.rename` / `.reorder` / `.ensure` | Window CRUD | `shux window <verb>` |
 | `pane.list` / `.split` / `.focus` / `.focus_dir` / `.resize` / `.zoom` / `.swap` / `.kill` / `.ensure` | Pane CRUD + layout ops | `shux pane <verb>` |
@@ -89,6 +89,9 @@ shux rpc call session.kill --params '{"id":"8b1a3c5e-..."}'        # by full UUI
 ```bash
 # Create-if-missing — safe to run from a flaky retry loop:
 shux session create build --ensure
+
+# Pin the initial pane's border label when app OSC titles are noisy:
+shux session create agent --title agent -- codex --yolo
 
 # Run a command, get exit code:
 shux pane run -s build -- cargo test

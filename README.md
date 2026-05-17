@@ -29,6 +29,7 @@ shux                                    # attach to last session, or create "def
 # As an agent — every CLI verb mirrors an RPC method 1:1.
 # RPC dots become CLI spaces. No top-level shortcuts to memorize.
 shux session create work                # → session.create RPC, cwd = caller $PWD
+shux session create work --title work   # pin the initial pane border title
 shux session list                       # → session.list
 shux pane send-keys -s work --text 'j'  # → pane.send_keys
 shux rpc call <method> --params @file   # raw fallthrough for any method
@@ -66,6 +67,7 @@ Requires Rust 1.93+ and a Unix-like OS (macOS, Linux). For dev setup, see
 ```bash
 shux                              # attach last session (TTY-only)
 shux session create work          # create + attach in the caller's cwd
+shux session create work --title work  # also pin the initial pane title
 shux pane split -s work           # split the active pane
 shux pane snapshot -s work        # PNG of the current frame
 shux config init                  # scaffold ~/.config/shux/config.toml
@@ -75,7 +77,9 @@ Every command mirrors an RPC method: `shux session create` is the same
 RPC as `session.create`. Drop to the raw form with
 `shux rpc call session.create --params @spec.json` when you'd rather
 write the payload in a file. CLI-created sessions start in the current
-directory of the `shux` invocation unless you pass `--cwd`.
+directory of the `shux` invocation unless you pass `--cwd`. Use `--title`
+when the initial pane's border label should be pinned instead of following
+app-emitted OSC titles or command/cwd auto-title derivation.
 
 Inside the TUI, the prefix key is `Ctrl+Space` by default:
 

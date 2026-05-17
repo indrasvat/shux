@@ -155,6 +155,7 @@ shux ships as a **single binary** (`shux`) with subcommands. The daemon starts a
 ```text
 $ shux                              # attach last session (TTY-only); JSON help otherwise
 $ shux session create work          # create session named "work" in caller cwd
+$ shux session create work --title work  # also pin the initial pane border title
 $ shux pane split -s work -d v      # vertical split in current pane
 $ shux session list                 # list sessions (alias: shux ses ls)
 $ shux session attach work          # attach to "work"
