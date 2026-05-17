@@ -96,6 +96,7 @@ zone = "right"
 command = ["starship", "prompt"]
 interval_ms = 1000
 fallback = " (starship not installed) "
+env = { STARSHIP_SHELL = "cmd", TERM = "xterm-256color" }
 starship_config = '''
 # any starship config — fully embedded, hot-reloadable
 add_newline = false

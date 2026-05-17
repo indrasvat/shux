@@ -1633,9 +1633,12 @@ prefix = "ctrl-space"
 #
 # `starship_config` is an INLINE TOML string. shux materialises it to
 # a tempfile per segment and exports `STARSHIP_CONFIG=<tempfile>` for
-# the spawned `starship prompt` invocation. Your shell PS1 (driven by
+# the spawned `starship prompt` invocation. The runner also defaults
+# Starship status-bar spawns to raw ANSI output (`STARSHIP_SHELL=cmd`,
+# `TERM=xterm-256color`) so shell prompt guards like Bash `\[` / `\]`
+# never leak into the bar. Your shell PS1 (driven by
 # `~/.config/starship.toml`) is unaffected — only the segment spawn
-# sees this override.
+# sees these overrides.
 # ─────────────────────────────────────────────────────────────────────
 
 [[statusbar.segment]]
@@ -1643,6 +1646,7 @@ zone = "right"
 command = ["starship", "prompt"]
 interval_ms = 1000
 fallback = " (starship not installed) "
+env = { STARSHIP_SHELL = "cmd", TERM = "xterm-256color" }
 starship_config = """
 add_newline = false
 format = '''

@@ -161,6 +161,7 @@ async fn run_one_segment(
                 seg.env
                     .entry("STARSHIP_CONFIG".to_string())
                     .or_insert_with(|| path.to_string_lossy().into_owned());
+                apply_starship_statusbar_env_defaults(&mut seg);
                 Some(path)
             }
             Err(e) => {
@@ -204,6 +205,20 @@ async fn run_one_segment(
     if let Some(p) = starship_tmp {
         let _ = std::fs::remove_file(p);
     }
+}
+
+fn apply_starship_statusbar_env_defaults(seg: &mut SegmentDef) {
+    // Starship defaults to Bash-shaped prompt output in many non-shell
+    // spawns. Bash wraps non-printing escape sequences in `\[` / `\]`,
+    // which a real PS1 consumes as metadata but shux's statusbar renders
+    // literally. `cmd` mode emits plain ANSI, which is the contract this
+    // runner parses.
+    seg.env
+        .entry("STARSHIP_SHELL".to_string())
+        .or_insert_with(|| "cmd".to_string());
+    seg.env
+        .entry("TERM".to_string())
+        .or_insert_with(|| "xterm-256color".to_string());
 }
 
 async fn run_segment_command(seg: &SegmentDef) -> std::io::Result<Vec<u8>> {
@@ -415,6 +430,88 @@ mod tests {
         let segs = ansi_to_segments(bytes);
         let combined: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(combined.trim(), "hi");
+    }
+
+    #[test]
+    fn starship_statusbar_defaults_request_raw_ansi_output() {
+        let mut seg = SegmentDef {
+            zone: "right".to_string(),
+            command: vec!["starship".to_string(), "prompt".to_string()],
+            env: HashMap::new(),
+            starship_config: Some("add_newline = false".to_string()),
+            interval_ms: 1_000,
+            fallback: None,
+        };
+
+        apply_starship_statusbar_env_defaults(&mut seg);
+
+        assert_eq!(
+            seg.env.get("STARSHIP_SHELL").map(String::as_str),
+            Some("cmd")
+        );
+        assert_eq!(
+            seg.env.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+    }
+
+    #[test]
+    fn starship_statusbar_defaults_preserve_explicit_env() {
+        let mut env = HashMap::new();
+        env.insert("STARSHIP_SHELL".to_string(), "fish".to_string());
+        env.insert("TERM".to_string(), "screen-256color".to_string());
+        let mut seg = SegmentDef {
+            zone: "right".to_string(),
+            command: vec!["starship".to_string(), "prompt".to_string()],
+            env,
+            starship_config: Some("add_newline = false".to_string()),
+            interval_ms: 1_000,
+            fallback: None,
+        };
+
+        apply_starship_statusbar_env_defaults(&mut seg);
+
+        assert_eq!(
+            seg.env.get("STARSHIP_SHELL").map(String::as_str),
+            Some("fish")
+        );
+        assert_eq!(
+            seg.env.get("TERM").map(String::as_str),
+            Some("screen-256color")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_segment_injects_starship_env_defaults_for_inline_config() {
+        let seg = SegmentDef {
+            zone: "right".to_string(),
+            command: vec!["env".to_string()],
+            env: HashMap::new(),
+            starship_config: Some("add_newline = false".to_string()),
+            interval_ms: 10_000,
+            fallback: None,
+        };
+        let cache = SegmentCache::new();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_one_segment(0, seg, cache.clone(), cancel.clone()));
+
+        assert!(
+            cache
+                .wait_for_first_outputs(1, Duration::from_secs(2))
+                .await,
+            "segment runner did not publish first output"
+        );
+
+        cancel.cancel();
+        task.await.unwrap();
+
+        let output = String::from_utf8(cache.get(0).await).unwrap();
+        assert!(output.contains("STARSHIP_SHELL=cmd"));
+        assert!(output.contains("TERM=xterm-256color"));
+        assert!(
+            output.contains("STARSHIP_CONFIG="),
+            "inline starship config should be materialized and exported"
+        );
     }
 
     #[tokio::test]

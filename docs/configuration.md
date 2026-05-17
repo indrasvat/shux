@@ -72,6 +72,7 @@ zone = "right"
 command = ["starship", "prompt"]
 interval_ms = 1000
 fallback = " (starship not installed) "
+env = { STARSHIP_SHELL = "cmd", TERM = "xterm-256color" }
 starship_config = '''
 add_newline = false
 command_timeout = 2000
@@ -95,8 +96,12 @@ format = "[ ip $output ](bold #8aadf4) "
 ```
 
 The runner materializes `starship_config` to `$TMPDIR/shux-segment-<idx>.toml`
-and exports `STARSHIP_CONFIG=<that file>` for the spawn. Your shell's PS1
-config (`~/.config/starship.toml`) is unaffected.
+and exports `STARSHIP_CONFIG=<that file>` for the spawn. For inline
+Starship segments, shux also defaults `STARSHIP_SHELL=cmd` and
+`TERM=xterm-256color` unless you override them in `env`. That makes
+Starship emit plain ANSI for the status bar instead of shell prompt guards
+such as Bash `\[` / `\]` or zsh `%{...%}`. Your shell's PS1 config
+(`~/.config/starship.toml`) is unaffected.
 
 ### TOML quoting gotcha
 
