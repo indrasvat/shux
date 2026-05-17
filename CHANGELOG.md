@@ -1,3 +1,10 @@
+## [0.24.3](https://github.com/indrasvat/shux/compare/v0.24.2...v0.24.3) (2026-05-17)
+
+
+### Bug Fixes
+
+* **session:** add initial pane title flag ([10b23c2](https://github.com/indrasvat/shux/commit/10b23c23aac02f99d32cd0c7d63ff5008f790c2d))
+
 ## [0.24.2](https://github.com/indrasvat/shux/compare/v0.24.1...v0.24.2) (2026-05-17)
 
 
