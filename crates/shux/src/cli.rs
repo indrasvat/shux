@@ -181,14 +181,14 @@ fn render_agent_help(colorize: bool) -> String {
     s.push_str(&format!(
         "  {dim}# 1. Spawn a session in the caller's cwd running any command.{r}\n"
     ));
+    s.push_str(&format!("  {} demo -- lazygit\n", shux("session create"),));
     s.push_str(&format!(
-        "  {} --params '{{\"name\":\"demo\",\"command\":[\"lazygit\"]}}'\n",
+        "  {dim}# Raw RPC callers should pass cwd explicitly.{r}\n"
+    ));
+    s.push_str(&format!(
+        "  {} --params '{{\"name\":\"demo\",\"cwd\":\"$PWD\",\"command\":[\"lazygit\"]}}'\n\n",
         shux("rpc call session.create"),
     ));
-    s.push_str(&format!(
-        "  {dim}# Or the noun-verb form (identical effect):{r}\n"
-    ));
-    s.push_str(&format!("  {} demo -- lazygit\n\n", shux("session create"),));
     s.push_str(&format!(
         "  {dim}# 2. Drive it. (Synchronous resize — next snapshot sees new dims.){r}\n"
     ));
@@ -1836,10 +1836,9 @@ pub async fn handle_new(
     ensure: bool,
     format: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
-    let cwd = cwd
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
+    let invocation_cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to determine current directory: {e}"))?;
+    let cwd = resolve_session_create_cwd(cwd, &invocation_cwd);
     let params = build_session_create_params(session_name, cwd, cmd, argv);
 
     let method = if ensure {
@@ -1866,6 +1865,18 @@ pub async fn handle_new(
     }
 
     Ok(result)
+}
+
+fn resolve_session_create_cwd(
+    cwd: Option<std::path::PathBuf>,
+    invocation_cwd: &std::path::Path,
+) -> std::path::PathBuf {
+    let cwd = cwd.unwrap_or_else(|| invocation_cwd.to_path_buf());
+    if cwd.is_absolute() {
+        cwd
+    } else {
+        invocation_cwd.join(cwd)
+    }
 }
 
 fn build_session_create_params(
@@ -4206,6 +4217,36 @@ mod tests {
             }
             _ => panic!("expected session create command"),
         }
+    }
+
+    #[test]
+    fn test_resolve_session_create_cwd_defaults_to_invocation_cwd() {
+        let cwd = resolve_session_create_cwd(None, std::path::Path::new("/tmp/shux-demo"));
+
+        assert_eq!(cwd, std::path::PathBuf::from("/tmp/shux-demo"));
+    }
+
+    #[test]
+    fn test_resolve_session_create_cwd_absolutizes_relative_override() {
+        let cwd = resolve_session_create_cwd(
+            Some(std::path::PathBuf::from("nested/project")),
+            std::path::Path::new("/tmp/shux-demo"),
+        );
+
+        assert_eq!(
+            cwd,
+            std::path::PathBuf::from("/tmp/shux-demo/nested/project")
+        );
+    }
+
+    #[test]
+    fn test_resolve_session_create_cwd_preserves_absolute_override() {
+        let cwd = resolve_session_create_cwd(
+            Some(std::path::PathBuf::from("/var/tmp/shux-project")),
+            std::path::Path::new("/tmp/shux-demo"),
+        );
+
+        assert_eq!(cwd, std::path::PathBuf::from("/var/tmp/shux-project"));
     }
 
     #[test]

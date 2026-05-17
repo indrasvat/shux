@@ -140,7 +140,7 @@ When a CLI verb doesn't exist for a method you want to call, or
 you'd rather write the params as JSON, use `shux rpc call`:
 
 ```bash
-shux rpc call session.create --params '{"name":"demo"}'
+shux rpc call session.create --params "{\"name\":\"demo\",\"cwd\":\"$PWD\"}"
 shux rpc call pane.send_keys --params @keys.json
 echo '{"pane_id":"...","text":"j"}' | shux rpc call pane.send_keys --params -
 ```

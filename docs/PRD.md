@@ -332,7 +332,7 @@ The API provides:
   "params": {
     "client_request_id": "agent-tx-001",
     "operations": [
-      {"op": "session.create", "params": {"name": "work"}},
+      {"op": "session.create", "params": {"name": "work", "cwd": "$PWD"}},
       {"op": "window.create", "params": {"session_id": "$0.id", "name": "editor"}},
       {"op": "pane.split", "params": {"pane_id": "$1.active_pane_id", "direction": "vertical", "command": ["nvim"]}}
     ]
