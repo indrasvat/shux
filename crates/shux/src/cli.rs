@@ -179,16 +179,16 @@ fn render_agent_help(colorize: bool) -> String {
 
     s.push_str(&format!("{}\n", h("TYPICAL AGENT WORKFLOW")));
     s.push_str(&format!(
-        "  {dim}# 1. Spawn a session running any command.{r}\n"
+        "  {dim}# 1. Spawn a session in the caller's cwd running any command.{r}\n"
+    ));
+    s.push_str(&format!("  {} demo -- lazygit\n", shux("session create"),));
+    s.push_str(&format!(
+        "  {dim}# Raw RPC callers should pass cwd explicitly.{r}\n"
     ));
     s.push_str(&format!(
-        "  {} --params '{{\"name\":\"demo\",\"command\":[\"lazygit\"]}}'\n",
+        "  {} --params \"{{\\\"name\\\":\\\"demo\\\",\\\"cwd\\\":\\\"$(pwd)\\\",\\\"command\\\":[\\\"lazygit\\\"]}}\"\n\n",
         shux("rpc call session.create"),
     ));
-    s.push_str(&format!(
-        "  {dim}# Or the noun-verb form (identical effect):{r}\n"
-    ));
-    s.push_str(&format!("  {} demo -- lazygit\n\n", shux("session create"),));
     s.push_str(&format!(
         "  {dim}# 2. Drive it. (Synchronous resize — next snapshot sees new dims.){r}\n"
     ));
@@ -488,15 +488,12 @@ pub enum RpcCommand {
     },
 }
 
-/// Aliases for the top-level session verbs. Every variant
-/// dispatches to the same handler as the corresponding top-level
-/// command — `shux session create` is `shux new`, `shux session ls`
-/// is `shux ls`. Mirrors the `window`/`pane` subcommand pattern
-/// and the `session.*` RPC namespace so agents that learned the
-/// RPC method names can type them directly as CLI words.
+/// Namespaced session verbs. Mirrors the `window`/`pane` subcommand
+/// pattern and the `session.*` RPC namespace so agents that learned
+/// the RPC method names can type them directly as CLI words.
 #[derive(Subcommand, Debug)]
 pub enum SessionCommand {
-    /// Create a new session (alias for `shux new`).
+    /// Create a new session.
     Create {
         /// Session name as a positional argument. Equivalent to `-s NAME`.
         #[arg(value_name = "NAME")]
@@ -514,6 +511,10 @@ pub enum SessionCommand {
         #[arg(short = 'd', long)]
         detached: bool,
 
+        /// Working directory for the initial pane (default: current directory).
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+
         /// Shell command to run in the initial pane (single string).
         #[arg(long)]
         cmd: Option<String>,
@@ -523,11 +524,11 @@ pub enum SessionCommand {
         argv: Vec<String>,
     },
 
-    /// List sessions (alias for `shux ls`).
+    /// List sessions.
     #[command(alias = "ls")]
     List,
 
-    /// Kill a session (alias for `shux kill`).
+    /// Kill a session.
     Kill {
         /// Session name (positional or `-s/--session`).
         #[arg(value_name = "NAME")]
@@ -541,7 +542,7 @@ pub enum SessionCommand {
         expected_version: Option<u64>,
     },
 
-    /// Rename a session (alias for `shux rename`).
+    /// Rename a session.
     Rename {
         /// Current session name.
         #[arg(short, long)]
@@ -555,7 +556,7 @@ pub enum SessionCommand {
         expected_version: Option<u64>,
     },
 
-    /// Attach to an existing session (alias for `shux attach`).
+    /// Attach to an existing session.
     Attach {
         /// Session name (positional or `-s/--session`).
         #[arg(value_name = "NAME")]
@@ -1481,7 +1482,7 @@ fn format_created_at(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-/// Handle the `shux ls` command.
+/// Handle the `shux session list` command.
 pub async fn handle_ls(
     stream: &mut tokio::net::UnixStream,
     format: OutputFormat,
@@ -1632,9 +1633,12 @@ prefix = "ctrl-space"
 #
 # `starship_config` is an INLINE TOML string. shux materialises it to
 # a tempfile per segment and exports `STARSHIP_CONFIG=<tempfile>` for
-# the spawned `starship prompt` invocation. Your shell PS1 (driven by
+# the spawned `starship prompt` invocation. The runner also defaults
+# Starship status-bar spawns to raw ANSI output (`STARSHIP_SHELL=cmd`,
+# `TERM=xterm-256color`) so shell prompt guards like Bash `\[` / `\]`
+# never leak into the bar. Your shell PS1 (driven by
 # `~/.config/starship.toml`) is unaffected — only the segment spawn
-# sees this override.
+# sees these overrides.
 # ─────────────────────────────────────────────────────────────────────
 
 [[statusbar.segment]]
@@ -1642,6 +1646,7 @@ zone = "right"
 command = ["starship", "prompt"]
 interval_ms = 1000
 fallback = " (starship not installed) "
+env = { STARSHIP_SHELL = "cmd", TERM = "xterm-256color" }
 starship_config = """
 add_newline = false
 format = '''
@@ -1825,28 +1830,20 @@ pub fn handle_config_validate(path: Option<std::path::PathBuf>) -> anyhow::Resul
     Ok(crate::config_validate::print_diagnostics(&diags, &resolved))
 }
 
-/// Handle the `shux new` command.
+/// Handle the `shux session create` command.
 pub async fn handle_new(
     stream: &mut tokio::net::UnixStream,
     session_name: Option<String>,
+    cwd: Option<std::path::PathBuf>,
     cmd: Option<String>,
     argv: Vec<String>,
     ensure: bool,
     format: OutputFormat,
 ) -> anyhow::Result<serde_json::Value> {
-    let mut params = serde_json::Map::new();
-    if let Some(name) = session_name {
-        params.insert("name".to_string(), serde_json::Value::String(name));
-    }
-    // argv (trailing `--`) wins over --cmd if both are given.
-    if !argv.is_empty() {
-        params.insert(
-            "command".to_string(),
-            serde_json::Value::Array(argv.into_iter().map(serde_json::Value::String).collect()),
-        );
-    } else if let Some(command) = cmd {
-        params.insert("command".to_string(), serde_json::Value::String(command));
-    }
+    let invocation_cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to determine current directory: {e}"))?;
+    let cwd = resolve_session_create_cwd(cwd, &invocation_cwd);
+    let params = build_session_create_params(session_name, cwd, cmd, argv);
 
     let method = if ensure {
         "session.ensure"
@@ -1874,7 +1871,45 @@ pub async fn handle_new(
     Ok(result)
 }
 
-/// Handle the `shux kill` command.
+fn resolve_session_create_cwd(
+    cwd: Option<std::path::PathBuf>,
+    invocation_cwd: &std::path::Path,
+) -> std::path::PathBuf {
+    let cwd = cwd.unwrap_or_else(|| invocation_cwd.to_path_buf());
+    if cwd.is_absolute() {
+        cwd
+    } else {
+        invocation_cwd.join(cwd)
+    }
+}
+
+fn build_session_create_params(
+    session_name: Option<String>,
+    cwd: std::path::PathBuf,
+    cmd: Option<String>,
+    argv: Vec<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut params = serde_json::Map::new();
+    if let Some(name) = session_name {
+        params.insert("name".to_string(), serde_json::Value::String(name));
+    }
+    params.insert(
+        "cwd".to_string(),
+        serde_json::Value::String(cwd.display().to_string()),
+    );
+    // argv (trailing `--`) wins over --cmd if both are given.
+    if !argv.is_empty() {
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::Array(argv.into_iter().map(serde_json::Value::String).collect()),
+        );
+    } else if let Some(command) = cmd {
+        params.insert("command".to_string(), serde_json::Value::String(command));
+    }
+    params
+}
+
+/// Handle the `shux session kill` command.
 pub async fn handle_kill(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -1904,7 +1939,7 @@ pub async fn handle_kill(
     Ok(())
 }
 
-/// Handle the `shux rename` command.
+/// Handle the `shux session rename` command.
 pub async fn handle_rename(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -2341,7 +2376,7 @@ pub async fn handle_window_new(
         );
     }
     // Trailing argv (after `--`) wins over --cmd, matching the
-    // `shux new` behavior so muscle memory carries over.
+    // `shux session create` behavior so muscle memory carries over.
     let command_vec: Vec<String> = if !argv.is_empty() {
         argv
     } else if let Some(c) = cmd {
@@ -3072,7 +3107,7 @@ pub async fn handle_pane_kill(
     Ok(())
 }
 
-/// Handle the `shux api <method> <params>` command (raw JSON-RPC for debugging).
+/// Handle the `shux rpc call <method> --params ...` command.
 pub async fn handle_api(
     stream: &mut tokio::net::UnixStream,
     method: &str,
@@ -3084,7 +3119,7 @@ pub async fn handle_api(
 
     // PR 3b: surface RPC errors as part of the JSON-RPC envelope on
     // stdout, not as a human-readable anyhow error on stderr. Callers
-    // of `shux api` are debug tools / agents that expect to parse the
+    // of `shux rpc call` are debug tools / agents that expect to parse the
     // raw `{result | error}` shape — including bounded `data` fields
     // like `expected_version` / `actual_version` for retry loops.
     match rpc_call(stream, method, params).await {
@@ -4123,6 +4158,7 @@ mod tests {
                         session,
                         ensure,
                         detached,
+                        cwd,
                         cmd,
                         argv,
                     },
@@ -4131,8 +4167,23 @@ mod tests {
                 assert_eq!(session, Some("work".to_string()));
                 assert!(ensure);
                 assert!(detached);
+                assert!(cwd.is_none());
                 assert!(cmd.is_none());
                 assert!(argv.is_empty());
+            }
+            _ => panic!("expected session create command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_session_create_cwd() {
+        let cli = Cli::try_parse_from(["shux", "session", "create", "work", "--cwd", "/tmp/demo"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Session {
+                command: SessionCommand::Create { cwd, .. },
+            }) => {
+                assert_eq!(cwd, Some(std::path::PathBuf::from("/tmp/demo")));
             }
             _ => panic!("expected session create command"),
         }
@@ -4170,6 +4221,67 @@ mod tests {
             }
             _ => panic!("expected session create command"),
         }
+    }
+
+    #[test]
+    fn test_resolve_session_create_cwd_defaults_to_invocation_cwd() {
+        let cwd = resolve_session_create_cwd(None, std::path::Path::new("/tmp/shux-demo"));
+
+        assert_eq!(cwd, std::path::PathBuf::from("/tmp/shux-demo"));
+    }
+
+    #[test]
+    fn test_resolve_session_create_cwd_absolutizes_relative_override() {
+        let cwd = resolve_session_create_cwd(
+            Some(std::path::PathBuf::from("nested/project")),
+            std::path::Path::new("/tmp/shux-demo"),
+        );
+
+        assert_eq!(
+            cwd,
+            std::path::PathBuf::from("/tmp/shux-demo/nested/project")
+        );
+    }
+
+    #[test]
+    fn test_resolve_session_create_cwd_preserves_absolute_override() {
+        let cwd = resolve_session_create_cwd(
+            Some(std::path::PathBuf::from("/var/tmp/shux-project")),
+            std::path::Path::new("/tmp/shux-demo"),
+        );
+
+        assert_eq!(cwd, std::path::PathBuf::from("/var/tmp/shux-project"));
+    }
+
+    #[test]
+    fn test_build_session_create_params_always_includes_cwd() {
+        let params = build_session_create_params(
+            Some("demo".to_string()),
+            std::path::PathBuf::from("/tmp/shux-demo"),
+            None,
+            vec!["pwd".to_string()],
+        );
+
+        assert_eq!(params.get("name").and_then(|v| v.as_str()), Some("demo"));
+        assert_eq!(
+            params.get("cwd").and_then(|v| v.as_str()),
+            Some("/tmp/shux-demo")
+        );
+        assert_eq!(params.get("command"), Some(&serde_json::json!(["pwd"])));
+    }
+
+    #[test]
+    fn test_agent_help_raw_rpc_cwd_example_is_copy_safe() {
+        let help = render_agent_help(false);
+
+        assert!(
+            help.contains(r#"--params "{\"name\":\"demo\",\"cwd\":\"$(pwd)\","#),
+            "raw RPC cwd example should use shell-expanded $(pwd) in double-quoted JSON"
+        );
+        assert!(
+            !help.contains(r#""cwd":"$PWD""#),
+            "single-quoted inline JSON would send literal $PWD"
+        );
     }
 
     #[test]
@@ -4472,7 +4584,7 @@ mod tests {
 
     /// `shux window new -s X -n Y --cwd /tmp --cmd "vim foo"` exposes
     /// every RPC param `window.create` accepts. Codex v3 dogfood:
-    /// CLI --help hid these and forced prototyping via `shux api`.
+    /// CLI --help hid these and forced prototyping via `shux rpc call`.
     #[test]
     fn test_cli_window_new_cwd_and_cmd() {
         let cli = Cli::try_parse_from([
@@ -4493,7 +4605,7 @@ mod tests {
     }
 
     /// Trailing argv after `--` lands on `argv` and takes precedence
-    /// over `--cmd` (matches `shux new` behavior).
+    /// over `--cmd` (matches `shux session create` behavior).
     #[test]
     fn test_cli_window_new_trailing_argv() {
         let cli = Cli::try_parse_from([

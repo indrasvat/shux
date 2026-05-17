@@ -72,7 +72,7 @@ command = ["codex", "--repo", "indrasvat/shux"]
 ```toml
 [session]
 name = "..."          # optional — daemon auto-generates if absent
-cwd  = "~/path"       # optional — defaults to daemon cwd; ~ expanded
+cwd  = "~/path"       # optional — defaults to current dir of `shux state apply`; ~ expanded
 
 [[windows]]
 title = "required"

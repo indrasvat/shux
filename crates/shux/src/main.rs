@@ -2856,10 +2856,13 @@ fn register_session_methods(
                         return Ok(json);
                     }
 
-                    // Create new session — `command` persisted onto the
-                    // initial pane (codex P2 #10 followup, same fix as
-                    // session.create above).
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+                    let cwd = params
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+                        });
 
                     match gh
                         .create_session_with_command(name, cwd.clone(), command.clone())
@@ -3842,14 +3845,15 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 session,
                 ensure,
                 detached,
+                cwd,
                 cmd,
                 argv,
             } => {
                 let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
                 let resolved = name.or(session);
                 let session_name = resolved.clone().unwrap_or_else(default_session_name);
-                let _ =
-                    cli::handle_new(&mut stream, resolved, cmd, argv, ensure, args.format).await?;
+                let _ = cli::handle_new(&mut stream, resolved, cwd, cmd, argv, ensure, args.format)
+                    .await?;
                 drop(stream);
                 if !detached {
                     run_attach(&socket_path, session_name).await

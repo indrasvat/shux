@@ -372,6 +372,27 @@ interval_ms = 2000
         );
     }
 
+    #[test]
+    fn emitted_default_starship_segment_requests_raw_ansi_output() {
+        let cfg: strict::Config = toml::from_str(crate::cli::DEFAULT_CONFIG_TOML)
+            .expect("DEFAULT_CONFIG_TOML should parse through strict mirror");
+        let segment = cfg
+            .statusbar
+            .segment
+            .iter()
+            .find(|segment| segment.command == ["starship", "prompt"])
+            .expect("default config should include a starship prompt segment");
+
+        assert_eq!(
+            segment.env.get("STARSHIP_SHELL").map(String::as_str),
+            Some("cmd")
+        );
+        assert_eq!(
+            segment.env.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+    }
+
     /// Feature-maxed `[appearance]`: every documented key set. Asserts
     /// the strict mirror accepts the full schema surface, not just the
     /// minimal happy path.

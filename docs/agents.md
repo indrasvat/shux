@@ -12,8 +12,8 @@ that drives shux programmatically.
 | Property | What it means |
 |---|---|
 | **CLI == API** | Every subcommand maps 1:1 to a JSON-RPC method. The CLI is just a thin wrapper. |
-| **Idempotent `--ensure`** | `shux new -s X --ensure` is safe to retry. Creates only if missing. |
-| **Deterministic state** | `shux ls --format json` returns the full session graph. Always consistent, never stale. |
+| **Idempotent `--ensure`** | `shux session create X --ensure` is safe to retry. Creates only if missing. |
+| **Deterministic state** | `shux session list --format json` returns the full session graph. Always consistent, never stale. |
 | **Typed events** | `events.watch` (planned, M2) yields a sequenced stream of typed events for reacting to pane output, exit codes, focus changes. |
 | **Same errors everywhere** | RPC error codes are stable: `-32601` method-not-found, `-32007` name-conflict, etc. CLI surfaces them as exit code 1 + structured stderr. |
 
@@ -29,10 +29,10 @@ Easiest. Stable interface, JSON output via `--format json`:
 import json, subprocess
 
 def shux_api(method, params=None):
-    args = ["shux", "api", method]
+    args = ["shux", "--format", "json", "rpc", "call", method]
     if params is not None:
-        args.append(json.dumps(params))
-    result = subprocess.run(args + ["--format", "json"], capture_output=True, text=True, check=True)
+        args.extend(["--params", json.dumps(params)])
+    result = subprocess.run(args, capture_output=True, text=True, check=True)
     return json.loads(result.stdout)
 
 state = shux_api("session.list")
@@ -64,10 +64,10 @@ print(rpc(s, "system.version"))
 |---|---|---|
 | `system.version` | Daemon version + git SHA | `shux version` |
 | `system.health` | Daemon health probe | — |
-| `session.list` | All sessions, sorted by created_at | `shux ls` |
-| `session.create` | Create session, optionally with a command | `shux new -s X` |
-| `session.ensure` | Create-if-missing | `shux new -s X --ensure` |
-| `session.kill` | Destroy session, reap PTYs | `shux kill -s X` |
+| `session.list` | All sessions, sorted by created_at | `shux session list` |
+| `session.create` | Create session, optionally with a command. CLI mirror sends caller cwd by default. | `shux session create X` |
+| `session.ensure` | Create-if-missing. CLI mirror sends caller cwd when creating. | `shux session create X --ensure` |
+| `session.kill` | Destroy session, reap PTYs | `shux session kill X` |
 | `window.list` / `.create` / `.kill` / `.focus` / `.rename` / `.reorder` / `.ensure` | Window CRUD | `shux window <verb>` |
 | `pane.list` / `.split` / `.focus` / `.focus_dir` / `.resize` / `.zoom` / `.swap` / `.kill` / `.ensure` | Pane CRUD + layout ops | `shux pane <verb>` |
 | `pane.send_keys` | Forward keystrokes to a pane | `shux pane send-keys -t "..."` |
@@ -79,16 +79,16 @@ print(rpc(s, "system.version"))
 Every resource accepts EITHER a UUID or a name:
 
 ```bash
-shux kill -s work                              # by name
-shux kill -s 8b1a3c5e                          # by ID prefix (8 chars)
-shux api session.kill '{"id":"8b1a3c5e-..."}'  # by full UUID
+shux session kill work                                             # by name
+shux session kill 8b1a3c5e                                         # by ID prefix (8 chars)
+shux rpc call session.kill --params '{"id":"8b1a3c5e-..."}'        # by full UUID
 ```
 
 ## Idempotent patterns
 
 ```bash
 # Create-if-missing — safe to run from a flaky retry loop:
-shux new -s build --ensure
+shux session create build --ensure
 
 # Run a command, get exit code:
 shux pane run -s build -- cargo test

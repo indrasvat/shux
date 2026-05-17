@@ -11,12 +11,12 @@ A session contains one or more **windows**. A window contains a layout tree of
 
 ```bash
 shux                          # attach to last session, or create "default"
-shux new -s work              # create + attach
-shux new -s work --detached   # create without attaching
-shux ls                       # list sessions
-shux kill -s work             # destroy a session
-shux rename -s work -n staging
-shux attach -s work           # attach to existing
+shux session create work      # create + attach in the caller's cwd
+shux session create work -d   # create without attaching
+shux session list             # list sessions
+shux session kill work        # destroy a session
+shux session rename -s work -n staging
+shux session attach work      # attach to existing
 ```
 
 ## Keybindings
@@ -50,9 +50,9 @@ The prefix key is `Ctrl+Space` (configurable via `[keys].prefix` in
 shux can launch a pane with a specific command instead of a shell:
 
 ```bash
-shux new -s vim -- vim foo.rs        # pane runs vim
-shux new -s top -- top                # pane runs top
-shux new -s srv -- python3 -m http.server 8000
+shux session create vim -- vim foo.rs        # pane runs vim
+shux session create top -- top                # pane runs top
+shux session create srv -- python3 -m http.server 8000
 ```
 
 The pane lifetime equals the command lifetime: when it exits, the pane EOFs.
@@ -96,6 +96,7 @@ zone = "right"
 command = ["starship", "prompt"]
 interval_ms = 1000
 fallback = " (starship not installed) "
+env = { STARSHIP_SHELL = "cmd", TERM = "xterm-256color" }
 starship_config = '''
 # any starship config — fully embedded, hot-reloadable
 add_newline = false
@@ -131,9 +132,9 @@ fi
 ## When something goes wrong
 
 ```bash
-shux api system.health           # daemon health check
-shux ls --format json            # raw machine-readable state
-RUST_LOG=debug shux ls           # verbose logs
+shux rpc call system.health      # daemon health check
+shux session list --format json  # raw machine-readable state
+RUST_LOG=debug shux session list # verbose logs
 pkill -f 'shux.*__daemon'        # force-kill the daemon
 ```
 

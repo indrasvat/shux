@@ -165,6 +165,9 @@ pub struct SegmentDef {
     /// file** as everything else — no second `~/.config/shux/statusbar.toml`
     /// to maintain. The user's actual PS1 starship (`~/.config/starship.toml`)
     /// is unaffected because shux only sets this env for its own spawns.
+    /// The status-bar runner also defaults Starship spawns to raw ANSI
+    /// output (`STARSHIP_SHELL=cmd`, `TERM=xterm-256color`) unless the
+    /// segment's `env` overrides those keys.
     #[serde(default)]
     pub starship_config: Option<String>,
     /// Refresh interval (ms). Lower bound is 100ms; the runner clamps to

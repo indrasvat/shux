@@ -506,7 +506,7 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                     ctx,
                     "Sessions",
                     "(no sessions)",
-                    "Create one: shux new -s my-project",
+                    "Create one: shux session create my-project",
                 );
                 return;
             }

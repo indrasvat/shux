@@ -364,7 +364,7 @@ daemon — if you find a drift, that is a bug, file it.
 | `pane.capture` | `{"pane_id": "<UUID>"}` | `{pane_id, cols, rows, cursor, text, lines}` — `text` is ANSI-stripped, `lines` is per-row. |
 | `pane.split` | `{"pane_id": "<UUID>", "direction": "horizontal" \| "vertical"}` | `{pane: {id, command, cwd, exit_status, ...}}` — the new pane's UUID lives at `result.pane.id`. |
 | `pane.kill` | `{"pane_id": "<UUID>"}` | `{killed: "<UUID>"}`. **Returns `invalid_params` with `"cannot remove last pane from window"` if it's the only pane.** Use `window.kill` or `session.kill` for those cases. |
-| `session.create` | `{"name": "<unique>"}`. Optional `command: ["bash","-l"]`, `cwd: "/path"`. | `{id, name, window_id, pane_id, windows, window_count, active_window_id, created_at}`. |
+| `session.create` | `{"name": "<unique>", "cwd": "/path"}`. Optional `command: ["bash","-l"]`. CLI wrappers fill `cwd` from the caller's current directory. | `{id, name, window_id, pane_id, windows, window_count, active_window_id, created_at}`. |
 | `session.list` | `{}` | `{sessions: [{id, name, active_window_id, windows, window_count, ...}, ...]}` — the `sessions` wrapper is present here. |
 | `session.kill` | Either `{"id": "<session UUID>"}` OR `{"name": "<session name>"}`. | `{killed: "<name>"}`. Reaps all windows and panes. |
 | `state.apply` | `{"ops": [<Op>, ...]}` | `{batch_id, correlation_id, spawn_results}`. Atomic — all graph ops commit or none. See `references/templates.md` for the `Op` shape. |
