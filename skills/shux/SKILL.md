@@ -55,7 +55,9 @@ Never pollute `.claude/`, `~/`, or the project root with shux output.
 
 ```bash
 # 1. Spawn a session running any command (or shell). Capture the
-#    pane_id from the response so the next calls can target it.
+#    pane_id from the response so the next calls can target it. CLI
+#    session creation starts in the caller's current directory unless
+#    you pass --cwd.
 RESP=$(shux --format json session create demo -d -- lazygit)
 PID=$(echo "$RESP" | jq -r .pane_id)
 

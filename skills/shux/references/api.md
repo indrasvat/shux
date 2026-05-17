@@ -31,6 +31,11 @@ shux events watch --filter 'session.'       # → events.watch
 shux config validate ./my-config.toml       # → CLI-only: positional path
 ```
 
+CLI-created sessions always send the caller's current directory as
+`cwd` unless `--cwd <DIR>` is provided. Direct RPC callers should pass
+`cwd` explicitly because a daemon is long-lived and its own process
+directory is not meaningful project context.
+
 ## Session
 
 ### `session.create`
@@ -40,7 +45,7 @@ Spawn a new session with an initial window + pane.
 ```json
 // Request
 { "name": "demo",                       // optional; auto-generates "session-N" if omitted
-  "cwd":  "/path/to/dir",               // optional; defaults to daemon cwd
+  "cwd":  "/path/to/dir",               // recommended; CLI fills caller cwd by default
   "command": ["bash", "-l"] }           // optional; defaults to user shell
 
 // Response
@@ -67,7 +72,7 @@ Spawn a new session with an initial window + pane.
 { "id": "name-or-uuid", "new_name": "demo2", "expected_version": 5 }
 
 // session.ensure — create-if-missing
-{ "name": "demo", "command": [...] }
+{ "name": "demo", "cwd": "/path/to/dir", "command": [...] }
 ```
 
 ## Window

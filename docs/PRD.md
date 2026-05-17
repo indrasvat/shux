@@ -154,7 +154,7 @@ shux ships as a **single binary** (`shux`) with subcommands. The daemon starts a
 
 ```text
 $ shux                              # attach last session (TTY-only); JSON help otherwise
-$ shux session create work          # create session named "work"
+$ shux session create work          # create session named "work" in caller cwd
 $ shux pane split -s work -d v      # vertical split in current pane
 $ shux session list                 # list sessions (alias: shux ses ls)
 $ shux session attach work          # attach to "work"
@@ -1267,8 +1267,8 @@ dogfood loop established repeated misprediction friction.
 ```bash
 # Sessions
 shux session list                            # → session.list (alias: ses ls)
-shux session create work                     # → session.create {name: "work"}
-shux session create --ensure work            # → session.ensure {name: "work"}
+shux session create work                     # → session.create {name: "work", cwd: "$PWD"}
+shux session create --ensure work            # → session.ensure {name: "work", cwd: "$PWD"}
 shux session kill work                       # → session.kill
 shux session attach work                     # → (client-side TUI attach)
 
