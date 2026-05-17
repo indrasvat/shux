@@ -186,7 +186,7 @@ fn render_agent_help(colorize: bool) -> String {
         "  {dim}# Raw RPC callers should pass cwd explicitly.{r}\n"
     ));
     s.push_str(&format!(
-        "  {} --params '{{\"name\":\"demo\",\"cwd\":\"$PWD\",\"command\":[\"lazygit\"]}}'\n\n",
+        "  {} --params \"{{\\\"name\\\":\\\"demo\\\",\\\"cwd\\\":\\\"$(pwd)\\\",\\\"command\\\":[\\\"lazygit\\\"]}}\"\n\n",
         shux("rpc call session.create"),
     ));
     s.push_str(&format!(
@@ -4268,6 +4268,20 @@ mod tests {
             Some("/tmp/shux-demo")
         );
         assert_eq!(params.get("command"), Some(&serde_json::json!(["pwd"])));
+    }
+
+    #[test]
+    fn test_agent_help_raw_rpc_cwd_example_is_copy_safe() {
+        let help = render_agent_help(false);
+
+        assert!(
+            help.contains(r#"--params "{\"name\":\"demo\",\"cwd\":\"$(pwd)\","#),
+            "raw RPC cwd example should use shell-expanded $(pwd) in double-quoted JSON"
+        );
+        assert!(
+            !help.contains(r#""cwd":"$PWD""#),
+            "single-quoted inline JSON would send literal $PWD"
+        );
     }
 
     #[test]

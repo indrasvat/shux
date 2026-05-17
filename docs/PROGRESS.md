@@ -30,7 +30,7 @@
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
-795 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
+796 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
 
 ## Status
 
@@ -105,6 +105,18 @@
   `XDG_RUNTIME_DIR` shux smoke captures. PR #50 has two uploaded Chrome
   comment screenshots: generated default raw-ANSI statusbar and an
   interactive `/tmp/shux-demo` session showing a clean clock.
+
+**2026-05-17 — fix(cli): make raw RPC cwd help copy-safe**
+- Review follow-up on PR #50: the raw `session.create` RPC example in
+  `shux --help` showed `"cwd":"$PWD"` inside single-quoted inline JSON,
+  which copy/pasted as a literal `$PWD` instead of the caller's directory.
+- Fix: the help now uses double-quoted inline JSON with escaped inner
+  quotes and `"cwd":"$(pwd)"`, so common POSIX shells expand the cwd
+  before passing JSON to shux. Added a regression test pinning the
+  copy-safe example and rejecting the literal `$PWD` form.
+- Verification: focused `cargo test -p shux
+  cli::tests::test_agent_help_raw_rpc_cwd_example_is_copy_safe`, `make
+  fmt-check`, `make test` (796/796), and `git diff --check`.
 
 **2026-05-15 — feat(snapshot): emoji glyph fallback in PNG rasterizer (issue #46)**
 - Issue #46: PNG snapshots dropped emoji glyphs (rendered as tofu /
