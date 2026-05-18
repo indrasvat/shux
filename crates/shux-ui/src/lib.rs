@@ -31,7 +31,7 @@ pub use compositor::{CompositorConfig, MultiPaneFrame, RenderCompositor, RenderS
 pub use copy_mode::{
     CopyKey, CopyModeState, handle_key as copy_mode_key,
     handle_key_with_vt as copy_mode_key_with_vt, osc52_copy, render_copy_overlay_into,
-    render_copy_view_into,
+    render_copy_overlay_with_vt_into, render_copy_view_into,
 };
 pub use help_overlay::render_help_overlay_into;
 pub use input::{InputEvent, KeyboardProtocol, MouseAction, MouseButton, MouseEvent};

@@ -1,12 +1,8 @@
 //! Copy mode — vim-style cursor + selection on the focused pane,
 //! yanking via OSC 52 (terminal-driven system clipboard).
 //!
-//! M1 slice of task 021. Captures the most common ad-hoc copy use
-//! case: select something visible on screen and put it on the system
-//! clipboard. Deferred to follow-ups: real scrollback navigation
-//! (the grid has scrollback but we don't expose viewport scrolling
-//! yet), search (/?nN), word/line/page motions, visual line/block
-//! variants.
+//! Captures the common ad-hoc copy use case: move through visible output or
+//! scrollback, search, select text, and put it on the system clipboard.
 //!
 //! Activated by `prefix + [` (tmux convention) → `ActionKind::
 //! EnterCopyMode`. While the mode is active the daemon swallows
@@ -26,7 +22,7 @@ use shux_vt::{CellFlags, Color, Row, VirtualTerminal};
 
 /// Per-attach session copy-mode state. `None` means the user is in
 /// normal pane-input mode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyModeState {
     /// 0-based cursor position relative to the focused pane content
     /// rect (NOT screen-absolute). 0,0 = top-left of the pane.
@@ -749,13 +745,36 @@ fn order_endpoints(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
     }
 }
 
-/// Append ANSI bytes that draw the copy-mode overlay over the focused
-/// pane's content rect. Two layers: a selection background (if anchor
-/// is set) and a cursor block. Both use the theme's status_accent /
-/// status_bg / status_fg so they match the rest of the chrome.
+/// Append ANSI bytes that draw the copy-mode overlay over the focused pane's
+/// content rect. Use [`render_copy_overlay_with_vt_into`] when a VT is
+/// available so selection can repaint the selected glyphs with a high-contrast
+/// palette instead of masking text with a blank band.
 pub fn render_copy_overlay_into(
     buf: &mut Vec<u8>,
     pane: Rect,
+    state: &CopyModeState,
+    theme: &Theme,
+) {
+    render_copy_overlay_inner(buf, pane, None, state, theme);
+}
+
+/// Variant of [`render_copy_overlay_into`] that can redraw selected text from
+/// the active VT viewport. This keeps visual selection legible instead of
+/// painting an opaque band over the glyphs.
+pub fn render_copy_overlay_with_vt_into(
+    buf: &mut Vec<u8>,
+    pane: Rect,
+    vt: &VirtualTerminal,
+    state: &CopyModeState,
+    theme: &Theme,
+) {
+    render_copy_overlay_inner(buf, pane, Some(vt), state, theme);
+}
+
+fn render_copy_overlay_inner(
+    buf: &mut Vec<u8>,
+    pane: Rect,
+    vt: Option<&VirtualTerminal>,
     state: &CopyModeState,
     theme: &Theme,
 ) {
@@ -783,15 +802,25 @@ pub fn render_copy_overlay_into(
             } else {
                 (0, pane.width.saturating_sub(1))
             };
-            highlight_run(
-                buf,
-                pane,
-                col_lo,
-                col_hi,
-                row,
-                theme.status_accent,
-                theme.status_bg,
-            );
+            if let Some(vt) = vt {
+                let ctx = SelectionRenderCtx {
+                    pane,
+                    vt,
+                    state,
+                    theme,
+                };
+                selection_text_run(buf, ctx, col_lo, col_hi, row);
+            } else {
+                highlight_run(
+                    buf,
+                    pane,
+                    col_lo,
+                    col_hi,
+                    row,
+                    theme.status_bg,
+                    theme.status_accent,
+                );
+            }
         }
     }
 
@@ -842,6 +871,51 @@ pub fn render_copy_overlay_into(
         truncated,
         " ".repeat(pad),
     );
+}
+
+struct SelectionRenderCtx<'a> {
+    pane: Rect,
+    vt: &'a VirtualTerminal,
+    state: &'a CopyModeState,
+    theme: &'a Theme,
+}
+
+fn selection_text_run(
+    buf: &mut Vec<u8>,
+    ctx: SelectionRenderCtx<'_>,
+    col_lo: u16,
+    col_hi: u16,
+    row: u16,
+) {
+    let Some(row_ref) = row_for_view(ctx.vt, ctx.pane.height, ctx.state.scroll_offset, row) else {
+        highlight_run(
+            buf,
+            ctx.pane,
+            col_lo,
+            col_hi,
+            row,
+            ctx.theme.status_bg,
+            ctx.theme.status_accent,
+        );
+        return;
+    };
+    let col_hi = col_hi.min(ctx.pane.width.saturating_sub(1));
+    for col in col_lo..=col_hi {
+        let ch = row_ref
+            .get(col as usize)
+            .filter(|cell| !cell.is_wide_continuation())
+            .map(|cell| cell.ch)
+            .unwrap_or(' ');
+        let _ = write!(
+            buf,
+            "\x1b[{};{}H{}{}\x1b[1m{}\x1b[0m",
+            ctx.pane.y + row + 1,
+            ctx.pane.x + col + 1,
+            sgr_bg(ctx.theme.status_accent),
+            sgr_fg(ctx.theme.status_bg),
+            ch,
+        );
+    }
 }
 
 fn display_width_str(s: &str) -> usize {
@@ -1183,6 +1257,33 @@ mod tests {
         // 1-based, so we expect CSI 6;7 H somewhere.
         assert!(s.contains("\x1b[6;7H"), "missing cursor position: {s:?}");
         assert!(s.contains("COPY"), "missing status hint");
+    }
+
+    #[test]
+    fn render_overlay_with_vt_keeps_selected_text_legible() {
+        let vt = vt_with(3, 20, "abcdef");
+        let pane = Rect::new(0, 0, 20, 3);
+        let state = CopyModeState {
+            cursor: (2, 0),
+            anchor: Some((0, 0)),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_copy_overlay_with_vt_into(&mut buf, pane, &vt, &state, &Theme::DEFAULT);
+        let rendered = String::from_utf8_lossy(&buf);
+        let plain = strip_ansi(&rendered);
+        assert!(
+            plain.contains("abc"),
+            "selection should repaint selected glyphs, rendered={rendered:?}"
+        );
+        assert!(
+            rendered.contains("\x1b[48;2;116;199;236m"),
+            "selection should use high-contrast accent background"
+        );
+        assert!(
+            rendered.contains("\x1b[38;2;30;32;48m"),
+            "selection should use dark foreground on accent background"
+        );
     }
 
     #[test]

@@ -35,6 +35,7 @@ use shux_core::config::ConfigHandle;
 use shux_core::graph::{GraphError, GraphHandle};
 use shux_core::layout::{NavDirection, Rect};
 use shux_core::model::{PaneId, SessionId, WindowId};
+use shux_core::theme::Theme;
 use shux_pty::handle::PtySize;
 use shux_rpc::attach::{
     ATTACH_PROTOCOL_VERSION, ActionKind, AttachClientFrame, AttachHello, AttachReady,
@@ -51,6 +52,29 @@ use crate::statusbar_runner::{SegmentCache, populate_bar};
 /// and PTY winsize — never inferred from the VT grid (which would create
 /// a self-feeding shrink loop).
 type ClientSize = Arc<Mutex<(u16, u16)>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyOverlayStamp {
+    pane_id: PaneId,
+    rect: Rect,
+    state: shux_ui::CopyModeState,
+    theme: Theme,
+}
+
+fn copy_overlay_needs_base_redraw(
+    last: Option<&CopyOverlayStamp>,
+    next: Option<&CopyOverlayStamp>,
+) -> bool {
+    last != next
+}
+
+fn copy_overlay_needs_repaint(
+    last: Option<&CopyOverlayStamp>,
+    next: Option<&CopyOverlayStamp>,
+    base_emitted: bool,
+) -> bool {
+    next.is_some() && (base_emitted || copy_overlay_needs_base_redraw(last, next))
+}
 
 /// Status-bar rows reserved at the bottom of the client screen.
 const STATUS_BAR_ROWS: u16 = 1;
@@ -931,6 +955,7 @@ async fn run_render_loop(
     let mut last_theme = initial_theme;
     let mut last_help_visible = false;
     let mut last_copy_active = false;
+    let mut last_copy_overlay: Option<CopyOverlayStamp> = None;
 
     loop {
         tokio::select! {
@@ -967,6 +992,7 @@ async fn run_render_loop(
         if live_theme != last_theme {
             last_theme = live_theme;
             compositor.set_border_colors(shux_ui::BorderColors::from_theme(&live_theme));
+            last_copy_overlay = None;
         }
 
         // Build a multi-pane frame snapshot.
@@ -986,24 +1012,43 @@ async fn run_render_loop(
         if copy_active_now != last_copy_active {
             compositor.force_redraw();
             last_copy_active = copy_active_now;
-        }
-        // Force a full redraw on every frame the copy-mode overlay is
-        // active. Cursor / selection movements only mutate ephemeral
-        // overlay bytes appended after the framebuffer diff — they
-        // never touch the underlying VT cells, so the diff renderer
-        // would otherwise leave stale cursor squares and highlight
-        // bands on screen as the user moves around. Per-iteration
-        // force_redraw is the simplest correct fix; the alternative
-        // would be tracking last cursor/anchor and only forcing
-        // redraws on deltas, which is more code for the same effect.
-        if copy_active_now {
-            compositor.force_redraw();
+            last_copy_overlay = None;
         }
 
         let win = match snap.windows.get(&attached.active_window_id) {
             Some(w) => w,
             None => continue,
         };
+        let copy_overlay = if let Some(ref cm) = attached.copy_mode {
+            let content = current_content_rect(&client_size).await;
+            let viewport = current_viewport(&client_size).await;
+            let rect = if win.layout.is_zoomed() {
+                Some(content)
+            } else {
+                win.layout
+                    .compute_rects(viewport)
+                    .into_iter()
+                    .find(|(pid, _)| *pid == attached.active_pane_id)
+                    .map(|(_, rect)| rect)
+            };
+            rect.map(|rect| CopyOverlayStamp {
+                pane_id: attached.active_pane_id,
+                rect,
+                state: cm.clone(),
+                theme: live_theme,
+            })
+        } else {
+            None
+        };
+        let copy_overlay_changed =
+            copy_overlay_needs_base_redraw(last_copy_overlay.as_ref(), copy_overlay.as_ref());
+        if copy_overlay_changed {
+            // The copy cursor/selection is drawn as an overlay after the normal
+            // framebuffer diff, so changes to it are invisible to the
+            // compositor. Redraw the base frame only when that overlay state
+            // changes; doing this every tick makes the pane visibly flicker.
+            compositor.force_redraw();
+        }
 
         // Collect pane VT references while holding the io_state lock.
         // We render under the lock to avoid copying VT grids; the lock
@@ -1078,33 +1123,40 @@ async fn run_render_loop(
         // highlight + status hint, scoped to the focused pane's
         // content rect. Drawn BEFORE the help overlay so the help
         // sheet wins z-order if both are somehow active.
-        if let Some(ref cm) = attached.copy_mode {
-            // When the active window is zoomed, the multipane render
-            // shows ONE pane filling the entire viewport — the saved
-            // split-rectangles aren't on screen. Use the full
-            // viewport as the overlay's pane rect in that case so the
-            // cursor / selection / hint align with what's actually
-            // visible.
-            let content = current_content_rect(&client_size).await;
-            let viewport = current_viewport(&client_size).await;
-            let pane_rect = if win.layout.is_zoomed() {
-                Some(content)
-            } else {
-                win.layout
-                    .compute_rects(viewport)
-                    .into_iter()
-                    .find(|(pid, _)| *pid == attached.active_pane_id)
-                    .map(|(_, rect)| rect)
-            };
-            if let Some(rect) = pane_rect {
-                if cm.scroll_offset > 0 {
-                    if let Some(vt) = state.vts.get(&attached.active_pane_id) {
-                        shux_ui::render_copy_view_into(compositor.inner_mut(), rect, vt, cm);
+        if let Some(ref overlay) = copy_overlay {
+            let base_emitted = !compositor.inner().is_empty();
+            if copy_overlay_needs_repaint(
+                last_copy_overlay.as_ref(),
+                copy_overlay.as_ref(),
+                base_emitted,
+            ) {
+                if let Some(vt) = state.vts.get(&overlay.pane_id) {
+                    if overlay.state.scroll_offset > 0 {
+                        shux_ui::render_copy_view_into(
+                            compositor.inner_mut(),
+                            overlay.rect,
+                            vt,
+                            &overlay.state,
+                        );
                     }
+                    shux_ui::render_copy_overlay_with_vt_into(
+                        compositor.inner_mut(),
+                        overlay.rect,
+                        vt,
+                        &overlay.state,
+                        &overlay.theme,
+                    );
+                } else {
+                    shux_ui::render_copy_overlay_into(
+                        compositor.inner_mut(),
+                        overlay.rect,
+                        &overlay.state,
+                        &overlay.theme,
+                    );
                 }
-                shux_ui::render_copy_overlay_into(compositor.inner_mut(), rect, cm, &live_theme);
             }
         }
+        last_copy_overlay = copy_overlay;
 
         // Help-overlay layer: drawn AFTER the diff'd multipane frame so
         // it covers the cells underneath. Toggling the overlay also
@@ -2121,6 +2173,42 @@ async fn resize_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn overlay_stamp(cursor: (u16, u16)) -> CopyOverlayStamp {
+        let mut state = shux_ui::CopyModeState::new();
+        state.cursor = cursor;
+        CopyOverlayStamp {
+            pane_id: PaneId::new(),
+            rect: Rect::new(1, 1, 80, 23),
+            state,
+            theme: Theme::DEFAULT,
+        }
+    }
+
+    #[test]
+    fn unchanged_copy_overlay_does_not_force_idle_redraw_or_repaint() {
+        let stamp = overlay_stamp((0, 0));
+        assert!(!copy_overlay_needs_base_redraw(Some(&stamp), Some(&stamp)));
+        assert!(!copy_overlay_needs_repaint(
+            Some(&stamp),
+            Some(&stamp),
+            false
+        ));
+    }
+
+    #[test]
+    fn changed_copy_overlay_forces_one_base_redraw_and_repaint() {
+        let old = overlay_stamp((0, 0));
+        let new = overlay_stamp((1, 0));
+        assert!(copy_overlay_needs_base_redraw(Some(&old), Some(&new)));
+        assert!(copy_overlay_needs_repaint(Some(&old), Some(&new), false));
+    }
+
+    #[test]
+    fn unchanged_copy_overlay_repaints_after_underlying_bytes() {
+        let stamp = overlay_stamp((0, 0));
+        assert!(copy_overlay_needs_repaint(Some(&stamp), Some(&stamp), true));
+    }
 
     #[test]
     fn point_in_rect_uses_half_open_bounds() {

@@ -9,6 +9,25 @@ fn test_cwd() -> PathBuf {
     std::env::temp_dir()
 }
 
+async fn read_pty_to_exit(handle: &mut PtyHandle) -> String {
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match handle.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+
+    assert!(result.is_ok(), "Read timed out");
+    String::from_utf8_lossy(&output).into_owned()
+}
+
 #[tokio::test]
 async fn test_spawn_echo() {
     let config = PtyConfig::with_command(vec!["echo".into(), "hello shux".into()], test_cwd());
@@ -34,6 +53,48 @@ async fn test_spawn_echo() {
     assert!(
         output_str.contains("hello shux"),
         "Expected 'hello shux' in output, got: {output_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_spawn_interactive_env_enables_color_by_default() {
+    let config = PtyConfig::with_command(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s|%s|%s|%s\n' \"$TERM\" \"${COLORTERM-unset}\" \"${CLICOLOR-unset}\" \"${NO_COLOR-unset}\"".into(),
+        ],
+        test_cwd(),
+    );
+
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(
+        output.contains("xterm-256color|truecolor|1|unset"),
+        "expected shux pane color defaults and no inherited NO_COLOR, got: {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_spawn_explicit_env_can_restore_no_color() {
+    let mut config = PtyConfig::with_command(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s|%s\n' \"$CLICOLOR\" \"${NO_COLOR-unset}\"".into(),
+        ],
+        test_cwd(),
+    );
+    config.env.push(("NO_COLOR".into(), "1".into()));
+    config.env.push(("CLICOLOR".into(), "0".into()));
+
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(
+        output.contains("0|1"),
+        "expected explicit config.env to override pane color defaults, got: {output:?}"
     );
 }
 

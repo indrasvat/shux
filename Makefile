@@ -111,6 +111,14 @@ test-lib: ## Run library tests only
 	@cargo nextest run --workspace --lib --no-tests=pass
 	@echo "$(COLOR_GREEN)✓ Library tests passed$(COLOR_RESET)"
 
+.PHONY: test-copy-mode
+test-copy-mode: ## Run focused copy-mode and copy-overlay tests
+	@echo "$(COLOR_BLUE)▶ Running copy-mode tests...$(COLOR_RESET)"
+	@cargo nextest run -p shux-ui --lib copy_mode --no-tests=pass
+	@cargo nextest run -p shux-ui --lib compositor::tests::test_compositor_does_not_churn_cursor_when_idle compositor::tests::test_compositor_moves_cursor_without_hide_show_when_only_cursor_changes --no-tests=pass
+	@cargo nextest run -p shux --bin shux attach::tests:: --no-tests=pass
+	@echo "$(COLOR_GREEN)✓ Copy-mode tests passed$(COLOR_RESET)"
+
 .PHONY: test-doc
 test-doc: ## Run doc tests
 	@echo "$(COLOR_BLUE)▶ Running doc tests...$(COLOR_RESET)"
@@ -132,6 +140,10 @@ bench: ## Run benchmarks
 .PHONY: bench-baseline
 bench-baseline: ## Record M0 performance baseline
 	@./scripts/bench-baseline.sh
+
+.PHONY: dogfood-human-copy
+dogfood-human-copy: build ## Run copy-mode human dogfood regression
+	@bash .shux/scripts/human_copy_mode_check.sh
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Code Quality

@@ -31,7 +31,7 @@
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
-822 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, scrollback-backed copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments, session save/restore).
+830 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, scrollback-backed copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments, session save/restore).
 
 ## Status
 
@@ -87,6 +87,37 @@
 ---
 
 ## Session Log
+
+**2026-05-18 — fix(copy): make selection legible and stop idle cursor churn**
+- User dogfood findings on the human-interactive branch: copy-mode
+  selection used a too-dark overlay that made text hard to read, and an
+  attached SHUX pane visibly blinked/janked while idle. Computer Use was
+  re-tried against Ghostty after a Codex restart, but the MCP still
+  rejected `com.mitchellh.ghostty` as not allowed; verification continued
+  with PTY/expect automation plus SHUX snapshots.
+- Copy-mode overlay now redraws selected glyphs from the focused
+  `VirtualTerminal` with explicit high-contrast foreground/background
+  instead of painting a block over text. A regression test asserts the
+  selected glyph remains present and styled.
+- Attach rendering no longer forces a base-frame redraw every copy-mode
+  tick. The render loop tracks a copy overlay stamp and only redraws or
+  repaints when the overlay state changes or underlying pane bytes
+  arrive.
+- The compositor now tracks the terminal cursor state. First render still
+  initializes cursor visibility, but idle frames with no dirty cells and
+  unchanged cursor emit no hide/show/move bytes; cursor-only movement
+  emits only the cursor move. This fixes the visible idle blink.
+- PTY child process env now defends interactive panes from degraded
+  parent environments by defaulting `TERM=xterm-256color`,
+  `COLORTERM=truecolor`, `CLICOLOR=1`, and removing inherited
+  `NO_COLOR` unless explicitly restored through `PtyConfig.env`.
+- Dogfood automation in `.shux/scripts/human_copy_mode_check.sh` now
+  exercises a real attach session through `expect`, enters copy mode,
+  searches/selects text, verifies high-contrast selection ANSI, checks
+  `NO_COLOR=unset` inside the pane, snapshots PNG evidence, and measures
+  idle output volume. Current proof: idle attach delta `0` bytes.
+- Verification: focused copy/attach/compositor tests,
+  `make dogfood-human-copy`, and `make test` (830/830).
 
 **2026-05-18 — feat(human): scrollback copy, keybinding config, session persistence**
 - Built the human-interactive core branch around three daily-driver UX
