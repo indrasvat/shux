@@ -1,3 +1,10 @@
+# [0.25.0](https://github.com/indrasvat/shux/compare/v0.24.3...v0.25.0) (2026-05-18)
+
+
+### Features
+
+* **copy:** improve mouse selection UX ([bf0617d](https://github.com/indrasvat/shux/commit/bf0617d29b6bfed6f12617786571e4bfb5e8674e))
+
 ## [0.24.3](https://github.com/indrasvat/shux/compare/v0.24.2...v0.24.3) (2026-05-17)
 
 
