@@ -11,6 +11,7 @@
 - **018 (Tier-1 keys) finalized (PR #13):** Bare Alt+h/j/k/l → directional focus; Alt+n/p → next/prev window; Alt+1..9 → switch directly to Nth window via new `ActionKind::SwitchToWindow` + `ActionArgs.window_index`. `key_to_bare_action` return type bumped from `Option<ActionKind>` to `Option<(ActionKind, ActionArgs)>`. Out-of-range Alt+digit silently ignored (matches tmux). 4 new unit tests in `crates/shux-ui/src/attach.rs`.
 - **027 (pane titles) — Done (PR 4 / #12):** `Pane` gained `manual_title: Option<String>`, `osc_title: Option<String>` alongside existing `title` + `auto_title`. Priority resolution: manual > osc (when auto on) > command basename > cwd basename, computed by `Pane::recalculate_title()`. `sanitize_title()` strips control chars + clamps to 64 chars. `set_pane_title()` and `set_pane_osc_title()` on SessionGraph fire `PaneTitleChanged` only when displayed title actually moves. Per-pane PTY task tracks `last_osc_title` locally and forwards changes to graph outside the io_state lock (deadlock avoidance). Compositor `MultiPaneFrame` gained `titles: Option<&HashMap<PaneId, String>>`; titles render as ` title `-padded text on the top border row, truncated to fit. `pane.set_title` RPC accepts `{title: string|null, auto: bool|null}` tri-state. `shux pane title` CLI with `-t/--clear/--auto/--no-auto`. 11 model unit tests + 5 graph unit tests.
 - **Pending:** 025 (per-pane theming), 031 (keybinding config + conflict detection), 032 (command palette), 034 (M1 quality gate). (030 — session templates — moved to M2 group as part of PR 3a since it lands alongside `state.apply`.)
+- **Done:** 061 (render parity analysis + mouse copy UX follow-up).
 
 **M2: API + Plugin System** — kicked off.
 - **Done:**
@@ -30,7 +31,7 @@
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
-799 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
+805 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
 
 ## Status
 
@@ -56,7 +57,7 @@
   - [x] TOML config with live reload
   - [~] Theme engine (border + status bar overrides; full token cascade + per-pane theming pending)
   - [x] Mouse support
-  - [ ] Pane titles (manual + auto)
+  - [x] Pane titles (manual + auto)
   - [x] Status bar (built-in 3-zone + script-driven `[[statusbar.segment]]`)
   - [x] Session templates + `shux apply` (PR 3a)
   - [ ] Keybinding config + conflict detection
@@ -84,6 +85,29 @@
 ---
 
 ## Session Log
+
+**2026-05-18 — fix(mouse): reduce capture and add copy-mode drag**
+- User dogfood finding: Codex and other TUIs look materially different
+  inside a SHUX attach than when launched directly, and mouse-drag text
+  copy did not work in an attached session.
+- Analysis: the visual difference has three layers: expected SHUX chrome
+  (border, pane title, status bar, inset PTY size), live attach vs host
+  terminal behavior, and headless PNG rasterizer limitations. Task 061
+  now documents the current VT/raster gaps and the phased parity plan.
+- Fix: `TerminalGuard::enter()` no longer uses crossterm's broad
+  `EnableMouseCapture`, which enabled `?1003h` any-motion tracking.
+  SHUX now enables only `?1000h` press/release, `?1002h` button-held
+  drag, and `?1006h` SGR coordinates. This preserves click focus and
+  border resize while avoiding unnecessary any-motion capture.
+- Copy-mode improvement: while `Prefix + [` copy mode is active,
+  left-drag inside the focused pane updates the existing
+  `CopyModeState`; mouse-up yanks via the same OSC 52 path as keyboard
+  `y` only when the cursor actually moved, then exits copy mode.
+  Click-only down/up does not copy a stray single cell. Zoomed panes use
+  the full visible pane rect for coordinate mapping.
+- Verification: `make fmt`, `make fmt-check`, two full `make test`
+  runs (803/803 each, triggered while attempting focused filters), and
+  `make lint` / clippy.
 
 **2026-05-17 — fix(session): add initial pane title flag**
 - User dogfood finding: `shux session create -s aww-shux --cmd "codex

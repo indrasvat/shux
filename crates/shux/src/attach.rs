@@ -534,6 +534,7 @@ async fn run_attach_loop(
     // which boundary it's grabbing so subsequent Drag events can adjust
     // the layout split ratio.
     let mut mouse_drag: Option<DragState> = None;
+    let mut copy_mouse_drag = false;
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -752,6 +753,25 @@ async fn run_attach_loop(
                         // doesn't keep ratcheting.
                         if render_session.lock().await.help_visible {
                             mouse_drag = None;
+                            copy_mouse_drag = false;
+                            continue;
+                        }
+                        if handle_copy_mode_mouse(
+                            kind,
+                            button,
+                            col,
+                            row,
+                            &graph,
+                            &io_state,
+                            &render_session,
+                            &client_size,
+                            &out_tx,
+                            &mut copy_mouse_drag,
+                        )
+                        .await?
+                        {
+                            let pulse = io_state.lock().await.render_pulse.clone();
+                            pulse.notify_one();
                             continue;
                         }
                         if let Err(e) = handle_mouse(
@@ -1054,9 +1074,10 @@ async fn run_render_loop(
             // viewport as the overlay's pane rect in that case so the
             // cursor / selection / hint align with what's actually
             // visible.
+            let content = current_content_rect(&client_size).await;
             let viewport = current_viewport(&client_size).await;
             let pane_rect = if win.layout.is_zoomed() {
-                Some(viewport)
+                Some(content)
             } else {
                 win.layout
                     .compute_rects(viewport)
@@ -1285,6 +1306,109 @@ fn border_at(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn handle_copy_mode_mouse(
+    kind: MouseKind,
+    button: ProtoMouseButton,
+    col: u16,
+    row: u16,
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+    out_tx: &mpsc::Sender<AttachServerFrame>,
+    dragging: &mut bool,
+) -> anyhow::Result<bool> {
+    let attached = session.lock().await.clone();
+    if attached.copy_mode.is_none() {
+        *dragging = false;
+        return Ok(false);
+    }
+
+    if button != ProtoMouseButton::Left {
+        return Ok(true);
+    }
+
+    let Some(rect) = focused_pane_rect(graph, &attached, client_size).await else {
+        *dragging = false;
+        return Ok(true);
+    };
+
+    match kind {
+        MouseKind::Down => {
+            if !point_in_rect(rect, col, row) {
+                *dragging = false;
+                return Ok(true);
+            }
+            let pos = pane_local_point_clamped(rect, col, row);
+            let mut s = session.lock().await;
+            if let Some(ref mut cm) = s.copy_mode {
+                cm.cursor = pos;
+                cm.anchor = Some(pos);
+            }
+            *dragging = true;
+        }
+        MouseKind::Drag if *dragging => {
+            let pos = pane_local_point_clamped(rect, col, row);
+            let mut s = session.lock().await;
+            if let Some(ref mut cm) = s.copy_mode {
+                cm.cursor = pos;
+            }
+        }
+        MouseKind::Up if *dragging => {
+            let pos = pane_local_point_clamped(rect, col, row);
+            let cm = {
+                let mut s = session.lock().await;
+                if let Some(ref mut cm) = s.copy_mode {
+                    cm.cursor = pos;
+                }
+                s.copy_mode.clone()
+            };
+            if let Some(cm) = cm {
+                let moved = cm.anchor.is_some_and(|anchor| anchor != cm.cursor);
+                if moved {
+                    let text = {
+                        let state = io_state.lock().await;
+                        state
+                            .vts
+                            .get(&attached.active_pane_id)
+                            .map(|vt| {
+                                shux_ui::copy_mode::extract_selection(
+                                    vt,
+                                    &cm,
+                                    rect.width,
+                                    rect.height,
+                                )
+                            })
+                            .unwrap_or_default()
+                    };
+                    if !text.is_empty() {
+                        let osc = shux_ui::osc52_copy(&text);
+                        let frame = AttachServerFrame::Render {
+                            data: BASE64.encode(&osc),
+                        };
+                        let _ = out_tx.send(frame).await;
+                    }
+                    let mut s = session.lock().await;
+                    s.copy_mode = None;
+                } else {
+                    let mut s = session.lock().await;
+                    if let Some(ref mut cm) = s.copy_mode {
+                        cm.anchor = None;
+                    }
+                }
+            }
+            *dragging = false;
+        }
+        MouseKind::Up => {
+            *dragging = false;
+        }
+        _ => {}
+    }
+
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_mouse(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -1369,6 +1493,21 @@ async fn handle_mouse(
     Ok(())
 }
 
+fn point_in_rect(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn pane_local_point_clamped(rect: Rect, col: u16, row: u16) -> (u16, u16) {
+    let max_col = rect.width.saturating_sub(1);
+    let max_row = rect.height.saturating_sub(1);
+    let local_col = col.saturating_sub(rect.x).min(max_col);
+    let local_row = row.saturating_sub(rect.y).min(max_row);
+    (local_col, local_row)
+}
+
 /// True if an action mutates the pane layout in a way that changes the
 /// rect size of one or more visible panes. Used to decide whether to
 /// re-fan PTY winsize after dispatching the action.
@@ -1407,21 +1546,38 @@ async fn focused_pane_size(
     attached: &AttachedSession,
     client_size: &ClientSize,
 ) -> (u16, u16) {
+    if pane_id != attached.active_pane_id {
+        return (0, 0);
+    }
+    focused_pane_rect(graph, attached, client_size)
+        .await
+        .map(|rect| (rect.width, rect.height))
+        .unwrap_or((0, 0))
+}
+
+async fn focused_pane_rect(
+    graph: &GraphHandle,
+    attached: &AttachedSession,
+    client_size: &ClientSize,
+) -> Option<Rect> {
+    let content = current_content_rect(client_size).await;
     let viewport = current_viewport(client_size).await;
     let snap = graph.snapshot();
-    let win = match snap.windows.get(&attached.active_window_id) {
-        Some(w) => w,
-        None => return (0, 0),
-    };
+    let win = snap.windows.get(&attached.active_window_id)?;
     if win.layout.is_zoomed() {
-        return (viewport.width, viewport.height);
+        return Some(content);
     }
     for (pid, rect) in win.layout.compute_rects(viewport) {
-        if pid == pane_id {
-            return (rect.width, rect.height);
+        if pid == attached.active_pane_id {
+            return Some(rect);
         }
     }
-    (0, 0)
+    None
+}
+
+async fn current_content_rect(client_size: &ClientSize) -> Rect {
+    let (cols, rows) = *client_size.lock().await;
+    Rect::new(0, 0, cols, rows.saturating_sub(STATUS_BAR_ROWS))
 }
 
 /// Compute the actual pane viewport (inset for outline + status bar) at
@@ -1920,4 +2076,47 @@ async fn resize_pane(
         .resize_pane(attached.active_pane_id, direction, delta, None)
         .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn point_in_rect_uses_half_open_bounds() {
+        let rect = Rect::new(2, 3, 10, 5);
+        assert!(point_in_rect(rect, 2, 3));
+        assert!(point_in_rect(rect, 11, 7));
+        assert!(!point_in_rect(rect, 12, 7));
+        assert!(!point_in_rect(rect, 11, 8));
+        assert!(!point_in_rect(rect, 1, 3));
+        assert!(!point_in_rect(rect, 2, 2));
+    }
+
+    #[test]
+    fn pane_local_point_clamps_to_content_rect() {
+        let rect = Rect::new(2, 3, 10, 5);
+        assert_eq!(pane_local_point_clamped(rect, 2, 3), (0, 0));
+        assert_eq!(pane_local_point_clamped(rect, 11, 7), (9, 4));
+        assert_eq!(pane_local_point_clamped(rect, 0, 0), (0, 0));
+        assert_eq!(pane_local_point_clamped(rect, 99, 99), (9, 4));
+    }
+
+    #[test]
+    fn pane_local_point_handles_empty_rect_without_underflow() {
+        let rect = Rect::new(4, 5, 0, 0);
+        assert_eq!(pane_local_point_clamped(rect, 10, 10), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn current_content_rect_reserves_only_status_row() {
+        let size = Arc::new(Mutex::new((120, 40)));
+        assert_eq!(current_content_rect(&size).await, Rect::new(0, 0, 120, 39));
+    }
+
+    #[tokio::test]
+    async fn current_viewport_insets_for_borders_and_status_row() {
+        let size = Arc::new(Mutex::new((120, 40)));
+        assert_eq!(current_viewport(&size).await, Rect::new(1, 1, 118, 37));
+    }
 }
