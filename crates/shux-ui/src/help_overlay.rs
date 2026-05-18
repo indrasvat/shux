@@ -88,6 +88,19 @@ const SECTIONS: &[Section] = &[
         }],
     },
     Section {
+        title: "Mouse",
+        entries: &[
+            Entry {
+                key: "Drag text",
+                desc: "Select visible text and copy on release",
+            },
+            Entry {
+                key: "Right-click selection",
+                desc: "Open Copy / Clear menu",
+            },
+        ],
+    },
+    Section {
         title: "Copy mode",
         entries: &[
             Entry {

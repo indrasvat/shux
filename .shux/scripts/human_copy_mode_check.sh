@@ -80,6 +80,10 @@ proc drain_ms {milliseconds} {
     }
 }
 
+proc sgr_mouse {code x y suffix} {
+    send -- "\033\[<${code};${x};${y}${suffix}"
+}
+
 log_user 1
 log_file -noappend $env(ATTACH_LOG)
 spawn env TERM=xterm-256color COLORTERM=truecolor sh -c "unset NO_COLOR; stty rows 24 columns 100; exec $env(SHUX_BIN) session attach $env(SESSION)"
@@ -98,7 +102,25 @@ set fd [open $env(IDLE_BYTES) w]
 puts $fd $delta
 close $fd
 send "q"
-after 300
+drain_ms 300
+
+# Normal-mode mouse UX: left-drag visible text, release to copy via OSC52,
+# right-click the still-visible selection, and click Copy from the inline menu.
+sgr_mouse 0 2 2 M
+drain_ms 120
+sgr_mouse 32 32 2 M
+drain_ms 120
+sgr_mouse 0 32 2 m
+drain_ms 500
+sgr_mouse 2 6 2 M
+drain_ms 250
+sgr_mouse 2 6 2 m
+drain_ms 150
+sgr_mouse 0 6 2 M
+drain_ms 250
+sgr_mouse 0 6 2 m
+drain_ms 400
+
 send -- "\x02d"
 after 300
 log_file
@@ -113,6 +135,9 @@ if [[ "$IDLE_DELTA" -gt 15000 ]]; then
 fi
 perl -0pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$ATTACH_LOG" > "$CLEAN_ATTACH_LOG"
 grep -q 'copy-line-49' "$CLEAN_ATTACH_LOG"
+grep -q ' Copy' "$CLEAN_ATTACH_LOG"
+grep -q ' Clear' "$CLEAN_ATTACH_LOG"
 perl -0ne 'exit(/\e\[48;2;116;199;236m/ && /\e\[38;2;30;32;48m/ ? 0 : 1)' "$ATTACH_LOG"
+perl -0ne 'exit(/\e\]52;c;/ ? 0 : 1)' "$ATTACH_LOG"
 
 echo "✓ copy-mode dogfood captured: $PNG; idle attach delta ${IDLE_DELTA} bytes"

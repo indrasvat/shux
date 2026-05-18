@@ -55,10 +55,30 @@ type ClientSize = Arc<Mutex<(u16, u16)>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CopyOverlayStamp {
+    kind: CopyOverlayKind,
     pane_id: PaneId,
     rect: Rect,
     state: shux_ui::CopyModeState,
     theme: Theme,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyOverlayKind {
+    Modal,
+    MouseSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MouseSelection {
+    pane_id: PaneId,
+    state: shux_ui::CopyModeState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyContextMenu {
+    pane_id: PaneId,
+    col: u16,
+    row: u16,
 }
 
 fn copy_overlay_needs_base_redraw(
@@ -292,6 +312,12 @@ struct AttachedSession {
     /// loop overlays a cursor + selection on the focused pane, and
     /// `y` triggers an OSC 52 clipboard write before exiting.
     copy_mode: Option<shux_ui::CopyModeState>,
+    /// Normal-mode, mouse-driven selection. Unlike `copy_mode`, this layer
+    /// does not trap keyboard input; it is the everyday terminal-style
+    /// selection model for visible pane text.
+    mouse_selection: Option<MouseSelection>,
+    /// Inline action menu opened by right-clicking an active mouse selection.
+    copy_menu: Option<CopyContextMenu>,
     /// Most recent prefix-action label, with the wallclock instant it
     /// fired. The status bar renders `[<label>]` in the center zone for
     /// ~1.5s, then it auto-clears. Gives the user immediate "yes, that
@@ -333,6 +359,8 @@ async fn resolve_or_create_session(
             active_pane_id: win.active_pane,
             help_visible: false,
             copy_mode: None,
+            mouse_selection: None,
+            copy_menu: None,
             last_action: None,
             // Whether the toast actually renders is decided at attach
             // time by reading the onboarding state file; this stays
@@ -380,6 +408,8 @@ async fn resolve_or_create_session(
         active_pane_id: win.active_pane,
         help_visible: false,
         copy_mode: None,
+        mouse_selection: None,
+        copy_menu: None,
         last_action: None,
         show_welcome_toast: true,
     })
@@ -558,7 +588,7 @@ async fn run_attach_loop(
     // which boundary it's grabbing so subsequent Drag events can adjust
     // the layout split ratio.
     let mut mouse_drag: Option<DragState> = None;
-    let mut copy_mouse_drag = false;
+    let mut selection_drag = SelectionDrag::None;
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -605,6 +635,22 @@ async fn run_attach_loop(
                                 }
                                 continue;
                             }
+                        }
+                        let cleared_mouse_selection = {
+                            let mut s = render_session.lock().await;
+                            if s.copy_mode.is_none()
+                                && (s.mouse_selection.is_some() || s.copy_menu.is_some())
+                            {
+                                s.mouse_selection = None;
+                                s.copy_menu = None;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if cleared_mouse_selection {
+                            let pulse = io_state.lock().await.render_pulse.clone();
+                            pulse.notify_one();
                         }
                         // Copy-mode capture: route bytes through the
                         // copy-mode key handler instead of forwarding
@@ -788,7 +834,25 @@ async fn run_attach_loop(
                         // doesn't keep ratcheting.
                         if render_session.lock().await.help_visible {
                             mouse_drag = None;
-                            copy_mouse_drag = false;
+                            selection_drag = SelectionDrag::None;
+                            continue;
+                        }
+                        if handle_mouse_selection(
+                            kind,
+                            button,
+                            col,
+                            row,
+                            &graph,
+                            &io_state,
+                            &render_session,
+                            &client_size,
+                            &out_tx,
+                            &mut selection_drag,
+                        )
+                        .await?
+                        {
+                            let pulse = io_state.lock().await.render_pulse.clone();
+                            pulse.notify_one();
                             continue;
                         }
                         if handle_copy_mode_mouse(
@@ -801,7 +865,7 @@ async fn run_attach_loop(
                             &render_session,
                             &client_size,
                             &out_tx,
-                            &mut copy_mouse_drag,
+                            &mut selection_drag,
                         )
                         .await?
                         {
@@ -954,8 +1018,9 @@ async fn run_render_loop(
     let mut last_border_style = initial.appearance.border_style.clone();
     let mut last_theme = initial_theme;
     let mut last_help_visible = false;
-    let mut last_copy_active = false;
+    let mut last_overlay_visible = false;
     let mut last_copy_overlay: Option<CopyOverlayStamp> = None;
+    let mut last_copy_menu: Option<CopyContextMenu> = None;
 
     loop {
         tokio::select! {
@@ -1008,11 +1073,14 @@ async fn run_render_loop(
             compositor.force_redraw();
             last_help_visible = attached.help_visible;
         }
-        let copy_active_now = attached.copy_mode.is_some();
-        if copy_active_now != last_copy_active {
+        let overlay_visible_now = attached.copy_mode.is_some()
+            || attached.mouse_selection.is_some()
+            || attached.copy_menu.is_some();
+        if overlay_visible_now != last_overlay_visible {
             compositor.force_redraw();
-            last_copy_active = copy_active_now;
+            last_overlay_visible = overlay_visible_now;
             last_copy_overlay = None;
+            last_copy_menu = None;
         }
 
         let win = match snap.windows.get(&attached.active_window_id) {
@@ -1032,17 +1100,29 @@ async fn run_render_loop(
                     .map(|(_, rect)| rect)
             };
             rect.map(|rect| CopyOverlayStamp {
+                kind: CopyOverlayKind::Modal,
                 pane_id: attached.active_pane_id,
                 rect,
                 state: cm.clone(),
                 theme: live_theme,
             })
+        } else if let Some(selection) = attached.mouse_selection.as_ref() {
+            pane_rect_for(&graph, &attached, &client_size, selection.pane_id)
+                .await
+                .map(|rect| CopyOverlayStamp {
+                    kind: CopyOverlayKind::MouseSelection,
+                    pane_id: selection.pane_id,
+                    rect,
+                    state: selection.state.clone(),
+                    theme: live_theme,
+                })
         } else {
             None
         };
         let copy_overlay_changed =
             copy_overlay_needs_base_redraw(last_copy_overlay.as_ref(), copy_overlay.as_ref());
-        if copy_overlay_changed {
+        let copy_menu_changed = attached.copy_menu != last_copy_menu;
+        if copy_overlay_changed || copy_menu_changed {
             // The copy cursor/selection is drawn as an overlay after the normal
             // framebuffer diff, so changes to it are invisible to the
             // compositor. Redraw the base frame only when that overlay state
@@ -1139,24 +1219,61 @@ async fn run_render_loop(
                             &overlay.state,
                         );
                     }
-                    shux_ui::render_copy_overlay_with_vt_into(
-                        compositor.inner_mut(),
-                        overlay.rect,
-                        vt,
-                        &overlay.state,
-                        &overlay.theme,
-                    );
+                    match overlay.kind {
+                        CopyOverlayKind::Modal => {
+                            shux_ui::render_copy_overlay_with_vt_into(
+                                compositor.inner_mut(),
+                                overlay.rect,
+                                vt,
+                                &overlay.state,
+                                &overlay.theme,
+                            );
+                        }
+                        CopyOverlayKind::MouseSelection => {
+                            shux_ui::copy_mode::render_selection_overlay_with_vt_into(
+                                compositor.inner_mut(),
+                                overlay.rect,
+                                vt,
+                                &overlay.state,
+                                &overlay.theme,
+                            );
+                        }
+                    }
                 } else {
-                    shux_ui::render_copy_overlay_into(
-                        compositor.inner_mut(),
-                        overlay.rect,
-                        &overlay.state,
-                        &overlay.theme,
-                    );
+                    match overlay.kind {
+                        CopyOverlayKind::Modal => {
+                            shux_ui::render_copy_overlay_into(
+                                compositor.inner_mut(),
+                                overlay.rect,
+                                &overlay.state,
+                                &overlay.theme,
+                            );
+                        }
+                        CopyOverlayKind::MouseSelection => {
+                            shux_ui::copy_mode::render_selection_overlay_into(
+                                compositor.inner_mut(),
+                                overlay.rect,
+                                &overlay.state,
+                                &overlay.theme,
+                            );
+                        }
+                    }
                 }
             }
         }
         last_copy_overlay = copy_overlay;
+
+        if let Some(menu) = attached.copy_menu {
+            shux_ui::copy_mode::render_copy_menu_into(
+                compositor.inner_mut(),
+                menu.col,
+                menu.row,
+                cols,
+                rows,
+                &live_theme,
+            );
+        }
+        last_copy_menu = attached.copy_menu;
 
         // Help-overlay layer: drawn AFTER the diff'd multipane frame so
         // it covers the cells underneath. Toggling the overlay also
@@ -1331,6 +1448,13 @@ struct DragState {
     last_row: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionDrag {
+    None,
+    CopyMode,
+    MouseSelection { pane_id: PaneId },
+}
+
 /// Look up which pane contains the cell at `(col, row)`. Returns the
 /// pane and its rect, or None if the click landed on a border cell or
 /// outside the content area.
@@ -1374,6 +1498,212 @@ fn border_at(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn handle_mouse_selection(
+    kind: MouseKind,
+    button: ProtoMouseButton,
+    col: u16,
+    row: u16,
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+    out_tx: &mpsc::Sender<AttachServerFrame>,
+    drag: &mut SelectionDrag,
+) -> anyhow::Result<bool> {
+    let attached = session.lock().await.clone();
+    if attached.copy_mode.is_some() {
+        return Ok(false);
+    }
+
+    if let Some(menu) = attached.copy_menu {
+        if matches!(kind, MouseKind::Down) {
+            let (cols, rows) = *client_size.lock().await;
+            let (menu_col, menu_row) =
+                shux_ui::copy_mode::copy_menu_origin(menu.col, menu.row, cols, rows);
+            let action = shux_ui::copy_mode::copy_menu_action_at(menu_col, menu_row, col, row);
+            match action {
+                Some(shux_ui::copy_mode::CopyMenuAction::Copy) => {
+                    let selection = attached
+                        .mouse_selection
+                        .as_ref()
+                        .filter(|selection| selection.pane_id == menu.pane_id);
+                    if let Some(selection) = selection {
+                        if let Some(rect) =
+                            pane_rect_for(graph, &attached, client_size, selection.pane_id).await
+                        {
+                            let copied = yank_selection(
+                                selection.pane_id,
+                                &selection.state,
+                                rect,
+                                io_state,
+                                out_tx,
+                            )
+                            .await;
+                            let mut s = session.lock().await;
+                            s.copy_menu = None;
+                            if copied {
+                                s.last_action =
+                                    Some(("copied selection".into(), std::time::Instant::now()));
+                            }
+                        }
+                    } else {
+                        session.lock().await.copy_menu = None;
+                    }
+                }
+                Some(shux_ui::copy_mode::CopyMenuAction::Clear) => {
+                    let mut s = session.lock().await;
+                    s.mouse_selection = None;
+                    s.copy_menu = None;
+                }
+                None => {
+                    session.lock().await.copy_menu = None;
+                }
+            }
+            *drag = SelectionDrag::None;
+            return Ok(true);
+        }
+        return Ok(true);
+    }
+
+    match (kind, button) {
+        (MouseKind::Down, ProtoMouseButton::Left) => {
+            let viewport = current_viewport(client_size).await;
+            let snap = graph.snapshot();
+            let Some(win) = snap.windows.get(&attached.active_window_id) else {
+                return Ok(false);
+            };
+            if !win.layout.is_zoomed() && border_at(&win.layout.tree, viewport, col, row).is_some()
+            {
+                return Ok(false);
+            }
+            let hit = if win.layout.is_zoomed() {
+                Some((
+                    attached.active_pane_id,
+                    current_content_rect(client_size).await,
+                ))
+            } else {
+                pane_at(&win.layout.tree, viewport, col, row)
+            };
+            let Some((pane_id, rect)) = hit else {
+                return Ok(false);
+            };
+            drop(snap);
+
+            if pane_id != attached.active_pane_id {
+                let _ = graph.focus_pane(pane_id).await;
+            }
+            let pos = pane_local_point_clamped(rect, col, row);
+            let mut state = shux_ui::CopyModeState::new();
+            state.cursor = pos;
+            state.anchor = Some(pos);
+            let mut s = session.lock().await;
+            s.active_pane_id = pane_id;
+            s.mouse_selection = Some(MouseSelection { pane_id, state });
+            s.copy_menu = None;
+            *drag = SelectionDrag::MouseSelection { pane_id };
+            Ok(true)
+        }
+        (MouseKind::Drag, ProtoMouseButton::Left) => {
+            let SelectionDrag::MouseSelection { pane_id } = *drag else {
+                return Ok(false);
+            };
+            let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+                *drag = SelectionDrag::None;
+                return Ok(true);
+            };
+            let pos = pane_local_point_clamped(rect, col, row);
+            let mut s = session.lock().await;
+            if let Some(selection) = s
+                .mouse_selection
+                .as_mut()
+                .filter(|selection| selection.pane_id == pane_id)
+            {
+                selection.state.cursor = pos;
+            }
+            Ok(true)
+        }
+        (MouseKind::Up, ProtoMouseButton::Left) => {
+            let SelectionDrag::MouseSelection { pane_id } = *drag else {
+                return Ok(false);
+            };
+            let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+                *drag = SelectionDrag::None;
+                return Ok(true);
+            };
+            let pos = pane_local_point_clamped(rect, col, row);
+            let selection = {
+                let mut s = session.lock().await;
+                if let Some(selection) = s
+                    .mouse_selection
+                    .as_mut()
+                    .filter(|selection| selection.pane_id == pane_id)
+                {
+                    selection.state.cursor = pos;
+                    Some(selection.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(selection) = selection {
+                let moved = selection
+                    .state
+                    .anchor
+                    .is_some_and(|anchor| anchor != selection.state.cursor);
+                if moved {
+                    let copied =
+                        yank_selection(selection.pane_id, &selection.state, rect, io_state, out_tx)
+                            .await;
+                    if copied {
+                        let mut s = session.lock().await;
+                        s.last_action =
+                            Some(("copied selection".into(), std::time::Instant::now()));
+                    }
+                } else {
+                    let mut s = session.lock().await;
+                    s.mouse_selection = None;
+                    s.copy_menu = None;
+                }
+            }
+            *drag = SelectionDrag::None;
+            Ok(true)
+        }
+        (MouseKind::Down, ProtoMouseButton::Right) => {
+            let Some(selection) = attached.mouse_selection.as_ref() else {
+                return Ok(false);
+            };
+            let Some(rect) = pane_rect_for(graph, &attached, client_size, selection.pane_id).await
+            else {
+                session.lock().await.mouse_selection = None;
+                return Ok(true);
+            };
+            if selection_contains_screen_point(&selection.state, rect, col, row) {
+                let mut s = session.lock().await;
+                s.copy_menu = Some(CopyContextMenu {
+                    pane_id: selection.pane_id,
+                    col,
+                    row,
+                });
+            } else {
+                let mut s = session.lock().await;
+                s.mouse_selection = None;
+                s.copy_menu = None;
+            }
+            *drag = SelectionDrag::None;
+            Ok(true)
+        }
+        (MouseKind::Up, _) => {
+            if matches!(*drag, SelectionDrag::MouseSelection { .. }) {
+                *drag = SelectionDrag::None;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_copy_mode_mouse(
     kind: MouseKind,
     button: ProtoMouseButton,
@@ -1384,16 +1714,18 @@ async fn handle_copy_mode_mouse(
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
     out_tx: &mpsc::Sender<AttachServerFrame>,
-    dragging: &mut bool,
+    dragging: &mut SelectionDrag,
 ) -> anyhow::Result<bool> {
     let attached = session.lock().await.clone();
     if attached.copy_mode.is_none() {
-        *dragging = false;
+        if matches!(*dragging, SelectionDrag::CopyMode) {
+            *dragging = SelectionDrag::None;
+        }
         return Ok(false);
     }
 
     let Some(rect) = focused_pane_rect(graph, &attached, client_size).await else {
-        *dragging = false;
+        *dragging = SelectionDrag::None;
         return Ok(true);
     };
 
@@ -1415,14 +1747,14 @@ async fn handle_copy_mode_mouse(
                     shux_ui::copy_mode::scroll_down(cm, 3, total_lines, rect.height);
                 }
             }
-            *dragging = false;
+            *dragging = SelectionDrag::None;
         }
         MouseKind::Down => {
             if button != ProtoMouseButton::Left {
                 return Ok(true);
             }
             if !point_in_rect(rect, col, row) {
-                *dragging = false;
+                *dragging = SelectionDrag::None;
                 return Ok(true);
             }
             let pos = pane_local_point_clamped(rect, col, row);
@@ -1431,9 +1763,9 @@ async fn handle_copy_mode_mouse(
                 cm.cursor = pos;
                 cm.anchor = Some(pos);
             }
-            *dragging = true;
+            *dragging = SelectionDrag::CopyMode;
         }
-        MouseKind::Drag if *dragging => {
+        MouseKind::Drag if matches!(*dragging, SelectionDrag::CopyMode) => {
             if button != ProtoMouseButton::Left {
                 return Ok(true);
             }
@@ -1443,7 +1775,7 @@ async fn handle_copy_mode_mouse(
                 cm.cursor = pos;
             }
         }
-        MouseKind::Up if *dragging => {
+        MouseKind::Up if matches!(*dragging, SelectionDrag::CopyMode) => {
             if button != ProtoMouseButton::Left {
                 return Ok(true);
             }
@@ -1489,10 +1821,10 @@ async fn handle_copy_mode_mouse(
                     }
                 }
             }
-            *dragging = false;
+            *dragging = SelectionDrag::None;
         }
         MouseKind::Up => {
-            *dragging = false;
+            *dragging = SelectionDrag::None;
         }
         _ => {}
     }
@@ -1652,19 +1984,98 @@ async fn focused_pane_rect(
     attached: &AttachedSession,
     client_size: &ClientSize,
 ) -> Option<Rect> {
+    pane_rect_for(graph, attached, client_size, attached.active_pane_id).await
+}
+
+async fn pane_rect_for(
+    graph: &GraphHandle,
+    attached: &AttachedSession,
+    client_size: &ClientSize,
+    pane_id: PaneId,
+) -> Option<Rect> {
     let content = current_content_rect(client_size).await;
     let viewport = current_viewport(client_size).await;
     let snap = graph.snapshot();
     let win = snap.windows.get(&attached.active_window_id)?;
     if win.layout.is_zoomed() {
-        return Some(content);
+        if pane_id == attached.active_pane_id {
+            return Some(content);
+        }
+        return None;
     }
     for (pid, rect) in win.layout.compute_rects(viewport) {
-        if pid == attached.active_pane_id {
+        if pid == pane_id {
             return Some(rect);
         }
     }
     None
+}
+
+async fn yank_selection(
+    pane_id: PaneId,
+    selection: &shux_ui::CopyModeState,
+    rect: Rect,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    out_tx: &mpsc::Sender<AttachServerFrame>,
+) -> bool {
+    let text = {
+        let state = io_state.lock().await;
+        state
+            .vts
+            .get(&pane_id)
+            .map(|vt| shux_ui::copy_mode::extract_selection(vt, selection, rect.width, rect.height))
+            .unwrap_or_default()
+    };
+    if text.is_empty() {
+        return false;
+    }
+    let osc = shux_ui::osc52_copy(&text);
+    let frame = AttachServerFrame::Render {
+        data: BASE64.encode(&osc),
+    };
+    out_tx.send(frame).await.is_ok()
+}
+
+fn selection_contains_screen_point(
+    state: &shux_ui::CopyModeState,
+    rect: Rect,
+    col: u16,
+    row: u16,
+) -> bool {
+    if !point_in_rect(rect, col, row) {
+        return false;
+    }
+    let Some(anchor) = state.anchor else {
+        return false;
+    };
+    let point = pane_local_point_clamped(rect, col, row);
+    selection_contains_local_point(anchor, state.cursor, point, rect.width)
+}
+
+fn selection_contains_local_point(
+    anchor: (u16, u16),
+    cursor: (u16, u16),
+    point: (u16, u16),
+    pane_width: u16,
+) -> bool {
+    let (start, end) = if anchor.1 < cursor.1 || (anchor.1 == cursor.1 && anchor.0 <= cursor.0) {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    };
+    if point.1 < start.1 || point.1 > end.1 {
+        return false;
+    }
+    if start.1 == end.1 {
+        return point.0 >= start.0 && point.0 <= end.0;
+    }
+    if point.1 == start.1 {
+        return point.0 >= start.0 && point.0 < pane_width;
+    }
+    if point.1 == end.1 {
+        return point.0 <= end.0;
+    }
+    true
 }
 
 async fn current_content_rect(client_size: &ClientSize) -> Rect {
@@ -2178,6 +2589,7 @@ mod tests {
         let mut state = shux_ui::CopyModeState::new();
         state.cursor = cursor;
         CopyOverlayStamp {
+            kind: CopyOverlayKind::Modal,
             pane_id: PaneId::new(),
             rect: Rect::new(1, 1, 80, 23),
             state,
@@ -2234,6 +2646,29 @@ mod tests {
     fn pane_local_point_handles_empty_rect_without_underflow() {
         let rect = Rect::new(4, 5, 0, 0);
         assert_eq!(pane_local_point_clamped(rect, 10, 10), (0, 0));
+    }
+
+    #[test]
+    fn selection_hit_test_handles_multiline_ranges() {
+        let anchor = (3, 1);
+        let cursor = (6, 3);
+        assert!(selection_contains_local_point(anchor, cursor, (3, 1), 10));
+        assert!(selection_contains_local_point(anchor, cursor, (9, 2), 10));
+        assert!(selection_contains_local_point(anchor, cursor, (6, 3), 10));
+        assert!(!selection_contains_local_point(anchor, cursor, (2, 1), 10));
+        assert!(!selection_contains_local_point(anchor, cursor, (7, 3), 10));
+        assert!(!selection_contains_local_point(anchor, cursor, (0, 4), 10));
+    }
+
+    #[test]
+    fn selection_hit_test_handles_reverse_drag() {
+        let anchor = (6, 3);
+        let cursor = (3, 1);
+        assert!(selection_contains_local_point(anchor, cursor, (4, 1), 10));
+        assert!(selection_contains_local_point(anchor, cursor, (1, 2), 10));
+        assert!(selection_contains_local_point(anchor, cursor, (6, 3), 10));
+        assert!(!selection_contains_local_point(anchor, cursor, (2, 1), 10));
+        assert!(!selection_contains_local_point(anchor, cursor, (7, 3), 10));
     }
 
     #[tokio::test]

@@ -771,6 +771,31 @@ pub fn render_copy_overlay_with_vt_into(
     render_copy_overlay_inner(buf, pane, Some(vt), state, theme);
 }
 
+/// Draw only the selected text, without the copy-mode cursor or status hint.
+///
+/// This is used by the human mouse-selection path: a selected range can remain
+/// visible while normal pane input keeps flowing to the PTY.
+pub fn render_selection_overlay_with_vt_into(
+    buf: &mut Vec<u8>,
+    pane: Rect,
+    vt: &VirtualTerminal,
+    state: &CopyModeState,
+    theme: &Theme,
+) {
+    render_selection_overlay_inner(buf, pane, Some(vt), state, theme);
+}
+
+/// Variant of [`render_selection_overlay_with_vt_into`] used when the VT has
+/// disappeared between frames.
+pub fn render_selection_overlay_into(
+    buf: &mut Vec<u8>,
+    pane: Rect,
+    state: &CopyModeState,
+    theme: &Theme,
+) {
+    render_selection_overlay_inner(buf, pane, None, state, theme);
+}
+
 fn render_copy_overlay_inner(
     buf: &mut Vec<u8>,
     pane: Rect,
@@ -782,47 +807,7 @@ fn render_copy_overlay_inner(
         return;
     }
 
-    // Selection highlight, if any.
-    if let Some(anchor) = state.anchor {
-        let (start, end) = order_endpoints(anchor, state.cursor);
-        for row in start.1..=end.1 {
-            if row >= pane.height {
-                break;
-            }
-            let (col_lo, col_hi) = if start.1 == end.1 {
-                if state.cursor.0 <= anchor.0 {
-                    (state.cursor.0, anchor.0)
-                } else {
-                    (anchor.0, state.cursor.0)
-                }
-            } else if row == start.1 {
-                (start.0, pane.width.saturating_sub(1))
-            } else if row == end.1 {
-                (0, end.0)
-            } else {
-                (0, pane.width.saturating_sub(1))
-            };
-            if let Some(vt) = vt {
-                let ctx = SelectionRenderCtx {
-                    pane,
-                    vt,
-                    state,
-                    theme,
-                };
-                selection_text_run(buf, ctx, col_lo, col_hi, row);
-            } else {
-                highlight_run(
-                    buf,
-                    pane,
-                    col_lo,
-                    col_hi,
-                    row,
-                    theme.status_bg,
-                    theme.status_accent,
-                );
-            }
-        }
-    }
+    render_selection_overlay_inner(buf, pane, vt, state, theme);
 
     // Cursor block — high-contrast inversion of the selection
     // palette so it stays visible whether or not it sits inside a
@@ -871,6 +856,118 @@ fn render_copy_overlay_inner(
         truncated,
         " ".repeat(pad),
     );
+}
+
+fn render_selection_overlay_inner(
+    buf: &mut Vec<u8>,
+    pane: Rect,
+    vt: Option<&VirtualTerminal>,
+    state: &CopyModeState,
+    theme: &Theme,
+) {
+    if pane.width < 1 || pane.height < 1 {
+        return;
+    }
+
+    if let Some(anchor) = state.anchor {
+        let (start, end) = order_endpoints(anchor, state.cursor);
+        for row in start.1..=end.1 {
+            if row >= pane.height {
+                break;
+            }
+            let (col_lo, col_hi) = if start.1 == end.1 {
+                if state.cursor.0 <= anchor.0 {
+                    (state.cursor.0, anchor.0)
+                } else {
+                    (anchor.0, state.cursor.0)
+                }
+            } else if row == start.1 {
+                (start.0, pane.width.saturating_sub(1))
+            } else if row == end.1 {
+                (0, end.0)
+            } else {
+                (0, pane.width.saturating_sub(1))
+            };
+            if let Some(vt) = vt {
+                let ctx = SelectionRenderCtx {
+                    pane,
+                    vt,
+                    state,
+                    theme,
+                };
+                selection_text_run(buf, ctx, col_lo, col_hi, row);
+            } else {
+                highlight_run(
+                    buf,
+                    pane,
+                    col_lo,
+                    col_hi,
+                    row,
+                    theme.status_bg,
+                    theme.status_accent,
+                );
+            }
+        }
+    }
+}
+
+/// Action chosen from the inline copy context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyMenuAction {
+    Copy,
+    Clear,
+}
+
+pub const COPY_MENU_WIDTH: u16 = 10;
+pub const COPY_MENU_HEIGHT: u16 = 2;
+
+pub fn copy_menu_origin(col: u16, row: u16, screen_cols: u16, screen_rows: u16) -> (u16, u16) {
+    let max_col = screen_cols.saturating_sub(COPY_MENU_WIDTH);
+    let max_row = screen_rows.saturating_sub(COPY_MENU_HEIGHT);
+    (col.min(max_col), row.min(max_row))
+}
+
+pub fn copy_menu_action_at(
+    menu_col: u16,
+    menu_row: u16,
+    click_col: u16,
+    click_row: u16,
+) -> Option<CopyMenuAction> {
+    if click_col < menu_col || click_col >= menu_col.saturating_add(COPY_MENU_WIDTH) {
+        return None;
+    }
+    match click_row.checked_sub(menu_row)? {
+        0 => Some(CopyMenuAction::Copy),
+        1 => Some(CopyMenuAction::Clear),
+        _ => None,
+    }
+}
+
+pub fn render_copy_menu_into(
+    buf: &mut Vec<u8>,
+    col: u16,
+    row: u16,
+    screen_cols: u16,
+    screen_rows: u16,
+    theme: &Theme,
+) {
+    if screen_cols == 0 || screen_rows == 0 {
+        return;
+    }
+    let (x, y) = copy_menu_origin(col, row, screen_cols, screen_rows);
+    let rows = [(" Copy", theme.status_accent), (" Clear", theme.status_bg)];
+    for (idx, (label, bg)) in rows.into_iter().enumerate() {
+        let text = format!("{label:<width$}", width = COPY_MENU_WIDTH as usize);
+        let _ = write!(
+            buf,
+            "\x1b[{};{}H{}{}{}\x1b[0m",
+            y + idx as u16 + 1,
+            x + 1,
+            sgr_bg(bg),
+            sgr_fg(theme.status_fg),
+            text,
+        );
+    }
 }
 
 struct SelectionRenderCtx<'a> {
@@ -1284,6 +1381,43 @@ mod tests {
             rendered.contains("\x1b[38;2;30;32;48m"),
             "selection should use dark foreground on accent background"
         );
+    }
+
+    #[test]
+    fn render_selection_overlay_omits_modal_cursor_and_hint() {
+        let vt = vt_with(3, 20, "abcdef");
+        let pane = Rect::new(0, 0, 20, 3);
+        let state = CopyModeState {
+            cursor: (2, 0),
+            anchor: Some((0, 0)),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_selection_overlay_with_vt_into(&mut buf, pane, &vt, &state, &Theme::DEFAULT);
+        let rendered = String::from_utf8_lossy(&buf);
+        let plain = strip_ansi(&rendered);
+        assert!(plain.contains("abc"));
+        assert!(!plain.contains("COPY"));
+    }
+
+    #[test]
+    fn copy_menu_origin_stays_on_screen() {
+        assert_eq!(copy_menu_origin(95, 23, 100, 24), (90, 22));
+        assert_eq!(copy_menu_origin(4, 5, 100, 24), (4, 5));
+    }
+
+    #[test]
+    fn copy_menu_action_maps_rows() {
+        assert_eq!(
+            copy_menu_action_at(10, 5, 12, 5),
+            Some(CopyMenuAction::Copy)
+        );
+        assert_eq!(
+            copy_menu_action_at(10, 5, 12, 6),
+            Some(CopyMenuAction::Clear)
+        );
+        assert_eq!(copy_menu_action_at(10, 5, 9, 5), None);
+        assert_eq!(copy_menu_action_at(10, 5, 12, 7), None);
     }
 
     #[test]
