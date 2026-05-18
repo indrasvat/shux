@@ -28,6 +28,10 @@ impl Row {
         self.cells.is_empty()
     }
 
+    pub fn get(&self, col: usize) -> Option<&Cell> {
+        self.cells.get(col)
+    }
+
     /// Resize the row, filling new cells with the given template.
     pub fn resize(&mut self, cols: usize, template: Cell) {
         self.cells.resize(cols, template);
@@ -172,6 +176,15 @@ impl Grid {
         } else {
             None
         }
+    }
+
+    /// Access a row by absolute line index across `scrollback + visible`.
+    ///
+    /// Index 0 is the oldest retained scrollback row. The last index is
+    /// the bottom visible row. Copy mode uses this to build a historical
+    /// viewport without cloning the whole grid.
+    pub fn row(&self, row: usize) -> Option<&Row> {
+        self.raw.get(row)
     }
 
     /// Scroll the visible area up by one line within a scroll region.

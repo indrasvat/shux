@@ -608,9 +608,20 @@ async fn run_attach_loop(
                                 )
                                 .await;
                                 let action = {
+                                    let state = io_state.lock().await;
+                                    let vt = state.vts.get(&active_pane);
+                                    let total_lines =
+                                        vt.map(|vt| vt.grid().total_lines()).unwrap_or(rows as usize);
                                     let mut s = render_session.lock().await;
                                     if let Some(ref mut cm) = s.copy_mode {
-                                        shux_ui::copy_mode_key(&bytes, cm, cols, rows)
+                                        shux_ui::copy_mode_key_with_vt(
+                                            &bytes,
+                                            cm,
+                                            cols,
+                                            rows,
+                                            total_lines,
+                                            vt,
+                                        )
                                     } else {
                                         shux_ui::CopyKey::Ignored
                                     }
@@ -1086,6 +1097,11 @@ async fn run_render_loop(
                     .map(|(_, rect)| rect)
             };
             if let Some(rect) = pane_rect {
+                if cm.scroll_offset > 0 {
+                    if let Some(vt) = state.vts.get(&attached.active_pane_id) {
+                        shux_ui::render_copy_view_into(compositor.inner_mut(), rect, vt, cm);
+                    }
+                }
                 shux_ui::render_copy_overlay_into(compositor.inner_mut(), rect, cm, &live_theme);
             }
         }
@@ -1324,17 +1340,35 @@ async fn handle_copy_mode_mouse(
         return Ok(false);
     }
 
-    if button != ProtoMouseButton::Left {
-        return Ok(true);
-    }
-
     let Some(rect) = focused_pane_rect(graph, &attached, client_size).await else {
         *dragging = false;
         return Ok(true);
     };
 
     match kind {
+        MouseKind::ScrollUp | MouseKind::ScrollDown => {
+            let total_lines = {
+                let state = io_state.lock().await;
+                state
+                    .vts
+                    .get(&attached.active_pane_id)
+                    .map(|vt| vt.grid().total_lines())
+                    .unwrap_or(rect.height as usize)
+            };
+            let mut s = session.lock().await;
+            if let Some(ref mut cm) = s.copy_mode {
+                if matches!(kind, MouseKind::ScrollUp) {
+                    shux_ui::copy_mode::scroll_up(cm, 3, total_lines, rect.height);
+                } else {
+                    shux_ui::copy_mode::scroll_down(cm, 3, total_lines, rect.height);
+                }
+            }
+            *dragging = false;
+        }
         MouseKind::Down => {
+            if button != ProtoMouseButton::Left {
+                return Ok(true);
+            }
             if !point_in_rect(rect, col, row) {
                 *dragging = false;
                 return Ok(true);
@@ -1348,6 +1382,9 @@ async fn handle_copy_mode_mouse(
             *dragging = true;
         }
         MouseKind::Drag if *dragging => {
+            if button != ProtoMouseButton::Left {
+                return Ok(true);
+            }
             let pos = pane_local_point_clamped(rect, col, row);
             let mut s = session.lock().await;
             if let Some(ref mut cm) = s.copy_mode {
@@ -1355,6 +1392,9 @@ async fn handle_copy_mode_mouse(
             }
         }
         MouseKind::Up if *dragging => {
+            if button != ProtoMouseButton::Left {
+                return Ok(true);
+            }
             let pos = pane_local_point_clamped(rect, col, row);
             let cm = {
                 let mut s = session.lock().await;

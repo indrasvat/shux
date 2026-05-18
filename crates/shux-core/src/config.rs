@@ -44,6 +44,8 @@ pub struct Config {
     #[serde(default)]
     pub keys: KeysConfig,
     #[serde(default)]
+    pub keybindings: std::collections::HashMap<String, String>,
+    #[serde(default)]
     pub shell: ShellConfig,
     #[serde(default)]
     pub statusbar: StatusBarConfig,

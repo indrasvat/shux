@@ -35,6 +35,7 @@ use shux_rpc::attach::{
 use shux_rpc::create_codec;
 
 use crate::client::{ClientConfig, ExitReason, encode_key_event};
+use crate::keybinding::{BindingTarget, KeybindingRegistry};
 use crate::terminal::{self, TerminalGuard};
 
 /// Public entry point: connect to the daemon's attach socket, do the
@@ -108,6 +109,8 @@ where
     // One-shot — no need to spam the wire on every prefix-arm.
     let mut prefix_announced = false;
     let mut last_size = TerminalGuard::size().unwrap_or((80, 24));
+    let bindings = KeybindingRegistry::with_overrides(&config.prefix, &config.keybindings)
+        .map_err(|e| anyhow::anyhow!("invalid keybinding config: {e:?}"))?;
 
     // Spawn input reader: poll crossterm events on a blocking thread,
     // forward via channel.
@@ -128,8 +131,6 @@ where
             }
         }
     });
-
-    let prefix_key = config.prefix_key;
 
     loop {
         tokio::select! {
@@ -188,9 +189,7 @@ where
                             // Prefix-prefix: send the literal prefix key
                             // (e.g. Ctrl+Space → NUL byte) to the PTY so
                             // nested shells / vim / emacs can receive it.
-                            if key.code == prefix_key.code
-                                && key.modifiers == prefix_key.modifiers
-                            {
+                            if bindings.is_prefix_key(key) {
                                 let bytes = encode_key_event(key);
                                 if !bytes.is_empty() {
                                     let frame = AttachClientFrame::Input {
@@ -201,29 +200,15 @@ where
                                 }
                                 continue;
                             }
-                            if let Some(action) = key_to_prefix_action(key) {
-                                let frame = AttachClientFrame::Action {
-                                    kind: action,
-                                    args: ActionArgs::default(),
-                                };
-                                let bytes = serde_json::to_vec(&frame)?;
-                                sink.send(Bytes::from(bytes)).await.ok();
-                                continue;
-                            } else if matches!(key.code, KeyCode::Char('d'))
-                                && key.modifiers == KeyModifiers::NONE
-                            {
-                                let frame = AttachClientFrame::Detach;
-                                let bytes = serde_json::to_vec(&frame)?;
-                                sink.send(Bytes::from(bytes)).await.ok();
+                            if let Some(target) = bindings.resolve_prefix(key) {
+                                send_binding_target(&mut sink, target).await?;
                                 continue;
                             }
                             // Unbound prefix-key: fall through and forward
                             // as a normal PTY input so the user doesn't
                             // lose the keystroke. (e.g. Prefix → Ctrl+C
                             // sends Ctrl+C to the running process.)
-                        } else if key.code == prefix_key.code
-                            && key.modifiers == prefix_key.modifiers
-                        {
+                        } else if bindings.is_prefix_key(key) {
                             // First tap of the prefix: arm and consume.
                             // Tell the daemon the first time we arm so
                             // the OOTB onboarding hint dismisses even
@@ -242,10 +227,8 @@ where
                             continue;
                         }
                         // Bare-key Tier-1 actions (Alt+key etc.).
-                        if let Some((kind, args)) = key_to_bare_action(key) {
-                            let frame = AttachClientFrame::Action { kind, args };
-                            let bytes = serde_json::to_vec(&frame)?;
-                            sink.send(Bytes::from(bytes)).await.ok();
+                        if let Some(target) = bindings.resolve_root(key) {
+                            send_binding_target(&mut sink, target).await?;
                             continue;
                         }
                         // Otherwise forward as PTY input bytes.
@@ -309,6 +292,25 @@ where
     }
 }
 
+async fn send_binding_target<SinkT>(sink: &mut SinkT, target: &BindingTarget) -> Result<()>
+where
+    SinkT: futures::Sink<Bytes> + Unpin,
+    SinkT::Error: std::fmt::Display,
+{
+    let frame = match target {
+        BindingTarget::Action(kind, args) => AttachClientFrame::Action {
+            kind: *kind,
+            args: args.clone(),
+        },
+        BindingTarget::Detach => AttachClientFrame::Detach,
+    };
+    let bytes = serde_json::to_vec(&frame)?;
+    sink.send(Bytes::from(bytes))
+        .await
+        .map_err(|e| anyhow::anyhow!("send binding frame: {e}"))?;
+    Ok(())
+}
+
 fn ct_button(b: CtMouseButton) -> MouseButton {
     match b {
         CtMouseButton::Left => MouseButton::Left,
@@ -322,6 +324,7 @@ fn ct_button(b: CtMouseButton) -> MouseButton {
 /// Only fires for unmodified keys. Prefix + Ctrl+C must NOT trigger
 /// `c → NewWindow` — the user is trying to send a literal SIGINT to
 /// whatever was running before they hit prefix.
+#[allow(dead_code)]
 fn key_to_prefix_action(key: KeyEvent) -> Option<ActionKind> {
     if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
         return None;
@@ -365,6 +368,7 @@ fn key_to_prefix_action(key: KeyEvent) -> Option<ActionKind> {
 /// - Alt+1..9: switch directly to the Nth window (1-indexed)
 ///
 /// Closes the gap that demoted task 018 to Partial.
+#[allow(dead_code)]
 fn key_to_bare_action(key: KeyEvent) -> Option<(ActionKind, ActionArgs)> {
     if !key.modifiers.contains(KeyModifiers::ALT) {
         return None;
