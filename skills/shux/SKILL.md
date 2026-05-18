@@ -27,7 +27,12 @@ Pick shux instead of the alternatives when **any** of these apply:
 - You're doing visual regression on a TUI you built (Bubbletea, Charm, ratatui, anything).
 - You want declarative workspace templates that apply atomically.
 
-If you're a human at a keyboard and tmux works for you, keep using tmux. shux exists for the cases tmux's contract doesn't reach.
+If you're a human at a keyboard and tmux works for you, keep using tmux.
+When a human does attach to shux, the normal interactions should still feel
+modern: click panes to focus, drag borders to resize, drag visible text to copy
+via OSC 52, and right-click a visible selection for the inline Copy / Clear
+menu. Reserve prefix copy mode for scrollback, search, and keyboard-only
+selection.
 
 ## Where shux artifacts live: `.shux/`
 

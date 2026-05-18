@@ -31,7 +31,7 @@
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
-830 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, scrollback-backed copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments, session save/restore).
+835 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, scrollback-backed copy mode, direct mouse selection/copy, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments, session save/restore).
 
 ## Status
 
@@ -87,6 +87,25 @@
 ---
 
 ## Session Log
+
+**2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
+- Normal-mode mouse selection is now a first-class attach-layer state,
+  separate from modal copy mode. Left-dragging visible pane text selects
+  it, release copies it through OSC 52, and the highlighted selection
+  stays visible without trapping keyboard input.
+- Right-clicking an active selection opens a small inline `Copy` /
+  `Clear` menu near the pointer. Typing into the pane clears the
+  selection and resumes normal PTY input.
+- Copy-mode remains the advanced path for scrollback, search, and
+  keyboard-only workflows. The help overlay, README, user guide, website,
+  and repo skill now document the mouse-first path so ordinary copy does
+  not require prefix-mode knowledge.
+- Dogfood automation injects real SGR mouse sequences through a live
+  attach session, verifies high-contrast selection bytes, confirms the
+  inline menu text, detects OSC 52 output, and keeps the idle repaint
+  guard at `0` bytes.
+- Verification: `make dogfood-human-copy`, `make ci`, and pre-push
+  checks (deny, progress-check, 835 tests, doctests).
 
 **2026-05-18 — fix(copy): make selection legible and stop idle cursor churn**
 - User dogfood findings on the human-interactive branch: copy-mode
