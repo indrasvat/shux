@@ -69,8 +69,12 @@ pub struct ClientConfig {
     pub socket_path: String,
     /// Session name to attach to.
     pub session_name: String,
+    /// Prefix key notation from `[keys].prefix`.
+    pub prefix: String,
     /// Prefix key for keybindings (default: Ctrl+Space).
     pub prefix_key: KeyEvent,
+    /// User keybinding overrides from `[keybindings]`.
+    pub keybindings: std::collections::HashMap<String, String>,
 }
 
 impl Default for ClientConfig {
@@ -78,7 +82,9 @@ impl Default for ClientConfig {
         Self {
             socket_path: String::new(),
             session_name: String::from("default"),
+            prefix: "ctrl-space".to_string(),
             prefix_key: KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
+            keybindings: std::collections::HashMap::new(),
         }
     }
 }

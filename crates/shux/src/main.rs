@@ -15,6 +15,7 @@ mod config_validate;
 mod daemon;
 mod onboarding;
 mod session_meta;
+mod session_persist;
 mod statusbar_build;
 mod statusbar_runner;
 mod style;
@@ -2645,6 +2646,7 @@ fn register_session_methods(
     let g3 = graph.clone();
     let g4 = graph.clone();
     let g5 = graph.clone();
+    let g6 = graph.clone();
 
     let io_create = io_state.clone();
     let io_kill = io_state.clone();
@@ -2985,6 +2987,32 @@ fn register_session_methods(
                         }
                         Err(e) => Err(graph_error_to_rpc(e)),
                     }
+                }
+            },
+        )
+        .register_with_policy(
+            "session.export_template",
+            Policy::fixed(Sensitivity::Public),
+            move |params: Option<serde_json::Value>| {
+                let gh = g6.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let snap = gh.snapshot();
+                    let session_id = if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
+                        id.parse::<shux_core::model::SessionId>()
+                            .map_err(|_| shux_rpc::RpcError::invalid_params("invalid session id"))?
+                    } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                        snap.find_session_by_name(name)
+                            .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?
+                            .id
+                    } else {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "missing 'name' or 'id' parameter",
+                        ));
+                    };
+                    let template = session_persist::export_session_template(&snap, session_id)
+                        .map_err(|e| shux_rpc::RpcError::internal(&format!("{e}")))?;
+                    Ok(serde_json::json!({ "template": template }))
                 }
             },
         )
@@ -3824,13 +3852,18 @@ fn default_session_name() -> String {
 /// terminal on every exit path via `TerminalGuard`'s Drop.
 async fn run_attach(_jsonrpc_socket: &std::path::Path, session_name: String) -> anyhow::Result<()> {
     let attach_path = daemon::attach_socket_path()?;
+    let cfg_snapshot =
+        shux_core::config::ConfigHandle::load_or_default(&shux_core::config::default_config_path())
+            .current();
     let cfg = shux_ui::ClientConfig {
         socket_path: attach_path.to_string_lossy().to_string(),
         session_name: session_name.clone(),
+        prefix: cfg_snapshot.keys.prefix.clone(),
         prefix_key: crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(' '),
             crossterm::event::KeyModifiers::CONTROL,
         ),
+        keybindings: cfg_snapshot.keybindings.clone(),
     };
     match shux_ui::attach::run_attach(&attach_path, cfg).await {
         Ok(reason) => {
@@ -3997,6 +4030,24 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     args.format,
                 )
                 .await
+            }
+            cli::SessionCommand::Save { session, output } => {
+                let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+                cli::handle_session_save(&mut stream, &session, output).await
+            }
+            cli::SessionCommand::Restore {
+                template,
+                dry_run,
+                watch,
+            } => {
+                let ops = template::load_and_lower(&template)?;
+                if dry_run {
+                    println!("{}", serde_json::to_string_pretty(&ops)?);
+                    Ok(())
+                } else {
+                    let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+                    cli::handle_apply(&mut stream, ops, watch, &socket_path).await
+                }
             }
         },
 

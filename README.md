@@ -91,6 +91,11 @@ Inside the TUI, the prefix key is `Ctrl+Space` by default:
 | `Ctrl+Space d` | detach |
 | click any pane | focus it |
 | drag a border | resize |
+| drag pane text | select visible text and copy on release |
+| right-click selected text | open inline Copy / Clear menu |
+
+For scrollback or keyboard-driven selection, use `Ctrl+Space [` to enter copy
+mode. Normal visible text copy is mouse-first: drag text, release, paste.
 
 ## Extend shux with a process plugin
 

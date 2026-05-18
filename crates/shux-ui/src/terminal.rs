@@ -6,10 +6,10 @@
 use std::io;
 
 use crossterm::{
-    cursor,
+    Command, cursor,
     event::{
-        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -46,8 +46,12 @@ impl TerminalGuard {
         execute!(io::stdout(), EnterAlternateScreen)?;
         guard.alternate_screen = true;
 
-        // Enable mouse capture for click-to-focus (can be toggled later)
-        execute!(io::stdout(), EnableMouseCapture)?;
+        // Enable only the mouse modes shux consumes: press/release,
+        // button-drag, and SGR coordinates. Crossterm's
+        // EnableMouseCapture also enables ?1003 any-motion tracking,
+        // which shux does not use and which makes native
+        // modifier-drag selection less reliable in common terminals.
+        execute!(io::stdout(), EnableButtonMouseCapture)?;
         guard.mouse_capture = true;
 
         // Try to enable Kitty keyboard protocol for improved key detection.
@@ -98,6 +102,39 @@ impl TerminalGuard {
     /// Query the current terminal size.
     pub fn size() -> io::Result<(u16, u16)> {
         terminal::size()
+    }
+}
+
+/// Mouse capture profile used by shux attach.
+///
+/// Crossterm's `EnableMouseCapture` intentionally turns on every
+/// common xterm mouse mode, including `?1003h` any-motion. shux only
+/// needs button press/release and button-held drags for pane focus and
+/// border resize, so avoid any-motion to keep host-terminal selection
+/// escape hatches (Shift/Option drag, depending on terminal) working
+/// where the terminal supports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableButtonMouseCapture;
+
+impl Command for EnableButtonMouseCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(concat!(
+            "\x1b[?1000h", // normal tracking: button press/release
+            "\x1b[?1002h", // button-event tracking: drag while pressed
+            "\x1b[?1006h", // SGR coordinates for large terminals
+        ))
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        // Match crossterm's Windows fallback; the ANSI profile above
+        // only applies on terminals that understand xterm modes.
+        crossterm::event::EnableMouseCapture.execute_winapi()
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
     }
 }
 
@@ -161,5 +198,18 @@ mod tests {
         // This test may fail in CI without a real terminal, so we just
         // check it does not panic.
         let _ = TerminalGuard::size();
+    }
+
+    #[test]
+    fn button_mouse_capture_does_not_enable_any_motion() {
+        let mut ansi = String::new();
+        EnableButtonMouseCapture.write_ansi(&mut ansi).unwrap();
+        assert!(ansi.contains("\x1b[?1000h"));
+        assert!(ansi.contains("\x1b[?1002h"));
+        assert!(ansi.contains("\x1b[?1006h"));
+        assert!(
+            !ansi.contains("\x1b[?1003h"),
+            "shux should not enable any-motion tracking"
+        );
     }
 }

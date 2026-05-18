@@ -42,6 +42,8 @@ mod strict {
         #[serde(default)]
         pub keys: Keys,
         #[serde(default)]
+        pub keybindings: HashMap<String, String>,
+        #[serde(default)]
         pub shell: Shell,
         #[serde(default)]
         pub statusbar: StatusBar,
@@ -249,6 +251,17 @@ pub fn validate(path: &Path) -> std::io::Result<Vec<Diagnostic>> {
                     });
                 }
             }
+            let prefix = cfg.keys.prefix.as_deref().unwrap_or("ctrl-space");
+            if let Err(err) = shux_ui::KeybindingRegistry::with_overrides(prefix, &cfg.keybindings)
+            {
+                diags.push(Diagnostic {
+                    file: path.to_path_buf(),
+                    line: None,
+                    column: None,
+                    context: "keybindings".to_string(),
+                    message: format!("{err:?}"),
+                });
+            }
         }
         Err(err) => {
             let (line, col) = err
@@ -350,6 +363,38 @@ interval_ms = 2000
         );
         let diags = validate(f.path()).unwrap();
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn validate_accepts_keybinding_overrides() {
+        let f = write_tmp(
+            r#"
+[keys]
+prefix = "ctrl-a"
+
+[keybindings]
+"alt-left" = "focus-left"
+"prefix c" = "new-window"
+"ctrl-a [" = "copy-mode"
+"prefix d" = "detach"
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_keybinding_action() {
+        let f = write_tmp(
+            r#"
+[keybindings]
+"alt-x" = "launch-moon"
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].context, "keybindings");
+        assert!(diags[0].message.contains("UnknownAction"));
     }
 
     /// End-to-end regression: the exact bytes emitted by

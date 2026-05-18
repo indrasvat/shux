@@ -1,6 +1,6 @@
 # 031 — Keybinding Configuration and Conflict Detection
 
-**Status:** Pending
+**Status:** Partial
 **Depends On:** 019, 022
 **Parallelizable With:** 030
 

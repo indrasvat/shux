@@ -591,6 +591,28 @@ pub enum SessionCommand {
         #[arg(long, default_value_t = 36)]
         rows: u16,
     },
+
+    /// Save a live session as a reusable workspace template.
+    Save {
+        /// Session name.
+        #[arg(short, long)]
+        session: String,
+        /// Output TOML path. If omitted, TOML is printed to stdout.
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+
+    /// Restore a session from a saved workspace template.
+    Restore {
+        /// Saved TOML template path.
+        template: std::path::PathBuf,
+        /// Validate and print lowered ops without applying.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stream lifecycle events after restore.
+        #[arg(long)]
+        watch: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1617,6 +1639,14 @@ nerd_fonts = true
 # Prefix key (e.g. "ctrl-space", "ctrl-b", "alt-w")
 prefix = "ctrl-space"
 
+[keybindings]
+# Optional attach key overrides. Keys use the same notation as prefix:
+# "alt-h" targets the root table; "prefix h" targets the key pressed
+# after the configured prefix. Values are action names, for example:
+#   "alt-h" = "focus-left"
+#   "prefix c" = "new-window"
+#   "prefix [" = "copy-mode"
+
 # ─────────────────────────────────────────────────────────────────────
 # Theme: override the built-in Catppuccin Macchiato palette. Every key
 # is optional; missing keys fall through to the defaults so an empty
@@ -1989,6 +2019,32 @@ pub async fn handle_rename(
         }
     }
 
+    Ok(())
+}
+
+/// Handle the `shux session save` command.
+pub async fn handle_session_save(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    output: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let result = rpc_call(
+        stream,
+        "session.export_template",
+        serde_json::json!({ "name": session_name }),
+    )
+    .await?;
+    let template = result
+        .get("template")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("session.export_template returned no template"))?;
+
+    if let Some(path) = output {
+        std::fs::write(&path, template)?;
+        crate::style::print_success("saved", &path.display().to_string(), None);
+    } else {
+        print!("{template}");
+    }
     Ok(())
 }
 
@@ -4380,6 +4436,62 @@ mod tests {
                 assert!(session.is_none());
             }
             _ => panic!("expected session attach command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_session_save() {
+        let cli = Cli::try_parse_from([
+            "shux",
+            "session",
+            "save",
+            "-s",
+            "dev",
+            "-o",
+            ".shux/templates/dev.toml",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Session {
+                command: SessionCommand::Save { session, output },
+            }) => {
+                assert_eq!(session, "dev");
+                assert_eq!(
+                    output,
+                    Some(std::path::PathBuf::from(".shux/templates/dev.toml"))
+                );
+            }
+            _ => panic!("expected session save command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_session_restore_dry_run() {
+        let cli = Cli::try_parse_from([
+            "shux",
+            "session",
+            "restore",
+            ".shux/templates/dev.toml",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Session {
+                command:
+                    SessionCommand::Restore {
+                        template,
+                        dry_run,
+                        watch,
+                    },
+            }) => {
+                assert_eq!(
+                    template,
+                    std::path::PathBuf::from(".shux/templates/dev.toml")
+                );
+                assert!(dry_run);
+                assert!(!watch);
+            }
+            _ => panic!("expected session restore command"),
         }
     }
 

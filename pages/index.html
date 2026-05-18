@@ -191,6 +191,122 @@
 }
 .diff-bullets li.win .marker { color: var(--accent-ink); }
 
+/* ── Human interaction band ── */
+.human-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: var(--s-6);
+  align-items: center;
+}
+@media (max-width: 900px) { .human-grid { grid-template-columns: 1fr; } }
+.human-copy {
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  background: linear-gradient(180deg, #24252b 0%, #1f2026 100%);
+  overflow: hidden;
+  box-shadow: 0 34px 70px -48px rgba(0,0,0,0.65);
+}
+.human-copy .terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid rgba(236,228,210,0.10);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.human-copy .terminal-bar span:first-child { color: var(--moss); }
+.human-copy .terminal-body {
+  position: relative;
+  padding: 18px 20px 22px;
+  min-height: 222px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.65;
+  color: #f2eadb;
+}
+.human-copy .line { white-space: nowrap; }
+.human-copy .muted { color: #8e929e; }
+.human-copy .selection {
+  background: #7ec8f2;
+  color: #17202a;
+  font-weight: 700;
+  padding: 1px 0;
+}
+.copy-pop {
+  position: absolute;
+  right: 22px;
+  top: 82px;
+  width: 112px;
+  border: 1px solid rgba(236,228,210,0.18);
+  border-radius: var(--r-2);
+  overflow: hidden;
+  background: rgba(28,29,35,0.94);
+  box-shadow: 0 18px 40px -22px rgba(0,0,0,0.8);
+}
+.copy-pop div {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: #f7efe0;
+  border-top: 1px solid rgba(236,228,210,0.10);
+}
+.copy-pop div:first-child {
+  border-top: 0;
+  background: var(--accent);
+  color: #fff8ef;
+  font-weight: 700;
+}
+.copy-pop kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: inherit;
+  opacity: 0.72;
+}
+.human-steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--s-3);
+  margin-top: var(--s-5);
+}
+@media (max-width: 720px) { .human-steps { grid-template-columns: 1fr; } }
+@media (max-width: 720px) {
+  .human-copy .terminal-body {
+    padding: 16px 18px 20px;
+    font-size: 12px;
+    min-height: 0;
+  }
+  .human-copy .line {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .copy-pop {
+    position: static;
+    width: 100%;
+    margin-top: 14px;
+  }
+}
+.human-steps .step-card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  padding: var(--s-4);
+  background: var(--bg-2);
+}
+.human-steps .step-card b {
+  display: block;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+.human-steps .step-card p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
 /* ── Agent-first code panel ── */
 .code-panel {
   display: grid; gap: var(--s-5);
@@ -657,6 +773,7 @@
   <a class="nav-mark" href="/">shux<span class="ver" id="ver" data-dyn="version">v0.8</span></a>
   <div class="nav-links">
     <a href="#difference"><span class="lbl">why</span></a>
+    <a href="#humans"><span class="lbl">humans</span></a>
     <a href="#agents"><span class="lbl">agents</span></a>
     <a href="#replaces"><span class="lbl">replaces</span></a>
     <a href="#plugins"><span class="lbl">plugins</span></a>
@@ -744,6 +861,50 @@
           <li class="win"><span class="marker">▸</span><span>Atomic <code>state.apply</code> batches. Optimistic concurrency on every entity.</span></li>
           <li class="win"><span class="marker">▸</span><span>Sealed, sequenced event bus with a separate data plane for PTY chunks.</span></li>
         </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Human interaction ───────────────────────────── -->
+<section class="section" id="humans">
+  <div class="wrap human-grid">
+    <div>
+      <p class="eyebrow">human-first where it counts</p>
+      <h2 class="measure">Copying text should feel like a terminal, not a ceremony.</h2>
+      <p class="lede" style="margin-top:var(--s-3)">
+        shux keeps the tmux-style copy mode for scrollback and search, but
+        the everyday path is direct: drag visible text, release, paste.
+        Right-click the selection when you want an explicit action.
+      </p>
+      <div class="human-steps">
+        <div class="step-card">
+          <b>Drag text</b>
+          <p>Select pane output without entering a modal copy screen.</p>
+        </div>
+        <div class="step-card">
+          <b>Release to copy</b>
+          <p>OSC 52 writes the selected text to the clipboard.</p>
+        </div>
+        <div class="step-card">
+          <b>Right-click</b>
+          <p>Use the inline Copy / Clear menu when you want confirmation.</p>
+        </div>
+      </div>
+    </div>
+    <div class="human-copy" aria-label="Illustration of shux mouse selection and inline copy menu">
+      <div class="terminal-bar"><span>●</span><span>shux session attach review</span></div>
+      <div class="terminal-body">
+        <div class="line muted">$ cargo test --workspace</div>
+        <div class="line">running 835 tests across 15 binaries</div>
+        <div class="line">test copy_mode::mouse_selection <span class="selection">selects text and copies on release</span> ... ok</div>
+        <div class="line">test attach::idle_repaint_volume ... ok</div>
+        <div class="line muted">$ paste</div>
+        <div class="line">selects text and copies on release</div>
+        <div class="copy-pop" aria-hidden="true">
+          <div>Copy <kbd>OSC52</kbd></div>
+          <div>Clear <kbd>Esc</kbd></div>
+        </div>
       </div>
     </div>
   </div>

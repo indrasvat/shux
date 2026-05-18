@@ -119,6 +119,12 @@ impl PtyHandle {
             .args(args)
             .current_dir(&config.cwd)
             .env("TERM", "xterm-256color")
+            // Pane children run inside an interactive PTY. If shux itself is
+            // launched by an agent or wrapper with NO_COLOR=1, do not let that
+            // degraded parent environment disable color inside every pane.
+            // Explicit PtyConfig.env entries are applied below and can opt
+            // back into NO_COLOR for a specific command.
+            .env_remove("NO_COLOR")
             // Tell shells / prompts they're running inside shux, mirroring
             // tmux's TMUX env var. Users can guard config with
             // `[[ -n $SHUX ]] && ...` if they want shux-specific behavior.
@@ -126,6 +132,8 @@ impl PtyHandle {
             // Hint truecolor support so colorful prompts (starship,
             // powerline) pick 24-bit codes by default.
             .env("COLORTERM", "truecolor")
+            // Some BSD/macOS tools consult CLICOLOR even when TERM is good.
+            .env("CLICOLOR", "1")
             // Claim TERM_PROGRAM so the parent emulator's value (e.g.
             // "WarpTerminal", "iTerm.app", "Apple_Terminal") does NOT
             // leak into the spawned shell. User rc files commonly branch

@@ -111,6 +111,12 @@ pub struct RenderCompositor<W: Write> {
     last_stats: Option<RenderStats>,
     /// Set to true after resize or other events that require a full redraw.
     force_full_redraw: bool,
+    /// Best-known terminal cursor state after the previous render.
+    ///
+    /// `None` means hidden. The first render starts unknown, so the
+    /// compositor still emits an initial hide/show pair as needed.
+    terminal_cursor: Option<(u16, u16)>,
+    cursor_state_known: bool,
 }
 
 impl<W: Write> RenderCompositor<W> {
@@ -121,6 +127,8 @@ impl<W: Write> RenderCompositor<W> {
             config,
             last_stats: None,
             force_full_redraw: true, // First render is always full
+            terminal_cursor: None,
+            cursor_state_known: false,
         }
     }
 
@@ -129,6 +137,7 @@ impl<W: Write> RenderCompositor<W> {
     pub fn resize(&mut self, width: u16, height: u16) {
         self.buffer.resize(width, height);
         self.force_full_redraw = true;
+        self.cursor_state_known = false;
     }
 
     /// Get the usable area for the pane content (excluding borders and
@@ -208,18 +217,13 @@ impl<W: Write> RenderCompositor<W> {
         // --- Phase 3: Render ---
         let render_start = Instant::now();
 
-        self.backend.hide_cursor()?;
-        self.backend.render_diff(&dirty)?;
-
-        // Position cursor
-        if let Some((cx, cy)) = cursor_pos {
+        let target_cursor = cursor_pos.and_then(|(cx, cy)| {
             let screen_x = content_x + cx;
             let screen_y = content_y + cy;
-            if screen_x < self.buffer.width() && screen_y < self.buffer.height() {
-                self.backend.set_cursor(screen_x, screen_y)?;
-                self.backend.show_cursor()?;
-            }
-        }
+            (screen_x < self.buffer.width() && screen_y < self.buffer.height())
+                .then_some((screen_x, screen_y))
+        });
+        self.render_dirty_and_cursor(&dirty, target_cursor)?;
 
         let render_time = render_start.elapsed();
 
@@ -287,6 +291,40 @@ impl<W: Write> RenderCompositor<W> {
     /// child process writing directly to the terminal).
     pub fn force_redraw(&mut self) {
         self.force_full_redraw = true;
+    }
+
+    fn render_dirty_and_cursor(
+        &mut self,
+        dirty: &[crate::buffer::DirtyCell],
+        target_cursor: Option<(u16, u16)>,
+    ) -> io::Result<()> {
+        let cursor_unknown = !self.cursor_state_known;
+        let cursor_visible = self.terminal_cursor.is_some();
+        let must_hide = cursor_unknown
+            || (!dirty.is_empty() && cursor_visible)
+            || (target_cursor.is_none() && cursor_visible);
+
+        if must_hide {
+            self.backend.hide_cursor()?;
+            self.terminal_cursor = None;
+            self.cursor_state_known = true;
+        }
+
+        self.backend.render_diff(dirty)?;
+
+        if let Some((x, y)) = target_cursor {
+            if self.terminal_cursor != Some((x, y)) {
+                let was_hidden = self.terminal_cursor.is_none();
+                self.backend.set_cursor(x, y)?;
+                if was_hidden {
+                    self.backend.show_cursor()?;
+                }
+                self.terminal_cursor = Some((x, y));
+                self.cursor_state_known = true;
+            }
+        }
+
+        Ok(())
     }
 
     /// Live-swap the border style. Used by the daemon's attach session
@@ -503,32 +541,37 @@ impl<W: Write> RenderCompositor<W> {
         let diff_time = diff_start.elapsed();
 
         let render_start = Instant::now();
-        self.backend.hide_cursor()?;
-        self.backend.render_diff(&dirty)?;
 
         // Position the cursor inside the focused pane.
         // Cursor at the *exact* right edge (col == width) is valid —
         // that's a "wrap pending" terminal state. Use ≤ on the upper
         // bound so we don't hide it.
-        if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == frame.focused) {
-            if let Some(vt) = frame.vts.get(&frame.focused) {
-                let cur = vt.cursor();
-                let sx = rect
-                    .x
-                    .saturating_add((cur.col as u16).min(rect.width.saturating_sub(1)));
-                let sy = rect
-                    .y
-                    .saturating_add((cur.row as u16).min(rect.height.saturating_sub(1)));
-                if sx < rect.x.saturating_add(rect.width)
-                    && sy < rect.y.saturating_add(rect.height)
-                    && sx < self.buffer.width()
-                    && sy < self.buffer.height()
-                {
-                    self.backend.set_cursor(sx, sy)?;
-                    self.backend.show_cursor()?;
+        let target_cursor =
+            if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == frame.focused) {
+                if let Some(vt) = frame.vts.get(&frame.focused) {
+                    let cur = vt.cursor();
+                    let sx = rect
+                        .x
+                        .saturating_add((cur.col as u16).min(rect.width.saturating_sub(1)));
+                    let sy = rect
+                        .y
+                        .saturating_add((cur.row as u16).min(rect.height.saturating_sub(1)));
+                    if sx < rect.x.saturating_add(rect.width)
+                        && sy < rect.y.saturating_add(rect.height)
+                        && sx < self.buffer.width()
+                        && sy < self.buffer.height()
+                    {
+                        Some((sx, sy))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
-            }
-        }
+            } else {
+                None
+            };
+        self.render_dirty_and_cursor(&dirty, target_cursor)?;
 
         let render_time = render_start.elapsed();
         self.buffer.swap();
@@ -904,6 +947,50 @@ mod tests {
         // Should contain both Hide and Show
         assert!(output_str.contains("\x1b[?25l")); // Hide (during render)
         assert!(output_str.contains("\x1b[?25h")); // Show (after render)
+    }
+
+    #[test]
+    fn test_compositor_does_not_churn_cursor_when_idle() {
+        let mut compositor = RenderCompositor::new(10, 5, Vec::new(), CompositorConfig::default());
+
+        compositor
+            .render_frame(|_, _| RenderCell::default(), 10, 5, Some((3, 2)))
+            .unwrap();
+        compositor.inner_mut().clear();
+
+        let stats = compositor
+            .render_frame(|_, _| RenderCell::default(), 10, 5, Some((3, 2)))
+            .unwrap();
+
+        assert_eq!(stats.dirty_cells, 0);
+        assert!(
+            compositor.inner().is_empty(),
+            "idle render should not emit cursor hide/show churn: {:?}",
+            String::from_utf8_lossy(compositor.inner())
+        );
+    }
+
+    #[test]
+    fn test_compositor_moves_cursor_without_hide_show_when_only_cursor_changes() {
+        let mut compositor = RenderCompositor::new(10, 5, Vec::new(), CompositorConfig::default());
+
+        compositor
+            .render_frame(|_, _| RenderCell::default(), 10, 5, Some((3, 2)))
+            .unwrap();
+        compositor.inner_mut().clear();
+
+        let stats = compositor
+            .render_frame(|_, _| RenderCell::default(), 10, 5, Some((4, 2)))
+            .unwrap();
+        let output = String::from_utf8_lossy(compositor.inner());
+
+        assert_eq!(stats.dirty_cells, 0);
+        assert!(
+            output.contains("\x1b[3;5H"),
+            "missing cursor move: {output:?}"
+        );
+        assert!(!output.contains("\x1b[?25l"), "unexpected hide: {output:?}");
+        assert!(!output.contains("\x1b[?25h"), "unexpected show: {output:?}");
     }
 
     #[test]

@@ -207,6 +207,49 @@ impl KeyPress {
     pub fn is_named(&self, key: NamedKey, modifier: u8) -> bool {
         self.key == KeyValue::Named(key) && self.modifiers == Modifiers::from_bits(modifier)
     }
+
+    /// Convert a crossterm key event into SHUX's canonical key press
+    /// representation. This mirrors the input decoder but is public so
+    /// the attach keybinding registry can resolve shortcuts before the
+    /// key is encoded and forwarded to the PTY.
+    pub fn from_crossterm(event: crossterm::event::KeyEvent) -> Option<Self> {
+        use crossterm::event::KeyCode;
+
+        let modifiers = Modifiers::from_crossterm(event.modifiers);
+        let key = match event.code {
+            KeyCode::Char(c) => KeyValue::Char(c),
+            KeyCode::Backspace => KeyValue::Named(NamedKey::Backspace),
+            KeyCode::Enter => KeyValue::Named(NamedKey::Enter),
+            KeyCode::Tab => KeyValue::Named(NamedKey::Tab),
+            KeyCode::BackTab => {
+                return Some(KeyPress {
+                    key: KeyValue::Named(NamedKey::BackTab),
+                    modifiers: modifiers.with(Modifiers::SHIFT),
+                });
+            }
+            KeyCode::Esc => KeyValue::Named(NamedKey::Escape),
+            KeyCode::Insert => KeyValue::Named(NamedKey::Insert),
+            KeyCode::Delete => KeyValue::Named(NamedKey::Delete),
+            KeyCode::Home => KeyValue::Named(NamedKey::Home),
+            KeyCode::End => KeyValue::Named(NamedKey::End),
+            KeyCode::PageUp => KeyValue::Named(NamedKey::PageUp),
+            KeyCode::PageDown => KeyValue::Named(NamedKey::PageDown),
+            KeyCode::Up => KeyValue::Named(NamedKey::Up),
+            KeyCode::Down => KeyValue::Named(NamedKey::Down),
+            KeyCode::Left => KeyValue::Named(NamedKey::Left),
+            KeyCode::Right => KeyValue::Named(NamedKey::Right),
+            KeyCode::F(n) => KeyValue::Named(NamedKey::F(n)),
+            KeyCode::Null => {
+                return Some(KeyPress {
+                    key: KeyValue::Char(' '),
+                    modifiers: modifiers.with(Modifiers::CTRL),
+                });
+            }
+            _ => return None,
+        };
+
+        Some(KeyPress { key, modifiers })
+    }
 }
 
 impl fmt::Display for KeyPress {
@@ -232,6 +275,9 @@ pub fn parse_key_notation(s: &str) -> Option<KeyPress> {
     let s = s.trim();
     if s.is_empty() {
         return None;
+    }
+    if s == "-" {
+        return Some(KeyPress::new(KeyValue::Char('-')));
     }
 
     // Split on '+' or '-' (but not inside key names like "BackTab").
@@ -260,6 +306,7 @@ fn parse_key_value(s: &str) -> Option<KeyValue> {
     let lower = s.to_lowercase();
     match lower.as_str() {
         "space" | " " => Some(KeyValue::Char(' ')),
+        "minus" | "dash" => Some(KeyValue::Char('-')),
         "backspace" | "bs" => Some(KeyValue::Named(NamedKey::Backspace)),
         "enter" | "return" | "cr" => Some(KeyValue::Named(NamedKey::Enter)),
         "tab" => Some(KeyValue::Named(NamedKey::Tab)),

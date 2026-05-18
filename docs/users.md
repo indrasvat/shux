@@ -44,6 +44,21 @@ The prefix key is `Ctrl+Space` (configurable via `[keys].prefix` in
 | `Alt+Enter` | smart split (no prefix needed) |
 | **mouse click** on a pane | focus that pane |
 | **mouse drag** on a border | resize the split |
+| **mouse drag** on pane text | select visible text and copy on release |
+| **right-click** selected text | open inline `Copy` / `Clear` menu |
+
+### Copying text
+
+For visible text, use the normal mouse path: drag over text in a pane and
+release. shux keeps the selected range highlighted and copies it through
+OSC 52 so it can work locally and over SSH when the outer terminal permits
+OSC 52 clipboard writes. Right-click the visible selection for the inline
+`Copy` / `Clear` menu. Typing into the pane clears the selection and sends
+your input to the running program.
+
+For scrollback, search, or keyboard-only selection, use copy mode:
+`Ctrl+Space [` enters copy mode, `/` and `?` search, `v` starts selection,
+`y` yanks, and `q` / `Esc` exits.
 
 ## Running commands directly
 

@@ -5,12 +5,13 @@
 ## Current Phase
 
 **M0: Architecture Spike** — **Complete** (000–012).
-**M1: Daily-Driver Core** — In progress, ~83% by task count.
-- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 027, 029, 033, 060.
-- **Partial:** 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet).
+**M1: Daily-Driver Core** — In progress, ~88% by task count.
+- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 027, 029, 033, 060, 062, 063.
+- **Partial:** 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet), 031 (attach keybinding config/validation landed; runtime keybinding RPC/plugin provenance deferred).
 - **018 (Tier-1 keys) finalized (PR #13):** Bare Alt+h/j/k/l → directional focus; Alt+n/p → next/prev window; Alt+1..9 → switch directly to Nth window via new `ActionKind::SwitchToWindow` + `ActionArgs.window_index`. `key_to_bare_action` return type bumped from `Option<ActionKind>` to `Option<(ActionKind, ActionArgs)>`. Out-of-range Alt+digit silently ignored (matches tmux). 4 new unit tests in `crates/shux-ui/src/attach.rs`.
 - **027 (pane titles) — Done (PR 4 / #12):** `Pane` gained `manual_title: Option<String>`, `osc_title: Option<String>` alongside existing `title` + `auto_title`. Priority resolution: manual > osc (when auto on) > command basename > cwd basename, computed by `Pane::recalculate_title()`. `sanitize_title()` strips control chars + clamps to 64 chars. `set_pane_title()` and `set_pane_osc_title()` on SessionGraph fire `PaneTitleChanged` only when displayed title actually moves. Per-pane PTY task tracks `last_osc_title` locally and forwards changes to graph outside the io_state lock (deadlock avoidance). Compositor `MultiPaneFrame` gained `titles: Option<&HashMap<PaneId, String>>`; titles render as ` title `-padded text on the top border row, truncated to fit. `pane.set_title` RPC accepts `{title: string|null, auto: bool|null}` tri-state. `shux pane title` CLI with `-t/--clear/--auto/--no-auto`. 11 model unit tests + 5 graph unit tests.
-- **Pending:** 025 (per-pane theming), 031 (keybinding config + conflict detection), 032 (command palette), 034 (M1 quality gate). (030 — session templates — moved to M2 group as part of PR 3a since it lands alongside `state.apply`.)
+- **Pending:** 025 (per-pane theming), 032 (command palette), 034 (M1 quality gate). (030 — session templates — moved to M2 group as part of PR 3a since it lands alongside `state.apply`.)
+- **Done:** 061 (render parity analysis + mouse copy UX follow-up).
 
 **M2: API + Plugin System** — kicked off.
 - **Done:**
@@ -30,7 +31,7 @@
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
-799 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, copy mode, mouse, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments).
+835 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, scrollback-backed copy mode, direct mouse selection/copy, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments, session save/restore).
 
 ## Status
 
@@ -56,10 +57,12 @@
   - [x] TOML config with live reload
   - [~] Theme engine (border + status bar overrides; full token cascade + per-pane theming pending)
   - [x] Mouse support
-  - [ ] Pane titles (manual + auto)
+  - [x] Pane titles (manual + auto)
   - [x] Status bar (built-in 3-zone + script-driven `[[statusbar.segment]]`)
   - [x] Session templates + `shux apply` (PR 3a)
-  - [ ] Keybinding config + conflict detection
+  - [~] Keybinding config + conflict detection (attach config landed; RPC/plugin layer pending)
+  - [x] Scrollback-backed copy mode
+  - [x] Session save/restore
   - [x] L1–L4 tests passing
   - [x] Dogfooding begins
 
@@ -84,6 +87,112 @@
 ---
 
 ## Session Log
+
+**2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
+- Normal-mode mouse selection is now a first-class attach-layer state,
+  separate from modal copy mode. Left-dragging visible pane text selects
+  it, release copies it through OSC 52, and the highlighted selection
+  stays visible without trapping keyboard input.
+- Right-clicking an active selection opens a small inline `Copy` /
+  `Clear` menu near the pointer. Typing into the pane clears the
+  selection and resumes normal PTY input.
+- Copy-mode remains the advanced path for scrollback, search, and
+  keyboard-only workflows. The help overlay, README, user guide, website,
+  and repo skill now document the mouse-first path so ordinary copy does
+  not require prefix-mode knowledge.
+- Dogfood automation injects real SGR mouse sequences through a live
+  attach session, verifies high-contrast selection bytes, confirms the
+  inline menu text, detects OSC 52 output, and keeps the idle repaint
+  guard at `0` bytes.
+- Verification: `make dogfood-human-copy`, `make ci`, and pre-push
+  checks (deny, progress-check, 835 tests, doctests).
+
+**2026-05-18 — fix(copy): make selection legible and stop idle cursor churn**
+- User dogfood findings on the human-interactive branch: copy-mode
+  selection used a too-dark overlay that made text hard to read, and an
+  attached SHUX pane visibly blinked/janked while idle. Computer Use was
+  re-tried against Ghostty after a Codex restart, but the MCP still
+  rejected `com.mitchellh.ghostty` as not allowed; verification continued
+  with PTY/expect automation plus SHUX snapshots.
+- Copy-mode overlay now redraws selected glyphs from the focused
+  `VirtualTerminal` with explicit high-contrast foreground/background
+  instead of painting a block over text. A regression test asserts the
+  selected glyph remains present and styled.
+- Attach rendering no longer forces a base-frame redraw every copy-mode
+  tick. The render loop tracks a copy overlay stamp and only redraws or
+  repaints when the overlay state changes or underlying pane bytes
+  arrive.
+- The compositor now tracks the terminal cursor state. First render still
+  initializes cursor visibility, but idle frames with no dirty cells and
+  unchanged cursor emit no hide/show/move bytes; cursor-only movement
+  emits only the cursor move. This fixes the visible idle blink.
+- PTY child process env now defends interactive panes from degraded
+  parent environments by defaulting `TERM=xterm-256color`,
+  `COLORTERM=truecolor`, `CLICOLOR=1`, and removing inherited
+  `NO_COLOR` unless explicitly restored through `PtyConfig.env`.
+- Dogfood automation in `.shux/scripts/human_copy_mode_check.sh` now
+  exercises a real attach session through `expect`, enters copy mode,
+  searches/selects text, verifies high-contrast selection ANSI, checks
+  `NO_COLOR=unset` inside the pane, snapshots PNG evidence, and measures
+  idle output volume. Current proof: idle attach delta `0` bytes.
+- Verification: focused copy/attach/compositor tests,
+  `make dogfood-human-copy`, and `make test` (830/830).
+
+**2026-05-18 — feat(human): scrollback copy, keybinding config, session persistence**
+- Built the human-interactive core branch around three daily-driver UX
+  features. `dootsabha council --json` was attempted twice per project
+  protocol, but the command hung with no output both times and was
+  killed; proceeded conservatively after documenting the blocker in the
+  working session.
+- Scrollback copy mode now uses the VT grid's `scrollback + visible`
+  logical row space. Copy mode supports PageUp/PageDown, Ctrl-b/f,
+  Ctrl-u/d, gg/G, `/` and `?` search, `n`/`N` repeat search, mouse-wheel
+  scroll while active, historical selection/yank, and live overlay
+  rendering of scrolled history without changing snapshot paths.
+- Configurable attach keybindings landed for root and prefix tables:
+  `[keybindings]` TOML overrides, configurable prefix, action alias
+  validation, conflict replacement semantics, config-validator
+  diagnostics, default config comments, and attach-loop resolution
+  through `KeybindingRegistry`. The broader task-031 runtime
+  `keybinding.*` RPC/plugin provenance layer remains deferred.
+- Session persistence landed as an explicit template round-trip:
+  `session.export_template` RPC, `shux session save -s NAME -o FILE`,
+  `shux session restore FILE`, and `--dry-run` restore output via the
+  existing `state.apply` lowering path. Saved templates preserve session
+  name, window titles, pane cwd, command, split direction, and ratio
+  where reconstructable.
+- Added dogfood automation:
+  `.shux/scripts/human_keybindings_check.sh`,
+  `.shux/scripts/human_session_persistence_check.sh`, and
+  `.shux/scripts/human_copy_mode_check.sh`. Outputs are written under
+  `.shux/out/`; verified PNG evidence for a restored split session and
+  a scrollback-heavy pane.
+- Verification: `make build`; focused copy/keybinding/session tests;
+  all three dogfood scripts; `make fmt`; `make lint`; `make test`
+  (822/822).
+
+**2026-05-18 — fix(mouse): reduce capture and add copy-mode drag**
+- User dogfood finding: Codex and other TUIs look materially different
+  inside a SHUX attach than when launched directly, and mouse-drag text
+  copy did not work in an attached session.
+- Analysis: the visual difference has three layers: expected SHUX chrome
+  (border, pane title, status bar, inset PTY size), live attach vs host
+  terminal behavior, and headless PNG rasterizer limitations. Task 061
+  now documents the current VT/raster gaps and the phased parity plan.
+- Fix: `TerminalGuard::enter()` no longer uses crossterm's broad
+  `EnableMouseCapture`, which enabled `?1003h` any-motion tracking.
+  SHUX now enables only `?1000h` press/release, `?1002h` button-held
+  drag, and `?1006h` SGR coordinates. This preserves click focus and
+  border resize while avoiding unnecessary any-motion capture.
+- Copy-mode improvement: while `Prefix + [` copy mode is active,
+  left-drag inside the focused pane updates the existing
+  `CopyModeState`; mouse-up yanks via the same OSC 52 path as keyboard
+  `y` only when the cursor actually moved, then exits copy mode.
+  Click-only down/up does not copy a stray single cell. Zoomed panes use
+  the full visible pane rect for coordinate mapping.
+- Verification: `make fmt`, `make fmt-check`, two full `make test`
+  runs (803/803 each, triggered while attempting focused filters), and
+  `make lint` / clippy.
 
 **2026-05-17 — fix(session): add initial pane title flag**
 - User dogfood finding: `shux session create -s aww-shux --cmd "codex
@@ -868,7 +977,7 @@
 | 028 | Capability negotiation (ClientCaps) | M1 | **Partial** ² | 010 |
 | 029 | Synchronized output (Mode 2026) | M1 | **Done** | 028 |
 | 030 | Session templates | M1 | **Done** ⁵ | 022, 015 |
-| 031 | Keybinding configuration and conflict detection | M1 | Pending | 019, 022 |
+| 031 | Keybinding configuration and conflict detection | M1 | **Partial** ⁶ | 019, 022 |
 | 032 | Command palette | M1 | Pending | 019, 031 |
 | 033 | Help overlay (keybinding cheat sheet) | M1 | **Done** | 032 |
 | 034 | M1 integration and quality gate | M1 | Pending | 013–033 |
@@ -899,12 +1008,17 @@
 | 058 | Binary releases and distribution | M3 | Pending | 052 |
 | 059 | M3 final quality gate and v1.0 release | M3 | Pending | 053–058 |
 | 060 | Rich CLI output — beautiful list commands | M1 | **Done** | 011, 015 |
+| 061 | Render parity and mouse copy UX | M1/M3 | **Done** | 017, 020, 021 |
+| 062 | Scrollback-backed copy mode | M1 | **Done** | 005, 021, 061 |
+| 063 | Session save and restore | M1/M3 | **Done** | 013, 014, 015, 030 |
 
 ---
 
 ¹ **Task 024 Partial:** `[theme]` config section overrides border colors (focused/unfocused) and status-bar fg/bg colors with hot reload. The full PRD §6.1 token cascade (per-pane themes, theme files in `~/.config/shux/themes/`, ANSI palette overrides, named theme references) is still pending — close-out lives with task 025 and the M1 quality gate (034).
 
 ² **Task 028 Partial:** daemon claims `TERM_PROGRAM=shux`, `TERM_PROGRAM_VERSION=<pkg ver>`, `COLORTERM=truecolor`, `SHUX=1` on every PTY spawn. Real cap negotiation (DA2 / XTVERSION / Kitty keyboard query / OSC 4 palette probe stored as a per-client `ClientCaps` and gating Mode 2026, OSC 8, OSC 52, true color) is still pending.
+
+⁶ **Task 031 Partial:** attach-time keybinding config is implemented: configurable prefix, root/prefix override tables, action validation, and config-validator diagnostics. The runtime `keybinding.list/set/reset` RPC surface, reserved-key policy, and plugin provenance/conflict model are intentionally deferred.
 
 ³ **Task 018 Partial** (caught by Codex review of PR #8): `attach.rs::key_to_bare_action` ships Alt+Enter, Alt+|/\\, Alt+-, Alt+arrows, Alt+z, Alt+x, Alt+Tab. Per PRD §9.1, **bare Alt+h/j/k/l, bare Alt+n/p, and Alt+1..9 are still missing** as Tier-1 bindings (the hjkl/n/p variants today only work after the Ctrl+Space prefix). Small follow-up — one match arm in `key_to_bare_action`. Lives with the M1 quality gate (034) or a focused 018-followup PR.
 
