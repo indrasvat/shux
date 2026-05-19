@@ -592,6 +592,7 @@ impl<W: Write> RenderCompositor<W> {
     /// Compose a single pane's VT grid into the framebuffer at `rect`.
     fn compose_pane(&mut self, rect: Rect, vt: &shux_vt::VirtualTerminal) {
         let grid = vt.grid();
+        let defaults = vt.default_colors();
         let total_rows = grid.rows();
         let total_cols = grid.cols();
         let visible_rows = rect.height as usize;
@@ -613,7 +614,7 @@ impl<W: Write> RenderCompositor<W> {
                     break;
                 }
                 let cell = &row[c];
-                let rcell: RenderCell = cell.into();
+                let rcell = RenderCell::from_vt_cell_with_defaults(cell, defaults);
                 self.buffer
                     .set_cell(rect.x + c as u16, rect.y + r as u16, rcell);
             }

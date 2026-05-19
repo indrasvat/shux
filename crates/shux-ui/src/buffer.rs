@@ -84,20 +84,17 @@ impl RenderCell {
             wide_continuation: false,
         }
     }
-}
 
-/// Conversion from shux-vt Cell to RenderCell.
-///
-/// Maps the VT cell's color enum and flag bits to the render buffer's
-/// representation. This decouples the VT grid format from the render
-/// pipeline while keeping the conversion zero-cost.
-impl From<&shux_vt::Cell> for RenderCell {
-    fn from(cell: &shux_vt::Cell) -> Self {
+    /// Convert a VT cell while resolving dynamic OSC 10/11 default colors.
+    pub fn from_vt_cell_with_defaults(
+        cell: &shux_vt::Cell,
+        defaults: shux_vt::TerminalDefaultColors,
+    ) -> Self {
         let flags = &cell.style.flags;
         Self {
             ch: cell.ch,
-            fg: vt_convert::vt_color_to_crossterm(cell.style.fg),
-            bg: vt_convert::vt_color_to_crossterm(cell.style.bg),
+            fg: vt_convert::vt_color_to_crossterm_with_default(cell.style.fg, defaults.fg),
+            bg: vt_convert::vt_color_to_crossterm_with_default(cell.style.bg, defaults.bg),
             attrs: RenderAttrs {
                 bold: flags.contains(shux_vt::CellFlags::BOLD),
                 dim: flags.contains(shux_vt::CellFlags::DIM),
@@ -110,6 +107,17 @@ impl From<&shux_vt::Cell> for RenderCell {
             },
             wide_continuation: cell.is_wide_continuation(),
         }
+    }
+}
+
+/// Conversion from shux-vt Cell to RenderCell.
+///
+/// Maps the VT cell's color enum and flag bits to the render buffer's
+/// representation. This decouples the VT grid format from the render
+/// pipeline while keeping the conversion zero-cost.
+impl From<&shux_vt::Cell> for RenderCell {
+    fn from(cell: &shux_vt::Cell) -> Self {
+        RenderCell::from_vt_cell_with_defaults(cell, shux_vt::TerminalDefaultColors::default())
     }
 }
 
@@ -453,6 +461,27 @@ mod tests {
                 b: 30
             })
         );
+    }
+
+    #[test]
+    fn test_from_vt_cell_resolves_dynamic_defaults() {
+        let vt_cell = shux_vt::Cell::default();
+        let render_cell = RenderCell::from_vt_cell_with_defaults(
+            &vt_cell,
+            shux_vt::TerminalDefaultColors {
+                fg: Some([232, 217, 201]),
+                bg: Some([18, 10, 8]),
+            },
+        );
+        assert_eq!(
+            render_cell.fg,
+            Some(Color::Rgb {
+                r: 232,
+                g: 217,
+                b: 201
+            })
+        );
+        assert_eq!(render_cell.bg, Some(Color::Rgb { r: 18, g: 10, b: 8 }));
     }
 
     #[test]

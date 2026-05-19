@@ -1,6 +1,6 @@
 use tracing::trace;
 
-use crate::cell::{Cell, CellFlags, CellStyle, Color};
+use crate::cell::{Cell, CellFlags, CellStyle, Color, TerminalDefaultColors};
 use crate::cursor::{Cursor, CursorShape};
 use crate::grid::{Grid, GridConfig};
 
@@ -74,6 +74,7 @@ pub struct VtHandler<'a> {
     pub modes: &'a mut TerminalModes,
     pub scroll_region: &'a mut ScrollRegion,
     pub title: &'a mut Option<String>,
+    pub default_colors: &'a mut TerminalDefaultColors,
     pub alt_grid: &'a mut Option<Grid>,
     pub alt_cursor: &'a mut Option<Cursor>,
 }
@@ -623,6 +624,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.grid.clear_scrollback();
                 *self.cursor = Cursor::new();
                 *self.modes = TerminalModes::default();
+                *self.default_colors = TerminalDefaultColors::default();
                 self.scroll_region.top = 0;
                 self.scroll_region.bottom = self.grid.rows().saturating_sub(1);
             }
@@ -650,6 +652,21 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     }
                 }
             }
+            // OSC 10/11 -- Set dynamic default foreground/background.
+            b"10" | b"11" => {
+                if let Some(color_bytes) = params.get(1) {
+                    if let Ok(color) = parse_osc_color(color_bytes) {
+                        if params[0] == b"10" {
+                            self.default_colors.fg = Some(color);
+                        } else {
+                            self.default_colors.bg = Some(color);
+                        }
+                    }
+                }
+            }
+            // OSC 110/111 -- Reset dynamic default foreground/background.
+            b"110" => self.default_colors.fg = None,
+            b"111" => self.default_colors.bg = None,
             _ => {
                 trace!(osc = ?params[0], "unhandled OSC sequence");
             }
@@ -669,6 +686,47 @@ impl<'a> vte::Perform for VtHandler<'a> {
     }
 }
 
+fn parse_osc_color(bytes: &[u8]) -> Result<[u8; 3], ()> {
+    let s = std::str::from_utf8(bytes).map_err(|_| ())?;
+    if let Some(hex) = s.strip_prefix('#') {
+        return parse_hex_color(hex);
+    }
+    if let Some(rgb) = s.strip_prefix("rgb:") {
+        return parse_rgb_color(rgb);
+    }
+    Err(())
+}
+
+fn parse_hex_color(hex: &str) -> Result<[u8; 3], ()> {
+    if hex.len() != 6 {
+        return Err(());
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| ())?;
+    let g = u8::from_str_radix(&hex[2..4], 16).map_err(|_| ())?;
+    let b = u8::from_str_radix(&hex[4..6], 16).map_err(|_| ())?;
+    Ok([r, g, b])
+}
+
+fn parse_rgb_color(rgb: &str) -> Result<[u8; 3], ()> {
+    let mut parts = rgb.split('/');
+    let r = parse_rgb_component(parts.next().ok_or(())?)?;
+    let g = parse_rgb_component(parts.next().ok_or(())?)?;
+    let b = parse_rgb_component(parts.next().ok_or(())?)?;
+    if parts.next().is_some() {
+        return Err(());
+    }
+    Ok([r, g, b])
+}
+
+fn parse_rgb_component(component: &str) -> Result<u8, ()> {
+    if component.is_empty() || component.len() > 4 {
+        return Err(());
+    }
+    let value = u16::from_str_radix(component, 16).map_err(|_| ())?;
+    let max = (1u32 << (component.len() * 4)) - 1;
+    Ok(((value as u32 * 255 + max / 2) / max) as u8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +739,7 @@ mod tests {
         modes: TerminalModes,
         scroll_region: ScrollRegion,
         title: Option<String>,
+        default_colors: TerminalDefaultColors,
         alt_grid: Option<Grid>,
         alt_cursor: Option<Cursor>,
         parser: vte::Parser,
@@ -697,6 +756,7 @@ mod tests {
                     bottom: rows.saturating_sub(1),
                 },
                 title: None,
+                default_colors: TerminalDefaultColors::default(),
                 alt_grid: None,
                 alt_cursor: None,
                 parser: vte::Parser::new(),
@@ -710,6 +770,7 @@ mod tests {
                 modes: &mut self.modes,
                 scroll_region: &mut self.scroll_region,
                 title: &mut self.title,
+                default_colors: &mut self.default_colors,
                 alt_grid: &mut self.alt_grid,
                 alt_cursor: &mut self.alt_cursor,
             };
@@ -838,10 +899,38 @@ mod tests {
     }
 
     #[test]
+    fn test_ris_full_reset_clears_dynamic_default_colors() {
+        let mut t = TestTerminal::new(24, 80);
+        t.process(b"\x1b]10;#ff8000\x07\x1b]11;#120a08\x07");
+        assert_eq!(t.default_colors.fg, Some([0xff, 0x80, 0x00]));
+        assert_eq!(t.default_colors.bg, Some([0x12, 0x0a, 0x08]));
+
+        t.process(b"\x1bc");
+
+        assert_eq!(t.default_colors, TerminalDefaultColors::default());
+    }
+
+    #[test]
     fn test_osc_title() {
         let mut t = TestTerminal::new(24, 80);
         t.process(b"\x1b]2;test title\x07");
         assert_eq!(t.title.as_deref(), Some("test title"));
+    }
+
+    #[test]
+    fn test_osc_dynamic_default_background_hex() {
+        let mut t = TestTerminal::new(24, 80);
+        t.process(b"\x1b]11;#120A08\x07");
+        assert_eq!(t.default_colors.bg, Some([0x12, 0x0a, 0x08]));
+    }
+
+    #[test]
+    fn test_osc_dynamic_default_foreground_rgb_and_reset() {
+        let mut t = TestTerminal::new(24, 80);
+        t.process(b"\x1b]10;rgb:ffff/8000/0000\x07");
+        assert_eq!(t.default_colors.fg, Some([255, 128, 0]));
+        t.process(b"\x1b]110\x07");
+        assert_eq!(t.default_colors.fg, None);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches};
 use shux_rpc::{Policy, Sensitivity};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing_subscriber::EnvFilter;
 
 mod attach;
@@ -48,6 +48,18 @@ pub struct PaneIoState {
     /// fire-and-forget; `ack: Some(tx)` for synchronous RPCs that must
     /// see the new dimensions on return.
     pub resizers: HashMap<shux_core::model::PaneId, mpsc::Sender<ResizeRequest>>,
+    /// Per-pane cancellation tokens. These are child tokens of the daemon
+    /// shutdown token, so daemon shutdown still cancels every pane, while
+    /// explicit pane/window/session kills can target only the affected panes.
+    pub shutdowns: HashMap<shux_core::model::PaneId, tokio_util::sync::CancellationToken>,
+    /// Per-pane completion receivers used by daemon shutdown to wait until
+    /// PTY tasks have actually signalled and reaped their children.
+    pub pty_done: HashMap<shux_core::model::PaneId, oneshot::Receiver<()>>,
+    /// Completion waiters for PTY tasks that were already explicitly torn
+    /// down by pane/window/session kill. Daemon shutdown drains these too so
+    /// it cannot exit while an earlier teardown is still in its reap/escalate
+    /// path.
+    pub teardown_waiters: Vec<tokio::task::JoinHandle<()>>,
     /// Per-pane VirtualTerminal instances for capturing output.
     pub vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
     /// Command execution engine for marker-based completion detection.
@@ -74,6 +86,9 @@ impl PaneIoState {
         Self {
             writers: HashMap::new(),
             resizers: HashMap::new(),
+            shutdowns: HashMap::new(),
+            pty_done: HashMap::new(),
+            teardown_waiters: Vec::new(),
             vts: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: Arc::new(tokio::sync::Notify::new()),
@@ -85,6 +100,60 @@ impl PaneIoState {
         self.event_bus = Some(bus);
         self
     }
+
+    pub fn teardown_panes(
+        &mut self,
+        pane_ids: &[shux_core::model::PaneId],
+        remove_vts: bool,
+    ) -> Arc<Notify> {
+        let (pulse, done) = self.teardown_panes_collecting(pane_ids, remove_vts);
+        self.track_teardown_waiters(done);
+        pulse
+    }
+
+    fn track_teardown_waiters(&mut self, done: Vec<oneshot::Receiver<()>>) {
+        self.teardown_waiters.retain(|waiter| !waiter.is_finished());
+        self.teardown_waiters.extend(done.into_iter().map(|rx| {
+            tokio::spawn(async move {
+                let _ = rx.await;
+            })
+        }));
+    }
+
+    pub fn teardown_panes_collecting(
+        &mut self,
+        pane_ids: &[shux_core::model::PaneId],
+        remove_vts: bool,
+    ) -> (Arc<Notify>, Vec<oneshot::Receiver<()>>) {
+        let mut done = Vec::new();
+        for pane_id in pane_ids {
+            if let Some(token) = self.shutdowns.remove(pane_id) {
+                token.cancel();
+            }
+            self.writers.remove(pane_id);
+            self.resizers.remove(pane_id);
+            if let Some(rx) = self.pty_done.remove(pane_id) {
+                done.push(rx);
+            }
+            if remove_vts {
+                self.vts.remove(pane_id);
+            }
+        }
+        (self.render_pulse.clone(), done)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PtyTaskExit {
+    Natural,
+    RequestedTeardown,
+}
+
+struct PtyTaskControl {
+    write_rx: mpsc::Receiver<Vec<u8>>,
+    resize_rx: mpsc::Receiver<ResizeRequest>,
+    shutdown: tokio_util::sync::CancellationToken,
+    done_tx: oneshot::Sender<()>,
 }
 
 /// Per-pane async task that owns the PtyHandle and handles both reads and writes.
@@ -96,12 +165,16 @@ async fn run_pane_pty_task(
     pane_id: shux_core::model::PaneId,
     mut handle: shux_pty::handle::PtyHandle,
     io_state: Arc<Mutex<PaneIoState>>,
-    mut write_rx: mpsc::Receiver<Vec<u8>>,
-    mut resize_rx: mpsc::Receiver<ResizeRequest>,
-    shutdown: tokio_util::sync::CancellationToken,
+    control: PtyTaskControl,
     graph: shux_core::graph::GraphHandle,
 ) {
     use base64::Engine;
+    let PtyTaskControl {
+        mut write_rx,
+        mut resize_rx,
+        shutdown,
+        done_tx,
+    } = control;
     let mut buf = vec![0u8; 8192];
     // Track the last OSC title we forwarded to the graph so we only
     // call set_pane_osc_title when it actually changes. bash's
@@ -123,9 +196,17 @@ async fn run_pane_pty_task(
         .checked_sub(output_sample_interval)
         .unwrap_or_else(std::time::Instant::now);
     let mut output_dropped_any = false;
+    let mut task_exit = PtyTaskExit::Natural;
 
     loop {
         tokio::select! {
+            biased;
+
+            _ = shutdown.cancelled() => {
+                tracing::debug!(%pane_id, "PTY task cancelled");
+                task_exit = PtyTaskExit::RequestedTeardown;
+                break;
+            }
             result = handle.read(&mut buf) => {
                 match result {
                     Ok(0) => {
@@ -244,6 +325,7 @@ async fn run_pane_pty_task(
                         // Sender dropped -- the pane was destroyed.
                         // Exit so we can kill() the child shell.
                         tracing::debug!(%pane_id, "writer channel closed");
+                        task_exit = PtyTaskExit::RequestedTeardown;
                         break;
                     }
                 };
@@ -261,6 +343,7 @@ async fn run_pane_pty_task(
                     Some(r) => r,
                     None => {
                         tracing::debug!(%pane_id, "resizer channel closed");
+                        task_exit = PtyTaskExit::RequestedTeardown;
                         break;
                     }
                 };
@@ -282,10 +365,6 @@ async fn run_pane_pty_task(
                     let _ = ack.send(());
                 }
             }
-            _ = shutdown.cancelled() => {
-                tracing::debug!(%pane_id, "PTY task cancelled");
-                break;
-            }
         }
     }
 
@@ -296,7 +375,23 @@ async fn run_pane_pty_task(
     // proper wait, while the channel-close and shutdown paths require
     // an explicit kill before waiting will return. Bound both stages
     // with timeouts so a wedged child can't stall pane teardown.
-    let exit_code =
+    let exit_code = if task_exit == PtyTaskExit::RequestedTeardown {
+        let _ = handle.terminate();
+        match tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait()).await {
+            Ok(Ok(status)) => status.code(),
+            Ok(Err(e)) => {
+                tracing::warn!(%pane_id, error = %e, "PTY child wait after teardown failed");
+                None
+            }
+            Err(_) => {
+                let _ = handle.kill();
+                match tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait()).await {
+                    Ok(Ok(status)) => status.code(),
+                    _ => None,
+                }
+            }
+        }
+    } else {
         match tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait()).await {
             Ok(Ok(status)) => status.code(),
             Ok(Err(e)) => {
@@ -304,14 +399,26 @@ async fn run_pane_pty_task(
                 None
             }
             Err(_) => {
-                // Still alive after 2s — SIGTERM and try once more.
-                let _ = handle.kill();
-                match tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait()).await {
+                // Still alive after 2s — send a PTY-style hangup to the
+                // process group, then escalate if it refuses to exit.
+                let _ = handle.terminate();
+                match tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait())
+                    .await
+                {
                     Ok(Ok(status)) => status.code(),
-                    _ => None,
+                    _ => {
+                        let _ = handle.kill();
+                        match tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait())
+                            .await
+                        {
+                            Ok(Ok(status)) => status.code(),
+                            _ => None,
+                        }
+                    }
                 }
             }
-        };
+        }
+    };
 
     // Propagate the captured exit code so the daemon's PaneExited
     // event carries it. set_pane_exit_status both updates the pane
@@ -334,9 +441,12 @@ async fn run_pane_pty_task(
     let mut state = io_state.lock().await;
     state.writers.remove(&pane_id);
     state.resizers.remove(&pane_id);
+    state.shutdowns.remove(&pane_id);
+    state.pty_done.remove(&pane_id);
     let pulse = state.render_pulse.clone();
     drop(state);
     pulse.notify_one();
+    let _ = done_tx.send(());
 }
 
 /// Spawn a PTY process and VT instance for a pane.
@@ -364,17 +474,32 @@ pub(crate) async fn spawn_pane_pty(
 
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
     let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>(16);
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let pane_shutdown = shutdown.child_token();
     let vt = shux_vt::VirtualTerminal::new(24, 80);
 
     {
         let mut state = io_state.lock().await;
+        if let Some(old) = state.shutdowns.insert(pane_id, pane_shutdown.clone()) {
+            old.cancel();
+        }
         state.writers.insert(pane_id, write_tx);
         state.resizers.insert(pane_id, resize_tx);
+        state.pty_done.insert(pane_id, done_rx);
         state.vts.insert(pane_id, vt);
     }
 
     tokio::spawn(run_pane_pty_task(
-        pane_id, handle, io_state, write_rx, resize_rx, shutdown, graph,
+        pane_id,
+        handle,
+        io_state,
+        PtyTaskControl {
+            write_rx,
+            resize_rx,
+            shutdown: pane_shutdown,
+            done_tx,
+        },
+        graph,
     ));
 
     Ok(())
@@ -439,11 +564,17 @@ fn run_daemon() -> anyhow::Result<()> {
         // Set up SessionGraph + graph loop
         let sock_path = daemon::socket_path()?;
         let cancel = tokens.root.clone();
-        run_rpc_server(sock_path, cancel.clone()).await?;
+        let io_state = run_rpc_server(sock_path, cancel.clone()).await?;
 
         // Run the daemon state loop (blocks until shutdown)
         shux_core::daemon::run_daemon_state_loop(cmd_rx, tokens.clone(), config_reload_notify)
             .await;
+
+        // Root cancellation is idempotent. Do it here as a final guard,
+        // then wait for pane PTY tasks to signal and reap their process
+        // groups before the runtime starts dropping tasks.
+        tokens.root.cancel();
+        shutdown_all_pane_io(io_state).await;
 
         // Cleanup
         daemon::remove_pid_file()?;
@@ -489,7 +620,7 @@ fn run_client(args: Cli) -> anyhow::Result<()> {
 async fn run_rpc_server(
     socket_path: PathBuf,
     cancel: tokio_util::sync::CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<Mutex<PaneIoState>>> {
     // EventBus: typed pub/sub for lifecycle events. Wired into SessionGraph
     // so every successful mutation publishes a typed event to subscribers.
     // events.watch / events.history RPC methods read from here.
@@ -514,6 +645,7 @@ async fn run_rpc_server(
     let io_state = Arc::new(Mutex::new(
         PaneIoState::new().with_event_bus(event_bus.clone()),
     ));
+    let shutdown_io_state = io_state.clone();
 
     // Load user config (~/.config/shux/config.toml). Missing file is
     // valid — defaults match current hardcoded behavior. Spawn a watcher
@@ -669,7 +801,46 @@ async fn run_rpc_server(
         }
     });
 
-    Ok(())
+    Ok(shutdown_io_state)
+}
+
+async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
+    let (done, teardown_waiters) = {
+        let mut state = io_state.lock().await;
+        let pane_ids: Vec<_> = state
+            .shutdowns
+            .keys()
+            .chain(state.writers.keys())
+            .chain(state.resizers.keys())
+            .chain(state.pty_done.keys())
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        state
+            .teardown_waiters
+            .retain(|waiter| !waiter.is_finished());
+        let teardown_waiters = std::mem::take(&mut state.teardown_waiters);
+        let (pulse, done) = state.teardown_panes_collecting(&pane_ids, true);
+        drop(state);
+        pulse.notify_waiters();
+        (done, teardown_waiters)
+    };
+
+    let wait_all = async move {
+        for rx in done {
+            let _ = rx.await;
+        }
+        for waiter in teardown_waiters {
+            let _ = waiter.await;
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(3), wait_all)
+        .await
+        .is_err()
+    {
+        tracing::warn!("timed out waiting for pane PTY tasks during daemon shutdown");
+    }
 }
 
 /// Map GraphError to appropriate RPC error codes.
@@ -1698,10 +1869,7 @@ fn register_pane_methods(
                     .map_err(graph_error_to_rpc)?;
                 {
                     let mut state = io.lock().await;
-                    state.writers.remove(&pane_id);
-                    state.resizers.remove(&pane_id);
-                    state.vts.remove(&pane_id);
-                    let pulse = state.render_pulse.clone();
+                    let pulse = state.teardown_panes(&[pane_id], true);
                     drop(state);
                     pulse.notify_one();
                 }
@@ -2093,10 +2261,11 @@ async fn snapshot_window(
             .pane_ids()
             .into_iter()
             .filter_map(|pid| {
-                state
-                    .vts
-                    .get(&pid)
-                    .map(|vt| (pid, vt.grid().clone(), vt.cursor().clone()))
+                state.vts.get(&pid).map(|vt| {
+                    let mut grid = vt.grid().clone();
+                    resolve_grid_default_colors(&mut grid, vt.default_colors());
+                    (pid, grid, vt.cursor().clone())
+                })
             })
             .collect()
     };
@@ -2183,6 +2352,28 @@ async fn snapshot_window(
         "rows": rows,
         "format": "png",
     }))
+}
+
+fn resolve_grid_default_colors(grid: &mut shux_vt::Grid, defaults: shux_vt::TerminalDefaultColors) {
+    if defaults.fg.is_none() && defaults.bg.is_none() {
+        return;
+    }
+    for row_idx in 0..grid.rows() {
+        let row = grid.visible_row_mut(row_idx);
+        for col_idx in 0..row.len() {
+            let cell = &mut row[col_idx];
+            if cell.style.fg == shux_vt::Color::Default
+                && let Some([r, g, b]) = defaults.fg
+            {
+                cell.style.fg = shux_vt::Color::Rgb(r, g, b);
+            }
+            if cell.style.bg == shux_vt::Color::Default
+                && let Some([r, g, b]) = defaults.bg
+            {
+                cell.style.bg = shux_vt::Color::Rgb(r, g, b);
+            }
+        }
+    }
 }
 
 /// Register window CRUD methods on the router builder.
@@ -2616,11 +2807,9 @@ fn register_window_methods(
 
                     {
                         let mut state = io.lock().await;
-                        for pid in pane_ids {
-                            state.writers.remove(&pid);
-                            state.resizers.remove(&pid);
-                            state.vts.remove(&pid);
-                        }
+                        let pulse = state.teardown_panes(&pane_ids, true);
+                        drop(state);
+                        pulse.notify_one();
                     }
 
                     Ok(serde_json::json!({ "killed": window_id_str }))
@@ -2865,22 +3054,15 @@ fn register_session_methods(
                         .await
                         .map_err(graph_error_to_rpc)?;
 
-                    // Tear down PTY/VT/writer/resizer entries for every pane
-                    // that belonged to the session. Dropping the writer
-                    // Sender closes the mpsc on the recv side, which makes
-                    // the per-pane PTY task observe `None` from `write_rx
-                    // .recv()`, break out of its select loop, and call
-                    // `handle.kill()` on its way out — reaping the child
-                    // shell. Without this codex-flagged fix (P1), shells
-                    // for killed sessions would stay alive but unreachable.
+                    // Tear down every pane that belonged to the session.
+                    // The explicit per-pane shutdown token is the hard
+                    // lifecycle contract; writer/resizer removal is only
+                    // bookkeeping. The PTY task prioritizes cancellation
+                    // and signals the pane's process group before reaping,
+                    // so rich TUIs do not survive as unreachable children.
                     {
                         let mut state = io.lock().await;
-                        for pid in &pane_ids {
-                            state.writers.remove(pid);
-                            state.resizers.remove(pid);
-                            state.vts.remove(pid);
-                        }
-                        let pulse = state.render_pulse.clone();
+                        let pulse = state.teardown_panes(&pane_ids, true);
                         drop(state);
                         pulse.notify_one();
                     }
@@ -3616,7 +3798,7 @@ fn register_pane_io_methods(
                     // because the default 5000-line scrollback was being copied
                     // unconditionally.
                     let (cw, ch) = r.cell_size();
-                    let (grid_snapshot, cursor_pos, snap_cols, snap_rows) = {
+                    let (grid_snapshot, cursor_pos, snap_cols, snap_rows, default_colors) = {
                         let state = io.lock().await;
                         let vt = state.vts.get(&pane_id).ok_or_else(|| {
                             shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
@@ -3637,9 +3819,10 @@ fn register_pane_io_methods(
                         }
                         let cur = vt.cursor();
                         let cursor_pos = cur.visible.then_some((cur.row, cur.col));
+                        let default_colors = vt.default_colors();
                         // Visible-only clone — does NOT copy scrollback.
                         let grid_clone = vt.grid().clone_visible();
-                        (grid_clone, cursor_pos, cols, rows)
+                        (grid_clone, cursor_pos, cols, rows, default_colors)
                     };
 
                     // Rasterize + PNG-encode off the runtime worker. Both are
@@ -3648,7 +3831,12 @@ fn register_pane_io_methods(
                     let (img, png_buf) = tokio::task::spawn_blocking(move || {
                         let opts = shux_raster::RasterOptions {
                             cursor: cursor_pos,
-                            ..Default::default()
+                            fg_default: default_colors.fg.unwrap_or_else(|| {
+                                shux_raster::RasterOptions::default().fg_default
+                            }),
+                            bg_default: default_colors.bg.unwrap_or_else(|| {
+                                shux_raster::RasterOptions::default().bg_default
+                            }),
                         };
                         let img = r.render(&grid_snapshot, &opts);
                         let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -4776,5 +4964,37 @@ mod tests {
 
         token.cancel();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_explicit_teardown_waiters() {
+        let pane_id = shux_core::model::PaneId::new();
+        let pane_shutdown = CancellationToken::new();
+        let (done_tx, done_rx) = oneshot::channel();
+        let io_state = Arc::new(Mutex::new(PaneIoState::new()));
+
+        {
+            let mut state = io_state.lock().await;
+            state.shutdowns.insert(pane_id, pane_shutdown.clone());
+            state.pty_done.insert(pane_id, done_rx);
+            let pulse = state.teardown_panes(&[pane_id], true);
+            pulse.notify_one();
+
+            assert!(pane_shutdown.is_cancelled());
+            assert!(state.pty_done.is_empty());
+            assert_eq!(state.teardown_waiters.len(), 1);
+        }
+
+        let mut shutdown = tokio::spawn(shutdown_all_pane_io(io_state.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "daemon shutdown must wait for explicit teardown PTY completion"
+        );
+
+        done_tx.send(()).unwrap();
+        shutdown.await.unwrap();
+        assert!(io_state.lock().await.teardown_waiters.is_empty());
     }
 }
