@@ -1204,4 +1204,243 @@ mod tests {
         assert_eq!(ctx.format, OutputFormat::Plain);
         assert!(!ctx.is_tty);
     }
+
+    fn text_ctx(colors: bool, unicode: bool) -> TerminalContext {
+        TerminalContext {
+            is_tty: true,
+            colors,
+            unicode,
+            width: 100,
+            format: OutputFormat::Text,
+        }
+    }
+
+    fn plain_ctx() -> TerminalContext {
+        TerminalContext {
+            is_tty: false,
+            colors: false,
+            unicode: false,
+            width: 100,
+            format: OutputFormat::Plain,
+        }
+    }
+
+    #[test]
+    fn styled_if_applies_all_requested_attributes_when_enabled() {
+        let styled = styled_if("active", true, Some(Color::Cyan), true, true);
+        assert!(styled.contains("\x1b["));
+        assert!(styled.contains("active"));
+        assert_eq!(
+            styled_if("plain", false, Some(Color::Red), true, true),
+            "plain"
+        );
+    }
+
+    #[test]
+    fn display_width_padding_and_empty_columns_are_stable() {
+        assert_eq!(display_width("क"), 1);
+        assert_eq!(display_width("界"), 2);
+        assert_eq!(pad_right("界", 4), "界  ");
+        assert_eq!(pad_left("界", 4), "  界");
+
+        let layout = ColumnLayout::new(Vec::new());
+        assert_eq!(layout.total_width(), 0);
+    }
+
+    #[test]
+    fn box_renderer_covers_titleless_footer_and_colored_variants() {
+        let ctx = text_ctx(true, true);
+        let bx = BoxRenderer::new(&ctx, 12).footer("done");
+        assert_eq!(bx.header(), "╭──────────────╮");
+        assert!(bx.footer_line().contains("done"));
+        assert!(bx.empty_row().starts_with("│ "));
+
+        let ascii = BoxRenderer::new(&text_ctx(false, false), 8).footer("ok");
+        assert_eq!(ascii.header(), "+----------+");
+        assert!(ascii.footer_line().starts_with("+"));
+    }
+
+    #[test]
+    fn column_layout_renders_headers_rows_missing_cells_and_color_callbacks() {
+        let mut layout = ColumnLayout::new(vec![
+            Column {
+                header: "NAME".to_string(),
+                align: Align::Left,
+                min_width: 4,
+            },
+            Column {
+                header: "COUNT".to_string(),
+                align: Align::Right,
+                min_width: 5,
+            },
+            Column {
+                header: "MISSING".to_string(),
+                align: Align::Left,
+                min_width: 7,
+            },
+        ]);
+        layout.add_row(vec!["dev".to_string(), "2".to_string()]);
+
+        let (header, header_width) = layout.render_header(true);
+        assert!(header.contains("NAME"));
+        assert!(header.contains("\x1b["));
+        assert_eq!(header_width, layout.total_width());
+
+        let (row, row_width) = layout.render_row(0, &|idx, cell| format!("{idx}:{cell}"));
+        assert!(row.contains("0:dev"));
+        assert!(row.contains("1:"));
+        assert!(row.contains("2:"));
+        assert_eq!(row_width, layout.total_width());
+    }
+
+    #[test]
+    fn empty_state_renderer_handles_hints_ascii_and_unicode() {
+        let mut unicode = Vec::new();
+        render_empty_state(
+            &mut unicode,
+            &text_ctx(false, true),
+            "Sessions",
+            "(no sessions)",
+            "Create one",
+        );
+        let unicode = String::from_utf8(unicode).expect("unicode output");
+        assert!(unicode.contains("Sessions"));
+        assert!(unicode.contains("Create one"));
+        assert!(unicode.contains("│"));
+
+        let mut ascii = Vec::new();
+        render_empty_state(
+            &mut ascii,
+            &text_ctx(false, false),
+            "Windows",
+            "(no windows)",
+            "",
+        );
+        let ascii = String::from_utf8(ascii).expect("ascii output");
+        assert!(ascii.contains("Windows"));
+        assert!(ascii.contains("|"));
+        assert!(!ascii.contains("Create one"));
+    }
+
+    #[test]
+    fn rich_list_renderers_cover_plain_empty_and_active_text_paths() {
+        let sessions = vec![
+            SessionInfo {
+                name: "dev".to_string(),
+                id: "12345678-aaaa-bbbb-cccc-000000000000".to_string(),
+                window_count: 1,
+                created: "now".to_string(),
+                is_active: true,
+            },
+            SessionInfo {
+                name: "ops".to_string(),
+                id: "87654321-aaaa-bbbb-cccc-000000000000".to_string(),
+                window_count: 2,
+                created: "later".to_string(),
+                is_active: false,
+            },
+        ];
+        let windows = vec![
+            WindowInfo {
+                title: "editor".to_string(),
+                index: 1,
+                pane_count: 2,
+                is_active: true,
+            },
+            WindowInfo {
+                title: "logs".to_string(),
+                index: 2,
+                pane_count: 1,
+                is_active: false,
+            },
+        ];
+        let panes = vec![
+            PaneInfo {
+                id: "abcdef0123456789".to_string(),
+                cwd: "/tmp".to_string(),
+                command: "bash".to_string(),
+                is_focused: true,
+                is_zoomed: true,
+            },
+            PaneInfo {
+                id: "fedcba9876543210".to_string(),
+                cwd: "/var/log".to_string(),
+                command: "tail -f app.log".to_string(),
+                is_focused: false,
+                is_zoomed: false,
+            },
+        ];
+
+        let colored = text_ctx(true, true);
+        render_session_list(&colored, &sessions);
+        render_window_list(&colored, "dev", &windows);
+        render_pane_list(&colored, "dev", "editor", &panes);
+
+        let plain = plain_ctx();
+        render_session_list(&plain, &sessions);
+        render_window_list(&plain, "dev", &windows);
+        render_pane_list(&plain, "dev", "editor", &panes);
+
+        let ascii_text = text_ctx(false, false);
+        render_session_list(&ascii_text, &[]);
+        render_window_list(&ascii_text, "dev", &[]);
+        render_pane_list(&ascii_text, "dev", "editor", &[]);
+    }
+
+    #[test]
+    fn confirmation_printers_cover_optional_and_status_branches() {
+        print_version("0.26.0", Some("abc1234"), Some("daemon offline"));
+        print_version("0.26.0", None, None);
+        print_success("Created", "session", Some("123456789"));
+        print_success("Updated", "config", None);
+        print_error("boom");
+
+        print_session_created("dev", "123456789", false);
+        print_session_created("dev", "123456789", true);
+        print_session_killed("dev");
+        print_session_renamed("old", "new");
+        print_window_created("editor", 2);
+        print_window_killed("editor");
+        print_window_renamed("old", "new");
+        print_window_focused("editor");
+        print_window_reordered("editor", 1);
+        print_pane_split("abcdef012345", "vertical");
+        print_pane_focused("abcdef012345");
+        print_pane_zoomed("abcdef012345", true);
+        print_pane_zoomed("abcdef012345", false);
+        print_pane_swapped("abcdef012345", "fedcba987654");
+        print_pane_killed("abcdef012345");
+        print_pane_resized("abcdef012345");
+        print_pane_title_set("abcdef012345", "editor");
+        print_send_keys("abcdef012345", 42);
+
+        print_run_command(&serde_json::json!({"command_id": "123456789abcdef"}), true);
+        print_run_command(
+            &serde_json::json!({
+                "state": "completed",
+                "exit_code": 0,
+                "runtime_ms": 12,
+                "stdout": "ok\n",
+            }),
+            false,
+        );
+        print_run_command(
+            &serde_json::json!({
+                "state": "completed",
+                "exit_code": 2,
+                "runtime_ms": 13,
+            }),
+            false,
+        );
+        print_run_command(
+            &serde_json::json!({"state": "timed_out", "runtime_ms": 14}),
+            false,
+        );
+        print_run_command(
+            &serde_json::json!({"state": "cancelled", "runtime_ms": 15}),
+            false,
+        );
+        print_run_command(&serde_json::json!({"state": "weird"}), false);
+        print_run_command(&serde_json::json!({}), false);
+    }
 }

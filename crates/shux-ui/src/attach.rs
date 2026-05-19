@@ -415,12 +415,26 @@ mod tests {
     fn test_prefix_actions() {
         for (code, expected) in [
             (KeyCode::Char('|'), ActionKind::SplitVertical),
+            (KeyCode::Char('v'), ActionKind::SplitVertical),
             (KeyCode::Char('-'), ActionKind::SplitHorizontal),
+            (KeyCode::Char('s'), ActionKind::SplitHorizontal),
+            (KeyCode::Char(' '), ActionKind::SplitSmart),
             (KeyCode::Char('z'), ActionKind::ToggleZoom),
             (KeyCode::Char('h'), ActionKind::FocusLeft),
+            (KeyCode::Char('j'), ActionKind::FocusDown),
+            (KeyCode::Char('k'), ActionKind::FocusUp),
             (KeyCode::Char('l'), ActionKind::FocusRight),
+            (KeyCode::Char('o'), ActionKind::FocusNext),
             (KeyCode::Char('c'), ActionKind::NewWindow),
+            (KeyCode::Char('n'), ActionKind::NextWindow),
+            (KeyCode::Char('p'), ActionKind::PrevWindow),
+            (KeyCode::Char('r'), ActionKind::Redraw),
             (KeyCode::Char('x'), ActionKind::KillPane),
+            (KeyCode::Left, ActionKind::ResizeLeft),
+            (KeyCode::Right, ActionKind::ResizeRight),
+            (KeyCode::Up, ActionKind::ResizeUp),
+            (KeyCode::Down, ActionKind::ResizeDown),
+            (KeyCode::Char('['), ActionKind::EnterCopyMode),
         ] {
             let action = key_to_prefix_action(KeyEvent::new(code, KeyModifiers::NONE));
             assert_eq!(action, Some(expected), "{code:?}");
@@ -452,15 +466,36 @@ mod tests {
 
     #[test]
     fn test_bare_alt_hjkl_directional_focus() {
-        for (ch, expected) in [
-            ('h', ActionKind::FocusLeft),
-            ('j', ActionKind::FocusDown),
-            ('k', ActionKind::FocusUp),
-            ('l', ActionKind::FocusRight),
+        for (code, expected) in [
+            (KeyCode::Char('h'), ActionKind::FocusLeft),
+            (KeyCode::Left, ActionKind::FocusLeft),
+            (KeyCode::Char('j'), ActionKind::FocusDown),
+            (KeyCode::Down, ActionKind::FocusDown),
+            (KeyCode::Char('k'), ActionKind::FocusUp),
+            (KeyCode::Up, ActionKind::FocusUp),
+            (KeyCode::Char('l'), ActionKind::FocusRight),
+            (KeyCode::Right, ActionKind::FocusRight),
         ] {
-            let action = key_to_bare_action(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT));
-            assert_eq!(action, Some((expected, ActionArgs::default())), "Alt+{ch}",);
+            let action = key_to_bare_action(KeyEvent::new(code, KeyModifiers::ALT));
+            assert_eq!(action, Some((expected, ActionArgs::default())), "{code:?}",);
         }
+    }
+
+    #[test]
+    fn test_bare_alt_split_zoom_kill_and_unbound_paths() {
+        for (code, expected) in [
+            (KeyCode::Char('|'), ActionKind::SplitVertical),
+            (KeyCode::Char('\\'), ActionKind::SplitVertical),
+            (KeyCode::Char('-'), ActionKind::SplitHorizontal),
+            (KeyCode::Char('z'), ActionKind::ToggleZoom),
+            (KeyCode::Char('x'), ActionKind::KillPane),
+        ] {
+            let action = key_to_bare_action(KeyEvent::new(code, KeyModifiers::ALT));
+            assert_eq!(action, Some((expected, ActionArgs::default())), "{code:?}");
+        }
+
+        let action = key_to_bare_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT));
+        assert_eq!(action, None);
     }
 
     #[test]
@@ -511,5 +546,53 @@ mod tests {
         // Same with explicit Shift modifier (some terminals send it).
         let action = key_to_prefix_action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
         assert_eq!(action, Some(ActionKind::ToggleHelp));
+    }
+
+    #[test]
+    fn test_modified_prefix_keys_do_not_trigger_actions() {
+        let action = key_to_prefix_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn mouse_button_mapping_matches_protocol_values() {
+        assert_eq!(ct_button(CtMouseButton::Left), MouseButton::Left);
+        assert_eq!(ct_button(CtMouseButton::Right), MouseButton::Right);
+        assert_eq!(ct_button(CtMouseButton::Middle), MouseButton::Middle);
+    }
+
+    #[tokio::test]
+    async fn send_binding_target_serializes_action_and_detach_frames() {
+        let (mut tx, mut rx) = futures::channel::mpsc::channel::<Bytes>(4);
+        send_binding_target(
+            &mut tx,
+            &BindingTarget::Action(
+                ActionKind::SwitchToWindow,
+                ActionArgs {
+                    window_index: Some(3),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("send action");
+        send_binding_target(&mut tx, &BindingTarget::Detach)
+            .await
+            .expect("send detach");
+        drop(tx);
+
+        let action = rx.next().await.expect("action frame");
+        let parsed: AttachClientFrame = serde_json::from_slice(&action).expect("action json");
+        match parsed {
+            AttachClientFrame::Action { kind, args } => {
+                assert_eq!(kind, ActionKind::SwitchToWindow);
+                assert_eq!(args.window_index, Some(3));
+            }
+            other => panic!("expected action frame, got {other:?}"),
+        }
+
+        let detach = rx.next().await.expect("detach frame");
+        let parsed: AttachClientFrame = serde_json::from_slice(&detach).expect("detach json");
+        assert!(matches!(parsed, AttachClientFrame::Detach));
     }
 }

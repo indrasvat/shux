@@ -1337,6 +1337,7 @@ fn resolve_owners(graph: &GraphHandle, targets: &Targets) -> TargetOwners {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shux_rpc::{Policy, Sensitivity};
 
     #[test]
     fn manifest_parses() {
@@ -1357,5 +1358,358 @@ mod tests {
     fn manifest_rejects_missing_result() {
         let line = r#"{"jsonrpc":"2.0","id":"init"}"#;
         assert!(parse_manifest(line).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_bad_json_and_malformed_manifest() {
+        assert!(parse_manifest("{").is_err());
+        let line = r#"{"jsonrpc":"2.0","id":"init","result":{"name":42}}"#;
+        assert!(parse_manifest(line).is_err());
+    }
+
+    #[test]
+    fn plugin_source_builders_and_name_links_are_stable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = EventBus::new();
+        let mgr = PluginManager::with_state_root(bus, dir.path().join("state"));
+        let plugin_id = PluginId::new();
+
+        let source = PluginSource::from_path("/bin/echo").with_watch(true);
+        assert_eq!(source.path, PathBuf::from("/bin/echo"));
+        assert!(source.watch);
+        assert!(source.args.is_empty());
+        assert!(source.cwd.is_none());
+        assert!(source.state_root.is_none());
+
+        mgr.persist_name_link("demo", &plugin_id)
+            .expect("persist name link");
+        assert_eq!(mgr.resolve_plugin_id_for_name("demo"), Some(plugin_id));
+        assert_eq!(mgr.resolve_plugin_id_for_name("missing"), None);
+        assert!(
+            mgr.permissions_root(&plugin_id)
+                .ends_with(plugin_id.to_string())
+        );
+        assert!(mgr.name_link_path("demo").ends_with("demo"));
+    }
+
+    #[test]
+    fn plugin_state_helpers_validate_roundtrip_corruption_and_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        assert!(plugin_state_path(root, "").is_err());
+        assert!(plugin_state_path(root, "bad/name").is_err());
+        assert!(plugin_state_path(root, "bad.name").is_err());
+        assert!(plugin_state_path(root, "bad name").is_err());
+        assert_eq!(
+            read_plugin_state(root, "demo").expect("missing state"),
+            Value::Null
+        );
+
+        let value = serde_json::json!({"answer": 42, "nested": {"ok": true}});
+        let bytes = write_plugin_state(root, "demo", &value).expect("write state");
+        assert!(bytes > 0);
+        assert_eq!(read_plugin_state(root, "demo").expect("read state"), value);
+        assert!(delete_plugin_state(root, "demo").expect("delete state"));
+        assert!(!delete_plugin_state(root, "demo").expect("delete missing state"));
+
+        let path = plugin_state_path(root, "demo").expect("state path");
+        std::fs::create_dir_all(path.parent().expect("state parent")).expect("mkdir");
+        std::fs::write(&path, b"{not-json").expect("corrupt state");
+        assert!(read_plugin_state(root, "demo").is_err());
+
+        let huge = serde_json::json!({"blob": "x".repeat(PLUGIN_STATE_MAX_BYTES)});
+        assert!(write_plugin_state(root, "huge", &huge).is_err());
+    }
+
+    #[test]
+    fn publish_plugin_event_validates_namespace_and_publishes() {
+        let bus = EventBus::new();
+        assert!(publish_plugin_event("plugin-a", None, &bus).is_err());
+        assert!(publish_plugin_event("plugin-a", Some(&serde_json::json!({})), &bus).is_err());
+        assert!(
+            publish_plugin_event(
+                "plugin-a",
+                Some(&serde_json::json!({"event_type": ""})),
+                &bus,
+            )
+            .is_err()
+        );
+        assert!(
+            publish_plugin_event(
+                "plugin-a",
+                Some(&serde_json::json!({"event_type": "bad.dot"})),
+                &bus,
+            )
+            .is_err()
+        );
+
+        let seq = publish_plugin_event(
+            "plugin-a",
+            Some(&serde_json::json!({"event_type": "ready", "data": {"ok": true}})),
+            &bus,
+        )
+        .expect("publish event");
+        assert!(seq > 0);
+        let history = bus.history(10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].data.full_event_type(), "plugin.plugin-a.ready");
+    }
+
+    async fn recv_json(rx: &mut mpsc::Receiver<String>) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("response timeout")
+            .expect("response line");
+        serde_json::from_str(&line).expect("response json")
+    }
+
+    #[tokio::test]
+    async fn dispatch_plugin_frame_handles_plugin_only_methods_and_audit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().join("state");
+        let perm_root = dir.path().join("perm");
+        let bus = EventBus::new();
+        let router = Arc::new(tokio::sync::OnceCell::new());
+        let graph = Arc::new(tokio::sync::OnceCell::new());
+        let plugin_id = PluginId::new();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "plugin.state.get"
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(frame["result"]["value"], Value::Null);
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "plugin.state.set",
+                "params": {"value": {"seen": true}}
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        let frame = recv_json(&mut rx).await;
+        assert!(frame["result"]["bytes_written"].as_u64().unwrap() > 0);
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "plugin.state.get"
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(frame["result"]["value"]["seen"], true);
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "event.publish",
+                "params": {"event_type": "tick", "data": {"n": 1}}
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        let frame = recv_json(&mut rx).await;
+        assert!(frame["result"]["seq"].as_u64().unwrap() > 0);
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "plugin.state.delete"
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(frame["result"]["deleted"], true);
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "plugin.state.set"
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx,
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(frame["error"]["code"], -32602);
+        assert!(perm_root.join("audit.log").exists());
+    }
+
+    #[tokio::test]
+    async fn dispatch_plugin_frame_handles_ignored_frames_router_errors_and_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().join("state");
+        let perm_root = dir.path().join("perm");
+        let bus = EventBus::new();
+        let plugin_id = PluginId::new();
+        let graph = Arc::new(tokio::sync::OnceCell::new());
+        let router = Arc::new(tokio::sync::OnceCell::new());
+        let (tx, mut rx) = mpsc::channel(8);
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            "{not-json".to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1}).to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({"jsonrpc": "2.0", "method": "notify"}).to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        assert!(rx.try_recv().is_err());
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "system.version"
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(frame["error"]["message"], "router not ready");
+
+        let ready_router = Router::builder()
+            .register_with_policy(
+                "system.version",
+                Policy::fixed(Sensitivity::Public),
+                |_params: Option<Value>| async { Ok(serde_json::json!({"version": "test"})) },
+            )
+            .register_with_policy(
+                "pane.send_keys",
+                Policy::fixed(Sensitivity::OwnedMutation),
+                |_params: Option<Value>| async { Ok(serde_json::json!({"bytes_written": 2})) },
+            )
+            .build();
+        router.set(ready_router).expect("set router");
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "system.version"
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx.clone(),
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(frame["result"]["version"], "test");
+
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "pane.send_keys",
+                "params": {"pane_id": PaneId::new().to_string(), "text": "ls"}
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            tx,
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(frame["error"]["code"], -32004);
+        assert_eq!(frame["error"]["data"]["reason"], "no_grant_and_not_owned");
     }
 }
