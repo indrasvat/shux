@@ -624,6 +624,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.grid.clear_scrollback();
                 *self.cursor = Cursor::new();
                 *self.modes = TerminalModes::default();
+                *self.default_colors = TerminalDefaultColors::default();
                 self.scroll_region.top = 0;
                 self.scroll_region.bottom = self.grid.rows().saturating_sub(1);
             }
@@ -895,6 +896,18 @@ mod tests {
         assert_eq!(t.cursor.row, 0);
         assert_eq!(t.cursor.col, 0);
         assert_eq!(t.cursor.style.fg, Color::Default);
+    }
+
+    #[test]
+    fn test_ris_full_reset_clears_dynamic_default_colors() {
+        let mut t = TestTerminal::new(24, 80);
+        t.process(b"\x1b]10;#ff8000\x07\x1b]11;#120a08\x07");
+        assert_eq!(t.default_colors.fg, Some([0xff, 0x80, 0x00]));
+        assert_eq!(t.default_colors.bg, Some([0x12, 0x0a, 0x08]));
+
+        t.process(b"\x1bc");
+
+        assert_eq!(t.default_colors, TerminalDefaultColors::default());
     }
 
     #[test]

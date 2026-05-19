@@ -55,6 +55,11 @@ pub struct PaneIoState {
     /// Per-pane completion receivers used by daemon shutdown to wait until
     /// PTY tasks have actually signalled and reaped their children.
     pub pty_done: HashMap<shux_core::model::PaneId, oneshot::Receiver<()>>,
+    /// Completion waiters for PTY tasks that were already explicitly torn
+    /// down by pane/window/session kill. Daemon shutdown drains these too so
+    /// it cannot exit while an earlier teardown is still in its reap/escalate
+    /// path.
+    pub teardown_waiters: Vec<tokio::task::JoinHandle<()>>,
     /// Per-pane VirtualTerminal instances for capturing output.
     pub vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
     /// Command execution engine for marker-based completion detection.
@@ -83,6 +88,7 @@ impl PaneIoState {
             resizers: HashMap::new(),
             shutdowns: HashMap::new(),
             pty_done: HashMap::new(),
+            teardown_waiters: Vec::new(),
             vts: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: Arc::new(tokio::sync::Notify::new()),
@@ -100,8 +106,18 @@ impl PaneIoState {
         pane_ids: &[shux_core::model::PaneId],
         remove_vts: bool,
     ) -> Arc<Notify> {
-        let (pulse, _done) = self.teardown_panes_collecting(pane_ids, remove_vts);
+        let (pulse, done) = self.teardown_panes_collecting(pane_ids, remove_vts);
+        self.track_teardown_waiters(done);
         pulse
+    }
+
+    fn track_teardown_waiters(&mut self, done: Vec<oneshot::Receiver<()>>) {
+        self.teardown_waiters.retain(|waiter| !waiter.is_finished());
+        self.teardown_waiters.extend(done.into_iter().map(|rx| {
+            tokio::spawn(async move {
+                let _ = rx.await;
+            })
+        }));
     }
 
     pub fn teardown_panes_collecting(
@@ -789,7 +805,7 @@ async fn run_rpc_server(
 }
 
 async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
-    let done = {
+    let (done, teardown_waiters) = {
         let mut state = io_state.lock().await;
         let pane_ids: Vec<_> = state
             .shutdowns
@@ -801,15 +817,22 @@ async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        state
+            .teardown_waiters
+            .retain(|waiter| !waiter.is_finished());
+        let teardown_waiters = std::mem::take(&mut state.teardown_waiters);
         let (pulse, done) = state.teardown_panes_collecting(&pane_ids, true);
         drop(state);
         pulse.notify_waiters();
-        done
+        (done, teardown_waiters)
     };
 
     let wait_all = async move {
         for rx in done {
             let _ = rx.await;
+        }
+        for waiter in teardown_waiters {
+            let _ = waiter.await;
         }
     };
     if tokio::time::timeout(Duration::from_secs(3), wait_all)
@@ -4941,5 +4964,37 @@ mod tests {
 
         token.cancel();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_explicit_teardown_waiters() {
+        let pane_id = shux_core::model::PaneId::new();
+        let pane_shutdown = CancellationToken::new();
+        let (done_tx, done_rx) = oneshot::channel();
+        let io_state = Arc::new(Mutex::new(PaneIoState::new()));
+
+        {
+            let mut state = io_state.lock().await;
+            state.shutdowns.insert(pane_id, pane_shutdown.clone());
+            state.pty_done.insert(pane_id, done_rx);
+            let pulse = state.teardown_panes(&[pane_id], true);
+            pulse.notify_one();
+
+            assert!(pane_shutdown.is_cancelled());
+            assert!(state.pty_done.is_empty());
+            assert_eq!(state.teardown_waiters.len(), 1);
+        }
+
+        let mut shutdown = tokio::spawn(shutdown_all_pane_io(io_state.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "daemon shutdown must wait for explicit teardown PTY completion"
+        );
+
+        done_tx.send(()).unwrap();
+        shutdown.await.unwrap();
+        assert!(io_state.lock().await.teardown_waiters.is_empty());
     }
 }
