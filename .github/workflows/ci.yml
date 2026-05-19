@@ -141,11 +141,14 @@ jobs:
       - name: Integration regressions (12 deterministic scenarios)
         run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/integration.sh
 
-  # Codecov tracks the release line, not per-PR gates. Main-only.
   coverage:
-    name: Coverage
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: Coverage (llvm-cov)
+    if: github.event_name != 'schedule'
+    needs: test-ubuntu
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -154,14 +157,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
-      - name: Generate lcov.info
+
+      - name: Generate coverage report
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v5
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
         with:
           files: lcov.info
-          fail_ci_if_error: false
-          # CODECOV_TOKEN is optional for public repos but recommended.
-          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: ${{ !(github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]')) }}
+          override_branch: ${{ github.head_ref || github.ref_name }}
+          override_commit: ${{ github.event.pull_request.head.sha || github.sha }}
+          slug: ${{ github.repository }}
+          use_oidc: ${{ !(github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]')) }}
+
+      - name: Export coverage summary
+        run: cargo llvm-cov report --lcov --summary-only --output-path coverage-summary.txt
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            lcov.info
+            coverage-summary.txt
 
   # License + advisory audit. Cheap on Linux (~45s), so kept on every
   # PR. The weekly schedule re-runs it so advisories that drop against

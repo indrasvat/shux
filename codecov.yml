@@ -1,0 +1,54 @@
+codecov:
+  require_ci_to_pass: yes
+
+coverage:
+  precision: 2
+  round: down
+  range: "60...100"
+
+  status:
+    project:
+      default:
+        target: 60%
+        threshold: 2%
+        base: auto
+    patch:
+      default:
+        target: 70%
+        threshold: 5%
+      non_code:
+        informational: true
+        paths:
+          - "assets/**"
+          - "docs/**"
+          - ".github/**"
+          - "scripts/**"
+          - ".shux/scripts/**"
+          - "config/**"
+          - "AGENTS.md"
+          - "CLAUDE.md"
+          - "README.md"
+
+comment:
+  layout: "reach,diff,flags,tree"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+
+ignore:
+  - "crates/*/tests/**"      # Ignore test code itself
+  - "**/*_test.rs"
+
+flags:
+  unittests:
+    paths:
+      - crates/shux/
+      - crates/shux-core/
+      - crates/shux-plugin/
+      - crates/shux-pty/
+      - crates/shux-raster/
+      - crates/shux-rpc/
+      - crates/shux-ui/
+      - crates/shux-vt/
+    carryforward: true
