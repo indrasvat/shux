@@ -95,28 +95,29 @@ install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, fuzz, lefth
 # ══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: test
-test: ## Run all tests with cargo-nextest
+test: ## Run all tests with cargo test
 	@echo "$(COLOR_BLUE)▶ Running tests...$(COLOR_RESET)"
-	@cargo nextest run --workspace --no-tests=pass
+	@bash scripts/run-cargo-test.sh --workspace -- --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Tests passed$(COLOR_RESET)"
 
 .PHONY: test-verbose
 test-verbose: ## Run tests with output visible
 	@echo "$(COLOR_BLUE)▶ Running tests (verbose)...$(COLOR_RESET)"
-	@cargo nextest run --workspace --no-capture --no-tests=pass
+	@bash scripts/run-cargo-test.sh --workspace -- --test-threads=1 --nocapture
 
 .PHONY: test-lib
 test-lib: ## Run library tests only
 	@echo "$(COLOR_BLUE)▶ Running library tests...$(COLOR_RESET)"
-	@cargo nextest run --workspace --lib --no-tests=pass
+	@bash scripts/run-cargo-test.sh --workspace --lib -- --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Library tests passed$(COLOR_RESET)"
 
 .PHONY: test-copy-mode
 test-copy-mode: ## Run focused copy-mode and copy-overlay tests
 	@echo "$(COLOR_BLUE)▶ Running copy-mode tests...$(COLOR_RESET)"
-	@cargo nextest run -p shux-ui --lib copy_mode --no-tests=pass
-	@cargo nextest run -p shux-ui --lib compositor::tests::test_compositor_does_not_churn_cursor_when_idle compositor::tests::test_compositor_moves_cursor_without_hide_show_when_only_cursor_changes --no-tests=pass
-	@cargo nextest run -p shux --bin shux attach::tests:: --no-tests=pass
+	@bash scripts/run-cargo-test.sh -p shux-ui --lib copy_mode -- --test-threads=1
+	@bash scripts/run-cargo-test.sh -p shux-ui --lib compositor::tests::test_compositor_does_not_churn_cursor_when_idle -- --test-threads=1
+	@bash scripts/run-cargo-test.sh -p shux-ui --lib compositor::tests::test_compositor_moves_cursor_without_hide_show_when_only_cursor_changes -- --test-threads=1
+	@bash scripts/run-cargo-test.sh -p shux --bin shux attach::tests:: -- --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Copy-mode tests passed$(COLOR_RESET)"
 
 .PHONY: test-doc
@@ -129,7 +130,7 @@ test-doc: ## Run doc tests
 test-coverage: ## Run tests with coverage report
 	@echo "$(COLOR_BLUE)▶ Running tests with coverage...$(COLOR_RESET)"
 	@mkdir -p $(COVERAGE_DIR)
-	@cargo llvm-cov nextest --workspace --lcov --output-path $(COVERAGE_DIR)/lcov.info
+	@cargo llvm-cov --workspace --lcov --output-path $(COVERAGE_DIR)/lcov.info -- --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Coverage report: $(COVERAGE_DIR)/lcov.info$(COLOR_RESET)"
 
 .PHONY: bench
@@ -195,8 +196,8 @@ ci-strict: ## Force latest stable toolchain, then run fmt+clippy+build+test (clo
 	@cargo +stable clippy --workspace --all-targets -- -D warnings
 	@echo "$(COLOR_BLUE)▶ Build --all-targets (+stable)$(COLOR_RESET)"
 	@cargo +stable build --workspace --all-targets
-	@echo "$(COLOR_BLUE)▶ Library tests (+stable, nextest)$(COLOR_RESET)"
-	@cargo +stable nextest run --workspace --lib --no-tests=pass
+	@echo "$(COLOR_BLUE)▶ Library tests (+stable)$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh --workspace --lib -- --test-threads=1
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ ci-strict passed against $$(rustc +stable --version)$(COLOR_RESET)"
 	@echo ""
