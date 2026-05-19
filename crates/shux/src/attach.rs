@@ -2445,12 +2445,9 @@ async fn cleanup_pane_io(io_state: &Arc<Mutex<PaneIoState>>, pane_ids: &[PaneId]
         return;
     }
     let mut state = io_state.lock().await;
-    for id in pane_ids {
-        state.writers.remove(id);
-        state.resizers.remove(id);
-        state.vts.remove(id);
-    }
-    state.render_pulse.notify_one();
+    let pulse = state.teardown_panes(pane_ids, true);
+    drop(state);
+    pulse.notify_one();
 }
 
 async fn new_window(

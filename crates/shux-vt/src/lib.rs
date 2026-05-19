@@ -9,7 +9,9 @@ mod cursor;
 mod grid;
 mod parser;
 
-pub use cell::{Cell, CellFlags, CellStyle, Color, ExtendedAttrs, UnderlineStyle};
+pub use cell::{
+    Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
+};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use grid::{Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
@@ -36,6 +38,8 @@ pub struct VirtualTerminal {
     scroll_region: ScrollRegion,
     /// Window title (set via OSC 0/2).
     title: Option<String>,
+    /// Dynamic default foreground/background set via OSC 10/11.
+    default_colors: TerminalDefaultColors,
     /// vte parser state machine.
     parser: Parser,
     /// Number of visible rows.
@@ -63,6 +67,7 @@ impl VirtualTerminal {
                 bottom: rows.saturating_sub(1),
             },
             title: None,
+            default_colors: TerminalDefaultColors::default(),
             parser: Parser::new(),
             rows,
             cols,
@@ -84,6 +89,7 @@ impl VirtualTerminal {
             modes: &mut self.modes,
             scroll_region: &mut self.scroll_region,
             title: &mut self.title,
+            default_colors: &mut self.default_colors,
             alt_grid: &mut self.alt_grid,
             alt_cursor: &mut self.alt_cursor,
         };
@@ -108,6 +114,11 @@ impl VirtualTerminal {
     /// Get the window title (set by OSC 0/2).
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Dynamic default foreground/background set by OSC 10/11.
+    pub fn default_colors(&self) -> TerminalDefaultColors {
+        self.default_colors
     }
 
     /// Whether alternate screen is active.

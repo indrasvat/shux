@@ -18,6 +18,18 @@ pub fn vt_color_to_crossterm(color: VtColor) -> Option<CtColor> {
     }
 }
 
+/// Convert a VT color to crossterm, resolving `Default` through an optional
+/// dynamic OSC 10/11 terminal color.
+pub fn vt_color_to_crossterm_with_default(
+    color: VtColor,
+    default: Option<shux_vt::Rgb>,
+) -> Option<CtColor> {
+    match color {
+        VtColor::Default => default.map(|[r, g, b]| CtColor::Rgb { r, g, b }),
+        other => vt_color_to_crossterm(other),
+    }
+}
+
 /// Inverse of `vt_color_to_crossterm`. Named ANSI colours fold into their
 /// indexed equivalents; unknown / impossible colours fall back to default.
 pub fn crossterm_to_vt(color: CtColor) -> VtColor {

@@ -219,9 +219,45 @@ impl PtyHandle {
         self.child.try_wait().map_err(PtyError::Child)
     }
 
-    pub fn kill(&mut self) -> Result<(), PtyError> {
-        // start_kill is non-async kill on tokio::process::Child
+    /// Ask the whole PTY process group to terminate.
+    ///
+    /// `pty-process` makes the spawned child the session leader, so the
+    /// child's PID is also the process group ID. Signalling the group matters
+    /// for interactive shells: the foreground TUI may be a child of the shell,
+    /// and killing only the shell can leave that foreground process alive.
+    pub fn terminate(&mut self) -> Result<(), PtyError> {
+        #[cfg(unix)]
+        {
+            if self
+                .signal_process_group(nix::sys::signal::Signal::SIGHUP)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
         self.child.start_kill().map_err(PtyError::Child)
+    }
+
+    pub fn kill(&mut self) -> Result<(), PtyError> {
+        #[cfg(unix)]
+        {
+            if self
+                .signal_process_group(nix::sys::signal::Signal::SIGKILL)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        self.child.start_kill().map_err(PtyError::Child)
+    }
+
+    #[cfg(unix)]
+    fn signal_process_group(&self, signal: nix::sys::signal::Signal) -> Result<(), PtyError> {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        killpg(Pid::from_raw(self.pid as i32), signal)
+            .map_err(|e| PtyError::Child(std::io::Error::from(e)))
     }
 
     /// Get the current working directory of the child process.

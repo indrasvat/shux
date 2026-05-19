@@ -1285,6 +1285,7 @@ dependencies = [
 name = "shux-pty"
 version = "0.24.3"
 dependencies = [
+ "nix",
  "pty-process",
  "serde",
  "serde_json",

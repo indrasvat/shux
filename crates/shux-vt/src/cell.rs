@@ -43,6 +43,20 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// Pixel color (sRGB).
+pub type Rgb = [u8; 3];
+
+/// Dynamic terminal default colors set by OSC 10/11.
+///
+/// `None` means "use the embedding terminal / rasterizer fallback".
+/// Real terminal emulators treat OSC 10 and OSC 11 as changes to the
+/// default foreground/background that `SGR 39` and `SGR 49` resolve to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalDefaultColors {
+    pub fg: Option<Rgb>,
+    pub bg: Option<Rgb>,
+}
+
 /// Cell style attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CellStyle {
