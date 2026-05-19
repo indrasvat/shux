@@ -4997,4 +4997,881 @@ mod tests {
         shutdown.await.unwrap();
         assert!(io_state.lock().await.teardown_waiters.is_empty());
     }
+
+    fn write_plugin_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[test]
+    fn daemon_utility_mappers_cover_error_preview_snapshot_and_color_edges() {
+        use shux_core::graph::GraphError;
+
+        assert_eq!(
+            graph_error_to_rpc(GraphError::SessionNotFound(
+                shux_core::model::SessionId::new()
+            ))
+            .code,
+            shux_rpc::ErrorCode::NotFound.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::WindowNotFound(shux_core::model::WindowId::new())).code,
+            shux_rpc::ErrorCode::NotFound.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::PaneNotFound(shux_core::model::PaneId::new())).code,
+            shux_rpc::ErrorCode::NotFound.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::WindowNameConflict("logs".to_string())).code,
+            shux_rpc::ErrorCode::NameConflict.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::InvalidSessionName("bad/name".to_string())).code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::EmptyWindowName).code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::LastPane).code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::LayoutError("split failed".to_string())).code,
+            shux_rpc::ErrorCode::InternalError.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::Shutdown).code,
+            shux_rpc::ErrorCode::InternalError.code()
+        );
+        assert_eq!(
+            graph_error_to_rpc(GraphError::VersionConflict {
+                resource: "pane",
+                id: "p1".to_string(),
+                expected: 1,
+                actual: 2,
+            })
+            .code,
+            shux_rpc::ErrorCode::VersionConflict.code()
+        );
+
+        assert_eq!(
+            parse_snapshot_dims(&serde_json::json!({"cols": 80, "rows": 24})).unwrap(),
+            (80, 24)
+        );
+        assert_eq!(
+            parse_snapshot_dims(&serde_json::json!({})).unwrap(),
+            (120, 36)
+        );
+        assert_eq!(
+            parse_snapshot_dims(&serde_json::json!({"cols": 3, "rows": 24}))
+                .unwrap_err()
+                .code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+        assert_eq!(
+            parse_expected_version(&serde_json::json!({})).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_expected_version(&serde_json::json!({"expected_version": null})).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_expected_version(&serde_json::json!({"expected_version": 7})).unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            parse_expected_version(&serde_json::json!({"expected_version": "old"}))
+                .unwrap_err()
+                .code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+        assert_eq!(
+            parse_initial_pane_title(&serde_json::json!({"pane_title": "editor"})).unwrap(),
+            Some("editor".to_string())
+        );
+        assert_eq!(
+            parse_initial_pane_title(&serde_json::json!({"pane_title": ""}))
+                .unwrap_err()
+                .code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+        assert_eq!(preview_for_log("short", 20), "short");
+        assert_eq!(preview_for_log("one\ntwo\nthree", 5), "three");
+
+        let default_io = PaneIoState::default();
+        assert!(default_io.writers.is_empty());
+
+        let mut grid = shux_vt::Grid::new(1, 2, shux_vt::GridConfig::default());
+        resolve_grid_default_colors(&mut grid, shux_vt::TerminalDefaultColors::default());
+        grid.visible_row_mut(0)[0].style.fg = shux_vt::Color::Default;
+        grid.visible_row_mut(0)[1].style.bg = shux_vt::Color::Default;
+        resolve_grid_default_colors(
+            &mut grid,
+            shux_vt::TerminalDefaultColors {
+                fg: Some([1, 2, 3]),
+                bg: Some([4, 5, 6]),
+            },
+        );
+        assert_eq!(
+            grid.visible_row(0)[0].style.fg,
+            shux_vt::Color::Rgb(1, 2, 3)
+        );
+        assert_eq!(
+            grid.visible_row(0)[1].style.bg,
+            shux_vt::Color::Rgb(4, 5, 6)
+        );
+    }
+
+    struct RpcHarness {
+        router: shux_rpc::Router,
+        graph: GraphHandle,
+        io: Arc<Mutex<PaneIoState>>,
+        bus: shux_core::bus::EventBus,
+        cancel: CancellationToken,
+        graph_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl RpcHarness {
+        fn new() -> Self {
+            let bus = shux_core::bus::EventBus::new();
+            let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+            let (cmd_tx, cmd_rx) = mpsc::channel(128);
+            let cancel = CancellationToken::new();
+            let graph_cancel = cancel.clone();
+            let graph_task = tokio::spawn(async move {
+                run_graph_loop(graph, cmd_rx, graph_cancel).await;
+            });
+            let graph = GraphHandle::new(cmd_tx, state);
+            let io = Arc::new(Mutex::new(PaneIoState::new().with_event_bus(bus.clone())));
+            let meta = session_meta::SessionMetaCache::new();
+            let config_path =
+                std::env::temp_dir().join(format!("shux-rpc-test-{}.toml", uuid::Uuid::new_v4()));
+            let config = ConfigHandle::load_or_default(&config_path);
+            let onboarding = onboarding::OnboardingHandle::from_state_for_test(Default::default());
+            let segments = statusbar_runner::SegmentCache::new();
+
+            let builder = register_session_methods(
+                shux_rpc::Router::builder(),
+                graph.clone(),
+                io.clone(),
+                cancel.clone(),
+                meta.clone(),
+            );
+            let builder =
+                register_window_methods(builder, graph.clone(), io.clone(), cancel.clone());
+            let builder = register_pane_methods(builder, graph.clone(), io.clone(), cancel.clone());
+            let builder =
+                register_state_methods(builder, graph.clone(), io.clone(), cancel.clone());
+            let builder = register_pane_io_methods(
+                builder,
+                graph.clone(),
+                io.clone(),
+                cancel.clone(),
+                config,
+                meta,
+                onboarding,
+                segments,
+            );
+            let router = register_events_methods(builder, bus.clone()).build();
+            router.assert_every_route_has_policy();
+
+            Self {
+                router,
+                graph,
+                io,
+                bus,
+                cancel,
+                graph_task,
+            }
+        }
+
+        async fn stop(self) {
+            self.cancel.cancel();
+            self.graph_task.await.unwrap();
+        }
+
+        async fn seed_session(
+            &self,
+            name: &str,
+        ) -> (
+            shux_core::model::SessionId,
+            shux_core::model::WindowId,
+            shux_core::model::PaneId,
+        ) {
+            let session_id = self
+                .graph
+                .create_session_with_command(
+                    name.to_string(),
+                    std::path::PathBuf::from("/tmp"),
+                    vec!["bash".to_string()],
+                )
+                .await
+                .unwrap();
+            let snap = self.graph.snapshot();
+            let session = snap.sessions.get(&session_id).unwrap();
+            let window_id = session.active_window;
+            let pane_id = snap.windows.get(&window_id).unwrap().active_pane;
+            (session_id, window_id, pane_id)
+        }
+
+        async fn seed_io(
+            &self,
+            pane_id: shux_core::model::PaneId,
+            text: &[u8],
+        ) -> mpsc::Receiver<Vec<u8>> {
+            let (write_tx, write_rx) = mpsc::channel(16);
+            let (resize_tx, mut resize_rx) = mpsc::channel::<ResizeRequest>(8);
+            let io = self.io.clone();
+            tokio::spawn(async move {
+                while let Some(req) = resize_rx.recv().await {
+                    let mut state = io.lock().await;
+                    if let Some(vt) = state.vts.get_mut(&pane_id) {
+                        vt.resize(req.size.rows as usize, req.size.cols as usize);
+                    }
+                    if let Some(ack) = req.ack {
+                        let _ = ack.send(());
+                    }
+                }
+            });
+
+            let mut vt = shux_vt::VirtualTerminal::new(6, 40);
+            if !text.is_empty() {
+                vt.process(text);
+            }
+            let mut state = self.io.lock().await;
+            state.writers.insert(pane_id, write_tx);
+            state.resizers.insert(pane_id, resize_tx);
+            state.shutdowns.insert(pane_id, self.cancel.child_token());
+            state.vts.insert(pane_id, vt);
+            write_rx
+        }
+    }
+
+    async fn dispatch_ok(
+        router: &shux_rpc::Router,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        router.dispatch(method, Some(params)).await.unwrap()
+    }
+
+    async fn dispatch_err(
+        router: &shux_rpc::Router,
+        method: &str,
+        params: serde_json::Value,
+    ) -> shux_rpc::RpcError {
+        router.dispatch(method, Some(params)).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn production_state_apply_reports_validation_and_spawn_results() {
+        let harness = RpcHarness::new();
+
+        let missing_ops = dispatch_err(&harness.router, "state.apply", serde_json::json!({})).await;
+        assert_eq!(missing_ops.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        let malformed_ops = dispatch_err(
+            &harness.router,
+            "state.apply",
+            serde_json::json!({"ops": "not-an-array"}),
+        )
+        .await;
+        assert_eq!(
+            malformed_ops.code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+
+        let empty_ops = dispatch_err(
+            &harness.router,
+            "state.apply",
+            serde_json::json!({"ops": []}),
+        )
+        .await;
+        assert_eq!(empty_ops.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        let applied = dispatch_ok(
+            &harness.router,
+            "state.apply",
+            serde_json::json!({
+                "ops": [{
+                    "op": "create_session",
+                    "name": "applied",
+                    "cwd": "/tmp",
+                    "initial_command": ["true"],
+                    "initial_window_title": "dev"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(applied["outputs"].as_array().unwrap().len(), 1);
+        assert_eq!(applied["spawn_results"].as_array().unwrap().len(), 1);
+        assert!(
+            applied["correlation_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("apply-")
+        );
+        let snap = harness.graph.snapshot();
+        let session = snap
+            .find_session_by_name("applied")
+            .expect("applied session");
+        let session_id = session.id;
+        let window_id = session.active_window;
+        let pane_id = snap.windows[&window_id].active_pane;
+        drop(snap);
+        assert_eq!(
+            resolve_window_id_from_params(
+                &harness.graph,
+                &serde_json::json!({"session_id": session_id.to_string()})
+            )
+            .unwrap(),
+            window_id
+        );
+        assert_eq!(
+            resolve_pane_id_from_params(
+                &harness.graph,
+                &serde_json::json!({"pane_id": pane_id.to_string()})
+            )
+            .unwrap(),
+            pane_id
+        );
+        assert_eq!(
+            resolve_window_id_from_params(&harness.graph, &serde_json::json!({}))
+                .unwrap_err()
+                .code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn production_plugin_router_covers_install_grants_audit_reload_and_kill() {
+        const NOOP_PLUGIN: &str = r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"noop","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+  esac
+done
+"#;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_plugin_script(tmp.path(), "noop.sh", NOOP_PLUGIN);
+        let manager = shux_plugin::PluginManager::with_state_root(
+            shux_core::bus::EventBus::new(),
+            tmp.path().join("plugins"),
+        );
+        let router = register_plugin_methods(shux_rpc::Router::builder(), manager.clone()).build();
+        router.assert_every_route_has_policy();
+
+        let missing_path = dispatch_err(&router, "plugin.install", serde_json::json!({})).await;
+        assert_eq!(missing_path.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        let installed = dispatch_ok(
+            &router,
+            "plugin.install",
+            serde_json::json!({
+                "path": script,
+                "watch": false,
+                "state_root": tmp.path().join("plugin-state"),
+            }),
+        )
+        .await;
+        assert_eq!(installed["name"], "noop");
+        assert_eq!(installed["watching"], false);
+
+        let listed = dispatch_ok(&router, "plugin.list", serde_json::json!({})).await;
+        assert_eq!(listed["plugins"].as_array().unwrap().len(), 1);
+
+        let granted = dispatch_ok(
+            &router,
+            "plugin.grant",
+            serde_json::json!({"plugin": "noop", "method": "pane.capture", "target": "pane-1"}),
+        )
+        .await;
+        assert_eq!(granted["granted"], true);
+        let subscribe_grant = dispatch_ok(
+            &router,
+            "plugin.grant",
+            serde_json::json!({"plugin": "noop", "method": "pane.output.", "subscribe": true}),
+        )
+        .await;
+        assert_eq!(subscribe_grant["subscribe"], true);
+
+        let grants = dispatch_ok(
+            &router,
+            "plugin.grants",
+            serde_json::json!({"plugin": "noop"}),
+        )
+        .await;
+        assert!(
+            grants["grants"]
+                .as_object()
+                .unwrap()
+                .contains_key("pane.capture")
+        );
+
+        let audit_path = manager.audit_path("noop").await.unwrap();
+        std::fs::create_dir_all(audit_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &audit_path,
+            r#"{"seq":1,"method":"old"}
+{"seq":2,"method":"new"}
+"#,
+        )
+        .unwrap();
+        let audit = dispatch_ok(
+            &router,
+            "plugin.audit",
+            serde_json::json!({"plugin": "noop", "tail": 1}),
+        )
+        .await;
+        assert_eq!(audit["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(audit["entries"][0]["method"], "new");
+
+        let revoked = dispatch_ok(
+            &router,
+            "plugin.revoke",
+            serde_json::json!({"plugin": "noop", "method": "pane.capture", "target": "pane-1"}),
+        )
+        .await;
+        assert_eq!(revoked["revoked"], true);
+
+        let reloaded = dispatch_ok(
+            &router,
+            "plugin.reload",
+            serde_json::json!({"name": "noop"}),
+        )
+        .await;
+        assert_eq!(reloaded["name"], "noop");
+
+        let killed = dispatch_ok(&router, "plugin.kill", serde_json::json!({"name": "noop"})).await;
+        assert_eq!(killed["killed"], "noop");
+        let missing_plugin =
+            dispatch_err(&router, "plugin.kill", serde_json::json!({"name": "noop"})).await;
+        assert_eq!(missing_plugin.code, shux_rpc::ErrorCode::NotFound.code());
+    }
+
+    #[tokio::test]
+    async fn production_router_session_window_pane_routes_mutate_graph_and_cleanup_io() {
+        let harness = RpcHarness::new();
+        let (session_id, window_id, first_pane) = harness.seed_session("alpha").await;
+        let second_pane = harness
+            .graph
+            .split_pane(first_pane, Direction::Vertical, 0.5)
+            .await
+            .unwrap();
+        let second_window = harness
+            .graph
+            .create_window(
+                session_id,
+                "logs".to_string(),
+                std::path::PathBuf::from("/tmp"),
+            )
+            .await
+            .unwrap();
+        let second_window_pane = {
+            let snap = harness.graph.snapshot();
+            snap.windows[&second_window].active_pane
+        };
+        let _first_rx = harness.seed_io(first_pane, b"alpha ready\n").await;
+        let _second_rx = harness.seed_io(second_pane, b"beta ready\n").await;
+        let _window_rx = harness.seed_io(second_window_pane, b"logs ready\n").await;
+
+        let listed = dispatch_ok(&harness.router, "session.list", serde_json::json!({})).await;
+        assert_eq!(listed["sessions"][0]["name"], "alpha");
+        assert_eq!(listed["sessions"][0]["window_count"], 2);
+
+        let renamed = dispatch_ok(
+            &harness.router,
+            "session.rename",
+            serde_json::json!({"name": "alpha", "new_name": "beta"}),
+        )
+        .await;
+        assert_eq!(renamed["name"], "beta");
+
+        let _other = harness.seed_session("other").await;
+        let conflict = dispatch_err(
+            &harness.router,
+            "session.rename",
+            serde_json::json!({"id": session_id.to_string(), "new_name": "other"}),
+        )
+        .await;
+        assert_eq!(conflict.code, shux_rpc::ErrorCode::NameConflict.code());
+
+        let windows = dispatch_ok(
+            &harness.router,
+            "window.list",
+            serde_json::json!({"session_id": session_id.to_string()}),
+        )
+        .await;
+        assert_eq!(windows.as_array().unwrap().len(), 2);
+
+        let renamed_window = dispatch_ok(
+            &harness.router,
+            "window.rename",
+            serde_json::json!({"id": second_window.to_string(), "name": "ops"}),
+        )
+        .await;
+        assert_eq!(renamed_window["title"], "ops");
+
+        let refocused_first = dispatch_ok(
+            &harness.router,
+            "window.focus",
+            serde_json::json!({"id": window_id.to_string()}),
+        )
+        .await;
+        assert_eq!(
+            refocused_first["previous_window_id"],
+            second_window.to_string()
+        );
+
+        let focused_window = dispatch_ok(
+            &harness.router,
+            "window.focus",
+            serde_json::json!({"id": second_window.to_string()}),
+        )
+        .await;
+        assert_eq!(focused_window["previous_window_id"], window_id.to_string());
+
+        let reordered = dispatch_ok(
+            &harness.router,
+            "window.reorder",
+            serde_json::json!({"id": second_window.to_string(), "new_index": 0}),
+        )
+        .await;
+        assert_eq!(reordered["index"], 0);
+
+        let panes = dispatch_ok(
+            &harness.router,
+            "pane.list",
+            serde_json::json!({"window_id": window_id.to_string()}),
+        )
+        .await;
+        assert_eq!(panes.as_array().unwrap().len(), 2);
+
+        let focused_pane = dispatch_ok(
+            &harness.router,
+            "pane.focus",
+            serde_json::json!({"pane_id": second_pane.to_string()}),
+        )
+        .await;
+        assert_eq!(focused_pane["pane_id"], second_pane.to_string());
+
+        let titled = dispatch_ok(
+            &harness.router,
+            "pane.set_title",
+            serde_json::json!({"pane_id": second_pane.to_string(), "title": "editor", "auto": false}),
+        )
+        .await;
+        assert_eq!(titled["manual_title"], "editor");
+        assert_eq!(titled["auto_title"], false);
+
+        let zoomed = dispatch_ok(
+            &harness.router,
+            "pane.zoom",
+            serde_json::json!({"pane_id": second_pane.to_string()}),
+        )
+        .await;
+        assert_eq!(zoomed["is_zoomed"], true);
+        let _ = dispatch_ok(
+            &harness.router,
+            "pane.zoom",
+            serde_json::json!({"pane_id": second_pane.to_string()}),
+        )
+        .await;
+
+        let swapped = dispatch_ok(
+            &harness.router,
+            "pane.swap",
+            serde_json::json!({"pane_id": first_pane.to_string(), "target_pane_id": second_pane.to_string()}),
+        )
+        .await;
+        assert_eq!(swapped["pane_a"], first_pane.to_string());
+
+        let stale = dispatch_err(
+            &harness.router,
+            "pane.resize",
+            serde_json::json!({"pane_id": second_pane.to_string(), "direction": "horizontal", "delta": 0.2, "expected_version": 999_999}),
+        )
+        .await;
+        assert_eq!(stale.code, shux_rpc::ErrorCode::VersionConflict.code());
+        assert!(
+            harness.io.lock().await.vts.contains_key(&second_pane),
+            "stale pane.resize must not tear down pane IO"
+        );
+
+        let killed_pane = dispatch_ok(
+            &harness.router,
+            "pane.kill",
+            serde_json::json!({"pane_id": second_pane.to_string()}),
+        )
+        .await;
+        assert_eq!(killed_pane["killed"], second_pane.to_string());
+        assert!(!harness.io.lock().await.vts.contains_key(&second_pane));
+
+        let killed_window = dispatch_ok(
+            &harness.router,
+            "window.kill",
+            serde_json::json!({"id": second_window.to_string()}),
+        )
+        .await;
+        assert_eq!(killed_window["killed"], second_window.to_string());
+        assert!(
+            !harness
+                .io
+                .lock()
+                .await
+                .vts
+                .contains_key(&second_window_pane)
+        );
+
+        let killed_session = dispatch_ok(
+            &harness.router,
+            "session.kill",
+            serde_json::json!({"id": session_id.to_string()}),
+        )
+        .await;
+        assert_eq!(killed_session["killed"], "beta");
+        assert!(!harness.io.lock().await.vts.contains_key(&first_pane));
+        assert!(!harness.graph.snapshot().sessions.contains_key(&session_id));
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn production_events_routes_filter_history_and_live_data_plane() {
+        let harness = RpcHarness::new();
+        let (session_id, window_id, pane_id) = harness.seed_session("events").await;
+
+        let seq = harness
+            .bus
+            .publish(shux_core::event::EventData::PluginEvent {
+                plugin_id: "mine".to_string(),
+                event_type: "tick".to_string(),
+                data: serde_json::json!({"ok": true}),
+            });
+        harness
+            .bus
+            .publish(shux_core::event::EventData::PluginEvent {
+                plugin_id: "other".to_string(),
+                event_type: "tick".to_string(),
+                data: serde_json::json!({"ok": false}),
+            });
+
+        let history = dispatch_ok(
+            &harness.router,
+            "events.history",
+            serde_json::json!({"filter": ["plugin.mine."], "count": 10}),
+        )
+        .await;
+        let events = history["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "plugin.mine.tick");
+
+        let watched = dispatch_ok(
+            &harness.router,
+            "events.watch",
+            serde_json::json!({"from_seq": seq, "filter": ["plugin.mine."], "max_events": 5, "timeout_ms": 25}),
+        )
+        .await;
+        assert_eq!(watched["events"].as_array().unwrap().len(), 1);
+        assert_eq!(watched["next_seq"], seq + 1);
+        assert_eq!(watched["lagged"], false);
+
+        let router = harness.router.clone();
+        let pane_str = pane_id.to_string();
+        let watch = tokio::spawn(async move {
+            router
+                .dispatch(
+                    "pane.output.watch",
+                    Some(serde_json::json!({
+                        "pane_id": pane_str,
+                        "timeout_ms": 500,
+                        "limit": 2,
+                    })),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let output_seq = harness.bus.publish_pane_output(
+            pane_id,
+            window_id,
+            session_id,
+            "aGVsbG8=".to_string(),
+            false,
+        );
+        let output = watch.await.unwrap();
+        assert_eq!(output["chunks"][0]["seq"], output_seq);
+        assert_eq!(output["chunks"][0]["bytes"], "aGVsbG8=");
+        assert_eq!(output["chunks"][0]["sampled"], false);
+
+        let missing_pane = dispatch_err(
+            &harness.router,
+            "pane.output.watch",
+            serde_json::json!({"timeout_ms": 100}),
+        )
+        .await;
+        assert_eq!(missing_pane.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn production_pane_io_routes_cover_writes_capture_wait_resize_and_commands() {
+        let harness = RpcHarness::new();
+        let (session_id, window_id, pane_id) = harness.seed_session("io").await;
+        let mut writer_rx = harness
+            .seed_io(pane_id, b"boot complete\nagent-ready\n")
+            .await;
+
+        let sent = dispatch_ok(
+            &harness.router,
+            "pane.send_keys",
+            serde_json::json!({"pane_id": pane_id.to_string(), "text": "echo hi\n"}),
+        )
+        .await;
+        assert_eq!(sent["bytes_written"], 8);
+        assert_eq!(writer_rx.recv().await.unwrap(), b"echo hi\n");
+
+        let sent_b64 = dispatch_ok(
+            &harness.router,
+            "pane.send_keys",
+            serde_json::json!({"pane_id": pane_id.to_string(), "data": "A03/"}),
+        )
+        .await;
+        assert_eq!(sent_b64["bytes_written"], 3);
+        assert_eq!(writer_rx.recv().await.unwrap(), vec![3, 77, 255]);
+
+        let capture = dispatch_ok(
+            &harness.router,
+            "pane.capture",
+            serde_json::json!({"session_id": session_id.to_string(), "lines": 2}),
+        )
+        .await;
+        assert!(capture["text"].as_str().unwrap().contains("agent-ready"));
+        assert_eq!(capture["requested_lines"], 2);
+
+        let wait_text = dispatch_ok(
+            &harness.router,
+            "pane.wait_for",
+            serde_json::json!({"window_id": window_id.to_string(), "text": "agent-ready", "timeout_ms": 40, "poll_ms": 20}),
+        )
+        .await;
+        assert_eq!(wait_text["matched"], true);
+        assert_eq!(wait_text["absent"], false);
+
+        let wait_absent = dispatch_ok(
+            &harness.router,
+            "pane.wait_for",
+            serde_json::json!({"pane_id": pane_id.to_string(), "regex": "panic|error", "absent": true, "timeout_ms": 40}),
+        )
+        .await;
+        assert_eq!(wait_absent["matched"], true);
+        assert_eq!(wait_absent["absent"], true);
+
+        let timeout = dispatch_err(
+            &harness.router,
+            "pane.wait_for",
+            serde_json::json!({"pane_id": pane_id.to_string(), "text": "never-happens", "timeout_ms": 20, "poll_ms": 20}),
+        )
+        .await;
+        assert_eq!(timeout.code, shux_rpc::ErrorCode::NotFound.code());
+        assert!(
+            timeout.data.unwrap()["last_capture_preview"]
+                .as_str()
+                .unwrap()
+                .contains("agent-ready")
+        );
+
+        let resized = dispatch_ok(
+            &harness.router,
+            "pane.set_size",
+            serde_json::json!({"pane_id": pane_id.to_string(), "cols": 24, "rows": 4}),
+        )
+        .await;
+        assert_eq!(resized["cols"], 24);
+        assert_eq!(resized["rows"], 4);
+        {
+            let state = harness.io.lock().await;
+            let vt = state.vts.get(&pane_id).unwrap();
+            assert_eq!(vt.grid().cols(), 24);
+            assert_eq!(vt.grid().rows(), 4);
+        }
+
+        let bad_size = dispatch_err(
+            &harness.router,
+            "pane.set_size",
+            serde_json::json!({"pane_id": pane_id.to_string(), "cols": 1001, "rows": 4}),
+        )
+        .await;
+        assert_eq!(bad_size.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        let running = dispatch_ok(
+            &harness.router,
+            "pane.run_command",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "command": "printf",
+                "args": ["hello world"],
+                "async": true,
+                "timeout": 5,
+            }),
+        )
+        .await;
+        assert_eq!(running["state"], "running");
+        let command_id = running["command_id"].as_str().unwrap().to_string();
+        let pty_command = String::from_utf8(writer_rx.recv().await.unwrap()).unwrap();
+        assert!(pty_command.contains("printf"));
+        assert!(pty_command.contains("hello"));
+        assert!(pty_command.contains("SHUX_MAR"));
+
+        let status = dispatch_ok(
+            &harness.router,
+            "pane.command_status",
+            serde_json::json!({"command_id": command_id}),
+        )
+        .await;
+        assert_eq!(status["state"], "running");
+
+        let cancelled = dispatch_ok(
+            &harness.router,
+            "pane.command_cancel",
+            serde_json::json!({"command_id": command_id}),
+        )
+        .await;
+        assert_eq!(cancelled["state"], "cancelled");
+        assert_eq!(writer_rx.recv().await.unwrap(), vec![0x03]);
+
+        let status = dispatch_ok(
+            &harness.router,
+            "pane.command_status",
+            serde_json::json!({"command_id": command_id}),
+        )
+        .await;
+        assert_eq!(status["state"], "cancelled");
+
+        let bad_command = dispatch_err(
+            &harness.router,
+            "pane.run_command",
+            serde_json::json!({"pane_id": pane_id.to_string()}),
+        )
+        .await;
+        assert_eq!(bad_command.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        harness.stop().await;
+    }
 }

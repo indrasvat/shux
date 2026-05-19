@@ -450,7 +450,13 @@ async fn apply_resize_to_window(
         // size so apps in the zoomed pane lay out correctly, while
         // others stay at the same nominal size (cheap, harmless).
         let state = io_state.lock().await;
-        for pid in win.layout.tree.pane_ids() {
+        let pane_ids = win
+            .layout
+            .zoom
+            .as_ref()
+            .map(|zoom| zoom.saved_layout.pane_ids())
+            .unwrap_or_else(|| win.layout.tree.pane_ids());
+        for pid in pane_ids {
             if let Some(tx) = state.resizers.get(&pid) {
                 to_send.push((tx.clone(), PtySize::new(content.width, content.height)));
             }
@@ -2678,5 +2684,998 @@ mod tests {
     async fn current_viewport_insets_for_borders_and_status_row() {
         let size = Arc::new(Mutex::new((120, 40)));
         assert_eq!(current_viewport(&size).await, Rect::new(1, 1, 118, 37));
+    }
+
+    struct AttachFixture {
+        graph: GraphHandle,
+        io_state: Arc<Mutex<PaneIoState>>,
+        cancel: CancellationToken,
+        graph_task: tokio::task::JoinHandle<()>,
+        attached: AttachedSession,
+        session_id: SessionId,
+        first_window: WindowId,
+        first_pane: PaneId,
+        second_pane: PaneId,
+        second_window: WindowId,
+        second_window_pane: PaneId,
+    }
+
+    impl AttachFixture {
+        fn stop(self) {
+            self.cancel.cancel();
+            self.graph_task.abort();
+        }
+    }
+
+    async fn attach_fixture() -> AttachFixture {
+        let (graph_inner, state) = shux_core::graph::SessionGraph::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(128);
+        let cancel = CancellationToken::new();
+        let graph_task = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                shux_core::graph::run_graph_loop(graph_inner, cmd_rx, cancel).await;
+            })
+        };
+        let graph = GraphHandle::new(cmd_tx, state);
+        let io_state = Arc::new(Mutex::new(PaneIoState::new()));
+        let cwd = std::env::temp_dir();
+
+        let session_id = graph
+            .create_session_with_command(
+                "attach-test".to_string(),
+                cwd.clone(),
+                vec!["bash".to_string()],
+            )
+            .await
+            .expect("create session");
+        let snap = graph.snapshot();
+        let sess = snap.sessions.get(&session_id).expect("session");
+        let first_window = sess.active_window;
+        let first_pane = snap
+            .windows
+            .get(&first_window)
+            .expect("first window")
+            .active_pane;
+        drop(snap);
+
+        let second_pane = graph
+            .split_pane(first_pane, shux_core::layout::Direction::Vertical, 0.5)
+            .await
+            .expect("split pane");
+        graph
+            .focus_pane(first_pane)
+            .await
+            .expect("focus first pane");
+
+        let second_window = graph
+            .create_window(session_id, "logs".to_string(), cwd)
+            .await
+            .expect("create second window");
+        let second_window_pane = graph
+            .snapshot()
+            .windows
+            .get(&second_window)
+            .expect("second window")
+            .active_pane;
+        graph
+            .focus_window(first_window, None)
+            .await
+            .expect("focus first window");
+        graph
+            .focus_pane(first_pane)
+            .await
+            .expect("focus first pane");
+
+        let attached = AttachedSession {
+            session_id,
+            name: "attach-test".to_string(),
+            active_window_id: first_window,
+            active_pane_id: first_pane,
+            help_visible: false,
+            copy_mode: None,
+            mouse_selection: None,
+            copy_menu: None,
+            last_action: None,
+            show_welcome_toast: true,
+        };
+
+        AttachFixture {
+            graph,
+            io_state,
+            cancel,
+            graph_task,
+            attached,
+            session_id,
+            first_window,
+            first_pane,
+            second_pane,
+            second_window,
+            second_window_pane,
+        }
+    }
+
+    async fn seed_io_for_pane(
+        io_state: &Arc<Mutex<PaneIoState>>,
+        pane_id: PaneId,
+    ) -> (
+        mpsc::Receiver<Vec<u8>>,
+        mpsc::Receiver<crate::ResizeRequest>,
+        CancellationToken,
+    ) {
+        let (writer_tx, writer_rx) = mpsc::channel(8);
+        let (resize_tx, resize_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let mut vt = shux_vt::VirtualTerminal::new(6, 40);
+        vt.process(b"hello world\r\nsecond line\r\nthird\r\n");
+        let mut state = io_state.lock().await;
+        state.writers.insert(pane_id, writer_tx);
+        state.resizers.insert(pane_id, resize_tx);
+        state.shutdowns.insert(pane_id, shutdown.clone());
+        state.vts.insert(pane_id, vt);
+        (writer_rx, resize_rx, shutdown)
+    }
+
+    async fn recv_render_text(out_rx: &mut mpsc::Receiver<AttachServerFrame>) -> String {
+        let frame = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("render frame timeout")
+            .expect("render frame");
+        match frame {
+            AttachServerFrame::Render { data } => {
+                let decoded = BASE64.decode(data.as_bytes()).expect("render base64");
+                String::from_utf8(decoded).expect("render utf8")
+            }
+            other => panic!("expected render frame, got {other:?}"),
+        }
+    }
+
+    fn find_pane_and_border_points(
+        graph: &GraphHandle,
+        window_id: WindowId,
+        viewport: Rect,
+    ) -> ((u16, u16), (u16, u16), (u16, u16)) {
+        let snap = graph.snapshot();
+        let win = snap.windows.get(&window_id).expect("window");
+        let rects = win.layout.compute_rects(viewport);
+        assert!(rects.len() >= 2, "fixture should have split panes");
+        let first = rects[0].1;
+        let second = rects[1].1;
+        let first_point = (first.x + 1, first.y + 1);
+        let second_point = (second.x + 1, second.y + 1);
+
+        for col in viewport.x..viewport.x + viewport.width {
+            for row in viewport.y..viewport.y + viewport.height {
+                if border_at(&win.layout.tree, viewport, col, row).is_some() {
+                    return (first_point, second_point, (col, row));
+                }
+            }
+        }
+        panic!("split border not found");
+    }
+
+    #[tokio::test]
+    async fn resize_fanout_uses_layout_rects_and_zoomed_content_size() {
+        let fixture = attach_fixture().await;
+        let (_, mut first_resize_rx, _) =
+            seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (_, mut second_resize_rx, _) =
+            seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+        let (_, mut hidden_resize_rx, _) =
+            seed_io_for_pane(&fixture.io_state, fixture.second_window_pane).await;
+
+        apply_resize_to_window(
+            &fixture.graph,
+            &fixture.io_state,
+            &fixture.attached,
+            100,
+            30,
+        )
+        .await;
+
+        let first = tokio::time::timeout(Duration::from_secs(1), first_resize_rx.recv())
+            .await
+            .expect("first resize")
+            .expect("first resize request");
+        let second = tokio::time::timeout(Duration::from_secs(1), second_resize_rx.recv())
+            .await
+            .expect("second resize")
+            .expect("second resize request");
+        assert_eq!(first.size.rows, 27);
+        assert_eq!(second.size.rows, 27);
+        assert!(first.size.cols < 98, "split pane should not get full width");
+        assert!(
+            second.size.cols < 98,
+            "split pane should not get full width"
+        );
+        assert!(hidden_resize_rx.try_recv().is_err());
+
+        fixture
+            .graph
+            .zoom_pane(fixture.first_pane, None)
+            .await
+            .expect("zoom active pane");
+        apply_resize_to_window(
+            &fixture.graph,
+            &fixture.io_state,
+            &fixture.attached,
+            100,
+            30,
+        )
+        .await;
+
+        let first_zoomed = first_resize_rx.recv().await.expect("first zoom resize");
+        let second_zoomed = second_resize_rx.recv().await.expect("second zoom resize");
+        assert_eq!((first_zoomed.size.cols, first_zoomed.size.rows), (100, 29));
+        assert_eq!(
+            (second_zoomed.size.cols, second_zoomed.size.rows),
+            (100, 29)
+        );
+
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn attach_action_state_machine_updates_ui_focus_zoom_resize_and_windows() {
+        let fixture = attach_fixture().await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+
+        handle_action(
+            ActionKind::ToggleHelp,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("toggle help on");
+        assert!(session.lock().await.help_visible);
+
+        handle_action(
+            ActionKind::FocusNext,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("focus swallowed by help");
+        assert_eq!(session.lock().await.active_pane_id, fixture.first_pane);
+
+        handle_action(
+            ActionKind::ToggleHelp,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("toggle help off");
+        handle_action(
+            ActionKind::EnterCopyMode,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("enter copy mode");
+        assert!(session.lock().await.copy_mode.is_some());
+
+        handle_action(
+            ActionKind::FocusNext,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("focus next");
+        assert_eq!(session.lock().await.active_pane_id, fixture.second_pane);
+        handle_action(
+            ActionKind::FocusPrev,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("focus prev");
+        assert_eq!(session.lock().await.active_pane_id, fixture.first_pane);
+
+        handle_action(
+            ActionKind::ToggleZoom,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("zoom");
+        assert!(
+            fixture
+                .graph
+                .snapshot()
+                .windows
+                .get(&fixture.first_window)
+                .expect("first window")
+                .layout
+                .is_zoomed()
+        );
+        handle_action(
+            ActionKind::ToggleZoom,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("unzoom");
+        handle_action(
+            ActionKind::ResizeRight,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("resize right");
+
+        handle_action(
+            ActionKind::SwitchToWindow,
+            shux_rpc::attach::ActionArgs {
+                window_index: Some(2),
+                ..Default::default()
+            },
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("switch to second window");
+        let switched = session.lock().await.clone();
+        assert_eq!(switched.active_window_id, fixture.second_window);
+        assert_eq!(switched.active_pane_id, fixture.second_window_pane);
+
+        handle_action(
+            ActionKind::NextWindow,
+            Default::default(),
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &fixture.cancel,
+        )
+        .await
+        .expect("wrap next window");
+        assert_eq!(session.lock().await.active_window_id, fixture.first_window);
+
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn kill_pane_cleans_target_io_then_cascades_singleton_session() {
+        let fixture = attach_fixture().await;
+        let (_, _, first_shutdown) = seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (_, _, second_shutdown) =
+            seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+
+        let mut attached = fixture.attached.clone();
+        attached.active_pane_id = fixture.second_pane;
+        kill_pane(&fixture.graph, &attached, &fixture.io_state)
+            .await
+            .expect("kill split pane");
+        {
+            let state = fixture.io_state.lock().await;
+            assert!(state.writers.contains_key(&fixture.first_pane));
+            assert!(!state.writers.contains_key(&fixture.second_pane));
+            assert!(state.vts.contains_key(&fixture.first_pane));
+            assert!(!state.vts.contains_key(&fixture.second_pane));
+        }
+        assert!(!first_shutdown.is_cancelled());
+        assert!(second_shutdown.is_cancelled());
+        assert!(
+            !fixture
+                .graph
+                .snapshot()
+                .panes
+                .contains_key(&fixture.second_pane)
+        );
+        fixture.stop();
+
+        let singleton = attach_fixture().await;
+        let (_, _, lone_shutdown) =
+            seed_io_for_pane(&singleton.io_state, singleton.second_window_pane).await;
+        let attached = AttachedSession {
+            active_window_id: singleton.second_window,
+            active_pane_id: singleton.second_window_pane,
+            ..singleton.attached.clone()
+        };
+        kill_pane(&singleton.graph, &attached, &singleton.io_state)
+            .await
+            .expect("kill only pane in non-only window");
+        assert!(lone_shutdown.is_cancelled());
+        assert!(
+            !singleton
+                .graph
+                .snapshot()
+                .windows
+                .contains_key(&singleton.second_window)
+        );
+
+        let last = attach_fixture().await;
+        let (_, _, last_shutdown) = seed_io_for_pane(&last.io_state, last.first_pane).await;
+        let attached = AttachedSession {
+            active_window_id: last.first_window,
+            active_pane_id: last.first_pane,
+            ..last.attached.clone()
+        };
+        last.graph
+            .destroy_pane(last.second_pane, None)
+            .await
+            .expect("remove split pane so session is singleton");
+        last.graph
+            .destroy_window(last.second_window, None)
+            .await
+            .expect("remove second window so session is singleton");
+        kill_pane(&last.graph, &attached, &last.io_state)
+            .await
+            .expect("kill singleton session");
+        assert!(last_shutdown.is_cancelled());
+        assert!(
+            !last
+                .graph
+                .snapshot()
+                .sessions
+                .contains_key(&last.session_id)
+        );
+
+        singleton.stop();
+        last.stop();
+    }
+
+    #[tokio::test]
+    async fn copy_helpers_render_toast_and_emit_osc52_selection() {
+        let fixture = attach_fixture().await;
+        seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+
+        let mut tiny = Vec::new();
+        render_welcome_toast(&mut tiny, 20, 4, &Theme::DEFAULT, "C-Space", false);
+        assert!(tiny.is_empty());
+
+        let mut toast = Vec::new();
+        render_welcome_toast(&mut toast, 80, 24, &Theme::DEFAULT, "C-Space", false);
+        let toast = String::from_utf8(toast).expect("toast utf8");
+        assert!(toast.contains("welcome to shux"));
+        assert!(toast.contains("C-Space ?"));
+
+        let rect = Rect::new(4, 3, 20, 6);
+        let mut selection = shux_ui::CopyModeState::new();
+        selection.anchor = Some((0, 0));
+        selection.cursor = (4, 0);
+        assert!(selection_contains_screen_point(&selection, rect, 6, 3));
+        assert!(!selection_contains_screen_point(&selection, rect, 3, 3));
+
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        assert!(
+            yank_selection(
+                fixture.first_pane,
+                &selection,
+                rect,
+                &fixture.io_state,
+                &out_tx,
+            )
+            .await
+        );
+        let frame = out_rx.recv().await.expect("render frame");
+        match frame {
+            AttachServerFrame::Render { data } => {
+                let decoded = BASE64.decode(data.as_bytes()).expect("osc52 base64");
+                let text = String::from_utf8(decoded).expect("osc52 utf8");
+                assert!(text.starts_with("\x1b]52;c;"));
+                assert!(text.ends_with("\x07"));
+            }
+            other => panic!("expected render frame, got {other:?}"),
+        }
+
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn mouse_selection_copies_opens_menu_and_clears_without_losing_focus() {
+        let fixture = attach_fixture().await;
+        seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let mut drag = SelectionDrag::None;
+
+        assert!(
+            handle_mouse_selection(
+                MouseKind::Down,
+                ProtoMouseButton::Left,
+                2,
+                2,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &out_tx,
+                &mut drag,
+            )
+            .await
+            .expect("selection down")
+        );
+        assert_eq!(
+            drag,
+            SelectionDrag::MouseSelection {
+                pane_id: fixture.first_pane
+            }
+        );
+
+        handle_mouse_selection(
+            MouseKind::Drag,
+            ProtoMouseButton::Left,
+            6,
+            2,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &out_tx,
+            &mut drag,
+        )
+        .await
+        .expect("selection drag");
+        handle_mouse_selection(
+            MouseKind::Up,
+            ProtoMouseButton::Left,
+            6,
+            2,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &out_tx,
+            &mut drag,
+        )
+        .await
+        .expect("selection up");
+
+        let copied = recv_render_text(&mut out_rx).await;
+        assert!(copied.starts_with("\x1b]52;c;"));
+        assert!(session.lock().await.last_action.is_some());
+
+        assert!(
+            handle_mouse_selection(
+                MouseKind::Down,
+                ProtoMouseButton::Right,
+                3,
+                2,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &out_tx,
+                &mut drag,
+            )
+            .await
+            .expect("open copy menu")
+        );
+        let menu = session.lock().await.copy_menu.expect("copy menu");
+        let (menu_col, menu_row) =
+            shux_ui::copy_mode::copy_menu_origin(menu.col, menu.row, 100, 30);
+        assert!(
+            handle_mouse_selection(
+                MouseKind::Down,
+                ProtoMouseButton::Left,
+                menu_col + 1,
+                menu_row + 1,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &out_tx,
+                &mut drag,
+            )
+            .await
+            .expect("clear menu action")
+        );
+        let cleared = session.lock().await;
+        assert!(cleared.mouse_selection.is_none());
+        assert!(cleared.copy_menu.is_none());
+
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn copy_mode_mouse_scrolls_drags_copies_and_handles_non_left_clicks() {
+        let fixture = attach_fixture().await;
+        seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let mut attached = fixture.attached.clone();
+        attached.copy_mode = Some(shux_ui::CopyModeState::new());
+        let session = Arc::new(Mutex::new(attached));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let mut drag = SelectionDrag::None;
+
+        assert!(
+            handle_copy_mode_mouse(
+                MouseKind::ScrollUp,
+                ProtoMouseButton::None,
+                2,
+                2,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &out_tx,
+                &mut drag,
+            )
+            .await
+            .expect("scroll up")
+        );
+        assert!(
+            handle_copy_mode_mouse(
+                MouseKind::Down,
+                ProtoMouseButton::Right,
+                2,
+                2,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &out_tx,
+                &mut drag,
+            )
+            .await
+            .expect("ignore right down")
+        );
+        assert_eq!(drag, SelectionDrag::None);
+
+        handle_copy_mode_mouse(
+            MouseKind::Down,
+            ProtoMouseButton::Left,
+            2,
+            2,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &out_tx,
+            &mut drag,
+        )
+        .await
+        .expect("copy mode down");
+        assert_eq!(drag, SelectionDrag::CopyMode);
+        handle_copy_mode_mouse(
+            MouseKind::Drag,
+            ProtoMouseButton::Left,
+            6,
+            2,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &out_tx,
+            &mut drag,
+        )
+        .await
+        .expect("copy mode drag");
+        handle_copy_mode_mouse(
+            MouseKind::Up,
+            ProtoMouseButton::Left,
+            6,
+            2,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &out_tx,
+            &mut drag,
+        )
+        .await
+        .expect("copy mode up");
+
+        let copied = recv_render_text(&mut out_rx).await;
+        assert!(copied.starts_with("\x1b]52;c;"));
+        assert!(session.lock().await.copy_mode.is_none());
+        assert_eq!(drag, SelectionDrag::None);
+
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn mouse_focus_border_drag_and_zoomed_noop_follow_layout_state() {
+        let fixture = attach_fixture().await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        let viewport = current_viewport(&client_size).await;
+        let (first_point, second_point, border_point) =
+            find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
+        let mut drag = None;
+
+        handle_mouse(
+            MouseKind::Down,
+            ProtoMouseButton::Left,
+            second_point.0,
+            second_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &mut drag,
+        )
+        .await
+        .expect("focus second pane");
+        assert_eq!(session.lock().await.active_pane_id, fixture.second_pane);
+        assert!(drag.is_none());
+
+        handle_mouse(
+            MouseKind::Down,
+            ProtoMouseButton::Left,
+            border_point.0,
+            border_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &mut drag,
+        )
+        .await
+        .expect("arm border drag");
+        let armed = drag.expect("drag armed");
+        assert_eq!(armed.target, fixture.first_pane);
+
+        handle_mouse(
+            MouseKind::Drag,
+            ProtoMouseButton::Left,
+            border_point.0 + 4,
+            border_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &mut drag,
+        )
+        .await
+        .expect("drag border");
+        assert_eq!(drag.expect("updated drag").last_col, border_point.0 + 4);
+        handle_mouse(
+            MouseKind::Up,
+            ProtoMouseButton::Left,
+            border_point.0 + 4,
+            border_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &mut drag,
+        )
+        .await
+        .expect("release border");
+        assert!(drag.is_none());
+
+        fixture
+            .graph
+            .zoom_pane(fixture.second_pane, None)
+            .await
+            .expect("zoom pane");
+        let before = session.lock().await.active_pane_id;
+        handle_mouse(
+            MouseKind::Down,
+            ProtoMouseButton::Left,
+            first_point.0,
+            first_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &mut drag,
+        )
+        .await
+        .expect("zoomed mouse noop");
+        assert_eq!(session.lock().await.active_pane_id, before);
+
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn attach_connection_routes_handshake_resize_actions_input_and_detach() {
+        let fixture = attach_fixture().await;
+        let (mut writer_rx, mut resize_rx, _) =
+            seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ConfigHandle::load_or_default(&temp.path().join("missing.toml"));
+        let segments = SegmentCache::new();
+        let meta_cache = crate::session_meta::SessionMetaCache::new();
+        let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+            crate::onboarding::OnboardingState {
+                prefix_discovered: false,
+                welcome_toast_seen: true,
+            },
+        );
+        let (server_stream, client_stream) = UnixStream::pair().expect("unix pair");
+        let server_cancel = fixture.cancel.child_token();
+        let server = {
+            let graph = fixture.graph.clone();
+            let io = fixture.io_state.clone();
+            let config = config.clone();
+            let segments = segments.clone();
+            let meta = meta_cache.clone();
+            let onboarding = onboarding.clone();
+            let cancel = server_cancel.clone();
+            tokio::spawn(async move {
+                handle_attach_connection(
+                    server_stream,
+                    graph,
+                    io,
+                    config,
+                    segments,
+                    meta,
+                    onboarding,
+                    std::time::Instant::now(),
+                    cancel,
+                )
+                .await
+            })
+        };
+
+        let mut framed = Framed::new(client_stream, create_codec());
+        let hello = AttachHello {
+            protocol: ATTACH_PROTOCOL_VERSION,
+            session_name: Some(fixture.attached.name.clone()),
+            cols: 90,
+            rows: 24,
+            client_version: "test".to_string(),
+        };
+        framed
+            .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+            .await
+            .expect("send hello");
+        let ready_buf = tokio::time::timeout(Duration::from_secs(1), framed.next())
+            .await
+            .expect("ready timeout")
+            .expect("ready frame")
+            .expect("ready bytes");
+        let ready: AttachReady = serde_json::from_slice(&ready_buf).expect("ready json");
+        match ready {
+            AttachReady::Ok {
+                session_name,
+                active_pane_id,
+                ..
+            } => {
+                assert_eq!(session_name, fixture.attached.name);
+                assert_eq!(active_pane_id, fixture.first_pane.to_string());
+            }
+            other => panic!("expected ready ok, got {other:?}"),
+        }
+
+        let initial_resize = tokio::time::timeout(Duration::from_secs(1), resize_rx.recv())
+            .await
+            .expect("initial resize timeout")
+            .expect("initial resize");
+        assert_eq!(initial_resize.size.rows, 21);
+
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Action {
+                    kind: ActionKind::ToggleHelp,
+                    args: Default::default(),
+                })
+                .expect("action json"),
+            ))
+            .await
+            .expect("send action");
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Input {
+                    data: BASE64.encode(b"abc"),
+                })
+                .expect("input json"),
+            ))
+            .await
+            .expect("send swallowed input");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(writer_rx.try_recv().is_err());
+
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Input {
+                    data: BASE64.encode(b"q"),
+                })
+                .expect("input json"),
+            ))
+            .await
+            .expect("dismiss help");
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Input {
+                    data: BASE64.encode(b"ls\n"),
+                })
+                .expect("input json"),
+            ))
+            .await
+            .expect("send input");
+        let written = tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
+            .await
+            .expect("writer timeout")
+            .expect("writer bytes");
+        assert_eq!(written, b"ls\n");
+
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Resize {
+                    cols: 100,
+                    rows: 30,
+                })
+                .expect("resize json"),
+            ))
+            .await
+            .expect("send resize");
+        let resized = tokio::time::timeout(Duration::from_secs(1), resize_rx.recv())
+            .await
+            .expect("resize timeout")
+            .expect("resize request");
+        assert_eq!(resized.size.rows, 27);
+
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::PrefixTapped).expect("prefix json"),
+            ))
+            .await
+            .expect("send prefix tapped");
+        framed
+            .send(Bytes::from(
+                serde_json::to_vec(&AttachClientFrame::Detach).expect("detach json"),
+            ))
+            .await
+            .expect("send detach");
+
+        let mut saw_detach = false;
+        for _ in 0..8 {
+            let Ok(next) = tokio::time::timeout(Duration::from_millis(100), framed.next()).await
+            else {
+                break;
+            };
+            let Some(frame) = next.transpose().expect("server frame bytes") else {
+                break;
+            };
+            let parsed: AttachServerFrame =
+                serde_json::from_slice(&frame).expect("server frame json");
+            if matches!(parsed, AttachServerFrame::DetachAck) {
+                saw_detach = true;
+                break;
+            }
+        }
+        assert!(onboarding.current().await.prefix_discovered);
+
+        drop(framed);
+        server_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+        assert!(saw_detach || writer_rx.try_recv().is_err());
+        fixture.stop();
     }
 }

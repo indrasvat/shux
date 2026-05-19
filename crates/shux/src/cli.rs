@@ -4151,6 +4151,88 @@ pub async fn handle_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn spawn_rpc_script(
+        responses: Vec<serde_json::Value>,
+    ) -> (
+        tokio::net::UnixStream,
+        Arc<StdMutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let captured = requests.clone();
+        let task = tokio::spawn(async move {
+            for scripted in responses {
+                let mut len_buf = [0u8; 4];
+                server.read_exact(&mut len_buf).await.unwrap();
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut payload = vec![0u8; len];
+                server.read_exact(&mut payload).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                captured.lock().unwrap().push(request.clone());
+
+                let response = if let Some(error) = scripted.get("error") {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "error": error,
+                    })
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "result": scripted,
+                    })
+                };
+                let bytes = serde_json::to_vec(&response).unwrap();
+                server
+                    .write_all(&(bytes.len() as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+                server.write_all(&bytes).await.unwrap();
+                server.flush().await.unwrap();
+            }
+        });
+        (client, requests, task)
+    }
+
+    async fn finish_rpc_script(
+        client: tokio::net::UnixStream,
+        task: tokio::task::JoinHandle<()>,
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    ) -> Vec<serde_json::Value> {
+        drop(client);
+        task.await.unwrap();
+        Arc::try_unwrap(requests).unwrap().into_inner().unwrap()
+    }
+
+    fn session_list_response(session_id: &str, window_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessions": [{
+                "id": session_id,
+                "name": "dev",
+                "active_window_id": window_id,
+                "windows": [window_id],
+                "window_count": 1,
+                "created_at": 0
+            }]
+        })
+    }
+
+    fn window_list_response(window_id: &str, pane_id: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "id": window_id,
+            "title": "main",
+            "index": 0,
+            "pane_count": 1,
+            "active_pane_id": pane_id,
+            "is_active": true,
+            "version": 7
+        }])
+    }
 
     #[test]
     fn test_socket_path_explicit() {
@@ -4927,5 +5009,585 @@ mod tests {
             }) => assert_eq!(text.as_deref(), Some("--help")),
             _ => panic!("expected Pane SendKeys command"),
         }
+    }
+
+    #[tokio::test]
+    async fn cli_session_handlers_emit_expected_rpc_shapes() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let wid = "22222222-2222-4222-8222-222222222222";
+        let template = "[session]\nname = \"dev\"\n";
+        let (mut client, requests, task) = spawn_rpc_script(vec![
+            session_list_response(sid, wid),
+            serde_json::json!({"id": sid, "name": "dev", "created": true}),
+            serde_json::json!({"killed": "dev"}),
+            serde_json::json!({"id": sid, "name": "renamed"}),
+            serde_json::json!({"template": template}),
+            serde_json::json!({"version": "0.26.0", "git_sha": "abc123"}),
+        ]);
+
+        handle_ls(&mut client, OutputFormat::Json).await.unwrap();
+        let created = handle_new(
+            &mut client,
+            SessionCreateOptions {
+                session_name: Some("dev".to_string()),
+                cwd: Some(std::path::PathBuf::from("relative")),
+                title: Some("agent".to_string()),
+                cmd: Some("ignored".to_string()),
+                argv: vec!["vim".to_string(), "main.rs".to_string()],
+                ensure: true,
+            },
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created["created"], true);
+        handle_kill(&mut client, "dev", Some(7), OutputFormat::Json)
+            .await
+            .unwrap();
+        handle_rename(&mut client, "dev", "renamed", Some(8), OutputFormat::Json)
+            .await
+            .unwrap();
+        handle_session_save(&mut client, "dev", None).await.unwrap();
+        handle_version(&mut client, OutputFormat::Json)
+            .await
+            .unwrap();
+
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert_eq!(requests[0]["method"], "session.list");
+        assert_eq!(requests[1]["method"], "session.ensure");
+        assert_eq!(requests[1]["params"]["name"], "dev");
+        assert!(
+            requests[1]["params"]["cwd"]
+                .as_str()
+                .unwrap()
+                .ends_with("relative")
+        );
+        assert_eq!(requests[1]["params"]["pane_title"], "agent");
+        assert_eq!(
+            requests[1]["params"]["command"],
+            serde_json::json!(["vim", "main.rs"])
+        );
+        assert_eq!(requests[2]["method"], "session.kill");
+        assert_eq!(requests[2]["params"]["expected_version"], 7);
+        assert_eq!(requests[3]["method"], "session.rename");
+        assert_eq!(requests[3]["params"]["new_name"], "renamed");
+        assert_eq!(requests[4]["method"], "session.export_template");
+        assert_eq!(requests[5]["method"], "system.version");
+    }
+
+    #[tokio::test]
+    async fn cli_window_and_pane_handlers_resolve_names_and_forward_params() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let wid = "22222222-2222-4222-8222-222222222222";
+        let pane = "33333333-3333-4333-8333-333333333333";
+        let target = "44444444-4444-4444-8444-444444444444";
+        let session = || session_list_response(sid, wid);
+        let windows = || window_list_response(wid, pane);
+        let mut responses = Vec::new();
+        responses.extend([
+            session(),
+            serde_json::json!({"id": "new-window", "title": "editor", "index": 1}),
+            session(),
+            windows(),
+            serde_json::json!({"killed": wid}),
+            session(),
+            windows(),
+            serde_json::json!({"id": wid, "title": "renamed"}),
+            session(),
+            windows(),
+            serde_json::json!({"id": wid, "previous_window_id": null}),
+            session(),
+            windows(),
+            serde_json::json!({"id": wid, "index": 0}),
+            session(),
+            windows(),
+            serde_json::json!([{"id": pane, "cwd": "/tmp", "command": "bash", "is_focused": true, "is_zoomed": false}]),
+            windows(),
+            session(),
+            windows(),
+            serde_json::json!({"pane": {"id": target}, "split_from": pane}),
+            session(),
+            windows(),
+            serde_json::json!({"pane_id": pane}),
+            session(),
+            windows(),
+            serde_json::json!({"pane_id": target}),
+            session(),
+            windows(),
+            serde_json::json!({"pane_id": pane}),
+            session(),
+            windows(),
+            serde_json::json!({"pane_id": pane, "is_zoomed": true}),
+            session(),
+            windows(),
+            serde_json::json!({"pane_a": pane, "pane_b": target}),
+            session(),
+            windows(),
+            serde_json::json!({"pane_id": pane, "title": "logs"}),
+            session(),
+            windows(),
+            serde_json::json!({"killed": pane}),
+        ]);
+        let (mut client, requests, task) = spawn_rpc_script(responses);
+
+        handle_window_new(
+            &mut client,
+            "dev",
+            Some("editor".to_string()),
+            Some(std::path::PathBuf::from("/tmp")),
+            Some("echo hi".to_string()),
+            vec![],
+            false,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_window_kill(&mut client, "dev", "main", Some(3), OutputFormat::Json)
+            .await
+            .unwrap();
+        handle_window_rename(
+            &mut client,
+            "dev",
+            "main",
+            "renamed",
+            None,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_window_focus(&mut client, "dev", "0", None, OutputFormat::Json)
+            .await
+            .unwrap();
+        handle_window_reorder(&mut client, "dev", "main", 0, Some(4), OutputFormat::Json)
+            .await
+            .unwrap();
+        handle_pane_list(&mut client, "dev", Some("main"), OutputFormat::Json)
+            .await
+            .unwrap();
+        handle_pane_split(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            Some("horizontal"),
+            Some(0.4),
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_focus(&mut client, "dev", Some("main"), pane, OutputFormat::Json)
+            .await
+            .unwrap();
+        handle_pane_focus_dir(
+            &mut client,
+            "dev",
+            Some("main"),
+            "right",
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_resize(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            "vertical",
+            Some(0.2),
+            Some(9),
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_zoom(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            None,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_swap(
+            &mut client,
+            "dev",
+            Some("main"),
+            pane,
+            target,
+            Some(10),
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_title(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            Some("logs"),
+            false,
+            false,
+            true,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_kill(
+            &mut client,
+            "dev",
+            Some("main"),
+            pane,
+            Some(11),
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+
+        let requests = finish_rpc_script(client, task, requests).await;
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect();
+        assert!(methods.contains(&"window.create"));
+        assert!(methods.contains(&"window.kill"));
+        assert!(methods.contains(&"pane.split"));
+        assert!(methods.contains(&"pane.set_title"));
+
+        let window_create = requests
+            .iter()
+            .find(|r| r["method"] == "window.create")
+            .unwrap();
+        assert_eq!(
+            window_create["params"]["command"],
+            serde_json::json!(["sh", "-c", "echo hi"])
+        );
+        let pane_split = requests
+            .iter()
+            .find(|r| r["method"] == "pane.split")
+            .unwrap();
+        assert_eq!(pane_split["params"]["direction"], "horizontal");
+        assert_eq!(pane_split["params"]["ratio"], 0.4);
+        let pane_title = requests
+            .iter()
+            .find(|r| r["method"] == "pane.set_title")
+            .unwrap();
+        assert_eq!(pane_title["params"]["title"], "logs");
+        assert_eq!(pane_title["params"]["auto"], false);
+    }
+
+    #[tokio::test]
+    async fn cli_pane_io_and_snapshot_handlers_forward_payloads() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let wid = "22222222-2222-4222-8222-222222222222";
+        let pane = "33333333-3333-4333-8333-333333333333";
+        let session = || session_list_response(sid, wid);
+        let windows = || window_list_response(wid, pane);
+        let png_b64 = "iVBORw0KGgo=";
+        let (mut client, requests, task) = spawn_rpc_script(vec![
+            session(),
+            windows(),
+            serde_json::json!({"pane_id": pane, "bytes_written": 5}),
+            session(),
+            windows(),
+            serde_json::json!({"command_id": "cmd-1", "state": "running"}),
+            session(),
+            windows(),
+            serde_json::json!({"pane_id": pane, "text": "ready\n", "lines": 1}),
+            serde_json::json!({"pane_id": pane, "matched": true, "elapsed_ms": 12, "absent": false}),
+            session(),
+            windows(),
+            serde_json::json!({"pane_id": pane, "cols": 100, "rows": 30}),
+            session(),
+            windows(),
+            serde_json::json!({"png_base64": png_b64, "width": 10, "height": 10}),
+            session(),
+            serde_json::json!({"png_base64": png_b64, "width": 20, "height": 10}),
+            session(),
+            windows(),
+            serde_json::json!({"png_base64": png_b64, "width": 30, "height": 10}),
+        ]);
+
+        handle_pane_send_keys(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            Some("hello"),
+            None,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_run(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            "make test",
+            60,
+            true,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_capture(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            5,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_wait_for(
+            &mut client,
+            Some("dev"),
+            None,
+            Some(pane),
+            Some("ready"),
+            None,
+            false,
+            20,
+            1000,
+            25,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_set_size(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            100,
+            30,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_pane_snapshot(
+            &mut client,
+            "dev",
+            Some("main"),
+            Some(pane),
+            None,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_snapshot(
+            &mut client,
+            Some("dev"),
+            None,
+            None,
+            120,
+            36,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        handle_snapshot(
+            &mut client,
+            Some("dev"),
+            Some("main"),
+            None,
+            80,
+            24,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert!(
+            requests
+                .iter()
+                .any(|r| r["method"] == "pane.send_keys" && r["params"]["text"] == "hello")
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r["method"] == "pane.run_command" && r["params"]["async"] == true)
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r["method"] == "pane.wait_for" && r["params"]["poll_ms"] == 25)
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r["method"] == "pane.set_size" && r["params"]["cols"] == 100)
+        );
+        assert!(requests.iter().any(|r| r["method"] == "pane.snapshot"));
+        assert!(requests.iter().any(|r| r["method"] == "session.snapshot"));
+        assert!(requests.iter().any(|r| r["method"] == "window.snapshot"));
+    }
+
+    #[tokio::test]
+    async fn cli_events_plugin_and_apply_handlers_cover_streaming_and_permissions() {
+        let event = serde_json::json!({"seq": 42, "type": "plugin.demo.tick", "data": {}});
+        let (mut client, requests, task) = spawn_rpc_script(vec![
+            serde_json::json!({"events": [event.clone()], "next_seq": 43, "gap": 0, "lagged": false}),
+            serde_json::json!({"events": [event], "current_seq": 44}),
+            serde_json::json!({"name": "demo", "version": "1.0.0", "pid": 123, "watching": true, "subscribes": ["pane."]}),
+            serde_json::json!({"plugins": [{"name": "demo", "version": "1.0.0", "status": "running", "pid": 123, "uptime_ms": 2500}]}),
+            serde_json::json!({"name": "demo", "pid": 124}),
+            serde_json::json!({"killed": "demo"}),
+            serde_json::json!({"granted": true}),
+            serde_json::json!({"revoked": true}),
+            serde_json::json!({"grants": {"pane.capture": "*"}, "subscribes": {"allowed": ["pane."]}}),
+            serde_json::json!({"path": "/tmp/audit.jsonl", "entries": [{"ts": "now", "method": "pane.capture", "decision": "allow", "reason": "grant"}]}),
+            serde_json::json!({"correlation_id": "apply-1", "outputs": [{"session_id": "sid"}], "last_event_seq": 50, "spawn_results": [{"pane_id": "pane-1", "spawned": true}]}),
+        ]);
+
+        handle_events_watch(
+            &mut client,
+            vec!["plugin.demo.".to_string()],
+            Some(42),
+            100,
+            Some(1),
+        )
+        .await
+        .unwrap();
+        handle_events_history(&mut client, vec!["plugin.demo.".to_string()], 5)
+            .await
+            .unwrap();
+        handle_plugin_install(
+            &mut client,
+            std::path::Path::new("/tmp/plugin"),
+            &["--flag".to_string()],
+            Some(std::path::Path::new("/tmp")),
+            true,
+            OutputFormat::Text,
+        )
+        .await
+        .unwrap();
+        handle_plugin_list(&mut client, OutputFormat::Plain)
+            .await
+            .unwrap();
+        handle_plugin_reload(&mut client, "demo", OutputFormat::Text)
+            .await
+            .unwrap();
+        handle_plugin_kill(&mut client, "demo", OutputFormat::Plain)
+            .await
+            .unwrap();
+        handle_plugin_grant(
+            &mut client,
+            "demo",
+            "pane.capture",
+            Some("*"),
+            false,
+            OutputFormat::Plain,
+        )
+        .await
+        .unwrap();
+        handle_plugin_revoke(
+            &mut client,
+            "demo",
+            "pane.capture",
+            Some("*"),
+            true,
+            OutputFormat::Text,
+        )
+        .await
+        .unwrap();
+        handle_plugin_grants(&mut client, "demo", OutputFormat::Text)
+            .await
+            .unwrap();
+        handle_plugin_audit(&mut client, "demo", 10, OutputFormat::Text)
+            .await
+            .unwrap();
+        handle_apply(
+            &mut client,
+            vec![shux_core::apply::Op::CreateSession {
+                name: Some("dev".to_string()),
+                cwd: std::path::PathBuf::from("/tmp"),
+                initial_command: Vec::new(),
+                initial_window_title: None,
+            }],
+            false,
+            std::path::Path::new("/tmp/shux.sock"),
+        )
+        .await
+        .unwrap();
+
+        let requests = finish_rpc_script(client, task, requests).await;
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect();
+        for method in [
+            "events.watch",
+            "events.history",
+            "plugin.install",
+            "plugin.list",
+            "plugin.reload",
+            "plugin.kill",
+            "plugin.grant",
+            "plugin.revoke",
+            "plugin.grants",
+            "plugin.audit",
+            "state.apply",
+        ] {
+            assert!(methods.contains(&method), "missing RPC call {method}");
+        }
+        let grant = requests
+            .iter()
+            .find(|r| r["method"] == "plugin.grant")
+            .unwrap();
+        assert_eq!(grant["params"]["plugin"], "demo");
+        assert_eq!(grant["params"]["method"], "pane.capture");
+        let apply = requests
+            .iter()
+            .find(|r| r["method"] == "state.apply")
+            .unwrap();
+        assert_eq!(apply["params"]["ops"][0]["op"], "create_session");
+    }
+
+    #[tokio::test]
+    async fn rpc_call_surfaces_structured_errors_and_frame_limits() {
+        let (mut client, requests, task) = spawn_rpc_script(vec![serde_json::json!({
+            "error": {
+                "code": -32002,
+                "message": "version_conflict",
+                "data": {
+                    "resource": "pane",
+                    "id": "p1",
+                    "expected_version": 1,
+                    "actual_version": 2
+                }
+            }
+        })]);
+
+        let err = rpc_call(&mut client, "pane.kill", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("version_conflict"));
+        assert!(rendered.contains("expected 1, actual 2"));
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert_eq!(requests[0]["method"], "pane.kill");
+
+        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let oversized = tokio::spawn(async move {
+            let mut len_buf = [0u8; 4];
+            server.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            server.read_exact(&mut payload).await.unwrap();
+            let too_large = 16 * 1024 * 1024 + 1;
+            server
+                .write_all(&(too_large as u32).to_be_bytes())
+                .await
+                .unwrap();
+        });
+        let err = rpc_call(&mut client, "system.version", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcClientError::FrameTooLarge(_)));
+        oversized.await.unwrap();
     }
 }
