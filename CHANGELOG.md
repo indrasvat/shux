@@ -1,3 +1,10 @@
+# [0.26.0](https://github.com/indrasvat/shux/compare/v0.25.0...v0.26.0) (2026-05-19)
+
+
+### Features
+
+* **rendering:** improve rich TUI parity ([#53](https://github.com/indrasvat/shux/issues/53)) ([8acce56](https://github.com/indrasvat/shux/commit/8acce56da89fb5248ffb86142dd1448ebb37c8da))
+
 # [0.25.0](https://github.com/indrasvat/shux/compare/v0.24.3...v0.25.0) (2026-05-18)
 
 
