@@ -1,0 +1,48 @@
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│vicaya | ◎ drishti: Patra (Files) | ⌁ ksetra: global | ● rakshaka  ok | ≡ suchi  1,896,164                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│prashna:                                                                                                                                                      │
+│niyama: —                                                                                                                                                     │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌phala (100)  varga:none───────────────────────────────────────────────────────────────┐┌purvadarshana — nvim.txt──────────────────────────────────────────────┐
+│▸ nvim.txt (/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/xterm256-rich-tu││/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/xterm256-ric│
+│  nvim-pane.png (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00         ││1591 bytes                                                            │
+│  nvim-window.png (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00       ││                                                                      │
+│  vicaya-tui.create.json (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00││use tracing::trace;                                                   │
+│  models_cache.json (/Users/indrasvat/.codex) 0.00                                    ││                                                                      │
+│  btop.txt (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00              ││use crate::cell::{Cell, CellFlags, CellStyle, Color, TerminalDefaultCo│
+│  btop-pane.png (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00         ││use crate::cursor::{Cursor, CursorShape};                             │
+│  btop-window.png (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00       ││use crate::grid::{Grid, GridConfig};                                  │
+│  nvim.create.json (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00      ││                                                                      │
+│  lazygit.txt (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00           ││/// Terminal mode flags (DECSET/DECRST).                              │
+│  lazygit-pane.png (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00      ││#[derive(Debug, Clone)]                                               │
+│  lazygit-window.png (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00    ││pub struct TerminalModes {                                            │
+│  btop.create.json (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00      ││    /// DECAWM -- auto-wrap mode (default: true).                     │
+│  logs_2.sqlite (/Users/indrasvat/.codex) 0.00                                        ││    pub auto_wrap: bool,                                              │
+│  xterm256-rich-tui-20260519-202424 (/Users/indrasvat/code/githu...indrasvat-shux/.shu││    /// DECCKM -- cursor keys mode (application vs normal).           │
+│  lazygit.create.json (/Users/indrasvat/code/githu...rich-tui-20260519-202424) 0.00   ││    pub application_cursor_keys: bool,                                │
+│  state_5.sqlite-wal (/Users/indrasvat/.codex) 0.00                                   ││    /// DECOM -- origin mode (cursor relative to scroll region).      │
+│  logs_2.sqlite-wal (/Users/indrasvat/.codex) 0.00                                    ││    pub origin_mode: bool,                                            │
+│  .global-cache (/Users/indrasvat/.cargo) 0.00                                        ││    /// DECTCEM -- text cursor enable mode (cursor visibility via mode│
+│  .codex-global-state.json.bak (/Users/indrasvat/.codex) 0.00                         ││    pub cursor_visible: bool,                                         │
+│  .codex-global-state.json (/Users/indrasvat/.codex) 0.00                             ││    /// Bracketed paste mode (Mode 2004).                             │
+│  history.db-wal (/Users/indrasvat/.local/share/atuin) 0.00                           ││    pub bracketed_paste: bool,                                        │
+│  records.db-shm (/Users/indrasvat/.local/share/atuin) 0.00                           ││    /// Mouse tracking modes.                                         │
+│  records.db-wal (/Users/indrasvat/.local/share/atuin) 0.00                           ││    pub mouse_tracking: MouseMode,                                    │
+│  history.db-shm (/Users/indrasvat/.local/share/atuin) 0.00                           ││    /// Alternate screen buffer active.                               │
+│  aliases.zsh (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00               ││    pub alternate_screen: bool,                                       │
+│  aliases.ps1 (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00               ││    /// Insert mode (IRM).                                            │
+│  vars.fish (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                 ││    pub insert_mode: bool,                                            │
+│  vars.zsh (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                  ││    /// Newline mode (LNM): LF also does CR.                          │
+│  vars.ps1 (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                  ││    pub newline_mode: bool,                                           │
+│  aliases.fish (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00              ││}                                                                     │
+│  aliases.xsh (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00               ││                                                                      │
+│  vars.bash (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                 ││impl Default for TerminalModes {                                      │
+│  vars.xsh (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                  ││    fn default() -> Self {                                            │
+│  aliases.bash (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00              ││        TerminalModes {                                               │
+│  scripts.db-wal (/Users/indrasvat/.local/share/atuin) 0.00                           ││            auto_wrap: true,                                          │
+│  scripts.db-shm (/Users/indrasvat/.local/share/atuin) 0.00                           ││            application_cursor_keys: false,                           │
+│  meta.db (/Users/indrasvat/.local/share/atuin) 0.00                                  ││            origin_mode: false,                                       │
+└──────────────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────────────────┘
+?: help  Tab: focus  Ctrl+T: drishti  Ctrl+P: kriya-suchi  Ctrl+O: purvadarshana  Ctrl+K: ksetra  Esc: clear  Ctrl-C: quit                v1.2.2@d5a60a2 d@9245!

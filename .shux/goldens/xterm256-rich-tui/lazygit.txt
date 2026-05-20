@@ -1,0 +1,48 @@
+╭─[1]─Status─────────────────────────────────────────╮╭─[0]─Diff───────────────────────────────────────────────────────────────────────────────────────────────╮
+│✓ indrasvat-shux → feat/xterm-256color-support      ││No changed files                                                                                        │
+╰────────────────────────────────────────────────────╯│                                                                                                        │
+╭─[2]─Files - Worktrees - Submodules─────────────────╮│                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+╰─────────────────────────────────────────────0 of 0─╯│                                                                                                        │
+╭─[3]─Local branches - Remotes - Tags────────────────╮│                                                                                                        │
+│  * ● feat/xterm-256color-support ✓                 ││                                                                                                        │
+│28m   main ✓                                        ││                                                                                                        │
+│1d    feat/render-parity-mouse-copy ✓               ││                                                                                                        │
+│6d    feat/conductor-plugin-design ✓                ││                                                                                                        │
+│1w    feat/m1-followups                             ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+│                                                    ││                                                                                                        │
+╰─────────────────────────────────────────────1 of 5─╯│                                                                                                        │
+╭─[4]─Commits - Reflog───────────────────────────────╮│                                                                                                        │
+│fcba6346 in ◯ feat(xterm): answer terminal probes   ▐│                                                                                                        │
+│e5f39b41 इन ◯ fix(pty): avoid xterm launch stalls   ▐│                                                                                                        │
+│21650a99 इन ◯ test(shux): raise coverage and stabili││                                                                                                        │
+│7d82e7c4 इन ◯ ci(coverage): add codecov workflow set││                                                                                                        │
+│8fe7117e se ◯ v0.26.0 chore(release): 0.26.0 [skip c│╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+│8acce56d इन ◯ feat(rendering): improve rich TUI pari│╭─Command log────────────────────────────────────────────────────────────────────────────────────────────╮
+│27c86393 se ◯ v0.25.0 chore(release): 0.25.0 [skip c││You can hide/focus this panel by pressing '@'                                                           │
+│bf0617d2 इन ◯ feat(copy): improve mouse selection UX││                                                                                                        │
+│5b5bce78 se ◯ v0.24.3 chore(release): 0.24.3 [skip c││Random tip: press 'd' on a commit to drop it (delete it)                                                │
+│10b23c23 इन ◯ fix(session): add initial pane title f││                                                                                                        │
+│a2e8d0e8 se ◯ v0.24.2 chore(release): 0.24.2 [skip c││                                                                                                        │
+╰────────────────────────────────────────────1 of 87─╯│                                                                                                        │
+╭─[5]─Stash──────────────────────────────────────────╮│                                                                                                        │
+│1w On create-shux: throwaway powerline statusbar    ││                                                                                                        │
+╰─────────────────────────────────────────────1 of 1─╯╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Commit: c | Stash: s | Reset: D | Keybindings: ?                                                                                      Donate Ask Question 0.61.1

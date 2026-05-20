@@ -1,0 +1,48 @@
+╭─┐¹cpu┌──┐menu┌┐preset *┌──────────────────────────────────────────────────┐20:24:32┌─────────────────────────────────────┐BAT■ 100% ■■■■■■■■■■┌─┐- 2000ms +┌─╮
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                            ⡀                                                                 │
+│                                                                                            ⡇╭─┐M2 Pro┌──────────────────────────────────────────────────────╮│
+│                                                                                            ⣿│CPU ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■  42% ⣀⣀⣀⣀⣤  56°C││
+│                                                                                           ⢰⣿│C0  ⣀⣀⣀⣀⣀⣀⣀⣀⢠⣦  51% ⣀⣀⣀⣀⣤  57°C│C5  ⣀⣀⣀⣀⣀⣀⣀⣀⢀⣦  46% ⣀⣀⣀⣀⣤  57°C││
+│                                                                                           ⢸⣿│C1  ⣀⣀⣀⣀⣀⣀⣀⣀⢠⣦  48% ⣀⣀⣀⣀⣤  56°C│C6  ⣀⣀⣀⣀⣀⣀⣀⣀⢀⣦  41% ⣀⣀⣀⣀⣤  57°C││
+├───────────────────────────────────total─▲▼─gpu-totals───────────────────────────────────────┤C2  ⣀⣀⣀⣀⣀⣀⣀⣀⢠⣦  48% ⣀⣀⣀⣀⣤  56°C│C7  ⣀⣀⣀⣀⣀⣀⣀⣀⢀⣦  35% ⣀⣀⣀⣀⣤  57°C││
+│                                                                                           ⠈⣿│C3  ⣀⣀⣀⣀⣀⣀⣀⣀⢠⣤  44% ⣀⣀⣀⣀⣤  56°C│C8  ⣀⣀⣀⣀⣀⣀⣀⣀⢀⣦  32% ⣀⣀⣀⣀⣤  57°C││
+│                                                                                            ⣿│C4  ⣀⣀⣀⣀⣀⣀⣀⣀⢀⣧  48% ⣀⣀⣀⣀⣤  57°C│C9  ⣀⣀⣀⣀⣀⣀⣀⣀⢀⣤  30% ⣀⣀⣀⣀⣤  57°C││
+│                                                                                            ⠹│                                       Load avg: 5.07 6.31 7.54││
+│                                                                                             │GPU ■■■■■■■■■■■■■■■■■■■■■■ 38% ⣀⣀⣀⢰⣶  24G/32G  ⣀⣀⣀⢠⣤ 57°C 0.83W││
+│                                                                                             ╰───────────────────────────────────────────────────────────────╯│
+│                                                                                                                                                              │
+│ up 2d 02:10                                                                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─┐²mem┌────────────────────────────┬─┐disks┌─────────────────────┐io┌─╮╭─┐⁴proc┌┐filter┌───────────────────────┐pause┌┐per-core┌┐reverse┌┐tree┌┐← cpu lazy →┌─╮
+│ Total:                   32.0 GiB ├─root─────────────────────460─GiB─┤│    Pid: Program:         Command:              Threads: User:       MemB       Cpu% ↑│
+├─Used:────────────────────10.9─GiB─┤ IO% ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││   57274 node             node --version               1 indrasvat    20M ⣀⣀⣀⣀⣀  0.0 █│
+│  34%                              │ Used: 97% ■■■■■■■■■■■■■  445 GiB ││   57259 kubectl          kubectl config current-co    8 indrasvat    35M ⣀⣀⣀⣀⣀  0.0  │
+│                                 ⢰⣶├─VM───────────────────────460─GiB─┤│   57256 starship         starship prompt             12 indrasvat    14M ⣀⣀⣀⣀⣀  0.0  │
+├─Available:───────────────21.0─GiB─┤ IO% ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││   57250 starship         starship prompt             10 indrasvat    14M ⣀⣀⣀⣀⣀  0.0  │
+│  66%                            ⢀⣀│ Used: 97% ■■■■■■■■■■■■■  445 GiB ││   57272 rustc            /Users/indrasvat/.rustup/    1 indrasvat   4.3M ⣀⣀⣀⣀⣀  0.0  │
+│                                 ⢸⣿├─Preboot──────────────────460─GiB─┤│   57263 rustc            /Users/indrasvat/.rustup/    1 indrasvat   4.4M ⣀⣀⣀⣀⣀  0.0  │
+├─Cached:──────────────────6.84─GiB─┤ IO% ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││   53977 Google Chrome He /Applications/Google Chro   19 indrasvat   304M ⣀⣀⣀⣀⣀  0.0  │
+│  21%                              │ Used: 97% ■■■■■■■■■■■■■  445 GiB ││   57267 volta-shim       /Users/indrasvat/.volta/b    2 indrasvat   6.4M ⣀⣀⣀⣀⣀  0.0  │
+│                                 ⢠⣤├─Update───────────────────460─GiB─┤│   57252 bash             bash -c kubectl config cu    1 indrasvat   6.3M ⣀⣀⣀⣀⣀  0.0  │
+├─Free:────────────────────1.80─GiB─┤ IO% ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││   12046 2.1.144          claude --dangerously-skip   29 indrasvat   407M ⣀⣀⣀⣀⣀  0.0  │
+│   6%                              │ Used: 97% ■■■■■■■■■■■■■  445 GiB ││   57262 sed              sed s/^/󱃾 /                  1 indrasvat   1.3M ⣀⣀⣀⣀⣀  0.0  │
+│                                 ⢀⣀├─xarts────────────────────500─MiB─┤│   56204 btop             btop                         5 indrasvat    14M ⣀⣀⣀⣀⢀  0.1  │
+├───────────────────────────────────┤ IO% ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││     753 WallpaperMacinto /System/Library/Extension    6 indrasvat    40M ⣀⣀⣀⣀⢀  1.6  │
+│                                   │ Used:  4% ■■■■■■■■■■■■■ 19.0 MiB ││   39590 Google Chrome He /Applications/Google Chro   20 indrasvat   179M ⣀⣀⣀⣀⣀  0.0  │
+╰───────────────────────────────────┴──────────────────────────────────╯│   39923 Google Chrome fo /Users/indrasvat/.agent-b   22 indrasvat   229M ⣀⣀⣀⣀⢀  1.3  │
+╭─┐³net┌┐10.0.0.160┌──────────────────────┐sync┌┐auto┌┐zero┌┐←b en0 n→┌╮│   88106 stable           /Applications/Warp.app/Co   59 indrasvat   318M ⣀⣀⣀⣀⢀  0.3  │
+│10K                                                                   ││   60438 Google Chrome He /Applications/Google Chro   22 indrasvat   249M ⣀⣀⣀⣀⢀  0.1  │
+│                                                                      ││   41700 Codex Helper (Re /Applications/Codex.app/C   23 indrasvat   603M ⣀⣀⣀⣀⣀  0.0  │
+│                                           ╭─┐download┌──────────────╮││   41441 Codex Helper     /Applications/Codex.app/C   16 indrasvat    80M ⣀⣀⣀⣀⣀  0.0  │
+│                                           │▼ 2.97 KiB/s (23.8 Kibps)│││   34861 Google Chrome He /Applications/Google Chro   19 indrasvat   282M ⣀⣀⣀⣀⣀  0.0  │
+│                                          ⢰│▼ Top:       (23.8 Kibps)│││    1067 Google Chrome He /Applications/Google Chro   24 indrasvat   148M ⣀⣀⣀⣀⣀  0.0  │
+│                                         ⢀⣸│▼ Total:          379 MiB│││   54373 lazygit          lazygit                     19 indrasvat    34M ⣀⣀⣀⣀⣀  0.0  │
+│                                         ⠈⠹│                         │││    1202 Google Chrome He /Applications/Google Chro   22 indrasvat   147M ⣀⣀⣀⣀⣀  0.0  │
+│                                           │▲ 1.48 KiB/s (11.9 Kibps)│││   41701 codex            /Applications/Codex.app/C   22 indrasvat   207M ⣀⣀⣀⣀⣀  0.0  │
+│                                           │▲ Top:       (11.9 Kibps)│││   91072 Wispr Flow Helpe /Applications/Wispr Flow.   25 indrasvat   100M ⣀⣀⣀⣀⢀  0.2  │
+│                                           │▲ Total:         2.80 GiB│││     710 iTerm2           /Applications/iTerm.app/C   10 indrasvat   108M ⣀⣀⣀⣀⢀  0.9  │
+│                                           ╰─┘upload└────────────────╯││     702 WhatsApp         /Applications/WhatsApp.ap   29 indrasvat   317M ⣀⣀⣀⣀⢀  2.8  │
+│10K                                                                   ││   14488 Google Chrome He /Applications/Google Chro   27 indrasvat   434M ⣀⣀⣀⣀⢀  0.1 ↓│
+╰──────────────────────────────────────────────────────────────────────╯╰┘↑ select ↓└┘info ↵└┘terminate└┘kill└┘signals└┘Nice└┘Follow└───────────────────┘0/902└╯
