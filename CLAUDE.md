@@ -38,7 +38,7 @@ crates/shux/           CLI entrypoint (clap, daemon auto-start)
     ↓
 crates/shux-core/      Core engine (SessionGraph, LayoutEngine, EventBus, config, theme)
     ↓
-crates/shux-pty/       PTY manager (pty-process, async I/O, lifecycle)
+crates/shux-pty/       PTY manager (openpty, async I/O, lifecycle)
 crates/shux-vt/        Virtual terminal grid (vte parser, VecDeque grid, scrollback)
 crates/shux-rpc/       JSON-RPC server (UDS + TCP, length-prefixed framing)
 crates/shux-plugin/    Plugin host (wasmtime, WIT, process plugins, permissions)
@@ -74,6 +74,39 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
   - `style::print_*()` functions for common output patterns (version, session entry, errors)
   - Respects `NO_COLOR` env var and `IsTerminal` detection automatically
   - When adding new CLI commands, add corresponding `print_*` helpers to `style.rs`
+
+## Rich TUI Compatibility Guardrail
+
+> **STRICT RULE — Do not regress rich TUI rendering or interactivity.**
+> The north star is top-notch, pixel-perfect TUIs rendered inside shux.
+> shux is a terminal multiplexer and pixel snapshotter; `vim`/`nvim`,
+> `lazygit`, `btop`/`htop`, `vicaya`, `vivecaka`, and other ratatui/Bubbletea/
+> curses-style apps must continue to render correctly inside shux panes.
+>
+> Any change touching PTY spawn, pane environment (`TERM`, `COLORTERM`,
+> `TERM_PROGRAM`, `NO_COLOR`, locale), VT parsing, input/mouse encoding,
+> resize/winsize, render composition, snapshot rasterization, or attach output
+> MUST include a rich-TUI compatibility pass before delivery:
+>
+> 1. Run the known rich TUI set that exists on the machine: at minimum
+>    `lazygit`, `btop` or `htop`, `vim` or `nvim`, plus shux dogfood TUIs such
+>    as `vicaya` and `vivecaka` when installed.
+> 2. Capture visual evidence through shux, not direct terminal screenshots:
+>    `pane.snapshot` for the app surface and `window.snapshot` when borders,
+>    titles, status bars, or layout are touched.
+> 3. Save screenshots under `.shux/out/<task-or-branch>/` and inspect them for
+>    layout corruption, missing color, broken borders, glyph fallback issues,
+>    alternate-screen failures, mouse/input regressions, and startup stalls.
+> 4. Compare against any existing `.shux/out/rich-tui-parity/` artifacts or
+>    relevant goldens when present. If the visual output differs, explain why
+>    the difference is intentional; otherwise fix it before handoff.
+> 5. Report the screenshot paths and a concise pass/fail table in the final
+>    response. If a TUI cannot be run on the current machine, say exactly which
+>    one and why.
+>
+> Never treat `TERM` or terminal capability changes as "just environment."
+> They change what TUIs emit. If changing terminal identity is necessary, prove
+> that rich TUIs still render correctly and document the compatibility impact.
 
 ## Git Workflow
 

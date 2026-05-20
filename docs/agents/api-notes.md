@@ -6,7 +6,7 @@
 - `vte` 0.15 — with `ansi` feature for typed handler callbacks
 - `ratatui` 0.30 — workspace reorganization, used for chrome only
 - `wasmtime` 41+ — WASI Preview 2, Component Model, epoch interruption
-- `pty-process` 0.5.3 — AsyncRead/AsyncWrite, tokio integration
+- `nix` 0.29 — `openpty`, process groups, signals, and winsize/ioctl glue
 - `arc-swap` 1.x — lock-free state snapshots
 - `clap` 4.x — derive macro, subcommands, completions
 
