@@ -1,3 +1,10 @@
+## [0.27.1](https://github.com/indrasvat/shux/compare/v0.27.0...v0.27.1) (2026-05-20)
+
+
+### Bug Fixes
+
+* **xterm:** address probe review feedback ([1d5a368](https://github.com/indrasvat/shux/commit/1d5a3689af36f9ce0e8f16dee32d70476cc2ef4f))
+
 # [0.27.0](https://github.com/indrasvat/shux/compare/v0.26.1...v0.27.0) (2026-05-20)
 
 
