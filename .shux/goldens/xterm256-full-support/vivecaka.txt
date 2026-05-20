@@ -1,4 +1,7 @@
- vivecaka      indrasvat/shux      0 open      All PRs                                                                                                     ↻ 24s
+ vivecaka      indrasvat/shux      1/1 open      All PRs                                                                                                   ↻ 24s
+  #     Title                                                                                                              Author        CI    Review    Age▼
+ -----+------------------------------------------------------------------------------------------------------------------+-------------+-----+---------+------
+│   59  feat(xterm): support richer terminal probes                                                                        indrasvat     ◐     —         2m
 
 
 
@@ -19,9 +22,6 @@
 
 
 
-
-
-                                                                     No pull requests found
 
 
 

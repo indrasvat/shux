@@ -1,47 +1,47 @@
 ╭─[1]─Status─────────────────────────────────────────╮╭─[0]─Unstaged changes───────────────────────────────────────────────────────────────────────────────────╮
-│indrasvat-shux → feat/xterm256-full-support         ││diff --git i/.shux/scripts/xterm256_rich_tui_check.sh w/.shux/scripts/xterm256_rich_tui_check.sh        ▐
-╰────────────────────────────────────────────────────╯│index 79a29be..a7a04a7 100755                                                                           ▐
-╭─[2]─Files - Worktrees - Submodules─────────────────╮│--- i/.shux/scripts/xterm256_rich_tui_check.sh                                                          │
-│▼ /                                                 ▐│+++ w/.shux/scripts/xterm256_rich_tui_check.sh                                                          │
-│  ▼ .shux                                           ▐│@@ -85,6 +85,24 @@ run_if_installed "nvim" "nvim" 2 -u NONE -n +"set termguicolors laststatus=2 rul     │
-│    ▼ goldens/xterm256-full-support                 ▐│ run_if_installed "vicaya-tui" "vicaya-tui" 5                                                           │
-│      ?? btop-window.png                            ▐│ run_if_installed "vivecaka" "vivecaka" 8 --repo=indrasvat/shux                                         │
-│      ?? btop.txt                                   ││                                                                                                        │
-│      ?? contact-sheet.png                          ││+SYNC_PROBE="$OUT_DIR/sync-output-probe.py"                                                             │
-│      ?? launch-timing.json                         ││+cat >"$SYNC_PROBE" <<'PY'                                                                              │
-│      ?? lazygit-window.png                         ││+import sys                                                                                             │
-│      ?? lazygit.txt                                ││+import time                                                                                            │
-│      ?? nvim-window.png                            ││+                                                                                                       │
-│      ?? nvim.txt                                   ││+sys.stdout.write("old-frame")                                                                          │
-│      ?? sync-output-probe-window.png               ││+sys.stdout.flush()                                                                                     │
-╰────────────────────────────────────────────1 of 35─╯│+sys.stdout.write("\x1b[?2026h\x1b[1;1Hpending-frame")                                                  │
-╭─[3]─Local branches - Remotes - Tags────────────────╮│+sys.stdout.flush()                                                                                     │
-│  *   feat/xterm256-full-support                    ││+time.sleep(1.0)                                                                                        │
-│10h   main ✓                                        ││+sys.stdout.write("\x1b[?2026l\x1b[2;1Hsync-output committed")                                          │
-│11h ● fix/xterm-review-followups (upstream gone)    ││+sys.stdout.flush()                                                                                     │
-│14h ● feat/xterm-256color-support (upstream gone)   ││+time.sleep(60)                                                                                         │
-│2d    feat/render-parity-mouse-copy ✓               ││+PY                                                                                                     │
-│1w    feat/conductor-plugin-design ✓                ││+run_tui "sync-output-probe" 3 python3 "$SYNC_PROBE"                                                    │
-│1w    feat/m1-followups                             ││+grep -q 'pending-frame' "$OUT_DIR/sync-output-probe.txt"                                               │
-│                                                    ││+grep -q 'sync-output committed' "$OUT_DIR/sync-output-probe.txt"                                       │
-│                                                    ││+                                                                                                       │
-│                                                    ││ if [[ -f "$OUT_DIR/vivecaka.txt" ]]; then                                                              │
-│                                                    ││     grep -q 'indrasvat/shux' "$OUT_DIR/vivecaka.txt"                                                   │
-│                                                    ││     if [[ "$EXPECT_VIVECAKA_PRS" == "1" ]]; then                                                       │
-╰─────────────────────────────────────────────1 of 7─╯│diff --git i/crates/shux-vt/src/lib.rs w/crates/shux-vt/src/lib.rs                                      │
-╭─[4]─Commits - Reflog───────────────────────────────╮│index de04655..17cb981 100644                                                                           │
-│1d5a3689 इन ◯ fix(xterm): address probe review feedb▐│--- i/crates/shux-vt/src/lib.rs                                                                         │
-│643e960f se ◯ v0.27.0 chore(release): 0.27.0 [skip c▐│+++ w/crates/shux-vt/src/lib.rs                                                                         │
-│5cc5a2d2 इन ◯ feat(xterm): answer terminal probes   ││@@ -46,6 +46,8 @@ pub struct VirtualTerminal {                                                          │
-│5b8f1ba0 se ◯ v0.26.1 chore(release): 0.26.1 [skip c││     parser: Parser,                                                                                    │
-│e5f39b41 इन ◯ fix(pty): avoid xterm launch stalls   │╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-│21650a99 इन ◯ test(shux): raise coverage and stabili│╭─Command log────────────────────────────────────────────────────────────────────────────────────────────╮
-│7d82e7c4 इन ◯ ci(coverage): add codecov workflow set││You can hide/focus this panel by pressing '@'                                                           │
+│✓ indrasvat-shux → feat/xterm256-full-support       ││diff --git i/.shux/goldens/xterm256-full-support/btop-pane.png w/.shux/goldens/xterm256-full-           ▐
+╰────────────────────────────────────────────────────╯│support/btop-pane.png                                                                                   ▐
+╭─[2]─Files - Worktrees - Submodules─────────────────╮│index f2e93a4..81cad90 100644                                                                           │
+│▼ .shux                                             ▐│Binary files i/.shux/goldens/xterm256-full-support/btop-pane.png and w/.shux/goldens/xterm256-full-     │
+│  ▼ goldens/xterm256-full-support                   ▐│support/btop-pane.png differ                                                                            │
+│     M btop-pane.png                                ▐│diff --git i/.shux/goldens/xterm256-full-support/btop-window.png w/.shux/goldens/xterm256-full-         │
+│     M btop-window.png                              ▐│support/btop-window.png                                                                                 │
+│     M btop.create.json                             ▐│index b17f328..6e9a874 100644                                                                           │
+│     M btop.txt                                     ▐│Binary files i/.shux/goldens/xterm256-full-support/btop-window.png and w/.shux/goldens/xterm256-full-   │
+│     M contact-sheet.png                            ││support/btop-window.png differ                                                                          │
+│     M lazygit-pane.png                             ││diff --git i/.shux/goldens/xterm256-full-support/btop.create.json w/.shux/goldens/xterm256-full-        │
+│     M lazygit-window.png                           ││support/btop.create.json                                                                                │
+│     M lazygit.create.json                          ││index 5853048..4e7ff30 100644                                                                           │
+│     M lazygit.txt                                  ││--- i/.shux/goldens/xterm256-full-support/btop.create.json                                              │
+│     M nvim-window.png                              ││+++ w/.shux/goldens/xterm256-full-support/btop.create.json                                              │
+╰────────────────────────────────────────────1 of 25─╯│@@ -1,12 +1,12 @@                                                                                       │
+╭─[3]─Local branches - Remotes - Tags────────────────╮│ {                                                                                                      │
+│  * ● feat/xterm256-full-support ✓                  ││-  "active_window_id": "c414e328-f138-45fc-9261-1caf0b532273",                                          │
+│11h   main ✓                                        ││-  "created_at": 1779299481,                                                                            │
+│11h ● fix/xterm-review-followups (upstream gone)    ││-  "id": "24d51bb0-414f-4280-a02d-8fcfe904a314",                                                        │
+│14h ● feat/xterm-256color-support (upstream gone)   ││-  "name": "xterm256-rich-87556-btop",                                                                  │
+│2d    feat/render-parity-mouse-copy ✓               ││-  "pane_id": "e818aa1a-5499-4276-ba2c-67a951db3333",                                                   │
+│1w    feat/conductor-plugin-design ✓                ││+  "active_window_id": "6c07ff9a-b12d-427f-9004-d9a919b488b9",                                          │
+│1w    feat/m1-followups                             ││+  "created_at": 1779300104,                                                                            │
+│                                                    ││+  "id": "2dfa31fa-d03a-43b5-8a1c-e39fc6fb8058",                                                        │
+│                                                    ││+  "name": "xterm256-rich-49396-btop",                                                                  │
+│                                                    ││+  "pane_id": "ff6be86d-f83a-4e5f-91ce-911730204b4d",                                                   │
+│                                                    ││   "window_count": 1,                                                                                   │
+│                                                    ││-  "window_id": "c414e328-f138-45fc-9261-1caf0b532273",                                                 │
+╰─────────────────────────────────────────────1 of 7─╯│+  "window_id": "6c07ff9a-b12d-427f-9004-d9a919b488b9",                                                 │
+╭─[4]─Commits - Reflog───────────────────────────────╮│   "windows": [                                                                                         │
+│e78742ba in ◯ feat(xterm): support richer terminal p▐│-    "c414e328-f138-45fc-9261-1caf0b532273"                                                             │
+│180f8434 in ◯ test(shux): stabilize daemon lifecycle▐│+    "6c07ff9a-b12d-427f-9004-d9a919b488b9"                                                             │
+│1d5a3689 इन ◯ fix(xterm): address probe review feedb││   ]                                                                                                    │
+│643e960f se ◯ v0.27.0 chore(release): 0.27.0 [skip c││ }                                                                                                      │
+│5cc5a2d2 इन ◯ feat(xterm): answer terminal probes   │╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+│5b8f1ba0 se ◯ v0.26.1 chore(release): 0.26.1 [skip c│╭─Command log────────────────────────────────────────────────────────────────────────────────────────────╮
+│e5f39b41 इन ◯ fix(pty): avoid xterm launch stalls   ││You can hide/focus this panel by pressing '@'                                                           │
+│21650a99 इन ◯ test(shux): raise coverage and stabili││                                                                                                        │
+│7d82e7c4 इन ◯ ci(coverage): add codecov workflow set││Random tip: To collapse/expand a directory, press '<enter>'                                             │
 │8fe7117e se ◯ v0.26.0 chore(release): 0.26.0 [skip c││                                                                                                        │
-│8acce56d इन ◯ feat(rendering): improve rich TUI pari││Random tip: If you want to learn Go and can think of ways to improve lazygit, join the team! Click 'Ask │
-│27c86393 se ◯ v0.25.0 chore(release): 0.25.0 [skip c││Question' and express your interest                                                                     │
-│bf0617d2 इन ◯ feat(copy): improve mouse selection UX││                                                                                                        │
-╰────────────────────────────────────────────1 of 90─╯│                                                                                                        │
+│8acce56d इन ◯ feat(rendering): improve rich TUI pari││                                                                                                        │
+╰────────────────────────────────────────────1 of 92─╯│                                                                                                        │
 ╭─[5]─Stash──────────────────────────────────────────╮│                                                                                                        │
 │1w On create-shux: throwaway powerline statusbar    ││                                                                                                        │
 ╰─────────────────────────────────────────────1 of 1─╯╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯

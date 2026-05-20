@@ -1,48 +1,48 @@
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│vicaya | ◎ drishti: Patra (Files) | ⌁ ksetra: global | ● rakshaka  ok | ≡ suchi  1,891,737                                                                    │
+│vicaya | ◎ drishti: Patra (Files) | ⌁ ksetra: global | ● rakshaka  offline | ≡ suchi  ?                                                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │prashna:                                                                                                                                                      │
 │niyama: —                                                                                                                                                     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌phala (100)  varga:none───────────────────────────────────────────────────────────────┐┌purvadarshana — nvim.txt──────────────────────────────────────────────┐
-│▸ nvim.txt (/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/xterm256-rich-tu││/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/xterm256-ric│
-│  nvim-pane.png (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00         ││1758 bytes                                                            │
-│  nvim-window.png (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00       ││                                                                      │
-│  vicaya-tui.create.json (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00││use tracing::trace;                                                   │
-│  nvim.log (/Users/indrasvat/.local/state/nvim) 0.00                                  ││                                                                      │
-│  models_cache.json (/Users/indrasvat/.codex) 0.00                                    ││use crate::cell::{Cell, CellFlags, CellStyle, Color, TerminalDefaultCo│
-│  btop.txt (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00              ││use crate::cursor::{Cursor, CursorShape};                             │
-│  btop-pane.png (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00         ││use crate::grid::{Grid, GridConfig};                                  │
-│  btop-window.png (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00       ││                                                                      │
-│  nvim.create.json (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00      ││/// Terminal mode flags (DECSET/DECRST).                              │
-│  aliases.zsh (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00               ││#[derive(Debug, Clone)]                                               │
-│  aliases.ps1 (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00               ││pub struct TerminalModes {                                            │
-│  vars.fish (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                 ││    /// DECAWM -- auto-wrap mode (default: true).                     │
-│  vars.zsh (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                  ││    pub auto_wrap: bool,                                              │
-│  vars.ps1 (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                  ││    /// DECCKM -- cursor keys mode (application vs normal).           │
-│  aliases.fish (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00              ││    pub application_cursor_keys: bool,                                │
-│  aliases.xsh (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00               ││    /// DECNKM -- keypad mode (application vs numeric).               │
-│  vars.bash (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                 ││    pub application_keypad: bool,                                     │
-│  vars.xsh (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00                  ││    /// DECOM -- origin mode (cursor relative to scroll region).      │
-│  aliases.bash (/Users/indrasvat/.local/share/atuin/dotfiles/cache) 0.00              ││    pub origin_mode: bool,                                            │
-│  scripts.db-wal (/Users/indrasvat/.local/share/atuin) 0.00                           ││    /// DECTCEM -- text cursor enable mode (cursor visibility via mode│
-│  logs_2.sqlite (/Users/indrasvat/.codex) 0.00                                        ││    pub cursor_visible: bool,                                         │
-│  7092fb96-f895-4c0e-a870-b836599c66b0.jsonl (/Users/indrasvat/.claude/pr...hub-com-in││    /// Bracketed paste mode (Mode 2004).                             │
-│  history.db-wal (/Users/indrasvat/.local/share/atuin) 0.00                           ││    pub bracketed_paste: bool,                                        │
-│  scripts.db-shm (/Users/indrasvat/.local/share/atuin) 0.00                           ││    /// Send focus events mode (Mode 1004).                           │
-│  lazygit.txt (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00           ││    pub focus_events: bool,                                           │
-│  lazygit-pane.png (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00      ││    /// Mouse tracking modes.                                         │
-│  lazygit-window.png (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00    ││    pub mouse_tracking: MouseMode,                                    │
-│  btop.create.json (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00      ││    /// SGR mouse coordinate encoding (Mode 1006).                    │
-│  meta.db (/Users/indrasvat/.local/share/atuin) 0.00                                  ││    pub sgr_mouse: bool,                                              │
-│  records.db-wal (/Users/indrasvat/.local/share/atuin) 0.00                           ││    /// Synchronized output mode (Mode 2026).                         │
-│  history.db-shm (/Users/indrasvat/.local/share/atuin) 0.00                           ││    pub synchronized_output: bool,                                    │
-│  records.db-shm (/Users/indrasvat/.local/share/atuin) 0.00                           ││    /// Alternate screen buffer active.                               │
-│  kv.db-shm (/Users/indrasvat/.local/share/atuin) 0.00                                ││    pub alternate_screen: bool,                                       │
-│  lazygit.create.json (/Users/indrasvat/code/githu...rich-tui-20260520-105116) 0.00   ││    /// Insert mode (IRM).                                            │
-│  xterm256-rich-tui-20260520-105116 (/Users/indrasvat/code/githu...indrasvat-shux/.shu││    pub insert_mode: bool,                                            │
-│  state_5.sqlite (/Users/indrasvat/.codex) 0.00                                       ││    /// Newline mode (LNM): LF also does CR.                          │
-│  records.db (/Users/indrasvat/.local/share/atuin) 0.00                               ││    pub newline_mode: bool,                                           │
+┌phala (0)  searching…  varga:none─────────────────────────────────────────────────────┐┌purvadarshana─────────────────────────────────────────────────────────┐
+│                                                                                      ││Select a result to preview its contents.                              │
+│                                                                                      ││                                                                      │
+│                                                                                      ││Ctrl+O toggles purvadarshana.                                         │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
+│                                                                                      ││                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────────────────┘
-?: help  Tab: focus  Ctrl+T: drishti  Ctrl+P: kriya-suchi  Ctrl+O: purvadarshana  Ctrl+K: ksetra  Esc: clear  Ctrl-C: quit                v1.2.2@d5a60a2 d@9245!
+?: help  Tab: focus  Ctrl+T: drishti  Ctrl+P: kriya-suchi  Ctrl+O: purvadarshana  Ctrl+K: ksetra  Esc: clear  Ctrl-C: quit                        v1.2.2@d5a60a2

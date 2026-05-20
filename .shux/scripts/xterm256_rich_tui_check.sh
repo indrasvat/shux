@@ -80,6 +80,7 @@ run_if_installed() {
 }
 
 run_if_installed "lazygit" "lazygit" 4
+run_if_installed "nidhi" "nidhi" 4 -C "$PWD" --no-animation
 run_if_installed "btop" "btop" 4
 run_if_installed "nvim" "nvim" 2 -u NONE -n +"set termguicolors laststatus=2 ruler" +"syntax on" +"set statusline=shux-xterm-256color\\ %f\\ %y\\ %m%=\\ %l,%c" crates/shux-vt/src/parser.rs
 run_if_installed "vicaya-tui" "vicaya-tui" 5
