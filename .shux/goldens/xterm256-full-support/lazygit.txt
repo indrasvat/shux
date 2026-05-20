@@ -1,0 +1,48 @@
+╭─[1]─Status─────────────────────────────────────────╮╭─[0]─Unstaged changes───────────────────────────────────────────────────────────────────────────────────╮
+│indrasvat-shux → feat/xterm256-full-support         ││diff --git i/.shux/scripts/xterm256_rich_tui_check.sh w/.shux/scripts/xterm256_rich_tui_check.sh        ▐
+╰────────────────────────────────────────────────────╯│index 79a29be..a7a04a7 100755                                                                           ▐
+╭─[2]─Files - Worktrees - Submodules─────────────────╮│--- i/.shux/scripts/xterm256_rich_tui_check.sh                                                          │
+│▼ /                                                 ▐│+++ w/.shux/scripts/xterm256_rich_tui_check.sh                                                          │
+│  ▼ .shux                                           ▐│@@ -85,6 +85,24 @@ run_if_installed "nvim" "nvim" 2 -u NONE -n +"set termguicolors laststatus=2 rul     │
+│    ▼ goldens/xterm256-full-support                 ▐│ run_if_installed "vicaya-tui" "vicaya-tui" 5                                                           │
+│      ?? btop-window.png                            ▐│ run_if_installed "vivecaka" "vivecaka" 8 --repo=indrasvat/shux                                         │
+│      ?? btop.txt                                   ││                                                                                                        │
+│      ?? contact-sheet.png                          ││+SYNC_PROBE="$OUT_DIR/sync-output-probe.py"                                                             │
+│      ?? launch-timing.json                         ││+cat >"$SYNC_PROBE" <<'PY'                                                                              │
+│      ?? lazygit-window.png                         ││+import sys                                                                                             │
+│      ?? lazygit.txt                                ││+import time                                                                                            │
+│      ?? nvim-window.png                            ││+                                                                                                       │
+│      ?? nvim.txt                                   ││+sys.stdout.write("old-frame")                                                                          │
+│      ?? sync-output-probe-window.png               ││+sys.stdout.flush()                                                                                     │
+╰────────────────────────────────────────────1 of 35─╯│+sys.stdout.write("\x1b[?2026h\x1b[1;1Hpending-frame")                                                  │
+╭─[3]─Local branches - Remotes - Tags────────────────╮│+sys.stdout.flush()                                                                                     │
+│  *   feat/xterm256-full-support                    ││+time.sleep(1.0)                                                                                        │
+│10h   main ✓                                        ││+sys.stdout.write("\x1b[?2026l\x1b[2;1Hsync-output committed")                                          │
+│11h ● fix/xterm-review-followups (upstream gone)    ││+sys.stdout.flush()                                                                                     │
+│14h ● feat/xterm-256color-support (upstream gone)   ││+time.sleep(60)                                                                                         │
+│2d    feat/render-parity-mouse-copy ✓               ││+PY                                                                                                     │
+│1w    feat/conductor-plugin-design ✓                ││+run_tui "sync-output-probe" 3 python3 "$SYNC_PROBE"                                                    │
+│1w    feat/m1-followups                             ││+grep -q 'pending-frame' "$OUT_DIR/sync-output-probe.txt"                                               │
+│                                                    ││+grep -q 'sync-output committed' "$OUT_DIR/sync-output-probe.txt"                                       │
+│                                                    ││+                                                                                                       │
+│                                                    ││ if [[ -f "$OUT_DIR/vivecaka.txt" ]]; then                                                              │
+│                                                    ││     grep -q 'indrasvat/shux' "$OUT_DIR/vivecaka.txt"                                                   │
+│                                                    ││     if [[ "$EXPECT_VIVECAKA_PRS" == "1" ]]; then                                                       │
+╰─────────────────────────────────────────────1 of 7─╯│diff --git i/crates/shux-vt/src/lib.rs w/crates/shux-vt/src/lib.rs                                      │
+╭─[4]─Commits - Reflog───────────────────────────────╮│index de04655..17cb981 100644                                                                           │
+│1d5a3689 इन ◯ fix(xterm): address probe review feedb▐│--- i/crates/shux-vt/src/lib.rs                                                                         │
+│643e960f se ◯ v0.27.0 chore(release): 0.27.0 [skip c▐│+++ w/crates/shux-vt/src/lib.rs                                                                         │
+│5cc5a2d2 इन ◯ feat(xterm): answer terminal probes   ││@@ -46,6 +46,8 @@ pub struct VirtualTerminal {                                                          │
+│5b8f1ba0 se ◯ v0.26.1 chore(release): 0.26.1 [skip c││     parser: Parser,                                                                                    │
+│e5f39b41 इन ◯ fix(pty): avoid xterm launch stalls   │╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+│21650a99 इन ◯ test(shux): raise coverage and stabili│╭─Command log────────────────────────────────────────────────────────────────────────────────────────────╮
+│7d82e7c4 इन ◯ ci(coverage): add codecov workflow set││You can hide/focus this panel by pressing '@'                                                           │
+│8fe7117e se ◯ v0.26.0 chore(release): 0.26.0 [skip c││                                                                                                        │
+│8acce56d इन ◯ feat(rendering): improve rich TUI pari││Random tip: If you want to learn Go and can think of ways to improve lazygit, join the team! Click 'Ask │
+│27c86393 se ◯ v0.25.0 chore(release): 0.25.0 [skip c││Question' and express your interest                                                                     │
+│bf0617d2 इन ◯ feat(copy): improve mouse selection UX││                                                                                                        │
+╰────────────────────────────────────────────1 of 90─╯│                                                                                                        │
+╭─[5]─Stash──────────────────────────────────────────╮│                                                                                                        │
+│1w On create-shux: throwaway powerline statusbar    ││                                                                                                        │
+╰─────────────────────────────────────────────1 of 1─╯╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Stage: <space> | Commit: c | Stash: s | Discard: d | Reset: D | Keybindings: ?                                                        Donate Ask Question 0.61.1

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc};
@@ -658,6 +658,38 @@ async fn create_test_session(stream: &mut UnixStream) -> (String, String) {
     (session_id, pane_id)
 }
 
+async fn capture_text(stream: &mut UnixStream, session_id: &str, lines: usize) -> String {
+    let result = rpc_call(
+        stream,
+        "pane.capture",
+        serde_json::json!({"session_id": session_id, "lines": lines}),
+    )
+    .await;
+    result["text"].as_str().unwrap().to_string()
+}
+
+async fn wait_for_capture_text<F>(
+    stream: &mut UnixStream,
+    session_id: &str,
+    timeout: Duration,
+    mut predicate: F,
+) -> String
+where
+    F: FnMut(&str) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let text = capture_text(stream, session_id, 80).await;
+        if predicate(&text) {
+            return text;
+        }
+        if Instant::now() >= deadline {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 // ══════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════
@@ -787,30 +819,177 @@ async fn test_capture_after_echo() {
 async fn test_xterm_cursor_report_probe_gets_terminal_response() {
     let dir = tempfile::tempdir().unwrap();
     let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let probe_path = dir.path().join("cpr_probe.py");
+    std::fs::write(
+        &probe_path,
+        r#"import os
+import select
+import sys
+import termios
+import time
+import tty
+
+fd = 0
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    sys.stdout.write("\x1b[5;10H\x1b[6n")
+    sys.stdout.flush()
+    data = b""
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            continue
+        data += os.read(fd, 128)
+        if b"\x1b[5;10R" in data:
+            break
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+print("\nSHUX_CPR=" + repr(data), flush=True)
+"#,
+    )
+    .unwrap();
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
 
-    let probe = r#"python3 -c 'import os,select,sys,termios,tty; fd=0; old=termios.tcgetattr(fd); tty.setraw(fd); sys.stdout.write("\x1b[5;10H\x1b[6n"); sys.stdout.flush(); r,_,_=select.select([fd],[],[],1.0); data=os.read(fd,32) if r else b""; termios.tcsetattr(fd, termios.TCSADRAIN, old); print("\nSHUX_CPR="+repr(data))'"#;
     rpc_call(
         &mut stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": format!("{probe}\n")}),
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
     )
     .await;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let text = wait_for_capture_text(&mut stream, &session_id, Duration::from_secs(5), |text| {
+        text.contains("SHUX_CPR=")
+    })
+    .await;
+    assert!(
+        text.contains("SHUX_CPR=b'\\x1b[5;10R'"),
+        "xterm CPR probe should receive a terminal response, got: {text}"
+    );
 
-    let result = rpc_call(
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_xterm_mode_and_version_probes_get_terminal_responses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let probe_path = dir.path().join("xterm_probe.py");
+    std::fs::write(
+        &probe_path,
+        r#"import os
+import select
+import sys
+import termios
+import time
+import tty
+
+fd = 0
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    sys.stdout.write("\x1b[?2026$p\x1b[>0q")
+    sys.stdout.flush()
+    data = b""
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            continue
+        data += os.read(fd, 256)
+        if b"\x1b[?2026;2$y" in data and b"\x1bP>|shux " in data:
+            break
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
+"#,
+    )
+    .unwrap();
+
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (session_id, _pane_id) = create_test_session(&mut stream).await;
+
+    rpc_call(
+        &mut stream,
+        "pane.send_keys",
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
+    )
+    .await;
+
+    let text = wait_for_capture_text(&mut stream, &session_id, Duration::from_secs(5), |text| {
+        text.contains("SHUX_XTERM_PROBES=")
+    })
+    .await;
+    assert!(
+        text.contains("\\x1b[?2026;2$y"),
+        "DECRQM ?2026 response missing, got: {text}"
+    );
+    assert!(
+        text.contains("\\x1bP>|shux "),
+        "XTVERSION response missing, got: {text}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_synchronized_output_freezes_capture_while_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let probe_path = dir.path().join("sync_probe.py");
+    std::fs::write(
+        &probe_path,
+        r#"import sys
+import time
+
+sys.stdout.write("old")
+sys.stdout.flush()
+sys.stdout.write("\x1b[?2026h\x1b[1;1Hnew")
+sys.stdout.flush()
+time.sleep(1.0)
+sys.stdout.write("\x1b[?2026l")
+sys.stdout.flush()
+time.sleep(0.2)
+"#,
+    )
+    .unwrap();
+
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (session_id, _pane_id) = create_test_session(&mut stream).await;
+
+    rpc_call(
+        &mut stream,
+        "pane.send_keys",
+        serde_json::json!({"session_id": session_id, "text": "stty -echo\n"}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    rpc_call(
+        &mut stream,
+        "pane.send_keys",
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let frozen = rpc_call(
         &mut stream,
         "pane.capture",
         serde_json::json!({"session_id": session_id, "lines": 80}),
     )
     .await;
-    let text = result["text"].as_str().unwrap();
+    let frozen_text = frozen["text"].as_str().unwrap();
     assert!(
-        text.contains("SHUX_CPR=b'\\x1b[5;10R'"),
-        "xterm CPR probe should receive a terminal response, got: {text}"
+        frozen_text.contains("old"),
+        "sync frame should preserve old presentation, got: {frozen_text}"
+    );
+    assert!(
+        !frozen_text.contains("new"),
+        "sync frame leaked pending content before reset, got: {frozen_text}"
     );
 
     cancel.cancel();

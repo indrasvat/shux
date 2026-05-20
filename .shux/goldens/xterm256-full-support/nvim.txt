@@ -1,0 +1,48 @@
+use tracing::trace;
+
+use crate::cell::{Cell, CellFlags, CellStyle, Color, TerminalDefaultColors};
+use crate::cursor::{Cursor, CursorShape};
+use crate::grid::{Grid, GridConfig};
+
+/// Terminal mode flags (DECSET/DECRST).
+#[derive(Debug, Clone)]
+pub struct TerminalModes {
+    /// DECAWM -- auto-wrap mode (default: true).
+    pub auto_wrap: bool,
+    /// DECCKM -- cursor keys mode (application vs normal).
+    pub application_cursor_keys: bool,
+    /// DECNKM -- keypad mode (application vs numeric).
+    pub application_keypad: bool,
+    /// DECOM -- origin mode (cursor relative to scroll region).
+    pub origin_mode: bool,
+    /// DECTCEM -- text cursor enable mode (cursor visibility via mode).
+    pub cursor_visible: bool,
+    /// Bracketed paste mode (Mode 2004).
+    pub bracketed_paste: bool,
+    /// Send focus events mode (Mode 1004).
+    pub focus_events: bool,
+    /// Mouse tracking modes.
+    pub mouse_tracking: MouseMode,
+    /// SGR mouse coordinate encoding (Mode 1006).
+    pub sgr_mouse: bool,
+    /// Synchronized output mode (Mode 2026).
+    pub synchronized_output: bool,
+    /// Alternate screen buffer active.
+    pub alternate_screen: bool,
+    /// Insert mode (IRM).
+    pub insert_mode: bool,
+    /// Newline mode (LNM): LF also does CR.
+    pub newline_mode: bool,
+}
+
+impl Default for TerminalModes {
+    fn default() -> Self {
+        TerminalModes {
+            auto_wrap: true,
+            application_cursor_keys: false,
+            application_keypad: false,
+            origin_mode: false,
+            cursor_visible: true,
+            bracketed_paste: false,
+shux-xterm-256color crates/shux-vt/src/parser.rs [rust]                                                                                                      1,1
+

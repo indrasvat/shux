@@ -85,6 +85,24 @@ run_if_installed "nvim" "nvim" 2 -u NONE -n +"set termguicolors laststatus=2 rul
 run_if_installed "vicaya-tui" "vicaya-tui" 5
 run_if_installed "vivecaka" "vivecaka" 8 --repo=indrasvat/shux
 
+SYNC_PROBE="$OUT_DIR/sync-output-probe.py"
+cat >"$SYNC_PROBE" <<'PY'
+import sys
+import time
+
+sys.stdout.write("old-frame")
+sys.stdout.flush()
+sys.stdout.write("\x1b[?2026h\x1b[1;1Hpending-frame")
+sys.stdout.flush()
+time.sleep(1.0)
+sys.stdout.write("\x1b[?2026l\x1b[2;1Hsync-output committed")
+sys.stdout.flush()
+time.sleep(60)
+PY
+run_tui "sync-output-probe" 3 python3 "$SYNC_PROBE"
+grep -q 'pending-frame' "$OUT_DIR/sync-output-probe.txt"
+grep -q 'sync-output committed' "$OUT_DIR/sync-output-probe.txt"
+
 if [[ -f "$OUT_DIR/vivecaka.txt" ]]; then
     grep -q 'indrasvat/shux' "$OUT_DIR/vivecaka.txt"
     if [[ "$EXPECT_VIVECAKA_PRS" == "1" ]]; then

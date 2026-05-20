@@ -6,7 +6,7 @@
 
 **M0: Architecture Spike** — **Complete** (000–012).
 **M1: Daily-Driver Core** — In progress, ~88% by task count.
-- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 027, 029, 033, 060, 062, 063.
+- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 027, 029, 033, 060, 062, 063, 064.
 - **Partial:** 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet), 031 (attach keybinding config/validation landed; runtime keybinding RPC/plugin provenance deferred).
 - **018 (Tier-1 keys) finalized (PR #13):** Bare Alt+h/j/k/l → directional focus; Alt+n/p → next/prev window; Alt+1..9 → switch directly to Nth window via new `ActionKind::SwitchToWindow` + `ActionArgs.window_index`. `key_to_bare_action` return type bumped from `Option<ActionKind>` to `Option<(ActionKind, ActionArgs)>`. Out-of-range Alt+digit silently ignored (matches tmux). 4 new unit tests in `crates/shux-ui/src/attach.rs`.
 - **027 (pane titles) — Done (PR 4 / #12):** `Pane` gained `manual_title: Option<String>`, `osc_title: Option<String>` alongside existing `title` + `auto_title`. Priority resolution: manual > osc (when auto on) > command basename > cwd basename, computed by `Pane::recalculate_title()`. `sanitize_title()` strips control chars + clamps to 64 chars. `set_pane_title()` and `set_pane_osc_title()` on SessionGraph fire `PaneTitleChanged` only when displayed title actually moves. Per-pane PTY task tracks `last_osc_title` locally and forwards changes to graph outside the io_state lock (deadlock avoidance). Compositor `MultiPaneFrame` gained `titles: Option<&HashMap<PaneId, String>>`; titles render as ` title `-padded text on the top border row, truncated to fit. `pane.set_title` RPC accepts `{title: string|null, auto: bool|null}` tri-state. `shux pane title` CLI with `-t/--clear/--auto/--no-auto`. 11 model unit tests + 5 graph unit tests.
@@ -129,6 +129,29 @@
 - Added `.shux/scripts/xterm256_rich_tui_check.sh` to dogfood rich TUIs under
   `TERM=xterm-256color`, including `vivecaka --repo=indrasvat/shux` so PR proof
   screenshots show the actual Shux PR when one is open.
+
+**2026-05-20 — feat(xterm): robust mode reports and synchronized output**
+- Started task 064 on `feat/xterm256-full-support`. Online research was
+  refreshed against XTerm patch #410 / terminfo v1.216, tmux terminal guidance,
+  Bubble Tea v2 releases, and Neovim TUI docs as of 2026-05-20.
+- `dootsabha council --json` was attempted for the design review but hung with
+  no JSON output and was killed; implementation proceeded conservatively with
+  source-backed scope and focused tests.
+- VT now answers DECRQM for tracked ANSI/private modes, answers XTVERSION, and
+  tracks application keypad, focus-event, SGR mouse, and synchronized-output
+  mode state.
+- Synchronized output mode 2026 now freezes the presented grid/cursor while the
+  app is inside a synchronized update block and exposes the accumulated working
+  frame on reset. This targets modern Bubble Tea v2-style renderers that query
+  and use mode 2026.
+- XTGETTCAP now covers additional common color, cursor-shape, alternate-screen,
+  keypad, and OSC 52 capabilities.
+- Verification so far: `make test-lib`, full `pane_io_integration`, release
+  build, and Shux rich-TUI proof under
+  `.shux/out/xterm256-rich-tui-20260520-105116/` with `lazygit`, `btop`,
+  `nvim`, `vicaya-tui`, `vivecaka --repo=indrasvat/shux`, and a synchronized
+  output probe. Launch timing data is stored at
+  `.shux/out/xterm256-launch-timing-20260520.json`.
 
 **2026-05-18 — fix(copy): make selection legible and stop idle cursor churn**
 - User dogfood findings on the human-interactive branch: copy-mode

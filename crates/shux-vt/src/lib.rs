@@ -46,6 +46,8 @@ pub struct VirtualTerminal {
     parser: Parser,
     /// In-progress DCS payload, preserved across partial PTY chunks.
     dcs_state: Option<DcsState>,
+    /// Last committed presentation while synchronized output mode is active.
+    sync_present: Option<(Grid, Cursor)>,
     /// Number of visible rows.
     rows: usize,
     /// Number of columns.
@@ -74,6 +76,7 @@ impl VirtualTerminal {
             default_colors: TerminalDefaultColors::default(),
             parser: Parser::new(),
             dcs_state: None,
+            sync_present: None,
             rows,
             cols,
         }
@@ -109,6 +112,7 @@ impl VirtualTerminal {
             alt_grid: &mut self.alt_grid,
             alt_cursor: &mut self.alt_cursor,
             dcs_state: &mut self.dcs_state,
+            sync_present: &mut self.sync_present,
             responses: &mut responses,
         };
         self.parser.advance(&mut handler, bytes);
@@ -117,12 +121,18 @@ impl VirtualTerminal {
 
     /// Access the current (active) grid.
     pub fn grid(&self) -> &Grid {
-        &self.grid
+        self.sync_present
+            .as_ref()
+            .map(|(grid, _)| grid)
+            .unwrap_or(&self.grid)
     }
 
     /// Access the cursor state.
     pub fn cursor(&self) -> &Cursor {
-        &self.cursor
+        self.sync_present
+            .as_ref()
+            .map(|(_, cursor)| cursor)
+            .unwrap_or(&self.cursor)
     }
 
     /// Access terminal modes.
@@ -158,6 +168,10 @@ impl VirtualTerminal {
         self.grid.resize(rows, cols);
         if let Some(ref mut alt) = self.alt_grid {
             alt.resize(rows, cols);
+        }
+        if let Some((ref mut grid, ref mut cursor)) = self.sync_present {
+            grid.resize(rows, cols);
+            cursor.clamp(rows, cols);
         }
         self.rows = rows;
         self.cols = cols;
@@ -428,6 +442,30 @@ mod tests {
     }
 
     #[test]
+    fn process_with_responses_answers_extended_xtgettcap() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        // Hex for AX;Ms;Ss;Se;smcup;rmcup;smkx;rmkx;setaf;setab;setrgbf;setrgbb.
+        let responses = vt.process_with_responses(
+            b"\x1bP+q4158;4d73;5373;5365;736d637570;726d637570;736d6b78;726d6b78;7365746166;7365746162;73657472676266;73657472676262\x1b\\",
+        );
+
+        let response = String::from_utf8(responses.into_iter().next().unwrap()).unwrap();
+        assert!(response.starts_with("\x1bP1+r"));
+        assert!(response.contains("41583d")); // AX=
+        assert!(response.contains("4d733d1b5d35323b25703125733b257032257307"));
+        assert!(response.contains("53733d1b5b25703125642071"));
+        assert!(response.contains("53653d1b5b2071"));
+        assert!(response.contains("736d6375703d1b5b3f3130343968"));
+        assert!(response.contains("726d6375703d1b5b3f313034396c"));
+        assert!(response.contains("736d6b783d1b5b3f31681b3d"));
+        assert!(response.contains("726d6b783d1b5b3f316c1b3e"));
+        assert!(response.contains("73657461663d"));
+        assert!(response.contains("73657461623d"));
+        assert!(response.contains("736574726762663d1b5b33383b323b"));
+        assert!(response.contains("736574726762623d1b5b34383b323b"));
+    }
+
+    #[test]
     fn process_with_responses_reports_failed_dcs_queries() {
         let mut vt = VirtualTerminal::new(24, 80);
         let responses = vt.process_with_responses(
@@ -438,6 +476,114 @@ mod tests {
             responses,
             vec![b"\x1bP0+r\x1b\\".to_vec(), b"\x1bP0$r\x1b\\".to_vec()]
         );
+    }
+
+    #[test]
+    fn process_with_responses_answers_decrqm_for_modes() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let initial = vt.process_with_responses(
+            b"\x1b[4$p\x1b[20$p\x1b[?1$p\x1b[?6$p\x1b[?7$p\x1b[?25$p\x1b[?66$p\x1b[?1000$p\x1b[?1002$p\x1b[?1003$p\x1b[?1004$p\x1b[?1006$p\x1b[?1049$p\x1b[?2004$p\x1b[?2026$p\x1b[?9999$p",
+        );
+
+        assert_eq!(
+            initial,
+            vec![
+                b"\x1b[4;2$y".to_vec(),
+                b"\x1b[20;2$y".to_vec(),
+                b"\x1b[?1;2$y".to_vec(),
+                b"\x1b[?6;2$y".to_vec(),
+                b"\x1b[?7;1$y".to_vec(),
+                b"\x1b[?25;1$y".to_vec(),
+                b"\x1b[?66;2$y".to_vec(),
+                b"\x1b[?1000;2$y".to_vec(),
+                b"\x1b[?1002;2$y".to_vec(),
+                b"\x1b[?1003;2$y".to_vec(),
+                b"\x1b[?1004;2$y".to_vec(),
+                b"\x1b[?1006;2$y".to_vec(),
+                b"\x1b[?1049;2$y".to_vec(),
+                b"\x1b[?2004;2$y".to_vec(),
+                b"\x1b[?2026;2$y".to_vec(),
+                b"\x1b[?9999;0$y".to_vec(),
+            ]
+        );
+
+        vt.process(
+            b"\x1b[4h\x1b[20h\x1b[?1h\x1b[?6h\x1b[?25l\x1b=\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h\x1b[?1049h\x1b[?2004h\x1b[?2026h\x1b[?2026h",
+        );
+        let enabled = vt.process_with_responses(
+            b"\x1b[4$p\x1b[20$p\x1b[?1$p\x1b[?6$p\x1b[?25$p\x1b[?66$p\x1b[?1000$p\x1b[?1002$p\x1b[?1003$p\x1b[?1004$p\x1b[?1006$p\x1b[?1049$p\x1b[?2004$p\x1b[?2026$p",
+        );
+
+        assert_eq!(
+            enabled,
+            vec![
+                b"\x1b[4;1$y".to_vec(),
+                b"\x1b[20;1$y".to_vec(),
+                b"\x1b[?1;1$y".to_vec(),
+                b"\x1b[?6;1$y".to_vec(),
+                b"\x1b[?25;2$y".to_vec(),
+                b"\x1b[?66;1$y".to_vec(),
+                b"\x1b[?1000;2$y".to_vec(),
+                b"\x1b[?1002;2$y".to_vec(),
+                b"\x1b[?1003;1$y".to_vec(),
+                b"\x1b[?1004;1$y".to_vec(),
+                b"\x1b[?1006;1$y".to_vec(),
+                b"\x1b[?1049;1$y".to_vec(),
+                b"\x1b[?2004;1$y".to_vec(),
+                b"\x1b[?2026;1$y".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_answers_xtversion() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let responses = vt.process_with_responses(b"\x1b[>0q");
+
+        assert_eq!(
+            responses,
+            vec![format!("\x1bP>|shux {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()]
+        );
+    }
+
+    #[test]
+    fn synchronized_output_freezes_presented_frame_until_reset() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"old");
+
+        vt.process(b"\x1b[?2026h\x1b[1;1Hnew");
+
+        assert!(vt.modes().synchronized_output);
+        assert_eq!(vt.grid().visible_row(0)[0].ch, 'o');
+        assert_eq!(vt.grid().visible_row(0)[1].ch, 'l');
+        assert_eq!(vt.grid().visible_row(0)[2].ch, 'd');
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "old");
+
+        vt.process(b"\x1b[?2026l");
+
+        assert!(!vt.modes().synchronized_output);
+        assert_eq!(vt.grid().visible_row(0)[0].ch, 'n');
+        assert_eq!(vt.grid().visible_row(0)[1].ch, 'e');
+        assert_eq!(vt.grid().visible_row(0)[2].ch, 'w');
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "new");
+    }
+
+    #[test]
+    fn synchronized_output_resize_keeps_presented_dimensions_valid() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"stable\x1b[?2026h\x1b[1;1Hpending");
+
+        vt.resize(5, 12);
+
+        assert_eq!(vt.grid().rows(), 5);
+        assert_eq!(vt.grid().cols(), 12);
+        assert_eq!(vt.grid().visible_row(0)[0].ch, 's');
+
+        vt.process(b"\x1b[?2026l");
+
+        assert_eq!(vt.grid().rows(), 5);
+        assert_eq!(vt.grid().cols(), 12);
+        assert_eq!(vt.grid().visible_row(0)[0].ch, 'p');
     }
 
     #[test]
@@ -789,6 +935,16 @@ mod tests {
         assert!(vt.modes().bracketed_paste);
         vt.process(b"\x1b[?2004l");
         assert!(!vt.modes().bracketed_paste);
+    }
+
+    #[test]
+    fn test_application_keypad_mode() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        assert!(!vt.modes().application_keypad);
+        vt.process(b"\x1b=");
+        assert!(vt.modes().application_keypad);
+        vt.process(b"\x1b>");
+        assert!(!vt.modes().application_keypad);
     }
 
     #[test]

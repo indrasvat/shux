@@ -11,14 +11,22 @@ pub struct TerminalModes {
     pub auto_wrap: bool,
     /// DECCKM -- cursor keys mode (application vs normal).
     pub application_cursor_keys: bool,
+    /// DECNKM -- keypad mode (application vs numeric).
+    pub application_keypad: bool,
     /// DECOM -- origin mode (cursor relative to scroll region).
     pub origin_mode: bool,
     /// DECTCEM -- text cursor enable mode (cursor visibility via mode).
     pub cursor_visible: bool,
     /// Bracketed paste mode (Mode 2004).
     pub bracketed_paste: bool,
+    /// Send focus events mode (Mode 1004).
+    pub focus_events: bool,
     /// Mouse tracking modes.
     pub mouse_tracking: MouseMode,
+    /// SGR mouse coordinate encoding (Mode 1006).
+    pub sgr_mouse: bool,
+    /// Synchronized output mode (Mode 2026).
+    pub synchronized_output: bool,
     /// Alternate screen buffer active.
     pub alternate_screen: bool,
     /// Insert mode (IRM).
@@ -32,10 +40,14 @@ impl Default for TerminalModes {
         TerminalModes {
             auto_wrap: true,
             application_cursor_keys: false,
+            application_keypad: false,
             origin_mode: false,
             cursor_visible: true,
             bracketed_paste: false,
+            focus_events: false,
             mouse_tracking: MouseMode::None,
+            sgr_mouse: false,
+            synchronized_output: false,
             alternate_screen: false,
             insert_mode: false,
             newline_mode: false,
@@ -85,6 +97,7 @@ pub struct VtHandler<'a> {
     pub alt_grid: &'a mut Option<Grid>,
     pub alt_cursor: &'a mut Option<Cursor>,
     pub dcs_state: &'a mut Option<DcsState>,
+    pub sync_present: &'a mut Option<(Grid, Cursor)>,
     pub responses: &'a mut Vec<Vec<u8>>,
 }
 
@@ -259,6 +272,10 @@ impl<'a> VtHandler<'a> {
                     MouseMode::None
                 };
             }
+            // Focus in/out events.
+            1004 => self.modes.focus_events = enable,
+            // SGR mouse coordinate encoding.
+            1006 => self.modes.sgr_mouse = enable,
             // Alternate screen buffer (1047, 1049).
             1047 | 1049 => {
                 if enable {
@@ -293,6 +310,18 @@ impl<'a> VtHandler<'a> {
             }
             // Bracketed paste mode (2004).
             2004 => self.modes.bracketed_paste = enable,
+            // Synchronized output mode (2026).
+            2026 => {
+                if enable {
+                    if self.sync_present.is_none() {
+                        *self.sync_present = Some((self.grid.clone_visible(), self.cursor.clone()));
+                    }
+                    self.modes.synchronized_output = true;
+                } else {
+                    self.modes.synchronized_output = false;
+                    self.sync_present.take();
+                }
+            }
             _ => trace!(mode, enable, "unhandled private mode"),
         }
     }
@@ -308,6 +337,46 @@ impl<'a> VtHandler<'a> {
             self.push_response(format!("\x1b[?{row};{col}R"));
         } else {
             self.push_response(format!("\x1b[{row};{col}R"));
+        }
+    }
+
+    fn report_mode(&mut self, mode: u16, private: bool) {
+        let value = if private {
+            self.private_mode_report_value(mode)
+        } else {
+            self.standard_mode_report_value(mode)
+        };
+        if private {
+            self.push_response(format!("\x1b[?{mode};{value}$y"));
+        } else {
+            self.push_response(format!("\x1b[{mode};{value}$y"));
+        }
+    }
+
+    fn standard_mode_report_value(&self, mode: u16) -> u8 {
+        match mode {
+            4 => mode_report(self.modes.insert_mode),
+            20 => mode_report(self.modes.newline_mode),
+            _ => 0,
+        }
+    }
+
+    fn private_mode_report_value(&self, mode: u16) -> u8 {
+        match mode {
+            1 => mode_report(self.modes.application_cursor_keys),
+            6 => mode_report(self.modes.origin_mode),
+            7 => mode_report(self.modes.auto_wrap),
+            25 => mode_report(self.modes.cursor_visible),
+            66 => mode_report(self.modes.application_keypad),
+            1000 => mode_report(self.modes.mouse_tracking == MouseMode::Normal),
+            1002 => mode_report(self.modes.mouse_tracking == MouseMode::ButtonEvent),
+            1003 => mode_report(self.modes.mouse_tracking == MouseMode::AnyEvent),
+            1004 => mode_report(self.modes.focus_events),
+            1006 => mode_report(self.modes.sgr_mouse),
+            1047 | 1049 => mode_report(self.modes.alternate_screen),
+            2004 => mode_report(self.modes.bracketed_paste),
+            2026 => mode_report(self.modes.synchronized_output),
+            _ => 0,
         }
     }
 }
@@ -646,6 +715,24 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     _ => CursorShape::Block,
                 };
             }
+            // XTVERSION -- Report xterm name and version (CSI > Ps q).
+            ('q', [b'>']) => {
+                if params_vec.is_empty() || params_vec == [0] {
+                    self.push_response(format!("\x1bP>|shux {}\x1b\\", env!("CARGO_PKG_VERSION")));
+                }
+            }
+            // DECRQM -- Request ANSI mode.
+            ('p', [b'$']) => {
+                for &mode in &params_vec {
+                    self.report_mode(mode, false);
+                }
+            }
+            // DECRQM -- Request DEC private mode.
+            ('p', [b'?', b'$']) => {
+                for &mode in &params_vec {
+                    self.report_mode(mode, true);
+                }
+            }
             _ => {
                 trace!(
                     action = %action,
@@ -667,6 +754,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     self.modes.origin_mode = origin;
                 }
             }
+            // DECPAM -- Application keypad mode (ESC =).
+            (b'=', []) => self.modes.application_keypad = true,
+            // DECPNM -- Normal keypad mode (ESC >).
+            (b'>', []) => self.modes.application_keypad = false,
             // RI -- Reverse Index (ESC M).
             (b'M', []) => self.reverse_index(),
             // IND -- Index (ESC D) -- move cursor down, scroll if needed.
@@ -683,6 +774,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 *self.cursor = Cursor::new();
                 *self.modes = TerminalModes::default();
                 *self.default_colors = TerminalDefaultColors::default();
+                self.sync_present.take();
                 self.scroll_region.top = 0;
                 self.scroll_region.bottom = self.grid.rows().saturating_sub(1);
             }
@@ -815,6 +907,10 @@ fn osc_terminator(bell_terminated: bool) -> &'static str {
     if bell_terminated { "\x07" } else { "\x1b\\" }
 }
 
+fn mode_report(enabled: bool) -> u8 {
+    if enabled { 1 } else { 2 }
+}
+
 fn xterm_256_palette(index: u8) -> [u8; 3] {
     const BASE16: [[u8; 3]; 16] = [
         [0, 0, 0],
@@ -858,6 +954,18 @@ fn xtgettcap_response(payload: &[u8]) -> Option<Vec<u8>> {
             "Co" | "colors" => "256",
             "TN" | "name" => "xterm-256color",
             "RGB" | "Tc" => "",
+            "AX" => "",
+            "Ms" => "\x1b]52;%p1%s;%p2%s\x07",
+            "Ss" => "\x1b[%p1%d q",
+            "Se" => "\x1b[ q",
+            "smcup" | "ti" => "\x1b[?1049h",
+            "rmcup" | "te" => "\x1b[?1049l",
+            "smkx" | "ks" => "\x1b[?1h\x1b=",
+            "rmkx" | "ke" => "\x1b[?1l\x1b>",
+            "setaf" | "AF" => "\x1b[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m",
+            "setab" | "AB" => "\x1b[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m",
+            "setrgbf" => "\x1b[38;2;%p1%d;%p2%d;%p3%dm",
+            "setrgbb" => "\x1b[48;2;%p1%d;%p2%d;%p3%dm",
             _ => return None,
         };
         pairs.push(encode_hex_ascii(&format!("{name}={value}")));
@@ -1032,6 +1140,7 @@ mod tests {
         alt_grid: Option<Grid>,
         alt_cursor: Option<Cursor>,
         dcs_state: Option<DcsState>,
+        sync_present: Option<(Grid, Cursor)>,
         responses: Vec<Vec<u8>>,
         parser: vte::Parser,
     }
@@ -1051,6 +1160,7 @@ mod tests {
                 alt_grid: None,
                 alt_cursor: None,
                 dcs_state: None,
+                sync_present: None,
                 responses: Vec::new(),
                 parser: vte::Parser::new(),
             }
@@ -1067,6 +1177,7 @@ mod tests {
                 alt_grid: &mut self.alt_grid,
                 alt_cursor: &mut self.alt_cursor,
                 dcs_state: &mut self.dcs_state,
+                sync_present: &mut self.sync_present,
                 responses: &mut self.responses,
             };
             self.parser.advance(&mut handler, bytes);
