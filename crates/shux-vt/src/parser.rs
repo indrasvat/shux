@@ -696,10 +696,11 @@ impl<'a> vte::Perform for VtHandler<'a> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         if params.is_empty() {
             return;
         }
+        let terminator = osc_terminator(bell_terminated);
         match params[0] {
             // OSC 0 -- Set Icon Name and Window Title.
             // OSC 2 -- Set Window Title.
@@ -721,8 +722,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
                         };
                         let selector = std::str::from_utf8(params[0]).unwrap_or("10");
                         self.push_response(format!(
-                            "\x1b]{selector};{}\x1b\\",
-                            format_osc_rgb(color)
+                            "\x1b]{selector};{}{}",
+                            format_osc_rgb(color),
+                            terminator
                         ));
                     } else if let Ok(color) = parse_osc_color(color_bytes) {
                         if params[0] == b"10" {
@@ -745,8 +747,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     if pair[1] == b"?" {
                         let color = xterm_256_palette(index);
                         self.push_response(format!(
-                            "\x1b]4;{index};{}\x1b\\",
-                            format_osc_rgb(color)
+                            "\x1b]4;{index};{}{}",
+                            format_osc_rgb(color),
+                            terminator
                         ));
                     }
                 }
@@ -808,6 +811,10 @@ fn format_osc_rgb(rgb: [u8; 3]) -> String {
     )
 }
 
+fn osc_terminator(bell_terminated: bool) -> &'static str {
+    if bell_terminated { "\x07" } else { "\x1b\\" }
+}
+
 fn xterm_256_palette(index: u8) -> [u8; 3] {
     const BASE16: [[u8; 3]; 16] = [
         [0, 0, 0],
@@ -863,7 +870,7 @@ fn xtgettcap_response(payload: &[u8]) -> Option<Vec<u8>> {
 
 fn decrqss_response(payload: &[u8], handler: &VtHandler<'_>) -> Option<Vec<u8>> {
     let response = match payload {
-        b"m" => "0m".to_string(),
+        b"m" => format!("{}m", sgr_response(&handler.cursor.style)),
         b"r" => format!(
             "{};{}r",
             handler.scroll_region.top + 1,
@@ -882,6 +889,67 @@ fn decrqss_response(payload: &[u8], handler: &VtHandler<'_>) -> Option<Vec<u8>> 
         _ => return None,
     };
     Some(format!("\x1bP1$r{response}\x1b\\").into_bytes())
+}
+
+fn sgr_response(style: &CellStyle) -> String {
+    let mut params = Vec::new();
+    if style.flags.contains(CellFlags::BOLD) {
+        params.push("1".to_string());
+    }
+    if style.flags.contains(CellFlags::DIM) {
+        params.push("2".to_string());
+    }
+    if style.flags.contains(CellFlags::ITALIC) {
+        params.push("3".to_string());
+    }
+    if style.flags.contains(CellFlags::UNDERLINE) {
+        params.push("4".to_string());
+    }
+    if style.flags.contains(CellFlags::BLINK) {
+        params.push("5".to_string());
+    }
+    if style.flags.contains(CellFlags::INVERSE) {
+        params.push("7".to_string());
+    }
+    if style.flags.contains(CellFlags::HIDDEN) {
+        params.push("8".to_string());
+    }
+    if style.flags.contains(CellFlags::STRIKETHROUGH) {
+        params.push("9".to_string());
+    }
+
+    append_color_sgr(&mut params, style.fg, false);
+    append_color_sgr(&mut params, style.bg, true);
+
+    if params.is_empty() {
+        "0".to_string()
+    } else {
+        params.join(";")
+    }
+}
+
+fn append_color_sgr(params: &mut Vec<String>, color: Color, background: bool) {
+    match color {
+        Color::Default => {}
+        Color::Indexed(index @ 0..=7) => {
+            params.push((index as u16 + if background { 40 } else { 30 }).to_string());
+        }
+        Color::Indexed(index @ 8..=15) => {
+            params.push((index as u16 - 8 + if background { 100 } else { 90 }).to_string());
+        }
+        Color::Indexed(index) => {
+            params.push(if background { "48" } else { "38" }.to_string());
+            params.push("5".to_string());
+            params.push(index.to_string());
+        }
+        Color::Rgb(r, g, b) => {
+            params.push(if background { "48" } else { "38" }.to_string());
+            params.push("2".to_string());
+            params.push(r.to_string());
+            params.push(g.to_string());
+            params.push(b.to_string());
+        }
+    }
 }
 
 fn decode_hex_ascii(encoded: &str) -> Option<String> {
