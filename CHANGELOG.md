@@ -1,3 +1,10 @@
+# [0.27.0](https://github.com/indrasvat/shux/compare/v0.26.1...v0.27.0) (2026-05-20)
+
+
+### Features
+
+* **xterm:** answer terminal probes ([5cc5a2d](https://github.com/indrasvat/shux/commit/5cc5a2d253a910a9719d174c944436cf9817284f))
+
 ## [0.26.1](https://github.com/indrasvat/shux/compare/v0.26.0...v0.26.1) (2026-05-20)
 
 
