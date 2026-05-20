@@ -231,12 +231,18 @@ pub async fn spawn_signal_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// Helper to set XDG_RUNTIME_DIR for testing.
     ///
-    /// SAFETY: These tests must run with `--test-threads=1` or use unique
-    /// temp dirs to avoid races. `set_var`/`remove_var` are unsafe in
-    /// edition 2024 because env vars are process-global shared mutable state.
+    /// SAFETY: Callers must hold `ENV_LOCK`. `set_var`/`remove_var` are unsafe
+    /// in edition 2024 because env vars are process-global shared mutable state.
     unsafe fn set_xdg_runtime_dir(path: impl AsRef<std::ffi::OsStr>) {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", path) };
     }
@@ -250,9 +256,9 @@ mod tests {
 
     #[test]
     fn test_runtime_dir_respects_xdg() {
+        let _guard = env_lock().lock().unwrap();
         let original = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: Test-only env mutation; tests using env vars are not parallel-safe
-        // but each test saves and restores the original value.
+        // SAFETY: Guarded by ENV_LOCK and restored before releasing it.
         unsafe { set_xdg_runtime_dir("/tmp/test-shux-xdg") };
 
         let dir = runtime_dir().unwrap();
@@ -263,8 +269,9 @@ mod tests {
 
     #[test]
     fn test_runtime_dir_fallback_without_xdg() {
+        let _guard = env_lock().lock().unwrap();
         let original = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: See above
+        // SAFETY: Guarded by ENV_LOCK and restored before releasing it.
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
 
         let dir = runtime_dir().unwrap();
@@ -277,9 +284,10 @@ mod tests {
 
     #[test]
     fn test_pid_file_round_trip() {
+        let _guard = env_lock().lock().unwrap();
         let tmpdir = tempfile::TempDir::new().unwrap();
         let original = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: See above
+        // SAFETY: Guarded by ENV_LOCK and restored before releasing it.
         unsafe { set_xdg_runtime_dir(tmpdir.path()) };
 
         ensure_runtime_dir().unwrap();
@@ -297,9 +305,10 @@ mod tests {
 
     #[test]
     fn test_remove_nonexistent_pid_file_is_ok() {
+        let _guard = env_lock().lock().unwrap();
         let tmpdir = tempfile::TempDir::new().unwrap();
         let original = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: See above
+        // SAFETY: Guarded by ENV_LOCK and restored before releasing it.
         unsafe { set_xdg_runtime_dir(tmpdir.path()) };
 
         ensure_runtime_dir().unwrap();
