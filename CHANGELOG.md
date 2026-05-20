@@ -1,3 +1,10 @@
+## [0.28.1](https://github.com/indrasvat/shux/compare/v0.28.0...v0.28.1) (2026-05-20)
+
+
+### Bug Fixes
+
+* **website:** keep terminal tokens intact ([77aad37](https://github.com/indrasvat/shux/commit/77aad3754568401986156ac0ffda3e7778c55955))
+
 # [0.28.0](https://github.com/indrasvat/shux/compare/v0.27.1...v0.28.0) (2026-05-20)
 
 
