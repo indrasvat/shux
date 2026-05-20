@@ -1,3 +1,10 @@
+# [0.28.0](https://github.com/indrasvat/shux/compare/v0.27.1...v0.28.0) (2026-05-20)
+
+
+### Features
+
+* **xterm:** support richer terminal probes ([3e06451](https://github.com/indrasvat/shux/commit/3e06451c81f55efcb16ff3471b9102d06ca56e9d))
+
 ## [0.27.1](https://github.com/indrasvat/shux/compare/v0.27.0...v0.27.1) (2026-05-20)
 
 
