@@ -7,7 +7,7 @@ crates/shux/           CLI entrypoint (clap, daemon auto-start, attach client wi
     ↓
 crates/shux-core/      Core engine — SessionGraph, LayoutEngine, EventBus, config
     ↓
-crates/shux-pty/       PTY manager (pty-process, async I/O, lifecycle, command engine)
+crates/shux-pty/       PTY manager (openpty, async I/O, lifecycle, command engine)
 crates/shux-vt/        Virtual terminal grid (vte parser, VecDeque grid, scrollback)
 crates/shux-rpc/       JSON-RPC server (UDS + TCP, length-prefixed, attach protocol)
 crates/shux-plugin/    Plugin host stub (wasmtime, WIT — fleshed out in M2)

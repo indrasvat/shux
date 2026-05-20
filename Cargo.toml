@@ -36,9 +36,6 @@ ratatui = "0.30"
 # VT parsing
 vte = { version = "0.15", features = ["ansi"] }
 
-# PTY
-pty-process = { version = "0.5", features = ["async"] }
-
 # Plugin (Wasm)
 wasmtime = "41"
 wasmtime-wasi = "41"
@@ -73,7 +70,7 @@ tonic = "0.12"
 prost = "0.13"
 
 # Daemonization
-nix = { version = "0.29", features = ["process", "signal", "fs", "user"] }
+nix = { version = "0.29", features = ["process", "signal", "fs", "user", "term"] }
 
 # Filesystem watching (for config hot reload)
 notify = "8"

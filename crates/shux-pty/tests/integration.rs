@@ -70,9 +70,41 @@ async fn test_spawn_interactive_env_enables_color_by_default() {
     let mut handle = PtyHandle::spawn(&config).unwrap();
     let output = read_pty_to_exit(&mut handle).await;
 
+    let has_supported_term = ["tmux-256color", "screen-256color", "xterm-256color"]
+        .iter()
+        .any(|term| output.contains(&format!("{term}|truecolor|1|unset")));
     assert!(
-        output.contains("xterm-256color|truecolor|1|unset"),
+        has_supported_term,
         "expected shux pane color defaults and no inherited NO_COLOR, got: {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_colored_startup_burst_reads_without_timeout_stall() {
+    let payload = "printf '\\033[38;2;75;85;99m'; yes startup | head -n 200";
+    let config =
+        PtyConfig::with_command(vec!["sh".into(), "-c".into(), payload.into()], test_cwd());
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    let mut buf = [0u8; 8192];
+
+    let result = tokio::time::timeout(Duration::from_millis(500), async {
+        let mut output = Vec::new();
+        while output.len() < 1024 {
+            let n = handle.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n]);
+        }
+        output
+    })
+    .await;
+
+    let output = result.expect("colored startup burst should be readable promptly");
+    let output = String::from_utf8_lossy(&output);
+    assert!(
+        output.contains("startup"),
+        "expected startup burst output, got: {output:?}"
     );
 }
 

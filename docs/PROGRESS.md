@@ -127,7 +127,8 @@
   unchanged cursor emit no hide/show/move bytes; cursor-only movement
   emits only the cursor move. This fixes the visible idle blink.
 - PTY child process env now defends interactive panes from degraded
-  parent environments by defaulting `TERM=xterm-256color`,
+  parent environments by preferring installed `TERM=tmux-256color`
+  terminfo with `screen-256color` / `xterm-256color` fallback,
   `COLORTERM=truecolor`, `CLICOLOR=1`, and removing inherited
   `NO_COLOR` unless explicitly restored through `PtyConfig.env`.
 - Dogfood automation in `.shux/scripts/human_copy_mode_check.sh` now
@@ -1016,7 +1017,7 @@
 
 ¹ **Task 024 Partial:** `[theme]` config section overrides border colors (focused/unfocused) and status-bar fg/bg colors with hot reload. The full PRD §6.1 token cascade (per-pane themes, theme files in `~/.config/shux/themes/`, ANSI palette overrides, named theme references) is still pending — close-out lives with task 025 and the M1 quality gate (034).
 
-² **Task 028 Partial:** daemon claims `TERM_PROGRAM=shux`, `TERM_PROGRAM_VERSION=<pkg ver>`, `COLORTERM=truecolor`, `SHUX=1` on every PTY spawn. Real cap negotiation (DA2 / XTVERSION / Kitty keyboard query / OSC 4 palette probe stored as a per-client `ClientCaps` and gating Mode 2026, OSC 8, OSC 52, true color) is still pending.
+² **Task 028 Partial:** daemon claims the best installed multiplexer-compatible `TERM` (`tmux-256color` preferred, then `screen-256color`, then `xterm-256color`), `TERM_PROGRAM=shux`, `TERM_PROGRAM_VERSION=<pkg ver>`, `COLORTERM=truecolor`, `SHUX=1` on every PTY spawn. Real cap negotiation (DA2 / XTVERSION / Kitty keyboard query / OSC 4 palette probe stored as a per-client `ClientCaps` and gating Mode 2026, OSC 8, OSC 52, true color) is still pending.
 
 ⁶ **Task 031 Partial:** attach-time keybinding config is implemented: configurable prefix, root/prefix override tables, action validation, and config-validator diagnostics. The runtime `keybinding.list/set/reset` RPC surface, reserved-key policy, and plugin provenance/conflict model are intentionally deferred.
 
