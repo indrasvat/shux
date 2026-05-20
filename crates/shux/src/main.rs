@@ -215,22 +215,42 @@ async fn run_pane_pty_task(
                     }
                     Ok(n) => {
                         let data = &buf[..n];
-                        let (pulse, vt_title, bus_opt) = {
+                        let (pulse, vt_title, bus_opt, terminal_responses) = {
                             let mut state = io_state.lock().await;
-                            let vt_title = if let Some(vt) = state.vts.get_mut(&pane_id) {
-                                vt.process(data);
-                                vt.title().map(|s| s.to_string())
-                            } else {
-                                None
-                            };
+                            let (vt_title, terminal_responses) =
+                                if let Some(vt) = state.vts.get_mut(&pane_id) {
+                                    let responses = vt.process_with_responses(data);
+                                    (vt.title().map(|s| s.to_string()), responses)
+                                } else {
+                                    (None, Vec::new())
+                                };
                             let output = String::from_utf8_lossy(data);
                             let _completed = state.cmd_engine.process_output(pane_id.0, &output);
                             (
                                 state.render_pulse.clone(),
                                 vt_title,
                                 state.event_bus.clone(),
+                                terminal_responses,
                             )
                         };
+
+                        let mut response_write_failed = false;
+                        for response in &terminal_responses {
+                            if let Err(e) = handle.write(response).await {
+                                tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
+                                response_write_failed = true;
+                                break;
+                            }
+                        }
+                        if response_write_failed {
+                            break;
+                        }
+                        if !terminal_responses.is_empty() {
+                            if let Err(e) = handle.flush().await {
+                                tracing::error!(%pane_id, error = %e, "PTY terminal response flush error");
+                                break;
+                            }
+                        }
 
                         // Stage these bytes for the next sampled publish.
                         // We cap the buffered chunk at 64KB to avoid

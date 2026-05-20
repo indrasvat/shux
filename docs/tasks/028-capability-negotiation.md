@@ -1,6 +1,6 @@
 # 028 — Capability Negotiation (ClientCaps)
 
-**Status:** Partial. The daemon claims `TERM_PROGRAM=shux` / `TERM_PROGRAM_VERSION=<pkg ver>` / `COLORTERM=truecolor` / `SHUX=1` on every PTY spawn (so user rc files don't mis-route). The active client tracks size via the attach `Resize` frame. The actual cap-query path (DA2, XTVERSION, Kitty keyboard query, OSC 4 palette probe stored as a per-client `ClientCaps`) is **not yet implemented** — synchronized output (Mode 2026) currently fires unconditionally.
+**Status:** Partial. The daemon claims `TERM_PROGRAM=shux` / `TERM_PROGRAM_VERSION=<pkg ver>` / `COLORTERM=truecolor` / `SHUX=1` on every PTY spawn (so user rc files don't mis-route), and panes now answer common xterm application probes (DA/DA2/DSR, OSC color queries, XTGETTCAP, and DECRQSS) through the PTY response path. The active client tracks size via the attach `Resize` frame. Full attached-client cap negotiation (XTVERSION, Kitty keyboard query, OSC 4 palette probe stored as a per-client `ClientCaps`) is still pending — synchronized output (Mode 2026) currently fires unconditionally.
 **Depends On:** 010
 **Parallelizable With:** 022, 024
 

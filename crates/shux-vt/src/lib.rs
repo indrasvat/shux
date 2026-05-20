@@ -18,6 +18,8 @@ pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 
 use vte::Parser;
 
+use crate::parser::DcsState;
+
 /// Per-pane virtual terminal.
 ///
 /// Owns the grid, cursor, terminal modes, and the vte parser state machine.
@@ -42,6 +44,8 @@ pub struct VirtualTerminal {
     default_colors: TerminalDefaultColors,
     /// vte parser state machine.
     parser: Parser,
+    /// In-progress DCS payload, preserved across partial PTY chunks.
+    dcs_state: Option<DcsState>,
     /// Number of visible rows.
     rows: usize,
     /// Number of columns.
@@ -69,6 +73,7 @@ impl VirtualTerminal {
             title: None,
             default_colors: TerminalDefaultColors::default(),
             parser: Parser::new(),
+            dcs_state: None,
             rows,
             cols,
         }
@@ -80,9 +85,20 @@ impl VirtualTerminal {
     /// Each byte is parsed by vte, which calls back into our handler
     /// to mutate the grid and cursor.
     pub fn process(&mut self, bytes: &[u8]) {
+        let _ = self.process_with_responses(bytes);
+    }
+
+    /// Process raw PTY output bytes and return terminal reply bytes.
+    ///
+    /// This is the request/response half of terminal emulation. Apps running
+    /// under `TERM=xterm-256color` commonly emit DA/DSR/OSC/DCS probes and
+    /// wait for the terminal to answer on stdin. Callers that own the PTY must
+    /// write every returned response back to the child process.
+    pub fn process_with_responses(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         // We need to create a VtHandler that borrows our fields mutably.
         // The vte Parser is taken out temporarily so we can pass both
         // the parser and the handler without conflicting borrows.
+        let mut responses = Vec::new();
         let mut handler = VtHandler {
             grid: &mut self.grid,
             cursor: &mut self.cursor,
@@ -92,8 +108,11 @@ impl VirtualTerminal {
             default_colors: &mut self.default_colors,
             alt_grid: &mut self.alt_grid,
             alt_cursor: &mut self.alt_cursor,
+            dcs_state: &mut self.dcs_state,
+            responses: &mut responses,
         };
         self.parser.advance(&mut handler, bytes);
+        responses
     }
 
     /// Access the current (active) grid.
@@ -291,6 +310,83 @@ mod tests {
         vt.process(b"\x1b[5;10H");
         assert_eq!(vt.cursor().row, 4); // 0-indexed
         assert_eq!(vt.cursor().col, 9); // 0-indexed
+    }
+
+    #[test]
+    fn process_with_responses_answers_da_and_dsr_queries() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let responses = vt.process_with_responses(b"\x1b[5;10H\x1b[6n\x1b[5n\x1b[c\x1b[>c");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b[5;10R".to_vec(),
+                b"\x1b[0n".to_vec(),
+                b"\x1b[?62;1;2;6;9;15;22c".to_vec(),
+                b"\x1b[>0;95;0c".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_answers_private_dsr() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let responses = vt.process_with_responses(b"\x1b[2;3H\x1b[?6n\x1b[?15n\x1b[?25n");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b[?2;3R".to_vec(),
+                b"\x1b[?10n".to_vec(),
+                b"\x1b[?20n".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_answers_osc_color_queries() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let responses =
+            vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
+                b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec(),
+                b"\x1b]4;1;rgb:cdcd/0000/0000\x1b\\".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_answers_xtgettcap() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        // Hex for TN;Co;RGB.
+        let responses = vt.process_with_responses(b"\x1bP+q544e;436f;524742\x1b\\");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1bP1+r544e3d787465726d2d323536636f6c6f72;436f3d323536;5247423d\x1b\\".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_answers_decrqss() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[2;4r\x1b[5 q");
+        let responses = vt.process_with_responses(b"\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1bP1$r0m\x1b\\".to_vec(),
+                b"\x1bP1$r2;4r\x1b\\".to_vec(),
+                b"\x1bP1$r5 q\x1b\\".to_vec(),
+            ]
+        );
     }
 
     #[test]
