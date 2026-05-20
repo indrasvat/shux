@@ -1,0 +1,48 @@
+╭─[1]─Status─────────────────────────────────────────╮╭─[0]─Unstaged changes───────────────────────────────────────────────────────────────────────────────────╮
+│✓ indrasvat-shux → feat/xterm256-full-support       ││diff --git i/crates/shux-vt/src/lib.rs w/crates/shux-vt/src/lib.rs                                      ▐
+╰────────────────────────────────────────────────────╯│index 17cb981..c64ecfc 100644                                                                           ▐
+╭─[2]─Files - Worktrees - Submodules─────────────────╮│--- i/crates/shux-vt/src/lib.rs                                                                         ▐
+│▼ /                                                 ││+++ w/crates/shux-vt/src/lib.rs                                                                         ▐
+│  ▼ crates/shux-vt/src                              ││@@ -46,7 +46,7 @@ pub struct VirtualTerminal {                                                          ▐
+│     M lib.rs                                       ││     parser: Parser,                                                                                    ▐
+│     M parser.rs                                    ││     /// In-progress DCS payload, preserved across partial PTY chunks.                                  ▐
+│  ▼ pages                                           ││     dcs_state: Option<DcsState>,                                                                       ▐
+│     M index.html                                   ││-    /// Last committed presentation while synchronized output mode is active.                          ▐
+│                                                    ││+    /// Frozen full-grid presentation while synchronized output mode is active.                        ▐
+│                                                    ││     sync_present: Option<(Grid, Cursor)>,                                                              │
+│                                                    ││     /// Number of visible rows.                                                                        │
+│                                                    ││     rows: usize,                                                                                       │
+│                                                    ││@@ -568,6 +568,36 @@ mod tests {                                                                        │
+│                                                    ││         assert_eq!(vt.capture_text(Some(1)).trim_end(), "new");                                        │
+╰─────────────────────────────────────────────1 of 6─╯│     }                                                                                                  │
+╭─[3]─Local branches - Remotes - Tags────────────────╮│                                                                                                        │
+│  * ● feat/xterm256-full-support ✓                  ││+    #[test]                                                                                            │
+│11h   main ✓                                        ││+    fn synchronized_output_preserves_presented_scrollback() {                                          │
+│11h ● fix/xterm-review-followups (upstream gone)    ││+        let mut vt = VirtualTerminal::new(2, 10);                                                      │
+│14h ● feat/xterm-256color-support (upstream gone)   ││+        vt.process(b"first\r\nsecond\r\nthird");                                                       │
+│2d    feat/render-parity-mouse-copy ✓               ││+        let presented_total = vt.grid().total_lines();                                                 │
+│1w    feat/conductor-plugin-design ✓                ││+        let presented_scrollback = vt.grid().scrollback_len();                                         │
+│1w    feat/m1-followups                             ││+                                                                                                       │
+│                                                    ││+        vt.process(b"\x1b[?2026h\x1b[1;1Hpending\r\nwork  ");                                          │
+│                                                    ││+                                                                                                       │
+│                                                    ││+        assert!(vt.modes().synchronized_output);                                                       │
+│                                                    ││+        assert_eq!(vt.grid().total_lines(), presented_total);                                          │
+│                                                    ││+        assert_eq!(vt.grid().scrollback_len(), presented_scrollback);                                  │
+╰─────────────────────────────────────────────1 of 7─╯│+        assert!(                                                                                       │
+╭─[4]─Commits - Reflog───────────────────────────────╮│+            vt.grid()                                                                                  │
+│cdda9c09 in ◯ test(xterm): add nidhi visual proof   ▐│+                .scrollback_row(0)                                                                     │
+│e78742ba in ◯ feat(xterm): support richer terminal p▐│+                .expect("scrollback row should remain visible")                                        │
+│180f8434 in ◯ test(shux): stabilize daemon lifecycle││+                .cells                                                                                 │
+│1d5a3689 इन ◯ fix(xterm): address probe review feedb││+                .iter()                                                                                │
+│643e960f se ◯ v0.27.0 chore(release): 0.27.0 [skip c│╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+│5cc5a2d2 इन ◯ feat(xterm): answer terminal probes   │╭─Command log────────────────────────────────────────────────────────────────────────────────────────────╮
+│5b8f1ba0 se ◯ v0.26.1 chore(release): 0.26.1 [skip c││You can hide/focus this panel by pressing '@'                                                           │
+│e5f39b41 इन ◯ fix(pty): avoid xterm launch stalls   ││                                                                                                        │
+│21650a99 इन ◯ test(shux): raise coverage and stabili││Random tip: To filter commits by path, press '<c-s>'                                                    │
+│7d82e7c4 इन ◯ ci(coverage): add codecov workflow set││                                                                                                        │
+│8fe7117e se ◯ v0.26.0 chore(release): 0.26.0 [skip c││                                                                                                        │
+╰────────────────────────────────────────────1 of 93─╯│                                                                                                        │
+╭─[5]─Stash──────────────────────────────────────────╮│                                                                                                        │
+│1w On create-shux: throwaway powerline statusbar    ││                                                                                                        │
+╰─────────────────────────────────────────────1 of 1─╯╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Stage: <space> | Commit: c | Stash: s | Discard: d | Reset: D | Keybindings: ?                                                        Donate Ask Question 0.61.1

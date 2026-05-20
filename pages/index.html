@@ -857,6 +857,7 @@
         <ul class="diff-bullets">
           <li class="win"><span class="marker">▸</span><span>Length-prefixed JSON-RPC over UDS + TCP. Every <code>shux</code> subcommand is a thin RPC call.</span></li>
           <li class="win"><span class="marker">▸</span><span>Owns the byte-to-pixel pipeline. Returns PNG bytes via <code>pane.snapshot</code>.</span></li>
+          <li class="win"><span class="marker">▸</span><span>Answers modern <code>xterm-256color</code> probes so rich TUIs start fast and render correctly.</span></li>
           <li class="win"><span class="marker">▸</span><span>Headless visual regression with no GUI, no display server, no emulator SDK.</span></li>
           <li class="win"><span class="marker">▸</span><span>Atomic <code>state.apply</code> batches. Optimistic concurrency on every entity.</span></li>
           <li class="win"><span class="marker">▸</span><span>Sealed, sequenced event bus with a separate data plane for PTY chunks.</span></li>
@@ -1086,6 +1087,7 @@ command = ["lazygit"]
           <li>Optimistic concurrency on every entity — stale writes get rejected with a typed conflict error.</li>
           <li>Sealed event bus, sequenced, gap-detectable. Separate data plane for PTY chunks.</li>
           <li>Built-in rasterizer — one RPC returns PNG bytes of any live pane.</li>
+          <li><code>xterm-256color</code> compatibility for DA/DSR, DECRQM, XTGETTCAP, OSC palette queries, and synchronized output.</li>
           <li>Synchronous resize: the next snapshot sees the new dims, guaranteed.</li>
         </ul>
         <p class="respect">If you're shipping agents, building TUIs, or want headless visual regression, this is for you.</p>

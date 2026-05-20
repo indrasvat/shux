@@ -135,19 +135,14 @@ fn stubborn_command(pid_file: &Path) -> Vec<String> {
     ]
 }
 
-fn read_pid(path: &Path) -> u32 {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read pid file {}: {e}", path.display()))
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid pid in {}: {e}", path.display()))
+fn try_read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn wait_for_pid_file(path: &Path) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if path.exists() {
-            let pid = read_pid(path);
+        if let Some(pid) = try_read_pid(path) {
             if pid_exists(pid) {
                 return pid;
             }
