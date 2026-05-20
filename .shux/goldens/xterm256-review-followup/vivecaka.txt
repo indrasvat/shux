@@ -1,0 +1,48 @@
+ vivecaka      indrasvat/shux      1/1 open      All PRs                                                                                                   ↻ 24s
+  #     Title                                                                                                              Author        CI    Review    Age▼
+ -----+------------------------------------------------------------------------------------------------------------------+-------------+-----+---------+------
+│   58  fix(xterm): address probe review feedback                                                                          indrasvat     ◐     —         <1m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ j/k navigate  Enter open  c checkout  / search  f filter  v select  I inbox  ? help  q quit

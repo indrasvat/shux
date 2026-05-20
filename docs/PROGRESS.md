@@ -107,6 +107,17 @@
 - Verification: `make dogfood-human-copy`, `make ci`, and pre-push
   checks (deny, progress-check, 835 tests, doctests).
 
+**2026-05-20 — fix(xterm): address PR #57 review follow-ups**
+- Follow-up for merged PR #57 review feedback: OSC color query replies now
+  preserve the query terminator style (`BEL` vs `ST`) so BEL-parsing clients
+  do not wait for a terminator shux never sends.
+- DECRQSS `$qm` now reports the active SGR state instead of always returning
+  `0m`, so applications that query-and-restore rendition do not lose active
+  styling.
+- Added focused coverage for BEL-terminated OSC replies, dynamic default color
+  query/reset behavior, extended 256-color palette queries, failed DCS query
+  replies, and active/indexed SGR DECRQSS responses.
+
 **2026-05-20 — feat(xterm): answer application terminal probes**
 - Added the first truthful `TERM=xterm-256color` response layer. The VT now
   returns response bytes for DA/DA2/DSR cursor reports, OSC 10/11/4 color

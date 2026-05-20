@@ -360,6 +360,60 @@ mod tests {
     }
 
     #[test]
+    fn process_with_responses_preserves_osc_bel_query_terminator() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let responses = vt.process_with_responses(b"\x1b]10;?\x07\x1b]4;2;?\x07");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b]10;rgb:eeee/eeee/eeee\x07".to_vec(),
+                b"\x1b]4;2;rgb:0000/cdcd/0000\x07".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_uses_dynamic_default_colors_in_osc_queries() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b]10;#123456\x1b\\\x1b]11;rgb:1/2/3\x1b\\");
+        let responses = vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+        vt.process(b"\x1b]110\x1b\\\x1b]111\x1b\\");
+        let reset_responses = vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b]10;rgb:1212/3434/5656\x1b\\".to_vec(),
+                b"\x1b]11;rgb:1111/2222/3333\x1b\\".to_vec(),
+            ]
+        );
+        assert_eq!(
+            reset_responses,
+            vec![
+                b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
+                b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_answers_extended_osc_palette_queries() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let responses = vt.process_with_responses(b"\x1b]4;16;?;231;?;232;?;255;?\x1b\\");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b]4;16;rgb:0000/0000/0000\x1b\\".to_vec(),
+                b"\x1b]4;231;rgb:ffff/ffff/ffff\x1b\\".to_vec(),
+                b"\x1b]4;232;rgb:0808/0808/0808\x1b\\".to_vec(),
+                b"\x1b]4;255;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
     fn process_with_responses_answers_xtgettcap() {
         let mut vt = VirtualTerminal::new(24, 80);
         // Hex for TN;Co;RGB.
@@ -371,6 +425,40 @@ mod tests {
                 b"\x1bP1+r544e3d787465726d2d323536636f6c6f72;436f3d323536;5247423d\x1b\\".to_vec()
             ]
         );
+    }
+
+    #[test]
+    fn process_with_responses_reports_failed_dcs_queries() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let responses = vt.process_with_responses(
+            b"\x1bP+q556e6b6e6f776e\x1b\\\x1bP$qunknown\x1b\\\x1bP!qignored\x1b\\",
+        );
+
+        assert_eq!(
+            responses,
+            vec![b"\x1bP0+r\x1b\\".to_vec(), b"\x1bP0$r\x1b\\".to_vec()]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_reports_active_sgr_in_decrqss() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[1;2;3;4;5;7;8;9;38;2;1;2;3;48;5;196m");
+        let responses = vt.process_with_responses(b"\x1bP$qm\x1b\\");
+
+        assert_eq!(
+            responses,
+            vec![b"\x1bP1$r1;2;3;4;5;7;8;9;38;2;1;2;3;48;5;196m\x1b\\".to_vec()]
+        );
+    }
+
+    #[test]
+    fn process_with_responses_reports_indexed_sgr_in_decrqss() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[91;44m");
+        let responses = vt.process_with_responses(b"\x1bP$qm\x1b\\");
+
+        assert_eq!(responses, vec![b"\x1bP1$r91;44m\x1b\\".to_vec()]);
     }
 
     #[test]
