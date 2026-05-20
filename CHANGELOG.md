@@ -1,3 +1,10 @@
+## [0.26.1](https://github.com/indrasvat/shux/compare/v0.26.0...v0.26.1) (2026-05-20)
+
+
+### Bug Fixes
+
+* **pty:** avoid xterm launch stalls ([e5f39b4](https://github.com/indrasvat/shux/commit/e5f39b418f61f3526ef8c26551d38c23f1d22de9))
+
 # [0.26.0](https://github.com/indrasvat/shux/compare/v0.25.0...v0.26.0) (2026-05-19)
 
 
