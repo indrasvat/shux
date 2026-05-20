@@ -118,6 +118,13 @@ code:not(pre code) {
   font-size: 0.88em;
   color: var(--ink);
 }
+.diff-bullets code,
+.versus li code {
+  align-self: flex-start;
+  display: inline-block;
+  line-height: 1.35;
+  white-space: nowrap;
+}
 kbd {
   background: var(--bg-3);
   border: 1px solid var(--line-2);
