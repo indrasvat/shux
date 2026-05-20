@@ -50,12 +50,23 @@ async fn run_pane_pty_task(
                     Ok(0) => break,
                     Ok(n) => {
                         let data = &buf[..n];
-                        let mut state = io_state.lock().await;
-                        if let Some(vt) = state.vts.get_mut(&pane_id) {
-                            vt.process(data);
+                        let terminal_responses = {
+                            let mut state = io_state.lock().await;
+                            let terminal_responses = if let Some(vt) = state.vts.get_mut(&pane_id) {
+                                vt.process_with_responses(data)
+                            } else {
+                                Vec::new()
+                            };
+                            let output = String::from_utf8_lossy(data);
+                            let _completed = state.cmd_engine.process_output(pane_id.0, &output);
+                            terminal_responses
+                        };
+                        for response in &terminal_responses {
+                            if handle.write(response).await.is_err() { break; }
                         }
-                        let output = String::from_utf8_lossy(data);
-                        let _completed = state.cmd_engine.process_output(pane_id.0, &output);
+                        if !terminal_responses.is_empty() && handle.flush().await.is_err() {
+                            break;
+                        }
                     }
                     Err(_) => break,
                 }
@@ -767,6 +778,39 @@ async fn test_capture_after_echo() {
     assert!(
         text.contains("SHUX_TEST_OUTPUT"),
         "captured text should contain 'SHUX_TEST_OUTPUT', got: {text}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_xterm_cursor_report_probe_gets_terminal_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (session_id, _pane_id) = create_test_session(&mut stream).await;
+
+    let probe = r#"python3 -c 'import os,select,sys,termios,tty; fd=0; old=termios.tcgetattr(fd); tty.setraw(fd); sys.stdout.write("\x1b[5;10H\x1b[6n"); sys.stdout.flush(); r,_,_=select.select([fd],[],[],1.0); data=os.read(fd,32) if r else b""; termios.tcsetattr(fd, termios.TCSADRAIN, old); print("\nSHUX_CPR="+repr(data))'"#;
+    rpc_call(
+        &mut stream,
+        "pane.send_keys",
+        serde_json::json!({"session_id": session_id, "text": format!("{probe}\n")}),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = rpc_call(
+        &mut stream,
+        "pane.capture",
+        serde_json::json!({"session_id": session_id, "lines": 80}),
+    )
+    .await;
+    let text = result["text"].as_str().unwrap();
+    assert!(
+        text.contains("SHUX_CPR=b'\\x1b[5;10R'"),
+        "xterm CPR probe should receive a terminal response, got: {text}"
     );
 
     cancel.cancel();

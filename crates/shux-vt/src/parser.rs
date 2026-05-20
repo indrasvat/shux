@@ -63,6 +63,13 @@ pub struct ScrollRegion {
     pub bottom: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct DcsState {
+    intermediates: Vec<u8>,
+    action: char,
+    payload: Vec<u8>,
+}
+
 /// The VT handler that translates escape sequences into grid operations.
 ///
 /// This struct is NOT the public API -- VirtualTerminal (in lib.rs) owns this
@@ -77,6 +84,8 @@ pub struct VtHandler<'a> {
     pub default_colors: &'a mut TerminalDefaultColors,
     pub alt_grid: &'a mut Option<Grid>,
     pub alt_cursor: &'a mut Option<Cursor>,
+    pub dcs_state: &'a mut Option<DcsState>,
+    pub responses: &'a mut Vec<Vec<u8>>,
 }
 
 impl<'a> VtHandler<'a> {
@@ -285,6 +294,20 @@ impl<'a> VtHandler<'a> {
             // Bracketed paste mode (2004).
             2004 => self.modes.bracketed_paste = enable,
             _ => trace!(mode, enable, "unhandled private mode"),
+        }
+    }
+
+    fn push_response(&mut self, response: impl Into<Vec<u8>>) {
+        self.responses.push(response.into());
+    }
+
+    fn report_cursor_position(&mut self, private: bool) {
+        let row = self.cursor.row + 1;
+        let col = self.cursor.col + 1;
+        if private {
+            self.push_response(format!("\x1b[?{row};{col}R"));
+        } else {
+            self.push_response(format!("\x1b[{row};{col}R"));
         }
     }
 }
@@ -530,6 +553,41 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     }
                 }
             }
+            // DA -- Primary Device Attributes.
+            ('c', []) => {
+                if params_vec.is_empty() || params_vec == [0] {
+                    self.push_response(b"\x1b[?62;1;2;6;9;15;22c".to_vec());
+                }
+            }
+            // DA2 -- Secondary Device Attributes.
+            ('c', [b'>']) => {
+                if params_vec.is_empty() || params_vec == [0] {
+                    self.push_response(b"\x1b[>0;95;0c".to_vec());
+                }
+            }
+            // DSR -- Device Status Report.
+            ('n', []) => {
+                for &param in &params_vec {
+                    match param {
+                        5 => self.push_response(b"\x1b[0n".to_vec()),
+                        6 => self.report_cursor_position(false),
+                        _ => trace!(param, "unhandled DSR request"),
+                    }
+                }
+            }
+            // DEC-specific DSR.
+            ('n', [b'?']) => {
+                for &param in &params_vec {
+                    match param {
+                        6 => self.report_cursor_position(true),
+                        15 => self.push_response(b"\x1b[?10n".to_vec()),
+                        25 => self.push_response(b"\x1b[?20n".to_vec()),
+                        26 => self.push_response(b"\x1b[?27;1;0;0n".to_vec()),
+                        53 => self.push_response(b"\x1b[?50n".to_vec()),
+                        _ => trace!(param, "unhandled private DSR request"),
+                    }
+                }
+            }
             // DECSTBM -- Set Scrolling Region.
             ('r', []) => {
                 let top = (p(0, 1) as usize).saturating_sub(1);
@@ -655,7 +713,18 @@ impl<'a> vte::Perform for VtHandler<'a> {
             // OSC 10/11 -- Set dynamic default foreground/background.
             b"10" | b"11" => {
                 if let Some(color_bytes) = params.get(1) {
-                    if let Ok(color) = parse_osc_color(color_bytes) {
+                    if *color_bytes == b"?" {
+                        let color = if params[0] == b"10" {
+                            self.default_colors.fg.unwrap_or([238, 238, 238])
+                        } else {
+                            self.default_colors.bg.unwrap_or([0, 0, 0])
+                        };
+                        let selector = std::str::from_utf8(params[0]).unwrap_or("10");
+                        self.push_response(format!(
+                            "\x1b]{selector};{}\x1b\\",
+                            format_osc_rgb(color)
+                        ));
+                    } else if let Ok(color) = parse_osc_color(color_bytes) {
                         if params[0] == b"10" {
                             self.default_colors.fg = Some(color);
                         } else {
@@ -667,23 +736,175 @@ impl<'a> vte::Perform for VtHandler<'a> {
             // OSC 110/111 -- Reset dynamic default foreground/background.
             b"110" => self.default_colors.fg = None,
             b"111" => self.default_colors.bg = None,
+            b"4" => {
+                let mut parts = params[1..].chunks_exact(2);
+                for pair in &mut parts {
+                    let Ok(index) = std::str::from_utf8(pair[0]).unwrap_or("").parse::<u8>() else {
+                        continue;
+                    };
+                    if pair[1] == b"?" {
+                        let color = xterm_256_palette(index);
+                        self.push_response(format!(
+                            "\x1b]4;{index};{}\x1b\\",
+                            format_osc_rgb(color)
+                        ));
+                    }
+                }
+            }
             _ => {
                 trace!(osc = ?params[0], "unhandled OSC sequence");
             }
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
-        // DCS sequences -- not needed for M0.
+    fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
+        *self.dcs_state = Some(DcsState {
+            intermediates: intermediates.to_vec(),
+            action,
+            payload: Vec::new(),
+        });
     }
 
-    fn put(&mut self, _byte: u8) {
-        // DCS payload -- not needed for M0.
+    fn put(&mut self, byte: u8) {
+        if let Some(dcs) = self.dcs_state.as_mut() {
+            dcs.payload.push(byte);
+        }
     }
 
     fn unhook(&mut self) {
-        // DCS termination -- not needed for M0.
+        let Some(dcs) = self.dcs_state.take() else {
+            return;
+        };
+        match (dcs.intermediates.as_slice(), dcs.action) {
+            ([b'+'], 'q') => {
+                if let Some(response) = xtgettcap_response(&dcs.payload) {
+                    self.push_response(response);
+                } else {
+                    self.push_response(b"\x1bP0+r\x1b\\".to_vec());
+                }
+            }
+            ([b'$'], 'q') => {
+                if let Some(response) = decrqss_response(&dcs.payload, self) {
+                    self.push_response(response);
+                } else {
+                    self.push_response(b"\x1bP0$r\x1b\\".to_vec());
+                }
+            }
+            _ => trace!(
+                intermediates = ?dcs.intermediates,
+                action = %dcs.action,
+                "unhandled DCS sequence"
+            ),
+        }
     }
+}
+
+fn format_osc_rgb(rgb: [u8; 3]) -> String {
+    format!(
+        "rgb:{:04x}/{:04x}/{:04x}",
+        u16::from(rgb[0]) * 257,
+        u16::from(rgb[1]) * 257,
+        u16::from(rgb[2]) * 257
+    )
+}
+
+fn xterm_256_palette(index: u8) -> [u8; 3] {
+    const BASE16: [[u8; 3]; 16] = [
+        [0, 0, 0],
+        [205, 0, 0],
+        [0, 205, 0],
+        [205, 205, 0],
+        [0, 0, 238],
+        [205, 0, 205],
+        [0, 205, 205],
+        [229, 229, 229],
+        [127, 127, 127],
+        [255, 0, 0],
+        [0, 255, 0],
+        [255, 255, 0],
+        [92, 92, 255],
+        [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 255],
+    ];
+
+    match index {
+        0..=15 => BASE16[index as usize],
+        16..=231 => {
+            let n = index - 16;
+            let component = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            [component(n / 36), component((n / 6) % 6), component(n % 6)]
+        }
+        232..=255 => {
+            let level = 8 + (index - 232) * 10;
+            [level, level, level]
+        }
+    }
+}
+
+fn xtgettcap_response(payload: &[u8]) -> Option<Vec<u8>> {
+    let names = std::str::from_utf8(payload).ok()?;
+    let mut pairs = Vec::new();
+    for encoded_name in names.split(';').filter(|name| !name.is_empty()) {
+        let name = decode_hex_ascii(encoded_name)?;
+        let value = match name.as_str() {
+            "Co" | "colors" => "256",
+            "TN" | "name" => "xterm-256color",
+            "RGB" | "Tc" => "",
+            _ => return None,
+        };
+        pairs.push(encode_hex_ascii(&format!("{name}={value}")));
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(format!("\x1bP1+r{}\x1b\\", pairs.join(";")).into_bytes())
+}
+
+fn decrqss_response(payload: &[u8], handler: &VtHandler<'_>) -> Option<Vec<u8>> {
+    let response = match payload {
+        b"m" => "0m".to_string(),
+        b"r" => format!(
+            "{};{}r",
+            handler.scroll_region.top + 1,
+            handler.scroll_region.bottom + 1
+        ),
+        b" q" => {
+            let shape = match handler.cursor.shape {
+                CursorShape::Block => 1,
+                CursorShape::Underline => 3,
+                CursorShape::Bar => 5,
+            };
+            format!("{shape} q")
+        }
+        b"\"q" => "0\"q".to_string(),
+        b"\"p" => "61;1\"p".to_string(),
+        _ => return None,
+    };
+    Some(format!("\x1bP1$r{response}\x1b\\").into_bytes())
+}
+
+fn decode_hex_ascii(encoded: &str) -> Option<String> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hex = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(hex, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn encode_hex_ascii(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn parse_osc_color(bytes: &[u8]) -> Result<[u8; 3], ()> {
@@ -742,6 +963,8 @@ mod tests {
         default_colors: TerminalDefaultColors,
         alt_grid: Option<Grid>,
         alt_cursor: Option<Cursor>,
+        dcs_state: Option<DcsState>,
+        responses: Vec<Vec<u8>>,
         parser: vte::Parser,
     }
 
@@ -759,6 +982,8 @@ mod tests {
                 default_colors: TerminalDefaultColors::default(),
                 alt_grid: None,
                 alt_cursor: None,
+                dcs_state: None,
+                responses: Vec::new(),
                 parser: vte::Parser::new(),
             }
         }
@@ -773,6 +998,8 @@ mod tests {
                 default_colors: &mut self.default_colors,
                 alt_grid: &mut self.alt_grid,
                 alt_cursor: &mut self.alt_cursor,
+                dcs_state: &mut self.dcs_state,
+                responses: &mut self.responses,
             };
             self.parser.advance(&mut handler, bytes);
         }

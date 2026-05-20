@@ -107,6 +107,18 @@
 - Verification: `make dogfood-human-copy`, `make ci`, and pre-push
   checks (deny, progress-check, 835 tests, doctests).
 
+**2026-05-20 — feat(xterm): answer application terminal probes**
+- Added the first truthful `TERM=xterm-256color` response layer. The VT now
+  returns response bytes for DA/DA2/DSR cursor reports, OSC 10/11/4 color
+  queries, XTGETTCAP, and DECRQSS, and the pane PTY task writes those bytes
+  back to the child process outside the pane I/O lock.
+- Added focused unit coverage for the response-producing parser path and a
+  PTY integration regression proving a child process that emits CPR (`CSI 6n`)
+  receives the expected `ESC[row;colR` reply.
+- Added `.shux/scripts/xterm256_rich_tui_check.sh` to dogfood rich TUIs under
+  `TERM=xterm-256color`, including `vivecaka --repo=indrasvat/shux` so PR proof
+  screenshots show the actual Shux PR when one is open.
+
 **2026-05-18 — fix(copy): make selection legible and stop idle cursor churn**
 - User dogfood findings on the human-interactive branch: copy-mode
   selection used a too-dark overlay that made text hard to read, and an
