@@ -46,7 +46,7 @@ pub struct VirtualTerminal {
     parser: Parser,
     /// In-progress DCS payload, preserved across partial PTY chunks.
     dcs_state: Option<DcsState>,
-    /// Last committed presentation while synchronized output mode is active.
+    /// Frozen full-grid presentation while synchronized output mode is active.
     sync_present: Option<(Grid, Cursor)>,
     /// Number of visible rows.
     rows: usize,
@@ -566,6 +566,36 @@ mod tests {
         assert_eq!(vt.grid().visible_row(0)[1].ch, 'e');
         assert_eq!(vt.grid().visible_row(0)[2].ch, 'w');
         assert_eq!(vt.capture_text(Some(1)).trim_end(), "new");
+    }
+
+    #[test]
+    fn synchronized_output_preserves_presented_scrollback() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process(b"first\r\nsecond\r\nthird");
+        let presented_total = vt.grid().total_lines();
+        let presented_scrollback = vt.grid().scrollback_len();
+
+        vt.process(b"\x1b[?2026h\x1b[1;1Hpending\r\nwork  ");
+
+        assert!(vt.modes().synchronized_output);
+        assert_eq!(vt.grid().total_lines(), presented_total);
+        assert_eq!(vt.grid().scrollback_len(), presented_scrollback);
+        assert!(
+            vt.grid()
+                .scrollback_row(0)
+                .expect("scrollback row should remain visible")
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+                .contains("first")
+        );
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "third");
+
+        vt.process(b"\x1b[?2026l");
+
+        assert!(!vt.modes().synchronized_output);
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "work");
     }
 
     #[test]

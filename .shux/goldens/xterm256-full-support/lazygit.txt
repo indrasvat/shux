@@ -1,47 +1,47 @@
 ╭─[1]─Status─────────────────────────────────────────╮╭─[0]─Unstaged changes───────────────────────────────────────────────────────────────────────────────────╮
-│✓ indrasvat-shux → feat/xterm256-full-support       ││diff --git i/.shux/goldens/xterm256-full-support/btop-pane.png w/.shux/goldens/xterm256-full-           ▐
-╰────────────────────────────────────────────────────╯│support/btop-pane.png                                                                                   ▐
-╭─[2]─Files - Worktrees - Submodules─────────────────╮│index f2e93a4..81cad90 100644                                                                           │
-│▼ .shux                                             ▐│Binary files i/.shux/goldens/xterm256-full-support/btop-pane.png and w/.shux/goldens/xterm256-full-     │
-│  ▼ goldens/xterm256-full-support                   ▐│support/btop-pane.png differ                                                                            │
-│     M btop-pane.png                                ▐│diff --git i/.shux/goldens/xterm256-full-support/btop-window.png w/.shux/goldens/xterm256-full-         │
-│     M btop-window.png                              ▐│support/btop-window.png                                                                                 │
-│     M btop.create.json                             ▐│index b17f328..6e9a874 100644                                                                           │
-│     M btop.txt                                     ▐│Binary files i/.shux/goldens/xterm256-full-support/btop-window.png and w/.shux/goldens/xterm256-full-   │
-│     M contact-sheet.png                            ││support/btop-window.png differ                                                                          │
-│     M lazygit-pane.png                             ││diff --git i/.shux/goldens/xterm256-full-support/btop.create.json w/.shux/goldens/xterm256-full-        │
-│     M lazygit-window.png                           ││support/btop.create.json                                                                                │
-│     M lazygit.create.json                          ││index 5853048..4e7ff30 100644                                                                           │
-│     M lazygit.txt                                  ││--- i/.shux/goldens/xterm256-full-support/btop.create.json                                              │
-│     M nvim-window.png                              ││+++ w/.shux/goldens/xterm256-full-support/btop.create.json                                              │
-╰────────────────────────────────────────────1 of 25─╯│@@ -1,12 +1,12 @@                                                                                       │
-╭─[3]─Local branches - Remotes - Tags────────────────╮│ {                                                                                                      │
-│  * ● feat/xterm256-full-support ✓                  ││-  "active_window_id": "c414e328-f138-45fc-9261-1caf0b532273",                                          │
-│11h   main ✓                                        ││-  "created_at": 1779299481,                                                                            │
-│11h ● fix/xterm-review-followups (upstream gone)    ││-  "id": "24d51bb0-414f-4280-a02d-8fcfe904a314",                                                        │
-│14h ● feat/xterm-256color-support (upstream gone)   ││-  "name": "xterm256-rich-87556-btop",                                                                  │
-│2d    feat/render-parity-mouse-copy ✓               ││-  "pane_id": "e818aa1a-5499-4276-ba2c-67a951db3333",                                                   │
-│1w    feat/conductor-plugin-design ✓                ││+  "active_window_id": "6c07ff9a-b12d-427f-9004-d9a919b488b9",                                          │
-│1w    feat/m1-followups                             ││+  "created_at": 1779300104,                                                                            │
-│                                                    ││+  "id": "2dfa31fa-d03a-43b5-8a1c-e39fc6fb8058",                                                        │
-│                                                    ││+  "name": "xterm256-rich-49396-btop",                                                                  │
-│                                                    ││+  "pane_id": "ff6be86d-f83a-4e5f-91ce-911730204b4d",                                                   │
-│                                                    ││   "window_count": 1,                                                                                   │
-│                                                    ││-  "window_id": "c414e328-f138-45fc-9261-1caf0b532273",                                                 │
-╰─────────────────────────────────────────────1 of 7─╯│+  "window_id": "6c07ff9a-b12d-427f-9004-d9a919b488b9",                                                 │
-╭─[4]─Commits - Reflog───────────────────────────────╮│   "windows": [                                                                                         │
-│e78742ba in ◯ feat(xterm): support richer terminal p▐│-    "c414e328-f138-45fc-9261-1caf0b532273"                                                             │
-│180f8434 in ◯ test(shux): stabilize daemon lifecycle▐│+    "6c07ff9a-b12d-427f-9004-d9a919b488b9"                                                             │
-│1d5a3689 इन ◯ fix(xterm): address probe review feedb││   ]                                                                                                    │
-│643e960f se ◯ v0.27.0 chore(release): 0.27.0 [skip c││ }                                                                                                      │
-│5cc5a2d2 इन ◯ feat(xterm): answer terminal probes   │╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-│5b8f1ba0 se ◯ v0.26.1 chore(release): 0.26.1 [skip c│╭─Command log────────────────────────────────────────────────────────────────────────────────────────────╮
-│e5f39b41 इन ◯ fix(pty): avoid xterm launch stalls   ││You can hide/focus this panel by pressing '@'                                                           │
-│21650a99 इन ◯ test(shux): raise coverage and stabili││                                                                                                        │
-│7d82e7c4 इन ◯ ci(coverage): add codecov workflow set││Random tip: To collapse/expand a directory, press '<enter>'                                             │
+│✓ indrasvat-shux → feat/xterm256-full-support       ││diff --git i/crates/shux-vt/src/lib.rs w/crates/shux-vt/src/lib.rs                                      ▐
+╰────────────────────────────────────────────────────╯│index 17cb981..c64ecfc 100644                                                                           ▐
+╭─[2]─Files - Worktrees - Submodules─────────────────╮│--- i/crates/shux-vt/src/lib.rs                                                                         ▐
+│▼ /                                                 ││+++ w/crates/shux-vt/src/lib.rs                                                                         ▐
+│  ▼ crates/shux-vt/src                              ││@@ -46,7 +46,7 @@ pub struct VirtualTerminal {                                                          ▐
+│     M lib.rs                                       ││     parser: Parser,                                                                                    ▐
+│     M parser.rs                                    ││     /// In-progress DCS payload, preserved across partial PTY chunks.                                  ▐
+│  ▼ pages                                           ││     dcs_state: Option<DcsState>,                                                                       ▐
+│     M index.html                                   ││-    /// Last committed presentation while synchronized output mode is active.                          ▐
+│                                                    ││+    /// Frozen full-grid presentation while synchronized output mode is active.                        ▐
+│                                                    ││     sync_present: Option<(Grid, Cursor)>,                                                              │
+│                                                    ││     /// Number of visible rows.                                                                        │
+│                                                    ││     rows: usize,                                                                                       │
+│                                                    ││@@ -568,6 +568,36 @@ mod tests {                                                                        │
+│                                                    ││         assert_eq!(vt.capture_text(Some(1)).trim_end(), "new");                                        │
+╰─────────────────────────────────────────────1 of 6─╯│     }                                                                                                  │
+╭─[3]─Local branches - Remotes - Tags────────────────╮│                                                                                                        │
+│  * ● feat/xterm256-full-support ✓                  ││+    #[test]                                                                                            │
+│11h   main ✓                                        ││+    fn synchronized_output_preserves_presented_scrollback() {                                          │
+│11h ● fix/xterm-review-followups (upstream gone)    ││+        let mut vt = VirtualTerminal::new(2, 10);                                                      │
+│14h ● feat/xterm-256color-support (upstream gone)   ││+        vt.process(b"first\r\nsecond\r\nthird");                                                       │
+│2d    feat/render-parity-mouse-copy ✓               ││+        let presented_total = vt.grid().total_lines();                                                 │
+│1w    feat/conductor-plugin-design ✓                ││+        let presented_scrollback = vt.grid().scrollback_len();                                         │
+│1w    feat/m1-followups                             ││+                                                                                                       │
+│                                                    ││+        vt.process(b"\x1b[?2026h\x1b[1;1Hpending\r\nwork  ");                                          │
+│                                                    ││+                                                                                                       │
+│                                                    ││+        assert!(vt.modes().synchronized_output);                                                       │
+│                                                    ││+        assert_eq!(vt.grid().total_lines(), presented_total);                                          │
+│                                                    ││+        assert_eq!(vt.grid().scrollback_len(), presented_scrollback);                                  │
+╰─────────────────────────────────────────────1 of 7─╯│+        assert!(                                                                                       │
+╭─[4]─Commits - Reflog───────────────────────────────╮│+            vt.grid()                                                                                  │
+│cdda9c09 in ◯ test(xterm): add nidhi visual proof   ▐│+                .scrollback_row(0)                                                                     │
+│e78742ba in ◯ feat(xterm): support richer terminal p▐│+                .expect("scrollback row should remain visible")                                        │
+│180f8434 in ◯ test(shux): stabilize daemon lifecycle││+                .cells                                                                                 │
+│1d5a3689 इन ◯ fix(xterm): address probe review feedb││+                .iter()                                                                                │
+│643e960f se ◯ v0.27.0 chore(release): 0.27.0 [skip c│╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+│5cc5a2d2 इन ◯ feat(xterm): answer terminal probes   │╭─Command log────────────────────────────────────────────────────────────────────────────────────────────╮
+│5b8f1ba0 se ◯ v0.26.1 chore(release): 0.26.1 [skip c││You can hide/focus this panel by pressing '@'                                                           │
+│e5f39b41 इन ◯ fix(pty): avoid xterm launch stalls   ││                                                                                                        │
+│21650a99 इन ◯ test(shux): raise coverage and stabili││Random tip: To filter commits by path, press '<c-s>'                                                    │
+│7d82e7c4 इन ◯ ci(coverage): add codecov workflow set││                                                                                                        │
 │8fe7117e se ◯ v0.26.0 chore(release): 0.26.0 [skip c││                                                                                                        │
-│8acce56d इन ◯ feat(rendering): improve rich TUI pari││                                                                                                        │
-╰────────────────────────────────────────────1 of 92─╯│                                                                                                        │
+╰────────────────────────────────────────────1 of 93─╯│                                                                                                        │
 ╭─[5]─Stash──────────────────────────────────────────╮│                                                                                                        │
 │1w On create-shux: throwaway powerline statusbar    ││                                                                                                        │
 ╰─────────────────────────────────────────────1 of 1─╯╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯

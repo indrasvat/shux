@@ -314,7 +314,7 @@ impl<'a> VtHandler<'a> {
             2026 => {
                 if enable {
                     if self.sync_present.is_none() {
-                        *self.sync_present = Some((self.grid.clone_visible(), self.cursor.clone()));
+                        *self.sync_present = Some((self.grid.clone(), self.cursor.clone()));
                     }
                     self.modes.synchronized_output = true;
                 } else {

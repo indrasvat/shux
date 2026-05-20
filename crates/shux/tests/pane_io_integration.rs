@@ -940,20 +940,26 @@ async fn test_synchronized_output_freezes_capture_while_active() {
     let dir = tempfile::tempdir().unwrap();
     let (socket_path, cancel) = start_test_server(dir.path()).await;
     let probe_path = dir.path().join("sync_probe.py");
+    let ready_path = dir.path().join("sync_ready");
+    let ready_literal = serde_json::to_string(ready_path.to_str().unwrap()).unwrap();
     std::fs::write(
         &probe_path,
-        r#"import sys
+        format!(
+            r#"import pathlib
+import sys
 import time
 
 sys.stdout.write("old")
 sys.stdout.flush()
 sys.stdout.write("\x1b[?2026h\x1b[1;1Hnew")
 sys.stdout.flush()
+pathlib.Path({ready_literal}).write_text("ready")
 time.sleep(1.0)
 sys.stdout.write("\x1b[?2026l")
 sys.stdout.flush()
 time.sleep(0.2)
 "#,
+        ),
     )
     .unwrap();
 
@@ -975,7 +981,15 @@ time.sleep(0.2)
     )
     .await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready_path.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        ready_path.exists(),
+        "sync probe did not enter synchronized-output mode"
+    );
+
     let frozen = rpc_call(
         &mut stream,
         "pane.capture",
