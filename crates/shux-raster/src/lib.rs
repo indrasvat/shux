@@ -253,6 +253,11 @@ impl Rasterizer {
             ]),
         );
 
+        let cursor_block_color = match (opts.cursor, opts.cursor_shape, opts.cursor_color) {
+            (Some((row, col)), CursorShape::Block, Some(color)) => Some((row, col, color)),
+            _ => None,
+        };
+
         for r in 0..grid.rows() {
             let row = grid.visible_row(r);
             for c in 0..grid.cols() {
@@ -263,11 +268,16 @@ impl Rasterizer {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                self.draw_cell(&mut img, r, c, cell, opts);
+                let cursor_color = cursor_block_color
+                    .filter(|(cr, cc, _)| *cr == r && *cc == c)
+                    .map(|(_, _, color)| color);
+                self.draw_cell(&mut img, r, c, cell, opts, cursor_color);
             }
         }
 
-        if let Some((cr, cc)) = opts.cursor {
+        if let Some((cr, cc)) = opts.cursor
+            && cursor_block_color.is_none()
+        {
             self.draw_cursor(&mut img, cr, cc, opts);
         }
 
@@ -281,6 +291,7 @@ impl Rasterizer {
         col: usize,
         cell: &Cell,
         opts: &RasterOptions,
+        cursor_block_color: Option<Rgb>,
     ) {
         let x = col as u32 * self.cell_w;
         let y = row as u32 * self.cell_h;
@@ -298,6 +309,10 @@ impl Rasterizer {
         }
         if style.flags.contains(CellFlags::HIDDEN) {
             fg = bg;
+        }
+        if let Some(cursor_bg) = cursor_block_color {
+            fg = bg;
+            bg = cursor_bg;
         }
 
         let cell_pixels_w = if cell.is_wide() {
@@ -657,6 +672,39 @@ mod tests {
         assert_eq!([bar[0], bar[1], bar[2]], [0, 255, 128]);
         let body = img.get_pixel(cw.saturating_sub(1), ch / 2);
         assert_eq!([body[0], body[1], body[2]], [0, 0, 0]);
+    }
+
+    #[test]
+    fn colored_block_cursor_preserves_underlying_glyph() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let mut vt = VirtualTerminal::new(1, 2);
+        vt.process(b"A");
+        let (cw, ch) = r.cell_size();
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            cursor: Some((0, 0)),
+            cursor_shape: CursorShape::Block,
+            cursor_color: Some([0, 255, 128]),
+        };
+
+        let img = r.render(vt.grid(), &opts);
+        let mut cursor_bg_pixels = 0usize;
+        let mut glyph_pixels = 0usize;
+        for y in 0..ch {
+            for x in 0..cw {
+                let p = img.get_pixel(x, y);
+                let rgb = [p[0], p[1], p[2]];
+                if rgb == [0, 255, 128] {
+                    cursor_bg_pixels += 1;
+                } else {
+                    glyph_pixels += 1;
+                }
+            }
+        }
+
+        assert!(cursor_bg_pixels > 0, "cursor background was not drawn");
+        assert!(glyph_pixels > 0, "cursor block erased the underlying glyph");
     }
 
     #[test]

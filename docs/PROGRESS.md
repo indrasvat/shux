@@ -145,6 +145,9 @@
 - Added focused regressions across `shux-vt`, `shux-ui`, and `shux-raster` for
   OSC 12 responses, cursor shape/color emission, cursor shape/color PNG
   rendering, and advanced underline color rasterization.
+- Follow-up review tightened colored block cursor snapshots so OSC 12 cursor
+  color paints the cursor cell while preserving the underlying glyph; added a
+  raster regression and reran the issue #63 visual matrix.
 
 **2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
 - Normal-mode mouse selection is now a first-class attach-layer state,
