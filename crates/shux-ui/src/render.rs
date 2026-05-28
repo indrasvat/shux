@@ -12,12 +12,13 @@ use crossterm::{
     cursor::MoveTo,
     style::{
         Attribute, Color as CtColor, Print, ResetColor, SetAttribute, SetBackgroundColor,
-        SetForegroundColor,
+        SetForegroundColor, SetUnderlineColor,
     },
     terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
 
 use crate::buffer::{DirtyCell, RenderAttrs, RenderCell};
+use crate::vt_convert;
 
 /// Abstraction over crossterm terminal output. Queues commands and
 /// flushes them in a single synchronized batch.
@@ -27,6 +28,9 @@ pub struct RenderBackend<W: Write> {
     last_fg: Option<Option<CtColor>>,
     last_bg: Option<Option<CtColor>>,
     last_attrs: Option<RenderAttrs>,
+    last_underline_style: Option<shux_vt::UnderlineStyle>,
+    last_underline_color: Option<Option<CtColor>>,
+    last_hyperlink: Option<Option<String>>,
 }
 
 impl<W: Write> RenderBackend<W> {
@@ -36,6 +40,9 @@ impl<W: Write> RenderBackend<W> {
             last_fg: None,
             last_bg: None,
             last_attrs: None,
+            last_underline_style: None,
+            last_underline_color: None,
+            last_hyperlink: None,
         }
     }
 
@@ -78,6 +85,7 @@ impl<W: Write> RenderBackend<W> {
         }
 
         // Reset colors at the end so the terminal is in a clean state
+        self.clear_hyperlink()?;
         self.out.queue(ResetColor)?;
 
         // End synchronized update
@@ -90,6 +98,8 @@ impl<W: Write> RenderBackend<W> {
         self.last_fg = None;
         self.last_bg = None;
         self.last_attrs = None;
+        self.last_underline_style = None;
+        self.last_underline_color = None;
 
         Ok(())
     }
@@ -114,6 +124,7 @@ impl<W: Write> RenderBackend<W> {
             }
         }
 
+        self.clear_hyperlink()?;
         self.out.queue(ResetColor)?;
         self.out.queue(EndSynchronizedUpdate)?;
         self.out.flush()?;
@@ -121,6 +132,8 @@ impl<W: Write> RenderBackend<W> {
         self.last_fg = None;
         self.last_bg = None;
         self.last_attrs = None;
+        self.last_underline_style = None;
+        self.last_underline_color = None;
 
         Ok(())
     }
@@ -129,9 +142,29 @@ impl<W: Write> RenderBackend<W> {
     /// stream. Only emits crossterm commands when the style actually
     /// changes from the last emitted style.
     fn apply_style(&mut self, cell: &RenderCell) -> io::Result<()> {
+        let underline_style = cell
+            .extended
+            .as_deref()
+            .map(|ext| ext.underline_style)
+            .unwrap_or_default();
+        let underline_color = cell
+            .extended
+            .as_deref()
+            .and_then(|ext| ext.underline_color)
+            .and_then(vt_convert::vt_color_to_crossterm);
+        let hyperlink = cell
+            .extended
+            .as_deref()
+            .and_then(|ext| ext.hyperlink.as_deref());
+
+        self.apply_hyperlink(hyperlink)?;
+
         // Attributes first -- Attribute::Reset clears fg/bg too, so we
         // must handle attributes before colors.
-        if self.last_attrs != Some(cell.attrs) {
+        if self.last_attrs != Some(cell.attrs)
+            || self.last_underline_style != Some(underline_style)
+            || self.last_underline_color != Some(underline_color)
+        {
             // Reset all attributes first, then set the ones we need.
             // This is simpler than tracking individual attribute deltas
             // and crossterm's Reset is cheap.
@@ -146,8 +179,29 @@ impl<W: Write> RenderBackend<W> {
             if cell.attrs.italic {
                 self.out.queue(SetAttribute(Attribute::Italic))?;
             }
-            if cell.attrs.underline {
-                self.out.queue(SetAttribute(Attribute::Underlined))?;
+            match underline_style {
+                shux_vt::UnderlineStyle::None if cell.attrs.underline => {
+                    self.out.queue(SetAttribute(Attribute::Underlined))?;
+                }
+                shux_vt::UnderlineStyle::None => {}
+                shux_vt::UnderlineStyle::Single => {
+                    self.out.queue(SetAttribute(Attribute::Underlined))?;
+                }
+                shux_vt::UnderlineStyle::Double => {
+                    self.out.queue(SetAttribute(Attribute::DoubleUnderlined))?;
+                }
+                shux_vt::UnderlineStyle::Curly => {
+                    self.out.queue(SetAttribute(Attribute::Undercurled))?;
+                }
+                shux_vt::UnderlineStyle::Dotted => {
+                    self.out.queue(SetAttribute(Attribute::Underdotted))?;
+                }
+                shux_vt::UnderlineStyle::Dashed => {
+                    self.out.queue(SetAttribute(Attribute::Underdashed))?;
+                }
+            }
+            if let Some(color) = underline_color {
+                self.out.queue(SetUnderlineColor(color))?;
             }
             if cell.attrs.blink {
                 self.out.queue(SetAttribute(Attribute::SlowBlink))?;
@@ -163,6 +217,8 @@ impl<W: Write> RenderBackend<W> {
             }
 
             self.last_attrs = Some(cell.attrs);
+            self.last_underline_style = Some(underline_style);
+            self.last_underline_color = Some(underline_color);
 
             // After Attribute::Reset, fg/bg state is also reset.
             // Force re-emit of colors below.
@@ -199,6 +255,35 @@ impl<W: Write> RenderBackend<W> {
         Ok(())
     }
 
+    fn apply_hyperlink(&mut self, hyperlink: Option<&str>) -> io::Result<()> {
+        let next = hyperlink.map(str::to_string);
+        if self.last_hyperlink.is_none() && next.is_none() {
+            return Ok(());
+        }
+        if self.last_hyperlink.as_ref() == Some(&next) {
+            return Ok(());
+        }
+
+        match hyperlink {
+            Some(uri) => write!(self.out, "\x1b]8;;{uri}\x1b\\")?,
+            None => self.out.write_all(b"\x1b]8;;\x1b\\")?,
+        }
+        self.last_hyperlink = Some(next);
+        Ok(())
+    }
+
+    fn clear_hyperlink(&mut self) -> io::Result<()> {
+        if self
+            .last_hyperlink
+            .as_ref()
+            .is_some_and(|link| link.is_some())
+        {
+            self.out.write_all(b"\x1b]8;;\x1b\\")?;
+        }
+        self.last_hyperlink = None;
+        Ok(())
+    }
+
     /// Clear the entire screen.
     pub fn clear_screen(&mut self) -> io::Result<()> {
         self.out.queue(terminal::Clear(terminal::ClearType::All))?;
@@ -228,6 +313,8 @@ impl<W: Write> RenderBackend<W> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::buffer::{RenderAttrs, RenderCell};
 
@@ -338,6 +425,58 @@ mod tests {
         let output_str = String::from_utf8_lossy(&output);
         assert!(output_str.contains('A'));
         assert!(output_str.contains('B'));
+    }
+
+    #[test]
+    fn test_render_diff_emits_and_clears_hyperlinks() {
+        let mut output = Vec::new();
+        let mut backend = RenderBackend::new(&mut output);
+
+        let mut cell = RenderCell::text('L');
+        cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            hyperlink: Some("https://example.invalid/a;b".to_string()),
+            underline_color: None,
+            underline_style: shux_vt::UnderlineStyle::None,
+        }));
+
+        backend
+            .render_diff(&[DirtyCell {
+                col: 0,
+                row: 0,
+                cell,
+            }])
+            .unwrap();
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("\x1b]8;;https://example.invalid/a;b\x1b\\"));
+        assert!(output_str.contains("L\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn test_render_diff_emits_advanced_underline_style_and_color() {
+        crossterm::style::Colored::set_ansi_color_disabled(false);
+        let mut output = Vec::new();
+        let mut backend = RenderBackend::new(&mut output);
+
+        let mut cell = RenderCell::text('U');
+        cell.attrs.underline = true;
+        cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            hyperlink: None,
+            underline_color: Some(shux_vt::Color::Rgb(10, 20, 30)),
+            underline_style: shux_vt::UnderlineStyle::Curly,
+        }));
+
+        backend
+            .render_diff(&[DirtyCell {
+                col: 0,
+                row: 0,
+                cell,
+            }])
+            .unwrap();
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("\x1b[4:3m"));
+        assert!(output_str.contains("\x1b[58;2;10;20;30m"));
     }
 
     #[test]

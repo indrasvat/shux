@@ -264,6 +264,7 @@ impl<W: Write> RenderCompositor<W> {
             fg: None, // Use default terminal color; task 024 adds theme tokens
             bg: None,
             attrs: RenderAttrs::default(),
+            extended: None,
             wide_continuation: false,
         };
 
@@ -450,6 +451,7 @@ impl<W: Write> RenderCompositor<W> {
                     }),
                     bg: None,
                     attrs: RenderAttrs::default(),
+                    extended: None,
                     wide_continuation: false,
                 };
                 self.buffer.set_cell(seg.x, seg.y, cell);
@@ -492,6 +494,7 @@ impl<W: Write> RenderCompositor<W> {
                             fg: Some(fg),
                             bg: None,
                             attrs: RenderAttrs::default(),
+                            extended: None,
                             wide_continuation: false,
                         };
                         self.buffer.set_cell(x, y, cell);
@@ -645,6 +648,7 @@ impl<W: Write> RenderCompositor<W> {
                         dim: true,
                         ..Default::default()
                     },
+                    extended: None,
                     wide_continuation: false,
                 },
             );

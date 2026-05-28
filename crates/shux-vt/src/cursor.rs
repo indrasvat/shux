@@ -1,4 +1,6 @@
-use crate::cell::CellStyle;
+use std::sync::Arc;
+
+use crate::cell::{CellStyle, ExtendedAttrs};
 
 /// Cursor shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -15,6 +17,7 @@ pub struct SavedCursor {
     pub row: usize,
     pub col: usize,
     pub style: CellStyle,
+    pub extended: Option<Arc<ExtendedAttrs>>,
     pub auto_wrap_pending: bool,
     pub origin_mode: bool,
 }
@@ -28,6 +31,8 @@ pub struct Cursor {
     pub col: usize,
     /// Current style that will be applied to newly written cells.
     pub style: CellStyle,
+    /// Current extended attributes that will be applied to newly written cells.
+    pub extended: Option<Arc<ExtendedAttrs>>,
     /// Cursor shape.
     pub shape: CursorShape,
     /// Whether the cursor is visible.
@@ -45,6 +50,7 @@ impl Cursor {
             row: 0,
             col: 0,
             style: CellStyle::default(),
+            extended: None,
             shape: CursorShape::Block,
             visible: true,
             auto_wrap_pending: false,
@@ -58,6 +64,7 @@ impl Cursor {
             row: self.row,
             col: self.col,
             style: self.style,
+            extended: self.extended.clone(),
             auto_wrap_pending: self.auto_wrap_pending,
             origin_mode,
         });
@@ -69,6 +76,7 @@ impl Cursor {
             self.row = saved.row;
             self.col = saved.col;
             self.style = saved.style;
+            self.extended = saved.extended.clone();
             self.auto_wrap_pending = saved.auto_wrap_pending;
             Some(saved.origin_mode)
         } else {

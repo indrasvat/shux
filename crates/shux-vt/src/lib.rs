@@ -629,6 +629,18 @@ mod tests {
     }
 
     #[test]
+    fn process_with_responses_reports_advanced_underline_sgr_in_decrqss() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[4:3;58:2::10:20:30m");
+        let responses = vt.process_with_responses(b"\x1bP$qm\x1b\\");
+
+        assert_eq!(
+            responses,
+            vec![b"\x1bP1$r4:3;58;2;10;20;30m\x1b\\".to_vec()]
+        );
+    }
+
+    #[test]
     fn process_with_responses_reports_indexed_sgr_in_decrqss() {
         let mut vt = VirtualTerminal::new(24, 80);
         vt.process(b"\x1b[91;44m");
@@ -874,6 +886,22 @@ mod tests {
     }
 
     #[test]
+    fn hpa_before_erase_clears_stale_scan_text_before_summary_redraw() {
+        let mut vt = VirtualTerminal::new(3, 80);
+        vt.process(b"\x1b[?1049h");
+        vt.process(b"\x1b[2;1Hhadolint x");
+        vt.process(b"\x1b[2;40H\x1b[1`\x1b[K    1. Fix blockers");
+
+        let row = vt.grid().visible_row(1);
+        let rendered: String = row.cells.iter().map(|cell| cell.ch).collect();
+        assert!(rendered.starts_with("    1. Fix blockers"));
+        assert!(
+            !rendered.contains("hadolint"),
+            "HPA before EL failed to clear stale scan text: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn renderer_cursor_tabulation_and_relative_moves_are_applied() {
         let mut vt = VirtualTerminal::new(4, 40);
         vt.process(b"A\x1b[2IC");
@@ -884,6 +912,66 @@ mod tests {
         assert_eq!(vt.grid().visible_row(0)[19].ch, 'Y');
         vt.process(b"\x1b[1eZ");
         assert_eq!(vt.grid().visible_row(1)[20].ch, 'Z');
+        vt.process(b"\x1b[5`H");
+        assert_eq!(vt.grid().visible_row(1)[4].ch, 'H');
+    }
+
+    #[test]
+    fn renderer_scroll_up_down_primitives_shift_scroll_region() {
+        let mut vt = VirtualTerminal::new(5, 10);
+        vt.process(b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD\x1b[5;1HE");
+        vt.process(b"\x1b[2;4r");
+        vt.process(b"\x1b[1S");
+
+        assert_eq!(vt.grid().visible_row(0)[0].ch, 'A');
+        assert_eq!(vt.grid().visible_row(1)[0].ch, 'C');
+        assert_eq!(vt.grid().visible_row(2)[0].ch, 'D');
+        assert_eq!(vt.grid().visible_row(3)[0].ch, ' ');
+        assert_eq!(vt.grid().visible_row(4)[0].ch, 'E');
+
+        vt.process(b"\x1b[1T");
+        assert_eq!(vt.grid().visible_row(0)[0].ch, 'A');
+        assert_eq!(vt.grid().visible_row(1)[0].ch, ' ');
+        assert_eq!(vt.grid().visible_row(2)[0].ch, 'C');
+        assert_eq!(vt.grid().visible_row(3)[0].ch, 'D');
+        assert_eq!(vt.grid().visible_row(4)[0].ch, 'E');
+    }
+
+    #[test]
+    fn advanced_underline_sgr_sets_extended_cell_attributes() {
+        let mut vt = VirtualTerminal::new(2, 40);
+        vt.process(b"\x1b[4:3mC\x1b[58:2::10:20:30mU\x1b[59mN\x1b[24mP");
+
+        let row = vt.grid().visible_row(0);
+        let curly = row[0].extended.as_ref().expect("curly underline");
+        assert_eq!(curly.underline_style, UnderlineStyle::Curly);
+        assert!(row[0].style.flags.contains(CellFlags::UNDERLINE));
+
+        let colored = row[1].extended.as_ref().expect("underline color");
+        assert_eq!(colored.underline_style, UnderlineStyle::Curly);
+        assert_eq!(colored.underline_color, Some(Color::Rgb(10, 20, 30)));
+
+        let no_color = row[2].extended.as_ref().expect("underline style remains");
+        assert_eq!(no_color.underline_style, UnderlineStyle::Curly);
+        assert_eq!(no_color.underline_color, None);
+        assert!(row[3].extended.is_none());
+        assert!(!row[3].style.flags.contains(CellFlags::UNDERLINE));
+    }
+
+    #[test]
+    fn osc8_hyperlink_applies_to_subsequent_cells_until_cleared() {
+        let mut vt = VirtualTerminal::new(2, 40);
+        vt.process(b"\x1b]8;;https://example.invalid/a;b\x07L\x1b]8;;\x07N");
+
+        let linked = vt.grid().visible_row(0)[0]
+            .extended
+            .as_ref()
+            .expect("hyperlink");
+        assert_eq!(
+            linked.hyperlink.as_deref(),
+            Some("https://example.invalid/a;b")
+        );
+        assert!(vt.grid().visible_row(0)[1].extended.is_none());
     }
 
     #[test]

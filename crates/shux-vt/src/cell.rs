@@ -95,6 +95,16 @@ pub struct ExtendedAttrs {
     pub underline_style: UnderlineStyle,
 }
 
+impl Default for ExtendedAttrs {
+    fn default() -> Self {
+        ExtendedAttrs {
+            hyperlink: None,
+            underline_color: None,
+            underline_style: UnderlineStyle::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnderlineStyle {
     #[default]

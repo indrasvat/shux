@@ -6,6 +6,8 @@
 //! of cells that need updating -- this is the core of the incremental rendering
 //! strategy required by PRD section 14.1 (p50 <= 8ms keypress-to-update).
 
+use std::sync::Arc;
+
 use crossterm::style::Color;
 
 use crate::vt_convert;
@@ -28,6 +30,9 @@ pub struct RenderCell {
 
     /// Style attributes (bold, italic, underline, etc.).
     pub attrs: RenderAttrs,
+
+    /// Rare extended terminal attributes that must participate in diffing.
+    pub extended: Option<Arc<shux_vt::ExtendedAttrs>>,
 
     /// True if this cell is the trailing half of a wide (CJK) character.
     /// The compositor skips these cells during output -- the primary cell's
@@ -57,6 +62,7 @@ impl Default for RenderCell {
             fg: None,
             bg: None,
             attrs: RenderAttrs::default(),
+            extended: None,
             wide_continuation: false,
         }
     }
@@ -70,6 +76,7 @@ impl RenderCell {
             fg: None,
             bg: None,
             attrs: RenderAttrs::default(),
+            extended: None,
             wide_continuation: false,
         }
     }
@@ -81,6 +88,7 @@ impl RenderCell {
             fg,
             bg,
             attrs,
+            extended: None,
             wide_continuation: false,
         }
     }
@@ -105,6 +113,7 @@ impl RenderCell {
                 hidden: flags.contains(shux_vt::CellFlags::HIDDEN),
                 strikethrough: flags.contains(shux_vt::CellFlags::STRIKETHROUGH),
             },
+            extended: cell.extended.clone(),
             wide_continuation: cell.is_wide_continuation(),
         }
     }
@@ -243,6 +252,8 @@ impl FrameBuffer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -406,6 +417,7 @@ mod tests {
         assert_eq!(cell.fg, None);
         assert_eq!(cell.bg, None);
         assert!(!cell.attrs.bold);
+        assert!(cell.extended.is_none());
         assert!(!cell.wide_continuation);
     }
 
@@ -424,6 +436,7 @@ mod tests {
         assert_eq!(cell.fg, Some(Color::Green));
         assert_eq!(cell.bg, Some(Color::Blue));
         assert!(cell.attrs.italic);
+        assert!(cell.extended.is_none());
         assert!(!cell.wide_continuation);
     }
 
@@ -514,5 +527,41 @@ mod tests {
         let vt_cell = shux_vt::Cell::wide_continuation();
         let render_cell = RenderCell::from(&vt_cell);
         assert!(render_cell.wide_continuation);
+    }
+
+    #[test]
+    fn test_from_vt_cell_preserves_extended_attributes_for_diffing() {
+        let extended = Arc::new(shux_vt::ExtendedAttrs {
+            hyperlink: Some("https://example.invalid/a;b".to_string()),
+            underline_color: Some(shux_vt::Color::Rgb(10, 20, 30)),
+            underline_style: shux_vt::UnderlineStyle::Curly,
+        });
+        let vt_cell = shux_vt::Cell {
+            ch: 'X',
+            width: 1,
+            style: shux_vt::CellStyle::default(),
+            extended: Some(extended.clone()),
+        };
+
+        let render_cell = RenderCell::from(&vt_cell);
+        assert_eq!(render_cell.extended, Some(extended));
+    }
+
+    #[test]
+    fn test_extended_attribute_only_change_is_dirty() {
+        let mut buf = FrameBuffer::new(1, 1);
+        buf.set_cell(0, 0, RenderCell::text('X'));
+        buf.swap();
+
+        let mut next = RenderCell::text('X');
+        next.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            hyperlink: Some("https://example.invalid".to_string()),
+            underline_color: None,
+            underline_style: shux_vt::UnderlineStyle::None,
+        }));
+        buf.set_cell(0, 0, next);
+
+        let dirty = buf.diff();
+        assert_eq!(dirty.len(), 1);
     }
 }

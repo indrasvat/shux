@@ -114,6 +114,18 @@
   batches that use repeated spaces and tab-relative cursor movement land on the
   intended cells. Added regressions for `REP` clearing and nested 1049 while
   already on alternate screen.
+- Second manual retest showed a stale token from the scanning frame surviving
+  into the summary frame. Added `HPA` (`CSI Ps \``) support so absolute
+  horizontal movement before `EL` clears the intended range, plus `SU`/`SD`
+  hard-scroll primitives from the same renderer capability set. Also wired
+  OSC 8 hyperlinks and advanced underline style/color SGR into existing
+  extended cell attributes. Added regressions for HPA-before-erase stale text,
+  scroll up/down regions, OSC 8 links, and underline style/color.
+- DootSabha review caught follow-up extended-attribute propagation gaps. Render
+  cells now preserve extended attributes for diffing, emit/clear OSC 8
+  hyperlinks, and render advanced underline style/color through crossterm.
+  OSC 8 URI parsing now preserves semicolons, and DECRQSS SGR reports advanced
+  underline style/color instead of collapsing to plain `4m`.
 
 **2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
 - Normal-mode mouse selection is now a first-class attach-layer state,
