@@ -164,6 +164,40 @@ impl<'a> VtHandler<'a> {
         }
     }
 
+    /// REP -- repeat the preceding graphic character at the current cursor.
+    fn repeat_preceding_char(&mut self, count: usize) {
+        if self.cursor.col == 0 || count == 0 {
+            return;
+        }
+        let ch = self
+            .grid
+            .visible_row(self.cursor.row)
+            .get(self.cursor.col - 1)
+            .map(|cell| cell.ch)
+            .filter(|ch| *ch != '\0')
+            .unwrap_or(' ');
+        for _ in 0..count {
+            self.write_char(ch);
+        }
+    }
+
+    fn next_tab_col(&self, count: usize) -> usize {
+        let mut col = self.cursor.col;
+        for _ in 0..count.max(1) {
+            col = (col / 8 + 1) * 8;
+        }
+        col.min(self.grid.cols().saturating_sub(1))
+    }
+
+    fn prev_tab_col(&self, count: usize) -> usize {
+        let mut col = self.cursor.col;
+        for _ in 0..count.max(1) {
+            col = col.saturating_sub(1);
+            col = (col / 8) * 8;
+        }
+        col
+    }
+
     /// Carriage return: move cursor to column 0.
     fn carriage_return(&mut self) {
         self.cursor.col = 0;
@@ -292,8 +326,10 @@ impl<'a> VtHandler<'a> {
                     }
                     if self.modes.alternate_screen {
                         if mode == 1049 {
+                            let saved = self.cursor.saved.clone();
                             self.grid.clear_visible(self.cursor.style.bg);
                             *self.cursor = Cursor::new();
+                            self.cursor.saved = saved;
                         }
                         return;
                     }
@@ -477,6 +513,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.cursor.col = (self.cursor.col + n).min(cols - 1);
                 self.cursor.auto_wrap_pending = false;
             }
+            // HPR -- Horizontal Position Relative.
+            ('a', []) => {
+                let n = p(0, 1) as usize;
+                self.cursor.col = (self.cursor.col + n).min(cols - 1);
+                self.cursor.auto_wrap_pending = false;
+            }
             // CUB -- Cursor Backward.
             ('D', []) => {
                 let n = p(0, 1) as usize;
@@ -490,6 +532,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.cursor.col = 0;
                 self.cursor.auto_wrap_pending = false;
             }
+            // VPR -- Vertical Position Relative.
+            ('e', []) => {
+                let n = p(0, 1) as usize;
+                self.cursor.row = (self.cursor.row + n).min(rows - 1);
+                self.cursor.auto_wrap_pending = false;
+            }
             // CPL -- Cursor Previous Line.
             ('F', []) => {
                 let n = p(0, 1) as usize;
@@ -501,6 +549,16 @@ impl<'a> vte::Perform for VtHandler<'a> {
             ('G', []) => {
                 let col = (p(0, 1) as usize).saturating_sub(1).min(cols - 1);
                 self.cursor.col = col;
+                self.cursor.auto_wrap_pending = false;
+            }
+            // CHT -- Cursor Forward Tabulation.
+            ('I', []) => {
+                self.cursor.col = self.next_tab_col(p(0, 1) as usize);
+                self.cursor.auto_wrap_pending = false;
+            }
+            // CBT -- Cursor Backward Tabulation.
+            ('Z', []) => {
+                self.cursor.col = self.prev_tab_col(p(0, 1) as usize);
                 self.cursor.auto_wrap_pending = false;
             }
             // CUP / HVP -- Cursor Position.
@@ -596,12 +654,19 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.grid
                     .erase_chars(self.cursor.row, self.cursor.col, n, self.cursor.style.bg);
             }
+            // REP -- Repeat Preceding Character.
+            ('b', []) => {
+                self.repeat_preceding_char(p(0, 1) as usize);
+            }
             // VPA -- Vertical Line Position Absolute.
             ('d', []) => {
                 let row = (p(0, 1) as usize).saturating_sub(1).min(rows - 1);
                 self.cursor.row = row;
                 self.cursor.auto_wrap_pending = false;
             }
+            // TBC -- Tab Clear. shux currently tracks default tab stops only,
+            // so there is no mutable tab-stop state to update yet.
+            ('g', []) => {}
             // SCOSC -- Save Cursor (SCO/private form, common in modern TUI diff renderers).
             ('s', []) if params_vec.iter().all(|&param| param == 0) => {
                 self.cursor.save(self.modes.origin_mode);
@@ -792,6 +857,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
             (b'=', []) => self.modes.application_keypad = true,
             // DECPNM -- Normal keypad mode (ESC >).
             (b'>', []) => self.modes.application_keypad = false,
+            // HTS -- Horizontal Tab Set. shux currently models default
+            // 8-column tab stops, but accepting HTS avoids treating renderer
+            // setup bytes as unknown.
+            (b'H', []) => {}
             // RI -- Reverse Index (ESC M).
             (b'M', []) => self.reverse_index(),
             // IND -- Index (ESC D) -- move cursor down, scroll if needed.

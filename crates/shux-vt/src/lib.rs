@@ -847,6 +847,46 @@ mod tests {
     }
 
     #[test]
+    fn nested_1049_enter_preserves_saved_cursor_while_already_alt_screen() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"\x1b[?1047h\x1b[2;5H");
+        vt.process(b"\x1b[?1049h");
+        vt.process(b"\x1b[3;20Hnested");
+        vt.process(b"\x1b[?1049l");
+
+        assert_eq!((vt.cursor().row, vt.cursor().col), (1, 4));
+    }
+
+    #[test]
+    fn repeat_preceding_space_clears_stale_prefix_before_short_redraw() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"\x1b[?1049h");
+        vt.process(b"\x1b[2;1Hhad 1. Fix blockers");
+        vt.process(b"\x1b[2;1H \x1b[3b1. Fix blockers");
+
+        let row = vt.grid().visible_row(1);
+        let rendered: String = row.cells.iter().map(|cell| cell.ch).collect();
+        assert!(rendered.starts_with("    1. Fix blockers"));
+        assert!(
+            !rendered.contains("had "),
+            "REP failed to clear stale prefix: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn renderer_cursor_tabulation_and_relative_moves_are_applied() {
+        let mut vt = VirtualTerminal::new(4, 40);
+        vt.process(b"A\x1b[2IC");
+        assert_eq!(vt.cursor().col, 17);
+        vt.process(b"\x1b[1ZX");
+        assert_eq!(vt.grid().visible_row(0)[16].ch, 'X');
+        vt.process(b"\x1b[2aY");
+        assert_eq!(vt.grid().visible_row(0)[19].ch, 'Y');
+        vt.process(b"\x1b[1eZ");
+        assert_eq!(vt.grid().visible_row(1)[20].ch, 'Z');
+    }
+
+    #[test]
     fn test_sgr_256_color() {
         let mut vt = VirtualTerminal::new(24, 80);
         // Set 256-color foreground: SGR 38;5;196.

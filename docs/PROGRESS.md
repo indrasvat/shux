@@ -107,6 +107,13 @@
   longer restores the primary cursor, 1049 leave restores saved cursor even
   when already on primary, and the Bubble Tea regression now covers multiple
   inner truecolor token transitions.
+- Follow-up PR review and manual retest caught a remaining stale-prefix redraw
+  case. Added renderer primitive support for `REP` (`CSI Ps b`), cursor
+  tabulation (`CSI I`/`CSI Z`), relative movement (`CSI a`/`CSI e`), and
+  no-op tab-stop setup/clear handling (`ESC H`, `CSI g`) so optimized renderer
+  batches that use repeated spaces and tab-relative cursor movement land on the
+  intended cells. Added regressions for `REP` clearing and nested 1049 while
+  already on alternate screen.
 
 **2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
 - Normal-mode mouse selection is now a first-class attach-layer state,
