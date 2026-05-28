@@ -1,3 +1,10 @@
+## [0.28.3](https://github.com/indrasvat/shux/compare/v0.28.2...v0.28.3) (2026-05-28)
+
+
+### Bug Fixes
+
+* **render:** complete Bubble Tea coverage audit ([330b9de](https://github.com/indrasvat/shux/commit/330b9dec5d1ffa5e670cee1253c36ad10ca13cd1))
+
 ## [0.28.2](https://github.com/indrasvat/shux/compare/v0.28.1...v0.28.2) (2026-05-28)
 
 
