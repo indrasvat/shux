@@ -132,11 +132,12 @@ while read -r binary; do
     attempt=$((attempt + 1))
     echo "▶ Running ${binary}"
 
-    if run_with_timeout "${binary}"; then
+    status=0
+    run_with_timeout "${binary}" || status=$?
+    if [[ "${status}" -eq 0 ]]; then
       break
     fi
 
-    status=$?
     if [[ "${status}" -ne 124 || "${attempt}" -gt "${binary_retries}" ]]; then
       echo "error: ${binary} failed with status ${status}" >&2
       exit "${status}"

@@ -71,6 +71,7 @@ impl StatusBar {
             fg: None,
             bg: self.bg,
             attrs: RenderAttrs::default(),
+            extended: None,
             wide_continuation: false,
         };
         let mut row = vec![blank.clone(); w];
@@ -132,6 +133,7 @@ fn paint_segments(
                     bold: seg.bold,
                     ..Default::default()
                 },
+                extended: None,
                 wide_continuation: false,
             };
             row[cursor] = cell;

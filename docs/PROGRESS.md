@@ -88,6 +88,45 @@
 
 ## Session Log
 
+**2026-05-27 — fix(vt): cursor save/restore + idempotent alt-screen (issue #61)**
+- VT parser now handles `CSI s` / `CSI u` (SCOSC/SCORC) cursor save/restore and
+  DEC private mode 1048 save/restore, fixing Bubble Tea-style diff redraws that
+  left stale cells when apps saved/restored the cursor between frames.
+- Alternate-screen enter/leave (1047/1049) made idempotent and split by mode:
+  repeated `?1049h` no longer discards the primary grid, 1047 no longer
+  restores the primary cursor, and `?1049l` still performs its 1048-style
+  cursor restore even if the primary screen is already active.
+- Added focused regression tests (truecolor mid-row SGR over box-drawing cells,
+  short-redraw EL clearing, CSI s/u redraw, sync-mode Bubble Tea redraw, 1048
+  save/restore, repeated alt-screen enter) and a `make test-vt` target.
+- Fixed `scripts/run-cargo-test.sh`: a failing test binary now propagates its
+  nonzero status (the old `if cmd; then …; fi; status=$?` always captured 0,
+  masking failures and disabling the timeout-retry path).
+- DootSabha implementation review found VT-mode edge cases. Addressed in this
+  branch: parameterized `CSI u` is not treated as cursor restore, 1047 no
+  longer restores the primary cursor, 1049 leave restores saved cursor even
+  when already on primary, and the Bubble Tea regression now covers multiple
+  inner truecolor token transitions.
+- Follow-up PR review and manual retest caught a remaining stale-prefix redraw
+  case. Added renderer primitive support for `REP` (`CSI Ps b`), cursor
+  tabulation (`CSI I`/`CSI Z`), relative movement (`CSI a`/`CSI e`), and
+  no-op tab-stop setup/clear handling (`ESC H`, `CSI g`) so optimized renderer
+  batches that use repeated spaces and tab-relative cursor movement land on the
+  intended cells. Added regressions for `REP` clearing and nested 1049 while
+  already on alternate screen.
+- Second manual retest showed a stale token from the scanning frame surviving
+  into the summary frame. Added `HPA` (`CSI Ps \``) support so absolute
+  horizontal movement before `EL` clears the intended range, plus `SU`/`SD`
+  hard-scroll primitives from the same renderer capability set. Also wired
+  OSC 8 hyperlinks and advanced underline style/color SGR into existing
+  extended cell attributes. Added regressions for HPA-before-erase stale text,
+  scroll up/down regions, OSC 8 links, and underline style/color.
+- DootSabha review caught follow-up extended-attribute propagation gaps. Render
+  cells now preserve extended attributes for diffing, emit/clear OSC 8
+  hyperlinks, and render advanced underline style/color through crossterm.
+  OSC 8 URI parsing now preserves semicolons, and DECRQSS SGR reports advanced
+  underline style/color instead of collapsing to plain `4m`.
+
 **2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
 - Normal-mode mouse selection is now a first-class attach-layer state,
   separate from modal copy mode. Left-dragging visible pane text selects

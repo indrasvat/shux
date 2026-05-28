@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use tracing::trace;
 
-use crate::cell::{Cell, CellFlags, CellStyle, Color, TerminalDefaultColors};
+use crate::cell::{
+    Cell, CellFlags, CellStyle, Color, ExtendedAttrs, TerminalDefaultColors, UnderlineStyle,
+};
 use crate::cursor::{Cursor, CursorShape};
 use crate::grid::{Grid, GridConfig};
 
@@ -148,7 +152,7 @@ impl<'a> VtHandler<'a> {
             ch,
             width: width as u8,
             style: self.cursor.style,
-            extended: None,
+            extended: self.cursor.extended.clone(),
         };
 
         // For wide characters, write a continuation cell.
@@ -162,6 +166,83 @@ impl<'a> VtHandler<'a> {
             self.cursor.col = cols.saturating_sub(1);
             self.cursor.auto_wrap_pending = true;
         }
+    }
+
+    fn cursor_extended_mut(&mut self) -> &mut ExtendedAttrs {
+        let extended = self
+            .cursor
+            .extended
+            .get_or_insert_with(|| Arc::new(ExtendedAttrs::default()));
+        Arc::make_mut(extended)
+    }
+
+    fn prune_cursor_extended(&mut self) {
+        if self.cursor.extended.as_deref() == Some(&ExtendedAttrs::default()) {
+            self.cursor.extended = None;
+        }
+    }
+
+    fn set_cursor_hyperlink(&mut self, hyperlink: Option<String>) {
+        self.cursor_extended_mut().hyperlink = hyperlink;
+        self.prune_cursor_extended();
+    }
+
+    fn set_underline_style(&mut self, underline_style: UnderlineStyle) {
+        self.cursor_extended_mut().underline_style = underline_style;
+        self.prune_cursor_extended();
+    }
+
+    fn set_underline_color(&mut self, underline_color: Option<Color>) {
+        self.cursor_extended_mut().underline_color = underline_color;
+        self.prune_cursor_extended();
+    }
+
+    /// REP -- repeat the preceding graphic character at the current cursor.
+    fn repeat_preceding_char(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let source_col = if self.cursor.auto_wrap_pending {
+            self.cursor.col
+        } else if let Some(col) = self.cursor.col.checked_sub(1) {
+            col
+        } else {
+            return;
+        };
+        let row = self.grid.visible_row(self.cursor.row);
+        let source_col = if row
+            .get(source_col)
+            .is_some_and(|cell| cell.is_wide_continuation())
+        {
+            source_col.saturating_sub(1)
+        } else {
+            source_col
+        };
+        let ch = row
+            .get(source_col)
+            .map(|cell| cell.ch)
+            .filter(|ch| *ch != '\0')
+            .unwrap_or(' ');
+        for _ in 0..count {
+            self.write_char(ch);
+        }
+    }
+
+    fn next_tab_col(&self, count: usize) -> usize {
+        let mut col = self.cursor.col;
+        for _ in 0..count.max(1) {
+            col = (col / 8 + 1) * 8;
+        }
+        col.min(self.grid.cols().saturating_sub(1))
+    }
+
+    fn prev_tab_col(&self, count: usize) -> usize {
+        let mut col = self.cursor.col;
+        for _ in 0..count.max(1) {
+            col = col.saturating_sub(1);
+            col = (col / 8) * 8;
+        }
+        col
     }
 
     /// Carriage return: move cursor to column 0.
@@ -198,11 +279,17 @@ impl<'a> VtHandler<'a> {
     /// Apply an SGR (Select Graphic Rendition) parameter to the cursor style.
     fn apply_sgr(&mut self, param: u16) {
         match param {
-            0 => self.cursor.style = CellStyle::default(),
+            0 => {
+                self.cursor.style = CellStyle::default();
+                self.cursor.extended = None;
+            }
             1 => self.cursor.style.flags.set(CellFlags::BOLD),
             2 => self.cursor.style.flags.set(CellFlags::DIM),
             3 => self.cursor.style.flags.set(CellFlags::ITALIC),
-            4 => self.cursor.style.flags.set(CellFlags::UNDERLINE),
+            4 => {
+                self.cursor.style.flags.set(CellFlags::UNDERLINE);
+                self.set_underline_style(UnderlineStyle::Single);
+            }
             5 | 6 => self.cursor.style.flags.set(CellFlags::BLINK),
             7 => self.cursor.style.flags.set(CellFlags::INVERSE),
             8 => self.cursor.style.flags.set(CellFlags::HIDDEN),
@@ -213,7 +300,10 @@ impl<'a> VtHandler<'a> {
                 self.cursor.style.flags.unset(CellFlags::DIM);
             }
             23 => self.cursor.style.flags.unset(CellFlags::ITALIC),
-            24 => self.cursor.style.flags.unset(CellFlags::UNDERLINE),
+            24 => {
+                self.cursor.style.flags.unset(CellFlags::UNDERLINE);
+                self.set_underline_style(UnderlineStyle::None);
+            }
             25 => self.cursor.style.flags.unset(CellFlags::BLINK),
             27 => self.cursor.style.flags.unset(CellFlags::INVERSE),
             28 => self.cursor.style.flags.unset(CellFlags::HIDDEN),
@@ -226,6 +316,7 @@ impl<'a> VtHandler<'a> {
             40..=47 => self.cursor.style.bg = Color::Indexed((param - 40) as u8),
             48 => {} // Extended background (handled via sub-params in csi_dispatch).
             49 => self.cursor.style.bg = Color::Default,
+            59 => self.set_underline_color(None),
             // Bright foreground colors (90-97).
             90..=97 => self.cursor.style.fg = Color::Indexed((param - 90 + 8) as u8),
             // Bright background colors (100-107).
@@ -276,34 +367,60 @@ impl<'a> VtHandler<'a> {
             1004 => self.modes.focus_events = enable,
             // SGR mouse coordinate encoding.
             1006 => self.modes.sgr_mouse = enable,
+            // Save cursor (1048).
+            1048 => {
+                if enable {
+                    self.cursor.save(self.modes.origin_mode);
+                } else if let Some(origin) = self.cursor.restore() {
+                    self.modes.origin_mode = origin;
+                }
+            }
             // Alternate screen buffer (1047, 1049).
             1047 | 1049 => {
                 if enable {
                     if mode == 1049 {
                         self.cursor.save(self.modes.origin_mode);
                     }
+                    if self.modes.alternate_screen {
+                        if mode == 1049 {
+                            let saved = self.cursor.saved.clone();
+                            self.grid.clear_visible(self.cursor.style.bg);
+                            *self.cursor = Cursor::new();
+                            self.cursor.saved = saved;
+                        }
+                        return;
+                    }
                     // Enter alternate screen: swap grids.
                     let rows = self.grid.rows();
                     let cols = self.grid.cols();
                     let config = GridConfig { max_scrollback: 0 };
                     let alt_grid = Grid::new(rows, cols, config);
-                    let alt_cursor = Cursor::new();
                     *self.alt_grid = Some(std::mem::replace(self.grid, alt_grid));
-                    *self.alt_cursor = Some(std::mem::replace(self.cursor, alt_cursor));
+                    if mode == 1049 {
+                        let alt_cursor = Cursor::new();
+                        *self.alt_cursor = Some(std::mem::replace(self.cursor, alt_cursor));
+                    } else {
+                        self.alt_cursor.take();
+                    }
                     self.modes.alternate_screen = true;
                 } else {
                     // Leave alternate screen: restore grids.
-                    if let Some(primary_grid) = self.alt_grid.take() {
-                        *self.grid = primary_grid;
+                    if self.modes.alternate_screen {
+                        if let Some(primary_grid) = self.alt_grid.take() {
+                            *self.grid = primary_grid;
+                        }
+                        if mode == 1049 {
+                            if let Some(primary_cursor) = self.alt_cursor.take() {
+                                *self.cursor = primary_cursor;
+                            }
+                        } else {
+                            self.alt_cursor.take();
+                        }
+                        self.modes.alternate_screen = false;
                     }
-                    if let Some(primary_cursor) = self.alt_cursor.take() {
-                        *self.cursor = primary_cursor;
-                    }
-                    self.modes.alternate_screen = false;
                     if mode == 1049 {
-                        let origin = self.cursor.restore();
-                        if let Some(o) = origin {
-                            self.modes.origin_mode = o;
+                        if let Some(origin) = self.cursor.restore() {
+                            self.modes.origin_mode = origin;
                         }
                     }
                 }
@@ -419,6 +536,8 @@ impl<'a> vte::Perform for VtHandler<'a> {
         _ignore: bool,
         action: char,
     ) {
+        let params_groups: Vec<Vec<u16>> =
+            params.iter().map(|subparam| subparam.to_vec()).collect();
         // Flatten params: each subparam slice is collected into a flat Vec<u16>.
         let params_vec: Vec<u16> = params
             .iter()
@@ -453,6 +572,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.cursor.col = (self.cursor.col + n).min(cols - 1);
                 self.cursor.auto_wrap_pending = false;
             }
+            // HPR -- Horizontal Position Relative.
+            ('a', []) => {
+                let n = p(0, 1) as usize;
+                self.cursor.col = (self.cursor.col + n).min(cols - 1);
+                self.cursor.auto_wrap_pending = false;
+            }
             // CUB -- Cursor Backward.
             ('D', []) => {
                 let n = p(0, 1) as usize;
@@ -466,6 +591,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.cursor.col = 0;
                 self.cursor.auto_wrap_pending = false;
             }
+            // VPR -- Vertical Position Relative.
+            ('e', []) => {
+                let n = p(0, 1) as usize;
+                self.cursor.row = (self.cursor.row + n).min(rows - 1);
+                self.cursor.auto_wrap_pending = false;
+            }
             // CPL -- Cursor Previous Line.
             ('F', []) => {
                 let n = p(0, 1) as usize;
@@ -477,6 +608,22 @@ impl<'a> vte::Perform for VtHandler<'a> {
             ('G', []) => {
                 let col = (p(0, 1) as usize).saturating_sub(1).min(cols - 1);
                 self.cursor.col = col;
+                self.cursor.auto_wrap_pending = false;
+            }
+            // HPA -- Horizontal Position Absolute.
+            ('`', []) => {
+                let col = (p(0, 1) as usize).saturating_sub(1).min(cols - 1);
+                self.cursor.col = col;
+                self.cursor.auto_wrap_pending = false;
+            }
+            // CHT -- Cursor Forward Tabulation.
+            ('I', []) => {
+                self.cursor.col = self.next_tab_col(p(0, 1) as usize);
+                self.cursor.auto_wrap_pending = false;
+            }
+            // CBT -- Cursor Backward Tabulation.
+            ('Z', []) => {
+                self.cursor.col = self.prev_tab_col(p(0, 1) as usize);
                 self.cursor.auto_wrap_pending = false;
             }
             // CUP / HVP -- Cursor Position.
@@ -556,6 +703,22 @@ impl<'a> vte::Perform for VtHandler<'a> {
                         .scroll_up(self.cursor.row, self.scroll_region.bottom);
                 }
             }
+            // SU -- Scroll Up.
+            ('S', []) => {
+                let n = p(0, 1) as usize;
+                for _ in 0..n {
+                    self.grid
+                        .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
+                }
+            }
+            // SD -- Scroll Down.
+            ('T', []) => {
+                let n = p(0, 1) as usize;
+                for _ in 0..n {
+                    self.grid
+                        .scroll_down(self.scroll_region.top, self.scroll_region.bottom);
+                }
+            }
             // ICH -- Insert Characters.
             ('@', []) => {
                 let n = p(0, 1) as usize;
@@ -572,51 +735,113 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.grid
                     .erase_chars(self.cursor.row, self.cursor.col, n, self.cursor.style.bg);
             }
+            // REP -- Repeat Preceding Character.
+            ('b', []) => {
+                self.repeat_preceding_char(p(0, 1) as usize);
+            }
             // VPA -- Vertical Line Position Absolute.
             ('d', []) => {
                 let row = (p(0, 1) as usize).saturating_sub(1).min(rows - 1);
                 self.cursor.row = row;
                 self.cursor.auto_wrap_pending = false;
             }
+            // TBC -- Tab Clear. shux currently tracks default tab stops only,
+            // so there is no mutable tab-stop state to update yet.
+            ('g', []) => {}
+            // SCOSC -- Save Cursor (SCO/private form, common in modern TUI diff renderers).
+            ('s', []) if params_vec.iter().all(|&param| param == 0) => {
+                self.cursor.save(self.modes.origin_mode);
+            }
+            // SCORC -- Restore Cursor (SCO/private form).
+            ('u', []) if params_vec.iter().all(|&param| param == 0) => {
+                if let Some(origin) = self.cursor.restore() {
+                    self.modes.origin_mode = origin;
+                }
+            }
             // SGR -- Select Graphic Rendition.
             ('m', []) => {
-                if params_vec.is_empty() {
+                if params_groups.is_empty() {
                     self.apply_sgr(0);
                     return;
                 }
                 let mut i = 0;
-                while i < params_vec.len() {
-                    match params_vec[i] {
-                        38 if i + 4 < params_vec.len() && params_vec[i + 1] == 2 => {
-                            // 38;2;R;G;B -- 24-bit foreground.
-                            self.cursor.style.fg = Color::Rgb(
-                                params_vec[i + 2] as u8,
-                                params_vec[i + 3] as u8,
-                                params_vec[i + 4] as u8,
-                            );
-                            i += 5;
+                while i < params_groups.len() {
+                    let group = &params_groups[i];
+                    if group.is_empty() {
+                        self.apply_sgr(0);
+                        i += 1;
+                        continue;
+                    }
+                    match group[0] {
+                        4 if group.len() > 1 => {
+                            match group[1] {
+                                0 => {
+                                    self.cursor.style.flags.unset(CellFlags::UNDERLINE);
+                                    self.set_underline_style(UnderlineStyle::None);
+                                }
+                                1 => {
+                                    self.cursor.style.flags.set(CellFlags::UNDERLINE);
+                                    self.set_underline_style(UnderlineStyle::Single);
+                                }
+                                2 => {
+                                    self.cursor.style.flags.set(CellFlags::UNDERLINE);
+                                    self.set_underline_style(UnderlineStyle::Double);
+                                }
+                                3 => {
+                                    self.cursor.style.flags.set(CellFlags::UNDERLINE);
+                                    self.set_underline_style(UnderlineStyle::Curly);
+                                }
+                                4 => {
+                                    self.cursor.style.flags.set(CellFlags::UNDERLINE);
+                                    self.set_underline_style(UnderlineStyle::Dotted);
+                                }
+                                5 => {
+                                    self.cursor.style.flags.set(CellFlags::UNDERLINE);
+                                    self.set_underline_style(UnderlineStyle::Dashed);
+                                }
+                                _ => trace!(sgr = ?group, "unhandled underline style SGR"),
+                            }
+                            i += 1;
                         }
-                        38 if i + 2 < params_vec.len() && params_vec[i + 1] == 5 => {
-                            // 38;5;N -- 256-color foreground.
-                            self.cursor.style.fg = Color::Indexed(params_vec[i + 2] as u8);
-                            i += 3;
+                        38 => {
+                            if let Some((color, consumed)) = parse_sgr_color(&params_groups, i) {
+                                self.cursor.style.fg = color;
+                                i += consumed;
+                            } else {
+                                trace!(sgr = ?group, "unhandled foreground color SGR");
+                                i += 1;
+                            }
                         }
-                        48 if i + 4 < params_vec.len() && params_vec[i + 1] == 2 => {
-                            // 48;2;R;G;B -- 24-bit background.
-                            self.cursor.style.bg = Color::Rgb(
-                                params_vec[i + 2] as u8,
-                                params_vec[i + 3] as u8,
-                                params_vec[i + 4] as u8,
-                            );
-                            i += 5;
+                        48 => {
+                            if let Some((color, consumed)) = parse_sgr_color(&params_groups, i) {
+                                self.cursor.style.bg = color;
+                                i += consumed;
+                            } else {
+                                trace!(sgr = ?group, "unhandled background color SGR");
+                                i += 1;
+                            }
                         }
-                        48 if i + 2 < params_vec.len() && params_vec[i + 1] == 5 => {
-                            // 48;5;N -- 256-color background.
-                            self.cursor.style.bg = Color::Indexed(params_vec[i + 2] as u8);
-                            i += 3;
+                        58 => {
+                            if let Some((color, consumed)) = parse_sgr_color(&params_groups, i) {
+                                self.set_underline_color(Some(color));
+                                i += consumed;
+                            } else {
+                                trace!(sgr = ?group, "unhandled underline color SGR");
+                                i += 1;
+                            }
                         }
-                        other => {
+                        59 => {
+                            self.set_underline_color(None);
+                            i += 1;
+                        }
+                        other if group.len() == 1 => {
                             self.apply_sgr(other);
+                            i += 1;
+                        }
+                        _ => {
+                            for &param in group {
+                                self.apply_sgr(param);
+                            }
                             i += 1;
                         }
                     }
@@ -758,6 +983,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
             (b'=', []) => self.modes.application_keypad = true,
             // DECPNM -- Normal keypad mode (ESC >).
             (b'>', []) => self.modes.application_keypad = false,
+            // HTS -- Horizontal Tab Set. shux currently models default
+            // 8-column tab stops, but accepting HTS avoids treating renderer
+            // setup bytes as unknown.
+            (b'H', []) => {}
             // RI -- Reverse Index (ESC M).
             (b'M', []) => self.reverse_index(),
             // IND -- Index (ESC D) -- move cursor down, scroll if needed.
@@ -846,6 +1075,17 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     }
                 }
             }
+            // OSC 8 -- Set/clear hyperlink for subsequent cells.
+            b"8" => {
+                if params.len() >= 3 {
+                    let uri_bytes = join_osc_parts(&params[2..]);
+                    if uri_bytes.is_empty() {
+                        self.set_cursor_hyperlink(None);
+                    } else if let Ok(uri) = String::from_utf8(uri_bytes) {
+                        self.set_cursor_hyperlink(Some(uri));
+                    }
+                }
+            }
             _ => {
                 trace!(osc = ?params[0], "unhandled OSC sequence");
             }
@@ -909,6 +1149,47 @@ fn osc_terminator(bell_terminated: bool) -> &'static str {
 
 fn mode_report(enabled: bool) -> u8 {
     if enabled { 1 } else { 2 }
+}
+
+fn parse_sgr_color(groups: &[Vec<u16>], start: usize) -> Option<(Color, usize)> {
+    let group = groups.get(start)?;
+    if group.len() > 1 {
+        return parse_sgr_color_tail(&group[1..]).map(|color| (color, 1));
+    }
+
+    match groups
+        .get(start + 1)
+        .and_then(|group| group.first())
+        .copied()
+    {
+        Some(5) => groups
+            .get(start + 2)
+            .and_then(|group| group.first())
+            .copied()
+            .map(|index| (Color::Indexed(sgr_u8(index)), 3)),
+        Some(2) => {
+            let r = groups.get(start + 2)?.first().copied()?;
+            let g = groups.get(start + 3)?.first().copied()?;
+            let b = groups.get(start + 4)?.first().copied()?;
+            Some((Color::Rgb(sgr_u8(r), sgr_u8(g), sgr_u8(b)), 5))
+        }
+        _ => None,
+    }
+}
+
+fn parse_sgr_color_tail(tail: &[u16]) -> Option<Color> {
+    match tail.first().copied() {
+        Some(5) if tail.len() >= 2 => Some(Color::Indexed(sgr_u8(tail[1]))),
+        Some(2) if tail.len() >= 4 => {
+            let rgb = &tail[tail.len() - 3..];
+            Some(Color::Rgb(sgr_u8(rgb[0]), sgr_u8(rgb[1]), sgr_u8(rgb[2])))
+        }
+        _ => None,
+    }
+}
+
+fn sgr_u8(value: u16) -> u8 {
+    value.min(u8::MAX as u16) as u8
 }
 
 fn xterm_256_palette(index: u8) -> [u8; 3] {
@@ -978,7 +1259,10 @@ fn xtgettcap_response(payload: &[u8]) -> Option<Vec<u8>> {
 
 fn decrqss_response(payload: &[u8], handler: &VtHandler<'_>) -> Option<Vec<u8>> {
     let response = match payload {
-        b"m" => format!("{}m", sgr_response(&handler.cursor.style)),
+        b"m" => format!(
+            "{}m",
+            sgr_response(&handler.cursor.style, handler.cursor.extended.as_deref())
+        ),
         b"r" => format!(
             "{};{}r",
             handler.scroll_region.top + 1,
@@ -999,7 +1283,7 @@ fn decrqss_response(payload: &[u8], handler: &VtHandler<'_>) -> Option<Vec<u8>> 
     Some(format!("\x1bP1$r{response}\x1b\\").into_bytes())
 }
 
-fn sgr_response(style: &CellStyle) -> String {
+fn sgr_response(style: &CellStyle, extended: Option<&ExtendedAttrs>) -> String {
     let mut params = Vec::new();
     if style.flags.contains(CellFlags::BOLD) {
         params.push("1".to_string());
@@ -1011,7 +1295,16 @@ fn sgr_response(style: &CellStyle) -> String {
         params.push("3".to_string());
     }
     if style.flags.contains(CellFlags::UNDERLINE) {
-        params.push("4".to_string());
+        match extended
+            .map(|ext| ext.underline_style)
+            .unwrap_or(UnderlineStyle::Single)
+        {
+            UnderlineStyle::None | UnderlineStyle::Single => params.push("4".to_string()),
+            UnderlineStyle::Double => params.push("4:2".to_string()),
+            UnderlineStyle::Curly => params.push("4:3".to_string()),
+            UnderlineStyle::Dotted => params.push("4:4".to_string()),
+            UnderlineStyle::Dashed => params.push("4:5".to_string()),
+        }
     }
     if style.flags.contains(CellFlags::BLINK) {
         params.push("5".to_string());
@@ -1028,12 +1321,26 @@ fn sgr_response(style: &CellStyle) -> String {
 
     append_color_sgr(&mut params, style.fg, false);
     append_color_sgr(&mut params, style.bg, true);
+    if let Some(color) = extended.and_then(|ext| ext.underline_color) {
+        append_underline_color_sgr(&mut params, color);
+    }
 
     if params.is_empty() {
         "0".to_string()
     } else {
         params.join(";")
     }
+}
+
+fn join_osc_parts(parts: &[&[u8]]) -> Vec<u8> {
+    let mut joined = Vec::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            joined.push(b';');
+        }
+        joined.extend_from_slice(part);
+    }
+    joined
 }
 
 fn append_color_sgr(params: &mut Vec<String>, color: Color, background: bool) {
@@ -1052,6 +1359,24 @@ fn append_color_sgr(params: &mut Vec<String>, color: Color, background: bool) {
         }
         Color::Rgb(r, g, b) => {
             params.push(if background { "48" } else { "38" }.to_string());
+            params.push("2".to_string());
+            params.push(r.to_string());
+            params.push(g.to_string());
+            params.push(b.to_string());
+        }
+    }
+}
+
+fn append_underline_color_sgr(params: &mut Vec<String>, color: Color) {
+    match color {
+        Color::Default => params.push("59".to_string()),
+        Color::Indexed(index) => {
+            params.push("58".to_string());
+            params.push("5".to_string());
+            params.push(index.to_string());
+        }
+        Color::Rgb(r, g, b) => {
+            params.push("58".to_string());
             params.push("2".to_string());
             params.push(r.to_string());
             params.push(g.to_string());
