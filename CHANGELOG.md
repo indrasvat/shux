@@ -1,3 +1,10 @@
+## [0.28.2](https://github.com/indrasvat/shux/compare/v0.28.1...v0.28.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* **vt:** handle renderer redraw primitives ([6d3d2fe](https://github.com/indrasvat/shux/commit/6d3d2fe46eb6f1ddcccf63b08916d2cddcb0390e))
+
 ## [0.28.1](https://github.com/indrasvat/shux/compare/v0.28.0...v0.28.1) (2026-05-20)
 
 
