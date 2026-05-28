@@ -148,6 +148,11 @@
 - Follow-up review tightened colored block cursor snapshots so OSC 12 cursor
   color paints the cursor cell while preserving the underlying glyph; added a
   raster regression and reran the issue #63 visual matrix.
+- DootSabha brutal review found additional cross-path rendering gaps before
+  merge. Addressed live attach hidden-cursor visibility, synchronized-output
+  presentation freezing for OSC defaults/title, OSC 12 query fallback to the
+  dynamic foreground, panic-hook cursor presentation reset, and wide/hidden
+  cursor raster edge cases.
 
 **2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
 - Normal-mode mouse selection is now a first-class attach-layer state,

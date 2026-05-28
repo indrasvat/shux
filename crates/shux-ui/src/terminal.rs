@@ -167,6 +167,8 @@ pub fn install_panic_hook() {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = execute!(io::stdout(), cursor::SetCursorStyle::DefaultUserShape);
+        let _ = execute!(io::stdout(), ResetCursorColor);
         let _ = execute!(io::stdout(), cursor::Show);
 
         // Now print the panic info on the restored terminal

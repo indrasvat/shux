@@ -253,8 +253,16 @@ impl Rasterizer {
             ]),
         );
 
-        let cursor_block_color = match (opts.cursor, opts.cursor_shape, opts.cursor_color) {
-            (Some((row, col)), CursorShape::Block, Some(color)) => Some((row, col, color)),
+        let cursor_block_cell = match (opts.cursor, opts.cursor_shape, opts.cursor_color) {
+            (Some((row, col)), CursorShape::Block, Some(color))
+                if row < grid.rows()
+                    && grid
+                        .visible_row(row)
+                        .get(col)
+                        .is_some_and(|cell| !cell.is_wide_continuation()) =>
+            {
+                Some((row, col, color))
+            }
             _ => None,
         };
 
@@ -268,7 +276,7 @@ impl Rasterizer {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                let cursor_color = cursor_block_color
+                let cursor_color = cursor_block_cell
                     .filter(|(cr, cc, _)| *cr == r && *cc == c)
                     .map(|(_, _, color)| color);
                 self.draw_cell(&mut img, r, c, cell, opts, cursor_color);
@@ -276,9 +284,9 @@ impl Rasterizer {
         }
 
         if let Some((cr, cc)) = opts.cursor
-            && cursor_block_color.is_none()
+            && cursor_block_cell.is_none()
         {
-            self.draw_cursor(&mut img, cr, cc, opts);
+            self.draw_cursor(&mut img, grid, cr, cc, opts);
         }
 
         img
@@ -313,6 +321,9 @@ impl Rasterizer {
         if let Some(cursor_bg) = cursor_block_color {
             fg = bg;
             bg = cursor_bg;
+        }
+        if style.flags.contains(CellFlags::HIDDEN) {
+            fg = bg;
         }
 
         let cell_pixels_w = if cell.is_wide() {
@@ -434,16 +445,31 @@ impl Rasterizer {
         }
     }
 
-    fn draw_cursor(&self, img: &mut RgbaImage, row: usize, col: usize, opts: &RasterOptions) {
+    fn draw_cursor(
+        &self,
+        img: &mut RgbaImage,
+        grid: &Grid,
+        row: usize,
+        col: usize,
+        opts: &RasterOptions,
+    ) {
         let x = col as u32 * self.cell_w;
         let y = row as u32 * self.cell_h;
         let max_y = (y + self.cell_h).min(img.height());
-        let max_x = (x + self.cell_w).min(img.width());
+        let cursor_w = if row < grid.rows() {
+            grid.visible_row(row)
+                .get(col)
+                .filter(|cell| cell.is_wide())
+                .map_or(self.cell_w, |_| self.cell_w * 2)
+        } else {
+            self.cell_w
+        };
+        let max_x = (x + cursor_w).min(img.width());
         let cursor_color = opts.cursor_color.unwrap_or(opts.fg_default);
         match opts.cursor_shape {
             CursorShape::Block => {
                 if let Some(color) = opts.cursor_color {
-                    fill_rect(img, x, y, self.cell_w, self.cell_h, color);
+                    fill_rect(img, x, y, cursor_w, self.cell_h, color);
                     return;
                 }
                 for yy in y..max_y {
@@ -458,7 +484,7 @@ impl Rasterizer {
             CursorShape::Underline => {
                 let h = (self.cell_h / 8).max(1);
                 let yy = max_y.saturating_sub(h);
-                fill_rect(img, x, yy, self.cell_w, h, cursor_color);
+                fill_rect(img, x, yy, cursor_w, h, cursor_color);
             }
             CursorShape::Bar => {
                 let w = (self.cell_w / 5).max(1);
@@ -705,6 +731,90 @@ mod tests {
 
         assert!(cursor_bg_pixels > 0, "cursor background was not drawn");
         assert!(glyph_pixels > 0, "cursor block erased the underlying glyph");
+    }
+
+    #[test]
+    fn colored_block_cursor_keeps_hidden_text_concealed() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let mut vt = VirtualTerminal::new(1, 2);
+        vt.process(b"\x1b[8mA\r");
+        let (cw, ch) = r.cell_size();
+        let cursor_color = [0, 255, 128];
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            cursor: Some((0, 0)),
+            cursor_shape: CursorShape::Block,
+            cursor_color: Some(cursor_color),
+        };
+
+        let img = r.render(vt.grid(), &opts);
+
+        for y in 0..ch {
+            for x in 0..cw {
+                let p = img.get_pixel(x, y);
+                assert_eq!(
+                    [p[0], p[1], p[2]],
+                    cursor_color,
+                    "hidden glyph leaked at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_lead_cell_cursor_spans_full_character_width() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let mut vt = VirtualTerminal::new(1, 3);
+        vt.process("界\r".as_bytes());
+        let (cw, ch) = r.cell_size();
+        let cursor_color = [0, 255, 128];
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            cursor: Some((0, 0)),
+            cursor_shape: CursorShape::Underline,
+            cursor_color: Some(cursor_color),
+        };
+
+        let img = r.render(vt.grid(), &opts);
+        let underline_y = ch - 1;
+        let left = img.get_pixel(cw / 2, underline_y);
+        let right = img.get_pixel(cw + cw / 2, underline_y);
+        assert_eq!([left[0], left[1], left[2]], cursor_color);
+        assert_eq!([right[0], right[1], right[2]], cursor_color);
+    }
+
+    #[test]
+    fn colored_block_cursor_on_wide_continuation_is_visible() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let mut vt = VirtualTerminal::new(1, 3);
+        vt.process("界\x1b[1;2H".as_bytes());
+        let (cw, ch) = r.cell_size();
+        let cursor_color = [0, 255, 128];
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            cursor: Some((0, 1)),
+            cursor_shape: CursorShape::Block,
+            cursor_color: Some(cursor_color),
+        };
+
+        let img = r.render(vt.grid(), &opts);
+        let mut continuation_cursor_pixels = 0usize;
+        for y in 0..ch {
+            for x in cw..(cw * 2) {
+                let p = img.get_pixel(x, y);
+                if [p[0], p[1], p[2]] == cursor_color {
+                    continuation_cursor_pixels += 1;
+                }
+            }
+        }
+
+        assert!(
+            continuation_cursor_pixels > 0,
+            "colored cursor disappeared on wide continuation cell"
+        );
     }
 
     #[test]

@@ -594,7 +594,8 @@ impl<W: Write> RenderCompositor<W> {
                     let sy = rect
                         .y
                         .saturating_add((cur.row as u16).min(rect.height.saturating_sub(1)));
-                    if sx < rect.x.saturating_add(rect.width)
+                    if cur.visible
+                        && sx < rect.x.saturating_add(rect.width)
                         && sy < rect.y.saturating_add(rect.height)
                         && sx < self.buffer.width()
                         && sy < self.buffer.height()
@@ -1070,6 +1071,37 @@ mod tests {
         assert!(
             output.contains("\x1b]12;#00ff80\x1b\\"),
             "missing cursor color: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_multi_pane_hidden_cursor_is_not_shown() {
+        let pid = PaneId::new();
+        let layout = LayoutNode::Leaf { pane: pid };
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"\x1b[?25lA");
+        let mut vts = HashMap::new();
+        vts.insert(pid, &vt);
+        let frame = MultiPaneFrame {
+            layout: &layout,
+            zoom: None,
+            focused: pid,
+            vts: &vts,
+            titles: None,
+            status_bar: None,
+        };
+        let mut compositor = RenderCompositor::new(10, 3, Vec::new(), CompositorConfig::default());
+
+        compositor.render_multi_pane(frame).unwrap();
+
+        let output = String::from_utf8_lossy(compositor.inner());
+        assert!(
+            output.contains("\x1b[?25l"),
+            "initial render should hide host cursor: {output:?}"
+        );
+        assert!(
+            !output.contains("\x1b[?25h"),
+            "hidden VT cursor must not be shown by attach: {output:?}"
         );
     }
 
