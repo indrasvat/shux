@@ -276,34 +276,58 @@ impl<'a> VtHandler<'a> {
             1004 => self.modes.focus_events = enable,
             // SGR mouse coordinate encoding.
             1006 => self.modes.sgr_mouse = enable,
+            // Save cursor (1048).
+            1048 => {
+                if enable {
+                    self.cursor.save(self.modes.origin_mode);
+                } else if let Some(origin) = self.cursor.restore() {
+                    self.modes.origin_mode = origin;
+                }
+            }
             // Alternate screen buffer (1047, 1049).
             1047 | 1049 => {
                 if enable {
                     if mode == 1049 {
                         self.cursor.save(self.modes.origin_mode);
                     }
+                    if self.modes.alternate_screen {
+                        if mode == 1049 {
+                            self.grid.clear_visible(self.cursor.style.bg);
+                            *self.cursor = Cursor::new();
+                        }
+                        return;
+                    }
                     // Enter alternate screen: swap grids.
                     let rows = self.grid.rows();
                     let cols = self.grid.cols();
                     let config = GridConfig { max_scrollback: 0 };
                     let alt_grid = Grid::new(rows, cols, config);
-                    let alt_cursor = Cursor::new();
                     *self.alt_grid = Some(std::mem::replace(self.grid, alt_grid));
-                    *self.alt_cursor = Some(std::mem::replace(self.cursor, alt_cursor));
+                    if mode == 1049 {
+                        let alt_cursor = Cursor::new();
+                        *self.alt_cursor = Some(std::mem::replace(self.cursor, alt_cursor));
+                    } else {
+                        self.alt_cursor.take();
+                    }
                     self.modes.alternate_screen = true;
                 } else {
                     // Leave alternate screen: restore grids.
-                    if let Some(primary_grid) = self.alt_grid.take() {
-                        *self.grid = primary_grid;
+                    if self.modes.alternate_screen {
+                        if let Some(primary_grid) = self.alt_grid.take() {
+                            *self.grid = primary_grid;
+                        }
+                        if mode == 1049 {
+                            if let Some(primary_cursor) = self.alt_cursor.take() {
+                                *self.cursor = primary_cursor;
+                            }
+                        } else {
+                            self.alt_cursor.take();
+                        }
+                        self.modes.alternate_screen = false;
                     }
-                    if let Some(primary_cursor) = self.alt_cursor.take() {
-                        *self.cursor = primary_cursor;
-                    }
-                    self.modes.alternate_screen = false;
                     if mode == 1049 {
-                        let origin = self.cursor.restore();
-                        if let Some(o) = origin {
-                            self.modes.origin_mode = o;
+                        if let Some(origin) = self.cursor.restore() {
+                            self.modes.origin_mode = origin;
                         }
                     }
                 }
@@ -577,6 +601,16 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 let row = (p(0, 1) as usize).saturating_sub(1).min(rows - 1);
                 self.cursor.row = row;
                 self.cursor.auto_wrap_pending = false;
+            }
+            // SCOSC -- Save Cursor (SCO/private form, common in modern TUI diff renderers).
+            ('s', []) if params_vec.iter().all(|&param| param == 0) => {
+                self.cursor.save(self.modes.origin_mode);
+            }
+            // SCORC -- Restore Cursor (SCO/private form).
+            ('u', []) if params_vec.iter().all(|&param| param == 0) => {
+                if let Some(origin) = self.cursor.restore() {
+                    self.modes.origin_mode = origin;
+                }
             }
             // SGR -- Select Graphic Rendition.
             ('m', []) => {

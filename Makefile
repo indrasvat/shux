@@ -111,6 +111,12 @@ test-lib: ## Run library tests only
 	@bash scripts/run-cargo-test.sh --workspace --lib -- --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Library tests passed$(COLOR_RESET)"
 
+.PHONY: test-vt
+test-vt: ## Run focused virtual terminal tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running virtual terminal tests...$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh -p shux-vt --lib -- $(FILTER) --test-threads=1
+	@echo "$(COLOR_GREEN)✓ Virtual terminal tests passed$(COLOR_RESET)"
+
 .PHONY: test-copy-mode
 test-copy-mode: ## Run focused copy-mode and copy-overlay tests
 	@echo "$(COLOR_BLUE)▶ Running copy-mode tests...$(COLOR_RESET)"

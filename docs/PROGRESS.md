@@ -88,6 +88,26 @@
 
 ## Session Log
 
+**2026-05-27 — fix(vt): cursor save/restore + idempotent alt-screen (issue #61)**
+- VT parser now handles `CSI s` / `CSI u` (SCOSC/SCORC) cursor save/restore and
+  DEC private mode 1048 save/restore, fixing Bubble Tea-style diff redraws that
+  left stale cells when apps saved/restored the cursor between frames.
+- Alternate-screen enter/leave (1047/1049) made idempotent and split by mode:
+  repeated `?1049h` no longer discards the primary grid, 1047 no longer
+  restores the primary cursor, and `?1049l` still performs its 1048-style
+  cursor restore even if the primary screen is already active.
+- Added focused regression tests (truecolor mid-row SGR over box-drawing cells,
+  short-redraw EL clearing, CSI s/u redraw, sync-mode Bubble Tea redraw, 1048
+  save/restore, repeated alt-screen enter) and a `make test-vt` target.
+- Fixed `scripts/run-cargo-test.sh`: a failing test binary now propagates its
+  nonzero status (the old `if cmd; then …; fi; status=$?` always captured 0,
+  masking failures and disabling the timeout-retry path).
+- DootSabha implementation review found VT-mode edge cases. Addressed in this
+  branch: parameterized `CSI u` is not treated as cursor restore, 1047 no
+  longer restores the primary cursor, 1049 leave restores saved cursor even
+  when already on primary, and the Bubble Tea regression now covers multiple
+  inner truecolor token transitions.
+
 **2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
 - Normal-mode mouse selection is now a first-class attach-layer state,
   separate from modal copy mode. Left-dragging visible pane text selects

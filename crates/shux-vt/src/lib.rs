@@ -693,6 +693,160 @@ mod tests {
     }
 
     #[test]
+    fn truecolor_mid_row_sgr_preserves_unicode_box_cells() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(
+            "\x1b[38;2;31;122;120m│\x1b[m \
+             \x1b[38;2;240;190;101m2E 7W 8I\x1b[m \
+             \x1b[38;2;31;122;120m│\x1b[m"
+                .as_bytes(),
+        );
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[0].ch, '│');
+        assert_eq!(row[0].style.fg, Color::Rgb(31, 122, 120));
+        assert_eq!(row[11].ch, '│');
+        assert_eq!(row[11].style.fg, Color::Rgb(31, 122, 120));
+    }
+
+    #[test]
+    fn erase_in_line_clears_shorter_diff_redraw_content() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"\x1b[?1049h");
+        vt.process(b"\x1b[2;1Hhad 1. Fix blockers");
+        vt.process(b"\x1b[2;1H\x1b[0K1. Fix blockers");
+
+        let row = vt.grid().visible_row(1);
+        let rendered: String = row.cells.iter().map(|cell| cell.ch).collect();
+        assert!(rendered.starts_with("1. Fix blockers"));
+        assert!(
+            !rendered.contains("had "),
+            "stale prior-frame content remained: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn csi_save_restore_keeps_diff_redraw_at_saved_cursor() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"\x1b[?1049h");
+        vt.process(b"\x1b[2;1H\x1b[s");
+        vt.process(b"had 1. Fix blockers");
+        vt.process(b"\x1b[u\x1b[0K1. Fix blockers");
+
+        let row = vt.grid().visible_row(1);
+        let rendered: String = row.cells.iter().map(|cell| cell.ch).collect();
+        assert!(rendered.starts_with("1. Fix blockers"));
+        assert!(
+            !rendered.contains("had "),
+            "CSI u did not restore before erase/redraw: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bubbletea_style_sync_redraw_preserves_box_and_clears_stale_text() {
+        let mut vt = VirtualTerminal::new(4, 40);
+        vt.process(b"\x1b[?1049h\x1b[?2026h");
+        vt.process(
+            "\x1b[2;1H\x1b[s\
+             \x1b[38;2;31;122;120m│\x1b[m \
+             \x1b[38;2;166;173;200mhad\x1b[m \
+             \x1b[38;2;240;190;101m1.\x1b[m \
+             \x1b[38;2;137;180;250mFix blockers\x1b[m \
+             \x1b[38;2;31;122;120m│\x1b[m"
+                .as_bytes(),
+        );
+        vt.process(
+            "\x1b[u\x1b[0K\
+             \x1b[38;2;31;122;120m│\x1b[m \
+             \x1b[38;2;240;190;101m1.\x1b[m \
+             \x1b[38;2;137;180;250mFix blockers\x1b[m \
+             \x1b[38;2;31;122;120m│\x1b[m\
+             \x1b[?2026l"
+                .as_bytes(),
+        );
+
+        let row = vt.grid().visible_row(1);
+        let rendered: String = row.cells.iter().map(|cell| cell.ch).collect();
+        assert!(rendered.starts_with("│ 1. Fix blockers │"));
+        assert!(
+            !rendered.contains("had "),
+            "stale prior-frame content remained: {rendered:?}"
+        );
+        assert_eq!(row[0].ch, '│');
+        assert_eq!(row[18].ch, '│');
+        assert_eq!(row[0].style.fg, Color::Rgb(31, 122, 120));
+        assert_eq!(row[2].style.fg, Color::Rgb(240, 190, 101));
+        assert_eq!(row[5].style.fg, Color::Rgb(137, 180, 250));
+        assert_eq!(row[18].style.fg, Color::Rgb(31, 122, 120));
+    }
+
+    #[test]
+    fn parameterized_csi_u_is_not_cursor_restore() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"\x1b[1;1H\x1b[s");
+        vt.process(b"\x1b[2;2H\x1b[27;2u");
+
+        assert_eq!((vt.cursor().row, vt.cursor().col), (1, 1));
+    }
+
+    #[test]
+    fn private_mode_1048_saves_and_restores_cursor() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"\x1b[2;5H\x1b[?1048h");
+        vt.process(b"\x1b[31m");
+        vt.process(b"\x1b[3;20H");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (2, 19));
+
+        vt.process(b"\x1b[?1048l");
+
+        assert_eq!((vt.cursor().row, vt.cursor().col), (1, 4));
+        assert_eq!(vt.cursor().style.fg, Color::Default);
+    }
+
+    #[test]
+    fn repeated_alt_screen_enter_does_not_discard_primary_grid() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"primary");
+        vt.process(b"\x1b[?1049h");
+        vt.process(b"alt");
+        vt.process(b"\x1b[?1049h");
+        assert_eq!(
+            vt.grid().visible_row(0)[0].ch,
+            ' ',
+            "re-entering 1049 should clear the active alternate grid"
+        );
+        vt.process(b"\x1b[?1049l");
+
+        let row = vt.grid().visible_row(0);
+        let rendered: String = row.cells.iter().map(|cell| cell.ch).collect();
+        assert!(rendered.starts_with("primary"));
+        assert!(!vt.is_alternate_screen());
+    }
+
+    #[test]
+    fn mode_1047_does_not_restore_primary_cursor_on_leave() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"\x1b[2;5H");
+        vt.process(b"\x1b[?1047h");
+        vt.process(b"\x1b[3;20H");
+        vt.process(b"\x1b[?1047l");
+
+        assert_eq!((vt.cursor().row, vt.cursor().col), (2, 19));
+        assert!(!vt.is_alternate_screen());
+    }
+
+    #[test]
+    fn mode_1049_leave_restores_saved_cursor_even_when_primary_active() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process(b"\x1b[2;5H\x1b[?1048h");
+        vt.process(b"\x1b[3;20H");
+        vt.process(b"\x1b[?1049l");
+
+        assert_eq!((vt.cursor().row, vt.cursor().col), (1, 4));
+        assert!(!vt.is_alternate_screen());
+    }
+
+    #[test]
     fn test_sgr_256_color() {
         let mut vt = VirtualTerminal::new(24, 80);
         // Set 256-color foreground: SGR 38;5;196.
