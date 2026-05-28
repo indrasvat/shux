@@ -96,6 +96,19 @@ pub struct MultiPaneFrame<'a> {
     pub status_bar: Option<&'a StatusBar>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorVisual {
+    shape: shux_vt::CursorShape,
+    color: Option<shux_vt::Rgb>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorTarget {
+    x: u16,
+    y: u16,
+    visual: CursorVisual,
+}
+
 /// The RenderCompositor is responsible for:
 /// 1. Reading cells from a VirtualTerminal grid (via a closure)
 /// 2. Writing them into a FrameBuffer
@@ -111,11 +124,14 @@ pub struct RenderCompositor<W: Write> {
     last_stats: Option<RenderStats>,
     /// Set to true after resize or other events that require a full redraw.
     force_full_redraw: bool,
-    /// Best-known terminal cursor state after the previous render.
+    /// Best-known terminal cursor position after the previous render.
     ///
     /// `None` means hidden. The first render starts unknown, so the
     /// compositor still emits an initial hide/show pair as needed.
     terminal_cursor: Option<(u16, u16)>,
+    /// Best-known host-terminal cursor shape/color. Tracked separately from
+    /// position so cursor-only movement can still emit just `MoveTo`.
+    terminal_cursor_visual: Option<CursorVisual>,
     cursor_state_known: bool,
 }
 
@@ -128,6 +144,7 @@ impl<W: Write> RenderCompositor<W> {
             last_stats: None,
             force_full_redraw: true, // First render is always full
             terminal_cursor: None,
+            terminal_cursor_visual: None,
             cursor_state_known: false,
         }
     }
@@ -138,6 +155,7 @@ impl<W: Write> RenderCompositor<W> {
         self.buffer.resize(width, height);
         self.force_full_redraw = true;
         self.cursor_state_known = false;
+        self.terminal_cursor_visual = None;
     }
 
     /// Get the usable area for the pane content (excluding borders and
@@ -223,6 +241,14 @@ impl<W: Write> RenderCompositor<W> {
             (screen_x < self.buffer.width() && screen_y < self.buffer.height())
                 .then_some((screen_x, screen_y))
         });
+        let target_cursor = target_cursor.map(|(x, y)| CursorTarget {
+            x,
+            y,
+            visual: CursorVisual {
+                shape: shux_vt::CursorShape::Block,
+                color: None,
+            },
+        });
         self.render_dirty_and_cursor(&dirty, target_cursor)?;
 
         let render_time = render_start.elapsed();
@@ -297,7 +323,7 @@ impl<W: Write> RenderCompositor<W> {
     fn render_dirty_and_cursor(
         &mut self,
         dirty: &[crate::buffer::DirtyCell],
-        target_cursor: Option<(u16, u16)>,
+        target_cursor: Option<CursorTarget>,
     ) -> io::Result<()> {
         let cursor_unknown = !self.cursor_state_known;
         let cursor_visible = self.terminal_cursor.is_some();
@@ -308,19 +334,27 @@ impl<W: Write> RenderCompositor<W> {
         if must_hide {
             self.backend.hide_cursor()?;
             self.terminal_cursor = None;
+            if cursor_unknown {
+                self.terminal_cursor_visual = None;
+            }
             self.cursor_state_known = true;
         }
 
         self.backend.render_diff(dirty)?;
 
-        if let Some((x, y)) = target_cursor {
-            if self.terminal_cursor != Some((x, y)) {
+        if let Some(target) = target_cursor {
+            if self.terminal_cursor_visual != Some(target.visual) {
+                self.backend.set_cursor_shape(target.visual.shape)?;
+                self.backend.set_cursor_color(target.visual.color)?;
+                self.terminal_cursor_visual = Some(target.visual);
+            }
+            if self.terminal_cursor != Some((target.x, target.y)) {
                 let was_hidden = self.terminal_cursor.is_none();
-                self.backend.set_cursor(x, y)?;
+                self.backend.set_cursor(target.x, target.y)?;
                 if was_hidden {
                     self.backend.show_cursor()?;
                 }
-                self.terminal_cursor = Some((x, y));
+                self.terminal_cursor = Some((target.x, target.y));
                 self.cursor_state_known = true;
             }
         }
@@ -553,6 +587,7 @@ impl<W: Write> RenderCompositor<W> {
             if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == frame.focused) {
                 if let Some(vt) = frame.vts.get(&frame.focused) {
                     let cur = vt.cursor();
+                    let defaults = vt.default_colors();
                     let sx = rect
                         .x
                         .saturating_add((cur.col as u16).min(rect.width.saturating_sub(1)));
@@ -564,7 +599,14 @@ impl<W: Write> RenderCompositor<W> {
                         && sx < self.buffer.width()
                         && sy < self.buffer.height()
                     {
-                        Some((sx, sy))
+                        Some(CursorTarget {
+                            x: sx,
+                            y: sy,
+                            visual: CursorVisual {
+                                shape: cur.shape,
+                                color: defaults.cursor,
+                            },
+                        })
                     } else {
                         None
                     }
@@ -671,10 +713,12 @@ impl<W: Write> RenderCompositor<W> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::Cursor;
 
     use super::*;
     use crate::buffer::RenderCell;
+    use shux_vt::VirtualTerminal;
 
     /// Helper: create a compositor backed by a `Cursor<Vec<u8>>` sink.
     /// The Cursor wrapper is owned by the compositor, so there are no
@@ -996,6 +1040,37 @@ mod tests {
         );
         assert!(!output.contains("\x1b[?25l"), "unexpected hide: {output:?}");
         assert!(!output.contains("\x1b[?25h"), "unexpected show: {output:?}");
+    }
+
+    #[test]
+    fn test_multi_pane_cursor_shape_and_color_are_emitted() {
+        let pid = PaneId::new();
+        let layout = LayoutNode::Leaf { pane: pid };
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"\x1b[3 q\x1b]12;#00ff80\x1b\\A");
+        let mut vts = HashMap::new();
+        vts.insert(pid, &vt);
+        let frame = MultiPaneFrame {
+            layout: &layout,
+            zoom: None,
+            focused: pid,
+            vts: &vts,
+            titles: None,
+            status_bar: None,
+        };
+        let mut compositor = RenderCompositor::new(10, 3, Vec::new(), CompositorConfig::default());
+
+        compositor.render_multi_pane(frame).unwrap();
+
+        let output = String::from_utf8_lossy(compositor.inner());
+        assert!(
+            output.contains("\x1b[4 q"),
+            "missing underline cursor shape: {output:?}"
+        );
+        assert!(
+            output.contains("\x1b]12;#00ff80\x1b\\"),
+            "missing cursor color: {output:?}"
+        );
     }
 
     #[test]

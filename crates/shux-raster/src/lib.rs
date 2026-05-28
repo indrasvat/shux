@@ -15,7 +15,7 @@
 //! - Per-cell glyph rendering via `fontdue` (pure Rust, no system deps).
 //! - 16-color ANSI + 256-indexed + truecolor RGB palette.
 //! - Bold (synthetic offset), dim, underline, strikethrough, inverse.
-//! - Block cursor (inverse cell).
+//! - Block/underline/bar cursor, including OSC 12 cursor color when present.
 //! - PNG output via the `image` crate.
 //!
 //! Out of scope (v1): **colour** emoji and **composed** emoji. Colour
@@ -30,7 +30,7 @@
 
 use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
-use shux_vt::{Cell, CellFlags, Color, Grid};
+use shux_vt::{Cell, CellFlags, Color, CursorShape, Grid, UnderlineStyle};
 
 /// Embedded text font. JetBrains Mono Nerd Font Mono Regular, the
 /// upstream Nerd Fonts patched build (2.4 MB) under SIL Open Font
@@ -70,6 +70,12 @@ pub struct RasterOptions {
     pub bg_default: Rgb,
     /// If set, the cursor cell `(row, col)` is rendered as an inverse block.
     pub cursor: Option<(usize, usize)>,
+    /// Cursor shape used when `cursor` is set.
+    pub cursor_shape: CursorShape,
+    /// Cursor color used when `cursor` is set. `None` preserves the legacy
+    /// inverse-block behavior for block cursors and uses `fg_default` for
+    /// underline/bar cursors.
+    pub cursor_color: Option<Rgb>,
 }
 
 impl Default for RasterOptions {
@@ -78,6 +84,8 @@ impl Default for RasterOptions {
             fg_default: [220, 220, 220],
             bg_default: [16, 16, 24],
             cursor: None,
+            cursor_shape: CursorShape::Block,
+            cursor_color: None,
         }
     }
 }
@@ -260,7 +268,7 @@ impl Rasterizer {
         }
 
         if let Some((cr, cc)) = opts.cursor {
-            self.draw_cursor(&mut img, cr, cc);
+            self.draw_cursor(&mut img, cr, cc, opts);
         }
 
         img
@@ -347,9 +355,21 @@ impl Rasterizer {
             }
         }
 
-        if style.flags.contains(CellFlags::UNDERLINE) {
-            let uy = y + self.cell_h.saturating_sub(2);
-            fill_rect(img, x, uy, cell_pixels_w, 1, fg);
+        let ext = cell.extended.as_ref();
+        let underline_style = ext
+            .map(|attrs| attrs.underline_style)
+            .unwrap_or(UnderlineStyle::None);
+        if style.flags.contains(CellFlags::UNDERLINE) || underline_style != UnderlineStyle::None {
+            let effective_style = if underline_style == UnderlineStyle::None {
+                UnderlineStyle::Single
+            } else {
+                underline_style
+            };
+            let underline_color = ext
+                .and_then(|attrs| attrs.underline_color)
+                .map(|color| resolve_color(color, opts.fg_default))
+                .unwrap_or(fg);
+            self.draw_underline(img, x, y, cell_pixels_w, effective_style, underline_color);
         }
         if style.flags.contains(CellFlags::STRIKETHROUGH) {
             let sy = y + (self.cell_h / 2);
@@ -357,17 +377,77 @@ impl Rasterizer {
         }
     }
 
-    fn draw_cursor(&self, img: &mut RgbaImage, row: usize, col: usize) {
+    fn draw_underline(
+        &self,
+        img: &mut RgbaImage,
+        x: u32,
+        y: u32,
+        width: u32,
+        style: UnderlineStyle,
+        color: Rgb,
+    ) {
+        let base = y + self.cell_h.saturating_sub(2);
+        match style {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => fill_rect(img, x, base, width, 1, color),
+            UnderlineStyle::Double => {
+                fill_rect(img, x, base.saturating_sub(2), width, 1, color);
+                fill_rect(img, x, base, width, 1, color);
+            }
+            UnderlineStyle::Curly => {
+                for dx in 0..width {
+                    let yy = match dx % 4 {
+                        0 | 2 => base,
+                        1 => (base + 1).min(y + self.cell_h.saturating_sub(1)),
+                        _ => base.saturating_sub(1),
+                    };
+                    set_pixel_rgb(img, x + dx, yy, color);
+                }
+            }
+            UnderlineStyle::Dotted => {
+                for dx in (0..width).step_by(2) {
+                    set_pixel_rgb(img, x + dx, base, color);
+                }
+            }
+            UnderlineStyle::Dashed => {
+                for dx in 0..width {
+                    if (dx / 3) % 2 == 0 {
+                        set_pixel_rgb(img, x + dx, base, color);
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_cursor(&self, img: &mut RgbaImage, row: usize, col: usize, opts: &RasterOptions) {
         let x = col as u32 * self.cell_w;
         let y = row as u32 * self.cell_h;
         let max_y = (y + self.cell_h).min(img.height());
         let max_x = (x + self.cell_w).min(img.width());
-        for yy in y..max_y {
-            for xx in x..max_x {
-                let p = img.get_pixel_mut(xx, yy);
-                p[0] = 255 - p[0];
-                p[1] = 255 - p[1];
-                p[2] = 255 - p[2];
+        let cursor_color = opts.cursor_color.unwrap_or(opts.fg_default);
+        match opts.cursor_shape {
+            CursorShape::Block => {
+                if let Some(color) = opts.cursor_color {
+                    fill_rect(img, x, y, self.cell_w, self.cell_h, color);
+                    return;
+                }
+                for yy in y..max_y {
+                    for xx in x..max_x {
+                        let p = img.get_pixel_mut(xx, yy);
+                        p[0] = 255 - p[0];
+                        p[1] = 255 - p[1];
+                        p[2] = 255 - p[2];
+                    }
+                }
+            }
+            CursorShape::Underline => {
+                let h = (self.cell_h / 8).max(1);
+                let yy = max_y.saturating_sub(h);
+                fill_rect(img, x, yy, self.cell_w, h, cursor_color);
+            }
+            CursorShape::Bar => {
+                let w = (self.cell_w / 5).max(1);
+                fill_rect(img, x, y, w, self.cell_h, cursor_color);
             }
         }
     }
@@ -409,6 +489,12 @@ fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, rgb: Rgb) {
         for xx in x..x_end {
             *img.get_pixel_mut(xx, yy) = Rgba([rgb[0], rgb[1], rgb[2], 255]);
         }
+    }
+}
+
+fn set_pixel_rgb(img: &mut RgbaImage, x: u32, y: u32, rgb: Rgb) {
+    if x < img.width() && y < img.height() {
+        *img.get_pixel_mut(x, y) = Rgba([rgb[0], rgb[1], rgb[2], 255]);
     }
 }
 
@@ -550,6 +636,47 @@ mod tests {
         assert_eq!(rgb[0], 0);
         assert!(rgb[1] > 200);
         assert_eq!(rgb[2], 0);
+    }
+
+    #[test]
+    fn renders_cursor_shape_and_color() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let vt = VirtualTerminal::new(2, 4);
+        let (cw, ch) = r.cell_size();
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            cursor: Some((0, 0)),
+            cursor_shape: CursorShape::Bar,
+            cursor_color: Some([0, 255, 128]),
+        };
+
+        let img = r.render(vt.grid(), &opts);
+
+        let bar = img.get_pixel(0, ch / 2);
+        assert_eq!([bar[0], bar[1], bar[2]], [0, 255, 128]);
+        let body = img.get_pixel(cw.saturating_sub(1), ch / 2);
+        assert_eq!([body[0], body[1], body[2]], [0, 0, 0]);
+    }
+
+    #[test]
+    fn renders_advanced_underline_color_in_snapshots() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let mut vt = VirtualTerminal::new(1, 4);
+        vt.process(b"\x1b[4:4;58:2::255:0:0mA");
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            ..Default::default()
+        };
+
+        let img = r.render(vt.grid(), &opts);
+        let red_pixels = img
+            .pixels()
+            .filter(|p| [p[0], p[1], p[2]] == [255, 0, 0])
+            .count();
+
+        assert!(red_pixels > 0, "underline color did not rasterize");
     }
 
     // ── font fallback ──────────────────────────────────────────────
@@ -719,6 +846,7 @@ mod tests {
             fg_default: [255, 255, 255],
             bg_default: [0, 0, 0],
             cursor: None,
+            ..Default::default()
         };
         let img = r.render(vt.grid(), &opts);
         assert_eq!(img.width(), 3 * cw);

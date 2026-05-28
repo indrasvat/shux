@@ -40,7 +40,7 @@ pub struct VirtualTerminal {
     scroll_region: ScrollRegion,
     /// Window title (set via OSC 0/2).
     title: Option<String>,
-    /// Dynamic default foreground/background set via OSC 10/11.
+    /// Dynamic default foreground/background/cursor set via OSC 10/11/12.
     default_colors: TerminalDefaultColors,
     /// vte parser state machine.
     parser: Parser,
@@ -145,7 +145,7 @@ impl VirtualTerminal {
         self.title.as_deref()
     }
 
-    /// Dynamic default foreground/background set by OSC 10/11.
+    /// Dynamic default foreground/background/cursor set by OSC 10/11/12.
     pub fn default_colors(&self) -> TerminalDefaultColors {
         self.default_colors
     }
@@ -360,14 +360,16 @@ mod tests {
     #[test]
     fn process_with_responses_answers_osc_color_queries() {
         let mut vt = VirtualTerminal::new(24, 80);
-        let responses =
-            vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\");
+        let responses = vt.process_with_responses(
+            b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b]4;1;?\x1b\\",
+        );
 
         assert_eq!(
             responses,
             vec![
                 b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
                 b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec(),
+                b"\x1b]12;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
                 b"\x1b]4;1;rgb:cdcd/0000/0000\x1b\\".to_vec(),
             ]
         );
@@ -390,16 +392,18 @@ mod tests {
     #[test]
     fn process_with_responses_uses_dynamic_default_colors_in_osc_queries() {
         let mut vt = VirtualTerminal::new(24, 80);
-        vt.process(b"\x1b]10;#123456\x1b\\\x1b]11;rgb:1/2/3\x1b\\");
-        let responses = vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
-        vt.process(b"\x1b]110\x1b\\\x1b]111\x1b\\");
-        let reset_responses = vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+        vt.process(b"\x1b]10;#123456\x1b\\\x1b]11;rgb:1/2/3\x1b\\\x1b]12;#00ff80\x1b\\");
+        let responses = vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\");
+        vt.process(b"\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
+        let reset_responses =
+            vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\");
 
         assert_eq!(
             responses,
             vec![
                 b"\x1b]10;rgb:1212/3434/5656\x1b\\".to_vec(),
                 b"\x1b]11;rgb:1111/2222/3333\x1b\\".to_vec(),
+                b"\x1b]12;rgb:0000/ffff/8080\x1b\\".to_vec(),
             ]
         );
         assert_eq!(
@@ -407,6 +411,7 @@ mod tests {
             vec![
                 b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
                 b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec(),
+                b"\x1b]12;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
             ]
         );
     }

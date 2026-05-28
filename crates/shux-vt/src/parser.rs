@@ -1032,14 +1032,15 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     }
                 }
             }
-            // OSC 10/11 -- Set dynamic default foreground/background.
-            b"10" | b"11" => {
+            // OSC 10/11/12 -- Set dynamic default foreground/background/cursor.
+            b"10" | b"11" | b"12" => {
                 if let Some(color_bytes) = params.get(1) {
                     if *color_bytes == b"?" {
-                        let color = if params[0] == b"10" {
-                            self.default_colors.fg.unwrap_or([238, 238, 238])
-                        } else {
-                            self.default_colors.bg.unwrap_or([0, 0, 0])
+                        let color = match params[0] {
+                            b"10" => self.default_colors.fg.unwrap_or([238, 238, 238]),
+                            b"11" => self.default_colors.bg.unwrap_or([0, 0, 0]),
+                            b"12" => self.default_colors.cursor.unwrap_or([238, 238, 238]),
+                            _ => [238, 238, 238],
                         };
                         let selector = std::str::from_utf8(params[0]).unwrap_or("10");
                         self.push_response(format!(
@@ -1048,17 +1049,19 @@ impl<'a> vte::Perform for VtHandler<'a> {
                             terminator
                         ));
                     } else if let Ok(color) = parse_osc_color(color_bytes) {
-                        if params[0] == b"10" {
-                            self.default_colors.fg = Some(color);
-                        } else {
-                            self.default_colors.bg = Some(color);
+                        match params[0] {
+                            b"10" => self.default_colors.fg = Some(color),
+                            b"11" => self.default_colors.bg = Some(color),
+                            b"12" => self.default_colors.cursor = Some(color),
+                            _ => {}
                         }
                     }
                 }
             }
-            // OSC 110/111 -- Reset dynamic default foreground/background.
+            // OSC 110/111/112 -- Reset dynamic default foreground/background/cursor.
             b"110" => self.default_colors.fg = None,
             b"111" => self.default_colors.bg = None,
+            b"112" => self.default_colors.cursor = None,
             b"4" => {
                 let mut parts = params[1..].chunks_exact(2);
                 for pair in &mut parts {
@@ -1632,9 +1635,10 @@ mod tests {
     #[test]
     fn test_ris_full_reset_clears_dynamic_default_colors() {
         let mut t = TestTerminal::new(24, 80);
-        t.process(b"\x1b]10;#ff8000\x07\x1b]11;#120a08\x07");
+        t.process(b"\x1b]10;#ff8000\x07\x1b]11;#120a08\x07\x1b]12;#00ff00\x07");
         assert_eq!(t.default_colors.fg, Some([0xff, 0x80, 0x00]));
         assert_eq!(t.default_colors.bg, Some([0x12, 0x0a, 0x08]));
+        assert_eq!(t.default_colors.cursor, Some([0x00, 0xff, 0x00]));
 
         t.process(b"\x1bc");
 
@@ -1662,6 +1666,15 @@ mod tests {
         assert_eq!(t.default_colors.fg, Some([255, 128, 0]));
         t.process(b"\x1b]110\x07");
         assert_eq!(t.default_colors.fg, None);
+    }
+
+    #[test]
+    fn test_osc_dynamic_cursor_color_rgb_and_reset() {
+        let mut t = TestTerminal::new(24, 80);
+        t.process(b"\x1b]12;rgb:0000/ffff/8000\x07");
+        assert_eq!(t.default_colors.cursor, Some([0, 255, 128]));
+        t.process(b"\x1b]112\x07");
+        assert_eq!(t.default_colors.cursor, None);
     }
 
     #[test]

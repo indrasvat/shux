@@ -9,7 +9,7 @@ use std::io::{self, Write};
 
 use crossterm::{
     QueueableCommand,
-    cursor::MoveTo,
+    cursor::{MoveTo, SetCursorStyle},
     style::{
         Attribute, Color as CtColor, Print, ResetColor, SetAttribute, SetBackgroundColor,
         SetForegroundColor, SetUnderlineColor,
@@ -303,6 +303,29 @@ impl<W: Write> RenderBackend<W> {
         self.out.flush()
     }
 
+    /// Set the host terminal cursor shape to match the focused pane's VT cursor.
+    pub fn set_cursor_shape(&mut self, shape: shux_vt::CursorShape) -> io::Result<()> {
+        let style = match shape {
+            shux_vt::CursorShape::Block => SetCursorStyle::SteadyBlock,
+            shux_vt::CursorShape::Underline => SetCursorStyle::SteadyUnderScore,
+            shux_vt::CursorShape::Bar => SetCursorStyle::SteadyBar,
+        };
+        self.out.queue(style)?;
+        self.out.flush()
+    }
+
+    /// Set or reset the host terminal cursor color.
+    ///
+    /// Crossterm does not expose OSC 12, so write the xterm-compatible
+    /// sequence directly. `None` resets to the user's terminal default.
+    pub fn set_cursor_color(&mut self, color: Option<shux_vt::Rgb>) -> io::Result<()> {
+        match color {
+            Some([r, g, b]) => write!(self.out, "\x1b]12;#{r:02x}{g:02x}{b:02x}\x1b\\")?,
+            None => self.out.write_all(b"\x1b]112\x1b\\")?,
+        }
+        self.out.flush()
+    }
+
     /// Move the cursor to a specific position (for placing the active
     /// pane's cursor after rendering).
     pub fn set_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
@@ -387,6 +410,23 @@ mod tests {
 
         backend.set_cursor(10, 20).unwrap();
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_set_cursor_shape_and_color() {
+        let mut output = Vec::new();
+        let mut backend = RenderBackend::new(&mut output);
+
+        backend
+            .set_cursor_shape(shux_vt::CursorShape::Underline)
+            .unwrap();
+        backend.set_cursor_color(Some([0, 255, 128])).unwrap();
+        backend.set_cursor_color(None).unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("\x1b[4 q"));
+        assert!(rendered.contains("\x1b]12;#00ff80\x1b\\"));
+        assert!(rendered.contains("\x1b]112\x1b\\"));
     }
 
     #[test]
