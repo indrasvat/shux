@@ -199,13 +199,27 @@ impl<'a> VtHandler<'a> {
 
     /// REP -- repeat the preceding graphic character at the current cursor.
     fn repeat_preceding_char(&mut self, count: usize) {
-        if self.cursor.col == 0 || count == 0 {
+        if count == 0 {
             return;
         }
-        let ch = self
-            .grid
-            .visible_row(self.cursor.row)
-            .get(self.cursor.col - 1)
+        let source_col = if self.cursor.auto_wrap_pending {
+            self.cursor.col
+        } else if let Some(col) = self.cursor.col.checked_sub(1) {
+            col
+        } else {
+            return;
+        };
+        let row = self.grid.visible_row(self.cursor.row);
+        let source_col = if row
+            .get(source_col)
+            .is_some_and(|cell| cell.is_wide_continuation())
+        {
+            source_col.saturating_sub(1)
+        } else {
+            source_col
+        };
+        let ch = row
+            .get(source_col)
             .map(|cell| cell.ch)
             .filter(|ch| *ch != '\0')
             .unwrap_or(' ');

@@ -886,6 +886,16 @@ mod tests {
     }
 
     #[test]
+    fn rep_after_last_column_repeats_pending_wrap_character() {
+        let mut vt = VirtualTerminal::new(3, 2);
+        vt.process(b"\x1b[2GA\x1b[2b");
+
+        assert_eq!(vt.grid().visible_row(0)[1].ch, 'A');
+        assert_eq!(vt.grid().visible_row(1)[0].ch, 'A');
+        assert_eq!(vt.grid().visible_row(1)[1].ch, 'A');
+    }
+
+    #[test]
     fn hpa_before_erase_clears_stale_scan_text_before_summary_redraw() {
         let mut vt = VirtualTerminal::new(3, 80);
         vt.process(b"\x1b[?1049h");
