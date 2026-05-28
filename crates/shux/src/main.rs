@@ -2271,9 +2271,15 @@ async fn snapshot_window(
         }
     }
 
-    // Snapshot just the (Grid, Cursor) per pane under the io lock — VT itself
-    // isn't Clone and we want to release the lock before rasterizing.
-    let pane_data: Vec<(shux_core::model::PaneId, shux_vt::Grid, shux_vt::Cursor)> = {
+    // Snapshot just the (Grid, Cursor, dynamic colors) per pane under the io
+    // lock — VT itself isn't Clone and we want to release the lock before
+    // rasterizing.
+    let pane_data: Vec<(
+        shux_core::model::PaneId,
+        shux_vt::Grid,
+        shux_vt::Cursor,
+        shux_vt::TerminalDefaultColors,
+    )> = {
         let state = io.lock().await;
         window
             .layout
@@ -2283,8 +2289,9 @@ async fn snapshot_window(
             .filter_map(|pid| {
                 state.vts.get(&pid).map(|vt| {
                     let mut grid = vt.grid().clone();
-                    resolve_grid_default_colors(&mut grid, vt.default_colors());
-                    (pid, grid, vt.cursor().clone())
+                    let default_colors = vt.default_colors();
+                    resolve_grid_default_colors(&mut grid, default_colors);
+                    (pid, grid, vt.cursor().clone(), default_colors)
                 })
             })
             .collect()
@@ -2317,7 +2324,17 @@ async fn snapshot_window(
         let panes: std::collections::HashMap<
             shux_core::model::PaneId,
             (&shux_vt::Grid, &shux_vt::Cursor),
-        > = pane_data.iter().map(|(p, g, c)| (*p, (g, c))).collect();
+        > = pane_data.iter().map(|(p, g, c, _)| (*p, (g, c))).collect();
+        let focused_defaults = pane_data
+            .iter()
+            .find(|(pid, _, _, _)| *pid == focused)
+            .map(|(_, _, _, defaults)| *defaults)
+            .unwrap_or_default();
+        let focused_cursor_shape = pane_data
+            .iter()
+            .find(|(pid, _, _, _)| *pid == focused)
+            .map(|(_, _, cursor, _)| cursor.shape)
+            .unwrap_or_default();
         let inputs = shux_ui::ComposeInputs {
             layout: &layout_tree,
             zoom: zoom_state.as_ref(),
@@ -2336,6 +2353,8 @@ async fn snapshot_window(
         );
         let opts = shux_raster::RasterOptions {
             cursor: composed.cursor,
+            cursor_shape: focused_cursor_shape,
+            cursor_color: focused_defaults.cursor,
             ..Default::default()
         };
         let img = rasterizer.render(&composed.grid, &opts);
@@ -3838,7 +3857,7 @@ fn register_pane_io_methods(
                             )));
                         }
                         let cur = vt.cursor();
-                        let cursor_pos = cur.visible.then_some((cur.row, cur.col));
+                        let cursor_pos = cur.visible.then_some((cur.row, cur.col, cur.shape));
                         let default_colors = vt.default_colors();
                         // Visible-only clone — does NOT copy scrollback.
                         let grid_clone = vt.grid().clone_visible();
@@ -3850,7 +3869,9 @@ fn register_pane_io_methods(
                     // worker that won't starve other RPC handlers.
                     let (img, png_buf) = tokio::task::spawn_blocking(move || {
                         let opts = shux_raster::RasterOptions {
-                            cursor: cursor_pos,
+                            cursor: cursor_pos.map(|(row, col, _)| (row, col)),
+                            cursor_shape: cursor_pos.map(|(_, _, shape)| shape).unwrap_or_default(),
+                            cursor_color: default_colors.cursor,
                             fg_default: default_colors.fg.unwrap_or_else(|| {
                                 shux_raster::RasterOptions::default().fg_default
                             }),
@@ -5139,6 +5160,7 @@ mod tests {
             shux_vt::TerminalDefaultColors {
                 fg: Some([1, 2, 3]),
                 bg: Some([4, 5, 6]),
+                cursor: None,
             },
         );
         assert_eq!(

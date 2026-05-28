@@ -94,6 +94,7 @@ impl RenderCell {
     }
 
     /// Convert a VT cell while resolving dynamic OSC 10/11 default colors.
+    /// OSC 12 cursor color is carried separately by the compositor/rasterizer.
     pub fn from_vt_cell_with_defaults(
         cell: &shux_vt::Cell,
         defaults: shux_vt::TerminalDefaultColors,
@@ -484,6 +485,7 @@ mod tests {
             shux_vt::TerminalDefaultColors {
                 fg: Some([232, 217, 201]),
                 bg: Some([18, 10, 8]),
+                cursor: None,
             },
         );
         assert_eq!(

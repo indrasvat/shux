@@ -93,7 +93,10 @@ impl TerminalGuard {
             self.raw_mode_enabled = false;
         }
 
-        // Show cursor in case it was hidden during rendering
+        // Restore cursor presentation in case a pane requested a custom
+        // shape or OSC 12 cursor color during rendering.
+        let _ = execute!(io::stdout(), cursor::SetCursorStyle::DefaultUserShape);
+        let _ = execute!(io::stdout(), ResetCursorColor);
         let _ = execute!(io::stdout(), cursor::Show);
 
         Ok(())
@@ -102,6 +105,14 @@ impl TerminalGuard {
     /// Query the current terminal size.
     pub fn size() -> io::Result<(u16, u16)> {
         terminal::size()
+    }
+}
+
+struct ResetCursorColor;
+
+impl Command for ResetCursorColor {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b]112\x1b\\")
     }
 }
 
@@ -156,6 +167,8 @@ pub fn install_panic_hook() {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = execute!(io::stdout(), cursor::SetCursorStyle::DefaultUserShape);
+        let _ = execute!(io::stdout(), ResetCursorColor);
         let _ = execute!(io::stdout(), cursor::Show);
 
         // Now print the panic info on the restored terminal

@@ -127,6 +127,33 @@
   OSC 8 URI parsing now preserves semicolons, and DECRQSS SGR reports advanced
   underline style/color instead of collapsing to plain `4m`.
 
+**2026-05-27 — fix(render): Bubble Tea / Charm coverage audit (issue #63)**
+- Audited Bubble Tea and Charm official renderer/VT sources for
+  rendering-adjacent behavior that affects shux attach rendering and PNG
+  snapshots. Existing coverage already included alternate screen, synchronized
+  output, renderer cursor/erase/scroll primitives, OSC 8 links, and advanced
+  underline state.
+- Closed the remaining small rendering gaps: VT now handles OSC 12/112 cursor
+  color set/query/reset; attach emits focused-pane cursor shape/color and
+  resets both on teardown; pane/window PNG snapshots render block, underline,
+  and bar cursors with OSC 12 color; raster snapshots now respect advanced
+  underline style/color instead of drawing every underline as a single fg line.
+- Added `.shux/scripts/issue_63_render_matrix.sh`, which generates stale-cell,
+  color/meta, cursor, OSC title, synchronized-output, and Vim smoke PNGs under
+  `.shux/out/issue-63/`, validates the files, and asserts synchronized output
+  does not leak unreleased text into capture.
+- Added focused regressions across `shux-vt`, `shux-ui`, and `shux-raster` for
+  OSC 12 responses, cursor shape/color emission, cursor shape/color PNG
+  rendering, and advanced underline color rasterization.
+- Follow-up review tightened colored block cursor snapshots so OSC 12 cursor
+  color paints the cursor cell while preserving the underlying glyph; added a
+  raster regression and reran the issue #63 visual matrix.
+- DootSabha brutal review found additional cross-path rendering gaps before
+  merge. Addressed live attach hidden-cursor visibility, synchronized-output
+  presentation freezing for OSC defaults/title, OSC 12 query fallback to the
+  dynamic foreground, panic-hook cursor presentation reset, and wide/hidden
+  cursor raster edge cases.
+
 **2026-05-18 — feat(copy): direct mouse selection and inline copy menu**
 - Normal-mode mouse selection is now a first-class attach-layer state,
   separate from modal copy mode. Left-dragging visible pane text selects

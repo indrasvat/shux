@@ -20,6 +20,16 @@ use vte::Parser;
 
 use crate::parser::DcsState;
 
+/// Frozen presentation state while synchronized output mode is active.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SyncPresentation {
+    pub grid: Grid,
+    pub cursor: Cursor,
+    pub default_colors: TerminalDefaultColors,
+    pub title: Option<String>,
+}
+
 /// Per-pane virtual terminal.
 ///
 /// Owns the grid, cursor, terminal modes, and the vte parser state machine.
@@ -40,14 +50,14 @@ pub struct VirtualTerminal {
     scroll_region: ScrollRegion,
     /// Window title (set via OSC 0/2).
     title: Option<String>,
-    /// Dynamic default foreground/background set via OSC 10/11.
+    /// Dynamic default foreground/background/cursor set via OSC 10/11/12.
     default_colors: TerminalDefaultColors,
     /// vte parser state machine.
     parser: Parser,
     /// In-progress DCS payload, preserved across partial PTY chunks.
     dcs_state: Option<DcsState>,
-    /// Frozen full-grid presentation while synchronized output mode is active.
-    sync_present: Option<(Grid, Cursor)>,
+    /// Frozen presentation while synchronized output mode is active.
+    sync_present: Option<SyncPresentation>,
     /// Number of visible rows.
     rows: usize,
     /// Number of columns.
@@ -123,7 +133,7 @@ impl VirtualTerminal {
     pub fn grid(&self) -> &Grid {
         self.sync_present
             .as_ref()
-            .map(|(grid, _)| grid)
+            .map(|present| &present.grid)
             .unwrap_or(&self.grid)
     }
 
@@ -131,7 +141,7 @@ impl VirtualTerminal {
     pub fn cursor(&self) -> &Cursor {
         self.sync_present
             .as_ref()
-            .map(|(_, cursor)| cursor)
+            .map(|present| &present.cursor)
             .unwrap_or(&self.cursor)
     }
 
@@ -142,12 +152,18 @@ impl VirtualTerminal {
 
     /// Get the window title (set by OSC 0/2).
     pub fn title(&self) -> Option<&str> {
-        self.title.as_deref()
+        self.sync_present
+            .as_ref()
+            .and_then(|present| present.title.as_deref())
+            .or(self.title.as_deref())
     }
 
-    /// Dynamic default foreground/background set by OSC 10/11.
+    /// Dynamic default foreground/background/cursor set by OSC 10/11/12.
     pub fn default_colors(&self) -> TerminalDefaultColors {
-        self.default_colors
+        self.sync_present
+            .as_ref()
+            .map(|present| present.default_colors)
+            .unwrap_or(self.default_colors)
     }
 
     /// Whether alternate screen is active.
@@ -169,9 +185,9 @@ impl VirtualTerminal {
         if let Some(ref mut alt) = self.alt_grid {
             alt.resize(rows, cols);
         }
-        if let Some((ref mut grid, ref mut cursor)) = self.sync_present {
-            grid.resize(rows, cols);
-            cursor.clamp(rows, cols);
+        if let Some(ref mut present) = self.sync_present {
+            present.grid.resize(rows, cols);
+            present.cursor.clamp(rows, cols);
         }
         self.rows = rows;
         self.cols = cols;
@@ -360,16 +376,29 @@ mod tests {
     #[test]
     fn process_with_responses_answers_osc_color_queries() {
         let mut vt = VirtualTerminal::new(24, 80);
-        let responses =
-            vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\");
+        let responses = vt.process_with_responses(
+            b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b]4;1;?\x1b\\",
+        );
 
         assert_eq!(
             responses,
             vec![
                 b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
                 b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec(),
+                b"\x1b]12;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
                 b"\x1b]4;1;rgb:cdcd/0000/0000\x1b\\".to_vec(),
             ]
+        );
+    }
+
+    #[test]
+    fn osc_12_query_falls_back_to_dynamic_foreground() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        let responses = vt.process_with_responses(b"\x1b]10;#ff0000\x1b\\\x1b]12;?\x1b\\");
+
+        assert_eq!(
+            responses,
+            vec![b"\x1b]12;rgb:ffff/0000/0000\x1b\\".to_vec()]
         );
     }
 
@@ -390,16 +419,18 @@ mod tests {
     #[test]
     fn process_with_responses_uses_dynamic_default_colors_in_osc_queries() {
         let mut vt = VirtualTerminal::new(24, 80);
-        vt.process(b"\x1b]10;#123456\x1b\\\x1b]11;rgb:1/2/3\x1b\\");
-        let responses = vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
-        vt.process(b"\x1b]110\x1b\\\x1b]111\x1b\\");
-        let reset_responses = vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+        vt.process(b"\x1b]10;#123456\x1b\\\x1b]11;rgb:1/2/3\x1b\\\x1b]12;#00ff80\x1b\\");
+        let responses = vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\");
+        vt.process(b"\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
+        let reset_responses =
+            vt.process_with_responses(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\");
 
         assert_eq!(
             responses,
             vec![
                 b"\x1b]10;rgb:1212/3434/5656\x1b\\".to_vec(),
                 b"\x1b]11;rgb:1111/2222/3333\x1b\\".to_vec(),
+                b"\x1b]12;rgb:0000/ffff/8080\x1b\\".to_vec(),
             ]
         );
         assert_eq!(
@@ -407,6 +438,7 @@ mod tests {
             vec![
                 b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
                 b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec(),
+                b"\x1b]12;rgb:eeee/eeee/eeee\x1b\\".to_vec(),
             ]
         );
     }
@@ -565,6 +597,44 @@ mod tests {
         assert_eq!(vt.grid().visible_row(0)[0].ch, 'n');
         assert_eq!(vt.grid().visible_row(0)[1].ch, 'e');
         assert_eq!(vt.grid().visible_row(0)[2].ch, 'w');
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "new");
+    }
+
+    #[test]
+    fn synchronized_output_freezes_presented_colors_and_title() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"\x1b]10;#112233\x1b\\\x1b]11;#000000\x1b\\\x1b]12;#eeeeee\x1b\\");
+        vt.process(b"\x1b]2;stable\x1b\\old");
+
+        vt.process(
+            b"\x1b[?2026h\x1b]10;#ff0000\x1b\\\x1b]11;#00ff00\x1b\\\
+              \x1b]12;#0000ff\x1b\\\x1b]2;pending\x1b\\\x1b[1;1Hnew",
+        );
+
+        assert!(vt.modes().synchronized_output);
+        assert_eq!(
+            vt.default_colors(),
+            TerminalDefaultColors {
+                fg: Some([0x11, 0x22, 0x33]),
+                bg: Some([0x00, 0x00, 0x00]),
+                cursor: Some([0xee, 0xee, 0xee]),
+            }
+        );
+        assert_eq!(vt.title(), Some("stable"));
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "old");
+
+        vt.process(b"\x1b[?2026l");
+
+        assert!(!vt.modes().synchronized_output);
+        assert_eq!(
+            vt.default_colors(),
+            TerminalDefaultColors {
+                fg: Some([0xff, 0x00, 0x00]),
+                bg: Some([0x00, 0xff, 0x00]),
+                cursor: Some([0x00, 0x00, 0xff]),
+            }
+        );
+        assert_eq!(vt.title(), Some("pending"));
         assert_eq!(vt.capture_text(Some(1)).trim_end(), "new");
     }
 
