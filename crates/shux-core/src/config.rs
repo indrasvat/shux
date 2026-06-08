@@ -75,12 +75,24 @@ pub struct AppearanceConfig {
     /// JetBrains Mono Nerd Font Mono Regular. When set, your font
     /// becomes primary and the bundled NF JBM stays in the fallback
     /// chain so any NF glyph your font lacks still resolves via the
-    /// bundled font.
+    /// bundled font, unless `font_fallbacks` is set explicitly. This is
+    /// the only appearance key that changes snapshot cell metrics.
     ///
     /// Doesn't affect live attach rendering (that's whatever font your
     /// terminal is configured to use).
     #[serde(default)]
     pub font: Option<std::path::PathBuf>,
+
+    /// Optional ordered fallback font chain used only by the PNG
+    /// rasterizer. Entries are file paths or builtin tokens such as
+    /// `builtin:nerd-font`, `builtin:math`, `builtin:symbols`,
+    /// `builtin:symbols-legacy`, and `builtin:emoji`. When omitted, shux
+    /// uses its default builtin fallback chain. When present, the
+    /// configured non-empty list is used exactly after the primary font.
+    /// If `font` is unset, bundled JetBrains Mono remains the metrics
+    /// anchor and this list only affects fallback glyph coverage.
+    #[serde(default)]
+    pub font_fallbacks: Option<Vec<String>>,
 }
 
 impl Default for AppearanceConfig {
@@ -89,6 +101,7 @@ impl Default for AppearanceConfig {
             border_style: default_border_style(),
             nerd_fonts: default_nerd_fonts(),
             font: None,
+            font_fallbacks: None,
         }
     }
 }

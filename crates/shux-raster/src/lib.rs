@@ -7,6 +7,10 @@
 //!   out of the box — no subset-regen ritual, no tofu when a user's
 //!   `[[statusbar.segment]]` script (starship, kubectl, …) emits NF
 //!   glyphs we didn't anticipate.
+//! - **Text-symbol fallbacks**: bundled Noto Sans Math, Noto Sans
+//!   Symbols 2, and Noto Sans Symbols cover common TUI text glyphs
+//!   such as rerun arrows, braille spinners, key legends, and status
+//!   symbols that programming fonts usually omit.
 //! - **Monochrome emoji fallback**: bundled Noto Emoji Regular
 //!   (~860 KB OFL) as the final entry in the font chain. Standalone
 //!   emoji (🍺 🧩 🦀 🚀 ⚡ …) resolve to legible monochrome glyphs in
@@ -40,6 +44,20 @@ use shux_vt::{Cell, CellFlags, Color, CursorShape, Grid, UnderlineStyle};
 /// <https://github.com/ryanoasis/nerd-fonts/releases/latest/>.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMonoNerdFontMono-Regular.ttf");
 
+/// Embedded mathematical / arrow symbol fallback. Noto Sans Math
+/// covers common text-presentation arrows such as U+21BB (↻) that
+/// terminal UIs use for rerun / refresh affordances.
+const MATH_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansMath-Regular.ttf");
+
+/// Embedded text-symbol fallback. Noto Sans Symbols 2 covers braille
+/// spinner glyphs (U+2800..U+28FF) and many status / UI symbols.
+const SYMBOLS_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansSymbols2-Regular.ttf");
+
+/// Embedded text-symbol fallback. Noto Sans Symbols covers
+/// Miscellaneous Technical glyphs that Symbols 2 deliberately does
+/// not, including U+2387 (⎇) ALTERNATIVE KEY SYMBOL.
+const SYMBOLS_1_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansSymbols-Regular.ttf");
+
 /// Embedded monochrome emoji fallback. Noto Emoji Regular (~860 KB
 /// under the same SIL OFL v1.1; license text in `assets/OFL.txt`).
 /// Appended to every rasterizer's font chain so standalone emoji
@@ -48,6 +66,38 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMonoNerdFontMono-Re
 /// flag pairs) are out of scope until `shux-vt` gains grapheme-cluster
 /// storage. See `assets/NOTICE.md` for re-fetch instructions.
 const EMOJI_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
+
+/// Builtin font token for the bundled JetBrains Mono Nerd Font.
+pub const BUILTIN_NERD_FONT: &str = "builtin:nerd-font";
+/// Builtin font token for the bundled Noto Sans Math fallback.
+pub const BUILTIN_MATH: &str = "builtin:math";
+/// Builtin font token for the bundled Noto Sans Symbols 2 fallback.
+pub const BUILTIN_SYMBOLS: &str = "builtin:symbols";
+/// Builtin font token for the bundled Noto Sans Symbols fallback.
+pub const BUILTIN_SYMBOLS_LEGACY: &str = "builtin:symbols-legacy";
+/// Builtin font token for the bundled monochrome Noto Emoji fallback.
+pub const BUILTIN_EMOJI: &str = "builtin:emoji";
+
+/// Default fallback chain appended after the primary font.
+pub const DEFAULT_FALLBACK_FONT_SPECS: &[&str] = &[
+    BUILTIN_NERD_FONT,
+    BUILTIN_MATH,
+    BUILTIN_SYMBOLS,
+    BUILTIN_SYMBOLS_LEGACY,
+    BUILTIN_EMOJI,
+];
+
+/// Resolve a builtin font token to embedded bytes.
+pub fn builtin_font_bytes(spec: &str) -> Option<&'static [u8]> {
+    match spec {
+        BUILTIN_NERD_FONT => Some(FONT_BYTES),
+        BUILTIN_MATH => Some(MATH_FONT_BYTES),
+        BUILTIN_SYMBOLS => Some(SYMBOLS_FONT_BYTES),
+        BUILTIN_SYMBOLS_LEGACY => Some(SYMBOLS_1_FONT_BYTES),
+        BUILTIN_EMOJI => Some(EMOJI_FONT_BYTES),
+        _ => None,
+    }
+}
 
 /// Rasterizer errors.
 #[derive(Debug, thiserror::Error)]
@@ -93,9 +143,9 @@ impl Default for RasterOptions {
 /// Owning rasterizer. Holds an ordered font fallback chain plus
 /// derived cell metrics. The first font that has a glyph for the
 /// requested character wins. The chain always ends with the bundled
-/// NF JetBrains Mono and the bundled monochrome Noto Emoji so PNG
-/// snapshots never tofu on common glyphs; user-supplied
-/// `appearance.font` slots in front of those builtins.
+/// NF JetBrains Mono, text-symbol fallbacks, and the bundled
+/// monochrome Noto Emoji so PNG snapshots never tofu on common glyphs;
+/// user-supplied `appearance.font` slots in front of those builtins.
 pub struct Rasterizer {
     /// Fallback chain: try fonts[0] first, then [1], etc. Metrics
     /// (cell_w / cell_h / ascent) are derived from fonts[0] only —
@@ -113,22 +163,54 @@ pub struct Rasterizer {
 impl Rasterizer {
     /// Construct a rasterizer at the given font size (in pixels)
     /// using the bundled NF-patched JetBrains Mono as primary, with
-    /// the bundled monochrome Noto Emoji as the emoji fallback. The
-    /// resulting chain is `[JBM_NF, NotoEmoji]`.
+    /// text-symbol fallbacks and bundled monochrome Noto Emoji. The
+    /// resulting chain is `[JBM_NF, NotoSansMath, NotoSansSymbols2,
+    /// NotoSansSymbols, NotoEmoji]`.
     pub fn new(font_size: f32) -> Result<Self, RasterError> {
-        Self::with_fonts(font_size, [FONT_BYTES, EMOJI_FONT_BYTES])
+        Self::with_fonts(
+            font_size,
+            [
+                FONT_BYTES,
+                MATH_FONT_BYTES,
+                SYMBOLS_FONT_BYTES,
+                SYMBOLS_1_FONT_BYTES,
+                EMOJI_FONT_BYTES,
+            ],
+        )
     }
 
     /// Construct a rasterizer with a user-supplied primary font, plus
-    /// the bundled NF-patched JBM (for NF / unicode coverage the
-    /// user's font may lack) and the bundled monochrome Noto Emoji
-    /// (for standalone emoji codepoints) as final fallbacks. The
-    /// resulting chain is `[primary, JBM_NF, NotoEmoji]`. Lets users
-    /// override the typeface via `appearance.font` while still getting
-    /// NF icons + non-tofu emoji in PNG snapshots regardless of their
-    /// chosen primary's coverage.
+    /// the default builtin fallback chain. Lets users override the
+    /// typeface via `appearance.font` while still getting NF icons,
+    /// text-symbol coverage, and non-tofu emoji in PNG snapshots
+    /// regardless of their chosen primary's coverage.
     pub fn with_primary_font(font_size: f32, primary: &[u8]) -> Result<Self, RasterError> {
-        Self::with_fonts(font_size, [primary, FONT_BYTES, EMOJI_FONT_BYTES])
+        Self::with_primary_and_fallback_fonts(
+            font_size,
+            Some(primary),
+            [
+                FONT_BYTES,
+                MATH_FONT_BYTES,
+                SYMBOLS_FONT_BYTES,
+                SYMBOLS_1_FONT_BYTES,
+                EMOJI_FONT_BYTES,
+            ],
+        )
+    }
+
+    /// Construct a rasterizer from an optional primary font and an
+    /// explicit fallback chain. When `primary` is `None`, the first
+    /// fallback font becomes the primary metrics font.
+    pub fn with_primary_and_fallback_fonts<'a, I>(
+        font_size: f32,
+        primary: Option<&'a [u8]>,
+        fallbacks: I,
+    ) -> Result<Self, RasterError>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let fonts = primary.into_iter().chain(fallbacks);
+        Self::with_fonts(font_size, fonts)
     }
 
     /// Construct a rasterizer from an explicit fallback chain.
@@ -925,15 +1007,22 @@ mod tests {
     fn with_primary_font_keeps_bundled_fallback() {
         // Pass the same bundled NF JBM bytes as "primary" — every
         // glyph the chain ever needs is here. The chain length must
-        // be 3 so a real "plain non-patched font" used as primary
-        // still gets NF coverage from the JBM fallback and emoji
-        // coverage from the Noto Emoji fallback.
+        // be 6 so a real "plain non-patched font" used as primary
+        // still gets NF coverage from the JBM fallback, text-symbol
+        // coverage from Noto, and emoji coverage from the Noto Emoji
+        // fallback.
         let r = Rasterizer::with_primary_font(14.0, FONT_BYTES).expect("rasterizer");
-        assert_eq!(r.font_count(), 3, "user-primary + JBM-NF + emoji");
+        assert_eq!(
+            r.font_count(),
+            6,
+            "user-primary + JBM-NF + math + symbols2 + symbols + emoji"
+        );
         // Sanity: ASCII, NF private-use, and an emoji codepoint all resolve.
         assert!(r.has_glyph('A'));
         assert!(r.has_glyph('\u{e0a0}')); // git branch
         assert!(r.has_glyph('\u{e7a8}')); // rust logo
+        assert!(r.has_glyph('\u{21bb}')); // ↻ rerun / refresh
+        assert!(r.has_glyph('\u{2839}')); // ⠹ braille spinner
         assert!(r.has_glyph('\u{1F37A}')); // 🍺 beer mug — resolves via Noto Emoji
     }
 
@@ -944,15 +1033,56 @@ mod tests {
     #[test]
     fn default_chain_has_emoji_fallback() {
         let r = Rasterizer::new(14.0).expect("rasterizer");
-        assert_eq!(r.font_count(), 2, "JBM-NF + emoji");
+        assert_eq!(
+            r.font_count(),
+            5,
+            "JBM-NF + math + symbols2 + symbols + emoji"
+        );
         assert!(r.has_glyph('\u{1F37A}')); // 🍺
         assert!(r.has_glyph('\u{1F9E9}')); // 🧩
         assert!(r.has_glyph('\u{1F680}')); // 🚀
         assert_eq!(r.font_idx_for('A'), 0, "ASCII resolves at primary (JBM)");
         assert_eq!(
             r.font_idx_for('\u{1F37A}'),
-            1,
+            4,
             "emoji resolves at the emoji fallback"
+        );
+    }
+
+    #[test]
+    fn builtin_font_tokens_resolve() {
+        for spec in DEFAULT_FALLBACK_FONT_SPECS {
+            assert!(
+                builtin_font_bytes(spec).is_some(),
+                "builtin font token {spec:?} should resolve"
+            );
+        }
+        assert!(builtin_font_bytes("builtin:nope").is_none());
+    }
+
+    /// Tofu-free assertion for common text-presentation glyphs used
+    /// by TUIs. These are not Nerd Font private-use icons and not
+    /// emoji; real terminals usually resolve them through their host
+    /// font fallback stack, so shux's headless PNG renderer must carry
+    /// equivalent fallback coverage.
+    #[test]
+    fn bundled_text_symbol_fallback_covers_important_tui_glyphs() {
+        let r = Rasterizer::new(14.0).expect("rasterizer");
+        let mut problems: Vec<String> = Vec::new();
+        for (label, ch) in important_tui_text_glyphs() {
+            let has = r.has_glyph(*ch);
+            let n = r.glyph_pixel_count(*ch);
+            if !has || n < 8 {
+                problems.push(format!(
+                    "  - {label} ({:#x}) has_glyph={has} pixels={n}",
+                    *ch as u32
+                ));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "bundled text-symbol fallbacks would tofu these codepoints:\n{}",
+            problems.join("\n")
         );
     }
 
@@ -1064,7 +1194,11 @@ mod tests {
             };
             let r = Rasterizer::with_primary_font(14.0, &bytes)
                 .unwrap_or_else(|e| panic!("alt font {} failed to load: {e}", alt.display()));
-            assert_eq!(r.font_count(), 3, "alt-primary + JBM-NF + emoji");
+            assert_eq!(
+                r.font_count(),
+                6,
+                "alt-primary + JBM-NF + math + symbols2 + symbols + emoji"
+            );
             let mut tofus: Vec<String> = Vec::new();
             for (label, ch) in important_glyphs_for_bundled_font() {
                 let c = *ch;
@@ -1113,15 +1247,6 @@ mod tests {
     ///
     /// Deliberately excluded (don't add unless you also add a font
     /// that has them):
-    ///   - `⎈` U+2388 (kubectl helm), `⎇` U+2387 (alt-branch) — these
-    ///     are obscure Miscellaneous-Technical-block BMP glyphs that
-    ///     JetBrains Mono does NOT include, and Nerd Fonts patching
-    ///     adds private-use-area glyphs only. The upstream
-    ///     `SymbolsNerdFontMono-Regular.ttf` also lacks them. The
-    ///     remedy is to use NF equivalents (`nf-md-kubernetes` U+F10FE
-    ///     for the helm wheel, `nf-pl-branch` U+E0A0 for git-style
-    ///     branch). `shux config init` emits a kubectl segment that
-    ///     uses U+F10FE for exactly this reason.
     ///   - Color emoji (e.g. 🦀 U+1F980) — requires a color emoji
     ///     font and a glyph-rendering pipeline that handles SVG/CBDT.
     ///     `shux config init`'s starship template sets `[rust]
@@ -1181,6 +1306,198 @@ mod tests {
             ("warning_sign U+26A0", '\u{26A0}'),    // ⚠
             ("heart U+2764", '\u{2764}'),           // ❤
             ("star_medium U+2B50", '\u{2B50}'),     // ⭐
+        ]
+    }
+
+    fn important_tui_text_glyphs() -> &'static [(&'static str, char)] {
+        &[
+            // ── arrows / key legends ──
+            ("rerun_clockwise_open_circle_arrow U+21BB", '\u{21bb}'),
+            ("rerun_anticlockwise_open_circle_arrow U+21BA", '\u{21ba}'),
+            ("clockwise_gapped_circle_arrow U+27F3", '\u{27f3}'),
+            ("anticlockwise_gapped_circle_arrow U+27F2", '\u{27f2}'),
+            ("left_arrow U+2190", '\u{2190}'),
+            ("right_arrow U+2192", '\u{2192}'),
+            ("up_arrow U+2191", '\u{2191}'),
+            ("down_arrow U+2193", '\u{2193}'),
+            ("downwards_arrow_with_corner_leftwards U+21B5", '\u{21b5}'),
+            ("return_symbol U+23CE", '\u{23ce}'),
+            ("place_of_interest U+2318", '\u{2318}'),
+            ("option_key U+2325", '\u{2325}'),
+            ("up_arrowhead U+2303", '\u{2303}'),
+            ("alternative_key_symbol U+2387", '\u{2387}'),
+            ("helm_symbol U+2388", '\u{2388}'),
+            ("erase_to_the_left U+232B", '\u{232b}'),
+            ("erase_to_the_right U+2326", '\u{2326}'),
+            ("rightwards_arrow_to_bar U+21E5", '\u{21e5}'),
+            ("leftwards_arrow_to_bar U+21E4", '\u{21e4}'),
+            ("upwards_white_arrow U+21E7", '\u{21e7}'),
+            ("escape_symbol U+238B", '\u{238b}'),
+            // ── common braille spinner frames ──
+            ("braille_spinner U+280B", '\u{280b}'),
+            ("braille_spinner U+2819", '\u{2819}'),
+            ("braille_spinner U+2839", '\u{2839}'),
+            ("braille_spinner U+2838", '\u{2838}'),
+            ("braille_spinner U+283C", '\u{283c}'),
+            ("braille_spinner U+2834", '\u{2834}'),
+            ("braille_spinner U+2826", '\u{2826}'),
+            ("braille_spinner U+2827", '\u{2827}'),
+            ("braille_spinner U+2807", '\u{2807}'),
+            ("braille_spinner U+280F", '\u{280f}'),
+            // ── status / diagnostics ──
+            ("check_mark U+2713", '\u{2713}'),
+            ("success_heavy_check U+2714", '\u{2714}'),
+            ("failure_ballot_x U+2717", '\u{2717}'),
+            ("heavy_ballot_x U+2718", '\u{2718}'),
+            ("heavy_multiplication_x U+2716", '\u{2716}'),
+            ("multiplication_sign U+00D7", '\u{00d7}'),
+            ("bullet U+2022", '\u{2022}'),
+            ("horizontal_ellipsis U+2026", '\u{2026}'),
+            ("dotted_circle U+25CC", '\u{25cc}'),
+            ("circled_division_slash U+2298", '\u{2298}'),
+            ("circled_dash U+229D", '\u{229d}'),
+            ("warning_sign U+26A0", '\u{26a0}'),
+            ("high_voltage U+26A1", '\u{26a1}'),
+            ("hourglass_flowing_sand U+23F3", '\u{23f3}'),
+            ("alarm_clock U+23F0", '\u{23f0}'),
+            ("timer_clock U+23F2", '\u{23f2}'),
+            ("stopwatch U+23F1", '\u{23f1}'),
+            ("timer_clock U+29D7", '\u{29d7}'),
+            ("hourglass U+231B", '\u{231b}'),
+            ("watch U+231A", '\u{231a}'),
+            ("black_star U+2605", '\u{2605}'),
+            ("white_star U+2606", '\u{2606}'),
+            ("black_four_pointed_star U+2726", '\u{2726}'),
+            ("white_four_pointed_star U+2727", '\u{2727}'),
+            ("circled_white_star U+272A", '\u{272a}'),
+            ("outlined_black_star U+272D", '\u{272d}'),
+            ("heavy_asterisk U+2731", '\u{2731}'),
+            ("open_center_asterisk U+2732", '\u{2732}'),
+            ("eight_spoked_asterisk U+2733", '\u{2733}'),
+            ("eight_pointed_black_star U+2734", '\u{2734}'),
+            ("twelve_pointed_black_star U+2739", '\u{2739}'),
+            ("ballot_box_with_check U+2611", '\u{2611}'),
+            ("ballot_box_with_x U+2612", '\u{2612}'),
+            ("ballot_box U+2610", '\u{2610}'),
+            ("trigram_for_heaven U+2630", '\u{2630}'),
+            ("trigram_for_lake U+2631", '\u{2631}'),
+            ("trigram_for_fire U+2632", '\u{2632}'),
+            ("trigram_for_thunder U+2633", '\u{2633}'),
+            ("trigram_for_wind U+2634", '\u{2634}'),
+            ("trigram_for_water U+2635", '\u{2635}'),
+            ("trigram_for_mountain U+2636", '\u{2636}'),
+            ("trigram_for_earth U+2637", '\u{2637}'),
+            // ── block / progress glyphs ──
+            ("full_block U+2588", '\u{2588}'),
+            ("left_seven_eighths_block U+2589", '\u{2589}'),
+            ("left_three_quarters_block U+258A", '\u{258a}'),
+            ("left_five_eighths_block U+258B", '\u{258b}'),
+            ("left_half_block U+258C", '\u{258c}'),
+            ("left_three_eighths_block U+258D", '\u{258d}'),
+            ("left_one_quarter_block U+258E", '\u{258e}'),
+            ("left_one_eighth_block U+258F", '\u{258f}'),
+            ("lower_one_eighth_block U+2581", '\u{2581}'),
+            ("lower_one_quarter_block U+2582", '\u{2582}'),
+            ("lower_three_eighths_block U+2583", '\u{2583}'),
+            ("lower_half_block U+2584", '\u{2584}'),
+            ("lower_five_eighths_block U+2585", '\u{2585}'),
+            ("lower_three_quarters_block U+2586", '\u{2586}'),
+            ("lower_seven_eighths_block U+2587", '\u{2587}'),
+            ("light_shade U+2591", '\u{2591}'),
+            ("medium_shade U+2592", '\u{2592}'),
+            ("dark_shade U+2593", '\u{2593}'),
+            // ── box drawing / borders ──
+            ("box_light_horizontal U+2500", '\u{2500}'),
+            ("box_light_vertical U+2502", '\u{2502}'),
+            ("box_light_down_right U+250C", '\u{250c}'),
+            ("box_light_down_left U+2510", '\u{2510}'),
+            ("box_light_up_right U+2514", '\u{2514}'),
+            ("box_light_up_left U+2518", '\u{2518}'),
+            ("box_light_vertical_right U+251C", '\u{251c}'),
+            ("box_light_vertical_left U+2524", '\u{2524}'),
+            ("box_light_down_horizontal U+252C", '\u{252c}'),
+            ("box_light_up_horizontal U+2534", '\u{2534}'),
+            ("box_light_cross U+253C", '\u{253c}'),
+            ("box_rounded_down_right U+256D", '\u{256d}'),
+            ("box_rounded_down_left U+256E", '\u{256e}'),
+            ("box_rounded_up_right U+2570", '\u{2570}'),
+            ("box_rounded_up_left U+256F", '\u{256f}'),
+            ("box_double_horizontal U+2550", '\u{2550}'),
+            ("box_double_vertical U+2551", '\u{2551}'),
+            ("box_double_down_right U+2554", '\u{2554}'),
+            ("box_double_down_left U+2557", '\u{2557}'),
+            ("box_double_up_right U+255A", '\u{255a}'),
+            ("box_double_up_left U+255D", '\u{255d}'),
+            ("box_double_vertical_right U+2560", '\u{2560}'),
+            ("box_double_vertical_left U+2563", '\u{2563}'),
+            ("box_double_down_horizontal U+2566", '\u{2566}'),
+            ("box_double_up_horizontal U+2569", '\u{2569}'),
+            ("box_double_cross U+256C", '\u{256c}'),
+            // ── geometric UI markers ──
+            ("black_right_small_triangle U+25B8", '\u{25b8}'),
+            ("black_down_small_triangle U+25BE", '\u{25be}'),
+            ("black_left_small_triangle U+25C2", '\u{25c2}'),
+            ("white_left_small_triangle U+25C3", '\u{25c3}'),
+            ("right-triangle U+25B6", '\u{25b6}'),
+            ("black_down_triangle U+25BC", '\u{25bc}'),
+            ("black_up_triangle U+25B2", '\u{25b2}'),
+            ("diamond U+25C6", '\u{25c6}'),
+            ("white_diamond U+25C7", '\u{25c7}'),
+            ("white_circle U+25CB", '\u{25cb}'),
+            ("black_circle U+25CF", '\u{25cf}'),
+            ("circle_left_half_black U+25D0", '\u{25d0}'),
+            ("circle_right_half_black U+25D1", '\u{25d1}'),
+            ("circle_lower_half_black U+25D2", '\u{25d2}'),
+            ("circle_upper_half_black U+25D3", '\u{25d3}'),
+            ("circle_upper_right_quadrant_black U+25D4", '\u{25d4}'),
+            (
+                "circle_all_but_upper_left_quadrant_black U+25D5",
+                '\u{25d5}',
+            ),
+            ("left_half_black_circle U+25D6", '\u{25d6}'),
+            ("right_half_black_circle U+25D7", '\u{25d7}'),
+            ("upper_left_quadrant_circular_arc U+25DC", '\u{25dc}'),
+            ("upper_right_quadrant_circular_arc U+25DD", '\u{25dd}'),
+            ("lower_right_quadrant_circular_arc U+25DE", '\u{25de}'),
+            ("lower_left_quadrant_circular_arc U+25DF", '\u{25df}'),
+            ("white_bullet U+25E6", '\u{25e6}'),
+            ("black_small_square U+25AA", '\u{25aa}'),
+            ("white_small_square U+25AB", '\u{25ab}'),
+            ("white_square U+25A1", '\u{25a1}'),
+            ("black_square U+25A0", '\u{25a0}'),
+            (
+                "white_square_containing_black_small_square U+25A3",
+                '\u{25a3}',
+            ),
+            ("square_horizontal_fill U+25A4", '\u{25a4}'),
+            ("square_vertical_fill U+25A5", '\u{25a5}'),
+            ("square_orthogonal_crosshatch_fill U+25A6", '\u{25a6}'),
+            ("square_upper_left_to_lower_right_fill U+25A7", '\u{25a7}'),
+            ("square_upper_right_to_lower_left_fill U+25A8", '\u{25a8}'),
+            ("square_diagonal_crosshatch_fill U+25A9", '\u{25a9}'),
+            ("square_left_half_black U+25E7", '\u{25e7}'),
+            ("square_right_half_black U+25E8", '\u{25e8}'),
+            ("square_upper_left_half_black U+25E9", '\u{25e9}'),
+            ("square_lower_right_half_black U+25EA", '\u{25ea}'),
+            ("downwards_arrow_with_tip_rightwards U+21B3", '\u{21b3}'),
+            ("upwards_arrow_with_tip_leftwards U+21B0", '\u{21b0}'),
+            ("upwards_arrow_with_tip_rightwards U+21B1", '\u{21b1}'),
+            ("downwards_arrow_with_tip_leftwards U+21B2", '\u{21b2}'),
+            ("rightwards_arrow_from_bar U+21A6", '\u{21a6}'),
+            ("leftwards_arrow_from_bar U+21A4", '\u{21a4}'),
+            ("rightwards_dashed_arrow U+21E2", '\u{21e2}'),
+            ("leftwards_dashed_arrow U+21E0", '\u{21e0}'),
+            ("upwards_dashed_arrow U+21E1", '\u{21e1}'),
+            ("downwards_dashed_arrow U+21E3", '\u{21e3}'),
+            ("rightwards_arrow_over_leftwards_arrow U+21C4", '\u{21c4}'),
+            (
+                "upwards_arrow_leftwards_of_downwards_arrow U+21C5",
+                '\u{21c5}',
+            ),
+            ("left_right_arrow U+2194", '\u{2194}'),
+            ("up_down_arrow U+2195", '\u{2195}'),
+            ("rightwards_double_arrow U+21D2", '\u{21d2}'),
+            ("leftwards_double_arrow U+21D0", '\u{21d0}'),
         ]
     }
 

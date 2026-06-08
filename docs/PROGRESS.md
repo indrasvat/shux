@@ -88,6 +88,57 @@
 
 ## Session Log
 
+**2026-06-08 — fix(snapshot): broaden PNG text-symbol fallbacks (issues #65/#66)**
+- Issues #65/#66 are real: GH-Hound renders common TUI glyphs correctly
+  in Ghostty while shux PNG snapshots tofu default-rasterizer gaps such
+  as `↻` and braille spinner symbols. Desktop evidence included
+  Ghostty screenshots plus shux crops where `↻ rerun` became a missing
+  glyph box.
+- Bundled three OFL Noto text-symbol fallbacks:
+  `NotoSansMath-Regular.ttf` (rerun/arrow/math symbols),
+  `NotoSansSymbols2-Regular.ttf` (braille spinners, status symbols,
+  geometric UI glyphs), and `NotoSansSymbols-Regular.ttf`
+  (Miscellaneous Technical glyphs like `⎇` / `⎈`). Default chain is now
+  `[JBM_NF, NotoSansMath, NotoSansSymbols2, NotoSansSymbols, NotoEmoji]`.
+- Added `appearance.font_fallbacks: Option<Vec<String>>` for
+  snapshot-only ordered fallbacks. Omitted config uses the default
+  builtin chain; explicit config can mix builtin tokens with font paths
+  without replacing the primary metrics font. Hot-reload key now tracks
+  both `appearance.font` and `appearance.font_fallbacks`; bad fallback
+  paths keep the last-good rasterizer.
+- Coverage expanded beyond the two reported glyphs: deterministic tests
+  assert non-empty raster output for arrows/key legends, braille spinner
+  frames, status/check/cross symbols, stars/checkboxes, progress blocks,
+  box drawing, geometric markers, segmented circles/squares, and common
+  Nerd Font icons. A local `fc-scan` pass over the curated common-TUI set
+  reported `missing_count=0` for the final chain.
+- Config docs, `shux config show` template, strict validator mirror, and
+  asset NOTICE provenance updated. `shux config validate` rejects invalid
+  `font_fallbacks` types, empty fallback lists, misspelled builtin tokens,
+  and missing fallback files. Tests assert custom fallbacks preserve the
+  primary metrics cell size; if `appearance.font` is unset, bundled JBM
+  remains the metrics anchor and explicit fallbacks only change glyph
+  coverage.
+- Skill docs and README snapshot notes updated so agent-facing guidance no
+  longer claims common scalar glyphs render as tofu; remaining limitations are
+  scoped to renderer-v2 work such as shaping, color/composed emoji, CJK/system
+  font discovery, and platform font fallback.
+- Long-term renderer-v2 scope split into GitHub issue #67: true
+  terminal-grade parity needs grapheme-cluster VT storage, shaping,
+  platform font discovery/fallback, color glyph support, and optional
+  terminal-backed capture. This branch is intentionally the tactical
+  #65/#66 compatibility layer, not the final renderer architecture.
+- Verification: `make fmt`, `make lint`, `make test-lib`, `make release`.
+  `make test-lib` passed; `shux-raster` and `shux-core` each hit the
+  known 45s per-binary runner timeout once and passed on retry. Real
+  GH-Hound proof captured from
+  `/Users/indrasvat/code/github.com/indrasvat-gh-hound/bin/gh-hound`
+  inside patched shux:
+  `.shux/out/font-fallback-gh-hound-after-review/gh-hound-runs-after-review.png`.
+- PR CI found one bad bin-test assertion for the invalid `font_fallbacks`
+  type diagnostic context; fixed the assertion and verified the
+  `config_validate` bin test module locally.
+
 **2026-05-27 — fix(vt): cursor save/restore + idempotent alt-screen (issue #61)**
 - VT parser now handles `CSI s` / `CSI u` (SCOSC/SCORC) cursor save/restore and
   DEC private mode 1048 save/restore, fixing Bubble Tea-style diff redraws that

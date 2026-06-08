@@ -37,6 +37,7 @@ of rendering tofu. Fetched from the Google Fonts CDN:
 - Family: `Noto Emoji` (Version 3.005, ~860 KB)
 - Source: <https://fonts.google.com/noto/specimen/Noto+Emoji>
 - Upstream: <https://github.com/notofonts/emoji>
+- Copyright: Copyright 2013 Google LLC
 
 Released under the SIL Open Font License v1.1 (same as JetBrains Mono;
 `OFL.txt` applies). The `name`-table License URL field points to the
@@ -74,3 +75,74 @@ Bypass route if the CSS path stops resolving cleanly: fetch a tagged
 release TTF directly from <https://github.com/notofonts/emoji/releases>
 (monochrome `.ttf`, not the COLR/CBDT colour variants) and drop it
 into this directory under the same filename.
+
+## `NotoSansMath-Regular.ttf`
+
+The text-symbol fallback used by the PNG rasterizer for mathematical
+and arrow glyphs that programming fonts often omit. The immediate
+regression case is `↻` U+21BB CLOCKWISE OPEN CIRCLE ARROW, used by
+terminal UIs for rerun / refresh actions.
+
+- Family: `Noto Sans Math`
+- Source: <https://github.com/notofonts/noto-fonts/blob/main/hinted/ttf/NotoSansMath/NotoSansMath-Regular.ttf>
+- Project: <https://github.com/notofonts/noto-fonts>
+- Copyright: Copyright 2022 The Noto Project Authors
+  (<https://github.com/notofonts/math>)
+
+Released under the SIL Open Font License v1.1 (`OFL.txt` applies).
+
+To regenerate:
+
+```bash
+curl -L --fail \
+  -o crates/shux-raster/assets/NotoSansMath-Regular.ttf \
+  https://github.com/notofonts/noto-fonts/raw/main/hinted/ttf/NotoSansMath/NotoSansMath-Regular.ttf
+make test-lib
+```
+
+## `NotoSansSymbols2-Regular.ttf`
+
+The text-symbol fallback used by the PNG rasterizer for braille
+spinners and common UI/status symbols. The immediate regression case
+is `⠹` U+2839 BRAILLE PATTERN DOTS-1456.
+
+- Family: `Noto Sans Symbols 2`
+- Source: <https://github.com/notofonts/noto-fonts/blob/main/hinted/ttf/NotoSansSymbols2/NotoSansSymbols2-Regular.ttf>
+- Project: <https://github.com/notofonts/noto-fonts>
+- Copyright: Copyright 2022 The Noto Project Authors
+  (<https://github.com/notofonts/symbols>)
+
+Released under the SIL Open Font License v1.1 (`OFL.txt` applies).
+
+To regenerate:
+
+```bash
+curl -L --fail \
+  -o crates/shux-raster/assets/NotoSansSymbols2-Regular.ttf \
+  https://github.com/notofonts/noto-fonts/raw/main/hinted/ttf/NotoSansSymbols2/NotoSansSymbols2-Regular.ttf
+make test-lib
+```
+
+## `NotoSansSymbols-Regular.ttf`
+
+The text-symbol fallback used by the PNG rasterizer for Miscellaneous
+Technical glyphs that Noto Sans Symbols 2 does not cover. The
+immediate regression-adjacent cases are `⎇` U+2387 ALTERNATIVE KEY
+SYMBOL and `⎈` U+2388 HELM SYMBOL.
+
+- Family: `Noto Sans Symbols`
+- Source: <https://github.com/notofonts/noto-fonts/blob/main/hinted/ttf/NotoSansSymbols/NotoSansSymbols-Regular.ttf>
+- Project: <https://github.com/notofonts/noto-fonts>
+- Copyright: Copyright 2022 The Noto Project Authors
+  (<https://github.com/notofonts/symbols>)
+
+Released under the SIL Open Font License v1.1 (`OFL.txt` applies).
+
+To regenerate:
+
+```bash
+curl -L --fail \
+  -o crates/shux-raster/assets/NotoSansSymbols-Regular.ttf \
+  https://github.com/notofonts/noto-fonts/raw/main/hinted/ttf/NotoSansSymbols/NotoSansSymbols-Regular.ttf
+make test-lib
+```

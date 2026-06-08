@@ -1604,34 +1604,40 @@ border_style = "rounded"
 # NF — the ASCII fallback (◆ ± ▶ @) works in any font.
 nerd_fonts = true
 # Optional custom primary text font for the PNG rasterizer. The
-# bundled NF JetBrains Mono and Noto Emoji stay in the fallback chain
-# so any glyph your font lacks (typical for plain non-patched
-# typefaces, or any standalone emoji) still resolves — no tofu either
-# way. Doesn't affect live attach (your terminal font controls that).
+# bundled NF JetBrains Mono, text-symbol fallbacks, and Noto Emoji
+# stay in the fallback chain so common glyphs your font lacks
+# (typical for plain non-patched typefaces, TUI symbols, or standalone
+# emoji) still resolve — no tofu either way. Doesn't affect live
+# attach (your terminal font controls that).
 # Font changes hot-reload: edit this line and the next snapshot uses
 # the new font. On a bad path the last-good rasterizer is retained
 # and a warning is logged.
 # font = "/path/to/your-font.ttf"
 #
-# Caveat for status-bar segments: stick to ASCII + Nerd Font
-# private-use codepoints in script segment output. Obscure BMP
-# glyphs like ⎈ (U+2388, kubectl helm) and ⎇ (U+2387, alt-branch)
-# are NOT in JetBrains Mono or any Nerd Font — they'll tofu in
-# PNG snapshots. Use NF equivalents instead. Paste either the
-# literal glyph (UTF-8) into a single-quoted TOML string, or use
-# TOML's escape inside a double-quoted string. Note TOML uses
-# bare \uXXXX (4-hex BMP) or \UXXXXXXXX (8-hex, supplementary
-# plane) — NOT Rust's \u{XXXX} form:
+# Optional ordered fallback chain for PNG snapshots only. Entries can
+# be builtin tokens or absolute font paths. Omit this field to use the
+# default builtin chain shown here. Set it explicitly when a TUI needs
+# a local/system font without changing the primary metrics font.
+# Empty lists are invalid. If font is unset, bundled JetBrains Mono
+# remains the primary metrics font and this list only changes glyph
+# fallback coverage.
+# font_fallbacks = ["builtin:nerd-font", "builtin:math", "builtin:symbols", "builtin:symbols-legacy", "builtin:emoji"]
+#
+# For status-bar segments, paste either the literal glyph (UTF-8) into
+# a single-quoted TOML string, or use TOML's escape inside a
+# double-quoted string. Note TOML uses bare \uXXXX (4-hex BMP) or
+# \UXXXXXXXX (8-hex, supplementary plane) — NOT Rust's \u{XXXX} form:
 #   nf-pl-branch      U+E0A0   ''  or  "\uE0A0"
 #   nf-md-kubernetes  U+F10FE  '󱃾'  or  "\U000F10FE"
 #   nf-md-ship_wheel  U+F124A  '󱉊'  or  "\U000F124A"
-# Standalone monochrome emoji (🍺 🧩 🦀 🚀 ⚡ …) render correctly in
-# PNG snapshots via the bundled Noto Emoji fallback — no extra
-# configuration needed. Colour emoji and composed emoji (ZWJ
-# sequences like 👨‍💻, VS16 like 🛠️, regional-indicator flag pairs,
-# skin-tone modifiers) are not yet supported — the parser splits
-# them into separate cells. For composed glyphs in status bars,
-# configure your starship language modules with the NF equivalent.
+# Common text UI glyphs (↻, ⠹, ✔, ✗, ⏎, ⌥) and standalone
+# monochrome emoji (🍺 🧩 🦀 🚀 ⚡ …) render correctly in PNG snapshots
+# via bundled fallbacks — no extra configuration needed. Colour emoji
+# and composed emoji (ZWJ sequences like 👨‍💻, VS16 like 🛠️,
+# regional-indicator flag pairs, skin-tone modifiers) are not yet
+# supported — the parser splits them into separate cells. For composed
+# glyphs in status bars, configure your starship language modules with
+# the NF equivalent.
 # Example for rust: symbol = ' ' (or
 # symbol = "\uE7A8 " using TOML escape syntax).
 

@@ -3289,15 +3289,34 @@ fn register_session_methods(
         )
 }
 
+enum SnapshotFontBytes {
+    Static(&'static [u8]),
+    Owned(Vec<u8>),
+}
+
+impl SnapshotFontBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Static(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
 /// Build the snapshot rasterizer from current config.
 ///
-/// - `appearance.font` unset → bundled JBM-NF + Noto Emoji chain.
+/// - `appearance.font` unset → bundled JBM-NF primary + default fallback chain.
 /// - `appearance.font` set + file readable + font parseable → that
-///   font as primary, then JBM-NF + Noto Emoji as fallbacks.
+///   font as primary, then configured/default fallbacks.
 /// - `appearance.font` set BUT unreadable or unparseable → returns
 ///   `Err`. The hot-reload caller's `Err` branch keeps the last-good
-///   rasterizer; the initial-build call surfaces the error so users
-///   see a clear startup failure rather than a silent downgrade.
+///   rasterizer; the startup caller logs the error and falls back to the
+///   bundled chain so snapshot RPCs still return PNGs.
+/// - `appearance.font_fallbacks` omitted → default builtin fallback
+///   tokens. Set explicitly → exact ordered fallback chain after the
+///   primary font. Empty lists are rejected. When `appearance.font` is
+///   unset, the bundled JBM-NF font remains the primary metrics anchor
+///   and the explicit list is used strictly as glyph fallback coverage.
 ///
 /// Council review (PR #46): the previous behaviour silently fell back
 /// to the bundled chain on bad custom-font paths, contradicting the
@@ -3307,26 +3326,83 @@ fn register_session_methods(
 fn build_snapshot_rasterizer(
     cfg: &shux_core::config::Config,
 ) -> Result<shux_raster::Rasterizer, shux_raster::RasterError> {
-    match cfg.appearance.font.as_ref() {
-        None => shux_raster::Rasterizer::new(14.0),
-        Some(path) => {
-            let bytes = std::fs::read(path).map_err(|e| {
-                shux_raster::RasterError::Font(format!(
-                    "appearance.font: read {} failed: {e}",
-                    path.display()
-                ))
-            })?;
-            shux_raster::Rasterizer::with_primary_font(14.0, &bytes)
+    let primary = match cfg.appearance.font.as_ref() {
+        None => None,
+        Some(path) => Some(std::fs::read(path).map_err(|e| {
+            shux_raster::RasterError::Font(format!(
+                "appearance.font: read {} failed: {e}",
+                path.display()
+            ))
+        })?),
+    };
+    let explicit_fallback_specs = cfg.appearance.font_fallbacks.clone();
+    if explicit_fallback_specs.as_ref().is_some_and(Vec::is_empty) {
+        return Err(shux_raster::RasterError::Font(
+            "appearance.font_fallbacks must not be empty; omit it to use the default fallback chain"
+                .into(),
+        ));
+    }
+    let mut fallback_specs = explicit_fallback_specs.unwrap_or_else(|| {
+        shux_raster::DEFAULT_FALLBACK_FONT_SPECS
+            .iter()
+            .map(|spec| (*spec).to_string())
+            .collect()
+    });
+    let mut bundled_primary = None;
+    if primary.is_none() {
+        bundled_primary = Some(
+            shux_raster::builtin_font_bytes(shux_raster::BUILTIN_NERD_FONT)
+                .expect("builtin nerd font token should resolve"),
+        );
+        if fallback_specs
+            .first()
+            .is_some_and(|spec| spec == shux_raster::BUILTIN_NERD_FONT)
+        {
+            fallback_specs.remove(0);
         }
     }
+    let fallback_fonts: Vec<SnapshotFontBytes> = fallback_specs
+        .iter()
+        .map(|spec| {
+            if let Some(bytes) = shux_raster::builtin_font_bytes(spec) {
+                Ok(SnapshotFontBytes::Static(bytes))
+            } else if spec.starts_with("builtin:") {
+                Err(shux_raster::RasterError::Font(format!(
+                    "appearance.font_fallbacks: unknown builtin font token {spec:?}; expected one of {}",
+                    shux_raster::DEFAULT_FALLBACK_FONT_SPECS.join(", ")
+                )))
+            } else {
+                std::fs::read(spec)
+                    .map(SnapshotFontBytes::Owned)
+                    .map_err(|e| {
+                        shux_raster::RasterError::Font(format!(
+                            "appearance.font_fallbacks: read {spec} failed: {e}"
+                        ))
+                    })
+            }
+        })
+        .collect::<Result<_, _>>()?;
+
+    let fallback_refs = fallback_fonts.iter().map(SnapshotFontBytes::as_slice);
+    let primary_ref = primary.as_deref().or(bundled_primary);
+    shux_raster::Rasterizer::with_primary_and_fallback_fonts(14.0, primary_ref, fallback_refs)
 }
 
 /// Cheap equality-key for the subset of config that affects the
 /// rasterizer chain. Returning the same value across two config
 /// reloads means we can skip the rebuild — most reloads (border
 /// styles, theme tweaks, statusbar segments) don't touch fonts.
-fn snapshot_font_key(cfg: &shux_core::config::Config) -> Option<std::path::PathBuf> {
-    cfg.appearance.font.clone()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFontKey {
+    primary: Option<std::path::PathBuf>,
+    fallbacks: Option<Vec<String>>,
+}
+
+fn snapshot_font_key(cfg: &shux_core::config::Config) -> SnapshotFontKey {
+    SnapshotFontKey {
+        primary: cfg.appearance.font.clone(),
+        fallbacks: cfg.appearance.font_fallbacks.clone(),
+    }
 }
 
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
@@ -4920,6 +4996,132 @@ mod tests {
         snap.windows.insert(window.id, window.clone());
         snap.panes.insert(pane.id, pane);
         (snap, session_id, window.id)
+    }
+
+    fn shux_raster_asset(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../shux-raster/assets")
+            .join(name)
+    }
+
+    #[test]
+    fn snapshot_rasterizer_default_chain_covers_tui_text_symbols() {
+        let cfg = Config::default();
+        let rasterizer = build_snapshot_rasterizer(&cfg).expect("rasterizer");
+        for ch in ['\u{21bb}', '\u{2839}'] {
+            assert!(
+                rasterizer.has_glyph(ch),
+                "default snapshot chain should resolve {ch:?}"
+            );
+            assert!(
+                rasterizer.glyph_pixel_count(ch) >= 8,
+                "default snapshot chain should render {ch:?} as non-empty pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_rasterizer_accepts_ordered_builtin_fallbacks() {
+        let mut cfg = Config::default();
+        cfg.appearance.font_fallbacks = Some(vec![
+            shux_raster::BUILTIN_SYMBOLS.to_string(),
+            shux_raster::BUILTIN_MATH.to_string(),
+            shux_raster::BUILTIN_SYMBOLS_LEGACY.to_string(),
+            shux_raster::BUILTIN_EMOJI.to_string(),
+        ]);
+
+        let rasterizer = build_snapshot_rasterizer(&cfg).expect("rasterizer");
+        let baseline = shux_raster::Rasterizer::new(14.0).expect("baseline rasterizer");
+        assert_eq!(
+            rasterizer.cell_size(),
+            baseline.cell_size(),
+            "custom fallbacks without appearance.font must not replace primary metrics"
+        );
+        assert!(rasterizer.has_glyph('\u{21bb}'));
+        assert!(rasterizer.has_glyph('\u{2839}'));
+        assert!(rasterizer.has_glyph('\u{1f37a}'));
+    }
+
+    #[test]
+    fn snapshot_rasterizer_accepts_path_fallback_without_replacing_primary_metrics() {
+        let mut cfg = Config::default();
+        cfg.appearance.font = Some(shux_raster_asset("JetBrainsMonoNerdFontMono-Regular.ttf"));
+        cfg.appearance.font_fallbacks = Some(vec![
+            shux_raster_asset("NotoSansSymbols2-Regular.ttf")
+                .display()
+                .to_string(),
+        ]);
+
+        let rasterizer = build_snapshot_rasterizer(&cfg).expect("rasterizer");
+        let baseline = shux_raster::Rasterizer::with_primary_font(
+            14.0,
+            include_bytes!("../../shux-raster/assets/JetBrainsMonoNerdFontMono-Regular.ttf"),
+        )
+        .expect("baseline rasterizer");
+        assert_eq!(
+            rasterizer.cell_size(),
+            baseline.cell_size(),
+            "fallback chain must not change the explicit primary font metrics"
+        );
+        assert!(rasterizer.has_glyph('A'));
+        assert!(rasterizer.has_glyph('\u{2839}'));
+    }
+
+    #[test]
+    fn snapshot_rasterizer_rejects_empty_fallbacks() {
+        let mut cfg = Config::default();
+        cfg.appearance.font_fallbacks = Some(vec![]);
+
+        let err = match build_snapshot_rasterizer(&cfg) {
+            Ok(_) => panic!("empty fallback list should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_rasterizer_rejects_unknown_builtin_fallback_token() {
+        let mut cfg = Config::default();
+        cfg.appearance.font_fallbacks = Some(vec!["builtin:symbol".to_string()]);
+
+        let err = match build_snapshot_rasterizer(&cfg) {
+            Ok(_) => panic!("unknown builtin fallback token should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unknown builtin font token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_rasterizer_rejects_missing_fallback_path() {
+        let mut cfg = Config::default();
+        cfg.appearance.font_fallbacks = Some(vec![
+            "/tmp/this-shux-font-fallback-does-not-exist.ttf".to_string(),
+        ]);
+
+        let err = match build_snapshot_rasterizer(&cfg) {
+            Ok(_) => panic!("missing fallback path should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("appearance.font_fallbacks"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_font_key_tracks_fallback_changes() {
+        let mut before = Config::default();
+        before.appearance.font = Some(std::path::PathBuf::from("/tmp/primary.ttf"));
+        let mut after = before.clone();
+        after.appearance.font_fallbacks = Some(vec![shux_raster::BUILTIN_SYMBOLS.to_string()]);
+
+        assert_ne!(snapshot_font_key(&before), snapshot_font_key(&after));
     }
 
     #[tokio::test]
