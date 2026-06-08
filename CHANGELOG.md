@@ -1,3 +1,10 @@
+## [0.28.4](https://github.com/indrasvat/shux/compare/v0.28.3...v0.28.4) (2026-06-08)
+
+
+### Bug Fixes
+
+* **snapshot:** broaden PNG font fallbacks ([15d90d7](https://github.com/indrasvat/shux/commit/15d90d7575824e20df6e7f246ade4f33d0a25b7a))
+
 ## [0.28.3](https://github.com/indrasvat/shux/compare/v0.28.2...v0.28.3) (2026-05-28)
 
 
