@@ -75,6 +75,14 @@ shux pane snapshot -s work        # PNG of the current frame
 shux config init                  # scaffold ~/.config/shux/config.toml
 ```
 
+PNG snapshots are headless: no terminal emulator participates. shux bundles a
+snapshot font chain for common TUI output out of the box: JetBrains Mono Nerd
+Font for primary monospace metrics and Nerd Font icons, Noto Sans Math/Symbols
+for arrows, braille spinners, status glyphs, box/progress symbols, and
+Miscellaneous Technical glyphs, plus monochrome Noto Emoji for standalone
+emoji. Use `appearance.font` only when you want to replace the primary metrics
+font; `appearance.font_fallbacks` is for extra snapshot-only fallback coverage.
+
 Every command mirrors an RPC method: `shux session create` is the same
 RPC as `session.create`. Drop to the raw form with
 `shux rpc call session.create --params @spec.json` when you'd rather

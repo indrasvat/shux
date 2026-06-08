@@ -19,6 +19,14 @@ never crashes on bad config.
 ```toml
 [appearance]
 border_style = "rounded"   # thin | thick | double | rounded | ascii | none
+nerd_fonts = true
+# PNG snapshots only. Live attach uses your terminal's font stack.
+# Omit font_fallbacks to use the default builtin chain shown here.
+# The list must be non-empty when set. If font is unset, bundled
+# JetBrains Mono still anchors cell metrics; this list only changes
+# glyph fallback coverage.
+# font = "/path/to/primary.ttf"
+# font_fallbacks = ["builtin:nerd-font", "builtin:math", "builtin:symbols", "builtin:symbols-legacy", "builtin:emoji"]
 
 [keys]
 prefix = "ctrl-space"      # any "<mod>-<key>" combo crossterm understands
@@ -146,8 +154,9 @@ that). On change:
    log a warning.
 2. Atomically swap the live snapshot.
 3. Notify all consumers — render loop redraws with the new appearance,
-   status-bar runner tears down the old segments and respawns with the
-   new list.
+   snapshot rasterizer rebuilds when `appearance.font` or
+   `appearance.font_fallbacks` changes, and status-bar runner tears
+   down the old segments and respawns with the new list.
 
 Edits land in <250ms. No restart, no re-attach.
 

@@ -242,4 +242,19 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 - `pane.send_keys --text` is JSON-quoted text. For raw control bytes (Esc/Enter/Tab/Ctrl+letter), use `--data` with base64.
 - `shux state apply foo.toml` atomically commits the graph but PTY spawn outcomes are reported per-pane in `spawn_results`. A spawn failure does not roll back the graph.
 - The first pane of the first template window is folded into the session's auto-created initial window — there is no phantom default-shell pane.
-- The bundled font (JetBrains Mono Regular, OFL-1.1) is monochrome. Color emoji and CJK glyphs render as `.notdef` tofu in the current rasterizer (P2 roadmap).
+- PNG snapshots use a bundled font chain by default: JetBrains Mono Nerd Font
+  for primary monospace metrics and Nerd Font icons, Noto Sans Math for arrows
+  such as `↻`, Noto Sans Symbols 2 for braille spinners/status glyphs such as
+  `⠹`, Noto Sans Symbols for older technical symbols such as `⎇`, and
+  monochrome Noto Emoji for standalone emoji. You normally do not need local
+  font config for common TUI glyphs.
+- `appearance.font` is the only config knob that changes PNG snapshot cell
+  metrics. `appearance.font_fallbacks` is snapshot-only fallback coverage; omit
+  it for the default chain. If set, it must be a non-empty ordered list of
+  builtin tokens (`builtin:nerd-font`, `builtin:math`, `builtin:symbols`,
+  `builtin:symbols-legacy`, `builtin:emoji`) or font paths. If `font` is unset,
+  bundled JetBrains Mono still anchors metrics.
+- Still not full terminal font parity: color emoji, composed emoji/ZWJ
+  sequences, ligatures, RTL shaping, CJK/system-font discovery, and platform
+  font fallback are renderer-v2 work. For those, trust live attach or keep
+  visual tests scoped to currently supported scalar glyphs.

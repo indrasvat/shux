@@ -79,11 +79,17 @@ done
 
 ## What the model sees (briefly)
 
-The shux rasterizer bundles JetBrains Mono Regular and renders all 16
-ANSI colors + the 256-cube + truecolor, plus bold/dim/inverse/underline/
-strikethrough attributes. Color emoji and CJK glyphs render as `.notdef`
-tofu in the current build — if your TUI uses those, ask the model to
-ignore them (P2 roadmap fixes this with a fallback font chain).
+The shux rasterizer renders all 16 ANSI colors + the 256-cube + truecolor,
+plus bold/dim/inverse/underline/strikethrough attributes. PNG snapshots use a
+bundled fallback chain: JetBrains Mono Nerd Font for primary monospace metrics
+and Nerd Font icons, Noto Sans Math for arrows such as `↻`, Noto Sans Symbols 2
+for braille spinners/status glyphs such as `⠹`, Noto Sans Symbols for older
+technical symbols such as `⎇`, and monochrome Noto Emoji for standalone emoji.
+
+Still not full terminal font parity: color emoji, composed emoji/ZWJ sequences,
+ligatures, RTL shaping, CJK/system-font discovery, and platform font fallback
+are renderer-v2 work. If your visual loop depends on those, keep the critique
+focused on layout/color/state and ignore those glyph-specific differences.
 
 ## Going further
 

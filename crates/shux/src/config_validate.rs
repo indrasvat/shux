@@ -60,6 +60,8 @@ mod strict {
         pub nerd_fonts: Option<bool>,
         #[serde(default)]
         pub font: Option<String>,
+        #[serde(default)]
+        pub font_fallbacks: Option<Vec<String>>,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -169,6 +171,46 @@ fn byte_to_line_col(content: &str, byte_offset: usize) -> (usize, usize) {
     (line, col)
 }
 
+fn validate_font_fallbacks(path: &Path, fallbacks: &[String], diags: &mut Vec<Diagnostic>) {
+    if fallbacks.is_empty() {
+        diags.push(Diagnostic {
+            file: path.to_path_buf(),
+            line: None,
+            column: None,
+            context: "appearance.font_fallbacks".to_string(),
+            message: "font_fallbacks must not be empty; omit it to use the default fallback chain"
+                .to_string(),
+        });
+        return;
+    }
+
+    for spec in fallbacks {
+        if shux_raster::builtin_font_bytes(spec).is_some() {
+            continue;
+        }
+        if spec.starts_with("builtin:") {
+            diags.push(Diagnostic {
+                file: path.to_path_buf(),
+                line: None,
+                column: None,
+                context: "appearance.font_fallbacks".to_string(),
+                message: format!(
+                    "unknown builtin font token {spec:?}; expected one of {}",
+                    shux_raster::DEFAULT_FALLBACK_FONT_SPECS.join(", ")
+                ),
+            });
+        } else if !Path::new(spec).is_file() {
+            diags.push(Diagnostic {
+                file: path.to_path_buf(),
+                line: None,
+                column: None,
+                context: "appearance.font_fallbacks".to_string(),
+                message: format!("fallback font path does not exist or is not a file: {spec}"),
+            });
+        }
+    }
+}
+
 /// Locate the `starship_config = """..."""` block belonging to the
 /// `segment_index`-th `[[statusbar.segment]]` header in the file.
 /// Returns the 1-based outer line on which the triple-quoted string
@@ -261,6 +303,9 @@ pub fn validate(path: &Path) -> std::io::Result<Vec<Diagnostic>> {
                     context: "keybindings".to_string(),
                     message: format!("{err:?}"),
                 });
+            }
+            if let Some(fallbacks) = cfg.appearance.font_fallbacks.as_ref() {
+                validate_font_fallbacks(path, fallbacks, &mut diags);
             }
         }
         Err(err) => {
@@ -449,10 +494,84 @@ prefix = "ctrl-a"
 border_style = "rounded"
 nerd_fonts = true
 font = "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf"
+font_fallbacks = ["builtin:nerd-font", "builtin:math", "builtin:symbols", "builtin:symbols-legacy", "builtin:emoji"]
 "#,
         );
         let diags = validate(f.path()).unwrap();
         assert!(diags.is_empty(), "diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_font_fallbacks_type() {
+        let f = write_tmp(
+            r#"
+[appearance]
+font_fallbacks = "builtin:symbols"
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].context, "");
+        assert!(
+            diags[0].message.contains("invalid type")
+                || diags[0].message.contains("expected a sequence"),
+            "unexpected diagnostic: {:?}",
+            diags[0]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_font_fallbacks() {
+        let f = write_tmp(
+            r#"
+[appearance]
+font_fallbacks = []
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].context, "appearance.font_fallbacks");
+        assert!(
+            diags[0].message.contains("must not be empty"),
+            "unexpected diagnostic: {:?}",
+            diags[0]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_builtin_font_fallback() {
+        let f = write_tmp(
+            r#"
+[appearance]
+font_fallbacks = ["builtin:symbol"]
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].context, "appearance.font_fallbacks");
+        assert!(
+            diags[0].message.contains("unknown builtin font token"),
+            "unexpected diagnostic: {:?}",
+            diags[0]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_font_fallback_path() {
+        let f = write_tmp(
+            r#"
+[appearance]
+font_fallbacks = ["/tmp/this-shux-font-fallback-does-not-exist.ttf"]
+"#,
+        );
+        let diags = validate(f.path()).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].context, "appearance.font_fallbacks");
+        assert!(
+            diags[0].message.contains("does not exist"),
+            "unexpected diagnostic: {:?}",
+            diags[0]
+        );
     }
 
     /// Same audit for `[theme]`: `status_muted` and `status_branch`
