@@ -117,6 +117,18 @@ test-vt: ## Run focused virtual terminal tests; optionally pass FILTER=<test-nam
 	@bash scripts/run-cargo-test.sh -p shux-vt --lib -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Virtual terminal tests passed$(COLOR_RESET)"
 
+.PHONY: test-ui
+test-ui: ## Run focused UI/rendering tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running UI/rendering tests...$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh -p shux-ui --lib -- $(FILTER) --test-threads=1
+	@echo "$(COLOR_GREEN)✓ UI/rendering tests passed$(COLOR_RESET)"
+
+.PHONY: test-attach-color
+test-attach-color: release ## Verify attach preserves pane colors even when daemon inherits NO_COLOR
+	@echo "$(COLOR_BLUE)▶ Running attach color regression check...$(COLOR_RESET)"
+	@.shux/scripts/issue_69_attach_color_check.sh
+	@echo "$(COLOR_GREEN)✓ Attach color regression check passed$(COLOR_RESET)"
+
 .PHONY: test-copy-mode
 test-copy-mode: ## Run focused copy-mode and copy-overlay tests
 	@echo "$(COLOR_BLUE)▶ Running copy-mode tests...$(COLOR_RESET)"

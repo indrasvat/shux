@@ -6,7 +6,7 @@
 
 **M0: Architecture Spike** — **Complete** (000–012).
 **M1: Daily-Driver Core** — In progress, ~88% by task count.
-- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 027, 029, 033, 060, 062, 063, 064.
+- **Done:** 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 026, 027, 029, 033, 060, 062, 063, 064, 065.
 - **Partial:** 024 (theme: only border + status-bar overrides — full token cascade pending), 028 (cap negotiation: TERM_PROGRAM claimed, no DA2/XTVERSION query yet), 031 (attach keybinding config/validation landed; runtime keybinding RPC/plugin provenance deferred).
 - **018 (Tier-1 keys) finalized (PR #13):** Bare Alt+h/j/k/l → directional focus; Alt+n/p → next/prev window; Alt+1..9 → switch directly to Nth window via new `ActionKind::SwitchToWindow` + `ActionArgs.window_index`. `key_to_bare_action` return type bumped from `Option<ActionKind>` to `Option<(ActionKind, ActionArgs)>`. Out-of-range Alt+digit silently ignored (matches tmux). 4 new unit tests in `crates/shux-ui/src/attach.rs`.
 - **027 (pane titles) — Done (PR 4 / #12):** `Pane` gained `manual_title: Option<String>`, `osc_title: Option<String>` alongside existing `title` + `auto_title`. Priority resolution: manual > osc (when auto on) > command basename > cwd basename, computed by `Pane::recalculate_title()`. `sanitize_title()` strips control chars + clamps to 64 chars. `set_pane_title()` and `set_pane_osc_title()` on SessionGraph fire `PaneTitleChanged` only when displayed title actually moves. Per-pane PTY task tracks `last_osc_title` locally and forwards changes to graph outside the io_state lock (deadlock avoidance). Compositor `MultiPaneFrame` gained `titles: Option<&HashMap<PaneId, String>>`; titles render as ` title `-padded text on the top border row, truncated to fit. `pane.set_title` RPC accepts `{title: string|null, auto: bool|null}` tri-state. `shux pane title` CLI with `-t/--clear/--auto/--no-auto`. 11 model unit tests + 5 graph unit tests.
@@ -87,6 +87,30 @@
 ---
 
 ## Session Log
+
+**2026-06-11 — fix(attach): preserve pane colors when daemon inherits NO_COLOR (issue #69)**
+- Issue #69 is an attach-renderer bug, not a guest TUI bug: pane PTYs and
+  snapshot rasterization can retain color while `session attach` strips pane
+  fg/bg color if the shux daemon inherited `NO_COLOR=1`.
+- Published release checks disproved `v0.25.0` as the introduction point:
+  both `v0.24.3` (May 17, 2026) and `v0.25.0` (May 18, 2026) rendered
+  `vivecaka --repo indrasvat/gh-hound` with color in a clean daemon and
+  emitted zero attach color SGR when the daemon started under `NO_COLOR=1`.
+- Root cause was crossterm's process-global color-disabled gate. The attach
+  backend previously serialized pane colors through crossterm
+  `SetForegroundColor` / `SetBackgroundColor`, which produce empty color SGR
+  when the global gate is set.
+- Fixed `shux-ui::RenderBackend` with renderer-local ANSI color commands for
+  foreground, background, and underline color. The fix does not mutate
+  crossterm global state, so ordinary CLI `NO_COLOR` semantics remain intact.
+- Added guardrails: focused `make test-ui`, unit coverage for RGB/256/basic
+  color SGR under disabled crossterm global color state, multi-pane attach
+  compositor coverage, and `make test-attach-color` for a release-binary PTY
+  attach smoke under daemon `NO_COLOR=1`.
+- Verification: `make test-ui`, `make test-attach-color`, and `make ci` passed.
+  Patched real-`vivecaka` proof under daemon `NO_COLOR=1` emitted
+  `truecolor_sgr=182`, `indexed_sgr=2`, `empty_sgr=0`; snapshot proof is
+  `.shux/out/issue-69/patched-no-color-vivecaka-pane.png`.
 
 **2026-06-08 — fix(snapshot): broaden PNG text-symbol fallbacks (issues #65/#66)**
 - Issues #65/#66 are real: GH-Hound renders common TUI glyphs correctly

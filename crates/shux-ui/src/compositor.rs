@@ -1075,6 +1075,60 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_pane_attach_preserves_vt_cell_colors_when_no_color_is_set() {
+        crossterm::style::Colored::set_ansi_color_disabled(true);
+
+        let pid = PaneId::new();
+        let layout = LayoutNode::Leaf { pane: pid };
+        let mut vt = VirtualTerminal::new(3, 12);
+        vt.process(
+            b"\x1b[38;2;10;20;30;48;2;40;50;60mT\x1b[0m\
+              \x1b[38;5;196mI\x1b[0m\
+              \x1b[31mB",
+        );
+        let mut vts = HashMap::new();
+        vts.insert(pid, &vt);
+        let frame = MultiPaneFrame {
+            layout: &layout,
+            zoom: None,
+            focused: pid,
+            vts: &vts,
+            titles: None,
+            status_bar: None,
+        };
+        let mut compositor = RenderCompositor::new(
+            12,
+            3,
+            Vec::new(),
+            CompositorConfig {
+                border_style: BorderStyle::None,
+                ..CompositorConfig::default()
+            },
+        );
+
+        compositor.render_multi_pane(frame).unwrap();
+        crossterm::style::Colored::set_ansi_color_disabled(false);
+
+        let output = String::from_utf8_lossy(compositor.inner());
+        assert!(
+            output.contains("\x1b[38;2;10;20;30m"),
+            "attach output stripped truecolor fg: {output:?}"
+        );
+        assert!(
+            output.contains("\x1b[48;2;40;50;60m"),
+            "attach output stripped truecolor bg: {output:?}"
+        );
+        assert!(
+            output.contains("\x1b[38;5;196m"),
+            "attach output stripped 256-color fg: {output:?}"
+        );
+        assert!(
+            output.contains("\x1b[38;5;1m"),
+            "attach output stripped indexed basic fg: {output:?}"
+        );
+    }
+
+    #[test]
     fn test_multi_pane_hidden_cursor_is_not_shown() {
         let pid = PaneId::new();
         let layout = LayoutNode::Leaf { pane: pid };
