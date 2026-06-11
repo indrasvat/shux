@@ -1,3 +1,10 @@
+## [0.28.5](https://github.com/indrasvat/shux/compare/v0.28.4...v0.28.5) (2026-06-11)
+
+
+### Bug Fixes
+
+* **attach:** preserve pane colors under no_color ([25c0307](https://github.com/indrasvat/shux/commit/25c030723c7f1ea53a3e1f4c67a8960e94ca6a9f))
+
 ## [0.28.4](https://github.com/indrasvat/shux/compare/v0.28.3...v0.28.4) (2026-06-08)
 
 
