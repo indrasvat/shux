@@ -5,15 +5,13 @@
 //! Uses synchronized output (Mode 2026) via `BeginSynchronizedUpdate` /
 //! `EndSynchronizedUpdate` to prevent tearing (PRD section 6.1).
 
+use std::fmt;
 use std::io::{self, Write};
 
 use crossterm::{
-    QueueableCommand,
+    Command, QueueableCommand,
     cursor::{MoveTo, SetCursorStyle},
-    style::{
-        Attribute, Color as CtColor, Print, ResetColor, SetAttribute, SetBackgroundColor,
-        SetForegroundColor, SetUnderlineColor,
-    },
+    style::{Attribute, Color as CtColor, Print, ResetColor, SetAttribute},
     terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
 
@@ -31,6 +29,108 @@ pub struct RenderBackend<W: Write> {
     last_underline_style: Option<shux_vt::UnderlineStyle>,
     last_underline_color: Option<Option<CtColor>>,
     last_hyperlink: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetAnsiForegroundColor(CtColor);
+
+impl Command for SetAnsiForegroundColor {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write_color_sgr(f, ColorTarget::Foreground, self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetAnsiBackgroundColor(CtColor);
+
+impl Command for SetAnsiBackgroundColor {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write_color_sgr(f, ColorTarget::Background, self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetAnsiUnderlineColor(CtColor);
+
+impl Command for SetAnsiUnderlineColor {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write_color_sgr(f, ColorTarget::Underline, self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorTarget {
+    Foreground,
+    Background,
+    Underline,
+}
+
+fn write_color_sgr(f: &mut impl fmt::Write, target: ColorTarget, color: CtColor) -> fmt::Result {
+    match color {
+        CtColor::Reset => write!(f, "\x1b[{}m", reset_code(target)),
+        CtColor::AnsiValue(index) => write!(f, "\x1b[{};5;{}m", extended_code(target), index),
+        CtColor::Rgb { r, g, b } => {
+            write!(f, "\x1b[{};2;{};{};{}m", extended_code(target), r, g, b)
+        }
+        named => {
+            let Some(index) = named_color_index(named) else {
+                return write!(f, "\x1b[{}m", reset_code(target));
+            };
+            match target {
+                ColorTarget::Foreground | ColorTarget::Background => {
+                    let base = if target == ColorTarget::Foreground {
+                        if index < 8 { 30 } else { 90 }
+                    } else if index < 8 {
+                        40
+                    } else {
+                        100
+                    };
+                    write!(f, "\x1b[{}m", base + u16::from(index % 8))
+                }
+                ColorTarget::Underline => {
+                    write!(f, "\x1b[{};5;{}m", extended_code(target), index)
+                }
+            }
+        }
+    }
+}
+
+fn reset_code(target: ColorTarget) -> u16 {
+    match target {
+        ColorTarget::Foreground => 39,
+        ColorTarget::Background => 49,
+        ColorTarget::Underline => 59,
+    }
+}
+
+fn extended_code(target: ColorTarget) -> u16 {
+    match target {
+        ColorTarget::Foreground => 38,
+        ColorTarget::Background => 48,
+        ColorTarget::Underline => 58,
+    }
+}
+
+fn named_color_index(color: CtColor) -> Option<u8> {
+    match color {
+        CtColor::Black => Some(0),
+        CtColor::DarkRed => Some(1),
+        CtColor::DarkGreen => Some(2),
+        CtColor::DarkYellow => Some(3),
+        CtColor::DarkBlue => Some(4),
+        CtColor::DarkMagenta => Some(5),
+        CtColor::DarkCyan => Some(6),
+        CtColor::Grey => Some(7),
+        CtColor::DarkGrey => Some(8),
+        CtColor::Red => Some(9),
+        CtColor::Green => Some(10),
+        CtColor::Yellow => Some(11),
+        CtColor::Blue => Some(12),
+        CtColor::Magenta => Some(13),
+        CtColor::Cyan => Some(14),
+        CtColor::White => Some(15),
+        _ => None,
+    }
 }
 
 impl<W: Write> RenderBackend<W> {
@@ -201,7 +301,7 @@ impl<W: Write> RenderBackend<W> {
                 }
             }
             if let Some(color) = underline_color {
-                self.out.queue(SetUnderlineColor(color))?;
+                self.out.queue(SetAnsiUnderlineColor(color))?;
             }
             if cell.attrs.blink {
                 self.out.queue(SetAttribute(Attribute::SlowBlink))?;
@@ -230,10 +330,10 @@ impl<W: Write> RenderBackend<W> {
         if self.last_fg != Some(cell.fg) {
             match cell.fg {
                 Some(color) => {
-                    self.out.queue(SetForegroundColor(color))?;
+                    self.out.queue(SetAnsiForegroundColor(color))?;
                 }
                 None => {
-                    self.out.queue(SetForegroundColor(CtColor::Reset))?;
+                    self.out.queue(SetAnsiForegroundColor(CtColor::Reset))?;
                 }
             }
             self.last_fg = Some(cell.fg);
@@ -243,10 +343,10 @@ impl<W: Write> RenderBackend<W> {
         if self.last_bg != Some(cell.bg) {
             match cell.bg {
                 Some(color) => {
-                    self.out.queue(SetBackgroundColor(color))?;
+                    self.out.queue(SetAnsiBackgroundColor(color))?;
                 }
                 None => {
-                    self.out.queue(SetBackgroundColor(CtColor::Reset))?;
+                    self.out.queue(SetAnsiBackgroundColor(CtColor::Reset))?;
                 }
             }
             self.last_bg = Some(cell.bg);
@@ -431,6 +531,7 @@ mod tests {
 
     #[test]
     fn test_render_diff_with_styled_cells() {
+        crossterm::style::Colored::set_ansi_color_disabled(false);
         let mut output = Vec::new();
         let mut backend = RenderBackend::new(&mut output);
 
@@ -465,6 +566,68 @@ mod tests {
         let output_str = String::from_utf8_lossy(&output);
         assert!(output_str.contains('A'));
         assert!(output_str.contains('B'));
+        assert!(
+            output_str.contains("\x1b[91m"),
+            "missing red fg SGR: {output_str:?}"
+        );
+        assert!(
+            output_str.contains("\x1b[104m"),
+            "missing blue bg SGR: {output_str:?}"
+        );
+        assert!(
+            output_str.contains("\x1b[92m"),
+            "missing green fg SGR: {output_str:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_backend_colors_ignore_no_color_without_mutating_global_state() {
+        crossterm::style::Colored::set_ansi_color_disabled(true);
+        let mut output = Vec::new();
+        let mut backend = RenderBackend::new(&mut output);
+        assert!(crossterm::style::Colored::ansi_color_disabled_memoized());
+
+        backend
+            .render_diff(&[
+                DirtyCell {
+                    col: 0,
+                    row: 0,
+                    cell: RenderCell::styled(
+                        'R',
+                        Some(crossterm::style::Color::Rgb { r: 1, g: 2, b: 3 }),
+                        Some(crossterm::style::Color::Rgb { r: 4, g: 5, b: 6 }),
+                        RenderAttrs::default(),
+                    ),
+                },
+                DirtyCell {
+                    col: 1,
+                    row: 0,
+                    cell: RenderCell::styled(
+                        'I',
+                        Some(crossterm::style::Color::AnsiValue(196)),
+                        None,
+                        RenderAttrs::default(),
+                    ),
+                },
+            ])
+            .unwrap();
+
+        assert!(crossterm::style::Colored::ansi_color_disabled_memoized());
+        crossterm::style::Colored::set_ansi_color_disabled(false);
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("\x1b[38;2;1;2;3m"),
+            "truecolor fg was stripped: {output_str:?}"
+        );
+        assert!(
+            output_str.contains("\x1b[48;2;4;5;6m"),
+            "truecolor bg was stripped: {output_str:?}"
+        );
+        assert!(
+            output_str.contains("\x1b[38;5;196m"),
+            "256-color fg was stripped: {output_str:?}"
+        );
     }
 
     #[test]
