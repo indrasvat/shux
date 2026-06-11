@@ -89,6 +89,16 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-06-11 — fix(record): validate pane record session scope**
+- Follow-up from PR review: `shux pane record -s <session>` now verifies the
+  target pane belongs to the requested session before calling
+  `pane.record.start`, so UUID-only access cannot cross session boundaries.
+- Tightened the CLI RPC fixture so successful result payloads can include
+  `"error": null` without being misclassified as JSON-RPC errors.
+- Verification after the review fix: `make fmt`, focused `pane_record` tests,
+  `make test-lossless-record`, `make ci`, `make deny`, and `git diff --check`
+  passed. `make check-progress` required this fresh session-log entry.
+
 **2026-06-11 — fix(record): add lossless pane output recording (issue #70)**
 - Issue #70 is real: `pane.output.watch` remains intentionally sampled and
   capped at the PTY source, so absence-of-bytes assertions over watch output

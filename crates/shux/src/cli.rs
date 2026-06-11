@@ -2692,6 +2692,52 @@ async fn resolve_pane_window_id(
     }
 }
 
+async fn validate_pane_belongs_to_session(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    pane_id: &str,
+) -> Result<(), RpcClientError> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    let windows = rpc_call(
+        stream,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await?;
+    let Some(windows) = windows.as_array() else {
+        return Err(RpcClientError::Rpc {
+            code: -32004,
+            message: "could not list session windows".to_string(),
+            data: None,
+        });
+    };
+
+    for window in windows {
+        let Some(window_id) = window.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let panes = rpc_call(
+            stream,
+            "pane.list",
+            serde_json::json!({"session_id": session_id, "window_id": window_id}),
+        )
+        .await?;
+        if panes.as_array().is_some_and(|panes| {
+            panes
+                .iter()
+                .any(|p| p.get("id").and_then(|v| v.as_str()) == Some(pane_id))
+        }) {
+            return Ok(());
+        }
+    }
+
+    Err(RpcClientError::Rpc {
+        code: -32004,
+        message: format!("pane {pane_id} does not belong to session {session_name}"),
+        data: None,
+    })
+}
+
 /// Handle the `shux pane list` command.
 pub async fn handle_pane_list(
     stream: &mut tokio::net::UnixStream,
@@ -3201,7 +3247,7 @@ pub async fn handle_pane_watch(
 /// a bounded duration or Ctrl-C, then stop and report the byte count.
 pub async fn handle_pane_record(
     stream: &mut tokio::net::UnixStream,
-    _session_name: &str,
+    session_name: &str,
     pane_id: &str,
     to: &std::path::Path,
     force: bool,
@@ -3212,6 +3258,7 @@ pub async fn handle_pane_record(
     let _: uuid::Uuid = pane_id
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid pane uuid: {e}"))?;
+    validate_pane_belongs_to_session(stream, session_name, pane_id).await?;
 
     let path = if to.is_absolute() {
         to.to_path_buf()
@@ -4320,7 +4367,7 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
                 captured.lock().unwrap().push(request.clone());
 
-                let response = if let Some(error) = scripted.get("error") {
+                let response = if let Some(error) = scripted.get("error").filter(|e| !e.is_null()) {
                     serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
@@ -5468,6 +5515,8 @@ mod tests {
         let session = || session_list_response(sid, wid);
         let windows = || window_list_response(wid, pane);
         let png_b64 = "iVBORw0KGgo=";
+        let record_dir = tempfile::tempdir().unwrap();
+        let record_path = record_dir.path().join("record.raw");
         let (mut client, requests, task) = spawn_rpc_script(vec![
             session(),
             windows(),
@@ -5482,6 +5531,11 @@ mod tests {
             session(),
             windows(),
             serde_json::json!({"pane_id": pane, "cols": 100, "rows": 30}),
+            session(),
+            windows(),
+            serde_json::json!([{"id": pane, "cwd": "/tmp", "command": "bash", "is_focused": true, "is_zoomed": false}]),
+            serde_json::json!({"recording_id": "55555555-5555-4555-8555-555555555555", "pane_id": pane, "path": record_path.display().to_string(), "duration_ms": 0, "lossless": true, "backpressure": true}),
+            serde_json::json!({"recording_id": "55555555-5555-4555-8555-555555555555", "path": record_path.display().to_string(), "bytes_written": 0, "status": "complete", "lossless": true, "error": null}),
             session(),
             windows(),
             serde_json::json!({"png_base64": png_b64, "width": 10, "height": 10}),
@@ -5551,6 +5605,17 @@ mod tests {
         )
         .await
         .unwrap();
+        handle_pane_record(
+            &mut client,
+            "dev",
+            pane,
+            &record_path,
+            true,
+            Some(0),
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
         handle_pane_snapshot(
             &mut client,
             "dev",
@@ -5605,6 +5670,16 @@ mod tests {
                 .iter()
                 .any(|r| r["method"] == "pane.set_size" && r["params"]["cols"] == 100)
         );
+        assert!(requests.iter().any(|r| {
+            r["method"] == "pane.record.start"
+                && r["params"]["pane_id"] == pane
+                && r["params"]["path"] == record_path.display().to_string()
+        }));
+        assert!(requests.iter().any(|r| {
+            r["method"] == "pane.list"
+                && r["params"]["session_id"] == sid
+                && r["params"]["window_id"] == wid
+        }));
         assert!(requests.iter().any(|r| r["method"] == "pane.snapshot"));
         assert!(requests.iter().any(|r| r["method"] == "session.snapshot"));
         assert!(requests.iter().any(|r| r["method"] == "window.snapshot"));
