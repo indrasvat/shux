@@ -1144,12 +1144,12 @@ pub enum PaneCommand {
     /// Watch sampled PTY output from a pane (PR 2c).
     ///
     /// Long-polls `pane.output.watch` and prints each base64-decoded
-    /// chunk to stdout. Pipes cleanly:
-    /// `shux pane watch -p X | tee log`. Output is rate-limited at
-    /// the source to ~10 chunks/sec/pane to prevent noisy panes from
-    /// drowning subscribers. Bytes that arrived before the first
-    /// poll are UNREACHABLE — the data plane is intentionally lossy
-    /// to keep terminal secrets out of any history.
+    /// chunk to stdout. This is a low-overhead live observation stream,
+    /// not a byte-exact transcript. Output is rate-limited at the source
+    /// to ~10 chunks/sec/pane and may drop older bytes from a burst before
+    /// publishing a sampled chunk. Absence-of-bytes assertions over this
+    /// command are unsound; use `shux pane record --to FILE` for lossless
+    /// capture.
     Watch {
         /// Session name (used to validate the pane belongs to a
         /// live session; the daemon also enforces this).
@@ -1168,6 +1168,36 @@ pub enum PaneCommand {
         /// Each chunk is one sample interval's worth of bytes.
         #[arg(long)]
         limit: Option<u64>,
+    },
+
+    /// Record lossless raw PTY output from a pane to a file.
+    ///
+    /// This tees bytes at the daemon's PTY read source before sampled
+    /// `pane.output.watch` coalescing. It is byte-exact and intentionally
+    /// applies backpressure if the destination cannot keep up. The start
+    /// boundary is explicit: emit the stimulus you want audited only after
+    /// this command has started recording.
+    Record {
+        /// Session name.
+        #[arg(short, long)]
+        session: String,
+
+        /// Pane UUID to record.
+        #[arg(short, long)]
+        pane: String,
+
+        /// Output file for raw PTY bytes.
+        #[arg(long, value_name = "FILE")]
+        to: std::path::PathBuf,
+
+        /// Overwrite an existing output file.
+        #[arg(long)]
+        force: bool,
+
+        /// Stop automatically after N milliseconds. Without this flag,
+        /// recording continues until Ctrl-C.
+        #[arg(long)]
+        duration_ms: Option<u64>,
     },
 
     /// Send keystrokes to a pane
@@ -3097,6 +3127,7 @@ pub async fn handle_pane_watch(
     let mut delivered: u64 = 0;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let mut warned_sampled = false;
 
     loop {
         let mut params = serde_json::json!({
@@ -3114,11 +3145,24 @@ pub async fn handle_pane_watch(
         if let Some(arr) = resp.get("chunks").and_then(|v| v.as_array()) {
             for chunk in arr {
                 let bytes_b64 = chunk.get("bytes").and_then(|v| v.as_str()).unwrap_or("");
+                let sampled = chunk
+                    .get("sampled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 match format {
                     OutputFormat::Json => {
                         let _ = writeln!(out, "{}", serde_json::to_string(chunk)?);
                     }
                     OutputFormat::Text | OutputFormat::Plain => {
+                        if sampled && !warned_sampled {
+                            eprintln!(
+                                "{} sampled pane.output chunk — bytes were dropped before this chunk; use `shux pane record --to FILE` for lossless audits",
+                                crate::style::warning("!"),
+                            );
+                            warned_sampled = true;
+                        } else if !sampled {
+                            warned_sampled = false;
+                        }
                         if let Ok(raw) =
                             base64::engine::general_purpose::STANDARD.decode(bytes_b64.as_bytes())
                         {
@@ -3151,6 +3195,102 @@ pub async fn handle_pane_watch(
             );
         }
     }
+}
+
+/// Handle `shux pane record` — start a daemon-side lossless recorder, wait for
+/// a bounded duration or Ctrl-C, then stop and report the byte count.
+pub async fn handle_pane_record(
+    stream: &mut tokio::net::UnixStream,
+    _session_name: &str,
+    pane_id: &str,
+    to: &std::path::Path,
+    force: bool,
+    duration_ms: Option<u64>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    // Validate the UUID early so typos don't create files.
+    let _: uuid::Uuid = pane_id
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid pane uuid: {e}"))?;
+
+    let path = if to.is_absolute() {
+        to.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(to)
+    };
+
+    let start = rpc_call(
+        stream,
+        "pane.record.start",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "path": path,
+            "overwrite": force,
+            "duration_ms": duration_ms,
+        }),
+    )
+    .await?;
+    let recording_id = start
+        .get("recording_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("daemon did not return recording_id"))?
+        .to_string();
+
+    match duration_ms {
+        Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+        None => {
+            eprintln!(
+                "{} recording lossless pane output; press Ctrl-C to stop",
+                crate::style::muted("..."),
+            );
+            tokio::signal::ctrl_c().await?;
+        }
+    }
+
+    let stopped = rpc_call(
+        stream,
+        "pane.record.stop",
+        serde_json::json!({
+            "recording_id": recording_id,
+        }),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&stopped)?),
+        OutputFormat::Plain => {
+            let path = stopped.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes = stopped
+                .get("bytes_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let status = stopped
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("recording\t{status}\t{path}\t{bytes}");
+        }
+        OutputFormat::Text => {
+            let path = stopped.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes = stopped
+                .get("bytes_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let status = stopped
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!(
+                "{} {} bytes to {} ({})",
+                crate::style::success("✓ recorded"),
+                crate::style::bold(&bytes.to_string()),
+                crate::style::muted(path),
+                status,
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle the `shux pane kill` command.
@@ -5014,6 +5154,44 @@ mod tests {
                 command: PaneCommand::SendKeys { text, .. },
             }) => assert_eq!(text.as_deref(), Some("--help")),
             _ => panic!("expected Pane SendKeys command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_pane_record_parse() {
+        let cli = Cli::try_parse_from([
+            "shux",
+            "pane",
+            "record",
+            "-s",
+            "work",
+            "-p",
+            "11111111-1111-4111-8111-111111111111",
+            "--to",
+            "out.bin",
+            "--duration-ms",
+            "250",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Pane {
+                command:
+                    PaneCommand::Record {
+                        session,
+                        pane,
+                        to,
+                        force,
+                        duration_ms,
+                    },
+            }) => {
+                assert_eq!(session, "work");
+                assert_eq!(pane, "11111111-1111-4111-8111-111111111111");
+                assert_eq!(to, std::path::PathBuf::from("out.bin"));
+                assert!(force);
+                assert_eq!(duration_ms, Some(250));
+            }
+            _ => panic!("expected Pane Record command"),
         }
     }
 

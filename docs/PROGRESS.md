@@ -27,11 +27,12 @@
   - **037 (optimistic concurrency surface)** — Done (PR 3b / #11). `expected_version: Option<u64>` plumbed through every mutating RPC (session.rename/kill, window.kill/rename/focus/reorder, pane.kill/resize/zoom/swap). `GraphError::VersionConflict` now carries `resource` + `id` so `RpcError::version_conflict` produces the full `data` shape (resource, id, expected_version, actual_version, hint) per PRD §8.3. Layout ops (resize/zoom/swap) bump the version of every pane in the affected window. `--expected-version` CLI flag on session/window/pane subcommands. `shux api` now wraps the JSON-RPC response in `{result | error}` envelope so agents can parse structured errors. L4 visual test in `.claude/automations/test_pr3b_optimistic_concurrency.py`.
   - **PR 2c — sampled pane.output events** — Done. Separate `data_plane: broadcast::Sender<PaneOutputEvent>` channel in `EventBus` with NO history — the secret-leak vector is sealed. Per-pane PTY task rate-limits at the source: ~10 chunks/sec/pane via `output_sample_interval = 100ms` + 64KB pending buffer cap. `pane.output.watch` RPC long-polls the data plane with pane_id filter and `from_seq` resumption. `shux pane watch -s X -p Y [--limit N]` CLI base64-decodes chunks to stdout. 4 new unit tests pin the data-plane / control-plane separation. Design rationale in `docs/PR2c-DESIGN.md`. L4 visual test in `.claude/automations/test_pr2c_pane_output.py` (A1..A6 green).
   - **Post-merge followups (PR #15):** (1) `session.create` RPC now persists `command` onto `Pane.command` via new `create_session_with_command(name, cwd, command)` method — closes the codex P2 #10 leftover so `shux new --cmd vim` auto-derives title as "vim" instead of cwd basename. (2) `.config/nextest.toml` added with retry override (2 retries) for known-flaky tests: `test_spawn_echo`, `test_m0_pty_spawn_echo`, `test_tcp_auth_required`. Default retries=0 elsewhere so new flakes stay loud. (3) `test_tcp_auth_required` gained an in-place comment documenting the bind→drop→re-bind TOCTOU race as a `KNOWN FLAKE`.
+  - **066 (lossless pane output recording)** — Done. `pane.record.start` / `pane.record.stop` add a daemon-owned raw PTY recorder for byte-exact audits while keeping `pane.output.watch` sampled. Recorder state reports `complete|error|aborted`, byte count, `lossless`, and error detail; v1 allows one active recorder per pane, applies explicit backpressure, supports daemon-side `duration_ms`, resolves CLI `--to` paths client-side, and protects existing files unless `--force` is used. `shux pane watch` help now says absence assertions are unsound and text/plain mode warns on sampled chunks.
 - **Pending:** 035 (complete RPC surface). 038–050 (plugin host + bundled plugins + MCP).
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
-835 tests pass. shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, scrollback-backed copy mode, direct mouse selection/copy, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments, session save/restore).
+shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, scrollback-backed copy mode, direct mouse selection/copy, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments, session save/restore).
 
 ## Status
 
@@ -87,6 +88,25 @@
 ---
 
 ## Session Log
+
+**2026-06-11 — fix(record): add lossless pane output recording (issue #70)**
+- Issue #70 is real: `pane.output.watch` remains intentionally sampled and
+  capped at the PTY source, so absence-of-bytes assertions over watch output
+  are unsound.
+- Added `pane.record.start` / `pane.record.stop` and `shux pane record` as a
+  separate raw PTY recorder. It tees bytes immediately after a successful PTY
+  read, before VT processing and before sampled `pane.output.watch` coalescing.
+- Recorder state is fail-closed: `stop` reports `status`, `lossless`,
+  `bytes_written`, and `error`; v1 enforces one active recorder per pane,
+  daemon-side `duration_ms`, client-side output-path resolution, create-new by
+  default, and Unix `O_NOFOLLOW` on `--force` opens.
+- `shux pane watch` now documents sampled/lossy semantics and warns on sampled
+  chunks in text/plain output while keeping JSON chunk metadata intact.
+- Verification: DootSabha design council, focused `pane_record` tests,
+  `make test-lossless-record`, and `make ci` passed. Real-tool proof under
+  `.shux/out/issue-70/`: deterministic raw record SHA-256 matched expected,
+  and gh-hound, vivecaka, and btop recordings all ended `complete` /
+  `lossless=true` with PNG screenshots.
 
 **2026-06-11 — fix(attach): preserve pane colors when daemon inherits NO_COLOR (issue #69)**
 - Issue #69 is an attach-renderer bug, not a guest TUI bug: pane PTYs and
@@ -1199,6 +1219,7 @@
 | 061 | Render parity and mouse copy UX | M1/M3 | **Done** | 017, 020, 021 |
 | 062 | Scrollback-backed copy mode | M1 | **Done** | 005, 021, 061 |
 | 063 | Session save and restore | M1/M3 | **Done** | 013, 014, 015, 030 |
+| 066 | Lossless pane output recording | M2 | **Done** | 036 |
 
 ---
 
