@@ -1,0 +1,44 @@
+{
+  "checks": [
+    {
+      "capture_bytes": 251,
+      "label": "wide-80x24",
+      "required_present": {
+        "SHUX_WIDE_END": true,
+        "SHUX_WIDE_START": true,
+        "colored-cjk": true,
+        "\u597d": true,
+        "\u754c": true,
+        "\ud83c\udf7a": true,
+        "\ud83d\ude80": true
+      }
+    },
+    {
+      "capture_bytes": 330,
+      "label": "wide-120x40",
+      "required_present": {
+        "SHUX_WIDE_END": true,
+        "SHUX_WIDE_START": true,
+        "colored-cjk": true,
+        "\u597d": true,
+        "\u754c": true,
+        "\ud83c\udf7a": true,
+        "\ud83d\ude80": true
+      }
+    },
+    {
+      "capture_bytes": 330,
+      "label": "wide-200x60",
+      "required_present": {
+        "SHUX_WIDE_END": true,
+        "SHUX_WIDE_START": true,
+        "colored-cjk": true,
+        "\u597d": true,
+        "\u754c": true,
+        "\ud83c\udf7a": true,
+        "\ud83d\ude80": true
+      }
+    }
+  ],
+  "status": "pass"
+}

@@ -101,6 +101,28 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-06-12 — feat(vt): preserve wide-cell invariants**
+- Completed task 068 by adding row/grid wide-cell repair primitives, final-column
+  width-2 handling, resize-canvas sanitization, saved-cursor clamping, focused
+  unit coverage, and a proptest operation-sequence invariant over visible rows
+  plus scrollback.
+- Added `make test-vt-wide-invariants` and `make test-vt-wide-visual`, with
+  shux-driven 80x24, 120x40, and 200x60 PNG captures compared exactly against
+  committed `.shux/goldens/068-shux-vt-wide-cell-invariants/` baselines.
+- Extended the VT corpus with a mixed CJK/ANSI/DEC/edit/resize synthetic
+  fixture and regenerated committed corpus goldens, closing the integration
+  fixture coverage gap found by implementation review.
+- Verification: `make test-vt FILTER=wide`, `make test-vt-wide-invariants`,
+  `make test-vt`, `make test-vt-corpus`, `make test-vt-wide-visual`,
+  `SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check`, and SOLID VT QA PASS.
+
+**2026-06-12 — start(vt): wide-cell invariants**
+- Started task 068 on branch `feat/vt-wide-cell-invariants` after landing task
+  067. Scope is hardening every width-2 cell mutation path so orphan
+  continuations, missing tails, ghost cells, and duplicate capture output are
+  caught by unit, integration, shux automation, visual, pixel, and SOLID QA
+  gates.
+
 **2026-06-12 — fix(vt): trim styled blank resize tails**
 - Addressed PR review feedback for task 067 by treating trailing visual blanks
   as reflow padding even when erase/reset operations left non-default styling
@@ -1316,7 +1338,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 063 | Session save and restore | M1/M3 | **Done** | 013, 014, 015, 030 |
 | 066 | Lossless pane output recording | M2 | **Done** | 036 |
 | 067 | shux-vt resize reflow | VT Quality | **Done** | 005, 016, 066, 073 |
-| 068 | shux-vt wide-cell invariants | VT Quality | Pending | 005, 067, 073 |
+| 068 | shux-vt wide-cell invariants | VT Quality | **Done** | 005, 067, 073 |
 | 069 | shux-vt grapheme-aware cell storage | VT Quality | Pending | 005, 068, 073 |
 | 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |
 | 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |

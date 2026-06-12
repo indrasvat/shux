@@ -89,6 +89,11 @@ impl Cursor {
         self.row = self.row.min(rows.saturating_sub(1));
         self.col = self.col.min(cols.saturating_sub(1));
         self.auto_wrap_pending = false;
+        if let Some(saved) = &mut self.saved {
+            saved.row = saved.row.min(rows.saturating_sub(1));
+            saved.col = saved.col.min(cols.saturating_sub(1));
+            saved.auto_wrap_pending = false;
+        }
     }
 }
 
@@ -166,6 +171,24 @@ mod tests {
         cursor.clamp(0, 0);
         assert_eq!(cursor.row, 0);
         assert_eq!(cursor.col, 0);
+    }
+
+    #[test]
+    fn test_cursor_clamp_also_clamps_saved_cursor() {
+        let mut cursor = Cursor::new();
+        cursor.row = 5;
+        cursor.col = 10;
+        cursor.auto_wrap_pending = true;
+        cursor.save(false);
+
+        cursor.clamp(2, 3);
+        cursor.row = 0;
+        cursor.col = 0;
+        cursor.restore();
+
+        assert_eq!(cursor.row, 1);
+        assert_eq!(cursor.col, 2);
+        assert!(!cursor.auto_wrap_pending);
     }
 
     #[test]

@@ -1,0 +1,59 @@
+{
+  "task": "068-shux-vt-wide-cell-invariants",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.json",
+  "dootsabha_implementation": "dootsabha-implementation.json",
+  "related_reviews": [
+    "dootsabha-implementation-resolution.json",
+    "dootsabha-implementation-claude-gemini-failed.json"
+  ],
+  "reports": [
+    "wide-automation-report.json",
+    "wide-capture-report.json",
+    "rich-tui-evidence.json",
+    "../073-shux-vt-corpus-regression-harness/corpus-report.json"
+  ],
+  "screenshots": [
+    "wide-80x24-actual.png",
+    "wide-80x24-expected.png",
+    "wide-80x24-diff.png",
+    "wide-120x40-actual.png",
+    "wide-120x40-expected.png",
+    "wide-120x40-diff.png",
+    "wide-200x60-actual.png",
+    "wide-200x60-expected.png",
+    "wide-200x60-diff.png",
+    "rich-nvim-wide-80x24.png",
+    "rich-nvim-wide-120x40.png",
+    "rich-nvim-wide-40x12.png"
+  ],
+  "pixel_metrics": [
+    "wide-80x24-pixel.json",
+    "wide-120x40-pixel.json",
+    "wide-200x60-pixel.json"
+  ],
+  "captures": [
+    "wide-80x24.txt",
+    "wide-120x40.txt",
+    "wide-200x60.txt",
+    "rich-nvim-wide-80x24.txt",
+    "rich-nvim-wide-120x40.txt",
+    "rich-nvim-wide-40x12.txt"
+  ],
+  "committed_baselines": [
+    "../../goldens/068-shux-vt-wide-cell-invariants/wide-80x24-expected.png",
+    "../../goldens/068-shux-vt-wide-cell-invariants/wide-120x40-expected.png",
+    "../../goldens/068-shux-vt-wide-cell-invariants/wide-200x60-expected.png",
+    "../../goldens/073-vt-corpus/synthetic-wide-cjk-ansi-dec-edit-expected.png"
+  ],
+  "verification_commands": [
+    "make test-vt FILTER=wide",
+    "make test-vt-wide-invariants",
+    "make test-vt",
+    "make test-vt-corpus",
+    "SHUX_WIDE_INVARIANTS_PROMOTE=1 make test-vt-wide-visual",
+    "make test-vt-wide-visual",
+    "make fmt",
+    "SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check"
+  ]
+}

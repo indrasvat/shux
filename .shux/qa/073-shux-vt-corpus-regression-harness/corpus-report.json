@@ -33,6 +33,21 @@
       "cols": 32
     },
     {
+      "name": "wide-cjk-ansi-dec-edit",
+      "layer": "synthetic",
+      "description": "wide CJK cells with ANSI color, DEC graphics, insert/delete/erase, and resize",
+      "status": "pending_pixel",
+      "text_status": "pass",
+      "responses_status": "pass",
+      "actual_text": ".shux/out/073-vt-corpus/rendered/synthetic-wide-cjk-ansi-dec-edit-actual.txt",
+      "expected_text": ".shux/goldens/073-vt-corpus/synthetic-wide-cjk-ansi-dec-edit-expected.txt",
+      "actual_png": ".shux/out/073-vt-corpus/rendered/synthetic-wide-cjk-ansi-dec-edit-actual.png",
+      "expected_png": ".shux/goldens/073-vt-corpus/synthetic-wide-cjk-ansi-dec-edit-expected.png",
+      "diff_png": ".shux/out/073-vt-corpus/rendered/synthetic-wide-cjk-ansi-dec-edit-diff.png",
+      "rows": 10,
+      "cols": 36
+    },
+    {
       "name": "grapheme-storage-current",
       "layer": "synthetic",
       "description": "combining mark stream preserves visible capture bytes for current cell model",

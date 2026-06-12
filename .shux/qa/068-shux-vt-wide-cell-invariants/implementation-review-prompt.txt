@@ -1,0 +1,23 @@
+Review task 068 implementation for shux-vt wide-cell invariants. Focus only on blocker/P1/P2 correctness gaps, missing tests, and task DoD compliance. Do not summarize.
+
+Context files to inspect in this repo:
+- docs/tasks/068-shux-vt-wide-cell-invariants.md
+- .shux/qa/068-shux-vt-wide-cell-invariants/DESIGN.md
+- .shux/qa/068-shux-vt-wide-cell-invariants/implementation-diff.txt
+- crates/shux-vt/src/grid.rs
+- crates/shux-vt/src/parser.rs
+- crates/shux-vt/src/cursor.rs
+- crates/shux-vt/src/lib.rs
+- crates/shux-vt/tests/wide_invariants.rs
+- .shux/scripts/wide_invariants_check.sh
+
+Verification already run and expected to be cross-checked by you:
+- make test-vt FILTER=wide
+- make test-vt-wide-invariants
+- make test-vt
+- make test-vt-corpus
+- make test-vt-wide-visual
+- make fmt
+- SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check
+
+Required output: PASS if no blocker/P1/P2 remains, otherwise list exact findings with files and criteria violated.

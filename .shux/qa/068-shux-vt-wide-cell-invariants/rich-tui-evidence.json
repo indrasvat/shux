@@ -1,0 +1,15 @@
+{
+  "status": "pass",
+  "tool": "nvim",
+  "create": "rich-nvim-wide.create.json",
+  "screenshots": [
+    "rich-nvim-wide-80x24.png",
+    "rich-nvim-wide-120x40.png",
+    "rich-nvim-wide-40x12.png"
+  ],
+  "captures": [
+    "rich-nvim-wide-80x24.txt",
+    "rich-nvim-wide-120x40.txt",
+    "rich-nvim-wide-40x12.txt"
+  ]
+}

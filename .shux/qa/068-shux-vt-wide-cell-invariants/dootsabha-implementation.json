@@ -1,0 +1,62 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "I've completed the review. Here are my findings.\n\n## VERDICT: FAIL — blockers remain (all in the evidence/DoD/process layer; the VT code itself is correct)\n\n### Code correctness (Scope §Hardening) — PASS, no blocker/P1/P2 found\nI traced every mutating path against the wide-cell invariant and found no correctness defect:\n- `write_char` (parser.rs:132-219): clears the pair around `col` and, for width-2, around `col+1`; handles `cols\u003c2`, final-column wrap (autowrap on) and degrade-to-space (autowrap off) before writing. Combining chars (`width==0`) return early without forging a continuation.\n- `clear_wide_pair_around` / `sanitize_wide_pairs` (grid.rs:77-111): the left-to-right sweep correctly resets head-with-no-tail and orphan/glyph-bearing continuations, and the head→blank reset cascades to its former tail on the next iteration.\n- `erase_chars_expanding_wide_pairs` (grid.rs:113-136) expands across both boundaries; `insert_chars`/`delete_chars` (grid.rs:653-688) preserve column geometry then sanitize; `resize_canvas` sanitizes every row after column change.\n- Verified empirically: `make test-vt` → 154 pass; `make test-vt-wide-invariants` → proptest passes (64 cases × ≤128 ops asserting whole-grid invariants over scrollback+visible); `cargo clippy -p shux-vt` clean (only the pre-existing MSRV-mismatch warning).\n\n### BLOCKER 1 — SOLID QA gate report missing\n`.shux/qa/068-wide-cell-invariants/SOLID-QA.md` does not exist.\nViolates: DoD line 70, CLAUDE.md \"VT Quality Hard Gate\" (first line must be exactly `VERDICT: PASS`). `scripts/check-progress.sh:121` will fail. Task cannot be marked Done.\n\n### BLOCKER 2 — `evidence-manifest.json` missing\n`.shux/qa/068-wide-cell-invariants/evidence-manifest.json` does not exist.\nViolates: DoD line 69, CLAUDE.md hard gate, `check-progress.sh:129-168` (requires keys `task, solid_qa_report, dootsabha_design, dootsabha_implementation, screenshots, pixel_metrics`). `make check-vt-qa` will fail.\n\n### BLOCKER 3 — QA evidence is untracked, not committed\n`git status` shows the entire `.shux/qa/068-wide-cell-invariants/` as `??` (untracked). DoD line 69 requires artifacts **committed**; `check-progress.sh` requires tracked PNG + ≥2 tracked JSON (lines 195-200). Nothing is staged.\n\n### P1 — Pixel baselines are circular / self-minted (non-probative)\n`wide-80x24-expected.png`, `wide-120x40-expected.png`, `wide-200x60-expected.png` are **byte-identical** to their `-actual.png` counterparts (`cmp` confirms; all pixel JSONs report `changed_pixels: 0`, `0.0/0.0`). The `wide_invariants_check.sh` `SHUX_WIDE_INVARIANTS_PROMOTE` path copied actual→expected in the same pass, so the `--max-pixel-diff-ratio 0.0 --max-mean-channel-delta 0.0` comparison proves only `actual == actual`.\nViolates: Testing Matrix \"Pixel\" row (\"New expected PNGs are an explicit task deliverable approved in design evidence, **not hidden implementation-minted baselines**\"), DESIGN.md lines 88-90, and CLAUDE.md (\"an implementation cannot mint its own expected PNG in the same pass and call it proof. Baselines must come from committed `.shux/goldens/`…\"). The pixel gate does not actually demonstrate \"no ghost cells\" (Acceptance line 60).\n\n### P1 — Implementation-diff DootSabha review was not actually produced\n`dootsabha-implementation.json`: `reviews: []` (length 0), `synthesis: null`. `dootsabha-implementation-fallback.json` is **0 bytes**.\nViolates: DoD line 67 and Mandatory Process line 36 (\"Run DootSabha implementation-diff council before marking done … clean or addressed\"). The design council (`dootsabha-design.json`, 38 KB) is real, but the implementation review is empty.\n\n### P2 — Completion bookkeeping not done\nTask file Status is `In Progress`; all Acceptance Criteria (lines 57-62) and DoD (lines 66-72) checkboxes are `[ ]`; PROGRESS.md row still `In Progress`; learnings not appended. `make check-vt-qa` fails first on this (progress check). Expected for in-progress work, but each is a DoD/Session-Protocol gate that must close before done.\n\n### Minor coverage gaps (not blockers)\n- The proptest asserts invariants only on `vt.grid()` (the *active* grid). While alt-screen is toggled on (op 12), a subsequent `resize` (op 11) reflows the *stored primary* grid, whose invariants are never asserted in that state. Consider asserting the inactive grid too.\n- DESIGN item 6 (\"copy/selection extraction must handle boundaries starting/ending on a continuation cell\") has no test — though that code lives in shux-ui, outside this task's `Touches` set.\n\n### Required to reach PASS\n1. Obtain a genuine `shux-vt-solid-qa` run; commit `SOLID-QA.md` with first line `VERDICT: PASS`.\n2. Add `evidence-manifest.json` with all required keys and re-derive expected PNGs from a non-circular, design-approved baseline (not a same-run promote).\n3. Run and save a real implementation-diff DootSabha review.\n4. Stage/commit all `.shux/qa/068-…` artifacts; flip task Status + PROGRESS + learnings; confirm `make check-vt-qa` and `make check` pass.",
+      "duration_ms": 404971,
+      "cost_usd": 3.076643,
+      "tokens_in": 24910,
+      "tokens_out": 19684
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "content": "FAIL\n\nP1 — QA hard gate evidence is missing. `docs/tasks/068-shux-vt-wide-cell-invariants.md:53` and `:70` require `SOLID-QA.md` with `VERDICT: PASS`; `:69` requires `evidence-manifest.json`. Neither exists under `.shux/qa/068-wide-cell-invariants/`; only the pixel JSON files are present. `make check-vt-qa` also fails because task 068 is still `In Progress`. Criteria violated: QA row, DoD hard-gate report, DoD evidence manifest.\n\nP1 — Implementation-diff DootSabha review is not clean. `.shux/qa/068-wide-cell-invariants/dootsabha-implementation.json:11` shows Claude timed out, `:21` shows Gemini quota failure, and `:24-37` has `reviews: null`, `synthesis: null`, providers both `error`. This does not satisfy `docs/tasks/068-shux-vt-wide-cell-invariants.md:36` or `:67`.\n\nP2 — Required integration fixture coverage is missing. `docs/tasks/068-shux-vt-wide-cell-invariants.md:49` requires VT byte fixtures mixing CJK, box drawing, ANSI colors, and edit operations. The existing synthetic corpus has `wide-cjk` only at `.shux/fixtures/vt-corpus/synthetic/manifest.json:13-18` and DEC special graphics separately at `:29-34`; the task’s new `crates/shux-vt/tests/wide_invariants.rs:45-80` is a property sequence test, not that integration fixture.\n\nP2 — Task/progress DoD is not complete. `docs/tasks/068-shux-vt-wide-cell-invariants.md:3` and `docs/PROGRESS.md:1326` still mark task 068 as `In Progress`, while DoD requires progress/learnings completion at `docs/tasks/068-shux-vt-wide-cell-invariants.md:72`.\n\n",
+      "duration_ms": 200392,
+      "cost_usd": 0,
+      "tokens_in": 933679,
+      "tokens_out": 7831
+    }
+  ],
+  "reviews": [
+    {
+      "reviewer": "claude",
+      "reviewed": [
+        "codex"
+      ],
+      "content": "",
+      "error": "review by claude: claude invoke: subprocess \"claude\": context deadline exceeded"
+    },
+    {
+      "reviewer": "codex",
+      "reviewed": [
+        "claude"
+      ],
+      "content": "",
+      "error": "review by codex: codex invoke: subprocess \"codex\": context deadline exceeded"
+    }
+  ],
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 605364,
+    "total_cost_usd": 3.076643,
+    "total_tokens_in": 958589,
+    "total_tokens_out": 27515,
+    "providers": {
+      "claude": "ok",
+      "codex": "ok"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "synthesis: synthesize fallback codex: codex invoke: subprocess \"codex\": context deadline exceeded"
+  }
+}

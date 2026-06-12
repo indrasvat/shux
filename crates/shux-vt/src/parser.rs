@@ -107,25 +107,42 @@ pub struct VtHandler<'a> {
 }
 
 impl<'a> VtHandler<'a> {
+    fn cursor_blank_cell(&self) -> Cell {
+        Cell {
+            ch: ' ',
+            width: 1,
+            style: self.cursor.style,
+            extended: None,
+        }
+    }
+
+    fn wrap_to_next_line(&mut self) {
+        self.cursor.col = 0;
+        self.cursor.auto_wrap_pending = false;
+        self.grid.visible_row_mut(self.cursor.row).wrapped = true;
+        if self.cursor.row == self.scroll_region.bottom {
+            self.grid
+                .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
+        } else {
+            self.cursor.row += 1;
+        }
+    }
+
     /// Write a character at the current cursor position, advancing the cursor.
     fn write_char(&mut self, ch: char) {
-        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        let width = unicode_width::UnicodeWidthChar::width(ch)
+            .unwrap_or(1)
+            .min(2);
+        if width == 0 {
+            return;
+        }
         let cols = self.grid.cols();
         let rows = self.grid.rows();
 
         // Handle auto-wrap pending state.
         if self.cursor.auto_wrap_pending {
             if self.modes.auto_wrap {
-                self.cursor.col = 0;
-                self.cursor.auto_wrap_pending = false;
-                // Mark the current row as wrapped.
-                self.grid.visible_row_mut(self.cursor.row).wrapped = true;
-                if self.cursor.row == self.scroll_region.bottom {
-                    self.grid
-                        .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
-                } else {
-                    self.cursor.row += 1;
-                }
+                self.wrap_to_next_line();
             } else {
                 // No auto-wrap: overwrite last column.
                 self.cursor.col = cols.saturating_sub(1);
@@ -141,6 +158,32 @@ impl<'a> VtHandler<'a> {
             self.cursor.row = rows.saturating_sub(1);
         }
 
+        if width == 2 && cols < 2 {
+            let col = self.cursor.col;
+            let blank = self.cursor_blank_cell();
+            let row = self.grid.visible_row_mut(self.cursor.row);
+            row.clear_wide_pair_around(col, self.cursor.style.bg);
+            row[col] = blank;
+            self.cursor.auto_wrap_pending = false;
+            return;
+        }
+
+        if width == 2 && self.cursor.col + 1 >= cols {
+            let col = self.cursor.col;
+            let blank = self.cursor_blank_cell();
+            {
+                let row = self.grid.visible_row_mut(self.cursor.row);
+                row.clear_wide_pair_around(col, self.cursor.style.bg);
+                row[col] = blank;
+            }
+            if self.modes.auto_wrap {
+                self.wrap_to_next_line();
+            } else {
+                self.cursor.auto_wrap_pending = false;
+                return;
+            }
+        }
+
         // Insert mode: shift characters right.
         if self.modes.insert_mode {
             self.grid
@@ -148,8 +191,14 @@ impl<'a> VtHandler<'a> {
         }
 
         // Write the cell.
+        let col = self.cursor.col;
+        let bg = self.cursor.style.bg;
         let row = self.grid.visible_row_mut(self.cursor.row);
-        row[self.cursor.col] = Cell {
+        row.clear_wide_pair_around(col, bg);
+        if width == 2 {
+            row.clear_wide_pair_around(col + 1, bg);
+        }
+        row[col] = Cell {
             ch,
             width: width as u8,
             style: self.cursor.style,
@@ -157,8 +206,8 @@ impl<'a> VtHandler<'a> {
         };
 
         // For wide characters, write a continuation cell.
-        if width == 2 && self.cursor.col + 1 < cols {
-            row[self.cursor.col + 1] = Cell::wide_continuation();
+        if width == 2 && col + 1 < cols {
+            row[col + 1] = Cell::wide_continuation();
         }
 
         // Advance cursor.

@@ -1,0 +1,17 @@
+SHUX_WIDE_START
+plain: ASCII | cjk: 界好語文 | mixed: A界B好C
+colored-cjk: 彩界彩好彩
+emoji-wide: 🍺 🧩 🦀 🚀
+
+wide-overwrite: 好你ABCD
+
+dch-tail:  ABCD
+
+ech-tail:   ABCD
+
+ich-edge:  AB界
+
+rep-wide: 界界界
+
+                                                                                界
+SHUX_WIDE_END

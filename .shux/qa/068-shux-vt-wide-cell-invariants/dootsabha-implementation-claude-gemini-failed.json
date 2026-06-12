@@ -1,0 +1,47 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke claude: claude invoke: subprocess \"claude\": context deadline exceeded"
+    },
+    {
+      "provider": "gemini",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke gemini: gemini: Warning: Basic terminal detected (TERM=dumb). Visual rendering will be limited. For the best experience, use a terminal emulator with truecolor support.\nWarning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.\nYOLO mode is enabled. All tool calls will be automatically approved.\nYOLO mode is enabled. All tool calls will be automatically approved.\nMCP issues detected. Run /mcp list for status.\nError when talking to Gemini API Full report available at: /var/folders/5c/_bn5jc5x7ybfz39b277z4y740000gn/T/gemini-client-error-Turn.run-sendMessageStream-2026-06-12T21-59-10-600Z.json TerminalQuotaError: You have exhausted your capacity on this model. Your quota will reset after 1h7m6s.\n    at classifyGoogleError (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:304214:18)\n    at retryWithBackoff (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:304874:31)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async GeminiChat.makeApiCallAndProcessStream (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328315:28)\n    at async GeminiChat.streamWithRetries (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328133:29)\n    at async Turn.run (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328879:24)\n    at async GeminiClient.processTurn (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:342369:22)\n    at async GeminiClient.sendMessageStream (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:342466:14)\n    at async file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/gemini-YXO2QQ66.js:10882:26\n    at async main (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/gemini-YXO2QQ66.js:16290:5) {\n  cause: {\n    code: 429,\n    message: 'You have exhausted your capacity on this model. Your quota will reset after 1h7m6s.',\n    details: [ [Object], [Object] ]\n  },\n  retryDelayMs: 4026486.560348,\n  reason: 'QUOTA_EXHAUSTED'\n}\n{\n  \"session_id\": \"bc18ef03-a6f5-4098-a81d-8be655283c27\",\n  \"error\": {\n    \"type\": \"Error\",\n    \"message\": \"You have exhausted your capacity on this model. Your quota will reset after 1h7m6s.\",\n    \"code\": 1\n  }\n}"
+    }
+  ],
+  "reviews": null,
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 0,
+    "total_cost_usd": 0,
+    "total_tokens_in": 0,
+    "total_tokens_out": 0,
+    "providers": {
+      "claude": "error",
+      "gemini": "error"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "all agents failed during dispatch"
+  }
+}

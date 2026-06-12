@@ -74,6 +74,67 @@ impl Row {
         self.wrapped = false;
     }
 
+    pub(crate) fn clear_wide_pair_around(&mut self, col: usize, bg: Color) {
+        if col >= self.cells.len() {
+            return;
+        }
+
+        if self.cells[col].is_wide_continuation() {
+            self.cells[col].reset(bg);
+            if col > 0 && self.cells[col - 1].is_wide() {
+                self.cells[col - 1].reset(bg);
+            }
+        } else if self.cells[col].is_wide() {
+            self.cells[col].reset(bg);
+            if col + 1 < self.cells.len() && self.cells[col + 1].is_wide_continuation() {
+                self.cells[col + 1].reset(bg);
+            }
+        }
+    }
+
+    pub(crate) fn sanitize_wide_pairs(&mut self, bg: Color) {
+        for col in 0..self.cells.len() {
+            if self.cells[col].is_wide() {
+                let has_tail = col + 1 < self.cells.len()
+                    && self.cells[col + 1].is_wide_continuation()
+                    && self.cells[col + 1].ch == ' ';
+                if !has_tail {
+                    self.cells[col].reset(bg);
+                }
+            } else if self.cells[col].is_wide_continuation() {
+                let has_head = col > 0 && self.cells[col - 1].is_wide();
+                if !has_head || self.cells[col].ch != ' ' {
+                    self.cells[col].reset(bg);
+                }
+            }
+        }
+    }
+
+    fn erase_chars_expanding_wide_pairs(&mut self, col: usize, count: usize, bg: Color) {
+        let len = self.cells.len();
+        let mut start = col.min(len);
+        let mut end = col.saturating_add(count).min(len);
+        if start >= end {
+            return;
+        }
+
+        if start > 0 && self.cells[start].is_wide_continuation() && self.cells[start - 1].is_wide()
+        {
+            start -= 1;
+        }
+        if end < len
+            && end > 0
+            && self.cells[end - 1].is_wide()
+            && self.cells[end].is_wide_continuation()
+        {
+            end += 1;
+        }
+
+        for col in start..end {
+            self.cells[col].reset(bg);
+        }
+    }
+
     /// Check if the row is entirely empty (all default spaces).
     pub fn is_blank(&self) -> bool {
         self.cells
@@ -309,6 +370,7 @@ impl Grid {
         if new_cols != self.cols {
             for row in self.raw.iter_mut() {
                 row.resize(new_cols, Cell::default());
+                row.sanitize_wide_pairs(Color::Default);
             }
             self.cols = new_cols;
         }
@@ -528,6 +590,20 @@ fn append_reflowed_line(
             row = Row::new(cols);
             col = 0;
         }
+        if width > cols {
+            let mut blank = cell;
+            blank.reset(blank.style.bg);
+            row[col] = blank;
+            positions.push(ReflowedCellPosition {
+                offset: logical_offset,
+                row: rows.len(),
+                col,
+                width: 1,
+            });
+            logical_offset += width;
+            col += 1;
+            continue;
+        }
         if col + width > cols && col > 0 {
             row.wrapped = true;
             rows.push_back(row);
@@ -569,10 +645,7 @@ impl Grid {
     /// Erase `count` characters starting at `(row, col)` in the visible area.
     pub fn erase_chars(&mut self, row: usize, col: usize, count: usize, bg: Color) {
         let r = self.visible_row_mut(row);
-        let end = (col + count).min(r.len());
-        for c in col..end {
-            r[c].reset(bg);
-        }
+        r.erase_chars_expanding_wide_pairs(col, count, bg);
     }
 
     /// Insert `count` blank cells at `(row, col)`, shifting existing cells right.
@@ -580,6 +653,9 @@ impl Grid {
     pub fn insert_chars(&mut self, row: usize, col: usize, count: usize) {
         let r = self.visible_row_mut(row);
         let len = r.len();
+        if col < len {
+            r.clear_wide_pair_around(col, Color::Default);
+        }
         // Shift right from the end.
         for i in (col..len).rev() {
             let target = i + count;
@@ -591,6 +667,7 @@ impl Grid {
         for i in col..(col + count).min(len) {
             r.cells[i] = Cell::default();
         }
+        r.sanitize_wide_pairs(Color::Default);
     }
 
     /// Delete `count` cells at `(row, col)`, shifting remaining cells left.
@@ -607,6 +684,7 @@ impl Grid {
         for i in (len - actual)..len {
             r.cells[i] = Cell::default();
         }
+        r.sanitize_wide_pairs(Color::Default);
     }
 }
 
@@ -631,6 +709,48 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    fn put_wide(row: &mut Row, col: usize, ch: char) {
+        row[col] = Cell {
+            ch,
+            width: 2,
+            style: CellStyle::default(),
+            extended: None,
+        };
+        row[col + 1] = Cell::wide_continuation();
+    }
+
+    fn assert_row_wide_invariants(row: &Row) {
+        for col in 0..row.len() {
+            let cell = &row[col];
+            if cell.is_wide_continuation() {
+                assert_eq!(
+                    cell.ch, ' ',
+                    "continuation at col {col} must not carry a glyph"
+                );
+                assert!(col > 0, "orphan continuation at col 0");
+                assert!(row[col - 1].is_wide(), "orphan continuation at col {col}");
+            }
+            if cell.is_wide() {
+                assert!(
+                    col + 1 < row.len(),
+                    "wide head at final col {col} is missing a tail"
+                );
+                assert!(
+                    row[col + 1].is_wide_continuation(),
+                    "wide head at col {col} is missing a tail"
+                );
+                assert_eq!(row[col + 1].ch, ' ', "wide tail at col {}", col + 1);
+            }
+        }
+    }
+
+    fn assert_grid_wide_invariants(grid: &Grid) {
+        for row_idx in 0..grid.total_lines() {
+            let row = grid.row(row_idx).expect("row exists");
+            assert_row_wide_invariants(row);
+        }
     }
 
     #[test]
@@ -848,15 +968,60 @@ mod tests {
         assert!(grid.visible_row(1)[1].is_wide_continuation());
         assert_eq!(grid.visible_row(2)[0].ch, 'B');
 
-        for row_idx in 0..grid.rows() {
-            for col in 0..grid.cols() {
-                let cell = &grid.visible_row(row_idx)[col];
-                if cell.is_wide_continuation() {
-                    assert!(col > 0, "orphan continuation at row {row_idx}");
-                    assert!(grid.visible_row(row_idx)[col - 1].is_wide());
-                }
-            }
-        }
+        assert_grid_wide_invariants(&grid);
+    }
+
+    #[test]
+    fn erase_from_continuation_clears_entire_wide_pair() {
+        let mut grid = Grid::new(1, 5, GridConfig::default());
+        put_wide(grid.visible_row_mut(0), 1, '界');
+        grid.visible_row_mut(0)[3].ch = 'A';
+
+        grid.erase_chars(0, 2, 1, Color::Default);
+
+        assert_eq!(grid.visible_row(0)[1].ch, ' ');
+        assert_eq!(grid.visible_row(0)[2].ch, ' ');
+        assert_eq!(grid.visible_row(0)[3].ch, 'A');
+        assert_grid_wide_invariants(&grid);
+    }
+
+    #[test]
+    fn delete_from_continuation_shifts_by_exactly_one_then_sanitizes() {
+        let mut grid = Grid::new(1, 5, GridConfig::default());
+        put_wide(grid.visible_row_mut(0), 0, '界');
+        grid.visible_row_mut(0)[2].ch = 'A';
+        grid.visible_row_mut(0)[3].ch = 'B';
+
+        grid.delete_chars(0, 1, 1);
+
+        assert_eq!(grid.visible_row(0)[0].ch, ' ');
+        assert_eq!(grid.visible_row(0)[1].ch, 'A');
+        assert_eq!(grid.visible_row(0)[2].ch, 'B');
+        assert_grid_wide_invariants(&grid);
+    }
+
+    #[test]
+    fn insert_sanitizes_wide_pair_pushed_off_right_edge() {
+        let mut grid = Grid::new(1, 4, GridConfig::default());
+        grid.visible_row_mut(0)[0].ch = 'A';
+        put_wide(grid.visible_row_mut(0), 1, '界');
+
+        grid.insert_chars(0, 1, 1);
+
+        assert_eq!(grid.visible_row(0)[0].ch, 'A');
+        assert_eq!(grid.visible_row(0)[1].ch, ' ');
+        assert_grid_wide_invariants(&grid);
+    }
+
+    #[test]
+    fn resize_canvas_sanitizes_truncated_wide_head() {
+        let mut grid = Grid::new(1, 4, GridConfig::default());
+        put_wide(grid.visible_row_mut(0), 2, '界');
+
+        grid.resize_canvas(1, 3);
+
+        assert_eq!(grid.visible_row(0)[2].ch, ' ');
+        assert_grid_wide_invariants(&grid);
     }
 
     #[test]
