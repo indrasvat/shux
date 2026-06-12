@@ -1,0 +1,13 @@
+[package]
+name = "shux-libghostty-vt-eval"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+image = "0.25.8"
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "20edad15d7984c727acc4f4facdadf045609f543", default-features = false }
+shux-raster = { path = "../../crates/shux-raster" }
+shux-vt = { path = "../../crates/shux-vt" }
+
+[workspace]

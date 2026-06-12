@@ -108,6 +108,33 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > They change what TUIs emit. If changing terminal identity is necessary, prove
 > that rich TUIs still render correctly and document the compatibility impact.
 
+## VT Quality Hard Gate
+
+> **STRICT RULE — VT/raster/snapshot work MUST pass the SOLID VT QA gate.**
+> Any change touching `crates/shux-vt`, `crates/shux-raster`, PTY output
+> processing, pane sizing/resize, capture text, snapshot pixels, Unicode width,
+> default colors, cursor presentation, alternate screen, scroll regions, or
+> terminal request/response behavior MUST use the local `shux-vt-solid-qa`
+> sub-agent before the task is marked done or a PR is opened.
+>
+> The sub-agent is defined in:
+> - `.claude/agents/shux-vt-solid-qa.md`
+> - `.codex/agents/shux-vt-solid-qa.toml`
+>
+> Its verdict is a hard gate:
+> - `VERDICT: PASS` is required to complete the task.
+> - `VERDICT: FAIL` or `VERDICT: BLOCKED` must be fixed or explicitly
+>   re-scoped in the task file before proceeding.
+>
+> The SOLID gate MUST read the active `docs/tasks/NNN-*.md` file and enforce
+> that task's exact Testing Matrix, Acceptance Criteria, and Definition of Done.
+> Missing evidence is failure, not residual risk.
+>
+> Pixel-level screenshot verification is mandatory whenever visible terminal
+> state is affected. Use `.claude/automations/pixel_verify.py` for exact or
+> thresholded PNG comparisons. Contact sheets are useful summaries, but they
+> never replace full-resolution individual screenshots and pixel diffs.
+
 ## Git Workflow
 
 - **Branch naming:** `feat/`, `fix/`, `refactor/`, `docs/`, `chore/`

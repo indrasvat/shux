@@ -9,6 +9,13 @@ BINARY_NAME := shux
 VERSION := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "dev")
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 RUST_VERSION := $(shell rustc --version 2>/dev/null | cut -d' ' -f2 || echo "unknown")
+LIBGHOSTTY_SPIKE_ZIG_VERSION ?= 0.15.2
+LIBGHOSTTY_SPIKE_ZIG_ARCH := $(shell uname -m | sed 's/^arm64$$/aarch64/')
+LIBGHOSTTY_SPIKE_ZIG_OS := $(shell uname -s | tr '[:upper:]' '[:lower:]' | sed 's/^darwin$$/macos/')
+LIBGHOSTTY_SPIKE_ZIG_PKG := zig-$(LIBGHOSTTY_SPIKE_ZIG_ARCH)-$(LIBGHOSTTY_SPIKE_ZIG_OS)-$(LIBGHOSTTY_SPIKE_ZIG_VERSION)
+LIBGHOSTTY_SPIKE_ZIG_DIR := .local/tools/zig-$(LIBGHOSTTY_SPIKE_ZIG_VERSION)
+LIBGHOSTTY_SPIKE_ZIG_URL := https://ziglang.org/download/$(LIBGHOSTTY_SPIKE_ZIG_VERSION)/$(LIBGHOSTTY_SPIKE_ZIG_PKG).tar.xz
+LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN ?= /opt/homebrew/opt/zig@0.15/bin
 
 # Directories
 COVERAGE_DIR := coverage
@@ -55,6 +62,9 @@ help: ## Show this help message
 	@echo ""
 	@echo "$(COLOR_BOLD)Tooling:$(COLOR_RESET)"
 	@awk 'BEGIN {FS = ":.*##"} /^(setup|hooks|doc|clean|version|info)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@echo ""
+	@echo "$(COLOR_BOLD)Spikes:$(COLOR_RESET)"
+	@awk 'BEGIN {FS = ":.*##"} /^spike[a-zA-Z0-9_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -169,6 +179,85 @@ bench-baseline: ## Record M0 performance baseline
 .PHONY: dogfood-human-copy
 dogfood-human-copy: build ## Run copy-mode human dogfood regression
 	@bash .shux/scripts/human_copy_mode_check.sh
+
+.PHONY: spike-libghostty-build
+spike-libghostty-build: ## Build the isolated libghostty-vt spike using Homebrew zig@0.15
+	@echo "$(COLOR_BLUE)▶ Building libghostty-vt spike...$(COLOR_RESET)"
+	@test -x "$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN)/zig" || { echo "$(COLOR_RED)zig@0.15 not found. Run: brew install zig@0.15$(COLOR_RESET)"; exit 1; }
+	@PATH="$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN):$$PATH" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --manifest-path spikes/libghostty-vt-eval/Cargo.toml
+	@echo "$(COLOR_GREEN)✓ libghostty-vt spike built$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-test
+spike-libghostty-test: ## Run the isolated libghostty-vt spike tests using Homebrew zig@0.15
+	@echo "$(COLOR_BLUE)▶ Running libghostty-vt spike tests...$(COLOR_RESET)"
+	@test -x "$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN)/zig" || { echo "$(COLOR_RED)zig@0.15 not found. Run: brew install zig@0.15$(COLOR_RESET)"; exit 1; }
+	@PATH="$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN):$$PATH" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --manifest-path spikes/libghostty-vt-eval/Cargo.toml -- --test-threads=1
+	@echo "$(COLOR_GREEN)✓ libghostty-vt spike tests passed$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-compare
+spike-libghostty-compare: ## Generate shux-vt vs libghostty-vt visual A/B comparisons
+	@echo "$(COLOR_BLUE)▶ Generating libghostty-vt replacement comparisons...$(COLOR_RESET)"
+	@test -x "$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN)/zig" || { echo "$(COLOR_RED)zig@0.15 not found. Run: brew install zig@0.15$(COLOR_RESET)"; exit 1; }
+	@PATH="$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN):$$PATH" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --manifest-path spikes/libghostty-vt-eval/Cargo.toml --bin compare --
+	@echo "$(COLOR_GREEN)✓ libghostty-vt replacement comparisons generated$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-record-tuis
+spike-libghostty-record-tuis: release ## Record installed rich TUIs as raw PTY fixtures for the libghostty-vt spike
+	@echo "$(COLOR_BLUE)▶ Recording rich TUI PTY fixtures...$(COLOR_RESET)"
+	@bash spikes/libghostty-vt-eval/scripts/record-rich-tuis.sh
+	@echo "$(COLOR_GREEN)✓ rich TUI PTY fixtures recorded$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-compare-tuis
+spike-libghostty-compare-tuis: ## Replay recorded rich TUI fixtures through shux-vt and libghostty-vt
+	@echo "$(COLOR_BLUE)▶ Comparing recorded rich TUI PTY fixtures...$(COLOR_RESET)"
+	@test -x "$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN)/zig" || { echo "$(COLOR_RED)zig@0.15 not found. Run: brew install zig@0.15$(COLOR_RESET)"; exit 1; }
+	@recordings=".shux/out/libghostty-vt-replacement/recordings/recordings.txt"; \
+	if [ ! -s "$$recordings" ]; then echo "$(COLOR_RED)missing $$recordings; run make spike-libghostty-record-tuis$(COLOR_RESET)"; exit 1; fi; \
+	args=""; \
+	while IFS= read -r rec; do args="$$args --recording $$rec"; done < "$$recordings"; \
+	PATH="$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN):$$PATH" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --manifest-path spikes/libghostty-vt-eval/Cargo.toml --bin compare -- $$args
+	@echo "$(COLOR_GREEN)✓ recorded rich TUI comparisons generated$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-fmt
+spike-libghostty-fmt: ## Format the isolated libghostty-vt spike crate
+	@echo "$(COLOR_BLUE)▶ Formatting libghostty-vt spike...$(COLOR_RESET)"
+	@cargo fmt --manifest-path spikes/libghostty-vt-eval/Cargo.toml
+	@echo "$(COLOR_GREEN)✓ libghostty-vt spike formatted$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-build-zig015
+spike-libghostty-build-zig015: ## Build the spike using Homebrew zig@0.15
+	@echo "$(COLOR_BLUE)▶ Building libghostty-vt spike with Homebrew Zig $(LIBGHOSTTY_SPIKE_ZIG_VERSION)...$(COLOR_RESET)"
+	@test -x "$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN)/zig" || { echo "$(COLOR_RED)zig@0.15 not found. Run: brew install zig@0.15$(COLOR_RESET)"; exit 1; }
+	@PATH="$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN):$$PATH" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --manifest-path spikes/libghostty-vt-eval/Cargo.toml
+	@echo "$(COLOR_GREEN)✓ libghostty-vt spike built with Homebrew Zig $(LIBGHOSTTY_SPIKE_ZIG_VERSION)$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-test-zig015
+spike-libghostty-test-zig015: ## Run spike tests using Homebrew zig@0.15
+	@echo "$(COLOR_BLUE)▶ Running libghostty-vt spike tests with Homebrew Zig $(LIBGHOSTTY_SPIKE_ZIG_VERSION)...$(COLOR_RESET)"
+	@test -x "$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN)/zig" || { echo "$(COLOR_RED)zig@0.15 not found. Run: brew install zig@0.15$(COLOR_RESET)"; exit 1; }
+	@PATH="$(LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN):$$PATH" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --manifest-path spikes/libghostty-vt-eval/Cargo.toml -- --test-threads=1
+	@echo "$(COLOR_GREEN)✓ libghostty-vt spike tests passed with Homebrew Zig $(LIBGHOSTTY_SPIKE_ZIG_VERSION)$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-build-zig015-macos-target
+spike-libghostty-build-zig015-macos-target: spike-libghostty-zig ## Build the spike with Zig 0.15.x and an explicit macOS Zig target
+	@echo "$(COLOR_BLUE)▶ Building libghostty-vt spike with explicit Zig macOS target...$(COLOR_RESET)"
+	@chmod +x spikes/libghostty-vt-eval/scripts/zig-macos-target-wrapper.sh
+	@mkdir -p .local/tools/libghostty-zig-wrapper
+	@ln -sf "$(CURDIR)/spikes/libghostty-vt-eval/scripts/zig-macos-target-wrapper.sh" .local/tools/libghostty-zig-wrapper/zig
+	@PATH="$(CURDIR)/.local/tools/libghostty-zig-wrapper:$$PATH" SHUX_LIBGHOSTTY_REAL_ZIG="$(CURDIR)/$(LIBGHOSTTY_SPIKE_ZIG_DIR)/zig" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --manifest-path spikes/libghostty-vt-eval/Cargo.toml
+	@echo "$(COLOR_GREEN)✓ libghostty-vt spike built with explicit Zig macOS target$(COLOR_RESET)"
+
+.PHONY: spike-libghostty-zig
+spike-libghostty-zig: ## Install spike-local Zig 0.15.2 under .local/tools
+	@if [ ! -x "$(LIBGHOSTTY_SPIKE_ZIG_DIR)/zig" ]; then \
+		echo "$(COLOR_BLUE)▶ Installing Zig $(LIBGHOSTTY_SPIKE_ZIG_VERSION) for libghostty spike...$(COLOR_RESET)"; \
+		mkdir -p .local/tools; \
+		curl -fsSL "$(LIBGHOSTTY_SPIKE_ZIG_URL)" -o ".local/tools/$(LIBGHOSTTY_SPIKE_ZIG_PKG).tar.xz"; \
+		tar -xJf ".local/tools/$(LIBGHOSTTY_SPIKE_ZIG_PKG).tar.xz" -C .local/tools; \
+		rm -rf "$(LIBGHOSTTY_SPIKE_ZIG_DIR)"; \
+		mv ".local/tools/$(LIBGHOSTTY_SPIKE_ZIG_PKG)" "$(LIBGHOSTTY_SPIKE_ZIG_DIR)"; \
+		rm ".local/tools/$(LIBGHOSTTY_SPIKE_ZIG_PKG).tar.xz"; \
+	fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Code Quality
