@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches};
@@ -34,6 +34,49 @@ use cli::{Cli, Command, OutputFormat, PaneCommand, WindowCommand};
 pub struct ResizeRequest {
     pub size: shux_pty::handle::PtySize,
     pub ack: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+const PANE_RECORD_CHANNEL_CAPACITY: usize = 128;
+const PANE_RECORD_COMPLETED_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+enum PaneRecordChunk {
+    Bytes(Vec<u8>),
+    Finish { status: PaneRecordStatus },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneRecordStatus {
+    Recording,
+    Complete,
+    Error,
+    Aborted,
+}
+
+impl PaneRecordStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            PaneRecordStatus::Recording => "recording",
+            PaneRecordStatus::Complete => "complete",
+            PaneRecordStatus::Error => "error",
+            PaneRecordStatus::Aborted => "aborted",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PaneRecordResult {
+    status: PaneRecordStatus,
+    bytes_written: u64,
+    error: Option<String>,
+}
+
+struct PaneRecorder {
+    id: uuid::Uuid,
+    path: PathBuf,
+    sender: mpsc::Sender<PaneRecordChunk>,
+    outcome: Arc<StdMutex<PaneRecordResult>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
@@ -73,6 +116,10 @@ pub struct PaneIoState {
     /// test harnesses that don't wire an event bus. Cheap to clone
     /// (Arc internally).
     pub event_bus: Option<shux_core::bus::EventBus>,
+    /// Lossless pane-output recorders, keyed by pane. The PTY read task
+    /// awaits these sends before sampled publishing, so this path is
+    /// byte-exact and intentionally applies backpressure.
+    recorders: HashMap<shux_core::model::PaneId, Vec<PaneRecorder>>,
 }
 
 impl Default for PaneIoState {
@@ -93,6 +140,7 @@ impl PaneIoState {
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: Arc::new(tokio::sync::Notify::new()),
             event_bus: None,
+            recorders: HashMap::new(),
         }
     }
 
@@ -147,6 +195,162 @@ impl PaneIoState {
 enum PtyTaskExit {
     Natural,
     RequestedTeardown,
+}
+
+async fn spawn_pane_recorder(
+    path: PathBuf,
+    overwrite: bool,
+) -> Result<
+    (
+        mpsc::Sender<PaneRecordChunk>,
+        Arc<StdMutex<PaneRecordResult>>,
+        tokio::task::JoinHandle<()>,
+    ),
+    String,
+> {
+    use tokio::fs::OpenOptions;
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            format!(
+                "failed to create parent directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let file = options
+        .open(&path)
+        .await
+        .map_err(|e| format!("failed to open record file {}: {e}", path.display()))?;
+
+    let (tx, mut rx) = mpsc::channel::<PaneRecordChunk>(PANE_RECORD_CHANNEL_CAPACITY);
+    let outcome = Arc::new(StdMutex::new(PaneRecordResult {
+        status: PaneRecordStatus::Recording,
+        bytes_written: 0,
+        error: None,
+    }));
+    let writer_outcome = outcome.clone();
+    let task = tokio::spawn(async move {
+        let mut file = file;
+        let mut bytes_written = 0u64;
+        let mut final_status = PaneRecordStatus::Complete;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                PaneRecordChunk::Bytes(bytes) => {
+                    if let Err(e) = file.write_all(&bytes).await {
+                        let mut outcome = writer_outcome.lock().expect("record outcome poisoned");
+                        outcome.status = PaneRecordStatus::Error;
+                        outcome.bytes_written = bytes_written;
+                        outcome.error = Some(format!("failed to write record chunk: {e}"));
+                        return;
+                    }
+                    bytes_written += bytes.len() as u64;
+                }
+                PaneRecordChunk::Finish { status } => {
+                    final_status = status;
+                    break;
+                }
+            }
+        }
+        let flush_error = file.flush().await.err();
+        let mut outcome = writer_outcome.lock().expect("record outcome poisoned");
+        outcome.bytes_written = bytes_written;
+        if let Some(e) = flush_error {
+            outcome.status = PaneRecordStatus::Error;
+            outcome.error = Some(format!("failed to flush record file: {e}"));
+        } else if outcome.status == PaneRecordStatus::Recording {
+            outcome.status = final_status;
+        }
+    });
+
+    Ok((tx, outcome, task))
+}
+
+async fn tee_pane_recorders(
+    io_state: &Arc<Mutex<PaneIoState>>,
+    pane_id: shux_core::model::PaneId,
+    data: &[u8],
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    let sinks: Vec<(
+        mpsc::Sender<PaneRecordChunk>,
+        Arc<StdMutex<PaneRecordResult>>,
+    )> = {
+        let state = io_state.lock().await;
+        state
+            .recorders
+            .get(&pane_id)
+            .map(|recorders| {
+                recorders
+                    .iter()
+                    .filter(|r| {
+                        r.outcome.lock().expect("record outcome poisoned").status
+                            == PaneRecordStatus::Recording
+                    })
+                    .map(|r| (r.sender.clone(), r.outcome.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    for (sender, outcome) in sinks {
+        tokio::select! {
+            result = sender.send(PaneRecordChunk::Bytes(data.to_vec())) => {
+                if result.is_err() {
+                    let mut outcome = outcome.lock().expect("record outcome poisoned");
+                    if outcome.status == PaneRecordStatus::Recording {
+                        outcome.status = PaneRecordStatus::Error;
+                        outcome.error = Some("pane recorder writer closed before accepting bytes".to_string());
+                    }
+                }
+            }
+            _ = shutdown.cancelled() => {
+                let mut outcome = outcome.lock().expect("record outcome poisoned");
+                if outcome.status == PaneRecordStatus::Recording {
+                    outcome.status = PaneRecordStatus::Aborted;
+                    outcome.error = Some("pane shutdown interrupted recorder backpressure".to_string());
+                }
+                return;
+            }
+        }
+    }
+}
+
+async fn finish_pane_recorders(
+    io_state: &Arc<Mutex<PaneIoState>>,
+    pane_id: shux_core::model::PaneId,
+) {
+    let senders: Vec<mpsc::Sender<PaneRecordChunk>> = {
+        let state = io_state.lock().await;
+        state
+            .recorders
+            .get(&pane_id)
+            .map(|recorders| recorders.iter().map(|r| r.sender.clone()).collect())
+            .unwrap_or_default()
+    };
+
+    for sender in senders {
+        let _ = sender
+            .send(PaneRecordChunk::Finish {
+                status: PaneRecordStatus::Complete,
+            })
+            .await;
+    }
 }
 
 struct PtyTaskControl {
@@ -215,6 +419,7 @@ async fn run_pane_pty_task(
                     }
                     Ok(n) => {
                         let data = &buf[..n];
+                        tee_pane_recorders(&io_state, pane_id, data, &shutdown).await;
                         let (pulse, vt_title, bus_opt, terminal_responses) = {
                             let mut state = io_state.lock().await;
                             let (vt_title, terminal_responses) =
@@ -387,6 +592,8 @@ async fn run_pane_pty_task(
             }
         }
     }
+
+    finish_pane_recorders(&io_state, pane_id).await;
 
     // Reap the child cleanly so plugins and `events.history` see the
     // real exit code on `pane.exited`. The loop exits for several
@@ -3424,7 +3631,8 @@ fn register_pane_io_methods(
     let g7 = graph.clone();
     let g8 = graph.clone();
     let g9 = graph.clone();
-    let g10 = graph;
+    let g10 = graph.clone();
+    let g11 = graph;
 
     let io1 = io_state.clone();
     let io2 = io_state.clone();
@@ -3435,7 +3643,9 @@ fn register_pane_io_methods(
     let io7 = io_state.clone();
     let io8 = io_state.clone();
     let io9 = io_state.clone();
-    let io10 = io_state;
+    let io10 = io_state.clone();
+    let io11 = io_state.clone();
+    let io12 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
     // Wrapped in an `ArcSwap` so the snapshot handlers can pick up
@@ -3891,6 +4101,240 @@ fn register_pane_io_methods(
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
                     }
+                }
+            },
+        )
+        .register_with_policy(
+            "pane.record.start",
+            Policy::fixed(Sensitivity::PluginsForbidden),
+            move |params: Option<serde_json::Value>| {
+                let gh = g11.clone();
+                let io = io11.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+                    let path_str =
+                        params.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'path' parameter")
+                        })?;
+                    if path_str.trim().is_empty() {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "'path' parameter must not be empty",
+                        ));
+                    }
+                    let path = PathBuf::from(path_str);
+                    let overwrite = params
+                        .get("overwrite")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let duration_ms = params.get("duration_ms").and_then(|v| v.as_u64());
+                    if !overwrite {
+                        match tokio::fs::try_exists(&path).await {
+                            Ok(true) => {
+                                return Err(shux_rpc::RpcError::invalid_params(
+                                    "record file already exists; pass overwrite=true to replace it",
+                                ));
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                return Err(shux_rpc::RpcError::internal(&format!(
+                                    "failed to inspect record file {}: {e}",
+                                    path.display()
+                                )));
+                            }
+                        }
+                    }
+
+                    {
+                        let state = io.lock().await;
+                        if !state.writers.contains_key(&pane_id) {
+                            return Err(shux_rpc::RpcError::not_found(
+                                "live pane PTY",
+                                &pane_id.to_string(),
+                            ));
+                        }
+                        if state.recorders.get(&pane_id).is_some_and(|recorders| {
+                            recorders.iter().any(|r| {
+                                r.outcome.lock().expect("record outcome poisoned").status
+                                    == PaneRecordStatus::Recording
+                            })
+                        }) {
+                            return Err(shux_rpc::RpcError::name_conflict(
+                                "pane recording",
+                                &pane_id.to_string(),
+                            ));
+                        }
+                    }
+
+                    let (sender, outcome, task) = spawn_pane_recorder(path.clone(), overwrite)
+                        .await
+                        .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+                    let recording_id = uuid::Uuid::new_v4();
+                    let mut state = io.lock().await;
+                    if !state.writers.contains_key(&pane_id) {
+                        drop(state);
+                        let _ = sender
+                            .send(PaneRecordChunk::Finish {
+                                status: PaneRecordStatus::Aborted,
+                            })
+                            .await;
+                        let _ = task.await;
+                        return Err(shux_rpc::RpcError::not_found(
+                            "live pane PTY",
+                            &pane_id.to_string(),
+                        ));
+                    }
+                    state
+                        .recorders
+                        .entry(pane_id)
+                        .or_default()
+                        .push(PaneRecorder {
+                            id: recording_id,
+                            path: path.clone(),
+                            sender: sender.clone(),
+                            outcome: outcome.clone(),
+                            task,
+                        });
+                    drop(state);
+
+                    if let Some(ms) = duration_ms {
+                        let io_for_deadline = io.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                            let deadline_sender = {
+                                let state = io_for_deadline.lock().await;
+                                state.recorders.get(&pane_id).and_then(|recorders| {
+                                    recorders
+                                        .iter()
+                                        .find(|r| r.id == recording_id)
+                                        .and_then(|r| {
+                                            let status = r
+                                                .outcome
+                                                .lock()
+                                                .expect("record outcome poisoned")
+                                                .status;
+                                            (status == PaneRecordStatus::Recording)
+                                                .then(|| r.sender.clone())
+                                        })
+                                })
+                            };
+                            if let Some(sender) = deadline_sender {
+                                let _ = sender
+                                    .send(PaneRecordChunk::Finish {
+                                        status: PaneRecordStatus::Complete,
+                                    })
+                                    .await;
+                            }
+                            tokio::time::sleep(PANE_RECORD_COMPLETED_TTL).await;
+                            let mut state = io_for_deadline.lock().await;
+                            for recorders in state.recorders.values_mut() {
+                                if let Some(pos) = recorders.iter().position(|r| {
+                                    r.id == recording_id
+                                        && r.outcome.lock().expect("record outcome poisoned").status
+                                            != PaneRecordStatus::Recording
+                                }) {
+                                    recorders.remove(pos);
+                                    break;
+                                }
+                            }
+                            state.recorders.retain(|_, recorders| !recorders.is_empty());
+                        });
+                    }
+
+                    Ok(serde_json::json!({
+                        "recording_id": recording_id.to_string(),
+                        "pane_id": pane_id.to_string(),
+                        "path": path.display().to_string(),
+                        "duration_ms": duration_ms,
+                        "lossless": true,
+                        "backpressure": true,
+                    }))
+                }
+            },
+        )
+        .register_with_policy(
+            "pane.record.stop",
+            Policy::fixed(Sensitivity::PluginsForbidden),
+            move |params: Option<serde_json::Value>| {
+                let io = io12.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let recording_id_str = params
+                        .get("recording_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params("missing 'recording_id' parameter")
+                        })?;
+                    let recording_id: uuid::Uuid = recording_id_str.parse().map_err(|_| {
+                        shux_rpc::RpcError::invalid_params("invalid recording_id format")
+                    })?;
+
+                    let recorder = {
+                        let mut state = io.lock().await;
+                        let mut found = None;
+                        for recorders in state.recorders.values_mut() {
+                            if let Some(pos) = recorders.iter().position(|r| r.id == recording_id) {
+                                found = Some(recorders.remove(pos));
+                                break;
+                            }
+                        }
+                        state.recorders.retain(|_, recorders| !recorders.is_empty());
+                        found
+                    }
+                    .ok_or_else(|| {
+                        shux_rpc::RpcError::not_found("pane recording", recording_id_str)
+                    })?;
+
+                    let should_finish = recorder
+                        .outcome
+                        .lock()
+                        .expect("record outcome poisoned")
+                        .status
+                        == PaneRecordStatus::Recording;
+                    if should_finish {
+                        let _ = recorder
+                            .sender
+                            .send(PaneRecordChunk::Finish {
+                                status: PaneRecordStatus::Complete,
+                            })
+                            .await;
+                    }
+                    drop(recorder.sender);
+                    let join_result =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), recorder.task)
+                            .await;
+                    match join_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let mut outcome =
+                                recorder.outcome.lock().expect("record outcome poisoned");
+                            outcome.status = PaneRecordStatus::Error;
+                            outcome.error = Some(format!("pane recorder task failed: {e}"));
+                        }
+                        Err(_) => {
+                            let mut outcome =
+                                recorder.outcome.lock().expect("record outcome poisoned");
+                            if outcome.status == PaneRecordStatus::Recording {
+                                outcome.status = PaneRecordStatus::Error;
+                                outcome.error =
+                                    Some("timed out while finalizing pane recording".to_string());
+                            }
+                        }
+                    }
+                    let result = recorder
+                        .outcome
+                        .lock()
+                        .expect("record outcome poisoned")
+                        .clone();
+
+                    Ok(serde_json::json!({
+                        "recording_id": recording_id.to_string(),
+                        "path": recorder.path.display().to_string(),
+                        "bytes_written": result.bytes_written,
+                        "status": result.status.as_str(),
+                        "lossless": result.status == PaneRecordStatus::Complete,
+                        "error": result.error,
+                    }))
                 }
             },
         )
@@ -4620,6 +5064,24 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         &pane,
                         timeout_ms,
                         limit,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Record {
+                    session,
+                    pane,
+                    to,
+                    force,
+                    duration_ms,
+                } => {
+                    cli::handle_pane_record(
+                        &mut stream,
+                        &session,
+                        &pane,
+                        &to,
+                        force,
+                        duration_ms,
                         args.format,
                     )
                     .await
@@ -5970,6 +6432,165 @@ done
         )
         .await;
         assert_eq!(missing_pane.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pane_record_routes_capture_source_bytes_losslessly() {
+        let harness = RpcHarness::new();
+        let (_session_id, _window_id, pane_id) = harness.seed_session("record").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw-output.bin");
+
+        let started = dispatch_ok(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": path.display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(started["lossless"], true);
+        assert_eq!(started["backpressure"], true);
+        let recording_id = started["recording_id"].as_str().unwrap().to_string();
+
+        let mut payload = Vec::new();
+        for i in 0..8192u32 {
+            payload.extend_from_slice(b"\x1b[2Jframe:");
+            payload.extend_from_slice(i.to_string().as_bytes());
+            payload.push(b'\n');
+        }
+        assert!(
+            payload.len() > 64 * 1024,
+            "payload should exceed sampled pane.output pending cap"
+        );
+        tee_pane_recorders(&harness.io, pane_id, &payload, &harness.cancel).await;
+
+        let stopped = dispatch_ok(
+            &harness.router,
+            "pane.record.stop",
+            serde_json::json!({
+                "recording_id": recording_id,
+            }),
+        )
+        .await;
+        assert_eq!(stopped["status"], "complete");
+        assert_eq!(stopped["lossless"], true);
+        assert_eq!(stopped["bytes_written"], payload.len() as u64);
+        let recorded = tokio::fs::read(dir.path().join("raw-output.bin"))
+            .await
+            .unwrap();
+        assert_eq!(recorded, payload);
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pane_record_start_rejects_duplicate_active_recorder_for_pane() {
+        let harness = RpcHarness::new();
+        let (_session_id, _window_id, pane_id) = harness.seed_session("record-duplicate").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.bin");
+        let second_path = dir.path().join("second.bin");
+
+        let started = dispatch_ok(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": first_path.display().to_string(),
+            }),
+        )
+        .await;
+        let err = dispatch_err(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": second_path.display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::NameConflict.code());
+
+        let _ = dispatch_ok(
+            &harness.router,
+            "pane.record.stop",
+            serde_json::json!({
+                "recording_id": started["recording_id"].as_str().unwrap(),
+            }),
+        )
+        .await;
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pane_record_duration_stops_on_daemon_side() {
+        let harness = RpcHarness::new();
+        let (_session_id, _window_id, pane_id) = harness.seed_session("record-duration").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duration.bin");
+
+        let started = dispatch_ok(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": path.display().to_string(),
+                "duration_ms": 25,
+            }),
+        )
+        .await;
+        let recording_id = started["recording_id"].as_str().unwrap().to_string();
+        tee_pane_recorders(&harness.io, pane_id, b"before-deadline", &harness.cancel).await;
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        tee_pane_recorders(&harness.io, pane_id, b"after-deadline", &harness.cancel).await;
+
+        let stopped = dispatch_ok(
+            &harness.router,
+            "pane.record.stop",
+            serde_json::json!({
+                "recording_id": recording_id,
+            }),
+        )
+        .await;
+        assert_eq!(stopped["status"], "complete");
+        assert_eq!(stopped["bytes_written"], "before-deadline".len() as u64);
+        assert_eq!(
+            tokio::fs::read(dir.path().join("duration.bin"))
+                .await
+                .unwrap(),
+            b"before-deadline"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pane_record_start_refuses_existing_file_without_overwrite() {
+        let harness = RpcHarness::new();
+        let (_session_id, _window_id, pane_id) = harness.seed_session("record-exists").await;
+        let _writer_rx = harness.seed_io(pane_id, b"ready\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.bin");
+        tokio::fs::write(&path, b"keep").await.unwrap();
+
+        let err = dispatch_err(
+            &harness.router,
+            "pane.record.start",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "path": path.display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"keep");
 
         harness.stop().await;
     }

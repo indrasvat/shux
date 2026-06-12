@@ -129,6 +129,12 @@ test-attach-color: release ## Verify attach preserves pane colors even when daem
 	@.shux/scripts/issue_69_attach_color_check.sh
 	@echo "$(COLOR_GREEN)✓ Attach color regression check passed$(COLOR_RESET)"
 
+.PHONY: test-lossless-record
+test-lossless-record: release ## Verify lossless pane recording with real PTY/TUI tools
+	@echo "$(COLOR_BLUE)▶ Running lossless pane record regression check...$(COLOR_RESET)"
+	@.shux/scripts/issue_70_lossless_record_check.sh
+	@echo "$(COLOR_GREEN)✓ Lossless pane record regression check passed$(COLOR_RESET)"
+
 .PHONY: test-copy-mode
 test-copy-mode: ## Run focused copy-mode and copy-overlay tests
 	@echo "$(COLOR_BLUE)▶ Running copy-mode tests...$(COLOR_RESET)"

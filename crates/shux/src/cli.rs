@@ -255,7 +255,7 @@ fn render_agent_help(colorize: bool) -> String {
     ));
     s.push_str(&row(
         "asciinema rec / script(1)",
-        &format!("{} {dim}(sealed data plane){r}", m("pane.output.watch")),
+        &format!("{} {dim}(lossless raw PTY bytes){r}", m("pane.record")),
     ));
     s.push_str(&row(
         "vhs / agg / terminalizer",
@@ -1144,12 +1144,12 @@ pub enum PaneCommand {
     /// Watch sampled PTY output from a pane (PR 2c).
     ///
     /// Long-polls `pane.output.watch` and prints each base64-decoded
-    /// chunk to stdout. Pipes cleanly:
-    /// `shux pane watch -p X | tee log`. Output is rate-limited at
-    /// the source to ~10 chunks/sec/pane to prevent noisy panes from
-    /// drowning subscribers. Bytes that arrived before the first
-    /// poll are UNREACHABLE — the data plane is intentionally lossy
-    /// to keep terminal secrets out of any history.
+    /// chunk to stdout. This is a low-overhead live observation stream,
+    /// not a byte-exact transcript. Output is rate-limited at the source
+    /// to ~10 chunks/sec/pane and may drop older bytes from a burst before
+    /// publishing a sampled chunk. Absence-of-bytes assertions over this
+    /// command are unsound; use `shux pane record --to FILE` for lossless
+    /// capture.
     Watch {
         /// Session name (used to validate the pane belongs to a
         /// live session; the daemon also enforces this).
@@ -1168,6 +1168,36 @@ pub enum PaneCommand {
         /// Each chunk is one sample interval's worth of bytes.
         #[arg(long)]
         limit: Option<u64>,
+    },
+
+    /// Record lossless raw PTY output from a pane to a file.
+    ///
+    /// This tees bytes at the daemon's PTY read source before sampled
+    /// `pane.output.watch` coalescing. It is byte-exact and intentionally
+    /// applies backpressure if the destination cannot keep up. The start
+    /// boundary is explicit: emit the stimulus you want audited only after
+    /// this command has started recording.
+    Record {
+        /// Session name.
+        #[arg(short, long)]
+        session: String,
+
+        /// Pane UUID to record.
+        #[arg(short, long)]
+        pane: String,
+
+        /// Output file for raw PTY bytes.
+        #[arg(long, value_name = "FILE")]
+        to: std::path::PathBuf,
+
+        /// Overwrite an existing output file.
+        #[arg(long)]
+        force: bool,
+
+        /// Stop automatically after N milliseconds. Without this flag,
+        /// recording continues until Ctrl-C.
+        #[arg(long)]
+        duration_ms: Option<u64>,
     },
 
     /// Send keystrokes to a pane
@@ -2662,6 +2692,52 @@ async fn resolve_pane_window_id(
     }
 }
 
+async fn validate_pane_belongs_to_session(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    pane_id: &str,
+) -> Result<(), RpcClientError> {
+    let session_id = resolve_session_id(stream, session_name).await?;
+    let windows = rpc_call(
+        stream,
+        "window.list",
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await?;
+    let Some(windows) = windows.as_array() else {
+        return Err(RpcClientError::Rpc {
+            code: -32004,
+            message: "could not list session windows".to_string(),
+            data: None,
+        });
+    };
+
+    for window in windows {
+        let Some(window_id) = window.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let panes = rpc_call(
+            stream,
+            "pane.list",
+            serde_json::json!({"session_id": session_id, "window_id": window_id}),
+        )
+        .await?;
+        if panes.as_array().is_some_and(|panes| {
+            panes
+                .iter()
+                .any(|p| p.get("id").and_then(|v| v.as_str()) == Some(pane_id))
+        }) {
+            return Ok(());
+        }
+    }
+
+    Err(RpcClientError::Rpc {
+        code: -32004,
+        message: format!("pane {pane_id} does not belong to session {session_name}"),
+        data: None,
+    })
+}
+
 /// Handle the `shux pane list` command.
 pub async fn handle_pane_list(
     stream: &mut tokio::net::UnixStream,
@@ -3097,6 +3173,7 @@ pub async fn handle_pane_watch(
     let mut delivered: u64 = 0;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let mut warned_sampled = false;
 
     loop {
         let mut params = serde_json::json!({
@@ -3114,11 +3191,24 @@ pub async fn handle_pane_watch(
         if let Some(arr) = resp.get("chunks").and_then(|v| v.as_array()) {
             for chunk in arr {
                 let bytes_b64 = chunk.get("bytes").and_then(|v| v.as_str()).unwrap_or("");
+                let sampled = chunk
+                    .get("sampled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 match format {
                     OutputFormat::Json => {
                         let _ = writeln!(out, "{}", serde_json::to_string(chunk)?);
                     }
                     OutputFormat::Text | OutputFormat::Plain => {
+                        if sampled && !warned_sampled {
+                            eprintln!(
+                                "{} sampled pane.output chunk — bytes were dropped before this chunk; use `shux pane record --to FILE` for lossless audits",
+                                crate::style::warning("!"),
+                            );
+                            warned_sampled = true;
+                        } else if !sampled {
+                            warned_sampled = false;
+                        }
                         if let Ok(raw) =
                             base64::engine::general_purpose::STANDARD.decode(bytes_b64.as_bytes())
                         {
@@ -3151,6 +3241,103 @@ pub async fn handle_pane_watch(
             );
         }
     }
+}
+
+/// Handle `shux pane record` — start a daemon-side lossless recorder, wait for
+/// a bounded duration or Ctrl-C, then stop and report the byte count.
+pub async fn handle_pane_record(
+    stream: &mut tokio::net::UnixStream,
+    session_name: &str,
+    pane_id: &str,
+    to: &std::path::Path,
+    force: bool,
+    duration_ms: Option<u64>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    // Validate the UUID early so typos don't create files.
+    let _: uuid::Uuid = pane_id
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid pane uuid: {e}"))?;
+    validate_pane_belongs_to_session(stream, session_name, pane_id).await?;
+
+    let path = if to.is_absolute() {
+        to.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(to)
+    };
+
+    let start = rpc_call(
+        stream,
+        "pane.record.start",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "path": path,
+            "overwrite": force,
+            "duration_ms": duration_ms,
+        }),
+    )
+    .await?;
+    let recording_id = start
+        .get("recording_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("daemon did not return recording_id"))?
+        .to_string();
+
+    match duration_ms {
+        Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+        None => {
+            eprintln!(
+                "{} recording lossless pane output; press Ctrl-C to stop",
+                crate::style::muted("..."),
+            );
+            tokio::signal::ctrl_c().await?;
+        }
+    }
+
+    let stopped = rpc_call(
+        stream,
+        "pane.record.stop",
+        serde_json::json!({
+            "recording_id": recording_id,
+        }),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&stopped)?),
+        OutputFormat::Plain => {
+            let path = stopped.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes = stopped
+                .get("bytes_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let status = stopped
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("recording\t{status}\t{path}\t{bytes}");
+        }
+        OutputFormat::Text => {
+            let path = stopped.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes = stopped
+                .get("bytes_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let status = stopped
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!(
+                "{} {} bytes to {} ({})",
+                crate::style::success("✓ recorded"),
+                crate::style::bold(&bytes.to_string()),
+                crate::style::muted(path),
+                status,
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle the `shux pane kill` command.
@@ -4180,7 +4367,7 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
                 captured.lock().unwrap().push(request.clone());
 
-                let response = if let Some(error) = scripted.get("error") {
+                let response = if let Some(error) = scripted.get("error").filter(|e| !e.is_null()) {
                     serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
@@ -5017,6 +5204,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_cli_pane_record_parse() {
+        let cli = Cli::try_parse_from([
+            "shux",
+            "pane",
+            "record",
+            "-s",
+            "work",
+            "-p",
+            "11111111-1111-4111-8111-111111111111",
+            "--to",
+            "out.bin",
+            "--duration-ms",
+            "250",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Pane {
+                command:
+                    PaneCommand::Record {
+                        session,
+                        pane,
+                        to,
+                        force,
+                        duration_ms,
+                    },
+            }) => {
+                assert_eq!(session, "work");
+                assert_eq!(pane, "11111111-1111-4111-8111-111111111111");
+                assert_eq!(to, std::path::PathBuf::from("out.bin"));
+                assert!(force);
+                assert_eq!(duration_ms, Some(250));
+            }
+            _ => panic!("expected Pane Record command"),
+        }
+    }
+
     #[tokio::test]
     async fn cli_session_handlers_emit_expected_rpc_shapes() {
         let sid = "11111111-1111-4111-8111-111111111111";
@@ -5290,6 +5515,8 @@ mod tests {
         let session = || session_list_response(sid, wid);
         let windows = || window_list_response(wid, pane);
         let png_b64 = "iVBORw0KGgo=";
+        let record_dir = tempfile::tempdir().unwrap();
+        let record_path = record_dir.path().join("record.raw");
         let (mut client, requests, task) = spawn_rpc_script(vec![
             session(),
             windows(),
@@ -5304,6 +5531,11 @@ mod tests {
             session(),
             windows(),
             serde_json::json!({"pane_id": pane, "cols": 100, "rows": 30}),
+            session(),
+            windows(),
+            serde_json::json!([{"id": pane, "cwd": "/tmp", "command": "bash", "is_focused": true, "is_zoomed": false}]),
+            serde_json::json!({"recording_id": "55555555-5555-4555-8555-555555555555", "pane_id": pane, "path": record_path.display().to_string(), "duration_ms": 0, "lossless": true, "backpressure": true}),
+            serde_json::json!({"recording_id": "55555555-5555-4555-8555-555555555555", "path": record_path.display().to_string(), "bytes_written": 0, "status": "complete", "lossless": true, "error": null}),
             session(),
             windows(),
             serde_json::json!({"png_base64": png_b64, "width": 10, "height": 10}),
@@ -5373,6 +5605,17 @@ mod tests {
         )
         .await
         .unwrap();
+        handle_pane_record(
+            &mut client,
+            "dev",
+            pane,
+            &record_path,
+            true,
+            Some(0),
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
         handle_pane_snapshot(
             &mut client,
             "dev",
@@ -5427,6 +5670,16 @@ mod tests {
                 .iter()
                 .any(|r| r["method"] == "pane.set_size" && r["params"]["cols"] == 100)
         );
+        assert!(requests.iter().any(|r| {
+            r["method"] == "pane.record.start"
+                && r["params"]["pane_id"] == pane
+                && r["params"]["path"] == record_path.display().to_string()
+        }));
+        assert!(requests.iter().any(|r| {
+            r["method"] == "pane.list"
+                && r["params"]["session_id"] == sid
+                && r["params"]["window_id"] == wid
+        }));
         assert!(requests.iter().any(|r| r["method"] == "pane.snapshot"));
         assert!(requests.iter().any(|r| r["method"] == "session.snapshot"));
         assert!(requests.iter().any(|r| r["method"] == "window.snapshot"));

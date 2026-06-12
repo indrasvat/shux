@@ -212,11 +212,30 @@ Enumerate panes in a window (or across all windows of a session).
 
 Subscribe to the data-plane stream of sampled PTY chunks. Returns a list
 of recent chunks (or blocks up to `timeout_ms` waiting for new ones).
+This is for live observation, not absence-of-bytes assertions.
 
 ```json
 { "pane_id": "uuid", "timeout_ms": 1500, "limit": 10 }
-  → { "chunks": [{ "seq": 42, "bytes_b64": "...", "timestamp": ... }, ...],
+  → { "chunks": [{ "seq": 42, "bytes_b64": "...", "sampled": true, "timestamp": ... }, ...],
       "next_seq": 52 }
+```
+
+### `pane.record.start` / `pane.record.stop`
+
+Record byte-exact raw PTY bytes to a daemon-side file. Bytes are teed at
+the PTY read source before VT processing and before sampled
+`pane.output.watch` coalescing.
+
+```json
+{ "pane_id": "uuid", "path": "/abs/path/pane.raw",
+  "overwrite": false, "duration_ms": 10000 }
+  → { "recording_id": "uuid", "pane_id": "uuid", "path": "/abs/path/pane.raw",
+      "duration_ms": 10000, "lossless": true, "backpressure": true }
+
+{ "recording_id": "uuid" }
+  → { "recording_id": "uuid", "path": "/abs/path/pane.raw",
+      "bytes_written": 12345, "status": "complete",
+      "lossless": true, "error": null }
 ```
 
 ## Pane management

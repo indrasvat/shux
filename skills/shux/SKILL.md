@@ -108,7 +108,7 @@ shux state apply spec.toml      # atomic — all or nothing
 | iTerm2 (Python SDK / AppleScript)                | Drive a terminal app from outside              | `shux pane send-keys` + `shux pane snapshot`               |
 | `expect` · `pexpect` · `sexpect`                 | Scripted CLI / REPL interaction                | `pane send-keys` → `pane wait-for` → `pane capture`        |
 | iTerm2 `wait_for_text` / `wait_for_absent`       | Block until screen contains (or stops containing) a needle | `shux pane wait-for` (text · regex · `--absent`)           |
-| `asciinema rec` · `script(1)`                    | Record a terminal session                      | `pane.output.watch` (sealed data-plane stream)             |
+| `asciinema rec` · `script(1)`                    | Record a terminal session                      | `shux pane record --to FILE` (lossless raw PTY bytes)      |
 | `vhs` · `agg` · `terminalizer`                   | Generate TUI demo GIFs / WebPs                 | `shux window snapshot` loop → `ffmpeg`                     |
 | `termshot` · `freezeframe`                       | Still PNG of a terminal frame                  | `shux pane snapshot` or `shux window snapshot`             |
 | iTerm2 broadcast input                           | Send keystrokes to many panes at once          | `shux pane send-keys` fan-out (one RPC per pane)           |
@@ -128,7 +128,7 @@ shape per method.
 |--        |--                                                                                |
 | Session  | `session.create` · `session.list` · `session.rename` · `session.kill` · `session.ensure` |
 | Window   | `window.create` · `window.list` · `window.focus` · `window.kill` · `window.ensure` |
-| Pane I/O | `pane.send_keys` · `pane.set_size` · `pane.snapshot` · `pane.capture` · `pane.output.watch` |
+| Pane I/O | `pane.send_keys` · `pane.set_size` · `pane.snapshot` · `pane.capture` · `pane.output.watch` · `pane.record.start` · `pane.record.stop` |
 | Pane mgmt| `pane.split` · `pane.focus` · `pane.zoom` · `pane.swap` · `pane.kill` · `pane.set_title` |
 | Window snap | `window.snapshot` · `session.snapshot` (composed multi-pane PNG)            |
 | State    | `state.apply` (atomic batch) · `events.history` · `system.version`               |
@@ -165,7 +165,8 @@ Need a snapshot of the session's
 active window?                     → session.snapshot (shux session snapshot)
 Need plain text of the screen?     → pane.capture    (shux pane capture)
 Need to block until text appears?  → pane.wait_for   (shux pane wait-for --text|--regex)
-Need a stream of PTY output?       → pane.output.watch (event-bus, sealed)
+Need live sampled PTY output?      → pane.output.watch (sealed data-plane, sampled)
+Need a byte-exact transcript?      → shux pane record --to FILE (lossless recorder)
 Want raw RPC for a new method?     → shux rpc call <method> --params @file
 ```
 

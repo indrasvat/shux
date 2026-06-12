@@ -481,6 +481,9 @@ the short version:
     `window.snapshot`, `events.history`, `events.watch` (when not
     self-scoped). Default-deny; auto-allowed for entities the plugin
     created; explicit grant otherwise.
+  - `PluginsForbidden` — raw transcript recorders such as
+    `pane.record.start` and `pane.record.stop`. These are not grantable to
+    process plugins because they create durable byte-exact PTY captures.
   - `OwnedMutation` — `pane.send_keys`, `pane.kill`, `pane.split`,
     `pane.resize`, `pane.set_title`, `window.create`, `session.create`,
     every other mutation. Same ownership-or-grant rule.

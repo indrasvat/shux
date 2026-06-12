@@ -124,8 +124,10 @@ tests anyway.
 
 shux doesn't have a tmux-style hook system. Instead, write a
 process plugin (see [`references/plugins.md`](../references/plugins.md))
-or subscribe to `events.history` / `pane.output.watch` and react in
-your driver script. Cleaner contract, no embedded shell evaluation.
+or subscribe to control-plane `events.watch` / `events.history` and react in
+your driver script. Use `pane.output.watch` only for sampled live pane bytes;
+use `pane record` for byte-exact transcripts. Cleaner contract, no embedded
+shell evaluation.
 
 ## tmux plugins
 

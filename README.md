@@ -72,6 +72,7 @@ shux session create work          # create + attach in the caller's cwd
 shux session create work --title work  # also pin the initial pane title
 shux pane split -s work           # split the active pane
 shux pane snapshot -s work        # PNG of the current frame
+shux pane record -s work -p <pane-id> --to pane.raw  # byte-exact PTY capture
 shux config init                  # scaffold ~/.config/shux/config.toml
 ```
 
@@ -90,6 +91,10 @@ write the payload in a file. CLI-created sessions start in the current
 directory of the `shux` invocation unless you pass `--cwd`. Use `--title`
 when the initial pane's border label should be pinned instead of following
 app-emitted OSC titles or command/cwd auto-title derivation.
+
+For live observation, `shux pane watch` follows the sampled data-plane stream.
+For audits, transcripts, or absence-of-bytes checks, use `shux pane record`;
+it writes raw PTY bytes before VT processing and before sampled coalescing.
 
 Inside the TUI, the prefix key is `Ctrl+Space` by default:
 

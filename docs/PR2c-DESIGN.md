@@ -138,13 +138,17 @@ shux pane watch -s <session> [-p <pane>] [--sample-ms 100]
 ```
 
 Long-polls `pane.output.watch` in a loop, base64-decodes each chunk,
-prints to stdout. Pipes cleanly: `shux pane watch -p X | tee log`.
+prints to stdout. This is a live observation stream, not a transcript
+recorder: high-volume panes can be sampled before publication. Use
+`shux pane record --to FILE` when absence-of-bytes or byte-exact audit
+semantics matter.
 
 ## Out of scope for v1
 
-- **Persistent recording.** No on-disk capture. Agents that want a
-  full transcript should redirect the `shux pane watch` stream into
-  a file.
+- **Persistent recording.** PR 2c intentionally did not provide an
+  on-disk capture path. Task 066 later added `pane.record.start` /
+  `pane.record.stop` and `shux pane record` as the lossless recorder
+  primitive for byte-exact transcripts.
 - **Multi-pane subscription in one call.** v1 requires one
   `pane.output.watch` per pane. Multiplexing inside one call is a
   later optimization once we see actual agent demand.

@@ -14,7 +14,7 @@ that drives shux programmatically.
 | **CLI == API** | Every subcommand maps 1:1 to a JSON-RPC method. The CLI is just a thin wrapper. |
 | **Idempotent `--ensure`** | `shux session create X --ensure` is safe to retry. Creates only if missing. |
 | **Deterministic state** | `shux session list --format json` returns the full session graph. Always consistent, never stale. |
-| **Typed events** | `events.watch` (planned, M2) yields a sequenced stream of typed events for reacting to pane output, exit codes, focus changes. |
+| **Typed events** | `events.watch` / `events.history` yield sequenced control-plane events; use `pane.output.watch` for sampled live bytes and `pane.record.*` for lossless transcripts. |
 | **Same errors everywhere** | RPC error codes are stable: `-32601` method-not-found, `-32007` name-conflict, etc. CLI surfaces them as exit code 1 + structured stderr. |
 
 ## Connect
@@ -99,6 +99,9 @@ echo $?   # 0 on success, exit code of cargo test on failure
 
 # Capture the last N lines of pane output:
 shux pane capture -s build --lines 50 --format json
+
+# Record byte-exact raw PTY output for audits/transcripts:
+shux pane record -s build -p <pane-id> --to ./pane.raw --duration-ms 10000
 ```
 
 ## Driving an attached session
@@ -151,18 +154,20 @@ Stable codes:
 CLI translates these to exit code 1 with a human-readable message;
 `--format json` returns the full error object so you can switch on `code`.
 
-## Events (planned, M2)
+## Events
 
-`events.watch` will return a streamed JSON-Lines feed of typed events:
+`events.watch` returns a streamed JSON-Lines feed of typed control-plane
+events, and `events.history` replays bounded history:
 
 ```jsonl
-{"seq":1,"type":"pane_output","pane":"...","bytes":"..."}
-{"seq":2,"type":"pane_exited","pane":"...","exit_code":0}
-{"seq":3,"type":"window_focused","window":"..."}
+{"seq":1,"type":"pane.exited","data":{"pane_id":"...","exit_status":0}}
+{"seq":2,"type":"window.focused","data":{"window_id":"..."}}
+{"seq":3,"type":"plugin.watcher.command_exit","data":{"pane_id":"..."}}
 ```
 
-Sequenced for gap detection. Until the M2 plugin host lands, the workaround
-is polling `pane.capture` and `session.list` at a low rate.
+Pane bytes are intentionally not replayed through control-plane history.
+Use `pane.output.watch` for sampled live observation and `pane.record.*` for
+byte-exact transcripts.
 
 ## MCP integration (planned)
 

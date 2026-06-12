@@ -80,7 +80,12 @@ Useful for scripts and agents that drive an attached session:
 shux pane send-keys -s work -t "git status\n"   # types "git status<Enter>"
 shux pane run -s work cargo test                # runs cargo test, waits for completion
 shux pane capture -s work --lines 50            # captures last 50 lines as text
+shux pane record -s work -p <pane-id> --to pane.raw --duration-ms 10000
 ```
+
+`pane capture` reads visible VT text. `pane watch` is a sampled live byte
+stream. For byte-exact transcripts or absence-of-bytes audits, use
+`pane record`; it records raw PTY bytes before sampled coalescing.
 
 ## Customization
 
