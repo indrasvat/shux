@@ -485,7 +485,7 @@ impl ReflowedLineMap {
 fn trim_default_trailing_cells(cells: &[Cell]) -> Vec<Cell> {
     let end = cells
         .iter()
-        .rposition(|cell| *cell != Cell::default())
+        .rposition(|cell| cell.ch != ' ' || cell.is_wide_continuation())
         .map(|idx| idx + 1)
         .unwrap_or(0);
     cells[..end].to_vec()
@@ -769,6 +769,23 @@ mod tests {
         assert_eq!(row_text(grid.visible_row(0)), "AAA");
         assert!(!grid.visible_row(0).wrapped);
         assert_eq!(row_text(grid.visible_row(1)), "BBB");
+        assert!(!grid.visible_row(1).wrapped);
+    }
+
+    #[test]
+    fn resize_ignores_trailing_styled_blanks_on_hard_lines() {
+        let mut grid = Grid::new(4, 8, GridConfig::default());
+        write_text(grid.visible_row_mut(0), "AB");
+        for col in 2..8 {
+            grid.visible_row_mut(0)[col].reset(Color::Indexed(4));
+        }
+        write_text(grid.visible_row_mut(1), "CD");
+
+        grid.resize(4, 3);
+
+        assert_eq!(row_text(grid.visible_row(0)), "AB");
+        assert!(!grid.visible_row(0).wrapped);
+        assert_eq!(row_text(grid.visible_row(1)), "CD");
         assert!(!grid.visible_row(1).wrapped);
     }
 

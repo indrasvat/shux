@@ -101,6 +101,19 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-06-12 — fix(vt): trim styled blank resize tails**
+- Addressed PR review feedback for task 067 by treating trailing visual blanks
+  as reflow padding even when erase/reset operations left non-default styling
+  on those cells, while still preserving wide-cell continuations.
+- Added a focused regression for hard lines with styled blank tails so resize
+  no longer wraps invisible padding into extra rows.
+- Fixed the pane I/O integration harness shutdown path to terminate and reap
+  PTY children on cancellation, preventing orphan login shells from poisoning
+  subsequent full-suite runs.
+- Verification: `make test-vt FILTER=resize`, `make test-vt-resize-reflow`,
+  `make test-vt`, `SHUX_TEST_BINARY_TIMEOUT_SECONDS=120 make test-pane-io`,
+  `SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check`, and SOLID VT QA PASS.
+
 **2026-06-12 — feat(vt): reflow soft-wrapped rows on resize**
 - Implemented `shux-vt` column resize reflow over scrollback + visible rows,
   preserving soft-wrapped logical lines, hard line breaks, styles, extended
