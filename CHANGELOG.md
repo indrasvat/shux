@@ -1,3 +1,10 @@
+# [0.29.0](https://github.com/indrasvat/shux/compare/v0.28.6...v0.29.0) (2026-06-12)
+
+
+### Features
+
+* **vt:** reflow soft-wrapped rows on resize ([6c2fb71](https://github.com/indrasvat/shux/commit/6c2fb71664b774a66e04b71d63c0193159f7e772))
+
 ## [0.28.6](https://github.com/indrasvat/shux/compare/v0.28.5...v0.28.6) (2026-06-12)
 
 
