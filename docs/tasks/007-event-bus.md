@@ -292,7 +292,8 @@ pub enum EventData {
         pane_id: PaneId,
         /// Base64-encoded bytes (PRD §8.4).
         bytes: String,
-        /// Whether this is a sample (true) or lossless (false).
+        /// Whether bytes were dropped/coalesced for this chunk.
+        /// This is not a stream-level transcript guarantee.
         sample: bool,
     },
 

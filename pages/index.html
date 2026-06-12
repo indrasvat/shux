@@ -957,9 +957,10 @@ command = ["lazygit"]
       <div class="annot">
         <h3>The full surface</h3>
         <p>
-          Twelve RPC methods cover session/window/pane lifecycle,
-          synchronous resize, scripted input, sampled PTY output, and
-          pixel snapshots. Each maps 1:1 to a CLI subcommand.
+          The RPC surface covers session/window/pane lifecycle,
+          synchronous resize, scripted input, sampled PTY watching,
+          lossless PTY recording, and pixel snapshots. Each maps 1:1
+          to a CLI subcommand.
         </p>
         <ul class="kv-list">
           <li><span class="k">session.*</span><span class="v">create / list / rename / kill / ensure</span></li>
@@ -967,7 +968,8 @@ command = ["lazygit"]
           <li><span class="k">pane.send_keys</span><span class="v">text or base64 control bytes</span></li>
           <li><span class="k">pane.set_size</span><span class="v">synchronous, ack via oneshot</span></li>
           <li><span class="k">pane.snapshot</span><span class="v">PNG, off-lock, budget-checked</span></li>
-          <li><span class="k">pane.output.watch</span><span class="v">sealed event-bus stream</span></li>
+          <li><span class="k">pane.output.watch</span><span class="v">sampled sealed data-plane stream</span></li>
+          <li><span class="k">pane.record.*</span><span class="v">lossless raw PTY transcript</span></li>
           <li><span class="k">state.apply</span><span class="v">atomic batch of typed Ops</span></li>
           <li><span class="k">events.history</span><span class="v">sequenced, gap-detectable</span></li>
         </ul>
@@ -1020,7 +1022,7 @@ command = ["lazygit"]
         <tr>
           <td data-label="if you'd reach for"><code>asciinema rec</code> · <code>script(1)</code></td>
           <td data-label="for this job">Record a terminal session</td>
-          <td data-label="the shux call"><code>pane.output.watch</code> data-plane stream</td>
+          <td data-label="the shux call"><code>shux pane record --to FILE</code> lossless PTY bytes</td>
         </tr>
         <tr>
           <td data-label="if you'd reach for"><code>vhs</code> · <code>agg</code> · <code>terminalizer</code></td>

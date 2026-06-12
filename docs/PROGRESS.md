@@ -89,6 +89,19 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-06-11 — docs(record): sync lossless recording across public surfaces**
+- Swept recent feature-release surfaces after PR #72: README, human/agent
+  guides, website copy, PRD/design docs, repo-bundled shux skill, and local
+  installed shux skill copies under `.agents` and `.codex`.
+- Replaced stale `pane.output.watch`-as-recording guidance with the current
+  contract: `pane.output.watch` is sampled live observation; `pane.record.*`
+  / `shux pane record --to FILE` is the byte-exact transcript path.
+- Checked recent released feature coverage. Status bar/onboarding,
+  emoji/font-fallback snapshots, mouse copy, richer TUI rendering, xterm probe
+  support, plugin hot reload, and `state.apply` remain represented in the
+  website/README/skill surfaces; the missing coverage was the new recorder and
+  stale exhaustive/lossless pane-output wording.
+
 **2026-06-11 — fix(record): validate pane record session scope**
 - Follow-up from PR review: `shux pane record -s <session>` now verifies the
   target pane belongs to the requested session before calling

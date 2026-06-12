@@ -116,11 +116,19 @@ This is the composability proof. Smart Context doesn't do anything dramatic on i
 ### How it works
 
 **Recording:**
-1. Subscribes to `pane.output` events for all panes with `exhaustive=true` (uses flow control `ack` to handle volume). ACKs are batched (every 16 events or 50ms, whichever comes first) to minimize protocol overhead.
-2. Stores timestamped byte streams to disk: `~/.local/share/shux/replay/{session}/{pane_id}.rec` (compressed with zstd). Compression runs in a dedicated thread to avoid blocking the event processing loop.
-3. Maintains an index of timestamps for fast seeking.
-4. Pane creation/destruction events mark recording boundaries.
-5. **Throughput management**: For extremely high-output panes (e.g., `cat /dev/urandom`), the plugin can opt into sampled mode per pane (via `drop` + re-`subscribe` with `exhaustive=false`) and mark the recording as lossy. This prevents the backpressure stall timeout (5s) from killing the plugin.
+1. Uses daemon-owned `pane.record.start` / `pane.record.stop` for panes the
+   user explicitly records. `pane.output` remains a sampled live-observation
+   stream and is not suitable for byte-exact replay files.
+2. Stores timestamped raw byte streams to disk:
+   `~/.local/share/shux/replay/{session}/{pane_id}.rec` (compressed with zstd).
+   Compression runs outside the PTY read path to avoid blocking the pane.
+3. Maintains an index of timestamps and pane lifecycle events for fast seeking.
+4. Pane creation/destruction events mark replay boundaries; recorder start/stop
+   events mark byte-exact transcript boundaries.
+5. **Throughput management**: the daemon recorder applies intentional
+   backpressure and reports `complete|error|aborted`, `bytes_written`, and
+   error detail. Sampled `pane.output` can still drive UI previews, but lossy
+   previews must never be labeled as replay-grade transcripts.
 
 **Playback:**
 ```
@@ -732,17 +740,19 @@ Route output from one pane as input to another -- create live data pipelines bet
 ### How it works
 
 1. **Tee to pane**: `shux pipe tee p-1 p-2` -- everything that appears in pane p-1 also gets sent to pane p-2.
-   - Subscribes to `pane.output` events for p-1 with `exhaustive=true` (lossless mode -- critical for data integrity when piping to parsers like `jq`).
+   - Subscribes to sampled `pane.output` events for p-1 for live interactive mirroring.
    - On each output event, calls `send-keys(p-2, output_bytes)` (raw bytes, not text).
-   - Uses flow control (`ack`/`drop`) to handle volume. The host applies backpressure to p-1's PTY reads if p-2 falls behind.
+   - Marks the pipe as live/best-effort; it is not byte-exact and must not be
+     used for parsers or audits that depend on absence-of-bytes semantics.
 
 2. **Pipe to command**: `shux pipe to p-1 "jq '.errors[]'"` -- creates a new pane running `jq`, feeds p-1's output into it.
    - Calls `split-pane(p-1, vertical, 40%, "jq '.errors[]'")`.
    - Subscribes to p-1's output, sends to the new pane via `send-keys`.
 
 3. **Tee to file**: `shux pipe file p-1 /tmp/session.log` -- writes all output from p-1 to a file.
-   - Subscribes to `pane.output` events.
-   - Calls `write-file` to append output (or uses the process plugin's own file I/O).
+   - Uses `pane.record.start` / `pane.record.stop` for a byte-exact file, or
+     explicitly labels sampled `pane.output` output as lossy when only a live
+     preview log is needed.
 
 4. **Filter pipe**: `shux pipe grep p-1 "ERROR" --pane` -- creates a pane that only shows lines matching a pattern.
    - Creates a new pane.
@@ -755,7 +765,11 @@ Route output from one pane as input to another -- create live data pipelines bet
 
 ### Why it matters
 
-Validates high-volume `pane.output` event streaming with flow control. Proves that `send-keys` and `read-pane-output` work together for cross-pane data flow. This is a uniquely terminal-multiplexer capability -- no other tool can route terminal output between processes interactively. It turns shux into a visual dataflow tool.
+Validates high-volume sampled `pane.output` observation for live cross-pane
+data flow, while reserving byte-exact file capture for `pane.record.*`. This
+is a uniquely terminal-multiplexer capability -- no other tool can route
+terminal output between processes interactively. It turns shux into a visual
+dataflow tool without confusing previews with transcripts.
 
 ### WIT functions exercised
 

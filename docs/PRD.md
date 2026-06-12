@@ -222,7 +222,7 @@ The daemon auto-exits when the last session is destroyed (configurable, with a 5
 
 1. **Single source of truth**: The `SessionGraph` in the daemon owns all state. Clients are views. State is accessed lock-free via `ArcSwap` snapshots.
 2. **CLI == API**: Every `shux` subcommand is a thin wrapper over a JSON-RPC call. There is no "CLI-only" functionality.
-3. **Plugins cannot block core**: The plugin host enforces timeouts via wasmtime epoch interruption (~100ms kill threshold). A misbehaving plugin is killed and reported, never stalling the event loop. **Interception caveat**: Sequential event interception (§7.2a) and exhaustive-stream backpressure (§7.6) can delay I/O for specific panes, but never the core render/input loop. Each interceptor has a hard per-call deadline (same 100ms kill threshold); if an interceptor times out, the event passes through unmodified and the plugin is flagged for restart. For exhaustive streams, the stall timeout (default 5s) bounds per-pane impact — the daemon kills the offending plugin and resumes normal PTY reads.
+3. **Plugins cannot block core**: The plugin host enforces timeouts via wasmtime epoch interruption (~100ms kill threshold). A misbehaving plugin is killed and reported, never stalling the event loop. **Future-design caveat**: Sequential event interception (§7.2a) and any future exhaustive-stream backpressure (§7.6) can delay I/O for specific panes, but never the core render/input loop. Each interceptor has a hard per-call deadline (same 100ms kill threshold); if an interceptor times out, the event passes through unmodified and the plugin is flagged for restart. Current v0 pane-output observation is sampled; byte-exact capture uses daemon-owned `pane.record.*`, not plugin-owned exhaustive streams.
 4. **Events are the integration surface**: Plugins, clients, and agents all subscribe to the same typed event stream via `tokio::sync::broadcast`. No polling needed.
 5. **Deterministic state**: `state.snapshot` returns the complete graph. `state.apply` is atomic; it is idempotent only when every operation is idempotent or carries an idempotency key. Agents work in read→plan→apply→verify loops.
 6. **Single writer, many readers**: All mutations flow through an mpsc channel to a single state-owner task. Readers access state via `ArcSwap` snapshots (lock-free). This avoids locks and serializes mutations naturally (following Zellij's proven pattern).
@@ -748,8 +748,9 @@ interface host {
   send-text: func(pane-id: string, text: string) -> result<_, host-error>;
 
   /// Read the last N lines of visible output from a pane's virtual terminal.
-  /// Returns rendered text (UTF-8, with ANSI stripped). For raw bytes, subscribe
-  /// to pane.output events with exhaustive mode.
+  /// Returns rendered text (UTF-8, with ANSI stripped). For raw byte-exact
+  /// transcripts, use daemon-owned pane.record.*; pane.output is sampled live
+  /// observation in current v0 builds.
   read-pane-output: func(pane-id: string, lines: u32) -> result<string, host-error>;
 
   /// Read from pane scrollback. offset=0 is the most recent scrollback line.
@@ -1007,13 +1008,13 @@ Version compatibility: `0.x.y` and `0.x'.y'` are incompatible if `x != x'`; for 
 {"type": "ack", "stream_id": 42}            // Plugin acknowledges receipt
 {"type": "drop", "stream_id": 42}           // Plugin no longer wants this stream
 
-// ── Event subscription (opt into exhaustive mode for lossless streams) ──
+// ── Event subscription (sampled live observation) ──
 {"type": "subscribe", "event_type": "pane.output", "pane_id": "p-1", "exhaustive": true}
-// exhaustive=true: host sends every byte, using ack-based flow control.
-//   The host buffers up to 256 un-acked events; if the buffer fills, the
-//   host pauses reading from that pane's PTY until the plugin catches up.
-// exhaustive=false (default): host samples/coalesces events. Suitable for
-//   status bar updates and pattern matching, not for lossless piping.
+// Current v0 pane.output is sampled/coalesced and suitable for live
+// observation, status updates, and pattern matching. Byte-exact transcripts
+// use the daemon-owned pane.record.start / pane.record.stop path instead.
+// A future exhaustive plugin stream would need a separate backpressure and
+// permission design; do not infer lossless semantics from pane.output today.
 
 // ── Cancellation ──
 {"type": "cancel", "id": "req-1"}           // Host cancels an in-flight request
@@ -1021,7 +1022,7 @@ Version compatibility: `0.x.y` and `0.x'.y'` are incompatible if `x != x'`; for 
 
 **Process plugin parity**: The process plugin protocol mirrors the WIT host interface 1:1. Every WIT function has a corresponding JSON message type. Permission enforcement is identical — the daemon checks `plugin.toml` permissions before executing any action, returning an error response if the permission is not granted.
 
-**Flow control bounds**: Each plugin has a bounded outbound event buffer (default: 256 events). If a plugin stops `ack`-ing but does not exit, the host drops new events for that plugin (logging a warning) rather than growing the buffer unbounded. For `exhaustive` streams, the host pauses PTY reads for the source pane instead of dropping — this provides backpressure but means a misbehaving plugin can stall a pane. The daemon monitors for this and kills plugins that stall for more than 5 seconds (configurable via `plugin_stall_timeout`).
+**Flow control bounds**: Each plugin has a bounded outbound event buffer (default: 256 events). If a plugin stops `ack`-ing but does not exit, the host drops new events for that plugin (logging a warning) rather than growing the buffer unbounded. Future exhaustive plugin streams would need explicit PTY backpressure, stall detection, and permission review. Current v0 pane output remains sampled for plugin/live observation; `pane.record.*` owns byte-exact capture.
 
 **Plugin GC**: Process plugins idle for more than 30 seconds (configurable) receive `shutdown` and are stopped. Plugins can opt out of GC in `plugin.toml`:
 
@@ -1245,7 +1246,7 @@ Events are streamed as JSON-RPC notifications on a held connection. Clients may 
 {"jsonrpc": "2.0", "method": "event", "params": {"seq": 1043, "ts": "2026-02-18T10:30:00.456Z", "type": "pane.focused", "data": {"pane_id": "...", "previous": "..."}}}
 ```
 
-**`pane.output` binary encoding**: The `data.bytes` field uses base64 encoding for raw PTY output. The `data.sample` boolean indicates whether the output was sampled/coalesced (true for default mode) or lossless (false for exhaustive subscribers). Max chunk size: 64 KB per event.
+**`pane.output` binary encoding**: The `data.bytes` field uses base64 encoding for raw PTY output. The `data.sample` boolean indicates whether bytes were dropped/coalesced for that chunk. A false value does not make the whole stream a transcript; byte-exact recording is handled by `pane.record.start` / `pane.record.stop`. Max chunk size: 64 KB per event.
 
 Event types: See Appendix A for complete taxonomy.
 
@@ -1805,7 +1806,7 @@ pane.cwd_changed       {pane_id, old_cwd, new_cwd}
 pane.exited            {pane_id, exit_status, command}
 pane.respawned         {pane_id, command}
 pane.command_completed {pane_id, command_id, exit_code, stdout, stderr}  # fired when pane.run_command(async=true) finishes
-pane.output            {pane_id, bytes, sample}  # opt-in; sampled by default, exhaustive if subscribed
+pane.output            {pane_id, bytes, sample}  # opt-in sampled live observation; use pane.record.* for transcripts
 pane.input             {pane_id, data}           # interceptable; fired on line-submit (Enter), not per-keystroke
 pane.bell              {pane_id}                 # fired when pane receives BEL character (\x07)
 pane.tag_changed       {pane_id, key, old_value, new_value}
@@ -1935,11 +1936,11 @@ error                  {code, message, context}
 ## 25. Appendix E — Corrections From v4 Review
 
 1. **Permission naming unified**: `run_subprocess` renamed to `exec` everywhere (manifest, WIT docs, tier table, security table) to match the WIT host function name. Subprocess sandboxing details added (env scrubbing, CWD restriction, rlimits).
-2. **Interception vs "cannot block core" clarified**: Invariant #3 now specifies per-interceptor deadline (100ms kill), fail-closed behavior on interceptor failure, and stall timeout bounds for exhaustive streams.
+2. **Interception vs "cannot block core" clarified**: Invariant #3 now specifies per-interceptor deadline (100ms kill), fail-closed behavior on interceptor failure, and marks exhaustive plugin streams as future design separate from current sampled pane output.
 3. **Daemon pinning added**: Long-lived plugins with `gc = false` hold daemon leases, preventing auto-exit while service plugins (MCP, SSH Tunnels) are active.
 4. **`state.apply` delta schema specified**: Operation types, positional back-references (`$N.field`), all-or-nothing rollback, `client_request_id` deduplication.
 5. **`events.watch` contract specified**: Filter grammar, `from_seq` resume, gap notifications, buffer policy, reconnect semantics.
-6. **`pane.output` binary encoding specified**: Base64 encoding, 64 KB max chunk, sample/exhaustive flag.
+6. **`pane.output` binary encoding specified**: Base64 encoding, 64 KB max chunk, chunk-local sample flag. Byte-exact transcripts use `pane.record.*`.
 7. **`pane.run_command` async lifecycle specified**: `command_id`, `pane.command_status/cancel`, completion event, timeout.
 8. **`stream_id` added to flow control events**: Process plugin notifications now carry `stream_id` for ACK/DROP linkage.
 9. **gRPC TCP auth required**: Same token auth as JSON-RPC TCP, documented in transport table.

@@ -255,7 +255,7 @@ fn render_agent_help(colorize: bool) -> String {
     ));
     s.push_str(&row(
         "asciinema rec / script(1)",
-        &format!("{} {dim}(sealed data plane){r}", m("pane.output.watch")),
+        &format!("{} {dim}(lossless raw PTY bytes){r}", m("pane.record")),
     ));
     s.push_str(&row(
         "vhs / agg / terminalizer",

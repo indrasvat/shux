@@ -86,6 +86,10 @@ the pane (the user could be typing a password into it).
 `pane.command_status`, `pane.wait_for`,
 `session.snapshot`, `window.snapshot`
 
+`pane.record.start` and `pane.record.stop` are stronger than ordinary
+content reads because they create durable raw PTY transcripts. They are
+registered as plugin-forbidden RPCs, not grantable Tier 1 reads.
+
 ### Tier 2 — owned-entity mutations (default-deny when target ≠ plugin)
 
 Mutate entities, but the gate is per-target ownership not blanket.

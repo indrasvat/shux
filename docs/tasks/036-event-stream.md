@@ -927,7 +927,7 @@ cargo nextest run --workspace
 - [ ] `events.watch` handler: parses filters, replays from ring buffer, streams live events
 - [ ] Gap notifications sent as `{"method": "event.gap", "params": {"from": N, "to": M, "lost": K}}`
 - [ ] Event notifications sent as `{"method": "event", "params": {"seq": N, "ts": "...", "type": "...", "data": {...}}}`
-- [ ] `pane.output` binary encoding: base64 `data.bytes`, `data.sample` boolean, 64 KB max chunk
+- [ ] `pane.output` binary encoding: base64 `data.bytes`, `data.sample` boolean, 64 KB max chunk; sampled live observation only, not a lossless transcript
 - [ ] `events.history` method queries ring buffer with filters and limit
 - [ ] `EventBus` integrates ring buffer: events stored before broadcast, ring buffer accessible for replay
 - [ ] CLI `shux events watch [--filter ...]` outputs JSON lines
@@ -947,7 +947,7 @@ feat(core,rpc): add event stream with ring buffer replay and gap detection
 - EventRingBuffer with bounded capacity and from_seq replay
 - events.watch handler: replay + live streaming over held UDS connection
 - Gap notifications for evicted events and broadcast overflow
-- pane.output binary encoding (base64, 64KB max chunk)
+- pane.output binary encoding (base64, 64KB max chunk, sampled live observation)
 - events.history method for ring buffer queries
 - EventBus integration: ring buffer storage + broadcast
 ```

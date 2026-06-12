@@ -332,7 +332,9 @@ pub fn read_pane_scrollback(state: &PluginState, pane_id: &str, offset: u32, lin
 }
 
 /// Subscribe to events. Returns a stream ID.
-/// - `exhaustive=true`: high-volume stream with backpressure (e.g. pane.output)
+/// - `exhaustive=true`: future high-volume stream with backpressure.
+///   Current v0 pane output is sampled; byte-exact transcripts use
+///   `pane.record.start` / `pane.record.stop` outside the process-plugin grant model.
 /// - `pane_id`: filter events to a specific pane
 pub fn subscribe(state: &PluginState, event_type: &str, pane_id: Option<&str>, exhaustive: bool) -> Result<u64, HostError> {
     // Requires 'events' permission containing the event type
