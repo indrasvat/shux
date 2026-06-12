@@ -1,0 +1,36 @@
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│vicaya | ◎ drishti: Patra (Files) | ⌁ ksetra: …ode/github.com/indrasvat-shux | ● rakshaka  ok | ≡ suchi  645,140      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│prashna:                                                                                                              │
+│niyama: —                                                                                                             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌phala (100)  varga:none─────────────────────────────────────────┐┌purvadarshana — record-rich-tuis.sh─────────────────┐
+│▸ record-rich-tuis.sh (/Users/indrasvat/code/github.com/indrasva││/Users/indrasvat/code/github.com/indrasvat-shux/spik│
+│  btop.raw (/Users/indrasvat...rpus/rich-tui) 0.00              ││2744 bytes                                          │
+│  lazygit.raw (/Users/indrasvat...rpus/rich-tui) 0.00           ││                                                    │
+│  nvim.raw (/Users/indrasvat...rpus/rich-tui) 0.00              ││#!/usr/bin/env bash                                 │
+│  vicaya.raw (/Users/indrasvat...rpus/rich-tui) 0.00            ││set -euo pipefail                                   │
+│  vivecaka.raw (/Users/indrasvat...rpus/rich-tui) 0.00          ││                                                    │
+│  .gitattributes (/Users/indrasvat...ndrasvat-shux) 0.00        ││repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.│
+│  CLAUDE.md (/Users/indrasvat...ndrasvat-shux) 0.00             ││shux_bin="${SHUX_BIN:-${repo_root}/target/release/sh│
+│  PROGRESS.md (/Users/indrasvat...vat-shux/docs) 0.00           ││out_dir="${SHUX_LIBGHOSTTY_RECORD_OUT:-${repo_root}/│
+│  learnings.md (/Users/indrasvat...x/docs/agents) 0.00          ││runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-libghostt│
+│  Makefile (/Users/indrasvat...ndrasvat-shux) 0.00              ││                                                    │
+│  pixel_verify.py (/Users/indrasvat...e/automations) 0.00       ││mkdir -p "${out_dir}"                               │
+│  067-shux-vt-resize-reflow.md (/Users/indrasvat...ux/docs/tasks││                                                    │
+│  068-shux-vt-wide-cell-invariants.md (/Users/indrasvat...ux/doc││cleanup() {                                         │
+│  069-shux-vt-grapheme-cell-storage.md (/Users/indrasvat...ux/do││  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "$│
+│  070-shux-vt-dec-special-graphics.md (/Users/indrasvat...ux/doc││    | python3 -c 'import json,sys; [print(s["name"])│
+│  071-shux-vt-tab-stops.md (/Users/indrasvat...ux/docs/tasks) 0.││    | while read -r session; do                     │
+│  072-shux-vt-origin-mode-scroll-region.md (/Users/indrasvat...u││        case "${session}" in                        │
+│  073-shux-vt-corpus-regression-harness.md (/Users/indrasvat...u││          libghostty-*) env -u SHUX_SOCKET XDG_RUNTI│
+│  074-shux-vt-dirty-region-tracking.md (/Users/indrasvat...ux/do││        esac                                        │
+│  shux-vt-solid-qa.toml (/Users/indrasvat....codex/agents) 0.00 ││      done || true                                  │
+│  shux-vt-solid-qa.md (/Users/indrasvat...claude/agents) 0.00   ││  rm -rf "${runtime}"                               │
+│  qa (/Users/indrasvat...at-shux/.shux) 0.00                    ││}                                                   │
+│  README.md (/Users/indrasvat...shux/.shux/qa) 0.00             ││trap cleanup EXIT                                   │
+│  README.md (/Users/indrasvat...res/vt-corpus) 0.00             ││                                                    │
+│  check-progress.sh (/Users/indrasvat...-shux/scripts) 0.00     ││export XDG_RUNTIME_DIR="${runtime}"                 │
+└────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────┘
+?: help  Tab: focus  Ctrl+T: drishti  Ctrl+P: kriya-suchi  Ctrl+O: purvadarshana  Ctrl+K: ksetra  Esc: cl v1.5.1@cb7d506

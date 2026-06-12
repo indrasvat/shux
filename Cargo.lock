@@ -1291,6 +1291,9 @@ version = "0.28.6"
 dependencies = [
  "fontdue",
  "image",
+ "serde",
+ "serde_json",
+ "sha2",
  "shux-vt",
  "tempfile",
  "thiserror",

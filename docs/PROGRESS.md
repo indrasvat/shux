@@ -101,6 +101,18 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-06-11 — test(vt): add corpus regression harness**
+- Added the task-073 VT corpus harness with typed synthetic action fixtures,
+  committed rich-TUI raw replay fixtures, explicit goldens, exact PNG
+  comparison, and machine-readable corpus/pixel reports.
+- Wired `make test-vt-corpus`, `make test-vt-corpus-unit`,
+  `make promote-vt-corpus-baselines`, and `make record-vt-corpus`; CI now runs
+  the exact pixel corpus in the VT QA job before checking the tracked evidence
+  contract.
+- Saved DootSabha design and implementation reviews under
+  `.shux/qa/073-shux-vt-corpus-regression-harness/`, captured full-resolution PNG evidence and pixel
+  metric JSON for all 16 replay cases, and ran the SOLID VT QA gate.
+
 **2026-06-11 — docs(vt): harden VT quality gate enforcement**
 - Followed up the Claude+Gemini DootSabha council review of
   `docs/shux-vt-quality-track`.
@@ -1279,7 +1291,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |
 | 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |
 | 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
-| 073 | shux-vt corpus regression harness | VT Quality | Pending | 066 |
+| 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
 | 074 | shux-vt dirty-region tracking | VT Quality | Pending | 005, 073 |
 
 ---

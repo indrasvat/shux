@@ -1,0 +1,36 @@
+
+~
+~
+~
+~
+~
+~
+~
+~
+~                                                        │ ╲ ││
+~                                                        ││╲╲││
+~                                                        ││ ╲ │
+~
+~                                                     NVIM v0.12.3
+~                                     ────────────────────────────────────────────
+~                                     Nvim is open source and freely distributable
+~                                               https://neovim.io/#chat
+~                                     ────────────────────────────────────────────
+~                                     type  :help nvim<Enter>     if you are new!
+~                                     type  :checkhealth<Enter>   to optimize Nvim
+~                                     type  :q<Enter>             to exit
+~                                     type  :help<Enter>          for help
+~                                     ────────────────────────────────────────────
+~                                     type  :help news<Enter>     for v0.12 notes
+~                                     ────────────────────────────────────────────
+~                                            Help poor children in Uganda!
+~                                     type  :help Kuwasha<Enter>  for information
+~
+~
+~
+~
+~
+~
+~
+libghostty-shux-vt-spike
+

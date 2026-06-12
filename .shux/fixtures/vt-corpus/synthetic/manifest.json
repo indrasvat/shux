@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "name": "plain-crlf",
+      "description": "plain text, carriage return, and line feed",
+      "init": {"rows": 8, "cols": 32},
+      "steps": [
+        {"process": {"text": "hello\r\nworld"}}
+      ]
+    },
+    {
+      "name": "wide-cjk",
+      "description": "wide CJK cells adjacent to ASCII",
+      "init": {"rows": 8, "cols": 32},
+      "steps": [
+        {"process": {"text": "A你B 界 C"}}
+      ]
+    },
+    {
+      "name": "grapheme-storage-current",
+      "description": "combining mark stream preserves visible capture bytes for current cell model",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "Café resumé"}}
+      ]
+    },
+    {
+      "name": "dec-special-graphics-current",
+      "description": "DEC special graphics fixture tracks current parser behavior until task 070 upgrades it",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "\u001b(0lqk\u001b(B ascii"}}
+      ]
+    },
+    {
+      "name": "tabs-current",
+      "description": "default tab stops and table alignment",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "a\tb\r\nlong\tc"}}
+      ]
+    },
+    {
+      "name": "origin-response",
+      "description": "cursor report response after absolute positioning",
+      "init": {"rows": 24, "cols": 80},
+      "steps": [
+        {"process": {"text": "\u001b[5;10H\u001b[6n\u001b[5n"}}
+      ],
+      "expected_responses_hex": ["1b5b353b313052", "1b5b306e"]
+    },
+    {
+      "name": "osc-default-colors",
+      "description": "OSC 10/11/12 default color assignments and queries",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "\u001b]10;#ff0000\u001b\\\u001b]11;#1E1E2E\u0007defaults\u001b]10;?\u001b\\\u001b]11;?\u001b\\"}}
+      ],
+      "expected_responses_hex": ["1b5d31303b7267623a666666662f303030302f303030301b5c", "1b5d31313b7267623a316531652f316531652f326532651b5c"]
+    },
+    {
+      "name": "alternate-screen",
+      "description": "alternate screen enter and leave restores primary content",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "primary\u001b[?1049h\u001b[2J\u001b[Halt-screen\u001b[?1049lback"}}
+      ]
+    },
+    {
+      "name": "scroll-region",
+      "description": "scroll margins with indexed lines",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "\u001b[2;5r\u001b[Hone\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\u001b[r"}}
+      ]
+    },
+    {
+      "name": "sync-output",
+      "description": "synchronized output hold and release",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "before\u001bP=1s\u001b\\hidden\u001bP=2s\u001b\\after"}}
+      ]
+    },
+    {
+      "name": "resize-smoke",
+      "description": "resize action-script path without asserting task 067 reflow behavior",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "resize smoke"}},
+        {"resize": {"rows": 10, "cols": 50}},
+        {"process": {"text": "\r\nsurvives"}}
+      ]
+    }
+  ]
+}

@@ -127,6 +127,30 @@ test-vt: ## Run focused virtual terminal tests; optionally pass FILTER=<test-nam
 	@bash scripts/run-cargo-test.sh -p shux-vt --lib -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Virtual terminal tests passed$(COLOR_RESET)"
 
+.PHONY: test-vt-corpus-unit
+test-vt-corpus-unit: ## Run VT corpus replay unit/integration tests
+	@echo "$(COLOR_BLUE)▶ Running VT corpus replay tests...$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh -p shux-vt --test vt_corpus_replay -- --test-threads=1
+	@echo "$(COLOR_GREEN)✓ VT corpus replay tests passed$(COLOR_RESET)"
+
+.PHONY: test-vt-corpus
+test-vt-corpus: test-vt-corpus-unit ## Replay committed VT corpus fixtures and verify text/PNG goldens
+	@echo "$(COLOR_BLUE)▶ Running VT corpus regression harness...$(COLOR_RESET)"
+	@.shux/scripts/vt_corpus_check.sh
+	@echo "$(COLOR_GREEN)✓ VT corpus regression harness passed$(COLOR_RESET)"
+
+.PHONY: promote-vt-corpus-baselines
+promote-vt-corpus-baselines: ## Promote current VT corpus output into committed goldens for review
+	@echo "$(COLOR_BLUE)▶ Promoting VT corpus baselines...$(COLOR_RESET)"
+	@.shux/scripts/vt_corpus_promote.sh
+	@echo "$(COLOR_GREEN)✓ VT corpus baselines promoted$(COLOR_RESET)"
+
+.PHONY: record-vt-corpus
+record-vt-corpus: release ## Record installed rich TUIs into .shux/out/073-vt-corpus/recordings
+	@echo "$(COLOR_BLUE)▶ Recording VT corpus rich-TUI streams...$(COLOR_RESET)"
+	@.shux/scripts/vt_corpus_record.sh
+	@echo "$(COLOR_GREEN)✓ VT corpus rich-TUI recording pass completed$(COLOR_RESET)"
+
 .PHONY: test-ui
 test-ui: ## Run focused UI/rendering tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running UI/rendering tests...$(COLOR_RESET)"

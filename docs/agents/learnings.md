@@ -3,6 +3,15 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-06-11 (task 073 VT corpus harness):** A replay corpus needs three
+  separate artifact classes: committed `.shux/fixtures/` input bytes,
+  committed `.shux/goldens/` baselines, and committed `.shux/qa/` review
+  evidence. The check target should never promote baselines; promotion must be
+  a separate Make target with council-approved provenance. Exact pixel gates
+  are viable across local macOS and Linux CI when the raster path uses embedded
+  font bytes, fixed rows/cols, fixed font size, fixed defaults, and
+  cursor-disabled rich-TUI replays. Keep live `pane.record` refreshes in
+  `.shux/out/` so installed-tool variance cannot mutate review baselines.
 - **2026-06-11 (VT quality planning):** The libghostty spike exposed a concrete
   shux-side priority order: `Row.wrapped` already exists, so resize reflow can
   be improved inside `shux-vt` before replacing the backend; wide-cell
