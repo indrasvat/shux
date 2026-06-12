@@ -101,6 +101,36 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-06-12 — fix(vt): trim styled blank resize tails**
+- Addressed PR review feedback for task 067 by treating trailing visual blanks
+  as reflow padding even when erase/reset operations left non-default styling
+  on those cells, while still preserving wide-cell continuations.
+- Added a focused regression for hard lines with styled blank tails so resize
+  no longer wraps invisible padding into extra rows.
+- Fixed the pane I/O integration harness shutdown path to terminate and reap
+  PTY children on cancellation, preventing orphan login shells from poisoning
+  subsequent full-suite runs.
+- Verification: `make test-vt FILTER=resize`, `make test-vt-resize-reflow`,
+  `make test-vt`, `SHUX_TEST_BINARY_TIMEOUT_SECONDS=120 make test-pane-io`,
+  `SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check`, and SOLID VT QA PASS.
+
+**2026-06-12 — feat(vt): reflow soft-wrapped rows on resize**
+- Implemented `shux-vt` column resize reflow over scrollback + visible rows,
+  preserving soft-wrapped logical lines, hard line breaks, styles, extended
+  attrs, wide-cell pairs, scrollback limits, and cursor anchors.
+- Wired `VirtualTerminal::resize()` so primary and synchronized-output
+  presentation grids use cursor-aware reflow while alternate-screen buffers
+  keep fixed-canvas resize semantics.
+- Added `make test-vt-resize-reflow` and `.shux/scripts/resize_reflow_check.sh`
+  to drive a real shux pane through 80x24, 120x40, 40x12, and return-to-80x24
+  text/PNG proof with exact pixel comparison.
+- Hardened pane I/O probe integration timing to avoid false failures under
+  full-suite load.
+- Verification: `make test-vt FILTER=resize`, `make test-vt`,
+  `make test-vt-corpus`, `make test-vt-resize-reflow`,
+  `SHUX_TEST_BINARY_TIMEOUT_SECONDS=120 make test-pane-io`, and
+  `SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check`.
+
 **2026-06-11 — test(vt): add corpus regression harness**
 - Added the task-073 VT corpus harness with typed synthetic action fixtures,
   committed rich-TUI raw replay fixtures, explicit goldens, exact PNG
@@ -1285,7 +1315,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 062 | Scrollback-backed copy mode | M1 | **Done** | 005, 021, 061 |
 | 063 | Session save and restore | M1/M3 | **Done** | 013, 014, 015, 030 |
 | 066 | Lossless pane output recording | M2 | **Done** | 036 |
-| 067 | shux-vt resize reflow | VT Quality | Pending | 005, 016, 066, 073 |
+| 067 | shux-vt resize reflow | VT Quality | **Done** | 005, 016, 066, 073 |
 | 068 | shux-vt wide-cell invariants | VT Quality | Pending | 005, 067, 073 |
 | 069 | shux-vt grapheme-aware cell storage | VT Quality | Pending | 005, 068, 073 |
 | 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |

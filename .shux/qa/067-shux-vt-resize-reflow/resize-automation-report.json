@@ -1,0 +1,18 @@
+{
+  "task": "067-shux-vt-resize-reflow",
+  "capture_report": "resize-capture-report.json",
+  "pixel_metric": "resize-80x24-return-pixel.json",
+  "screenshots": [
+    "resize-80x24-before-actual.png",
+    "resize-120x40-actual.png",
+    "resize-40x12-actual.png",
+    "resize-80x24-after-actual.png",
+    "resize-80x24-return-diff.png"
+  ],
+  "captures": [
+    "resize-80x24-before.txt",
+    "resize-120x40.txt",
+    "resize-40x12.txt",
+    "resize-80x24-after.txt"
+  ]
+}

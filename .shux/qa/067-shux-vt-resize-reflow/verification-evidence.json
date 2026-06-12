@@ -1,0 +1,44 @@
+{
+  "task": "067-shux-vt-resize-reflow",
+  "status": "current-run-summary",
+  "commands": [
+    {
+      "command": "make test-vt FILTER=resize",
+      "status": "pass",
+      "evidence": "16 resize-focused shux-vt tests passed after restoring VirtualTerminal::resize wiring."
+    },
+    {
+      "command": "make test-vt-resize-reflow",
+      "status": "pass",
+      "evidence": "Real shux pane automation resized through 80x24, 120x40, 40x12, and back to 80x24; text captures contained the sentinel and exact 80x24 return pixel comparison passed."
+    },
+    {
+      "command": "make test-vt",
+      "status": "pass",
+      "evidence": "143 shux-vt tests passed after the final VirtualTerminal::resize wiring restoration."
+    },
+    {
+      "command": "make test-vt-corpus",
+      "status": "pass",
+      "evidence": "3 VT corpus replay tests passed and the rich-TUI/synthetic corpus harness verified committed text/PNG goldens."
+    },
+    {
+      "command": "make test-pane-io",
+      "status": "pass",
+      "evidence": "13 pane I/O integration tests passed with SHUX_TEST_BINARY_TIMEOUT_SECONDS=120 after probe timeout hardening."
+    },
+    {
+      "command": "SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check",
+      "status": "pass",
+      "evidence": "Top-level check passed after the final VirtualTerminal::resize wiring restoration: clippy, format, and all workspace tests."
+    }
+  ],
+  "visual_inspection": {
+    "status": "pass",
+    "notes": [
+      "resize-40x12-actual.png visually preserves the full sentinel across wrapped rows with no missing middle content.",
+      "resize-120x40-actual.png visually preserves the sentinel on a wider row.",
+      "resize-80x24-after-actual.png matches resize-80x24-before-actual.png exactly; resize-80x24-return-diff.png is blank."
+    ]
+  }
+}

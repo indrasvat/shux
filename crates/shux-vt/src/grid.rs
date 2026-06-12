@@ -3,12 +3,41 @@ use std::ops::{Index, IndexMut};
 
 use crate::cell::{Cell, Color};
 
+#[derive(Debug, Default)]
+struct LogicalLine {
+    cells: Vec<Cell>,
+    display_width: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CursorAnchor {
+    logical_line: usize,
+    display_offset: usize,
+}
+
+#[derive(Debug)]
+struct ReflowedLineMap {
+    range: std::ops::Range<usize>,
+    cells: Vec<ReflowedCellPosition>,
+    end_row: usize,
+    end_col: usize,
+    display_width: usize,
+}
+
+#[derive(Debug)]
+struct ReflowedCellPosition {
+    offset: usize,
+    row: usize,
+    col: usize,
+    width: usize,
+}
+
 /// A single row of terminal cells.
 #[derive(Debug, Clone)]
 pub struct Row {
     /// Cell storage. `pub(crate)` for access from `Grid::insert_chars`/`Grid::delete_chars`.
     pub(crate) cells: Vec<Cell>,
-    /// Whether this row was wrapped from the previous line (soft wrap).
+    /// Whether this row soft-wraps into the next row.
     pub wrapped: bool,
 }
 
@@ -251,9 +280,32 @@ impl Grid {
     /// adjusts the cursor; we simply reduce the visible window).
     /// On grow (more rows): lines are pulled back from scrollback if available,
     /// otherwise new blank lines are appended.
-    /// Column resize: each row is resized (truncated or extended).
+    /// Column resize: soft-wrapped logical lines are reflowed.
     pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
-        // Handle column resize first.
+        self.resize_with_cursor(new_rows, new_cols, None);
+    }
+
+    /// Resize the grid and remap an optional visible cursor position through
+    /// column reflow. Returns the new visible cursor position when one was
+    /// supplied.
+    pub fn resize_with_cursor(
+        &mut self,
+        new_rows: usize,
+        new_cols: usize,
+        cursor: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        if new_cols != self.cols && new_cols > 0 && new_rows > 0 {
+            return self.resize_reflowing_columns(new_rows, new_cols, cursor);
+        }
+
+        let old_abs_cursor = cursor.map(|(row, col)| (self.scrollback_len() + row, col));
+        self.resize_canvas(new_rows, new_cols);
+        old_abs_cursor.map(|(abs_row, col)| self.visible_cursor_from_abs(abs_row, col))
+    }
+
+    /// Resize without column reflow. This is used for fixed-canvas alternate
+    /// screen buffers where fullscreen apps redraw after SIGWINCH.
+    pub fn resize_canvas(&mut self, new_rows: usize, new_cols: usize) {
         if new_cols != self.cols {
             for row in self.raw.iter_mut() {
                 row.resize(new_cols, Cell::default());
@@ -296,6 +348,114 @@ impl Grid {
         self.rows = new_rows;
     }
 
+    fn resize_reflowing_columns(
+        &mut self,
+        new_rows: usize,
+        new_cols: usize,
+        cursor: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        let old_scrollback_len = self.scrollback_len();
+        let cursor_abs = cursor.map(|(row, col)| (old_scrollback_len + row, col));
+        let mut cursor_anchor = None;
+        let mut logical_lines = Vec::new();
+        let mut current = LogicalLine::default();
+
+        for (abs_row, row) in self.raw.iter().enumerate() {
+            let is_tail = !row.wrapped;
+            let row_cells = if is_tail {
+                trim_default_trailing_cells(&row.cells)
+            } else {
+                row.cells.clone()
+            };
+
+            if let Some((cursor_row, cursor_col)) = cursor_abs {
+                if cursor_row == abs_row {
+                    let row_offset = display_width_until(&row.cells, cursor_col);
+                    cursor_anchor = Some(CursorAnchor {
+                        logical_line: logical_lines.len(),
+                        display_offset: current.display_width + row_offset,
+                    });
+                }
+            }
+
+            current.display_width += display_width(&row_cells);
+            current.cells.extend(row_cells);
+
+            if is_tail {
+                logical_lines.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.cells.is_empty() {
+            logical_lines.push(current);
+        }
+        if logical_lines.is_empty() {
+            logical_lines.push(LogicalLine::default());
+        }
+
+        if let Some(anchor) = &mut cursor_anchor {
+            if let Some(line) = logical_lines.get(anchor.logical_line) {
+                anchor.display_offset = anchor.display_offset.min(line.display_width);
+            }
+        }
+
+        let mut reflowed = VecDeque::new();
+        let mut line_ranges = Vec::with_capacity(logical_lines.len());
+        for line in logical_lines {
+            line_ranges.push(append_reflowed_line(
+                &mut reflowed,
+                line.cells,
+                line.display_width,
+                new_cols,
+            ));
+        }
+
+        while reflowed.len() < new_rows {
+            reflowed.push_back(Row::new(new_cols));
+        }
+        let min_total_to_keep = old_scrollback_len.min(self.config.max_scrollback) + new_rows;
+        while reflowed.len() > min_total_to_keep && reflowed.back().is_some_and(Row::is_blank) {
+            reflowed.pop_back();
+        }
+        while reflowed.len() < new_rows {
+            reflowed.push_back(Row::new(new_cols));
+        }
+        let max_total = new_rows + self.config.max_scrollback;
+        let mut dropped_rows = 0;
+        while reflowed.len() > max_total {
+            reflowed.pop_front();
+            dropped_rows += 1;
+        }
+
+        self.raw = reflowed;
+        self.rows = new_rows;
+        self.cols = new_cols;
+
+        cursor_anchor.map(|anchor| {
+            let (abs_row, col) = self.abs_cursor_for_anchor(&line_ranges, anchor, dropped_rows);
+            self.visible_cursor_from_abs(abs_row, col)
+        })
+    }
+
+    fn visible_cursor_from_abs(&self, abs_row: usize, col: usize) -> (usize, usize) {
+        let sb = self.scrollback_len();
+        let visible_row = abs_row.saturating_sub(sb).min(self.rows.saturating_sub(1));
+        let visible_col = col.min(self.cols.saturating_sub(1));
+        (visible_row, visible_col)
+    }
+
+    fn abs_cursor_for_anchor(
+        &self,
+        line_ranges: &[ReflowedLineMap],
+        anchor: CursorAnchor,
+        dropped_rows: usize,
+    ) -> (usize, usize) {
+        let Some(line) = line_ranges.get(anchor.logical_line) else {
+            return (self.scrollback_len(), 0);
+        };
+        let (abs_row, col) = line.position_for_offset(anchor.display_offset);
+        (abs_row.saturating_sub(dropped_rows), col)
+    }
+
     /// Clear the scrollback buffer entirely.
     pub fn clear_scrollback(&mut self) {
         let sb = self.scrollback_len();
@@ -303,7 +463,109 @@ impl Grid {
             self.raw.pop_front();
         }
     }
+}
 
+impl ReflowedLineMap {
+    fn position_for_offset(&self, offset: usize) -> (usize, usize) {
+        let offset = offset.min(self.display_width);
+        if offset == self.display_width {
+            return (self.end_row, self.end_col);
+        }
+
+        for cell in &self.cells {
+            if offset >= cell.offset && offset < cell.offset + cell.width {
+                return (cell.row, cell.col + (offset - cell.offset));
+            }
+        }
+
+        (self.range.start, 0)
+    }
+}
+
+fn trim_default_trailing_cells(cells: &[Cell]) -> Vec<Cell> {
+    let end = cells
+        .iter()
+        .rposition(|cell| cell.ch != ' ' || cell.is_wide_continuation())
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    cells[..end].to_vec()
+}
+
+fn display_width_until(cells: &[Cell], col: usize) -> usize {
+    cells
+        .iter()
+        .take(col.min(cells.len()))
+        .map(|cell| usize::from(cell.width))
+        .sum()
+}
+
+fn display_width(cells: &[Cell]) -> usize {
+    cells.iter().map(|cell| usize::from(cell.width)).sum()
+}
+
+fn append_reflowed_line(
+    rows: &mut VecDeque<Row>,
+    cells: Vec<Cell>,
+    display_width: usize,
+    cols: usize,
+) -> ReflowedLineMap {
+    debug_assert!(cols > 0);
+
+    let start = rows.len();
+    let mut row = Row::new(cols);
+    let mut col = 0;
+    let mut logical_offset = 0;
+    let mut positions = Vec::new();
+
+    for cell in cells
+        .into_iter()
+        .filter(|cell| !cell.is_wide_continuation())
+    {
+        let width = usize::from(cell.width).max(1);
+        if col >= cols {
+            row.wrapped = true;
+            rows.push_back(row);
+            row = Row::new(cols);
+            col = 0;
+        }
+        if col + width > cols && col > 0 {
+            row.wrapped = true;
+            rows.push_back(row);
+            row = Row::new(cols);
+            col = 0;
+        }
+
+        let abs_row = rows.len();
+        positions.push(ReflowedCellPosition {
+            offset: logical_offset,
+            row: abs_row,
+            col,
+            width,
+        });
+
+        row[col] = cell;
+        if width == 2 && col + 1 < cols {
+            row[col + 1] = Cell::wide_continuation();
+        }
+        logical_offset += width;
+        col += width.min(cols);
+    }
+
+    let end_row = rows.len();
+    let end_col = col.min(cols.saturating_sub(1));
+    rows.push_back(row);
+    let end = rows.len();
+
+    ReflowedLineMap {
+        range: start..end,
+        cells: positions,
+        end_row,
+        end_col,
+        display_width,
+    }
+}
+
+impl Grid {
     /// Erase `count` characters starting at `(row, col)` in the visible area.
     pub fn erase_chars(&mut self, row: usize, col: usize, count: usize, bg: Color) {
         let r = self.visible_row_mut(row);
@@ -350,7 +612,26 @@ impl Grid {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::cell::{CellFlags, CellStyle, ExtendedAttrs, UnderlineStyle};
+
+    fn write_text(row: &mut Row, text: &str) {
+        for (idx, ch) in text.chars().enumerate() {
+            row[idx].ch = ch;
+        }
+    }
+
+    fn row_text(row: &Row) -> String {
+        row.cells
+            .iter()
+            .filter(|cell| !cell.is_wide_continuation())
+            .map(|cell| cell.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
 
     #[test]
     fn test_new_grid_dimensions() {
@@ -435,7 +716,6 @@ mod tests {
         grid.visible_row_mut(0)[9].ch = 'Z';
         grid.resize(3, 5);
         assert_eq!(grid.cols(), 5);
-        // Column 9 is gone.
         assert_eq!(grid.visible_row(0).len(), 5);
     }
 
@@ -452,6 +732,148 @@ mod tests {
         assert_eq!(grid.scrollback_len(), 0);
         // The scrollback line with 'S' is now a visible line.
         assert_eq!(grid.visible_row(0)[0].ch, 'S');
+    }
+
+    #[test]
+    fn resize_reflows_source_row_wrapped_runs_on_shrink_and_grow() {
+        let mut grid = Grid::new(4, 5, GridConfig::default());
+        write_text(grid.visible_row_mut(0), "HELLO");
+        grid.visible_row_mut(0).wrapped = true;
+        write_text(grid.visible_row_mut(1), "WORLD");
+
+        grid.resize(5, 4);
+
+        assert_eq!(row_text(grid.visible_row(0)), "HELL");
+        assert!(grid.visible_row(0).wrapped);
+        assert_eq!(row_text(grid.visible_row(1)), "OWOR");
+        assert!(grid.visible_row(1).wrapped);
+        assert_eq!(row_text(grid.visible_row(2)), "LD");
+        assert!(!grid.visible_row(2).wrapped);
+
+        grid.resize(5, 8);
+
+        assert_eq!(row_text(grid.visible_row(0)), "HELLOWOR");
+        assert!(grid.visible_row(0).wrapped);
+        assert_eq!(row_text(grid.visible_row(1)), "LD");
+        assert!(!grid.visible_row(1).wrapped);
+    }
+
+    #[test]
+    fn resize_keeps_hard_line_breaks_hard() {
+        let mut grid = Grid::new(3, 5, GridConfig::default());
+        write_text(grid.visible_row_mut(0), "AAA");
+        write_text(grid.visible_row_mut(1), "BBB");
+
+        grid.resize(3, 4);
+
+        assert_eq!(row_text(grid.visible_row(0)), "AAA");
+        assert!(!grid.visible_row(0).wrapped);
+        assert_eq!(row_text(grid.visible_row(1)), "BBB");
+        assert!(!grid.visible_row(1).wrapped);
+    }
+
+    #[test]
+    fn resize_ignores_trailing_styled_blanks_on_hard_lines() {
+        let mut grid = Grid::new(4, 8, GridConfig::default());
+        write_text(grid.visible_row_mut(0), "AB");
+        for col in 2..8 {
+            grid.visible_row_mut(0)[col].reset(Color::Indexed(4));
+        }
+        write_text(grid.visible_row_mut(1), "CD");
+
+        grid.resize(4, 3);
+
+        assert_eq!(row_text(grid.visible_row(0)), "AB");
+        assert!(!grid.visible_row(0).wrapped);
+        assert_eq!(row_text(grid.visible_row(1)), "CD");
+        assert!(!grid.visible_row(1).wrapped);
+    }
+
+    #[test]
+    fn resize_preserves_cell_style_rgb_and_extended_attrs() {
+        let mut grid = Grid::new(2, 3, GridConfig::default());
+        write_text(grid.visible_row_mut(0), "ABC");
+        grid.visible_row_mut(0).wrapped = true;
+
+        let mut flags = CellFlags::default();
+        flags.set(CellFlags::BOLD);
+        flags.set(CellFlags::UNDERLINE);
+        let ext = Arc::new(ExtendedAttrs {
+            hyperlink: Some("https://example.com".to_string()),
+            underline_color: Some(Color::Rgb(9, 8, 7)),
+            underline_style: UnderlineStyle::Curly,
+        });
+        grid.visible_row_mut(1)[0] = Cell {
+            ch: 'D',
+            width: 1,
+            style: CellStyle {
+                fg: Color::Rgb(1, 2, 3),
+                bg: Color::Indexed(4),
+                flags,
+            },
+            extended: Some(ext.clone()),
+        };
+
+        grid.resize(4, 2);
+
+        let moved = &grid.visible_row(1)[1];
+        assert_eq!(moved.ch, 'D');
+        assert_eq!(moved.style.fg, Color::Rgb(1, 2, 3));
+        assert_eq!(moved.style.bg, Color::Indexed(4));
+        assert!(moved.style.flags.contains(CellFlags::BOLD));
+        assert!(moved.style.flags.contains(CellFlags::UNDERLINE));
+        assert_eq!(moved.extended.as_ref(), Some(&ext));
+    }
+
+    #[test]
+    fn resize_keeps_wide_cells_atomic() {
+        let mut grid = Grid::new(2, 3, GridConfig::default());
+        grid.visible_row_mut(0)[0].ch = 'A';
+        grid.visible_row_mut(0)[1] = Cell {
+            ch: '\u{4f60}',
+            width: 2,
+            style: CellStyle::default(),
+            extended: None,
+        };
+        grid.visible_row_mut(0)[2] = Cell::wide_continuation();
+        grid.visible_row_mut(0).wrapped = true;
+        grid.visible_row_mut(1)[0].ch = 'B';
+
+        grid.resize(4, 2);
+
+        assert_eq!(grid.visible_row(0)[0].ch, 'A');
+        assert_eq!(grid.visible_row(0)[1], Cell::default());
+        assert_eq!(grid.visible_row(1)[0].ch, '\u{4f60}');
+        assert!(grid.visible_row(1)[0].is_wide());
+        assert!(grid.visible_row(1)[1].is_wide_continuation());
+        assert_eq!(grid.visible_row(2)[0].ch, 'B');
+
+        for row_idx in 0..grid.rows() {
+            for col in 0..grid.cols() {
+                let cell = &grid.visible_row(row_idx)[col];
+                if cell.is_wide_continuation() {
+                    assert!(col > 0, "orphan continuation at row {row_idx}");
+                    assert!(grid.visible_row(row_idx)[col - 1].is_wide());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resize_reflow_preserves_scrollback_order_and_limit() {
+        let config = GridConfig { max_scrollback: 2 };
+        let mut grid = Grid::new(2, 5, config);
+
+        for ch in ['A', 'B', 'C', 'D'] {
+            grid.visible_row_mut(0)[0].ch = ch;
+            grid.scroll_up(0, 1);
+        }
+
+        grid.resize(2, 3);
+
+        assert_eq!(grid.scrollback_len(), 2);
+        assert_eq!(grid.scrollback_row(0).unwrap()[0].ch, 'C');
+        assert_eq!(grid.scrollback_row(1).unwrap()[0].ch, 'D');
     }
 
     #[test]

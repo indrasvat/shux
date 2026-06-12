@@ -181,13 +181,42 @@ impl VirtualTerminal {
     /// This resizes both primary and alternate grids, adjusts the scroll
     /// region, and clamps the cursor position.
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        self.grid.resize(rows, cols);
-        if let Some(ref mut alt) = self.alt_grid {
-            alt.resize(rows, cols);
+        if self.modes.alternate_screen {
+            self.grid.resize_canvas(rows, cols);
+            if let (Some(primary), Some(primary_cursor)) =
+                (&mut self.alt_grid, &mut self.alt_cursor)
+            {
+                if let Some((row, col)) = primary.resize_with_cursor(
+                    rows,
+                    cols,
+                    Some((primary_cursor.row, primary_cursor.col)),
+                ) {
+                    primary_cursor.row = row;
+                    primary_cursor.col = col;
+                }
+                primary_cursor.clamp(rows, cols);
+            }
+        } else {
+            if let Some((row, col)) =
+                self.grid
+                    .resize_with_cursor(rows, cols, Some((self.cursor.row, self.cursor.col)))
+            {
+                self.cursor.row = row;
+                self.cursor.col = col;
+            }
+            if let Some(ref mut alt) = self.alt_grid {
+                alt.resize_canvas(rows, cols);
+            }
         }
         if let Some(ref mut present) = self.sync_present {
-            present.grid.resize(rows, cols);
-            present.cursor.clamp(rows, cols);
+            if let Some((row, col)) = present.grid.resize_with_cursor(
+                rows,
+                cols,
+                Some((present.cursor.row, present.cursor.col)),
+            ) {
+                present.cursor.row = row;
+                present.cursor.col = col;
+            }
         }
         self.rows = rows;
         self.cols = cols;
@@ -196,6 +225,12 @@ impl VirtualTerminal {
             bottom: rows.saturating_sub(1),
         };
         self.cursor.clamp(rows, cols);
+        if let Some(ref mut saved_cursor) = self.alt_cursor {
+            saved_cursor.clamp(rows, cols);
+        }
+        if let Some(ref mut present) = self.sync_present {
+            present.cursor.clamp(rows, cols);
+        }
     }
 
     /// Switch to alternate screen buffer (DECSET 1049).
@@ -282,6 +317,10 @@ impl VirtualTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compact_capture(vt: &VirtualTerminal) -> String {
+        vt.capture_text(None).replace('\n', "")
+    }
 
     #[test]
     fn capture_text_skips_trailing_blank_rows_below_content() {
@@ -684,6 +723,20 @@ mod tests {
         assert_eq!(vt.grid().rows(), 5);
         assert_eq!(vt.grid().cols(), 12);
         assert_eq!(vt.grid().visible_row(0)[0].ch, 'p');
+    }
+
+    #[test]
+    fn synchronized_output_resize_reflows_presented_frame() {
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"ABCDEFGHIJK");
+        vt.process(b"\x1b[?2026h\x1b[1;1Hpending");
+
+        vt.resize(5, 4);
+
+        assert!(vt.modes().synchronized_output);
+        assert_eq!(compact_capture(&vt), "ABCDEFGHIJK");
+        vt.process(b"\x1b[?2026l");
+        assert!(compact_capture(&vt).starts_with("pending"));
     }
 
     #[test]
@@ -1209,6 +1262,70 @@ mod tests {
         assert_eq!(vt.grid().cols(), 40);
         // Content should be preserved.
         assert_eq!(vt.grid().visible_row(0)[0].ch, 't');
+    }
+
+    #[test]
+    fn parser_marks_source_row_as_wrapped_before_advancing() {
+        let mut vt = VirtualTerminal::new(3, 5);
+        vt.process(b"abcdef");
+
+        assert!(vt.grid().visible_row(0).wrapped);
+        assert!(!vt.grid().visible_row(1).wrapped);
+        assert_eq!(vt.grid().visible_row(0)[4].ch, 'e');
+        assert_eq!(vt.grid().visible_row(1)[0].ch, 'f');
+    }
+
+    #[test]
+    fn resize_reflow_preserves_wrapped_capture_text() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let mut vt = VirtualTerminal::new(5, 10);
+        vt.process(text.as_bytes());
+
+        vt.resize(7, 7);
+
+        assert_eq!(compact_capture(&vt), text);
+
+        vt.resize(7, 13);
+
+        assert_eq!(compact_capture(&vt), text);
+    }
+
+    #[test]
+    fn resize_keeps_alternate_screen_canvas_separate_from_primary_reflow() {
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"primary-wrap");
+        vt.enter_alternate_screen();
+        vt.process(b"ALT-CANVAS");
+
+        vt.resize(4, 4);
+
+        assert!(vt.is_alternate_screen());
+        assert_eq!(vt.grid().visible_row(0)[0].ch, 'A');
+        assert_eq!(vt.grid().visible_row(0)[3].ch, '-');
+
+        vt.leave_alternate_screen();
+
+        assert!(!vt.is_alternate_screen());
+        assert_eq!(compact_capture(&vt), "primary-wrap");
+    }
+
+    #[test]
+    fn resize_preserves_dynamic_default_colors() {
+        let mut vt = VirtualTerminal::new(4, 5);
+        vt.process(b"\x1b]10;#112233\x1b\\\x1b]11;#445566\x1b\\\x1b]12;#778899\x1b\\");
+        vt.process(b"abcdef");
+
+        vt.resize(5, 4);
+
+        assert_eq!(
+            vt.default_colors(),
+            TerminalDefaultColors {
+                fg: Some([0x11, 0x22, 0x33]),
+                bg: Some([0x44, 0x55, 0x66]),
+                cursor: Some([0x77, 0x88, 0x99]),
+            }
+        );
+        assert_eq!(compact_capture(&vt), "abcdef");
     }
 
     #[test]

@@ -1,0 +1,26 @@
+{
+  "checks": [
+    {
+      "capture_bytes": 133,
+      "contains_expected": true,
+      "label": "resize-80x24-before"
+    },
+    {
+      "capture_bytes": 133,
+      "contains_expected": true,
+      "label": "resize-120x40"
+    },
+    {
+      "capture_bytes": 135,
+      "contains_expected": true,
+      "label": "resize-40x12"
+    },
+    {
+      "capture_bytes": 133,
+      "contains_expected": true,
+      "label": "resize-80x24-after"
+    }
+  ],
+  "expected": "SHUX_RESIZE_REFLOW_abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789_END",
+  "status": "pass"
+}

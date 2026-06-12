@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc};
 
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ══════════════════════════════════════════════════════════════
 // Shared state (mirrors main.rs PaneIoState)
 // ══════════════════════════════════════════════════════════════
@@ -75,7 +77,11 @@ async fn run_pane_pty_task(
                 if handle.write(&data).await.is_err() { break; }
                 if handle.flush().await.is_err() { break; }
             }
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => {
+                let _ = handle.terminate();
+                let _ = handle.wait().await;
+                break;
+            }
         }
     }
     // Mirrors main.rs: drop the PTY-bound writer, keep the VT around
@@ -541,6 +547,23 @@ async fn rpc_call(
     method: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
+    let response = rpc_call_raw(stream, method, params).await;
+
+    if let Some(error) = response.get("error") {
+        panic!("RPC error: {error}");
+    }
+
+    response
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+async fn rpc_call_raw(
+    stream: &mut UnixStream,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let request = serde_json::json!({
@@ -563,16 +586,7 @@ async fn rpc_call(
     let mut resp_buf = vec![0u8; resp_len];
     stream.read_exact(&mut resp_buf).await.unwrap();
 
-    let response: serde_json::Value = serde_json::from_slice(&resp_buf).unwrap();
-
-    if let Some(error) = response.get("error") {
-        panic!("RPC error: {error}");
-    }
-
-    response
-        .get("result")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null)
+    serde_json::from_slice(&resp_buf).unwrap()
 }
 
 /// Start a test server with pane I/O methods, returning (socket_path, cancel_token).
@@ -653,8 +667,24 @@ async fn create_test_session(stream: &mut UnixStream) -> (String, String) {
     .await;
     let session_id = result["id"].as_str().unwrap().to_string();
     let pane_id = result["pane_id"].as_str().unwrap().to_string();
-    // Give the shell a moment to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        let response = rpc_call_raw(
+            stream,
+            "pane.capture",
+            serde_json::json!({"session_id": session_id, "lines": 1}),
+        )
+        .await;
+        if response.get("result").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("pane PTY did not become capturable: {response}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Give the login shell a moment to finish startup after the PTY is registered.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     (session_id, pane_id)
 }
 
@@ -795,18 +825,10 @@ async fn test_capture_after_echo() {
     )
     .await;
 
-    // Wait for output to arrive and be processed
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Capture output
-    let result = rpc_call(
-        &mut stream,
-        "pane.capture",
-        serde_json::json!({"session_id": session_id}),
-    )
+    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
+        text.contains("SHUX_TEST_OUTPUT")
+    })
     .await;
-
-    let text = result["text"].as_str().unwrap();
     assert!(
         text.contains("SHUX_TEST_OUTPUT"),
         "captured text should contain 'SHUX_TEST_OUTPUT', got: {text}"
@@ -861,7 +883,7 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, Duration::from_secs(5), |text| {
+    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
         text.contains("SHUX_CPR=")
     })
     .await;
@@ -919,7 +941,7 @@ print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, Duration::from_secs(5), |text| {
+    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
         text.contains("SHUX_XTERM_PROBES=")
     })
     .await;
@@ -981,7 +1003,7 @@ time.sleep(0.2)
     )
     .await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     while !ready_path.exists() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
