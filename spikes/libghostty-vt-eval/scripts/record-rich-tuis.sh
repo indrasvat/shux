@@ -63,7 +63,9 @@ record_case() {
   elif command -v vim >/dev/null 2>&1; then
     record_case vim "vim -Nu NONE" || true
   fi
-  if command -v vicaya >/dev/null 2>&1; then
+  if command -v vicaya-tui >/dev/null 2>&1; then
+    record_case vicaya "vicaya-tui '${repo_root}'" || true
+  elif command -v vicaya >/dev/null 2>&1; then
     record_case vicaya "vicaya" || true
   fi
   if command -v vivecaka >/dev/null 2>&1; then

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["pillow"]
+# dependencies = ["pillow", "numpy"]
 # ///
 """Pixel-level PNG verification helper for shux visual gates.
 
@@ -15,7 +15,8 @@ import argparse
 import json
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageStat
+import numpy as np
+from PIL import Image, ImageChops
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,21 +67,25 @@ def main() -> int:
         actual = actual.crop((0, 0, compare_size[0], compare_size[1]))
         expected = expected.crop((0, 0, compare_size[0], compare_size[1]))
 
-    diff = ImageChops.difference(actual, expected)
-    stat = ImageStat.Stat(diff)
+    # RGBA comparison is intentional: alpha differences are visual state too.
+    actual_arr = np.array(actual, dtype=np.int16)
+    expected_arr = np.array(expected, dtype=np.int16)
+    diff_arr = np.abs(actual_arr - expected_arr)
+
     total_pixels = actual.width * actual.height
-    changed_pixels = sum(1 for pixel in diff.getdata() if pixel[:3] != (0, 0, 0))
+    changed_pixels = int(np.sum(np.any(diff_arr > 0, axis=-1)))
     pixel_diff_ratio = changed_pixels / total_pixels if total_pixels else 0.0
-    mean_channel_delta = sum(stat.mean[:3]) / 3.0
+    mean_rgba_channel_delta = float(np.mean(diff_arr))
 
     if args.diff:
         args.diff.parent.mkdir(parents=True, exist_ok=True)
         # Amplify nonzero deltas for human review while keeping exact geometry.
+        diff = ImageChops.difference(actual, expected)
         diff.point(lambda value: 255 if value else 0).save(args.diff)
 
     passed = (
         pixel_diff_ratio <= args.max_pixel_diff_ratio
-        and mean_channel_delta <= args.max_mean_channel_delta
+        and mean_rgba_channel_delta <= args.max_mean_channel_delta
     )
     payload = {
         "status": "pass" if passed else "fail",
@@ -90,7 +95,7 @@ def main() -> int:
         "changed_pixels": changed_pixels,
         "total_pixels": total_pixels,
         "pixel_diff_ratio": pixel_diff_ratio,
-        "mean_channel_delta": mean_channel_delta,
+        "mean_rgba_channel_delta": mean_rgba_channel_delta,
         "max_pixel_diff_ratio": args.max_pixel_diff_ratio,
         "max_mean_channel_delta": args.max_mean_channel_delta,
         "diff": str(args.diff) if args.diff else None,

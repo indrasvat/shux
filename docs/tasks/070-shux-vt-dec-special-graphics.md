@@ -3,8 +3,8 @@
 **Status:** Not Started
 **Priority:** Medium
 **Milestone:** VT Quality Track
-**Depends On:** 005, 068
-**Touches:** `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/cell.rs`, `.shux/out/070-dec-special-graphics/`
+**Depends On:** 005, 068, 073
+**Touches:** `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/cell.rs`, `.shux/qa/070-dec-special-graphics/`
 
 ---
 
@@ -34,7 +34,7 @@ Out of scope:
 - Run DootSabha design council before coding.
 - Run DootSabha implementation-diff council before marking done.
 - Invoke `shux-vt-solid-qa`.
-- Save artifacts under `.shux/out/070-dec-special-graphics/`.
+- Save auditable task artifacts under `.shux/qa/070-dec-special-graphics/`.
 
 ## Testing Matrix
 
@@ -46,8 +46,8 @@ Out of scope:
 | Integration | A curses-style box fixture renders borders correctly in `pane.capture`. |
 | Shux automation | Render DEC graphics stress screen and snapshot at 80x24, 120x40, and 200x60. |
 | Visual | Inspect corners, horizontal/vertical joins, mixed text, and color boundaries. |
-| Pixel | Deterministic DEC graphics PNG exactly matches baseline. |
-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS`. |
+| Pixel | Deterministic DEC graphics PNG exactly matches committed `.shux/goldens/` or DootSabha-approved `.shux/qa/070-dec-special-graphics/` baseline with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. |
+| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/070-dec-special-graphics/SOLID-QA.md`. |
 
 ## Acceptance Criteria
 
@@ -59,6 +59,7 @@ Out of scope:
 
 - [ ] DootSabha design and implementation-diff reviews are saved.
 - [ ] Unit, integration, shux automation, visual, and pixel checks pass.
-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS`.
+- [ ] Full-resolution PNGs, pixel metric JSON, and `evidence-manifest.json` are committed under `.shux/qa/070-dec-special-graphics/`.
+- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/070-dec-special-graphics/SOLID-QA.md`.
 - [ ] `make check` passes.
 - [ ] Progress and learnings are updated.

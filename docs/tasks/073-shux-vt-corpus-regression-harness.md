@@ -3,8 +3,8 @@
 **Status:** Not Started
 **Priority:** High
 **Milestone:** VT Quality Track
-**Depends On:** 066, 067, 068
-**Touches:** `Makefile`, `.shux/scripts/`, `.shux/goldens/`, `.shux/out/073-vt-corpus/`, `crates/shux-vt/tests/`
+**Depends On:** 066
+**Touches:** `Makefile`, `.shux/scripts/`, `.shux/goldens/`, `.shux/fixtures/vt-corpus/`, `.shux/qa/073-vt-corpus/`, `crates/shux-vt/tests/`
 
 ---
 
@@ -20,7 +20,8 @@ harness for synthetic fixtures and real TUI byte streams.
 Create a Makefile-driven corpus harness that:
 
 - runs deterministic synthetic VT byte fixtures,
-- records or replays raw PTY streams from rich TUIs,
+- replays committed raw PTY streams from rich TUIs,
+- records optional refreshed raw PTY streams into `.shux/out/073-vt-corpus/`,
 - captures text and PNG output,
 - compares pixel output against baselines,
 - emits a concise machine-readable report.
@@ -35,7 +36,7 @@ Out of scope:
 - Run DootSabha design council before coding.
 - Run DootSabha implementation-diff council before marking done.
 - Invoke `shux-vt-solid-qa`.
-- Save artifacts under `.shux/out/073-vt-corpus/`.
+- Save auditable task artifacts under `.shux/qa/073-vt-corpus/`.
 
 ## Testing Matrix
 
@@ -43,17 +44,17 @@ Out of scope:
 |---|---|
 | Unit | Fixture parser/replayer handles partial chunks and invalid bytes deterministically. |
 | Integration | Harness runs synthetic fixtures through `VirtualTerminal` and compares expected text/cells. |
-| Integration | Harness replays raw `.raw` PTY files captured by `pane.record`. |
+| Integration | Harness replays committed raw `.raw` PTY files from `.shux/fixtures/vt-corpus/rich-tui/`. |
 | Makefile | `make test-vt-corpus` or equivalent target exists and is documented in `make help`. |
 | Shux automation | `make record-vt-corpus` captures installed TUI streams into `.shux/out/073-vt-corpus/recordings/`. |
 | Visual | Harness emits individual full-resolution PNGs and optional contact sheets; individual PNGs remain the review source. |
-| Pixel | Harness calls `.claude/automations/pixel_verify.py` or equivalent exact metric for baseline comparisons. |
-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS`. |
+| Pixel | Harness calls `.claude/automations/pixel_verify.py` with task-stated thresholds, defaulting to exact `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. |
+| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/073-vt-corpus/SOLID-QA.md`. |
 
 ## Acceptance Criteria
 
 - [ ] Corpus includes fixtures for resize reflow, wide cells, graphemes, DEC graphics, tab stops, origin mode, OSC defaults, alternate screen, scroll regions, and sync output.
-- [ ] Real TUI recording list is explicit and optional-missing tools are reported.
+- [ ] Committed real-TUI fixtures exist for `btop`, `lazygit`, `nvim`, `vicaya-tui`, and `vivecaka`; optional live refresh reports missing tools without skipping committed replay.
 - [ ] Generated reports include pass/fail, screenshot paths, baseline paths, diff paths, and metric values.
 - [ ] Harness is deterministic enough for CI on committed fixtures.
 
@@ -62,6 +63,7 @@ Out of scope:
 - [ ] DootSabha design and implementation-diff reviews are saved.
 - [ ] Make targets are added and documented.
 - [ ] Unit, integration, shux automation, visual, and pixel checks pass.
-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS`.
+- [ ] Full-resolution PNGs, pixel metric JSON, and `evidence-manifest.json` are committed under `.shux/qa/073-vt-corpus/`.
+- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/073-vt-corpus/SOLID-QA.md`.
 - [ ] `make check` passes.
 - [ ] Progress and learnings are updated.

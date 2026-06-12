@@ -330,6 +330,11 @@ deny-soft: ## Run license/advisory audit (non-blocking)
 check-progress: ## Verify PROGRESS.md and task Status fields are updated
 	@bash scripts/check-progress.sh
 
+.PHONY: check-vt-qa
+check-vt-qa: ## Verify completed VT tasks have tracked SOLID QA evidence
+	@bash scripts/check-progress.sh
+	@bash scripts/check-vt-fixtures.sh
+
 .PHONY: check-progress-active
 check-progress-active: ## Verify progress (active session variant, allows In Progress)
 	@bash scripts/check-progress.sh --active-session

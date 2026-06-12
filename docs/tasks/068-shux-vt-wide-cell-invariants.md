@@ -3,8 +3,8 @@
 **Status:** Not Started
 **Priority:** High
 **Milestone:** VT Quality Track
-**Depends On:** 005, 067
-**Touches:** `crates/shux-vt/src/cell.rs`, `crates/shux-vt/src/grid.rs`, `crates/shux-vt/src/parser.rs`, `.shux/out/068-wide-cell-invariants/`
+**Depends On:** 005, 067, 073
+**Touches:** `crates/shux-vt/src/cell.rs`, `crates/shux-vt/src/grid.rs`, `crates/shux-vt/src/parser.rs`, `.shux/qa/068-wide-cell-invariants/`
 
 ---
 
@@ -35,7 +35,7 @@ Harden all cell-mutating operations around width-2 cells:
 - Run DootSabha design council before coding.
 - Run DootSabha implementation-diff council before marking done.
 - Invoke `shux-vt-solid-qa` for an independent hard-gate review.
-- Save artifacts under `.shux/out/068-wide-cell-invariants/`.
+- Save auditable task artifacts under `.shux/qa/068-wide-cell-invariants/`.
 
 ## Testing Matrix
 
@@ -49,8 +49,8 @@ Harden all cell-mutating operations around width-2 cells:
 | Integration | VT byte fixtures mix CJK, box drawing, ANSI colors, and edit operations. |
 | Shux automation | Render a wide-glyph stress grid at 80x24, 120x40, and 200x60 and capture PNGs. |
 | Visual | Inspect CJK rows, right borders, selected rows, and mixed-width tables for drift. |
-| Pixel | Compare deterministic stress-grid PNGs against committed or task-local baselines; exact match required unless baseline is intentionally updated. |
-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS`. |
+| Pixel | Compare deterministic stress-grid PNGs against committed `.shux/goldens/` or DootSabha-approved `.shux/qa/068-wide-cell-invariants/` expected PNGs with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. Self-minted implementation baselines are not allowed. |
+| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/068-wide-cell-invariants/SOLID-QA.md`. |
 
 ## Acceptance Criteria
 
@@ -61,9 +61,10 @@ Harden all cell-mutating operations around width-2 cells:
 
 ## Definition of Done
 
-- [ ] DootSabha design council evidence saved.
+- [ ] DootSabha design council evidence saved under `.shux/qa/068-wide-cell-invariants/`.
 - [ ] Implementation-diff DootSabha review saved and clean or addressed.
 - [ ] Unit, integration, shux automation, visual, and pixel checks pass.
-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS`.
+- [ ] Full-resolution PNGs, pixel metric JSON, and `evidence-manifest.json` are committed under `.shux/qa/068-wide-cell-invariants/`.
+- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/068-wide-cell-invariants/SOLID-QA.md`.
 - [ ] `make check` passes.
 - [ ] Progress and learnings are updated.

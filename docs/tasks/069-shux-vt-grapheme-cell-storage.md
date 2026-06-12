@@ -3,8 +3,8 @@
 **Status:** Not Started
 **Priority:** Medium/High
 **Milestone:** VT Quality Track
-**Depends On:** 005, 068
-**Touches:** `crates/shux-vt/src/cell.rs`, `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster/src/lib.rs`, `.shux/out/069-grapheme-cell-storage/`
+**Depends On:** 005, 068, 073
+**Touches:** `crates/shux-vt/src/cell.rs`, `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster/src/lib.rs`, `.shux/qa/069-grapheme-cell-storage/`
 
 ---
 
@@ -42,7 +42,7 @@ Out of scope:
 - Run DootSabha design council before coding, with explicit memory/performance critique.
 - Run DootSabha implementation-diff council before marking done.
 - Invoke `shux-vt-solid-qa`.
-- Save artifacts under `.shux/out/069-grapheme-cell-storage/`.
+- Save auditable task artifacts under `.shux/qa/069-grapheme-cell-storage/`.
 
 ## Testing Matrix
 
@@ -54,11 +54,11 @@ Out of scope:
 | Unit | Wide-cell invariant helper from task 068 still passes with grapheme cells. |
 | Integration | `pane.capture` returns full grapheme content for deterministic fixtures. |
 | Raster | PNG rendering remains stable for existing simple glyphs and documents unsupported composed rendering. |
-| Performance | Memory and extraction cost measured against pre-change baseline for 80x24 with 5K scrollback. |
+| Performance | Memory and extraction cost measured against pre-change baseline for 80x24 with 5K scrollback; RSS must increase by no more than 15% and ASCII `capture_text()` throughput must slow by no more than 10% unless the task is explicitly re-scoped before implementation. |
 | Shux automation | Capture a Unicode stress pane across 80x24, 120x40, and 200x60. |
 | Visual | Inspect combining marks, emoji fallback, CJK adjacency, and tofu behavior. |
-| Pixel | Existing non-grapheme golden/stress PNGs remain exact; grapheme fixtures have task-approved baselines. |
-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS`. |
+| Pixel | Existing non-grapheme golden/stress PNGs remain exact with `--max-pixel-diff-ratio 0.0`; grapheme expected PNGs must be committed and DootSabha-approved before implementation output is compared. |
+| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/069-grapheme-cell-storage/SOLID-QA.md`. |
 
 ## Acceptance Criteria
 
@@ -66,12 +66,13 @@ Out of scope:
 - [ ] Existing ASCII/simple Unicode behavior remains compatible.
 - [ ] Capture and snapshot paths both account for grapheme payloads.
 - [ ] Remaining renderer limitations are documented in task evidence.
-- [ ] Memory overhead is measured and acceptable.
+- [ ] Memory and extraction overhead stay within the Testing Matrix budgets or the task is explicitly re-scoped before coding.
 
 ## Definition of Done
 
 - [ ] DootSabha design and implementation-diff reviews are saved.
 - [ ] Unit, integration, performance, shux automation, visual, and pixel checks pass.
-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS`.
+- [ ] Full-resolution PNGs, pixel metric JSON, performance JSON, and `evidence-manifest.json` are committed under `.shux/qa/069-grapheme-cell-storage/`.
+- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/069-grapheme-cell-storage/SOLID-QA.md`.
 - [ ] `make check` passes.
 - [ ] Progress and learnings are updated.

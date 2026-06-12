@@ -31,14 +31,16 @@
 - **Pending:** 035 (complete RPC surface). 038–050 (plugin host + bundled plugins + MCP).
 
 **VT Quality Track** — planned, not started.
-- **Pending:** 067 (resize reflow), 068 (wide-cell invariants), 069
-  (grapheme-aware cell storage), 070 (DEC special graphics), 071 (tab stops),
-  072 (origin-mode/scroll-region semantics), 073 (VT corpus regression
-  harness), 074 (dirty-region tracking).
+- **Implementation order:** 073 first, then 067/068, then 069-072, then 074.
+- **Pending:** 073 (VT corpus regression harness), 067 (resize reflow), 068
+  (wide-cell invariants), 069 (grapheme-aware cell storage), 070 (DEC special
+  graphics), 071 (tab stops), 072 (origin-mode/scroll-region semantics), 074
+  (dirty-region tracking).
 - Every task in this track requires DootSabha design review, DootSabha
   implementation-diff review, unit/integration/raw replay/shux automation
   coverage as applicable, full-resolution visual evidence, pixel-level PNG
-  verification, and a `shux-vt-solid-qa` hard-gate `VERDICT: PASS`.
+  verification, and a tracked `.shux/qa/<task>/SOLID-QA.md` hard-gate
+  `VERDICT: PASS`.
 
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
@@ -98,6 +100,24 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 ---
 
 ## Session Log
+
+**2026-06-11 — docs(vt): harden VT quality gate enforcement**
+- Followed up the Claude+Gemini DootSabha council review of
+  `docs/shux-vt-quality-track`.
+- Tightened the VT quality track from a prose-only gate into a machine-checked
+  artifact contract: completed VT tasks must commit `.shux/qa/<task>/SOLID-QA.md`
+  with first line `VERDICT: PASS`, `evidence-manifest.json`, full-resolution
+  PNG evidence, and pixel metric JSON.
+- Updated `scripts/check-progress.sh` and `make check-vt-qa` so Done VT tasks
+  fail local progress checks when tracked SOLID QA evidence is missing,
+  untracked, or malformed.
+- Moved real-TUI replay from optional installed tools to committed raw PTY
+  fixtures under `.shux/fixtures/vt-corpus/rich-tui/`.
+- Removed the task dependency cycle by making task 073 the first VT Quality
+  Track implementation step and task 067 depend on it.
+- Tightened tasks 067-074 with explicit baseline provenance, exact pixel
+  thresholds, tracked `.shux/qa` evidence paths, and concrete performance
+  budgets for grapheme storage and dirty-region tracking.
 
 **2026-06-11 — docs(record): sync lossless recording across public surfaces**
 - Swept recent feature-release surfaces after PR #72: README, human/agent
@@ -1253,13 +1273,13 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 062 | Scrollback-backed copy mode | M1 | **Done** | 005, 021, 061 |
 | 063 | Session save and restore | M1/M3 | **Done** | 013, 014, 015, 030 |
 | 066 | Lossless pane output recording | M2 | **Done** | 036 |
-| 067 | shux-vt resize reflow | VT Quality | Pending | 005, 016, 066 |
-| 068 | shux-vt wide-cell invariants | VT Quality | Pending | 005, 067 |
-| 069 | shux-vt grapheme-aware cell storage | VT Quality | Pending | 005, 068 |
-| 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068 |
-| 071 | shux-vt real tab-stop state | VT Quality | Pending | 005 |
-| 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029 |
-| 073 | shux-vt corpus regression harness | VT Quality | Pending | 066, 067, 068 |
+| 067 | shux-vt resize reflow | VT Quality | Pending | 005, 016, 066, 073 |
+| 068 | shux-vt wide-cell invariants | VT Quality | Pending | 005, 067, 073 |
+| 069 | shux-vt grapheme-aware cell storage | VT Quality | Pending | 005, 068, 073 |
+| 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |
+| 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |
+| 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
+| 073 | shux-vt corpus regression harness | VT Quality | Pending | 066 |
 | 074 | shux-vt dirty-region tracking | VT Quality | Pending | 005, 073 |
 
 ---

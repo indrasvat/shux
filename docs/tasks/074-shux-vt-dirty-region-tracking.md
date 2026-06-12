@@ -4,7 +4,7 @@
 **Priority:** Medium
 **Milestone:** VT Quality Track
 **Depends On:** 005, 073
-**Touches:** `crates/shux-vt/src/grid.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster`, `crates/shux-core`, `.shux/out/074-dirty-region-tracking/`
+**Touches:** `crates/shux-vt/src/grid.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster`, `crates/shux-core`, `.shux/qa/074-dirty-region-tracking/`
 
 ---
 
@@ -37,7 +37,7 @@ Out of scope:
 - Run DootSabha design council before coding.
 - Run DootSabha implementation-diff council before marking done.
 - Invoke `shux-vt-solid-qa`.
-- Save artifacts under `.shux/out/074-dirty-region-tracking/`.
+- Save auditable task artifacts under `.shux/qa/074-dirty-region-tracking/`.
 
 ## Testing Matrix
 
@@ -48,23 +48,24 @@ Out of scope:
 | Unit | Scroll and resize force appropriate full-row/full-frame invalidation. |
 | Unit | Dirty state can be cleared and does not leak across reads. |
 | Integration | VT byte fixture produces expected dirty region sequence. |
-| Performance | Benchmark overhead for high-output stream and idle snapshot path. |
+| Performance | Benchmark overhead for high-output stream and idle snapshot path; dirty tracking must add no more than 5% throughput overhead on replay and no more than 2ms per 200x60 frame on idle snapshot invalidation bookkeeping. |
 | Shux automation | Run a live pane with incremental updates and capture dirty report + PNGs. |
 | Visual | Verify dirty-optimized path, if used by renderer, matches full render screenshots. |
-| Pixel | Full render vs dirty/incremental render PNGs are exact matches. |
-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS`. |
+| Pixel | Full render vs dirty/incremental render PNGs are exact matches with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. |
+| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/074-dirty-region-tracking/SOLID-QA.md`. |
 
 ## Acceptance Criteria
 
 - [ ] Dirty tracking is correct for all grid mutation classes.
 - [ ] API is documented and hard to misuse.
-- [ ] Dirty tracking overhead is measured and acceptable.
+- [ ] Dirty tracking overhead stays within the Testing Matrix budgets or the task is explicitly re-scoped before coding.
 - [ ] If any renderer path consumes dirty regions, exact pixel parity with full render is proven.
 
 ## Definition of Done
 
 - [ ] DootSabha design and implementation-diff reviews are saved.
 - [ ] Unit, integration, performance, shux automation, visual, and pixel checks pass.
-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS`.
+- [ ] Full-resolution PNGs, pixel metric JSON, performance JSON, and `evidence-manifest.json` are committed under `.shux/qa/074-dirty-region-tracking/`.
+- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/074-dirty-region-tracking/SOLID-QA.md`.
 - [ ] `make check` passes.
 - [ ] Progress and learnings are updated.

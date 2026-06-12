@@ -3,8 +3,8 @@
 **Status:** Not Started
 **Priority:** High
 **Milestone:** VT Quality Track
-**Depends On:** 005, 016, 066
-**Touches:** `crates/shux-vt/src/grid.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster`, `.shux/scripts/`, `.shux/out/067-resize-reflow/`
+**Depends On:** 005, 016, 066, 073
+**Touches:** `crates/shux-vt/src/grid.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster`, `.shux/scripts/`, `.shux/qa/067-resize-reflow/`
 
 ---
 
@@ -20,6 +20,9 @@ For agents, this is correctness, not polish. If pane content disappears after a
 resize, `pane.capture`, `pane.snapshot`, and visual QA can all inspect the wrong
 state.
 
+Additionally, OSC 10/11/12 default color assignments need to be preserved
+and accurately rendered, which was a highlighted regression risk in the spike.
+
 ## Scope
 
 Implement reflow for soft-wrapped visible and scrollback rows when terminal
@@ -32,6 +35,7 @@ In scope:
 - Preserve cell style, width metadata, extended attrs, default colors, cursor
   clamping, scrollback limits, and alternate-screen behavior.
 - Handle resize under synchronized output presentation state.
+- Ensure OSC 10/11/12 default color settings are maintained and applied correctly.
 
 Out of scope:
 
@@ -53,7 +57,7 @@ Out of scope:
 - Run DootSabha design council before coding.
 - Run DootSabha implementation-diff council before marking done.
 - Invoke `shux-vt-solid-qa` for an independent hard-gate review.
-- Save all task artifacts under `.shux/out/067-resize-reflow/`.
+- Save auditable task artifacts under `.shux/qa/067-resize-reflow/`.
 
 ## Testing Matrix
 
@@ -66,10 +70,10 @@ Out of scope:
 | Integration | `VirtualTerminal::resize()` reproduces the libghostty spike case: no missing middle text. |
 | Integration | `capture_text()` after resize returns the preserved logical content. |
 | Shux automation | Launch a pane, write long wrapped text, resize through 80x24, 120x40, 40x12, and capture text + PNG. |
-| Real TUI | Record and replay at least `btop` or `htop`, `lazygit`, `nvim`/`vim`, `vicaya`, and `vivecaka` if installed. |
+| Real TUI | Replay committed `.raw` PTY fixtures from `.shux/fixtures/vt-corpus/rich-tui/` for `btop`, `lazygit`, `nvim`, `vicaya-tui`, and `vivecaka` via harness (mandatory). Refreshing requires installation. |
 | Visual | Inspect full-resolution PNGs for lost rows, clipped text, ghost wide cells, and cursor artifacts. |
-| Pixel | Compare before/after stable resize-return PNGs with `.claude/automations/pixel_verify.py`; exact match required when returning to original size. |
-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS`. |
+| Pixel | Compare before/after stable resize-return PNGs with `.claude/automations/pixel_verify.py` using `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`; exact match required against committed `.shux/goldens/` or DootSabha-approved `.shux/qa/067-resize-reflow/` baselines. Self-minted implementation baselines are not allowed. |
+| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/067-resize-reflow/SOLID-QA.md`. |
 
 ## Acceptance Criteria
 
@@ -78,16 +82,18 @@ Out of scope:
 - [ ] Styles and extended attrs survive reflow.
 - [ ] Wide-cell head/tail pairs remain valid after reflow.
 - [ ] Scrollback limits remain enforced.
+- [ ] OSC 10/11/12 default color settings apply correctly and survive resize.
 - [ ] `pane.capture` and `pane.snapshot` agree on visible content after resize.
 - [ ] Real TUI corpus has no visual regressions or documented intentional deltas.
 
 ## Definition of Done
 
-- [ ] DootSabha design council evidence saved under `.shux/out/067-resize-reflow/`.
+- [ ] DootSabha design council evidence saved under `.shux/qa/067-resize-reflow/`.
 - [ ] Implementation-diff DootSabha review saved and clean or addressed.
 - [ ] Focused unit/integration tests pass through Make targets.
 - [ ] Real shux automation artifacts include text captures, PNGs, and pixel diffs.
-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS`.
+- [ ] Full-resolution PNGs, pixel metric JSON, and `evidence-manifest.json` are committed under `.shux/qa/067-resize-reflow/`.
+- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/067-resize-reflow/SOLID-QA.md`.
 - [ ] `make check` passes.
 - [ ] `docs/PROGRESS.md` and this task status are updated.
 - [ ] New learnings are appended to `docs/agents/learnings.md`.
