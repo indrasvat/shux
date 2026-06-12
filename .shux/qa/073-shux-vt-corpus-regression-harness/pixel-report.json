@@ -2,10 +2,10 @@
   "schema_version": 1,
   "cases": [
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-plain-crlf-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-plain-crlf-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-plain-crlf-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-plain-crlf-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-plain-crlf-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-plain-crlf-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -18,10 +18,10 @@
       "total_pixels": 43776
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-wide-cjk-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-wide-cjk-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-wide-cjk-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-wide-cjk-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-wide-cjk-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-wide-cjk-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -34,10 +34,10 @@
       "total_pixels": 43776
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-grapheme-storage-current-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-grapheme-storage-current-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-grapheme-storage-current-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-grapheme-storage-current-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -50,10 +50,10 @@
       "total_pixels": 54720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-dec-special-graphics-current-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-dec-special-graphics-current-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-dec-special-graphics-current-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-dec-special-graphics-current-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-dec-special-graphics-current-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-dec-special-graphics-current-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -66,10 +66,10 @@
       "total_pixels": 54720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-tabs-current-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-tabs-current-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-tabs-current-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-tabs-current-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-tabs-current-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-tabs-current-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -82,10 +82,10 @@
       "total_pixels": 54720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-origin-response-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-origin-response-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-origin-response-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-origin-response-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-origin-response-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-origin-response-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -98,10 +98,10 @@
       "total_pixels": 328320
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-osc-default-colors-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-osc-default-colors-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-osc-default-colors-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-osc-default-colors-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-osc-default-colors-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-osc-default-colors-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -114,10 +114,10 @@
       "total_pixels": 54720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-alternate-screen-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-alternate-screen-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-alternate-screen-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-alternate-screen-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-alternate-screen-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-alternate-screen-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -130,10 +130,10 @@
       "total_pixels": 54720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-scroll-region-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-scroll-region-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-scroll-region-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-scroll-region-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-scroll-region-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-scroll-region-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -146,10 +146,10 @@
       "total_pixels": 54720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-sync-output-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-sync-output-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-sync-output-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-sync-output-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-sync-output-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-sync-output-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -162,10 +162,10 @@
       "total_pixels": 54720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-resize-smoke-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-resize-smoke-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-resize-smoke-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-resize-smoke-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-resize-smoke-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-resize-smoke-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -178,10 +178,10 @@
       "total_pixels": 85500
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/rich-tui-btop-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/rich-tui-btop-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-btop-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/rich-tui-btop-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-btop-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/rich-tui-btop-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -194,10 +194,10 @@
       "total_pixels": 738720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/rich-tui-lazygit-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/rich-tui-lazygit-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-lazygit-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/rich-tui-lazygit-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-lazygit-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/rich-tui-lazygit-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -210,10 +210,10 @@
       "total_pixels": 738720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/rich-tui-nvim-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/rich-tui-nvim-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-nvim-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/rich-tui-nvim-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-nvim-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/rich-tui-nvim-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -226,10 +226,10 @@
       "total_pixels": 738720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/rich-tui-vicaya-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/rich-tui-vicaya-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-vicaya-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/rich-tui-vicaya-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-vicaya-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/rich-tui-vicaya-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,
@@ -242,10 +242,10 @@
       "total_pixels": 738720
     },
     {
-      "actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/rich-tui-vivecaka-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/rich-tui-vivecaka-actual.png",
       "changed_pixels": 0,
-      "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-vivecaka-diff.png",
-      "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/rich-tui-vivecaka-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/rich-tui-vivecaka-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/rich-tui-vivecaka-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,

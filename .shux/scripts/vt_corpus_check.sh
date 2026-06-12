@@ -19,6 +19,26 @@ need cargo
 need jq
 need uv
 
+scrub_paths_filter='
+def scrub:
+  if type == "object" then
+    with_entries(.value |= scrub)
+  elif type == "array" then
+    map(scrub)
+  elif type == "string" and startswith($root) then
+    .[($root | length):]
+  else
+    .
+  end;
+scrub
+'
+
+scrub_json_paths() {
+  local source="$1"
+  local target="$2"
+  jq --arg root "${repo_root}/" "${scrub_paths_filter}" "${source}" > "${target}"
+}
+
 rm -rf "${rendered}"
 mkdir -p "${rendered}" "${qa}"
 
@@ -37,7 +57,7 @@ find "${qa}" -maxdepth 1 -type f \( \
   -name 'evidence-manifest.json' \
 \) -delete
 
-cp "${rendered}/corpus-report.json" "${qa}/corpus-report.json"
+scrub_json_paths "${rendered}/corpus-report.json" "${qa}/corpus-report.json"
 
 failed=0
 screenshots=()
@@ -48,14 +68,17 @@ while IFS=$'\t' read -r layer name actual expected diff; do
   qa_actual="${qa}/${case_id}-actual.png"
   qa_diff="${qa}/${case_id}-diff.png"
   qa_metric="${qa}/${case_id}-pixel.json"
+  qa_metric_tmp="${qa_metric}.tmp"
   cp "${actual}" "${qa_actual}"
   if ! uv run --script "${repo_root}/.claude/automations/pixel_verify.py" \
     "${actual}" "${expected}" \
     --diff "${qa_diff}" \
     --max-pixel-diff-ratio 0 \
-    --max-mean-channel-delta 0 > "${qa_metric}"; then
+    --max-mean-channel-delta 0 > "${qa_metric_tmp}"; then
     failed=1
   fi
+  scrub_json_paths "${qa_metric_tmp}" "${qa_metric}"
+  rm -f "${qa_metric_tmp}"
   screenshots+=("$(basename "${qa_actual}")")
   screenshots+=("$(basename "${qa_diff}")")
   pixel_metrics+=("$(basename "${qa_metric}")")

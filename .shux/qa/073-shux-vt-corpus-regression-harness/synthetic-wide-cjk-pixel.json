@@ -1,1 +1,16 @@
-{"actual": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/out/073-vt-corpus/rendered/synthetic-wide-cjk-actual.png", "changed_pixels": 0, "diff": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-wide-cjk-diff.png", "expected": "/Users/indrasvat/code/github.com/indrasvat-shux/.shux/goldens/073-vt-corpus/synthetic-wide-cjk-expected.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [288, 152], "status": "pass", "total_pixels": 43776}
+{
+  "actual": ".shux/out/073-vt-corpus/rendered/synthetic-wide-cjk-actual.png",
+  "changed_pixels": 0,
+  "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-wide-cjk-diff.png",
+  "expected": ".shux/goldens/073-vt-corpus/synthetic-wide-cjk-expected.png",
+  "max_mean_channel_delta": 0.0,
+  "max_pixel_diff_ratio": 0.0,
+  "mean_rgba_channel_delta": 0.0,
+  "pixel_diff_ratio": 0.0,
+  "size": [
+    288,
+    152
+  ],
+  "status": "pass",
+  "total_pixels": 43776
+}
