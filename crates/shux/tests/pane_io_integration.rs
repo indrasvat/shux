@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc};
 
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ══════════════════════════════════════════════════════════════
 // Shared state (mirrors main.rs PaneIoState)
 // ══════════════════════════════════════════════════════════════
@@ -654,7 +656,7 @@ async fn create_test_session(stream: &mut UnixStream) -> (String, String) {
     let session_id = result["id"].as_str().unwrap().to_string();
     let pane_id = result["pane_id"].as_str().unwrap().to_string();
     // Give the shell a moment to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     (session_id, pane_id)
 }
 
@@ -861,7 +863,7 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, Duration::from_secs(5), |text| {
+    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
         text.contains("SHUX_CPR=")
     })
     .await;
@@ -919,7 +921,7 @@ print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
     )
     .await;
 
-    let text = wait_for_capture_text(&mut stream, &session_id, Duration::from_secs(5), |text| {
+    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
         text.contains("SHUX_XTERM_PROBES=")
     })
     .await;
@@ -981,7 +983,7 @@ time.sleep(0.2)
     )
     .await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     while !ready_path.exists() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

@@ -1,0 +1,26 @@
+{
+  "task": "067-shux-vt-resize-reflow",
+  "kind": "dootsabha-implementation-review",
+  "normalized": true,
+  "normalization_note": "The raw dootsabha stream emitted two JSON objects and included unescaped terminal control characters in model content. This file preserves the review result in valid JSON for task evidence.",
+  "command": "dootsabha council --json --agents claude,gemini --chair claude --timeout 4m --session-timeout 6m",
+  "dispatch": [
+    {
+      "provider": "claude",
+      "status": "error",
+      "error": "invoke claude: claude invoke: subprocess \"claude\": context deadline exceeded"
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-3.1-pro-preview",
+      "status": "ok",
+      "verdict": "CLEAN",
+      "duration_ms": 231909,
+      "summary": "Gemini reviewed the current git diff for task 067 and found no blockers. It explicitly checked source-row Row.wrapped semantics, scrollback plus visible-grid reflow, wide-cell handling, cursor remapping after scrollback trim, alternate-screen canvas behavior versus saved primary reflow, synchronized-output resize, OSC default color preservation, and pane I/O timing hardening."
+    }
+  ],
+  "synthesis": null,
+  "synthesis_error": "synthesis: synthesize fallback gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded",
+  "verdict": "CLEAN_WITH_PARTIAL_COUNCIL",
+  "accepted_for_task_gate": true
+}

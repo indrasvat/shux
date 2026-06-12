@@ -127,6 +127,12 @@ test-vt: ## Run focused virtual terminal tests; optionally pass FILTER=<test-nam
 	@bash scripts/run-cargo-test.sh -p shux-vt --lib -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Virtual terminal tests passed$(COLOR_RESET)"
 
+.PHONY: test-pane-io
+test-pane-io: ## Run pane I/O integration tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running pane I/O integration tests...$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh -p shux --test pane_io_integration -- $(FILTER) --test-threads=1
+	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
+
 .PHONY: test-vt-corpus-unit
 test-vt-corpus-unit: ## Run VT corpus replay unit/integration tests
 	@echo "$(COLOR_BLUE)▶ Running VT corpus replay tests...$(COLOR_RESET)"
@@ -138,6 +144,12 @@ test-vt-corpus: test-vt-corpus-unit ## Replay committed VT corpus fixtures and v
 	@echo "$(COLOR_BLUE)▶ Running VT corpus regression harness...$(COLOR_RESET)"
 	@.shux/scripts/vt_corpus_check.sh
 	@echo "$(COLOR_GREEN)✓ VT corpus regression harness passed$(COLOR_RESET)"
+
+.PHONY: test-vt-resize-reflow
+test-vt-resize-reflow: release ## Drive shux pane resize reflow automation and exact PNG return check
+	@echo "$(COLOR_BLUE)▶ Running VT resize reflow automation...$(COLOR_RESET)"
+	@.shux/scripts/resize_reflow_check.sh
+	@echo "$(COLOR_GREEN)✓ VT resize reflow automation passed$(COLOR_RESET)"
 
 .PHONY: promote-vt-corpus-baselines
 promote-vt-corpus-baselines: ## Promote current VT corpus output into committed goldens for review

@@ -1,0 +1,27 @@
+{
+  "task": "067-shux-vt-resize-reflow",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.json",
+  "dootsabha_implementation": "dootsabha-implementation.json",
+  "reports": [
+    "verification-evidence.json",
+    "resize-automation-report.json",
+    "resize-capture-report.json"
+  ],
+  "captures": [
+    "resize-80x24-before.txt",
+    "resize-120x40.txt",
+    "resize-40x12.txt",
+    "resize-80x24-after.txt"
+  ],
+  "screenshots": [
+    "resize-80x24-before-actual.png",
+    "resize-120x40-actual.png",
+    "resize-40x12-actual.png",
+    "resize-80x24-after-actual.png",
+    "resize-80x24-return-diff.png"
+  ],
+  "pixel_metrics": [
+    "resize-80x24-return-pixel.json"
+  ]
+}
