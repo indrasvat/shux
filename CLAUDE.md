@@ -23,6 +23,7 @@ make check                 # lint + test (pre-commit)
 make ci / ci-strict        # CI target / forces latest stable toolchain
 make deny / deny-soft      # license + advisory audit (strict / non-blocking)
 make check-progress        # verify PROGRESS.md + task Status fields current
+make check-vt-qa           # verify completed VT tasks have tracked SOLID QA evidence
 make install               # install to ~/.local/bin/shux
 make hooks                 # install lefthook git hooks
 make release-build         # build host binary into staging/<triple>/shux
@@ -107,6 +108,45 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > Never treat `TERM` or terminal capability changes as "just environment."
 > They change what TUIs emit. If changing terminal identity is necessary, prove
 > that rich TUIs still render correctly and document the compatibility impact.
+
+## VT Quality Hard Gate
+
+> **STRICT RULE — VT/raster/snapshot work MUST pass the SOLID VT QA gate.**
+> Any change touching `crates/shux-vt`, `crates/shux-raster`, PTY output
+> processing, pane sizing/resize, capture text, snapshot pixels, Unicode width,
+> default colors, cursor presentation, alternate screen, scroll regions, or
+> terminal request/response behavior MUST use the local `shux-vt-solid-qa`
+> sub-agent before the task is marked done or a PR is opened.
+>
+> The sub-agent is defined in:
+> - `.claude/agents/shux-vt-solid-qa.md`
+> - `.codex/agents/shux-vt-solid-qa.toml`
+>
+> Its verdict is a hard gate:
+> - `VERDICT: PASS` is required to complete the task.
+> - `VERDICT: FAIL` or `VERDICT: BLOCKED` must be fixed or explicitly
+>   re-scoped in the task file before proceeding.
+> - The PASS report must be committed at `.shux/qa/<task>/SOLID-QA.md`.
+> - The first line of that file must be exactly `VERDICT: PASS`.
+> - The same directory must include a committed `evidence-manifest.json`, at
+>   least one full-resolution PNG evidence file, and pixel metric JSON.
+>
+> The SOLID gate MUST read the active `docs/tasks/NNN-*.md` file and enforce
+> that task's exact Testing Matrix, Acceptance Criteria, and Definition of Done.
+> Missing evidence is failure, not residual risk.
+>
+> Pixel-level screenshot verification is mandatory whenever visible terminal
+> state is affected. Use `.claude/automations/pixel_verify.py` for exact or
+> thresholded PNG comparisons. Contact sheets are useful summaries, but they
+> never replace full-resolution individual screenshots and pixel diffs.
+>
+> `.shux/out/<task>/` is scratch space for bulky intermediate captures and live
+> recording output. It is not auditable PR evidence. The reviewable subset
+> required by the hard gate lives in `.shux/qa/<task>/` and must be tracked.
+> Baselines must come from committed `.shux/goldens/` or committed
+> `.shux/fixtures/` replay outputs. New or changed baselines require explicit
+> task documentation plus DootSabha design-review approval; an implementation
+> cannot mint its own expected PNG in the same pass and call it proof.
 
 ## Git Workflow
 

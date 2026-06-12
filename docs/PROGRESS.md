@@ -30,6 +30,18 @@
   - **066 (lossless pane output recording)** — Done. `pane.record.start` / `pane.record.stop` add a daemon-owned raw PTY recorder for byte-exact audits while keeping `pane.output.watch` sampled. Recorder state reports `complete|error|aborted`, byte count, `lossless`, and error detail; v1 allows one active recorder per pane, applies explicit backpressure, supports daemon-side `duration_ms`, resolves CLI `--to` paths client-side, and protects existing files unless `--force` is used. `shux pane watch` help now says absence assertions are unsound and text/plain mode warns on sampled chunks.
 - **Pending:** 035 (complete RPC surface). 038–050 (plugin host + bundled plugins + MCP).
 
+**VT Quality Track** — planned, not started.
+- **Implementation order:** 073 first, then 067/068, then 069-072, then 074.
+- **Pending:** 073 (VT corpus regression harness), 067 (resize reflow), 068
+  (wide-cell invariants), 069 (grapheme-aware cell storage), 070 (DEC special
+  graphics), 071 (tab stops), 072 (origin-mode/scroll-region semantics), 074
+  (dirty-region tracking).
+- Every task in this track requires DootSabha design review, DootSabha
+  implementation-diff review, unit/integration/raw replay/shux automation
+  coverage as applicable, full-resolution visual evidence, pixel-level PNG
+  verification, and a tracked `.shux/qa/<task>/SOLID-QA.md` hard-gate
+  `VERDICT: PASS`.
+
 **M3: Polish** — not started. Release pipeline + binary distribution already exist.
 
 shux is a usable interactive multiplexer end-to-end (multi-pane render, attach client, Tier-1 + Tier-2 keybindings, scrollback-backed copy mode, direct mouse selection/copy, TOML config + hot reload, themed border + status bar, help overlay, script-driven status segments, session save/restore).
@@ -88,6 +100,36 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 ---
 
 ## Session Log
+
+**2026-06-11 — test(vt): add corpus regression harness**
+- Added the task-073 VT corpus harness with typed synthetic action fixtures,
+  committed rich-TUI raw replay fixtures, explicit goldens, exact PNG
+  comparison, and machine-readable corpus/pixel reports.
+- Wired `make test-vt-corpus`, `make test-vt-corpus-unit`,
+  `make promote-vt-corpus-baselines`, and `make record-vt-corpus`; CI now runs
+  the exact pixel corpus in the VT QA job before checking the tracked evidence
+  contract.
+- Saved DootSabha design and implementation reviews under
+  `.shux/qa/073-shux-vt-corpus-regression-harness/`, captured full-resolution PNG evidence and pixel
+  metric JSON for all 16 replay cases, and ran the SOLID VT QA gate.
+
+**2026-06-11 — docs(vt): harden VT quality gate enforcement**
+- Followed up the Claude+Gemini DootSabha council review of
+  `docs/shux-vt-quality-track`.
+- Tightened the VT quality track from a prose-only gate into a machine-checked
+  artifact contract: completed VT tasks must commit `.shux/qa/<task>/SOLID-QA.md`
+  with first line `VERDICT: PASS`, `evidence-manifest.json`, full-resolution
+  PNG evidence, and pixel metric JSON.
+- Updated `scripts/check-progress.sh` and `make check-vt-qa` so Done VT tasks
+  fail local progress checks when tracked SOLID QA evidence is missing,
+  untracked, or malformed.
+- Moved real-TUI replay from optional installed tools to committed raw PTY
+  fixtures under `.shux/fixtures/vt-corpus/rich-tui/`.
+- Removed the task dependency cycle by making task 073 the first VT Quality
+  Track implementation step and task 067 depend on it.
+- Tightened tasks 067-074 with explicit baseline provenance, exact pixel
+  thresholds, tracked `.shux/qa` evidence paths, and concrete performance
+  budgets for grapheme storage and dirty-region tracking.
 
 **2026-06-11 — docs(record): sync lossless recording across public surfaces**
 - Swept recent feature-release surfaces after PR #72: README, human/agent
@@ -1243,6 +1285,14 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 062 | Scrollback-backed copy mode | M1 | **Done** | 005, 021, 061 |
 | 063 | Session save and restore | M1/M3 | **Done** | 013, 014, 015, 030 |
 | 066 | Lossless pane output recording | M2 | **Done** | 036 |
+| 067 | shux-vt resize reflow | VT Quality | Pending | 005, 016, 066, 073 |
+| 068 | shux-vt wide-cell invariants | VT Quality | Pending | 005, 067, 073 |
+| 069 | shux-vt grapheme-aware cell storage | VT Quality | Pending | 005, 068, 073 |
+| 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |
+| 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |
+| 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
+| 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
+| 074 | shux-vt dirty-region tracking | VT Quality | Pending | 005, 073 |
 
 ---
 

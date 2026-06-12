@@ -1,0 +1,36 @@
+╭─┐¹cpu┌──┐menu┌┐preset *┌──────────────────────────────┐23:25:11┌─────────────────┐BAT■ 100% ■■■■■■■■■■┌─┐- 2000ms +┌─╮
+│                                                                                                                      │
+│                                                     ╭─┐M2 Pro┌──────────────────────────────────────────────────────╮│
+│                                                    ⢸│CPU ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■  57% ⣀⣀⣀⣀⢠  59°C││
+│                                                    ⣿│C0  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣤  38% ⣀⣀⣀⣀⢠  60°C│C5  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣴  75% ⣀⣀⣀⣀⢠  59°C││
+│                                                    ⣿│C1  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣤  31% ⣀⣀⣀⣀⢠  59°C│C6  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣴  63% ⣀⣀⣀⣀⢠  59°C││
+├───────────────total─▲▼─gpu-totals───────────────────┤C2  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣤  33% ⣀⣀⣀⣀⢠  59°C│C7  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣴  79% ⣀⣀⣀⣀⢠  60°C││
+│                                                    ⠉│C3  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣄  26% ⣀⣀⣀⣀⢠  59°C│C8  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣴  71% ⣀⣀⣀⣀⢠  59°C││
+│                                                     │C4  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣴  74% ⣀⣀⣀⣀⢠  60°C│C9  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣴  77% ⣀⣀⣀⣀⢠  60°C││
+│                                                     │                                     Load avg: 25.53 11.55 7.56││
+│                                                     │GPU ■■■■■■■■■■■■■■■■■■■■■■  0% ⣀⣀⣀⣀⣶  24G/32G  ⣀⣀⣀⣀⣤ 61°C 0.11W││
+│ up 25d 05:11                                        ╰───────────────────────────────────────────────────────────────╯│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─┐²mem┌──────────────────┬─┐disks┌─────────────┐io┌─╮╭─┐⁴proc┌┐filter┌────────┐per-core┌┐reverse┌┐tree┌┐← cpu lazy →┌─╮
+│ Total:         32.0 GiB ├─root─────────────460─GiB─┤│    Pid: Program: Command:              User:  MemB       Cpu% ↑│
+├─Used:──────────13.5─GiB─┤ IO% ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││   73740 node     node /Users/indrasvat indr+  1.9G ⣀⣀⣀⣀⣀  0.0 █│
+│                   ⣤ 42% │ Used: 85% ■■■■■  389 GiB ││   45726 node     node /Users/indrasvat indr+  1.7G ⣀⣀⣀⣀⣀  0.0  │
+├─Available:─────18.4─GiB─├─swap────────────13.0─GiB─┤│   27993 btop     btop                  indr+   13M ⣀⣀⣀⣀⣀  0.0  │
+│                   ⣶ 58% │ Used: 92% ■■■■■ 11.9 GiB ││    8203 BetterDi /Applications/BetterD indr+  100M ⣀⣀⣀⣀⣀  0.0  │
+├─Cached:────────5.88─GiB─├─VM───────────────460─GiB─┤│   27928 shux     /Users/indrasvat/code indr+  114M ⣀⣀⣀⣀⣀  0.0  │
+│                   ⣀ 18% │ IO% ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││     753 Wallpape /System/Library/Exten indr+   12M ⣀⣀⣀⣀⣀  0.0  │
+├─Free:──────────1.28─GiB─┤ Used: 85% ■■■■■  389 GiB ││   62010 codex    /Applications/Codex.a indr+  178M ⣀⣀⣀⣀⣀  0.0  │
+│                      4% ├─Preboot──────────460─GiB─┤│   24865 com.appl /Library/Developer/Co indr+  160M ⣀⣀⣀⣀⣀  0.0  │
+├─────────────────────────┤ IO% ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││   70745 Google C /Applications/Google  indr+  318M ⣀⣀⣀⣀⣀  0.0  │
+╰─────────────────────────┴──────────────────────────╯│   95726 MobileSa /Library/Developer/Co indr+  159M ⣀⣀⣀⣀⣀  0.0  │
+╭─┐³net┌─────────────┐sync┌┐auto┌┐zero┌┐←b utun11 n→┌╮│   62106 Codex (R /Applications/Codex.a indr+  513M ⣀⣀⣀⣀⣀  0.0  │
+│10K                      ╭─┐download┌──────────────╮││   43638 Google C /Applications/Google  indr+  103M ⣀⣀⣀⣀⣀  0.0  │
+│                         │▼ 0 Byte/s      (0 bitps)│││   75028 Google C /Applications/Google  indr+  340M ⣀⣀⣀⣀⣀  0.0  │
+│                         │▼ Top:          (0 bitps)│││   98645 healthap /Library/Developer/Co indr+  258M ⣀⣀⣀⣀⣀  0.0  │
+│                        ⣀│▼ Total:          603 MiB│││   74460 vicaya-d /Users/indrasvat/.car indr+   36M ⣀⣀⣀⣀⣀  0.0  │
+│                        ⠉│                         │││   41026 WhatsApp /Applications/WhatsAp indr+  243M ⣀⣀⣀⣀⣀  0.0  │
+│                         │▲ 2 Byte/s     (16 bitps)│││   77118 Wispr Fl /Applications/Wispr F indr+  120M ⣀⣀⣀⣀⣀  0.0  │
+│                         │▲ Top:         (16 bitps)│││   61896 Codex (S /Applications/Codex.a indr+  123M ⣀⣀⣀⣀⣀  0.0  │
+│                         │▲ Total:         3.15 GiB│││   77942 diagnost /Library/Developer/Co indr+   10M ⣀⣀⣀⣀⣀  0.0  │
+│10K                      ╰─┘upload└────────────────╯││   82706 com.appl /Library/Developer/Co indr+   61M ⣀⣀⣀⣀⣀  0.0 ↓│
+╰────────────────────────────────────────────────────╯╰┘↑ select ↓└┘info ↵└┘terminate└┘kill└┘signals└┘Nice└────┘0/1350└╯

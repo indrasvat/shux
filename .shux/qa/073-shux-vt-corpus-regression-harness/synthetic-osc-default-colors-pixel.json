@@ -1,0 +1,16 @@
+{
+  "actual": ".shux/out/073-vt-corpus/rendered/synthetic-osc-default-colors-actual.png",
+  "changed_pixels": 0,
+  "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-osc-default-colors-diff.png",
+  "expected": ".shux/goldens/073-vt-corpus/synthetic-osc-default-colors-expected.png",
+  "max_mean_channel_delta": 0.0,
+  "max_pixel_diff_ratio": 0.0,
+  "mean_rgba_channel_delta": 0.0,
+  "pixel_diff_ratio": 0.0,
+  "size": [
+    360,
+    152
+  ],
+  "status": "pass",
+  "total_pixels": 54720
+}

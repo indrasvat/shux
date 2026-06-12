@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "recorded_on": "2026-06-11",
+  "cols": 120,
+  "rows": 36,
+  "font_size": 14.0,
+  "font": "crates/shux-raster/assets/JetBrainsMonoNerdFontMono-Regular.ttf",
+  "fg_default": [220, 220, 220],
+  "bg_default": [16, 16, 24],
+  "cursor_policy": "disabled",
+  "duration_ms": 2500,
+  "fixtures": [
+    {
+      "name": "btop",
+      "command": "btop",
+      "raw": "btop.raw",
+      "cols": 120,
+      "rows": 36,
+      "bytes": 38505,
+      "sha256": "8c6ae3ad4c296a39d080fdd50b017a6912ba34b00a8047b8562f1a5e6d365656"
+    },
+    {
+      "name": "lazygit",
+      "command": "lazygit",
+      "raw": "lazygit.raw",
+      "cols": 120,
+      "rows": 36,
+      "bytes": 11418,
+      "sha256": "6850f401d14464aff357fa4087498d9c8e3da3a7b6889fd95b45b81f6b27df5a"
+    },
+    {
+      "name": "nvim",
+      "command": "nvim --clean -u NONE +'set noruler laststatus=2' +'set statusline=libghostty-shux-vt-spike'",
+      "raw": "nvim.raw",
+      "cols": 120,
+      "rows": 36,
+      "bytes": 22084,
+      "sha256": "43cdec5a8ae1258d014c9cc21312c1442a3e11fd861c9e800570f05124404280"
+    },
+    {
+      "name": "vicaya",
+      "command": "vicaya-tui <repo-root>",
+      "raw": "vicaya.raw",
+      "cols": 120,
+      "rows": 36,
+      "bytes": 20757,
+      "sha256": "e5eea1301c358c579b2247d37fb915a13bee074603dd4ce7ebd2c8ab994c38b9"
+    },
+    {
+      "name": "vivecaka",
+      "command": "vivecaka --repo indrasvat/shux",
+      "raw": "vivecaka.raw",
+      "cols": 120,
+      "rows": 36,
+      "bytes": 6403,
+      "sha256": "9e03384f4f09e1675516e25eb37a487fed5970d3dbaf14d9788f40fa39ce9139"
+    }
+  ]
+}
