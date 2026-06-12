@@ -1,3 +1,10 @@
+## [0.28.6](https://github.com/indrasvat/shux/compare/v0.28.5...v0.28.6) (2026-06-12)
+
+
+### Bug Fixes
+
+* **record:** add lossless pane output capture ([#72](https://github.com/indrasvat/shux/issues/72)) ([f8d21c9](https://github.com/indrasvat/shux/commit/f8d21c906a81ab68067feccffae9add6eec9d2ec))
+
 ## [0.28.5](https://github.com/indrasvat/shux/compare/v0.28.4...v0.28.5) (2026-06-11)
 
 
