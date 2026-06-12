@@ -139,6 +139,12 @@ test-vt-corpus-unit: ## Run VT corpus replay unit/integration tests
 	@bash scripts/run-cargo-test.sh -p shux-vt --test vt_corpus_replay -- --test-threads=1
 	@echo "$(COLOR_GREEN)✓ VT corpus replay tests passed$(COLOR_RESET)"
 
+.PHONY: test-vt-wide-invariants
+test-vt-wide-invariants: ## Run wide-cell invariant property tests
+	@echo "$(COLOR_BLUE)▶ Running VT wide-cell invariant tests...$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh -p shux-vt --test wide_invariants -- --test-threads=1
+	@echo "$(COLOR_GREEN)✓ VT wide-cell invariant tests passed$(COLOR_RESET)"
+
 .PHONY: test-vt-corpus
 test-vt-corpus: test-vt-corpus-unit ## Replay committed VT corpus fixtures and verify text/PNG goldens
 	@echo "$(COLOR_BLUE)▶ Running VT corpus regression harness...$(COLOR_RESET)"
@@ -150,6 +156,12 @@ test-vt-resize-reflow: release ## Drive shux pane resize reflow automation and e
 	@echo "$(COLOR_BLUE)▶ Running VT resize reflow automation...$(COLOR_RESET)"
 	@.shux/scripts/resize_reflow_check.sh
 	@echo "$(COLOR_GREEN)✓ VT resize reflow automation passed$(COLOR_RESET)"
+
+.PHONY: test-vt-wide-visual
+test-vt-wide-visual: release ## Drive shux wide-cell invariant visual/pixel automation
+	@echo "$(COLOR_BLUE)▶ Running VT wide-cell visual automation...$(COLOR_RESET)"
+	@.shux/scripts/wide_invariants_check.sh
+	@echo "$(COLOR_GREEN)✓ VT wide-cell visual automation passed$(COLOR_RESET)"
 
 .PHONY: promote-vt-corpus-baselines
 promote-vt-corpus-baselines: ## Promote current VT corpus output into committed goldens for review

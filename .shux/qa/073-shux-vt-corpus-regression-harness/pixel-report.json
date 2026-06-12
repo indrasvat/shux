@@ -34,6 +34,22 @@
       "total_pixels": 43776
     },
     {
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-wide-cjk-ansi-dec-edit-actual.png",
+      "changed_pixels": 0,
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-wide-cjk-ansi-dec-edit-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-wide-cjk-ansi-dec-edit-expected.png",
+      "max_mean_channel_delta": 0.0,
+      "max_pixel_diff_ratio": 0.0,
+      "mean_rgba_channel_delta": 0.0,
+      "pixel_diff_ratio": 0.0,
+      "size": [
+        324,
+        190
+      ],
+      "status": "pass",
+      "total_pixels": 61560
+    },
+    {
       "actual": ".shux/out/073-vt-corpus/rendered/synthetic-grapheme-storage-current-actual.png",
       "changed_pixels": 0,
       "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-grapheme-storage-current-diff.png",

@@ -18,6 +18,16 @@
       ]
     },
     {
+      "name": "wide-cjk-ansi-dec-edit",
+      "description": "wide CJK cells with ANSI color, DEC graphics, insert/delete/erase, and resize",
+      "init": {"rows": 10, "cols": 40},
+      "steps": [
+        {"process": {"text": "\u001b[2J\u001b[H\u001b[31;44mA你B界\u001b[0m\r\n\u001b(0lqk\u001b(B\r\nABCD\u001b[3;2H\u001b[1@界\u001b[3;4H\u001b[1P\u001b[3;5H\u001b[1X\r\nwide-tail:界"}},
+        {"resize": {"rows": 10, "cols": 36}},
+        {"process": {"text": "\r\n\u001b[32mOK界\u001b[0m"}}
+      ]
+    },
+    {
       "name": "grapheme-storage-current",
       "description": "combining mark stream preserves visible capture bytes for current cell model",
       "init": {"rows": 8, "cols": 40},

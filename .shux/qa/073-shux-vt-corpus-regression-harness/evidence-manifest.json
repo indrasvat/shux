@@ -12,6 +12,8 @@
     "synthetic-plain-crlf-diff.png",
     "synthetic-wide-cjk-actual.png",
     "synthetic-wide-cjk-diff.png",
+    "synthetic-wide-cjk-ansi-dec-edit-actual.png",
+    "synthetic-wide-cjk-ansi-dec-edit-diff.png",
     "synthetic-grapheme-storage-current-actual.png",
     "synthetic-grapheme-storage-current-diff.png",
     "synthetic-dec-special-graphics-current-actual.png",
@@ -44,6 +46,7 @@
   "pixel_metrics": [
     "synthetic-plain-crlf-pixel.json",
     "synthetic-wide-cjk-pixel.json",
+    "synthetic-wide-cjk-ansi-dec-edit-pixel.json",
     "synthetic-grapheme-storage-current-pixel.json",
     "synthetic-dec-special-graphics-current-pixel.json",
     "synthetic-tabs-current-pixel.json",

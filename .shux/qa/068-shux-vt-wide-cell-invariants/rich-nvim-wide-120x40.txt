@@ -1,0 +1,40 @@
+SHUX_RICH_WIDE_START
+CJK: 界好語文 A界B好C
+Emoji: 🍺 🧩 🦀 🚀
+Colored-ish source: 彩界彩好彩
+SHUX_RICH_WIDE_END
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+/private/var/folders/5c/_bn5jc5x7ybfz39b277z4y740000gn/T/shux-wide-nvim.NqK45a/wide.txt               1,1            All
+

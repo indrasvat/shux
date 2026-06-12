@@ -322,6 +322,36 @@ mod tests {
         vt.capture_text(None).replace('\n', "")
     }
 
+    fn assert_grid_wide_invariants(grid: &Grid) {
+        for row_idx in 0..grid.total_lines() {
+            let row = grid.row(row_idx).expect("row exists");
+            for col in 0..row.len() {
+                let cell = &row[col];
+                if cell.is_wide_continuation() {
+                    assert_eq!(
+                        cell.ch, ' ',
+                        "continuation at row {row_idx} col {col} carries glyph"
+                    );
+                    assert!(col > 0, "orphan continuation at row {row_idx} col 0");
+                    assert!(
+                        row[col - 1].is_wide(),
+                        "orphan continuation at row {row_idx} col {col}"
+                    );
+                }
+                if cell.is_wide() {
+                    assert!(
+                        col + 1 < row.len(),
+                        "wide head at row {row_idx} final col {col}"
+                    );
+                    assert!(
+                        row[col + 1].is_wide_continuation(),
+                        "wide head at row {row_idx} col {col} missing tail"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn capture_text_skips_trailing_blank_rows_below_content() {
         // Regression: pane.capture {lines:N} used to take the literal
@@ -1251,6 +1281,65 @@ mod tests {
         assert_eq!(vt.grid().visible_row(0)[0].width, 2);
         assert!(vt.grid().visible_row(0)[1].is_wide_continuation());
         assert_eq!(vt.cursor().col, 2);
+    }
+
+    #[test]
+    fn wide_overwrite_on_continuation_clears_both_old_pairs() {
+        let mut vt = VirtualTerminal::new(2, 8);
+        vt.process("你你".as_bytes());
+        vt.process("\x1b[1;2H好".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[0].ch, ' ');
+        assert_eq!(row[1].ch, '好');
+        assert!(row[2].is_wide_continuation());
+        assert_eq!(row[3].ch, ' ');
+        assert_grid_wide_invariants(vt.grid());
+        assert_eq!(compact_capture(&vt), " 好");
+    }
+
+    #[test]
+    fn final_column_wide_char_wraps_before_writing_when_autowrap_enabled() {
+        let mut vt = VirtualTerminal::new(2, 4);
+        vt.process("\x1b[1;4H界".as_bytes());
+
+        assert_eq!(vt.grid().visible_row(0)[3].ch, ' ');
+        assert!(vt.grid().visible_row(0).wrapped);
+        assert_eq!(vt.grid().visible_row(1)[0].ch, '界');
+        assert!(vt.grid().visible_row(1)[1].is_wide_continuation());
+        assert_grid_wide_invariants(vt.grid());
+    }
+
+    #[test]
+    fn final_column_wide_char_degrades_to_space_when_autowrap_disabled() {
+        let mut vt = VirtualTerminal::new(1, 4);
+        vt.process("\x1b[?7l\x1b[1;4H界".as_bytes());
+
+        let cell = &vt.grid().visible_row(0)[3];
+        assert_eq!(cell.ch, ' ');
+        assert_eq!(cell.width, 1);
+        assert_eq!(vt.cursor().col, 3);
+        assert!(!vt.cursor().auto_wrap_pending);
+        assert_grid_wide_invariants(vt.grid());
+    }
+
+    #[test]
+    fn zero_width_combining_character_does_not_create_fake_continuation() {
+        let mut vt = VirtualTerminal::new(1, 4);
+        vt.process("A\u{0301}B".as_bytes());
+
+        assert_eq!(vt.grid().visible_row(0)[0].ch, 'A');
+        assert_eq!(vt.grid().visible_row(0)[1].ch, 'B');
+        assert_grid_wide_invariants(vt.grid());
+    }
+
+    #[test]
+    fn rep_of_wide_character_preserves_wide_pairs() {
+        let mut vt = VirtualTerminal::new(1, 8);
+        vt.process("界\x1b[2b".as_bytes());
+
+        assert_eq!(compact_capture(&vt), "界界界");
+        assert_grid_wide_invariants(vt.grid());
     }
 
     #[test]
