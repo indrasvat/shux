@@ -1,3 +1,10 @@
+# [0.30.0](https://github.com/indrasvat/shux/compare/v0.29.0...v0.30.0) (2026-06-12)
+
+
+### Features
+
+* **vt:** preserve wide-cell invariants ([6e6128a](https://github.com/indrasvat/shux/commit/6e6128af74e9580bdbd66fa3e80333ca7aa0890f))
+
 # [0.29.0](https://github.com/indrasvat/shux/compare/v0.28.6...v0.29.0) (2026-06-12)
 
 
