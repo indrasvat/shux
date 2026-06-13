@@ -1,0 +1,1350 @@
+diff --git i/.shux/fixtures/vt-corpus/synthetic/manifest.json w/.shux/fixtures/vt-corpus/synthetic/manifest.json
+index 7e2aa39..076ced1 100644
+--- i/.shux/fixtures/vt-corpus/synthetic/manifest.json
++++ w/.shux/fixtures/vt-corpus/synthetic/manifest.json
+@@ -29,7 +29,7 @@
+     },
+     {
+       "name": "grapheme-storage-current",
+-      "description": "combining mark stream preserves visible capture bytes for current cell model",
++      "description": "combining mark stream preserves full grapheme capture after task 069",
+       "init": {"rows": 8, "cols": 40},
+       "steps": [
+         {"process": {"text": "Café resumé"}}
+diff --git i/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.png w/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.png
+index 4fa3d5f..0612e6d 100644
+Binary files i/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.png and w/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.png differ
+diff --git i/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.txt w/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.txt
+index 37f64a9..871f15d 100644
+--- i/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.txt
++++ w/.shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.txt
+@@ -1 +1 @@
+-Cafe resume
++Café resumé
+diff --git i/.shux/qa/073-shux-vt-corpus-regression-harness/corpus-report.json w/.shux/qa/073-shux-vt-corpus-regression-harness/corpus-report.json
+index fe77ae0..bcc6489 100644
+--- i/.shux/qa/073-shux-vt-corpus-regression-harness/corpus-report.json
++++ w/.shux/qa/073-shux-vt-corpus-regression-harness/corpus-report.json
+@@ -50,7 +50,7 @@
+     {
+       "name": "grapheme-storage-current",
+       "layer": "synthetic",
+-      "description": "combining mark stream preserves visible capture bytes for current cell model",
++      "description": "combining mark stream preserves full grapheme capture after task 069",
+       "status": "pending_pixel",
+       "text_status": "pass",
+       "responses_status": "pass",
+diff --git i/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-grapheme-storage-current-actual.png w/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-grapheme-storage-current-actual.png
+index 4fa3d5f..0612e6d 100644
+Binary files i/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-grapheme-storage-current-actual.png and w/.shux/qa/073-shux-vt-corpus-regression-harness/synthetic-grapheme-storage-current-actual.png differ
+diff --git i/Makefile w/Makefile
+index 4d8624f..1911cee 100644
+--- i/Makefile
++++ w/Makefile
+@@ -163,6 +163,18 @@ test-vt-wide-visual: release ## Drive shux wide-cell invariant visual/pixel auto
+     @.shux/scripts/wide_invariants_check.sh
+     @echo "$(COLOR_GREEN)✓ VT wide-cell visual automation passed$(COLOR_RESET)"
+
++.PHONY: test-vt-grapheme
++test-vt-grapheme: release ## Drive shux grapheme storage visual/pixel automation
++    @echo "$(COLOR_BLUE)▶ Running VT grapheme storage automation...$(COLOR_RESET)"
++    @.shux/scripts/grapheme_check.sh
++    @echo "$(COLOR_GREEN)✓ VT grapheme storage automation passed$(COLOR_RESET)"
++
++.PHONY: test-vt-grapheme-performance
++test-vt-grapheme-performance: ## Measure grapheme storage performance on ASCII VT path
++    @echo "$(COLOR_BLUE)▶ Measuring VT grapheme storage performance...$(COLOR_RESET)"
++    @.shux/scripts/grapheme_perf_check.sh
++    @echo "$(COLOR_GREEN)✓ VT grapheme storage performance passed$(COLOR_RESET)"
++
+ .PHONY: promote-vt-corpus-baselines
+ promote-vt-corpus-baselines: ## Promote current VT corpus output into committed goldens for review
+     @echo "$(COLOR_BLUE)▶ Promoting VT corpus baselines...$(COLOR_RESET)"
+diff --git i/crates/shux-raster/src/lib.rs w/crates/shux-raster/src/lib.rs
+index a86c13f..d9ba051 100644
+--- i/crates/shux-raster/src/lib.rs
++++ w/crates/shux-raster/src/lib.rs
+@@ -34,7 +34,7 @@
+
+ use fontdue::{Font, FontSettings};
+ use image::{ImageBuffer, Rgba, RgbaImage};
+-use shux_vt::{Cell, CellFlags, Color, CursorShape, Grid, UnderlineStyle};
++use shux_vt::{Cell, CellFlags, CellStyle, Color, CursorShape, Grid, UnderlineStyle};
+
+ /// Embedded text font. JetBrains Mono Nerd Font Mono Regular, the
+ /// upstream Nerd Fonts patched build (2.4 MB) under SIL Open Font
+@@ -415,51 +415,14 @@ impl Rasterizer {
+         };
+         fill_rect(img, x, y, cell_pixels_w, self.cell_h, bg);
+
+-        let ch = cell.ch;
+-        if ch != ' ' && ch != '\0' {
+-            let idx = self.font_idx_for(ch);
+-            let font = &self.fonts[idx];
+-            let (metrics, bitmap, glyph_x, glyph_y) = if idx == 0 {
+-                // Primary font: cell metrics were derived from it, so
+-                // baseline positioning aligns by construction.
+-                let (m, bmp) = font.rasterize(ch, self.font_size);
+-                let baseline_y = y as i32 + self.ascent.round() as i32;
+-                let gx = x as i32 + m.xmin;
+-                let gy = baseline_y - m.height as i32 - m.ymin;
+-                (m, bmp, gx, gy)
++        let text = cell.display_text();
++        if text.as_ref() != " " && text.as_ref() != "\0" {
++            if cell.has_grapheme_payload() {
++                for ch in text.chars().filter(|ch| *ch != '\0' && *ch != '\u{200d}') {
++                    self.draw_scalar_glyph(img, ch, x, y, cell_pixels_w, fg, style);
++                }
+             } else {
+-                // Fallback font (e.g. Noto Emoji): its native advance
+-                // and ascent don't match the primary's, so naively
+-                // blitting at primary baseline would spill into the
+-                // next cell or float far above the row. Re-rasterize
+-                // at a font size that fits inside the cell box, then
+-                // center both axes within `cell_pixels_w * cell_h`.
+-                let (m, bmp) =
+-                    fit_and_rasterize(font, ch, self.font_size, cell_pixels_w, self.cell_h);
+-                let gx = x as i32 + (cell_pixels_w as i32 - m.width as i32).max(0) / 2;
+-                let gy = y as i32 + (self.cell_h as i32 - m.height as i32).max(0) / 2;
+-                (m, bmp, gx, gy)
+-            };
+-            blit_glyph(
+-                img,
+-                glyph_x,
+-                glyph_y,
+-                metrics.width as u32,
+-                metrics.height as u32,
+-                &bitmap,
+-                fg,
+-            );
+-            // Synthetic bold: render again 1px to the right and blend.
+-            if style.flags.contains(CellFlags::BOLD) {
+-                blit_glyph(
+-                    img,
+-                    glyph_x + 1,
+-                    glyph_y,
+-                    metrics.width as u32,
+-                    metrics.height as u32,
+-                    &bitmap,
+-                    fg,
+-                );
++                self.draw_scalar_glyph(img, cell.ch, x, y, cell_pixels_w, fg, style);
+             }
+         }
+
+@@ -485,6 +448,59 @@ impl Rasterizer {
+         }
+     }
+
++    fn draw_scalar_glyph(
++        &self,
++        img: &mut RgbaImage,
++        ch: char,
++        x: u32,
++        y: u32,
++        cell_pixels_w: u32,
++        fg: Rgb,
++        style: CellStyle,
++    ) {
++        if ch == ' ' || ch == '\0' {
++            return;
++        }
++        let idx = self.font_idx_for(ch);
++        let font = &self.fonts[idx];
++        let (metrics, bitmap, glyph_x, glyph_y) = if idx == 0 {
++            // Primary font: cell metrics were derived from it, so baseline
++            // positioning aligns by construction.
++            let (m, bmp) = font.rasterize(ch, self.font_size);
++            let baseline_y = y as i32 + self.ascent.round() as i32;
++            let gx = x as i32 + m.xmin;
++            let gy = baseline_y - m.height as i32 - m.ymin;
++            (m, bmp, gx, gy)
++        } else {
++            // Fallback font (e.g. Noto Emoji): its native advance and ascent
++            // don't match the primary's, so fit and center inside the cell box.
++            let (m, bmp) = fit_and_rasterize(font, ch, self.font_size, cell_pixels_w, self.cell_h);
++            let gx = x as i32 + (cell_pixels_w as i32 - m.width as i32).max(0) / 2;
++            let gy = y as i32 + (self.cell_h as i32 - m.height as i32).max(0) / 2;
++            (m, bmp, gx, gy)
++        };
++        blit_glyph(
++            img,
++            glyph_x,
++            glyph_y,
++            metrics.width as u32,
++            metrics.height as u32,
++            &bitmap,
++            fg,
++        );
++        if style.flags.contains(CellFlags::BOLD) {
++            blit_glyph(
++                img,
++                glyph_x + 1,
++                glyph_y,
++                metrics.width as u32,
++                metrics.height as u32,
++                &bitmap,
++                fg,
++            );
++        }
++    }
++
+     fn draw_underline(
+         &self,
+         img: &mut RgbaImage,
+@@ -745,6 +761,47 @@ mod tests {
+         );
+     }
+
++    #[test]
++    fn grapheme_payload_renders_without_spilling_into_adjacent_cells() {
++        let r = Rasterizer::new(14.0).unwrap();
++        let (cw, _ch) = r.cell_size();
++        let mut vt = VirtualTerminal::new(1, 4);
++        vt.process("👨\u{200d}💻Z ".as_bytes());
++
++        let opts = RasterOptions {
++            fg_default: [255, 255, 255],
++            bg_default: [0, 0, 0],
++            cursor: None,
++            ..Default::default()
++        };
++        let img = r.render(vt.grid(), &opts);
++
++        let mut composed_pixels = 0u32;
++        let mut adjacent_pixels = 0u32;
++        let mut spillover_pixels = 0u32;
++        for y in 0..img.height() {
++            for x in 0..img.width() {
++                let p = img.get_pixel(x, y);
++                if (p[0], p[1], p[2]) == (0, 0, 0) {
++                    continue;
++                }
++                if x < 2 * cw {
++                    composed_pixels += 1;
++                } else if x < 3 * cw {
++                    adjacent_pixels += 1;
++                } else {
++                    spillover_pixels += 1;
++                }
++            }
++        }
++        assert!(composed_pixels > 0, "composed grapheme rendered blank");
++        assert!(adjacent_pixels > 0, "adjacent ASCII cell rendered blank");
++        assert_eq!(
++            spillover_pixels, 0,
++            "composed grapheme spilled into the following blank cell"
++        );
++    }
++
+     #[test]
+     fn indexed_palette_red_is_red() {
+         let rgb = indexed_to_rgb(1);
+diff --git i/crates/shux-ui/src/buffer.rs w/crates/shux-ui/src/buffer.rs
+index e230a53..ac181a8 100644
+--- i/crates/shux-ui/src/buffer.rs
++++ w/crates/shux-ui/src/buffer.rs
+@@ -6,6 +6,7 @@
+ //! of cells that need updating -- this is the core of the incremental rendering
+ //! strategy required by PRD section 14.1 (p50 <= 8ms keypress-to-update).
+
++use std::borrow::Cow;
+ use std::sync::Arc;
+
+ use crossterm::style::Color;
+@@ -93,6 +94,15 @@ impl RenderCell {
+         }
+     }
+
++    /// Full display text for this render cell.
++    pub fn display_text(&self) -> Cow<'_, str> {
++        self.extended
++            .as_ref()
++            .and_then(|attrs| attrs.grapheme.as_deref())
++            .map(Cow::Borrowed)
++            .unwrap_or_else(|| Cow::Owned(self.ch.to_string()))
++    }
++
+     /// Convert a VT cell while resolving dynamic OSC 10/11 default colors.
+     /// OSC 12 cursor color is carried separately by the compositor/rasterizer.
+     pub fn from_vt_cell_with_defaults(
+@@ -534,6 +544,7 @@ mod tests {
+     #[test]
+     fn test_from_vt_cell_preserves_extended_attributes_for_diffing() {
+         let extended = Arc::new(shux_vt::ExtendedAttrs {
++            grapheme: None,
+             hyperlink: Some("https://example.invalid/a;b".to_string()),
+             underline_color: Some(shux_vt::Color::Rgb(10, 20, 30)),
+             underline_style: shux_vt::UnderlineStyle::Curly,
+@@ -557,6 +568,7 @@ mod tests {
+
+         let mut next = RenderCell::text('X');
+         next.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
++            grapheme: None,
+             hyperlink: Some("https://example.invalid".to_string()),
+             underline_color: None,
+             underline_style: shux_vt::UnderlineStyle::None,
+diff --git i/crates/shux-ui/src/copy_mode.rs w/crates/shux-ui/src/copy_mode.rs
+index 41536e8..588c084 100644
+--- i/crates/shux-ui/src/copy_mode.rs
++++ w/crates/shux-ui/src/copy_mode.rs
+@@ -432,7 +432,7 @@ fn row_text(row: &Row, pane_cols: u16) -> String {
+             break;
+         };
+         if !cell.is_wide_continuation() {
+-            out.push(cell.ch);
++            cell.push_display_text(&mut out);
+         }
+     }
+     out
+@@ -644,7 +644,7 @@ pub fn extract_selection(
+             if cell.is_wide_continuation() {
+                 continue;
+             }
+-            out.push(cell.ch);
++            cell.push_display_text(&mut out);
+         }
+         if row != end.1 {
+             // Trim trailing whitespace per line for cleaner copies.
+@@ -695,7 +695,7 @@ pub fn render_copy_view_into(
+
+ fn write_cell(buf: &mut Vec<u8>, cell: &shux_vt::Cell) {
+     write_style(buf, cell);
+-    let _ = write!(buf, "{}", cell.ch);
++    let _ = write!(buf, "{}", cell.display_text());
+ }
+
+ fn write_style(buf: &mut Vec<u8>, cell: &shux_vt::Cell) {
+@@ -998,11 +998,11 @@ fn selection_text_run(
+     };
+     let col_hi = col_hi.min(ctx.pane.width.saturating_sub(1));
+     for col in col_lo..=col_hi {
+-        let ch = row_ref
++        let text = row_ref
+             .get(col as usize)
+             .filter(|cell| !cell.is_wide_continuation())
+-            .map(|cell| cell.ch)
+-            .unwrap_or(' ');
++            .map(|cell| cell.display_text().into_owned())
++            .unwrap_or_else(|| " ".to_string());
+         let _ = write!(
+             buf,
+             "\x1b[{};{}H{}{}\x1b[1m{}\x1b[0m",
+@@ -1010,7 +1010,7 @@ fn selection_text_run(
+             ctx.pane.x + col + 1,
+             sgr_bg(ctx.theme.status_accent),
+             sgr_fg(ctx.theme.status_bg),
+-            ch,
++            text,
+         );
+     }
+ }
+diff --git i/crates/shux-ui/src/render.rs w/crates/shux-ui/src/render.rs
+index 342532a..7d335b6 100644
+--- i/crates/shux-ui/src/render.rs
++++ w/crates/shux-ui/src/render.rs
+@@ -180,8 +180,9 @@ impl<W: Write> RenderBackend<W> {
+             // from the last emitted style to reduce output volume)
+             self.apply_style(&cell.cell)?;
+
+-            // Print the character
+-            self.out.queue(Print(cell.cell.ch))?;
++            // Print the full cell display text when the VT preserved a
++            // multi-codepoint grapheme payload.
++            self.out.queue(Print(cell.cell.display_text()))?;
+         }
+
+         // Reset colors at the end so the terminal is in a clean state
+@@ -220,7 +221,7 @@ impl<W: Write> RenderBackend<W> {
+                 }
+
+                 self.apply_style(cell)?;
+-                self.out.queue(Print(cell.ch))?;
++                self.out.queue(Print(cell.display_text()))?;
+             }
+         }
+
+@@ -466,6 +467,30 @@ mod tests {
+         assert!(output_str.contains('H'));
+     }
+
++    #[test]
++    fn grapheme_render_diff_emits_full_payload() {
++        let mut output = Vec::new();
++        let mut backend = RenderBackend::new(&mut output);
++        let mut cell = RenderCell::text('e');
++        cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
++            grapheme: Some("e\u{0301}".to_string()),
++            hyperlink: None,
++            underline_color: None,
++            underline_style: shux_vt::UnderlineStyle::None,
++        }));
++
++        backend
++            .render_diff(&[DirtyCell {
++                col: 0,
++                row: 0,
++                cell,
++            }])
++            .unwrap();
++
++        let output_str = String::from_utf8_lossy(&output);
++        assert!(output_str.contains("e\u{0301}"));
++    }
++
+     #[test]
+     fn test_empty_diff_produces_no_output() {
+         let mut output = Vec::new();
+@@ -637,6 +662,7 @@ mod tests {
+
+         let mut cell = RenderCell::text('L');
+         cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
++            grapheme: None,
+             hyperlink: Some("https://example.invalid/a;b".to_string()),
+             underline_color: None,
+             underline_style: shux_vt::UnderlineStyle::None,
+@@ -664,6 +690,7 @@ mod tests {
+         let mut cell = RenderCell::text('U');
+         cell.attrs.underline = true;
+         cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
++            grapheme: None,
+             hyperlink: None,
+             underline_color: Some(shux_vt::Color::Rgb(10, 20, 30)),
+             underline_style: shux_vt::UnderlineStyle::Curly,
+@@ -703,6 +730,24 @@ mod tests {
+         assert!(output_str.contains('D'));
+     }
+
++    #[test]
++    fn grapheme_render_full_emits_full_payload() {
++        let mut output = Vec::new();
++        let mut backend = RenderBackend::new(&mut output);
++        let mut cell = RenderCell::text('👨');
++        cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
++            grapheme: Some("👨\u{200d}💻".to_string()),
++            hyperlink: None,
++            underline_color: None,
++            underline_style: shux_vt::UnderlineStyle::None,
++        }));
++
++        backend.render_full(1, 1, &[cell]).unwrap();
++
++        let output_str = String::from_utf8_lossy(&output);
++        assert!(output_str.contains("👨\u{200d}💻"));
++    }
++
+     #[test]
+     fn test_render_full_skips_wide_continuation() {
+         let mut output = Vec::new();
+diff --git i/crates/shux-vt/src/cell.rs w/crates/shux-vt/src/cell.rs
+index 3953290..e865a80 100644
+--- i/crates/shux-vt/src/cell.rs
++++ w/crates/shux-vt/src/cell.rs
+@@ -1,3 +1,4 @@
++use std::borrow::Cow;
+ use std::sync::Arc;
+
+ /// Compact cell flags packed into a single byte.
+@@ -89,6 +90,12 @@ pub struct Cell {
+ /// Extended attributes that are rare enough to be heap-allocated.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct ExtendedAttrs {
++    /// Full display text for rare multi-codepoint cells.
++    ///
++    /// Normal ASCII and simple Unicode cells keep this as `None` and use
++    /// `Cell::ch` directly. The field lives in extended storage so the common
++    /// cell layout does not grow for grapheme support.
++    pub grapheme: Option<String>,
+     /// OSC 8 hyperlink target.
+     pub hyperlink: Option<String>,
+     /// Underline color (separate from fg).
+@@ -100,6 +107,7 @@ pub struct ExtendedAttrs {
+ impl Default for ExtendedAttrs {
+     fn default() -> Self {
+         ExtendedAttrs {
++            grapheme: None,
+             hyperlink: None,
+             underline_color: None,
+             underline_style: UnderlineStyle::None,
+@@ -151,6 +159,71 @@ impl Cell {
+         self.width == 2
+     }
+
++    /// Full display text for this cell.
++    pub fn display_text(&self) -> Cow<'_, str> {
++        self.extended
++            .as_ref()
++            .and_then(|attrs| attrs.grapheme.as_deref())
++            .map(Cow::Borrowed)
++            .unwrap_or_else(|| Cow::Owned(self.ch.to_string()))
++    }
++
++    /// Append this cell's display text into `out` without allocating on the
++    /// simple scalar path.
++    pub fn push_display_text(&self, out: &mut String) {
++        if let Some(text) = self
++            .extended
++            .as_ref()
++            .and_then(|attrs| attrs.grapheme.as_deref())
++        {
++            out.push_str(text);
++        } else {
++            out.push(self.ch);
++        }
++    }
++
++    /// Rare grapheme payload, if this cell stores multi-codepoint text.
++    pub fn grapheme(&self) -> Option<&str> {
++        self.extended
++            .as_ref()
++            .and_then(|attrs| attrs.grapheme.as_deref())
++    }
++
++    /// Whether this cell carries a multi-codepoint display payload.
++    pub fn has_grapheme_payload(&self) -> bool {
++        self.grapheme().is_some()
++    }
++
++    /// Set the rare grapheme payload. A payload equal to the scalar fast path is
++    /// pruned so common cells keep `extended == None`.
++    pub fn set_grapheme_payload(&mut self, text: String) {
++        if text.chars().eq(std::iter::once(self.ch)) {
++            if let Some(extended) = &mut self.extended {
++                Arc::make_mut(extended).grapheme = None;
++            }
++            self.prune_default_extended();
++            return;
++        }
++        let extended = self
++            .extended
++            .get_or_insert_with(|| Arc::new(ExtendedAttrs::default()));
++        Arc::make_mut(extended).grapheme = Some(text);
++    }
++
++    /// Append one scalar to this cell's rare grapheme payload.
++    pub fn append_grapheme_scalar(&mut self, ch: char) {
++        let mut text = self.display_text().into_owned();
++        text.push(ch);
++        self.set_grapheme_payload(text);
++    }
++
++    /// Remove extended storage when every rare field has returned to default.
++    pub fn prune_default_extended(&mut self) {
++        if self.extended.as_deref() == Some(&ExtendedAttrs::default()) {
++            self.extended = None;
++        }
++    }
++
+     /// Reset this cell to empty with the given background color.
+     pub fn reset(&mut self, bg: Color) {
+         self.ch = ' ';
+@@ -251,6 +324,7 @@ mod tests {
+     #[test]
+     fn test_extended_attrs() {
+         let ext = ExtendedAttrs {
++            grapheme: None,
+             hyperlink: Some("https://example.com".to_string()),
+             underline_color: Some(Color::Rgb(255, 0, 0)),
+             underline_style: UnderlineStyle::Curly,
+diff --git i/crates/shux-vt/src/grid.rs w/crates/shux-vt/src/grid.rs
+index 3bf3379..9e4eb7b 100644
+--- i/crates/shux-vt/src/grid.rs
++++ w/crates/shux-vt/src/grid.rs
+@@ -919,6 +919,7 @@ mod tests {
+         flags.set(CellFlags::BOLD);
+         flags.set(CellFlags::UNDERLINE);
+         let ext = Arc::new(ExtendedAttrs {
++            grapheme: None,
+             hyperlink: Some("https://example.com".to_string()),
+             underline_color: Some(Color::Rgb(9, 8, 7)),
+             underline_style: UnderlineStyle::Curly,
+diff --git i/crates/shux-vt/src/lib.rs w/crates/shux-vt/src/lib.rs
+index 7f87a37..2f2b7a8 100644
+--- i/crates/shux-vt/src/lib.rs
++++ w/crates/shux-vt/src/lib.rs
+@@ -58,6 +58,8 @@ pub struct VirtualTerminal {
+     dcs_state: Option<DcsState>,
+     /// Frozen presentation while synchronized output mode is active.
+     sync_present: Option<SyncPresentation>,
++    /// Visible cell currently accepting zero-width/joined grapheme scalars.
++    active_grapheme_cell: Option<(usize, usize)>,
+     /// Number of visible rows.
+     rows: usize,
+     /// Number of columns.
+@@ -87,6 +89,7 @@ impl VirtualTerminal {
+             parser: Parser::new(),
+             dcs_state: None,
+             sync_present: None,
++            active_grapheme_cell: None,
+             rows,
+             cols,
+         }
+@@ -123,6 +126,7 @@ impl VirtualTerminal {
+             alt_cursor: &mut self.alt_cursor,
+             dcs_state: &mut self.dcs_state,
+             sync_present: &mut self.sync_present,
++            active_grapheme_cell: &mut self.active_grapheme_cell,
+             responses: &mut responses,
+         };
+         self.parser.advance(&mut handler, bytes);
+@@ -181,6 +185,7 @@ impl VirtualTerminal {
+     /// This resizes both primary and alternate grids, adjusts the scroll
+     /// region, and clamps the cursor position.
+     pub fn resize(&mut self, rows: usize, cols: usize) {
++        self.active_grapheme_cell = None;
+         if self.modes.alternate_screen {
+             self.grid.resize_canvas(rows, cols);
+             if let (Some(primary), Some(primary_cursor)) =
+@@ -235,6 +240,7 @@ impl VirtualTerminal {
+
+     /// Switch to alternate screen buffer (DECSET 1049).
+     pub fn enter_alternate_screen(&mut self) {
++        self.active_grapheme_cell = None;
+         if !self.modes.alternate_screen {
+             let config = GridConfig { max_scrollback: 0 }; // No scrollback on alt screen.
+             let alt_grid = Grid::new(self.rows, self.cols, config);
+@@ -247,6 +253,7 @@ impl VirtualTerminal {
+
+     /// Switch back to primary screen buffer (DECRST 1049).
+     pub fn leave_alternate_screen(&mut self) {
++        self.active_grapheme_cell = None;
+         if self.modes.alternate_screen {
+             if let Some(primary_grid) = self.alt_grid.take() {
+                 self.grid = primary_grid;
+@@ -305,7 +312,7 @@ impl VirtualTerminal {
+                 if cell.is_wide_continuation() {
+                     continue;
+                 }
+-                line.push(cell.ch);
++                cell.push_display_text(&mut line);
+             }
+             output.push_str(line.trim_end());
+             output.push('\n');
+@@ -317,6 +324,7 @@ impl VirtualTerminal {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use std::sync::Arc;
+
+     fn compact_capture(vt: &VirtualTerminal) -> String {
+         vt.capture_text(None).replace('\n', "")
+@@ -1137,6 +1145,224 @@ mod tests {
+         assert!(vt.grid().visible_row(0)[1].extended.is_none());
+     }
+
++    #[test]
++    fn grapheme_combining_mark_is_stored_and_captured() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process("e\u{0301}x".as_bytes());
++
++        let row = vt.grid().visible_row(0);
++        assert_eq!(row[0].ch, 'e');
++        assert_eq!(row[0].grapheme(), Some("e\u{0301}"));
++        assert_eq!(row[1].ch, 'x');
++        assert!(row[1].grapheme().is_none());
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "e\u{0301}x");
++    }
++
++    #[test]
++    fn grapheme_variation_modifier_zwj_and_flag_payloads_are_preserved() {
++        let mut vt = VirtualTerminal::new(3, 40);
++        vt.process("A🛠\u{fe0f} B👍🏽 C👨\u{200d}💻 D🇺🇸".as_bytes());
++
++        let captured = vt.capture_text(Some(1));
++        assert!(
++            captured.contains("🛠\u{fe0f}"),
++            "VS16 payload missing: {captured:?}"
++        );
++        assert!(
++            captured.contains("👍🏽"),
++            "skin-tone payload missing: {captured:?}"
++        );
++        assert!(
++            captured.contains("👨\u{200d}💻"),
++            "ZWJ payload missing: {captured:?}"
++        );
++        assert!(
++            captured.contains("🇺🇸"),
++            "flag payload missing: {captured:?}"
++        );
++        assert!(
++            vt.grid()
++                .visible_row(0)
++                .cells
++                .iter()
++                .any(|cell| cell.grapheme() == Some("👨\u{200d}💻"))
++        );
++        assert!(
++            vt.grid()
++                .visible_row(0)
++                .cells
++                .iter()
++                .any(|cell| cell.grapheme() == Some("🇺🇸") && cell.width == 2)
++        );
++        assert_grid_wide_invariants(vt.grid());
++    }
++
++    #[test]
++    fn ascii_cells_remain_on_compact_common_path() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"plain ascii");
++
++        for cell in vt.grid().visible_row(0).cells.iter().take(11) {
++            assert!(cell.extended.is_none(), "ASCII cell used extended attrs");
++            assert!(
++                cell.grapheme().is_none(),
++                "ASCII cell used grapheme payload"
++            );
++        }
++    }
++
++    #[test]
++    fn grapheme_payload_is_cell_local_not_cursor_style() {
++        let mut vt = VirtualTerminal::new(2, 40);
++        vt.process(b"\x1b]8;;https://example.invalid/a;b\x07");
++        vt.process("e\u{0301}x".as_bytes());
++
++        let row = vt.grid().visible_row(0);
++        let first = row[0].extended.as_ref().expect("first cell extended attrs");
++        assert_eq!(first.grapheme.as_deref(), Some("e\u{0301}"));
++        assert_eq!(
++            first.hyperlink.as_deref(),
++            Some("https://example.invalid/a;b")
++        );
++
++        let second = row[1].extended.as_ref().expect("second cell hyperlink");
++        assert_eq!(
++            second.hyperlink.as_deref(),
++            Some("https://example.invalid/a;b")
++        );
++        assert_eq!(
++            second.grapheme, None,
++            "grapheme payload leaked through cursor extended attrs"
++        );
++    }
++
++    #[test]
++    fn styled_ascii_cells_share_cursor_extended_attrs() {
++        let mut vt = VirtualTerminal::new(2, 40);
++        vt.process(b"\x1b]8;;https://example.invalid/a;b\x07");
++        vt.process(b"ab");
++        vt.process("e\u{0301}".as_bytes());
++
++        let row = vt.grid().visible_row(0);
++        let first = row[0].extended.as_ref().expect("first hyperlink");
++        let second = row[1].extended.as_ref().expect("second hyperlink");
++        let grapheme = row[2].extended.as_ref().expect("grapheme hyperlink");
++
++        assert!(
++            Arc::ptr_eq(first, second),
++            "plain styled run should share cursor extended attrs"
++        );
++        assert!(
++            !Arc::ptr_eq(second, grapheme),
++            "grapheme payload should copy-on-write cell attrs"
++        );
++        assert_eq!(first.grapheme, None);
++        assert_eq!(second.grapheme, None);
++        assert_eq!(grapheme.grapheme.as_deref(), Some("e\u{0301}"));
++        assert_eq!(
++            grapheme.hyperlink.as_deref(),
++            Some("https://example.invalid/a;b")
++        );
++    }
++
++    #[test]
++    fn combining_after_cursor_motion_does_not_attach_to_stale_cell() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process("e\x1b[1;10H\u{0301}x".as_bytes());
++
++        let row = vt.grid().visible_row(0);
++        assert_eq!(row[0].ch, 'e');
++        assert!(row[0].grapheme().is_none());
++        assert_eq!(row[9].ch, 'x');
++    }
++
++    #[test]
++    fn combining_after_esc_line_movement_does_not_attach_to_stale_cell() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process("e\x1bE\u{0301}x".as_bytes());
++
++        let row0 = vt.grid().visible_row(0);
++        let row1 = vt.grid().visible_row(1);
++        assert_eq!(row0[0].ch, 'e');
++        assert!(row0[0].grapheme().is_none());
++        assert_eq!(row1[0].ch, 'x');
++    }
++
++    #[test]
++    fn combining_after_final_column_preserves_pending_wrap() {
++        let mut vt = VirtualTerminal::new(2, 3);
++        vt.process("abe\u{0301}x".as_bytes());
++
++        assert_eq!(vt.grid().visible_row(0)[2].grapheme(), Some("e\u{0301}"));
++        assert_eq!(vt.grid().visible_row(1)[0].ch, 'x');
++        assert_eq!(vt.capture_text(None), "abe\u{0301}\nx\n");
++    }
++
++    #[test]
++    fn combining_after_cjk_attaches_to_wide_head() {
++        let mut vt = VirtualTerminal::new(2, 10);
++        vt.process("界\u{0301}x".as_bytes());
++
++        let row = vt.grid().visible_row(0);
++        assert_eq!(row[0].grapheme(), Some("界\u{0301}"));
++        assert!(row[1].is_wide_continuation());
++        assert_eq!(row[2].ch, 'x');
++        assert_grid_wide_invariants(vt.grid());
++    }
++
++    #[test]
++    fn zwj_width_expansion_preserves_wide_invariants() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process("a\u{200d}👨x".as_bytes());
++
++        let row = vt.grid().visible_row(0);
++        assert_eq!(row[0].grapheme(), Some("a\u{200d}👨"));
++        assert!(row[0].is_wide());
++        assert!(row[1].is_wide_continuation());
++        assert_eq!(row[2].ch, 'x');
++        assert_grid_wide_invariants(vt.grid());
++    }
++
++    #[test]
++    fn zwj_and_flag_at_final_column_do_not_create_final_wide_head() {
++        let mut zwj = VirtualTerminal::new(2, 5);
++        zwj.process(b"\x1b[1;5H");
++        zwj.process("a\u{200d}👨".as_bytes());
++        assert!(
++            !zwj.grid().visible_row(0)[4].is_wide(),
++            "ZWJ sequence created a width-2 head in the final column"
++        );
++        assert!(
++            zwj.capture_text(None).contains("a\u{200d}"),
++            "final-column ZWJ marker was lost"
++        );
++        assert_grid_wide_invariants(zwj.grid());
++
++        let mut flag = VirtualTerminal::new(2, 5);
++        flag.process(b"\x1b[1;5H");
++        flag.process("🇺🇸".as_bytes());
++        assert!(
++            !flag.grid().visible_row(0)[4].is_wide(),
++            "flag pair created a width-2 head in the final column"
++        );
++        assert!(
++            flag.capture_text(None).contains("🇺") && flag.capture_text(None).contains("🇸"),
++            "final-column regional indicators were lost"
++        );
++        assert_grid_wide_invariants(flag.grid());
++    }
++
++    #[test]
++    fn rep_repeats_full_grapheme_payload() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process("e\u{0301}\x1b[3b".as_bytes());
++
++        assert_eq!(
++            vt.capture_text(Some(1)).trim_end(),
++            "e\u{0301}e\u{0301}e\u{0301}e\u{0301}"
++        );
++    }
++
+     #[test]
+     fn test_sgr_256_color() {
+         let mut vt = VirtualTerminal::new(24, 80);
+diff --git i/crates/shux-vt/src/parser.rs w/crates/shux-vt/src/parser.rs
+index 9252d62..b4a58b8 100644
+--- i/crates/shux-vt/src/parser.rs
++++ w/crates/shux-vt/src/parser.rs
+@@ -103,10 +103,19 @@ pub struct VtHandler<'a> {
+     pub alt_cursor: &'a mut Option<Cursor>,
+     pub dcs_state: &'a mut Option<DcsState>,
+     pub sync_present: &'a mut Option<SyncPresentation>,
++    pub active_grapheme_cell: &'a mut Option<(usize, usize)>,
+     pub responses: &'a mut Vec<Vec<u8>>,
+ }
+
+ impl<'a> VtHandler<'a> {
++    fn clear_active_grapheme_cell(&mut self) {
++        *self.active_grapheme_cell = None;
++    }
++
++    fn set_active_grapheme_cell(&mut self, row: usize, col: usize) {
++        *self.active_grapheme_cell = Some((row, col));
++    }
++
+     fn cursor_blank_cell(&self) -> Cell {
+         Cell {
+             ch: ' ',
+@@ -116,7 +125,12 @@ impl<'a> VtHandler<'a> {
+         }
+     }
+
++    fn cursor_cell_extended(&self) -> Option<Arc<ExtendedAttrs>> {
++        self.cursor.extended.clone()
++    }
++
+     fn wrap_to_next_line(&mut self) {
++        self.clear_active_grapheme_cell();
+         self.cursor.col = 0;
+         self.cursor.auto_wrap_pending = false;
+         self.grid.visible_row_mut(self.cursor.row).wrapped = true;
+@@ -134,6 +148,13 @@ impl<'a> VtHandler<'a> {
+             .unwrap_or(1)
+             .min(2);
+         if width == 0 {
++            self.append_zero_width_scalar(ch);
++            return;
++        }
++        if self.try_append_to_active_grapheme(ch, width) {
++            return;
++        }
++        if self.try_append_regional_indicator_pair(ch, width) {
+             return;
+         }
+         let cols = self.grid.cols();
+@@ -165,6 +186,7 @@ impl<'a> VtHandler<'a> {
+             row.clear_wide_pair_around(col, self.cursor.style.bg);
+             row[col] = blank;
+             self.cursor.auto_wrap_pending = false;
++            self.clear_active_grapheme_cell();
+             return;
+         }
+
+@@ -180,6 +202,7 @@ impl<'a> VtHandler<'a> {
+                 self.wrap_to_next_line();
+             } else {
+                 self.cursor.auto_wrap_pending = false;
++                self.clear_active_grapheme_cell();
+                 return;
+             }
+         }
+@@ -192,23 +215,28 @@ impl<'a> VtHandler<'a> {
+
+         // Write the cell.
+         let col = self.cursor.col;
++        let cursor_row = self.cursor.row;
+         let bg = self.cursor.style.bg;
+-        let row = self.grid.visible_row_mut(self.cursor.row);
+-        row.clear_wide_pair_around(col, bg);
+-        if width == 2 {
+-            row.clear_wide_pair_around(col + 1, bg);
+-        }
+-        row[col] = Cell {
+-            ch,
+-            width: width as u8,
+-            style: self.cursor.style,
+-            extended: self.cursor.extended.clone(),
+-        };
++        let extended = self.cursor_cell_extended();
++        {
++            let row = self.grid.visible_row_mut(cursor_row);
++            row.clear_wide_pair_around(col, bg);
++            if width == 2 {
++                row.clear_wide_pair_around(col + 1, bg);
++            }
++            row[col] = Cell {
++                ch,
++                width: width as u8,
++                style: self.cursor.style,
++                extended,
++            };
+
+-        // For wide characters, write a continuation cell.
+-        if width == 2 && col + 1 < cols {
+-            row[col + 1] = Cell::wide_continuation();
++            // For wide characters, write a continuation cell.
++            if width == 2 && col + 1 < cols {
++                row[col + 1] = Cell::wide_continuation();
++            }
+         }
++        self.set_active_grapheme_cell(cursor_row, col);
+
+         // Advance cursor.
+         self.cursor.col += width;
+@@ -218,6 +246,138 @@ impl<'a> VtHandler<'a> {
+         }
+     }
+
++    fn append_zero_width_scalar(&mut self, ch: char) {
++        let Some((row, col)) = self
++            .active_grapheme_position()
++            .or_else(|| self.preceding_cell_position())
++        else {
++            return;
++        };
++        if let Some(cell) = self.cell_mut(row, col)
++            && !cell.is_wide_continuation()
++            && cell.ch != ' '
++        {
++            cell.append_grapheme_scalar(ch);
++            self.set_active_grapheme_cell(row, col);
++        }
++    }
++
++    fn try_append_to_active_grapheme(&mut self, ch: char, width: usize) -> bool {
++        let Some((row, col)) = self.active_grapheme_position() else {
++            return false;
++        };
++        let should_join = self
++            .grid
++            .visible_row(row)
++            .get(col)
++            .is_some_and(|cell| cell.grapheme().is_some_and(str_ends_with_zwj));
++        if !should_join {
++            return false;
++        }
++        let cols = self.grid.cols();
++        let target_width = self
++            .grid
++            .visible_row(row)
++            .get(col)
++            .map(|cell| usize::from(cell.width).max(width))
++            .unwrap_or(width)
++            .min(2);
++        if target_width == 2 && col + 1 >= cols {
++            return false;
++        }
++        {
++            let bg = self.cursor.style.bg;
++            let row_ref = self.grid.visible_row_mut(row);
++            row_ref[col].append_grapheme_scalar(ch);
++            row_ref[col].width = target_width as u8;
++            if target_width == 2 {
++                if !row_ref[col + 1].is_wide_continuation() {
++                    row_ref.clear_wide_pair_around(col + 1, bg);
++                }
++                row_ref[col + 1] = Cell::wide_continuation();
++            }
++        }
++        let next_col = col + target_width;
++        if next_col >= cols {
++            self.cursor.col = cols.saturating_sub(1);
++            self.cursor.auto_wrap_pending = true;
++        } else {
++            self.cursor.col = self.cursor.col.max(next_col);
++        }
++        true
++    }
++
++    fn try_append_regional_indicator_pair(&mut self, ch: char, width: usize) -> bool {
++        if !is_regional_indicator(ch) {
++            return false;
++        }
++        let Some((row, col)) = self.preceding_cell_position() else {
++            return false;
++        };
++        let previous_is_single_ri = self
++            .grid
++            .visible_row(row)
++            .get(col)
++            .is_some_and(|cell| cell_contains_single_regional_indicator(cell));
++        if !previous_is_single_ri {
++            return false;
++        }
++
++        let cols = self.grid.cols();
++        let target_width = width.max(2).min(2);
++        if target_width == 2 && col + 1 >= cols {
++            return false;
++        }
++        {
++            let bg = self.cursor.style.bg;
++            let row_ref = self.grid.visible_row_mut(row);
++            row_ref[col].append_grapheme_scalar(ch);
++            row_ref[col].width = target_width as u8;
++            if target_width == 2 && col + 1 < cols {
++                if !row_ref[col + 1].is_wide_continuation() {
++                    row_ref.clear_wide_pair_around(col + 1, bg);
++                }
++                row_ref[col + 1] = Cell::wide_continuation();
++            }
++        }
++        self.set_active_grapheme_cell(row, col);
++        self.cursor.col = (col + target_width).min(cols.saturating_sub(1));
++        self.cursor.auto_wrap_pending = col + target_width >= cols;
++        true
++    }
++
++    fn active_grapheme_position(&self) -> Option<(usize, usize)> {
++        let (row, col) = (*self.active_grapheme_cell)?;
++        let cell = self.grid.visible_row(row).get(col)?;
++        (!cell.is_wide_continuation() && cell.ch != ' ').then_some((row, col))
++    }
++
++    fn preceding_cell_position(&self) -> Option<(usize, usize)> {
++        let source_col = if self.cursor.auto_wrap_pending {
++            self.cursor.col
++        } else {
++            self.cursor.col.checked_sub(1)?
++        };
++        let row = self.grid.visible_row(self.cursor.row);
++        let source_col = if row
++            .get(source_col)
++            .is_some_and(|cell| cell.is_wide_continuation())
++        {
++            source_col.checked_sub(1)?
++        } else {
++            source_col
++        };
++        row.get(source_col)?;
++        Some((self.cursor.row, source_col))
++    }
++
++    fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
++        if row >= self.grid.rows() || col >= self.grid.cols() {
++            return None;
++        }
++        self.grid.visible_row_mut(row).cells.get_mut(col)
++    }
++
+     fn cursor_extended_mut(&mut self) -> &mut ExtendedAttrs {
+         let extended = self
+             .cursor
+@@ -268,13 +428,22 @@ impl<'a> VtHandler<'a> {
+         } else {
+             source_col
+         };
+-        let ch = row
+-            .get(source_col)
+-            .map(|cell| cell.ch)
+-            .filter(|ch| *ch != '\0')
+-            .unwrap_or(' ');
++        let source = row.get(source_col).cloned().unwrap_or(Cell::EMPTY);
+         for _ in 0..count {
+-            self.write_char(ch);
++            self.write_cell_from_source(&source);
++        }
++    }
++
++    fn write_cell_from_source(&mut self, source: &Cell) {
++        self.write_char(source.ch);
++        let Some(text) = source.grapheme().map(str::to_owned) else {
++            return;
++        };
++        let Some((row, col)) = self.preceding_cell_position() else {
++            return;
++        };
++        if let Some(cell) = self.cell_mut(row, col) {
++            cell.set_grapheme_payload(text);
+         }
+     }
+
+@@ -559,6 +728,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
+     }
+
+     fn execute(&mut self, byte: u8) {
++        self.clear_active_grapheme_cell();
+         match byte {
+             // BEL -- bell.
+             0x07 => { /* emit bell event in the future */ }
+@@ -591,6 +761,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
+         _ignore: bool,
+         action: char,
+     ) {
++        if !(action == 'm' && intermediates.is_empty()) {
++            self.clear_active_grapheme_cell();
++        }
+         let params_groups: Vec<Vec<u16>> =
+             params.iter().map(|subparam| subparam.to_vec()).collect();
+         // Flatten params: each subparam slice is collected into a flat Vec<u16>.
+@@ -1025,6 +1198,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
+     }
+
+     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
++        self.clear_active_grapheme_cell();
+         match (byte, intermediates) {
+             // DECSC -- Save Cursor (ESC 7).
+             (b'7', []) => self.cursor.save(self.modes.origin_mode),
+@@ -1213,6 +1387,20 @@ fn mode_report(enabled: bool) -> u8 {
+     if enabled { 1 } else { 2 }
+ }
+
++fn str_ends_with_zwj(text: &str) -> bool {
++    text.ends_with('\u{200d}')
++}
++
++fn is_regional_indicator(ch: char) -> bool {
++    ('\u{1f1e6}'..='\u{1f1ff}').contains(&ch)
++}
++
++fn cell_contains_single_regional_indicator(cell: &Cell) -> bool {
++    let text = cell.display_text();
++    let mut chars = text.chars();
++    chars.next().is_some_and(is_regional_indicator) && chars.next().is_none()
++}
++
+ fn parse_sgr_color(groups: &[Vec<u16>], start: usize) -> Option<(Color, usize)> {
+     let group = groups.get(start)?;
+     if group.len() > 1 {
+@@ -1528,6 +1716,7 @@ mod tests {
+         alt_cursor: Option<Cursor>,
+         dcs_state: Option<DcsState>,
+         sync_present: Option<SyncPresentation>,
++        active_grapheme_cell: Option<(usize, usize)>,
+         responses: Vec<Vec<u8>>,
+         parser: vte::Parser,
+     }
+@@ -1548,6 +1737,7 @@ mod tests {
+                 alt_cursor: None,
+                 dcs_state: None,
+                 sync_present: None,
++                active_grapheme_cell: None,
+                 responses: Vec::new(),
+                 parser: vte::Parser::new(),
+             }
+@@ -1565,6 +1755,7 @@ mod tests {
+                 alt_cursor: &mut self.alt_cursor,
+                 dcs_state: &mut self.dcs_state,
+                 sync_present: &mut self.sync_present,
++                active_grapheme_cell: &mut self.active_grapheme_cell,
+                 responses: &mut self.responses,
+             };
+             self.parser.advance(&mut handler, bytes);
+diff --git i/crates/shux/src/statusbar_runner.rs w/crates/shux/src/statusbar_runner.rs
+index aa04eda..9f54631 100644
+--- i/crates/shux/src/statusbar_runner.rs
++++ w/crates/shux/src/statusbar_runner.rs
+@@ -335,7 +335,8 @@ fn ansi_to_segments(bytes: &[u8]) -> Vec<StatusSegment> {
+
+     for i in 0..row_len {
+         let cell = &row[i];
+-        if cell.ch != ' ' || cell.style.bg != shux_vt::Color::Default {
++        if cell.ch != ' ' || cell.has_grapheme_payload() || cell.style.bg != shux_vt::Color::Default
++        {
+             last_non_blank = i + 1;
+         }
+     }
+@@ -367,7 +368,7 @@ fn ansi_to_segments(bytes: &[u8]) -> Vec<StatusSegment> {
+
+ fn cell_to_seg(cell: &Cell) -> StatusSegment {
+     StatusSegment {
+-        text: cell.ch.to_string(),
++        text: cell.display_text().into_owned(),
+         fg: vt_color(cell.style.fg),
+         bg: vt_color(cell.style.bg),
+         bold: cell.style.flags.contains(CellFlags::BOLD),
+diff --git i/crates/shux/tests/pane_io_integration.rs w/crates/shux/tests/pane_io_integration.rs
+index 3abb9e1..c83329d 100644
+--- i/crates/shux/tests/pane_io_integration.rs
++++ w/crates/shux/tests/pane_io_integration.rs
+@@ -837,6 +837,47 @@ async fn test_capture_after_echo() {
+     cancel.cancel();
+ }
+
++#[tokio::test]
++async fn test_capture_preserves_grapheme_payloads() {
++    let dir = tempfile::tempdir().unwrap();
++    let (socket_path, cancel) = start_test_server(dir.path()).await;
++    let script_path = dir.path().join("grapheme_probe.py");
++    std::fs::write(
++        &script_path,
++        r#"import sys
++import time
++
++sys.stdout.write("SHUX_GRAPHEME_START e\u0301 🛠\ufe0f 👍🏽 👨\u200d💻 🇺🇸 SHUX_GRAPHEME_END\n")
++sys.stdout.flush()
++time.sleep(2)
++"#,
++    )
++    .unwrap();
++
++    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
++    let (session_id, _pane_id) = create_test_session(&mut stream).await;
++
++    rpc_call(
++        &mut stream,
++        "pane.send_keys",
++        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", script_path.display())}),
++    )
++    .await;
++
++    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
++        text.contains("SHUX_GRAPHEME_END")
++    })
++    .await;
++    for expected in ["e\u{0301}", "🛠\u{fe0f}", "👍🏽", "👨\u{200d}💻", "🇺🇸"] {
++        assert!(
++            text.contains(expected),
++            "pane.capture lost grapheme payload {expected:?}; captured: {text:?}"
++        );
++    }
++
++    cancel.cancel();
++}
++
+ #[tokio::test]
+ async fn test_xterm_cursor_report_probe_gets_terminal_response() {
+     let dir = tempfile::tempdir().unwrap();
+diff --git i/docs/PROGRESS.md w/docs/PROGRESS.md
+index 857b771..30e2148 100644
+--- i/docs/PROGRESS.md
++++ w/docs/PROGRESS.md
+@@ -101,6 +101,12 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
+
+ ## Session Log
+
++**2026-06-12 — start(vt): grapheme-aware cell storage**
++- Started task 069 on branch `feat/vt-grapheme-cell-storage` after landing
++  task 068. Scope is preserving multi-codepoint cell content in `shux-vt`
++  without taking on full shaping/color emoji, with explicit memory and capture
++  throughput budgets before implementation proceeds.
++
+ **2026-06-12 — feat(vt): preserve wide-cell invariants**
+ - Completed task 068 by adding row/grid wide-cell repair primitives, final-column
+   width-2 handling, resize-canvas sanitization, saved-cursor clamping, focused
+@@ -1339,7 +1345,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
+ | 066 | Lossless pane output recording | M2 | **Done** | 036 |
+ | 067 | shux-vt resize reflow | VT Quality | **Done** | 005, 016, 066, 073 |
+ | 068 | shux-vt wide-cell invariants | VT Quality | **Done** | 005, 067, 073 |
+-| 069 | shux-vt grapheme-aware cell storage | VT Quality | Pending | 005, 068, 073 |
++| 069 | shux-vt grapheme-aware cell storage | VT Quality | In Progress | 005, 068, 073 |
+ | 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |
+ | 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |
+ | 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
+diff --git i/docs/tasks/069-shux-vt-grapheme-cell-storage.md w/docs/tasks/069-shux-vt-grapheme-cell-storage.md
+index 49e9f54..e48066f 100644
+--- i/docs/tasks/069-shux-vt-grapheme-cell-storage.md
++++ w/docs/tasks/069-shux-vt-grapheme-cell-storage.md
+@@ -1,10 +1,10 @@
+ # Task 069: shux-vt Grapheme-Aware Cell Storage
+
+-**Status:** Not Started
++**Status:** In Progress
+ **Priority:** Medium/High
+ **Milestone:** VT Quality Track
+ **Depends On:** 005, 068, 073
+-**Touches:** `crates/shux-vt/src/cell.rs`, `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster/src/lib.rs`, `.shux/qa/069-grapheme-cell-storage/`
++**Touches:** `crates/shux-vt/src/cell.rs`, `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster/src/lib.rs`, `.shux/qa/069-shux-vt-grapheme-cell-storage/`
+
+ ---
+
+@@ -42,7 +42,7 @@ Out of scope:
+ - Run DootSabha design council before coding, with explicit memory/performance critique.
+ - Run DootSabha implementation-diff council before marking done.
+ - Invoke `shux-vt-solid-qa`.
+-- Save auditable task artifacts under `.shux/qa/069-grapheme-cell-storage/`.
++- Save auditable task artifacts under `.shux/qa/069-shux-vt-grapheme-cell-storage/`.
+
+ ## Testing Matrix
+
+@@ -58,7 +58,7 @@ Out of scope:
+ | Shux automation | Capture a Unicode stress pane across 80x24, 120x40, and 200x60. |
+ | Visual | Inspect combining marks, emoji fallback, CJK adjacency, and tofu behavior. |
+ | Pixel | Existing non-grapheme golden/stress PNGs remain exact with `--max-pixel-diff-ratio 0.0`; grapheme expected PNGs must be committed and DootSabha-approved before implementation output is compared. |
+-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/069-grapheme-cell-storage/SOLID-QA.md`. |
++| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/069-shux-vt-grapheme-cell-storage/SOLID-QA.md`. |
+
+ ## Acceptance Criteria
+
+@@ -72,7 +72,7 @@ Out of scope:
+
+ - [ ] DootSabha design and implementation-diff reviews are saved.
+ - [ ] Unit, integration, performance, shux automation, visual, and pixel checks pass.
+-- [ ] Full-resolution PNGs, pixel metric JSON, performance JSON, and `evidence-manifest.json` are committed under `.shux/qa/069-grapheme-cell-storage/`.
+-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/069-grapheme-cell-storage/SOLID-QA.md`.
++- [ ] Full-resolution PNGs, pixel metric JSON, performance JSON, and `evidence-manifest.json` are committed under `.shux/qa/069-shux-vt-grapheme-cell-storage/`.
++- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/069-shux-vt-grapheme-cell-storage/SOLID-QA.md`.
+ - [ ] `make check` passes.
+ - [ ] Progress and learnings are updated.

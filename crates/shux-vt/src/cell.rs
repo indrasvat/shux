@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// Compact cell flags packed into a single byte.
@@ -89,6 +90,12 @@ pub struct Cell {
 /// Extended attributes that are rare enough to be heap-allocated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtendedAttrs {
+    /// Full display text for rare multi-codepoint cells.
+    ///
+    /// Normal ASCII and simple Unicode cells keep this as `None` and use
+    /// `Cell::ch` directly. The field lives in extended storage so the common
+    /// cell layout does not grow for grapheme support.
+    pub grapheme: Option<String>,
     /// OSC 8 hyperlink target.
     pub hyperlink: Option<String>,
     /// Underline color (separate from fg).
@@ -100,6 +107,7 @@ pub struct ExtendedAttrs {
 impl Default for ExtendedAttrs {
     fn default() -> Self {
         ExtendedAttrs {
+            grapheme: None,
             hyperlink: None,
             underline_color: None,
             underline_style: UnderlineStyle::None,
@@ -149,6 +157,71 @@ impl Cell {
     /// Whether this cell is a wide character (width 2).
     pub fn is_wide(&self) -> bool {
         self.width == 2
+    }
+
+    /// Full display text for this cell.
+    pub fn display_text(&self) -> Cow<'_, str> {
+        self.extended
+            .as_ref()
+            .and_then(|attrs| attrs.grapheme.as_deref())
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(self.ch.to_string()))
+    }
+
+    /// Append this cell's display text into `out` without allocating on the
+    /// simple scalar path.
+    pub fn push_display_text(&self, out: &mut String) {
+        if let Some(text) = self
+            .extended
+            .as_ref()
+            .and_then(|attrs| attrs.grapheme.as_deref())
+        {
+            out.push_str(text);
+        } else {
+            out.push(self.ch);
+        }
+    }
+
+    /// Rare grapheme payload, if this cell stores multi-codepoint text.
+    pub fn grapheme(&self) -> Option<&str> {
+        self.extended
+            .as_ref()
+            .and_then(|attrs| attrs.grapheme.as_deref())
+    }
+
+    /// Whether this cell carries a multi-codepoint display payload.
+    pub fn has_grapheme_payload(&self) -> bool {
+        self.grapheme().is_some()
+    }
+
+    /// Set the rare grapheme payload. A payload equal to the scalar fast path is
+    /// pruned so common cells keep `extended == None`.
+    pub fn set_grapheme_payload(&mut self, text: String) {
+        if text.chars().eq(std::iter::once(self.ch)) {
+            if let Some(extended) = &mut self.extended {
+                Arc::make_mut(extended).grapheme = None;
+            }
+            self.prune_default_extended();
+            return;
+        }
+        let extended = self
+            .extended
+            .get_or_insert_with(|| Arc::new(ExtendedAttrs::default()));
+        Arc::make_mut(extended).grapheme = Some(text);
+    }
+
+    /// Append one scalar to this cell's rare grapheme payload.
+    pub fn append_grapheme_scalar(&mut self, ch: char) {
+        let mut text = self.display_text().into_owned();
+        text.push(ch);
+        self.set_grapheme_payload(text);
+    }
+
+    /// Remove extended storage when every rare field has returned to default.
+    pub fn prune_default_extended(&mut self) {
+        if self.extended.as_deref() == Some(&ExtendedAttrs::default()) {
+            self.extended = None;
+        }
     }
 
     /// Reset this cell to empty with the given background color.
@@ -251,6 +324,7 @@ mod tests {
     #[test]
     fn test_extended_attrs() {
         let ext = ExtendedAttrs {
+            grapheme: None,
             hyperlink: Some("https://example.com".to_string()),
             underline_color: Some(Color::Rgb(255, 0, 0)),
             underline_style: UnderlineStyle::Curly,

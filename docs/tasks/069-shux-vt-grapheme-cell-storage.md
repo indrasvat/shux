@@ -1,10 +1,10 @@
 # Task 069: shux-vt Grapheme-Aware Cell Storage
 
-**Status:** Not Started
+**Status:** Done
 **Priority:** Medium/High
 **Milestone:** VT Quality Track
 **Depends On:** 005, 068, 073
-**Touches:** `crates/shux-vt/src/cell.rs`, `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster/src/lib.rs`, `.shux/qa/069-grapheme-cell-storage/`
+**Touches:** `crates/shux-vt/src/cell.rs`, `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `crates/shux-raster/src/lib.rs`, `.shux/qa/069-shux-vt-grapheme-cell-storage/`
 
 ---
 
@@ -42,7 +42,7 @@ Out of scope:
 - Run DootSabha design council before coding, with explicit memory/performance critique.
 - Run DootSabha implementation-diff council before marking done.
 - Invoke `shux-vt-solid-qa`.
-- Save auditable task artifacts under `.shux/qa/069-grapheme-cell-storage/`.
+- Save auditable task artifacts under `.shux/qa/069-shux-vt-grapheme-cell-storage/`.
 
 ## Testing Matrix
 
@@ -58,21 +58,21 @@ Out of scope:
 | Shux automation | Capture a Unicode stress pane across 80x24, 120x40, and 200x60. |
 | Visual | Inspect combining marks, emoji fallback, CJK adjacency, and tofu behavior. |
 | Pixel | Existing non-grapheme golden/stress PNGs remain exact with `--max-pixel-diff-ratio 0.0`; grapheme expected PNGs must be committed and DootSabha-approved before implementation output is compared. |
-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/069-grapheme-cell-storage/SOLID-QA.md`. |
+| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/069-shux-vt-grapheme-cell-storage/SOLID-QA.md`. |
 
 ## Acceptance Criteria
 
-- [ ] Complex cell content is not irreversibly lost by `shux-vt`.
-- [ ] Existing ASCII/simple Unicode behavior remains compatible.
-- [ ] Capture and snapshot paths both account for grapheme payloads.
-- [ ] Remaining renderer limitations are documented in task evidence.
-- [ ] Memory and extraction overhead stay within the Testing Matrix budgets or the task is explicitly re-scoped before coding.
+- [x] Complex cell content is not irreversibly lost by `shux-vt`.
+- [x] Existing ASCII/simple Unicode behavior remains compatible.
+- [x] Capture and snapshot paths both account for grapheme payloads.
+- [x] Remaining renderer limitations are documented in task evidence.
+- [x] Memory and extraction overhead stay within the Testing Matrix budgets or the task is explicitly re-scoped before coding.
 
 ## Definition of Done
 
-- [ ] DootSabha design and implementation-diff reviews are saved.
-- [ ] Unit, integration, performance, shux automation, visual, and pixel checks pass.
-- [ ] Full-resolution PNGs, pixel metric JSON, performance JSON, and `evidence-manifest.json` are committed under `.shux/qa/069-grapheme-cell-storage/`.
-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/069-grapheme-cell-storage/SOLID-QA.md`.
-- [ ] `make check` passes.
-- [ ] Progress and learnings are updated.
+- [x] DootSabha design and implementation-diff reviews are saved.
+- [x] Unit, integration, performance, shux automation, visual, and pixel checks pass.
+- [x] Full-resolution PNGs, pixel metric JSON, performance JSON, and `evidence-manifest.json` are committed under `.shux/qa/069-shux-vt-grapheme-cell-storage/`.
+- [x] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/069-shux-vt-grapheme-cell-storage/SOLID-QA.md`.
+- [x] `make check` passes.
+- [x] Progress and learnings are updated.

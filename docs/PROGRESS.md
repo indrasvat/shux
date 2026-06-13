@@ -30,12 +30,12 @@
   - **066 (lossless pane output recording)** — Done. `pane.record.start` / `pane.record.stop` add a daemon-owned raw PTY recorder for byte-exact audits while keeping `pane.output.watch` sampled. Recorder state reports `complete|error|aborted`, byte count, `lossless`, and error detail; v1 allows one active recorder per pane, applies explicit backpressure, supports daemon-side `duration_ms`, resolves CLI `--to` paths client-side, and protects existing files unless `--force` is used. `shux pane watch` help now says absence assertions are unsound and text/plain mode warns on sampled chunks.
 - **Pending:** 035 (complete RPC surface). 038–050 (plugin host + bundled plugins + MCP).
 
-**VT Quality Track** — planned, not started.
+**VT Quality Track** — in progress.
 - **Implementation order:** 073 first, then 067/068, then 069-072, then 074.
-- **Pending:** 073 (VT corpus regression harness), 067 (resize reflow), 068
-  (wide-cell invariants), 069 (grapheme-aware cell storage), 070 (DEC special
-  graphics), 071 (tab stops), 072 (origin-mode/scroll-region semantics), 074
-  (dirty-region tracking).
+- **Done:** 073 (VT corpus regression harness), 067 (resize reflow), 068
+  (wide-cell invariants), 069 (grapheme-aware cell storage).
+- **Pending:** 070 (DEC special graphics), 071 (tab stops), 072
+  (origin-mode/scroll-region semantics), 074 (dirty-region tracking).
 - Every task in this track requires DootSabha design review, DootSabha
   implementation-diff review, unit/integration/raw replay/shux automation
   coverage as applicable, full-resolution visual evidence, pixel-level PNG
@@ -100,6 +100,26 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 ---
 
 ## Session Log
+
+**2026-06-12 — feat(vt): preserve grapheme cell payloads**
+- Completed task 069 by adding rare grapheme payload storage to `Cell` extended
+  attrs while preserving the compact ASCII path and keeping `Cell` at 24 bytes.
+- Preserved combining marks, variation selectors, skin-tone modifiers, ZWJ
+  sequences, and regional-indicator flag pairs through `capture_text`, live
+  render buffers, copy mode, status-bar extraction, pane capture, and snapshot
+  rasterization.
+- Added parser anchor clearing and width-invariant coverage for cursor/ESC
+  motion, final-column clusters, CJK-adjacent combining marks, ZWJ width
+  expansion, flag-pair merging, and REP of grapheme payloads.
+- Added `make test-vt-grapheme` and `make test-vt-grapheme-performance`, with
+  80x24, 120x40, and 200x60 full-resolution PNG evidence, exact pixel metrics,
+  and performance reports under `.shux/qa/069-shux-vt-grapheme-cell-storage/`.
+- Verification: `make test-vt`, `make test-vt-corpus`,
+  `make test-vt-wide-invariants`, focused shux-ui/shux-raster grapheme tests,
+  `SHUX_TEST_BINARY_TIMEOUT_SECONDS=120 make test-pane-io FILTER=grapheme`,
+  `make test-vt-grapheme-performance`, `make test-vt-grapheme`,
+  `make check-vt-qa`, `SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check`, and
+  SOLID VT QA PASS.
 
 **2026-06-12 — feat(vt): preserve wide-cell invariants**
 - Completed task 068 by adding row/grid wide-cell repair primitives, final-column
@@ -1339,7 +1359,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 066 | Lossless pane output recording | M2 | **Done** | 036 |
 | 067 | shux-vt resize reflow | VT Quality | **Done** | 005, 016, 066, 073 |
 | 068 | shux-vt wide-cell invariants | VT Quality | **Done** | 005, 067, 073 |
-| 069 | shux-vt grapheme-aware cell storage | VT Quality | Pending | 005, 068, 073 |
+| 069 | shux-vt grapheme-aware cell storage | VT Quality | **Done** | 005, 068, 073 |
 | 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |
 | 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |
 | 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |

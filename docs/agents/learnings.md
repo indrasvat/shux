@@ -3,6 +3,13 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-06-12 (task 069 grapheme storage):** Grapheme payloads are cell
+  content, not cursor/style state. Store them only on the target cell and use
+  `Arc::make_mut` so hyperlink/underline attrs shared by a styled run remain
+  shared until a specific cell needs a payload. Parser anchors for combining
+  marks and ZWJ clusters must be cleared by cursor/grid movement, ESC dispatch,
+  resize, and alternate-screen transitions; otherwise later zero-width scalars
+  can attach to stale cells after movement.
 - **2026-06-11 (task 073 VT corpus harness):** A replay corpus needs three
   separate artifact classes: committed `.shux/fixtures/` input bytes,
   committed `.shux/goldens/` baselines, and committed `.shux/qa/` review

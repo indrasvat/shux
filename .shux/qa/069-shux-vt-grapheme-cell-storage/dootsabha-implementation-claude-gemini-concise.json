@@ -1,0 +1,22 @@
+{
+  "status": "failed",
+  "phase": "implementation",
+  "attempted_command": "rtk dootsabha council --json --agents claude,gemini --timeout 10m <concise-implementation-prompt>",
+  "observed_result": {
+    "exit_code": 3,
+    "claude": {
+      "status": "ok",
+      "model": "claude-opus-4-8",
+      "duration_ms": 394296,
+      "tokens_in": 26909,
+      "tokens_out": 21091,
+      "content": ""
+    },
+    "gemini": {
+      "status": "error",
+      "error": "invoke gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    },
+    "synthesis_error": "synthesis: synthesize: no healthy agents available for synthesis"
+  },
+  "verdict": "No actionable implementation review content was produced by this council attempt."
+}

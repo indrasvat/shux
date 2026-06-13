@@ -432,7 +432,7 @@ fn row_text(row: &Row, pane_cols: u16) -> String {
             break;
         };
         if !cell.is_wide_continuation() {
-            out.push(cell.ch);
+            cell.push_display_text(&mut out);
         }
     }
     out
@@ -644,7 +644,7 @@ pub fn extract_selection(
             if cell.is_wide_continuation() {
                 continue;
             }
-            out.push(cell.ch);
+            cell.push_display_text(&mut out);
         }
         if row != end.1 {
             // Trim trailing whitespace per line for cleaner copies.
@@ -695,7 +695,7 @@ pub fn render_copy_view_into(
 
 fn write_cell(buf: &mut Vec<u8>, cell: &shux_vt::Cell) {
     write_style(buf, cell);
-    let _ = write!(buf, "{}", cell.ch);
+    let _ = write!(buf, "{}", cell.display_text());
 }
 
 fn write_style(buf: &mut Vec<u8>, cell: &shux_vt::Cell) {
@@ -998,11 +998,11 @@ fn selection_text_run(
     };
     let col_hi = col_hi.min(ctx.pane.width.saturating_sub(1));
     for col in col_lo..=col_hi {
-        let ch = row_ref
+        let text = row_ref
             .get(col as usize)
             .filter(|cell| !cell.is_wide_continuation())
-            .map(|cell| cell.ch)
-            .unwrap_or(' ');
+            .map(|cell| cell.display_text().into_owned())
+            .unwrap_or_else(|| " ".to_string());
         let _ = write!(
             buf,
             "\x1b[{};{}H{}{}\x1b[1m{}\x1b[0m",
@@ -1010,7 +1010,7 @@ fn selection_text_run(
             ctx.pane.x + col + 1,
             sgr_bg(ctx.theme.status_accent),
             sgr_fg(ctx.theme.status_bg),
-            ch,
+            text,
         );
     }
 }

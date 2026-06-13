@@ -919,6 +919,7 @@ mod tests {
         flags.set(CellFlags::BOLD);
         flags.set(CellFlags::UNDERLINE);
         let ext = Arc::new(ExtendedAttrs {
+            grapheme: None,
             hyperlink: Some("https://example.com".to_string()),
             underline_color: Some(Color::Rgb(9, 8, 7)),
             underline_style: UnderlineStyle::Curly,

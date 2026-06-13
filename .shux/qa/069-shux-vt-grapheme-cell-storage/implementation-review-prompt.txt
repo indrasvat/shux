@@ -1,0 +1,13 @@
+Review task 069 implementation diff in `.shux/qa/069-shux-vt-grapheme-cell-storage/implementation-diff.txt`.
+
+Task: preserve multi-codepoint cell content in shux-vt without full shaping/color emoji.
+
+Focus on blockers only:
+- Cell memory/common ASCII path remains compact.
+- Grapheme payload is cell-local and cannot leak through cursor.extended.
+- Parser anchor behavior is safe across wrap, resize, alternate screen, cursor motion, erase/insert/delete, REP, wide cells, ZWJ, and regional indicators.
+- capture_text, pane.capture, copy mode, live attach render, status extraction, and raster paths consume full display_text.
+- Existing corpus/simple PNG behavior remains stable except the intended task-069 grapheme corpus golden update.
+- Performance evidence and visual/pixel evidence satisfy docs/tasks/069.
+
+Return P0/P1 findings with file/line references, or say no blocking findings.

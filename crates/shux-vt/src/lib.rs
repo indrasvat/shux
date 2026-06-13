@@ -58,6 +58,8 @@ pub struct VirtualTerminal {
     dcs_state: Option<DcsState>,
     /// Frozen presentation while synchronized output mode is active.
     sync_present: Option<SyncPresentation>,
+    /// Visible cell currently accepting zero-width/joined grapheme scalars.
+    active_grapheme_cell: Option<(usize, usize)>,
     /// Number of visible rows.
     rows: usize,
     /// Number of columns.
@@ -87,6 +89,7 @@ impl VirtualTerminal {
             parser: Parser::new(),
             dcs_state: None,
             sync_present: None,
+            active_grapheme_cell: None,
             rows,
             cols,
         }
@@ -123,6 +126,7 @@ impl VirtualTerminal {
             alt_cursor: &mut self.alt_cursor,
             dcs_state: &mut self.dcs_state,
             sync_present: &mut self.sync_present,
+            active_grapheme_cell: &mut self.active_grapheme_cell,
             responses: &mut responses,
         };
         self.parser.advance(&mut handler, bytes);
@@ -181,6 +185,7 @@ impl VirtualTerminal {
     /// This resizes both primary and alternate grids, adjusts the scroll
     /// region, and clamps the cursor position.
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        self.active_grapheme_cell = None;
         if self.modes.alternate_screen {
             self.grid.resize_canvas(rows, cols);
             if let (Some(primary), Some(primary_cursor)) =
@@ -235,6 +240,7 @@ impl VirtualTerminal {
 
     /// Switch to alternate screen buffer (DECSET 1049).
     pub fn enter_alternate_screen(&mut self) {
+        self.active_grapheme_cell = None;
         if !self.modes.alternate_screen {
             let config = GridConfig { max_scrollback: 0 }; // No scrollback on alt screen.
             let alt_grid = Grid::new(self.rows, self.cols, config);
@@ -247,6 +253,7 @@ impl VirtualTerminal {
 
     /// Switch back to primary screen buffer (DECRST 1049).
     pub fn leave_alternate_screen(&mut self) {
+        self.active_grapheme_cell = None;
         if self.modes.alternate_screen {
             if let Some(primary_grid) = self.alt_grid.take() {
                 self.grid = primary_grid;
@@ -305,7 +312,7 @@ impl VirtualTerminal {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                line.push(cell.ch);
+                cell.push_display_text(&mut line);
             }
             output.push_str(line.trim_end());
             output.push('\n');
@@ -317,6 +324,7 @@ impl VirtualTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn compact_capture(vt: &VirtualTerminal) -> String {
         vt.capture_text(None).replace('\n', "")
@@ -1135,6 +1143,247 @@ mod tests {
             Some("https://example.invalid/a;b")
         );
         assert!(vt.grid().visible_row(0)[1].extended.is_none());
+    }
+
+    #[test]
+    fn grapheme_combining_mark_is_stored_and_captured() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process("e\u{0301}x".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[0].ch, 'e');
+        assert_eq!(row[0].grapheme(), Some("e\u{0301}"));
+        assert_eq!(row[1].ch, 'x');
+        assert!(row[1].grapheme().is_none());
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "e\u{0301}x");
+    }
+
+    #[test]
+    fn grapheme_variation_modifier_zwj_and_flag_payloads_are_preserved() {
+        let mut vt = VirtualTerminal::new(3, 40);
+        vt.process("A🛠\u{fe0f} B👍🏽 C👨\u{200d}💻 D🇺🇸".as_bytes());
+
+        let captured = vt.capture_text(Some(1));
+        assert!(
+            captured.contains("🛠\u{fe0f}"),
+            "VS16 payload missing: {captured:?}"
+        );
+        assert!(
+            captured.contains("👍🏽"),
+            "skin-tone payload missing: {captured:?}"
+        );
+        assert!(
+            captured.contains("👨\u{200d}💻"),
+            "ZWJ payload missing: {captured:?}"
+        );
+        assert!(
+            captured.contains("🇺🇸"),
+            "flag payload missing: {captured:?}"
+        );
+        assert!(
+            vt.grid()
+                .visible_row(0)
+                .cells
+                .iter()
+                .any(|cell| cell.grapheme() == Some("👨\u{200d}💻"))
+        );
+        assert!(
+            vt.grid()
+                .visible_row(0)
+                .cells
+                .iter()
+                .any(|cell| cell.grapheme() == Some("🇺🇸") && cell.width == 2)
+        );
+        assert_grid_wide_invariants(vt.grid());
+    }
+
+    #[test]
+    fn ascii_cells_remain_on_compact_common_path() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"plain ascii");
+
+        for cell in vt.grid().visible_row(0).cells.iter().take(11) {
+            assert!(cell.extended.is_none(), "ASCII cell used extended attrs");
+            assert!(
+                cell.grapheme().is_none(),
+                "ASCII cell used grapheme payload"
+            );
+        }
+    }
+
+    #[test]
+    fn grapheme_payload_is_cell_local_not_cursor_style() {
+        let mut vt = VirtualTerminal::new(2, 40);
+        vt.process(b"\x1b]8;;https://example.invalid/a;b\x07");
+        vt.process("e\u{0301}x".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        let first = row[0].extended.as_ref().expect("first cell extended attrs");
+        assert_eq!(first.grapheme.as_deref(), Some("e\u{0301}"));
+        assert_eq!(
+            first.hyperlink.as_deref(),
+            Some("https://example.invalid/a;b")
+        );
+
+        let second = row[1].extended.as_ref().expect("second cell hyperlink");
+        assert_eq!(
+            second.hyperlink.as_deref(),
+            Some("https://example.invalid/a;b")
+        );
+        assert_eq!(
+            second.grapheme, None,
+            "grapheme payload leaked through cursor extended attrs"
+        );
+    }
+
+    #[test]
+    fn styled_ascii_cells_share_cursor_extended_attrs() {
+        let mut vt = VirtualTerminal::new(2, 40);
+        vt.process(b"\x1b]8;;https://example.invalid/a;b\x07");
+        vt.process(b"ab");
+        vt.process("e\u{0301}".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        let first = row[0].extended.as_ref().expect("first hyperlink");
+        let second = row[1].extended.as_ref().expect("second hyperlink");
+        let grapheme = row[2].extended.as_ref().expect("grapheme hyperlink");
+
+        assert!(
+            Arc::ptr_eq(first, second),
+            "plain styled run should share cursor extended attrs"
+        );
+        assert!(
+            !Arc::ptr_eq(second, grapheme),
+            "grapheme payload should copy-on-write cell attrs"
+        );
+        assert_eq!(first.grapheme, None);
+        assert_eq!(second.grapheme, None);
+        assert_eq!(grapheme.grapheme.as_deref(), Some("e\u{0301}"));
+        assert_eq!(
+            grapheme.hyperlink.as_deref(),
+            Some("https://example.invalid/a;b")
+        );
+    }
+
+    #[test]
+    fn combining_after_cursor_motion_does_not_attach_to_stale_cell() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process("e\x1b[1;10H\u{0301}x".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[0].ch, 'e');
+        assert!(row[0].grapheme().is_none());
+        assert_eq!(row[9].ch, 'x');
+    }
+
+    #[test]
+    fn combining_after_esc_line_movement_does_not_attach_to_stale_cell() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process("e\x1bE\u{0301}x".as_bytes());
+
+        let row0 = vt.grid().visible_row(0);
+        let row1 = vt.grid().visible_row(1);
+        assert_eq!(row0[0].ch, 'e');
+        assert!(row0[0].grapheme().is_none());
+        assert_eq!(row1[0].ch, 'x');
+    }
+
+    #[test]
+    fn combining_after_final_column_preserves_pending_wrap() {
+        let mut vt = VirtualTerminal::new(2, 3);
+        vt.process("abe\u{0301}x".as_bytes());
+
+        assert_eq!(vt.grid().visible_row(0)[2].grapheme(), Some("e\u{0301}"));
+        assert_eq!(vt.grid().visible_row(1)[0].ch, 'x');
+        assert_eq!(vt.capture_text(None), "abe\u{0301}\nx\n");
+    }
+
+    #[test]
+    fn combining_after_cjk_attaches_to_wide_head() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process("界\u{0301}x".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[0].grapheme(), Some("界\u{0301}"));
+        assert!(row[1].is_wide_continuation());
+        assert_eq!(row[2].ch, 'x');
+        assert_grid_wide_invariants(vt.grid());
+    }
+
+    #[test]
+    fn zwj_width_expansion_preserves_wide_invariants() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process("a\u{200d}👨x".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[0].grapheme(), Some("a\u{200d}👨"));
+        assert!(row[0].is_wide());
+        assert!(row[1].is_wide_continuation());
+        assert_eq!(row[2].ch, 'x');
+        assert_grid_wide_invariants(vt.grid());
+    }
+
+    #[test]
+    fn zwj_and_flag_at_final_column_do_not_create_final_wide_head() {
+        let mut zwj = VirtualTerminal::new(2, 5);
+        zwj.process(b"\x1b[1;5H");
+        zwj.process("a\u{200d}👨".as_bytes());
+        assert!(
+            !zwj.grid().visible_row(0)[4].is_wide(),
+            "ZWJ sequence created a width-2 head in the final column"
+        );
+        assert!(
+            zwj.capture_text(None).contains("a\u{200d}"),
+            "final-column ZWJ marker was lost"
+        );
+        assert_grid_wide_invariants(zwj.grid());
+
+        let mut flag = VirtualTerminal::new(2, 5);
+        flag.process(b"\x1b[1;5H");
+        flag.process("🇺🇸".as_bytes());
+        assert!(
+            !flag.grid().visible_row(0)[4].is_wide(),
+            "flag pair created a width-2 head in the final column"
+        );
+        assert!(
+            flag.capture_text(None).contains("🇺") && flag.capture_text(None).contains("🇸"),
+            "final-column regional indicators were lost"
+        );
+        assert_grid_wide_invariants(flag.grid());
+    }
+
+    #[test]
+    fn rep_repeats_full_grapheme_payload() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process("e\u{0301}\x1b[3b".as_bytes());
+
+        assert_eq!(
+            vt.capture_text(Some(1)).trim_end(),
+            "e\u{0301}e\u{0301}e\u{0301}e\u{0301}"
+        );
+    }
+
+    #[test]
+    fn rep_preserves_width_expanded_grapheme_payload() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process("a\u{200d}👨\x1b[2bZ".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        for col in [0, 2, 4] {
+            assert_eq!(row[col].grapheme(), Some("a\u{200d}👨"));
+            assert!(row[col].is_wide(), "cell {col} lost width-2 head");
+            assert!(
+                row[col + 1].is_wide_continuation(),
+                "cell {} lost continuation",
+                col + 1
+            );
+        }
+        assert_eq!(row[6].ch, 'Z');
+        assert_eq!(
+            vt.capture_text(Some(1)).trim_end(),
+            "a\u{200d}👨a\u{200d}👨a\u{200d}👨Z"
+        );
+        assert_grid_wide_invariants(vt.grid());
     }
 
     #[test]

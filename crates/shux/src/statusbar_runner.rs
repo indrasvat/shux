@@ -335,7 +335,8 @@ fn ansi_to_segments(bytes: &[u8]) -> Vec<StatusSegment> {
 
     for i in 0..row_len {
         let cell = &row[i];
-        if cell.ch != ' ' || cell.style.bg != shux_vt::Color::Default {
+        if cell.ch != ' ' || cell.has_grapheme_payload() || cell.style.bg != shux_vt::Color::Default
+        {
             last_non_blank = i + 1;
         }
     }
@@ -367,7 +368,7 @@ fn ansi_to_segments(bytes: &[u8]) -> Vec<StatusSegment> {
 
 fn cell_to_seg(cell: &Cell) -> StatusSegment {
     StatusSegment {
-        text: cell.ch.to_string(),
+        text: cell.display_text().into_owned(),
         fg: vt_color(cell.style.fg),
         bg: vt_color(cell.style.bg),
         bold: cell.style.flags.contains(CellFlags::BOLD),

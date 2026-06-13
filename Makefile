@@ -163,6 +163,18 @@ test-vt-wide-visual: release ## Drive shux wide-cell invariant visual/pixel auto
 	@.shux/scripts/wide_invariants_check.sh
 	@echo "$(COLOR_GREEN)✓ VT wide-cell visual automation passed$(COLOR_RESET)"
 
+.PHONY: test-vt-grapheme
+test-vt-grapheme: release ## Drive shux grapheme storage visual/pixel automation
+	@echo "$(COLOR_BLUE)▶ Running VT grapheme storage automation...$(COLOR_RESET)"
+	@.shux/scripts/grapheme_check.sh
+	@echo "$(COLOR_GREEN)✓ VT grapheme storage automation passed$(COLOR_RESET)"
+
+.PHONY: test-vt-grapheme-performance
+test-vt-grapheme-performance: ## Measure grapheme storage performance on ASCII VT path
+	@echo "$(COLOR_BLUE)▶ Measuring VT grapheme storage performance...$(COLOR_RESET)"
+	@.shux/scripts/grapheme_perf_check.sh
+	@echo "$(COLOR_GREEN)✓ VT grapheme storage performance passed$(COLOR_RESET)"
+
 .PHONY: promote-vt-corpus-baselines
 promote-vt-corpus-baselines: ## Promote current VT corpus output into committed goldens for review
 	@echo "$(COLOR_BLUE)▶ Promoting VT corpus baselines...$(COLOR_RESET)"

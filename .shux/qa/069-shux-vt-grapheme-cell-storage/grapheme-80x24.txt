@@ -1,0 +1,9 @@
+SHUX_GRAPHEME_START
+combining: café naive é
+variation: tool 🛠️ gear ⚙️
+skin: thumbs 👍🏽 wave 👋🏿
+zwj: technologist 👨‍💻 scientist 👩‍🔬
+flags: us 🇺🇸 india 🇮🇳 japan 🇯🇵
+wide-adjacent: 界́A 好B 語C
+styled-link: é 🛠️ 👨‍💻
+SHUX_GRAPHEME_END

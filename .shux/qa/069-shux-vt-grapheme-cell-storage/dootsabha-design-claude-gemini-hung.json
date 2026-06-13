@@ -1,0 +1,8 @@
+{
+  "status": "failed",
+  "phase": "design",
+  "command": "rtk dootsabha council --json --agents claude,gemini --timeout 20m <design-council-prompt>",
+  "reason": "No JSON was written to dootsabha-design.json after several minutes; the process remained alive and was terminated so the task could continue with a fallback council.",
+  "fallback_required": true,
+  "health_snapshot": "dootsabha-status-after-hung-design.json"
+}
