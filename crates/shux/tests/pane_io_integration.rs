@@ -720,6 +720,31 @@ where
     }
 }
 
+async fn wait_for_shell_ready(stream: &mut UnixStream, session_id: &str) {
+    let marker_path = PathBuf::from(format!(
+        "/tmp/shux-ready-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let marker_display = marker_path.display().to_string();
+    rpc_call(
+        stream,
+        "pane.send_keys",
+        serde_json::json!({"session_id": session_id, "text": format!("touch {}\r\n", marker_display)}),
+    )
+    .await;
+
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    while !marker_path.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let text = capture_text(stream, session_id, 80).await;
+    assert!(
+        marker_path.exists(),
+        "pane shell did not become command-ready; got: {text}"
+    );
+    let _ = std::fs::remove_file(marker_path);
+}
+
 // ══════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════
@@ -860,7 +885,7 @@ time.sleep(2)
     rpc_call(
         &mut stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", script_path.display())}),
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", script_path.display())}),
     )
     .await;
 
@@ -901,7 +926,7 @@ time.sleep(2)
     rpc_call(
         &mut stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", script_path.display())}),
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", script_path.display())}),
     )
     .await;
 
@@ -1024,11 +1049,12 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
+    wait_for_shell_ready(&mut stream, &session_id).await;
 
     rpc_call(
         &mut stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", probe_path.display())}),
     )
     .await;
 
@@ -1082,11 +1108,12 @@ print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
 
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
+    wait_for_shell_ready(&mut stream, &session_id).await;
 
     rpc_call(
         &mut stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", probe_path.display())}),
     )
     .await;
 
@@ -1148,7 +1175,7 @@ time.sleep(0.2)
     rpc_call(
         &mut stream,
         "pane.send_keys",
-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", probe_path.display())}),
     )
     .await;
 

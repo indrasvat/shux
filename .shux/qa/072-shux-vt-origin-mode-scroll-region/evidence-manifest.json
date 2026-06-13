@@ -1,0 +1,46 @@
+{
+  "task": "072-shux-vt-origin-mode-scroll-region",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.json",
+  "dootsabha_implementation": "dootsabha-implementation.json",
+  "reports": [
+    "BASELINE-APPROVAL.md",
+    "DESIGN.md",
+    "origin-automation-report.json",
+        "origin-capture-report.json",
+        "implementation-diff.txt",
+        "implementation-review-prompt.md",
+        "implementation-review-concise-prompt.md",
+        "dootsabha-implementation-raw.jsonl",
+        "dootsabha-implementation-final-raw.jsonl",
+        "design-council-prompt.md",
+        "design-council-concise-prompt.md",
+        "dootsabha-design-raw.jsonl"
+  ],
+  "screenshots": [
+    "origin-80x24-actual.png",
+    "origin-80x24-expected.png",
+    "origin-80x24-diff.png",
+    "origin-120x40-actual.png",
+    "origin-120x40-expected.png",
+    "origin-120x40-diff.png",
+    "origin-200x60-actual.png",
+    "origin-200x60-expected.png",
+    "origin-200x60-diff.png"
+  ],
+  "pixel_metrics": [
+    "origin-80x24-pixel.json",
+    "origin-120x40-pixel.json",
+    "origin-200x60-pixel.json"
+  ],
+  "captures": [
+    "origin-80x24.txt",
+    "origin-120x40.txt",
+    "origin-200x60.txt"
+  ],
+  "text_metrics": [
+    "origin-80x24-text.json",
+    "origin-120x40-text.json",
+    "origin-200x60-text.json"
+  ]
+}

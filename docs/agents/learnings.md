@@ -3,6 +3,16 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-06-13 (task 072 origin mode and scroll regions):** DECOM is an
+  addressing policy, not a separate cursor coordinate space. Store cursor rows
+  as absolute grid rows, offset CUP/HVP/VPA and CPR/DSR row reports through the
+  active scroll-region top only while origin mode is enabled, and clamp
+  save/restore to the grid rather than to the current margins. Relative
+  vertical motions (`CUU`/`CUD`/`CNL`/`CPL`/`VPR`) should clamp to margins only
+  when the cursor starts inside the region; outside it they remain full-grid
+  movement. Real PTY probes that paste multi-line scripts through an interactive
+  shell should wait for shell readiness and submit CRLF so the fixture executes
+  reliably under login-shell/readline variants.
 - **2026-06-12 (task 071 tab stops):** Mutable tab stops are terminal state,
   not parser-local cursor math. A flat bitmap seeded with `col > 0 && col % 8 ==
   0` avoids the Default-to-Explicit trap where first HTS/TBC wipes existing

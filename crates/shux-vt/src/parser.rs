@@ -141,7 +141,79 @@ impl<'a> VtHandler<'a> {
         if let Some((origin, charsets)) = self.cursor.restore() {
             self.modes.origin_mode = origin;
             *self.charsets = charsets;
+            self.clamp_cursor_to_grid();
         }
+    }
+
+    fn grid_last_row(&self) -> usize {
+        self.grid.rows().saturating_sub(1)
+    }
+
+    fn grid_last_col(&self) -> usize {
+        self.grid.cols().saturating_sub(1)
+    }
+
+    fn origin_top(&self) -> usize {
+        if self.modes.origin_mode {
+            self.scroll_region.top.min(self.grid_last_row())
+        } else {
+            0
+        }
+    }
+
+    fn origin_bottom(&self) -> usize {
+        if self.modes.origin_mode {
+            self.scroll_region.bottom.min(self.grid_last_row())
+        } else {
+            self.grid_last_row()
+        }
+    }
+
+    fn addressed_row(&self, param: u16, default: u16) -> usize {
+        let row_offset = usize::from(if param == 0 { default } else { param }).saturating_sub(1);
+        let top = self.origin_top();
+        let bottom = self.origin_bottom().max(top);
+        top.saturating_add(row_offset)
+            .min(bottom)
+            .min(self.grid_last_row())
+    }
+
+    fn relative_vertical_bounds(&self) -> (usize, usize) {
+        let top = self.scroll_region.top.min(self.grid_last_row());
+        let bottom = self.scroll_region.bottom.min(self.grid_last_row());
+        if top <= bottom && (top..=bottom).contains(&self.cursor.row) {
+            (top, bottom)
+        } else {
+            (0, self.grid_last_row())
+        }
+    }
+
+    fn move_cursor_up(&mut self, n: usize) {
+        let (top, _) = self.relative_vertical_bounds();
+        self.cursor.row = self.cursor.row.saturating_sub(n).max(top);
+        self.cursor.auto_wrap_pending = false;
+    }
+
+    fn move_cursor_down(&mut self, n: usize) {
+        let (_, bottom) = self.relative_vertical_bounds();
+        self.cursor.row = self.cursor.row.saturating_add(n).min(bottom);
+        self.cursor.auto_wrap_pending = false;
+    }
+
+    fn home_cursor_to_origin(&mut self) {
+        self.cursor.row = self.origin_top();
+        self.cursor.col = 0;
+        self.cursor.auto_wrap_pending = false;
+    }
+
+    fn clamp_cursor_to_grid(&mut self) {
+        let row = self.cursor.row.min(self.grid_last_row());
+        let col = self.cursor.col.min(self.grid_last_col());
+        if row != self.cursor.row || col != self.cursor.col {
+            self.cursor.auto_wrap_pending = false;
+        }
+        self.cursor.row = row;
+        self.cursor.col = col;
     }
 
     fn reset_charsets(&mut self) {
@@ -607,7 +679,10 @@ impl<'a> VtHandler<'a> {
             // DECCKM -- Cursor keys mode.
             1 => self.modes.application_cursor_keys = enable,
             // DECOM -- Origin mode.
-            6 => self.modes.origin_mode = enable,
+            6 => {
+                self.modes.origin_mode = enable;
+                self.home_cursor_to_origin();
+            }
             // DECAWM -- Auto-wrap mode.
             7 => self.modes.auto_wrap = enable,
             // DECTCEM -- Text cursor enable.
@@ -727,7 +802,14 @@ impl<'a> VtHandler<'a> {
     }
 
     fn report_cursor_position(&mut self, private: bool) {
-        let row = self.cursor.row + 1;
+        let row = if self.modes.origin_mode {
+            self.cursor
+                .row
+                .saturating_sub(self.scroll_region.top.min(self.grid_last_row()))
+                + 1
+        } else {
+            self.cursor.row + 1
+        };
         let col = self.cursor.col + 1;
         if private {
             self.push_response(format!("\x1b[?{row};{col}R"));
@@ -842,14 +924,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
             // CUU -- Cursor Up.
             ('A', []) => {
                 let n = p(0, 1) as usize;
-                self.cursor.row = self.cursor.row.saturating_sub(n);
-                self.cursor.auto_wrap_pending = false;
+                self.move_cursor_up(n);
             }
             // CUD -- Cursor Down.
             ('B', []) => {
                 let n = p(0, 1) as usize;
-                self.cursor.row = (self.cursor.row + n).min(rows - 1);
-                self.cursor.auto_wrap_pending = false;
+                self.move_cursor_down(n);
             }
             // CUF -- Cursor Forward.
             ('C', []) => {
@@ -872,22 +952,19 @@ impl<'a> vte::Perform for VtHandler<'a> {
             // CNL -- Cursor Next Line.
             ('E', []) => {
                 let n = p(0, 1) as usize;
-                self.cursor.row = (self.cursor.row + n).min(rows - 1);
+                self.move_cursor_down(n);
                 self.cursor.col = 0;
-                self.cursor.auto_wrap_pending = false;
             }
             // VPR -- Vertical Position Relative.
             ('e', []) => {
                 let n = p(0, 1) as usize;
-                self.cursor.row = (self.cursor.row + n).min(rows - 1);
-                self.cursor.auto_wrap_pending = false;
+                self.move_cursor_down(n);
             }
             // CPL -- Cursor Previous Line.
             ('F', []) => {
                 let n = p(0, 1) as usize;
-                self.cursor.row = self.cursor.row.saturating_sub(n);
+                self.move_cursor_up(n);
                 self.cursor.col = 0;
-                self.cursor.auto_wrap_pending = false;
             }
             // CHA -- Cursor Character Absolute (column).
             ('G', []) => {
@@ -913,7 +990,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
             }
             // CUP / HVP -- Cursor Position.
             ('H', []) | ('f', []) => {
-                let row = (p(0, 1) as usize).saturating_sub(1).min(rows - 1);
+                let row = self.addressed_row(p(0, 1), 1);
                 let col = (p(1, 1) as usize).saturating_sub(1).min(cols - 1);
                 self.cursor.row = row;
                 self.cursor.col = col;
@@ -1026,7 +1103,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
             }
             // VPA -- Vertical Line Position Absolute.
             ('d', []) => {
-                let row = (p(0, 1) as usize).saturating_sub(1).min(rows - 1);
+                let row = self.addressed_row(p(0, 1), 1);
                 self.cursor.row = row;
                 self.cursor.auto_wrap_pending = false;
             }
@@ -1175,10 +1252,8 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 if top < bottom {
                     self.scroll_region.top = top;
                     self.scroll_region.bottom = bottom;
+                    self.home_cursor_to_origin();
                 }
-                self.cursor.row = 0;
-                self.cursor.col = 0;
-                self.cursor.auto_wrap_pending = false;
             }
             // SM -- Set Mode (standard modes).
             ('h', []) => {

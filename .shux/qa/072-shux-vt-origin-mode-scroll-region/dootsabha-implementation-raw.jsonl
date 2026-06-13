@@ -1,0 +1,49 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "Review complete. The VT semantics are correct and well-proven, but the task has **merge-blocking QA-gate gaps**.\n\n## Verdict: NOT mergeable — blocked on the VT Quality hard gate\n\n### VT semantics — correct, no blockers\nThe core implementation is sound. I read every changed handler and ran the suite:\n- `addressed_row()` correctly applies origin-relative addressing only under DECOM, clamps to `scroll_region.bottom` in origin mode and full grid otherwise (CUP/HVP/VPA). Non-origin CUP stays absolute. ✓\n- `relative_vertical_bounds()` clamps CUU/CUD/CNL/CPL/VPR to margins only when the cursor starts inside the region — matches xterm. ✓\n- DECSTBM accepts only `top \u003c bottom`, homes through current origin policy, leaves margins/cursor untouched when invalid (`parser.rs:1249`). ✓\n- DECSC/DECRC save+restore origin mode and absolute position, clamp to grid only (not margins) on restore. ✓\n- CPR/DSR report origin-relative rows; DECRQM `?6` reports mode state (`private_mode_report_value`, `parser.rs:845`). ✓\n- **205 unit tests pass, corpus replay passes** — the new `origin-scroll-region` corpus fixture genuinely proves relative CPR (`\\x1b[2;4R` / `\\x1b[?2;4R` from hex `1b5b323b3452` / `1b5b3f323b3452`). The shell automation's *text* checks (fixed header/footer, margin clamps) are substantive, non-circular proof.\n\n### Blockers (all in the SOLID QA hard gate)\n\n1. **`SOLID-QA.md` is missing entirely.** The hard gate requires `.shux/qa/072-.../SOLID-QA.md` with first line exactly `VERDICT: PASS`. It does not exist. The `shux-vt-solid-qa` sub-agent has not run. This alone blocks completion.\n\n2. **`evidence-manifest.json` is missing** from the 072 QA dir. The gate explicitly requires a committed manifest alongside the PNG/pixel evidence (the file present is `origin-automation-report.json`, not the required manifest).\n\n3. **`dootsabha-implementation.json` is 0 bytes.** The Mandatory Process and Feature Protocol both require a DootSabha implementation-diff council before marking done. An empty file means it was never captured.\n\n4. **Pixel proof is circular — baselines minted this same pass.** `actual`, `expected`, and `golden` PNGs are byte-identical (md5 matches across all three sizes). The \"0.0 diff pass\" is meaningless because the expected is a copy of the actual. DESIGN.md claims the baselines were \"approved by the DootSabha design review,\" but that council ran pre-code on the design *text* and could not have visually approved rendered pixels. This is exactly the failure the gate forbids: *\"an implementation cannot mint its own expected PNG in the same pass and call it proof.\"*\n\n5. **QA dir and goldens are untracked.** `git ls-files` returns nothing for `.shux/qa/072-...` and `.shux/goldens/072-...`. The gate requires the reviewable evidence committed.\n\n### To unblock\nRun `shux-vt-solid-qa` and commit its `VERDICT: PASS` report + `evidence-manifest.json`; capture a real implementation-diff council; obtain genuine review/approval of the pixel baselines (not a pre-code design-text council) and commit goldens + QA evidence as tracked files. The code itself needs no changes.",
+      "duration_ms": 493626,
+      "cost_usd": 2.0248649999999997,
+      "tokens_in": 14366,
+      "tokens_out": 17546
+    },
+    {
+      "provider": "gemini",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke gemini: gemini: Warning: Basic terminal detected (TERM=dumb). Visual rendering will be limited. For the best experience, use a terminal emulator with truecolor support.\nWarning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.\nYOLO mode is enabled. All tool calls will be automatically approved.\nYOLO mode is enabled. All tool calls will be automatically approved.\nMCP issues detected. Run /mcp list for status.\nError when talking to Gemini API Full report available at: /var/folders/5c/_bn5jc5x7ybfz39b277z4y740000gn/T/gemini-client-error-Turn.run-sendMessageStream-2026-06-13T08-00-05-113Z.json TerminalQuotaError: You have exhausted your capacity on this model. Your quota will reset after 15h6m11s.\n    at classifyGoogleError (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:304214:18)\n    at retryWithBackoff (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:304874:31)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async GeminiChat.makeApiCallAndProcessStream (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328315:28)\n    at async GeminiChat.streamWithRetries (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328133:29)\n    at async Turn.run (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328879:24)\n    at async GeminiClient.processTurn (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:342369:22)\n    at async GeminiClient.sendMessageStream (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:342466:14)\n    at async file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/gemini-YXO2QQ66.js:10882:26\n    at async main (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/gemini-YXO2QQ66.js:16290:5) {\n  cause: {\n    code: 429,\n    message: 'You have exhausted your capacity on this model. Your quota will reset after 15h6m11s.',\n    details: [ [Object], [Object] ]\n  },\n  retryDelayMs: 54371974.860488,\n  reason: 'QUOTA_EXHAUSTED'\n}\n{\n  \"session_id\": \"a177e33e-aa15-427a-a7dc-ad7a4461cd25\",\n  \"error\": {\n    \"type\": \"Error\",\n    \"message\": \"You have exhausted your capacity on this model. Your quota will reset after 15h6m11s.\",\n    \"code\": 1\n  }\n}"
+    }
+  ],
+  "reviews": null,
+  "synthesis": {
+    "chair": "claude",
+    "content": "## Synthesis: Task 072 (VT Origin Mode + Scroll Region) — Review Verdict\n\n**VERDICT: NOT mergeable — VT semantics are correct, but the SOLID VT QA hard gate is unmet.**\n\n### VT semantics — correct, no blockers ✓\n\nThe implementation is sound across every changed handler, confirmed by reading the code and running the suite (**205 unit tests + corpus replay pass**):\n\n- **`addressed_row()`** — applies origin-relative addressing only under DECOM; clamps to `scroll_region.bottom` in origin mode, full grid otherwise (CUP/HVP/VPA). Non-origin CUP stays absolute.\n- **`relative_vertical_bounds()`** — clamps CUU/CUD/CNL/CPL/VPR to margins only when the cursor starts inside the region (matches xterm).\n- **DECSTBM** (`parser.rs:1249`) — accepts only `top \u003c bottom`; homes through current origin policy; leaves margins/cursor untouched when invalid.\n- **DECSC/DECRC** — save+restore origin mode and absolute position; clamp to grid (not margins) on restore.\n- **CPR/DSR/DECRQM** — report origin-relative rows; `?6` reports mode state (`private_mode_report_value`, `parser.rs:845`).\n- The new `origin-scroll-region` corpus fixture genuinely proves relative CPR; the shell automation's text checks (fixed header/footer, margin clamps) are substantive and non-circular.\n\n**The code itself needs no changes.**\n\n### Merge blockers — all in the QA hard gate\n\n1. **`SOLID-QA.md` missing** — required at `.shux/qa/072-.../SOLID-QA.md` with first line `VERDICT: PASS`. The `shux-vt-solid-qa` sub-agent has not run.\n2. **`evidence-manifest.json` missing** from the 072 QA dir (only `origin-automation-report.json` is present).\n3. **`dootsabha-implementation.json` is 0 bytes** — the required implementation-diff council was never captured.\n4. **Pixel proof is circular** — `actual`, `expected`, and `golden` PNGs are byte-identical (md5 match across all sizes). A \"0.0 diff\" against a copy of the actual proves nothing. DESIGN.md claims the pre-code design-text council \"approved\" these baselines, but that council never saw rendered pixels — exactly the failure the gate forbids (\"an implementation cannot mint its own expected PNG in the same pass and call it proof\").\n5. **QA dir and goldens untracked** — `git ls-files` returns nothing for `.shux/qa/072-...` or `.shux/goldens/072-...`; the gate requires committed evidence.\n\n### To unblock\n\n1. Run `shux-vt-solid-qa`; commit its `VERDICT: PASS` report + `evidence-manifest.json`.\n2. Capture a real implementation-diff DootSabha council.\n3. Obtain genuine review/approval of the pixel baselines (not the pre-code design-text council).\n4. Commit goldens + QA evidence as **tracked** files.\n\nNo source changes required — this is purely a QA-evidence and process gap."
+  },
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 549003,
+    "total_cost_usd": 2.299466,
+    "total_tokens_in": 27655,
+    "total_tokens_out": 18796,
+    "providers": {
+      "claude": "ok",
+      "gemini": "error"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "partial result: some agents failed"
+  }
+}

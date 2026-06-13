@@ -1,0 +1,49 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "I've completed the review. Here are my findings.\n\n## Task 072 — Final Merge Review\n\n### Source changes — clean ✅\nThe only production change is `crates/shux-vt/src/parser.rs`. I traced every path against DEC/xterm semantics:\n\n- **Origin-relative CUP/HVP/VPA** (`addressed_row`): offsets from `origin_top()`, clamped to `origin_bottom()` (scroll-region bottom in DECOM) then grid — correct; can't escape the region.\n- **DSR/CPR origin-relative rows** (`report_cursor_position`): subtracts `scroll_region.top` only in origin mode, column stays absolute (shux has no left/right margins) — correct. `saturating_sub` guards underflow.\n- **DECSET/DECRST ?6 homing** + **DECSTBM valid-region homing / invalid-region no-op**: `home_cursor_to_origin()` on toggle and on valid `r`; invalid region (`top \u003e= bottom`) leaves region and cursor untouched — verified by `invalid_scroll_region_does_not_home_or_change_region`.\n- **CUU/CUD/CNL/CPL/VPR margin clamp** (`relative_vertical_bounds`): clamps to margins only when the cursor starts inside the region, else full grid — matches xterm, covered by both inside/outside tests.\n- **DECRC restore = grid-clamp only**: restores origin mode + cursor, clamps to grid, does *not* restore scroll region — correct, tested.\n\nUnit/integration tests cover each cell; corpus golden responses (`1b5b323b3452` = `ESC[2;4R`, `1b5b3f323b3452` = `ESC[?2;4R`) match a hand-trace of the fixture. Pixel metrics are exact `0.0` / `0.0` / `pass` at all three sizes (80×24, 120×40, 200×60).\n\nHarness changes (`wait_for_shell_ready` + CRLF marker, `run-cargo-test.sh` default 45→300s) are reasonable and non-source.\n\n### 🔴 Merge blocker — missing SOLID-QA hard-gate report\n**`.shux/qa/072-shux-vt-origin-mode-scroll-region/SOLID-QA.md` does not exist.**\n\n- The VT Quality Hard Gate (CLAUDE.md) requires it committed with first line exactly `VERDICT: PASS`.\n- `evidence-manifest.json` already references it (`\"solid_qa_report\": \"SOLID-QA.md\"`) — so the manifest points at an absent file.\n- `scripts/check-progress.sh::check_vt_qa_artifacts` (run by `make check-vt-qa` / pre-push) will hard-fail: `require_tracked_artifact \"$qa_file\"` and the `VERDICT: PASS` first-line assertion. The task also can't flip to `Done` without it, and the pre-push gate already rejects the current `In Progress` status.\n\nThis is the one thing standing between the branch and merge. The `shux-vt-solid-qa` sub-agent must run and produce/commit that report.\n\n### Minor (non-blocking)\n- `dootsabha-implementation-final.json` is a 0-byte stray file (not referenced by the manifest) — worth deleting for cleanliness.\n\n### Recorded, non-source\n- DootSabha implementation council: **Gemini failed with HTTP 429 `QUOTA_EXHAUSTED`** (\"quota will reset after 15h6m11s\"). Per instructions this is treated as a non-source environment failure, not a defect — recorded here.\n\n## Verdict: **Not mergeable yet**\nSource and pixel/evidence data are solid, but the mandatory `SOLID-QA.md` (`VERDICT: PASS`) is missing. Add that committed report (and mark the task Done) and it's clear to merge.",
+      "duration_ms": 154718,
+      "cost_usd": 1.5657350000000003,
+      "tokens_in": 17577,
+      "tokens_out": 9310
+    },
+    {
+      "provider": "gemini",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke gemini: gemini: Warning: Basic terminal detected (TERM=dumb). Visual rendering will be limited. For the best experience, use a terminal emulator with truecolor support.\nWarning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.\nYOLO mode is enabled. All tool calls will be automatically approved.\nYOLO mode is enabled. All tool calls will be automatically approved.\nMCP issues detected. Run /mcp list for status.\nError when talking to Gemini API Full report available at: /var/folders/5c/_bn5jc5x7ybfz39b277z4y740000gn/T/gemini-client-error-Turn.run-sendMessageStream-2026-06-13T10-31-15-611Z.json TerminalQuotaError: You have exhausted your capacity on this model. Your quota will reset after 12h35m1s.\n    at classifyGoogleError (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:304214:18)\n    at retryWithBackoff (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:304874:31)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async GeminiChat.makeApiCallAndProcessStream (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328315:28)\n    at async GeminiChat.streamWithRetries (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328133:29)\n    at async Turn.run (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:328879:24)\n    at async GeminiClient.processTurn (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:342369:22)\n    at async GeminiClient.sendMessageStream (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/chunk-RCJSF5RP.js:342466:14)\n    at async file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/gemini-YXO2QQ66.js:10882:26\n    at async main (file:///Users/indrasvat/.volta/tools/image/packages/@google/gemini-cli/lib/node_modules/@google/gemini-cli/bundle/gemini-YXO2QQ66.js:16290:5) {\n  cause: {\n    code: 429,\n    message: 'You have exhausted your capacity on this model. Your quota will reset after 12h35m1s.',\n    details: [ [Object], [Object] ]\n  },\n  retryDelayMs: 45301559.663809,\n  reason: 'QUOTA_EXHAUSTED'\n}\n{\n  \"session_id\": \"0bb5489c-8bb4-4669-9cae-9ce1ce6b3fcd\",\n  \"error\": {\n    \"type\": \"Error\",\n    \"message\": \"You have exhausted your capacity on this model. Your quota will reset after 12h35m1s.\",\n    \"code\": 1\n  }\n}"
+    }
+  ],
+  "reviews": null,
+  "synthesis": {
+    "chair": "claude",
+    "content": "## Task 072 (VT Origin Mode / Scroll Region) — Merge Review\n\n**Verdict: Not mergeable yet.** The code is correct and the visual evidence is exact, but one mandatory hard-gate artifact is missing.\n\n### What's solid ✅\n\n**Source diff** — the only production change is `crates/shux-vt/src/parser.rs`, and every path checks out against DEC/xterm semantics:\n\n| Behavior | Implementation | Status |\n|---|---|---|\n| Origin-relative CUP/HVP/VPA | offset from `origin_top()`, clamped to `origin_bottom()` then grid | ✅ can't escape region |\n| DSR/CPR row reporting | subtracts `scroll_region.top` only in DECOM; column stays absolute; `saturating_sub` guards underflow | ✅ |\n| DECSET/DECRST ?6 + DECSTBM homing | `home_cursor_to_origin()` on valid toggle; invalid region (`top \u003e= bottom`) is a no-op | ✅ tested |\n| CUU/CUD/CNL/CPL/VPR clamp | margins only when cursor starts inside region, else full grid | ✅ inside+outside covered |\n| DECRC restore | restores origin mode + cursor, grid-clamps, does *not* restore scroll region | ✅ correct |\n\n**Evidence** — pixel metrics are exact (`0.0` diff, `pass`) at 80×24, 120×40, 200×60. Corpus golden responses hand-trace correctly (`ESC[2;4R` / `ESC[?2;4R`). Harness tweaks (`wait_for_shell_ready` + CRLF marker, test timeout 45→300s) are reasonable and non-source.\n\n### 🔴 Merge blocker\n\n**`.shux/qa/072-shux-vt-origin-mode-scroll-region/SOLID-QA.md` does not exist.**\n\n- The VT Quality Hard Gate requires it committed with first line exactly `VERDICT: PASS`.\n- `evidence-manifest.json` already references it (`\"solid_qa_report\": \"SOLID-QA.md\"`) — the manifest points at an absent file.\n- `scripts/check-progress.sh::check_vt_qa_artifacts` (via `make check-vt-qa` / pre-push) will hard-fail on both `require_tracked_artifact` and the `VERDICT: PASS` first-line check. The task also can't flip to `Done` without it.\n\n**To unblock:** run the `shux-vt-solid-qa` sub-agent, commit its `VERDICT: PASS` report at that path, then mark the task Done in the task file + `docs/PROGRESS.md`.\n\n### Minor / recorded (non-blocking)\n\n- `dootsabha-implementation-final.json` is a 0-byte stray (not in the manifest) — delete for cleanliness.\n- DootSabha implementation council: **Gemini failed HTTP 429 `QUOTA_EXHAUSTED`** (resets in ~15h). Treated as an environment failure, not a defect — recorded, not actioned.\n\n---\n\nSource + pixel evidence are merge-ready. The single gap is the mandatory `SOLID-QA.md` (`VERDICT: PASS`). Add that committed report and mark the task Done, and the branch is clear.\n\nWant me to run the `shux-vt-solid-qa` gate now and generate the report?"
+  },
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 191957,
+    "total_cost_usd": 1.8686010000000004,
+    "total_tokens_in": 35089,
+    "total_tokens_out": 10602,
+    "providers": {
+      "claude": "ok",
+      "gemini": "error"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "partial result: some agents failed"
+  }
+}

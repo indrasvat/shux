@@ -1,0 +1,40 @@
+HEADER origin-120x40----------------------------------------------------------------------------------------------------
+
+BODY-TOP                                                                       CLAMP-UP
+SCROLL-04
+SCROLL-05
+SCROLL-06
+SCROLL-07
+SCROLL-08
+SCROLL-09
+SCROLL-10
+SCROLL-11
+SCROLL-12
+SCROLL-13
+SCROLL-14
+SCROLL-15
+SCROLL-16
+SCROLL-17
+SCROLL-18
+SCROLL-19
+SCROLL-20
+SCROLL-21
+SCROLL-22
+SCROLL-23
+SCROLL-24
+SCROLL-25
+SCROLL-26
+SCROLL-27
+SCROLL-28
+SCROLL-29
+SCROLL-30
+SCROLL-31
+SCROLL-32
+SCROLL-33
+SCROLL-34
+SCROLL-35
+SCROLL-36
+SCROLL-37
+BODY-BOTTOM                            CLAMP-DOWN
+
+FOOTER origin-120x40====================================================================================================

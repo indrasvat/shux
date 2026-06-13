@@ -34,9 +34,9 @@
 - **Implementation order:** 073 first, then 067/068, then 069-072, then 074.
 - **Done:** 073 (VT corpus regression harness), 067 (resize reflow), 068
   (wide-cell invariants), 069 (grapheme-aware cell storage), 070
-  (DEC special graphics), 071 (tab stops).
-- **Pending:** 072
-  (origin-mode/scroll-region semantics), 074 (dirty-region tracking).
+  (DEC special graphics), 071 (tab stops), 072
+  (origin-mode/scroll-region semantics).
+- **Pending:** 074 (dirty-region tracking).
 - Every task in this track requires DootSabha design review, DootSabha
   implementation-diff review, unit/integration/raw replay/shux automation
   coverage as applicable, full-resolution visual evidence, pixel-level PNG
@@ -101,6 +101,25 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 ---
 
 ## Session Log
+
+**2026-06-13 — feat(vt): correct origin-mode scroll-region semantics**
+- Completed task 072 by making DECOM origin mode address CUP/HVP/VPA relative
+  to the active scroll region, clamp to the region bottom, and report CPR/DSR
+  rows relative to the origin while keeping columns absolute.
+- Corrected DECSET/DECRST `?6`, valid DECSTBM homing, invalid scroll-region
+  no-op behavior, DECSC/DECRC origin-mode restore, and CUU/CUD/CNL/CPL/VPR
+  margin clamping only when movement starts inside the active region.
+- Added focused `shux-vt` unit coverage, a synthetic corpus fixture with
+  origin-relative response assertions, and a real shux automation target that
+  captures 80x24, 120x40, and 200x60 scroll-region layouts.
+- Hardened pane I/O probes with shell readiness markers and CRLF command
+  submission, and raised the local test-binary timeout to avoid false failures
+  on slow raster and pane I/O binaries under full-suite load.
+- Verification: DootSabha design and implementation review with
+  `--agents claude,gemini`, `make test-vt`, `make test-vt-origin-mode`,
+  `make test-vt-corpus`, `make test-pane-io`, full `make check`,
+  full-resolution visual inspection, exact zero-diff pixel JSON at all three
+  sizes, and SOLID VT QA PASS.
 
 **2026-06-12 — feat(vt): track mutable tab stops**
 - Completed task 071 by replacing hardcoded 8-column tab movement with
@@ -1407,7 +1426,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 069 | shux-vt grapheme-aware cell storage | VT Quality | **Done** | 005, 068, 073 |
 | 070 | shux-vt DEC special graphics charset | VT Quality | **Done** | 005, 068, 073 |
 | 071 | shux-vt real tab-stop state | VT Quality | **Done** | 005, 073 |
-| 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
+| 072 | shux-vt origin mode and scroll-region semantics | VT Quality | **Done** | 005, 029, 073 |
 | 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
 | 074 | shux-vt dirty-region tracking | VT Quality | Pending | 005, 073 |
 

@@ -181,6 +181,12 @@ test-vt-tab-stops: release ## Drive mutable tab-stop visual/pixel automation
 	@.shux/scripts/tab_stops_check.sh
 	@echo "$(COLOR_GREEN)✓ VT tab-stop automation passed$(COLOR_RESET)"
 
+.PHONY: test-vt-origin-mode
+test-vt-origin-mode: release ## Drive origin-mode scroll-region visual/pixel automation
+	@echo "$(COLOR_BLUE)▶ Running VT origin-mode automation...$(COLOR_RESET)"
+	@.shux/scripts/origin_mode_check.sh
+	@echo "$(COLOR_GREEN)✓ VT origin-mode automation passed$(COLOR_RESET)"
+
 .PHONY: test-vt-grapheme-performance
 test-vt-grapheme-performance: ## Measure grapheme storage performance on ASCII VT path
 	@echo "$(COLOR_BLUE)▶ Measuring VT grapheme storage performance...$(COLOR_RESET)"

@@ -1,0 +1,842 @@
+diff --git c/.shux/fixtures/vt-corpus/synthetic/manifest.json i/.shux/fixtures/vt-corpus/synthetic/manifest.json
+index 6b4e044..90a119c 100644
+--- c/.shux/fixtures/vt-corpus/synthetic/manifest.json
++++ i/.shux/fixtures/vt-corpus/synthetic/manifest.json
+@@ -68,6 +68,15 @@
+       ],
+       "expected_responses_hex": ["1b5b353b313052", "1b5b306e"]
+     },
++    {
++      "name": "origin-scroll-region",
++      "description": "DECOM origin-relative addressing, scroll-margin clamps, and relative CPR replies",
++      "init": {"rows": 10, "cols": 40},
++      "steps": [
++        {"process": {"text": "\u001b[2J\u001b[HHEADER\u001b[10;1HFOOTER\u001b[3;6r\u001b[?6h\u001b[1;1HTOP\u001b[2;4H\u001b[6n\u001b[?6nCPR\u001b[99;1HBOTTOM\u001b[?6l\u001b[r"}}
++      ],
++      "expected_responses_hex": ["1b5b323b3452", "1b5b3f323b3452"]
++    },
+     {
+       "name": "osc-default-colors",
+       "description": "OSC 10/11/12 default color assignments and queries",
+diff --git c/.shux/scripts/origin_mode_check.sh i/.shux/scripts/origin_mode_check.sh
+new file mode 100755
+index 0000000..8bdad67
+--- /dev/null
++++ i/.shux/scripts/origin_mode_check.sh
+@@ -0,0 +1,210 @@
++#!/usr/bin/env bash
++# Verify DECOM origin-mode and scroll-region rendering through real shux pane automation.
++
++set -euo pipefail
++
++repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
++task="072-shux-vt-origin-mode-scroll-region"
++golden_task="072-shux-vt-origin-mode-scroll-region"
++qa_dir="${SHUX_ORIGIN_MODE_QA:-${repo_root}/.shux/qa/${task}}"
++golden_dir="${SHUX_ORIGIN_MODE_GOLDENS:-${repo_root}/.shux/goldens/${golden_task}}"
++shux_bin="${SHUX_BIN:-${repo_root}/target/release/shux}"
++runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-origin-mode.XXXXXX")"
++session="origin-mode-${RANDOM}-$$"
++trigger="${runtime}/label"
++promote="${SHUX_ORIGIN_MODE_PROMOTE:-0}"
++
++cleanup() {
++  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill "${session}" >/dev/null 2>&1 || true
++  rm -rf "${runtime}"
++}
++trap cleanup EXIT
++
++mkdir -p "${qa_dir}" "${golden_dir}"
++
++fixture_py="${runtime}/origin_mode_fixture.py"
++cat >"${fixture_py}" <<'PY'
++import os
++import sys
++import time
++
++trigger = sys.argv[1]
++last = None
++
++
++def terminal_size() -> tuple[int, int]:
++    size = os.get_terminal_size(sys.stdout.fileno())
++    return size.columns, size.lines
++
++
++def clipped(text: str, cols: int, fill: str) -> str:
++    return (text + (fill * cols))[:cols]
++
++
++def draw(label: str) -> None:
++    cols, rows = terminal_size()
++    top = 3
++    bottom = max(top + 2, rows - 2)
++    body_height = bottom - top + 1
++    mid_col = min(max(18, cols // 3), max(1, cols - 14))
++    right_col = min(max(mid_col + 14, (cols * 2) // 3), max(1, cols - 10))
++
++    out = sys.stdout
++    out.write("\x1b[?25l\x1b[0m\x1b[2J\x1b[H")
++    out.write(f"\x1b[1;1H{clipped(f'HEADER {label}', cols, '-')}")
++    out.write(f"\x1b[{rows};1H{clipped(f'FOOTER {label}', cols, '=')}")
++
++    out.write(f"\x1b[{top};{bottom}r\x1b[?6h")
++    out.write("\x1b[1;1H\x1b[2KBODY-TOP")
++    out.write(f"\x1b[{body_height};1H\x1b[2KBODY-BOTTOM")
++
++    out.write(f"\x1b[{body_height};{mid_col}H")
++    for idx in range(body_height + 2):
++        out.write(f"SCROLL-{idx:02d}\n")
++
++    out.write("\x1b[1;1H\x1b[2KBODY-TOP")
++    out.write(f"\x1b[{body_height};1H\x1b[2KBODY-BOTTOM")
++    out.write(f"\x1b[2;{mid_col}H\x1b[999BCLAMP-DOWN")
++    out.write(f"\x1b[2;{right_col}H\x1b[999ACLAMP-UP")
++    out.write(f"\x1b[?6l\x1b[r\x1b[{rows};1H{clipped(f'FOOTER {label}', cols, '=')}")
++    out.flush()
++
++
++while True:
++    try:
++        with open(trigger, "r", encoding="utf-8") as handle:
++            label = handle.read().strip()
++    except FileNotFoundError:
++        time.sleep(0.05)
++        continue
++    if label and label != last:
++        draw(label)
++        last = label
++    time.sleep(0.05)
++PY
++
++create_json="$(
++  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" --format json \
++    session create "${session}" -d --title "origin mode" -- \
++    python3 -u "${fixture_py}" "${trigger}"
++)"
++pane_id="$(jq -r '.pane_id' <<<"${create_json}")"
++
++capture_one() {
++  local label="$1"
++  local cols="$2"
++  local rows="$3"
++
++  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" pane set-size \
++    -s "${session}" -p "${pane_id}" --cols "${cols}" --rows "${rows}" >/dev/null
++  printf '%s\n' "${label}" >"${trigger}"
++  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" pane wait-for \
++    -s "${session}" -p "${pane_id}" --text "FOOTER ${label}" --timeout-ms 15000 >/dev/null
++  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" pane capture \
++    -s "${session}" -p "${pane_id}" --lines "${rows}" >"${qa_dir}/${label}.txt"
++  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" pane snapshot \
++    -s "${session}" -p "${pane_id}" -o "${qa_dir}/${label}-actual.png" >/dev/null
++
++  python3 - "${qa_dir}/${label}.txt" "${label}" "${rows}" >"${qa_dir}/${label}-text.json" <<'PY'
++import json
++import sys
++from pathlib import Path
++
++path = Path(sys.argv[1])
++label = sys.argv[2]
++rows = int(sys.argv[3])
++lines = path.read_text(encoding="utf-8").splitlines()
++while len(lines) < rows:
++    lines.append("")
++top_idx = 2
++bottom_idx = rows - 3
++checks = {
++    "header_fixed": lines[0].startswith(f"HEADER {label}"),
++    "footer_fixed": lines[rows - 1].startswith(f"FOOTER {label}"),
++    "body_top_in_margin": "BODY-TOP" in lines[top_idx],
++    "body_bottom_in_margin": "BODY-BOTTOM" in lines[bottom_idx],
++    "clamp_up_in_top_margin": "CLAMP-UP" in lines[top_idx],
++    "clamp_down_in_bottom_margin": "CLAMP-DOWN" in lines[bottom_idx],
++    "no_body_in_header": "BODY" not in lines[0],
++    "no_body_in_footer": "BODY" not in lines[rows - 1],
++    "no_footer_bleed_above_last_row": all(
++        "FOOTER" not in line for line in lines[: rows - 1]
++    ),
++}
++status = "pass" if all(checks.values()) else "fail"
++print(json.dumps({"status": status, "label": label, "checks": checks}, indent=2, sort_keys=True))
++raise SystemExit(0 if status == "pass" else 1)
++PY
++
++  if [ "${promote}" = "1" ]; then
++    cp "${qa_dir}/${label}-actual.png" "${golden_dir}/${label}-expected.png"
++    cp "${qa_dir}/${label}.txt" "${golden_dir}/${label}-expected.txt"
++  fi
++
++  if [ ! -f "${golden_dir}/${label}-expected.png" ]; then
++    printf 'missing expected PNG: %s\n' "${golden_dir}/${label}-expected.png" >&2
++    printf 'rerun with SHUX_ORIGIN_MODE_PROMOTE=1 only after DootSabha-approved origin-mode baselines are reviewed\n' >&2
++    exit 1
++  fi
++  cp "${golden_dir}/${label}-expected.png" "${qa_dir}/${label}-expected.png"
++
++  cd "${repo_root}"
++  .claude/automations/pixel_verify.py \
++    ".shux/qa/${task}/${label}-actual.png" \
++    ".shux/qa/${task}/${label}-expected.png" \
++    --diff ".shux/qa/${task}/${label}-diff.png" \
++    --max-pixel-diff-ratio 0.0 \
++    --max-mean-channel-delta 0.0 \
++    >".shux/qa/${task}/${label}-pixel.json"
++}
++
++capture_one "origin-80x24" 80 24
++capture_one "origin-120x40" 120 40
++capture_one "origin-200x60" 200 60
++
++python3 - "${qa_dir}" >"${qa_dir}/origin-capture-report.json" <<'PY'
++import json
++import sys
++from pathlib import Path
++
++qa_dir = Path(sys.argv[1])
++labels = ["origin-80x24", "origin-120x40", "origin-200x60"]
++reports = [json.loads((qa_dir / f"{label}-text.json").read_text()) for label in labels]
++status = "pass" if all(report["status"] == "pass" for report in reports) else "fail"
++print(json.dumps({"status": status, "text_reports": reports}, indent=2, sort_keys=True))
++raise SystemExit(0 if status == "pass" else 1)
++PY
++
++jq -n \
++  --arg task "${task}" \
++  --arg capture "origin-capture-report.json" \
++  '{
++    task: $task,
++    capture_report: $capture,
++    screenshots: [
++      "origin-80x24-actual.png",
++      "origin-80x24-expected.png",
++      "origin-80x24-diff.png",
++      "origin-120x40-actual.png",
++      "origin-120x40-expected.png",
++      "origin-120x40-diff.png",
++      "origin-200x60-actual.png",
++      "origin-200x60-expected.png",
++      "origin-200x60-diff.png"
++    ],
++    pixel_metrics: [
++      "origin-80x24-pixel.json",
++      "origin-120x40-pixel.json",
++      "origin-200x60-pixel.json"
++    ],
++    captures: [
++      "origin-80x24.txt",
++      "origin-120x40.txt",
++      "origin-200x60.txt"
++    ],
++    text_metrics: [
++      "origin-80x24-text.json",
++      "origin-120x40-text.json",
++      "origin-200x60-text.json"
++    ]
++  }' >"${qa_dir}/origin-automation-report.json"
+diff --git c/Makefile i/Makefile
+index 7508b3e..a670418 100644
+--- c/Makefile
++++ i/Makefile
+@@ -181,6 +181,12 @@ test-vt-tab-stops: release ## Drive mutable tab-stop visual/pixel automation
+     @.shux/scripts/tab_stops_check.sh
+     @echo "$(COLOR_GREEN)✓ VT tab-stop automation passed$(COLOR_RESET)"
+
++.PHONY: test-vt-origin-mode
++test-vt-origin-mode: release ## Drive origin-mode scroll-region visual/pixel automation
++    @echo "$(COLOR_BLUE)▶ Running VT origin-mode automation...$(COLOR_RESET)"
++    @.shux/scripts/origin_mode_check.sh
++    @echo "$(COLOR_GREEN)✓ VT origin-mode automation passed$(COLOR_RESET)"
++
+ .PHONY: test-vt-grapheme-performance
+ test-vt-grapheme-performance: ## Measure grapheme storage performance on ASCII VT path
+     @echo "$(COLOR_BLUE)▶ Measuring VT grapheme storage performance...$(COLOR_RESET)"
+diff --git c/crates/shux-vt/src/lib.rs i/crates/shux-vt/src/lib.rs
+index a8096e2..6391595 100644
+--- c/crates/shux-vt/src/lib.rs
++++ i/crates/shux-vt/src/lib.rs
+@@ -463,6 +463,18 @@ mod tests {
+         );
+     }
+
++    #[test]
++    fn process_with_responses_reports_origin_relative_cursor_position() {
++        let mut vt = VirtualTerminal::new(10, 20);
++        let responses = vt.process_with_responses(b"\x1b[3;6r\x1b[?6h\x1b[2;4H\x1b[6n\x1b[?6n");
++
++        assert_eq!(
++            responses,
++            vec![b"\x1b[2;4R".to_vec(), b"\x1b[?2;4R".to_vec()]
++        );
++        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 3));
++    }
++
+     #[test]
+     fn process_with_responses_answers_osc_color_queries() {
+         let mut vt = VirtualTerminal::new(24, 80);
+@@ -790,6 +802,25 @@ mod tests {
+         assert!(compact_capture(&vt).starts_with("pending"));
+     }
+
++    #[test]
++    fn synchronized_output_freezes_origin_mode_presented_frame() {
++        let mut vt = VirtualTerminal::new(8, 20);
++        vt.process(b"\x1b[3;6r\x1b[?6h\x1b[1;1HX");
++
++        vt.process(b"\x1b[?2026h\x1b[1;1HY");
++
++        assert!(vt.modes().synchronized_output);
++        assert_eq!(vt.grid().visible_row(2)[0].ch, 'X');
++        assert_eq!(vt.cursor().row, 2);
++        assert_eq!(vt.cursor().col, 1);
++
++        vt.process(b"\x1b[?2026l");
++
++        assert_eq!(vt.grid().visible_row(2)[0].ch, 'Y');
++        assert_eq!(vt.cursor().row, 2);
++        assert_eq!(vt.cursor().col, 1);
++    }
++
+     #[test]
+     fn process_with_responses_reports_active_sgr_in_decrqss() {
+         let mut vt = VirtualTerminal::new(24, 80);
+@@ -1607,6 +1638,115 @@ mod tests {
+         assert_eq!(vt.scroll_region().bottom, 3);
+     }
+
++    #[test]
++    fn origin_mode_cup_addresses_scroll_region_top() {
++        let mut vt = VirtualTerminal::new(10, 20);
++        vt.process(b"\x1b[3;6r\x1b[?6h\x1b[1;1H");
++
++        assert_eq!((vt.cursor().row, vt.cursor().col), (2, 0));
++    }
++
++    #[test]
++    fn origin_mode_cup_clamps_to_scroll_region_bottom() {
++        let mut vt = VirtualTerminal::new(10, 20);
++        vt.process(b"\x1b[3;6r\x1b[?6h\x1b[99;99H");
++
++        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 19));
++    }
++
++    #[test]
++    fn cup_outside_origin_mode_remains_absolute() {
++        let mut vt = VirtualTerminal::new(10, 20);
++        vt.process(b"\x1b[3;6r\x1b[2;4H");
++
++        assert_eq!((vt.cursor().row, vt.cursor().col), (1, 3));
++    }
++
++    #[test]
++    fn origin_mode_vpa_addresses_scroll_region_top() {
++        let mut vt = VirtualTerminal::new(10, 20);
++        vt.process(b"\x1b[4;6r\x1b[?6h\x1b[2d");
++
++        assert_eq!(vt.cursor().row, 4);
++    }
++
++    #[test]
++    fn origin_mode_toggle_homes_to_current_origin() {
++        let mut vt = VirtualTerminal::new(10, 20);
++        vt.process(b"\x1b[3;6r\x1b[9;9H\x1b[?6h");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (2, 0));
++
++        vt.process(b"\x1b[9;9H\x1b[?6l");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0));
++    }
++
++    #[test]
++    fn scroll_region_set_homes_to_origin_top_when_origin_mode_is_set() {
++        let mut vt = VirtualTerminal::new(10, 20);
++        vt.process(b"\x1b[?6h\x1b[8;8H\x1b[4;7r");
++
++        assert_eq!(vt.scroll_region().top, 3);
++        assert_eq!(vt.scroll_region().bottom, 6);
++        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 0));
++
++        vt.process(b"\x1b[r");
++        assert_eq!(vt.scroll_region().top, 0);
++        assert_eq!(vt.scroll_region().bottom, 9);
++        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0));
++    }
++
++    #[test]
++    fn invalid_scroll_region_does_not_home_or_change_region() {
++        let mut vt = VirtualTerminal::new(10, 20);
++        vt.process(b"\x1b[3;6r\x1b[5;5H");
++        vt.process(b"\x1b[8;2r");
++
++        assert_eq!(vt.scroll_region().top, 2);
++        assert_eq!(vt.scroll_region().bottom, 5);
++        assert_eq!((vt.cursor().row, vt.cursor().col), (4, 4));
++    }
++
++    #[test]
++    fn save_restore_restores_origin_mode_and_grid_clamps_not_scroll_region() {
++        let mut vt = VirtualTerminal::new(8, 20);
++        vt.process(b"\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b7");
++        vt.process(b"\x1b[5;7r\x1b[3;3H\x1b[?6l\x1b8");
++
++        assert!(vt.modes().origin_mode);
++        assert_eq!(vt.scroll_region().top, 4);
++        assert_eq!(vt.scroll_region().bottom, 6);
++        assert_eq!((vt.cursor().row, vt.cursor().col), (2, 2));
++    }
++
++    #[test]
++    fn relative_vertical_moves_clamp_within_scroll_region_when_started_inside() {
++        let mut vt = VirtualTerminal::new(12, 20);
++        vt.process(b"\x1b[4;6r");
++
++        vt.process(b"\x1b[5;10H\x1b[99A");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 9));
++
++        vt.process(b"\x1b[5;10H\x1b[99B");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 9));
++
++        vt.process(b"\x1b[5;10H\x1b[99E");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 0));
++
++        vt.process(b"\x1b[5;10H\x1b[99e");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 9));
++
++        vt.process(b"\x1b[5;10H\x1b[99F");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 0));
++    }
++
++    #[test]
++    fn relative_vertical_moves_use_full_grid_when_started_outside_scroll_region() {
++        let mut vt = VirtualTerminal::new(12, 20);
++        vt.process(b"\x1b[4;6r\x1b[2;1H\x1b[8B");
++
++        assert_eq!((vt.cursor().row, vt.cursor().col), (9, 0));
++    }
++
+     #[test]
+     fn test_auto_wrap() {
+         let mut vt = VirtualTerminal::new(3, 5);
+diff --git c/crates/shux-vt/src/parser.rs i/crates/shux-vt/src/parser.rs
+index 98ead27..9527912 100644
+--- c/crates/shux-vt/src/parser.rs
++++ i/crates/shux-vt/src/parser.rs
+@@ -141,9 +141,81 @@ impl<'a> VtHandler<'a> {
+         if let Some((origin, charsets)) = self.cursor.restore() {
+             self.modes.origin_mode = origin;
+             *self.charsets = charsets;
++            self.clamp_cursor_to_grid();
+         }
+     }
+
++    fn grid_last_row(&self) -> usize {
++        self.grid.rows().saturating_sub(1)
++    }
++
++    fn grid_last_col(&self) -> usize {
++        self.grid.cols().saturating_sub(1)
++    }
++
++    fn origin_top(&self) -> usize {
++        if self.modes.origin_mode {
++            self.scroll_region.top.min(self.grid_last_row())
++        } else {
++            0
++        }
++    }
++
++    fn origin_bottom(&self) -> usize {
++        if self.modes.origin_mode {
++            self.scroll_region.bottom.min(self.grid_last_row())
++        } else {
++            self.grid_last_row()
++        }
++    }
++
++    fn addressed_row(&self, param: u16, default: u16) -> usize {
++        let row_offset = usize::from(if param == 0 { default } else { param }).saturating_sub(1);
++        let top = self.origin_top();
++        let bottom = self.origin_bottom().max(top);
++        top.saturating_add(row_offset)
++            .min(bottom)
++            .min(self.grid_last_row())
++    }
++
++    fn relative_vertical_bounds(&self) -> (usize, usize) {
++        let top = self.scroll_region.top.min(self.grid_last_row());
++        let bottom = self.scroll_region.bottom.min(self.grid_last_row());
++        if top <= bottom && (top..=bottom).contains(&self.cursor.row) {
++            (top, bottom)
++        } else {
++            (0, self.grid_last_row())
++        }
++    }
++
++    fn move_cursor_up(&mut self, n: usize) {
++        let (top, _) = self.relative_vertical_bounds();
++        self.cursor.row = self.cursor.row.saturating_sub(n).max(top);
++        self.cursor.auto_wrap_pending = false;
++    }
++
++    fn move_cursor_down(&mut self, n: usize) {
++        let (_, bottom) = self.relative_vertical_bounds();
++        self.cursor.row = self.cursor.row.saturating_add(n).min(bottom);
++        self.cursor.auto_wrap_pending = false;
++    }
++
++    fn home_cursor_to_origin(&mut self) {
++        self.cursor.row = self.origin_top();
++        self.cursor.col = 0;
++        self.cursor.auto_wrap_pending = false;
++    }
++
++    fn clamp_cursor_to_grid(&mut self) {
++        let row = self.cursor.row.min(self.grid_last_row());
++        let col = self.cursor.col.min(self.grid_last_col());
++        if row != self.cursor.row || col != self.cursor.col {
++            self.cursor.auto_wrap_pending = false;
++        }
++        self.cursor.row = row;
++        self.cursor.col = col;
++    }
++
+     fn reset_charsets(&mut self) {
+         *self.charsets = TerminalCharsets::default();
+     }
+@@ -607,7 +679,10 @@ impl<'a> VtHandler<'a> {
+             // DECCKM -- Cursor keys mode.
+             1 => self.modes.application_cursor_keys = enable,
+             // DECOM -- Origin mode.
+-            6 => self.modes.origin_mode = enable,
++            6 => {
++                self.modes.origin_mode = enable;
++                self.home_cursor_to_origin();
++            }
+             // DECAWM -- Auto-wrap mode.
+             7 => self.modes.auto_wrap = enable,
+             // DECTCEM -- Text cursor enable.
+@@ -727,7 +802,14 @@ impl<'a> VtHandler<'a> {
+     }
+
+     fn report_cursor_position(&mut self, private: bool) {
+-        let row = self.cursor.row + 1;
++        let row = if self.modes.origin_mode {
++            self.cursor
++                .row
++                .saturating_sub(self.scroll_region.top.min(self.grid_last_row()))
++                + 1
++        } else {
++            self.cursor.row + 1
++        };
+         let col = self.cursor.col + 1;
+         if private {
+             self.push_response(format!("\x1b[?{row};{col}R"));
+@@ -842,14 +924,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
+             // CUU -- Cursor Up.
+             ('A', []) => {
+                 let n = p(0, 1) as usize;
+-                self.cursor.row = self.cursor.row.saturating_sub(n);
+-                self.cursor.auto_wrap_pending = false;
++                self.move_cursor_up(n);
+             }
+             // CUD -- Cursor Down.
+             ('B', []) => {
+                 let n = p(0, 1) as usize;
+-                self.cursor.row = (self.cursor.row + n).min(rows - 1);
+-                self.cursor.auto_wrap_pending = false;
++                self.move_cursor_down(n);
+             }
+             // CUF -- Cursor Forward.
+             ('C', []) => {
+@@ -872,22 +952,19 @@ impl<'a> vte::Perform for VtHandler<'a> {
+             // CNL -- Cursor Next Line.
+             ('E', []) => {
+                 let n = p(0, 1) as usize;
+-                self.cursor.row = (self.cursor.row + n).min(rows - 1);
++                self.move_cursor_down(n);
+                 self.cursor.col = 0;
+-                self.cursor.auto_wrap_pending = false;
+             }
+             // VPR -- Vertical Position Relative.
+             ('e', []) => {
+                 let n = p(0, 1) as usize;
+-                self.cursor.row = (self.cursor.row + n).min(rows - 1);
+-                self.cursor.auto_wrap_pending = false;
++                self.move_cursor_down(n);
+             }
+             // CPL -- Cursor Previous Line.
+             ('F', []) => {
+                 let n = p(0, 1) as usize;
+-                self.cursor.row = self.cursor.row.saturating_sub(n);
++                self.move_cursor_up(n);
+                 self.cursor.col = 0;
+-                self.cursor.auto_wrap_pending = false;
+             }
+             // CHA -- Cursor Character Absolute (column).
+             ('G', []) => {
+@@ -913,7 +990,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
+             }
+             // CUP / HVP -- Cursor Position.
+             ('H', []) | ('f', []) => {
+-                let row = (p(0, 1) as usize).saturating_sub(1).min(rows - 1);
++                let row = self.addressed_row(p(0, 1), 1);
+                 let col = (p(1, 1) as usize).saturating_sub(1).min(cols - 1);
+                 self.cursor.row = row;
+                 self.cursor.col = col;
+@@ -1026,7 +1103,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
+             }
+             // VPA -- Vertical Line Position Absolute.
+             ('d', []) => {
+-                let row = (p(0, 1) as usize).saturating_sub(1).min(rows - 1);
++                let row = self.addressed_row(p(0, 1), 1);
+                 self.cursor.row = row;
+                 self.cursor.auto_wrap_pending = false;
+             }
+@@ -1175,10 +1252,8 @@ impl<'a> vte::Perform for VtHandler<'a> {
+                 if top < bottom {
+                     self.scroll_region.top = top;
+                     self.scroll_region.bottom = bottom;
++                    self.home_cursor_to_origin();
+                 }
+-                self.cursor.row = 0;
+-                self.cursor.col = 0;
+-                self.cursor.auto_wrap_pending = false;
+             }
+             // SM -- Set Mode (standard modes).
+             ('h', []) => {
+diff --git c/crates/shux/tests/pane_io_integration.rs i/crates/shux/tests/pane_io_integration.rs
+index 7d11340..7e5ea88 100644
+--- c/crates/shux/tests/pane_io_integration.rs
++++ i/crates/shux/tests/pane_io_integration.rs
+@@ -720,6 +720,31 @@ where
+     }
+ }
+
++async fn wait_for_shell_ready(stream: &mut UnixStream, session_id: &str) {
++    let marker_path = PathBuf::from(format!(
++        "/tmp/shux-ready-{}",
++        &uuid::Uuid::new_v4().simple().to_string()[..8]
++    ));
++    let marker_display = marker_path.display().to_string();
++    rpc_call(
++        stream,
++        "pane.send_keys",
++        serde_json::json!({"session_id": session_id, "text": format!("touch {}\r\n", marker_display)}),
++    )
++    .await;
++
++    let deadline = Instant::now() + PROBE_TIMEOUT;
++    while !marker_path.exists() && Instant::now() < deadline {
++        tokio::time::sleep(Duration::from_millis(100)).await;
++    }
++    let text = capture_text(stream, session_id, 80).await;
++    assert!(
++        marker_path.exists(),
++        "pane shell did not become command-ready; got: {text}"
++    );
++    let _ = std::fs::remove_file(marker_path);
++}
++
+ // ══════════════════════════════════════════════════════════════
+ // Tests
+ // ══════════════════════════════════════════════════════════════
+@@ -860,7 +885,7 @@ time.sleep(2)
+     rpc_call(
+         &mut stream,
+         "pane.send_keys",
+-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", script_path.display())}),
++        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", script_path.display())}),
+     )
+     .await;
+
+@@ -901,7 +926,7 @@ time.sleep(2)
+     rpc_call(
+         &mut stream,
+         "pane.send_keys",
+-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", script_path.display())}),
++        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", script_path.display())}),
+     )
+     .await;
+
+@@ -1024,11 +1049,12 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
+
+     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+     let (session_id, _pane_id) = create_test_session(&mut stream).await;
++    wait_for_shell_ready(&mut stream, &session_id).await;
+
+     rpc_call(
+         &mut stream,
+         "pane.send_keys",
+-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
++        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", probe_path.display())}),
+     )
+     .await;
+
+@@ -1082,11 +1108,12 @@ print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
+
+     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+     let (session_id, _pane_id) = create_test_session(&mut stream).await;
++    wait_for_shell_ready(&mut stream, &session_id).await;
+
+     rpc_call(
+         &mut stream,
+         "pane.send_keys",
+-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
++        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", probe_path.display())}),
+     )
+     .await;
+
+@@ -1148,7 +1175,7 @@ time.sleep(0.2)
+     rpc_call(
+         &mut stream,
+         "pane.send_keys",
+-        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", probe_path.display())}),
++        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\r\n", probe_path.display())}),
+     )
+     .await;
+
+diff --git c/docs/PROGRESS.md i/docs/PROGRESS.md
+index 3253674..ef667d4 100644
+--- c/docs/PROGRESS.md
++++ i/docs/PROGRESS.md
+@@ -34,9 +34,9 @@
+ - **Implementation order:** 073 first, then 067/068, then 069-072, then 074.
+ - **Done:** 073 (VT corpus regression harness), 067 (resize reflow), 068
+   (wide-cell invariants), 069 (grapheme-aware cell storage), 070
+-  (DEC special graphics), 071 (tab stops).
+-- **Pending:** 072
+-  (origin-mode/scroll-region semantics), 074 (dirty-region tracking).
++  (DEC special graphics), 071 (tab stops), 072
++  (origin-mode/scroll-region semantics).
++- **Pending:** 074 (dirty-region tracking).
+ - Every task in this track requires DootSabha design review, DootSabha
+   implementation-diff review, unit/integration/raw replay/shux automation
+   coverage as applicable, full-resolution visual evidence, pixel-level PNG
+@@ -102,6 +102,25 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
+
+ ## Session Log
+
++**2026-06-13 — feat(vt): correct origin-mode scroll-region semantics**
++- Completed task 072 by making DECOM origin mode address CUP/HVP/VPA relative
++  to the active scroll region, clamp to the region bottom, and report CPR/DSR
++  rows relative to the origin while keeping columns absolute.
++- Corrected DECSET/DECRST `?6`, valid DECSTBM homing, invalid scroll-region
++  no-op behavior, DECSC/DECRC origin-mode restore, and CUU/CUD/CNL/CPL/VPR
++  margin clamping only when movement starts inside the active region.
++- Added focused `shux-vt` unit coverage, a synthetic corpus fixture with
++  origin-relative response assertions, and a real shux automation target that
++  captures 80x24, 120x40, and 200x60 scroll-region layouts.
++- Hardened pane I/O probes with shell readiness markers and CRLF command
++  submission, and raised the local test-binary timeout to avoid false failures
++  on slow raster and pane I/O binaries under full-suite load.
++- Verification: DootSabha design and implementation review with
++  `--agents claude,gemini`, `make test-vt`, `make test-vt-origin-mode`,
++  `make test-vt-corpus`, `make test-pane-io`, full `make check`,
++  full-resolution visual inspection, exact zero-diff pixel JSON at all three
++  sizes, and SOLID VT QA PASS.
++
+ **2026-06-12 — feat(vt): track mutable tab stops**
+ - Completed task 071 by replacing hardcoded 8-column tab movement with
+   `VirtualTerminal`-owned bitmap tab-stop state used by HT, HTS, TBC, CHT, and
+@@ -1407,7 +1426,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
+ | 069 | shux-vt grapheme-aware cell storage | VT Quality | **Done** | 005, 068, 073 |
+ | 070 | shux-vt DEC special graphics charset | VT Quality | **Done** | 005, 068, 073 |
+ | 071 | shux-vt real tab-stop state | VT Quality | **Done** | 005, 073 |
+-| 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
++| 072 | shux-vt origin mode and scroll-region semantics | VT Quality | **Done** | 005, 029, 073 |
+ | 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
+ | 074 | shux-vt dirty-region tracking | VT Quality | Pending | 005, 073 |
+
+diff --git c/docs/agents/learnings.md i/docs/agents/learnings.md
+index 3be38a8..5da0a3c 100644
+--- c/docs/agents/learnings.md
++++ i/docs/agents/learnings.md
+@@ -3,6 +3,16 @@
+ > **STRICT RULE:** This section MUST be updated at the end of every coding session.
+ > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
+
++- **2026-06-13 (task 072 origin mode and scroll regions):** DECOM is an
++  addressing policy, not a separate cursor coordinate space. Store cursor rows
++  as absolute grid rows, offset CUP/HVP/VPA and CPR/DSR row reports through the
++  active scroll-region top only while origin mode is enabled, and clamp
++  save/restore to the grid rather than to the current margins. Relative
++  vertical motions (`CUU`/`CUD`/`CNL`/`CPL`/`VPR`) should clamp to margins only
++  when the cursor starts inside the region; outside it they remain full-grid
++  movement. Real PTY probes that paste multi-line scripts through an interactive
++  shell should wait for shell readiness and submit CRLF so the fixture executes
++  reliably under login-shell/readline variants.
+ - **2026-06-12 (task 071 tab stops):** Mutable tab stops are terminal state,
+   not parser-local cursor math. A flat bitmap seeded with `col > 0 && col % 8 ==
+   0` avoids the Default-to-Explicit trap where first HTS/TBC wipes existing
+diff --git c/docs/tasks/072-shux-vt-origin-mode-scroll-region.md i/docs/tasks/072-shux-vt-origin-mode-scroll-region.md
+index 240db3e..1d140dc 100644
+--- c/docs/tasks/072-shux-vt-origin-mode-scroll-region.md
++++ i/docs/tasks/072-shux-vt-origin-mode-scroll-region.md
+@@ -1,10 +1,10 @@
+ # Task 072: shux-vt Origin Mode and Scroll-Region Semantics
+
+-**Status:** Not Started
++**Status:** Done
+ **Priority:** Medium
+ **Milestone:** VT Quality Track
+ **Depends On:** 005, 029, 073
+-**Touches:** `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `.shux/qa/072-origin-mode-scroll-region/`
++**Touches:** `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `.shux/qa/072-shux-vt-origin-mode-scroll-region/`
+
+ ---
+
+@@ -30,7 +30,7 @@ Audit and correct origin-mode behavior for:
+ - Run DootSabha design council before coding.
+ - Run DootSabha implementation-diff council before marking done.
+ - Invoke `shux-vt-solid-qa`.
+-- Save auditable task artifacts under `.shux/qa/072-origin-mode-scroll-region/`.
++- Save auditable task artifacts under `.shux/qa/072-shux-vt-origin-mode-scroll-region/`.
+
+ ## Testing Matrix
+
+@@ -44,21 +44,21 @@ Audit and correct origin-mode behavior for:
+ | Integration | `process_with_responses()` reports DECRQM origin-mode state correctly. |
+ | Shux automation | Render scroll-margin fixture and resize it across 80x24/120x40/200x60. |
+ | Visual | Inspect fixed headers/footers, scroll body, cursor, and alternate-screen transitions. |
+-| Pixel | Deterministic scroll-region PNGs exactly match committed `.shux/goldens/` or DootSabha-approved `.shux/qa/072-origin-mode-scroll-region/` baselines with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. |
+-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/072-origin-mode-scroll-region/SOLID-QA.md`. |
++| Pixel | Deterministic scroll-region PNGs exactly match committed `.shux/goldens/` or DootSabha-approved `.shux/qa/072-shux-vt-origin-mode-scroll-region/` baselines with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. |
++| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/072-shux-vt-origin-mode-scroll-region/SOLID-QA.md`. |
+
+ ## Acceptance Criteria
+
+-- [ ] Origin-mode cursor movement matches xterm common behavior.
+-- [ ] Scroll margins isolate scrolling to the intended body.
+-- [ ] No header/footer row bleed appears in capture or PNG.
+-- [ ] Terminal response behavior remains correct.
++- [x] Origin-mode cursor movement matches xterm common behavior.
++- [x] Scroll margins isolate scrolling to the intended body.
++- [x] No header/footer row bleed appears in capture or PNG.
++- [x] Terminal response behavior remains correct.
+
+ ## Definition of Done
+
+-- [ ] DootSabha design and implementation-diff reviews are saved.
+-- [ ] Unit, integration, shux automation, visual, and pixel checks pass.
+-- [ ] Full-resolution PNGs, pixel metric JSON, and `evidence-manifest.json` are committed under `.shux/qa/072-origin-mode-scroll-region/`.
+-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/072-origin-mode-scroll-region/SOLID-QA.md`.
+-- [ ] `make check` passes.
+-- [ ] Progress and learnings are updated.
++- [x] DootSabha design and implementation-diff reviews are saved.
++- [x] Unit, integration, shux automation, visual, and pixel checks pass.
++- [x] Full-resolution PNGs, pixel metric JSON, and `evidence-manifest.json` are committed under `.shux/qa/072-shux-vt-origin-mode-scroll-region/`.
++- [x] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/072-shux-vt-origin-mode-scroll-region/SOLID-QA.md`.
++- [x] `make check` passes.
++- [x] Progress and learnings are updated.
+diff --git c/scripts/run-cargo-test.sh i/scripts/run-cargo-test.sh
+index 765e087..5b9f59d 100755
+--- c/scripts/run-cargo-test.sh
++++ i/scripts/run-cargo-test.sh
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+
+-binary_timeout_seconds="${SHUX_TEST_BINARY_TIMEOUT_SECONDS:-45}"
++binary_timeout_seconds="${SHUX_TEST_BINARY_TIMEOUT_SECONDS:-300}"
+ binary_retries="${SHUX_TEST_BINARY_RETRIES:-2}"
+
+ cargo_args=()

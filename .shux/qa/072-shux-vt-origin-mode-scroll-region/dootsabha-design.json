@@ -1,0 +1,53 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "I have everything I need. Here's the review.\n\n## Task 072 Design Review — Origin Mode & Scroll-Region Semantics\n\nThe core model (cursor stays absolute; origin mode is an addressing policy applied at CUP/HVP/VPA) is the right architecture and matches how xterm/ghostty handle DECOM. The helper decomposition (`origin_top/bottom`, `addressed_row`, `home_cursor`, `clamp_cursor_to_addressing_region`) is clean and testable. Most of the design is sound. The findings below are where it diverges from xterm or leaves a gate-relevant gap.\n\n### Findings\n\n**[HIGH — must-fix] DSR/CPR must report origin-relative coordinates when origin mode is set.**\nThe design states \"DSR cursor reports continue reporting absolute visible cursor coordinates.\" This contradicts VT100/xterm: when DECOM is set, CPR (`CSI 6n` → `CSI row;col R`) reports the cursor **relative to the scroll-region top** (`row - scroll_region.top + 1`). Confirmed current code (`report_cursor_position`, parser.rs:729) emits absolute `cursor.row + 1` unconditionally — so this is both a design error and a live bug. A TUI that enables origin mode, queries position, and repositions will land on the wrong row. This directly violates AC \"Terminal response behavior remains correct\" / \"matches xterm common behavior.\" Fix: subtract `origin_top()` from the reported row (and clamp ≥1) when origin mode is on, for both private and standard DSR-6. Add a dedicated unit test.\n\n**[MEDIUM — must-fix] Restore-clamp target is ambiguous (grid vs region) between the prompt and DESIGN.md.**\nThe prompt says restored cursor is \"clamped to the current grid/region\"; DESIGN.md says \"current grid bounds.\" These are different. xterm DECRC restores the saved absolute position clamped to the **page (grid)**, *not* re-clamped into the scroll region, even when origin mode is on at restore time. Pin the design explicitly to grid-bounds clamping and add a test that saves inside a region, shrinks/changes the region, restores, and asserts grid-clamp (not region-clamp).\n\n**[MEDIUM — must-fix] New scroll-margin goldens cannot be self-minted in the same pass.**\nThe evidence plan does \"exact pixel comparison to committed goldens\" at 0.0 tolerance, but no scroll-region golden exists yet under `.shux/goldens/`. The VT hard gate forbids an implementation minting its own expected PNG and calling it proof — new baselines need explicit task documentation + DootSabha design-review approval. The design must state where these baselines come from and that they carry DootSabha sign-off, or the pixel cell is self-certified and the gate fails on principle.\n\n**[MEDIUM] CUU/CUD scroll-margin clamping left unaddressed.**\nThe design scopes out relative movement (\"does not reinterpret its parameters through origin mode\") — correct as to *param reinterpretation*. But it's silent on the separate, real scroll-region semantic: CUU stops at the top margin and CUD at the bottom margin when the cursor starts within the region (independent of origin mode). Current CUU/CUD (parser.rs:855+) clamp to grid edges, not margins. Since the task title is \"...and Scroll-Region Semantics,\" either bring CUU/CUD margin-clamping in scope (with tests) or explicitly document it as deliberate out-of-scope with rationale. Right now it's an unstated gap.\n\n**[LOW] Invalid-DECSTBM cursor behavior should cite its reference.**\nDesign says invalid region (top ≥ bottom) leaves margins *and cursor* unchanged. Recent xterm gates the home-to-origin inside the `if (bot > top)` block, so this matches — but older emulators home unconditionally. Since the AC pegs to \"xterm common behavior,\" cite the reference and add the no-op test so this choice is defensible rather than incidental. (Note the design also flips current behavior, which homes 0,0 even on invalid input — that's a real change worth a test.)\n\n**[LOW] Column origin is correctly out of scope, but record the DECSLRM dependency.**\nOrigin mode only offsets columns when left/right margins (DECSLRM `?69`) are active, which shux doesn't implement. The design correctly leaves columns absolute. Add a one-line non-goal note that `addressed_row`'s column counterpart must be introduced *if/when* DECSLRM lands, so this isn't silently re-broken later.\n\n**[LOW] Synchronized-output section is non-specific to origin mode.**\nThe described freeze/release behavior is just normal `?2026` semantics; nothing here is origin-specific beyond \"the pending writes happen to be origin-addressed.\" Fine to keep the test, but the design shouldn't imply origin mode needs special sync handling — it doesn't. Keep the test, trim the framing.\n\n### Missing must-fixes to add to the plan\n1. CPR origin-relative reporting + test (the HIGH above) — currently absent from the evidence plan entirely.\n2. Explicit grid-bounds (not region) restore-clamp test.\n3. DootSabha-approved provenance statement for the new scroll-margin goldens.\n4. A decision + note on CUU/CUD margin clamping (in-scope w/ tests, or documented out-of-scope).\n\nNone of these block the architecture; they're correctness and gate-evidence gaps. The CPR one is the only behavioral defect that would actually mislead a TUI.\n\nVERDICT: APPROVE-WITH-CONDITIONS",
+      "duration_ms": 167065,
+      "cost_usd": 1.072286,
+      "tokens_in": 17504,
+      "tokens_out": 8545
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-3.1-pro-preview",
+      "content": "### Findings\n\n**[HIGH] DSR (Device Status Report) incorrect coordinate reporting**\n*   **Issue:** The proposal states: \"DSR cursor reports absolute visible coordinates.\" This violates VT100/VT220 specifications. When Origin Mode (DECOM `?6`) is SET, the Cursor Position Report (CPR, `ESC [ 6 n`) **must** report the line number relative to the top margin, not the absolute screen coordinates.\n*   **Impact:** TUI applications that query the cursor position while in origin mode will receive incorrect coordinates, leading to corrupted UI state.\n*   **Must-Fix:** Modify the DSR response logic to check `origin_mode`. If true, subtract the active top margin from the absolute row (adjusting for 1-based indexing) before emitting the CPR response.\n\n**[MEDIUM] Ambiguous clamping for Relative Vertical Movements (CUU/CUD)**\n*   **Issue:** The proposal states: \"HPA/CHA and relative movement stay unaffected by origin mode.\" While Origin Mode doesn't change their relative nature, the *margins* do. If the cursor is currently inside the scrolling region, `CUU` (Cursor Up) and `CUD` (Cursor Down) **must** be clamped by the top and bottom margins. They cannot move the cursor out of the scrolling region.\n*   **Impact:** If relative movements ignore margins, TUI applications relying on boundary constraints may overwrite static headers or footers.\n*   **Must-Fix:** Implement margin clamping for vertical relative movements (`CUU`, `CUD`, `IND`, `RI`, `NEL`) when the cursor originates within the defined margins.\n\n**[LOW] Horizontal Margins (DECSLRM) scoping**\n*   **Issue:** The proposal only mentions row parameters. If Shux supports or plans to support Left/Right margins (DECSLRM), Origin Mode also makes column coordinates for `CUP`/`HVP`/`DSR` relative to the left margin.\n*   **Must-Fix:** If DECSLRM is out of scope, no action is needed, but this constraint should be explicitly noted in the design.\n\n**[LOW] Erase Display (ED) boundary clarification**\n*   **Issue:** The design omits screen erasure commands (`ED`).\n*   **Must-Fix:** Ensure that `ED 2` (Erase Entire Display) and similar full-screen clears continue to clear the *absolute* visible grid, ignoring Origin Mode and margins, as per VT standards.\n\n### Missing Must-Fixes\n1. Relative reporting for DSR CPR (`ESC [ 6 n`) when Origin Mode is enabled.\n2. Vertical margin clamping for relative cursor movements (`CUU`, `CUD`).\n\nVERDICT: APPROVE-WITH-CONDITIONS",
+      "duration_ms": 238213,
+      "cost_usd": 0,
+      "tokens_in": 52408,
+      "tokens_out": 631
+    }
+  ],
+  "reviews": [
+    {
+      "reviewer": "claude",
+      "reviewed": [
+        "gemini"
+      ],
+      "content": "",
+      "error": "review by claude: claude invoke: subprocess \"claude\": context deadline exceeded"
+    },
+    {
+      "reviewer": "gemini",
+      "reviewed": [
+        "claude"
+      ],
+      "content": "",
+      "error": "review by gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    }
+  ],
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 405279,
+    "total_cost_usd": 1.072286,
+    "total_tokens_in": 69912,
+    "total_tokens_out": 9176,
+    "providers": {
+      "claude": "ok",
+      "gemini": "ok"
+    }
+  }
+}
