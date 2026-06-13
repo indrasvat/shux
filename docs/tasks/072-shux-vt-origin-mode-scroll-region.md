@@ -1,10 +1,10 @@
 # Task 072: shux-vt Origin Mode and Scroll-Region Semantics
 
-**Status:** Not Started
+**Status:** Done
 **Priority:** Medium
 **Milestone:** VT Quality Track
 **Depends On:** 005, 029, 073
-**Touches:** `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `.shux/qa/072-origin-mode-scroll-region/`
+**Touches:** `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`, `.shux/qa/072-shux-vt-origin-mode-scroll-region/`
 
 ---
 
@@ -30,7 +30,7 @@ Audit and correct origin-mode behavior for:
 - Run DootSabha design council before coding.
 - Run DootSabha implementation-diff council before marking done.
 - Invoke `shux-vt-solid-qa`.
-- Save auditable task artifacts under `.shux/qa/072-origin-mode-scroll-region/`.
+- Save auditable task artifacts under `.shux/qa/072-shux-vt-origin-mode-scroll-region/`.
 
 ## Testing Matrix
 
@@ -44,21 +44,21 @@ Audit and correct origin-mode behavior for:
 | Integration | `process_with_responses()` reports DECRQM origin-mode state correctly. |
 | Shux automation | Render scroll-margin fixture and resize it across 80x24/120x40/200x60. |
 | Visual | Inspect fixed headers/footers, scroll body, cursor, and alternate-screen transitions. |
-| Pixel | Deterministic scroll-region PNGs exactly match committed `.shux/goldens/` or DootSabha-approved `.shux/qa/072-origin-mode-scroll-region/` baselines with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. |
-| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/072-origin-mode-scroll-region/SOLID-QA.md`. |
+| Pixel | Deterministic scroll-region PNGs exactly match committed `.shux/goldens/` or DootSabha-approved `.shux/qa/072-shux-vt-origin-mode-scroll-region/` baselines with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. |
+| QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/072-shux-vt-origin-mode-scroll-region/SOLID-QA.md`. |
 
 ## Acceptance Criteria
 
-- [ ] Origin-mode cursor movement matches xterm common behavior.
-- [ ] Scroll margins isolate scrolling to the intended body.
-- [ ] No header/footer row bleed appears in capture or PNG.
-- [ ] Terminal response behavior remains correct.
+- [x] Origin-mode cursor movement matches xterm common behavior.
+- [x] Scroll margins isolate scrolling to the intended body.
+- [x] No header/footer row bleed appears in capture or PNG.
+- [x] Terminal response behavior remains correct.
 
 ## Definition of Done
 
-- [ ] DootSabha design and implementation-diff reviews are saved.
-- [ ] Unit, integration, shux automation, visual, and pixel checks pass.
-- [ ] Full-resolution PNGs, pixel metric JSON, and `evidence-manifest.json` are committed under `.shux/qa/072-origin-mode-scroll-region/`.
-- [ ] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/072-origin-mode-scroll-region/SOLID-QA.md`.
-- [ ] `make check` passes.
-- [ ] Progress and learnings are updated.
+- [x] DootSabha design and implementation-diff reviews are saved.
+- [x] Unit, integration, shux automation, visual, and pixel checks pass.
+- [x] Full-resolution PNGs, pixel metric JSON, and `evidence-manifest.json` are committed under `.shux/qa/072-shux-vt-origin-mode-scroll-region/`.
+- [x] `shux-vt-solid-qa` hard-gate report is `VERDICT: PASS` saved to `.shux/qa/072-shux-vt-origin-mode-scroll-region/SOLID-QA.md`.
+- [x] `make check` passes.
+- [x] Progress and learnings are updated.

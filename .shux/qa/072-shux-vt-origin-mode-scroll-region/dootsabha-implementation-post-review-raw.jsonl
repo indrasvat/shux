@@ -1,0 +1,46 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "Progress check passes now. I added a session-log entry documenting the post-review direction-aware clamping fix (PROGRESS.md:122).\n\nMy review verdict stands unchanged: **mergeable**. The fix correctly reproduces xterm's directional `CursorUp`/`CursorDown` margin clamping, all four regression assertions are right, no stragglers reference the removed `relative_vertical_bounds`, pixel diffs are zero across all three sizes, SOLID-QA is PASS, and the full shux-vt suite (209 tests) is green.\n\nOne non-blocking hygiene item remains: the untracked 0-byte `dootsabha-implementation-post-review-raw.jsonl` should be populated or deleted before committing.",
+      "duration_ms": 281173,
+      "cost_usd": 1.392418,
+      "tokens_in": 21421,
+      "tokens_out": 7781
+    },
+    {
+      "provider": "gemini",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    }
+  ],
+  "reviews": null,
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 281173,
+    "total_cost_usd": 1.392418,
+    "total_tokens_in": 21421,
+    "total_tokens_out": 7781,
+    "providers": {
+      "claude": "ok",
+      "gemini": "error"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "synthesis: synthesize: no healthy agents available for synthesis"
+  }
+}

@@ -1,0 +1,74 @@
+diff --git c/crates/shux-vt/src/lib.rs i/crates/shux-vt/src/lib.rs
+index 6391595..6769f9c 100644
+--- c/crates/shux-vt/src/lib.rs
++++ i/crates/shux-vt/src/lib.rs
+@@ -1740,11 +1740,21 @@ mod tests {
+     }
+
+     #[test]
+-    fn relative_vertical_moves_use_full_grid_when_started_outside_scroll_region() {
++    fn relative_vertical_moves_use_directional_scroll_region_bounds_when_started_outside() {
+         let mut vt = VirtualTerminal::new(12, 20);
+-        vt.process(b"\x1b[4;6r\x1b[2;1H\x1b[8B");
++        vt.process(b"\x1b[4;6r");
+
+-        assert_eq!((vt.cursor().row, vt.cursor().col), (9, 0));
++        vt.process(b"\x1b[2;1H\x1b[8B");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 0));
++
++        vt.process(b"\x1b[10;1H\x1b[99A");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 0));
++
++        vt.process(b"\x1b[2;1H\x1b[99A");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0));
++
++        vt.process(b"\x1b[10;1H\x1b[99B");
++        assert_eq!((vt.cursor().row, vt.cursor().col), (11, 0));
+     }
+
+     #[test]
+diff --git c/crates/shux-vt/src/parser.rs i/crates/shux-vt/src/parser.rs
+index 9527912..9b14457 100644
+--- c/crates/shux-vt/src/parser.rs
++++ i/crates/shux-vt/src/parser.rs
+@@ -178,24 +178,34 @@ impl<'a> VtHandler<'a> {
+             .min(self.grid_last_row())
+     }
+
+-    fn relative_vertical_bounds(&self) -> (usize, usize) {
++    fn upward_vertical_top(&self) -> usize {
+         let top = self.scroll_region.top.min(self.grid_last_row());
+         let bottom = self.scroll_region.bottom.min(self.grid_last_row());
+-        if top <= bottom && (top..=bottom).contains(&self.cursor.row) {
+-            (top, bottom)
++        if top <= bottom && self.cursor.row >= top {
++            top
+         } else {
+-            (0, self.grid_last_row())
++            0
++        }
++    }
++
++    fn downward_vertical_bottom(&self) -> usize {
++        let top = self.scroll_region.top.min(self.grid_last_row());
++        let bottom = self.scroll_region.bottom.min(self.grid_last_row());
++        if top <= bottom && self.cursor.row <= bottom {
++            bottom
++        } else {
++            self.grid_last_row()
+         }
+     }
+
+     fn move_cursor_up(&mut self, n: usize) {
+-        let (top, _) = self.relative_vertical_bounds();
++        let top = self.upward_vertical_top();
+         self.cursor.row = self.cursor.row.saturating_sub(n).max(top);
+         self.cursor.auto_wrap_pending = false;
+     }
+
+     fn move_cursor_down(&mut self, n: usize) {
+-        let (_, bottom) = self.relative_vertical_bounds();
++        let bottom = self.downward_vertical_bottom();
+         self.cursor.row = self.cursor.row.saturating_add(n).min(bottom);
+         self.cursor.auto_wrap_pending = false;
+     }

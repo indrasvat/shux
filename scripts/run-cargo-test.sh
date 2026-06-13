@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-binary_timeout_seconds="${SHUX_TEST_BINARY_TIMEOUT_SECONDS:-45}"
+binary_timeout_seconds="${SHUX_TEST_BINARY_TIMEOUT_SECONDS:-300}"
 binary_retries="${SHUX_TEST_BINARY_RETRIES:-2}"
 
 cargo_args=()

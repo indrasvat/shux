@@ -1,0 +1,15 @@
+{
+  "checks": {
+    "body_bottom_in_margin": true,
+    "body_top_in_margin": true,
+    "clamp_down_in_bottom_margin": true,
+    "clamp_up_in_top_margin": true,
+    "footer_fixed": true,
+    "header_fixed": true,
+    "no_body_in_footer": true,
+    "no_body_in_header": true,
+    "no_footer_bleed_above_last_row": true
+  },
+  "label": "origin-200x60",
+  "status": "pass"
+}

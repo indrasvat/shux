@@ -123,6 +123,21 @@
       "cols": 80
     },
     {
+      "name": "origin-scroll-region",
+      "layer": "synthetic",
+      "description": "DECOM origin-relative addressing, scroll-margin clamps, and relative CPR replies",
+      "status": "pending_pixel",
+      "text_status": "pass",
+      "responses_status": "pass",
+      "actual_text": ".shux/out/073-vt-corpus/rendered/synthetic-origin-scroll-region-actual.txt",
+      "expected_text": ".shux/goldens/073-vt-corpus/synthetic-origin-scroll-region-expected.txt",
+      "actual_png": ".shux/out/073-vt-corpus/rendered/synthetic-origin-scroll-region-actual.png",
+      "expected_png": ".shux/goldens/073-vt-corpus/synthetic-origin-scroll-region-expected.png",
+      "diff_png": ".shux/out/073-vt-corpus/rendered/synthetic-origin-scroll-region-diff.png",
+      "rows": 10,
+      "cols": 40
+    },
+    {
       "name": "osc-default-colors",
       "layer": "synthetic",
       "description": "OSC 10/11/12 default color assignments and queries",

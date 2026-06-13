@@ -1,0 +1,24 @@
+HEADER origin-80x24-------------------------------------------------------------
+
+BODY-TOP                                            CLAMP-UP
+SCROLL-04
+SCROLL-05
+SCROLL-06
+SCROLL-07
+SCROLL-08
+SCROLL-09
+SCROLL-10
+SCROLL-11
+SCROLL-12
+SCROLL-13
+SCROLL-14
+SCROLL-15
+SCROLL-16
+SCROLL-17
+SCROLL-18
+SCROLL-19
+SCROLL-20
+SCROLL-21
+BODY-BOTTOM              CLAMP-DOWN
+
+FOOTER origin-80x24=============================================================

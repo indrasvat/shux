@@ -69,6 +69,15 @@
       "expected_responses_hex": ["1b5b353b313052", "1b5b306e"]
     },
     {
+      "name": "origin-scroll-region",
+      "description": "DECOM origin-relative addressing, scroll-margin clamps, and relative CPR replies",
+      "init": {"rows": 10, "cols": 40},
+      "steps": [
+        {"process": {"text": "\u001b[2J\u001b[HHEADER\u001b[10;1HFOOTER\u001b[3;6r\u001b[?6h\u001b[1;1HTOP\u001b[2;4H\u001b[6n\u001b[?6nCPR\u001b[99;1HBOTTOM\u001b[?6l\u001b[r"}}
+      ],
+      "expected_responses_hex": ["1b5b323b3452", "1b5b3f323b3452"]
+    },
+    {
       "name": "osc-default-colors",
       "description": "OSC 10/11/12 default color assignments and queries",
       "init": {"rows": 8, "cols": 40},

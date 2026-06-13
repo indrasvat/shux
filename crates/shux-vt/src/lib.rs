@@ -464,6 +464,18 @@ mod tests {
     }
 
     #[test]
+    fn process_with_responses_reports_origin_relative_cursor_position() {
+        let mut vt = VirtualTerminal::new(10, 20);
+        let responses = vt.process_with_responses(b"\x1b[3;6r\x1b[?6h\x1b[2;4H\x1b[6n\x1b[?6n");
+
+        assert_eq!(
+            responses,
+            vec![b"\x1b[2;4R".to_vec(), b"\x1b[?2;4R".to_vec()]
+        );
+        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 3));
+    }
+
+    #[test]
     fn process_with_responses_answers_osc_color_queries() {
         let mut vt = VirtualTerminal::new(24, 80);
         let responses = vt.process_with_responses(
@@ -788,6 +800,25 @@ mod tests {
         assert_eq!(compact_capture(&vt), "ABCDEFGHIJK");
         vt.process(b"\x1b[?2026l");
         assert!(compact_capture(&vt).starts_with("pending"));
+    }
+
+    #[test]
+    fn synchronized_output_freezes_origin_mode_presented_frame() {
+        let mut vt = VirtualTerminal::new(8, 20);
+        vt.process(b"\x1b[3;6r\x1b[?6h\x1b[1;1HX");
+
+        vt.process(b"\x1b[?2026h\x1b[1;1HY");
+
+        assert!(vt.modes().synchronized_output);
+        assert_eq!(vt.grid().visible_row(2)[0].ch, 'X');
+        assert_eq!(vt.cursor().row, 2);
+        assert_eq!(vt.cursor().col, 1);
+
+        vt.process(b"\x1b[?2026l");
+
+        assert_eq!(vt.grid().visible_row(2)[0].ch, 'Y');
+        assert_eq!(vt.cursor().row, 2);
+        assert_eq!(vt.cursor().col, 1);
     }
 
     #[test]
@@ -1605,6 +1636,125 @@ mod tests {
         vt.process(b"\x1b[2;4r");
         assert_eq!(vt.scroll_region().top, 1);
         assert_eq!(vt.scroll_region().bottom, 3);
+    }
+
+    #[test]
+    fn origin_mode_cup_addresses_scroll_region_top() {
+        let mut vt = VirtualTerminal::new(10, 20);
+        vt.process(b"\x1b[3;6r\x1b[?6h\x1b[1;1H");
+
+        assert_eq!((vt.cursor().row, vt.cursor().col), (2, 0));
+    }
+
+    #[test]
+    fn origin_mode_cup_clamps_to_scroll_region_bottom() {
+        let mut vt = VirtualTerminal::new(10, 20);
+        vt.process(b"\x1b[3;6r\x1b[?6h\x1b[99;99H");
+
+        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 19));
+    }
+
+    #[test]
+    fn cup_outside_origin_mode_remains_absolute() {
+        let mut vt = VirtualTerminal::new(10, 20);
+        vt.process(b"\x1b[3;6r\x1b[2;4H");
+
+        assert_eq!((vt.cursor().row, vt.cursor().col), (1, 3));
+    }
+
+    #[test]
+    fn origin_mode_vpa_addresses_scroll_region_top() {
+        let mut vt = VirtualTerminal::new(10, 20);
+        vt.process(b"\x1b[4;6r\x1b[?6h\x1b[2d");
+
+        assert_eq!(vt.cursor().row, 4);
+    }
+
+    #[test]
+    fn origin_mode_toggle_homes_to_current_origin() {
+        let mut vt = VirtualTerminal::new(10, 20);
+        vt.process(b"\x1b[3;6r\x1b[9;9H\x1b[?6h");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (2, 0));
+
+        vt.process(b"\x1b[9;9H\x1b[?6l");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0));
+    }
+
+    #[test]
+    fn scroll_region_set_homes_to_origin_top_when_origin_mode_is_set() {
+        let mut vt = VirtualTerminal::new(10, 20);
+        vt.process(b"\x1b[?6h\x1b[8;8H\x1b[4;7r");
+
+        assert_eq!(vt.scroll_region().top, 3);
+        assert_eq!(vt.scroll_region().bottom, 6);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 0));
+
+        vt.process(b"\x1b[r");
+        assert_eq!(vt.scroll_region().top, 0);
+        assert_eq!(vt.scroll_region().bottom, 9);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0));
+    }
+
+    #[test]
+    fn invalid_scroll_region_does_not_home_or_change_region() {
+        let mut vt = VirtualTerminal::new(10, 20);
+        vt.process(b"\x1b[3;6r\x1b[5;5H");
+        vt.process(b"\x1b[8;2r");
+
+        assert_eq!(vt.scroll_region().top, 2);
+        assert_eq!(vt.scroll_region().bottom, 5);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (4, 4));
+    }
+
+    #[test]
+    fn save_restore_restores_origin_mode_and_grid_clamps_not_scroll_region() {
+        let mut vt = VirtualTerminal::new(8, 20);
+        vt.process(b"\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b7");
+        vt.process(b"\x1b[5;7r\x1b[3;3H\x1b[?6l\x1b8");
+
+        assert!(vt.modes().origin_mode);
+        assert_eq!(vt.scroll_region().top, 4);
+        assert_eq!(vt.scroll_region().bottom, 6);
+        assert_eq!((vt.cursor().row, vt.cursor().col), (2, 2));
+    }
+
+    #[test]
+    fn relative_vertical_moves_clamp_within_scroll_region_when_started_inside() {
+        let mut vt = VirtualTerminal::new(12, 20);
+        vt.process(b"\x1b[4;6r");
+
+        vt.process(b"\x1b[5;10H\x1b[99A");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 9));
+
+        vt.process(b"\x1b[5;10H\x1b[99B");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 9));
+
+        vt.process(b"\x1b[5;10H\x1b[99E");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 0));
+
+        vt.process(b"\x1b[5;10H\x1b[99e");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 9));
+
+        vt.process(b"\x1b[5;10H\x1b[99F");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 0));
+    }
+
+    #[test]
+    fn relative_vertical_moves_use_directional_scroll_region_bounds_when_started_outside() {
+        let mut vt = VirtualTerminal::new(12, 20);
+        vt.process(b"\x1b[4;6r");
+
+        vt.process(b"\x1b[2;1H\x1b[8B");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 0));
+
+        vt.process(b"\x1b[10;1H\x1b[99A");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 0));
+
+        vt.process(b"\x1b[2;1H\x1b[99A");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0));
+
+        vt.process(b"\x1b[10;1H\x1b[99B");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (11, 0));
     }
 
     #[test]
