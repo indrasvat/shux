@@ -175,6 +175,12 @@ test-vt-dec-special-graphics: release ## Drive DEC special graphics visual/pixel
 	@.shux/scripts/dec_special_graphics_check.sh
 	@echo "$(COLOR_GREEN)✓ VT DEC special graphics automation passed$(COLOR_RESET)"
 
+.PHONY: test-vt-tab-stops
+test-vt-tab-stops: release ## Drive mutable tab-stop visual/pixel automation
+	@echo "$(COLOR_BLUE)▶ Running VT tab-stop automation...$(COLOR_RESET)"
+	@.shux/scripts/tab_stops_check.sh
+	@echo "$(COLOR_GREEN)✓ VT tab-stop automation passed$(COLOR_RESET)"
+
 .PHONY: test-vt-grapheme-performance
 test-vt-grapheme-performance: ## Measure grapheme storage performance on ASCII VT path
 	@echo "$(COLOR_BLUE)▶ Measuring VT grapheme storage performance...$(COLOR_RESET)"

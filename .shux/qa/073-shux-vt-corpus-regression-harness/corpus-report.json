@@ -93,6 +93,21 @@
       "cols": 40
     },
     {
+      "name": "tab-stops",
+      "layer": "synthetic",
+      "description": "mutable HTS/TBC tab stops align custom table columns",
+      "status": "pending_pixel",
+      "text_status": "pass",
+      "responses_status": "pass",
+      "actual_text": ".shux/out/073-vt-corpus/rendered/synthetic-tab-stops-actual.txt",
+      "expected_text": ".shux/goldens/073-vt-corpus/synthetic-tab-stops-expected.txt",
+      "actual_png": ".shux/out/073-vt-corpus/rendered/synthetic-tab-stops-actual.png",
+      "expected_png": ".shux/goldens/073-vt-corpus/synthetic-tab-stops-expected.png",
+      "diff_png": ".shux/out/073-vt-corpus/rendered/synthetic-tab-stops-diff.png",
+      "rows": 8,
+      "cols": 40
+    },
+    {
       "name": "origin-response",
       "layer": "synthetic",
       "description": "cursor report response after absolute positioning",

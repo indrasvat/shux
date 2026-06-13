@@ -9,6 +9,7 @@ use crate::cell::{
 use crate::charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 use crate::cursor::{Cursor, CursorShape};
 use crate::grid::{Grid, GridConfig};
+use crate::tabstops::TabStops;
 
 /// Terminal mode flags (DECSET/DECRST).
 #[derive(Debug, Clone)]
@@ -106,6 +107,7 @@ pub struct VtHandler<'a> {
     pub sync_present: &'a mut Option<SyncPresentation>,
     pub active_grapheme_cell: &'a mut Option<(usize, usize)>,
     pub charsets: &'a mut TerminalCharsets,
+    pub tab_stops: &'a mut TabStops,
     pub responses: &'a mut Vec<Vec<u8>>,
 }
 
@@ -512,20 +514,11 @@ impl<'a> VtHandler<'a> {
     }
 
     fn next_tab_col(&self, count: usize) -> usize {
-        let mut col = self.cursor.col;
-        for _ in 0..count.max(1) {
-            col = (col / 8 + 1) * 8;
-        }
-        col.min(self.grid.cols().saturating_sub(1))
+        self.tab_stops.next_from(self.cursor.col, count)
     }
 
     fn prev_tab_col(&self, count: usize) -> usize {
-        let mut col = self.cursor.col;
-        for _ in 0..count.max(1) {
-            col = col.saturating_sub(1);
-            col = (col / 8) * 8;
-        }
-        col
+        self.tab_stops.prev_from(self.cursor.col, count)
     }
 
     /// Carriage return: move cursor to column 0.
@@ -803,8 +796,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
             }
             // HT -- horizontal tab.
             0x09 => {
-                let next_tab = (self.cursor.col / 8 + 1) * 8;
-                self.cursor.col = next_tab.min(self.grid.cols() - 1);
+                self.cursor.col = self.next_tab_col(1);
                 self.cursor.auto_wrap_pending = false;
             }
             // LF, VT, FF -- linefeed variants.
@@ -1038,9 +1030,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.cursor.row = row;
                 self.cursor.auto_wrap_pending = false;
             }
-            // TBC -- Tab Clear. shux currently tracks default tab stops only,
-            // so there is no mutable tab-stop state to update yet.
-            ('g', []) => {}
+            // TBC -- Tab Clear.
+            ('g', []) => match p(0, 0) {
+                0 => self.tab_stops.clear_current(self.cursor.col),
+                3 => self.tab_stops.clear_all(),
+                param => trace!(param, "unhandled TBC parameter"),
+            },
             // SCOSC -- Save Cursor (SCO/private form, common in modern TUI diff renderers).
             ('s', []) if params_vec.iter().all(|&param| param == 0) => {
                 self.save_cursor_state();
@@ -1274,10 +1269,8 @@ impl<'a> vte::Perform for VtHandler<'a> {
             (b'=', []) => self.modes.application_keypad = true,
             // DECPNM -- Normal keypad mode (ESC >).
             (b'>', []) => self.modes.application_keypad = false,
-            // HTS -- Horizontal Tab Set. shux currently models default
-            // 8-column tab stops, but accepting HTS avoids treating renderer
-            // setup bytes as unknown.
-            (b'H', []) => {}
+            // HTS -- Horizontal Tab Set.
+            (b'H', []) => self.tab_stops.set(self.cursor.col),
             // RI -- Reverse Index (ESC M).
             (b'M', []) => self.reverse_index(),
             // IND -- Index (ESC D) -- move cursor down, scroll if needed.
@@ -1296,6 +1289,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 *self.default_colors = TerminalDefaultColors::default();
                 self.sync_present.take();
                 self.reset_charsets();
+                self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
                 self.scroll_region.bottom = self.grid.rows().saturating_sub(1);
             }
@@ -1819,6 +1813,7 @@ mod tests {
         sync_present: Option<SyncPresentation>,
         active_grapheme_cell: Option<(usize, usize)>,
         charsets: TerminalCharsets,
+        tab_stops: TabStops,
         responses: Vec<Vec<u8>>,
         parser: vte::Parser,
     }
@@ -1841,6 +1836,7 @@ mod tests {
                 sync_present: None,
                 active_grapheme_cell: None,
                 charsets: TerminalCharsets::default(),
+                tab_stops: TabStops::new(cols),
                 responses: Vec::new(),
                 parser: vte::Parser::new(),
             }
@@ -1860,6 +1856,7 @@ mod tests {
                 sync_present: &mut self.sync_present,
                 active_grapheme_cell: &mut self.active_grapheme_cell,
                 charsets: &mut self.charsets,
+                tab_stops: &mut self.tab_stops,
                 responses: &mut self.responses,
             };
             self.parser.advance(&mut handler, bytes);
@@ -1917,6 +1914,52 @@ mod tests {
         assert_eq!(t.grid.visible_row(0)[0].ch, 'A');
         assert_eq!(t.cursor.col, 9); // 'B' at col 8, cursor at 9
         assert_eq!(t.grid.visible_row(0)[8].ch, 'B');
+    }
+
+    #[test]
+    fn tab_honor_hts_without_losing_default_stops() {
+        let mut t = TestTerminal::new(3, 40);
+        t.process(b"\x1b[13G\x1bH\r\tA\tB\tC");
+        let row = t.grid.visible_row(0);
+        assert_eq!(row[8].ch, 'A');
+        assert_eq!(row[12].ch, 'B');
+        assert_eq!(row[16].ch, 'C');
+    }
+
+    #[test]
+    fn tab_clear_current_preserves_other_default_stops() {
+        let mut t = TestTerminal::new(3, 40);
+        t.process(b"\x1b[9G\x1b[g\r\tX");
+        let row = t.grid.visible_row(0);
+        assert_eq!(row[8].ch, ' ');
+        assert_eq!(row[16].ch, 'X');
+    }
+
+    #[test]
+    fn tab_clear_all_clamps_forward_and_backward() {
+        let mut t = TestTerminal::new(3, 20);
+        t.process(b"\x1b[3g\r\tX\x1b[2ZB");
+        let row = t.grid.visible_row(0);
+        assert_eq!(row[19].ch, 'X');
+        assert_eq!(row[0].ch, 'B');
+    }
+
+    #[test]
+    fn tab_forward_and_backward_counts_use_custom_stops() {
+        let mut t = TestTerminal::new(3, 40);
+        t.process(b"\x1b[13G\x1bH\r\x1b[3IY\x1b[21G\x1b[2ZX");
+        let row = t.grid.visible_row(0);
+        assert_eq!(row[16].ch, 'Y');
+        assert_eq!(row[12].ch, 'X');
+    }
+
+    #[test]
+    fn decstr_does_not_reset_tab_stops() {
+        let mut t = TestTerminal::new(3, 40);
+        t.process(b"\x1b[9G\x1b[g\x1b[!p\r\tX");
+        let row = t.grid.visible_row(0);
+        assert_eq!(row[8].ch, ' ');
+        assert_eq!(row[16].ch, 'X');
     }
 
     #[test]

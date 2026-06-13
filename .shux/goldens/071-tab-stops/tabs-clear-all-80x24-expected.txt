@@ -1,0 +1,3 @@
+SHUX_TAB_START tabs-clear-all-80x24
+clear-all:                                                                     Z
+SHUX_TAB_END tabs-clear-all-80x24

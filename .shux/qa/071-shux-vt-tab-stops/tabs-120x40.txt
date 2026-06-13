@@ -1,0 +1,4 @@
+SHUX_TAB_START tabs-120x40
+preserved:  A   B
+                                                                                        W
+SHUX_TAB_END tabs-120x40

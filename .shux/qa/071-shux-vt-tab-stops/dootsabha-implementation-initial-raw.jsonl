@@ -1,0 +1,103 @@
+{
+  "dispatch": [
+    {
+      "provider": "codex",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke codex: codex invoke: subprocess \"codex\": context deadline exceeded"
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-3.1-pro-preview",
+      "content": "Here is the implementation-diff review for Task 071 (shux-vt mutable tab stops):\n\n### 1. Correctness \u0026 Logic\n**Verdict:** Solid. The implementation handles the edge cases perfectly.\n- **Counts \u0026 Clamping:** `next_from()` and `prev_from()` correctly loop over counts, defaulting to 1 (via `count.max(1)` and parameter filtering), and safely clamp to `width - 1` or `0` when `next_after` / `prev_before` yield `None`. \n- **`auto_wrap_pending`:** Correctly cleared on all tab movements (`HT`, `CHT`, `CBT`) in `parser.rs`, while `HTS` and `TBC` (which are state mutations, not cursor movements) correctly leave the wrap state untouched.\n- **Grapheme Anchors:** Properly cleared at the top of `execute`, `esc_dispatch`, and `csi_dispatch`, covering all tab movements and mutations.\n- **Narrow-then-Widen Resurrection:** Correctly handled. `stops.truncate()` physically drops custom stops beyond the new width, preventing them from coming back on a subsequent widen, which matches terminal-state resize semantics.\n\n### 2. Design-Council Must-Fixes\n**Verdict:** All 5 items are directly and accurately addressed.\n1. **State-seeding:** Fully addressed. Transitioning to a flat `Vec\u003cbool\u003e` populated with `col \u003e 0 \u0026\u0026 col % 8 == 0` at initialization guarantees that setting/clearing a single stop (`set()`, `clear_current()`) just flips one bit and doesn't wipe other defaults.\n2. **Resize-wider parity:** Fully addressed. Uses `extend_defaults` to continue extending 8-column defaults when growing width, but `TBC 3` explicitly sets `extend_defaults = false` to prevent recreation.\n3. **Reject DECSTR resetting tabs:** Fully addressed. `CSI ! p` falls through to the unhandled `_` match arm in `csi_dispatch`, so it does nothing to tabs. The `decstr_does_not_reset_tab_stops` test explicitly verifies this.\n4. **Column 0 is not a default stop:** Fully addressed in `default_stop()` (`col \u003e 0 \u0026\u0026 ...`).\n5. **Bitmap representation:** Fully addressed. Uses `Vec\u003cbool\u003e` instead of `BTreeSet`, granting `O(1)` state lookups in the hot path.\n\n### 3. Missing Tests / Evidence Gaps\n* **P2 Gap (Alternate Screen Preservation):** `crates/shux-vt/src/parser.rs` correctly avoids swapping or resetting `tab_stops` when entering/leaving the alternate screen (`DECSET 1047` / `1049`). However, **there is no unit test proving this behavior.** You must add a test confirming that custom tab stops set in the primary screen remain active in the alternate screen, and vice-versa, to prevent future regressions.\n\n*(Note: Width-boundary HT clamp is implicitly tested inside `tab_clear_all_clamps_forward_and_backward`, which relies on `stops.len() - 1` clamping, so that coverage is sufficient).*",
+      "duration_ms": 242640,
+      "cost_usd": 0,
+      "tokens_in": 223725,
+      "tokens_out": 1376
+    }
+  ],
+  "reviews": null,
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 242640,
+    "total_cost_usd": 0,
+    "total_tokens_in": 223725,
+    "total_tokens_out": 1376,
+    "providers": {
+      "codex": "error",
+      "gemini": "ok"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "synthesis: synthesize fallback gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+  }
+}
+**Pixel baseline points at a self-minted copy.** `tabs-80x24-pixel.json` compares against `.shux/qa/.../tabs-80x24-expected.png` (a copy inside the QA dir), not the governed `.shux/goldens/071-tab-stops/` baseline the Testing Matrix names. Per CLAUDE.md an implementation \"cannot mint its own expected PNG in the same pass and call it proof\" — the golden needs to be the committed, design-approved one.\n\n### Missing tests worth adding before PR\n- Width-boundary HT clamp (explicit `width-1`).\n- Alt-screen switch preserves tab stops.\n- `TBC 3` → HTS → resize-wider (the `extend_defaults` latch).\n\nI'll fold the codex + gemini council verdict in as soon as it returns and flag any net-new P1/P2 they surface.",
+      "duration_ms": 380883,
+      "cost_usd": 1.7393680000000002,
+      "tokens_in": 16134,
+      "tokens_out": 16478
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-3.1-pro-preview",
+      "content": "An implementation review of task 071 (mutable tab stops) yields the following assessment against the code and the DootSabha design council directives.\n\n### 1. Correctness Bugs (None Found)\nThere are no P1/P2 correctness bugs. The implementation is highly robust:\n* **State \u0026 State Seeding:** The `Vec\u003cbool\u003e` implementation completely sidesteps the state-seeding trap. Setting (`HTS`) or clearing (`TBC 0`) single stops correctly modifies the bitmap in `O(1)` without dropping untouched 8-column defaults.\n* **Parser Integration:** `HT`, `CHT`, and `CBT` all delegate to the bitmap correctly and properly clear `auto_wrap_pending`. Grapheme anchors are correctly cleared upstream by `clear_active_grapheme_cell()` at the beginning of `execute`, `esc_dispatch`, and `csi_dispatch`.\n* **Clamping:** Tab boundaries gracefully clamp to the left (`0`) and right (`stops.len() - 1`) margins if there are no more stops. \n* **Resetting:** `RIS` correctly triggers `reset()`, while `DECSTR` correctly bypasses the reset, fulfilling the standard VT spec.\n\n### 2. Design-Council Must-Fixes\n**Both P1 must-fixes were successfully addressed:**\n* **State-seeding on Default→Explicit:** The developer heeded the council's advice, abandoning the fragile `Explicit(BTreeSet)` enum state in favor of a flat `Vec\u003cbool\u003e` (`TabStops`). Initializing `TabStops` pre-seeds all 8-column boundaries, ensuring point mutations like `HTS` never accidentally wipe the board.\n* **Resize-wider parity:** The developer implemented the xterm-faithful \"preserve-and-extend\" model. `resize()` now correctly iterates over `old_cols..cols` and appends `extend_defaults \u0026\u0026 Self::default_stop(col)`. `TBC 3` properly disables future default extension.\n\n### 3. Missing Tests \u0026 DoD Evidence Gaps (Actionable)\n* **P3 (Missing Test Logic):** The test `tab_forward_and_backward_counts_use_custom_stops` only contains logic for backward counts (`\\x1b[2ZX` / `CBT`). You must add an assertion for forward counts (`CSI Ps I` / `CHT`) to fully satisfy the \"CHT and CBT honor custom stops and counts\" requirement.\n* **DoD Gap (Artifact Location):** The `evidence-manifest.json`, `pixel-report.json`, and `synthetic-tab-stops-diff.png` appear to have been generated and committed under the `073` corpus regression folder instead of `.shux/qa/071-shux-vt-tab-stops/` as required by the Task 071 DoD.\n* **DoD Gap (SOLID QA):** The `shux-vt-solid-qa` hard-gate step hasn't been run yet (`SOLID-QA.md` is missing). \n\n**Verdict:** The core VT logic is excellent and ready for merge. Fix the missing `CHT` test case and ensure the QA artifacts are generated into the correct `071` directory before invoking SOLID QA.",
+      "duration_ms": 223277,
+      "cost_usd": 0,
+      "tokens_in": 124651,
+      "tokens_out": 1125
+    }
+  ],
+  "reviews": [
+    {
+      "reviewer": "claude",
+      "reviewed": [
+        "gemini"
+      ],
+      "content": "",
+      "error": "review by claude: claude invoke: subprocess \"claude\": context deadline exceeded"
+    },
+    {
+      "reviewer": "gemini",
+      "reviewed": [
+        "claude"
+      ],
+      "content": "",
+      "error": "review by gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    }
+  ],
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 604160,
+    "total_cost_usd": 1.7393680000000002,
+    "total_tokens_in": 140785,
+    "total_tokens_out": 17603,
+    "providers": {
+      "claude": "ok",
+      "gemini": "ok"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "synthesis: synthesize fallback gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+  }
+}

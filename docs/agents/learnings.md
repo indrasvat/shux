@@ -3,6 +3,13 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-06-12 (task 071 tab stops):** Mutable tab stops are terminal state,
+  not parser-local cursor math. A flat bitmap seeded with `col > 0 && col % 8 ==
+  0` avoids the Default-to-Explicit trap where first HTS/TBC wipes existing
+  defaults. `TBC 3` needs a separate latch so resize growth does not resurrect
+  cleared defaults, while local HTS/TBC mutations can still extend default
+  8-column stops on grow. RIS resets tabs; DECSTR and alternate-screen switches
+  must not.
 - **2026-06-12 (task 070 DEC special graphics):** DEC charset selection is VT
   state, not parser-handler scratch state. Store G0/G1 and active GL selection
   on `VirtualTerminal`, translate only in `print()`, reset on RIS, and snapshot

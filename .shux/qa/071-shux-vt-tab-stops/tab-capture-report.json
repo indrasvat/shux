@@ -1,0 +1,38 @@
+{
+  "checks": [
+    {
+      "cols": 80,
+      "custom_A_col_8": true,
+      "custom_B_col_12": true,
+      "custom_C_col_16": true,
+      "default_A_col_16": true,
+      "default_B_col_24": true,
+      "kind": "initial",
+      "label": "tabs-80x24",
+      "preserved_A_col_12": true,
+      "preserved_B_col_16": true
+    },
+    {
+      "cols": 120,
+      "kind": "resize-wide",
+      "label": "tabs-120x40",
+      "preserved_A_col_12": true,
+      "preserved_B_col_16": true,
+      "resize_wide_default_col_88": true
+    },
+    {
+      "cols": 80,
+      "kind": "resize-return",
+      "label": "tabs-return-80x24",
+      "preserved_A_col_12": true,
+      "preserved_B_col_16": true
+    },
+    {
+      "clear_all_Z_last_col": true,
+      "cols": 80,
+      "kind": "clear-all",
+      "label": "tabs-clear-all-80x24"
+    }
+  ],
+  "status": "pass"
+}

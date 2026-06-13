@@ -1,0 +1,3 @@
+SHUX_TAB_START tabs-return-80x24
+preserved:  A   B
+SHUX_TAB_END tabs-return-80x24

@@ -9,6 +9,7 @@ mod charset;
 mod cursor;
 mod grid;
 mod parser;
+mod tabstops;
 
 pub use cell::{
     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
@@ -17,6 +18,7 @@ pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use grid::{Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
+pub use tabstops::TabStops;
 
 use vte::Parser;
 
@@ -64,6 +66,8 @@ pub struct VirtualTerminal {
     active_grapheme_cell: Option<(usize, usize)>,
     /// VT100 G0/G1 charset designations and active locking shift.
     charsets: TerminalCharsets,
+    /// Mutable horizontal tab-stop state.
+    tab_stops: TabStops,
     /// Number of visible rows.
     rows: usize,
     /// Number of columns.
@@ -95,6 +99,7 @@ impl VirtualTerminal {
             sync_present: None,
             active_grapheme_cell: None,
             charsets: TerminalCharsets::default(),
+            tab_stops: TabStops::new(cols),
             rows,
             cols,
         }
@@ -133,6 +138,7 @@ impl VirtualTerminal {
             sync_present: &mut self.sync_present,
             active_grapheme_cell: &mut self.active_grapheme_cell,
             charsets: &mut self.charsets,
+            tab_stops: &mut self.tab_stops,
             responses: &mut responses,
         };
         self.parser.advance(&mut handler, bytes);
@@ -231,6 +237,7 @@ impl VirtualTerminal {
         }
         self.rows = rows;
         self.cols = cols;
+        self.tab_stops.resize(cols);
         self.scroll_region = ScrollRegion {
             top: 0,
             bottom: rows.saturating_sub(1),
@@ -1091,6 +1098,49 @@ mod tests {
         assert_eq!(vt.grid().visible_row(1)[20].ch, 'Z');
         vt.process(b"\x1b[5`H");
         assert_eq!(vt.grid().visible_row(1)[4].ch, 'H');
+    }
+
+    #[test]
+    fn tab_stops_resize_preserves_custom_and_extends_defaults() {
+        let mut vt = VirtualTerminal::new(2, 16);
+        vt.process(b"\x1b[13G\x1bH");
+        vt.resize(2, 40);
+        vt.process(b"\r\x1b[13G\x1b[IX");
+        assert_eq!(vt.grid().visible_row(0)[16].ch, 'X');
+    }
+
+    #[test]
+    fn tab_stops_clear_all_survives_resize_growth() {
+        let mut vt = VirtualTerminal::new(2, 16);
+        vt.process(b"\x1b[3g");
+        vt.resize(2, 40);
+        vt.process(b"\r\tX");
+        assert_eq!(vt.grid().visible_row(0)[39].ch, 'X');
+    }
+
+    #[test]
+    fn tab_stops_clear_all_then_hts_does_not_restore_resize_defaults() {
+        let mut vt = VirtualTerminal::new(2, 16);
+        vt.process(b"\x1b[3g\x1b[13G\x1bH");
+        vt.resize(2, 40);
+        vt.process(b"\r\x1b[13G\x1b[IX");
+        assert_eq!(vt.grid().visible_row(0)[39].ch, 'X');
+    }
+
+    #[test]
+    fn tab_stops_survive_alternate_screen_switch() {
+        let mut vt = VirtualTerminal::new(4, 40);
+        vt.process(b"\x1b[13G\x1bH\x1b[?1049h\x1b[?1049l\r\tA\tB");
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[8].ch, 'A');
+        assert_eq!(row[12].ch, 'B');
+    }
+
+    #[test]
+    fn tab_stops_ris_restores_defaults() {
+        let mut vt = VirtualTerminal::new(2, 40);
+        vt.process(b"\x1b[3g\x1bc\r\tX");
+        assert_eq!(vt.grid().visible_row(0)[8].ch, 'X');
     }
 
     #[test]
