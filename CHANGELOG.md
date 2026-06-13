@@ -1,3 +1,10 @@
+# [0.34.0](https://github.com/indrasvat/shux/compare/v0.33.0...v0.34.0) (2026-06-13)
+
+
+### Features
+
+* **vt:** correct origin mode scroll regions ([bd9e170](https://github.com/indrasvat/shux/commit/bd9e170fc68f8c7f8d24c438a1377a68ca97c0db))
+
 # [0.33.0](https://github.com/indrasvat/shux/compare/v0.32.0...v0.33.0) (2026-06-13)
 
 
