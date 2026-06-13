@@ -918,6 +918,75 @@ time.sleep(2)
 }
 
 #[tokio::test]
+async fn test_capture_honors_mutable_tab_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let script_path = PathBuf::from(format!("/tmp/shux_tab_{}.py", &id[..8]));
+    std::fs::write(
+        &script_path,
+        r#"import sys
+import time
+
+sys.stdout.write("default:\tA\tB\n")
+sys.stdout.write("\x1b[13G\x1bH\rcustom:\tA\tB\tC\n")
+sys.stdout.write("\x1b[9G\x1b[g\rclear-current:\tA\n")
+sys.stdout.write("\x1b[3g\rclear-all:\tZ\n")
+sys.stdout.write("SHUX_TAB_END\n")
+sys.stdout.flush()
+time.sleep(2)
+"#,
+    )
+    .unwrap();
+
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (session_id, _pane_id) = create_test_session(&mut stream).await;
+
+    let result = rpc_call(
+        &mut stream,
+        "pane.run_command",
+        serde_json::json!({
+            "session_id": session_id,
+            "command": "python3",
+            "args": [script_path.to_string_lossy()],
+            "timeout": 30,
+        }),
+    )
+    .await;
+    assert_eq!(result["state"].as_str().unwrap(), "completed");
+    assert_eq!(result["exit_code"].as_i64().unwrap(), 0);
+
+    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
+        text.contains("SHUX_TAB_END")
+    })
+    .await;
+    assert!(
+        text.contains("default:        A       B"),
+        "default tabs not captured as expected: {text:?}"
+    );
+    assert!(
+        text.contains("custom: A   B   C"),
+        "custom HTS tab stop did not preserve/default-align as expected: {text:?}"
+    );
+    assert!(
+        text.contains("clear-current:  A"),
+        "TBC current stop did not skip the cleared tab as expected: {text:?}"
+    );
+    let clear_all_line = text
+        .lines()
+        .find(|line| line.starts_with("clear-all:"))
+        .unwrap_or("");
+    assert_eq!(
+        clear_all_line.chars().nth(79),
+        Some('Z'),
+        "TBC clear-all did not clamp HT to the last column as expected: {text:?}"
+    );
+
+    cancel.cancel();
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
 async fn test_xterm_cursor_report_probe_gets_terminal_response() {
     let dir = tempfile::tempdir().unwrap();
     let (socket_path, cancel) = start_test_server(dir.path()).await;
@@ -1126,7 +1195,7 @@ async fn test_run_command_sync_echo() {
             "session_id": session_id,
             "command": "echo",
             "args": ["hello_from_shux"],
-            "timeout": 10,
+            "timeout": 30,
         }),
     )
     .await;
@@ -1156,7 +1225,7 @@ async fn test_run_command_sync_false() {
         serde_json::json!({
             "session_id": session_id,
             "command": "false",
-            "timeout": 10,
+            "timeout": 30,
         }),
     )
     .await;

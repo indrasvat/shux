@@ -52,6 +52,14 @@
       ]
     },
     {
+      "name": "tab-stops",
+      "description": "mutable HTS/TBC tab stops align custom table columns",
+      "init": {"rows": 8, "cols": 40},
+      "steps": [
+        {"process": {"text": "default:\tA\tB\r\n\u001b[13G\u001bH\rcustom:\tA\tB\tC\r\n\u001b[9G\u001b[g\rclear-current:\tA\r\n\u001b[3g\rclear-all:\tZ"}}
+      ]
+    },
+    {
       "name": "origin-response",
       "description": "cursor report response after absolute positioning",
       "init": {"rows": 24, "cols": 80},

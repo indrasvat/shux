@@ -1,0 +1,30 @@
+{
+  "task": "071-shux-vt-tab-stops",
+  "capture_report": "tab-capture-report.json",
+  "screenshots": [
+    "tabs-80x24-actual.png",
+    "tabs-80x24-expected.png",
+    "tabs-80x24-diff.png",
+    "tabs-120x40-actual.png",
+    "tabs-120x40-expected.png",
+    "tabs-120x40-diff.png",
+    "tabs-return-80x24-actual.png",
+    "tabs-return-80x24-expected.png",
+    "tabs-return-80x24-diff.png",
+    "tabs-clear-all-80x24-actual.png",
+    "tabs-clear-all-80x24-expected.png",
+    "tabs-clear-all-80x24-diff.png"
+  ],
+  "pixel_metrics": [
+    "tabs-80x24-pixel.json",
+    "tabs-120x40-pixel.json",
+    "tabs-return-80x24-pixel.json",
+    "tabs-clear-all-80x24-pixel.json"
+  ],
+  "captures": [
+    "tabs-80x24.txt",
+    "tabs-120x40.txt",
+    "tabs-return-80x24.txt",
+    "tabs-clear-all-80x24.txt"
+  ]
+}

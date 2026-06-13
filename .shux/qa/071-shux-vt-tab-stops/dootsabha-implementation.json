@@ -1,0 +1,53 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "I have everything I need. Here's the review.\n\n---\n\n# DootSabha Implementation Review — Task 071 (mutable tab stops)\n\nVerified against `tabstops.rs`, `parser.rs` integration sites, `lib.rs`/`parser.rs` tests, the integration test, both council JSONs, and the committed QA/golden artifacts.\n\n## 1. Correctness (state / parser / resize / reset / capture)\n\n**No P1/P2 bugs found.** The `Vec<bool>` model is the right call and sidesteps the entire class of \"first mutation wipes defaults\" traps. Specifically confirmed:\n\n- **State seeding** — defaults are materialized at construction (`default_stop: col>0 && col%8==0`), so `set()`/`clear_current()` flip a single bit without disturbing other 8-col stops. `tabstops.rs:36-46`.\n- **Resize growth** — `extend_defaults` gates re-seeding of new columns; `clear_all()` (TBC 3) sets it `false` so cleared boards don't resurrect defaults on widen. `tabstops.rs:24-34, 48-51`. ✔ matches xterm.\n- **Clamping** — `next_from`/`prev_from` clamp to `cols-1` / `0` when no stop remains, count defaults via `count.max(1)`, start index clamped with `.min(len-1)`. No overflow/underflow paths. `tabstops.rs:53-79`.\n- **Parser integration** — HT (`0x09`), CHT (`I`), CBT (`Z`) all clear `auto_wrap_pending`; HTS (`ESC H`) and TBC (`g`) correctly leave wrap state untouched (they mutate stop state, not the cursor). Grapheme anchor cleared at top of `execute`/`csi_dispatch`/`esc_dispatch`. `parser.rs:798-801, 905-913, 1035-1037, 1273`.\n- **Reset semantics** — RIS (`ESC c`) calls `tab_stops.reset(cols)`; DECSTR (`CSI ! p`) falls through to `_` and does not touch tabs. `parser.rs:1292`. ✔\n- **Alt-screen / capture** — tab stops are VT-owned (not swapped on 1047/1049) and `resize()` calls `tab_stops.resize(cols)` once regardless of active screen; capture honours the stops via cursor placement. ✔\n\nOne semantic worth a sentence in the task notes (not a bug): CHT with a count exceeding remaining stops lands on the right margin (`cols-1`) rather than the last real stop — this is xterm-faithful, but it's the kind of thing a future reader will second-guess.\n\n## 2. Design-council must-fixes — addressed\n\n| Must-fix (design council) | Status |\n|---|---|\n| P1 seed defaults on first HTS/TBC0 (don't wipe) | ✔ Vec<bool> makes it structural |\n| P1 resize-wider re-adds 8-col defaults | ✔ `extend_defaults`, tested |\n| Column 0 is not a default stop | ✔ `col > 0` guard |\n| Bitmap over BTreeSet/enum modes | ✔ `Vec<bool>` |\n| **P2: \"DECSTR must reset tabs\"** | **Deliberately rejected — and correctly so** |\n\n⚠️ The gemini design council's P2 (\"DECSTR must reset tab stops\") is **factually wrong** per DEC STD 070 / xterm `ctlseqs` — DECSTR does *not* touch tab stops; only RIS (`TabReset`) does. The implementation correctly overrules it, and the `decstr_does_not_reset_tab_stops` test pins the behavior. **Action:** add one line to the task file / DESIGN noting \"council P2 evaluated and rejected as non-xterm-conformant\" so a reviewer doesn't read it as an unaddressed must-fix.\n\nTwo impl-council findings are already **stale/resolved** — flagging so they aren't re-raised: alt-screen preservation *is* tested (`tab_stops_survive_alternate_screen_switch`, `lib.rs:1131`), and CHT forward-count *is* tested (`\\x1b[3I` in `tab_forward_and_backward_counts_use_custom_stops`, `parser.rs:1950`).\n\n## 3. Missing tests / DoD evidence gaps — **blockers before PR**\n\n1. **🔴 BLOCKER — `crates/shux-vt/src/tabstops.rs` is untracked (`??`).** It's the core feature module; it compiles locally only because it's on disk. If not `git add`ed, the PR ships without the implementation. Stage it.\n2. **🔴 BLOCKER — VT hard gate not satisfied.** `.shux/qa/071-shux-vt-tab-stops/SOLID-QA.md` is **absent** (siblings 067–070, 073 all have one with `VERDICT: PASS` on line 1). Per CLAUDE.md the task cannot be marked done / PR opened without it.\n3. **🔴 BLOCKER — `evidence-manifest.json` missing under `.shux/qa/071-shux-vt-tab-stops/`.** DoD requires it there; it (plus `pixel-report.json` and `synthetic-tab-stops-diff.png`) currently live under the **073 corpus folder** instead. Relocate/duplicate into the 071 dir so the gate sees them.\n4. **🟡 P3 — Testing-Matrix row not actually covered.** \"Resize clamps/removes stops beyond width *without corrupting remaining stops*\" has no **shrink** test asserting a custom stop *below* the new width survives while one *above* is dropped (and not resurrected on regrow). Current resize tests cover grow + clear_all-grow only. Add a `resize(narrow)` unit test.\n5. **🟡 Hygiene — stray scratch files untracked in repo root** (`full_inputs.md`, `review_output.json`, `review_prompt.txt`, `run_review.py`, `run_review.sh`). Don't commit these; delete or gitignore.\n\n**Pixel evidence is good:** all three cells (80×24, 120×40, return-80×24) report `changed_pixels: 0`, `max_pixel_diff_ratio: 0.0`, `max_mean_channel_delta: 0.0` against committed `.shux/goldens/071-tab-stops/` baselines. Baseline minting is pre-authorized by `dootsabha-design.json` per the task, so that's clean. `make test-vt-tab-stops` exists (`Makefile:179`).\n\n---\n\n### Bottom line\nCode is **PR-ready on correctness** — no P1/P2 logic defects, must-fixes addressed (one correctly rejected). **Not gate-ready**: stage `tabstops.rs`, produce `SOLID-QA.md` (`VERDICT: PASS`) and `evidence-manifest.json` under the 071 dir, add the shrink-resize unit test, and clean the root scratch files. Run `make check` last.\n\nWant me to add the missing shrink-resize unit test and the one-line DECSTR rationale note, then stage `tabstops.rs`?",
+      "duration_ms": 283251,
+      "cost_usd": 1.5940500000000002,
+      "tokens_in": 14025,
+      "tokens_out": 14252
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-3.1-pro-preview",
+      "content": "### 1. Correctness Bugs (Tab-stop state, parser integration, resize, reset, capture)\n**Verdict: None. The implementation is exceptionally robust.**\n- **Tab-stop state:** Correctly and safely implemented as a flat `Vec<bool>` (`TabStops`). Out-of-bounds checks and empty-array edge cases are securely handled.\n- **Parser integration:** `HT`, `CHT`, `CBT`, `HTS`, and `TBC` perfectly wrap the new state. The missing parameter fallback for `CSI g` is correctly handled via `p(0, 0)`. Crucially, the active grapheme anchor is correctly cleared because `execute`, `csi_dispatch`, and `esc_dispatch` uniformly invoke `self.clear_active_grapheme_cell()` before routing the byte.\n- **Resize:** Safely truncates on shrink and correctly handles xterm's expansion semantics. \n- **Reset:** `RIS` fully restores default tabs, while `DECSTR` correctly leaves them untouched (matching DEC/VT specifications, directly validating the design chair's correction).\n- **Capture:** `test_capture_honors_mutable_tab_stops` confirms text alignment translates properly to pane output.\n\n### 2. Design-Council Must-Fixes\n**Verdict: Fully Addressed.**\n- **Must-fix 1 (State-seeding on Default->Explicit transition):** Addressed by taking the council's structural recommendation. By using a flat `Vec<bool>` pre-seeded with 8-column boundaries at initialization, the fragile `Default`/`Explicit` enum trap was completely avoided. `HTS` and `TBC 0` simply flip individual bits, preserving all other default stops naturally.\n- **Must-fix 2 (Resize-wider xterm parity):** Addressed via the elegant `extend_defaults` boolean. By default, resizing wider pushes new 8-column boundaries (matching xterm's fixed-array illusion). When `TBC 3` (clear all) is called, `extend_defaults` is set to `false`, ensuring subsequent resize growths do not inappropriately spawn new default stops.\n\n### 3. Missing Tests or DoD Evidence Gaps\n**Verdict: There are explicit DoD evidence gaps preventing PR readiness.**\nWhile unit tests comprehensively cover the matrix and raw artifacts (`tabs-*-actual.png`, `tabs-*-pixel.json`, etc.) exist in `.shux/qa/071-shux-vt-tab-stops/`, the final administrative bounds have not been closed:\n- **Gap (P1 - Process):** Missing `.shux/qa/071-shux-vt-tab-stops/evidence-manifest.json`. The raw PNGs/reports are present, but the manifest bundling them for this specific task track is missing (the diff only shows it being added to the `073` corpus harness).\n- **Gap (P1 - Process):** Missing `.shux/qa/071-shux-vt-tab-stops/SOLID-QA.md`. The final `shux-vt-solid-qa` verification agent has not been run to issue the required `VERDICT: PASS`.\n- **Gap (P2 - Tracking):** The checkboxes in `docs/tasks/071-shux-vt-tab-stops.md` corresponding to the manifest, the QA report, and final task checks remain unchecked.",
+      "duration_ms": 396050,
+      "cost_usd": 0,
+      "tokens_in": 160921,
+      "tokens_out": 1766
+    }
+  ],
+  "reviews": [
+    {
+      "reviewer": "claude",
+      "reviewed": [
+        "gemini"
+      ],
+      "content": "",
+      "error": "review by claude: claude invoke: subprocess \"claude\": context deadline exceeded"
+    },
+    {
+      "reviewer": "gemini",
+      "reviewed": [
+        "claude"
+      ],
+      "content": "",
+      "error": "review by gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    }
+  ],
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 679301,
+    "total_cost_usd": 1.5940500000000002,
+    "total_tokens_in": 174946,
+    "total_tokens_out": 16018,
+    "providers": {
+      "claude": "ok",
+      "gemini": "ok"
+    }
+  }
+}

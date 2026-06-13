@@ -1,0 +1,46 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "Both background tasks are tracked; I'll be re-invoked when the council completes. Waiting.",
+      "duration_ms": 106449,
+      "cost_usd": 1.7561505,
+      "tokens_in": 17549,
+      "tokens_out": 5526
+    },
+    {
+      "provider": "gemini",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    }
+  ],
+  "reviews": null,
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 106449,
+    "total_cost_usd": 1.7561505,
+    "total_tokens_in": 17549,
+    "total_tokens_out": 5526,
+    "providers": {
+      "claude": "ok",
+      "gemini": "error"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "synthesis: synthesize: no healthy agents available for synthesis"
+  }
+}

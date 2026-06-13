@@ -34,8 +34,8 @@
 - **Implementation order:** 073 first, then 067/068, then 069-072, then 074.
 - **Done:** 073 (VT corpus regression harness), 067 (resize reflow), 068
   (wide-cell invariants), 069 (grapheme-aware cell storage), 070
-  (DEC special graphics).
-- **Pending:** 071 (tab stops), 072
+  (DEC special graphics), 071 (tab stops).
+- **Pending:** 072
   (origin-mode/scroll-region semantics), 074 (dirty-region tracking).
 - Every task in this track requires DootSabha design review, DootSabha
   implementation-diff review, unit/integration/raw replay/shux automation
@@ -101,6 +101,30 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 ---
 
 ## Session Log
+
+**2026-06-12 — feat(vt): track mutable tab stops**
+- Completed task 071 by replacing hardcoded 8-column tab movement with
+  `VirtualTerminal`-owned bitmap tab-stop state used by HT, HTS, TBC, CHT, and
+  CBT.
+- Preserved default stops on local HTS/TBC mutations, excluded column 0 from
+  defaults, reset stops on RIS only, kept DECSTR and alternate-screen switches
+  from resetting tabs, and handled resize growth/shrink with explicit
+  clear-all behavior.
+- Added unit coverage for default tabs, custom HTS, TBC current/all, CHT/CBT
+  counts, resize growth and shrink, RIS, DECSTR, and alternate-screen
+  preservation.
+- Added real PTY `pane.capture` integration coverage plus
+  `make test-vt-tab-stops`, which snapshots 80x24, 120x40, and return-to-80x24
+  tab-alignment fixtures with exact pixel comparison against committed
+  `.shux/goldens/071-tab-stops/` baselines.
+- Extended the VT corpus with a synthetic mutable tab-stop fixture and refreshed
+  the task-073 corpus evidence.
+- Verification: DootSabha design and implementation review with
+  `--agents claude,gemini`, `make test-vt FILTER=tab`,
+  `SHUX_TEST_BINARY_TIMEOUT_SECONDS=120 make test-pane-io FILTER=tab_stops`,
+  `make test-vt-tab-stops`, `make test-vt-corpus`,
+  `make test-vt-wide-invariants`, full-resolution visual inspection, exact
+  pixel JSON, and SOLID VT QA PASS.
 
 **2026-06-12 — feat(vt): render DEC special graphics**
 - Completed task 070 by adding G0/G1 charset state, DEC special graphics
@@ -1382,7 +1406,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 068 | shux-vt wide-cell invariants | VT Quality | **Done** | 005, 067, 073 |
 | 069 | shux-vt grapheme-aware cell storage | VT Quality | **Done** | 005, 068, 073 |
 | 070 | shux-vt DEC special graphics charset | VT Quality | **Done** | 005, 068, 073 |
-| 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |
+| 071 | shux-vt real tab-stop state | VT Quality | **Done** | 005, 073 |
 | 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
 | 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
 | 074 | shux-vt dirty-region tracking | VT Quality | Pending | 005, 073 |

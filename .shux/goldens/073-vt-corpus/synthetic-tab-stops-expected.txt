@@ -1,0 +1,4 @@
+default:        A       B
+custom: A   B   C
+clear-current:  A
+clear-all:                             Z

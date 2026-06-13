@@ -1,0 +1,5 @@
+SHUX_TAB_START tabs-80x24
+default:        A       B
+custom: A   B   C
+preserved:  A   B
+SHUX_TAB_END tabs-80x24
