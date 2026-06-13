@@ -1,3 +1,10 @@
+# [0.31.0](https://github.com/indrasvat/shux/compare/v0.30.0...v0.31.0) (2026-06-13)
+
+
+### Features
+
+* **vt:** preserve grapheme cell payloads ([8ad8749](https://github.com/indrasvat/shux/commit/8ad8749c0229ac4ece345beabcd1842a9136e727))
+
 # [0.30.0](https://github.com/indrasvat/shux/compare/v0.29.0...v0.30.0) (2026-06-12)
 
 
