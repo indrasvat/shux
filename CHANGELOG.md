@@ -1,3 +1,10 @@
+# [0.32.0](https://github.com/indrasvat/shux/compare/v0.31.0...v0.32.0) (2026-06-13)
+
+
+### Features
+
+* **vt:** render DEC special graphics ([d7bc3fd](https://github.com/indrasvat/shux/commit/d7bc3fd230e83504c4729e72f85a8638a9a1e6d7))
+
 # [0.31.0](https://github.com/indrasvat/shux/compare/v0.30.0...v0.31.0) (2026-06-13)
 
 
