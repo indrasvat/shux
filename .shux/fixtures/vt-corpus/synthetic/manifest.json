@@ -36,11 +36,11 @@
       ]
     },
     {
-      "name": "dec-special-graphics-current",
-      "description": "DEC special graphics fixture tracks current parser behavior until task 070 upgrades it",
+      "name": "dec-special-graphics",
+      "description": "DEC special graphics fixture renders VT100 line drawing as Unicode box drawing after task 070",
       "init": {"rows": 8, "cols": 40},
       "steps": [
-        {"process": {"text": "\u001b(0lqk\u001b(B ascii"}}
+        {"process": {"text": "\u001b(0lqkxmj\u001b(B ascii"}}
       ]
     },
     {

@@ -1,0 +1,12 @@
+SHUX_DEC_START
+g0-box: ┌────┐
+        │    │  ascii-safe
+        └────┘
+g1-shift: A┌─┐│└┘Z
+redesignate: ─q
+full-map:  ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·
+color-boundary: ├───┤ text
+unicode-direct: ┌─┐│└┘ stays
+wide-safe: 你─
+rep: ────
+SHUX_DEC_END

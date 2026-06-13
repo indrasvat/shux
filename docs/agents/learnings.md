@@ -3,6 +3,13 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-06-12 (task 070 DEC special graphics):** DEC charset selection is VT
+  state, not parser-handler scratch state. Store G0/G1 and active GL selection
+  on `VirtualTerminal`, translate only in `print()`, reset on RIS, and snapshot
+  the charset set inside `SavedCursor` so DECSC/DECRC and 1049 alternate-screen
+  transitions cannot clobber nested saved state. Baseline promotion for charset
+  rendering must remain separate from verification and tied to DootSabha-approved
+  fixture content; otherwise exact pixel matching can become a same-run proof.
 - **2026-06-12 (task 069 grapheme storage):** Grapheme payloads are cell
   content, not cursor/style state. Store them only on the target cell and use
   `Arc::make_mut` so hyperlink/underline attrs shared by a styled run remain

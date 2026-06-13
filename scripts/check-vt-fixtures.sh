@@ -69,7 +69,7 @@ elif command -v jq >/dev/null 2>&1; then
     if ! jq -e '.fixtures | type == "array" and length > 0' "$SYNTHETIC_MANIFEST" >/dev/null 2>&1; then
         add_error "Synthetic VT fixture manifest must contain a non-empty fixtures array"
     fi
-    for required in resize-smoke wide-cjk grapheme-storage-current dec-special-graphics-current tabs-current origin-response osc-default-colors alternate-screen scroll-region sync-output; do
+    for required in resize-smoke wide-cjk grapheme-storage-current dec-special-graphics tabs-current origin-response osc-default-colors alternate-screen scroll-region sync-output; do
         if ! jq -e --arg name "$required" '.fixtures | any(.name == $name)' "$SYNTHETIC_MANIFEST" >/dev/null 2>&1; then
             add_error "Synthetic VT fixture manifest missing required fixture '$required'"
         fi

@@ -1,0 +1,658 @@
+diff --git i/.shux/fixtures/vt-corpus/synthetic/manifest.json w/.shux/fixtures/vt-corpus/synthetic/manifest.json
+index 076ced1..993d725 100644
+--- i/.shux/fixtures/vt-corpus/synthetic/manifest.json
++++ w/.shux/fixtures/vt-corpus/synthetic/manifest.json
+@@ -36,11 +36,11 @@
+       ]
+     },
+     {
+-      "name": "dec-special-graphics-current",
+-      "description": "DEC special graphics fixture tracks current parser behavior until task 070 upgrades it",
++      "name": "dec-special-graphics",
++      "description": "DEC special graphics fixture renders VT100 line drawing as Unicode box drawing after task 070",
+       "init": {"rows": 8, "cols": 40},
+       "steps": [
+-        {"process": {"text": "\u001b(0lqk\u001b(B ascii"}}
++        {"process": {"text": "\u001b(0lqkxmj\u001b(B ascii"}}
+       ]
+     },
+     {
+diff --git i/Makefile w/Makefile
+index 1911cee..14664c7 100644
+--- i/Makefile
++++ w/Makefile
+@@ -169,6 +169,12 @@ test-vt-grapheme: release ## Drive shux grapheme storage visual/pixel automation
+ 	@.shux/scripts/grapheme_check.sh
+ 	@echo "$(COLOR_GREEN)✓ VT grapheme storage automation passed$(COLOR_RESET)"
+ 
++.PHONY: test-vt-dec-special-graphics
++test-vt-dec-special-graphics: release ## Drive DEC special graphics visual/pixel automation
++	@echo "$(COLOR_BLUE)▶ Running VT DEC special graphics automation...$(COLOR_RESET)"
++	@.shux/scripts/dec_special_graphics_check.sh
++	@echo "$(COLOR_GREEN)✓ VT DEC special graphics automation passed$(COLOR_RESET)"
++
+ .PHONY: test-vt-grapheme-performance
+ test-vt-grapheme-performance: ## Measure grapheme storage performance on ASCII VT path
+ 	@echo "$(COLOR_BLUE)▶ Measuring VT grapheme storage performance...$(COLOR_RESET)"
+diff --git i/crates/shux-vt/src/cursor.rs w/crates/shux-vt/src/cursor.rs
+index 2131560..cddefa8 100644
+--- i/crates/shux-vt/src/cursor.rs
++++ w/crates/shux-vt/src/cursor.rs
+@@ -1,6 +1,7 @@
+ use std::sync::Arc;
+ 
+ use crate::cell::{CellStyle, ExtendedAttrs};
++use crate::charset::TerminalCharsets;
+ 
+ /// Cursor shape.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+@@ -20,6 +21,7 @@ pub struct SavedCursor {
+     pub extended: Option<Arc<ExtendedAttrs>>,
+     pub auto_wrap_pending: bool,
+     pub origin_mode: bool,
++    pub charsets: TerminalCharsets,
+ }
+ 
+ /// Terminal cursor state.
+@@ -59,7 +61,7 @@ impl Cursor {
+     }
+ 
+     /// Save cursor state (DECSC -- ESC 7).
+-    pub fn save(&mut self, origin_mode: bool) {
++    pub fn save(&mut self, origin_mode: bool, charsets: TerminalCharsets) {
+         self.saved = Some(SavedCursor {
+             row: self.row,
+             col: self.col,
+@@ -67,18 +69,19 @@ impl Cursor {
+             extended: self.extended.clone(),
+             auto_wrap_pending: self.auto_wrap_pending,
+             origin_mode,
++            charsets,
+         });
+     }
+ 
+-    /// Restore cursor state (DECRC -- ESC 8). Returns the saved origin_mode.
+-    pub fn restore(&mut self) -> Option<bool> {
++    /// Restore cursor state (DECRC -- ESC 8). Returns saved origin_mode and charsets.
++    pub fn restore(&mut self) -> Option<(bool, TerminalCharsets)> {
+         if let Some(ref saved) = self.saved.clone() {
+             self.row = saved.row;
+             self.col = saved.col;
+             self.style = saved.style;
+             self.extended = saved.extended.clone();
+             self.auto_wrap_pending = saved.auto_wrap_pending;
+-            Some(saved.origin_mode)
++            Some((saved.origin_mode, saved.charsets))
+         } else {
+             None
+         }
+@@ -128,7 +131,7 @@ mod tests {
+         cursor.style.flags.set(CellFlags::BOLD);
+         cursor.auto_wrap_pending = true;
+ 
+-        cursor.save(true);
++        cursor.save(true, TerminalCharsets::default());
+ 
+         // Move cursor elsewhere.
+         cursor.row = 0;
+@@ -137,7 +140,7 @@ mod tests {
+         cursor.auto_wrap_pending = false;
+ 
+         let origin = cursor.restore();
+-        assert_eq!(origin, Some(true));
++        assert_eq!(origin, Some((true, TerminalCharsets::default())));
+         assert_eq!(cursor.row, 5);
+         assert_eq!(cursor.col, 10);
+         assert_eq!(cursor.style.fg, Color::Indexed(1));
+@@ -179,7 +182,7 @@ mod tests {
+         cursor.row = 5;
+         cursor.col = 10;
+         cursor.auto_wrap_pending = true;
+-        cursor.save(false);
++        cursor.save(false, TerminalCharsets::default());
+ 
+         cursor.clamp(2, 3);
+         cursor.row = 0;
+@@ -196,13 +199,13 @@ mod tests {
+         let mut cursor = Cursor::new();
+         cursor.row = 3;
+         cursor.col = 7;
+-        cursor.save(false);
++        cursor.save(false, TerminalCharsets::default());
+ 
+         // First restore.
+         cursor.row = 0;
+         cursor.col = 0;
+         let origin1 = cursor.restore();
+-        assert_eq!(origin1, Some(false));
++        assert_eq!(origin1, Some((false, TerminalCharsets::default())));
+         assert_eq!(cursor.row, 3);
+         assert_eq!(cursor.col, 7);
+ 
+@@ -210,7 +213,7 @@ mod tests {
+         cursor.row = 10;
+         cursor.col = 20;
+         let origin2 = cursor.restore();
+-        assert_eq!(origin2, Some(false));
++        assert_eq!(origin2, Some((false, TerminalCharsets::default())));
+         assert_eq!(cursor.row, 3);
+         assert_eq!(cursor.col, 7);
+     }
+diff --git i/crates/shux-vt/src/lib.rs w/crates/shux-vt/src/lib.rs
+index c60392b..7802462 100644
+--- i/crates/shux-vt/src/lib.rs
++++ w/crates/shux-vt/src/lib.rs
+@@ -5,6 +5,7 @@
+ //! vte crate parsing raw PTY output bytes.
+ 
+ mod cell;
++mod charset;
+ mod cursor;
+ mod grid;
+ mod parser;
+@@ -12,6 +13,7 @@ mod parser;
+ pub use cell::{
+     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
+ };
++pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
+ pub use cursor::{Cursor, CursorShape, SavedCursor};
+ pub use grid::{Grid, GridConfig, Row};
+ pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
+@@ -60,6 +62,8 @@ pub struct VirtualTerminal {
+     sync_present: Option<SyncPresentation>,
+     /// Visible cell currently accepting zero-width/joined grapheme scalars.
+     active_grapheme_cell: Option<(usize, usize)>,
++    /// VT100 G0/G1 charset designations and active locking shift.
++    charsets: TerminalCharsets,
+     /// Number of visible rows.
+     rows: usize,
+     /// Number of columns.
+@@ -90,6 +94,7 @@ impl VirtualTerminal {
+             dcs_state: None,
+             sync_present: None,
+             active_grapheme_cell: None,
++            charsets: TerminalCharsets::default(),
+             rows,
+             cols,
+         }
+@@ -127,6 +132,7 @@ impl VirtualTerminal {
+             dcs_state: &mut self.dcs_state,
+             sync_present: &mut self.sync_present,
+             active_grapheme_cell: &mut self.active_grapheme_cell,
++            charsets: &mut self.charsets,
+             responses: &mut responses,
+         };
+         self.parser.advance(&mut handler, bytes);
+@@ -1386,6 +1392,105 @@ mod tests {
+         assert_grid_wide_invariants(vt.grid());
+     }
+ 
++    #[test]
++    fn dec_special_graphics_maps_g0_line_drawing() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b(0lqkxmj\x1b(B ascii");
++
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "┌─┐│└┘ ascii");
++    }
++
++    #[test]
++    fn dec_special_graphics_maps_complete_standard_set() {
++        let mut vt = VirtualTerminal::new(2, 80);
++        vt.process(b"\x1b(0_`abcdefghijklmnopqrstuvwxyz{|}~");
++
++        assert_eq!(
++            vt.capture_text(Some(1)).trim_end(),
++            " ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·"
++        );
++    }
++
++    #[test]
++    fn dec_special_graphics_state_persists_across_process_chunks() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b(0");
++        vt.process(b"lqk");
++
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "┌─┐");
++    }
++
++    #[test]
++    fn dec_special_graphics_so_si_switches_g1_without_leaking() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b)0A\x0elqk\x0fZ");
++
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "A┌─┐Z");
++    }
++
++    #[test]
++    fn dec_special_graphics_dynamic_redesignation_updates_active_slot() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b)0\x0eq\x1b)Bq");
++
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "─q");
++    }
++
++    #[test]
++    fn dec_special_graphics_invalid_designation_falls_back_to_ascii() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b(0q\x1b(Xq");
++
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "─q");
++    }
++
++    #[test]
++    fn dec_special_graphics_rep_repeats_translated_cell() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b(0q\x1b[3b");
++
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "────");
++    }
++
++    #[test]
++    fn dec_special_graphics_ris_resets_charset_state() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b(0q\x1bcq");
++
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "q");
++    }
++
++    #[test]
++    fn dec_special_graphics_desc_decrc_restore_charset_state() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b[3C\x1b(0\x1b7\x1b(Ba\x1b8q");
++
++        let row = vt.grid().visible_row(0);
++        assert_eq!(row[3].ch, '─');
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "   ─");
++    }
++
++    #[test]
++    fn dec_special_graphics_1049_restore_keeps_primary_saved_charset() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(b"\x1b(0\x1b[?1049h\x1b(B\x1b7\x1b(0q\x1b8\x1b[?1049lq");
++
++        assert_eq!(vt.capture_text(Some(1)).trim_end(), "─");
++    }
++
++    #[test]
++    fn dec_special_graphics_does_not_translate_or_narrow_unicode_wide_cells() {
++        let mut vt = VirtualTerminal::new(2, 20);
++        vt.process(" \x1b(0你q".as_bytes());
++
++        let row = vt.grid().visible_row(0);
++        assert_eq!(row[1].ch, '你');
++        assert!(row[1].is_wide());
++        assert!(row[2].is_wide_continuation());
++        assert_eq!(row[3].ch, '─');
++        assert_grid_wide_invariants(vt.grid());
++    }
++
+     #[test]
+     fn test_sgr_256_color() {
+         let mut vt = VirtualTerminal::new(24, 80);
+diff --git i/crates/shux-vt/src/parser.rs w/crates/shux-vt/src/parser.rs
+index e78e636..2023a1c 100644
+--- i/crates/shux-vt/src/parser.rs
++++ w/crates/shux-vt/src/parser.rs
+@@ -6,6 +6,7 @@ use crate::SyncPresentation;
+ use crate::cell::{
+     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, TerminalDefaultColors, UnderlineStyle,
+ };
++use crate::charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
+ use crate::cursor::{Cursor, CursorShape};
+ use crate::grid::{Grid, GridConfig};
+ 
+@@ -104,6 +105,7 @@ pub struct VtHandler<'a> {
+     pub dcs_state: &'a mut Option<DcsState>,
+     pub sync_present: &'a mut Option<SyncPresentation>,
+     pub active_grapheme_cell: &'a mut Option<(usize, usize)>,
++    pub charsets: &'a mut TerminalCharsets,
+     pub responses: &'a mut Vec<Vec<u8>>,
+ }
+ 
+@@ -129,6 +131,47 @@ impl<'a> VtHandler<'a> {
+         self.cursor.extended.clone()
+     }
+ 
++    fn save_cursor_state(&mut self) {
++        self.cursor.save(self.modes.origin_mode, *self.charsets);
++    }
++
++    fn restore_cursor_state(&mut self) {
++        if let Some((origin, charsets)) = self.cursor.restore() {
++            self.modes.origin_mode = origin;
++            *self.charsets = charsets;
++        }
++    }
++
++    fn reset_charsets(&mut self) {
++        *self.charsets = TerminalCharsets::default();
++    }
++
++    fn active_charset(&self) -> TerminalCharset {
++        match self.charsets.active {
++            CharsetSlot::G0 => self.charsets.g0,
++            CharsetSlot::G1 => self.charsets.g1,
++        }
++    }
++
++    fn translate_printable(&self, ch: char) -> char {
++        if self.active_charset() != TerminalCharset::DecSpecialGraphics {
++            return ch;
++        }
++        dec_special_graphics(ch).unwrap_or(ch)
++    }
++
++    fn designate_charset(&mut self, slot: CharsetSlot, final_byte: u8) {
++        let charset = match final_byte {
++            b'0' => TerminalCharset::DecSpecialGraphics,
++            b'B' => TerminalCharset::Ascii,
++            _ => TerminalCharset::Ascii,
++        };
++        match slot {
++            CharsetSlot::G0 => self.charsets.g0 = charset,
++            CharsetSlot::G1 => self.charsets.g1 = charset,
++        }
++    }
++
+     fn wrap_to_next_line(&mut self) {
+         self.clear_active_grapheme_cell();
+         self.cursor.col = 0;
+@@ -610,16 +653,16 @@ impl<'a> VtHandler<'a> {
+             // Save cursor (1048).
+             1048 => {
+                 if enable {
+-                    self.cursor.save(self.modes.origin_mode);
+-                } else if let Some(origin) = self.cursor.restore() {
+-                    self.modes.origin_mode = origin;
++                    self.save_cursor_state();
++                } else {
++                    self.restore_cursor_state();
+                 }
+             }
+             // Alternate screen buffer (1047, 1049).
+             1047 | 1049 => {
+                 if enable {
+                     if mode == 1049 {
+-                        self.cursor.save(self.modes.origin_mode);
++                        self.save_cursor_state();
+                     }
+                     if self.modes.alternate_screen {
+                         if mode == 1049 {
+@@ -659,9 +702,7 @@ impl<'a> VtHandler<'a> {
+                         self.modes.alternate_screen = false;
+                     }
+                     if mode == 1049 {
+-                        if let Some(origin) = self.cursor.restore() {
+-                            self.modes.origin_mode = origin;
+-                        }
++                        self.restore_cursor_state();
+                     }
+                 }
+             }
+@@ -745,7 +786,7 @@ impl<'a> VtHandler<'a> {
+ 
+ impl<'a> vte::Perform for VtHandler<'a> {
+     fn print(&mut self, ch: char) {
+-        self.write_char(ch);
++        self.write_char(self.translate_printable(ch));
+     }
+ 
+     fn execute(&mut self, byte: u8) {
+@@ -770,7 +811,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
+             0x0A..=0x0C => self.linefeed(),
+             // CR -- carriage return.
+             0x0D => self.carriage_return(),
+-            // SO (0x0E), SI (0x0F) -- character set shift (ignored for now).
++            // SO -- Shift Out / LS1: select G1 into GL.
++            0x0E => self.charsets.active = CharsetSlot::G1,
++            // SI -- Shift In / LS0: select G0 into GL.
++            0x0F => self.charsets.active = CharsetSlot::G0,
+             _ => trace!(byte, "unhandled C0 control"),
+         }
+     }
+@@ -999,13 +1043,11 @@ impl<'a> vte::Perform for VtHandler<'a> {
+             ('g', []) => {}
+             // SCOSC -- Save Cursor (SCO/private form, common in modern TUI diff renderers).
+             ('s', []) if params_vec.iter().all(|&param| param == 0) => {
+-                self.cursor.save(self.modes.origin_mode);
++                self.save_cursor_state();
+             }
+             // SCORC -- Restore Cursor (SCO/private form).
+             ('u', []) if params_vec.iter().all(|&param| param == 0) => {
+-                if let Some(origin) = self.cursor.restore() {
+-                    self.modes.origin_mode = origin;
+-                }
++                self.restore_cursor_state();
+             }
+             // SGR -- Select Graphic Rendition.
+             ('m', []) => {
+@@ -1222,13 +1264,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
+         self.clear_active_grapheme_cell();
+         match (byte, intermediates) {
+             // DECSC -- Save Cursor (ESC 7).
+-            (b'7', []) => self.cursor.save(self.modes.origin_mode),
++            (b'7', []) => self.save_cursor_state(),
+             // DECRC -- Restore Cursor (ESC 8).
+-            (b'8', []) => {
+-                if let Some(origin) = self.cursor.restore() {
+-                    self.modes.origin_mode = origin;
+-                }
+-            }
++            (b'8', []) => self.restore_cursor_state(),
++            // Designate G0/G1 character sets.
++            (byte, [b'(']) => self.designate_charset(CharsetSlot::G0, byte),
++            (byte, [b')']) => self.designate_charset(CharsetSlot::G1, byte),
+             // DECPAM -- Application keypad mode (ESC =).
+             (b'=', []) => self.modes.application_keypad = true,
+             // DECPNM -- Normal keypad mode (ESC >).
+@@ -1254,6 +1295,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
+                 *self.modes = TerminalModes::default();
+                 *self.default_colors = TerminalDefaultColors::default();
+                 self.sync_present.take();
++                self.reset_charsets();
+                 self.scroll_region.top = 0;
+                 self.scroll_region.bottom = self.grid.rows().saturating_sub(1);
+             }
+@@ -1614,6 +1656,44 @@ fn join_osc_parts(parts: &[&[u8]]) -> Vec<u8> {
+     joined
+ }
+ 
++fn dec_special_graphics(ch: char) -> Option<char> {
++    match ch {
++        '_' => Some(' '),
++        '`' => Some('◆'),
++        'a' => Some('▒'),
++        'b' => Some('␉'),
++        'c' => Some('␌'),
++        'd' => Some('␍'),
++        'e' => Some('␊'),
++        'f' => Some('°'),
++        'g' => Some('±'),
++        'h' => Some('␤'),
++        'i' => Some('␋'),
++        'j' => Some('┘'),
++        'k' => Some('┐'),
++        'l' => Some('┌'),
++        'm' => Some('└'),
++        'n' => Some('┼'),
++        'o' => Some('⎺'),
++        'p' => Some('⎻'),
++        'q' => Some('─'),
++        'r' => Some('⎼'),
++        's' => Some('⎽'),
++        't' => Some('├'),
++        'u' => Some('┤'),
++        'v' => Some('┴'),
++        'w' => Some('┬'),
++        'x' => Some('│'),
++        'y' => Some('≤'),
++        'z' => Some('≥'),
++        '{' => Some('π'),
++        '|' => Some('≠'),
++        '}' => Some('£'),
++        '~' => Some('·'),
++        _ => None,
++    }
++}
++
+ fn append_color_sgr(params: &mut Vec<String>, color: Color, background: bool) {
+     match color {
+         Color::Default => {}
+@@ -1738,6 +1818,7 @@ mod tests {
+         dcs_state: Option<DcsState>,
+         sync_present: Option<SyncPresentation>,
+         active_grapheme_cell: Option<(usize, usize)>,
++        charsets: TerminalCharsets,
+         responses: Vec<Vec<u8>>,
+         parser: vte::Parser,
+     }
+@@ -1759,6 +1840,7 @@ mod tests {
+                 dcs_state: None,
+                 sync_present: None,
+                 active_grapheme_cell: None,
++                charsets: TerminalCharsets::default(),
+                 responses: Vec::new(),
+                 parser: vte::Parser::new(),
+             }
+@@ -1777,6 +1859,7 @@ mod tests {
+                 dcs_state: &mut self.dcs_state,
+                 sync_present: &mut self.sync_present,
+                 active_grapheme_cell: &mut self.active_grapheme_cell,
++                charsets: &mut self.charsets,
+                 responses: &mut self.responses,
+             };
+             self.parser.advance(&mut handler, bytes);
+diff --git i/crates/shux/tests/pane_io_integration.rs w/crates/shux/tests/pane_io_integration.rs
+index c83329d..8a8e03f 100644
+--- i/crates/shux/tests/pane_io_integration.rs
++++ w/crates/shux/tests/pane_io_integration.rs
+@@ -878,6 +878,45 @@ time.sleep(2)
+     cancel.cancel();
+ }
+ 
++#[tokio::test]
++async fn test_capture_translates_dec_special_graphics() {
++    let dir = tempfile::tempdir().unwrap();
++    let (socket_path, cancel) = start_test_server(dir.path()).await;
++    let script_path = dir.path().join("dec_graphics_probe.py");
++    std::fs::write(
++        &script_path,
++        r#"import sys
++import time
++
++sys.stdout.write("\x1b(0lqkxmj\x1b(B ASCII-END\n")
++sys.stdout.flush()
++time.sleep(2)
++"#,
++    )
++    .unwrap();
++
++    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
++    let (session_id, _pane_id) = create_test_session(&mut stream).await;
++
++    rpc_call(
++        &mut stream,
++        "pane.send_keys",
++        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", script_path.display())}),
++    )
++    .await;
++
++    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
++        text.contains("ASCII-END")
++    })
++    .await;
++    assert!(
++        text.contains("┌─┐│└┘ ASCII-END"),
++        "pane.capture did not translate DEC graphics, got: {text:?}"
++    );
++
++    cancel.cancel();
++}
++
+ #[tokio::test]
+ async fn test_xterm_cursor_report_probe_gets_terminal_response() {
+     let dir = tempfile::tempdir().unwrap();
+diff --git i/docs/PROGRESS.md w/docs/PROGRESS.md
+index c297652..60f3a53 100644
+--- i/docs/PROGRESS.md
++++ w/docs/PROGRESS.md
+@@ -34,7 +34,8 @@
+ - **Implementation order:** 073 first, then 067/068, then 069-072, then 074.
+ - **Done:** 073 (VT corpus regression harness), 067 (resize reflow), 068
+   (wide-cell invariants), 069 (grapheme-aware cell storage).
+-- **Pending:** 070 (DEC special graphics), 071 (tab stops), 072
++- **In Progress:** 070 (DEC special graphics).
++- **Pending:** 071 (tab stops), 072
+   (origin-mode/scroll-region semantics), 074 (dirty-region tracking).
+ - Every task in this track requires DootSabha design review, DootSabha
+   implementation-diff review, unit/integration/raw replay/shux automation
+@@ -1360,7 +1361,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
+ | 067 | shux-vt resize reflow | VT Quality | **Done** | 005, 016, 066, 073 |
+ | 068 | shux-vt wide-cell invariants | VT Quality | **Done** | 005, 067, 073 |
+ | 069 | shux-vt grapheme-aware cell storage | VT Quality | **Done** | 005, 068, 073 |
+-| 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |
++| 070 | shux-vt DEC special graphics charset | VT Quality | In Progress | 005, 068, 073 |
+ | 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |
+ | 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
+ | 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
+diff --git i/docs/tasks/070-shux-vt-dec-special-graphics.md w/docs/tasks/070-shux-vt-dec-special-graphics.md
+index ba2e898..6b93e45 100644
+--- i/docs/tasks/070-shux-vt-dec-special-graphics.md
++++ w/docs/tasks/070-shux-vt-dec-special-graphics.md
+@@ -1,6 +1,6 @@
+ # Task 070: shux-vt DEC Special Graphics Charset
+ 
+-**Status:** Not Started
++**Status:** In Progress
+ **Priority:** Medium
+ **Milestone:** VT Quality Track
+ **Depends On:** 005, 068, 073
+@@ -23,10 +23,17 @@ Implement the common VT100 DEC special graphics path:
+ - `ESC ( B` / `ESC ) B` return to ASCII,
+ - SO/SI shift between G0/G1,
+ - mapping of DEC graphics codepoints to Unicode box drawing and symbols.
++- DECSC/DECRC save and restore charset state alongside cursor state.
+ 
+ Out of scope:
+ 
+ - Full ISO-2022 charset support beyond the common DEC graphics set.
++- G2/G3 designation (`ESC *`, `ESC +`), LS2/LS3, SS2/SS3 (`ESC N`, `ESC O`).
++- GR / 96-charset / 8-bit designation (`ESC -`, `ESC .`, `ESC /`).
++- National replacement, UK, and DEC technical charsets; unsupported G0/G1
++  designations fall back to ASCII rendering.
++- DECSTR soft reset handling; when DECSTR is implemented, it should reset
++  charset state too.
+ - Locale-specific legacy charsets.
+ 
+ ## Mandatory Process
+@@ -41,12 +48,15 @@ Out of scope:
+ | Layer | Required Evidence |
+ |---|---|
+ | Unit | DEC graphics map produces expected Unicode line drawing for `lqkxmj...` fixtures. |
+-| Unit | SO/SI switches G0/G1 correctly and resets safely. |
++| Unit | Mapping includes the standard `_`, `` ` ``, `a`-`i`, `j`-`x`, `y`-`~` DEC graphics glyphs, including control-picture symbols. |
++| Unit | SO/SI switches G0/G1 correctly, persists across separate `process()` chunks, and resets safely on RIS. |
+ | Unit | ASCII mode remains unchanged after `ESC ( B` / `ESC ) B`. |
++| Unit | Dynamic re-designation while a charset is active takes effect immediately; invalid G0/G1 designations fall back to ASCII safely. |
++| Unit | REP repeats already translated glyphs without double translation; wide Unicode emitted while DEC graphics is active remains width-correct. |
+ | Integration | A curses-style box fixture renders borders correctly in `pane.capture`. |
+ | Shux automation | Render DEC graphics stress screen and snapshot at 80x24, 120x40, and 200x60. |
+ | Visual | Inspect corners, horizontal/vertical joins, mixed text, and color boundaries. |
+-| Pixel | Deterministic DEC graphics PNG exactly matches committed `.shux/goldens/` or DootSabha-approved `.shux/qa/070-dec-special-graphics/` baseline with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. |
++| Pixel | Deterministic DEC graphics PNG exactly matches committed `.shux/goldens/070-dec-special-graphics/` baselines with `--max-pixel-diff-ratio 0.0` and `--max-mean-channel-delta 0.0`. The baseline glyph content is approved by `.shux/qa/070-dec-special-graphics/dootsabha-design.json`; generated expected PNG files must be committed before SOLID QA treats them as evidence. |
+ | QA | `shux-vt-solid-qa` returns `VERDICT: PASS` in `.shux/qa/070-dec-special-graphics/SOLID-QA.md`. |
+ 
+ ## Acceptance Criteria
+diff --git i/scripts/check-vt-fixtures.sh w/scripts/check-vt-fixtures.sh
+index 195d5e4..0cbcfe9 100755
+--- i/scripts/check-vt-fixtures.sh
++++ w/scripts/check-vt-fixtures.sh
+@@ -69,7 +69,7 @@ elif command -v jq >/dev/null 2>&1; then
+     if ! jq -e '.fixtures | type == "array" and length > 0' "$SYNTHETIC_MANIFEST" >/dev/null 2>&1; then
+         add_error "Synthetic VT fixture manifest must contain a non-empty fixtures array"
+     fi
+-    for required in resize-smoke wide-cjk grapheme-storage-current dec-special-graphics-current tabs-current origin-response osc-default-colors alternate-screen scroll-region sync-output; do
++    for required in resize-smoke wide-cjk grapheme-storage-current dec-special-graphics tabs-current origin-response osc-default-colors alternate-screen scroll-region sync-output; do
+         if ! jq -e --arg name "$required" '.fixtures | any(.name == $name)' "$SYNTHETIC_MANIFEST" >/dev/null 2>&1; then
+             add_error "Synthetic VT fixture manifest missing required fixture '$required'"
+         fi

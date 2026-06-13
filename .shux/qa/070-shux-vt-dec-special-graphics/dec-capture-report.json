@@ -1,0 +1,59 @@
+{
+  "checks": [
+    {
+      "capture_bytes": 376,
+      "label": "dec-80x24",
+      "required_present": {
+        "A\u250c\u2500\u2510\u2502\u2514\u2518Z": true,
+        "SHUX_DEC_END": true,
+        "SHUX_DEC_START": true,
+        "color-boundary: \u251c\u2500\u2500\u2500\u2524 text": true,
+        "full-map:  \u25c6\u2592\u2409\u240c\u240d\u240a\u00b0\u00b1\u2424\u240b\u2518\u2510\u250c\u2514\u253c\u23ba\u23bb\u2500\u23bc\u23bd\u251c\u2524\u2534\u252c\u2502\u2264\u2265\u03c0\u2260\u00a3\u00b7": true,
+        "redesignate: \u2500q": true,
+        "rep: \u2500\u2500\u2500\u2500": true,
+        "unicode-direct: \u250c\u2500\u2510\u2502\u2514\u2518 stays": true,
+        "wide-safe: \u4f60\u2500": true,
+        "\u2502    \u2502  ascii-safe": true,
+        "\u250c\u2500\u2500\u2500\u2500\u2510": true,
+        "\u2514\u2500\u2500\u2500\u2500\u2518": true
+      }
+    },
+    {
+      "capture_bytes": 376,
+      "label": "dec-120x40",
+      "required_present": {
+        "A\u250c\u2500\u2510\u2502\u2514\u2518Z": true,
+        "SHUX_DEC_END": true,
+        "SHUX_DEC_START": true,
+        "color-boundary: \u251c\u2500\u2500\u2500\u2524 text": true,
+        "full-map:  \u25c6\u2592\u2409\u240c\u240d\u240a\u00b0\u00b1\u2424\u240b\u2518\u2510\u250c\u2514\u253c\u23ba\u23bb\u2500\u23bc\u23bd\u251c\u2524\u2534\u252c\u2502\u2264\u2265\u03c0\u2260\u00a3\u00b7": true,
+        "redesignate: \u2500q": true,
+        "rep: \u2500\u2500\u2500\u2500": true,
+        "unicode-direct: \u250c\u2500\u2510\u2502\u2514\u2518 stays": true,
+        "wide-safe: \u4f60\u2500": true,
+        "\u2502    \u2502  ascii-safe": true,
+        "\u250c\u2500\u2500\u2500\u2500\u2510": true,
+        "\u2514\u2500\u2500\u2500\u2500\u2518": true
+      }
+    },
+    {
+      "capture_bytes": 376,
+      "label": "dec-200x60",
+      "required_present": {
+        "A\u250c\u2500\u2510\u2502\u2514\u2518Z": true,
+        "SHUX_DEC_END": true,
+        "SHUX_DEC_START": true,
+        "color-boundary: \u251c\u2500\u2500\u2500\u2524 text": true,
+        "full-map:  \u25c6\u2592\u2409\u240c\u240d\u240a\u00b0\u00b1\u2424\u240b\u2518\u2510\u250c\u2514\u253c\u23ba\u23bb\u2500\u23bc\u23bd\u251c\u2524\u2534\u252c\u2502\u2264\u2265\u03c0\u2260\u00a3\u00b7": true,
+        "redesignate: \u2500q": true,
+        "rep: \u2500\u2500\u2500\u2500": true,
+        "unicode-direct: \u250c\u2500\u2510\u2502\u2514\u2518 stays": true,
+        "wide-safe: \u4f60\u2500": true,
+        "\u2502    \u2502  ascii-safe": true,
+        "\u250c\u2500\u2500\u2500\u2500\u2510": true,
+        "\u2514\u2500\u2500\u2500\u2500\u2518": true
+      }
+    }
+  ],
+  "status": "pass"
+}

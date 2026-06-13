@@ -879,6 +879,45 @@ time.sleep(2)
 }
 
 #[tokio::test]
+async fn test_capture_translates_dec_special_graphics() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+    let script_path = dir.path().join("dec_graphics_probe.py");
+    std::fs::write(
+        &script_path,
+        r#"import sys
+import time
+
+sys.stdout.write("\x1b(0lqkxmj\x1b(B ASCII-END\n")
+sys.stdout.flush()
+time.sleep(2)
+"#,
+    )
+    .unwrap();
+
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (session_id, _pane_id) = create_test_session(&mut stream).await;
+
+    rpc_call(
+        &mut stream,
+        "pane.send_keys",
+        serde_json::json!({"session_id": session_id, "text": format!("python3 {}\n", script_path.display())}),
+    )
+    .await;
+
+    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |text| {
+        text.contains("ASCII-END")
+    })
+    .await;
+    assert!(
+        text.contains("┌─┐│└┘ ASCII-END"),
+        "pane.capture did not translate DEC graphics, got: {text:?}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
 async fn test_xterm_cursor_report_probe_gets_terminal_response() {
     let dir = tempfile::tempdir().unwrap();
     let (socket_path, cancel) = start_test_server(dir.path()).await;

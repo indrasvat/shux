@@ -66,10 +66,10 @@
       "total_pixels": 54720
     },
     {
-      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-dec-special-graphics-current-actual.png",
+      "actual": ".shux/out/073-vt-corpus/rendered/synthetic-dec-special-graphics-actual.png",
       "changed_pixels": 0,
-      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-dec-special-graphics-current-diff.png",
-      "expected": ".shux/goldens/073-vt-corpus/synthetic-dec-special-graphics-current-expected.png",
+      "diff": ".shux/qa/073-shux-vt-corpus-regression-harness/synthetic-dec-special-graphics-diff.png",
+      "expected": ".shux/goldens/073-vt-corpus/synthetic-dec-special-graphics-expected.png",
       "max_mean_channel_delta": 0.0,
       "max_pixel_diff_ratio": 0.0,
       "mean_rgba_channel_delta": 0.0,

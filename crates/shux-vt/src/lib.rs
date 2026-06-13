@@ -5,6 +5,7 @@
 //! vte crate parsing raw PTY output bytes.
 
 mod cell;
+mod charset;
 mod cursor;
 mod grid;
 mod parser;
@@ -12,6 +13,7 @@ mod parser;
 pub use cell::{
     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
 };
+pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use grid::{Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
@@ -60,6 +62,8 @@ pub struct VirtualTerminal {
     sync_present: Option<SyncPresentation>,
     /// Visible cell currently accepting zero-width/joined grapheme scalars.
     active_grapheme_cell: Option<(usize, usize)>,
+    /// VT100 G0/G1 charset designations and active locking shift.
+    charsets: TerminalCharsets,
     /// Number of visible rows.
     rows: usize,
     /// Number of columns.
@@ -90,6 +94,7 @@ impl VirtualTerminal {
             dcs_state: None,
             sync_present: None,
             active_grapheme_cell: None,
+            charsets: TerminalCharsets::default(),
             rows,
             cols,
         }
@@ -127,6 +132,7 @@ impl VirtualTerminal {
             dcs_state: &mut self.dcs_state,
             sync_present: &mut self.sync_present,
             active_grapheme_cell: &mut self.active_grapheme_cell,
+            charsets: &mut self.charsets,
             responses: &mut responses,
         };
         self.parser.advance(&mut handler, bytes);
@@ -1383,6 +1389,105 @@ mod tests {
             vt.capture_text(Some(1)).trim_end(),
             "a\u{200d}👨a\u{200d}👨a\u{200d}👨Z"
         );
+        assert_grid_wide_invariants(vt.grid());
+    }
+
+    #[test]
+    fn dec_special_graphics_maps_g0_line_drawing() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b(0lqkxmj\x1b(B ascii");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "┌─┐│└┘ ascii");
+    }
+
+    #[test]
+    fn dec_special_graphics_maps_complete_standard_set() {
+        let mut vt = VirtualTerminal::new(2, 80);
+        vt.process(b"\x1b(0_`abcdefghijklmnopqrstuvwxyz{|}~");
+
+        assert_eq!(
+            vt.capture_text(Some(1)).trim_end(),
+            " ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·"
+        );
+    }
+
+    #[test]
+    fn dec_special_graphics_state_persists_across_process_chunks() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b(0");
+        vt.process(b"lqk");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "┌─┐");
+    }
+
+    #[test]
+    fn dec_special_graphics_so_si_switches_g1_without_leaking() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b)0A\x0elqk\x0fZ");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "A┌─┐Z");
+    }
+
+    #[test]
+    fn dec_special_graphics_dynamic_redesignation_updates_active_slot() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b)0\x0eq\x1b)Bq");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "─q");
+    }
+
+    #[test]
+    fn dec_special_graphics_invalid_designation_falls_back_to_ascii() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b(0q\x1b(Xq");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "─q");
+    }
+
+    #[test]
+    fn dec_special_graphics_rep_repeats_translated_cell() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b(0q\x1b[3b");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "────");
+    }
+
+    #[test]
+    fn dec_special_graphics_ris_resets_charset_state() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b(0q\x1bcq");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "q");
+    }
+
+    #[test]
+    fn dec_special_graphics_decsc_decrc_restore_charset_state() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b[3C\x1b(0\x1b7\x1b(Ba\x1b8q");
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[3].ch, '─');
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "   ─");
+    }
+
+    #[test]
+    fn dec_special_graphics_1049_restore_keeps_primary_saved_charset() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"\x1b(0\x1b[?1049h\x1b(B\x1b7\x1b(0q\x1b8\x1b[?1049lq");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "─");
+    }
+
+    #[test]
+    fn dec_special_graphics_does_not_translate_or_narrow_unicode_wide_cells() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(" \x1b(0你q".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[1].ch, '你');
+        assert!(row[1].is_wide());
+        assert!(row[2].is_wide_continuation());
+        assert_eq!(row[3].ch, '─');
         assert_grid_wide_invariants(vt.grid());
     }
 

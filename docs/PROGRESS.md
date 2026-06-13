@@ -33,8 +33,9 @@
 **VT Quality Track** — in progress.
 - **Implementation order:** 073 first, then 067/068, then 069-072, then 074.
 - **Done:** 073 (VT corpus regression harness), 067 (resize reflow), 068
-  (wide-cell invariants), 069 (grapheme-aware cell storage).
-- **Pending:** 070 (DEC special graphics), 071 (tab stops), 072
+  (wide-cell invariants), 069 (grapheme-aware cell storage), 070
+  (DEC special graphics).
+- **Pending:** 071 (tab stops), 072
   (origin-mode/scroll-region semantics), 074 (dirty-region tracking).
 - Every task in this track requires DootSabha design review, DootSabha
   implementation-diff review, unit/integration/raw replay/shux automation
@@ -100,6 +101,26 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 ---
 
 ## Session Log
+
+**2026-06-12 — feat(vt): render DEC special graphics**
+- Completed task 070 by adding G0/G1 charset state, DEC special graphics
+  designation (`ESC ( 0` / `ESC ) 0`), ASCII redesignation, SO/SI shifts, and
+  DECSC/DECRC charset save/restore to `shux-vt`.
+- Mapped the standard DEC special graphics set to Unicode box drawing and
+  symbols, while unsupported G0/G1 designations safely fall back to ASCII.
+- Added unit coverage for full-map translation, cross-chunk state, dynamic
+  redesignation, invalid designations, REP, RIS, alternate-screen save/restore,
+  and wide Unicode written while DEC graphics is active.
+- Added a real PTY `pane.capture` integration test plus
+  `make test-vt-dec-special-graphics`, which snapshots 80x24, 120x40, and
+  200x60 stress screens with exact pixel comparison against committed
+  `.shux/goldens/070-dec-special-graphics/` baselines.
+- Verification: DootSabha design and implementation review with
+  `--agents claude,gemini`, `make test-vt FILTER=dec_special_graphics`,
+  `SHUX_TEST_BINARY_TIMEOUT_SECONDS=120 make test-pane-io FILTER=dec_special_graphics`,
+  `make test-vt-dec-special-graphics`, `make test-vt-corpus`,
+  `make test-vt-wide-invariants`, `SHUX_TEST_BINARY_TIMEOUT_SECONDS=180 make check`,
+  full-resolution visual inspection, exact pixel JSON, and SOLID VT QA PASS.
 
 **2026-06-12 — feat(vt): preserve grapheme cell payloads**
 - Completed task 069 by adding rare grapheme payload storage to `Cell` extended
@@ -1360,7 +1381,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 067 | shux-vt resize reflow | VT Quality | **Done** | 005, 016, 066, 073 |
 | 068 | shux-vt wide-cell invariants | VT Quality | **Done** | 005, 067, 073 |
 | 069 | shux-vt grapheme-aware cell storage | VT Quality | **Done** | 005, 068, 073 |
-| 070 | shux-vt DEC special graphics charset | VT Quality | Pending | 005, 068, 073 |
+| 070 | shux-vt DEC special graphics charset | VT Quality | **Done** | 005, 068, 073 |
 | 071 | shux-vt real tab-stop state | VT Quality | Pending | 005, 073 |
 | 072 | shux-vt origin mode and scroll-region semantics | VT Quality | Pending | 005, 029, 073 |
 | 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |

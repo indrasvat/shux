@@ -1,0 +1,33 @@
+{
+  "task": "070-shux-vt-dec-special-graphics",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.json",
+  "dootsabha_implementation": "dootsabha-implementation.json",
+  "reports": [
+    "dec-automation-report.json",
+    "dec-capture-report.json",
+    "dootsabha-implementation-full-diff-partial.jsonl",
+    "dootsabha-implementation-concise-raw.jsonl"
+  ],
+  "screenshots": [
+    "dec-80x24-actual.png",
+    "dec-80x24-expected.png",
+    "dec-80x24-diff.png",
+    "dec-120x40-actual.png",
+    "dec-120x40-expected.png",
+    "dec-120x40-diff.png",
+    "dec-200x60-actual.png",
+    "dec-200x60-expected.png",
+    "dec-200x60-diff.png"
+  ],
+  "pixel_metrics": [
+    "dec-80x24-pixel.json",
+    "dec-120x40-pixel.json",
+    "dec-200x60-pixel.json"
+  ],
+  "captures": [
+    "dec-80x24.txt",
+    "dec-120x40.txt",
+    "dec-200x60.txt"
+  ]
+}

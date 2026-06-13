@@ -169,6 +169,12 @@ test-vt-grapheme: release ## Drive shux grapheme storage visual/pixel automation
 	@.shux/scripts/grapheme_check.sh
 	@echo "$(COLOR_GREEN)✓ VT grapheme storage automation passed$(COLOR_RESET)"
 
+.PHONY: test-vt-dec-special-graphics
+test-vt-dec-special-graphics: release ## Drive DEC special graphics visual/pixel automation
+	@echo "$(COLOR_BLUE)▶ Running VT DEC special graphics automation...$(COLOR_RESET)"
+	@.shux/scripts/dec_special_graphics_check.sh
+	@echo "$(COLOR_GREEN)✓ VT DEC special graphics automation passed$(COLOR_RESET)"
+
 .PHONY: test-vt-grapheme-performance
 test-vt-grapheme-performance: ## Measure grapheme storage performance on ASCII VT path
 	@echo "$(COLOR_BLUE)▶ Measuring VT grapheme storage performance...$(COLOR_RESET)"
