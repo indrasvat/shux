@@ -120,6 +120,14 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
   `make test-vt-corpus`, `make test-pane-io`, full `make check`,
   full-resolution visual inspection, exact zero-diff pixel JSON at all three
   sizes, and SOLID VT QA PASS.
+- Post-review fix (Codex PR finding): relative vertical moves starting outside
+  the scroll region are now direction-aware — `move_cursor_up` clamps to the top
+  margin only when the cursor is at/below it (else row 0), and `move_cursor_down`
+  clamps to the bottom margin only when at/above it (else last row), matching
+  xterm `CursorUp`/`CursorDown`. Replaced `relative_vertical_bounds` with
+  `upward_vertical_top`/`downward_vertical_bottom` and extended the regression to
+  cover above/down and below/up margin clamping. Focused `make test-vt`
+  filters and `make test-vt-origin-mode` pass after the fix.
 
 **2026-06-12 — feat(vt): track mutable tab stops**
 - Completed task 071 by replacing hardcoded 8-column tab movement with

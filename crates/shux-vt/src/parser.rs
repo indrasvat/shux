@@ -178,24 +178,34 @@ impl<'a> VtHandler<'a> {
             .min(self.grid_last_row())
     }
 
-    fn relative_vertical_bounds(&self) -> (usize, usize) {
+    fn upward_vertical_top(&self) -> usize {
         let top = self.scroll_region.top.min(self.grid_last_row());
         let bottom = self.scroll_region.bottom.min(self.grid_last_row());
-        if top <= bottom && (top..=bottom).contains(&self.cursor.row) {
-            (top, bottom)
+        if top <= bottom && self.cursor.row >= top {
+            top
         } else {
-            (0, self.grid_last_row())
+            0
+        }
+    }
+
+    fn downward_vertical_bottom(&self) -> usize {
+        let top = self.scroll_region.top.min(self.grid_last_row());
+        let bottom = self.scroll_region.bottom.min(self.grid_last_row());
+        if top <= bottom && self.cursor.row <= bottom {
+            bottom
+        } else {
+            self.grid_last_row()
         }
     }
 
     fn move_cursor_up(&mut self, n: usize) {
-        let (top, _) = self.relative_vertical_bounds();
+        let top = self.upward_vertical_top();
         self.cursor.row = self.cursor.row.saturating_sub(n).max(top);
         self.cursor.auto_wrap_pending = false;
     }
 
     fn move_cursor_down(&mut self, n: usize) {
-        let (_, bottom) = self.relative_vertical_bounds();
+        let bottom = self.downward_vertical_bottom();
         self.cursor.row = self.cursor.row.saturating_add(n).min(bottom);
         self.cursor.auto_wrap_pending = false;
     }

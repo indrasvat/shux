@@ -1740,11 +1740,21 @@ mod tests {
     }
 
     #[test]
-    fn relative_vertical_moves_use_full_grid_when_started_outside_scroll_region() {
+    fn relative_vertical_moves_use_directional_scroll_region_bounds_when_started_outside() {
         let mut vt = VirtualTerminal::new(12, 20);
-        vt.process(b"\x1b[4;6r\x1b[2;1H\x1b[8B");
+        vt.process(b"\x1b[4;6r");
 
-        assert_eq!((vt.cursor().row, vt.cursor().col), (9, 0));
+        vt.process(b"\x1b[2;1H\x1b[8B");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (5, 0));
+
+        vt.process(b"\x1b[10;1H\x1b[99A");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 0));
+
+        vt.process(b"\x1b[2;1H\x1b[99A");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0));
+
+        vt.process(b"\x1b[10;1H\x1b[99B");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (11, 0));
     }
 
     #[test]
