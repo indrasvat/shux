@@ -435,6 +435,7 @@ impl<'a> VtHandler<'a> {
     }
 
     fn write_cell_from_source(&mut self, source: &Cell) {
+        let source_width = source.width.clamp(1, 2) as usize;
         self.write_char(source.ch);
         let Some(text) = source.grapheme().map(str::to_owned) else {
             return;
@@ -442,8 +443,28 @@ impl<'a> VtHandler<'a> {
         let Some((row, col)) = self.preceding_cell_position() else {
             return;
         };
-        if let Some(cell) = self.cell_mut(row, col) {
-            cell.set_grapheme_payload(text);
+        let cols = self.grid.cols();
+        let bg = self.cursor.style.bg;
+        {
+            let row_ref = self.grid.visible_row_mut(row);
+            row_ref[col].set_grapheme_payload(text);
+            if source_width == 2 && col + 1 < cols {
+                row_ref[col].width = 2;
+                if !row_ref[col + 1].is_wide_continuation() {
+                    row_ref.clear_wide_pair_around(col + 1, bg);
+                }
+                row_ref[col + 1] = Cell::wide_continuation();
+            }
+        }
+        if source_width == 2 && col + 1 < cols {
+            let next_col = col + 2;
+            if next_col >= cols {
+                self.cursor.col = cols.saturating_sub(1);
+                self.cursor.auto_wrap_pending = true;
+            } else {
+                self.cursor.col = next_col;
+                self.cursor.auto_wrap_pending = false;
+            }
         }
     }
 

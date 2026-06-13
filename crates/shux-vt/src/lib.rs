@@ -1364,6 +1364,29 @@ mod tests {
     }
 
     #[test]
+    fn rep_preserves_width_expanded_grapheme_payload() {
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process("a\u{200d}👨\x1b[2bZ".as_bytes());
+
+        let row = vt.grid().visible_row(0);
+        for col in [0, 2, 4] {
+            assert_eq!(row[col].grapheme(), Some("a\u{200d}👨"));
+            assert!(row[col].is_wide(), "cell {col} lost width-2 head");
+            assert!(
+                row[col + 1].is_wide_continuation(),
+                "cell {} lost continuation",
+                col + 1
+            );
+        }
+        assert_eq!(row[6].ch, 'Z');
+        assert_eq!(
+            vt.capture_text(Some(1)).trim_end(),
+            "a\u{200d}👨a\u{200d}👨a\u{200d}👨Z"
+        );
+        assert_grid_wide_invariants(vt.grid());
+    }
+
+    #[test]
     fn test_sgr_256_color() {
         let mut vt = VirtualTerminal::new(24, 80);
         // Set 256-color foreground: SGR 38;5;196.
