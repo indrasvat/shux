@@ -1,3 +1,10 @@
+# [0.33.0](https://github.com/indrasvat/shux/compare/v0.32.0...v0.33.0) (2026-06-13)
+
+
+### Features
+
+* **vt:** track mutable tab stops ([6d59952](https://github.com/indrasvat/shux/commit/6d599522c45d639d83330b39059fce89c6a24bb2))
+
 # [0.32.0](https://github.com/indrasvat/shux/compare/v0.31.0...v0.32.0) (2026-06-13)
 
 
