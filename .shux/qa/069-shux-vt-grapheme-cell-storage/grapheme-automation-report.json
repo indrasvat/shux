@@ -1,0 +1,25 @@
+{
+  "task": "069-shux-vt-grapheme-cell-storage",
+  "capture_report": "grapheme-capture-report.json",
+  "screenshots": [
+    "grapheme-80x24-actual.png",
+    "grapheme-80x24-expected.png",
+    "grapheme-80x24-diff.png",
+    "grapheme-120x40-actual.png",
+    "grapheme-120x40-expected.png",
+    "grapheme-120x40-diff.png",
+    "grapheme-200x60-actual.png",
+    "grapheme-200x60-expected.png",
+    "grapheme-200x60-diff.png"
+  ],
+  "pixel_metrics": [
+    "grapheme-80x24-pixel.json",
+    "grapheme-120x40-pixel.json",
+    "grapheme-200x60-pixel.json"
+  ],
+  "captures": [
+    "grapheme-80x24.txt",
+    "grapheme-120x40.txt",
+    "grapheme-200x60.txt"
+  ]
+}

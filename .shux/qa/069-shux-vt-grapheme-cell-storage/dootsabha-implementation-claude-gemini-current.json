@@ -1,0 +1,47 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke claude: claude invoke: subprocess \"claude\": context deadline exceeded"
+    },
+    {
+      "provider": "gemini",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    }
+  ],
+  "reviews": null,
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 0,
+    "total_cost_usd": 0,
+    "total_tokens_in": 0,
+    "total_tokens_out": 0,
+    "providers": {
+      "claude": "error",
+      "gemini": "error"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "all agents failed during dispatch"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "checks": [
+    {
+      "capture_bytes": 308,
+      "label": "grapheme-80x24",
+      "required_present": {
+        "SHUX_GRAPHEME_END": true,
+        "SHUX_GRAPHEME_START": true,
+        "e\u0301": true,
+        "\u754c\u0301A": true,
+        "\ud83c\uddfa\ud83c\uddf8": true,
+        "\ud83d\udc4d\ud83c\udffd": true,
+        "\ud83d\udc68\u200d\ud83d\udcbb": true,
+        "\ud83d\udee0\ufe0f": true
+      }
+    },
+    {
+      "capture_bytes": 308,
+      "label": "grapheme-120x40",
+      "required_present": {
+        "SHUX_GRAPHEME_END": true,
+        "SHUX_GRAPHEME_START": true,
+        "e\u0301": true,
+        "\u754c\u0301A": true,
+        "\ud83c\uddfa\ud83c\uddf8": true,
+        "\ud83d\udc4d\ud83c\udffd": true,
+        "\ud83d\udc68\u200d\ud83d\udcbb": true,
+        "\ud83d\udee0\ufe0f": true
+      }
+    },
+    {
+      "capture_bytes": 308,
+      "label": "grapheme-200x60",
+      "required_present": {
+        "SHUX_GRAPHEME_END": true,
+        "SHUX_GRAPHEME_START": true,
+        "e\u0301": true,
+        "\u754c\u0301A": true,
+        "\ud83c\uddfa\ud83c\uddf8": true,
+        "\ud83d\udc4d\ud83c\udffd": true,
+        "\ud83d\udc68\u200d\ud83d\udcbb": true,
+        "\ud83d\udee0\ufe0f": true
+      }
+    }
+  ],
+  "status": "pass"
+}

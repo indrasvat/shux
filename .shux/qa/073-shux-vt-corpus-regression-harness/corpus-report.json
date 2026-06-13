@@ -50,7 +50,7 @@
     {
       "name": "grapheme-storage-current",
       "layer": "synthetic",
-      "description": "combining mark stream preserves visible capture bytes for current cell model",
+      "description": "combining mark stream preserves full grapheme capture after task 069",
       "status": "pending_pixel",
       "text_status": "pass",
       "responses_status": "pass",

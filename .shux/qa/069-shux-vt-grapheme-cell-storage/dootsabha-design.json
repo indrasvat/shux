@@ -1,0 +1,29 @@
+{
+  "status": "partial_with_current_claude_approval",
+  "phase": "design",
+  "required_command_attempts": [
+    "rtk dootsabha council --json --agents claude,gemini --timeout 20m <design-council-prompt>",
+    "rtk dootsabha council --json --agents claude,codex --timeout 15m <design-council-prompt>",
+    "rtk dootsabha consult --json --agent claude --timeout 10m <design-council-prompt>",
+    "rtk dootsabha consult --json --agent claude --timeout 5m <concise-current-design-prompt>",
+    "rtk dootsabha consult --json --agent gemini --timeout 5m <concise-current-design-prompt>"
+  ],
+  "failure_records": [
+    "dootsabha-design-claude-gemini-hung.json",
+    "dootsabha-design-claude-codex-hung.json",
+    "dootsabha-design-consult-hung.json",
+    "dootsabha-design-gemini-consult-current.json"
+  ],
+  "approval_records": [
+    "dootsabha-design-claude-consult-current.json"
+  ],
+  "fallback_reviewer": "multi_agent_v1 explorer 019ebe22-c236-7ab3-8b3d-0221bbebdcfb",
+  "fallback_findings_resolved": [
+    "Grapheme payload is cell-local only and is stripped from cursor extended attrs before writing a new cell.",
+    "Parser anchor tests cover final-column pending wrap, CJK wide-head attachment, cursor-motion clearing, ZWJ, flags, and REP.",
+    "Copy, live render, pane.capture, and raster paths have display_text coverage.",
+    "Raster fallback is documented as conservative fontdue scalar rendering, not full shaping.",
+    "Performance evidence includes pre-change baseline from commit 6e6128a."
+  ],
+  "verdict": "Design is approved by the current Claude consult and earlier fallback review. Claude+Gemini council synthesis remained unreliable; Gemini design consult timed out."
+}

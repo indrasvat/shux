@@ -180,8 +180,9 @@ impl<W: Write> RenderBackend<W> {
             // from the last emitted style to reduce output volume)
             self.apply_style(&cell.cell)?;
 
-            // Print the character
-            self.out.queue(Print(cell.cell.ch))?;
+            // Print the full cell display text when the VT preserved a
+            // multi-codepoint grapheme payload.
+            self.out.queue(Print(cell.cell.display_text()))?;
         }
 
         // Reset colors at the end so the terminal is in a clean state
@@ -220,7 +221,7 @@ impl<W: Write> RenderBackend<W> {
                 }
 
                 self.apply_style(cell)?;
-                self.out.queue(Print(cell.ch))?;
+                self.out.queue(Print(cell.display_text()))?;
             }
         }
 
@@ -467,6 +468,30 @@ mod tests {
     }
 
     #[test]
+    fn grapheme_render_diff_emits_full_payload() {
+        let mut output = Vec::new();
+        let mut backend = RenderBackend::new(&mut output);
+        let mut cell = RenderCell::text('e');
+        cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            grapheme: Some("e\u{0301}".to_string()),
+            hyperlink: None,
+            underline_color: None,
+            underline_style: shux_vt::UnderlineStyle::None,
+        }));
+
+        backend
+            .render_diff(&[DirtyCell {
+                col: 0,
+                row: 0,
+                cell,
+            }])
+            .unwrap();
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("e\u{0301}"));
+    }
+
+    #[test]
     fn test_empty_diff_produces_no_output() {
         let mut output = Vec::new();
         let mut backend = RenderBackend::new(&mut output);
@@ -637,6 +662,7 @@ mod tests {
 
         let mut cell = RenderCell::text('L');
         cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            grapheme: None,
             hyperlink: Some("https://example.invalid/a;b".to_string()),
             underline_color: None,
             underline_style: shux_vt::UnderlineStyle::None,
@@ -664,6 +690,7 @@ mod tests {
         let mut cell = RenderCell::text('U');
         cell.attrs.underline = true;
         cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            grapheme: None,
             hyperlink: None,
             underline_color: Some(shux_vt::Color::Rgb(10, 20, 30)),
             underline_style: shux_vt::UnderlineStyle::Curly,
@@ -701,6 +728,24 @@ mod tests {
         assert!(output_str.contains('B'));
         assert!(output_str.contains('C'));
         assert!(output_str.contains('D'));
+    }
+
+    #[test]
+    fn grapheme_render_full_emits_full_payload() {
+        let mut output = Vec::new();
+        let mut backend = RenderBackend::new(&mut output);
+        let mut cell = RenderCell::text('👨');
+        cell.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            grapheme: Some("👨\u{200d}💻".to_string()),
+            hyperlink: None,
+            underline_color: None,
+            underline_style: shux_vt::UnderlineStyle::None,
+        }));
+
+        backend.render_full(1, 1, &[cell]).unwrap();
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("👨\u{200d}💻"));
     }
 
     #[test]

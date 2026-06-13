@@ -1,0 +1,7 @@
+{
+  "status": "failed",
+  "phase": "design",
+  "command": "rtk dootsabha council --json --agents claude,codex --timeout 15m <design-council-prompt>",
+  "reason": "No JSON was written to dootsabha-design.json while the council process remained alive; the process was terminated and the task used individual DootSabha consult fallback evidence.",
+  "fallback_required": true
+}

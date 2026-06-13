@@ -6,6 +6,7 @@
 //! of cells that need updating -- this is the core of the incremental rendering
 //! strategy required by PRD section 14.1 (p50 <= 8ms keypress-to-update).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crossterm::style::Color;
@@ -91,6 +92,15 @@ impl RenderCell {
             extended: None,
             wide_continuation: false,
         }
+    }
+
+    /// Full display text for this render cell.
+    pub fn display_text(&self) -> Cow<'_, str> {
+        self.extended
+            .as_ref()
+            .and_then(|attrs| attrs.grapheme.as_deref())
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(self.ch.to_string()))
     }
 
     /// Convert a VT cell while resolving dynamic OSC 10/11 default colors.
@@ -534,6 +544,7 @@ mod tests {
     #[test]
     fn test_from_vt_cell_preserves_extended_attributes_for_diffing() {
         let extended = Arc::new(shux_vt::ExtendedAttrs {
+            grapheme: None,
             hyperlink: Some("https://example.invalid/a;b".to_string()),
             underline_color: Some(shux_vt::Color::Rgb(10, 20, 30)),
             underline_style: shux_vt::UnderlineStyle::Curly,
@@ -557,6 +568,7 @@ mod tests {
 
         let mut next = RenderCell::text('X');
         next.extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            grapheme: None,
             hyperlink: Some("https://example.invalid".to_string()),
             underline_color: None,
             underline_style: shux_vt::UnderlineStyle::None,

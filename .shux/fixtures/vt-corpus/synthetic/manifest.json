@@ -29,7 +29,7 @@
     },
     {
       "name": "grapheme-storage-current",
-      "description": "combining mark stream preserves visible capture bytes for current cell model",
+      "description": "combining mark stream preserves full grapheme capture after task 069",
       "init": {"rows": 8, "cols": 40},
       "steps": [
         {"process": {"text": "Café resumé"}}

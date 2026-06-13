@@ -1,0 +1,11 @@
+{
+  "bytes_per_second": 202571312.356,
+  "capture_iters": 1000,
+  "captures_per_second": 134331.109,
+  "cell_size_bytes": 24,
+  "cols": 80,
+  "elapsed_seconds": 0.007444292,
+  "max_rss_kb": 12112,
+  "rows": 24,
+  "scrollback_lines": 5000
+}

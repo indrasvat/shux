@@ -1,0 +1,7 @@
+{
+  "status": "failed",
+  "phase": "design",
+  "command": "rtk dootsabha consult --json --agent claude --timeout 10m <design-council-prompt>",
+  "reason": "No JSON was written to dootsabha-design-claude-consult.json while the consult process remained alive; the process was terminated after the prior council attempts also hung.",
+  "fallback_required": true
+}

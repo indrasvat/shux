@@ -103,10 +103,19 @@ pub struct VtHandler<'a> {
     pub alt_cursor: &'a mut Option<Cursor>,
     pub dcs_state: &'a mut Option<DcsState>,
     pub sync_present: &'a mut Option<SyncPresentation>,
+    pub active_grapheme_cell: &'a mut Option<(usize, usize)>,
     pub responses: &'a mut Vec<Vec<u8>>,
 }
 
 impl<'a> VtHandler<'a> {
+    fn clear_active_grapheme_cell(&mut self) {
+        *self.active_grapheme_cell = None;
+    }
+
+    fn set_active_grapheme_cell(&mut self, row: usize, col: usize) {
+        *self.active_grapheme_cell = Some((row, col));
+    }
+
     fn cursor_blank_cell(&self) -> Cell {
         Cell {
             ch: ' ',
@@ -116,7 +125,12 @@ impl<'a> VtHandler<'a> {
         }
     }
 
+    fn cursor_cell_extended(&self) -> Option<Arc<ExtendedAttrs>> {
+        self.cursor.extended.clone()
+    }
+
     fn wrap_to_next_line(&mut self) {
+        self.clear_active_grapheme_cell();
         self.cursor.col = 0;
         self.cursor.auto_wrap_pending = false;
         self.grid.visible_row_mut(self.cursor.row).wrapped = true;
@@ -134,6 +148,13 @@ impl<'a> VtHandler<'a> {
             .unwrap_or(1)
             .min(2);
         if width == 0 {
+            self.append_zero_width_scalar(ch);
+            return;
+        }
+        if self.try_append_to_active_grapheme(ch, width) {
+            return;
+        }
+        if self.try_append_regional_indicator_pair(ch) {
             return;
         }
         let cols = self.grid.cols();
@@ -165,6 +186,7 @@ impl<'a> VtHandler<'a> {
             row.clear_wide_pair_around(col, self.cursor.style.bg);
             row[col] = blank;
             self.cursor.auto_wrap_pending = false;
+            self.clear_active_grapheme_cell();
             return;
         }
 
@@ -180,6 +202,7 @@ impl<'a> VtHandler<'a> {
                 self.wrap_to_next_line();
             } else {
                 self.cursor.auto_wrap_pending = false;
+                self.clear_active_grapheme_cell();
                 return;
             }
         }
@@ -192,23 +215,28 @@ impl<'a> VtHandler<'a> {
 
         // Write the cell.
         let col = self.cursor.col;
+        let cursor_row = self.cursor.row;
         let bg = self.cursor.style.bg;
-        let row = self.grid.visible_row_mut(self.cursor.row);
-        row.clear_wide_pair_around(col, bg);
-        if width == 2 {
-            row.clear_wide_pair_around(col + 1, bg);
-        }
-        row[col] = Cell {
-            ch,
-            width: width as u8,
-            style: self.cursor.style,
-            extended: self.cursor.extended.clone(),
-        };
+        let extended = self.cursor_cell_extended();
+        {
+            let row = self.grid.visible_row_mut(cursor_row);
+            row.clear_wide_pair_around(col, bg);
+            if width == 2 {
+                row.clear_wide_pair_around(col + 1, bg);
+            }
+            row[col] = Cell {
+                ch,
+                width: width as u8,
+                style: self.cursor.style,
+                extended,
+            };
 
-        // For wide characters, write a continuation cell.
-        if width == 2 && col + 1 < cols {
-            row[col + 1] = Cell::wide_continuation();
+            // For wide characters, write a continuation cell.
+            if width == 2 && col + 1 < cols {
+                row[col + 1] = Cell::wide_continuation();
+            }
         }
+        self.set_active_grapheme_cell(cursor_row, col);
 
         // Advance cursor.
         self.cursor.col += width;
@@ -216,6 +244,138 @@ impl<'a> VtHandler<'a> {
             self.cursor.col = cols.saturating_sub(1);
             self.cursor.auto_wrap_pending = true;
         }
+    }
+
+    fn append_zero_width_scalar(&mut self, ch: char) {
+        let Some((row, col)) = self
+            .active_grapheme_position()
+            .or_else(|| self.preceding_cell_position())
+        else {
+            return;
+        };
+        if let Some(cell) = self.cell_mut(row, col)
+            && !cell.is_wide_continuation()
+            && cell.ch != ' '
+        {
+            cell.append_grapheme_scalar(ch);
+            self.set_active_grapheme_cell(row, col);
+        }
+    }
+
+    fn try_append_to_active_grapheme(&mut self, ch: char, width: usize) -> bool {
+        let Some((row, col)) = self.active_grapheme_position() else {
+            return false;
+        };
+        let should_join = self
+            .grid
+            .visible_row(row)
+            .get(col)
+            .is_some_and(|cell| cell.grapheme().is_some_and(str_ends_with_zwj));
+        if !should_join {
+            return false;
+        }
+        let cols = self.grid.cols();
+        let target_width = self
+            .grid
+            .visible_row(row)
+            .get(col)
+            .map(|cell| usize::from(cell.width).max(width))
+            .unwrap_or(width)
+            .min(2);
+        if target_width == 2 && col + 1 >= cols {
+            return false;
+        }
+        {
+            let bg = self.cursor.style.bg;
+            let row_ref = self.grid.visible_row_mut(row);
+            row_ref[col].append_grapheme_scalar(ch);
+            row_ref[col].width = target_width as u8;
+            if target_width == 2 {
+                if !row_ref[col + 1].is_wide_continuation() {
+                    row_ref.clear_wide_pair_around(col + 1, bg);
+                }
+                row_ref[col + 1] = Cell::wide_continuation();
+            }
+        }
+        let next_col = col + target_width;
+        if next_col >= cols {
+            self.cursor.col = cols.saturating_sub(1);
+            self.cursor.auto_wrap_pending = true;
+        } else {
+            self.cursor.col = self.cursor.col.max(next_col);
+        }
+        true
+    }
+
+    fn try_append_regional_indicator_pair(&mut self, ch: char) -> bool {
+        if !is_regional_indicator(ch) {
+            return false;
+        }
+        let Some((row, col)) = self.preceding_cell_position() else {
+            return false;
+        };
+        let previous_is_single_ri = self
+            .grid
+            .visible_row(row)
+            .get(col)
+            .is_some_and(cell_contains_single_regional_indicator);
+        if !previous_is_single_ri {
+            return false;
+        }
+
+        let cols = self.grid.cols();
+        let target_width = 2;
+        if col + 1 >= cols {
+            return false;
+        }
+        {
+            let bg = self.cursor.style.bg;
+            let row_ref = self.grid.visible_row_mut(row);
+            row_ref[col].append_grapheme_scalar(ch);
+            row_ref[col].width = target_width as u8;
+            if col + 1 < cols {
+                if !row_ref[col + 1].is_wide_continuation() {
+                    row_ref.clear_wide_pair_around(col + 1, bg);
+                }
+                row_ref[col + 1] = Cell::wide_continuation();
+            }
+        }
+        self.set_active_grapheme_cell(row, col);
+        self.cursor.col = (col + target_width).min(cols.saturating_sub(1));
+        self.cursor.auto_wrap_pending = col + target_width >= cols;
+        true
+    }
+
+    fn active_grapheme_position(&self) -> Option<(usize, usize)> {
+        let (row, col) = (*self.active_grapheme_cell)?;
+        let cell = self.grid.visible_row(row).get(col)?;
+        (!cell.is_wide_continuation() && cell.ch != ' ').then_some((row, col))
+    }
+
+    fn preceding_cell_position(&self) -> Option<(usize, usize)> {
+        let source_col = if self.cursor.auto_wrap_pending {
+            self.cursor.col
+        } else {
+            self.cursor.col.checked_sub(1)?
+        };
+        let row = self.grid.visible_row(self.cursor.row);
+        let source_col = if row
+            .get(source_col)
+            .is_some_and(|cell| cell.is_wide_continuation())
+        {
+            source_col.checked_sub(1)?
+        } else {
+            source_col
+        };
+        row.get(source_col)?;
+        Some((self.cursor.row, source_col))
+    }
+
+    fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
+        if row >= self.grid.rows() || col >= self.grid.cols() {
+            return None;
+        }
+        self.grid.visible_row_mut(row).cells.get_mut(col)
     }
 
     fn cursor_extended_mut(&mut self) -> &mut ExtendedAttrs {
@@ -268,13 +428,22 @@ impl<'a> VtHandler<'a> {
         } else {
             source_col
         };
-        let ch = row
-            .get(source_col)
-            .map(|cell| cell.ch)
-            .filter(|ch| *ch != '\0')
-            .unwrap_or(' ');
+        let source = row.get(source_col).cloned().unwrap_or(Cell::EMPTY);
         for _ in 0..count {
-            self.write_char(ch);
+            self.write_cell_from_source(&source);
+        }
+    }
+
+    fn write_cell_from_source(&mut self, source: &Cell) {
+        self.write_char(source.ch);
+        let Some(text) = source.grapheme().map(str::to_owned) else {
+            return;
+        };
+        let Some((row, col)) = self.preceding_cell_position() else {
+            return;
+        };
+        if let Some(cell) = self.cell_mut(row, col) {
+            cell.set_grapheme_payload(text);
         }
     }
 
@@ -559,6 +728,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
     }
 
     fn execute(&mut self, byte: u8) {
+        self.clear_active_grapheme_cell();
         match byte {
             // BEL -- bell.
             0x07 => { /* emit bell event in the future */ }
@@ -591,6 +761,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
         _ignore: bool,
         action: char,
     ) {
+        if !(action == 'm' && intermediates.is_empty()) {
+            self.clear_active_grapheme_cell();
+        }
         let params_groups: Vec<Vec<u16>> =
             params.iter().map(|subparam| subparam.to_vec()).collect();
         // Flatten params: each subparam slice is collected into a flat Vec<u16>.
@@ -1025,6 +1198,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.clear_active_grapheme_cell();
         match (byte, intermediates) {
             // DECSC -- Save Cursor (ESC 7).
             (b'7', []) => self.cursor.save(self.modes.origin_mode),
@@ -1211,6 +1385,20 @@ fn osc_terminator(bell_terminated: bool) -> &'static str {
 
 fn mode_report(enabled: bool) -> u8 {
     if enabled { 1 } else { 2 }
+}
+
+fn str_ends_with_zwj(text: &str) -> bool {
+    text.ends_with('\u{200d}')
+}
+
+fn is_regional_indicator(ch: char) -> bool {
+    ('\u{1f1e6}'..='\u{1f1ff}').contains(&ch)
+}
+
+fn cell_contains_single_regional_indicator(cell: &Cell) -> bool {
+    let text = cell.display_text();
+    let mut chars = text.chars();
+    chars.next().is_some_and(is_regional_indicator) && chars.next().is_none()
 }
 
 fn parse_sgr_color(groups: &[Vec<u16>], start: usize) -> Option<(Color, usize)> {
@@ -1528,6 +1716,7 @@ mod tests {
         alt_cursor: Option<Cursor>,
         dcs_state: Option<DcsState>,
         sync_present: Option<SyncPresentation>,
+        active_grapheme_cell: Option<(usize, usize)>,
         responses: Vec<Vec<u8>>,
         parser: vte::Parser,
     }
@@ -1548,6 +1737,7 @@ mod tests {
                 alt_cursor: None,
                 dcs_state: None,
                 sync_present: None,
+                active_grapheme_cell: None,
                 responses: Vec::new(),
                 parser: vte::Parser::new(),
             }
@@ -1565,6 +1755,7 @@ mod tests {
                 alt_cursor: &mut self.alt_cursor,
                 dcs_state: &mut self.dcs_state,
                 sync_present: &mut self.sync_present,
+                active_grapheme_cell: &mut self.active_grapheme_cell,
                 responses: &mut self.responses,
             };
             self.parser.advance(&mut handler, bytes);

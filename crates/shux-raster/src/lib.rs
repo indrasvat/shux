@@ -34,7 +34,7 @@
 
 use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
-use shux_vt::{Cell, CellFlags, Color, CursorShape, Grid, UnderlineStyle};
+use shux_vt::{Cell, CellFlags, CellStyle, Color, CursorShape, Grid, UnderlineStyle};
 
 /// Embedded text font. JetBrains Mono Nerd Font Mono Regular, the
 /// upstream Nerd Fonts patched build (2.4 MB) under SIL Open Font
@@ -86,6 +86,15 @@ pub const DEFAULT_FALLBACK_FONT_SPECS: &[&str] = &[
     BUILTIN_SYMBOLS_LEGACY,
     BUILTIN_EMOJI,
 ];
+
+#[derive(Clone, Copy)]
+struct GlyphDrawContext {
+    x: u32,
+    y: u32,
+    cell_pixels_w: u32,
+    fg: Rgb,
+    style: CellStyle,
+}
 
 /// Resolve a builtin font token to embedded bytes.
 pub fn builtin_font_bytes(spec: &str) -> Option<&'static [u8]> {
@@ -415,51 +424,21 @@ impl Rasterizer {
         };
         fill_rect(img, x, y, cell_pixels_w, self.cell_h, bg);
 
-        let ch = cell.ch;
-        if ch != ' ' && ch != '\0' {
-            let idx = self.font_idx_for(ch);
-            let font = &self.fonts[idx];
-            let (metrics, bitmap, glyph_x, glyph_y) = if idx == 0 {
-                // Primary font: cell metrics were derived from it, so
-                // baseline positioning aligns by construction.
-                let (m, bmp) = font.rasterize(ch, self.font_size);
-                let baseline_y = y as i32 + self.ascent.round() as i32;
-                let gx = x as i32 + m.xmin;
-                let gy = baseline_y - m.height as i32 - m.ymin;
-                (m, bmp, gx, gy)
-            } else {
-                // Fallback font (e.g. Noto Emoji): its native advance
-                // and ascent don't match the primary's, so naively
-                // blitting at primary baseline would spill into the
-                // next cell or float far above the row. Re-rasterize
-                // at a font size that fits inside the cell box, then
-                // center both axes within `cell_pixels_w * cell_h`.
-                let (m, bmp) =
-                    fit_and_rasterize(font, ch, self.font_size, cell_pixels_w, self.cell_h);
-                let gx = x as i32 + (cell_pixels_w as i32 - m.width as i32).max(0) / 2;
-                let gy = y as i32 + (self.cell_h as i32 - m.height as i32).max(0) / 2;
-                (m, bmp, gx, gy)
-            };
-            blit_glyph(
-                img,
-                glyph_x,
-                glyph_y,
-                metrics.width as u32,
-                metrics.height as u32,
-                &bitmap,
+        let text = cell.display_text();
+        if text.as_ref() != " " && text.as_ref() != "\0" {
+            let glyph_ctx = GlyphDrawContext {
+                x,
+                y,
+                cell_pixels_w,
                 fg,
-            );
-            // Synthetic bold: render again 1px to the right and blend.
-            if style.flags.contains(CellFlags::BOLD) {
-                blit_glyph(
-                    img,
-                    glyph_x + 1,
-                    glyph_y,
-                    metrics.width as u32,
-                    metrics.height as u32,
-                    &bitmap,
-                    fg,
-                );
+                style,
+            };
+            if cell.has_grapheme_payload() {
+                for ch in text.chars().filter(|ch| *ch != '\0' && *ch != '\u{200d}') {
+                    self.draw_scalar_glyph(img, ch, glyph_ctx);
+                }
+            } else {
+                self.draw_scalar_glyph(img, cell.ch, glyph_ctx);
             }
         }
 
@@ -482,6 +461,51 @@ impl Rasterizer {
         if style.flags.contains(CellFlags::STRIKETHROUGH) {
             let sy = y + (self.cell_h / 2);
             fill_rect(img, x, sy, cell_pixels_w, 1, fg);
+        }
+    }
+
+    fn draw_scalar_glyph(&self, img: &mut RgbaImage, ch: char, ctx: GlyphDrawContext) {
+        if ch == ' ' || ch == '\0' {
+            return;
+        }
+        let idx = self.font_idx_for(ch);
+        let font = &self.fonts[idx];
+        let (metrics, bitmap, glyph_x, glyph_y) = if idx == 0 {
+            // Primary font: cell metrics were derived from it, so baseline
+            // positioning aligns by construction.
+            let (m, bmp) = font.rasterize(ch, self.font_size);
+            let baseline_y = ctx.y as i32 + self.ascent.round() as i32;
+            let gx = ctx.x as i32 + m.xmin;
+            let gy = baseline_y - m.height as i32 - m.ymin;
+            (m, bmp, gx, gy)
+        } else {
+            // Fallback font (e.g. Noto Emoji): its native advance and ascent
+            // don't match the primary's, so fit and center inside the cell box.
+            let (m, bmp) =
+                fit_and_rasterize(font, ch, self.font_size, ctx.cell_pixels_w, self.cell_h);
+            let gx = ctx.x as i32 + (ctx.cell_pixels_w as i32 - m.width as i32).max(0) / 2;
+            let gy = ctx.y as i32 + (self.cell_h as i32 - m.height as i32).max(0) / 2;
+            (m, bmp, gx, gy)
+        };
+        blit_glyph(
+            img,
+            glyph_x,
+            glyph_y,
+            metrics.width as u32,
+            metrics.height as u32,
+            &bitmap,
+            ctx.fg,
+        );
+        if ctx.style.flags.contains(CellFlags::BOLD) {
+            blit_glyph(
+                img,
+                glyph_x + 1,
+                glyph_y,
+                metrics.width as u32,
+                metrics.height as u32,
+                &bitmap,
+                ctx.fg,
+            );
         }
     }
 
@@ -742,6 +766,47 @@ mod tests {
         assert!(
             found,
             "no non-background pixels found — rasterizer drew nothing"
+        );
+    }
+
+    #[test]
+    fn grapheme_payload_renders_without_spilling_into_adjacent_cells() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let (cw, _ch) = r.cell_size();
+        let mut vt = VirtualTerminal::new(1, 4);
+        vt.process("👨\u{200d}💻Z ".as_bytes());
+
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            cursor: None,
+            ..Default::default()
+        };
+        let img = r.render(vt.grid(), &opts);
+
+        let mut composed_pixels = 0u32;
+        let mut adjacent_pixels = 0u32;
+        let mut spillover_pixels = 0u32;
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let p = img.get_pixel(x, y);
+                if (p[0], p[1], p[2]) == (0, 0, 0) {
+                    continue;
+                }
+                if x < 2 * cw {
+                    composed_pixels += 1;
+                } else if x < 3 * cw {
+                    adjacent_pixels += 1;
+                } else {
+                    spillover_pixels += 1;
+                }
+            }
+        }
+        assert!(composed_pixels > 0, "composed grapheme rendered blank");
+        assert!(adjacent_pixels > 0, "adjacent ASCII cell rendered blank");
+        assert_eq!(
+            spillover_pixels, 0,
+            "composed grapheme spilled into the following blank cell"
         );
     }
 

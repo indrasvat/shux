@@ -1,0 +1,40 @@
+{
+  "status": "partial_with_fallback_reviews",
+  "phase": "implementation",
+  "attempted_commands": [
+    "rtk dootsabha council --json --agents claude,gemini --timeout 10m <implementation-review-prompt>",
+    "rtk dootsabha council --json --agents claude,gemini --timeout 4m <refreshed-implementation-review-prompt>",
+    "rtk dootsabha council --json --agents claude,gemini --timeout 10m <concise-implementation-prompt>",
+    "rtk dootsabha consult --json --agent gemini --timeout 6m <concise-implementation-prompt>"
+  ],
+  "reason": "DootSabha claude+gemini council could not complete on the implementation diff. Attempts either hung, returned provider deadline errors, or failed synthesis. A separate Gemini consult on the concise current implementation review completed with APPROVE.",
+  "related_evidence": [
+    "dootsabha-implementation-claude.json",
+    "dootsabha-implementation-claude-gemini-current.json",
+    "dootsabha-implementation-claude-gemini-concise.json",
+    "dootsabha-implementation-gemini-consult.json"
+  ],
+  "fallback_reviewers": [
+    "multi_agent_v1 explorer 019ebe43-98e4-7083-8182-bb0aadee48f9",
+    "dootsabha consult --agent claude saved as dootsabha-implementation-claude.json",
+    "dootsabha consult --agent gemini saved as dootsabha-implementation-gemini-consult.json"
+  ],
+  "findings": [
+    {
+      "severity": "P1",
+      "finding": "esc_dispatch leaked active grapheme anchor across ESC cursor/grid movement sequences.",
+      "resolution": "Resolved by clearing active_grapheme_cell at the start of esc_dispatch and adding combining_after_esc_line_movement_does_not_attach_to_stale_cell."
+    },
+    {
+      "severity": "P1",
+      "finding": "cursor_cell_extended deep-cloned extended attrs per styled cell, regressing Arc sharing for styled runs.",
+      "resolution": "Resolved by restoring cursor.extended Arc cloning and adding styled_ascii_cells_share_cursor_extended_attrs."
+    },
+    {
+      "severity": "P1",
+      "finding": "SOLID-QA.md hard gate was still missing.",
+      "resolution": "Pending independent SOLID QA audit."
+    }
+  ],
+  "verdict": "Implementation review found no P0 blockers. Known P1 code findings from fallback/Claude review were fixed; Gemini consult approved the current concise implementation packet; SOLID QA remains the final hard gate."
+}

@@ -1,0 +1,76 @@
+{
+  "task": "069-shux-vt-grapheme-cell-storage",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.json",
+  "dootsabha_implementation": "dootsabha-implementation.json",
+  "related_reviews": [
+    "dootsabha-design-claude-gemini-hung.json",
+    "dootsabha-design-claude-codex-hung.json",
+    "dootsabha-design-consult-hung.json",
+    "dootsabha-design-claude-consult-current.json",
+    "dootsabha-design-gemini-consult-current.json",
+    "dootsabha-implementation-claude.json",
+    "dootsabha-implementation-claude-gemini-current.json",
+    "dootsabha-implementation-claude-gemini-concise.json",
+    "dootsabha-implementation-gemini-consult.json"
+  ],
+  "design": [
+    "DESIGN.md",
+    "design-council-prompt.md"
+  ],
+  "implementation": [
+    "implementation-diff.txt",
+    "implementation-review-prompt.txt"
+  ],
+  "reports": [
+    "grapheme-automation-report.json",
+    "grapheme-capture-report.json",
+    "performance-baseline.json",
+    "performance-current.json",
+    "performance-report.json",
+    "VISUAL-INSPECTION.md",
+    "../073-shux-vt-corpus-regression-harness/corpus-report.json"
+  ],
+  "screenshots": [
+    "grapheme-80x24-actual.png",
+    "grapheme-80x24-expected.png",
+    "grapheme-80x24-diff.png",
+    "grapheme-120x40-actual.png",
+    "grapheme-120x40-expected.png",
+    "grapheme-120x40-diff.png",
+    "grapheme-200x60-actual.png",
+    "grapheme-200x60-expected.png",
+    "grapheme-200x60-diff.png"
+  ],
+  "pixel_metrics": [
+    "grapheme-80x24-pixel.json",
+    "grapheme-120x40-pixel.json",
+    "grapheme-200x60-pixel.json"
+  ],
+  "captures": [
+    "grapheme-80x24.txt",
+    "grapheme-120x40.txt",
+    "grapheme-200x60.txt"
+  ],
+  "committed_baselines": [
+    "../../goldens/069-shux-vt-grapheme-cell-storage/grapheme-80x24-expected.png",
+    "../../goldens/069-shux-vt-grapheme-cell-storage/grapheme-120x40-expected.png",
+    "../../goldens/069-shux-vt-grapheme-cell-storage/grapheme-200x60-expected.png",
+    "../../goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.png"
+  ],
+  "verification_commands": [
+    "make test-vt",
+    "cargo test -p shux-ui --lib grapheme -- --test-threads=1",
+    "cargo test -p shux-raster --lib grapheme -- --test-threads=1",
+    "SHUX_TEST_BINARY_TIMEOUT_SECONDS=120 make test-pane-io FILTER=grapheme",
+    "make test-vt-grapheme-performance",
+    "make test-vt-grapheme",
+    "make test-vt-corpus",
+    "make test-vt-wide-invariants"
+  ],
+  "known_renderer_limitations": [
+    "fontdue raster output is conservative scalar fallback, not full shaping",
+    "color emoji rendering remains out of scope",
+    "some composed emoji and regional-indicator flags render as monochrome fallback glyphs or boxes even though capture preserves the full payload"
+  ]
+}
