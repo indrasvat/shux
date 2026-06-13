@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::cell::{CellStyle, ExtendedAttrs};
+use crate::charset::TerminalCharsets;
 
 /// Cursor shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -20,6 +21,7 @@ pub struct SavedCursor {
     pub extended: Option<Arc<ExtendedAttrs>>,
     pub auto_wrap_pending: bool,
     pub origin_mode: bool,
+    pub charsets: TerminalCharsets,
 }
 
 /// Terminal cursor state.
@@ -59,7 +61,7 @@ impl Cursor {
     }
 
     /// Save cursor state (DECSC -- ESC 7).
-    pub fn save(&mut self, origin_mode: bool) {
+    pub fn save(&mut self, origin_mode: bool, charsets: TerminalCharsets) {
         self.saved = Some(SavedCursor {
             row: self.row,
             col: self.col,
@@ -67,18 +69,19 @@ impl Cursor {
             extended: self.extended.clone(),
             auto_wrap_pending: self.auto_wrap_pending,
             origin_mode,
+            charsets,
         });
     }
 
-    /// Restore cursor state (DECRC -- ESC 8). Returns the saved origin_mode.
-    pub fn restore(&mut self) -> Option<bool> {
+    /// Restore cursor state (DECRC -- ESC 8). Returns saved origin_mode and charsets.
+    pub fn restore(&mut self) -> Option<(bool, TerminalCharsets)> {
         if let Some(ref saved) = self.saved.clone() {
             self.row = saved.row;
             self.col = saved.col;
             self.style = saved.style;
             self.extended = saved.extended.clone();
             self.auto_wrap_pending = saved.auto_wrap_pending;
-            Some(saved.origin_mode)
+            Some((saved.origin_mode, saved.charsets))
         } else {
             None
         }
@@ -128,7 +131,7 @@ mod tests {
         cursor.style.flags.set(CellFlags::BOLD);
         cursor.auto_wrap_pending = true;
 
-        cursor.save(true);
+        cursor.save(true, TerminalCharsets::default());
 
         // Move cursor elsewhere.
         cursor.row = 0;
@@ -137,7 +140,7 @@ mod tests {
         cursor.auto_wrap_pending = false;
 
         let origin = cursor.restore();
-        assert_eq!(origin, Some(true));
+        assert_eq!(origin, Some((true, TerminalCharsets::default())));
         assert_eq!(cursor.row, 5);
         assert_eq!(cursor.col, 10);
         assert_eq!(cursor.style.fg, Color::Indexed(1));
@@ -179,7 +182,7 @@ mod tests {
         cursor.row = 5;
         cursor.col = 10;
         cursor.auto_wrap_pending = true;
-        cursor.save(false);
+        cursor.save(false, TerminalCharsets::default());
 
         cursor.clamp(2, 3);
         cursor.row = 0;
@@ -196,13 +199,13 @@ mod tests {
         let mut cursor = Cursor::new();
         cursor.row = 3;
         cursor.col = 7;
-        cursor.save(false);
+        cursor.save(false, TerminalCharsets::default());
 
         // First restore.
         cursor.row = 0;
         cursor.col = 0;
         let origin1 = cursor.restore();
-        assert_eq!(origin1, Some(false));
+        assert_eq!(origin1, Some((false, TerminalCharsets::default())));
         assert_eq!(cursor.row, 3);
         assert_eq!(cursor.col, 7);
 
@@ -210,7 +213,7 @@ mod tests {
         cursor.row = 10;
         cursor.col = 20;
         let origin2 = cursor.restore();
-        assert_eq!(origin2, Some(false));
+        assert_eq!(origin2, Some((false, TerminalCharsets::default())));
         assert_eq!(cursor.row, 3);
         assert_eq!(cursor.col, 7);
     }

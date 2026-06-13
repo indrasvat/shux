@@ -1,0 +1,46 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "Progress check passes now. The three renamed-fixture corpus artifacts (`synthetic-dec-special-graphics-actual.png`, `-diff.png`, `-pixel.json`) are now staged — they're the regenerated task-073 evidence that the corpus `evidence-manifest.json` references after the fixture rename, so they correctly belong in this branch's commit.\n\nNote this directly reinforces review finding **F3**: the rest of the new evidence is still untracked. Before the PR, the remaining artifacts should also be `git add`ed:\n\n- `.shux/goldens/070-dec-special-graphics/` (the DootSabha-approved baseline PNGs + txt)\n- `.shux/qa/070-dec-special-graphics/` (automation/pixel reports — plus the still-missing `SOLID-QA.md` and `evidence-manifest.json` per **F1**)\n- `.shux/goldens/073-vt-corpus/synthetic-dec-special-graphics-*` (the new corpus goldens; the old `-current` deletions are already in the worktree)\n\nMy review verdict stands: **code APPROVE**, conditional on closing F1 (commit a `VERDICT: PASS` SOLID-QA.md + evidence-manifest.json), F2 (populate the implementation-council artifact), and F3 (stage the remaining evidence) before the PR — with F4 (the `1049`/DECSC charset-register clobber) recommended for this PR but defensible as a noted fast-follow.",
+      "duration_ms": 301044,
+      "cost_usd": 2.1459760000000005,
+      "tokens_in": 24505,
+      "tokens_out": 18799
+    },
+    {
+      "provider": "gemini",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    }
+  ],
+  "reviews": null,
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 301044,
+    "total_cost_usd": 2.1459760000000005,
+    "total_tokens_in": 24505,
+    "total_tokens_out": 18799,
+    "providers": {
+      "claude": "ok",
+      "gemini": "error"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "synthesis: synthesize: no healthy agents available for synthesis"
+  }
+}

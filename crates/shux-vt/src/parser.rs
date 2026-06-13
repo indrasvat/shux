@@ -6,6 +6,7 @@ use crate::SyncPresentation;
 use crate::cell::{
     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, TerminalDefaultColors, UnderlineStyle,
 };
+use crate::charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 use crate::cursor::{Cursor, CursorShape};
 use crate::grid::{Grid, GridConfig};
 
@@ -104,6 +105,7 @@ pub struct VtHandler<'a> {
     pub dcs_state: &'a mut Option<DcsState>,
     pub sync_present: &'a mut Option<SyncPresentation>,
     pub active_grapheme_cell: &'a mut Option<(usize, usize)>,
+    pub charsets: &'a mut TerminalCharsets,
     pub responses: &'a mut Vec<Vec<u8>>,
 }
 
@@ -127,6 +129,47 @@ impl<'a> VtHandler<'a> {
 
     fn cursor_cell_extended(&self) -> Option<Arc<ExtendedAttrs>> {
         self.cursor.extended.clone()
+    }
+
+    fn save_cursor_state(&mut self) {
+        self.cursor.save(self.modes.origin_mode, *self.charsets);
+    }
+
+    fn restore_cursor_state(&mut self) {
+        if let Some((origin, charsets)) = self.cursor.restore() {
+            self.modes.origin_mode = origin;
+            *self.charsets = charsets;
+        }
+    }
+
+    fn reset_charsets(&mut self) {
+        *self.charsets = TerminalCharsets::default();
+    }
+
+    fn active_charset(&self) -> TerminalCharset {
+        match self.charsets.active {
+            CharsetSlot::G0 => self.charsets.g0,
+            CharsetSlot::G1 => self.charsets.g1,
+        }
+    }
+
+    fn translate_printable(&self, ch: char) -> char {
+        if self.active_charset() != TerminalCharset::DecSpecialGraphics {
+            return ch;
+        }
+        dec_special_graphics(ch).unwrap_or(ch)
+    }
+
+    fn designate_charset(&mut self, slot: CharsetSlot, final_byte: u8) {
+        let charset = match final_byte {
+            b'0' => TerminalCharset::DecSpecialGraphics,
+            b'B' => TerminalCharset::Ascii,
+            _ => TerminalCharset::Ascii,
+        };
+        match slot {
+            CharsetSlot::G0 => self.charsets.g0 = charset,
+            CharsetSlot::G1 => self.charsets.g1 = charset,
+        }
     }
 
     fn wrap_to_next_line(&mut self) {
@@ -610,16 +653,16 @@ impl<'a> VtHandler<'a> {
             // Save cursor (1048).
             1048 => {
                 if enable {
-                    self.cursor.save(self.modes.origin_mode);
-                } else if let Some(origin) = self.cursor.restore() {
-                    self.modes.origin_mode = origin;
+                    self.save_cursor_state();
+                } else {
+                    self.restore_cursor_state();
                 }
             }
             // Alternate screen buffer (1047, 1049).
             1047 | 1049 => {
                 if enable {
                     if mode == 1049 {
-                        self.cursor.save(self.modes.origin_mode);
+                        self.save_cursor_state();
                     }
                     if self.modes.alternate_screen {
                         if mode == 1049 {
@@ -659,9 +702,7 @@ impl<'a> VtHandler<'a> {
                         self.modes.alternate_screen = false;
                     }
                     if mode == 1049 {
-                        if let Some(origin) = self.cursor.restore() {
-                            self.modes.origin_mode = origin;
-                        }
+                        self.restore_cursor_state();
                     }
                 }
             }
@@ -745,7 +786,7 @@ impl<'a> VtHandler<'a> {
 
 impl<'a> vte::Perform for VtHandler<'a> {
     fn print(&mut self, ch: char) {
-        self.write_char(ch);
+        self.write_char(self.translate_printable(ch));
     }
 
     fn execute(&mut self, byte: u8) {
@@ -770,7 +811,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
             0x0A..=0x0C => self.linefeed(),
             // CR -- carriage return.
             0x0D => self.carriage_return(),
-            // SO (0x0E), SI (0x0F) -- character set shift (ignored for now).
+            // SO -- Shift Out / LS1: select G1 into GL.
+            0x0E => self.charsets.active = CharsetSlot::G1,
+            // SI -- Shift In / LS0: select G0 into GL.
+            0x0F => self.charsets.active = CharsetSlot::G0,
             _ => trace!(byte, "unhandled C0 control"),
         }
     }
@@ -999,13 +1043,11 @@ impl<'a> vte::Perform for VtHandler<'a> {
             ('g', []) => {}
             // SCOSC -- Save Cursor (SCO/private form, common in modern TUI diff renderers).
             ('s', []) if params_vec.iter().all(|&param| param == 0) => {
-                self.cursor.save(self.modes.origin_mode);
+                self.save_cursor_state();
             }
             // SCORC -- Restore Cursor (SCO/private form).
             ('u', []) if params_vec.iter().all(|&param| param == 0) => {
-                if let Some(origin) = self.cursor.restore() {
-                    self.modes.origin_mode = origin;
-                }
+                self.restore_cursor_state();
             }
             // SGR -- Select Graphic Rendition.
             ('m', []) => {
@@ -1222,13 +1264,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
         self.clear_active_grapheme_cell();
         match (byte, intermediates) {
             // DECSC -- Save Cursor (ESC 7).
-            (b'7', []) => self.cursor.save(self.modes.origin_mode),
+            (b'7', []) => self.save_cursor_state(),
             // DECRC -- Restore Cursor (ESC 8).
-            (b'8', []) => {
-                if let Some(origin) = self.cursor.restore() {
-                    self.modes.origin_mode = origin;
-                }
-            }
+            (b'8', []) => self.restore_cursor_state(),
+            // Designate G0/G1 character sets.
+            (byte, [b'(']) => self.designate_charset(CharsetSlot::G0, byte),
+            (byte, [b')']) => self.designate_charset(CharsetSlot::G1, byte),
             // DECPAM -- Application keypad mode (ESC =).
             (b'=', []) => self.modes.application_keypad = true,
             // DECPNM -- Normal keypad mode (ESC >).
@@ -1254,6 +1295,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 *self.modes = TerminalModes::default();
                 *self.default_colors = TerminalDefaultColors::default();
                 self.sync_present.take();
+                self.reset_charsets();
                 self.scroll_region.top = 0;
                 self.scroll_region.bottom = self.grid.rows().saturating_sub(1);
             }
@@ -1614,6 +1656,44 @@ fn join_osc_parts(parts: &[&[u8]]) -> Vec<u8> {
     joined
 }
 
+fn dec_special_graphics(ch: char) -> Option<char> {
+    match ch {
+        '_' => Some(' '),
+        '`' => Some('◆'),
+        'a' => Some('▒'),
+        'b' => Some('␉'),
+        'c' => Some('␌'),
+        'd' => Some('␍'),
+        'e' => Some('␊'),
+        'f' => Some('°'),
+        'g' => Some('±'),
+        'h' => Some('␤'),
+        'i' => Some('␋'),
+        'j' => Some('┘'),
+        'k' => Some('┐'),
+        'l' => Some('┌'),
+        'm' => Some('└'),
+        'n' => Some('┼'),
+        'o' => Some('⎺'),
+        'p' => Some('⎻'),
+        'q' => Some('─'),
+        'r' => Some('⎼'),
+        's' => Some('⎽'),
+        't' => Some('├'),
+        'u' => Some('┤'),
+        'v' => Some('┴'),
+        'w' => Some('┬'),
+        'x' => Some('│'),
+        'y' => Some('≤'),
+        'z' => Some('≥'),
+        '{' => Some('π'),
+        '|' => Some('≠'),
+        '}' => Some('£'),
+        '~' => Some('·'),
+        _ => None,
+    }
+}
+
 fn append_color_sgr(params: &mut Vec<String>, color: Color, background: bool) {
     match color {
         Color::Default => {}
@@ -1738,6 +1818,7 @@ mod tests {
         dcs_state: Option<DcsState>,
         sync_present: Option<SyncPresentation>,
         active_grapheme_cell: Option<(usize, usize)>,
+        charsets: TerminalCharsets,
         responses: Vec<Vec<u8>>,
         parser: vte::Parser,
     }
@@ -1759,6 +1840,7 @@ mod tests {
                 dcs_state: None,
                 sync_present: None,
                 active_grapheme_cell: None,
+                charsets: TerminalCharsets::default(),
                 responses: Vec::new(),
                 parser: vte::Parser::new(),
             }
@@ -1777,6 +1859,7 @@ mod tests {
                 dcs_state: &mut self.dcs_state,
                 sync_present: &mut self.sync_present,
                 active_grapheme_cell: &mut self.active_grapheme_cell,
+                charsets: &mut self.charsets,
                 responses: &mut self.responses,
             };
             self.parser.advance(&mut handler, bytes);
