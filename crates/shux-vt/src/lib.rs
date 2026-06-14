@@ -16,7 +16,7 @@ pub use cell::{
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
-pub use grid::{Grid, GridConfig, Row};
+pub use grid::{DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 pub use tabstops::TabStops;
 
@@ -153,6 +153,27 @@ impl VirtualTerminal {
             .unwrap_or(&self.grid)
     }
 
+    /// Whether the currently presented viewport has changed since the last
+    /// dirty drain.
+    pub fn is_dirty(&self) -> bool {
+        self.sync_present
+            .as_ref()
+            .map(|present| present.grid.is_dirty())
+            .unwrap_or_else(|| self.grid.is_dirty())
+    }
+
+    /// Consume and clear dirty regions for the currently presented viewport.
+    ///
+    /// This reports visible grid changes only. Cursor-only movement is outside
+    /// this API because renderers draw cursor presentation as an overlay.
+    pub fn take_dirty_regions(&mut self) -> Vec<DirtyRegion> {
+        if let Some(ref mut present) = self.sync_present {
+            present.grid.take_dirty_regions()
+        } else {
+            self.grid.take_dirty_regions()
+        }
+    }
+
     /// Access the cursor state.
     pub fn cursor(&self) -> &Cursor {
         self.sync_present
@@ -255,8 +276,12 @@ impl VirtualTerminal {
     pub fn enter_alternate_screen(&mut self) {
         self.active_grapheme_cell = None;
         if !self.modes.alternate_screen {
-            let config = GridConfig { max_scrollback: 0 }; // No scrollback on alt screen.
-            let alt_grid = Grid::new(self.rows, self.cols, config);
+            let config = GridConfig {
+                max_scrollback: 0,
+                ..GridConfig::default()
+            }; // No scrollback on alt screen.
+            let mut alt_grid = Grid::new(self.rows, self.cols, config);
+            alt_grid.mark_all_dirty();
             let alt_cursor = Cursor::new();
             self.alt_grid = Some(std::mem::replace(&mut self.grid, alt_grid));
             self.alt_cursor = Some(std::mem::replace(&mut self.cursor, alt_cursor));
@@ -270,6 +295,7 @@ impl VirtualTerminal {
         if self.modes.alternate_screen {
             if let Some(primary_grid) = self.alt_grid.take() {
                 self.grid = primary_grid;
+                self.grid.mark_all_dirty();
             }
             if let Some(primary_cursor) = self.alt_cursor.take() {
                 self.cursor = primary_cursor;
@@ -2195,5 +2221,162 @@ mod tests {
         vt.process(b"\x1b[2F"); // CPL 2 -- move up 2 lines, col 0.
         assert_eq!(vt.cursor().row, 2);
         assert_eq!(vt.cursor().col, 0);
+    }
+
+    #[test]
+    fn dirty_single_print_marks_written_row() {
+        let mut vt = VirtualTerminal::new(2, 6);
+        vt.process(b"A");
+
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 0..6 }]
+        );
+        assert!(!vt.is_dirty());
+    }
+
+    #[test]
+    fn dirty_cursor_only_movement_is_out_of_scope() {
+        let mut vt = VirtualTerminal::new(2, 6);
+        vt.process(b"\x1b[2;3H");
+
+        assert!(vt.take_dirty_regions().is_empty());
+    }
+
+    #[test]
+    fn dirty_vt_byte_fixture_reports_expected_sequence() {
+        let mut vt = VirtualTerminal::new(3, 8);
+
+        vt.process(b"abc");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 0..8 }]
+        );
+
+        vt.process(b"\x1b[1;2H\x1b[2P");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 0..8 }]
+        );
+
+        vt.process(b"\x1b[2J");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 0, cols: 0..8 },
+                DirtyRegion { row: 1, cols: 0..8 },
+                DirtyRegion { row: 2, cols: 0..8 },
+            ]
+        );
+    }
+
+    #[test]
+    fn dirty_rep_and_grapheme_append_dirty_the_target_row() {
+        let mut vt = VirtualTerminal::new(2, 8);
+        vt.process("e\u{301}".as_bytes());
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 0..8 }]
+        );
+
+        vt.process(b"\x1b[2b");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 0..8 }]
+        );
+    }
+
+    #[test]
+    fn dirty_wide_cell_neighbor_repair_dirties_row() {
+        let mut vt = VirtualTerminal::new(2, 8);
+        vt.process("A界B".as_bytes());
+        vt.take_dirty_regions();
+
+        vt.process(b"\x1b[1;3HX");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 0..8 }]
+        );
+        assert_eq!(vt.grid().visible_row(0)[1].ch, ' ');
+        assert_eq!(vt.grid().visible_row(0)[2].ch, 'X');
+    }
+
+    #[test]
+    fn dirty_sync_output_reports_presented_buffer_only_then_full_frame_on_leave() {
+        let mut vt = VirtualTerminal::new(2, 6);
+        vt.process(b"old");
+        vt.take_dirty_regions();
+
+        vt.process(b"\x1b[?2026h\x1b[1;1Hnew");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 0, cols: 0..6 },
+                DirtyRegion { row: 1, cols: 0..6 },
+            ]
+        );
+        assert_eq!(compact_capture(&vt), "old");
+
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 0, cols: 0..6 },
+                DirtyRegion { row: 1, cols: 0..6 },
+            ]
+        );
+        assert_eq!(compact_capture(&vt), "new");
+    }
+
+    #[test]
+    fn dirty_alternate_screen_enter_and_leave_are_full_frame() {
+        let mut vt = VirtualTerminal::new(2, 5);
+        vt.process(b"main");
+        vt.take_dirty_regions();
+
+        vt.process(b"\x1b[?1049h");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 0, cols: 0..5 },
+                DirtyRegion { row: 1, cols: 0..5 },
+            ]
+        );
+
+        vt.process(b"alt");
+        vt.take_dirty_regions();
+        vt.process(b"\x1b[?1049l");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 0, cols: 0..5 },
+                DirtyRegion { row: 1, cols: 0..5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn dirty_default_color_changes_are_full_frame() {
+        let mut vt = VirtualTerminal::new(2, 4);
+        vt.process(b"cell");
+        vt.take_dirty_regions();
+
+        vt.process(b"\x1b]10;#ff0000\x1b\\");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 0, cols: 0..4 },
+                DirtyRegion { row: 1, cols: 0..4 },
+            ]
+        );
+
+        vt.process(b"\x1b]110\x1b\\");
+        assert_eq!(
+            vt.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 0, cols: 0..4 },
+                DirtyRegion { row: 1, cols: 0..4 },
+            ]
+        );
     }
 }

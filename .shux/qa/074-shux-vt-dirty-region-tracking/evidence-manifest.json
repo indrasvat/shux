@@ -1,0 +1,34 @@
+{
+  "task": "074-shux-vt-dirty-region-tracking",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.json",
+  "dootsabha_implementation": "dootsabha-implementation.json",
+  "screenshots": [
+    "dirty-120x30-actual.png",
+    "dirty-120x30-expected.png",
+    "dirty-120x30-diff.png",
+    "dirty-live-80x24-actual.png",
+    "dirty-live-120x40-actual.png",
+    "dirty-live-200x60-actual.png"
+  ],
+  "captures": [
+    "dirty-live-80x24.txt",
+    "dirty-live-120x40.txt",
+    "dirty-live-200x60.txt"
+  ],
+  "pixel_metrics": [
+    "dirty-120x30-pixel.json"
+  ],
+  "reports": [
+    "dirty-region-report.json",
+    "performance.json",
+    "dirty-live-report.json",
+    "dirty-live-color-report.json"
+  ],
+  "notes": [
+    "Dirty-region API is observation-only in task 074; raster parity compares a dirty-tracking-disabled VT replay against a dirty-tracking-enabled VT replay of the same fixture.",
+    "No renderer consumes dirty regions in task 074, so dirty/incremental-render pixel parity is intentionally out of scope until a renderer consumer lands.",
+    "Cursor-only movement is documented as outside grid dirty regions because cursor presentation is rendered as an overlay.",
+    "Live shux automation includes explicit truecolor, indexed-color, and basic-color probes; screenshots must contain saturated color pixels."
+  ]
+}

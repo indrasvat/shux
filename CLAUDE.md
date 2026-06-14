@@ -65,6 +65,10 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 - **Testing:** `#[cfg(test)]` modules in each file. Integration tests in `tests/`. Property tests with `proptest` where applicable.
 - **Imports:** `use` statements grouped: std → external crates → workspace crates → local modules. Enforced by `rustfmt`.
 - **Makefile is the command interface.** ALWAYS use `make <target>` instead of running raw `cargo`, `lefthook`, or script commands directly. If a task requires a command that has no Makefile target, add one (with proper parameterization) before using it. At the end of each task, audit any new commands discovered during implementation and add them as Makefile targets. All hooks (lefthook, Claude Code) MUST invoke `make` targets, never raw commands.
+- **Process hygiene is non-negotiable:** every shux feature/test/automation run MUST leave zero new `shux` daemons or child processes behind; use `.shux/scripts/no_leak_guard.sh` and isolated `XDG_RUNTIME_DIR` cleanup for any daemon-backed command.
+- **External reviewer CLIs are process-hygiene risks:** run Claude/Codex/DootSabha/agy review commands through `.shux/scripts/agent_review_guard.sh`; do not use Gemini for shux review automation unless explicitly requested.
+- **Color probes are mandatory in shux automation:** any daemon-backed shux test or fixture that captures pane/window output MUST include explicit truecolor, indexed-color, or basic-color content so monochrome/`NO_COLOR` regressions cannot pass unnoticed.
+- **Prefer real terminal workloads:** when behavior is user-visible, tests should exercise real shux panes, Unix commands, and installed TUIs where practical; keep synthetic fixtures for narrow parser invariants, not as the only proof.
 - **CLI output styling:** All user-facing CLI text output MUST use the style module (`crates/shux/src/style.rs`). Never use raw `println!` for styled output — use the helpers:
   - `style::accent(text)` — Cyan bold, for "shux" brand name and key identifiers
   - `style::success(text)` — Green, for confirmations (created, killed, ensured)

@@ -4,6 +4,7 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+source "${repo_root}/.shux/scripts/lib/shux_harness.sh"
 task="068-shux-vt-wide-cell-invariants"
 qa_dir="${SHUX_WIDE_INVARIANTS_QA:-${repo_root}/.shux/qa/${task}}"
 golden_dir="${SHUX_WIDE_INVARIANTS_GOLDENS:-${repo_root}/.shux/goldens/${task}}"
@@ -14,8 +15,7 @@ trigger="${runtime}/go"
 promote="${SHUX_WIDE_INVARIANTS_PROMOTE:-0}"
 
 cleanup() {
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill "${session}" >/dev/null 2>&1 || true
-  rm -rf "${runtime}"
+  shux_harness_cleanup_runtime "${runtime}" "${shux_bin}" "${session}"
 }
 trap cleanup EXIT
 

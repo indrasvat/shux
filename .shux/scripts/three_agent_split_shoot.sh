@@ -14,6 +14,8 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX_BIN:-shux}"
 SESSION="three-agents"
 TEMPLATE=".shux/templates/three-agents.toml"
@@ -27,13 +29,20 @@ ROWS="${ROWS:-50}"
 SPLASH_WAIT="${SPLASH_WAIT:-4}"
 CODEX_TRUST_WAIT="${CODEX_TRUST_WAIT:-4}"
 PROMPT_WAIT="${PROMPT_WAIT:-0.6}"
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-three-agents.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 
 ENTER_B64=$(printf '\r' | base64)
 
 mkdir -p "$(dirname "$OUT")"
 
+cleanup() {
+    shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" "$SESSION"
+}
+trap cleanup EXIT INT TERM HUP
+
 # 1. idempotent teardown
-"$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" "$SESSION"
 
 # 2. atomic 3-pane spawn via the template
 "$SHUX" state apply "$TEMPLATE" >/dev/null
@@ -95,12 +104,8 @@ sleep "$PROMPT_WAIT"
 "$SHUX" window snapshot -s "$SESSION" --cols "$COLS" --rows "$ROWS" -o "$OUT" >/dev/null
 cp "$OUT" "$FINAL"
 
-# 10. teardown (commented out by default — leave the session up so you
-#     can `shux session attach three-agents` and inspect manually)
-# "$SHUX" session kill "$SESSION" >/dev/null
+# 10. teardown is handled by the EXIT trap. Re-run with a debugger if
+#     manual inspection is needed; automation must not leave daemons behind.
 
 echo "→ $FINAL"
 echo "  $(file "$FINAL" | sed 's/^[^:]*: //')"
-echo
-echo "Inspect interactively: shux session attach $SESSION"
-echo "Tear down:             shux session kill $SESSION"

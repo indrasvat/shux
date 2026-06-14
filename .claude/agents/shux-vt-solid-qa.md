@@ -104,7 +104,7 @@ Unless the active task explicitly narrows scope, require all layers:
 1. **Unit tests:** focused Rust tests in the touched crate.
 2. **Integration tests:** workspace or crate-level tests proving public behavior.
 3. **Raw byte / replay tests:** deterministic VT byte fixtures or `pane.record` raw PTY recordings for real TUI streams.
-4. **Shux automation:** launch via shux, drive keys/resizes, capture `pane.capture` and `pane.snapshot`.
+4. **Shux automation:** launch via shux, drive keys/resizes, capture `pane.capture` and `pane.snapshot` from colored Unix commands and installed TUIs where practical.
 5. **Visual inspection:** inspect PNGs as images for clipping, color bleed, tofu, ghost cells, bad wrapping, cursor artifacts, layout drift, and missing content.
 6. **Pixel-level verification:** compare before/after or actual/baseline PNGs with numeric metrics.
 7. **Independent QA verdict:** your own report, not the implementer's summary.
@@ -155,6 +155,11 @@ shux --format json pane snapshot -s solid-vt-<task> \
   | jq -r .png_base64 | base64 -d > .shux/out/<task>/pane-80x24.png
 shux session kill solid-vt-<task>
 ```
+
+Every daemon-backed capture/snapshot audit must include explicit truecolor,
+indexed-color, or basic-color probes. Prefer real commands/TUIs for
+user-visible behavior; synthetic fixtures are acceptable for narrow parser
+invariants but must not be the only proof when real workloads are practical.
 
 Breakpoints unless task narrows scope:
 

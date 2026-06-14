@@ -11,6 +11,8 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+source "$REPO_ROOT/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX_BIN:-target/release/shux}"
 MAKE_BIN="${MAKE:-make}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -40,9 +42,7 @@ shux_cmd() {
 
 SESSIONS=()
 cleanup() {
-    for session in "${SESSIONS[@]:-}"; do
-        shux_cmd session kill "$session" >/dev/null 2>&1 || true
-    done
+    shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" "${SESSIONS[@]:-}"
 }
 trap cleanup EXIT INT TERM HUP
 
@@ -55,7 +55,7 @@ run_tui() {
     SESSIONS+=("$session")
 
     echo "==> $name: $*"
-    shux_cmd session kill "$session" >/dev/null 2>&1 || true
+    shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" "$session"
     shux_cmd --format json session create "$session" -d --title "$name" -- \
         env TERM=xterm-256color COLORTERM=truecolor "$@" \
         >"$OUT_DIR/$name.create.json"

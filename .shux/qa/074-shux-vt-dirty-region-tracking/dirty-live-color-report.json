@@ -1,0 +1,23 @@
+{
+  "checks": [
+    {
+      "colored_pixels": 693,
+      "screenshot": "dirty-live-80x24-actual.png",
+      "status": "pass",
+      "viewport": "80x24"
+    },
+    {
+      "colored_pixels": 693,
+      "screenshot": "dirty-live-120x40-actual.png",
+      "status": "pass",
+      "viewport": "120x40"
+    },
+    {
+      "colored_pixels": 693,
+      "screenshot": "dirty-live-200x60-actual.png",
+      "status": "pass",
+      "viewport": "200x60"
+    }
+  ],
+  "status": "pass"
+}

@@ -10,12 +10,16 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX_BIN:-shux}"
 SESSION="conductor-shoot"
 PLUGIN_NAME="conductor"
 PLUGIN_SRC="examples/plugins/conductor/plugin.sh"
 OUT=".shux/out/conductor-v0.1-demo.png"
 FINAL="pages/screenshots/conductor-v0.1-demo.png"
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-conductor-v01.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -37,8 +41,8 @@ EOF
 chmod +x "$FAKE_AGENT_DIR/claude"
 
 cleanup() {
-    "$SHUX" plugin kill "$PLUGIN_NAME" >/dev/null 2>&1 || true
-    "$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
+    shux_harness_kill_plugin "$RUNTIME_DIR" "$SHUX" "$PLUGIN_NAME"
+    shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" "$SESSION"
     rm -rf "$FAKE_AGENT_DIR"
 }
 trap cleanup EXIT INT TERM HUP

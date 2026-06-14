@@ -35,8 +35,8 @@
 - **Done:** 073 (VT corpus regression harness), 067 (resize reflow), 068
   (wide-cell invariants), 069 (grapheme-aware cell storage), 070
   (DEC special graphics), 071 (tab stops), 072
-  (origin-mode/scroll-region semantics).
-- **Pending:** 074 (dirty-region tracking).
+  (origin-mode/scroll-region semantics), 074 (dirty-region tracking).
+- **In Progress:** none.
 - Every task in this track requires DootSabha design review, DootSabha
   implementation-diff review, unit/integration/raw replay/shux automation
   coverage as applicable, full-resolution visual evidence, pixel-level PNG
@@ -101,6 +101,27 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 ---
 
 ## Session Log
+
+**2026-06-13 — feat(vt): add dirty-region tracking and process leak guardrails**
+- Completed task 074 by adding opt-in dirty-region tracking to `shux-vt` grid
+  mutation paths, exposing `is_dirty` / `take_dirty_regions`, and preserving
+  clean cloned snapshots for existing rendering paths.
+- Added focused coverage for print, erase, insert/delete, scroll, resize,
+  alternate-screen/sync transitions, direct row mutation guards, clone behavior,
+  wide-cell repair ranges, and VT byte-fixture dirty sequences.
+- Added `make test-vt-dirty-regions` with independent tracking-disabled versus
+  tracking-enabled raster parity, 0-diff pixel verification, replay/idle
+  performance budgets, and live 80x24 / 120x40 / 200x60 shux screenshots with
+  explicit truecolor, indexed-color, and basic-color probes.
+- Hardened process hygiene after finding orphan daemon/reviewer processes:
+  `.shux/scripts/no_leak_guard.sh` now gates daemon-backed shux automation,
+  `.shux/scripts/lib/shux_harness.sh` provides timeout fallback and isolated
+  runtime cleanup, and `.shux/scripts/agent_review_guard.sh` bounds external
+  reviewer CLIs that may spawn MCP children.
+- Verification: focused dirty-region unit tests, `make test-vt-dirty-regions`,
+  `make test-shux-leak-guard`, `make test-agent-review-guard`, exact pixel
+  JSON, color-pixel report, performance JSON, and no remaining task-owned
+  `shux`/Gemini/DootSabha processes after cleanup.
 
 **2026-06-13 — feat(vt): correct origin-mode scroll-region semantics**
 - Completed task 072 by making DECOM origin mode address CUP/HVP/VPA relative
@@ -1436,7 +1457,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 071 | shux-vt real tab-stop state | VT Quality | **Done** | 005, 073 |
 | 072 | shux-vt origin mode and scroll-region semantics | VT Quality | **Done** | 005, 029, 073 |
 | 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
-| 074 | shux-vt dirty-region tracking | VT Quality | Pending | 005, 073 |
+| 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
 
 ---
 

@@ -31,6 +31,29 @@ fixture = (
 )
 
 
+def stop_daemon() -> None:
+    pid_file = runtime / "shux" / "shux.pid"
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return
+    try:
+        os.kill(pid, 15)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, 9)
+    except ProcessLookupError:
+        pass
+
+
 def run(cmd: list[str], env: dict[str, str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
@@ -152,6 +175,7 @@ def main() -> int:
         return 0
     finally:
         run([str(shux), "session", "kill", session], env)
+        stop_daemon()
         shutil.rmtree(runtime, ignore_errors=True)
 
 

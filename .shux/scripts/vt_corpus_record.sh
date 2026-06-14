@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${repo_root}/.shux/scripts/lib/shux_harness.sh"
 shux_bin="${SHUX_BIN:-${repo_root}/target/release/shux}"
 out_dir="${VT_CORPUS_RECORD_OUT:-${repo_root}/.shux/out/073-vt-corpus/recordings}"
 runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-vt-corpus-record.XXXXXX")"
@@ -20,14 +21,17 @@ need base64
 need shasum
 
 cleanup() {
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" --format json session list 2>/dev/null \
-    | python3 -c 'import json,sys; [print(s["name"]) for s in json.load(sys.stdin)]' 2>/dev/null \
-    | while read -r session; do
-        case "${session}" in
-          vt-corpus-*) env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill "${session}" >/dev/null 2>&1 || true ;;
-        esac
-      done || true
-  rm -rf "${runtime}"
+  local sessions=()
+  while read -r session; do
+    case "${session}" in
+      vt-corpus-*) sessions+=("${session}") ;;
+    esac
+  done < <(
+    shux_harness_timeout 8s \
+      env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" --format json session list 2>/dev/null \
+      | python3 -c 'import json,sys; [print(s["name"]) for s in json.load(sys.stdin)]' 2>/dev/null || true
+  )
+  shux_harness_cleanup_runtime "${runtime}" "${shux_bin}" "${sessions[@]:-}"
 }
 trap cleanup EXIT
 

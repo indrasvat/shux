@@ -14,6 +14,8 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX_BIN:-shux}"
 SESSION="conductor-v0.2-shoot"
 PLUGIN_NAME="conductor"
@@ -21,13 +23,15 @@ PLUGIN_SRC="examples/plugins/conductor/plugin.sh"
 OUT=".shux/out/conductor-v0.2-settle-archive.png"
 FINAL="pages/screenshots/conductor-v0.2-settle-archive.png"
 SNAPSHOT_DIR_OUT=".shux/out/conductor-v0.2-snapshots"
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-conductor-v02.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 
 mkdir -p "$(dirname "$OUT")" "$SNAPSHOT_DIR_OUT"
 
 FAKE_AGENT_DIR="/tmp/conductor-v0.2-shoot"
 cleanup() {
-    "$SHUX" plugin kill "$PLUGIN_NAME" >/dev/null 2>&1 || true
-    "$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
+    shux_harness_kill_plugin "$RUNTIME_DIR" "$SHUX" "$PLUGIN_NAME"
+    shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" "${SESSION:-}" "${SESSION_C:-}" "${SESSION_X:-}" "${SESSION_O:-}"
     rm -f "$FAKE_AGENT_DIR"/* "/tmp/conductor-v0.2-wrap.sh" 2>/dev/null || true
     rmdir "$FAKE_AGENT_DIR" 2>/dev/null || true
 }
@@ -129,9 +133,9 @@ cp "$OUT" "$FINAL"
 cp "$SNAPSHOT_DIR_OUT/INDEX.tsv" ".shux/out/conductor-v0.2-INDEX.tsv" 2>/dev/null || true
 
 # Make sure the agent sessions are torn down too.
-"$SHUX" session kill "$SESSION_C" >/dev/null 2>&1 || true
-"$SHUX" session kill "$SESSION_X" >/dev/null 2>&1 || true
-"$SHUX" session kill "$SESSION_O" >/dev/null 2>&1 || true
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" "$SESSION_C"
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" "$SESSION_X"
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" "$SESSION_O"
 
 echo "→ $FINAL"
 echo "→ snapshots in $SNAPSHOT_DIR_OUT"

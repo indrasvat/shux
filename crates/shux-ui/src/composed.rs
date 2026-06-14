@@ -52,7 +52,10 @@ pub fn compose(
     let mut grid = Grid::new(
         rows as usize,
         cols as usize,
-        GridConfig { max_scrollback: 0 },
+        GridConfig {
+            max_scrollback: 0,
+            ..GridConfig::default()
+        },
     );
 
     let content_height = rows.saturating_sub(status_bar_height);
@@ -215,7 +218,7 @@ fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid) {
         let src_row_cells: Vec<Cell> = (0..visible_cols.min(total_cols))
             .map(|c| src.visible_row(src_row_idx)[c].clone())
             .collect();
-        let dst_row = grid.visible_row_mut(dst_row_idx);
+        let mut dst_row = grid.visible_row_mut(dst_row_idx);
         for (c, cell) in src_row_cells.into_iter().enumerate() {
             let dst_col = rect.x as usize + c;
             if dst_col >= dst_row.len() {
@@ -254,7 +257,7 @@ fn put_cell(grid: &mut Grid, x: u16, y: u16, ch: char, fg: Color, bg: Color, fla
     if y as usize >= grid.rows() {
         return;
     }
-    let row = grid.visible_row_mut(y as usize);
+    let mut row = grid.visible_row_mut(y as usize);
     if (x as usize) >= row.len() {
         return;
     }

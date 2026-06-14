@@ -1,0 +1,12 @@
+DIRTY REGION LIVE CHECK-------------------------------------------------------------------------------------------------
+
+
+
+         tick=120x40
+
+
+================================================================================
+
+Only a small area changes between ticks; full PNG capture remains stable.
+
+color-probe: TRUECOLOR INDEXED BASIC
