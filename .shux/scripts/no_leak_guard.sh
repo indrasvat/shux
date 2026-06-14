@@ -67,11 +67,14 @@ set -e
 
 after_shux=($(shux_pids))
 new_shux_pids=()
-for pid in "${after_shux[@]:-}"; do
+set +u
+for pid in "${after_shux[@]}"; do
+  [ -n "${pid}" ] || continue
   if ! pid_in_list "${pid}" "${baseline_shux[@]:-}"; then
     new_shux_pids+=("${pid}")
   fi
 done
+set -u
 
 if [ "${#new_shux_pids[@]}" -gt 0 ]; then
   echo "shux leak guard: command left new shux process(es): ${new_shux_pids[*]}" >&2
@@ -84,11 +87,14 @@ fi
 # Re-scan after daemon cleanup: killing a daemon must not strand pane commands.
 after_orphans=($(orphan_candidate_pids))
 new_orphan_pids=()
-for pid in "${after_orphans[@]:-}"; do
+set +u
+for pid in "${after_orphans[@]}"; do
+  [ -n "${pid}" ] || continue
   if ! pid_in_list "${pid}" "${baseline_orphans[@]:-}"; then
     new_orphan_pids+=("${pid}")
   fi
 done
+set -u
 
 if [ "${#new_orphan_pids[@]}" -gt 0 ]; then
   echo "shux leak guard: command left new orphan automation process(es): ${new_orphan_pids[*]}" >&2

@@ -381,13 +381,13 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint test test-shux-leak-guard test-agent-review-guard ## Run lint + test + process leak guards (what pre-commit runs)
+check: lint test test-shux-leak-guard test-agent-review-guard check-tui-qa ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
 
 .PHONY: ci
-ci: lint test-lib test-doc test-shux-leak-guard test-agent-review-guard ## Run CI pipeline (lint + test-lib + test-doc + process leak guards)
+ci: lint test-lib test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa ## Run CI pipeline (lint + test-lib + test-doc + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
@@ -430,6 +430,10 @@ check-progress: ## Verify PROGRESS.md and task Status fields are updated
 check-vt-qa: ## Verify completed VT tasks have tracked SOLID QA evidence
 	@bash scripts/check-progress.sh
 	@bash scripts/check-vt-fixtures.sh
+
+.PHONY: check-tui-qa
+check-tui-qa: ## Verify tracked general TUI QA evidence manifests
+	@bash scripts/check-tui-qa.sh
 
 .PHONY: check-progress-active
 check-progress-active: ## Verify progress (active session variant, allows In Progress)
