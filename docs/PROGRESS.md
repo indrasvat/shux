@@ -102,6 +102,21 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-06-13 — chore(qa): add general TUI QA gate**
+- Added reusable Claude/Codex `shux-tui-qa` subagents for user-visible
+  terminal/TUI work outside the stricter VT-specific gate.
+- Wired the gate into `CLAUDE.md` with hard requirements for task DoD
+  enforcement, real colored shux automation, native screenshot inspection,
+  pixel-level verification, cleanup proof, and scoped committed evidence under
+  `.shux/qa/<scope>/`.
+- Added `scripts/check-tui-qa.sh` and `make check-tui-qa` to validate
+  `TUI-QA.md` plus `tui-evidence-manifest.json`, tracked PNG/capture/pixel
+  artifacts, `pixel_verify.py`-shaped metric JSON, cleanup status, and required
+  scoped evidence via `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope>`.
+- External review: DootSabha Claude plus `agy` review identified gaps around
+  durable evidence, scoped enforcement, placeholder artifacts, and cleanup
+  examples; the gate/checker were tightened accordingly.
+
 **2026-06-13 — feat(vt): add dirty-region tracking and process leak guardrails**
 - Completed task 074 by adding opt-in dirty-region tracking to `shux-vt` grid
   mutation paths, exposing `is_dirty` / `take_dirty_regions`, and preserving

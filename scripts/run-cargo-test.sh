@@ -70,11 +70,27 @@ run_with_timeout() {
   local pid=$!
 
   (
-    sleep "${binary_timeout_seconds}"
+    active_sleep_pid=""
+    cleanup_watchdog() {
+      if [[ -n "${active_sleep_pid}" ]]; then
+        kill "${active_sleep_pid}" 2>/dev/null || true
+        wait "${active_sleep_pid}" 2>/dev/null || true
+      fi
+    }
+    trap cleanup_watchdog EXIT INT TERM
+
+    sleep "${binary_timeout_seconds}" &
+    active_sleep_pid=$!
+    wait "${active_sleep_pid}" 2>/dev/null || exit 0
+    active_sleep_pid=""
+
     if kill -0 "${pid}" 2>/dev/null; then
       echo "error: ${binary} exceeded ${binary_timeout_seconds}s; terminating process tree" >&2
       kill_tree "${pid}"
-      sleep 2
+      sleep 2 &
+      active_sleep_pid=$!
+      wait "${active_sleep_pid}" 2>/dev/null || exit 0
+      active_sleep_pid=""
       kill_tree_hard "${pid}"
     fi
   ) &

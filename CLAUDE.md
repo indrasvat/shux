@@ -114,6 +114,41 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > They change what TUIs emit. If changing terminal identity is necessary, prove
 > that rich TUIs still render correctly and document the compatibility impact.
 
+## General TUI QA Hard Gate
+
+> **STRICT RULE — user-visible terminal/TUI work MUST pass the general TUI QA gate.**
+> Any change touching attach UI, keyboard input, mouse input, copy mode, command
+> palette, help, status bar, themes, pane/window/session UX, plugin UX, CLI
+> flows, agent workflows, templates, recordings, or rich TUI compatibility MUST
+> use the local `shux-tui-qa` sub-agent before the task is marked done or a PR
+> is opened, unless the stricter `shux-vt-solid-qa` gate applies.
+>
+> The sub-agent is defined in:
+> - `.claude/agents/shux-tui-qa.md`
+> - `.codex/agents/shux-tui-qa.toml`
+>
+> Its verdict is a hard gate:
+> - `VERDICT: PASS` is required to complete the task.
+> - `VERDICT: FAIL` or `VERDICT: BLOCKED` must be fixed or explicitly
+>   re-scoped in the task file before proceeding.
+> - It MUST enforce the active task's exact Testing Matrix, Acceptance
+>   Criteria, and Definition of Done when a task file exists.
+> - It MUST use real colored shux automation and real Unix/TUI workloads where
+>   practical, not synthetic fixtures alone.
+> - It MUST visually inspect full-resolution screenshots and use pixel-level
+>   verification whenever a baseline, expected frame, or stability contract
+>   exists.
+> - It MUST prove cleanup: no new `shux` daemons and no new orphan automation
+>   processes.
+> - The PASS report and evidence manifest MUST be committed under
+>   `.shux/qa/<scope>/` as `TUI-QA.md` and `tui-evidence-manifest.json` when
+>   this gate is used.
+> - `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope> make check-tui-qa` MUST pass before
+>   handoff when this gate is used.
+>
+> Run daemon-backed shux QA serially through `.shux/scripts/no_leak_guard.sh`.
+> Do not parallelize leak-guarded shux checks.
+
 ## VT Quality Hard Gate
 
 > **STRICT RULE — VT/raster/snapshot work MUST pass the SOLID VT QA gate.**
