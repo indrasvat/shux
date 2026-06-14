@@ -1,3 +1,10 @@
+# [0.35.0](https://github.com/indrasvat/shux/compare/v0.34.0...v0.35.0) (2026-06-14)
+
+
+### Features
+
+* **vt:** track dirty regions ([afc6578](https://github.com/indrasvat/shux/commit/afc657896816bb43ba97a785715cdbf2e8aeeb71))
+
 # [0.34.0](https://github.com/indrasvat/shux/compare/v0.33.0...v0.34.0) (2026-06-13)
 
 
