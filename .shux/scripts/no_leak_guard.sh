@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run a command and hard-fail if it leaves behind any new `shux` process or
-# orphaned PTY process. The orphan PTY check protects the macOS PTY pool from
-# daemon teardown bugs that reparent pane commands to PID 1.
+# orphaned automation child process. The orphan check protects the macOS PTY
+# pool and catches detached test fixtures without sweeping up unrelated OS
+# workers that may appear during a run.
 #
 # This protects automation from leaking daemons while avoiding destructive
 # broad cleanup: PIDs that existed before the command are never killed.
@@ -17,10 +18,10 @@ shux_pids() {
   pgrep -x shux 2>/dev/null || true
 }
 
-orphan_tty_pids() {
+orphan_candidate_pids() {
   ps -axo pid=,ppid=,tty=,comm=,args= |
     awk '
-      $2 == 1 && $3 ~ /^(ttys|pts\/)/ {
+      $2 == 1 && ($3 ~ /^(ttys|pts\/)/ || $4 ~ /^(sh|bash|zsh|fish|sleep|yes|python|python3|node|cargo|shux)$/) {
         print $1
       }
     '
@@ -56,15 +57,15 @@ kill_new_pids() {
   done
 }
 
-mapfile -t baseline_shux < <(shux_pids)
-mapfile -t baseline_orphans < <(orphan_tty_pids)
+baseline_shux=($(shux_pids))
+baseline_orphans=($(orphan_candidate_pids))
 
 set +e
 "$@"
 cmd_status=$?
 set -e
 
-mapfile -t after_shux < <(shux_pids)
+after_shux=($(shux_pids))
 new_shux_pids=()
 for pid in "${after_shux[@]:-}"; do
   if ! pid_in_list "${pid}" "${baseline_shux[@]:-}"; then
@@ -81,7 +82,7 @@ if [ "${#new_shux_pids[@]}" -gt 0 ]; then
 fi
 
 # Re-scan after daemon cleanup: killing a daemon must not strand pane commands.
-mapfile -t after_orphans < <(orphan_tty_pids)
+after_orphans=($(orphan_candidate_pids))
 new_orphan_pids=()
 for pid in "${after_orphans[@]:-}"; do
   if ! pid_in_list "${pid}" "${baseline_orphans[@]:-}"; then
@@ -90,7 +91,7 @@ for pid in "${after_orphans[@]:-}"; do
 done
 
 if [ "${#new_orphan_pids[@]}" -gt 0 ]; then
-  echo "shux leak guard: command left new orphan PTY process(es): ${new_orphan_pids[*]}" >&2
+  echo "shux leak guard: command left new orphan automation process(es): ${new_orphan_pids[*]}" >&2
   for pid in "${new_orphan_pids[@]}"; do
     describe_pid "${pid}" >&2
   done

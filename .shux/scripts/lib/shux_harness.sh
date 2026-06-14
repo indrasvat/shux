@@ -55,6 +55,7 @@ shux_harness_bash_timeout() {
   status=$?
   set -e
 
+  pkill -TERM -P "${timer}" >/dev/null 2>&1 || true
   kill "${timer}" >/dev/null 2>&1 || true
   wait "${timer}" 2>/dev/null || true
 

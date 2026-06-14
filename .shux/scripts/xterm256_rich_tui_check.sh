@@ -115,7 +115,10 @@ if [[ -f "$OUT_DIR/vivecaka.txt" ]]; then
 fi
 
 if command -v magick >/dev/null 2>&1; then
-    mapfile -t windows < <(find "$OUT_DIR" -maxdepth 1 -name '*-window.png' | sort)
+    windows=()
+    while IFS= read -r window; do
+        [[ -n "$window" ]] && windows+=("$window")
+    done < <(find "$OUT_DIR" -maxdepth 1 -name '*-window.png' | sort)
     if [[ "${#windows[@]}" -gt 0 ]]; then
         FONT_OPT=()
         if [[ -f /System/Library/Fonts/Supplemental/Arial.ttf ]]; then
