@@ -9,6 +9,8 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+source "$REPO_ROOT/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX_BIN:-target/debug/shux}"
 SESSION="${SESSION:-human-copy-mode-$$}"
 OUT_DIR="${OUT_DIR:-.shux/out}"
@@ -45,8 +47,8 @@ shux_cmd() {
     "$SHUX" "$@"
 }
 
-trap 'shux_cmd session kill "$SESSION" >/dev/null 2>&1 || true' EXIT
-shux_cmd session kill "$SESSION" >/dev/null 2>&1 || true
+trap 'shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" "$SESSION"' EXIT
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" "$SESSION"
 
 echo "==> unit coverage: scrollback copy-mode navigation/search/render"
 "$MAKE_BIN" test-copy-mode

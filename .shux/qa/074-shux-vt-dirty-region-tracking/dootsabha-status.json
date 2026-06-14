@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": [
+    {
+      "Name": "claude",
+      "Healthy": true,
+      "Version": "2.1.177",
+      "Model": "claude-opus-4-8",
+      "Auth": "✓",
+      "Error": ""
+    },
+    {
+      "Name": "codex",
+      "Healthy": true,
+      "Version": "0.139.0",
+      "Model": "gpt-5.5",
+      "Auth": "✓",
+      "Error": ""
+    },
+    {
+      "Name": "gemini",
+      "Healthy": true,
+      "Version": "0.46.0",
+      "Model": "gemini-3.1-pro-preview",
+      "Auth": "✓",
+      "Error": ""
+    }
+  ]
+}

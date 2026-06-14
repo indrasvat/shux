@@ -1,7 +1,169 @@
 use std::collections::VecDeque;
-use std::ops::{Index, IndexMut};
+use std::ops::{Deref, DerefMut, Index, IndexMut, Range};
 
 use crate::cell::{Cell, Color};
+
+/// A half-open dirty cell range on one visible row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirtyRegion {
+    /// Visible row index.
+    pub row: usize,
+    /// Dirty columns in `start..end` form.
+    pub cols: Range<usize>,
+}
+
+#[derive(Debug)]
+struct DirtyState {
+    enabled: bool,
+    full_frame: bool,
+    any_dirty: bool,
+    last_full_row: Option<usize>,
+    full_rows: Vec<bool>,
+    rows: Vec<Option<Range<usize>>>,
+}
+
+impl DirtyState {
+    fn new(rows: usize, enabled: bool) -> Self {
+        DirtyState {
+            enabled,
+            full_frame: false,
+            any_dirty: false,
+            last_full_row: None,
+            full_rows: vec![false; rows],
+            rows: vec![None; rows],
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.enabled && self.any_dirty
+    }
+
+    fn resize_rows(&mut self, rows: usize) {
+        self.full_rows.resize(rows, false);
+        self.rows.resize(rows, None);
+    }
+
+    fn mark_all(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.last_full_row = None;
+        self.full_frame = true;
+        self.any_dirty = true;
+    }
+
+    fn mark_rows(&mut self, start: usize, end: usize, rows: usize, cols: usize) {
+        if !self.enabled || self.full_frame {
+            return;
+        }
+        let end = end.min(rows);
+        for row in start.min(rows)..end {
+            self.mark_row(row, rows, cols);
+        }
+    }
+
+    fn mark_row(&mut self, row: usize, rows: usize, cols: usize) {
+        if !self.enabled || self.full_frame || row >= rows || cols == 0 {
+            return;
+        }
+        if self.last_full_row == Some(row) {
+            return;
+        }
+        if self.row_is_fully_dirty(row, cols) {
+            self.last_full_row = Some(row);
+            return;
+        }
+        self.any_dirty = true;
+        self.full_rows[row] = true;
+        self.last_full_row = Some(row);
+        self.rows[row] = Some(0..cols);
+    }
+
+    fn mark_range(&mut self, row: usize, range: Range<usize>, rows: usize, cols: usize) {
+        if !self.enabled || self.full_frame || self.row_is_fully_dirty(row, cols) {
+            return;
+        }
+        self.last_full_row = None;
+        if row >= rows || cols == 0 {
+            return;
+        }
+        let start = range.start.min(cols);
+        let end = range.end.min(cols);
+        if start >= end {
+            return;
+        }
+        self.any_dirty = true;
+        let slot = &mut self.rows[row];
+        match slot {
+            Some(existing) => {
+                existing.start = existing.start.min(start);
+                existing.end = existing.end.max(end);
+                if existing.start == 0 && existing.end >= cols {
+                    self.full_rows[row] = true;
+                }
+            }
+            None => {
+                if start == 0 && end >= cols {
+                    self.full_rows[row] = true;
+                }
+                *slot = Some(start..end);
+            }
+        }
+    }
+
+    fn should_mark_row(&self, row: usize, rows: usize, cols: usize) -> bool {
+        self.enabled
+            && !self.full_frame
+            && row < rows
+            && cols > 0
+            && !self.row_is_fully_dirty(row, cols)
+    }
+
+    fn row_is_fully_dirty(&self, row: usize, _cols: usize) -> bool {
+        self.rows
+            .get(row)
+            .is_some_and(|_| self.full_rows.get(row).copied().unwrap_or(false))
+    }
+
+    fn take(&mut self, rows: usize, cols: usize) -> Vec<DirtyRegion> {
+        if !self.enabled || !self.any_dirty {
+            return Vec::new();
+        }
+
+        let regions = if self.full_frame {
+            (0..rows)
+                .filter(|_| cols > 0)
+                .map(|row| DirtyRegion { row, cols: 0..cols })
+                .collect()
+        } else {
+            self.rows
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(row, range)| {
+                    range.take().and_then(|cols_range| {
+                        let start = cols_range.start.min(cols);
+                        let end = cols_range.end.min(cols);
+                        (row < rows && start < end).then_some(DirtyRegion {
+                            row,
+                            cols: start..end,
+                        })
+                    })
+                })
+                .collect()
+        };
+
+        self.full_frame = false;
+        self.any_dirty = false;
+        self.last_full_row = None;
+        for row in &mut self.full_rows {
+            *row = false;
+        }
+        for row in &mut self.rows {
+            *row = None;
+        }
+        regions
+    }
+}
 
 #[derive(Debug, Default)]
 struct LogicalLine {
@@ -39,6 +201,42 @@ pub struct Row {
     pub(crate) cells: Vec<Cell>,
     /// Whether this row soft-wraps into the next row.
     pub wrapped: bool,
+}
+
+/// Mutable access to one visible row.
+///
+/// Dropping the guard marks the whole row dirty. This makes direct cell writes
+/// in the parser dirty by construction instead of relying on a parallel mark
+/// call that can drift from the actual mutation.
+pub struct RowMut<'a> {
+    row: &'a mut Row,
+    dirty: &'a mut DirtyState,
+    row_idx: usize,
+    rows: usize,
+    cols: usize,
+    mark_on_drop: bool,
+}
+
+impl Deref for RowMut<'_> {
+    type Target = Row;
+
+    fn deref(&self) -> &Self::Target {
+        self.row
+    }
+}
+
+impl DerefMut for RowMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.row
+    }
+}
+
+impl Drop for RowMut<'_> {
+    fn drop(&mut self) {
+        if self.mark_on_drop {
+            self.dirty.mark_row(self.row_idx, self.rows, self.cols);
+        }
+    }
 }
 
 impl Row {
@@ -110,12 +308,17 @@ impl Row {
         }
     }
 
-    fn erase_chars_expanding_wide_pairs(&mut self, col: usize, count: usize, bg: Color) {
+    fn erase_chars_expanding_wide_pairs(
+        &mut self,
+        col: usize,
+        count: usize,
+        bg: Color,
+    ) -> Option<Range<usize>> {
         let len = self.cells.len();
         let mut start = col.min(len);
         let mut end = col.saturating_add(count).min(len);
         if start >= end {
-            return;
+            return None;
         }
 
         if start > 0 && self.cells[start].is_wide_continuation() && self.cells[start - 1].is_wide()
@@ -133,6 +336,7 @@ impl Row {
         for col in start..end {
             self.cells[col].reset(bg);
         }
+        Some(start..end)
     }
 
     /// Check if the row is entirely empty (all default spaces).
@@ -162,12 +366,16 @@ impl IndexMut<usize> for Row {
 pub struct GridConfig {
     /// Maximum number of scrollback lines. Default: 5000 (PRD 5.5).
     pub max_scrollback: usize,
+    /// Track visible viewport dirtiness. Enabled for production grids; tests and
+    /// benchmarks can disable it to measure tracking overhead directly.
+    pub track_dirty: bool,
 }
 
 impl Default for GridConfig {
     fn default() -> Self {
         GridConfig {
             max_scrollback: 5000,
+            track_dirty: true,
         }
     }
 }
@@ -179,7 +387,7 @@ impl Default for GridConfig {
 ///   - visible lines (index scrollback_len..scrollback_len+rows): the current viewport
 ///
 /// The VecDeque allows O(1) push_front (for scrollback) and O(1) push_back (for new lines).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Grid {
     /// All lines: scrollback + visible area.
     raw: VecDeque<Row>,
@@ -189,6 +397,20 @@ pub struct Grid {
     cols: usize,
     /// Configuration (max scrollback, etc.).
     config: GridConfig,
+    /// Dirty visible viewport state.
+    dirty: DirtyState,
+}
+
+impl Clone for Grid {
+    fn clone(&self) -> Self {
+        Grid {
+            raw: self.raw.clone(),
+            rows: self.rows,
+            cols: self.cols,
+            config: self.config.clone(),
+            dirty: DirtyState::new(self.rows, self.config.track_dirty),
+        }
+    }
 }
 
 impl Grid {
@@ -202,6 +424,7 @@ impl Grid {
             raw,
             rows,
             cols,
+            dirty: DirtyState::new(rows, config.track_dirty),
             config,
         }
     }
@@ -214,6 +437,24 @@ impl Grid {
     /// Number of columns.
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    /// Whether the visible viewport has changed since the last dirty drain.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.is_dirty()
+    }
+
+    /// Consume and clear dirty regions for the visible viewport.
+    ///
+    /// Cursor movement is intentionally outside this grid dirty API; renderers
+    /// that draw a cursor overlay must track cursor presentation separately.
+    pub fn take_dirty_regions(&mut self) -> Vec<DirtyRegion> {
+        self.dirty.take(self.rows, self.cols)
+    }
+
+    /// Mark the full visible viewport dirty.
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty.mark_all();
     }
 
     /// Number of scrollback lines above the visible area.
@@ -249,14 +490,45 @@ impl Grid {
             cols: self.cols,
             // Snapshot grids never need scrollback — the parser isn't
             // going to feed them more rows.
-            config: GridConfig { max_scrollback: 0 },
+            config: GridConfig {
+                max_scrollback: 0,
+                track_dirty: self.config.track_dirty,
+            },
+            dirty: DirtyState::new(self.rows, self.config.track_dirty),
         }
     }
 
     /// Mutably access a visible row (0 = top of visible area).
-    pub fn visible_row_mut(&mut self, row: usize) -> &mut Row {
+    pub fn visible_row_mut(&mut self, row: usize) -> RowMut<'_> {
+        let idx = self.visible_abs_index(row);
+        let mark_on_drop = self.dirty.should_mark_row(row, self.rows, self.cols);
+        let row_ref = &mut self.raw[idx];
+        RowMut {
+            row: row_ref,
+            dirty: &mut self.dirty,
+            row_idx: row,
+            rows: self.rows,
+            cols: self.cols,
+            mark_on_drop,
+        }
+    }
+
+    fn visible_abs_index(&self, row: usize) -> usize {
+        self.scrollback_len() + row
+    }
+
+    fn visible_row_mut_untracked(&mut self, row: usize) -> &mut Row {
         let idx = self.scrollback_len() + row;
         &mut self.raw[idx]
+    }
+
+    /// Mutably access a visible row after marking that row dirty.
+    ///
+    /// Parser hot paths use this to keep dirty tracking centralized in `Grid`
+    /// without paying a drop-guard cost for every printable cell.
+    pub(crate) fn visible_row_mut_marked(&mut self, row: usize) -> &mut Row {
+        self.dirty.mark_row(row, self.rows, self.cols);
+        self.visible_row_mut_untracked(row)
     }
 
     /// Access a scrollback row (0 = oldest scrollback line).
@@ -298,6 +570,16 @@ impl Grid {
             self.raw.remove(abs_top);
             self.raw.insert(abs_bottom, Row::new(self.cols));
         }
+        if region_top == 0 && region_bottom == self.rows.saturating_sub(1) {
+            self.dirty.mark_all();
+        } else {
+            self.dirty.mark_rows(
+                region_top,
+                region_bottom.saturating_add(1),
+                self.rows,
+                self.cols,
+            );
+        }
     }
 
     /// Scroll the visible area down by one line within a scroll region.
@@ -309,6 +591,16 @@ impl Grid {
         let abs_bottom = sb + region_bottom;
         self.raw.remove(abs_bottom);
         self.raw.insert(abs_top, Row::new(self.cols));
+        if region_top == 0 && region_bottom == self.rows.saturating_sub(1) {
+            self.dirty.mark_all();
+        } else {
+            self.dirty.mark_rows(
+                region_top,
+                region_bottom.saturating_add(1),
+                self.rows,
+                self.cols,
+            );
+        }
     }
 
     /// Clear all visible rows (reset to empty with given background).
@@ -317,6 +609,7 @@ impl Grid {
         for i in sb..self.raw.len() {
             self.raw[i].reset(bg);
         }
+        self.dirty.mark_rows(0, self.rows, self.rows, self.cols);
     }
 
     /// Clear rows from `start_row` to the end of the visible area.
@@ -325,6 +618,8 @@ impl Grid {
         for i in (sb + start_row)..self.raw.len() {
             self.raw[i].reset(bg);
         }
+        self.dirty
+            .mark_rows(start_row, self.rows, self.rows, self.cols);
     }
 
     /// Clear rows from the top of the visible area to `end_row` (inclusive).
@@ -333,6 +628,8 @@ impl Grid {
         for i in sb..=(sb + end_row) {
             self.raw[i].reset(bg);
         }
+        self.dirty
+            .mark_rows(0, end_row.saturating_add(1), self.rows, self.cols);
     }
 
     /// Resize the grid. Handles both growing and shrinking.
@@ -367,6 +664,7 @@ impl Grid {
     /// Resize without column reflow. This is used for fixed-canvas alternate
     /// screen buffers where fullscreen apps redraw after SIGWINCH.
     pub fn resize_canvas(&mut self, new_rows: usize, new_cols: usize) {
+        let resized = new_rows != self.rows || new_cols != self.cols;
         if new_cols != self.cols {
             for row in self.raw.iter_mut() {
                 row.resize(new_cols, Cell::default());
@@ -408,6 +706,10 @@ impl Grid {
         }
 
         self.rows = new_rows;
+        self.dirty.resize_rows(new_rows);
+        if resized {
+            self.dirty.mark_all();
+        }
     }
 
     fn resize_reflowing_columns(
@@ -491,6 +793,8 @@ impl Grid {
         self.raw = reflowed;
         self.rows = new_rows;
         self.cols = new_cols;
+        self.dirty.resize_rows(new_rows);
+        self.dirty.mark_all();
 
         cursor_anchor.map(|anchor| {
             let (abs_row, col) = self.abs_cursor_for_anchor(&line_ranges, anchor, dropped_rows);
@@ -644,14 +948,19 @@ fn append_reflowed_line(
 impl Grid {
     /// Erase `count` characters starting at `(row, col)` in the visible area.
     pub fn erase_chars(&mut self, row: usize, col: usize, count: usize, bg: Color) {
-        let r = self.visible_row_mut(row);
-        r.erase_chars_expanding_wide_pairs(col, count, bg);
+        let dirty = {
+            let r = self.visible_row_mut_untracked(row);
+            r.erase_chars_expanding_wide_pairs(col, count, bg)
+        };
+        if let Some(range) = dirty {
+            self.dirty.mark_range(row, range, self.rows, self.cols);
+        }
     }
 
     /// Insert `count` blank cells at `(row, col)`, shifting existing cells right.
     /// Cells that shift past the right edge are lost.
     pub fn insert_chars(&mut self, row: usize, col: usize, count: usize) {
-        let r = self.visible_row_mut(row);
+        let r = self.visible_row_mut_untracked(row);
         let len = r.len();
         if col < len {
             r.clear_wide_pair_around(col, Color::Default);
@@ -668,14 +977,21 @@ impl Grid {
             r.cells[i] = Cell::default();
         }
         r.sanitize_wide_pairs(Color::Default);
+        if count > 0 && col < len {
+            self.dirty
+                .mark_range(row, col.saturating_sub(1)..len, self.rows, self.cols);
+        }
     }
 
     /// Delete `count` cells at `(row, col)`, shifting remaining cells left.
     /// New cells at the right edge are blank.
     pub fn delete_chars(&mut self, row: usize, col: usize, count: usize) {
-        let r = self.visible_row_mut(row);
+        let r = self.visible_row_mut_untracked(row);
         let len = r.len();
         let actual = count.min(len.saturating_sub(col));
+        if actual == 0 {
+            return;
+        }
         // Shift left.
         for i in col..(len - actual) {
             r.cells[i] = r.cells[i + actual].clone();
@@ -685,6 +1001,8 @@ impl Grid {
             r.cells[i] = Cell::default();
         }
         r.sanitize_wide_pairs(Color::Default);
+        self.dirty
+            .mark_range(row, col.saturating_sub(1)..len, self.rows, self.cols);
     }
 }
 
@@ -695,7 +1013,7 @@ mod tests {
     use super::*;
     use crate::cell::{CellFlags, CellStyle, ExtendedAttrs, UnderlineStyle};
 
-    fn write_text(row: &mut Row, text: &str) {
+    fn write_text(mut row: impl std::ops::DerefMut<Target = Row>, text: &str) {
         for (idx, ch) in text.chars().enumerate() {
             row[idx].ch = ch;
         }
@@ -711,7 +1029,7 @@ mod tests {
             .to_string()
     }
 
-    fn put_wide(row: &mut Row, col: usize, ch: char) {
+    fn put_wide(mut row: impl std::ops::DerefMut<Target = Row>, col: usize, ch: char) {
         row[col] = Cell {
             ch,
             width: 2,
@@ -786,7 +1104,10 @@ mod tests {
 
     #[test]
     fn test_scrollback_limit() {
-        let config = GridConfig { max_scrollback: 2 };
+        let config = GridConfig {
+            max_scrollback: 2,
+            ..GridConfig::default()
+        };
         let mut grid = Grid::new(3, 10, config);
         for i in 0..5u8 {
             grid.visible_row_mut(0)[0].ch = char::from(b'A' + i);
@@ -1027,7 +1348,10 @@ mod tests {
 
     #[test]
     fn resize_reflow_preserves_scrollback_order_and_limit() {
-        let config = GridConfig { max_scrollback: 2 };
+        let config = GridConfig {
+            max_scrollback: 2,
+            ..GridConfig::default()
+        };
         let mut grid = Grid::new(2, 5, config);
 
         for ch in ['A', 'B', 'C', 'D'] {
@@ -1161,5 +1485,106 @@ mod tests {
         assert_eq!(snap.total_lines(), 3);
         // Visible content is preserved across the clone.
         assert_eq!(snap.visible_row(2).cells[0].ch, 'V');
+    }
+
+    #[test]
+    fn dirty_direct_row_mutation_marks_the_row_and_take_clears() {
+        let mut grid = Grid::new(2, 5, GridConfig::default());
+        assert!(!grid.is_dirty());
+
+        grid.visible_row_mut(0)[2].ch = 'X';
+        assert!(grid.is_dirty());
+        assert_eq!(
+            grid.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 0..5 }]
+        );
+        assert!(!grid.is_dirty());
+        assert!(grid.take_dirty_regions().is_empty());
+    }
+
+    #[test]
+    fn dirty_erase_insert_delete_report_helper_ranges() {
+        let mut grid = Grid::new(1, 6, GridConfig::default());
+        write_text(grid.visible_row_mut(0), "ABCDEF");
+        grid.take_dirty_regions();
+
+        grid.erase_chars(0, 2, 2, Color::Default);
+        assert_eq!(
+            grid.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 2..4 }]
+        );
+
+        grid.insert_chars(0, 1, 2);
+        assert_eq!(
+            grid.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 0..6 }]
+        );
+
+        grid.delete_chars(0, 3, 1);
+        assert_eq!(
+            grid.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 2..6 }]
+        );
+    }
+
+    #[test]
+    fn dirty_insert_delete_include_repaired_wide_head_to_the_left() {
+        let mut grid = Grid::new(1, 6, GridConfig::default());
+        put_wide(grid.visible_row_mut(0), 1, '界');
+        grid.take_dirty_regions();
+
+        grid.insert_chars(0, 2, 1);
+        assert_eq!(
+            grid.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 1..6 }]
+        );
+
+        put_wide(grid.visible_row_mut(0), 1, '界');
+        grid.take_dirty_regions();
+        grid.delete_chars(0, 2, 1);
+        assert_eq!(
+            grid.take_dirty_regions(),
+            vec![DirtyRegion { row: 0, cols: 1..6 }]
+        );
+    }
+
+    #[test]
+    fn dirty_scroll_and_resize_invalidate_visible_frame() {
+        let mut grid = Grid::new(3, 4, GridConfig::default());
+        grid.take_dirty_regions();
+
+        grid.scroll_up(1, 2);
+        assert_eq!(
+            grid.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 1, cols: 0..4 },
+                DirtyRegion { row: 2, cols: 0..4 },
+            ]
+        );
+
+        grid.resize_canvas(4, 5);
+        assert_eq!(
+            grid.take_dirty_regions(),
+            vec![
+                DirtyRegion { row: 0, cols: 0..5 },
+                DirtyRegion { row: 1, cols: 0..5 },
+                DirtyRegion { row: 2, cols: 0..5 },
+                DirtyRegion { row: 3, cols: 0..5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn dirty_clone_and_clone_visible_start_clean() {
+        let mut grid = Grid::new(2, 4, GridConfig::default());
+        grid.visible_row_mut(0)[0].ch = 'X';
+
+        let mut cloned = grid.clone();
+        let mut visible = grid.clone_visible();
+        assert!(grid.is_dirty());
+        assert!(!cloned.is_dirty());
+        assert!(!visible.is_dirty());
+        assert!(cloned.take_dirty_regions().is_empty());
+        assert!(visible.take_dirty_regions().is_empty());
     }
 }

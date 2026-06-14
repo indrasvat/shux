@@ -107,13 +107,13 @@ install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, fuzz, lefth
 .PHONY: test
 test: ## Run all tests with cargo test
 	@echo "$(COLOR_BLUE)▶ Running tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh --workspace -- --test-threads=1
+	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh --workspace -- --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Tests passed$(COLOR_RESET)"
 
 .PHONY: test-verbose
 test-verbose: ## Run tests with output visible
 	@echo "$(COLOR_BLUE)▶ Running tests (verbose)...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh --workspace -- --test-threads=1 --nocapture
+	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh --workspace -- --test-threads=1 --nocapture
 
 .PHONY: test-lib
 test-lib: ## Run library tests only
@@ -130,7 +130,7 @@ test-vt: ## Run focused virtual terminal tests; optionally pass FILTER=<test-nam
 .PHONY: test-pane-io
 test-pane-io: ## Run pane I/O integration tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running pane I/O integration tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux --test pane_io_integration -- $(FILTER) --test-threads=1
+	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test pane_io_integration -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
 
 .PHONY: test-vt-corpus-unit
@@ -154,38 +154,56 @@ test-vt-corpus: test-vt-corpus-unit ## Replay committed VT corpus fixtures and v
 .PHONY: test-vt-resize-reflow
 test-vt-resize-reflow: release ## Drive shux pane resize reflow automation and exact PNG return check
 	@echo "$(COLOR_BLUE)▶ Running VT resize reflow automation...$(COLOR_RESET)"
-	@.shux/scripts/resize_reflow_check.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/resize_reflow_check.sh
 	@echo "$(COLOR_GREEN)✓ VT resize reflow automation passed$(COLOR_RESET)"
 
 .PHONY: test-vt-wide-visual
 test-vt-wide-visual: release ## Drive shux wide-cell invariant visual/pixel automation
 	@echo "$(COLOR_BLUE)▶ Running VT wide-cell visual automation...$(COLOR_RESET)"
-	@.shux/scripts/wide_invariants_check.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/wide_invariants_check.sh
 	@echo "$(COLOR_GREEN)✓ VT wide-cell visual automation passed$(COLOR_RESET)"
 
 .PHONY: test-vt-grapheme
 test-vt-grapheme: release ## Drive shux grapheme storage visual/pixel automation
 	@echo "$(COLOR_BLUE)▶ Running VT grapheme storage automation...$(COLOR_RESET)"
-	@.shux/scripts/grapheme_check.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/grapheme_check.sh
 	@echo "$(COLOR_GREEN)✓ VT grapheme storage automation passed$(COLOR_RESET)"
 
 .PHONY: test-vt-dec-special-graphics
 test-vt-dec-special-graphics: release ## Drive DEC special graphics visual/pixel automation
 	@echo "$(COLOR_BLUE)▶ Running VT DEC special graphics automation...$(COLOR_RESET)"
-	@.shux/scripts/dec_special_graphics_check.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/dec_special_graphics_check.sh
 	@echo "$(COLOR_GREEN)✓ VT DEC special graphics automation passed$(COLOR_RESET)"
 
 .PHONY: test-vt-tab-stops
 test-vt-tab-stops: release ## Drive mutable tab-stop visual/pixel automation
 	@echo "$(COLOR_BLUE)▶ Running VT tab-stop automation...$(COLOR_RESET)"
-	@.shux/scripts/tab_stops_check.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/tab_stops_check.sh
 	@echo "$(COLOR_GREEN)✓ VT tab-stop automation passed$(COLOR_RESET)"
 
 .PHONY: test-vt-origin-mode
 test-vt-origin-mode: release ## Drive origin-mode scroll-region visual/pixel automation
 	@echo "$(COLOR_BLUE)▶ Running VT origin-mode automation...$(COLOR_RESET)"
-	@.shux/scripts/origin_mode_check.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/origin_mode_check.sh
 	@echo "$(COLOR_GREEN)✓ VT origin-mode automation passed$(COLOR_RESET)"
+
+.PHONY: test-vt-dirty-regions
+test-vt-dirty-regions: release ## Drive dirty-region tracking evidence, performance, and pixel automation
+	@echo "$(COLOR_BLUE)▶ Running VT dirty-region automation...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/dirty_region_check.sh
+	@echo "$(COLOR_GREEN)✓ VT dirty-region automation passed$(COLOR_RESET)"
+
+.PHONY: test-shux-leak-guard
+test-shux-leak-guard: release ## Verify shux automation leak guard catches and kills orphan daemons
+	@echo "$(COLOR_BLUE)▶ Running shux leak-guard self-test...$(COLOR_RESET)"
+	@.shux/scripts/leak_guard_selftest.sh
+	@echo "$(COLOR_GREEN)✓ Shux leak-guard self-test passed$(COLOR_RESET)"
+
+.PHONY: test-agent-review-guard
+test-agent-review-guard: ## Verify external reviewer guard kills timed-out process trees
+	@echo "$(COLOR_BLUE)▶ Running agent review guard self-test...$(COLOR_RESET)"
+	@.shux/scripts/agent_review_guard_selftest.sh
+	@echo "$(COLOR_GREEN)✓ Agent review guard self-test passed$(COLOR_RESET)"
 
 .PHONY: test-vt-grapheme-performance
 test-vt-grapheme-performance: ## Measure grapheme storage performance on ASCII VT path
@@ -202,7 +220,7 @@ promote-vt-corpus-baselines: ## Promote current VT corpus output into committed 
 .PHONY: record-vt-corpus
 record-vt-corpus: release ## Record installed rich TUIs into .shux/out/073-vt-corpus/recordings
 	@echo "$(COLOR_BLUE)▶ Recording VT corpus rich-TUI streams...$(COLOR_RESET)"
-	@.shux/scripts/vt_corpus_record.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/vt_corpus_record.sh
 	@echo "$(COLOR_GREEN)✓ VT corpus rich-TUI recording pass completed$(COLOR_RESET)"
 
 .PHONY: test-ui
@@ -214,13 +232,13 @@ test-ui: ## Run focused UI/rendering tests; optionally pass FILTER=<test-name>
 .PHONY: test-attach-color
 test-attach-color: release ## Verify attach preserves pane colors even when daemon inherits NO_COLOR
 	@echo "$(COLOR_BLUE)▶ Running attach color regression check...$(COLOR_RESET)"
-	@.shux/scripts/issue_69_attach_color_check.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/issue_69_attach_color_check.sh
 	@echo "$(COLOR_GREEN)✓ Attach color regression check passed$(COLOR_RESET)"
 
 .PHONY: test-lossless-record
 test-lossless-record: release ## Verify lossless pane recording with real PTY/TUI tools
 	@echo "$(COLOR_BLUE)▶ Running lossless pane record regression check...$(COLOR_RESET)"
-	@.shux/scripts/issue_70_lossless_record_check.sh
+	@.shux/scripts/no_leak_guard.sh .shux/scripts/issue_70_lossless_record_check.sh
 	@echo "$(COLOR_GREEN)✓ Lossless pane record regression check passed$(COLOR_RESET)"
 
 .PHONY: test-copy-mode
@@ -256,7 +274,7 @@ bench-baseline: ## Record M0 performance baseline
 
 .PHONY: dogfood-human-copy
 dogfood-human-copy: build ## Run copy-mode human dogfood regression
-	@bash .shux/scripts/human_copy_mode_check.sh
+	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/human_copy_mode_check.sh
 
 .PHONY: spike-libghostty-build
 spike-libghostty-build: ## Build the isolated libghostty-vt spike using Homebrew zig@0.15
@@ -363,13 +381,13 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint test ## Run lint + test (what pre-commit runs)
+check: lint test test-shux-leak-guard test-agent-review-guard ## Run lint + test + process leak guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
 
 .PHONY: ci
-ci: lint test-lib test-doc ## Run CI pipeline (lint + test-lib + test-doc)
+ci: lint test-lib test-doc test-shux-leak-guard test-agent-review-guard ## Run CI pipeline (lint + test-lib + test-doc + process leak guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""

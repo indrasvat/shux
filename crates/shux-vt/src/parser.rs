@@ -260,7 +260,7 @@ impl<'a> VtHandler<'a> {
         self.clear_active_grapheme_cell();
         self.cursor.col = 0;
         self.cursor.auto_wrap_pending = false;
-        self.grid.visible_row_mut(self.cursor.row).wrapped = true;
+        self.grid.visible_row_mut_marked(self.cursor.row).wrapped = true;
         if self.cursor.row == self.scroll_region.bottom {
             self.grid
                 .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
@@ -309,9 +309,11 @@ impl<'a> VtHandler<'a> {
         if width == 2 && cols < 2 {
             let col = self.cursor.col;
             let blank = self.cursor_blank_cell();
-            let row = self.grid.visible_row_mut(self.cursor.row);
-            row.clear_wide_pair_around(col, self.cursor.style.bg);
-            row[col] = blank;
+            {
+                let row = self.grid.visible_row_mut_marked(self.cursor.row);
+                row.clear_wide_pair_around(col, self.cursor.style.bg);
+                row[col] = blank;
+            }
             self.cursor.auto_wrap_pending = false;
             self.clear_active_grapheme_cell();
             return;
@@ -321,7 +323,7 @@ impl<'a> VtHandler<'a> {
             let col = self.cursor.col;
             let blank = self.cursor_blank_cell();
             {
-                let row = self.grid.visible_row_mut(self.cursor.row);
+                let row = self.grid.visible_row_mut_marked(self.cursor.row);
                 row.clear_wide_pair_around(col, self.cursor.style.bg);
                 row[col] = blank;
             }
@@ -346,7 +348,7 @@ impl<'a> VtHandler<'a> {
         let bg = self.cursor.style.bg;
         let extended = self.cursor_cell_extended();
         {
-            let row = self.grid.visible_row_mut(cursor_row);
+            let row = self.grid.visible_row_mut_marked(cursor_row);
             row.clear_wide_pair_around(col, bg);
             if width == 2 {
                 row.clear_wide_pair_around(col + 1, bg);
@@ -380,13 +382,21 @@ impl<'a> VtHandler<'a> {
         else {
             return;
         };
-        if let Some(cell) = self.cell_mut(row, col)
-            && !cell.is_wide_continuation()
-            && cell.ch != ' '
-        {
-            cell.append_grapheme_scalar(ch);
-            self.set_active_grapheme_cell(row, col);
+        if row >= self.grid.rows() || col >= self.grid.cols() {
+            return;
         }
+        {
+            let row_ref = self.grid.visible_row_mut_marked(row);
+            if let Some(cell) = row_ref.cells.get_mut(col)
+                && !cell.is_wide_continuation()
+                && cell.ch != ' '
+            {
+                cell.append_grapheme_scalar(ch);
+            } else {
+                return;
+            }
+        }
+        self.set_active_grapheme_cell(row, col);
     }
 
     fn try_append_to_active_grapheme(&mut self, ch: char, width: usize) -> bool {
@@ -414,7 +424,7 @@ impl<'a> VtHandler<'a> {
         }
         {
             let bg = self.cursor.style.bg;
-            let row_ref = self.grid.visible_row_mut(row);
+            let row_ref = self.grid.visible_row_mut_marked(row);
             row_ref[col].append_grapheme_scalar(ch);
             row_ref[col].width = target_width as u8;
             if target_width == 2 {
@@ -457,7 +467,7 @@ impl<'a> VtHandler<'a> {
         }
         {
             let bg = self.cursor.style.bg;
-            let row_ref = self.grid.visible_row_mut(row);
+            let row_ref = self.grid.visible_row_mut_marked(row);
             row_ref[col].append_grapheme_scalar(ch);
             row_ref[col].width = target_width as u8;
             if col + 1 < cols {
@@ -496,13 +506,6 @@ impl<'a> VtHandler<'a> {
         };
         row.get(source_col)?;
         Some((self.cursor.row, source_col))
-    }
-
-    fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
-        if row >= self.grid.rows() || col >= self.grid.cols() {
-            return None;
-        }
-        self.grid.visible_row_mut(row).cells.get_mut(col)
     }
 
     fn cursor_extended_mut(&mut self) -> &mut ExtendedAttrs {
@@ -573,7 +576,7 @@ impl<'a> VtHandler<'a> {
         let cols = self.grid.cols();
         let bg = self.cursor.style.bg;
         {
-            let row_ref = self.grid.visible_row_mut(row);
+            let row_ref = self.grid.visible_row_mut_marked(row);
             row_ref[col].set_grapheme_payload(text);
             if source_width == 2 && col + 1 < cols {
                 row_ref[col].width = 2;
@@ -754,8 +757,12 @@ impl<'a> VtHandler<'a> {
                     // Enter alternate screen: swap grids.
                     let rows = self.grid.rows();
                     let cols = self.grid.cols();
-                    let config = GridConfig { max_scrollback: 0 };
-                    let alt_grid = Grid::new(rows, cols, config);
+                    let config = GridConfig {
+                        max_scrollback: 0,
+                        ..GridConfig::default()
+                    };
+                    let mut alt_grid = Grid::new(rows, cols, config);
+                    alt_grid.mark_all_dirty();
                     *self.alt_grid = Some(std::mem::replace(self.grid, alt_grid));
                     if mode == 1049 {
                         let alt_cursor = Cursor::new();
@@ -769,6 +776,7 @@ impl<'a> VtHandler<'a> {
                     if self.modes.alternate_screen {
                         if let Some(primary_grid) = self.alt_grid.take() {
                             *self.grid = primary_grid;
+                            self.grid.mark_all_dirty();
                         }
                         if mode == 1049 {
                             if let Some(primary_cursor) = self.alt_cursor.take() {
@@ -790,8 +798,10 @@ impl<'a> VtHandler<'a> {
             2026 => {
                 if enable {
                     if self.sync_present.is_none() {
+                        let mut presented_grid = self.grid.clone();
+                        presented_grid.mark_all_dirty();
                         *self.sync_present = Some(SyncPresentation {
-                            grid: self.grid.clone(),
+                            grid: presented_grid,
                             cursor: self.cursor.clone(),
                             default_colors: *self.default_colors,
                             title: self.title.clone(),
@@ -801,6 +811,7 @@ impl<'a> VtHandler<'a> {
                 } else {
                     self.modes.synchronized_output = false;
                     self.sync_present.take();
+                    self.grid.mark_all_dirty();
                 }
             }
             _ => trace!(mode, enable, "unhandled private mode"),
@@ -1369,6 +1380,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
             (b'c', []) => {
                 self.grid.clear_visible(Color::Default);
                 self.grid.clear_scrollback();
+                self.grid.mark_all_dirty();
                 *self.cursor = Cursor::new();
                 *self.modes = TerminalModes::default();
                 *self.default_colors = TerminalDefaultColors::default();
@@ -1425,18 +1437,39 @@ impl<'a> vte::Perform for VtHandler<'a> {
                         ));
                     } else if let Ok(color) = parse_osc_color(color_bytes) {
                         match params[0] {
-                            b"10" => self.default_colors.fg = Some(color),
-                            b"11" => self.default_colors.bg = Some(color),
-                            b"12" => self.default_colors.cursor = Some(color),
+                            b"10" if self.default_colors.fg != Some(color) => {
+                                self.default_colors.fg = Some(color);
+                                self.grid.mark_all_dirty();
+                            }
+                            b"11" if self.default_colors.bg != Some(color) => {
+                                self.default_colors.bg = Some(color);
+                                self.grid.mark_all_dirty();
+                            }
+                            b"12" if self.default_colors.cursor != Some(color) => {
+                                self.default_colors.cursor = Some(color);
+                                self.grid.mark_all_dirty();
+                            }
                             _ => {}
                         }
                     }
                 }
             }
             // OSC 110/111/112 -- Reset dynamic default foreground/background/cursor.
-            b"110" => self.default_colors.fg = None,
-            b"111" => self.default_colors.bg = None,
-            b"112" => self.default_colors.cursor = None,
+            b"110" => {
+                if self.default_colors.fg.take().is_some() {
+                    self.grid.mark_all_dirty();
+                }
+            }
+            b"111" => {
+                if self.default_colors.bg.take().is_some() {
+                    self.grid.mark_all_dirty();
+                }
+            }
+            b"112" => {
+                if self.default_colors.cursor.take().is_some() {
+                    self.grid.mark_all_dirty();
+                }
+            }
             b"4" => {
                 let mut parts = params[1..].chunks_exact(2);
                 for pair in &mut parts {
@@ -1450,6 +1483,8 @@ impl<'a> vte::Perform for VtHandler<'a> {
                             format_osc_rgb(color),
                             terminator
                         ));
+                    } else if parse_osc_color(pair[1]).is_ok() {
+                        self.grid.mark_all_dirty();
                     }
                 }
             }

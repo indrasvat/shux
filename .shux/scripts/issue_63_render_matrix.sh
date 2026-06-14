@@ -2,19 +2,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${ROOT}/.shux/scripts/lib/shux_harness.sh"
 BIN="${SHUX_BIN:-$ROOT/target/debug/shux}"
 OUT="${SHUX_OUT_DIR:-$ROOT/.shux/out/issue-63}"
 MATRIX_COLS="${SHUX_MATRIX_COLS:-108}"
 MATRIX_ROWS="${SHUX_MATRIX_ROWS:-32}"
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-issue63.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 mkdir -p "$OUT"
 
 SESSIONS=()
 
 cleanup() {
-  local session
-  for session in "${SESSIONS[@]:-}"; do
-    "$BIN" session kill "$session" >/dev/null 2>&1 || true
-  done
+  shux_harness_cleanup_runtime "$RUNTIME_DIR" "$BIN" "${SESSIONS[@]:-}"
 }
 trap cleanup EXIT
 

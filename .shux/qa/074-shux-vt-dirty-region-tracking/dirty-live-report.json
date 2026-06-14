@@ -1,0 +1,41 @@
+{
+  "checks": [
+    {
+      "capture": "dirty-live-80x24.txt",
+      "checks": {
+        "body_present": true,
+        "color_probe_text_present": true,
+        "header_present": true,
+        "tick_present": true
+      },
+      "screenshot": "dirty-live-80x24-actual.png",
+      "status": "pass",
+      "viewport": "80x24"
+    },
+    {
+      "capture": "dirty-live-120x40.txt",
+      "checks": {
+        "body_present": true,
+        "color_probe_text_present": true,
+        "header_present": true,
+        "tick_present": true
+      },
+      "screenshot": "dirty-live-120x40-actual.png",
+      "status": "pass",
+      "viewport": "120x40"
+    },
+    {
+      "capture": "dirty-live-200x60.txt",
+      "checks": {
+        "body_present": true,
+        "color_probe_text_present": true,
+        "header_present": true,
+        "tick_present": true
+      },
+      "screenshot": "dirty-live-200x60-actual.png",
+      "status": "pass",
+      "viewport": "200x60"
+    }
+  ],
+  "status": "pass"
+}

@@ -4,6 +4,7 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+source "${repo_root}/.shux/scripts/lib/shux_harness.sh"
 task="067-shux-vt-resize-reflow"
 qa_dir="${SHUX_RESIZE_REFLOW_QA:-${repo_root}/.shux/qa/${task}}"
 shux_bin="${SHUX_BIN:-${repo_root}/target/release/shux}"
@@ -13,8 +14,7 @@ trigger="${runtime}/go"
 expected="SHUX_RESIZE_REFLOW_abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789_END"
 
 cleanup() {
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill "${session}" >/dev/null 2>&1 || true
-  rm -rf "${runtime}"
+  shux_harness_cleanup_runtime "${runtime}" "${shux_bin}" "${session}"
 }
 trap cleanup EXIT
 

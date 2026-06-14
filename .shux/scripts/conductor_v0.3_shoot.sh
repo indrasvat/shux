@@ -11,12 +11,16 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX_BIN:-shux}"
 SESSION="conductor-v0.3-shoot"
 PLUGIN_NAME="conductor"
 PLUGIN_SRC="examples/plugins/conductor/plugin.sh"
 OUT=".shux/out/conductor-v0.3-notifications.png"
 FINAL="pages/screenshots/conductor-v0.3-notifications.png"
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-conductor-v03.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -24,8 +28,8 @@ FAKE_AGENT_DIR="/tmp/conductor-v0.3-shoot"
 NOTIFY_LOG="/tmp/conductor-v0.3-notify.log"
 
 cleanup() {
-    "$SHUX" plugin kill "$PLUGIN_NAME" >/dev/null 2>&1 || true
-    "$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
+    shux_harness_kill_plugin "$RUNTIME_DIR" "$SHUX" "$PLUGIN_NAME"
+    shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" "$SESSION"
     rm -f "$FAKE_AGENT_DIR"/* "/tmp/conductor-v0.3-wrap.sh" "$NOTIFY_LOG" 2>/dev/null || true
     rmdir "$FAKE_AGENT_DIR" 2>/dev/null || true
 }

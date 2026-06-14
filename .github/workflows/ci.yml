@@ -98,9 +98,9 @@ jobs:
       - name: Build shux (debug, for smoke)
         run: cargo build -p shux
       - name: Run end-to-end smoke (happy path)
-        run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/smoke.sh
+        run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/smoke.sh
       - name: Run integration regressions (12 deterministic scenarios)
-        run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/integration.sh
+        run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/integration.sh
 
   # Combined macOS job: unit tests + doc tests + e2e smoke + integration
   # all on a single runner. macOS pricing is ~10x Linux; deduping setup
@@ -153,9 +153,9 @@ jobs:
       - name: Build shux (debug, for smoke)
         run: cargo build -p shux
       - name: End-to-end smoke (happy path)
-        run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/smoke.sh
+        run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/smoke.sh
       - name: Integration regressions (12 deterministic scenarios)
-        run: SHUX="$PWD/target/debug/shux" bash .shux/scripts/integration.sh
+        run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/integration.sh
 
   coverage:
     name: Coverage (llvm-cov)

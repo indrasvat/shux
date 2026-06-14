@@ -16,10 +16,13 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX:-shux}"
 WORKDIR="${WORKDIR:-$(mktemp -d -t shux-smoke.XXXXXX)}"
-trap '"$SHUX" session kill shux-smoke-wait 2>/dev/null || true;
-      "$SHUX" session kill shux-smoke-snap 2>/dev/null || true' EXIT
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-smoke-runtime.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+trap 'shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" shux-smoke-wait shux-smoke-snap' EXIT
 
 echo "==> using shux: $($SHUX --version)"
 echo "==> workdir: $WORKDIR"
@@ -55,7 +58,7 @@ echo "==> [4b] pane wait-for: regex match"
 echo "==> [4c] pane wait-for: --absent (text never appears)"
 "$SHUX" pane wait-for -s shux-smoke-wait -t NEVER-PRESENT --absent --timeout-ms 500
 
-"$SHUX" session kill shux-smoke-wait > /dev/null
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" shux-smoke-wait
 
 echo
 echo "==> [5/7] state apply 2-pane split spec — target for snapshot"
@@ -85,7 +88,7 @@ head -c 8 .shux/out/snap.png | od -A n -t x1 | tr -d ' \n' | grep -q '89504e470d
 
 echo
 echo "==> [7/7] cleanup"
-"$SHUX" session kill shux-smoke-snap > /dev/null
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" shux-smoke-snap
 
 echo
 echo "✓ shux end-to-end smoke passed on $(uname -s)/$(uname -m)"

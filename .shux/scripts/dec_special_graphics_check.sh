@@ -4,6 +4,7 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+source "${repo_root}/.shux/scripts/lib/shux_harness.sh"
 task="070-shux-vt-dec-special-graphics"
 golden_task="070-dec-special-graphics"
 qa_dir="${SHUX_DEC_GRAPHICS_QA:-${repo_root}/.shux/qa/${task}}"
@@ -15,8 +16,7 @@ trigger="${runtime}/go"
 promote="${SHUX_DEC_GRAPHICS_PROMOTE:-0}"
 
 cleanup() {
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill "${session}" >/dev/null 2>&1 || true
-  rm -rf "${runtime}"
+  shux_harness_cleanup_runtime "${runtime}" "${shux_bin}" "${session}"
 }
 trap cleanup EXIT
 

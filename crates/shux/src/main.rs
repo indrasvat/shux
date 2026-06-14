@@ -2605,7 +2605,7 @@ fn resolve_grid_default_colors(grid: &mut shux_vt::Grid, defaults: shux_vt::Term
         return;
     }
     for row_idx in 0..grid.rows() {
-        let row = grid.visible_row_mut(row_idx);
+        let mut row = grid.visible_row_mut(row_idx);
         for col_idx in 0..row.len() {
             let cell = &mut row[col_idx];
             if cell.style.fg == shux_vt::Color::Default

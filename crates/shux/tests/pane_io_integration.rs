@@ -79,7 +79,13 @@ async fn run_pane_pty_task(
             }
             _ = shutdown.cancelled() => {
                 let _ = handle.terminate();
-                let _ = handle.wait().await;
+                if tokio::time::timeout(Duration::from_millis(500), handle.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = handle.kill();
+                    let _ = tokio::time::timeout(Duration::from_secs(1), handle.wait()).await;
+                }
                 break;
             }
         }
@@ -266,7 +272,7 @@ fn register_session_methods(
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 if let Some(wid) = s.windows.first() {
                                     if let Some(w) = snap.windows.get(wid) {
-                                        let _ = spawn_pane_pty(w.active_pane, cwd, io, ct).await;
+                                        spawn_pane_pty(w.active_pane, cwd, io, ct).await?;
                                     }
                                 }
                                 Ok(session_to_json(s, &snap))
@@ -657,6 +663,13 @@ async fn start_test_server(
     (socket_path, cancel)
 }
 
+async fn stop_test_server(cancel: tokio_util::sync::CancellationToken) {
+    cancel.cancel();
+    // Let in-process pane tasks observe cancellation, signal their PTY process
+    // groups, and reap before the test runtime drops them.
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+}
+
 /// Create a session and return (session_id, pane_id).
 async fn create_test_session(stream: &mut UnixStream) -> (String, String) {
     let result = rpc_call(
@@ -768,7 +781,7 @@ async fn test_send_keys_text() {
     let bytes = result["bytes_written"].as_u64().unwrap();
     assert_eq!(bytes, 11); // "echo hello\n" = 11 bytes
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -792,7 +805,7 @@ async fn test_send_keys_base64() {
 
     assert_eq!(result["bytes_written"].as_u64().unwrap(), 1);
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -831,7 +844,7 @@ async fn test_send_keys_nonexistent_pane() {
     let response: serde_json::Value = serde_json::from_slice(&resp_buf).unwrap();
     assert!(response.get("error").is_some());
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -859,7 +872,7 @@ async fn test_capture_after_echo() {
         "captured text should contain 'SHUX_TEST_OUTPUT', got: {text}"
     );
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -900,7 +913,7 @@ time.sleep(2)
         );
     }
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -939,7 +952,7 @@ time.sleep(2)
         "pane.capture did not translate DEC graphics, got: {text:?}"
     );
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -1007,7 +1020,7 @@ time.sleep(2)
         "TBC clear-all did not clamp HT to the last column as expected: {text:?}"
     );
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
     let _ = std::fs::remove_file(script_path);
 }
 
@@ -1067,7 +1080,7 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
         "xterm CPR probe should receive a terminal response, got: {text}"
     );
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -1130,7 +1143,7 @@ print("\nSHUX_XTERM_PROBES=" + repr(data), flush=True)
         "XTVERSION response missing, got: {text}"
     );
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -1204,7 +1217,7 @@ time.sleep(0.2)
         "sync frame leaked pending content before reset, got: {frozen_text}"
     );
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -1235,7 +1248,7 @@ async fn test_run_command_sync_echo() {
         "stdout should contain 'hello_from_shux', got: {stdout}"
     );
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -1260,7 +1273,7 @@ async fn test_run_command_sync_false() {
     assert_eq!(result["state"].as_str().unwrap(), "completed");
     assert_eq!(result["exit_code"].as_i64().unwrap(), 1);
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -1297,7 +1310,7 @@ async fn test_run_command_async_and_poll() {
     .await;
     assert_eq!(status["state"].as_str().unwrap(), "running");
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -1334,7 +1347,7 @@ async fn test_run_command_cancel() {
 
     assert_eq!(cancel_result["state"].as_str().unwrap(), "cancelled");
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 #[tokio::test]
@@ -1356,7 +1369,7 @@ async fn test_capture_lines_default() {
     assert!(result.get("text").is_some());
     assert_eq!(result["lines"].as_u64().unwrap(), 50);
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }
 
 // Codex hit this in May 2026: short-lived commands inside a shux pane
@@ -1406,5 +1419,5 @@ async fn test_capture_works_after_pane_process_exits() {
         "captured text after exit should contain the marker, got: {text}"
     );
 
-    cancel.cancel();
+    stop_test_server(cancel).await;
 }

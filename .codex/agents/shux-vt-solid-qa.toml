@@ -24,7 +24,7 @@ Required evidence layers unless the task explicitly narrows scope:
 - focused Rust unit tests,
 - integration tests,
 - deterministic VT byte replay or raw `pane.record` replay,
-- shux automation using real sessions,
+- shux automation using real sessions, colored Unix commands, and installed TUIs where practical,
 - `pane.capture` text evidence,
 - `pane.snapshot` or `window.snapshot` PNG evidence,
 - visual inspection of PNGs as images,
@@ -55,6 +55,8 @@ Shux capture protocol:
 - Launch with `shux --format json session create solid-vt-<task> -d --title solid-vt -- <command>`.
 - Resize to 80x24, 120x40, and 200x60 unless task scope narrows it.
 - Use `shux pane wait-for --timeout-ms`, then `pane.capture`, then `pane.snapshot`.
+- Include explicit truecolor, indexed-color, or basic-color probes in every daemon-backed capture/snapshot audit so monochrome regressions fail.
+- Prefer real commands/TUIs over synthetic-only proof for user-visible behavior; synthetic fixtures are acceptable for narrow parser invariants but not as the only evidence when real workloads are practical.
 - Store bulky scratch artifacts under `.shux/out/<task>/`; store reviewable final evidence under `.shux/qa/<task>/`.
 - Always kill audit sessions and report cleanup status.
 

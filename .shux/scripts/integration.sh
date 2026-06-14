@@ -22,20 +22,25 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX:-shux}"
 WORKDIR="${WORKDIR:-$(mktemp -d -t shux-integration.XXXXXX)}"
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-integration-runtime.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 
 # All sessions created in this script use this prefix so the trap can
 # sweep them on exit without touching unrelated state.
 PFX="shux-it"
 
 cleanup() {
-    "$SHUX" rpc call session.list 2>/dev/null \
+    shux_harness_timeout 8s "$SHUX" rpc call session.list 2>/dev/null \
         | jq -r --arg pfx "$PFX" \
             '.result.sessions[]? | select(.name | startswith($pfx)) | .id' \
         | while read -r sid; do
-            "$SHUX" rpc call session.kill --params "{\"id\":\"$sid\"}" >/dev/null 2>&1 || true
-          done
+            shux_harness_timeout 8s "$SHUX" rpc call session.kill --params "{\"id\":\"$sid\"}" >/dev/null 2>&1 || true
+          done || true
+    shux_harness_stop_daemon "${RUNTIME_DIR}"
 }
 trap cleanup EXIT
 

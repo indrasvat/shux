@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "strategy": "bounded-implementation-review",
+  "task": "074-dirty-region-tracking",
+  "date": "2026-06-13",
+  "status": "reviewed-with-tooling-caveats",
+  "primary_review_artifact": "dootsabha-implementation-raw.jsonl",
+  "dispatch": [
+    {
+      "provider": "claude",
+      "source": "dootsabha-implementation-raw.jsonl",
+      "status": "ok",
+      "summary": "Claude reviewed task 074 implementation and found the dirty-region API technically sound: replay overhead 1.47% under the 5% budget, idle take_dirty_regions far under 2ms/frame, independent tracking-disabled versus tracking-enabled raster parity at 0 changed pixels, live 80x24/120x40/200x60 colored screenshots present, focused dirty-region unit tests present, and make check previously passing. The review correctly blocked final Done on process and evidence gates: all new scripts/artifacts must be staged, SOLID-QA must be rerun to PASS, the observation-only pixel scope must be documented, and task/progress status must match evidence."
+    },
+    {
+      "provider": "gemini",
+      "source": "dootsabha-implementation-raw.jsonl",
+      "status": "excluded",
+      "summary": "Gemini timed out and spawned a recursive process tree with MCP children during review. It is excluded from shux review automation until explicitly requested; future second-agent review should use bounded agy once it responds reliably, or DootSabha native agy support when available."
+    },
+    {
+      "provider": "agy",
+      "source": "agent_review_guard smoke",
+      "status": "not-used",
+      "summary": "agy is installed at /Users/indrasvat/.local/bin/agy and exposes --print plus --print-timeout, but a trivial guarded smoke prompt timed out after its print timeout. It was therefore not used as a task-074 gate in this run."
+    }
+  ],
+  "resolved_blockers_from_review": [
+    "new scripts and QA artifacts are present in git status and must be committed with the feature",
+    "task documentation now states dirty regions are observation-only in task 074 and renderer consumption is out of scope",
+    "live shux evidence now includes 80x24, 120x40, and 200x60 screenshots",
+    "live screenshots include truecolor, indexed-color, and basic-color probes with saturated colored pixels",
+    "external reviewer process hygiene is now guarded by .shux/scripts/agent_review_guard.sh"
+  ],
+  "remaining_gate": "shux-vt-solid-qa must be rerun and write VERDICT: PASS before final completion."
+}

@@ -1,0 +1,46 @@
+{
+  "dispatch": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "content": "## Task 074 — Dirty-Region Tracking: Synthesized Verdict\n\n**VERDICT: NOT DONE — conditional.** The engineering is sound and within budget, but the user's framing (\"remaining issues are purely procedural\") is too optimistic. Staging is necessary but not sufficient, and one genuine build-breaking blocker is hiding inside what looks like a staging step.\n\n### Technical substance — clears the bar\nVerified against code, not paraphrase:\n- **Perf:** replay overhead **1.47%** (budget 5%), idle `take_dirty_regions` **1.8e-6 ms/frame** (budget 2ms). Both `pass`.\n- **Parity:** harness runs two *independent* VTs (`track_dirty:false` vs `true`), **0 changed pixels**. The council confirmed these are genuinely separate VTs — not the self-cloned grid the committed `SOLID-QA.md` feared (see blocker 4).\n- **Live coverage:** 80x24 / 120x40 / 200x60 colored PNGs now exist and pass (693 saturated pixels each, all probes present). This *resolves* the old P1 viewport gap.\n- 13 focused dirty-region unit tests + VT byte-fixture integration + `make check` all pass.\n\n### Blockers (in severity order)\n\n1. **🔴 CI is broken at HEAD — not procedural.** The *committed* `ci.yml` now wraps smoke/integration steps with `.shux/scripts/no_leak_guard.sh`, which depends on `.shux/scripts/lib/shux_harness.sh` and `dirty_region_check.sh` — **all three untracked.** A clean CI checkout fails with \"No such file.\" The fix is `git add`, but the staging set is **broader than `.shux/qa/`**: it must include `no_leak_guard.sh`, `leak_guard_selftest.sh`, `lib/`, `dirty_region_check.sh`, and the modified `ci.yml`/`Makefile`. Staging only the QA dir leaves CI red.\n\n2. **🔴 SOLID hard gate is `VERDICT: FAIL` and must be genuinely re-run.** The committed report's line 1 is `FAIL`. The council explicitly flagged hand-editing it to `PASS` as **fabrication** — do not. After staging, the `shux-vt-solid-qa` subagent must re-audit and emit a real PASS. Until then the hard gate blocks completion by rule.\n\n3. **🟡 Implementation-diff DootSabha council has `synthesis: null`.** The two reviews exist and converge, but no chair synthesis was produced (earlier gemini API error; gemini is healthy now). Feature protocol wants a clean converged implementation-diff review — re-run for a real synthesis, or document that the null is a tooling artifact and the two reviews already converge.\n\n4. **🟡 Pixel-baseline methodology must be reconciled in the task file.** The committed `SOLID-QA.md` fails on a \"self-minted baseline\" citing `dirty_region_harness.rs:134-139` (one cloned grid); the council verified the live harness runs two independent VTs. Confirm which harness is authoritative, and ensure the task file documents the **observation-only scope** (no renderer consumes dirty regions in 074 → dirty/incremental pixel parity is intentionally out of scope) per the hard-gate baseline rule. If reconciled, this clears; if not, it's a real gate failure.\n\n5. **⚪ Procedural:** task `Status:` still `In Progress` (so `make check-progress` fails), PROGRESS.md row stale, and the live session name is `dirty-region-$RANDOM` instead of `solid-vt-074` (P2 convention).\n\n### Remediation sequence to reach Done\n1. `git add` the **full** untracked set (scripts + lib + QA dir), not just `.shux/qa/` — this is what un-breaks CI.\n2. Reconcile blocker 4 in `docs/tasks/074-*.md` (scope statement / approved baseline).\n3. Re-run the implementation-diff council for a clean synthesis (blocker 3).\n4. Re-run `shux-vt-solid-qa` for a **genuine** PASS; commit it to `SOLID-QA.md` (blocker 2).\n5. Flip task `Status:` → Done and the PROGRESS.md row; verify `make check-progress`.\n\nBottom line: it's close, and most of the residue is mechanical — but step 1 fixes a real broken build, and steps 2–4 require honest re-runs, not edits. Don't mark Done until the SOLID report genuinely reads PASS.",
+      "duration_ms": 117660,
+      "cost_usd": 0.8258430000000001,
+      "tokens_in": 14767,
+      "tokens_out": 7301
+    },
+    {
+      "provider": "gemini",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke gemini: gemini invoke: subprocess \"gemini\": context deadline exceeded"
+    }
+  ],
+  "reviews": null,
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 117660,
+    "total_cost_usd": 0.8258430000000001,
+    "total_tokens_in": 14767,
+    "total_tokens_out": 7301,
+    "providers": {
+      "claude": "ok",
+      "gemini": "error"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "synthesis: synthesize: no healthy agents available for synthesis"
+  }
+}

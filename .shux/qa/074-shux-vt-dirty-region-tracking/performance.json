@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "task": "074-shux-vt-dirty-region-tracking",
+  "replay_bytes": 4862007,
+  "replay_chunks": 75,
+  "replay_tracking_off_median_ms": 78.44541600000001,
+  "replay_tracking_on_median_ms": 80.02758299999999,
+  "replay_tracking_overhead_pct": 0.20785838658046174,
+  "replay_tracking_overhead_budget_pct": 5.0,
+  "replay_tracking_status": "pass",
+  "idle_take_iterations": 10000,
+  "idle_take_avg_ms_per_frame": 1.7708999999999998e-6,
+  "idle_take_budget_ms_per_frame": 2.0,
+  "idle_take_status": "pass",
+  "methodology": "median paired high-output VT replay compares shux-vt parsing with GridConfig.track_dirty=false against track_dirty=true; repeated pairs filter scheduler noise, and idle measures clean take_dirty_regions on a 200x60 VT"
+}

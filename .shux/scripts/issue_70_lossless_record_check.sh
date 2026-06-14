@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${repo_root}/.shux/scripts/lib/shux_harness.sh"
 shux_bin="${SHUX_BIN:-${repo_root}/target/release/shux}"
 out_dir="${SHUX_ISSUE70_OUT:-${repo_root}/.shux/out/issue-70}"
 gh_hound="${GH_HOUND_BIN:-/Users/indrasvat/code/github.com/indrasvat-gh-hound/bin/gh-hound}"
@@ -11,11 +12,13 @@ mkdir -p "${out_dir}"
 
 runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-issue70.XXXXXX")"
 cleanup() {
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill issue70-lossless >/dev/null 2>&1 || true
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill issue70-gh-hound >/dev/null 2>&1 || true
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill issue70-vivecaka >/dev/null 2>&1 || true
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" session kill issue70-btop >/dev/null 2>&1 || true
-  rm -rf "${runtime}"
+  shux_harness_cleanup_runtime \
+    "${runtime}" \
+    "${shux_bin}" \
+    issue70-lossless \
+    issue70-gh-hound \
+    issue70-vivecaka \
+    issue70-btop
 }
 trap cleanup EXIT
 

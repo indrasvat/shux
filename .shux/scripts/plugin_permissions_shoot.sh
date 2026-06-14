@@ -9,18 +9,22 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX_BIN:-shux}"
 SESSION="perm-shoot"
 PLUGIN_NAME="hello"
 PLUGIN_SRC="examples/plugins/hello/plugin.sh"
 OUT=".shux/out/plugin-permissions-demo.png"
 FINAL="pages/screenshots/plugin-permissions-demo.png"
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-plugin-perms.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 
 mkdir -p "$(dirname "$OUT")"
 
 cleanup () {
-    "$SHUX" plugin kill "$PLUGIN_NAME" >/dev/null 2>&1 || true
-    "$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
+    shux_harness_kill_plugin "$RUNTIME_DIR" "$SHUX" "$PLUGIN_NAME"
+    shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" "$SESSION"
 }
 trap cleanup EXIT INT TERM HUP
 

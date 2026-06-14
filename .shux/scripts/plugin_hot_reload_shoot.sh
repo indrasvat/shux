@@ -10,12 +10,16 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/.shux/scripts/lib/shux_harness.sh"
 SHUX="${SHUX_BIN:-shux}"
 SESSION="hr-shoot"
 INNER_SESSION="hr-target"
 PLUGIN_SRC="examples/plugins/hello/plugin.sh"
 OUT=".shux/out/plugin-hot-reload.png"
 FINAL="pages/screenshots/plugin-hot-reload.png"
+RUNTIME_DIR="${SHUX_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/shux-plugin-hot-reload.XXXXXX")}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -25,17 +29,16 @@ cp "$PLUGIN_SRC" "$PLUGIN_SRC.shootbak"
 TMPFILES=()
 cleanup () {
     mv -f "$PLUGIN_SRC.shootbak" "$PLUGIN_SRC" 2>/dev/null || true
-    "$SHUX" plugin kill hello >/dev/null 2>&1 || true
-    "$SHUX" session kill "$INNER_SESSION" >/dev/null 2>&1 || true
-    "$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
+    shux_harness_kill_plugin "$RUNTIME_DIR" "$SHUX" hello
+    shux_harness_cleanup_runtime "$RUNTIME_DIR" "$SHUX" "$INNER_SESSION" "$SESSION"
     for f in "${TMPFILES[@]:-}"; do [[ -n "$f" && -e "$f" ]] && rm -f "$f"; done
 }
 trap cleanup EXIT INT TERM HUP
 
 # Pre-clean
-"$SHUX" plugin kill hello >/dev/null 2>&1 || true
-"$SHUX" session kill "$INNER_SESSION" >/dev/null 2>&1 || true
-"$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
+shux_harness_kill_plugin "$RUNTIME_DIR" "$SHUX" hello
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" "$INNER_SESSION"
+shux_harness_kill_session "$RUNTIME_DIR" "$SHUX" "$SESSION"
 
 # The demo runs inside one shux shell pane. Each `echo "$ ..."` is
 # the prompt-mock; the actual command runs underneath. Sleeps give the
