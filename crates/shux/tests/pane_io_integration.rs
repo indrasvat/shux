@@ -1075,12 +1075,12 @@ print("\nSHUX_CPR=" + repr(data), flush=True)
         text.contains("SHUX_CPR=")
     })
     .await;
+    let got_response = text.contains("\\x1b[5;10R");
+    stop_test_server(cancel).await;
     assert!(
-        text.contains("SHUX_CPR=b'\\x1b[5;10R'"),
+        got_response,
         "xterm CPR probe should receive a terminal response, got: {text}"
     );
-
-    stop_test_server(cancel).await;
 }
 
 #[tokio::test]

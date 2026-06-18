@@ -61,7 +61,11 @@ pub fn params_hash(params: Option<&Value>) -> String {
         }
         None => h.update(b"null"),
     }
-    format!("sha256:{:x}", h.finalize())
+    format!("sha256:{}", hex_encode(&h.finalize()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Append one entry to `path`. Rotates if the existing file exceeds
