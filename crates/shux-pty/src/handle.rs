@@ -1,7 +1,7 @@
 //! PtyHandle: per-pane PTY wrapper with async read/write/resize.
 
 use std::fs::File;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -194,15 +194,13 @@ fn nix_to_io(err: nix::Error) -> PtyError {
 }
 
 fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
-    let flags = OFlag::from_bits_truncate(fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL)?);
-    fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(())
 }
 
 fn dup_stdio(fd: &OwnedFd) -> std::io::Result<Stdio> {
-    let duped = nix::unistd::dup(fd.as_raw_fd())?;
-    // SAFETY: dup returns a fresh owned file descriptor.
-    let duped = unsafe { OwnedFd::from_raw_fd(duped) };
+    let duped = nix::unistd::dup(fd)?;
     Ok(Stdio::from(File::from(duped)))
 }
 
@@ -265,6 +263,9 @@ fn is_pty_eof_errno(errno: nix::errno::Errno) -> bool {
 }
 
 fn drain_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
+    // SAFETY: the fd is owned by self.pty and remains valid for the duration
+    // of this synchronous nonblocking read.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut total = 0usize;
     loop {
         match nix::unistd::read(fd, &mut buf[total..]) {

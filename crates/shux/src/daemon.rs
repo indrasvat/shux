@@ -180,9 +180,13 @@ fn redirect_stdio_to_devnull() {
     {
         let fd = devnull.as_raw_fd();
         // Best-effort: if dup2 fails, continue anyway
-        let _ = nix::unistd::dup2(fd, 0); // stdin
-        let _ = nix::unistd::dup2(fd, 1); // stdout
-        let _ = nix::unistd::dup2(fd, 2); // stderr
+        // SAFETY: dup2 only duplicates the already-open /dev/null fd onto the
+        // standard file descriptor numbers in the daemon child.
+        unsafe {
+            let _ = nix::libc::dup2(fd, 0); // stdin
+            let _ = nix::libc::dup2(fd, 1); // stdout
+            let _ = nix::libc::dup2(fd, 2); // stderr
+        }
     }
 }
 

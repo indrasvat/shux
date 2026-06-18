@@ -13,6 +13,15 @@
   movement. Real PTY probes that paste multi-line scripts through an interactive
   shell should wait for shell readiness and submit CRLF so the fixture executes
   reliably under login-shell/readline variants.
+- **2026-06-18 (dependency upgrades):** `nix` 0.31 moves fd helpers toward
+  `AsFd`/`OwnedFd`: pass `&OwnedFd` to `fcntl`/`dup`, borrow raw async fds only
+  at the PTY read/write boundary, and use `libc::dup2` for daemon stdio
+  redirection to fd 0/1/2 so ownership of standard descriptors does not get
+  confused. `sha2` 0.11 finalized digests no longer format directly with
+  `LowerHex`; encode bytes explicitly to preserve existing `sha256:<hex>` audit
+  strings. PTY response tests should assert the required escape sequence is
+  present and stop their test server before panicking, because shell echo/newline
+  bytes can legitimately precede terminal responses.
 - **2026-06-12 (task 071 tab stops):** Mutable tab stops are terminal state,
   not parser-local cursor math. A flat bitmap seeded with `col > 0 && col % 8 ==
   0` avoids the Default-to-Explicit trap where first HTS/TBC wipes existing
