@@ -13,6 +13,7 @@ mod cli;
 mod client;
 mod config_validate;
 mod daemon;
+mod features;
 mod onboarding;
 mod session_meta;
 mod session_persist;
@@ -1380,6 +1381,14 @@ fn register_plugin_methods(
                         .get("state_root")
                         .and_then(|v| v.as_str())
                         .map(PathBuf::from);
+                    let expected_name = params
+                        .get("expected_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let expected_version = params
+                        .get("expected_version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
 
                     let source = shux_plugin::PluginSource {
                         path: PathBuf::from(path),
@@ -1387,6 +1396,8 @@ fn register_plugin_methods(
                         cwd,
                         watch,
                         state_root,
+                        expected_name,
+                        expected_version,
                     };
                     let info = mgr.install(source).await.map_err(plugin_error_to_rpc)?;
                     serde_json::to_value(&info).map_err(|e| {
@@ -5261,70 +5272,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
         },
 
         Some(Command::Plugin { command: pl_cmd }) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            match pl_cmd {
-                cli::PluginCommand::Install {
-                    path,
-                    args: pargs,
-                    cwd,
-                    no_watch,
-                } => {
-                    cli::handle_plugin_install(
-                        &mut stream,
-                        &path,
-                        &pargs,
-                        cwd.as_deref(),
-                        !no_watch,
-                        args.format,
-                    )
-                    .await
-                }
-                cli::PluginCommand::List => cli::handle_plugin_list(&mut stream, args.format).await,
-                cli::PluginCommand::Kill { name } => {
-                    cli::handle_plugin_kill(&mut stream, &name, args.format).await
-                }
-                cli::PluginCommand::Reload { name } => {
-                    cli::handle_plugin_reload(&mut stream, &name, args.format).await
-                }
-                cli::PluginCommand::Grant {
-                    plugin,
-                    method,
-                    target,
-                    subscribe,
-                } => {
-                    cli::handle_plugin_grant(
-                        &mut stream,
-                        &plugin,
-                        &method,
-                        target.as_deref(),
-                        subscribe,
-                        args.format,
-                    )
-                    .await
-                }
-                cli::PluginCommand::Revoke {
-                    plugin,
-                    method,
-                    target,
-                    subscribe,
-                } => {
-                    cli::handle_plugin_revoke(
-                        &mut stream,
-                        &plugin,
-                        &method,
-                        target.as_deref(),
-                        subscribe,
-                        args.format,
-                    )
-                    .await
-                }
-                cli::PluginCommand::Grants { plugin } => {
-                    cli::handle_plugin_grants(&mut stream, &plugin, args.format).await
-                }
-                cli::PluginCommand::Audit { plugin, tail } => {
-                    cli::handle_plugin_audit(&mut stream, &plugin, tail, args.format).await
-                }
-            }
+            features::plugin::dispatch(pl_cmd, &socket_path, args.format).await
         }
 
         Some(Command::Events { command: ev_cmd }) => {
@@ -6084,6 +6032,31 @@ done
 
         let missing_path = dispatch_err(&router, "plugin.install", serde_json::json!({})).await;
         assert_eq!(missing_path.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        let identity_mismatch = dispatch_err(
+            &router,
+            "plugin.install",
+            serde_json::json!({
+                "path": script.clone(),
+                "watch": false,
+                "expected_name": "not-noop",
+                "expected_version": "0.1.0",
+            }),
+        )
+        .await;
+        assert_eq!(
+            identity_mismatch.code,
+            shux_rpc::ErrorCode::InvalidParams.code()
+        );
+        assert!(
+            identity_mismatch
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail"))
+                .and_then(|detail| detail.as_str())
+                .unwrap_or_default()
+                .contains("plugin manifest name mismatch")
+        );
 
         let installed = dispatch_ok(
             &router,

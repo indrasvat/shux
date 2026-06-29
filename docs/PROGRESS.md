@@ -28,6 +28,8 @@
   - **PR 2c — sampled pane.output events** — Done. Separate `data_plane: broadcast::Sender<PaneOutputEvent>` channel in `EventBus` with NO history — the secret-leak vector is sealed. Per-pane PTY task rate-limits at the source: ~10 chunks/sec/pane via `output_sample_interval = 100ms` + 64KB pending buffer cap. `pane.output.watch` RPC long-polls the data plane with pane_id filter and `from_seq` resumption. `shux pane watch -s X -p Y [--limit N]` CLI base64-decodes chunks to stdout. 4 new unit tests pin the data-plane / control-plane separation. Design rationale in `docs/PR2c-DESIGN.md`. L4 visual test in `.claude/automations/test_pr2c_pane_output.py` (A1..A6 green).
   - **Post-merge followups (PR #15):** (1) `session.create` RPC now persists `command` onto `Pane.command` via new `create_session_with_command(name, cwd, command)` method — closes the codex P2 #10 leftover so `shux new --cmd vim` auto-derives title as "vim" instead of cwd basename. (2) `.config/nextest.toml` added with retry override (2 retries) for known-flaky tests: `test_spawn_echo`, `test_m0_pty_spawn_echo`, `test_tcp_auth_required`. Default retries=0 elsewhere so new flakes stay loud. (3) `test_tcp_auth_required` gained an in-place comment documenting the bind→drop→re-bind TOCTOU race as a `KNOWN FLAKE`.
   - **066 (lossless pane output recording)** — Done. `pane.record.start` / `pane.record.stop` add a daemon-owned raw PTY recorder for byte-exact audits while keeping `pane.output.watch` sampled. Recorder state reports `complete|error|aborted`, byte count, `lossless`, and error detail; v1 allows one active recorder per pane, applies explicit backpressure, supports daemon-side `duration_ms`, resolves CLI `--to` paths client-side, and protects existing files unless `--force` is used. `shux pane watch` help now says absence assertions are unsound and text/plain mode warns on sampled chunks.
+  - **075 (plugin DX v0.5 and OCP extraction)** — Done. Local-only plugin authoring and lifecycle foundation: plugin feature command dispatch boundary, `sh` scaffold/create/init, manifest-directory validation and canonicalized directory installs, package name/version handshake checks, `plugin stop` lifecycle alias, existing permission/audit path preservation, and leak-guarded Shux dogfood QA.
+- **In Progress:** none.
 - **Pending:** 035 (complete RPC surface). 038–050 (plugin host + bundled plugins + MCP).
 
 **VT Quality Track** — in progress.
@@ -101,6 +103,13 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 ---
 
 ## Session Log
+
+**2026-06-29 — feat(plugin): improve plugin DX foundation**
+- Completed task 075 with a local-only plugin DX first pass: `shux plugin scaffold/create/init --runtime sh`, `shux plugin stop`, manifest-directory install validation, canonicalized entrypoints, default package-root cwd, and package name/version handshake checks.
+- Extracted plugin command routing into `features::plugin::dispatch`, reducing central `main.rs` churn for future plugin subcommands while preserving existing daemon-backed permission, grant, audit, runtime UUID, and hot-reload paths.
+- Added focused package/scaffold/router/CLI coverage plus `make test-plugin-dx`; preserved direct executable and legacy `plugin.sh` directory install compatibility.
+- Dogfooded with real shux automation under `.shux/scripts/no_leak_guard.sh`; kept screenshot evidence out of the PR because this task changes plugin CLI/package behavior, not terminal rendering.
+- External review: DootSabha implementation review found canonicalization, symlink-escape, identity-binding, TUI-QA, doc-scope, scaffold README/license, and route-boundary gaps; fixes were incorporated before PR.
 
 **2026-06-13 — chore(qa): add general TUI QA gate**
 - Added reusable Claude/Codex `shux-tui-qa` subagents for user-visible
@@ -1473,6 +1482,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 072 | shux-vt origin mode and scroll-region semantics | VT Quality | **Done** | 005, 029, 073 |
 | 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
 | 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
+| 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 
 ---
 

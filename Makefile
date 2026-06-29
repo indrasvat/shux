@@ -133,6 +133,13 @@ test-pane-io: ## Run pane I/O integration tests; optionally pass FILTER=<test-na
 	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test pane_io_integration -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
 
+.PHONY: test-plugin-dx
+test-plugin-dx: ## Run focused plugin DX CLI/integration tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running plugin DX tests...$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh -p shux --bin shux -- $(FILTER) --test-threads=1
+	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test cli_integration -- $(FILTER) --test-threads=1
+	@echo "$(COLOR_GREEN)✓ Plugin DX tests passed$(COLOR_RESET)"
+
 .PHONY: test-vt-corpus-unit
 test-vt-corpus-unit: ## Run VT corpus replay unit/integration tests
 	@echo "$(COLOR_BLUE)▶ Running VT corpus replay tests...$(COLOR_RESET)"

@@ -106,7 +106,12 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > 4. Compare against any existing `.shux/out/rich-tui-parity/` artifacts or
 >    relevant goldens when present. If the visual output differs, explain why
 >    the difference is intentional; otherwise fix it before handoff.
-> 5. Report the screenshot paths and a concise pass/fail table in the final
+> 5. Treat these screenshots as scratch evidence by default. For PR review,
+>    attach the important screenshots to GitHub PR comments, preferably via the
+>    `browsing-as-you` skill so the authenticated GitHub UI stores the images in
+>    the PR discussion. Do not commit these screenshots unless they are approved
+>    regression baselines or product assets.
+> 6. Report the screenshot paths and a concise pass/fail table in the final
 >    response. If a TUI cannot be run on the current machine, say exactly which
 >    one and why.
 >
@@ -140,11 +145,15 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 >   exists.
 > - It MUST prove cleanup: no new `shux` daemons and no new orphan automation
 >   processes.
-> - The PASS report and evidence manifest MUST be committed under
->   `.shux/qa/<scope>/` as `TUI-QA.md` and `tui-evidence-manifest.json` when
->   this gate is used.
-> - `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope> make check-tui-qa` MUST pass before
->   handoff when this gate is used.
+> - Screenshots, transcripts, and pixel diffs from this general gate are scratch
+>   artifacts by default. Keep them under `.shux/out/<scope>/` or another
+>   gitignored working directory, then attach the review-worthy subset to the PR
+>   as comments. Use `browsing-as-you` for authenticated GitHub uploads when
+>   `gh` cannot attach images directly.
+> - Do not commit general TUI QA screenshots or manifests unless the task
+>   explicitly justifies a durable repo artifact and DootSabha agrees. `make
+>   check-tui-qa` validates committed manifests only when such an exception is
+>   intentionally present.
 >
 > Run daemon-backed shux QA serially through `.shux/scripts/no_leak_guard.sh`.
 > Do not parallelize leak-guarded shux checks.
@@ -168,8 +177,13 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 >   re-scoped in the task file before proceeding.
 > - The PASS report must be committed at `.shux/qa/<task>/SOLID-QA.md`.
 > - The first line of that file must be exactly `VERDICT: PASS`.
-> - The same directory must include a committed `evidence-manifest.json`, at
->   least one full-resolution PNG evidence file, and pixel metric JSON.
+> - Committed PNG evidence is allowed only when it is a true regression baseline,
+>   golden fixture, or intentionally durable VT/raster evidence approved by the
+>   task plan and DootSabha design review. Otherwise keep full-resolution PNGs
+>   in scratch storage and attach them to the PR as comments.
+> - When committed PNG evidence is justified, the same directory must include a
+>   committed `evidence-manifest.json`, at least one full-resolution PNG evidence
+>   file, and pixel metric JSON.
 >
 > The SOLID gate MUST read the active `docs/tasks/NNN-*.md` file and enforce
 > that task's exact Testing Matrix, Acceptance Criteria, and Definition of Done.
@@ -181,8 +195,9 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > never replace full-resolution individual screenshots and pixel diffs.
 >
 > `.shux/out/<task>/` is scratch space for bulky intermediate captures and live
-> recording output. It is not auditable PR evidence. The reviewable subset
-> required by the hard gate lives in `.shux/qa/<task>/` and must be tracked.
+> recording output. The default review path is PR comments with attached
+> screenshots, not committed binary artifacts. The tracked `.shux/qa/<task>/`
+> subset is reserved for durable reports, manifests, and justified baselines.
 > Baselines must come from committed `.shux/goldens/` or committed
 > `.shux/fixtures/` replay outputs. New or changed baselines require explicit
 > task documentation plus DootSabha design-review approval; an implementation
@@ -229,18 +244,23 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > 5. **Local `dootsabha council` review of the implementation diff BEFORE pushing.**
 >    Don't wait for codex-bot on the PR to find issues. The goal is the PR
 >    shows up *already solid* — codex should react 👍, not write P2 reviews.
-> 6. **Visual evidence per (render path × config state) cell.** Save under
->    `.claude/screenshots/<feature>/`, name
+> 6. **Visual evidence per (render path × config state) cell.** Save local
+>    screenshots under `.shux/out/<feature>/` or `.claude/screenshots/<feature>/`,
+>    name
 >    `v<N>_<render-path>_<width>_<config-state>.png` (e.g.
 >    `v1_attach_120_default.png`, `v1_window_snapshot_120_max.png`). Render
 >    path is mandatory in the filename — two cells from different paths
 >    at the same width + state would otherwise collide and silently
 >    overwrite each other, making the matrix unauditable.
-> 7. **Cross-path consistency assertion.** At least one test that asserts the
+> 7. **PR evidence, not repo cruft.** Attach the review-worthy screenshots to the
+>    PR as comments. Prefer `browsing-as-you` for GitHub UI uploads when image
+>    attachment is needed. Do not commit screenshots unless they are durable
+>    goldens/baselines/product assets with explicit task and DootSabha approval.
+> 8. **Cross-path consistency assertion.** At least one test that asserts the
 >    same logical output across render paths (e.g., snapshot at width W matches
 >    the attach renderer's bar at width W). Prevents future drift.
-> 8. **`gh-ghent` post-push, background only** (per memory `feedback-ghent-background`).
-> 9. **Post-merge `curl|sh` smoke** (per memory `feedback-post-merge-smoke-test`) —
+> 9. **`gh-ghent` post-push, background only** (per memory `feedback-ghent-background`).
+> 10. **Post-merge `curl|sh` smoke** (per memory `feedback-post-merge-smoke-test`) —
 >    verify against the *publicly-installed* binary, not local `target/release/`.
 >
 > **Paste this into every feature PR description:**
@@ -258,7 +278,8 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > - [ ] hot-reload state (config edit mid-session takes effect)
 > - [ ] cross-path consistency test
 > - [ ] `make check` (lint + tests)
-> - [ ] visual evidence for every relevant (path × state) cell
+> - [ ] visual evidence for every relevant (path × state) cell is attached to PR comments
+> - [ ] no screenshots committed unless justified as durable baselines/assets
 > ```
 >
 > If a cell can't be filled for a *good* reason (e.g., welcome toast doesn't

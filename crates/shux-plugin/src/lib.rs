@@ -105,6 +105,10 @@ pub struct PluginSource {
     /// CLIENT's cwd so a daemon shared across projects keeps each
     /// project's plugin state isolated. (codex P2 review on PR #32.)
     pub state_root: Option<PathBuf>,
+    /// Optional package-manifest identity expectations supplied by
+    /// directory installs. Direct executable installs leave these unset.
+    pub expected_name: Option<String>,
+    pub expected_version: Option<String>,
 }
 
 impl PluginSource {
@@ -115,6 +119,8 @@ impl PluginSource {
             cwd: None,
             watch: false,
             state_root: None,
+            expected_name: None,
+            expected_version: None,
         }
     }
 
@@ -311,6 +317,24 @@ impl PluginManager {
             return Err(PluginError::HandshakeFailed(
                 "plugin manifest missing 'name'".into(),
             ));
+        }
+        if let Some(expected) = &source.expected_name
+            && manifest.name != *expected
+        {
+            let _ = child.kill().await;
+            return Err(PluginError::HandshakeFailed(format!(
+                "plugin manifest name mismatch: package expected {expected:?}, process reported {:?}",
+                manifest.name
+            )));
+        }
+        if let Some(expected) = &source.expected_version
+            && manifest.version != *expected
+        {
+            let _ = child.kill().await;
+            return Err(PluginError::HandshakeFailed(format!(
+                "plugin manifest version mismatch: package expected {expected:?}, process reported {:?}",
+                manifest.version
+            )));
         }
         // Names must be filter-safe — they're concatenated verbatim
         // into the `plugin.<name>.<type>` namespace used by

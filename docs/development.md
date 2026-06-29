@@ -56,7 +56,13 @@ uv run .claude/automations/test_*.py   # L4 (per script)
 L4 scripts live in `.claude/automations/` and use the shared
 `_shux_iterm.py` helpers (janitor, own window, position-based Quartz
 screenshots, multi-level cleanup). Screenshots go to
-`.claude/screenshots/` (gitignored).
+`.claude/screenshots/` or `.shux/out/<scope>/` and stay gitignored by default.
+
+For PR review, attach the useful screenshots to GitHub PR comments instead of
+committing them. Use the `browsing-as-you` skill when an authenticated GitHub UI
+upload is needed. Only commit screenshots when they are durable regression
+goldens, fixtures, or product assets with explicit task and review
+justification.
 
 ## Conventional commits
 

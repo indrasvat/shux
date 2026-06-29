@@ -614,6 +614,102 @@ fn test_cli_session_ls_alias_help() {
 }
 
 #[test]
+fn test_cli_plugin_scaffold_help_no_daemon() {
+    let output = shux_bin()
+        .args(["plugin", "scaffold", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("--runtime"));
+    assert!(stdout.contains("sh"));
+}
+
+#[test]
+fn test_cli_plugin_create_alias_help_no_daemon() {
+    let output = shux_bin()
+        .args(["plugin", "create", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("--runtime"));
+}
+
+#[test]
+fn test_cli_plugin_init_help_no_daemon() {
+    let output = shux_bin()
+        .args(["plugin", "init", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("--runtime"));
+}
+
+#[test]
+fn test_cli_plugin_stop_help_no_daemon() {
+    let output = shux_bin()
+        .args(["plugin", "stop", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Plugin name"));
+}
+
+#[test]
+fn test_plugin_scaffold_generates_sh_process_plugin_without_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_dir = tmp.path().join("hello-plugin");
+
+    let output = shux_bin()
+        .args([
+            "plugin",
+            "scaffold",
+            plugin_dir.to_str().unwrap(),
+            "--runtime",
+            "sh",
+            "--name",
+            "hello-plugin",
+            "--id",
+            "dev.shux.hello-plugin",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = std::fs::read_to_string(plugin_dir.join("shux-plugin.toml")).unwrap();
+    assert!(manifest.contains("name = \"hello-plugin\""));
+    assert!(manifest.contains("id = \"dev.shux.hello-plugin\""));
+    assert!(manifest.contains("runtime = \"process\""));
+    assert!(plugin_dir.join("bin/hello-plugin.sh").is_file());
+    assert!(plugin_dir.join("README.md").is_file());
+    assert!(plugin_dir.join("LICENSE").is_file());
+}
+
+#[test]
 fn test_cli_config_validate_clean() {
     use std::io::Write;
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
