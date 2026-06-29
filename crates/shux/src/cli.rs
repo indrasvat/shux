@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use crate::features::plugin::{PluginScaffoldRuntime, ScaffoldOptions};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -692,6 +693,69 @@ pub enum EventsCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum PluginCommand {
+    /// Scaffold a local Shux process plugin.
+    Scaffold {
+        /// Directory to create.
+        path: std::path::PathBuf,
+
+        /// Runtime template to generate.
+        #[arg(long, value_enum, default_value_t = PluginScaffoldRuntime::Sh)]
+        runtime: PluginScaffoldRuntime,
+
+        /// Plugin name. Defaults to the directory basename.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Stable plugin package id. Defaults to `local.shux.<name>`.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Allow writing into a non-empty directory and replacing scaffold files.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Alias for `plugin scaffold`.
+    Create {
+        /// Directory to create.
+        path: std::path::PathBuf,
+
+        /// Runtime template to generate.
+        #[arg(long, value_enum, default_value_t = PluginScaffoldRuntime::Sh)]
+        runtime: PluginScaffoldRuntime,
+
+        /// Plugin name. Defaults to the directory basename.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Stable plugin package id. Defaults to `local.shux.<name>`.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Allow writing into a non-empty directory and replacing scaffold files.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Scaffold a plugin in the current directory.
+    Init {
+        /// Runtime template to generate.
+        #[arg(long, value_enum, default_value_t = PluginScaffoldRuntime::Sh)]
+        runtime: PluginScaffoldRuntime,
+
+        /// Plugin name. Defaults to the current directory basename.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Stable plugin package id. Defaults to `local.shux.<name>`.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Allow writing into a non-empty directory and replacing scaffold files.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Spawn a plugin process, perform the JSON-RPC handshake, and
     /// register it under the name reported in its manifest. The
     /// executable must speak shux's line-delimited dialect — see
@@ -725,6 +789,12 @@ pub enum PluginCommand {
     /// Send a plugin a `plugin.shutdown` notification, then terminate
     /// the child process after the grace window.
     Kill {
+        /// Plugin name (as reported in its manifest).
+        name: String,
+    },
+
+    /// Alias for graceful plugin shutdown/unregister.
+    Stop {
         /// Plugin name (as reported in its manifest).
         name: String,
     },
@@ -3780,6 +3850,66 @@ fn resolve_plugin_state_root(start: &std::path::Path) -> std::path::PathBuf {
     start.join(".shux").join("plugins")
 }
 
+pub fn handle_plugin_scaffold(
+    path: &std::path::Path,
+    runtime: PluginScaffoldRuntime,
+    name: Option<String>,
+    id: Option<String>,
+    force: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::features::plugin;
+    use crate::style;
+
+    let report = plugin::scaffold_plugin(
+        path,
+        &ScaffoldOptions {
+            runtime,
+            name,
+            id,
+            force,
+        },
+    )?;
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "root": report.root,
+                    "name": report.name,
+                    "id": report.id,
+                    "runtime": runtime.as_str(),
+                    "entrypoint": report.entrypoint,
+                }))?
+            );
+        }
+        OutputFormat::Plain => {
+            println!(
+                "{}\t{}\t{}\t{}",
+                report.name,
+                report.id,
+                runtime.as_str(),
+                report.root.display()
+            );
+        }
+        OutputFormat::Text => {
+            println!(
+                "{} {} {}",
+                style::success("✓ scaffolded plugin"),
+                style::bold(&report.name),
+                style::muted(&format!("at {}", report.root.display())),
+            );
+            println!(
+                "  {} {}",
+                style::muted("entrypoint"),
+                report.entrypoint.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn handle_plugin_install(
     stream: &mut tokio::net::UnixStream,
     path: &std::path::Path,
@@ -3788,20 +3918,38 @@ pub async fn handle_plugin_install(
     watch: bool,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
+    use crate::features::plugin;
     use crate::style;
+
+    let resolved = plugin::resolve_plugin_package(path)?;
+    let mut resolved_args = resolved.args;
+    resolved_args.extend(args.iter().cloned());
 
     let mut params = serde_json::Map::new();
     params.insert(
         "path".into(),
-        serde_json::Value::String(path.display().to_string()),
+        serde_json::Value::String(resolved.command.display().to_string()),
     );
-    if !args.is_empty() {
-        params.insert("args".into(), serde_json::json!(args));
+    if !resolved_args.is_empty() {
+        params.insert("args".into(), serde_json::json!(resolved_args));
     }
-    if let Some(cwd) = cwd {
+    let resolved_cwd = cwd.map(std::path::Path::to_path_buf).or(resolved.cwd);
+    if let Some(cwd) = resolved_cwd.as_deref() {
         params.insert(
             "cwd".into(),
             serde_json::Value::String(cwd.display().to_string()),
+        );
+    }
+    if let Some(expected_name) = resolved.expected_name {
+        params.insert(
+            "expected_name".into(),
+            serde_json::Value::String(expected_name),
+        );
+    }
+    if let Some(expected_version) = resolved.expected_version {
+        params.insert(
+            "expected_version".into(),
+            serde_json::Value::String(expected_version),
         );
     }
     params.insert("watch".into(), serde_json::Value::Bool(watch));
@@ -3987,6 +4135,29 @@ pub async fn handle_plugin_kill(
         OutputFormat::Text => println!(
             "{} {}",
             style::success("✓ killed plugin"),
+            style::bold(name)
+        ),
+    }
+    Ok(())
+}
+
+/// `shux plugin stop <name>` — UX alias for graceful shutdown + unregister.
+pub async fn handle_plugin_stop(
+    stream: &mut tokio::net::UnixStream,
+    name: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::style;
+
+    let params = serde_json::json!({ "name": name });
+    let result = rpc_call(stream, "plugin.kill", params).await?;
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Plain => println!("{name}\tstopped"),
+        OutputFormat::Text => println!(
+            "{} {}",
+            style::success("✓ stopped plugin"),
             style::bold(name)
         ),
     }

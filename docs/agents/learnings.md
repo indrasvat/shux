@@ -3,6 +3,14 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-06-29 (task 075 plugin DX):** Plugin package validation must account
+  for the daemon boundary. Directory installs should canonicalize the package
+  root and entrypoint in the client before sending `plugin.install`, reject
+  symlink escapes after canonicalization, and default package cwd to the
+  package root. If a package manifest advertises name/version, pass those as
+  expected handshake values to the plugin manager so a process cannot register
+  a different runtime identity than the package metadata. Keep package ids as
+  metadata until the process protocol grows an id field.
 - **2026-06-13 (task 072 origin mode and scroll regions):** DECOM is an
   addressing policy, not a separate cursor coordinate space. Store cursor rows
   as absolute grid rows, offset CUP/HVP/VPA and CPR/DSR row reports through the
@@ -45,9 +53,11 @@
   can attach to stale cells after movement.
 - **2026-06-11 (task 073 VT corpus harness):** A replay corpus needs three
   separate artifact classes: committed `.shux/fixtures/` input bytes,
-  committed `.shux/goldens/` baselines, and committed `.shux/qa/` review
-  evidence. The check target should never promote baselines; promotion must be
-  a separate Make target with council-approved provenance. Exact pixel gates
+  committed `.shux/goldens/` baselines, and PR-attached review evidence. Commit
+  `.shux/qa/` PNG evidence only when it is a deliberate durable baseline or
+  fixture with task and DootSabha approval. The check target should never
+  promote baselines; promotion must be a separate Make target with
+  council-approved provenance. Exact pixel gates
   are viable across local macOS and Linux CI when the raster path uses embedded
   font bytes, fixed rows/cols, fixed font size, fixed defaults, and
   cursor-disabled rich-TUI replays. Keep live `pane.record` refreshes in
@@ -60,11 +70,11 @@
   contact sheets or text captures. The local `shux-vt-solid-qa` agent is the
   hard gate for this track and must enforce each task file's exact DoD.
 - **2026-06-11 (VT QA enforcement):** A VT hard gate is only real if it produces
-  tracked evidence. `.shux/out/` is scratch space; final SOLID reports,
-  manifests, PNG evidence, and pixel metric JSON must live under `.shux/qa/`
-  and be enforced by `scripts/check-progress.sh`. Baselines must have committed
-  provenance or DootSabha approval; never let an implementation mint its own
-  expected PNG and pass against it.
+  reviewable evidence. `.shux/out/` is scratch space; attach transient
+  screenshots to the PR and commit only durable SOLID reports, manifests, and
+  approved baseline/fixture PNGs under `.shux/qa/`. Baselines must have
+  committed provenance or DootSabha approval; never let an implementation mint
+  its own expected PNG and pass against it.
 - **2026-02-18 (task 000):** `edition = "2024"` requires Rust 1.85+. The `rust-toolchain.toml` pins stable which is ≥1.85 as of Feb 2026, but CI should use `dtolnay/rust-toolchain@stable` to stay current.
 - **2026-02-18 (task 001):** Rust edition 2024 makes `std::env::set_var`/`remove_var` unsafe. Wrap in `unsafe {}` with safety comments in tests. Use `tokio::time::pause()` + `advance()` for deterministic timer tests instead of real sleeps.
 - **2026-02-18 (task 001):** nix 0.29 requires explicit feature flags per module: `"user"` for `getuid()`, `"process"` for `fork()`/`setsid()`, `"signal"` for signal handling, `"fs"` for `dup2()`. Grace timer pattern: store `Option<tokio::time::Instant>` deadline and use `sleep_until()` inside `select!` async block to avoid `Pin` complexity.
