@@ -1,3 +1,10 @@
+# [0.36.0](https://github.com/indrasvat/shux/compare/v0.35.0...v0.36.0) (2026-06-29)
+
+
+### Features
+
+* **plugin:** improve plugin dx foundation ([63573e8](https://github.com/indrasvat/shux/commit/63573e83678c5c7089a04648a5486de55101f905))
+
 # [0.35.0](https://github.com/indrasvat/shux/compare/v0.34.0...v0.35.0) (2026-06-14)
 
 
