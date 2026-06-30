@@ -96,6 +96,26 @@ For live observation, `shux pane watch` follows the sampled data-plane stream.
 For audits, transcripts, or absence-of-bytes checks, use `shux pane record`;
 it writes raw PTY bytes before VT processing and before sampled coalescing.
 
+## TUI QA evidence
+
+For repeatable terminal UI verification, use the first-party Sightline package
+instead of hand-rolled snapshot scripts when you need a verdict for layout,
+keyboard probes, color rendering, or PR evidence:
+
+```bash
+plugins/sightline/bin/sightline verify \
+  --session work \
+  --pane <pane-id> \
+  --viewport 80x24 \
+  --color-probe-shell \
+  --expect-text READY
+```
+
+Sightline writes reports, captures, raw color evidence, and PNG snapshots under
+`.shux/out/sightline/` by default. If this repository is not checked out, the
+`shux` skill includes a helper that downloads only the minimal Sightline package
+into a user-scoped cache.
+
 Inside the TUI, the prefix key is `Ctrl+Space` by default:
 
 | Key | Action |

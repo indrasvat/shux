@@ -6,12 +6,13 @@ usage() {
 usage: install-sightline.sh [--ref REF] [--dest DIR]
 
 Downloads the minimal Sightline plugin package without cloning the shux repo.
-Default destination: .shux/out/plugins/sightline
+Default destination:
+  ${SHUX_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/shux/plugins}/sightline/<ref>
 USAGE
 }
 
 ref="${SHUX_SIGHTLINE_REF:-main}"
-dest=".shux/out/plugins/sightline"
+dest=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +42,14 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 skill_dir="$(cd "${script_dir}/.." && pwd -P)"
 repo_root="$(cd "${skill_dir}/../.." 2>/dev/null && pwd -P || true)"
 local_pkg="${repo_root}/plugins/sightline"
+cache_root="${SHUX_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/shux/plugins}"
+ref_key="$(printf '%s' "${ref}" | LC_ALL=C sed 's/[^A-Za-z0-9._-]/_/g')"
+if [[ -z "${ref_key}" ]]; then
+  ref_key="main"
+fi
+if [[ -z "${dest}" ]]; then
+  dest="${cache_root}/sightline/${ref_key}"
+fi
 
 mkdir -p "${dest}/bin"
 
@@ -61,13 +70,16 @@ fi
 chmod +x "${dest}/bin/sightline"
 
 if [[ ! -f ".shux/.gitignore" ]]; then
-  echo "note: run 'shux init' so .shux/out is gitignored" >&2
+  echo "note: run 'shux init' in target projects so Sightline evidence under .shux/out is gitignored" >&2
 fi
 
 cat <<EOF
 Sightline installed at: ${dest}
 Runner:
   ${dest}/bin/sightline verify --session <name> --pane <pane-id>
+
+Reusable shell variable:
+  SIGHTLINE_RUNNER="${dest}/bin/sightline"
 
 Optional plugin lifecycle smoke:
   shux plugin install ${dest} --no-watch

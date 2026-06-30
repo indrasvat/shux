@@ -104,6 +104,32 @@ shux pane capture -s build --lines 50 --format json
 shux pane record -s build -p <pane-id> --to ./pane.raw --duration-ms 10000
 ```
 
+## Repeatable TUI QA
+
+When you need to verify terminal UI layout, keyboard behavior, colors, or
+review-ready screenshot evidence, prefer the first-party Sightline verifier over
+ad hoc snapshot scripts:
+
+```bash
+plugins/sightline/bin/sightline verify \
+  --session build \
+  --pane <pane-id> \
+  --viewport 80x24 \
+  --viewport 120x40 \
+  --color-probe-shell \
+  --expect-text READY
+```
+
+Sightline writes `summary.json`, `SIGHTLINE.md`, text captures, raw SGR
+evidence, and PNG snapshots under `.shux/out/sightline/`. Keep those artifacts
+out of git unless they are explicit goldens/baselines; attach review-worthy
+screenshots to PR comments instead.
+
+If this repository is not checked out, use the `shux` skill's
+`scripts/install-sightline.sh` helper to download the minimal package into a
+user-scoped cache. `shux plugin install` is local-path only today: no registry
+search, remote URL install, or `shux plugin run` yet.
+
 ## Driving an attached session
 
 If you need a real interactive PTY (e.g. running `vim` in a pane and sending

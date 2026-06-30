@@ -55,7 +55,7 @@ the verifier; the direct runner above is the v1 product.
 `shux plugin install` does not yet support registry search, remote URLs, or
 `shux plugin run`. It accepts a local executable or local package directory.
 Avoid cloning the full repository just to use Sightline; bootstrap the minimal
-package into gitignored scratch space:
+package into a user-scoped plugin cache:
 
 From the target project root, run this skill's helper script
 (`scripts/install-sightline.sh`, resolved relative to the shux skill directory):
@@ -65,11 +65,13 @@ From the target project root, run this skill's helper script
 ```
 
 The script downloads only `shux-plugin.toml`, `bin/sightline`, and `README.md`
-into `.shux/out/plugins/sightline/` by default, then prints the direct runner
-path. Use that path exactly like the checked-out runner:
+into `${SHUX_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/shux/plugins}/sightline/<ref>`
+by default, then prints the direct runner path. Use that path exactly like the
+checked-out runner. Set `SIGHTLINE_RUNNER` to the runner path printed by the
+script:
 
 ```bash
-.shux/out/plugins/sightline/bin/sightline verify \
+"$SIGHTLINE_RUNNER" verify \
   --session "$SESSION" \
   --pane "$PANE_ID" \
   --viewport 80x24 \
@@ -80,6 +82,9 @@ path. Use that path exactly like the checked-out runner:
 If the helper is not available in the installed skill bundle, download the same
 three files from the shux repository into a local package directory and
 `chmod +x bin/sightline`.
+
+Sightline's package cache is reusable across repositories. Its run evidence is
+still project-local under `.shux/out/sightline/`.
 
 ## When not to use it
 
