@@ -321,6 +321,24 @@ args = ["--from-manifest"]
     }
 
     #[test]
+    fn resolves_sightline_package_manifest() {
+        let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("plugins/sightline");
+
+        let resolved = resolve_plugin_package(&package).unwrap();
+        assert_eq!(resolved.args, ["--plugin-host"]);
+        assert_eq!(resolved.expected_name.as_deref(), Some("sightline"));
+        assert_eq!(resolved.expected_version.as_deref(), Some("0.1.0"));
+        assert_eq!(resolved.cwd, Some(package.canonicalize().unwrap()));
+        assert!(
+            resolved
+                .command
+                .ends_with("plugins/sightline/bin/sightline")
+        );
+    }
+
+    #[test]
     fn rejects_escaping_entrypoint() {
         let tmp = tempfile::tempdir().unwrap();
         write_plugin(tmp.path(), "");

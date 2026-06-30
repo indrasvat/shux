@@ -36,15 +36,18 @@ Required evidence layers unless the task explicitly narrows scope:
 - external council/reviewer evidence when the task or CLAUDE.md requires it.
 
 Auditable artifact contract:
-- Final PASS evidence must be committed under `.shux/qa/<scope>/`; `.shux/out/<scope>/` is scratch-only.
-- Require `.shux/qa/<scope>/TUI-QA.md` with first line exactly `VERDICT: PASS`.
-- Require `.shux/qa/<scope>/tui-evidence-manifest.json`.
-- Require at least one full-resolution PNG evidence file.
-- Require at least one text capture or command transcript.
-- Require at least one pixel metric JSON.
+- Routine general TUI QA evidence is scratch by default. Write reports, captures, PNG screenshots, pixel summaries, and transcripts under `.shux/out/<scope>/` or another gitignored working directory.
+- Attach review-worthy screenshots to the PR as comments; use `browsing-as-you` for authenticated GitHub uploads when needed. Do not commit routine screenshots.
+- Committed `.shux/qa/<scope>/` evidence is an exception, not the default. Require tracked `.shux/qa` artifacts only when the active task explicitly justifies a durable baseline, golden, product asset, or long-lived QA report and DootSabha agrees.
+- In that exception case, require `.shux/qa/<scope>/TUI-QA.md` with first line exactly `VERDICT: PASS`.
+- In that exception case, require `.shux/qa/<scope>/tui-evidence-manifest.json`.
+- In that exception case, require full-resolution PNG evidence.
+- In that exception case, require at least one text capture or command transcript.
+- In that exception case, require pixel metric JSON.
 - The manifest must include top-level keys: `scope`, `tui_qa_report`, `screenshots`, `captures`, `pixel_metrics`, `commands`, and `cleanup`.
 - `cleanup.no_new_shux` and `cleanup.no_new_orphan_automation_processes` must both be `true`.
-- Run `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope> make check-tui-qa` before PASS and fail if evidence is missing, untracked, from another scope, or exists only in `.shux/out/`.
+- Run plain `make check-tui-qa` before PASS. Run `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope> make check-tui-qa` only for tasks that explicitly require committed `.shux/qa/<scope>` evidence. Fail if a committed manifest exists but its referenced artifacts are missing, stale, untracked, or from another scope.
+- The current manifest checker intentionally requires non-empty `screenshots`, `captures`, and `pixel_metrics` arrays for every committed `.shux/qa` manifest. If a task does not justify that full durable artifact contract, keep its evidence in scratch storage and PR comments instead of committing a manifest.
 
 Shux automation protocol:
 - Prefer committed Makefile targets.
@@ -90,5 +93,5 @@ Required report sections:
 8. Residual risk.
 9. Cleanup status.
 
-PASS requires task DoD fully satisfied, required tests passing, real colored shux automation evidence, native screenshot inspection, pixel metrics, no leaked shux daemons or orphan automation processes, `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope> make check-tui-qa` passing, reviewer/council evidence when required, and updated task/progress docs when status changes.
+PASS requires task DoD fully satisfied, required tests passing, real colored shux automation evidence, native screenshot inspection, pixel metrics when visible state is asserted, no leaked shux daemons or orphan automation processes, `make check-tui-qa` passing, reviewer/council evidence when required, and updated task/progress docs when status changes. Add `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope>` only when the task explicitly requires committed `.shux/qa` evidence.
 """

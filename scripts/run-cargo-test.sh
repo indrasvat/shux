@@ -33,6 +33,12 @@ fi
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/shux-test-bins.XXXXXX")"
 binary_list="${tmpdir}/binaries.txt"
 build_log="${tmpdir}/build.jsonl"
+test_config_home="${tmpdir}/xdg-config"
+test_state_home="${tmpdir}/xdg-state"
+
+mkdir -p "${test_config_home}" "${test_state_home}"
+export XDG_CONFIG_HOME="${test_config_home}"
+export XDG_STATE_HOME="${test_state_home}"
 
 cleanup() {
   rm -rf "${tmpdir}"
