@@ -1,3 +1,10 @@
+# [0.37.0](https://github.com/indrasvat/shux/compare/v0.36.0...v0.37.0) (2026-06-30)
+
+
+### Features
+
+* **plugin:** add sightline tui qa plugin ([#85](https://github.com/indrasvat/shux/issues/85)) ([2a8ee1c](https://github.com/indrasvat/shux/commit/2a8ee1c0d0e4411a24ec2803eada0238716c5c12))
+
 # [0.36.0](https://github.com/indrasvat/shux/compare/v0.35.0...v0.36.0) (2026-06-29)
 
 
