@@ -94,13 +94,28 @@ def parse_json_output(output: str, label: str) -> dict[str, Any]:
     return parsed
 
 
-def resolve_target(shux_bin: str, session: str, explicit_pane: str | None) -> tuple[bool, str | None]:
+def resolve_target(shux_bin: str, session: str, window: str | None, explicit_pane: str | None) -> tuple[bool, str | None]:
     output = require_success(shux_cmd(shux_bin, ["--format", "json", "session", "list"]), "session list")
     data = parse_json_output(output, "session list")
     for item in data.get("sessions", []):
         if item.get("name") == session:
             if explicit_pane:
                 return True, explicit_pane
+            if window:
+                pane_output = require_success(
+                    shux_cmd(shux_bin, ["--format", "json", "pane", "list", "--session", session, "--window", window]),
+                    "pane list",
+                )
+                panes = json.loads(pane_output)
+                if not isinstance(panes, list):
+                    raise RuntimeError("pane list returned non-array JSON")
+                for pane in panes:
+                    if pane.get("is_focused") and pane.get("id"):
+                        return True, str(pane["id"])
+                for pane in panes:
+                    if pane.get("id"):
+                        return True, str(pane["id"])
+                return True, None
             pane_id = item.get("pane_id")
             return True, str(pane_id) if pane_id else None
     return False, explicit_pane
@@ -321,7 +336,7 @@ def verify(args: argparse.Namespace) -> int:
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     shux_bin = args.shux_bin
-    session_found, pane_id = resolve_target(shux_bin, args.session, args.pane)
+    session_found, pane_id = resolve_target(shux_bin, args.session, args.window, args.pane)
     checks: list[Check] = []
     summary: dict[str, Any] = {
         "session": args.session,
@@ -366,13 +381,13 @@ def verify(args: argparse.Namespace) -> int:
         )
 
     if args.send_text or args.send_data:
-        before = capture_text(shux_bin, args.session, args.window, args.pane, args.lines)
+        before = capture_text(shux_bin, args.session, args.window, pane_id, args.lines)
         try:
             send_args = ["pane", "send-keys", "--session", args.session]
             if args.window:
                 send_args += ["--window", args.window]
-            if args.pane:
-                send_args += ["--pane", args.pane]
+            if pane_id:
+                send_args += ["--pane", pane_id]
             if args.send_text:
                 send_args += ["--text", args.send_text]
             else:
@@ -382,10 +397,10 @@ def verify(args: argparse.Namespace) -> int:
                 wait_args = ["pane", "wait-for", "--session", args.session, "--text", args.expect_after, "--timeout-ms", str(args.wait_ms)]
                 if args.window:
                     wait_args += ["--window", args.window]
-                if args.pane:
-                    wait_args += ["--pane", args.pane]
+                if pane_id:
+                    wait_args += ["--pane", pane_id]
                 require_success(shux_cmd(shux_bin, wait_args), "pane wait-for")
-            after = capture_text(shux_bin, args.session, args.window, args.pane, args.lines)
+            after = capture_text(shux_bin, args.session, args.window, pane_id, args.lines)
             changed = before != after
             contains = bool(args.expect_after and args.expect_after in after)
             if args.expect_after:
@@ -400,18 +415,18 @@ def verify(args: argparse.Namespace) -> int:
             resize_args = ["pane", "set-size", "--session", args.session, "--cols", str(cols), "--rows", str(rows)]
             if args.window:
                 resize_args += ["--window", args.window]
-            if args.pane:
-                resize_args += ["--pane", args.pane]
+            if pane_id:
+                resize_args += ["--pane", pane_id]
             require_success(shux_cmd(shux_bin, resize_args), "pane set-size")
             time.sleep(args.settle_ms / 1000)
-            capture = capture_text(shux_bin, args.session, args.window, args.pane, args.lines)
+            capture = capture_text(shux_bin, args.session, args.window, pane_id, args.lines)
             capture_path = out_dir / f"capture_{cols}x{rows}.txt"
             capture_path.write_text(capture)
             checks.append(Check("capture.text", "PASS" if capture.strip() else "FAIL", f"{len(capture)} chars at {cols}x{rows}", str(capture_path)))
             for needle in args.expect_text:
                 checks.append(Check(f"capture.contains:{needle}", "PASS" if needle in capture else "FAIL", f"needle={needle!r}", str(capture_path)))
             snapshot_path = out_dir / f"pane_{cols}x{rows}.png"
-            snap = snapshot(shux_bin, args.session, args.window, args.pane, snapshot_path)
+            snap = snapshot(shux_bin, args.session, args.window, pane_id, snapshot_path)
             metrics, png_checks = png_metrics(
                 snapshot_path,
                 int(snap.get("width", 0)),
