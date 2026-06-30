@@ -104,6 +104,14 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-06-29 — feat(plugin): add Sightline TUI QA plugin**
+- Completed task 076 with first-party local package `plugins/sightline/`; `bin/sightline` is the direct v1 product and `shux plugin install plugins/sightline` is explicit lifecycle smoke via `--plugin-host`.
+- Added deterministic Sightline checks for pane capture, PNG validity/dimensions/grid dimensions, nonblank pixels, truecolor/indexed/basic SGR emission and rendered color samples, keyboard delta probes, structured Markdown/JSON reports, and scratch evidence under `.shux/out/sightline/`.
+- Added `make test-sightline`, `.shux/scripts/sightline_check.sh`, and a package resolver test for the committed Sightline manifest.
+- Updated general TUI QA agent instructions so routine screenshots stay scratch/PR-comment evidence while committed `.shux/qa` manifests remain explicit durable exceptions with strict manifests.
+- Updated README/agent/skill discovery guidance so agents can find Sightline for TUI QA without bloating the base skill; added a no-clone helper that caches the minimal package under the user cache instead of duplicating it per repo.
+- Dogfooded with real shux automation, `nvim`, and the `Laghudarshi` cold-context Textual TUI gauntlet; DootSabha design/implementation/fix reviews and independent `shux-tui-qa` all passed.
+
 **2026-06-29 — feat(plugin): improve plugin DX foundation**
 - Completed task 075 with a local-only plugin DX first pass: `shux plugin scaffold/create/init --runtime sh`, `shux plugin stop`, manifest-directory install validation, canonicalized entrypoints, default package-root cwd, and package name/version handshake checks.
 - Extracted plugin command routing into `features::plugin::dispatch`, reducing central `main.rs` churn for future plugin subcommands while preserving existing daemon-backed permission, grant, audit, runtime UUID, and hot-reload paths.
@@ -1483,6 +1491,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 073 | shux-vt corpus regression harness | VT Quality | **Done** | 066 |
 | 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
+| 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
 
 ---
 

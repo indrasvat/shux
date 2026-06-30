@@ -140,6 +140,12 @@ test-plugin-dx: ## Run focused plugin DX CLI/integration tests; optionally pass 
 	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test cli_integration -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Plugin DX tests passed$(COLOR_RESET)"
 
+.PHONY: test-sightline
+test-sightline: release ## Run focused Sightline plugin/package checks
+	@echo "$(COLOR_BLUE)▶ Running Sightline checks...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/sightline_check.sh
+	@echo "$(COLOR_GREEN)✓ Sightline checks passed$(COLOR_RESET)"
+
 .PHONY: test-vt-corpus-unit
 test-vt-corpus-unit: ## Run VT corpus replay unit/integration tests
 	@echo "$(COLOR_BLUE)▶ Running VT corpus replay tests...$(COLOR_RESET)"

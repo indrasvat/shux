@@ -1,0 +1,22 @@
+[plugin]
+name = "sightline"
+id = "dev.shux.sightline"
+version = "0.1.0"
+description = "Deterministic TUI QA verifier for Shux panes"
+runtime = "process"
+
+[entry]
+command = "bin/sightline"
+args = ["--plugin-host"]
+
+[platform]
+os = ["macos", "linux"]
+arch = ["aarch64", "x86_64"]
+
+# Forward-declared metadata only. Shux validates [commands] entries today but
+# does not dispatch custom package commands yet. Run the direct executable:
+#   plugins/sightline/bin/sightline verify ...
+[commands.verify]
+usage = "plugins/sightline/bin/sightline verify --session <name>"
+description = "Run deterministic TUI QA probes against a Shux target"
+entry = "bin/sightline"

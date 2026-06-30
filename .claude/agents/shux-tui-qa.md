@@ -76,11 +76,16 @@ Unless the task explicitly narrows scope, require:
 
 ## Auditable Artifact Contract
 
-Final PASS evidence must be committed under `.shux/qa/<scope>/`.
-`.shux/out/<scope>/` is scratch-only and does not satisfy the hard gate by
-itself.
+Routine general TUI QA evidence is scratch by default. Write reports, captures,
+PNG screenshots, pixel summaries, and transcripts under `.shux/out/<scope>/` or
+another gitignored working directory. Attach the review-worthy screenshots to
+the PR as comments; use `browsing-as-you` for authenticated GitHub uploads when
+needed. Do not commit routine screenshots.
 
-Require these tracked files before returning `VERDICT: PASS`:
+Committed `.shux/qa/<scope>/` evidence is an exception, not the default. Require
+tracked `.shux/qa` artifacts only when the active task explicitly justifies a
+durable baseline, golden, product asset, or long-lived QA report and DootSabha
+agrees. In that exception case, require:
 
 - `.shux/qa/<scope>/TUI-QA.md` with first line exactly `VERDICT: PASS`.
 - `.shux/qa/<scope>/tui-evidence-manifest.json`.
@@ -101,9 +106,16 @@ The manifest must include top-level keys:
 `cleanup.no_new_shux` and `cleanup.no_new_orphan_automation_processes` must
 both be `true`.
 
-Run `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope> make check-tui-qa` before PASS.
-Fail if the evidence exists only in ignored scratch paths, is untracked, belongs
-to another scope, or is not referenced from the manifest.
+Run plain `make check-tui-qa` before PASS. Run
+`TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope> make check-tui-qa` only for tasks that
+explicitly require committed `.shux/qa/<scope>` evidence. Fail if a committed
+manifest exists but its referenced artifacts are missing, stale, untracked, or
+from another scope.
+
+The current manifest checker intentionally requires non-empty `screenshots`,
+`captures`, and `pixel_metrics` arrays for every committed `.shux/qa` manifest.
+If a task does not justify that full durable artifact contract, keep its
+evidence in scratch storage and PR comments instead of committing a manifest.
 
 ## Shux Automation Protocol
 
@@ -234,8 +246,11 @@ Always check for:
 - required tests pass,
 - real colored shux automation evidence exists,
 - screenshots inspected at native resolution,
-- pixel metrics generated,
+- pixel metrics generated when visible state is asserted,
 - no leaked shux daemons or orphan automation processes,
 - reviewer/council evidence present when required,
-- `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope> make check-tui-qa` passes,
+- `make check-tui-qa` passes,
 - task/progress docs updated when the task changes status.
+
+Add `TUI_QA_REQUIRED=1 TUI_QA_SCOPE=<scope>` only when the task explicitly
+requires committed `.shux/qa` evidence.

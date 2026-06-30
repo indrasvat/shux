@@ -1,0 +1,681 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+from __future__ import annotations
+
+import argparse
+import base64
+import dataclasses
+import json
+import os
+import pathlib
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
+from collections.abc import Sequence
+from typing import Any
+
+
+VERSION = "0.1.0"
+DEFAULT_OUT_DIR = pathlib.Path(".shux/out/sightline")
+TRUECOLOR_RGB = (255, 64, 0)
+INDEXED_RGB = (0, 215, 255)
+BASIC_RGB = (205, 49, 49)
+
+
+@dataclasses.dataclass
+class Check:
+    name: str
+    status: str
+    detail: str
+    evidence: str | None = None
+
+
+@dataclasses.dataclass
+class PngStats:
+    width: int
+    height: int
+    byte_count: int
+    unique_rgb: set[tuple[int, int, int]]
+
+
+def run_plugin_host() -> int:
+    init_line = sys.stdin.readline()
+    if not init_line:
+        return 1
+    response = {
+        "jsonrpc": "2.0",
+        "id": "init",
+        "result": {
+            "name": "sightline",
+            "version": VERSION,
+            "subscribes": [],
+            "provides": [],
+            "capabilities": [],
+        },
+    }
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+    for line in sys.stdin:
+        if "plugin.shutdown" in line:
+            return 0
+    return 0
+
+
+def shux_cmd(shux_bin: str, args: Sequence[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [shux_bin, *args],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+
+
+def require_success(result: subprocess.CompletedProcess[str], label: str) -> str:
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        detail = stderr or stdout or f"exit {result.returncode}"
+        raise RuntimeError(f"{label} failed: {detail}")
+    return result.stdout or ""
+
+
+def parse_json_output(output: str, label: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{label} returned invalid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{label} returned non-object JSON")
+    return parsed
+
+
+def shux_rpc_call(shux_bin: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    output = require_success(
+        shux_cmd(shux_bin, ["--format", "json", "rpc", "call", method, "--params", json.dumps(params)]),
+        f"rpc {method}",
+    )
+    envelope = parse_json_output(output, f"rpc {method}")
+    if "error" in envelope:
+        error = envelope["error"]
+        if isinstance(error, dict):
+            detail = error.get("message") or json.dumps(error, sort_keys=True)
+        else:
+            detail = str(error)
+        raise RuntimeError(f"rpc {method} failed: {detail}")
+    result = envelope.get("result", {})
+    if not isinstance(result, dict):
+        raise RuntimeError(f"rpc {method} returned non-object result")
+    return result
+
+
+def resolve_target(shux_bin: str, session: str, window: str | None, explicit_pane: str | None) -> tuple[bool, str | None]:
+    output = require_success(shux_cmd(shux_bin, ["--format", "json", "session", "list"]), "session list")
+    data = parse_json_output(output, "session list")
+    for item in data.get("sessions", []):
+        if item.get("name") == session:
+            if explicit_pane:
+                return True, explicit_pane
+            if window:
+                pane_output = require_success(
+                    shux_cmd(shux_bin, ["--format", "json", "pane", "list", "--session", session, "--window", window]),
+                    "pane list",
+                )
+                panes = json.loads(pane_output)
+                if not isinstance(panes, list):
+                    raise RuntimeError("pane list returned non-array JSON")
+                for pane in panes:
+                    if pane.get("is_focused") and pane.get("id"):
+                        return True, str(pane["id"])
+                for pane in panes:
+                    if pane.get("id"):
+                        return True, str(pane["id"])
+                return True, None
+            pane_id = item.get("pane_id")
+            return True, str(pane_id) if pane_id else None
+    return False, explicit_pane
+
+
+def parse_viewport(value: str) -> tuple[int, int]:
+    left, sep, right = value.lower().partition("x")
+    if not sep:
+        raise argparse.ArgumentTypeError("viewport must look like COLSxROWS")
+    try:
+        cols = int(left)
+        rows = int(right)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("viewport must contain integers") from exc
+    if cols < 20 or rows < 8:
+        raise argparse.ArgumentTypeError("viewport is too small for useful QA")
+    return cols, rows
+
+
+def read_png_stats(path: pathlib.Path) -> PngStats:
+    raw = path.read_bytes()
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("not a PNG file")
+    pos = 8
+    width = height = color_type = bit_depth = interlace = None
+    compressed = bytearray()
+    while pos + 8 <= len(raw):
+        length = struct.unpack(">I", raw[pos : pos + 4])[0]
+        kind = raw[pos + 4 : pos + 8]
+        chunk = raw[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        if kind == b"IHDR":
+            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", chunk)
+        elif kind == b"IDAT":
+            compressed.extend(chunk)
+        elif kind == b"IEND":
+            break
+    if width is None or height is None or color_type is None or bit_depth is None or interlace is None:
+        raise ValueError("PNG missing IHDR")
+    if bit_depth != 8 or color_type not in (2, 6) or interlace != 0:
+        raise ValueError(f"unsupported PNG format bit_depth={bit_depth} color_type={color_type} interlace={interlace}")
+    channels = 4 if color_type == 6 else 3
+    stride = width * channels
+    decompressed = zlib.decompress(bytes(compressed))
+    offset = 0
+    previous = bytearray(stride)
+    unique_rgb: set[tuple[int, int, int]] = set()
+    for _ in range(height):
+        if offset >= len(decompressed):
+            raise ValueError("PNG data ended before row filter byte")
+        filter_type = decompressed[offset]
+        offset += 1
+        current = bytearray(decompressed[offset : offset + stride])
+        if len(current) != stride:
+            raise ValueError("PNG data ended before row payload")
+        offset += stride
+        unfilter_row(current, previous, filter_type, channels)
+        for x in range(width):
+            base = x * channels
+            r, g, b = current[base], current[base + 1], current[base + 2]
+            a = current[base + 3] if channels == 4 else 255
+            if a > 0:
+                unique_rgb.add((r, g, b))
+        previous = current
+    return PngStats(width=width, height=height, byte_count=len(raw), unique_rgb=unique_rgb)
+
+
+def unfilter_row(current: bytearray, previous: bytearray, filter_type: int, bpp: int) -> None:
+    for i, value in enumerate(current):
+        left = current[i - bpp] if i >= bpp else 0
+        up = previous[i]
+        up_left = previous[i - bpp] if i >= bpp else 0
+        if filter_type == 0:
+            add = 0
+        elif filter_type == 1:
+            add = left
+        elif filter_type == 2:
+            add = up
+        elif filter_type == 3:
+            add = (left + up) // 2
+        elif filter_type == 4:
+            add = paeth(left, up, up_left)
+        else:
+            raise ValueError(f"unsupported PNG filter {filter_type}")
+        current[i] = (value + add) & 0xFF
+
+
+def paeth(left: int, up: int, up_left: int) -> int:
+    p = left + up - up_left
+    pa = abs(p - left)
+    pb = abs(p - up)
+    pc = abs(p - up_left)
+    if pa <= pb and pa <= pc:
+        return left
+    if pb <= pc:
+        return up
+    return up_left
+
+
+def png_metrics(
+    path: pathlib.Path,
+    expected_width: int,
+    expected_height: int,
+    expected_cols: int | None = None,
+    expected_rows: int | None = None,
+) -> tuple[dict[str, Any], list[Check]]:
+    checks: list[Check] = []
+    try:
+        image = read_png_stats(path)
+    except Exception as exc:
+        return {"path": str(path), "status": "fail", "error": str(exc)}, [
+            Check("png.valid", "FAIL", str(exc), str(path))
+        ]
+
+    nonblank = len(image.unique_rgb) > 1
+    color_hits = {
+        "truecolor": has_color(image.unique_rgb, TRUECOLOR_RGB),
+        "indexed": has_color(image.unique_rgb, INDEXED_RGB),
+        "basic": has_color(image.unique_rgb, BASIC_RGB),
+    }
+    metrics = {
+        "path": str(path),
+        "status": "pass" if nonblank else "fail",
+        "width": image.width,
+        "height": image.height,
+        "expected_width": expected_width,
+        "expected_height": expected_height,
+        "expected_cols": expected_cols,
+        "expected_rows": expected_rows,
+        "unique_rgb_count": len(image.unique_rgb),
+        "nonblank": nonblank,
+        "color_hits": color_hits,
+    }
+    checks.append(
+        Check(
+            "png.valid",
+            "PASS",
+            f"{image.width}x{image.height}, {image.byte_count} bytes",
+            str(path),
+        )
+    )
+    checks.append(
+        Check(
+            "png.dimensions",
+            "PASS" if (image.width, image.height) == (expected_width, expected_height) else "FAIL",
+            f"png={image.width}x{image.height}, rpc={expected_width}x{expected_height}",
+            str(path),
+        )
+    )
+    if expected_cols is not None and expected_rows is not None:
+        grid_ok = (
+            image.width % expected_cols == 0
+            and image.height % expected_rows == 0
+            and image.width // expected_cols > 0
+            and image.height // expected_rows > 0
+        )
+        metrics["rendered_cell_width"] = image.width // expected_cols if image.width % expected_cols == 0 else None
+        metrics["rendered_cell_height"] = image.height // expected_rows if image.height % expected_rows == 0 else None
+        checks.append(
+            Check(
+                "png.grid_dimensions",
+                "PASS" if grid_ok else "FAIL",
+                f"requested={expected_cols}x{expected_rows}, pixels={image.width}x{image.height}",
+                str(path),
+            )
+        )
+    checks.append(
+        Check(
+            "png.nonblank",
+            "PASS" if nonblank else "FAIL",
+            f"{len(image.unique_rgb)} unique visible RGB values",
+            str(path),
+        )
+    )
+    return metrics, checks
+
+
+def has_color(unique_rgb: set[tuple[int, int, int]], target: tuple[int, int, int], tolerance: int = 16) -> bool:
+    return any(
+        abs(r - target[0]) <= tolerance
+        and abs(g - target[1]) <= tolerance
+        and abs(b - target[2]) <= tolerance
+        for r, g, b in unique_rgb
+    )
+
+
+def write_report(out_dir: pathlib.Path, checks: list[Check], summary: dict[str, Any]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "SIGHTLINE.md"
+    summary_path = out_dir / "summary.json"
+    verdict = "PASS" if all(check.status in ("PASS", "ADVISORY") for check in checks) else "FAIL"
+    summary["verdict"] = verdict
+    summary["checks"] = [dataclasses.asdict(check) for check in checks]
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    lines = [
+        f"VERDICT: {verdict}",
+        "",
+        "# Sightline TUI QA Report",
+        "",
+        f"- Session: `{summary.get('session')}`",
+        f"- Pane: `{summary.get('pane_id') or 'active'}`",
+        f"- Evidence directory: `{out_dir}`",
+        "",
+        "| Check | Status | Detail | Evidence |",
+        "|---|---|---|---|",
+    ]
+    for check in checks:
+        evidence = check.evidence or ""
+        lines.append(f"| `{check.name}` | {check.status} | {escape_table(check.detail)} | `{evidence}` |")
+    report_path.write_text("\n".join(lines) + "\n")
+
+
+def escape_table(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
+
+
+def verify(args: argparse.Namespace) -> int:
+    out_dir = pathlib.Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shux_bin = args.shux_bin
+    session_found, pane_id = resolve_target(shux_bin, args.session, args.window, args.pane)
+    checks: list[Check] = []
+    summary: dict[str, Any] = {
+        "session": args.session,
+        "pane_id": pane_id,
+        "out_dir": str(out_dir),
+        "viewports": [],
+        "artifacts": {},
+    }
+
+    if not session_found:
+        checks.append(Check("target.session", "FAIL", f"session not found: {args.session}"))
+        write_report(out_dir, checks, summary)
+        return 1
+    if not pane_id and args.color_probe_shell:
+        checks.append(Check("target.pane_id", "FAIL", "pane UUID is required for recording; pass --pane or use a session with pane_id in session.list"))
+        write_report(out_dir, checks, summary)
+        return 1
+    checks.append(Check("target.session", "PASS", f"session={args.session}"))
+
+    if args.color_probe_shell:
+        raw_path = out_dir / "color-probe.raw"
+        try:
+            marker = run_recorded_color_probe(shux_bin, args.session, pane_id, raw_path, args.record_ms)
+            raw = raw_path.read_bytes()
+            raw_checks = [
+                ("probe.marker", marker.encode() in raw, "raw PTY marker evidence"),
+                ("sgr.truecolor", b"\x1b[38;2;255;64;0m" in raw, "raw PTY SGR evidence"),
+                ("sgr.indexed", b"\x1b[38;5;45m" in raw, "raw PTY SGR evidence"),
+                ("sgr.basic", b"\x1b[31m" in raw, "raw PTY SGR evidence"),
+            ]
+            for name, ok, detail in raw_checks:
+                checks.append(Check(name, "PASS" if ok else "FAIL", detail, str(raw_path)))
+            summary["artifacts"]["raw_color_probe"] = str(raw_path)
+        except Exception as exc:
+            checks.append(Check("color_probe.shell", "FAIL", str(exc), str(raw_path)))
+    else:
+        checks.append(
+            Check(
+                "color_probe.shell",
+                "ADVISORY",
+                "skipped; pass --color-probe-shell to prove truecolor, 256-indexed, and basic SGR rendering",
+            )
+        )
+
+    if args.send_text or args.send_data:
+        before = capture_text(shux_bin, args.session, args.window, pane_id, args.lines)
+        try:
+            send_args = ["pane", "send-keys", "--session", args.session]
+            if args.window:
+                send_args += ["--window", args.window]
+            if pane_id:
+                send_args += ["--pane", pane_id]
+            if args.send_text:
+                send_args += ["--text", args.send_text]
+            else:
+                send_args += ["--data", args.send_data]
+            require_success(shux_cmd(shux_bin, send_args), "pane send-keys")
+            if args.expect_after:
+                wait_args = ["pane", "wait-for", "--session", args.session, "--text", args.expect_after, "--timeout-ms", str(args.wait_ms)]
+                if args.window:
+                    wait_args += ["--window", args.window]
+                if pane_id:
+                    wait_args += ["--pane", pane_id]
+                require_success(shux_cmd(shux_bin, wait_args), "pane wait-for")
+            after = capture_text(shux_bin, args.session, args.window, pane_id, args.lines)
+            changed = before != after
+            contains = bool(args.expect_after and args.expect_after in after)
+            if args.expect_after:
+                checks.append(Check("keyboard.delta", "PASS" if changed and contains else "FAIL", f"changed={changed}, expected_after={contains}"))
+            else:
+                checks.append(Check("keyboard.delta", "ADVISORY", f"changed={changed}; no --expect-after supplied"))
+        except Exception as exc:
+            checks.append(Check("keyboard.delta", "FAIL", str(exc)))
+
+    for cols, rows in args.viewport:
+        try:
+            resize_args = ["pane", "set-size", "--session", args.session, "--cols", str(cols), "--rows", str(rows)]
+            if args.window:
+                resize_args += ["--window", args.window]
+            if pane_id:
+                resize_args += ["--pane", pane_id]
+            require_success(shux_cmd(shux_bin, resize_args), "pane set-size")
+            time.sleep(args.settle_ms / 1000)
+            capture = capture_text(shux_bin, args.session, args.window, pane_id, args.lines)
+            capture_path = out_dir / f"capture_{cols}x{rows}.txt"
+            capture_path.write_text(capture)
+            checks.append(Check("capture.text", "PASS" if capture.strip() else "FAIL", f"{len(capture)} chars at {cols}x{rows}", str(capture_path)))
+            for needle in args.expect_text:
+                checks.append(Check(f"capture.contains:{needle}", "PASS" if needle in capture else "FAIL", f"needle={needle!r}", str(capture_path)))
+            snapshot_path = out_dir / f"pane_{cols}x{rows}.png"
+            snap = snapshot(shux_bin, args.session, args.window, pane_id, snapshot_path)
+            metrics, png_checks = png_metrics(
+                snapshot_path,
+                int(snap.get("width", 0)),
+                int(snap.get("height", 0)),
+                cols,
+                rows,
+            )
+            metrics_path = out_dir / f"pixels_{cols}x{rows}.json"
+            metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
+            checks.extend(png_checks)
+            if args.color_probe_shell:
+                for color_name, ok in metrics.get("color_hits", {}).items():
+                    checks.append(Check(f"png.color:{color_name}", "PASS" if ok else "FAIL", "rendered color sample present", str(snapshot_path)))
+            summary["viewports"].append(
+                {
+                    "cols": cols,
+                    "rows": rows,
+                    "capture": str(capture_path),
+                    "snapshot": str(snapshot_path),
+                    "pixel_metrics": str(metrics_path),
+                    "snapshot_rpc": {key: value for key, value in snap.items() if key != "png_base64"},
+                }
+            )
+        except Exception as exc:
+            checks.append(Check(f"viewport:{cols}x{rows}", "FAIL", str(exc)))
+
+    write_report(out_dir, checks, summary)
+    return 0 if all(check.status in ("PASS", "ADVISORY") for check in checks) else 1
+
+
+def capture_text(shux_bin: str, session: str, window: str | None, pane: str | None, lines: int) -> str:
+    args = ["--format", "json", "pane", "capture", "--session", session, "--lines", str(lines)]
+    if window:
+        args += ["--window", window]
+    if pane:
+        args += ["--pane", pane]
+    output = require_success(shux_cmd(shux_bin, args), "pane capture")
+    data = parse_json_output(output, "pane capture")
+    return str(data.get("text", ""))
+
+
+def snapshot(shux_bin: str, session: str, window: str | None, pane: str | None, output_path: pathlib.Path) -> dict[str, Any]:
+    args = ["--format", "json", "pane", "snapshot", "--session", session, "--output", str(output_path)]
+    if window:
+        args += ["--window", window]
+    if pane:
+        args += ["--pane", pane]
+    output = require_success(shux_cmd(shux_bin, args), "pane snapshot")
+    return parse_json_output(output, "pane snapshot")
+
+
+def run_recorded_color_probe(shux_bin: str, session: str, pane_id: str | None, raw_path: pathlib.Path, duration_ms: int) -> str:
+    if pane_id is None:
+        raise RuntimeError("pane id is required for pane record")
+    if duration_ms <= 0:
+        raise RuntimeError("--record-ms must be positive")
+    if raw_path.exists():
+        raw_path.unlink()
+    recording_id: str | None = None
+    stop_result: dict[str, Any] | None = None
+    stop_error: Exception | None = None
+    safety_duration_ms = duration_ms + 1000
+    start = shux_rpc_call(
+        shux_bin,
+        "pane.record.start",
+        {
+            "pane_id": pane_id,
+            "path": str(raw_path.resolve()),
+            "overwrite": True,
+            "duration_ms": safety_duration_ms,
+        },
+    )
+    recording_id = start.get("recording_id")
+    if not isinstance(recording_id, str) or not recording_id:
+        raise RuntimeError("pane.record.start did not return recording_id")
+    marker = f"SIGHTLINE_COLOR_PROBE_DONE_{time.monotonic_ns() % 1_000_000:06d}"
+    try:
+        command = (
+            "printf '\\033[38;2;255;64;0mSL_TRUECOLOR\\033[0m "
+            "\\033[38;5;45mSL_INDEXED\\033[0m "
+            f"\\033[31mSL_BASIC\\033[0m {marker}\\n'\r"
+        )
+        require_success(shux_cmd(shux_bin, ["pane", "send-keys", "--session", session, "--pane", pane_id, "--text", command]), "color probe send-keys")
+        require_success(
+            shux_cmd(
+                shux_bin,
+                [
+                    "pane",
+                    "wait-for",
+                    "--session",
+                    session,
+                    "--pane",
+                    pane_id,
+                    "--text",
+                    marker,
+                    "--timeout-ms",
+                    str(duration_ms),
+                ],
+            ),
+            "color probe wait-for",
+        )
+    finally:
+        if recording_id is not None:
+            try:
+                stop_result = shux_rpc_call(shux_bin, "pane.record.stop", {"recording_id": recording_id})
+            except Exception as exc:
+                stop_error = exc
+    if stop_error is not None:
+        raise RuntimeError(f"pane.record.stop failed: {stop_error}") from stop_error
+    if stop_result is None:
+        raise RuntimeError("pane.record.stop did not return a result")
+    status = stop_result.get("status")
+    if status != "complete":
+        error = stop_result.get("error")
+        detail = f" ({error})" if error else ""
+        raise RuntimeError(f"pane recording ended with status {status}{detail}")
+    return marker
+
+
+def self_test(_args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="sightline-self-test-") as temp_name:
+        temp = pathlib.Path(temp_name)
+        good = temp / "good.png"
+        blank = temp / "blank.png"
+        invalid = temp / "invalid.png"
+        missing_color = temp / "missing-color.png"
+        write_test_png(good, [(0, 0, 0, 255), (*TRUECOLOR_RGB, 255), (*INDEXED_RGB, 255), (*BASIC_RGB, 255)])
+        write_test_png(blank, [(0, 0, 0, 255)] * 4)
+        write_test_png(missing_color, [(0, 0, 0, 255), (*TRUECOLOR_RGB, 255), (*INDEXED_RGB, 255), (255, 255, 255, 255)])
+        invalid.write_bytes(b"not a png")
+
+        good_metrics, good_checks = png_metrics(good, 2, 2, 2, 2)
+        blank_metrics, blank_checks = png_metrics(blank, 2, 2)
+        invalid_metrics, invalid_checks = png_metrics(invalid, 2, 2)
+        wrong_dim_metrics, wrong_dim_checks = png_metrics(good, 3, 2)
+        missing_color_metrics, _ = png_metrics(missing_color, 2, 2)
+
+        failures = [check for check in good_checks if check.status == "FAIL"]
+        if not all(good_metrics["color_hits"].values()):
+            failures.append(Check("selftest.colors", "FAIL", str(good_metrics["color_hits"])))
+        if all(check.status != "FAIL" for check in blank_checks):
+            failures.append(Check("selftest.blank_rejected", "FAIL", f"blank PNG was not rejected: {blank_metrics}"))
+        if all(check.status != "FAIL" for check in invalid_checks):
+            failures.append(Check("selftest.invalid_rejected", "FAIL", f"invalid PNG was not rejected: {invalid_metrics}"))
+        if not any(check.name == "png.dimensions" and check.status == "FAIL" for check in wrong_dim_checks):
+            failures.append(Check("selftest.wrong_dimensions_rejected", "FAIL", f"wrong dimensions were not rejected: {wrong_dim_metrics}"))
+        if missing_color_metrics["color_hits"]["basic"]:
+            failures.append(Check("selftest.missing_color_rejected", "FAIL", str(missing_color_metrics["color_hits"])))
+        if failures:
+            for failure in failures:
+                print(f"FAIL {failure.name}: {failure.detail}", file=sys.stderr)
+            return 1
+    print("sightline self-test passed")
+    return 0
+
+
+def write_test_png(path: pathlib.Path, pixels: list[tuple[int, int, int, int]]) -> None:
+    width = 2
+    height = 2
+    rows = []
+    for y in range(height):
+        raw = bytearray([0])
+        for x in range(width):
+            raw.extend(pixels[y * width + x])
+        rows.append(bytes(raw))
+    payload = zlib.compress(b"".join(rows))
+    data = bytearray(b"\x89PNG\r\n\x1a\n")
+    data.extend(png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)))
+    data.extend(png_chunk(b"IDAT", payload))
+    data.extend(png_chunk(b"IEND", b""))
+    path.write_bytes(bytes(data))
+
+
+def png_chunk(kind: bytes, payload: bytes) -> bytes:
+    crc = zlib.crc32(kind + payload) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sightline", description="Deterministic Shux TUI QA verifier")
+    parser.add_argument("--plugin-host", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    subparsers = parser.add_subparsers(dest="command")
+
+    verify_parser = subparsers.add_parser("verify", help="verify a Shux pane")
+    verify_parser.add_argument("--session", required=True, help="target Shux session name")
+    verify_parser.add_argument("--window", help="target window name or index")
+    verify_parser.add_argument("--pane", help="target pane UUID; required for recording if session.list cannot resolve it")
+    verify_parser.add_argument("--shux-bin", default=os.environ.get("SHUX_BIN", "shux"), help="Shux binary path")
+    verify_parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="scratch evidence directory")
+    verify_parser.add_argument("--lines", type=int, default=120, help="capture line count")
+    verify_parser.add_argument("--viewport", type=parse_viewport, action="append", default=[], help="viewport COLSxROWS; repeatable")
+    verify_parser.add_argument("--expect-text", action="append", default=[], help="required text in pane capture; repeatable")
+    verify_parser.add_argument("--send-text", help="text to send for keyboard delta probe")
+    verify_parser.add_argument("--send-data", help="base64 bytes to send for keyboard delta probe")
+    verify_parser.add_argument("--expect-after", help="text expected after keyboard probe")
+    verify_parser.add_argument("--wait-ms", type=int, default=5000, help="wait timeout for expected text")
+    verify_parser.add_argument("--settle-ms", type=int, default=250, help="settle after resize before capture")
+    verify_parser.add_argument("--color-probe-shell", action="store_true", help="send a shell printf color probe and assert raw SGR + rendered pixels")
+    verify_parser.add_argument("--record-ms", type=int, default=1200, help="recording duration for color probe")
+    verify_parser.set_defaults(func=verify)
+
+    self_parser = subparsers.add_parser("self-test", help="run local helper self-tests")
+    self_parser.set_defaults(func=self_test)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.plugin_host:
+        return run_plugin_host()
+    if not hasattr(args, "func"):
+        parser.print_help(sys.stderr)
+        return 2
+    if getattr(args, "command", None) == "verify" and not args.viewport:
+        args.viewport = [(80, 24)]
+    if getattr(args, "send_text", None) and getattr(args, "send_data", None):
+        print("--send-text and --send-data are mutually exclusive", file=sys.stderr)
+        return 2
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        print(f"sightline: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,6 +1,6 @@
 ---
 name: shux
-description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane, and extend shux itself with line-delimited JSON-RPC plugins in any language. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, do headless visual regression on a terminal UI, or write a process plugin that subscribes to the shux event bus and calls back through `window.rename`, `pane.send_keys`, `state.apply`, etc. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "replace tmux", "iTerm2 automation", "expect script", "headless terminal test", "agent multiplexer", "asciinema record", "write a shux plugin", "extend shux", "shux plugin install".
+description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane, run deterministic terminal UI QA, and extend shux itself with line-delimited JSON-RPC plugins in any language. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, verify terminal UI layout/keyboard/color behavior, do headless visual regression on a terminal UI, or write a process plugin that subscribes to the shux event bus and calls back through `window.rename`, `pane.send_keys`, `state.apply`, etc. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "verify a TUI", "TUI QA", "terminal UI regression", "keyboard navigation", "color bleed", "replace tmux", "iTerm2 automation", "expect script", "headless terminal test", "agent multiplexer", "asciinema record", "write a shux plugin", "extend shux", "shux plugin install".
 ---
 
 # shux — terminal multiplexer with a JSON-RPC API + pixel snapshotter
@@ -25,6 +25,7 @@ Pick shux instead of the alternatives when **any** of these apply:
 - You want a PNG of what a terminal looks like *right now*, headless, no display server.
 - You're running scripted CLI/REPL interactions that need typed keystrokes and known wait points.
 - You're doing visual regression on a TUI you built (Bubbletea, Charm, ratatui, anything).
+- You're asked to verify terminal UI behavior: layout, alignment, keyboard navigation, color rendering, or screenshot evidence.
 - You want declarative workspace templates that apply atomically.
 
 If you're a human at a keyboard and tmux works for you, keep using tmux.
@@ -167,6 +168,7 @@ Need plain text of the screen?     → pane.capture    (shux pane capture)
 Need to block until text appears?  → pane.wait_for   (shux pane wait-for --text|--regex)
 Need live sampled PTY output?      → pane.output.watch (sealed data-plane, sampled)
 Need a byte-exact transcript?      → shux pane record --to FILE (lossless recorder)
+Need repeatable TUI QA evidence?   → Sightline verifier; read references/sightline.md
 Want raw RPC for a new method?     → shux rpc call <method> --params @file
 ```
 
@@ -227,6 +229,7 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 | Full RPC inventory + JSON request/response shapes | [references/api.md](references/api.md) |
 | Apply-template TOML shape, lowering rules, multi-window workspaces | [references/templates.md](references/templates.md) |
 | Scenario-driver patterns (send/wait/snap loops, golden-image diff) | [references/scenarios.md](references/scenarios.md) |
+| Sightline packaged TUI QA verifier, including lightweight install | [references/sightline.md](references/sightline.md) |
 | Process plugins — protocol, manifest, event/RPC shapes, gotchas | [references/plugins.md](references/plugins.md) |
 
 ## Worked examples
