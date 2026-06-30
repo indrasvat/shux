@@ -19,6 +19,12 @@ shux plugin stop sightline
 Shux does not dispatch package commands yet, so `shux plugin run sightline ...`
 and `shux sightline ...` are intentionally not supported.
 
+`shux plugin install` accepts local executables or local package directories
+today; it does not yet search a registry or install remote URLs. If the shux
+repo is not checked out, use the `shux` skill's `install-sightline.sh` helper
+to download the minimal package into `.shux/out/plugins/sightline/` instead of
+cloning the whole repository.
+
 Sightline writes scratch evidence under `.shux/out/sightline/` by default:
 Markdown report, JSON summary, text captures, raw PTY/color evidence when
 requested, pixel metrics, and PNG snapshots. Review-worthy screenshots should be
