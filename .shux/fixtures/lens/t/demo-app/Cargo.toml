@@ -1,0 +1,15 @@
+# lens T-tier seeded-bug demo app (§13 T5).
+#
+# Standalone crate: the empty [workspace] table detaches it from the shux
+# workspace, and the shux root Cargo.toml `exclude`s this path. Built/run ONLY
+# for the P6 unaided-agent demo — never by `make check`.
+[package]
+name = "lens-demo-app"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+ratatui = "0.30"
