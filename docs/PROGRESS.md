@@ -104,6 +104,14 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-05 — feat(lens): P0 red suite + fixtures (task 077, In Progress)**
+- Started task 077 (shux lens). Phase P0 delivers ONLY fixtures + the complete RED test suite — zero feature/daemon/RPC code.
+- Fixtures `.shux/fixtures/lens/f1..f10` (§11): POSIX sh + printf, token-handshake paced (no sleeps), shellcheck-clean, each carrying truecolor + 256-color + basic-color content. Applied convergence deltas: F4 `s`-before-`a` no-op, F7 SIGWINCH-proof `while :; do read -r _ || :; done`.
+- 10 fixture smoke tests (`lens_fixtures_smoke.rs`) GREEN via existing machinery (session/pane CRUD, set_size, send-keys, capture, snapshot, pixel probes) — proving each fixture's contract, incl. F7 live-resize WINCH reprint.
+- 24-test red suite `crates/shux/tests/lens_*.rs` (G1,G2,G2w,G3,G4 · S1–S5 · D1–D4 · A1 · R1–R7 · K1 · E1) + RPC twins where marked ⇄. Black-box: drives only `shux rpc call` / CLI. Every lens test fails rooted in `-32601` (missing method) or a missing snapshot field — the red receipt. Pre-P5 tests use ordinary sessions; frozen local helpers under the test paths.
+- T-tier scaffolding (§13): `t/make_nidhi_repo.sh` (pinned 2020-01-01 dates, exactly 3 Devanagari/CJK/emoji stashes), `t/demo-app/` (standalone excluded ratatui crate with a seeded border break at col 80), tests T1–T4 with loud skip when `nidhi`/`vivecaka` absent.
+- Test integrity: `scripts/check-lens-frozen.sh` (§16.2 `LENS-TEST-CHANGE:` trailer guard) wired into lefthook `commit-msg` + `make check-lens-frozen` (in `check`). Red suite lives in a `test = false` Cargo lane so `make test`/`make check` stay clean while the suite is red; `make test-lens` / `test-lens-t` run it explicitly, serially, under the leak guard.
+
 **2026-06-29 — feat(plugin): add Sightline TUI QA plugin**
 - Completed task 076 with first-party local package `plugins/sightline/`; `bin/sightline` is the direct v1 product and `shux plugin install plugins/sightline` is explicit lifecycle smoke via `--plugin-host`.
 - Added deterministic Sightline checks for pane capture, PNG validity/dimensions/grid dimensions, nonblank pixels, truecolor/indexed/basic SGR emission and rendered color samples, keyboard delta probes, structured Markdown/JSON reports, and scratch evidence under `.shux/out/sightline/`.
@@ -1492,6 +1500,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 | 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
+| 077 | shux lens — give every agent eyes (P0: fixtures + red suite) | M3 | **In Progress** | 016, 017, 060, 064, 074 |
 
 ---
 
