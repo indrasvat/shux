@@ -387,7 +387,9 @@ test-lens: ## Run the lens synthetic red suite (§12) serially under the leak gu
 .PHONY: test-lens-t
 test-lens-t: ## Run the lens T-tier real-TUI suite (§13; loud-skips absent binaries)
 	@echo "$(COLOR_BLUE)▶ Running lens T-tier suite (§13)...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test lens_ttier
+	@# --no-capture so the loud skip notice (§13) is visible when nidhi/vivecaka
+	@# are absent (nextest otherwise captures stderr of passing/skipping tests).
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --no-capture --test lens_ttier
 
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
