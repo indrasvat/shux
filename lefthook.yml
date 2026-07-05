@@ -12,6 +12,14 @@ pre-commit:
       glob: "*.rs"
       run: make clippy
 
+# The lens frozen-path guard (PRD §16.2) runs at commit-msg time because it must
+# read the commit message for a `LENS-TEST-CHANGE:` trailer — pre-commit hooks
+# cannot access the message. `{1}` is the commit-message file path.
+commit-msg:
+  commands:
+    lens-frozen:
+      run: make check-lens-frozen MSG={1}
+
 # pre-push mirrors CI exactly so a clean local push survives CI:
 #   - `make test`       → matches CI Test job (`cargo nextest run --workspace`)
 #   - `make test-doc`   → matches CI Test job's doc-test step
