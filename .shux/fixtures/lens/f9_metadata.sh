@@ -11,6 +11,9 @@
 # legend drawn once at startup (house rule).
 
 printf '\033[2J\033[3J\033[H'
+# Echo OFF is load-bearing: an echoed token newline is a VISIBLE cell change —
+# it would turn every Class-B token into a Class-A mutation and invalidate S5.
+stty -echo 2>/dev/null || :
 
 printf '\033[1;1H\033[1;38;2;250;250;250mLENS-F9-META\033[0m'
 printf '\033[21;3H'

@@ -12,6 +12,9 @@
 # a static 256/basic legend (house rule).
 
 printf '\033[2J\033[3J\033[H'
+# Echo OFF is load-bearing: echoed token newlines would scroll the frame and
+# add unintended Class-A mutations beyond the pure repaint under test.
+stty -echo 2>/dev/null || :
 
 # Title / wait_for sentinel (drawn once).
 printf '\033[1;1H\033[1;38;2;250;250;250mLENS-F8-REPAINT\033[0m'

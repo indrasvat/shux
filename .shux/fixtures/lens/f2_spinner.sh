@@ -11,6 +11,10 @@
 # Used by: S1, S2.
 
 printf '\033[2J\033[3J\033[H'
+# Echo OFF is load-bearing for every token-paced fixture: the PTY line
+# discipline would otherwise echo each token newline at the cursor, scrolling
+# and corrupting the frame (breaks S1/S2 golden determinism).
+stty -echo 2>/dev/null || :
 
 # Static wait_for sentinel + colour legend (drawn once).
 printf '\033[1;1H\033[1;38;2;250;250;250mLENS-F2-SPIN\033[0m'
@@ -48,6 +52,7 @@ while read -r tok; do
 	R)
 		printf '\033[13;36H\033[1;38;2;60;220;90mREADY\033[0m'
 		printf '\033[24;1H\033[?25l'
+		break
 		;;
 	*)
 		spin_frame "$((i % 8))"
@@ -55,3 +60,7 @@ while read -r tok; do
 		;;
 	esac
 done
+
+# Post-READY: drain any further stdin SILENTLY and stay still forever
+# (p0-council-r1 minor 12). SIGWINCH-safe loop, zero output.
+while :; do read -r _ || :; done

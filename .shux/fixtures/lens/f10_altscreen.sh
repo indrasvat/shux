@@ -11,6 +11,9 @@
 # truecolor/256/basic colour (house rule).
 
 printf '\033[2J\033[3J\033[H'
+# Echo OFF is load-bearing: echoed token newlines would scroll whichever
+# screen is active and break A1's normal-screen restore golden.
+stty -echo 2>/dev/null || :
 
 # --- Normal screen (wait_for sentinel: LENS-F10-ALT) ----------------------
 printf '\033[1;1H\033[1;38;2;250;250;250mLENS-F10-ALT\033[0m'

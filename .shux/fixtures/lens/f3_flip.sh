@@ -14,6 +14,9 @@
 # the house colour rule holds. Used by: G1, S3.
 
 printf '\033[2J\033[3J\033[H'
+# Echo OFF is load-bearing: an echoed token newline at the parked cursor
+# (bottom row) would scroll the frame mid-flip and fail G1's clean-frame check.
+stty -echo 2>/dev/null || :
 
 # Build the 79-char fill strings once (cols 0..78; col 79 is the checksum).
 A79=''

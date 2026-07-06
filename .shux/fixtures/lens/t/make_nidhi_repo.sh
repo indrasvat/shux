@@ -25,6 +25,9 @@ mkdir -p "$target"
 cd "$target"
 
 git init -q -b main
+# A user-level commit.gpgsign=true would hang/vary the fixture (p0-council-r1
+# major 11) — pin it off for this repo.
+git config commit.gpgsign false
 printf 'base\n' >file.txt
 git add file.txt
 git commit -q -m 'base commit'
