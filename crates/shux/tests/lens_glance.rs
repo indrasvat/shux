@@ -104,8 +104,10 @@ fn g1_glance_atomicity_under_concurrent_flips() {
         // could quiesce early and let late glances see a still pane, weakening
         // the atomicity claim. The 10_000-token hard cap and the deadline are
         // PANIC BOUNDS only (a paniced sibling can no longer hang the scope);
-        // 10_000 newline bytes also fit the PTY input buffer, so send_keys can
-        // never wedge. The pump never inspects the glance handles.
+        // each 5-token batch is a tiny write — a full canonical PTY buffer
+        // (≈4 KiB) only backpressures the pump until F3 (which reads
+        // continuously) drains it, so the write can never wedge permanently.
+        // The pump never inspects the glance handles.
         let pump = scope.spawn(|| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             let mut sent = 0_u32;
