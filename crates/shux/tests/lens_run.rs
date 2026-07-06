@@ -305,18 +305,9 @@ fn r5_live_resize() {
     h.rpc_raw("session.kill", serde_json::json!({ "id": sid }));
 }
 
-// R8 — spawn failure + bounds (LENS-R-040/045; p0-council-r1 major 9).
-#[test]
-fn r8_spawn_failure_and_bounds() {
-    let h = Harness::new();
-
-    // (a) RPC: argv[0] does not resolve → SPAWN_FAILED (-32014), and the
-    // scratch allocation is rolled back (no residual scratch), daemon healthy.
-    let env = h.rpc_raw(
-        "lens.run",
-        serde_json::json!({ "argv": ["/nonexistent-lens-binary"], "cols": 80, "rows": 24 }),
-    );
-    env.expect_error_code(-32014, "R8a rpc spawn failure");
+/// Zero `scratch: true` entries in `session.list --include-scratch` — a failed
+/// spawn must roll its allocation back (R8a, both twins).
+fn assert_no_residual_scratch(h: &Harness, ctx: &str) {
     let list = h.rpc_ok(
         "session.list",
         serde_json::json!({ "include_scratch": true }),
@@ -329,16 +320,40 @@ fn r8_spawn_failure_and_bounds() {
                 .count()
         })
         .unwrap_or(0);
-    assert_eq!(residual, 0, "R8a: failed spawn must roll back its scratch");
+    assert_eq!(
+        residual, 0,
+        "{ctx}: failed spawn must roll back its scratch"
+    );
+}
+
+// R8 — spawn failure + bounds (LENS-R-040/045; p0-council-r1 major 9).
+#[test]
+fn r8_spawn_failure_and_bounds() {
+    let h = Harness::new();
+
+    // (a) RPC: argv[0] does not resolve → SPAWN_FAILED (-32014), and the
+    // scratch allocation is rolled back (no residual scratch), daemon healthy.
+    let env = h.rpc_raw(
+        "lens.run",
+        serde_json::json!({ "argv": ["/nonexistent-lens-binary"], "cols": 80, "rows": 24 }),
+    );
+    env.expect_error_code(-32014, "R8a rpc spawn failure");
+    assert_no_residual_scratch(&h, "R8a rpc");
     assert!(
         h.system_health_ok(),
         "R8a: daemon healthy after spawn failure"
     );
 
-    // (a) CLI twin: exit 5 with the same error envelope.
+    // (a) CLI twin: exit 5 with the same error envelope AND the same
+    // daemon-state guarantees (p0-council-r2 major 3 — twin symmetry).
     let cli = h.cli_envelope(&["lens", "run", "--", "/nonexistent-lens-binary"]);
     cli.expect_error_code(-32014, "R8a cli spawn failure envelope");
     assert_eq!(cli.exit_code, 5, "R8a: CLI exit 5 on SPAWN_FAILED");
+    assert_no_residual_scratch(&h, "R8a cli");
+    assert!(
+        h.system_health_ok(),
+        "R8a: daemon healthy after CLI spawn failure"
+    );
 
     // (b) RPC: size below the [20,500]x[5,200] bounds → INVALID_PARAMS.
     let env = h.rpc_raw(

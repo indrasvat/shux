@@ -62,6 +62,21 @@ fn f2_spinner_advances_and_signals_ready() {
         !changed,
         "F2: output changed after READY — post-READY tokens must be drained silently"
     );
+
+    // p0-council-r2 major 1: the post-READY drain is `cat >/dev/null` — it must
+    // exit cleanly on EOF (VEOF 0x04 in canonical mode) leaving no residual
+    // fixture process (the old read-loop drain busy-spun at 100% CPU here).
+    assert!(
+        Harness::count_procs("f2_spinner.sh") >= 1,
+        "F2: fixture process should be alive before EOF"
+    );
+    h.send_raw(&f.pane_id, "\u{4}");
+    assert!(
+        wait_until(std::time::Duration::from_secs(5), || Harness::count_procs(
+            "f2_spinner.sh"
+        ) == 0),
+        "F2: fixture must exit on stdin EOF (no busy-spin, no residual process)"
+    );
     h.kill_session(&f.session_id);
 }
 
@@ -169,6 +184,25 @@ fn f7_winsize_reports_and_reprints_on_resize() {
     );
     h.wait_for(&f.pane_id, "SIZE=40 120", 5_000)
         .expect("F7 WINCH reprint");
+
+    // p0-council-r2 major 1, part (a): the SIGWINCH-interrupted `read` returned
+    // >128 and the loop CONTINUED — the fixture must still be alive after the
+    // signal (an unguarded `read` would have exited the script).
+    assert!(
+        Harness::count_procs("f7_winsize.sh") >= 1,
+        "F7: fixture must survive SIGWINCH (signal-interrupted read continues)"
+    );
+
+    // Part (b): EOF (VEOF 0x04, canonical mode) makes `read` return 1 — the
+    // loop exits cleanly, leaving no residual process (the old `|| :` loop
+    // busy-spun at 100% CPU here).
+    h.send_raw(&f.pane_id, "\u{4}");
+    assert!(
+        wait_until(std::time::Duration::from_secs(5), || Harness::count_procs(
+            "f7_winsize.sh"
+        ) == 0),
+        "F7: fixture must exit on stdin EOF (no busy-spin, no residual process)"
+    );
     h.kill_session(&f.session_id);
 }
 

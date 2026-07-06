@@ -87,21 +87,34 @@ fn assert_untorn_f3_glance(env: &RpcEnvelope, cw: u32, ch: u32, ctx: &str) {
 // G1 ⇄ — glance atomicity (50 RPC + 50 CLI glances race the pump; M9 parity).
 #[test]
 fn g1_glance_atomicity_under_concurrent_flips() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let h = Harness::new();
     let f = h.launch_fixture("f3_flip.sh", 80, 24, "AAAAAAAAAA");
     let (_, cw, ch) = h.snapshot_png(&f.pane_id);
 
-    let mut rpc_envelopes: Vec<RpcEnvelope> = Vec::new();
-    let mut cli_envelopes: Vec<RpcEnvelope> = Vec::new();
+    type JoinOut = std::thread::Result<RpcEnvelope>;
+    let done = AtomicBool::new(false);
+    let mut rpc_joins: Vec<JoinOut> = Vec::new();
+    let mut cli_joins: Vec<JoinOut> = Vec::new();
 
     std::thread::scope(|scope| {
-        // Token pump: exactly 200 tokens at max rate (§12 G1 — bounded by
-        // construction; each 5-token batch is a tiny PTY write, so the pump can
-        // never wedge on a full input buffer and always terminates on its own,
-        // even if a glance thread panics mid-scope).
+        // Token pump (§12 G1, p0-council-r2 major 2): loops on the shared
+        // done-flag so it OUTLIVES the slowest glance — a fixed token budget
+        // could quiesce early and let late glances see a still pane, weakening
+        // the atomicity claim. The 10_000-token hard cap and the deadline are
+        // PANIC BOUNDS only (a paniced sibling can no longer hang the scope);
+        // 10_000 newline bytes also fit the PTY input buffer, so send_keys can
+        // never wedge. The pump never inspects the glance handles.
         let pump = scope.spawn(|| {
-            for _ in 0..40 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let mut sent = 0_u32;
+            while !done.load(Ordering::Relaxed)
+                && sent < 10_000
+                && std::time::Instant::now() < deadline
+            {
                 h.pump_line_tokens(&f.pane_id, 5);
+                sent += 5;
             }
         });
 
@@ -120,22 +133,32 @@ fn g1_glance_atomicity_under_concurrent_flips() {
         let cli_handles: Vec<_> = (0..50)
             .map(|_| scope.spawn(|| h.cli_envelope(&["pane", "glance", &f.pane_id])))
             .collect();
-        for handle in rpc_handles {
-            rpc_envelopes.push(handle.join().expect("rpc glance thread"));
-        }
-        for handle in cli_handles {
-            cli_envelopes.push(handle.join().expect("cli glance thread"));
-        }
+
+        // Collect join RESULTS without panicking so the done-flag is stored
+        // even when a glance thread panicked (P0: the CLI verb is missing) —
+        // the pump then stops promptly instead of running to its panic bounds.
+        rpc_joins.extend(rpc_handles.into_iter().map(|handle| handle.join()));
+        cli_joins.extend(cli_handles.into_iter().map(|handle| handle.join()));
+        done.store(true, Ordering::Relaxed);
         pump.join().expect("pump thread");
     });
 
     // Every glance (both paths) must be an internally-consistent single frame.
-    // The first `expect_result` is the P0 red-receipt failure (-32601).
-    for (i, env) in rpc_envelopes.iter().enumerate() {
-        assert_untorn_f3_glance(env, cw, ch, &format!("G1 rpc glance #{i}"));
+    // A panicked glance thread re-raises here (its own message — e.g. the
+    // missing CLI verb — was already printed when the thread panicked); a
+    // successful envelope goes through the untorn-frame assertions, where
+    // `expect_result` is the P0 red-receipt failure (-32601).
+    for (i, join) in rpc_joins.into_iter().enumerate() {
+        match join {
+            Ok(env) => assert_untorn_f3_glance(&env, cw, ch, &format!("G1 rpc glance #{i}")),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
-    for (i, env) in cli_envelopes.iter().enumerate() {
-        assert_untorn_f3_glance(env, cw, ch, &format!("G1 cli glance #{i}"));
+    for (i, join) in cli_joins.into_iter().enumerate() {
+        match join {
+            Ok(env) => assert_untorn_f3_glance(&env, cw, ch, &format!("G1 cli glance #{i}")),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     h.kill_session(&f.session_id);
