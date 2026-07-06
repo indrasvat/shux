@@ -14,6 +14,11 @@
 #          the old cell and drawing the new one — EXACTLY 2 cells change.
 # The cursor is parked at grid (23,0) after every redraw.
 #
+# INPUT CONTRACT (p0-council-r3 item 2, normative): callers send ONLY the
+# bytes 'a', 's', and Tab (0x09). Bare LF (0x0a) and NUL (0x00) read back
+# EMPTY through command substitution and are treated as EOF by the read loop —
+# they must never be sent. An empty dd read therefore unambiguously means EOF.
+#
 # Coordinates are 0-based grid; ANSI = (row+1,col+1). Used by: D2, D4, K1, E1.
 
 printf '\033[2J\033[3J\033[H'
