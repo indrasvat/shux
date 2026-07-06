@@ -104,6 +104,11 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-05 — test(lens): P0 council round-2 hardening (task 077, In Progress)**
+- Applied the P0 phase-diff council round-2 verdict (3 majors — PRD §A1): fixed the EOF busy-spin the PRD itself had prescribed (`while :; do read || :; done` spins at 100% CPU on EOF) — F1/F2/F5 blockers now drain via `cat >/dev/null`, F7 uses the POSIX signal-safe `while read -r _ || [ $? -gt 128 ]; do :; done` (SIGWINCH continues, EOF exits), F4's dd loop breaks on empty read; F2/F7 smoke tests extended to prove WINCH survival and EOF-exit with zero residual processes.
+- G1's pump now loops on a shared done-flag stored after all glance threads join (must outlive the slowest glance), with a 10k-token cap + 120s deadline purely as panic bounds; glance joins are collected non-panicking so the flag is always stored.
+- R8's CLI spawn-failure twin now repeats the RPC twin's daemon-state assertions (zero residual scratch entries + system health).
+
 **2026-07-05 — test(lens): P0 council round-1 hardening (task 077, In Progress)**
 - Applied the P0 phase-diff council verdict (1 blocker, 9 majors, 4 minors — PRD §A1): S3 pump-lifetime race fixed with per-check pump scopes; harness global NO_COLOR removed (T-tier color cases now assert non-grayscale, no-color cases inject per-test); CLI/RPC parity twins completed across G1/G2/G2w/D1/D2/D3/R1/R3/R5 incl. successful-path `pane diff` and `--png`/`--heat` file surfaces; D2 asserts byte-exact FULL-WIDTH rows; G4 checks session AND pane structural versions; three NEW red tests D5 (checkpoint FIFO eviction + same-revision no-op), V1 (settle param validation), R8 (spawn failure rollback + size bounds) — synthetic count 24→27.
 - check-lens-frozen.sh hardened: `git interpret-trailers --parse` with non-empty reason required, HEAD-itself shallow fallback, merge commits diffed against first parent (never skipped).

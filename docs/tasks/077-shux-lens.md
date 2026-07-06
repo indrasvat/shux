@@ -99,3 +99,16 @@ classify_frame validates exact RGB · G1 single-decode · D-tests assert
 from/to_revision. Hardening exposed a real fixture bug: PTY echo of token
 newlines corrupted token-paced frames — all token-paced fixtures now set
 `stty -echo` (like F4).
+
+## P0 phase-diff council round 2 (2026-07-05) — hardening applied
+
+3 majors adopted (PRD §A1 round-2 entry): (1) EOF busy-spin — the PRD's own
+`while :; do read || :; done` prescription spun at 100% CPU on EOF; F2 (and the
+F1/F5 blockers) now drain via `cat >/dev/null`, F7 uses the signal-safe
+`while read -r _ || [ $? -gt 128 ]; do :; done` (WINCH-interrupt continues, EOF
+exits), F4's dd loop breaks on empty read; F2/F7 smoke tests prove
+signal-survival and EOF-exit with zero residual processes. (2) G1 pump loops on
+a shared done-flag set after all glance threads join (outlives the slowest
+glance); 10k-token cap + 120s deadline are panic bounds only; joins collected
+non-panicking so the flag is always stored. (3) R8 CLI twin repeats the RPC
+twin's daemon-state assertions (zero residual scratch + health).
