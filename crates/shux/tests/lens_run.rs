@@ -13,8 +13,10 @@ use lens_common::*;
 
 use std::time::Duration;
 
-fn f_argv(name: &str) -> serde_json::Value {
-    serde_json::json!(["sh", Harness::fixture_rel(name)])
+/// `["sh", <abs fixture path>]` — absolute-anchored so count_fixture_procs
+/// can match the spawned argv at its start (p0-council-r3 item 1).
+fn f_argv(h: &Harness, name: &str) -> serde_json::Value {
+    serde_json::json!(["sh", h.fixture_abs(name)])
 }
 
 /// Field lookup tolerant of either a bare result or a `{result:{...}}` envelope.
@@ -35,7 +37,7 @@ fn r1_scratch_lifecycle() {
     let env = h.rpc_raw(
         "lens.run",
         serde_json::json!({
-            "argv": f_argv("f6_exit42.sh"), "cols": 80, "rows": 24,
+            "argv": f_argv(&h, "f6_exit42.sh"), "cols": 80, "rows": 24,
             "post_exit_ttl_ms": 1000
         }),
     );
@@ -51,7 +53,7 @@ fn r1_scratch_lifecycle() {
         "R1: scratch must vanish from `session list --include-scratch` after ttl"
     );
     assert_eq!(
-        Harness::count_procs("f6_exit42.sh"),
+        h.count_fixture_procs("f6_exit42.sh"),
         0,
         "R1: no fixture procs remain"
     );
@@ -65,10 +67,10 @@ fn r1_scratch_lifecycle() {
     );
 
     // CLI --wait form: surfaces the child's exit code (42) and JSON fields.
-    let rel = Harness::fixture_rel("f6_exit42.sh");
+    let abs = h.fixture_abs("f6_exit42.sh");
     let out = h.cli(&[
         "--format", "json", "lens", "run", "--size", "80x24", "--ttl", "1s", "--wait", "--", "sh",
-        &rel,
+        &abs,
     ]);
     assert_eq!(
         out.status.code(),
@@ -92,7 +94,7 @@ fn r1_scratch_lifecycle() {
         "R1: CLI-created scratch must also vanish after ttl"
     );
     assert_eq!(
-        Harness::count_procs("f6_exit42.sh"),
+        h.count_fixture_procs("f6_exit42.sh"),
         0,
         "R1: no fixture procs remain after the CLI run"
     );
@@ -104,7 +106,7 @@ fn r2_hidden_but_authorized() {
     let h = Harness::new();
     let env = h.rpc_raw(
         "lens.run",
-        serde_json::json!({ "argv": f_argv("f1_static.sh"), "cols": 80, "rows": 24 }),
+        serde_json::json!({ "argv": f_argv(&h, "f1_static.sh"), "cols": 80, "rows": 24 }),
     );
     let r = env.expect_result("R2 lens.run rpc");
     let sid = r["session_id"].as_str().expect("session_id").to_string();
@@ -137,12 +139,12 @@ fn r2_hidden_but_authorized() {
 #[test]
 fn r3_pty_sizing_truth() {
     let h = Harness::new();
-    let rel = Harness::fixture_rel("f7_winsize.sh");
+    let abs = h.fixture_abs("f7_winsize.sh");
 
     // RPC path at 80x24.
     let env = h.rpc_raw(
         "lens.run",
-        serde_json::json!({ "argv": f_argv("f7_winsize.sh"), "cols": 80, "rows": 24 }),
+        serde_json::json!({ "argv": f_argv(&h, "f7_winsize.sh"), "cols": 80, "rows": 24 }),
     );
     let r = env.expect_result("R3 lens.run rpc");
     let sid = r["session_id"].as_str().expect("session_id").to_string();
@@ -157,7 +159,7 @@ fn r3_pty_sizing_truth() {
     h.rpc_raw("session.kill", serde_json::json!({ "id": sid }));
 
     // CLI path at 120x40 (async form; ids parsed from the json envelope).
-    let cli = h.cli_envelope(&["lens", "run", "--size", "120x40", "--", "sh", &rel]);
+    let cli = h.cli_envelope(&["lens", "run", "--size", "120x40", "--", "sh", &abs]);
     let cr = cli.expect_result("R3 lens run cli");
     let cli_sid = cr["session_id"].as_str().expect("session_id").to_string();
     let cli_pane = cr["pane_id"].as_str().expect("pane_id").to_string();
@@ -180,7 +182,7 @@ fn r4_orphan_proof_and_waiter_drop() {
     let probe = h.rpc_raw(
         "lens.run",
         serde_json::json!({
-            "argv": f_argv("f1_static.sh"), "cols": 80, "rows": 24,
+            "argv": f_argv(&h, "f1_static.sh"), "cols": 80, "rows": 24,
             "max_runtime_ms": 2000, "post_exit_ttl_ms": 1000
         }),
     );
@@ -190,15 +192,15 @@ fn r4_orphan_proof_and_waiter_drop() {
         serde_json::json!({ "id": pr["session_id"] }),
     );
     assert!(
-        wait_until(Duration::from_millis(2000), || Harness::count_procs(
-            "f1_static.sh"
-        ) == 0),
+        wait_until(Duration::from_millis(2000), || h
+            .count_fixture_procs("f1_static.sh")
+            == 0),
         "R4: probe scratch must be reaped before the real scenario"
     );
 
     // The real scenario: `lens run --wait` blocks (F1 never exits); launch it as
     // a child of the test, then SIGKILL the client.
-    let rel = Harness::fixture_rel("f1_static.sh");
+    let abs = h.fixture_abs("f1_static.sh");
     let mut child = h
         .shux()
         .args([
@@ -209,7 +211,7 @@ fn r4_orphan_proof_and_waiter_drop() {
             "--wait",
             "--",
             "sh",
-            &rel,
+            &abs,
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -217,9 +219,9 @@ fn r4_orphan_proof_and_waiter_drop() {
         .expect("spawn lens run --wait child");
 
     assert!(
-        wait_until(Duration::from_secs(5), || Harness::count_procs(
-            "f1_static.sh"
-        ) >= 1),
+        wait_until(Duration::from_secs(5), || h
+            .count_fixture_procs("f1_static.sh")
+            >= 1),
         "R4: scratch F1 should come up under --wait"
     );
     // Kill the CLIENT (the waiter) — the scratch must outlive it.
@@ -231,16 +233,15 @@ fn r4_orphan_proof_and_waiter_drop() {
         "R4(a): dropped waiter must not wedge the daemon"
     );
     assert!(
-        Harness::count_procs("f1_static.sh") >= 1,
+        h.count_fixture_procs("f1_static.sh") >= 1,
         "R4(b): scratch F1 must survive the client's death"
     );
 
     // R4(c): after max_runtime the daemon reaps the scratch.
     assert!(
-        wait_until(
-            Duration::from_millis(2000 + LENS_TEST_TOL_MS),
-            || Harness::count_procs("f1_static.sh") == 0
-        ),
+        wait_until(Duration::from_millis(2000 + LENS_TEST_TOL_MS), || h
+            .count_fixture_procs("f1_static.sh")
+            == 0),
         "R4(c): scratch must be reaped at max_runtime"
     );
     assert!(
@@ -255,7 +256,7 @@ fn r5_live_resize() {
     let h = Harness::new();
     let env = h.rpc_raw(
         "lens.run",
-        serde_json::json!({ "argv": f_argv("f7_winsize.sh"), "cols": 80, "rows": 24 }),
+        serde_json::json!({ "argv": f_argv(&h, "f7_winsize.sh"), "cols": 80, "rows": 24 }),
     );
     let r = env.expect_result("R5 lens.run rpc");
     let sid = r["session_id"].as_str().expect("session_id").to_string();
@@ -358,13 +359,13 @@ fn r8_spawn_failure_and_bounds() {
     // (b) RPC: size below the [20,500]x[5,200] bounds → INVALID_PARAMS.
     let env = h.rpc_raw(
         "lens.run",
-        serde_json::json!({ "argv": f_argv("f1_static.sh"), "cols": 10, "rows": 3 }),
+        serde_json::json!({ "argv": f_argv(&h, "f1_static.sh"), "cols": 10, "rows": 3 }),
     );
     env.expect_error_code(-32602, "R8b rpc size below bounds");
 
     // (b) CLI twin: usage / INVALID_PARAMS → exit 2.
-    let rel = Harness::fixture_rel("f1_static.sh");
-    let out = h.cli(&["lens", "run", "--size", "10x3", "--", "sh", &rel]);
+    let abs = h.fixture_abs("f1_static.sh");
+    let out = h.cli(&["lens", "run", "--size", "10x3", "--", "sh", &abs]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -382,7 +383,7 @@ fn r6_quota() {
     for i in 0..16 {
         let env = h.rpc_raw(
             "lens.run",
-            serde_json::json!({ "argv": f_argv("f1_static.sh"), "cols": 80, "rows": 24 }),
+            serde_json::json!({ "argv": f_argv(&h, "f1_static.sh"), "cols": 80, "rows": 24 }),
         );
         let r = env.expect_result(&format!("R6 lens.run #{i}"));
         ids.push(r["session_id"].as_str().expect("session_id").to_string());
@@ -391,11 +392,11 @@ fn r6_quota() {
     // The 17th exceeds the quota.
     let env = h.rpc_raw(
         "lens.run",
-        serde_json::json!({ "argv": f_argv("f1_static.sh"), "cols": 80, "rows": 24 }),
+        serde_json::json!({ "argv": f_argv(&h, "f1_static.sh"), "cols": 80, "rows": 24 }),
     );
     env.expect_error_code(-32012, "R6: 17th scratch → RESOURCE_EXHAUSTED");
-    let rel = Harness::fixture_rel("f1_static.sh");
-    let out = h.cli(&["lens", "run", "--size", "80x24", "--", "sh", &rel]);
+    let abs = h.fixture_abs("f1_static.sh");
+    let out = h.cli(&["lens", "run", "--size", "80x24", "--", "sh", &abs]);
     assert_eq!(
         out.status.code(),
         Some(5),
@@ -411,7 +412,7 @@ fn r6_quota() {
     );
     let env = h.rpc_raw(
         "lens.run",
-        serde_json::json!({ "argv": f_argv("f1_static.sh"), "cols": 80, "rows": 24 }),
+        serde_json::json!({ "argv": f_argv(&h, "f1_static.sh"), "cols": 80, "rows": 24 }),
     );
     let r = env.expect_result("R6 retry after kill");
     ids.push(r["session_id"].as_str().expect("session_id").to_string());
@@ -427,13 +428,13 @@ fn r7_registry_reap() {
     let h = Harness::new();
     let env = h.rpc_raw(
         "lens.run",
-        serde_json::json!({ "argv": f_argv("f1_static.sh"), "cols": 80, "rows": 24 }),
+        serde_json::json!({ "argv": f_argv(&h, "f1_static.sh"), "cols": 80, "rows": 24 }),
     );
     let _ = env.expect_result("R7 lens.run rpc");
     assert!(
-        wait_until(Duration::from_secs(5), || Harness::count_procs(
-            "f1_static.sh"
-        ) >= 1),
+        wait_until(Duration::from_secs(5), || h
+            .count_fixture_procs("f1_static.sh")
+            >= 1),
         "R7: scratch F1 should be running"
     );
 
@@ -451,9 +452,9 @@ fn r7_registry_reap() {
     // Any command auto-starts a fresh daemon → startup registry reap.
     assert!(h.system_health_ok(), "R7: fresh daemon must come up");
     assert!(
-        wait_until(Duration::from_secs(5), || Harness::count_procs(
-            "f1_static.sh"
-        ) == 0),
+        wait_until(Duration::from_secs(5), || h
+            .count_fixture_procs("f1_static.sh")
+            == 0),
         "R7: startup must kill the registered scratch pgid (zero F1 procs)"
     );
 

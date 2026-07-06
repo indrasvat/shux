@@ -85,7 +85,7 @@ fn e1_whole_loop() {
         .rpc_raw(
             "lens.run",
             serde_json::json!({
-                "argv": ["sh", Harness::fixture_rel("f4_keys.sh")], "cols": 80, "rows": 24
+                "argv": ["sh", h.fixture_abs("f4_keys.sh")], "cols": 80, "rows": 24
             }),
         )
         .expect_result("E1 lens.run");

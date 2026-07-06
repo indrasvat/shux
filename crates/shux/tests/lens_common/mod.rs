@@ -236,9 +236,20 @@ impl Harness {
 
     // ── Fixture launch (ordinary session; §12 discipline) ────────────────
 
-    /// Repo-relative path used verbatim in the exec command (delta 4).
+    /// Explicit repo-relative fixture path (delta 4: never bare names).
     pub fn fixture_rel(name: &str) -> String {
         format!(".shux/fixtures/lens/{name}")
+    }
+
+    /// The repo-relative fixture path anchored at THIS harness's repo root
+    /// (p0-council-r3 item 1). Every fixture spawn uses this exact absolute
+    /// form so `count_fixture_procs` can match argv anchored at the start —
+    /// immune to co-tenant processes that merely mention a fixture filename.
+    pub fn fixture_abs(&self, name: &str) -> String {
+        self.repo_root
+            .join(Self::fixture_rel(name))
+            .display()
+            .to_string()
     }
 
     /// Create an ordinary session, size the pane, `exec` the fixture over the
@@ -261,12 +272,13 @@ impl Harness {
             serde_json::json!({ "pane_id": pane_id, "cols": cols, "rows": rows }),
         );
 
-        // Replace the pane shell with the fixture (repo-relative path; the pane
-        // cwd is the repo root). `exec` leaves no residual shell to reap.
-        let rel = Self::fixture_rel(name);
+        // Replace the pane shell with the fixture. The absolute-anchored path
+        // keeps the argv matchable by count_fixture_procs (r3 item 1); `exec`
+        // leaves no residual shell to reap.
+        let abs = self.fixture_abs(name);
         self.rpc_ok(
             "pane.send_keys",
-            serde_json::json!({ "pane_id": pane_id, "text": format!("exec sh {rel}\n") }),
+            serde_json::json!({ "pane_id": pane_id, "text": format!("exec sh {abs}\n") }),
         );
 
         self.wait_for(&pane_id, sentinel, 10_000)
@@ -434,13 +446,21 @@ impl Harness {
             .is_some()
     }
 
-    /// Count live processes whose args match `pattern` (pgrep -f).
-    pub fn count_procs(pattern: &str) -> usize {
-        let out = Command::new("pgrep").arg("-f").arg(pattern).output();
+    /// Count live fixture processes by ANCHORED argv match: only processes
+    /// whose command line BEGINS with `sh <abs-repo-root>/.shux/fixtures/lens/
+    /// <script>` count (p0-council-r3 item 1). A substring match on the bare
+    /// script name false-matched co-tenant processes whose argv merely
+    /// mentioned the filename (e.g. a review agent holding the diff text in
+    /// its prompt), flaking the EOF-exit proofs under parallel load. Fixtures
+    /// are always exec'd with this exact absolute-path argv, so the anchored
+    /// prefix is both necessary and sufficient.
+    pub fn count_fixture_procs(&self, name: &str) -> usize {
+        let prefix = format!("sh {}", self.fixture_abs(name));
+        let out = Command::new("ps").args(["-axo", "args="]).output();
         match out {
             Ok(o) => String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .filter(|l| !l.trim().is_empty())
+                .filter(|l| l.trim_start().starts_with(&prefix))
                 .count(),
             Err(_) => 0,
         }

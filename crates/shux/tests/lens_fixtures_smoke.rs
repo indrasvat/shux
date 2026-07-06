@@ -67,14 +67,14 @@ fn f2_spinner_advances_and_signals_ready() {
     // exit cleanly on EOF (VEOF 0x04 in canonical mode) leaving no residual
     // fixture process (the old read-loop drain busy-spun at 100% CPU here).
     assert!(
-        Harness::count_procs("f2_spinner.sh") >= 1,
+        h.count_fixture_procs("f2_spinner.sh") >= 1,
         "F2: fixture process should be alive before EOF"
     );
     h.send_raw(&f.pane_id, "\u{4}");
     assert!(
-        wait_until(std::time::Duration::from_secs(5), || Harness::count_procs(
-            "f2_spinner.sh"
-        ) == 0),
+        wait_until(std::time::Duration::from_secs(5), || h
+            .count_fixture_procs("f2_spinner.sh")
+            == 0),
         "F2: fixture must exit on stdin EOF (no busy-spin, no residual process)"
     );
     h.kill_session(&f.session_id);
@@ -117,6 +117,9 @@ fn f3_flip_alternates_frames_and_colours() {
 fn f4_keys_press_recolour_and_marker() {
     let h = Harness::new();
     let f = h.launch_fixture("f4_keys.sh", 80, 24, "LENS-F4-KEYS");
+
+    // F4 INPUT CONTRACT (r3 item 2): only a/s/Tab are ever sent — bare LF and
+    // NUL read back empty and would be treated as EOF by the fixture.
 
     // `s` before any `a` is a documented NO-OP (delta 1).
     h.send_raw(&f.pane_id, "s");
@@ -189,7 +192,7 @@ fn f7_winsize_reports_and_reprints_on_resize() {
     // >128 and the loop CONTINUED — the fixture must still be alive after the
     // signal (an unguarded `read` would have exited the script).
     assert!(
-        Harness::count_procs("f7_winsize.sh") >= 1,
+        h.count_fixture_procs("f7_winsize.sh") >= 1,
         "F7: fixture must survive SIGWINCH (signal-interrupted read continues)"
     );
 
@@ -198,9 +201,9 @@ fn f7_winsize_reports_and_reprints_on_resize() {
     // busy-spun at 100% CPU here).
     h.send_raw(&f.pane_id, "\u{4}");
     assert!(
-        wait_until(std::time::Duration::from_secs(5), || Harness::count_procs(
-            "f7_winsize.sh"
-        ) == 0),
+        wait_until(std::time::Duration::from_secs(5), || h
+            .count_fixture_procs("f7_winsize.sh")
+            == 0),
         "F7: fixture must exit on stdin EOF (no busy-spin, no residual process)"
     );
     h.kill_session(&f.session_id);
