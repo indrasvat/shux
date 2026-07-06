@@ -79,5 +79,8 @@ printf '\033[9;3H\033[32m✓ \033[31m✗ \033[33m⚠\033[0m'
 # Park a HIDDEN cursor at grid (23,79) == ANSI (24,80).
 printf '\033[24;80H\033[?25l'
 
-# Block forever. SIGWINCH-safe loop (a bare read can be interrupted and exit).
-while :; do read -r _ || :; done
+# Block while stdin is open; exit cleanly on EOF. `cat >/dev/null` never
+# outputs and cannot busy-spin (a `while :; do read || :; done` loop spins at
+# 100% CPU on EOF — p0-council-r2 major 1). No WINCH trap here, and SIGWINCH's
+# default action is ignore, so signals leave cat undisturbed.
+cat >/dev/null

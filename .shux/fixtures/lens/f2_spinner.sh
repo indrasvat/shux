@@ -61,6 +61,8 @@ while read -r tok; do
 	esac
 done
 
-# Post-READY: drain any further stdin SILENTLY and stay still forever
-# (p0-council-r1 minor 12). SIGWINCH-safe loop, zero output.
-while :; do read -r _ || :; done
+# Post-READY: drain any further stdin SILENTLY (p0-council-r1 minor 12).
+# `cat >/dev/null` blocks while stdin is open, exits cleanly on EOF, and never
+# outputs — a `while :; do read || :; done` loop would busy-spin at 100% CPU
+# once stdin hits EOF (p0-council-r2 major 1).
+cat >/dev/null

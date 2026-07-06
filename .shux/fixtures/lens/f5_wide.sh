@@ -57,4 +57,6 @@ printf '\033[0m'
 # Hidden cursor parked bottom-right (grid (29,99)).
 printf '\033[30;100H\033[?25l'
 
-while :; do read -r _ || :; done
+# Block while stdin is open; exit cleanly on EOF (no EOF busy-spin —
+# p0-council-r2 major 1).
+cat >/dev/null

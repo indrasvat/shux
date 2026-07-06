@@ -6,9 +6,11 @@
 # stty is the only truth), then blocks. A SIGWINCH trap reprints the new size
 # on the next line so a live resize is observable.
 #
-# The blocking loop MUST be `while :; do read -r _ || :; done`: a bare `read`
-# can be interrupted by SIGWINCH and exit the script, which would kill the pane
-# out from under R5. The loop is load-bearing. Used by: R3, R5.
+# Blocking loop (p0-council-r2 major 1): `while read -r _ || [ $? -gt 128 ];
+# do :; done` — a SIGWINCH-interrupted `read` returns >128 (POSIX) and the loop
+# CONTINUES (signal-survival is load-bearing for R5); EOF returns 1 and the
+# loop EXITS cleanly. NEVER `|| :` inside `while :` — that busy-spins at 100%
+# CPU once stdin hits EOF. Used by: R3, R5.
 
 printf '\033[2J\033[H'
 # House-rule colour content (truecolor / 256 / basic).
@@ -20,4 +22,4 @@ report
 # Reprint on resize. Newline first so each report is its own capture line.
 trap 'printf "\n"; report' WINCH
 
-while :; do read -r _ || :; done
+while read -r _ || [ $? -gt 128 ]; do :; done

@@ -52,6 +52,11 @@ tab=$(printf '\t')
 
 while :; do
 	c=$(dd bs=1 count=1 2>/dev/null) || :
+	# EOF: dd succeeds with EMPTY output — break instead of busy-spinning
+	# (p0-council-r2 major 1). Tests only ever send a/s/Tab to F4; NUL and
+	# bare newline (the two byte values that also read back empty through
+	# command substitution) are never sent.
+	[ -n "$c" ] || break
 	if [ "$c" = a ]; then
 		printf '\033[3;3H\033[38;2;220;40;40m█\033[0m'
 		printf '\033[6;11H\033[1;38;2;40;200;80mA-PRESSED\033[0m'
