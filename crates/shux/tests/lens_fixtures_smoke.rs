@@ -46,7 +46,22 @@ fn f2_spinner_advances_and_signals_ready() {
     }
     h.send_line_token(&f.pane_id, "R");
     h.wait_for(&f.pane_id, "READY", 5_000).expect("F2 READY");
-    assert!(h.capture_text(&f.pane_id).contains("READY"));
+    let ready_text = h.capture_text(&f.pane_id);
+    assert!(ready_text.contains("READY"));
+
+    // p0-council-r1 minor 12: after READY the fixture drains further stdin
+    // SILENTLY — more tokens must not change a single cell. Bounded negative
+    // check: poll for any divergence from the READY frame and require none.
+    for _ in 0..5 {
+        h.send_line_token(&f.pane_id, "");
+    }
+    let changed = wait_until(std::time::Duration::from_millis(1_000), || {
+        h.capture_text(&f.pane_id) != ready_text
+    });
+    assert!(
+        !changed,
+        "F2: output changed after READY — post-READY tokens must be drained silently"
+    );
     h.kill_session(&f.session_id);
 }
 
@@ -55,14 +70,31 @@ fn f3_flip_alternates_frames_and_colours() {
     let h = Harness::new();
     let f = h.launch_fixture("f3_flip.sh", 80, 24, "AAAAAAAAAA");
     let (png_a, cw, ch) = h.snapshot_png(&f.pane_id);
-    assert_eq!(classify_frame(probe_cell_bg(&png_a, 0, 0, cw, ch)), 'A');
+    assert_eq!(
+        classify_frame_exact(probe_cell_bg(&png_a, 0, 0, cw, ch), 0),
+        'A'
+    );
 
     // One token flips to frame B.
     h.send_line_token(&f.pane_id, "");
     h.wait_for(&f.pane_id, "BBBBBBBBBB", 5_000)
         .expect("F3 flip to B");
     let (png_b, _, _) = h.snapshot_png(&f.pane_id);
-    assert_eq!(classify_frame(probe_cell_bg(&png_b, 0, 0, cw, ch)), 'B');
+    assert_eq!(
+        classify_frame_exact(probe_cell_bg(&png_b, 0, 0, cw, ch), 0),
+        'B'
+    );
+    // Exact-color validation must hold on every probe row class G1 uses:
+    // rows 0/12 (truecolor) and 23 (basic ANSI palette).
+    let img_b = decode_png(&png_b);
+    assert_eq!(
+        classify_frame_exact(probe_cell_bg_img(&img_b, 40, 12, cw, ch), 12),
+        'B'
+    );
+    assert_eq!(
+        classify_frame_exact(probe_cell_bg_img(&img_b, 40, 23, cw, ch), 23),
+        'B'
+    );
     h.kill_session(&f.session_id);
 }
 

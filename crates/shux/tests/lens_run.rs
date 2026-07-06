@@ -1,4 +1,4 @@
-//! Red suite — scratch sessions + `lens.run` (§8 SPEC-E; R1–R7 from §12).
+//! Red suite — scratch sessions + `lens.run` (§8 SPEC-E; R1–R8 from §12).
 //!
 //! FROZEN after P0 (§16.2). Scratch is created ONLY by `lens.run` (DEC-21 /
 //! delta 6). Every test leads with an RPC-form `lens.run`, so in Phase P0 it
@@ -79,6 +79,23 @@ fn r1_scratch_lifecycle() {
         serde_json::from_slice(&out.stdout).expect("R1: lens run --wait JSON");
     assert_eq!(field(&j, "exit_code"), &serde_json::json!(42));
     assert!(field(&j, "pane_id").is_string());
+
+    // p0-council-r1 major 3: the CLI-created scratch obeys the SAME lifecycle —
+    // reaped within ttl+TOL with a reap(reason=exit) audit entry.
+    let cli_sid = field(&j, "session_id")
+        .as_str()
+        .expect("R1: --wait output carries session_id")
+        .to_string();
+    assert!(
+        wait_until(Duration::from_millis(1000 + LENS_TEST_TOL_MS), || !h
+            .session_listed(&cli_sid, true)),
+        "R1: CLI-created scratch must also vanish after ttl"
+    );
+    assert_eq!(
+        Harness::count_procs("f6_exit42.sh"),
+        0,
+        "R1: no fixture procs remain after the CLI run"
+    );
 }
 
 // R2 — hidden but authorized.
@@ -115,29 +132,43 @@ fn r2_hidden_but_authorized() {
     h.rpc_raw("session.kill", serde_json::json!({ "id": sid }));
 }
 
-// R3 ⇄ — PTY sizing truth.
+// R3 ⇄ — PTY sizing truth. One size via RPC lens.run, the other via the CLI
+// verb (p0-council-r1 major 3: both paths must size the PTY identically).
 #[test]
 fn r3_pty_sizing_truth() {
     let h = Harness::new();
+    let rel = Harness::fixture_rel("f7_winsize.sh");
 
-    for (cols, rows, want) in [(80u16, 24u16, "SIZE=24 80"), (120, 40, "SIZE=40 120")] {
-        let env = h.rpc_raw(
-            "lens.run",
-            serde_json::json!({ "argv": f_argv("f7_winsize.sh"), "cols": cols, "rows": rows }),
-        );
-        let r = env.expect_result("R3 lens.run rpc");
-        let sid = r["session_id"].as_str().expect("session_id").to_string();
-        let pane = r["pane_id"].as_str().expect("pane_id").to_string();
+    // RPC path at 80x24.
+    let env = h.rpc_raw(
+        "lens.run",
+        serde_json::json!({ "argv": f_argv("f7_winsize.sh"), "cols": 80, "rows": 24 }),
+    );
+    let r = env.expect_result("R3 lens.run rpc");
+    let sid = r["session_id"].as_str().expect("session_id").to_string();
+    let pane = r["pane_id"].as_str().expect("pane_id").to_string();
+    h.wait_for(&pane, "SIZE=24 80", 5_000)
+        .unwrap_or_else(|e| panic!("R3: F7 (rpc) never printed SIZE=24 80: {e}"));
+    let text = h.capture_text(&pane);
+    assert!(
+        text.lines().any(|l| l == "SIZE=24 80"),
+        "R3: captured text must contain the exact line SIZE=24 80\n{text}"
+    );
+    h.rpc_raw("session.kill", serde_json::json!({ "id": sid }));
 
-        h.wait_for(&pane, want, 5_000)
-            .unwrap_or_else(|e| panic!("R3: F7 never printed {want:?}: {e}"));
-        let text = h.capture_text(&pane);
-        assert!(
-            text.lines().any(|l| l == want),
-            "R3: captured text must contain the exact line {want:?}\n{text}"
-        );
-        h.rpc_raw("session.kill", serde_json::json!({ "id": sid }));
-    }
+    // CLI path at 120x40 (async form; ids parsed from the json envelope).
+    let cli = h.cli_envelope(&["lens", "run", "--size", "120x40", "--", "sh", &rel]);
+    let cr = cli.expect_result("R3 lens run cli");
+    let cli_sid = cr["session_id"].as_str().expect("session_id").to_string();
+    let cli_pane = cr["pane_id"].as_str().expect("pane_id").to_string();
+    h.wait_for(&cli_pane, "SIZE=40 120", 5_000)
+        .unwrap_or_else(|e| panic!("R3: F7 (cli) never printed SIZE=40 120: {e}"));
+    let text = h.capture_text(&cli_pane);
+    assert!(
+        text.lines().any(|l| l == "SIZE=40 120"),
+        "R3: captured text must contain the exact line SIZE=40 120\n{text}"
+    );
+    h.rpc_raw("session.kill", serde_json::json!({ "id": cli_sid }));
 }
 
 // R4 — orphan proof + waiter drop.
@@ -261,7 +292,69 @@ fn r5_live_resize() {
     );
     diff.expect_error_code(-32011, "R5: prior checkpoint invalidated by resize");
 
+    // ⇄ CLI twins (p0-council-r1 major 3): the CLI glance sees the new size;
+    // the CLI diff reports the invalidation envelope + exit 5.
+    let cli = h.cli_envelope(&["pane", "glance", &pane]);
+    let cg = cli.expect_result("R5 glance cli after resize");
+    assert_eq!(cg["cols"], 120, "R5: CLI glance cols after resize");
+    assert_eq!(cg["rows"], 40, "R5: CLI glance rows after resize");
+    let cli = h.cli_envelope(&["pane", "diff", &pane, "--since", &c.to_string()]);
+    cli.expect_error_code(-32011, "R5: CLI diff invalidated envelope");
+    assert_eq!(cli.exit_code, 5, "R5: CLI diff exit 5 on invalidated");
+
     h.rpc_raw("session.kill", serde_json::json!({ "id": sid }));
+}
+
+// R8 — spawn failure + bounds (LENS-R-040/045; p0-council-r1 major 9).
+#[test]
+fn r8_spawn_failure_and_bounds() {
+    let h = Harness::new();
+
+    // (a) RPC: argv[0] does not resolve → SPAWN_FAILED (-32014), and the
+    // scratch allocation is rolled back (no residual scratch), daemon healthy.
+    let env = h.rpc_raw(
+        "lens.run",
+        serde_json::json!({ "argv": ["/nonexistent-lens-binary"], "cols": 80, "rows": 24 }),
+    );
+    env.expect_error_code(-32014, "R8a rpc spawn failure");
+    let list = h.rpc_ok(
+        "session.list",
+        serde_json::json!({ "include_scratch": true }),
+    );
+    let residual = list["sessions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|s| s.get("scratch").and_then(|v| v.as_bool()) == Some(true))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(residual, 0, "R8a: failed spawn must roll back its scratch");
+    assert!(
+        h.system_health_ok(),
+        "R8a: daemon healthy after spawn failure"
+    );
+
+    // (a) CLI twin: exit 5 with the same error envelope.
+    let cli = h.cli_envelope(&["lens", "run", "--", "/nonexistent-lens-binary"]);
+    cli.expect_error_code(-32014, "R8a cli spawn failure envelope");
+    assert_eq!(cli.exit_code, 5, "R8a: CLI exit 5 on SPAWN_FAILED");
+
+    // (b) RPC: size below the [20,500]x[5,200] bounds → INVALID_PARAMS.
+    let env = h.rpc_raw(
+        "lens.run",
+        serde_json::json!({ "argv": f_argv("f1_static.sh"), "cols": 10, "rows": 3 }),
+    );
+    env.expect_error_code(-32602, "R8b rpc size below bounds");
+
+    // (b) CLI twin: usage / INVALID_PARAMS → exit 2.
+    let rel = Harness::fixture_rel("f1_static.sh");
+    let out = h.cli(&["lens", "run", "--size", "10x3", "--", "sh", &rel]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R8b: CLI exit 2 on size below bounds"
+    );
 }
 
 // R6 — quota.

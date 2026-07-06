@@ -50,7 +50,8 @@ fn g4_revision_is_not_graph_version() {
     let f = h.launch_fixture("f8_repaint.sh", 80, 24, "LENS-F8-REPAINT");
 
     let rev_first = h.content_revision(&f.session_id, &f.pane_id);
-    let ver_first = h.snapshot_pane_structural_version(&f.session_id, &f.pane_id);
+    let pane_ver_first = h.snapshot_pane_structural_version(&f.session_id, &f.pane_id);
+    let sess_ver_first = h.snapshot_session_structural_version(&f.session_id);
 
     // Five pure repaints — no splits/renames/resizes.
     for i in 0..5 {
@@ -60,15 +61,21 @@ fn g4_revision_is_not_graph_version() {
     }
 
     let rev_last = h.content_revision(&f.session_id, &f.pane_id);
-    let ver_last = h.snapshot_pane_structural_version(&f.session_id, &f.pane_id);
+    let pane_ver_last = h.snapshot_pane_structural_version(&f.session_id, &f.pane_id);
+    let sess_ver_last = h.snapshot_session_structural_version(&f.session_id);
 
     assert!(
         rev_last >= rev_first + 5,
         "G4: content_revision must climb by >=5 over five repaints ({rev_first} -> {rev_last})"
     );
+    // p0-council-r1 major 5: BOTH structural version levels must be unmoved.
     assert_eq!(
-        ver_first, ver_last,
-        "G4: structural version must NOT move on a pure repaint — revision is not graph version"
+        pane_ver_first, pane_ver_last,
+        "G4: PANE structural version must NOT move on a pure repaint"
+    );
+    assert_eq!(
+        sess_ver_first, sess_ver_last,
+        "G4: SESSION structural version must NOT move on a pure repaint"
     );
 
     h.kill_session(&f.session_id);

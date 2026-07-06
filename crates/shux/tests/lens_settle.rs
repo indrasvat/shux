@@ -1,4 +1,4 @@
-//! Red suite — `pane.wait_settled` (§6 SPEC-C; tests S1–S5 from §12).
+//! Red suite — `pane.wait_settled` (§6 SPEC-C; tests S1–S5, V1 from §12).
 //!
 //! FROZEN after P0 (§16.2). In Phase P0 `pane.wait_settled` is unregistered, so
 //! every test fails at its first settle call with `method_not_found (-32601)`.
@@ -80,26 +80,38 @@ fn s2_settle_flake_gate_100x() {
     }
 }
 
+/// Run one S3 check under its OWN pump whose lifetime is bound to the check
+/// (p0-council-r1 BLOCKER 1: a shared pump dying early would let a later check
+/// observe a quiet pane and false-green). The pump stops right after the check
+/// completes; its deadline (check timeout + 4s margin) only bounds the panic
+/// path so a P0 `-32601` panic cannot leave it spinning.
+fn s3_check_under_pump<T>(h: &Harness, pane_id: &str, check: impl FnOnce() -> T) -> T {
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // §16.1 exception: this sleep paces INPUT (a token every 100 ms), it
+        // never synchronises on output.
+        let pump = scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_millis(6_000);
+            while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+                h.send_line_token(pane_id, "");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let out = check();
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("pump");
+        out
+    })
+}
+
 // S3 — settle timeout under a continuous 100 ms input pump.
 #[test]
 fn s3_settle_timeout() {
     let h = Harness::new();
     let f = h.launch_fixture("f3_flip.sh", 80, 24, "AAAAAAAAAA");
 
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        // §16.1 exception: this sleep paces INPUT (a token every 100 ms), it
-        // never synchronises on output. The pump is deadline-bounded so it
-        // self-terminates even if the body panics (P0: `expect_result` panics
-        // on -32601 before `stop` is set — the pump must NOT spin forever).
-        let pump = scope.spawn(|| {
-            let deadline = Instant::now() + Duration::from_millis(3_000);
-            while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-                h.send_line_token(&f.pane_id, "");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
-
+    // RPC check under its own pump.
+    s3_check_under_pump(&h, &f.pane_id, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 2_000 }),
@@ -115,8 +127,11 @@ fn s3_settle_timeout() {
             (2_000..=2_000 + LENS_TEST_TOL_MS).contains(&waited),
             "S3: waited_ms {waited} out of [2000, 2000+{LENS_TEST_TOL_MS}]"
         );
+    });
 
-        // CLI twin exits 1 on timeout (settled=false).
+    // CLI twin under a FRESH pump that outlives the whole CLI call — it must
+    // also observe a never-quiet pane and exit 1.
+    s3_check_under_pump(&h, &f.pane_id, || {
         let out = h.cli(&[
             "pane",
             "wait-settled",
@@ -127,10 +142,60 @@ fn s3_settle_timeout() {
             "2s",
         ]);
         assert_eq!(out.status.code(), Some(1), "S3: CLI exit 1 on timeout");
-
-        stop.store(true, Ordering::Relaxed);
-        pump.join().expect("pump");
     });
+
+    h.kill_session(&f.session_id);
+}
+
+// V1 — wait_settled parameter validation (LENS-R-025; p0-council-r1 major 8).
+#[test]
+fn v1_wait_settled_param_validation() {
+    let h = Harness::new();
+    let f = h.launch_fixture("f1_static.sh", 80, 24, "दृश्यते");
+
+    // RPC: quiet_ms below the [10, 60_000] minimum → INVALID_PARAMS (-32602).
+    let env = h.rpc_raw(
+        "pane.wait_settled",
+        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 5, "timeout_ms": 10_000 }),
+    );
+    env.expect_error_code(-32602, "V1 rpc quiet below min");
+
+    // RPC: timeout_ms < quiet_ms violates timeout ∈ [quiet_ms, 600_000].
+    let env = h.rpc_raw(
+        "pane.wait_settled",
+        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 100 }),
+    );
+    env.expect_error_code(-32602, "V1 rpc timeout below quiet");
+
+    // CLI twins: usage / INVALID_PARAMS → exit 2 (§10 exit table).
+    let out = h.cli(&[
+        "pane",
+        "wait-settled",
+        &f.pane_id,
+        "--quiet",
+        "5ms",
+        "--timeout",
+        "10s",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "V1: CLI exit 2 on quiet below min"
+    );
+    let out = h.cli(&[
+        "pane",
+        "wait-settled",
+        &f.pane_id,
+        "--quiet",
+        "300ms",
+        "--timeout",
+        "100ms",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "V1: CLI exit 2 on timeout < quiet"
+    );
 
     h.kill_session(&f.session_id);
 }

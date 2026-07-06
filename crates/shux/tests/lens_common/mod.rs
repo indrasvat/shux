@@ -127,14 +127,20 @@ impl Harness {
     /// A `shux` command with the isolated XDG env and cwd == repo root (so
     /// repo-relative fixture paths resolve and the auto-started daemon inherits
     /// the repo root as its cwd).
+    ///
+    /// Deliberately does NOT set NO_COLOR/CLICOLOR (p0-council-r1 major 2): the
+    /// auto-started daemon inherits this environment and would propagate it to
+    /// every pane child, poisoning T-tier color assertions. No-color cases
+    /// inject NO_COLOR per-test (T3 `env` param); color cases assert its
+    /// absence via non-grayscale pixel checks.
     pub fn shux(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
         cmd.current_dir(&self.repo_root)
             .env("XDG_RUNTIME_DIR", self.runtime.path())
             .env("XDG_CONFIG_HOME", self.xdg_config.path())
             .env("XDG_STATE_HOME", self.xdg_state.path())
-            .env("NO_COLOR", "1")
-            .env("CLICOLOR", "0")
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR")
             .env("SHELL", "/bin/sh");
         cmd
     }
@@ -189,6 +195,43 @@ impl Harness {
     /// any RPC error — used only for pre-lens machinery.
     pub fn rpc_ok(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
         self.rpc_raw(method, params).expect_result(method)
+    }
+
+    /// Run a lens CLI subcommand with `--format json` and parse the raw RPC
+    /// `{result|error}` envelope it emits (§10: json format emits the raw RPC
+    /// result envelope). The CLI-parity twin of `rpc_raw` (M9). In Phase P0 the
+    /// lens subcommands do not exist, so clap rejects them — the panic message
+    /// carries stderr, rooting the failure in the missing CLI verb.
+    pub fn cli_envelope(&self, args: &[&str]) -> RpcEnvelope {
+        let mut full: Vec<&str> = vec!["--format", "json"];
+        full.extend_from_slice(args);
+        let out = self.cli(&full);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let exit_code = out.status.code().unwrap_or(-1);
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "shux {args:?}: stdout was not a JSON envelope (exit {exit_code}): {e}\n\
+                 stdout:\n{stdout}\nstderr:\n{}\n\
+                 (Phase-P0 red receipt: missing lens CLI verb — subcommand not implemented.)",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        let result = value.get("result").cloned();
+        let error = value.get("error").map(|e| RpcErr {
+            code: e.get("code").and_then(|v| v.as_i64()).unwrap_or(0),
+            message: e
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            data: e.get("data").cloned(),
+        });
+        RpcEnvelope {
+            result,
+            error,
+            exit_code,
+            raw_stdout: stdout,
+        }
     }
 
     // ── Fixture launch (ordinary session; §12 discipline) ────────────────
@@ -325,6 +368,23 @@ impl Harness {
             .as_u64()
             .unwrap_or_else(|| {
                 panic!("structural version not a u64 in session.snapshot pane entry")
+            })
+    }
+
+    /// The SESSION-level structural `version` as exposed by `session.snapshot`
+    /// (p0-council-r1 major 5: G4 asserts session AND pane versions unchanged).
+    /// P1 must expose it as a top-level `session_version` field.
+    pub fn snapshot_session_structural_version(&self, session_id: &str) -> u64 {
+        let snap = self.session_snapshot(session_id);
+        snap.get("session_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| {
+                panic!(
+                    "session.snapshot has no `session_version` u64 field — the P1 \
+                     LENS-R-006 surface must expose the session's structural version.\n\
+                     snapshot keys: {:?}",
+                    snap.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                )
             })
     }
 
@@ -489,24 +549,65 @@ fn collect_audit(dir: &Path, out: &mut Vec<serde_json::Value>) {
     }
 }
 
-/// RGBA pixel at the top-left interior of a grid cell (avoids the glyph, so it
-/// reads the cell BACKGROUND) using the raster's fixed cell metrics.
-pub fn probe_cell_bg(png: &[u8], col: u32, row: u32, cw: u32, ch: u32) -> (u8, u8, u8, u8) {
-    let img = image::load_from_memory(png).expect("decode png").to_rgba8();
+/// Decode a PNG once into an RGBA image (p0-council-r1 minor 14: decode once
+/// per glance, probe the decoded image many times).
+pub fn decode_png(png: &[u8]) -> image::RgbaImage {
+    image::load_from_memory(png).expect("decode png").to_rgba8()
+}
+
+/// RGBA pixel at the top-left interior of a grid cell of an already-decoded
+/// image (avoids the glyph, so it reads the cell BACKGROUND) using the
+/// raster's fixed cell metrics.
+pub fn probe_cell_bg_img(
+    img: &image::RgbaImage,
+    col: u32,
+    row: u32,
+    cw: u32,
+    ch: u32,
+) -> (u8, u8, u8, u8) {
     let x = (col * cw + 1).min(img.width().saturating_sub(1));
     let y = (row * ch + 1).min(img.height().saturating_sub(1));
     let p = img.get_pixel(x, y);
     (p[0], p[1], p[2], p[3])
 }
 
-/// Classify a background pixel as F3 frame 'A' (red) or 'B' (blue) by the
-/// dominant of the red/blue channels. Works for truecolor, 256 and basic reds
-/// and blues alike (G1 clarification: pixels identify frames by colour).
-pub fn classify_frame(rgb: (u8, u8, u8, u8)) -> char {
-    if rgb.0 as i32 > rgb.2 as i32 {
+/// One-shot convenience: decode + probe (single-probe call sites only).
+pub fn probe_cell_bg(png: &[u8], col: u32, row: u32, cw: u32, ch: u32) -> (u8, u8, u8, u8) {
+    probe_cell_bg_img(&decode_png(png), col, row, cw, ch)
+}
+
+/// F3's exact expected background RGB for frame `frame` at grid row `row`.
+/// F3 spreads backgrounds by row%3: truecolor / 256-color / basic ANSI. The
+/// 256 and basic values are the raster's pinned palette (indexed_to_rgb).
+pub fn f3_expected_bg(frame: char, row: u32) -> (u8, u8, u8) {
+    match (frame, row % 3) {
+        ('A', 0) => (190, 30, 40),  // 48;2;190;30;40
+        ('A', 1) => (255, 0, 0),    // 48;5;196 → xterm cube
+        ('A', 2) => (205, 49, 49),  // SGR 41 → palette index 1
+        ('B', 0) => (30, 60, 200),  // 48;2;30;60;200
+        ('B', 1) => (0, 0, 255),    // 48;5;21 → xterm cube
+        ('B', 2) => (36, 114, 200), // SGR 44 → palette index 4
+        _ => unreachable!("frame is 'A' or 'B'"),
+    }
+}
+
+/// Classify an F3 background probe as frame 'A' (red) or 'B' (blue) by EXACT
+/// expected RGB for that row (p0-council-r1 minor 13). Any other value is a
+/// hard failure — a torn/blended/wrong-color pixel must never silently
+/// classify as a frame.
+pub fn classify_frame_exact(rgba: (u8, u8, u8, u8), row: u32) -> char {
+    let rgb = (rgba.0, rgba.1, rgba.2);
+    if rgb == f3_expected_bg('A', row) {
         'A'
-    } else {
+    } else if rgb == f3_expected_bg('B', row) {
         'B'
+    } else {
+        panic!(
+            "F3 probe at row {row} read {rgba:?} — matches neither frame A {:?} nor \
+             frame B {:?} (torn or mis-rendered cell)",
+            f3_expected_bg('A', row),
+            f3_expected_bg('B', row)
+        )
     }
 }
 

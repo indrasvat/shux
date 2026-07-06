@@ -1,4 +1,4 @@
-//! Red suite — checkpoints + `pane.diff_since` (§7 SPEC-D; D1–D4, A1 from §12).
+//! Red suite — checkpoints + `pane.diff_since` (§7 SPEC-D; D1–D5, A1 from §12).
 //!
 //! FROZEN after P0 (§16.2). In Phase P0 `pane.glance` / `pane.checkpoint` /
 //! `pane.diff_since` are unregistered, so each test fails at its first lens
@@ -47,6 +47,35 @@ fn settle(h: &Harness, pane: &str, ctx: &str) {
     );
 }
 
+/// Zero-delta diff assertions shared by the D1 RPC and CLI twins.
+fn assert_zero_delta(d: &serde_json::Value, rev: u64, ctx: &str) {
+    assert_eq!(d["cells_changed"], 0, "{ctx}: cells_changed");
+    assert_eq!(d["regions"], serde_json::json!([]), "{ctx}: regions");
+    assert_eq!(
+        d["changed_row_text"],
+        serde_json::json!({}),
+        "{ctx}: row text"
+    );
+    assert_eq!(
+        d["cursor_moved"],
+        serde_json::Value::Bool(false),
+        "{ctx}: cursor"
+    );
+    assert_eq!(
+        d["regions_truncated"],
+        serde_json::Value::Bool(false),
+        "{ctx}: truncated"
+    );
+    // p0-council-r1 minor 15: from/to revision fields.
+    assert_eq!(d["from_revision"], rev, "{ctx}: from_revision");
+    assert_eq!(d["to_revision"], rev, "{ctx}: to_revision (no mutations)");
+    // Zero-delta bounding box is all zeros (delta 5).
+    assert_eq!(d["bounding_box"]["row_start"], 0, "{ctx}: bbox");
+    assert_eq!(d["bounding_box"]["col_start"], 0, "{ctx}: bbox");
+    assert_eq!(d["bounding_box"]["row_end"], 0, "{ctx}: bbox");
+    assert_eq!(d["bounding_box"]["col_end"], 0, "{ctx}: bbox");
+}
+
 // D1 ⇄ — diff zero delta.
 #[test]
 fn d1_diff_zero_delta() {
@@ -59,20 +88,71 @@ fn d1_diff_zero_delta() {
         "pane.diff_since",
         serde_json::json!({ "pane_id": f.pane_id, "since_revision": rev }),
     );
-    let d = env.expect_result("D1 diff");
+    let d = env.expect_result("D1 diff rpc");
+    assert_zero_delta(&d, rev, "D1 rpc");
 
-    assert_eq!(d["cells_changed"], 0);
-    assert_eq!(d["regions"], serde_json::json!([]));
-    assert_eq!(d["changed_row_text"], serde_json::json!({}));
-    assert_eq!(d["cursor_moved"], serde_json::Value::Bool(false));
-    assert_eq!(d["regions_truncated"], serde_json::Value::Bool(false));
-    // Zero-delta bounding box is all zeros (delta 5).
-    assert_eq!(d["bounding_box"]["row_start"], 0);
-    assert_eq!(d["bounding_box"]["col_start"], 0);
-    assert_eq!(d["bounding_box"]["row_end"], 0);
-    assert_eq!(d["bounding_box"]["col_end"], 0);
+    // ⇄ CLI twin, successful path (p0-council-r1 major 3): same zero delta,
+    // exit 0 (diff is data, not a verdict — §10).
+    let cli = h.cli_envelope(&["pane", "diff", &f.pane_id, "--since", &rev.to_string()]);
+    let cd = cli.expect_result("D1 diff cli");
+    assert_zero_delta(&cd, rev, "D1 cli");
+    assert_eq!(cli.exit_code, 0, "D1: CLI exit 0 on zero delta");
 
     h.kill_session(&f.session_id);
+}
+
+/// The exact FULL-WIDTH (80-cell) new text of F4's changed rows after `a`
+/// (p0-council-r1 major 4 / LENS-R-036: byte-stable full-width rows,
+/// trailing cells included — NO trim).
+fn f4_expected_row2() -> String {
+    let mut s = format!("{}█", " ".repeat(2));
+    while s.chars().count() < 80 {
+        s.push(' ');
+    }
+    s
+}
+
+fn f4_expected_row5() -> String {
+    let mut s = format!("{}A-PRESSED", " ".repeat(10));
+    while s.chars().count() < 80 {
+        s.push(' ');
+    }
+    s
+}
+
+/// Exact-delta diff assertions shared by the D2 RPC and CLI twins.
+fn assert_f4_exact_delta(d: &serde_json::Value, since: u64, ctx: &str) {
+    assert_eq!(d["cells_changed"], 10, "{ctx}: exactly 10 cells");
+    assert_eq!(d["regions"], f4_expected_regions(), "{ctx}: exact regions");
+    // p0-council-r1 minor 15: from/to revision fields.
+    assert_eq!(d["from_revision"], since, "{ctx}: from_revision");
+    assert!(
+        d["to_revision"].as_u64().is_some_and(|t| t > since),
+        "{ctx}: to_revision must exceed since_revision after `a`"
+    );
+
+    let rows = d["changed_row_text"].as_object().expect("changed_row_text");
+    let keys: std::collections::BTreeSet<&String> = rows.keys().collect();
+    let want: std::collections::BTreeSet<String> = ["2".to_string(), "5".to_string()].into();
+    assert_eq!(
+        keys,
+        want.iter().collect(),
+        "{ctx}: changed rows must be exactly {{2,5}}"
+    );
+    // Byte-exact FULL-WIDTH rows (major 4): trailing cells preserved, row
+    // width == pane width.
+    for (key, expected) in [("2", f4_expected_row2()), ("5", f4_expected_row5())] {
+        let actual = rows[key].as_str().expect("row text");
+        assert_eq!(
+            actual.chars().count(),
+            80,
+            "{ctx}: changed_row_text[{key}] must be full pane width (80 cells)"
+        );
+        assert_eq!(
+            actual, expected,
+            "{ctx}: changed_row_text[{key}] byte-exact"
+        );
+    }
 }
 
 // D2 ⇄ — diff exact delta.
@@ -89,27 +169,8 @@ fn d2_diff_exact_delta() {
         "pane.diff_since",
         serde_json::json!({ "pane_id": f.pane_id, "since_revision": r1, "heat_png": true }),
     );
-    let d = env.expect_result("D2 diff");
-
-    assert_eq!(d["cells_changed"], 10, "D2: exactly 10 cells");
-    assert_eq!(d["regions"], f4_expected_regions(), "D2: exact regions");
-
-    let rows = d["changed_row_text"].as_object().expect("changed_row_text");
-    let keys: std::collections::BTreeSet<&String> = rows.keys().collect();
-    let want: std::collections::BTreeSet<String> = ["2".to_string(), "5".to_string()].into();
-    assert_eq!(
-        keys,
-        want.iter().collect(),
-        "D2: changed rows must be exactly {{2,5}}"
-    );
-    assert_eq!(
-        rows["2"].as_str().map(str::trim_end),
-        Some(format!("{}█", " ".repeat(2)).as_str())
-    );
-    assert_eq!(
-        rows["5"].as_str().map(str::trim_end),
-        Some(format!("{}A-PRESSED", " ".repeat(10)).as_str())
-    );
+    let d = env.expect_result("D2 diff rpc");
+    assert_f4_exact_delta(&d, r1, "D2 rpc");
 
     // Heat PNG golden (mint per §16.3).
     use base64::Engine;
@@ -117,6 +178,32 @@ fn d2_diff_exact_delta() {
         .decode(d["heat_png_base64"].as_str().expect("heat png"))
         .expect("decode heat png");
     assert_png_golden(&h, &heat, "d2_heat.png");
+
+    // ⇄ CLI twin, successful path (p0-council-r1 major 3): the pane is still,
+    // so the CLI diff against the same checkpoint reports the same exact delta.
+    let cli = h.cli_envelope(&["pane", "diff", &f.pane_id, "--since", &r1.to_string()]);
+    let cd = cli.expect_result("D2 diff cli");
+    assert_f4_exact_delta(&cd, r1, "D2 cli");
+    assert_eq!(
+        cli.exit_code, 0,
+        "D2: CLI exit 0 (diff is data, not a verdict)"
+    );
+
+    // CLI heat-file surface: `--heat <path>` writes the heat PNG.
+    let heat_path = std::env::temp_dir().join(format!("lens_d2_heat_{}.png", unique()));
+    let out = h.cli(&[
+        "pane",
+        "diff",
+        &f.pane_id,
+        "--since",
+        &r1.to_string(),
+        "--heat",
+        heat_path.to_str().expect("tmp path utf8"),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "D2: CLI --heat exit 0");
+    let written = std::fs::read(&heat_path)
+        .unwrap_or_else(|e| panic!("D2: CLI --heat did not write {}: {e}", heat_path.display()));
+    assert_png_golden(&h, &written, "d2_heat.png");
 
     h.kill_session(&f.session_id);
 }
@@ -139,8 +226,11 @@ fn d3_stale_and_invalidated() {
         Some(serde_json::json!([c])),
         "D3a: STALE_REVISION must report available:[C]"
     );
-    let out = h.cli(&["pane", "diff", &f.pane_id, "--since", &(c + 1).to_string()]);
-    assert_eq!(out.status.code(), Some(5), "D3a: CLI exit 5 on stale");
+    // CLI twin (p0-council-r1 major 3): exit 5 AND the json-format error
+    // envelope carries the same code (§10: json emits the raw RPC envelope).
+    let cli = h.cli_envelope(&["pane", "diff", &f.pane_id, "--since", &(c + 1).to_string()]);
+    cli.expect_error_code(-32010, "D3a cli stale envelope");
+    assert_eq!(cli.exit_code, 5, "D3a: CLI exit 5 on stale");
 
     // (b) RESIZE_INVALIDATED -32011 after a resize (LENS-R-033 ordering).
     let c2 = checkpoint_revision(&h, &f.pane_id, "D3b checkpoint");
@@ -153,8 +243,9 @@ fn d3_stale_and_invalidated() {
         serde_json::json!({ "pane_id": f.pane_id, "since_revision": c2 }),
     );
     env.expect_error_code(-32011, "D3b diff invalidated");
-    let out = h.cli(&["pane", "diff", &f.pane_id, "--since", &c2.to_string()]);
-    assert_eq!(out.status.code(), Some(5), "D3b: CLI exit 5 on invalidated");
+    let cli = h.cli_envelope(&["pane", "diff", &f.pane_id, "--since", &c2.to_string()]);
+    cli.expect_error_code(-32011, "D3b cli invalidated envelope");
+    assert_eq!(cli.exit_code, 5, "D3b: CLI exit 5 on invalidated");
 
     h.kill_session(&f.session_id);
 }
@@ -189,6 +280,104 @@ fn d4_style_only_delta() {
         f4_expected_regions(),
         "D4: regions identical to D2 — style change == glyph change"
     );
+    // p0-council-r1 minor 15: from/to revision fields.
+    assert_eq!(d["from_revision"], rev, "D4: from_revision");
+    assert!(
+        d["to_revision"].as_u64().is_some_and(|t| t > rev),
+        "D4: to_revision must exceed the checkpoint after `s`"
+    );
+
+    h.kill_session(&f.session_id);
+}
+
+// D5 — checkpoint FIFO eviction + same-revision no-op (LENS-R-030/031, DEC-22;
+// p0-council-r1 major 7).
+#[test]
+fn d5_checkpoint_fifo_eviction_and_noop() {
+    let h = Harness::new();
+    let f = h.launch_fixture("f8_repaint.sh", 80, 24, "LENS-F8-REPAINT");
+
+    // Five checkpoints at five DISTINCT revisions (token + wait_for between).
+    let glyphs = b"0123456789";
+    let mut revs: Vec<u64> = Vec::new();
+    let mut evictions: Vec<Option<u64>> = Vec::new();
+    for i in 0..5 {
+        if i > 0 {
+            h.send_line_token(&f.pane_id, "");
+            h.wait_for(
+                &f.pane_id,
+                &format!("FRAME:{}", glyphs[i - 1] as char),
+                5_000,
+            )
+            .unwrap_or_else(|e| panic!("D5: repaint {i} never landed: {e}"));
+        }
+        let env = h.rpc_raw(
+            "pane.checkpoint",
+            serde_json::json!({ "pane_id": f.pane_id }),
+        );
+        let r = env.expect_result(&format!("D5 checkpoint #{i}"));
+        revs.push(r["revision"].as_u64().expect("checkpoint revision"));
+        evictions.push(r["evicted_revision"].as_u64());
+    }
+    let uniq: std::collections::BTreeSet<&u64> = revs.iter().collect();
+    assert_eq!(
+        uniq.len(),
+        5,
+        "D5: five checkpoints at five DISTINCT revisions"
+    );
+
+    // First four evict nothing; the 5th evicts the FIFO-oldest (the 1st).
+    for (i, ev) in evictions.iter().take(4).enumerate() {
+        assert_eq!(*ev, None, "D5: checkpoint #{i} must evict nothing");
+    }
+    assert_eq!(
+        evictions[4],
+        Some(revs[0]),
+        "D5: the 5th checkpoint must evict the FIFO-oldest (the 1st)"
+    );
+
+    // Diff against the evicted 1st → STALE_REVISION with exactly the 4 live.
+    let env = h.rpc_raw(
+        "pane.diff_since",
+        serde_json::json!({ "pane_id": f.pane_id, "since_revision": revs[0] }),
+    );
+    let err = env.expect_error_code(-32010, "D5 diff against evicted");
+    assert_eq!(
+        err.data.as_ref().and_then(|d| d.get("available")).cloned(),
+        Some(serde_json::json!([revs[1], revs[2], revs[3], revs[4]])),
+        "D5: available must list exactly the 4 live revisions"
+    );
+
+    // Re-checkpoint at the CURRENT revision with no intervening mutation:
+    // no-op — same revision back, nothing evicted (LENS-R-030).
+    let env = h.rpc_raw(
+        "pane.checkpoint",
+        serde_json::json!({ "pane_id": f.pane_id }),
+    );
+    let r = env.expect_result("D5 re-checkpoint no-op");
+    assert_eq!(
+        r["revision"].as_u64(),
+        Some(revs[4]),
+        "D5: same-revision re-checkpoint returns the same revision"
+    );
+    assert_eq!(
+        r["evicted_revision"],
+        serde_json::Value::Null,
+        "D5: same-revision re-checkpoint evicts nothing"
+    );
+
+    // The same 4 revisions are still diffable (minor 15: from_revision agrees).
+    for want in [revs[1], revs[2], revs[3], revs[4]] {
+        let env = h.rpc_raw(
+            "pane.diff_since",
+            serde_json::json!({ "pane_id": f.pane_id, "since_revision": want }),
+        );
+        let d = env.expect_result(&format!("D5 diff since {want}"));
+        assert_eq!(
+            d["from_revision"], want,
+            "D5: from_revision for live checkpoint"
+        );
+    }
 
     h.kill_session(&f.session_id);
 }

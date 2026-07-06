@@ -81,6 +81,13 @@ fn t1_nidhi_golden() {
         .expect("T1: nidhi drew the stashes");
     settle(&h, &pane, "T1 settle");
     let png = glance_png(&h, &pane, "T1 glance");
+    // p0-council-r1 major 2: this COLOR case must prove NO_COLOR is absent
+    // from the pane environment — a grayscale render means the harness (or
+    // daemon) leaked NO_COLOR into the scratch.
+    assert!(
+        !is_grayscale_png(&png),
+        "T1: truecolor nidhi render came out grayscale — NO_COLOR poisoning"
+    );
     assert_png_golden(&h, &png, "t1_nidhi_nerd_color_120x40.png");
 
     h.rpc_raw("session.kill", serde_json::json!({ "id": r["session_id"] }));
@@ -213,6 +220,15 @@ fn t3_nidhi_matrix() {
         h.wait_for(&pane, "विवेचक", 10_000).expect("T3: nidhi up");
         settle(&h, &pane, "T3 settle");
         let png = glance_png(&h, &pane, "T3 glance");
+        // p0-council-r1 major 2: color cells must PROVE NO_COLOR absence
+        // (non-grayscale pixels present); no-color cells prove the inverse.
+        if !cell.no_color {
+            assert!(
+                !is_grayscale_png(&png),
+                "T3: color render came out grayscale — NO_COLOR poisoning ({})",
+                cell.golden
+            );
+        }
         assert_png_golden(&h, &png, cell.golden);
         if cell.no_color {
             assert!(
