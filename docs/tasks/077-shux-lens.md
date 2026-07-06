@@ -112,3 +112,13 @@ a shared done-flag set after all glance threads join (outlives the slowest
 glance); 10k-token cap + 120s deadline are panic bounds only; joins collected
 non-panicking so the flag is always stored. (3) R8 CLI twin repeats the RPC
 twin's daemon-state assertions (zero residual scratch + health).
+
+## P0 phase-diff council round 3 (2026-07-05) — micro-fixes applied
+
+Codex CONVERGED (1 minor) + 1 live-found robustness bug: (1) count_procs
+substring match false-matched co-tenant processes whose argv merely mentioned a
+fixture filename (proven A/B under a parallel dootsabha run: 8/29 vs 10/27) —
+fixture spawns now use the absolute repo-root-anchored path and
+count_fixture_procs matches argv anchored at start (`sh <abs>/…/<script>`).
+(2) F4's empty-read-as-EOF conflation made explicit: normative input contract
+(a/s/Tab only; LF/NUL never sent) added to the fixture header and smoke test.

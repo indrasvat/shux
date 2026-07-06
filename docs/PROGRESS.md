@@ -104,6 +104,10 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-05 — test(lens): P0 council round-3 micro-fixes (task 077, In Progress)**
+- Fixed the count_procs argv false-match found under parallel load (a co-tenant review agent's prompt contained fixture filenames and the substring match counted it, flaking the F2/F7 EOF-exit proofs): fixture spawns now exec the absolute repo-root-anchored path and `count_fixture_procs` counts only processes whose argv BEGINS with `sh <abs>/.shux/fixtures/lens/<script>`.
+- Made F4's empty-read-as-EOF handling an explicit normative input contract (a/s/Tab only; bare LF and NUL — which also read back empty through command substitution — are never sent), documented in the fixture header and the smoke test.
+
 **2026-07-05 — test(lens): P0 council round-2 hardening (task 077, In Progress)**
 - Applied the P0 phase-diff council round-2 verdict (3 majors — PRD §A1): fixed the EOF busy-spin the PRD itself had prescribed (`while :; do read || :; done` spins at 100% CPU on EOF) — F1/F2/F5 blockers now drain via `cat >/dev/null`, F7 uses the POSIX signal-safe `while read -r _ || [ $? -gt 128 ]; do :; done` (SIGWINCH continues, EOF exits), F4's dd loop breaks on empty read; F2/F7 smoke tests extended to prove WINCH survival and EOF-exit with zero residual processes.
 - G1's pump now loops on a shared done-flag stored after all glance threads join (must outlive the slowest glance), with a 10k-token cap + 120s deadline purely as panic bounds; glance joins are collected non-panicking so the flag is always stored.
