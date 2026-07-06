@@ -1514,7 +1514,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 | 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
-| 077 | shux lens — give every agent eyes (P0: fixtures + red suite) | M3 | **In Progress** | 016, 017, 060, 064, 074 |
+| 077 | shux lens — give every agent eyes (P0: fixtures + red suite) | M3 | **Partial** (P0 done; P1–P6 pending) | 016, 017, 060, 064, 074 |
 
 ---
 

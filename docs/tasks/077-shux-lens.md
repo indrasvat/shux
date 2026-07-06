@@ -1,6 +1,6 @@
 # Task 077: shux lens — give every agent eyes
 
-**Status:** In Progress
+**Status:** Partial (P0 complete — fixtures + 27-test red suite + freeze guard landed; P1–P6 pending)
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 016, 017, 060, 064, 074
