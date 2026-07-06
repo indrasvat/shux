@@ -104,6 +104,11 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-05 — test(lens): P0 council round-1 hardening (task 077, In Progress)**
+- Applied the P0 phase-diff council verdict (1 blocker, 9 majors, 4 minors — PRD §A1): S3 pump-lifetime race fixed with per-check pump scopes; harness global NO_COLOR removed (T-tier color cases now assert non-grayscale, no-color cases inject per-test); CLI/RPC parity twins completed across G1/G2/G2w/D1/D2/D3/R1/R3/R5 incl. successful-path `pane diff` and `--png`/`--heat` file surfaces; D2 asserts byte-exact FULL-WIDTH rows; G4 checks session AND pane structural versions; three NEW red tests D5 (checkpoint FIFO eviction + same-revision no-op), V1 (settle param validation), R8 (spawn failure rollback + size bounds) — synthetic count 24→27.
+- check-lens-frozen.sh hardened: `git interpret-trailers --parse` with non-empty reason required, HEAD-itself shallow fallback, merge commits diffed against first parent (never skipped).
+- Hardening exposed a real fixture bug: PTY echo of token newlines scrolled/corrupted token-paced frames. All token-paced fixtures (F2/F3/F8/F9/F10) now set `stty -echo` like F4; F2 drains stdin silently post-READY and its smoke test proves frame stillness; F3 probes validated against exact raster palette RGB values.
+
 **2026-07-05 — feat(lens): P0 red suite + fixtures (task 077, In Progress)**
 - Started task 077 (shux lens). Phase P0 delivers ONLY fixtures + the complete RED test suite — zero feature/daemon/RPC code.
 - Fixtures `.shux/fixtures/lens/f1..f10` (§11): POSIX sh + printf, token-handshake paced (no sleeps), shellcheck-clean, each carrying truecolor + 256-color + basic-color content. Applied convergence deltas: F4 `s`-before-`a` no-op, F7 SIGWINCH-proof `while :; do read -r _ || :; done`.
