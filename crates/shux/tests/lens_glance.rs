@@ -108,13 +108,20 @@ fn g1_glance_atomicity_under_concurrent_flips() {
         // (≈4 KiB) only backpressures the pump until F3 (which reads
         // continuously) drains it, so the write can never wedge permanently.
         // The pump never inspects the glance handles.
+        // The pump returns its exit reason: true iff it stopped because the
+        // done-flag was set (PR #86 bot review — exiting via the cap/deadline
+        // panic bounds while done=false means late glances raced a QUIET pane
+        // and the atomicity claim was not actually exercised).
         let pump = scope.spawn(|| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             let mut sent = 0_u32;
-            while !done.load(Ordering::Relaxed)
-                && sent < 10_000
-                && std::time::Instant::now() < deadline
-            {
+            loop {
+                if done.load(Ordering::Relaxed) {
+                    break true; // stopped by flag — glances all finished first
+                }
+                if sent >= 10_000 || std::time::Instant::now() >= deadline {
+                    break false; // panic bound hit while glances still running
+                }
                 h.pump_line_tokens(&f.pane_id, 5);
                 sent += 5;
             }
@@ -142,7 +149,11 @@ fn g1_glance_atomicity_under_concurrent_flips() {
         rpc_joins.extend(rpc_handles.into_iter().map(|handle| handle.join()));
         cli_joins.extend(cli_handles.into_iter().map(|handle| handle.join()));
         done.store(true, Ordering::Relaxed);
-        pump.join().expect("pump thread");
+        let stopped_by_flag = pump.join().expect("pump thread");
+        assert!(
+            stopped_by_flag,
+            "G1: pump hit panic bounds before glances finished — atomicity not exercised"
+        );
     });
 
     // Every glance (both paths) must be an internally-consistent single frame.
