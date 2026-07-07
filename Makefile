@@ -393,7 +393,7 @@ test-lens-t: ## Run the lens T-tier real-TUI suite (§13; loud-skips absent bina
 
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
-	@bash scripts/check-lens-frozen.sh $(MSG)
+	@bash scripts/check-lens-frozen.sh "$(MSG)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Code Quality
