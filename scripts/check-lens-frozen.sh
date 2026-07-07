@@ -9,7 +9,10 @@
 # trailer with a NON-EMPTY reason, verified via `git interpret-trailers --parse`
 # (a body-grep would accept the string anywhere, including quoted text —
 # p0-council-r1 major 10). This catches silent assertion-weakening and helper
-# extraction (the helpers live under the frozen paths too).
+# extraction (the helpers live under the frozen paths too). All file listings
+# use --no-renames so a `git mv` of a frozen file OUT of the guarded prefix
+# decomposes into delete(old)+add(new) — the frozen-prefix delete is caught
+# instead of only the (unguarded) destination path (PR #86 bot review).
 #
 # Modes:
 #   check-lens-frozen.sh <commit-msg-file>
@@ -58,9 +61,9 @@ fail_frozen() {
 commit_frozen_files() {
 	local sha="$1"
 	if git rev-parse --verify --quiet "${sha}^1" >/dev/null; then
-		git diff --name-only "${sha}^1" "${sha}" | sgrep "${FROZEN_RE}"
+		git diff --no-renames --name-only "${sha}^1" "${sha}" | sgrep "${FROZEN_RE}"
 	else
-		git diff-tree --no-commit-id --name-only -r --root "${sha}" | sgrep "${FROZEN_RE}"
+		git diff-tree --no-renames --no-commit-id --name-only -r --root "${sha}" | sgrep "${FROZEN_RE}"
 	fi
 }
 
@@ -80,7 +83,7 @@ check_commit() {
 if [ "$#" -ge 1 ] && [ -n "${1:-}" ]; then
 	# ── commit-msg mode ────────────────────────────────────────────────
 	msg_file="$1"
-	touched="$(git diff --cached --name-only --diff-filter=ACMRD | sgrep "${FROZEN_RE}")"
+	touched="$(git diff --cached --no-renames --name-only --diff-filter=ACMRD | sgrep "${FROZEN_RE}")"
 	[ -n "${touched}" ] || exit 0
 	if ! has_trailer <"${msg_file}"; then
 		fail_frozen "staged commit touches frozen lens paths without a non-empty ${TRAILER_KEY}: trailer" "${touched}"
@@ -94,7 +97,7 @@ status=0
 base="${LENS_FROZEN_BASE:-origin/main}"
 if git rev-parse --verify --quiet "${base}" >/dev/null; then
 	range="${base}..HEAD"
-	any_touch="$(git diff --name-only "${range}" -- 2>/dev/null | sgrep "${FROZEN_RE}")"
+	any_touch="$(git diff --no-renames --name-only "${range}" -- 2>/dev/null | sgrep "${FROZEN_RE}")"
 	if [ -n "${any_touch}" ]; then
 		# rev-list includes merge commits; check_commit diffs them against
 		# their first parent (never skipped).
