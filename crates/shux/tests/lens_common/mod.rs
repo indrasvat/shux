@@ -357,8 +357,20 @@ impl Harness {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .expect("decode pane png");
-        let cw = snap["cell_width"].as_u64().unwrap_or(0) as u32;
-        let ch = snap["cell_height"].as_u64().unwrap_or(0) as u32;
+        // Hard-assert the cell metrics (PR #86 bot review): a silent 0 would
+        // pin every pixel probe to x=0/y=0 and fake-classify frames.
+        let cw = snap["cell_width"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("pane.snapshot missing cell_width: {snap}"))
+            as u32;
+        let ch = snap["cell_height"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("pane.snapshot missing cell_height: {snap}"))
+            as u32;
+        assert!(
+            cw > 0 && ch > 0,
+            "pane.snapshot reported zero cell metrics (cw={cw}, ch={ch}) — pixel probes would all pin to origin"
+        );
         (bytes, cw, ch)
     }
 
