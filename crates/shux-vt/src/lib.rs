@@ -2711,6 +2711,36 @@ mod content_revision_tests {
         assert!(vt.last_mutation_ns() >= 1);
     }
 
+    // Council major 3 — a combining mark whose target cell is BLANK commits
+    // no write and must not bump: row ACCESS is not a write. (Before the
+    // fix, append_zero_width_scalar took the tally-bumping mutable row and
+    // then returned without writing.)
+    #[test]
+    fn combining_mark_on_blank_no_bump() {
+        let mut vt = vt();
+        vt.process(b"\x1b[1;6H"); // park cursor at col 6 (Class-A bump)
+        let cursor = (vt.cursor().row, vt.cursor().col);
+        let r = vt.content_revision();
+        vt.process("\u{0301}".as_bytes()); // combining acute; preceding cell blank
+        assert_eq!(
+            (vt.cursor().row, vt.cursor().col),
+            cursor,
+            "zero-width scalar must not move the cursor"
+        );
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // Companion guard: the same combining mark ON A REAL GLYPH does commit a
+    // write and must bump (the major-3 fix must not swallow real joins).
+    #[test]
+    fn combining_mark_on_glyph_bumps() {
+        let mut vt = vt();
+        vt.process(b"e");
+        let r = vt.content_revision();
+        vt.process("\u{0301}".as_bytes()); // e + combining acute → é
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
     // §4.2 Class B — cursor style/shape change DECSCUSR (no bump).
     #[test]
     fn class_b_decscusr_no_bump() {

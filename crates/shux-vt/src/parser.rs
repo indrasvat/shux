@@ -385,15 +385,22 @@ impl<'a> VtHandler<'a> {
         if row >= self.grid.rows() || col >= self.grid.cols() {
             return;
         }
+        // Peek immutably FIRST: taking the mutable row bumps the content
+        // tally (lens ContentRevision), and a combining mark landing on a
+        // blank or wide-continuation cell commits no write — access is not
+        // a write (lens council P1 major 3).
+        let will_write = self
+            .grid
+            .visible_row(row)
+            .get(col)
+            .is_some_and(|cell| !cell.is_wide_continuation() && cell.ch != ' ');
+        if !will_write {
+            return;
+        }
         {
             let row_ref = self.grid.visible_row_mut_marked(row);
-            if let Some(cell) = row_ref.cells.get_mut(col)
-                && !cell.is_wide_continuation()
-                && cell.ch != ' '
-            {
+            if let Some(cell) = row_ref.cells.get_mut(col) {
                 cell.append_grapheme_scalar(ch);
-            } else {
-                return;
             }
         }
         self.set_active_grapheme_cell(row, col);
