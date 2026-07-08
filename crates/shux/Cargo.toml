@@ -45,3 +45,49 @@ arc-swap = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# ── lens red suite (§12/§13) — SEPARATE TEST LANE ──────────────────────────
+# `test = false` keeps these daemon-backed integration tests out of the default
+# `cargo test` / `make test` (so `make check` stays clean while the suite is red
+# during P0–P5), while `make test-lens` / `make test-lens-t` run them EXPLICITLY
+# via `--test <name>`. This is NOT `#[ignore]`, NOT a cfg feature-gate, and NOT
+# a CI exclusion (they run in the dedicated lens CI lane) — see PRD §16.1.
+[[test]]
+name = "lens_fixtures_smoke"
+path = "tests/lens_fixtures_smoke.rs"
+test = false
+
+[[test]]
+name = "lens_glance"
+path = "tests/lens_glance.rs"
+test = false
+
+[[test]]
+name = "lens_revision"
+path = "tests/lens_revision.rs"
+test = false
+
+[[test]]
+name = "lens_settle"
+path = "tests/lens_settle.rs"
+test = false
+
+[[test]]
+name = "lens_diff"
+path = "tests/lens_diff.rs"
+test = false
+
+[[test]]
+name = "lens_run"
+path = "tests/lens_run.rs"
+test = false
+
+[[test]]
+name = "lens_loop"
+path = "tests/lens_loop.rs"
+test = false
+
+[[test]]
+name = "lens_ttier"
+path = "tests/lens_ttier.rs"
+test = false

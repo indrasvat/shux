@@ -369,6 +369,33 @@ spike-libghostty-zig: ## Install spike-local Zig 0.15.2 under .local/tools
 	fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Lens (separate red-suite lane — PRD §12/§13/§16)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# The lens integration tests carry `test = false` in crates/shux/Cargo.toml, so
+# `make test` / `make check` never run them (they are RED during P0–P5). These
+# dedicated targets run them EXPLICITLY, serially, under the leak guard.
+
+LENS_TESTS := --test lens_fixtures_smoke --test lens_glance --test lens_revision \
+	--test lens_settle --test lens_diff --test lens_run --test lens_loop
+
+.PHONY: test-lens
+test-lens: ## Run the lens synthetic red suite (§12) serially under the leak guard
+	@echo "$(COLOR_BLUE)▶ Running lens red suite (§12)...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast $(LENS_TESTS)
+
+.PHONY: test-lens-t
+test-lens-t: ## Run the lens T-tier real-TUI suite (§13; loud-skips absent binaries)
+	@echo "$(COLOR_BLUE)▶ Running lens T-tier suite (§13)...$(COLOR_RESET)"
+	@# --no-capture so the loud skip notice (§13) is visible when nidhi/vivecaka
+	@# are absent (nextest otherwise captures stderr of passing/skipping tests).
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --no-capture --test lens_ttier
+
+.PHONY: check-lens-frozen
+check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
+	@bash scripts/check-lens-frozen.sh "$(MSG)"
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Code Quality
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -394,7 +421,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint test test-shux-leak-guard test-agent-review-guard check-tui-qa ## Run lint + test + process/QA guards (what pre-commit runs)
+check: lint test test-shux-leak-guard test-agent-review-guard check-tui-qa check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""

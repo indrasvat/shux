@@ -104,6 +104,28 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-05 — test(lens): P0 council round-3 micro-fixes (task 077, In Progress)**
+- Fixed the count_procs argv false-match found under parallel load (a co-tenant review agent's prompt contained fixture filenames and the substring match counted it, flaking the F2/F7 EOF-exit proofs): fixture spawns now exec the absolute repo-root-anchored path and `count_fixture_procs` counts only processes whose argv BEGINS with `sh <abs>/.shux/fixtures/lens/<script>`.
+- Made F4's empty-read-as-EOF handling an explicit normative input contract (a/s/Tab only; bare LF and NUL — which also read back empty through command substitution — are never sent), documented in the fixture header and the smoke test.
+
+**2026-07-05 — test(lens): P0 council round-2 hardening (task 077, In Progress)**
+- Applied the P0 phase-diff council round-2 verdict (3 majors — PRD §A1): fixed the EOF busy-spin the PRD itself had prescribed (`while :; do read || :; done` spins at 100% CPU on EOF) — F1/F2/F5 blockers now drain via `cat >/dev/null`, F7 uses the POSIX signal-safe `while read -r _ || [ $? -gt 128 ]; do :; done` (SIGWINCH continues, EOF exits), F4's dd loop breaks on empty read; F2/F7 smoke tests extended to prove WINCH survival and EOF-exit with zero residual processes.
+- G1's pump now loops on a shared done-flag stored after all glance threads join (must outlive the slowest glance), with a 10k-token cap + 120s deadline purely as panic bounds; glance joins are collected non-panicking so the flag is always stored.
+- R8's CLI spawn-failure twin now repeats the RPC twin's daemon-state assertions (zero residual scratch entries + system health).
+
+**2026-07-05 — test(lens): P0 council round-1 hardening (task 077, In Progress)**
+- Applied the P0 phase-diff council verdict (1 blocker, 9 majors, 4 minors — PRD §A1): S3 pump-lifetime race fixed with per-check pump scopes; harness global NO_COLOR removed (T-tier color cases now assert non-grayscale, no-color cases inject per-test); CLI/RPC parity twins completed across G1/G2/G2w/D1/D2/D3/R1/R3/R5 incl. successful-path `pane diff` and `--png`/`--heat` file surfaces; D2 asserts byte-exact FULL-WIDTH rows; G4 checks session AND pane structural versions; three NEW red tests D5 (checkpoint FIFO eviction + same-revision no-op), V1 (settle param validation), R8 (spawn failure rollback + size bounds) — synthetic count 24→27.
+- check-lens-frozen.sh hardened: `git interpret-trailers --parse` with non-empty reason required, HEAD-itself shallow fallback, merge commits diffed against first parent (never skipped).
+- Hardening exposed a real fixture bug: PTY echo of token newlines scrolled/corrupted token-paced frames. All token-paced fixtures (F2/F3/F8/F9/F10) now set `stty -echo` like F4; F2 drains stdin silently post-READY and its smoke test proves frame stillness; F3 probes validated against exact raster palette RGB values.
+
+**2026-07-05 — feat(lens): P0 red suite + fixtures (task 077, In Progress)**
+- Started task 077 (shux lens). Phase P0 delivers ONLY fixtures + the complete RED test suite — zero feature/daemon/RPC code.
+- Fixtures `.shux/fixtures/lens/f1..f10` (§11): POSIX sh + printf, token-handshake paced (no sleeps), shellcheck-clean, each carrying truecolor + 256-color + basic-color content. Applied convergence deltas: F4 `s`-before-`a` no-op, F7 SIGWINCH-proof `while :; do read -r _ || :; done`.
+- 10 fixture smoke tests (`lens_fixtures_smoke.rs`) GREEN via existing machinery (session/pane CRUD, set_size, send-keys, capture, snapshot, pixel probes) — proving each fixture's contract, incl. F7 live-resize WINCH reprint.
+- 24-test red suite `crates/shux/tests/lens_*.rs` (G1,G2,G2w,G3,G4 · S1–S5 · D1–D4 · A1 · R1–R7 · K1 · E1) + RPC twins where marked ⇄. Black-box: drives only `shux rpc call` / CLI. Every lens test fails rooted in `-32601` (missing method) or a missing snapshot field — the red receipt. Pre-P5 tests use ordinary sessions; frozen local helpers under the test paths.
+- T-tier scaffolding (§13): `t/make_nidhi_repo.sh` (pinned 2020-01-01 dates, exactly 3 Devanagari/CJK/emoji stashes), `t/demo-app/` (standalone excluded ratatui crate with a seeded border break at col 80), tests T1–T4 with loud skip when `nidhi`/`vivecaka` absent.
+- Test integrity: `scripts/check-lens-frozen.sh` (§16.2 `LENS-TEST-CHANGE:` trailer guard) wired into lefthook `commit-msg` + `make check-lens-frozen` (in `check`). Red suite lives in a `test = false` Cargo lane so `make test`/`make check` stay clean while the suite is red; `make test-lens` / `test-lens-t` run it explicitly, serially, under the leak guard.
+
 **2026-06-29 — feat(plugin): add Sightline TUI QA plugin**
 - Completed task 076 with first-party local package `plugins/sightline/`; `bin/sightline` is the direct v1 product and `shux plugin install plugins/sightline` is explicit lifecycle smoke via `--plugin-host`.
 - Added deterministic Sightline checks for pane capture, PNG validity/dimensions/grid dimensions, nonblank pixels, truecolor/indexed/basic SGR emission and rendered color samples, keyboard delta probes, structured Markdown/JSON reports, and scratch evidence under `.shux/out/sightline/`.
@@ -1492,6 +1514,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 | 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
+| 077 | shux lens — give every agent eyes (P0: fixtures + red suite) | M3 | **Partial** (P0 done; P1–P6 pending) | 016, 017, 060, 064, 074 |
 
 ---
 
