@@ -2515,7 +2515,11 @@ fn parse_snapshot_dims(params: &serde_json::Value) -> Result<(u16, u16), shux_rp
 /// response (with `window_id` in place of `pane_id`).
 #[allow(clippy::too_many_arguments)]
 async fn snapshot_window(
-    gh: &shux_core::graph::GraphHandle,
+    // The caller's graph snapshot — taken ONCE and shared with any metadata
+    // the caller derives (lens council P1 major 5: session.snapshot's
+    // session_version/panes[] and the rendered window must come from the
+    // same snapshot, or concurrent structural mutation yields torn output).
+    snap: &shux_core::graph::SessionGraphSnapshot,
     io: &Arc<Mutex<PaneIoState>>,
     window_id: shux_core::model::WindowId,
     cols: u16,
@@ -2538,7 +2542,6 @@ async fn snapshot_window(
         )));
     }
 
-    let snap = gh.snapshot();
     let window = snap
         .windows
         .get(&window_id)
@@ -2592,7 +2595,7 @@ async fn snapshot_window(
     // (git branch, onboarding hint, theme, nerd-fonts toggle) IS still
     // populated, so PNGs honestly reflect the OOTB experience.
     let status_bar = build_snapshot_status_bar(
-        &snap,
+        snap,
         &window.session_id,
         window_id,
         cols,
@@ -4533,8 +4536,9 @@ fn register_pane_io_methods(
                         let params = params.unwrap_or_default();
                         let window_id = resolve_window_id_from_params(&gh, &params)?;
                         let (cols, rows) = parse_snapshot_dims(&params)?;
+                        let snap = gh.snapshot();
                         snapshot_window(
-                            &gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
+                            &snap, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
                         )
                         .await
                     }
@@ -4588,8 +4592,12 @@ fn register_pane_io_methods(
                             .filter_map(|pid| snap.panes.get(&pid).map(|p| (pid, p.version)))
                             .collect();
                         let (cols, rows) = parse_snapshot_dims(&params)?;
+                        // Council major 5: render from the SAME snapshot the
+                        // session_version/panes[] metadata above came from —
+                        // a second gh.snapshot() here could interleave with a
+                        // concurrent structural mutation and tear the result.
                         let mut result = snapshot_window(
-                            &gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
+                            &snap, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
                         )
                         .await?;
                         // Read content_revision for each pane under a single io
