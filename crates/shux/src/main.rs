@@ -4615,15 +4615,16 @@ fn register_pane_io_methods(
                                 })
                                 .collect()
                         };
-                        // A graph pane without a VT is unreachable by design
-                        // (VTs are created before session/pane creation returns
-                        // and removed only when the graph pane is destroyed).
-                        // If it ever happens, OMIT the entry rather than emit
-                        // content_revision: 0 — LENS-R-001 says the counter
-                        // starts at 1, so 0 is a lie. Skip-with-log matches
-                        // snapshot_window's established handling of VT-less
-                        // panes (filter_map over `state.vts`); debug builds
-                        // assert loudly (council major 4).
+                        // A graph pane without a VT is REACHABLE via a
+                        // snapshot/kill race (TOCTOU): the graph snapshot is a
+                        // point-in-time copy, so a pane killed between
+                        // `gh.snapshot()` and this PaneIoState read has its VT
+                        // already removed. Skip is the correct behavior — OMIT
+                        // the entry rather than emit content_revision: 0
+                        // (LENS-R-001 starts the counter at 1, so 0 is a lie),
+                        // matching snapshot_window's established filter_map
+                        // handling of VT-less panes. No assert: panicking on a
+                        // legitimate race is wrong (council claude-r2 major).
                         let panes_json: Vec<serde_json::Value> = pane_meta
                             .iter()
                             .filter_map(|(pid, version)| match content_revs.get(pid) {
@@ -4633,14 +4634,11 @@ fn register_pane_io_methods(
                                     "content_revision": rev,
                                 })),
                                 None => {
-                                    debug_assert!(
-                                        false,
-                                        "session.snapshot: graph pane {pid} has no VT"
-                                    );
                                     tracing::warn!(
                                         %pid,
-                                        "session.snapshot: graph pane has no VT; \
-                                         omitting from panes[] (never emit revision 0)"
+                                        "session.snapshot: graph pane has no VT \
+                                         (killed since snapshot); omitting from \
+                                         panes[] (never emit revision 0)"
                                     );
                                     None
                                 }
