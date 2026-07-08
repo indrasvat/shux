@@ -448,9 +448,11 @@ impl Grid {
 
     #[inline]
     fn bump_mutations(&mut self) {
-        // wrapping is unreachable in practice (u64 write ops); we never rely on
-        // the absolute value, only on before != after within one batch.
-        self.mutations = self.mutations.wrapping_add(1);
+        // saturating_add to match the spec's "never wraps" (PRD §4 / PR #87
+        // greptile P2) and record_class_a_batch's counter op. u64 exhaustion
+        // is unreachable in practice; the batch compare uses !=, so even a
+        // saturated tally only ever under-reports, never wraps backwards.
+        self.mutations = self.mutations.saturating_add(1);
     }
 
     /// Number of visible rows.
