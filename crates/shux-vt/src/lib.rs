@@ -2569,6 +2569,34 @@ mod content_revision_tests {
         assert_eq!(vt.content_revision(), r);
     }
 
+    // Convergence-round pin: resize while the ALTERNATE screen is live must
+    // bump. The bump is the explicit dims-compare in VirtualTerminal::resize()
+    // (record_class_a_batch on dims_changed) — independent of mark_all_dirty
+    // and of which grid is active.
+    #[test]
+    fn alt_screen_resize_bumps() {
+        let mut vt = vt();
+        vt.process(b"\x1b[?1049h");
+        assert!(vt.is_alternate_screen());
+        let r = vt.content_revision();
+        vt.resize(30, 100);
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // Convergence-round pin: a WIDTH change takes the column-reflow path
+    // (rows rewrap; content itself unchanged) and must bump — exactly once,
+    // because the VT-level dims-compare fires once per resize() call no
+    // matter how many rows the reflow rewrites.
+    #[test]
+    fn column_reflow_bumps() {
+        let mut vt = vt();
+        // A line long enough to rewrap when the width halves.
+        vt.process(b"the quick brown fox jumps over the lazy dog 0123456789");
+        let r = vt.content_revision();
+        vt.resize(24, 40); // cols 80 -> 40: reflow path
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
     // §4.2 Class A — "Full repaint with identical resulting cells". Writing the
     // same cell twice (cursor returned to origin each time so cursor state is
     // identical across batches) MUST bump per batch — proving the counter keys
