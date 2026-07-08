@@ -477,8 +477,14 @@ impl Grid {
     }
 
     /// Mark the full visible viewport dirty.
+    ///
+    /// Deliberately does NOT advance the content tally (`mutations()`): this is
+    /// generic RENDER invalidation, also fired by Class-B events (OSC 10/11/12
+    /// dynamic default colors, OSC 110/111/112 resets, OSC 4 palette
+    /// redefinition, sync-mode leave). Class-A repaints advance the tally
+    /// through their own write calls (RIS via `clear_visible`, repaints via
+    /// row writes) or are detected by the VT's alt-flag comparison.
     pub fn mark_all_dirty(&mut self) {
-        self.bump_mutations();
         self.dirty.mark_all();
     }
 

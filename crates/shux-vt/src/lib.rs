@@ -2635,6 +2635,45 @@ mod content_revision_tests {
         assert_eq!(vt.content_revision(), r);
     }
 
+    // §4.2 Class B (adjudicated) — OSC 10/11/12 dynamic default fg/bg/cursor
+    // color changes mark the viewport dirty (render invalidation) but MUST NOT
+    // bump ContentRevision (lens council P1 blocker).
+    #[test]
+    fn osc_10_11_12_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b]10;#ff8800\x07"); // default fg
+        vt.process(b"\x1b]11;rgb:00/2b/36\x07"); // default bg
+        vt.process(b"\x1b]12;#00ff00\x07"); // cursor color
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // §4.2 Class B (adjudicated) — OSC 110/111/112 dynamic-color RESETS are
+    // Class B too (they also fire mark_all_dirty when a color was set).
+    #[test]
+    fn osc_110_111_112_no_bump() {
+        let mut vt = vt();
+        // Set all three first so the resets actually take the invalidation path.
+        vt.process(b"\x1b]10;#ff8800\x07\x1b]11;#002b36\x07\x1b]12;#00ff00\x07");
+        let r = vt.content_revision();
+        vt.process(b"\x1b]110\x07");
+        vt.process(b"\x1b]111\x07");
+        vt.process(b"\x1b]112\x07");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // Guard for the mark_all_dirty decoupling: RIS (ESC c) is a real repaint
+    // (clears every visible cell) and must STILL bump — via clear_visible's
+    // own write tally, not via mark_all_dirty.
+    #[test]
+    fn ris_full_reset_still_bumps() {
+        let mut vt = vt();
+        vt.process(b"hello");
+        let r = vt.content_revision();
+        vt.process(b"\x1bc");
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
     // §4.2 Class B — cursor style/shape change DECSCUSR (no bump).
     #[test]
     fn class_b_decscusr_no_bump() {
