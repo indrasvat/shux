@@ -82,6 +82,11 @@ pub struct VirtualTerminal {
     /// INITIALIZED to pane-creation time so a fresh pane never reports
     /// "settled" before `quiet_ms` of genuine silence.
     last_mutation_ns: u64,
+    /// Class-A events occurred while synchronized output (CSI ?2026h) froze
+    /// the presentation. The revision bump is DEFERRED to mode release as ONE
+    /// batch (§4.2 adjudicated row): the counter tracks the PRESENTED frame,
+    /// matching `grid()`/`cursor()`'s frozen view.
+    sync_hidden_class_a: bool,
 }
 
 /// Process-monotonic nanoseconds since the first VT was created. Used for
@@ -128,6 +133,7 @@ impl VirtualTerminal {
             // seeded at creation so settle can't fire before real silence.
             content_revision: 1,
             last_mutation_ns: monotonic_now_ns(),
+            sync_hidden_class_a: false,
         }
     }
 
@@ -187,7 +193,17 @@ impl VirtualTerminal {
         let class_a = after_alt != before_alt
             || after_cursor != before_cursor
             || (before_alt == after_alt && self.grid.mutations() != before_writes);
-        if class_a {
+        // §4.2 (adjudicated, PR #87 bot P1): while synchronized output
+        // (CSI ?2026h) freezes the presentation, Class-A events must NOT bump
+        // immediately — the counter tracks the PRESENTED frame, matching
+        // grid()/cursor()'s frozen view. Defer: accumulate hidden events and
+        // record exactly ONE batch when the mode releases (nothing hidden →
+        // release records nothing).
+        if self.sync_present.is_some() {
+            if class_a {
+                self.sync_hidden_class_a = true;
+            }
+        } else if std::mem::take(&mut self.sync_hidden_class_a) || class_a {
             self.record_class_a_batch();
         }
         responses
@@ -2737,6 +2753,41 @@ mod content_revision_tests {
     fn monotonic_ns_never_zero() {
         let vt = vt();
         assert!(vt.last_mutation_ns() >= 1);
+    }
+
+    // §4.2 (adjudicated) — writes under synchronized output (CSI ?2026h) are
+    // hidden by the frozen presentation and must NOT bump; the bump is
+    // deferred to mode release as exactly ONE batch (revision tracks the
+    // PRESENTED frame, matching grid()/cursor()'s frozen view).
+    #[test]
+    fn sync_output_defers_bump() {
+        let mut vt = vt();
+        vt.process(b"\x1b[?2026h");
+        let r = vt.content_revision();
+        vt.process(b"hidden frame one");
+        vt.process(b"hidden frame two");
+        assert_eq!(
+            vt.content_revision(),
+            r,
+            "writes during synchronized output must not bump"
+        );
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(
+            vt.content_revision(),
+            r + 1,
+            "release must record the hidden writes as exactly ONE batch"
+        );
+    }
+
+    // §4.2 (adjudicated) — a 2026h/2026l cycle with NOTHING hidden in between
+    // presents the same frame it started with: no bump at all.
+    #[test]
+    fn sync_output_no_writes_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[?2026h");
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(vt.content_revision(), r);
     }
 
     // Council major 3 — a combining mark whose target cell is BLANK commits
