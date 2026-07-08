@@ -85,14 +85,15 @@ pub struct VirtualTerminal {
 }
 
 /// Process-monotonic nanoseconds since the first VT was created. Used for
-/// `last_mutation_ns` (lens settle substrate). Monotonic and never 0 for any
-/// mutation that happens after the reference instant is established.
+/// `last_mutation_ns` (lens settle substrate). Clamped to ≥1: LENS-R-002 says
+/// never 0, but the caller that INITIALIZES the epoch (the first
+/// `VirtualTerminal::new()` in the process) would otherwise read elapsed == 0.
 fn monotonic_now_ns() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
+    (start.elapsed().as_nanos() as u64).max(1)
 }
 
 impl VirtualTerminal {
@@ -2672,6 +2673,42 @@ mod content_revision_tests {
         let r = vt.content_revision();
         vt.process(b"\x1bc");
         assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // Council addendum — OSC 4 palette redefinition also fires mark_all_dirty
+    // and is Class B (dynamic-color metadata; no cell write): no bump.
+    // (OSC 104 palette reset is not handled by the parser, so only the set
+    // path exists to test.)
+    #[test]
+    fn osc_4_palette_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b]4;1;#ff0000\x07");
+        vt.process(b"\x1b]4;4;rgb:24/72/c8\x07");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // Council addendum — DOCUMENTED semantics, not adjudicated correctness:
+    // alt-screen enter+leave within ONE process() batch nets to zero (same
+    // alt flag, same cursor, same primary-grid tally at the batch boundary)
+    // → NO bump. Consistent with the adjudicated net-zero-batch rule: batch
+    // boundaries compare end states; transient intra-batch states are not
+    // events. Flagged in the P1 report; revisit only via spec change.
+    #[test]
+    fn alt_screen_double_toggle_one_batch_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[?1049h\x1b[?1049l");
+        assert!(!vt.is_alternate_screen());
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // LENS-R-002 — last_mutation_ns is never 0, even for the VT whose
+    // construction initializes the monotonic epoch (clamped to >= 1).
+    #[test]
+    fn monotonic_ns_never_zero() {
+        let vt = vt();
+        assert!(vt.last_mutation_ns() >= 1);
     }
 
     // §4.2 Class B — cursor style/shape change DECSCUSR (no bump).
