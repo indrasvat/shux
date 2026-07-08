@@ -104,6 +104,13 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-08 — feat(lens): P1 ContentRevision substrate (task 077, P1 In Progress)**
+- Built the §4 SPEC-A substrate the council proved missing. `VirtualTerminal` now owns `content_revision: u64` (starts at 1, +1 per Class-A mutation BATCH — one per `process()`/`resize()` producing ≥1 Class-A event) and `last_mutation_ns: u64` (monotonic, seeded at pane creation).
+- Class-A detection is value-INDEPENDENT (identical repaints still bump — §4.2 "MUST NOT diff to decide"): a new monotonic `Grid::mutations()` write tally, bumped in every cell/scroll/clear/erase/insert/delete write, is compared before/after each `process()` batch alongside cursor pos/visibility and the alt-screen flag. Deliberately NOT `DirtyState` (never drained/coalesced → no lost-edge race vs an attached render client; LENS-R-004/§4.4). Zero render/compositor behavior change.
+- LENS-R-003: per-pane `tokio::sync::watch` publisher in `PaneIoState.revisions`, published in the same PTY-task critical section as the grid mutation, once per Class-A batch (`send_if_modified`). Same lifetime as the VT.
+- LENS-R-006: `session.snapshot` result gains top-level `session_version` (session structural version) and `panes: [{pane_id, version, content_revision}]`. Only public exposure of the counter until `pane.glance` (P2).
+- Gate: `make test-lens` → G3 + G4 GREEN via `session.snapshot`; 12 pass / 25 red, every red rooted in `-32601` (missing pane.glance/wait_settled/checkpoint/lens.run) or missing CLI verb — unchanged roots. L0: 20 shux-vt unit tests map every §4.2 table row. `make test-vt-corpus` byte-exact + `make test` (533 pass, 0 fail) untouched; clippy `-D warnings` clean; leak-guard clean, zero orphans.
+
 **2026-07-05 — test(lens): P0 council round-3 micro-fixes (task 077, In Progress)**
 - Fixed the count_procs argv false-match found under parallel load (a co-tenant review agent's prompt contained fixture filenames and the substring match counted it, flaking the F2/F7 EOF-exit proofs): fixture spawns now exec the absolute repo-root-anchored path and `count_fixture_procs` counts only processes whose argv BEGINS with `sh <abs>/.shux/fixtures/lens/<script>`.
 - Made F4's empty-read-as-EOF handling an explicit normative input contract (a/s/Tab only; bare LF and NUL — which also read back empty through command substitution — are never sent), documented in the fixture header and the smoke test.
@@ -1514,7 +1521,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 | 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
-| 077 | shux lens — give every agent eyes (P0: fixtures + red suite) | M3 | **Partial** (P0 done; P1–P6 pending) | 016, 017, 060, 064, 074 |
+| 077 | shux lens — give every agent eyes (P0: fixtures + red suite; P1: ContentRevision substrate) | M3 | **Partial** (P0 done; P1 In Progress — G3/G4 green; P2–P6 pending) | 016, 017, 060, 064, 074 |
 
 ---
 

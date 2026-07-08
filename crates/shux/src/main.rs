@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches};
 use shux_rpc::{Policy, Sensitivity};
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tracing_subscriber::EnvFilter;
 
 mod attach;
@@ -80,6 +80,16 @@ struct PaneRecorder {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Lens ContentRevision publication payload (PRD §4, LENS-R-003). Published on
+/// a per-pane `tokio::sync::watch` channel once per Class-A batch so late
+/// subscribers (`pane.wait_settled`, P3) always read the current value — no
+/// lost-edge races (a `watch`, deliberately NOT a `Notify`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneRevision {
+    pub content_revision: u64,
+    pub last_mutation_ns: u64,
+}
+
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
 ///
 /// This is the bridge between the RPC handlers and the per-pane PTY read loops.
@@ -106,6 +116,11 @@ pub struct PaneIoState {
     pub teardown_waiters: Vec<tokio::task::JoinHandle<()>>,
     /// Per-pane VirtualTerminal instances for capturing output.
     pub vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
+    /// Per-pane lens ContentRevision publishers (PRD §4, LENS-R-003). The
+    /// single-writer PTY task publishes `(content_revision, last_mutation_ns)`
+    /// here once per Class-A batch; `pane.wait_settled` (P3) subscribes. Same
+    /// lifetime as `vts` (created with the pane, removed only on destroy).
+    pub revisions: HashMap<shux_core::model::PaneId, watch::Sender<PaneRevision>>,
     /// Command execution engine for marker-based completion detection.
     pub cmd_engine: shux_pty::CommandEngine,
     /// Notify any attach-render loops that a pane's VT has new bytes to
@@ -138,6 +153,7 @@ impl PaneIoState {
             pty_done: HashMap::new(),
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),
+            revisions: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: Arc::new(tokio::sync::Notify::new()),
             event_bus: None,
@@ -186,9 +202,29 @@ impl PaneIoState {
             }
             if remove_vts {
                 self.vts.remove(pane_id);
+                // The revision publisher has the same lifetime as the VT;
+                // dropping the sender closes the watch for any settle waiter.
+                self.revisions.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)
+    }
+
+    /// Publish a pane's lens ContentRevision on its watch channel, but only when
+    /// `content_revision` advanced (LENS-R-003: once per Class-A batch; Class-B
+    /// no-op batches leave the value — and settle waiters — untouched). No-op
+    /// when the pane has no publisher (e.g. test-only VT inserts).
+    fn publish_revision(&self, pane_id: shux_core::model::PaneId, rev: PaneRevision) {
+        if let Some(tx) = self.revisions.get(&pane_id) {
+            tx.send_if_modified(|cur| {
+                if cur.content_revision != rev.content_revision {
+                    *cur = rev;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
     }
 }
 
@@ -423,13 +459,22 @@ async fn run_pane_pty_task(
                         tee_pane_recorders(&io_state, pane_id, data, &shutdown).await;
                         let (pulse, vt_title, bus_opt, terminal_responses) = {
                             let mut state = io_state.lock().await;
-                            let (vt_title, terminal_responses) =
+                            let (vt_title, terminal_responses, rev_state) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
                                     let responses = vt.process_with_responses(data);
-                                    (vt.title().map(|s| s.to_string()), responses)
+                                    let rev = PaneRevision {
+                                        content_revision: vt.content_revision(),
+                                        last_mutation_ns: vt.last_mutation_ns(),
+                                    };
+                                    (vt.title().map(|s| s.to_string()), responses, Some(rev))
                                 } else {
-                                    (None, Vec::new())
+                                    (None, Vec::new(), None)
                                 };
+                            // LENS-R-003: publish in the same critical section as
+                            // the grid mutation, once per Class-A batch.
+                            if let Some(rev) = rev_state {
+                                state.publish_revision(pane_id, rev);
+                            }
                             let output = String::from_utf8_lossy(data);
                             let _completed = state.cmd_engine.process_output(pane_id.0, &output);
                             (
@@ -578,8 +623,18 @@ async fn run_pane_pty_task(
                 }
                 let pulse = {
                     let mut state = io_state.lock().await;
-                    if let Some(vt) = state.vts.get_mut(&pane_id) {
+                    let rev_state = if let Some(vt) = state.vts.get_mut(&pane_id) {
                         vt.resize(req.size.rows as usize, req.size.cols as usize);
+                        Some(PaneRevision {
+                            content_revision: vt.content_revision(),
+                            last_mutation_ns: vt.last_mutation_ns(),
+                        })
+                    } else {
+                        None
+                    };
+                    // LENS-R-003: resize is Class-A — publish the bumped revision.
+                    if let Some(rev) = rev_state {
+                        state.publish_revision(pane_id, rev);
                     }
                     state.render_pulse.clone()
                 };
@@ -705,6 +760,16 @@ pub(crate) async fn spawn_pane_pty(
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let pane_shutdown = shutdown.child_token();
     let vt = shux_vt::VirtualTerminal::new(24, 80);
+    // LENS-R-003: seed the per-pane revision watch with the VT's initial
+    // (content_revision=1, last_mutation_ns=creation time). The initial
+    // receiver is dropped; P3 subscribers call `subscribe()` on the stored
+    // sender (send_if_modified still updates the retained value with no
+    // receivers attached).
+    let initial_rev = PaneRevision {
+        content_revision: vt.content_revision(),
+        last_mutation_ns: vt.last_mutation_ns(),
+    };
+    let (rev_tx, _rev_rx) = watch::channel(initial_rev);
 
     {
         let mut state = io_state.lock().await;
@@ -715,6 +780,7 @@ pub(crate) async fn spawn_pane_pty(
         state.resizers.insert(pane_id, resize_tx);
         state.pty_done.insert(pane_id, done_rx);
         state.vts.insert(pane_id, vt);
+        state.revisions.insert(pane_id, rev_tx);
     }
 
     tokio::spawn(run_pane_pty_task(
@@ -4508,11 +4574,63 @@ fn register_pane_io_methods(
                             shux_rpc::RpcError::not_found("session", session_id_str)
                         })?;
                         let window_id = session.active_window;
+                        // LENS-R-006 (P1): collect every pane in the session with
+                        // its structural entity `version`. The `content_revision`
+                        // (§4 substrate) is read from each pane's VT below. This is
+                        // the ONLY public exposure of the counter until pane.glance
+                        // ships in P2 — it is what lets G3/G4 go green.
+                        let session_version: u64 = session.version;
+                        let pane_meta: Vec<(shux_core::model::PaneId, u64)> = session
+                            .windows
+                            .iter()
+                            .filter_map(|wid| snap.windows.get(wid))
+                            .flat_map(|win| win.layout.tree.pane_ids())
+                            .filter_map(|pid| snap.panes.get(&pid).map(|p| (pid, p.version)))
+                            .collect();
                         let (cols, rows) = parse_snapshot_dims(&params)?;
-                        snapshot_window(
+                        let mut result = snapshot_window(
                             &gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
                         )
-                        .await
+                        .await?;
+                        // Read content_revision for each pane under a single io
+                        // lock (a plain read — never touches DirtyState or any
+                        // render-consumed state; LENS-R-004).
+                        let content_revs: std::collections::HashMap<
+                            shux_core::model::PaneId,
+                            u64,
+                        > = {
+                            let state = io.lock().await;
+                            pane_meta
+                                .iter()
+                                .map(|(pid, _)| {
+                                    let rev = state
+                                        .vts
+                                        .get(pid)
+                                        .map(|vt| vt.content_revision())
+                                        .unwrap_or(0);
+                                    (*pid, rev)
+                                })
+                                .collect()
+                        };
+                        let panes_json: Vec<serde_json::Value> = pane_meta
+                            .iter()
+                            .map(|(pid, version)| {
+                                serde_json::json!({
+                                    "pane_id": pid.to_string(),
+                                    "version": version,
+                                    "content_revision":
+                                        content_revs.get(pid).copied().unwrap_or(0),
+                                })
+                            })
+                            .collect();
+                        if let Some(obj) = result.as_object_mut() {
+                            obj.insert(
+                                "session_version".to_string(),
+                                serde_json::json!(session_version),
+                            );
+                            obj.insert("panes".to_string(), serde_json::json!(panes_json));
+                        }
+                        Ok(result)
                     }
                 }
             },
