@@ -4602,25 +4602,40 @@ fn register_pane_io_methods(
                             let state = io.lock().await;
                             pane_meta
                                 .iter()
-                                .map(|(pid, _)| {
-                                    let rev = state
-                                        .vts
-                                        .get(pid)
-                                        .map(|vt| vt.content_revision())
-                                        .unwrap_or(0);
-                                    (*pid, rev)
+                                .filter_map(|(pid, _)| {
+                                    state.vts.get(pid).map(|vt| (*pid, vt.content_revision()))
                                 })
                                 .collect()
                         };
+                        // A graph pane without a VT is unreachable by design
+                        // (VTs are created before session/pane creation returns
+                        // and removed only when the graph pane is destroyed).
+                        // If it ever happens, OMIT the entry rather than emit
+                        // content_revision: 0 — LENS-R-001 says the counter
+                        // starts at 1, so 0 is a lie. Skip-with-log matches
+                        // snapshot_window's established handling of VT-less
+                        // panes (filter_map over `state.vts`); debug builds
+                        // assert loudly (council major 4).
                         let panes_json: Vec<serde_json::Value> = pane_meta
                             .iter()
-                            .map(|(pid, version)| {
-                                serde_json::json!({
+                            .filter_map(|(pid, version)| match content_revs.get(pid) {
+                                Some(rev) => Some(serde_json::json!({
                                     "pane_id": pid.to_string(),
                                     "version": version,
-                                    "content_revision":
-                                        content_revs.get(pid).copied().unwrap_or(0),
-                                })
+                                    "content_revision": rev,
+                                })),
+                                None => {
+                                    debug_assert!(
+                                        false,
+                                        "session.snapshot: graph pane {pid} has no VT"
+                                    );
+                                    tracing::warn!(
+                                        %pid,
+                                        "session.snapshot: graph pane has no VT; \
+                                         omitting from panes[] (never emit revision 0)"
+                                    );
+                                    None
+                                }
                             })
                             .collect();
                         if let Some(obj) = result.as_object_mut() {
