@@ -1,6 +1,6 @@
 # Task 077: shux lens — give every agent eyes
 
-**Status:** Partial (P0 complete — fixtures + 27-test red suite + freeze guard landed; P1–P6 pending)
+**Status:** Partial (P0 complete — fixtures + 27-test red suite + freeze guard landed; P1 In Progress; P2–P6 pending)
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 016, 017, 060, 064, 074
@@ -33,7 +33,7 @@ and `session.snapshot` pane entries gain `content_revision`). CLI mirrors RPC
 | Phase | Scope | Green gate | Extra DoD |
 |---|---|---|---|
 | **P0** | Fixtures + entire red suite + stubs (this task, current) | ALL §12 tests fail `method_not_found` / missing field (red receipt); fixture smoke tests green | PRD council convergence; cross-arch PNG spike (RESOLVED: shared goldens, §17); red receipt embedded; this task file |
-| **P1** | ContentRevision substrate (§4) | G3, G4 via `session.snapshot` + unit mutation-class table | no render-path behavior change (existing goldens byte-stable) |
+| **P1** _(In Progress)_ | ContentRevision substrate (§4) | G3, G4 via `session.snapshot` + unit mutation-class table | no render-path behavior change (existing goldens byte-stable) |
 | **P2** | `pane.glance` (§5) | G1, G2, G2w + determinism micro-test | SOLID VT QA (glance); goldens approved §16.3 |
 | **P3** | `pane.wait_settled` (§6) | S1–S5, V1 (incl. 100× S2) | — |
 | **P4** | checkpoints + `pane.diff_since` (§7) | D1–D5, A1 + attached-client concurrency | SOLID VT QA (heat) |

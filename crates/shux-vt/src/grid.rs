@@ -399,6 +399,13 @@ pub struct Grid {
     config: GridConfig,
     /// Dirty visible viewport state.
     dirty: DirtyState,
+    /// Value-INDEPENDENT monotonic write tally (lens ContentRevision substrate,
+    /// PRD §4). Bumped on every cell/scroll/erase/clear write regardless of
+    /// whether the resulting value changed, so identical repaints still count
+    /// (§4.2 "MUST NOT diff to decide"). Deliberately NOT `DirtyState`: it is
+    /// never drained/coalesced, so a concurrently attached render client that
+    /// drains dirty regions cannot make a lens reader miss a write (§4.4).
+    mutations: u64,
 }
 
 impl Clone for Grid {
@@ -409,6 +416,7 @@ impl Clone for Grid {
             cols: self.cols,
             config: self.config.clone(),
             dirty: DirtyState::new(self.rows, self.config.track_dirty),
+            mutations: self.mutations,
         }
     }
 }
@@ -426,7 +434,25 @@ impl Grid {
             cols,
             dirty: DirtyState::new(rows, config.track_dirty),
             config,
+            mutations: 0,
         }
+    }
+
+    /// Monotonic count of cell/scroll/clear write operations on this grid
+    /// (lens ContentRevision substrate, PRD §4). Value-independent: identical
+    /// repaints still advance it. The VT compares this before/after a
+    /// `process()` batch to decide a Class-A bump; it is never drained.
+    pub fn mutations(&self) -> u64 {
+        self.mutations
+    }
+
+    #[inline]
+    fn bump_mutations(&mut self) {
+        // saturating_add to match the spec's "never wraps" (PRD §4 / PR #87
+        // greptile P2) and record_class_a_batch's counter op. u64 exhaustion
+        // is unreachable in practice; the batch compare uses !=, so even a
+        // saturated tally only ever under-reports, never wraps backwards.
+        self.mutations = self.mutations.saturating_add(1);
     }
 
     /// Number of visible rows.
@@ -453,6 +479,13 @@ impl Grid {
     }
 
     /// Mark the full visible viewport dirty.
+    ///
+    /// Deliberately does NOT advance the content tally (`mutations()`): this is
+    /// generic RENDER invalidation, also fired by Class-B events (OSC 10/11/12
+    /// dynamic default colors, OSC 110/111/112 resets, OSC 4 palette
+    /// redefinition, sync-mode leave). Class-A repaints advance the tally
+    /// through their own write calls (RIS via `clear_visible`, repaints via
+    /// row writes) or are detected by the VT's alt-flag comparison.
     pub fn mark_all_dirty(&mut self) {
         self.dirty.mark_all();
     }
@@ -495,11 +528,14 @@ impl Grid {
                 track_dirty: self.config.track_dirty,
             },
             dirty: DirtyState::new(self.rows, self.config.track_dirty),
+            // A read-only clone for snapshotting; the tally is irrelevant here.
+            mutations: 0,
         }
     }
 
     /// Mutably access a visible row (0 = top of visible area).
     pub fn visible_row_mut(&mut self, row: usize) -> RowMut<'_> {
+        self.bump_mutations();
         let idx = self.visible_abs_index(row);
         let mark_on_drop = self.dirty.should_mark_row(row, self.rows, self.cols);
         let row_ref = &mut self.raw[idx];
@@ -527,6 +563,7 @@ impl Grid {
     /// Parser hot paths use this to keep dirty tracking centralized in `Grid`
     /// without paying a drop-guard cost for every printable cell.
     pub(crate) fn visible_row_mut_marked(&mut self, row: usize) -> &mut Row {
+        self.bump_mutations();
         self.dirty.mark_row(row, self.rows, self.cols);
         self.visible_row_mut_untracked(row)
     }
@@ -553,6 +590,7 @@ impl Grid {
     /// The top line of the region moves into scrollback (if region starts at line 0).
     /// A new empty line appears at the bottom of the region.
     pub fn scroll_up(&mut self, region_top: usize, region_bottom: usize) {
+        self.bump_mutations();
         if region_top == 0 && region_bottom == self.rows - 1 {
             // Full-screen scroll: top line goes to scrollback.
             // We already have it in the VecDeque -- just add a new line at the bottom.
@@ -586,6 +624,7 @@ impl Grid {
     /// A new empty line appears at the top of the region.
     /// The bottom line of the region is discarded.
     pub fn scroll_down(&mut self, region_top: usize, region_bottom: usize) {
+        self.bump_mutations();
         let sb = self.scrollback_len();
         let abs_top = sb + region_top;
         let abs_bottom = sb + region_bottom;
@@ -605,6 +644,7 @@ impl Grid {
 
     /// Clear all visible rows (reset to empty with given background).
     pub fn clear_visible(&mut self, bg: Color) {
+        self.bump_mutations();
         let sb = self.scrollback_len();
         for i in sb..self.raw.len() {
             self.raw[i].reset(bg);
@@ -614,6 +654,7 @@ impl Grid {
 
     /// Clear rows from `start_row` to the end of the visible area.
     pub fn clear_below(&mut self, start_row: usize, bg: Color) {
+        self.bump_mutations();
         let sb = self.scrollback_len();
         for i in (sb + start_row)..self.raw.len() {
             self.raw[i].reset(bg);
@@ -624,6 +665,7 @@ impl Grid {
 
     /// Clear rows from the top of the visible area to `end_row` (inclusive).
     pub fn clear_above(&mut self, end_row: usize, bg: Color) {
+        self.bump_mutations();
         let sb = self.scrollback_len();
         for i in sb..=(sb + end_row) {
             self.raw[i].reset(bg);
@@ -948,6 +990,7 @@ fn append_reflowed_line(
 impl Grid {
     /// Erase `count` characters starting at `(row, col)` in the visible area.
     pub fn erase_chars(&mut self, row: usize, col: usize, count: usize, bg: Color) {
+        self.bump_mutations();
         let dirty = {
             let r = self.visible_row_mut_untracked(row);
             r.erase_chars_expanding_wide_pairs(col, count, bg)
@@ -960,6 +1003,7 @@ impl Grid {
     /// Insert `count` blank cells at `(row, col)`, shifting existing cells right.
     /// Cells that shift past the right edge are lost.
     pub fn insert_chars(&mut self, row: usize, col: usize, count: usize) {
+        self.bump_mutations();
         let r = self.visible_row_mut_untracked(row);
         let len = r.len();
         if col < len {
@@ -986,6 +1030,7 @@ impl Grid {
     /// Delete `count` cells at `(row, col)`, shifting remaining cells left.
     /// New cells at the right edge are blank.
     pub fn delete_chars(&mut self, row: usize, col: usize, count: usize) {
+        self.bump_mutations();
         let r = self.visible_row_mut_untracked(row);
         let len = r.len();
         let actual = count.min(len.saturating_sub(col));

@@ -3,6 +3,22 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-07-08 (task 077 lens P1 — ContentRevision):** Detecting a "content
+  changed" event in the VT write path without diffing cell values (identical
+  repaints MUST still bump) needs a value-INDEPENDENT signal. The clean solution
+  was a monotonic `Grid::mutations()` write tally, incremented in every grid
+  mutation method (cell write, scroll, clear, erase, insert/delete, mark-all)
+  regardless of the resulting value — then compared before/after each
+  `process()` batch, together with cursor position/visibility and the
+  alt-screen flag (which the §4.2 table names as "change" events, so comparing
+  them is legitimate, not forbidden cell-value diffing). Crucially this tally is
+  SEPARATE from `DirtyState`: DirtyState is drained/coalesced by the attach
+  render path, so a concurrently attached client would make a DirtyState-derived
+  counter miss frames. The alt-screen grid swap (`std::mem::replace` of
+  `self.grid`) means the mutations tally belongs to whichever grid is now live —
+  guard the before/after tally comparison with `before_alt == after_alt` and let
+  the alt-toggle be its own Class-A term. Batch granularity ("one bump per
+  `process()`") falls out for free from the single before/after comparison.
 - **2026-06-29 (task 075 plugin DX):** Plugin package validation must account
   for the daemon boundary. Directory installs should canonicalize the package
   root and entrypoint in the client before sending `plugin.install`, reject

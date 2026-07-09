@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches};
 use shux_rpc::{Policy, Sensitivity};
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tracing_subscriber::EnvFilter;
 
 mod attach;
@@ -80,6 +80,16 @@ struct PaneRecorder {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Lens ContentRevision publication payload (PRD §4, LENS-R-003). Published on
+/// a per-pane `tokio::sync::watch` channel once per Class-A batch so late
+/// subscribers (`pane.wait_settled`, P3) always read the current value — no
+/// lost-edge races (a `watch`, deliberately NOT a `Notify`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneRevision {
+    pub content_revision: u64,
+    pub last_mutation_ns: u64,
+}
+
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
 ///
 /// This is the bridge between the RPC handlers and the per-pane PTY read loops.
@@ -106,6 +116,11 @@ pub struct PaneIoState {
     pub teardown_waiters: Vec<tokio::task::JoinHandle<()>>,
     /// Per-pane VirtualTerminal instances for capturing output.
     pub vts: HashMap<shux_core::model::PaneId, shux_vt::VirtualTerminal>,
+    /// Per-pane lens ContentRevision publishers (PRD §4, LENS-R-003). The
+    /// single-writer PTY task publishes `(content_revision, last_mutation_ns)`
+    /// here once per Class-A batch; `pane.wait_settled` (P3) subscribes. Same
+    /// lifetime as `vts` (created with the pane, removed only on destroy).
+    pub revisions: HashMap<shux_core::model::PaneId, watch::Sender<PaneRevision>>,
     /// Command execution engine for marker-based completion detection.
     pub cmd_engine: shux_pty::CommandEngine,
     /// Notify any attach-render loops that a pane's VT has new bytes to
@@ -138,6 +153,7 @@ impl PaneIoState {
             pty_done: HashMap::new(),
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),
+            revisions: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: Arc::new(tokio::sync::Notify::new()),
             event_bus: None,
@@ -186,9 +202,29 @@ impl PaneIoState {
             }
             if remove_vts {
                 self.vts.remove(pane_id);
+                // The revision publisher has the same lifetime as the VT;
+                // dropping the sender closes the watch for any settle waiter.
+                self.revisions.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)
+    }
+
+    /// Publish a pane's lens ContentRevision on its watch channel, but only when
+    /// `content_revision` advanced (LENS-R-003: once per Class-A batch; Class-B
+    /// no-op batches leave the value — and settle waiters — untouched). No-op
+    /// when the pane has no publisher (e.g. test-only VT inserts).
+    fn publish_revision(&self, pane_id: shux_core::model::PaneId, rev: PaneRevision) {
+        if let Some(tx) = self.revisions.get(&pane_id) {
+            tx.send_if_modified(|cur| {
+                if cur.content_revision != rev.content_revision {
+                    *cur = rev;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
     }
 }
 
@@ -423,13 +459,22 @@ async fn run_pane_pty_task(
                         tee_pane_recorders(&io_state, pane_id, data, &shutdown).await;
                         let (pulse, vt_title, bus_opt, terminal_responses) = {
                             let mut state = io_state.lock().await;
-                            let (vt_title, terminal_responses) =
+                            let (vt_title, terminal_responses, rev_state) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
                                     let responses = vt.process_with_responses(data);
-                                    (vt.title().map(|s| s.to_string()), responses)
+                                    let rev = PaneRevision {
+                                        content_revision: vt.content_revision(),
+                                        last_mutation_ns: vt.last_mutation_ns(),
+                                    };
+                                    (vt.title().map(|s| s.to_string()), responses, Some(rev))
                                 } else {
-                                    (None, Vec::new())
+                                    (None, Vec::new(), None)
                                 };
+                            // LENS-R-003: publish in the same critical section as
+                            // the grid mutation, once per Class-A batch.
+                            if let Some(rev) = rev_state {
+                                state.publish_revision(pane_id, rev);
+                            }
                             let output = String::from_utf8_lossy(data);
                             let _completed = state.cmd_engine.process_output(pane_id.0, &output);
                             (
@@ -578,8 +623,18 @@ async fn run_pane_pty_task(
                 }
                 let pulse = {
                     let mut state = io_state.lock().await;
-                    if let Some(vt) = state.vts.get_mut(&pane_id) {
+                    let rev_state = if let Some(vt) = state.vts.get_mut(&pane_id) {
                         vt.resize(req.size.rows as usize, req.size.cols as usize);
+                        Some(PaneRevision {
+                            content_revision: vt.content_revision(),
+                            last_mutation_ns: vt.last_mutation_ns(),
+                        })
+                    } else {
+                        None
+                    };
+                    // LENS-R-003: resize is Class-A — publish the bumped revision.
+                    if let Some(rev) = rev_state {
+                        state.publish_revision(pane_id, rev);
                     }
                     state.render_pulse.clone()
                 };
@@ -705,6 +760,16 @@ pub(crate) async fn spawn_pane_pty(
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let pane_shutdown = shutdown.child_token();
     let vt = shux_vt::VirtualTerminal::new(24, 80);
+    // LENS-R-003: seed the per-pane revision watch with the VT's initial
+    // (content_revision=1, last_mutation_ns=creation time). The initial
+    // receiver is dropped; P3 subscribers call `subscribe()` on the stored
+    // sender (send_if_modified still updates the retained value with no
+    // receivers attached).
+    let initial_rev = PaneRevision {
+        content_revision: vt.content_revision(),
+        last_mutation_ns: vt.last_mutation_ns(),
+    };
+    let (rev_tx, _rev_rx) = watch::channel(initial_rev);
 
     {
         let mut state = io_state.lock().await;
@@ -715,6 +780,7 @@ pub(crate) async fn spawn_pane_pty(
         state.resizers.insert(pane_id, resize_tx);
         state.pty_done.insert(pane_id, done_rx);
         state.vts.insert(pane_id, vt);
+        state.revisions.insert(pane_id, rev_tx);
     }
 
     tokio::spawn(run_pane_pty_task(
@@ -2444,12 +2510,29 @@ fn parse_snapshot_dims(params: &serde_json::Value) -> Result<(u16, u16), shux_rp
     Ok((cols as u16, rows as u16))
 }
 
+/// One pane's render-clone payload, captured under the pane-IO lock:
+/// (id, grid clone with resolved defaults, cursor, dynamic default colors).
+type PaneSnapshotData = (
+    shux_core::model::PaneId,
+    shux_vt::Grid,
+    shux_vt::Cursor,
+    shux_vt::TerminalDefaultColors,
+);
+
+/// Per-pane lens ContentRevision map, captured in the SAME io-lock critical
+/// section as the grid clones (PR #87 bot P1: same-lock, no VT-side tear).
+type PaneRevisions = std::collections::HashMap<shux_core::model::PaneId, u64>;
+
 /// Compose every pane in `window_id` into a single ComposedFrame at
 /// `cols × rows`, rasterize it, and return the JSON `pane.snapshot`-shaped
 /// response (with `window_id` in place of `pane_id`).
 #[allow(clippy::too_many_arguments)]
 async fn snapshot_window(
-    gh: &shux_core::graph::GraphHandle,
+    // The caller's graph snapshot — taken ONCE and shared with any metadata
+    // the caller derives (lens council P1 major 5: session.snapshot's
+    // session_version/panes[] and the rendered window must come from the
+    // same snapshot, or concurrent structural mutation yields torn output).
+    snap: &shux_core::graph::SessionGraphSnapshot,
     io: &Arc<Mutex<PaneIoState>>,
     window_id: shux_core::model::WindowId,
     cols: u16,
@@ -2459,7 +2542,12 @@ async fn snapshot_window(
     meta_cache: &session_meta::SessionMetaCache,
     onboarding: &onboarding::OnboardingHandle,
     segments: &statusbar_runner::SegmentCache,
-) -> Result<serde_json::Value, shux_rpc::RpcError> {
+    // Pane ids whose `content_revision` must be captured in the SAME io-lock
+    // critical section as the VT grid clones (PR #87 bot P1: a second lock
+    // read at T2 let an old PNG pair with a newer revision). Returned as the
+    // second tuple element; pass `&[]` when revisions aren't needed.
+    revision_panes: &[shux_core::model::PaneId],
+) -> Result<(serde_json::Value, PaneRevisions), shux_rpc::RpcError> {
     let (cw, ch) = rasterizer.cell_size();
     let pixel_count = (cols as u64)
         .saturating_mul(cw as u64)
@@ -2472,7 +2560,6 @@ async fn snapshot_window(
         )));
     }
 
-    let snap = gh.snapshot();
     let window = snap
         .windows
         .get(&window_id)
@@ -2491,15 +2578,12 @@ async fn snapshot_window(
 
     // Snapshot just the (Grid, Cursor, dynamic colors) per pane under the io
     // lock — VT itself isn't Clone and we want to release the lock before
-    // rasterizing.
-    let pane_data: Vec<(
-        shux_core::model::PaneId,
-        shux_vt::Grid,
-        shux_vt::Cursor,
-        shux_vt::TerminalDefaultColors,
-    )> = {
+    // rasterizing. The caller's `revision_panes` content_revisions are read
+    // inside the SAME critical section so the rendered pixels and the
+    // published revisions are provably same-lock (no VT-side tear).
+    let (pane_data, revisions): (Vec<PaneSnapshotData>, PaneRevisions) = {
         let state = io.lock().await;
-        window
+        let pane_data = window
             .layout
             .tree
             .pane_ids()
@@ -2512,7 +2596,12 @@ async fn snapshot_window(
                     (pid, grid, vt.cursor().clone(), default_colors)
                 })
             })
-            .collect()
+            .collect();
+        let revisions = revision_panes
+            .iter()
+            .filter_map(|pid| state.vts.get(pid).map(|vt| (*pid, vt.content_revision())))
+            .collect();
+        (pane_data, revisions)
     };
 
     let focused = window.active_pane;
@@ -2526,7 +2615,7 @@ async fn snapshot_window(
     // (git branch, onboarding hint, theme, nerd-fonts toggle) IS still
     // populated, so PNGs honestly reflect the OOTB experience.
     let status_bar = build_snapshot_status_bar(
-        &snap,
+        snap,
         &window.session_id,
         window_id,
         cols,
@@ -2598,17 +2687,20 @@ async fn snapshot_window(
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
 
-    Ok(serde_json::json!({
-        "window_id": window_id.to_string(),
-        "png_base64": b64,
-        "width": img.width(),
-        "height": img.height(),
-        "cell_width": cw,
-        "cell_height": ch,
-        "cols": cols,
-        "rows": rows,
-        "format": "png",
-    }))
+    Ok((
+        serde_json::json!({
+            "window_id": window_id.to_string(),
+            "png_base64": b64,
+            "width": img.width(),
+            "height": img.height(),
+            "cell_width": cw,
+            "cell_height": ch,
+            "cols": cols,
+            "rows": rows,
+            "format": "png",
+        }),
+        revisions,
+    ))
 }
 
 fn resolve_grid_default_colors(grid: &mut shux_vt::Grid, defaults: shux_vt::TerminalDefaultColors) {
@@ -4467,10 +4559,22 @@ fn register_pane_io_methods(
                         let params = params.unwrap_or_default();
                         let window_id = resolve_window_id_from_params(&gh, &params)?;
                         let (cols, rows) = parse_snapshot_dims(&params)?;
-                        snapshot_window(
-                            &gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
+                        let snap = gh.snapshot();
+                        let (result, _revisions) = snapshot_window(
+                            &snap,
+                            &io,
+                            window_id,
+                            cols,
+                            rows,
+                            r,
+                            &cfg,
+                            &meta,
+                            &onb,
+                            &segs,
+                            &[],
                         )
-                        .await
+                        .await?;
+                        Ok(result)
                     }
                 }
             },
@@ -4508,11 +4612,86 @@ fn register_pane_io_methods(
                             shux_rpc::RpcError::not_found("session", session_id_str)
                         })?;
                         let window_id = session.active_window;
+                        // LENS-R-006 (P1): collect every pane in the session with
+                        // its structural entity `version`. The `content_revision`
+                        // (§4 substrate) is read from each pane's VT below. This is
+                        // the ONLY public exposure of the counter until pane.glance
+                        // ships in P2 — it is what lets G3/G4 go green.
+                        let session_version: u64 = session.version;
+                        let pane_meta: Vec<(shux_core::model::PaneId, u64)> = session
+                            .windows
+                            .iter()
+                            .filter_map(|wid| snap.windows.get(wid))
+                            .flat_map(|win| win.layout.tree.pane_ids())
+                            .filter_map(|pid| snap.panes.get(&pid).map(|p| (pid, p.version)))
+                            .collect();
                         let (cols, rows) = parse_snapshot_dims(&params)?;
-                        snapshot_window(
-                            &gh, &io, window_id, cols, rows, r, &cfg, &meta, &onb, &segs,
+                        // Council major 5: render from the SAME snapshot the
+                        // session_version/panes[] metadata above came from —
+                        // a second gh.snapshot() here could interleave with a
+                        // concurrent structural mutation and tear the result.
+                        //
+                        // PR #87 bot P1 (codex + greptile): content_revisions
+                        // are captured INSIDE snapshot_window's io-lock clone
+                        // pass — the same critical section that clones the VT
+                        // grids for rendering — so pixels and revisions are
+                        // provably same-lock (a second lock read here let an
+                        // old PNG pair with a newer revision). Plain reads:
+                        // never touches DirtyState or render-consumed state
+                        // (LENS-R-004).
+                        let revision_pane_ids: Vec<shux_core::model::PaneId> =
+                            pane_meta.iter().map(|(pid, _)| *pid).collect();
+                        let (mut result, content_revs) = snapshot_window(
+                            &snap,
+                            &io,
+                            window_id,
+                            cols,
+                            rows,
+                            r,
+                            &cfg,
+                            &meta,
+                            &onb,
+                            &segs,
+                            &revision_pane_ids,
                         )
-                        .await
+                        .await?;
+                        // A graph pane without a VT is REACHABLE via a
+                        // snapshot/kill race (TOCTOU): the graph snapshot is a
+                        // point-in-time copy, so a pane killed between
+                        // `gh.snapshot()` and this PaneIoState read has its VT
+                        // already removed. Skip is the correct behavior — OMIT
+                        // the entry rather than emit content_revision: 0
+                        // (LENS-R-001 starts the counter at 1, so 0 is a lie),
+                        // matching snapshot_window's established filter_map
+                        // handling of VT-less panes. No assert: panicking on a
+                        // legitimate race is wrong (council claude-r2 major).
+                        let panes_json: Vec<serde_json::Value> = pane_meta
+                            .iter()
+                            .filter_map(|(pid, version)| match content_revs.get(pid) {
+                                Some(rev) => Some(serde_json::json!({
+                                    "pane_id": pid.to_string(),
+                                    "version": version,
+                                    "content_revision": rev,
+                                })),
+                                None => {
+                                    tracing::warn!(
+                                        %pid,
+                                        "session.snapshot: graph pane has no VT \
+                                         (killed since snapshot); omitting from \
+                                         panes[] (never emit revision 0)"
+                                    );
+                                    None
+                                }
+                            })
+                            .collect();
+                        if let Some(obj) = result.as_object_mut() {
+                            obj.insert(
+                                "session_version".to_string(),
+                                serde_json::json!(session_version),
+                            );
+                            obj.insert("panes".to_string(), serde_json::json!(panes_json));
+                        }
+                        Ok(result)
                     }
                 }
             },

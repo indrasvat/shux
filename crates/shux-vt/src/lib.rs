@@ -72,6 +72,33 @@ pub struct VirtualTerminal {
     rows: usize,
     /// Number of columns.
     cols: usize,
+    /// Lens ContentRevision (PRD §4, LENS-R-001): per-pane monotonic `u64`
+    /// starting at 1, incremented by exactly 1 per Class-A mutation BATCH
+    /// (one `process()`/`resize()` producing ≥1 Class-A event). Never wraps,
+    /// never decreases, not persisted. Independent of `SessionGraph` version
+    /// and `DirtyState` (LENS-R-005, §4.4).
+    content_revision: u64,
+    /// Monotonic-clock nanoseconds at the last Class-A batch (LENS-R-002),
+    /// INITIALIZED to pane-creation time so a fresh pane never reports
+    /// "settled" before `quiet_ms` of genuine silence.
+    last_mutation_ns: u64,
+    /// Class-A events occurred while synchronized output (CSI ?2026h) froze
+    /// the presentation. The revision bump is DEFERRED to mode release as ONE
+    /// batch (§4.2 adjudicated row): the counter tracks the PRESENTED frame,
+    /// matching `grid()`/`cursor()`'s frozen view.
+    sync_hidden_class_a: bool,
+}
+
+/// Process-monotonic nanoseconds since the first VT was created. Used for
+/// `last_mutation_ns` (lens settle substrate). Clamped to ≥1: LENS-R-002 says
+/// never 0, but the caller that INITIALIZES the epoch (the first
+/// `VirtualTerminal::new()` in the process) would otherwise read elapsed == 0.
+fn monotonic_now_ns() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    (start.elapsed().as_nanos() as u64).max(1)
 }
 
 impl VirtualTerminal {
@@ -102,6 +129,11 @@ impl VirtualTerminal {
             tab_stops: TabStops::new(cols),
             rows,
             cols,
+            // LENS-R-001/002: revision starts at 1; last-mutation clock is
+            // seeded at creation so settle can't fire before real silence.
+            content_revision: 1,
+            last_mutation_ns: monotonic_now_ns(),
+            sync_hidden_class_a: false,
         }
     }
 
@@ -121,6 +153,16 @@ impl VirtualTerminal {
     /// wait for the terminal to answer on stdin. Callers that own the PTY must
     /// write every returned response back to the child process.
     pub fn process_with_responses(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        // Lens ContentRevision (PRD §4): snapshot the Class-A signals BEFORE the
+        // parser runs. `self.grid` is always the live writable grid (alt-screen
+        // enter/leave swaps it), and its `mutations()` tally is value-independent
+        // (identical repaints still advance it — §4.2 "MUST NOT diff to decide").
+        // Cursor position/visibility and the alt-screen flag are compared as the
+        // table literally states ("... change"); this is NOT cell-value diffing.
+        let before_writes = self.grid.mutations();
+        let before_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
+        let before_alt = self.modes.alternate_screen;
+
         // We need to create a VtHandler that borrows our fields mutably.
         // The vte Parser is taken out temporarily so we can pass both
         // the parser and the handler without conflicting borrows.
@@ -142,7 +184,53 @@ impl VirtualTerminal {
             responses: &mut responses,
         };
         self.parser.advance(&mut handler, bytes);
+
+        let after_alt = self.modes.alternate_screen;
+        let after_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
+        // Alt toggle is Class-A on its own and also invalidates the write-tally
+        // comparison (the tally belongs to whichever grid is now live), so only
+        // compare tallies when the alt flag is unchanged.
+        let class_a = after_alt != before_alt
+            || after_cursor != before_cursor
+            || (before_alt == after_alt && self.grid.mutations() != before_writes);
+        // §4.2 (adjudicated, PR #87 bot P1): while synchronized output
+        // (CSI ?2026h) freezes the presentation, Class-A events must NOT bump
+        // immediately — the counter tracks the PRESENTED frame, matching
+        // grid()/cursor()'s frozen view. Defer: accumulate hidden events and
+        // record exactly ONE batch when the mode releases (nothing hidden →
+        // release records nothing).
+        if self.sync_present.is_some() {
+            if class_a {
+                self.sync_hidden_class_a = true;
+            }
+        } else if std::mem::take(&mut self.sync_hidden_class_a) || class_a {
+            self.record_class_a_batch();
+        }
         responses
+    }
+
+    /// Advance ContentRevision by exactly one BATCH (§4.2 batching rule) and
+    /// stamp the mutation clock. Called once per `process()`/`resize()` call
+    /// that produced ≥1 Class-A event — inside the VT write path (single-writer
+    /// task), BEFORE any watch publish (§4.4).
+    fn record_class_a_batch(&mut self) {
+        // "never wrapping" (LENS-R-001): saturating_add clamps instead of
+        // wrapping; u64 exhaustion is unreachable in practice.
+        self.content_revision = self.content_revision.saturating_add(1);
+        self.last_mutation_ns = monotonic_now_ns();
+    }
+
+    /// Lens ContentRevision (PRD §4, LENS-R-001): monotonic per-pane frame
+    /// counter, one per Class-A batch. Exposed on `session.snapshot` pane
+    /// entries (LENS-R-006) and later by `pane.glance` (P2).
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    /// Monotonic-clock nanoseconds at the last Class-A batch (LENS-R-002),
+    /// seeded at pane creation. Basis for `pane.wait_settled` (P3).
+    pub fn last_mutation_ns(&self) -> u64 {
+        self.last_mutation_ns
     }
 
     /// Access the current (active) grid.
@@ -218,6 +306,10 @@ impl VirtualTerminal {
     /// This resizes both primary and alternate grids, adjusts the scroll
     /// region, and clamps the cursor position.
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        // §4.2: "Pane resize" is Class-A. A resize to the SAME dimensions is not
+        // a resize event (avoids spurious bumps when the daemon re-fans an
+        // unchanged winsize) — compare dims, which is not cell-value diffing.
+        let dims_changed = rows != self.rows || cols != self.cols;
         self.active_grapheme_cell = None;
         if self.modes.alternate_screen {
             self.grid.resize_canvas(rows, cols);
@@ -269,6 +361,9 @@ impl VirtualTerminal {
         }
         if let Some(ref mut present) = self.sync_present {
             present.cursor.clamp(rows, cols);
+        }
+        if dims_changed {
+            self.record_class_a_batch();
         }
     }
 
@@ -2377,6 +2472,418 @@ mod tests {
                 DirtyRegion { row: 0, cols: 0..4 },
                 DirtyRegion { row: 1, cols: 0..4 },
             ]
+        );
+    }
+}
+
+/// Lens ContentRevision substrate — L0 unit coverage of the §4.2 mutation-class
+/// table (PRD §4 SPEC-A). Every row of that table is exercised here by feeding
+/// escape sequences to a `VirtualTerminal` and asserting a bump / no-bump, plus
+/// the batching rule, the identical-repaint rule, and `last_mutation_ns`
+/// behaviour (LENS-R-001/002). These L0 tests never diff cell values.
+#[cfg(test)]
+mod content_revision_tests {
+    use super::*;
+
+    fn vt() -> VirtualTerminal {
+        VirtualTerminal::new(24, 80)
+    }
+
+    // LENS-R-001: revision starts at 1 for a fresh VT.
+    #[test]
+    fn initial_revision_is_one() {
+        assert_eq!(vt().content_revision(), 1);
+    }
+
+    // §4.2 Class A — visible cell change (glyph).
+    #[test]
+    fn class_a_glyph_print_bumps() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"X");
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // §4.2 Class A — visible cell change (fg/bg/attrs). A style-only recolor of
+    // an existing cell, SAME glyph, MUST bump exactly like a glyph change
+    // (LENS-R-038 spirit; value-independent write tally).
+    #[test]
+    fn class_a_style_only_change_bumps() {
+        let mut vt = vt();
+        vt.process(b"\x1b[HX"); // write 'X' at (1,1)
+        let r = vt.content_revision();
+        vt.process(b"\x1b[H\x1b[42mX"); // same glyph 'X', green bg
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // §4.2 Class A — cursor position change (CUP only, no cell write).
+    #[test]
+    fn class_a_cursor_move_bumps() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[5;10H");
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // §4.2 Class A — cursor visibility change (DECTCEM).
+    #[test]
+    fn class_a_cursor_visibility_bumps() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[?25l"); // hide
+        assert_eq!(vt.content_revision(), r + 1);
+        let r2 = vt.content_revision();
+        vt.process(b"\x1b[?25h"); // show
+        assert_eq!(vt.content_revision(), r2 + 1);
+    }
+
+    // §4.2 Class A — viewport scroll. SU (CSI S) scrolls WITHOUT moving the
+    // cursor, isolating the scroll path from cursor movement.
+    #[test]
+    fn class_a_scroll_bumps() {
+        let mut vt = vt();
+        let cursor_before = (vt.cursor().row, vt.cursor().col);
+        let r = vt.content_revision();
+        vt.process(b"\x1b[S");
+        assert_eq!(vt.content_revision(), r + 1);
+        assert_eq!(
+            (vt.cursor().row, vt.cursor().col),
+            cursor_before,
+            "SU must not move the cursor — proves the scroll path alone bumped"
+        );
+    }
+
+    // §4.2 Class A — alternate screen enter/leave (each a batch, each a bump).
+    #[test]
+    fn class_a_alt_screen_enter_leave_bumps() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[?1049h");
+        assert!(vt.is_alternate_screen());
+        assert_eq!(vt.content_revision(), r + 1);
+        let r2 = vt.content_revision();
+        vt.process(b"\x1b[?1049l");
+        assert!(!vt.is_alternate_screen());
+        assert_eq!(vt.content_revision(), r2 + 1);
+    }
+
+    // §4.2 Class A — pane resize (a real dimension change).
+    #[test]
+    fn class_a_resize_bumps() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.resize(30, 100);
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // A resize to the SAME dimensions is not a resize event → no bump.
+    #[test]
+    fn resize_same_dims_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.resize(24, 80);
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // Convergence-round pin: resize while the ALTERNATE screen is live must
+    // bump. The bump is the explicit dims-compare in VirtualTerminal::resize()
+    // (record_class_a_batch on dims_changed) — independent of mark_all_dirty
+    // and of which grid is active.
+    #[test]
+    fn alt_screen_resize_bumps() {
+        let mut vt = vt();
+        vt.process(b"\x1b[?1049h");
+        assert!(vt.is_alternate_screen());
+        let r = vt.content_revision();
+        vt.resize(30, 100);
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // Convergence-round pin: a WIDTH change takes the column-reflow path
+    // (rows rewrap; content itself unchanged) and must bump — exactly once,
+    // because the VT-level dims-compare fires once per resize() call no
+    // matter how many rows the reflow rewrites.
+    #[test]
+    fn column_reflow_bumps() {
+        let mut vt = vt();
+        // A line long enough to rewrap when the width halves.
+        vt.process(b"the quick brown fox jumps over the lazy dog 0123456789");
+        let r = vt.content_revision();
+        vt.resize(24, 40); // cols 80 -> 40: reflow path
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // §4.2 Class A — "Full repaint with identical resulting cells". Writing the
+    // same cell twice (cursor returned to origin each time so cursor state is
+    // identical across batches) MUST bump per batch — proving the counter keys
+    // off the write, not a cell-value delta (§4.2 "MUST NOT diff to decide").
+    #[test]
+    fn class_a_identical_repaint_bumps() {
+        let mut vt = vt();
+        vt.process(b"\x1b[HX\x1b[H"); // write X, cursor back to (0,0)
+        let cursor = (vt.cursor().row, vt.cursor().col, vt.cursor().visible);
+        let r = vt.content_revision();
+        vt.process(b"\x1b[HX\x1b[H"); // identical bytes, identical end cursor
+        assert_eq!(
+            (vt.cursor().row, vt.cursor().col, vt.cursor().visible),
+            cursor,
+            "end cursor must be identical so the bump is proven to come from the write"
+        );
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // §4.2 batching rule — one process() call with MANY Class-A events bumps by
+    // exactly 1 (frames, not bytes).
+    #[test]
+    fn batching_one_bump_per_process_batch() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"line one\r\nline two\r\nline three\r\n");
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // Two separate process() batches → exactly two bumps (batch granularity).
+    #[test]
+    fn two_batches_two_bumps() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"aaa");
+        vt.process(b"bbb");
+        assert_eq!(vt.content_revision(), r + 2);
+    }
+
+    // §4.2 Class B — OSC title/icon change (no bump).
+    #[test]
+    fn class_b_osc_title_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b]2;my title\x07");
+        vt.process(b"\x1b]0;icon+title\x07");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // §4.2 Class B — Bell (no bump).
+    #[test]
+    fn class_b_bel_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x07");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // §4.2 Class B — OSC 52 clipboard write (no bump).
+    #[test]
+    fn class_b_osc52_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // §4.2 Class B (adjudicated) — OSC 10/11/12 dynamic default fg/bg/cursor
+    // color changes mark the viewport dirty (render invalidation) but MUST NOT
+    // bump ContentRevision (lens council P1 blocker).
+    #[test]
+    fn osc_10_11_12_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b]10;#ff8800\x07"); // default fg
+        vt.process(b"\x1b]11;rgb:00/2b/36\x07"); // default bg
+        vt.process(b"\x1b]12;#00ff00\x07"); // cursor color
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // §4.2 Class B (adjudicated) — OSC 110/111/112 dynamic-color RESETS are
+    // Class B too (they also fire mark_all_dirty when a color was set).
+    #[test]
+    fn osc_110_111_112_no_bump() {
+        let mut vt = vt();
+        // Set all three first so the resets actually take the invalidation path.
+        vt.process(b"\x1b]10;#ff8800\x07\x1b]11;#002b36\x07\x1b]12;#00ff00\x07");
+        let r = vt.content_revision();
+        vt.process(b"\x1b]110\x07");
+        vt.process(b"\x1b]111\x07");
+        vt.process(b"\x1b]112\x07");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // Guard for the mark_all_dirty decoupling: RIS (ESC c) is a real repaint
+    // (clears every visible cell) and must STILL bump — via clear_visible's
+    // own write tally, not via mark_all_dirty.
+    #[test]
+    fn ris_full_reset_still_bumps() {
+        let mut vt = vt();
+        vt.process(b"hello");
+        let r = vt.content_revision();
+        vt.process(b"\x1bc");
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // Council addendum — OSC 4 palette redefinition also fires mark_all_dirty
+    // and is Class B (dynamic-color metadata; no cell write): no bump.
+    // (OSC 104 palette reset is not handled by the parser, so only the set
+    // path exists to test.)
+    #[test]
+    fn osc_4_palette_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b]4;1;#ff0000\x07");
+        vt.process(b"\x1b]4;4;rgb:24/72/c8\x07");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // Council addendum — DOCUMENTED semantics, not adjudicated correctness:
+    // alt-screen enter+leave within ONE process() batch nets to zero (same
+    // alt flag, same cursor, same primary-grid tally at the batch boundary)
+    // → NO bump. Consistent with the adjudicated net-zero-batch rule: batch
+    // boundaries compare end states; transient intra-batch states are not
+    // events. Flagged in the P1 report; revisit only via spec change.
+    #[test]
+    fn alt_screen_double_toggle_one_batch_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[?1049h\x1b[?1049l");
+        assert!(!vt.is_alternate_screen());
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // LENS-R-002 — last_mutation_ns is never 0, even for the VT whose
+    // construction initializes the monotonic epoch (clamped to >= 1).
+    #[test]
+    fn monotonic_ns_never_zero() {
+        let vt = vt();
+        assert!(vt.last_mutation_ns() >= 1);
+    }
+
+    // §4.2 (adjudicated) — writes under synchronized output (CSI ?2026h) are
+    // hidden by the frozen presentation and must NOT bump; the bump is
+    // deferred to mode release as exactly ONE batch (revision tracks the
+    // PRESENTED frame, matching grid()/cursor()'s frozen view).
+    #[test]
+    fn sync_output_defers_bump() {
+        let mut vt = vt();
+        vt.process(b"\x1b[?2026h");
+        let r = vt.content_revision();
+        vt.process(b"hidden frame one");
+        vt.process(b"hidden frame two");
+        assert_eq!(
+            vt.content_revision(),
+            r,
+            "writes during synchronized output must not bump"
+        );
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(
+            vt.content_revision(),
+            r + 1,
+            "release must record the hidden writes as exactly ONE batch"
+        );
+    }
+
+    // §4.2 (adjudicated) — a 2026h/2026l cycle with NOTHING hidden in between
+    // presents the same frame it started with: no bump at all.
+    #[test]
+    fn sync_output_no_writes_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[?2026h");
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // Council major 3 — a combining mark whose target cell is BLANK commits
+    // no write and must not bump: row ACCESS is not a write. (Before the
+    // fix, append_zero_width_scalar took the tally-bumping mutable row and
+    // then returned without writing.)
+    #[test]
+    fn combining_mark_on_blank_no_bump() {
+        let mut vt = vt();
+        vt.process(b"\x1b[1;6H"); // park cursor at col 6 (Class-A bump)
+        let cursor = (vt.cursor().row, vt.cursor().col);
+        let r = vt.content_revision();
+        vt.process("\u{0301}".as_bytes()); // combining acute; preceding cell blank
+        assert_eq!(
+            (vt.cursor().row, vt.cursor().col),
+            cursor,
+            "zero-width scalar must not move the cursor"
+        );
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // Companion guard: the same combining mark ON A REAL GLYPH does commit a
+    // write and must bump (the major-3 fix must not swallow real joins).
+    #[test]
+    fn combining_mark_on_glyph_bumps() {
+        let mut vt = vt();
+        vt.process(b"e");
+        let r = vt.content_revision();
+        vt.process("\u{0301}".as_bytes()); // e + combining acute → é
+        assert_eq!(vt.content_revision(), r + 1);
+    }
+
+    // §4.2 Class B — cursor style/shape change DECSCUSR (no bump).
+    #[test]
+    fn class_b_decscusr_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[2 q"); // steady block
+        vt.process(b"\x1b[5 q"); // blinking bar
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // §4.2 Class B — mode toggles: mouse reporting, bracketed paste, focus
+    // events, kitty keyboard (no bump).
+    #[test]
+    fn class_b_mode_toggles_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[?1000h"); // mouse: normal tracking
+        vt.process(b"\x1b[?1002h"); // mouse: button-event tracking
+        vt.process(b"\x1b[?1003h"); // mouse: any-event tracking
+        vt.process(b"\x1b[?1006h"); // mouse: SGR encoding
+        vt.process(b"\x1b[?2004h"); // bracketed paste
+        vt.process(b"\x1b[?1004h"); // focus events
+        vt.process(b"\x1b[>1u"); // kitty keyboard push
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // SGR pen change ALONE (no cell written) is not a visible cell change → no
+    // bump. The bump only lands when a cell is subsequently written.
+    #[test]
+    fn sgr_pen_only_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b[31;1m"); // bold red pen, no glyph
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // An empty process() batch produces no Class-A event → no bump.
+    #[test]
+    fn empty_process_no_bump() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"");
+        assert_eq!(vt.content_revision(), r);
+    }
+
+    // LENS-R-002: last_mutation_ns is stamped on Class-A batches and left
+    // untouched by Class-B batches (settle must not reset on metadata noise).
+    #[test]
+    fn last_mutation_ns_updates_on_class_a_not_class_b() {
+        let mut vt = vt();
+        let ns_init = vt.last_mutation_ns();
+        vt.process(b"hello");
+        let ns_after_a = vt.last_mutation_ns();
+        assert!(
+            ns_after_a >= ns_init,
+            "monotonic clock must not go backwards ({ns_init} -> {ns_after_a})"
+        );
+        assert!(vt.content_revision() > 1, "Class-A batch must have bumped");
+        // A Class-B batch must NOT move the clock.
+        vt.process(b"\x1b]2;title\x07");
+        assert_eq!(
+            vt.last_mutation_ns(),
+            ns_after_a,
+            "Class-B metadata must not update last_mutation_ns"
         );
     }
 }
