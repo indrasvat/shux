@@ -214,9 +214,9 @@ impl VirtualTerminal {
         // PRESENTED colors on both sides: under sync this pair is frozen==
         // frozen (hidden churn never flags), and the release batch is
         // frozen-vs-live (net change bumps once, net-zero never).
-        let class_a = after_alt != before_alt
+        let presented_colors_changed = self.default_colors() != before_colors;
+        let other_class_a = after_alt != before_alt
             || after_cursor != before_cursor
-            || self.default_colors() != before_colors
             || (before_alt == after_alt && self.grid.mutations() != before_writes);
         // §4.2 (adjudicated, PR #87 bot P1): while synchronized output
         // (CSI ?2026h) freezes the presentation, Class-A events must NOT bump
@@ -224,11 +224,27 @@ impl VirtualTerminal {
         // grid()/cursor()'s frozen view. Defer: accumulate hidden events and
         // record exactly ONE batch when the mode releases (nothing hidden →
         // release records nothing).
+        //
+        // EXCEPTION (claude P2 review minor a): the presented-colors compare
+        // is sync-aware on BOTH sides, so when it reports a change while sync
+        // is active at batch end, the PRESENTATION itself changed within this
+        // batch — e.g. `OSC 10` landing in the SAME batch that then opened
+        // ?2026h froze the new color into the presentation. Deferring that
+        // bump would lag the revision behind visibly-changed presented pixels
+        // for the whole sync window. Bump immediately; only the OTHER Class-A
+        // signals (whose compares read live state and cannot distinguish
+        // pre-freeze from post-freeze changes within the batch) defer.
         if self.sync_present.is_some() {
-            if class_a {
+            if presented_colors_changed {
+                self.record_class_a_batch();
+            }
+            if other_class_a {
                 self.sync_hidden_class_a = true;
             }
-        } else if std::mem::take(&mut self.sync_hidden_class_a) || class_a {
+        } else if std::mem::take(&mut self.sync_hidden_class_a)
+            || presented_colors_changed
+            || other_class_a
+        {
             self.record_class_a_batch();
         }
         responses
@@ -2794,6 +2810,33 @@ mod content_revision_tests {
         vt.process(b"\x1b]10;#ff0000\x07");
         vt.process(b"\x1b[?2026l");
         assert_eq!(vt.content_revision(), r2 + 1);
+    }
+
+    // claude P2 review minor (a) — a color change landing in the SAME batch
+    // that opens ?2026h is frozen INTO the presentation (the presented frame
+    // visibly changed this batch), so the bump must land NOW, not lag to
+    // release; and the release itself (frozen == live) must add nothing.
+    #[test]
+    fn osc_color_set_then_sync_enter_same_batch_bumps_immediately() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b]10;#ff8800\x07\x1b[?2026h"); // one batch: set + freeze
+        assert_eq!(
+            vt.default_colors().fg,
+            Some([0xff, 0x88, 0x00]),
+            "the frozen presentation carries the new color"
+        );
+        assert_eq!(
+            vt.content_revision(),
+            r + 1,
+            "presented change must bump in the same batch, not lag to release"
+        );
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(
+            vt.content_revision(),
+            r + 1,
+            "release with no hidden changes adds nothing"
+        );
     }
 
     // codex P2 review blocker — presented alt-screen consistency: an alt

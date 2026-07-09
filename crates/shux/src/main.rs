@@ -265,9 +265,13 @@ impl PaneIoState {
     /// until daemon shutdown (teardown has already run and won't re-run).
     ///
     /// Unique per revision: a checkpoint already stored at `revision` is a
-    /// no-op (stores nothing, evicts nothing). Otherwise appends and, past
-    /// the 4-checkpoint cap, evicts the FIFO-oldest (by creation revision —
-    /// DEC-22: reads never refresh recency). Returns `(stored_or_present,
+    /// no-op (stores nothing, evicts nothing). Otherwise inserts SORTED by
+    /// revision and, past the 4-checkpoint cap, evicts the front — the
+    /// LOWEST creation revision. LENS-R-031 orders the FIFO by CREATION
+    /// REVISION, not arrival (claude P2 review minor c): two racing glances
+    /// can reach their second lock windows out of revision order, and
+    /// insertion-order eviction would then evict the newer frame. (DEC-22:
+    /// reads never refresh recency.) Returns `(stored_or_present,
     /// evicted_revision)`: the flag is false only when the pane was gone.
     fn store_checkpoint(
         &mut self,
@@ -284,11 +288,20 @@ impl PaneIoState {
         if deque.iter().any(|c| c.revision == revision) {
             return (true, None);
         }
-        deque.push_back(PaneCheckpoint {
-            revision,
-            grid,
-            cursor,
-        });
+        // Sorted insert keeps the deque revision-ascending, so the front is
+        // always the oldest-by-creation-revision eviction candidate.
+        let at = deque
+            .iter()
+            .position(|c| c.revision > revision)
+            .unwrap_or(deque.len());
+        deque.insert(
+            at,
+            PaneCheckpoint {
+                revision,
+                grid,
+                cursor,
+            },
+        );
         if deque.len() > MAX_CHECKPOINTS {
             (true, deque.pop_front().map(|evicted| evicted.revision))
         } else {
@@ -6138,6 +6151,59 @@ mod tests {
             !state.checkpoints.contains_key(&pane_id),
             "dead pane's checkpoint state must not be resurrected"
         );
+    }
+
+    /// claude P2 review minors (b)+(c) — LENS-R-031 FIFO eviction, unit level
+    /// (the frozen D5 integration test stays red until P4): the cap-4 FIFO
+    /// orders by CREATION REVISION, not arrival — two racing glances can
+    /// reach their second lock windows out of revision order, and eviction
+    /// must still pick the lowest revision.
+    #[test]
+    fn checkpoint_fifo_evicts_lowest_creation_revision() {
+        let pane_id = shux_core::model::PaneId::new();
+        let mut state = PaneIoState::new();
+        let vt = shux_vt::VirtualTerminal::new(24, 80);
+        let grid = vt.grid().clone_visible();
+        state.vts.insert(pane_id, vt);
+
+        // (b) Ascending stores: cap 4, the 5th evicts the first.
+        for rev in [1_u64, 2, 3, 4] {
+            let (stored, evicted) =
+                state.store_checkpoint(pane_id, rev, grid.clone(), (0, 0, true));
+            assert!(
+                stored && evicted.is_none(),
+                "rev {rev} stores without eviction"
+            );
+        }
+        let (stored, evicted) = state.store_checkpoint(pane_id, 5, grid.clone(), (0, 0, true));
+        assert!(stored);
+        assert_eq!(evicted, Some(1), "5th store evicts the FIFO-oldest (rev 1)");
+
+        // (c) Out-of-order arrival (the two-lock race): live revisions are
+        // now [2,3,4,5]. Evict 2 and 3 out from under it, then interleave.
+        let mut state = PaneIoState::new();
+        let vt = shux_vt::VirtualTerminal::new(24, 80);
+        state.vts.insert(pane_id, vt);
+        for rev in [10_u64, 5, 20, 30] {
+            let (stored, evicted) =
+                state.store_checkpoint(pane_id, rev, grid.clone(), (0, 0, true));
+            assert!(stored && evicted.is_none());
+        }
+        // Deque must be revision-ordered despite arrival order, so the next
+        // store evicts revision 5 (oldest by CREATION REVISION) — a pure
+        // insertion-order FIFO would wrongly evict 10 (the first arrival).
+        let (stored, evicted) = state.store_checkpoint(pane_id, 40, grid, (0, 0, true));
+        assert!(stored);
+        assert_eq!(
+            evicted,
+            Some(5),
+            "eviction is by lowest creation revision, not arrival order"
+        );
+        let live: Vec<u64> = state.checkpoints[&pane_id]
+            .iter()
+            .map(|c| c.revision)
+            .collect();
+        assert_eq!(live, vec![10, 20, 30, 40], "deque stays revision-ascending");
     }
 
     fn write_plugin_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {

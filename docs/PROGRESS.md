@@ -104,6 +104,14 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-09 — fix(lens)/docs(lens): P2 ship round — claude minors + baseline approval + council evidence (task 077)**
+- Claude full review CONVERGED (0 new blockers/majors, 3 minors) — chain complete: verifier ✓, codex round fixed ✓, claude converged ✓, SOLID VT QA PASS ✓ (`.shux/qa/lens-p2/SOLID-QA.md`, VERDICT: PASS, commit 1a578b4).
+- **Minor (a), REAL — sync-enter color lag:** a color change in the SAME batch that opens `?2026h` is frozen INTO the presentation (presented frame changed) but the bump was routed to the deferred flag → revision lagged the visible pixels for the whole sync window. Fix: the presented-colors compare (sync-aware on both sides) bumps IMMEDIATELY even when sync is active at batch end — it can only fire then if the presentation itself changed this batch; other Class-A signals keep the defer path. Test: `osc_color_set_then_sync_enter_same_batch_bumps_immediately` (+1 at enter, release adds nothing). shux-vt lane 254/0.
+- **Minors (b)+(c) — checkpoint FIFO by CREATION REVISION:** `store_checkpoint` now inserts sorted by revision so eviction (front) always takes the LOWEST creation revision even when two racing glances reach their second lock windows out of order (LENS-R-031; pure insertion-order FIFO would evict the newer frame). Test: `checkpoint_fifo_evicts_lowest_creation_revision` (ascending 5th-store evicts rev 1; out-of-order arrival [10,5,20,30]+40 evicts 5 not 10; deque stays revision-ascending). shux bin lane 184/0.
+- **Baselines APPROVED:** BASELINE-APPROVAL.md flipped to APPROVED citing the QA PASS + orchestrator sign-off under the user's standing ship authorization; `evidence-manifest.json` `provisional: false`; golden bytes verified unchanged (sha256 re-check against the manifest).
+- **Council evidence committed on-branch:** `.shux/qa/lens-p2/council/{lens-p2-codex.json,lens-p2-claude-full2.json}`.
+- Gates: `make test-lens` 15/22 (zero golden diff) · shux-vt 254/0 · vt-corpus byte-exact · lint clean · leak check clean. Pushed; PR opened (do-not-merge pending bot triage).
+
 **2026-07-09 — fix(lens): P2 codex review round — presented-frame consistency fixes (task 077, gate 15/22 held)**
 - Codex review (NOT CONVERGED: 1B+2M+1m, all presented-frame-doctrine descendants) after the verifier passed P2 (VERIFIED-WITH-NOTES, goldens byte-matched a live drive). Applied:
 - **BLOCKER, torn alt_screen under sync:** `SyncPresentation` gains `alternate_screen` (captured at `?2026h` freeze); `is_alternate_screen()` is now presented-aware like `grid()`/`cursor()`/`default_colors()` — an alt toggle inside sync can no longer pair old pixels with a future flag in glance. Live state via `modes()`. Test: `sync_alt_toggle_glance_consistency`.

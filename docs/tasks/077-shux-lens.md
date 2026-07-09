@@ -286,3 +286,33 @@ Gates after the round: `make test-lens` 15/22 (identical fail set, goldens
 byte-stable — F1/F5 rendering untouched) · shux-vt 253/0 · shux bin lane
 183/0 · vt-corpus byte-exact · full lanes 0 failed · lint clean ·
 leak-guard clean.
+
+## P2 ship round (2026-07-09 — claude CONVERGED; minors applied; baselines approved)
+
+Claude full review: CONVERGED — zero new blockers/majors, 3 minors. The P2
+chain is complete (verifier ✓ · codex round fixed ✓ · claude converged ✓ ·
+SOLID VT QA PASS ✓ at `.shux/qa/lens-p2/SOLID-QA.md`, commit 1a578b4).
+
+1. **Minor (a), REAL — sync-enter color lag (fixed):** a color change in
+   the SAME batch that opens `?2026h` is frozen INTO the presentation (the
+   presented frame visibly changed) but the bump was deferred to release.
+   Fix: the presented-colors compare bumps immediately even when sync is
+   active at batch end — under sync it can only fire if the presentation
+   itself changed this batch; the other Class-A signals (live-state
+   compares that cannot split pre-/post-freeze within a batch) keep the
+   defer path. Test: `osc_color_set_then_sync_enter_same_batch_bumps_immediately`.
+2. **Minor (b) — FIFO eviction unit coverage (added):** frozen D5 stays
+   red until P4, so `checkpoint_fifo_evicts_lowest_creation_revision` pins
+   the LENS-R-031 contract at unit level (5 ascending stores → rev 1
+   evicted + reported).
+3. **Minor (c) — revision-ordered FIFO (fixed):** `store_checkpoint` now
+   inserts sorted by revision, so eviction always takes the LOWEST creation
+   revision even when racing glances store out of arrival order (the same
+   unit test covers the out-of-order insert: arrivals [10,5,20,30]+40 evict
+   5, not 10).
+
+Baselines: BASELINE-APPROVAL.md → **APPROVED** (QA PASS + orchestrator
+sign-off under the user's standing ship authorization; tofu limitation
+acknowledged per PRD §17); `evidence-manifest.json` `provisional: false`;
+golden bytes verified unchanged (sha256 re-check). Council verdicts
+committed at `.shux/qa/lens-p2/council/`.
