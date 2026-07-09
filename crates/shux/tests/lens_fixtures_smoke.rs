@@ -110,6 +110,22 @@ fn f3_flip_alternates_frames_and_colours() {
         classify_frame_exact(probe_cell_bg_img(&img_b, 40, 23, cw, ch), 23),
         'B'
     );
+
+    // Sync-wrap contract (LENS-TEST-CHANGE p2-g1): each frame draw is wrapped
+    // in DEC 2026 synchronized output, so one token presents as exactly ONE
+    // atomic revision step — the 24 row writes can never present as a partial
+    // frame, no matter how the PTY chunks them (hidden batches defer; the
+    // ?2026l release bumps exactly once).
+    let rev_before = h.content_revision(&f.session_id, &f.pane_id);
+    h.send_line_token(&f.pane_id, "");
+    h.wait_for(&f.pane_id, "AAAAAAAAAA", 5_000)
+        .expect("F3 flip back to A");
+    assert_eq!(
+        h.content_revision(&f.session_id, &f.pane_id),
+        rev_before + 1,
+        "F3: a sync-wrapped flip must present as exactly one revision step"
+    );
+
     h.kill_session(&f.session_id);
 }
 
