@@ -1,3 +1,10 @@
+# [0.38.0](https://github.com/indrasvat/shux/compare/v0.37.0...v0.38.0) (2026-07-09)
+
+
+### Features
+
+* **lens:** P1 ContentRevision substrate (task 077) ([#87](https://github.com/indrasvat/shux/issues/87)) ([542101f](https://github.com/indrasvat/shux/commit/542101fba7daeaa6ce1c7cf63d9c3d74eb553fc4))
+
 # [0.37.0](https://github.com/indrasvat/shux/compare/v0.36.0...v0.37.0) (2026-06-30)
 
 
