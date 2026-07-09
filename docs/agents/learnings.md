@@ -20,10 +20,19 @@
   Do NOT "fix" this by adding retry/quiet-wait/PTY-draining logic inside a
   read-only glance-style RPC — that violates the "reflects exactly what the
   VT has processed at lock time, no implicit drain" contract and makes the
-  API secretly fixture-aware. The correct fix, if approved, belongs in the
+  API secretly fixture-aware. The correct fix belongs in the
   PRODUCER: wrap the writes in DEC 2026 sync mode, which `shux-vt` already
   supports (P1 shipped `sync_present`/`SyncPresentation` — Class-A events
   during sync are deferred and released as ONE atomic batch on `?2026l`).
+  RESOLUTION (same day, adjudicated): the F3 sync-wrap was approved as a
+  LENS-TEST-CHANGE and applied — G1 went 0/3 → 3/3 green with ZERO
+  implementation changes, confirming the diagnosis. Companion ruling: OSC
+  10/11/12 dynamic default colors were re-adjudicated Class A (they change
+  the presented frame's pixels), detected by a before/after
+  `default_colors` compare in the batch disjunction — the parser's
+  change-guards keep value-equal sets net-zero, and the existing
+  sync-deferral covers color changes under `?2026h` for free. OSC 4
+  palette redefinition stays Class B (documented known limitation).
   When a red-suite fixture predates a new capability (glance/settle) that
   depends on frame-level atomicity, check whether it uses sync mode before
   assuming the RPC has a locking bug.

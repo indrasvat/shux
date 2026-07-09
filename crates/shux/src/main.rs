@@ -4680,18 +4680,15 @@ fn register_pane_io_methods(
                     // unchanged, cursor drawn iff visible AND include_cursor
                     // (default true) — identical policy to `pane.snapshot`.
                     //
-                    // KNOWN LIMITATION (PRD §4.2 OSC row, re-examined here
-                    // per its own instruction to do so when glance was
-                    // wired up): `default_colors` below comes from OSC
-                    // 10/11/12, which is Class B (does NOT bump
-                    // ContentRevision) yet DOES change these rendered
-                    // pixels — this is the exact same wiring
-                    // `pane.snapshot` already uses (vt.default_colors() ->
-                    // RasterOptions.{fg,bg,cursor}_default). A caller that
-                    // only watches `revision` to decide whether to re-glance
-                    // can therefore miss a color-only repaint. Not
-                    // redesigned in P2 scope; flagged for adjudication (see
-                    // agent report).
+                    // `default_colors` below comes from OSC 10/11/12 — the
+                    // exact same wiring `pane.snapshot` already uses
+                    // (vt.default_colors() → RasterOptions.{fg,bg,cursor}
+                    // _default). Per the P2 re-adjudication of §4.2's OSC
+                    // row, dynamic-default-color changes are Class A (they
+                    // bump ContentRevision — revision tracks the PRESENTED
+                    // frame), so a revision-watching caller can no longer
+                    // miss a color-only repaint. Residual known limitation:
+                    // OSC 4 palette redefinition remains Class B.
                     let png_base64 = if include_png {
                         let render_cursor = include_cursor && cursor_visible;
                         let cursor_pos = render_cursor.then_some((cursor_row, cursor_col));

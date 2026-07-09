@@ -1,6 +1,6 @@
 # Task 077: shux lens — give every agent eyes
 
-**Status:** Partial (P0, P1 complete; P2 `pane.glance` implemented — G2/G2w green, G1 red pending a fixture/spec decision, see P2 notes below; P3–P6 pending)
+**Status:** Partial (P0, P1 complete; P2 `pane.glance` implemented — G1/G2/G2w green after the adjudication round (F3 sync-wrap LENS-TEST-CHANGE + OSC 10/11/12 re-adjudicated to Class A), goldens PROVISIONAL pending the QA gate; P3–P6 pending)
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 016, 017, 060, 064, 074
@@ -34,7 +34,7 @@ and `session.snapshot` pane entries gain `content_revision`). CLI mirrors RPC
 |---|---|---|---|
 | **P0** | Fixtures + entire red suite + stubs (this task, current) | ALL §12 tests fail `method_not_found` / missing field (red receipt); fixture smoke tests green | PRD council convergence; cross-arch PNG spike (RESOLVED: shared goldens, §17); red receipt embedded; this task file |
 | **P1** _(Done)_ | ContentRevision substrate (§4) | G3, G4 via `session.snapshot` + unit mutation-class table | no render-path behavior change (existing goldens byte-stable) |
-| **P2** _(Implemented; G1 blocked — see notes)_ | `pane.glance` (§5) | G1, G2, G2w + determinism micro-test | SOLID VT QA (glance); goldens approved §16.3 (PROVISIONAL, pending BASELINE-APPROVAL) |
+| **P2** _(Implemented; gate 15/22 green — G1/G2/G2w all pass)_ | `pane.glance` (§5) | G1, G2, G2w + determinism micro-test | SOLID VT QA (glance); goldens approved §16.3 (PROVISIONAL, pending BASELINE-APPROVAL) |
 | **P3** | `pane.wait_settled` (§6) | S1–S5, V1 (incl. 100× S2) | — |
 | **P4** | checkpoints + `pane.diff_since` (§7) | D1–D5, A1 + attached-client concurrency | SOLID VT QA (heat) |
 | **P5** | scratch + `lens.run` (§8, §9) | R1–R8 | audit entries asserted; serial-only |
@@ -199,7 +199,41 @@ just spec prose). Not redesigned in P2 per the phase brief's explicit
 instruction; flagged here for adjudication.
 
 **Not done in this PR (explicitly out of P2 scope):** `pane.checkpoint`,
-`pane.diff_since` RPCs (P4); any change to `f3_flip.sh` or other frozen
-fixtures/tests; SOLID VT QA subagent run + BASELINE-APPROVAL sign-off
-(orchestrator-run per the phase brief); `docs/agents/learnings.md` entry
-(added separately, see commit log).
+`pane.diff_since` RPCs (P4); SOLID VT QA subagent run + BASELINE-APPROVAL
+sign-off (orchestrator-run per the phase brief).
+
+## P2 adjudication round (2026-07-09 — all three P2 findings ruled; applied)
+
+The orchestrator adjudicated the three P2 findings (PRD updated: §4.2 OSC
+row, §11 F3 row, §17 new font-risk row). Applied on this branch:
+
+1. **G1/F3 — APPROVED as a LENS-TEST-CHANGE.** `f3_flip.sh` now wraps each
+   `draw_frame` in DEC 2026 synchronized output (`\033[?2026h` …
+   `\033[?2026l`): the 24 row writes present as ONE atomic Class-A batch at
+   release, exactly per the dispute council's recommendation. The F3 smoke
+   test gained a sync-wrap contract assertion: one token → the flip presents
+   as exactly ONE revision step (`content_revision` +1), chunking-independent.
+   Result: **G1 green, 3/3 consecutive runs** (was 0/3 before the wrap);
+   suite now exactly 15 passed / 22 failed with all remaining roots unchanged
+   (`-32601` on P3/P4/P5 methods). Fixture stays shellcheck-clean.
+2. **OSC 10/11/12 — RE-ADJUDICATED to Class A** (revision tracks the
+   PRESENTED frame; the P2 evidence that dynamic-default-color changes alter
+   glance pixels without a bump made the P1 Class-B ruling untenable).
+   Implementation: `VirtualTerminal::process_with_responses` snapshots
+   `default_colors` before the parser batch and includes
+   `self.default_colors != before_colors` in the Class-A disjunction — the
+   parser's existing change-guards make a same-value OSC set a net-zero
+   batch (no bump), and the existing sync-deferral handles `?2026h` frames
+   (color change while frozen defers to ONE bump at `?2026l`). Both
+   directions covered: sets (OSC 10/11/12) and resets (OSC 110/111/112)
+   bump when they change the presented colors; a reset with nothing set is
+   a no-op. Unit tests flipped/renamed (NOT frozen paths):
+   `osc_10_11_12_bumps`, `osc_110_111_112_bumps_when_set`, new
+   `osc_dynamic_color_defers_under_sync`. **OSC 4 palette redefinition
+   remains Class B** (adjudicated known limitation — noted in the test and
+   in `Grid::mark_all_dirty`'s doc). The glance-handler comment now
+   references the new ruling. shux-vt lane: 251 pass / 0 fail.
+3. **Goldens — approved as-is pending the QA gate.** NOT regenerated:
+   verified F1/F5 emit zero OSC 10/11/12 sequences (SGR colors only), so
+   the reclassification cannot change their rendering; tofu limitation now
+   documented in PRD §17.

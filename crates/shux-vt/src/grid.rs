@@ -481,11 +481,14 @@ impl Grid {
     /// Mark the full visible viewport dirty.
     ///
     /// Deliberately does NOT advance the content tally (`mutations()`): this is
-    /// generic RENDER invalidation, also fired by Class-B events (OSC 10/11/12
-    /// dynamic default colors, OSC 110/111/112 resets, OSC 4 palette
-    /// redefinition, sync-mode leave). Class-A repaints advance the tally
-    /// through their own write calls (RIS via `clear_visible`, repaints via
-    /// row writes) or are detected by the VT's alt-flag comparison.
+    /// generic RENDER invalidation. OSC 10/11/12 dynamic default colors and
+    /// their 110/111/112 resets are Class A since the P2 re-adjudication, but
+    /// their bump comes from the VT's before/after `default_colors` compare —
+    /// never from this call. OSC 4 palette redefinition remains Class B
+    /// (adjudicated known limitation); sync-mode leave defers through the
+    /// VT's hidden-batch flag. Class-A repaints advance the tally through
+    /// their own write calls (RIS via `clear_visible`, repaints via row
+    /// writes) or are detected by the VT's alt-flag comparison.
     pub fn mark_all_dirty(&mut self) {
         self.dirty.mark_all();
     }

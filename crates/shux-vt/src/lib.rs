@@ -157,11 +157,16 @@ impl VirtualTerminal {
         // parser runs. `self.grid` is always the live writable grid (alt-screen
         // enter/leave swaps it), and its `mutations()` tally is value-independent
         // (identical repaints still advance it — §4.2 "MUST NOT diff to decide").
-        // Cursor position/visibility and the alt-screen flag are compared as the
-        // table literally states ("... change"); this is NOT cell-value diffing.
+        // Cursor position/visibility, the alt-screen flag, and the OSC 10/11/12
+        // dynamic default colors are compared as the table literally states
+        // ("... change"); this is NOT cell-value diffing. Default colors are
+        // Class A per the P2 re-adjudication (§4.2 OSC row): revision tracks
+        // the PRESENTED frame, and a dynamic-default-color change alters every
+        // rendered pixel that resolves Color::Default.
         let before_writes = self.grid.mutations();
         let before_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
         let before_alt = self.modes.alternate_screen;
+        let before_colors = self.default_colors;
 
         // We need to create a VtHandler that borrows our fields mutably.
         // The vte Parser is taken out temporarily so we can pass both
@@ -189,9 +194,13 @@ impl VirtualTerminal {
         let after_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
         // Alt toggle is Class-A on its own and also invalidates the write-tally
         // comparison (the tally belongs to whichever grid is now live), so only
-        // compare tallies when the alt flag is unchanged.
+        // compare tallies when the alt flag is unchanged. `default_colors` is a
+        // single VT-level field (not swapped by alt screen), so its compare
+        // needs no alt guard; the parser's own change-guards make a same-value
+        // OSC set a net-zero batch (no bump), per the §4.2 batching rule.
         let class_a = after_alt != before_alt
             || after_cursor != before_cursor
+            || self.default_colors != before_colors
             || (before_alt == after_alt && self.grid.mutations() != before_writes);
         // §4.2 (adjudicated, PR #87 bot P1): while synchronized output
         // (CSI ?2026h) freezes the presentation, Class-A events must NOT bump
@@ -2680,31 +2689,59 @@ mod content_revision_tests {
         assert_eq!(vt.content_revision(), r);
     }
 
-    // §4.2 Class B (adjudicated) — OSC 10/11/12 dynamic default fg/bg/cursor
-    // color changes mark the viewport dirty (render invalidation) but MUST NOT
-    // bump ContentRevision (lens council P1 blocker).
+    // §4.2 Class A (RE-ADJUDICATED in P2 — supersedes the P1 Class-B ruling):
+    // OSC 10/11/12 dynamic default fg/bg/cursor color changes alter the
+    // PRESENTED frame (every rendered pixel resolving Color::Default), so
+    // they bump ContentRevision — one bump per changing batch. A repeat set
+    // to the SAME color is a net-zero batch (parser change-guards) → no bump.
     #[test]
-    fn osc_10_11_12_no_bump() {
+    fn osc_10_11_12_bumps() {
         let mut vt = vt();
         let r = vt.content_revision();
         vt.process(b"\x1b]10;#ff8800\x07"); // default fg
+        assert_eq!(vt.content_revision(), r + 1);
         vt.process(b"\x1b]11;rgb:00/2b/36\x07"); // default bg
+        assert_eq!(vt.content_revision(), r + 2);
         vt.process(b"\x1b]12;#00ff00\x07"); // cursor color
-        assert_eq!(vt.content_revision(), r);
+        assert_eq!(vt.content_revision(), r + 3);
+        // Same value again → net-zero batch → no bump (§4.2 batching rule).
+        vt.process(b"\x1b]10;#ff8800\x07");
+        assert_eq!(vt.content_revision(), r + 3);
     }
 
-    // §4.2 Class B (adjudicated) — OSC 110/111/112 dynamic-color RESETS are
-    // Class B too (they also fire mark_all_dirty when a color was set).
+    // §4.2 Class A (P2 re-adjudication, both directions) — OSC 110/111/112
+    // dynamic-color RESETS also change the presented default colors when one
+    // was set, so they bump too. A reset with nothing set is a no-op batch.
     #[test]
-    fn osc_110_111_112_no_bump() {
+    fn osc_110_111_112_bumps_when_set() {
         let mut vt = vt();
-        // Set all three first so the resets actually take the invalidation path.
+        // Reset with nothing set → nothing changes → no bump.
+        let r0 = vt.content_revision();
+        vt.process(b"\x1b]110\x07");
+        assert_eq!(vt.content_revision(), r0);
+        // Set all three, then each reset changes presented colors → bump.
         vt.process(b"\x1b]10;#ff8800\x07\x1b]11;#002b36\x07\x1b]12;#00ff00\x07");
         let r = vt.content_revision();
         vt.process(b"\x1b]110\x07");
+        assert_eq!(vt.content_revision(), r + 1);
         vt.process(b"\x1b]111\x07");
+        assert_eq!(vt.content_revision(), r + 2);
         vt.process(b"\x1b]112\x07");
-        assert_eq!(vt.content_revision(), r);
+        assert_eq!(vt.content_revision(), r + 3);
+    }
+
+    // §4.2 (P2 re-adjudication) — a dynamic-color change while synchronized
+    // output is active must respect the sync-deferral: no bump while frozen,
+    // exactly one deferred bump at mode release (presented-frame semantics).
+    #[test]
+    fn osc_dynamic_color_defers_under_sync() {
+        let mut vt = vt();
+        vt.process(b"\x1b[?2026h");
+        let r = vt.content_revision();
+        vt.process(b"\x1b]10;#ff8800\x07");
+        assert_eq!(vt.content_revision(), r, "frozen: no bump during sync");
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(vt.content_revision(), r + 1, "one deferred bump at release");
     }
 
     // Guard for the mark_all_dirty decoupling: RIS (ESC c) is a real repaint
@@ -2720,7 +2757,8 @@ mod content_revision_tests {
     }
 
     // Council addendum — OSC 4 palette redefinition also fires mark_all_dirty
-    // and is Class B (dynamic-color metadata; no cell write): no bump.
+    // and REMAINS Class B (P2 re-adjudication kept it: known limitation —
+    // palette redefinition can alter indexed-color pixels without a bump).
     // (OSC 104 palette reset is not handled by the parser, so only the set
     // path exists to test.)
     #[test]

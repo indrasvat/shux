@@ -104,6 +104,13 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-09 — fix(lens): P2 adjudication round — F3 sync-wrap + OSC 10/11/12 → Class A (task 077, P2 gate now 15/22)**
+- All three P2 findings adjudicated by the orchestrator (PRD §4.2 OSC row, §11 F3 row, §17 font-risk row updated). Applied:
+- **F3 sync-wrap (approved LENS-TEST-CHANGE):** `f3_flip.sh` wraps each `draw_frame` in DEC 2026 synchronized output — the 24 row writes present as ONE atomic Class-A batch at `?2026l` release. F3 smoke test extended with the sync contract: one token → exactly one revision step. **G1 green, 3/3 consecutive runs**; `make test-lens` now exactly **15 passed / 22 failed**, all remaining roots unchanged (`-32601` on P3/P4/P5 methods). Fixture shellcheck-clean.
+- **OSC 10/11/12 re-adjudicated to Class A** (revision tracks the PRESENTED frame — the P2 evidence made the P1 Class-B ruling untenable): `process_with_responses` now includes a before/after `default_colors` compare in the Class-A disjunction. Parser change-guards make same-value sets net-zero (no bump); sync-deferral respected (color change under `?2026h` → one bump at release). Sets AND resets (110/111/112) covered both directions; reset-with-nothing-set is a no-op. Tests renamed/added: `osc_10_11_12_bumps`, `osc_110_111_112_bumps_when_set`, `osc_dynamic_color_defers_under_sync` (shux-vt lane 251/0). OSC 4 remains Class B (documented known limitation). Glance-handler comment updated to the new ruling.
+- **Goldens NOT regenerated** (approved as-is pending QA gate): verified F1/F5 emit zero OSC 10/11/12 (SGR only), so the reclassification cannot alter their rendering.
+- Gates: `make test-lens` 15/22 · shux-vt unit lane 251/0 · `make test-vt-corpus` byte-exact · `make test` all lanes 0 failed · `make lint` clean · all daemon-backed runs under `no_leak_guard.sh` (anchored count_fixture_procs matching), zero leaks.
+
 **2026-07-09 — feat(lens): P2 `pane.glance` (task 077, P2 implemented — G1 blocked on a spec/fixture decision)**
 - Built §5 SPEC-B: `pane.glance` RPC (LENS-R-010..016) + `shux pane glance` CLI, mirroring `pane.snapshot`'s existing atomic-clone-under-lock pattern. One `PaneIoState` lock acquisition clones grid (visible-only)/cursor/size/alt_screen/dynamic-default-colors/`content_revision`; render (via unchanged `shux-raster`) and text extraction happen from that frozen clone outside the lock, guaranteeing PNG and text agree on the same frame.
 - New `Grid::glance_text()` (`crates/shux-vt/src/grid.rs`): full-width, untrimmed, `\n`-joined viewport rows — deliberately NOT `capture_text()`'s "drop trailing blank rows + trim_end per row" UX contract, since LENS-R-012 wants byte-stable fixed-shape text.
@@ -1538,7 +1545,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 | 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
-| 077 | shux lens — give every agent eyes (P0: fixtures + red suite; P1: ContentRevision substrate; P2: pane.glance) | M3 | **Partial** (P0, P1 done; P2 implemented — G2/G2w green, G1 blocked pending §16.4 decision on `f3_flip.sh`; P3–P6 pending) | 016, 017, 060, 064, 074 |
+| 077 | shux lens — give every agent eyes (P0: fixtures + red suite; P1: ContentRevision substrate; P2: pane.glance) | M3 | **Partial** (P0, P1 done; P2 implemented — gate 15/22, G1/G2/G2w green after adjudication round; goldens PROVISIONAL pending QA gate; P3–P6 pending) | 016, 017, 060, 064, 074 |
 
 ---
 
