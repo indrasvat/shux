@@ -90,6 +90,25 @@ pub struct PaneRevision {
     pub last_mutation_ns: u64,
 }
 
+/// A stored atomic clone of a pane's visible grid at one ContentRevision
+/// (lens PRD §7 LENS-R-030/031). P2 scope only: `pane.glance{checkpoint:true}`
+/// creates these; storage + FIFO dedup is all this phase needs.
+/// `pane.diff_since` (P4) is the future consumer — invalidation tracking
+/// (resize/alt-screen, LENS-R-032) is also P4 and NOT implemented here.
+// `grid`/`cursor` are written by `store_checkpoint` and read by nothing yet
+// in P2 — `pane.diff_since` (P4) is their first consumer. Keeping them on
+// the struct now (rather than a revision-only placeholder) means the P4
+// diff implementation finds real stored frames instead of redesigning
+// storage from scratch.
+#[allow(dead_code)]
+struct PaneCheckpoint {
+    revision: u64,
+    grid: shux_vt::Grid,
+    /// (row, col, visible) at capture time — the §5.1 clone's cursor, not
+    /// re-derived later.
+    cursor: (usize, usize, bool),
+}
+
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
 ///
 /// This is the bridge between the RPC handlers and the per-pane PTY read loops.
@@ -121,6 +140,10 @@ pub struct PaneIoState {
     /// here once per Class-A batch; `pane.wait_settled` (P3) subscribes. Same
     /// lifetime as `vts` (created with the pane, removed only on destroy).
     pub revisions: HashMap<shux_core::model::PaneId, watch::Sender<PaneRevision>>,
+    /// Per-pane lens checkpoint FIFO (PRD §7, LENS-R-030/031; P2 scope —
+    /// `pane.glance{checkpoint:true}` is the only writer so far). Same
+    /// lifetime as `vts`: cleared on pane teardown.
+    checkpoints: HashMap<shux_core::model::PaneId, std::collections::VecDeque<PaneCheckpoint>>,
     /// Command execution engine for marker-based completion detection.
     pub cmd_engine: shux_pty::CommandEngine,
     /// Notify any attach-render loops that a pane's VT has new bytes to
@@ -154,6 +177,7 @@ impl PaneIoState {
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),
             revisions: HashMap::new(),
+            checkpoints: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: Arc::new(tokio::sync::Notify::new()),
             event_bus: None,
@@ -205,6 +229,7 @@ impl PaneIoState {
                 // The revision publisher has the same lifetime as the VT;
                 // dropping the sender closes the watch for any settle waiter.
                 self.revisions.remove(pane_id);
+                self.checkpoints.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)
@@ -224,6 +249,41 @@ impl PaneIoState {
                     false
                 }
             });
+        }
+    }
+
+    /// Store (or dedup) a `pane.glance{checkpoint:true}` clone (lens PRD §7,
+    /// LENS-R-030/031; P2 scope: storage + FIFO dedup only — no invalidation
+    /// tracking, that's P4). `grid`/`cursor` are the SAME atomic clone the
+    /// caller already rendered/extracted text from (LENS-R-010), keyed by
+    /// the revision read alongside it — not re-read here.
+    ///
+    /// Unique per revision: a checkpoint already stored at `revision` is a
+    /// no-op (stores nothing, evicts nothing). Otherwise appends and, past
+    /// the 4-checkpoint cap, evicts the FIFO-oldest (by creation revision —
+    /// DEC-22: reads never refresh recency). Returns the evicted revision,
+    /// if any.
+    fn store_checkpoint(
+        &mut self,
+        pane_id: shux_core::model::PaneId,
+        revision: u64,
+        grid: shux_vt::Grid,
+        cursor: (usize, usize, bool),
+    ) -> Option<u64> {
+        const MAX_CHECKPOINTS: usize = 4;
+        let deque = self.checkpoints.entry(pane_id).or_default();
+        if deque.iter().any(|c| c.revision == revision) {
+            return None;
+        }
+        deque.push_back(PaneCheckpoint {
+            revision,
+            grid,
+            cursor,
+        });
+        if deque.len() > MAX_CHECKPOINTS {
+            deque.pop_front().map(|evicted| evicted.revision)
+        } else {
+            None
         }
     }
 }
@@ -3735,6 +3795,7 @@ fn register_pane_io_methods(
     let g8 = graph.clone();
     let g9 = graph.clone();
     let g10 = graph.clone();
+    let g12 = graph.clone(); // pane.glance (LENS-R-010..016)
     let g11 = graph;
 
     let io1 = io_state.clone();
@@ -3748,6 +3809,7 @@ fn register_pane_io_methods(
     let io9 = io_state.clone();
     let io10 = io_state.clone();
     let io11 = io_state.clone();
+    let io13 = io_state.clone(); // pane.glance
     let io12 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
@@ -3835,6 +3897,7 @@ fn register_pane_io_methods(
     let rasterizer_pane = rasterizer.clone();
     let rasterizer_window = rasterizer.clone();
     let rasterizer_session = rasterizer.clone();
+    let rasterizer_glance = rasterizer.clone();
 
     builder
         .register_with_policy(
@@ -4535,6 +4598,188 @@ fn register_pane_io_methods(
                         "cols": snap_cols,
                         "rows": snap_rows,
                         "format": "png",
+                    }))
+                }
+            },
+        )
+        .register_with_policy(
+            "pane.glance",
+            Policy::fixed(Sensitivity::ContentRead),
+            move |params: Option<serde_json::Value>| {
+                let gh = g12.clone();
+                let io = io13.clone();
+                let r = rasterizer_glance.load_full();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                    let include_cursor = params
+                        .get("include_cursor")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let include_png = params
+                        .get("include_png")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let want_checkpoint = params
+                        .get("checkpoint")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    // LENS-R-010: ONE atomic clone under the pane's state
+                    // lock — grid, cursor {row,col,visible}, size,
+                    // alt_screen, dynamic default colors, ContentRevision —
+                    // all read from the same critical section. Render + text
+                    // extraction happen from THIS clone, outside the lock
+                    // (LENS-R-011): same revision guaranteed for both.
+                    let (
+                        revision,
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                        cursor_shape,
+                        alt_screen,
+                        snap_cols,
+                        snap_rows,
+                        default_colors,
+                        grid_snapshot,
+                    ) = {
+                        let state = io.lock().await;
+                        let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                        })?;
+                        let cur = vt.cursor();
+                        let default_colors = vt.default_colors();
+                        // Visible-only clone — no scrollback (LENS-R-012).
+                        let grid_clone = vt.grid().clone_visible();
+                        (
+                            vt.content_revision(),
+                            cur.row,
+                            cur.col,
+                            cur.visible,
+                            cur.shape,
+                            vt.is_alternate_screen(),
+                            vt.grid().cols(),
+                            vt.grid().rows(),
+                            default_colors,
+                            grid_clone,
+                        )
+                    };
+
+                    // Text extraction (LENS-R-012), from the clone, outside
+                    // the lock: ANSI-free, full-width rows (no trim), joined
+                    // by `\n`, no scrollback.
+                    let text = grid_snapshot.glance_text();
+
+                    // Checkpoint storage (§7 LENS-R-030/031, P2 scope) needs
+                    // its own clone — `grid_snapshot` is about to move into
+                    // the PNG render closure below when `include_png`.
+                    let checkpoint_grid = want_checkpoint.then(|| grid_snapshot.clone());
+
+                    // PNG rendering (LENS-R-013): reuses shux-raster
+                    // unchanged, cursor drawn iff visible AND include_cursor
+                    // (default true) — identical policy to `pane.snapshot`.
+                    //
+                    // KNOWN LIMITATION (PRD §4.2 OSC row, re-examined here
+                    // per its own instruction to do so when glance was
+                    // wired up): `default_colors` below comes from OSC
+                    // 10/11/12, which is Class B (does NOT bump
+                    // ContentRevision) yet DOES change these rendered
+                    // pixels — this is the exact same wiring
+                    // `pane.snapshot` already uses (vt.default_colors() ->
+                    // RasterOptions.{fg,bg,cursor}_default). A caller that
+                    // only watches `revision` to decide whether to re-glance
+                    // can therefore miss a color-only repaint. Not
+                    // redesigned in P2 scope; flagged for adjudication (see
+                    // agent report).
+                    let png_base64 = if include_png {
+                        let render_cursor = include_cursor && cursor_visible;
+                        let cursor_pos = render_cursor.then_some((cursor_row, cursor_col));
+                        let cursor_shape = if render_cursor {
+                            cursor_shape
+                        } else {
+                            shux_vt::CursorShape::default()
+                        };
+                        let opts = shux_raster::RasterOptions {
+                            cursor: cursor_pos,
+                            cursor_shape,
+                            cursor_color: default_colors.cursor,
+                            fg_default: default_colors.fg.unwrap_or_else(|| {
+                                shux_raster::RasterOptions::default().fg_default
+                            }),
+                            bg_default: default_colors.bg.unwrap_or_else(|| {
+                                shux_raster::RasterOptions::default().bg_default
+                            }),
+                        };
+                        let png_buf = tokio::task::spawn_blocking(move || {
+                            let img = r.render(&grid_snapshot, &opts);
+                            let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+                            {
+                                use image::ImageEncoder;
+                                let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+                                encoder
+                                    .write_image(
+                                        img.as_raw(),
+                                        img.width(),
+                                        img.height(),
+                                        image::ExtendedColorType::Rgba8,
+                                    )
+                                    .map_err(|e| format!("PNG encode failed: {e}"))?;
+                            }
+                            Ok::<_, String>(buf)
+                        })
+                        .await
+                        .map_err(|e| shux_rpc::RpcError::internal(&format!("rasterize join: {e}")))?
+                        .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+
+                        // §5.2: PAYLOAD_TOO_LARGE at 8 MiB DECODED (before
+                        // base64, which would inflate it further).
+                        const MAX_PNG_BYTES: usize = 8 * 1024 * 1024;
+                        if png_buf.len() > MAX_PNG_BYTES {
+                            return Err(shux_rpc::RpcError::payload_too_large(
+                                png_buf.len(),
+                                MAX_PNG_BYTES,
+                            ));
+                        }
+
+                        use base64::Engine;
+                        Some(base64::engine::general_purpose::STANDARD.encode(&png_buf))
+                    } else {
+                        drop(grid_snapshot);
+                        None
+                    };
+
+                    // Checkpoint storage (§7 LENS-R-030/031): a second, short
+                    // lock acquisition — keyed by `revision`, the SAME value
+                    // read alongside the clone above (not re-read here); that
+                    // clone IS the checkpoint (LENS-R-014).
+                    let (checkpointed, evicted_revision) = if let Some(grid) = checkpoint_grid {
+                        let mut state = io.lock().await;
+                        let evicted = state.store_checkpoint(
+                            pane_id,
+                            revision,
+                            grid,
+                            (cursor_row, cursor_col, cursor_visible),
+                        );
+                        (true, evicted)
+                    } else {
+                        (false, None)
+                    };
+
+                    Ok(serde_json::json!({
+                        "revision": revision,
+                        "cols": snap_cols,
+                        "rows": snap_rows,
+                        "cursor": {
+                            "row": cursor_row,
+                            "col": cursor_col,
+                            "visible": cursor_visible,
+                        },
+                        "alt_screen": alt_screen,
+                        "text": text,
+                        "png_base64": png_base64,
+                        "checkpointed": checkpointed,
+                        "evicted_revision": evicted_revision,
                     }))
                 }
             },
@@ -5368,6 +5613,24 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         window.as_deref(),
                         pane.as_deref(),
                         output,
+                        args.format,
+                    )
+                    .await
+                }
+                PaneCommand::Glance {
+                    pane,
+                    png,
+                    text_only,
+                    no_cursor,
+                    checkpoint,
+                } => {
+                    cli::handle_pane_glance(
+                        &mut stream,
+                        &pane,
+                        png,
+                        text_only,
+                        no_cursor,
+                        checkpoint,
                         args.format,
                     )
                     .await

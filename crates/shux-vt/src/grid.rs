@@ -533,6 +533,34 @@ impl Grid {
         }
     }
 
+    /// Lens `pane.glance` text extraction (PRD §5, LENS-R-012): the
+    /// ANSI-free viewport text of ALL `rows` (fixed count, no scrollback —
+    /// callers pass a `clone_visible()` clone so there IS no scrollback to
+    /// accidentally include), each row's FULL display width reproduced
+    /// verbatim (blank cells store a literal `' '`, so trailing whitespace
+    /// falls out of the iteration for free), rows joined by `\n`.
+    ///
+    /// Deliberately distinct from `VirtualTerminal::capture_text`, which is
+    /// tuned for "recent visible output" (drops trailing all-blank rows,
+    /// `trim_end()`s each row) — glance wants byte-stable, fixed-shape text
+    /// so `text.lines().nth(row)` always lines up with grid row `row`.
+    pub fn glance_text(&self) -> String {
+        (0..self.rows)
+            .map(|row_idx| {
+                let row = self.visible_row(row_idx);
+                let mut line = String::with_capacity(self.cols);
+                for cell in &row.cells {
+                    if cell.is_wide_continuation() {
+                        continue;
+                    }
+                    cell.push_display_text(&mut line);
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Mutably access a visible row (0 = top of visible area).
     pub fn visible_row_mut(&mut self, row: usize) -> RowMut<'_> {
         self.bump_mutations();

@@ -1367,6 +1367,38 @@ pub enum PaneCommand {
         output: Option<std::path::PathBuf>,
     },
 
+    /// Atomic {png, text, revision} of one pane from ONE grid clone.
+    /// Mirrors `pane.glance` RPC (lens PRD §5). Unlike `pane snapshot` +
+    /// `pane capture` (two separate calls, two separate clones — can tear
+    /// under concurrent writes), glance guarantees the PNG and text agree
+    /// on the same frame.
+    ///
+    /// PNG bytes are never printed to stdout: use `--png <path>` to save
+    /// them, or `--format json` for base64 inside the RPC result.
+    Glance {
+        /// Pane UUID.
+        #[arg(value_name = "PANE")]
+        pane: String,
+
+        /// Write the rendered PNG to this path.
+        #[arg(long, value_name = "PATH")]
+        png: Option<std::path::PathBuf>,
+
+        /// Skip PNG rendering entirely (`include_png=false`) — cheaper
+        /// when only the text matters.
+        #[arg(long)]
+        text_only: bool,
+
+        /// Render without the cursor overlay (`include_cursor=false`).
+        #[arg(long)]
+        no_cursor: bool,
+
+        /// Store this glance as a checkpoint for a future `pane diff`
+        /// (`checkpoint=true`).
+        #[arg(long)]
+        checkpoint: bool,
+    },
+
     /// Resize a pane's PTY + VT grid to absolute (cols, rows).
     /// Mirrors `pane.set_size` RPC. Synchronous — the next snapshot
     /// sees the new dims. Use this BEFORE driving keystrokes when
@@ -3638,6 +3670,130 @@ pub async fn handle_pane_snapshot(
         }
     }
     Ok(())
+}
+
+/// Map a `pane.glance` RPC error code to its CLI exit code (lens PRD §10
+/// exit-code table). `pane.glance`'s error surface is INVALID_PARAMS,
+/// PANE_NOT_FOUND, PERMISSION_DENIED, PAYLOAD_TOO_LARGE — everything else
+/// falls into the table's generic "any other RPC error" bucket.
+fn lens_glance_exit_code(rpc_error_code: i64) -> i32 {
+    match rpc_error_code {
+        -32602 => 2, // INVALID_PARAMS
+        -32005 => 4, // PERMISSION_DENIED
+        -32013 => 5, // PAYLOAD_TOO_LARGE
+        _ => 3,      // any other RPC error, incl. PANE_NOT_FOUND (-32004)
+    }
+}
+
+/// `shux pane glance` — atomic {png, text, revision} of one pane via
+/// `pane.glance` RPC (lens PRD §5, §10). No session/window resolution:
+/// `pane` is always a raw pane UUID, mirroring the RPC's `pane_id` param.
+pub async fn handle_pane_glance(
+    stream: &mut tokio::net::UnixStream,
+    pane: &str,
+    png_path: Option<std::path::PathBuf>,
+    text_only: bool,
+    no_cursor: bool,
+    checkpoint: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({
+        "pane_id": pane,
+        "include_cursor": !no_cursor,
+        "include_png": !text_only,
+        "checkpoint": checkpoint,
+    });
+
+    match rpc_call(stream, "pane.glance", params).await {
+        Ok(result) => {
+            if let Some(path) = &png_path {
+                use base64::Engine;
+                let b64 = result.get("png_base64").and_then(|v| v.as_str());
+                let Some(b64) = b64 else {
+                    anyhow::bail!(
+                        "--png given but the glance result has no png_base64 \
+                         (was --text-only also passed?)"
+                    );
+                };
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| anyhow::anyhow!("decode glance png: {e}"))?;
+                std::fs::write(path, &bytes)?;
+            }
+
+            match format {
+                OutputFormat::Json => {
+                    let envelope = serde_json::json!({"result": result});
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+                OutputFormat::Text | OutputFormat::Plain => {
+                    let revision = result.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cols = result.get("cols").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let rows = result.get("rows").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cursor = result.get("cursor").cloned().unwrap_or_default();
+                    let cursor_row = cursor.get("row").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cursor_col = cursor.get("col").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cursor_visible = cursor
+                        .get("visible")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let alt_screen = result
+                        .get("alt_screen")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let checkpointed = result
+                        .get("checkpointed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let evicted_revision = result.get("evicted_revision").and_then(|v| v.as_u64());
+                    let text = result.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let png_written = png_path.as_deref().map(|p| {
+                        let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        (p, len)
+                    });
+                    crate::style::print_pane_glance(
+                        pane,
+                        revision,
+                        cols,
+                        rows,
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                        alt_screen,
+                        checkpointed,
+                        evicted_revision,
+                        text,
+                        png_written,
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => {
+            match format {
+                OutputFormat::Json => {
+                    let mut err_obj = serde_json::json!({
+                        "code": code,
+                        "message": message,
+                    });
+                    if let Some(d) = data {
+                        err_obj["data"] = d;
+                    }
+                    let envelope = serde_json::json!({"error": err_obj});
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+                OutputFormat::Text | OutputFormat::Plain => {
+                    crate::style::print_error(&format!("glance failed: {message} (code {code})"));
+                }
+            }
+            std::process::exit(lens_glance_exit_code(code));
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 /// `shux pane set-size` — call `pane.set_size` RPC with absolute dims.
