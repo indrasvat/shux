@@ -258,22 +258,31 @@ impl PaneIoState {
     /// caller already rendered/extracted text from (LENS-R-010), keyed by
     /// the revision read alongside it — not re-read here.
     ///
+    /// Refuses panes with no live VT (codex P2 review major): the glance
+    /// handler stores under a SECOND lock acquisition, so the pane can be
+    /// torn down between the clone and the store — `entry().or_default()`
+    /// would silently resurrect checkpoint state for a dead pane, leaking it
+    /// until daemon shutdown (teardown has already run and won't re-run).
+    ///
     /// Unique per revision: a checkpoint already stored at `revision` is a
     /// no-op (stores nothing, evicts nothing). Otherwise appends and, past
     /// the 4-checkpoint cap, evicts the FIFO-oldest (by creation revision —
-    /// DEC-22: reads never refresh recency). Returns the evicted revision,
-    /// if any.
+    /// DEC-22: reads never refresh recency). Returns `(stored_or_present,
+    /// evicted_revision)`: the flag is false only when the pane was gone.
     fn store_checkpoint(
         &mut self,
         pane_id: shux_core::model::PaneId,
         revision: u64,
         grid: shux_vt::Grid,
         cursor: (usize, usize, bool),
-    ) -> Option<u64> {
+    ) -> (bool, Option<u64>) {
         const MAX_CHECKPOINTS: usize = 4;
+        if !self.vts.contains_key(&pane_id) {
+            return (false, None);
+        }
         let deque = self.checkpoints.entry(pane_id).or_default();
         if deque.iter().any(|c| c.revision == revision) {
-            return None;
+            return (true, None);
         }
         deque.push_back(PaneCheckpoint {
             revision,
@@ -281,9 +290,9 @@ impl PaneIoState {
             cursor,
         });
         if deque.len() > MAX_CHECKPOINTS {
-            deque.pop_front().map(|evicted| evicted.revision)
+            (true, deque.pop_front().map(|evicted| evicted.revision))
         } else {
-            None
+            (true, None)
         }
     }
 }
@@ -4749,16 +4758,19 @@ fn register_pane_io_methods(
                     // Checkpoint storage (§7 LENS-R-030/031): a second, short
                     // lock acquisition — keyed by `revision`, the SAME value
                     // read alongside the clone above (not re-read here); that
-                    // clone IS the checkpoint (LENS-R-014).
+                    // clone IS the checkpoint (LENS-R-014). store_checkpoint
+                    // refuses if the pane was torn down between the two lock
+                    // windows (codex P2 review major: no resurrection of
+                    // checkpoint state for a dead pane); `checkpointed` then
+                    // honestly reports false.
                     let (checkpointed, evicted_revision) = if let Some(grid) = checkpoint_grid {
                         let mut state = io.lock().await;
-                        let evicted = state.store_checkpoint(
+                        state.store_checkpoint(
                             pane_id,
                             revision,
                             grid,
                             (cursor_row, cursor_col, cursor_visible),
-                        );
-                        (true, evicted)
+                        )
                     } else {
                         (false, None)
                     };
@@ -6088,6 +6100,44 @@ mod tests {
         done_tx.send(()).unwrap();
         shutdown.await.unwrap();
         assert!(io_state.lock().await.teardown_waiters.is_empty());
+    }
+
+    /// codex P2 review major — checkpoint resurrection: `pane.glance` stores
+    /// its checkpoint under a SECOND lock acquisition, so the pane can be
+    /// torn down between the clone and the store. store_checkpoint must
+    /// refuse VT-less panes instead of `entry().or_default()`-recreating
+    /// checkpoint state that teardown already cleared (and will never clear
+    /// again).
+    #[test]
+    fn checkpoint_store_refuses_resurrection_after_teardown() {
+        let pane_id = shux_core::model::PaneId::new();
+        let mut state = PaneIoState::new();
+        let vt = shux_vt::VirtualTerminal::new(24, 80);
+        let grid = vt.grid().clone_visible();
+
+        // No VT registered at all → refuse, and do NOT create an entry.
+        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        assert!(!stored && evicted.is_none());
+        assert!(!state.checkpoints.contains_key(&pane_id));
+
+        // Live VT → stores; same-revision re-store is the LENS-R-030 no-op.
+        state.vts.insert(pane_id, vt);
+        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        assert!(stored && evicted.is_none());
+        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        assert!(stored && evicted.is_none(), "same-revision no-op");
+        assert_eq!(state.checkpoints[&pane_id].len(), 1);
+
+        // Teardown clears VT + checkpoints; a late store (the glance race)
+        // must refuse and must NOT resurrect the checkpoints entry.
+        let _ = state.teardown_panes_collecting(&[pane_id], true);
+        assert!(!state.checkpoints.contains_key(&pane_id));
+        let (stored, evicted) = state.store_checkpoint(pane_id, 2, grid, (0, 0, true));
+        assert!(!stored && evicted.is_none());
+        assert!(
+            !state.checkpoints.contains_key(&pane_id),
+            "dead pane's checkpoint state must not be resurrected"
+        );
     }
 
     fn write_plugin_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {

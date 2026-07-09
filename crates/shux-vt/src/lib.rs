@@ -32,6 +32,11 @@ pub struct SyncPresentation {
     pub cursor: Cursor,
     pub default_colors: TerminalDefaultColors,
     pub title: Option<String>,
+    /// Alt-screen flag at freeze time (codex P2 review blocker): presented
+    /// readers (glance) must see grid/cursor/colors AND this flag from the
+    /// same frozen frame — an alt toggle inside ?2026h must not leak a
+    /// future flag against old pixels.
+    pub alternate_screen: bool,
 }
 
 /// Per-pane virtual terminal.
@@ -163,10 +168,18 @@ impl VirtualTerminal {
         // Class A per the P2 re-adjudication (§4.2 OSC row): revision tracks
         // the PRESENTED frame, and a dynamic-default-color change alters every
         // rendered pixel that resolves Color::Default.
+        //
+        // The color compare uses the PRESENTED colors (the `default_colors()`
+        // accessor, sync-aware), not the raw live field (codex P2 review
+        // major): while ?2026h freezes the presentation, hidden color churn
+        // must not accumulate a deferred bump — a set-then-restore inside
+        // sync nets to NO presented change. The release batch compares the
+        // frozen colors against the now-live value, so a real net change
+        // still bumps exactly once at ?2026l, and a net-zero one never does.
         let before_writes = self.grid.mutations();
         let before_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
         let before_alt = self.modes.alternate_screen;
-        let before_colors = self.default_colors;
+        let before_colors = self.default_colors();
 
         // We need to create a VtHandler that borrows our fields mutably.
         // The vte Parser is taken out temporarily so we can pass both
@@ -198,9 +211,12 @@ impl VirtualTerminal {
         // single VT-level field (not swapped by alt screen), so its compare
         // needs no alt guard; the parser's own change-guards make a same-value
         // OSC set a net-zero batch (no bump), per the §4.2 batching rule.
+        // PRESENTED colors on both sides: under sync this pair is frozen==
+        // frozen (hidden churn never flags), and the release batch is
+        // frozen-vs-live (net change bumps once, net-zero never).
         let class_a = after_alt != before_alt
             || after_cursor != before_cursor
-            || self.default_colors != before_colors
+            || self.default_colors() != before_colors
             || (before_alt == after_alt && self.grid.mutations() != before_writes);
         // §4.2 (adjudicated, PR #87 bot P1): while synchronized output
         // (CSI ?2026h) freezes the presentation, Class-A events must NOT bump
@@ -300,9 +316,18 @@ impl VirtualTerminal {
             .unwrap_or(self.default_colors)
     }
 
-    /// Whether alternate screen is active.
+    /// Whether alternate screen is active in the PRESENTED frame.
+    ///
+    /// While synchronized output (?2026) freezes the presentation, this
+    /// reads the flag captured at freeze time — the same source as
+    /// `grid()`/`cursor()`/`default_colors()` — so a presented reader
+    /// (glance) can never pair old pixels with a future alt flag (codex P2
+    /// review blocker). Live mode state is available via `modes()`.
     pub fn is_alternate_screen(&self) -> bool {
-        self.modes.alternate_screen
+        self.sync_present
+            .as_ref()
+            .map(|present| present.alternate_screen)
+            .unwrap_or(self.modes.alternate_screen)
     }
 
     /// Get the current scroll region.
@@ -2742,6 +2767,68 @@ mod content_revision_tests {
         assert_eq!(vt.content_revision(), r, "frozen: no bump during sync");
         vt.process(b"\x1b[?2026l");
         assert_eq!(vt.content_revision(), r + 1, "one deferred bump at release");
+    }
+
+    // codex P2 review major — presented-colors compare: a set-then-restore of
+    // a dynamic default color INSIDE sync nets to NO presented change, so
+    // release must NOT bump. (A raw live-field compare would have flagged
+    // each hidden batch and false-bumped at ?2026l.)
+    #[test]
+    fn osc_color_net_zero_under_sync_no_bump() {
+        let mut vt = vt();
+        vt.process(b"\x1b]10;#112233\x07"); // baseline set (bumps, pre-sync)
+        vt.process(b"\x1b[?2026h");
+        let r = vt.content_revision();
+        vt.process(b"\x1b]10;#ff0000\x07"); // hidden change
+        vt.process(b"\x1b]10;#112233\x07"); // hidden restore — net zero
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(
+            vt.content_revision(),
+            r,
+            "net-zero hidden color churn must not bump at release"
+        );
+        // Control: the same churn WITHOUT the restore is a real presented
+        // change and must bump exactly once at release.
+        vt.process(b"\x1b[?2026h");
+        let r2 = vt.content_revision();
+        vt.process(b"\x1b]10;#ff0000\x07");
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(vt.content_revision(), r2 + 1);
+    }
+
+    // codex P2 review blocker — presented alt-screen consistency: an alt
+    // toggle inside ?2026h must not leak the future flag against the frozen
+    // frame. The presented reader surface (grid/cursor/colors/alt flag — what
+    // pane.glance clones) stays the frozen primary frame until release.
+    #[test]
+    fn sync_alt_toggle_glance_consistency() {
+        let mut vt = vt();
+        vt.process(b"primary");
+        vt.process(b"\x1b[?2026h");
+        vt.process(b"\x1b[?1049h\x1b[2JALT-CONTENT");
+        assert!(
+            vt.modes().alternate_screen,
+            "live mode flag flips immediately"
+        );
+        assert!(
+            !vt.is_alternate_screen(),
+            "presented alt flag stays frozen until release"
+        );
+        // Flag and pixels must come from the SAME frozen frame: the
+        // presented grid still shows the primary content.
+        assert!(
+            vt.capture_text(None).contains("primary"),
+            "presented grid is still the frozen primary frame"
+        );
+        vt.process(b"\x1b[?2026l");
+        assert!(
+            vt.is_alternate_screen(),
+            "release presents the alt frame's flag"
+        );
+        assert!(
+            vt.capture_text(None).contains("ALT-CONTENT"),
+            "release presents the alt frame's pixels"
+        );
     }
 
     // Guard for the mark_all_dirty decoupling: RIS (ESC c) is a real repaint

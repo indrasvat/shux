@@ -104,6 +104,14 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-09 — fix(lens): P2 codex review round — presented-frame consistency fixes (task 077, gate 15/22 held)**
+- Codex review (NOT CONVERGED: 1B+2M+1m, all presented-frame-doctrine descendants) after the verifier passed P2 (VERIFIED-WITH-NOTES, goldens byte-matched a live drive). Applied:
+- **BLOCKER, torn alt_screen under sync:** `SyncPresentation` gains `alternate_screen` (captured at `?2026h` freeze); `is_alternate_screen()` is now presented-aware like `grid()`/`cursor()`/`default_colors()` — an alt toggle inside sync can no longer pair old pixels with a future flag in glance. Live state via `modes()`. Test: `sync_alt_toggle_glance_consistency`.
+- **MAJOR, OSC net-zero false bump under sync:** the Class-A color compare now uses PRESENTED colors on both sides — hidden set-then-restore inside sync nets to no bump at release; a real net change bumps exactly once (release compares frozen-vs-live). Test: `osc_color_net_zero_under_sync_no_bump` (+ control).
+- **MAJOR, checkpoint resurrection:** `store_checkpoint` refuses panes with no live VT (the glance store runs under a SECOND lock; teardown can interleave) — returns `(stored, evicted)`, handler reports `checkpointed: false` honestly. Test: `checkpoint_store_refuses_resurrection_after_teardown`.
+- **MINOR, CLI json envelope — DISPUTED with evidence:** bare-result emission per codex's §10 reading breaks the FROZEN harness (`cli_envelope` parses `{result|error}`; verified: G2 CLI twin panics at lens_common/mod.rs:59, gate would drop 15/22 → 12/25). Envelope kept (byte-parity with `shux rpc call`, M9); dispute documented at the emission site; escalated to the claude convergence round.
+- Gates: `make test-lens` 15/22 (identical fail set; goldens byte-stable) · shux-vt 253/0 · shux bin 183/0 · vt-corpus byte-exact · full lanes 0 failed · lint clean · leak-guard clean.
+
 **2026-07-09 — fix(lens): P2 adjudication round — F3 sync-wrap + OSC 10/11/12 → Class A (task 077, P2 gate now 15/22)**
 - All three P2 findings adjudicated by the orchestrator (PRD §4.2 OSC row, §11 F3 row, §17 font-risk row updated). Applied:
 - **F3 sync-wrap (approved LENS-TEST-CHANGE):** `f3_flip.sh` wraps each `draw_frame` in DEC 2026 synchronized output — the 24 row writes present as ONE atomic Class-A batch at `?2026l` release. F3 smoke test extended with the sync contract: one token → exactly one revision step. **G1 green, 3/3 consecutive runs**; `make test-lens` now exactly **15 passed / 22 failed**, all remaining roots unchanged (`-32601` on P3/P4/P5 methods). Fixture shellcheck-clean.

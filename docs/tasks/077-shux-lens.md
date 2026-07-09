@@ -237,3 +237,52 @@ row, §11 F3 row, §17 new font-risk row). Applied on this branch:
    verified F1/F5 emit zero OSC 10/11/12 sequences (SGR colors only), so
    the reclassification cannot change their rendering; tofu limitation now
    documented in PRD §17.
+
+## P2 codex review round (2026-07-09 — 1 blocker + 2 majors fixed, 1 minor disputed)
+
+Verifier: VERIFIED-WITH-NOTES (goldens byte-matched a live drive). Codex
+review NOT CONVERGED: 1 BLOCKER + 2 MAJORS + 1 MINOR, all presented-frame-
+doctrine descendants. Fixes applied on the branch:
+
+1. **BLOCKER — torn `alt_screen` under sync (fixed):** glance cloned
+   grid/cursor/colors from the frozen sync presentation but `alt_screen`
+   read the LIVE mode flag — an alt toggle inside `?2026h` paired old
+   pixels with a future flag. Fix: `SyncPresentation` gains
+   `alternate_screen` (captured at freeze); `is_alternate_screen()` is now
+   presented-aware (same source as `grid()`/`cursor()`/`default_colors()`;
+   live state remains available via `modes()`). Pinned by
+   `sync_alt_toggle_glance_consistency` (live flag flips immediately,
+   presented flag + pixels stay the frozen primary frame until release).
+2. **MAJOR — OSC net-zero false bump under sync (fixed):** the batch
+   compare used the raw live `default_colors` field, so a hidden
+   set-then-restore inside sync flagged each batch and false-bumped at
+   release. Fix: compare PRESENTED colors (`default_colors()` accessor) on
+   both sides — under sync the pair is frozen==frozen (hidden churn never
+   flags) and the release batch is frozen-vs-live (net change bumps exactly
+   once, net-zero never). Pinned by `osc_color_net_zero_under_sync_no_bump`
+   (net-zero → no bump; control: net change → +1 at release).
+3. **MAJOR — checkpoint resurrection (fixed):** `store_checkpoint`'s
+   `entry().or_default()` could recreate checkpoint state for a pane torn
+   down between glance's clone and its second lock acquisition. Fix: refuse
+   when `vts` has no live entry; returns `(stored, evicted)` and the
+   handler reports `checkpointed: false` honestly in the race. Pinned by
+   `checkpoint_store_refuses_resurrection_after_teardown` (no entry
+   creation pre-VT, store + same-revision no-op with live VT, no
+   resurrection post-teardown).
+4. **MINOR — CLI `--format json` envelope (DISPUTED with evidence):** codex
+   asked for bare-result emission per §10's prose. The FROZEN harness
+   (`lens_common::cli_envelope`, whose own doc comment reads §10 as "the
+   raw RPC `{result|error}` envelope") parses `.get("result")/.get("error")`
+   from every lens CLI verb's json output. Verified empirically: emitting
+   the bare result panics G2's CLI twin at `lens_common/mod.rs:59`
+   ("envelope had neither result nor error") and would break G1's 50 CLI
+   glances + G2w — gate 15/22 → 12/25, violating the round's own
+   no-other-flips tripwire. The envelope also gives byte-parity with
+   `shux rpc call` (M9). Changing the shape requires a LENS-TEST-CHANGE to
+   the frozen harness first; code comment at the emission site records the
+   dispute. Escalated for the claude convergence round to adjudicate.
+
+Gates after the round: `make test-lens` 15/22 (identical fail set, goldens
+byte-stable — F1/F5 rendering untouched) · shux-vt 253/0 · shux bin lane
+183/0 · vt-corpus byte-exact · full lanes 0 failed · lint clean ·
+leak-guard clean.

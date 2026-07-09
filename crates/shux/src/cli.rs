@@ -3723,6 +3723,17 @@ pub async fn handle_pane_glance(
 
             match format {
                 OutputFormat::Json => {
+                    // Deliberately the `{result|error}` envelope, NOT the bare
+                    // result the sibling snapshot/capture handlers emit: the
+                    // FROZEN lens harness (lens_common::cli_envelope, its doc
+                    // comment reads §10 as "the raw RPC result envelope")
+                    // parses `.get("result")/.get("error")` from every lens
+                    // CLI verb's --format json output, giving byte-parity
+                    // with `shux rpc call` (M9). Emitting the bare result
+                    // breaks G1/G2/G2w CLI twins (verified empirically —
+                    // codex P2 review minor 4 is DISPUTED with that
+                    // evidence; changing shape requires a LENS-TEST-CHANGE
+                    // to the frozen harness first).
                     let envelope = serde_json::json!({"result": result});
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 }
