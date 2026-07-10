@@ -1,6 +1,6 @@
 # Task 077: shux lens — give every agent eyes
 
-**Status:** Partial (P0, P1, P2 complete; P3 `pane.wait_settled` implemented — S1–S5, V1 green, `make test-lens` now 21 passed / 16 failed (remaining reds all -32601 on P4/P5 methods); `s1_ready.png` golden minted PROVISIONAL pending the downstream council/QA ratification; P4–P6 pending)
+**Status:** Partial (P0, P1, P2 complete; P3 `pane.wait_settled` implemented + verifier VERIFIED — S1–S5, V1 green, `make test-lens` 21 passed / 16 failed (remaining reds all -32601 on P4/P5 methods); `s1_ready.png` golden RATIFIED (verifier re-render byte-identical, ddebb43); P3 review round fixed on-branch: codex B1 deadline precedence + claude TOCTOU guard (bf975bc), codex B2 shux-rpc cancellable request execution — client disconnect drops in-flight waiters (04032a2), codex M1 pane-killed-mid-wait → NOT_FOUND (7ee229a), codex M2 strict param typing (1a7981b); awaiting the convergence round on the fix delta; P4–P6 pending)
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 016, 017, 060, 064, 074
