@@ -1,6 +1,6 @@
 # Task 077: shux lens — give every agent eyes
 
-**Status:** Done (through P5) — P5 scratch sessions + `lens.run` IMPLEMENTED on `feat/lens-p5-scratch-run` (branched from `origin/main` at the v0.41.0 release commit, includes P4 #91 "pane.checkpoint + pane.diff_since"); `make test-lens` **35 passed / 2 failed** — **R1–R8 all green (8/8)**; K1/E1 both red at the identical root cause (`golden not found`, not a functional failure — see P5 notes below for the full E1 trace and the pending golden-mint decision). P0–P4 all Done and merged: P0 red suite (ff688a8, PR #86), P1 ContentRevision substrate (542101f, PR #87, v0.38.0), P2 pane.glance (0e6d611, PR #89, v0.39.0), P3 pane.wait_settled (3914dbb, PR #90, v0.40.0), P4 pane.checkpoint + pane.diff_since (80ffce8, PR #91, v0.41.0; gate 27/10 — D1–D5+A1 green, R1–R8/K1/E1 untouched). Full per-phase detail preserved in the P0–P4 sections below (P0 council rounds, P2 G1/F3 sync-wrap + OSC reclassification, P3 cancellable-RPC + PeerDeathMonitor, P4 invalidation-gating + LENS-R-038b). Awaiting: independent verifier + dootsabha convergence review + E1-golden adjudication before this phase can ship. Convergence CLOSED round 8: codex CONVERGED (two-pass seeding invariant verified, zero open findings; codex ×8 + claude ×2 total).
+**Status:** In Progress (P6) — skill rewrite + CLI polish + K1/E1 goldens IMPLEMENTED on `feat/lens-p6-skill-polish` (branched from `origin/main` at `eb65947`, the v0.42.0 release commit, includes P5 #92 "scratch sessions + lens.run"). `make test-lens` **37 passed / 0 failed** — full green, K1 and E1 both flipped by minting `k1_pos1/2/3.png`/`e1_glance.png`/`e1_heat.png` (PROVISIONAL per §14 raster-untouched rule; see P6 notes + `.shux/goldens/lens/BASELINE-APPROVAL.md` P6 addendum). `make test-lens-t`: T4 green (`t4_vivecaka_help_100x30/60x20.png` minted); **T1/T2/T3 BLOCKED** — `nidhi 0.1.0-alpha.1` now shows a mandatory "Press Enter to continue" welcome screen with no bypass, so the frozen tests' `wait_for("विवेचक")` times out at 10s on every run; this is a genuine frozen-test/reality drift (§16.4), NOT an environment gap, and the frozen test file was NOT modified — see P6 notes for the full diagnosis, candidate fix, and required user approval before any `LENS-TEST-CHANGE`. CLI polish: `session kill` + every `-s/--session` resolve helper now accept a UUID directly (closes issue #88's class of gap and the session-kill/lens.run loop the PRD called out), `--wait` exit-255-on-signal-death documented + empirically verified, lens CLI help texts swept. Skill rewrite: `skills/shux/SKILL.md` + new `references/lens.md` + new `examples/lens-verify-loop.md`. T5 demo brief written to `.shux/qa/lens-p6/T5-DEMO-BRIEF.md` for the orchestrator to run with a fresh agent (not run by the implementing agent per PRD m4). Outstanding before this phase (and the whole task) can flip to Done: shux-tui-qa gate run, dootsabha convergence review, independent verifier ratification of the PROVISIONAL P6 goldens, user adjudication of the T1/T2/T3 nidhi-welcome blocker, and the T5 demo itself. P0–P5 all Done and merged: P0 red suite (ff688a8, PR #86), P1 ContentRevision substrate (542101f, PR #87, v0.38.0), P2 pane.glance (0e6d611, PR #89, v0.39.0), P3 pane.wait_settled (3914dbb, PR #90, v0.40.0), P4 pane.checkpoint + pane.diff_since (80ffce8, PR #91, v0.41.0), P5 scratch + lens.run (64745cf, PR #92, v0.42.0; gate 35/2 — R1–R8 green, K1/E1 deferred to P6 per spec). Full per-phase detail preserved in the P0–P5 sections below.
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 016, 017, 060, 064, 074
@@ -1127,3 +1127,189 @@ per row, no duplicates.
    existing chain.
 
 (4th bot thread was non-substantive; replied with the fix reference.)
+
+## P6 implementation notes (skill rewrite + CLI polish + K1/E1/T-tier goldens, branch `feat/lens-p6-skill-polish`)
+
+Branch point: `origin/main` at `eb659473869edbf9d4ae509cbad9b7456cd7788e`
+(v0.42.0 release commit, includes `64745cf` PR #92 per the P6 branch-point
+requirement).
+
+### K1/E1 goldens — MINTED, PROVISIONAL
+
+`crates/shux/tests/lens_loop.rs` K1/E1 were the two remaining reds from P5
+(gate 35/2). Minted `k1_pos1/2/3.png`, `e1_glance.png`, `e1_heat.png` by
+driving the real daemon through the CLI with the exact steps the frozen
+tests use (session create/lens.run → set-size → send-keys exec → wait-for
+sentinel → glance/checkpoint/diff loop), under the same fixture-font
+fallback chain `lens_common::Harness::new` uses. `make test-lens` is now
+**37 passed / 0 failed** — full green.
+
+Receipts:
+- Byte-reproducibility: every PNG rendered from 2 independent driver
+  invocations (fresh isolated daemon + temp dirs each time), `cmp`-compared
+  byte-identical (sha256 matches both runs).
+- K1 live delta: `cells_changed: 2` on every one of the 3 Tab presses
+  (matches K1's exact assertion).
+- E1 live delta: `cells_changed: 10`,
+  `regions: [{row:2,col_start:2,col_end:3},{row:5,col_start:10,col_end:19}]`
+  — byte-identical to E1's frozen `f4_expected_regions()`.
+- Cross-validation: `k1_pos3.png` == `e1_glance.png` (byte-identical; F4's
+  focus marker cycles through 3 cells, both frames land on the cycle start
+  by fixture design — two independent mints agreeing exactly). `e1_heat.png`
+  == the already-RATIFIED P4 golden `d2_heat.png` (`deef295d…`) — same F4
+  fixture, same pre-/post-`a` checkpoint pair, same unresized 80×24 pane.
+- Visual inspection (implementing agent, full resolution): sentinel,
+  truecolor/256/basic legend, focus marker at each grid position, heat
+  overlay on exactly the changed cells — no tofu, no monochrome
+  regression.
+
+**PROVISIONAL per PRD §14's raster-untouched golden-ratification rule** — P6
+changes no rendering code. Full mint recipe, per-golden sha256, and the
+sign-off record: `.shux/goldens/lens/evidence-manifest.json` (`k1_pos1`,
+`k1_pos2`, `k1_pos3`, `e1_glance`, `e1_heat` entries) and
+`.shux/goldens/lens/BASELINE-APPROVAL.md` P6 addendum. Ratification (an
+INDEPENDENT verifier's re-render + byte cmp + visual sign-off) is
+outstanding — not self-certified here per the repo's golden discipline.
+
+### T-tier — T4 green, T1/T2/T3 BLOCKED (§16.4, not silently worked around)
+
+`t4_vivecaka_help_card` (vivecaka 0.1.9, network-free help card at 100×30
+and 60×20) is green — `t4_vivecaka_help_100x30.png` /
+`t4_vivecaka_help_60x20.png` minted with the same recipe/receipts discipline
+as K1/E1 (byte-reproducible across 2 runs, visually inspected).
+
+**T1/T2/T3 (`t1_nidhi_golden`, `t2_nidhi_keyboard_truth`,
+`t3_nidhi_matrix`) are BLOCKED, confirmed empirically, and the frozen
+`crates/shux/tests/lens_ttier.rs` was NOT modified.** Root cause: the
+installed `nidhi 0.1.0-alpha.1` (commit `1e5d952`) now renders a mandatory
+"Press Enter to continue" welcome screen on every invocation
+(`internal/ui/screens/welcome.go`) — no CLI flag, env var, or config key
+skips it (checked `nidhi --help` and the binary's embedded strings for
+every `nidhi.*`/`NIDHI_*` key; none exist), and it never auto-advances
+(confirmed idle 8s with zero input, still on the welcome frame). The frozen
+tests call `pane.wait_for("विवेचक")` immediately after `lens.run` with no
+dismiss keystroke in between, so every run times out at 10s with an empty
+capture (`last_capture_preview: ""`) — reproduced live for all three tests,
+identical failure mode.
+
+This is a real behavior drift in `nidhi` since the frozen §13 harness was
+authored, not a "TUI not installed" case (§13's sanctioned fallback for
+that doesn't apply here — nidhi IS installed and runs). Per §16.2/§16.4 the
+frozen test file requires a `LENS-TEST-CHANGE` trailer + council verdict +
+explicit user approval before any edit, so none was made.
+
+A CANDIDATE fix was verified out-of-band (scratch only, not committed, not
+applied to the frozen file): insert `pane wait-for --text "Press Enter to
+continue"` then `pane send-keys --data DQ==` (Enter) before the existing
+`pane wait-for --text "विवेचक"`, at all three call sites. Candidate T1/T3
+goldens rendered cleanly under this recipe — real Devanagari (`निधि
+संग्रह`, `विवेचक समीक्षा`), CJK (`終端テスト`), emoji, full color, no tofu.
+One extra finding worth flagging alongside the approval decision: in this
+nidhi version, `--icons nerd` vs `--icons ascii` produced byte-identical
+renders of the stash-LIST screen (icon glyphs apparently only affect other
+screens) — T3's 4-way icon×color matrix may need re-scoping once someone
+checks nidhi's own docs for where `--icons` is actually supposed to show.
+
+**Needs explicit user approval before proceeding**: a `LENS-TEST-CHANGE:
+nidhi welcome-screen dismiss (T1/T2/T3)` trailer + one-question `dootsabha
+council` per §16.4, in a follow-up commit — not bundled into this
+PROVISIONAL golden mint. Candidate goldens + receipts are described in
+`.shux/goldens/lens/BASELINE-APPROVAL.md`'s P6 addendum; the actual
+candidate PNGs live in the implementing agent's scratch space, not this
+repo, pending that approval.
+
+### CLI polish
+
+1. **Closed the `session kill` / `lens.run` `session_id` loop** (the exact
+   gap the PRD called out, same class as issue #88 — "`-s/--session`
+   resolves by name only"). Root cause found while minting E1: `pane
+   send-keys -s <scratch-session-uuid>` failed with "resource not found"
+   because (a) `resolve_session_id` only matched by name via `session.list`,
+   never trusting a syntactically valid UUID, and (b) the "no `--window`
+   given, use the session's active window" fallback in
+   `resolve_pane_window_id` queried the DEFAULT `session.list` — which
+   excludes scratch sessions by design (LENS-R-041) — so it could never find
+   a scratch session's active window even once (a) was fixed. Both fixed in
+   `crates/shux/src/cli.rs`:
+   - `resolve_session_id` now short-circuits on `uuid::Uuid::parse_str`
+     success, skipping the name-list round trip entirely (fixes issue #88's
+     stated direction for every `-s/--session` consumer, not just lens).
+   - `resolve_pane_window_id`'s active-window lookup now passes
+     `include_scratch: true` (visibility vs. authorization — the same
+     principle `session.kill`'s existing `id`-or-`name` param already uses).
+   - `handle_kill` (`shux session kill`) now sends `id` instead of `name`
+     when given a UUID — `session.kill`'s RPC handler already accepted `id`,
+     the CLI wrapper never used it. `lens.run`'s own `session_id` is now
+     directly `session kill`-able, closing the loop named in the PRD.
+   - `session kill`'s positional arg help text updated (`NAME_OR_ID`).
+   All downstream RPCs still validate existence server-side (a bogus UUID
+   still gets `not_found`), so none of this can mask a real error.
+   `make test` (244 tests, non-lens) and `make test-lens` (37/37) both
+   green after the change.
+2. **`--wait` exit-255-on-signal-death — documented AND empirically
+   verified**, not just asserted. `lens run --max-runtime 2s --wait --
+   sleep 30` → observed `exit code -1` in the printed result, `$? == 255`
+   at the shell, zero leaked processes after. Root cause: `ExitStatus::
+   code()` returns `None` on signal death, `wait_for_pane_exit(...).
+   unwrap_or(-1)` turns that into `-1`, and `std::process::exit(-1)`
+   truncates to the OS's low-8-bits exit convention → 255. Documented in
+   `LensCommand::Run`'s doc comment (visible via `shux lens run --help`),
+   `skills/shux/references/lens.md`, and `skills/shux/SKILL.md`'s Gotchas.
+   (Separately observed: a direct `sh -c 'kill -9 $$'` self-signal inside a
+   scratch pane hung the `--wait` RPC for 2 minutes before I killed it by
+   hand — cleaned up with zero leaked children. Not chased further: it's a
+   self-signal edge case outside the sanctioned `--max-runtime`/`session
+   kill` reap paths this task's CLI-polish scope covers, and the sanctioned
+   path (which IS what agents are meant to use) verified cleanly. Flagging
+   it here in case a future task wants to look at `pty-process`'s reap
+   behavior for a process that SIGKILLs its own PTY session leader.)
+3. **Lens CLI help-text sweep**: read `shux lens --help`, `shux lens run
+   --help`, `shux pane glance --help`, `shux pane wait-settled --help`,
+   `shux pane checkpoint --help`, `shux pane diff --help` against actual
+   shipped behavior (grammar, defaults, exit codes) — all accurate, no
+   fixes needed beyond the `--wait` addition above and the `session kill`
+   help text.
+
+### Skill rewrite
+
+- `skills/shux/SKILL.md`: new "lens" quickstart section (the canonical
+  run→settle→glance→drive→diff loop, positioned right after the existing
+  80%-quickstart), updated RPC-surface table, "Decide which method to use"
+  block, "Tools shux replaces" table, Deep-dives table, Worked-examples
+  list, and 5 new Gotchas entries (positional-PANE calling convention for
+  the 4 lens `pane` verbs vs. `-s/-p` for everything else, UUID-or-name
+  session resolution, `--wait` 255 semantics, secrets/no-redaction warning).
+  Frontmatter `description` gained lens trigger phrases.
+- New `skills/shux/references/lens.md`: full CLI grammar for all 5 verbs,
+  the canonical E1-style loop worked end to end, `lens run` in depth
+  (ttl/max-runtime/quota/env, scratch visibility, kill-by-UUID-or-name),
+  checkpoint/FIFO/invalidation semantics, the CLI exit-code table (§10,
+  verbatim-accurate against shipped behavior), output-format rules,
+  LENS-R-053 secrets warning, and a "when lens is the wrong tool" section.
+- New `skills/shux/references/api.md` "Lens" section: RPC contracts for all
+  5 methods + the 5 lens-specific error codes, matching the existing
+  per-method JSON-shape convention the rest of that file uses.
+- New `skills/shux/examples/lens-verify-loop.md`: a generic worked example
+  (deliberately NOT using the repo's own seeded demo-app bug, to avoid
+  spoiling T5's discovery test) showing the full find-fix-prove loop.
+
+### T5 — demo brief written, NOT run (per m4 — orchestrator runs the fresh
+agent)
+
+`.shux/qa/lens-p6/T5-DEMO-BRIEF.md`: what to give a fresh agent (the skill
+only, no hints), the exact prompt, a success checklist, evidence to
+collect, and a ground-truth section for the orchestrator's own judging
+(not for the demo agent). Sanity-checked the demo-app itself builds
+(`cargo build --release` in `.shux/fixtures/lens/t/demo-app`) and the
+seeded border break is genuinely visible via `lens run --size 120x30` →
+`wait-settled` → `glance` (confirmed with a real glance PNG, not just
+reading the source).
+
+### Outstanding before P6 (and the whole task) can flip to Done
+
+- shux-tui-qa gate run and PASS.
+- dootsabha convergence review of this phase's diff (§2.4).
+- Independent verifier ratification of the PROVISIONAL K1/E1/T4 goldens.
+- User adjudication of the T1/T2/T3 nidhi-welcome-screen blocker
+  (LENS-TEST-CHANGE approval or an alternative direction).
+- The T5 unaided-agent demo itself, run by the orchestrator per m4.
