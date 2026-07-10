@@ -1,0 +1,14 @@
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "Content": "**Findings**\n\nBLOCKER: `pane.glance` can return a non-presented `alt_screen` with a presented/frozen grid under DEC 2026 sync. The clone uses `vt.grid()`, `vt.cursor()`, and `vt.default_colors()` accessors, which return `sync_present` while frozen, but `alt_screen` is read from `vt.is_alternate_screen()` at [crates/shux/src/main.rs:4660], which is the live mode flag. If an app toggles alt-screen inside `?2026h`, glance can report old grid/revision with future `alt_screen`. Fix by adding presented alt-screen state to `SyncPresentation` and making the glance path read the presented alt flag from the same source as the grid/cursor/default colors.\n\nMAJOR: OSC 10/11/12 sync deferral can false-bump when hidden color changes cancel before release. The implementation snapshots raw `self.default_colors` at [crates/shux-vt/src/lib.rs:171] and compares raw live state at [crates/shux-vt/src/lib.rs:202]. During sync, `vt.default_colors()` remains the frozen presented color, so a hidden `OSC 10 red` followed by `OSC 10 \u003coriginal\u003e` before `?2026l` should be net no presented-frame change, but the deferred Class-A flag can still force a revision bump. Fix by comparing presented colors via `self.default_colors()` before/after the parser batch, or by checking live colors against `sync_present.default_colors` only at release.\n\nMAJOR: checkpoint storage can outlive pane teardown. `pane.glance` releases the lock for render, then reacquires and calls `store_checkpoint` later; `store_checkpoint` uses `self.checkpoints.entry(pane_id).or_default()` at [crates/shux/src/main.rs:271]. If the pane is killed between clone and checkpoint store, teardown removes the VT/checkpoints, then this second lock recreates an orphan checkpoint for a dead pane. Fix by verifying `state.vts.contains_key(\u0026pane_id)` before storing, or by making checkpoint insertion conditional on a still-live pane in the second critical section.\n\nMINOR: CLI JSON shape is not a mirror of the RPC result. `handle_pane_glance` wraps successful JSON as `{\"result\": result}` at [crates/shux/src/cli.rs:3735], while adjacent CLI handlers print the RPC result directly for `--format json` (for example `pane.snapshot`). Fix by printing `result` directly; keep error exit-code mapping separate.\n\nNOT CONVERGED: alt_screen-presented-state mismatch; OSC sync net-zero false bump; checkpoint resurrection after teardown",
+    "Model": "gpt-5.5",
+    "Duration": 215351445458,
+    "CostUSD": 0,
+    "TokensIn": 634260,
+    "TokensOut": 9683,
+    "SessionID": ""
+  }
+}

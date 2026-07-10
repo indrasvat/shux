@@ -3,6 +3,39 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-07-09 (task 077 lens P2 — `pane.glance` atomicity vs. unsynchronized
+  multi-write frame producers):** A per-pane RPC can be PROVABLY atomic (one
+  lock, one clone, render+text both derived from that frozen clone — verified
+  by three independent concurrent calls landing on the same `ContentRevision`
+  returning byte-identical PNG+text) and STILL observe a "torn" application-
+  level frame, because `ContentRevision` (PRD §4.2) bumps once per PTY
+  `process()` BATCH, not once per app-level "frame" — a fixture/TUI that
+  paints a full screen as N separate raw writes (no DEC 2026 synchronized-
+  output `CSI ?2026h`/`?2026l` wrapping) can have its repaint split across
+  multiple batches under load, and a reader's atomic clone can legitimately
+  land mid-repaint. Diagnosed by reproducing at small scale outside the
+  frozen test (manual pump + concurrent `pane.glance` calls against F3),
+  confirming the SAME revision always reproduces the SAME (possibly mixed)
+  content, then tracing root cause to `f3_flip.sh` not using sync-mode.
+  Do NOT "fix" this by adding retry/quiet-wait/PTY-draining logic inside a
+  read-only glance-style RPC — that violates the "reflects exactly what the
+  VT has processed at lock time, no implicit drain" contract and makes the
+  API secretly fixture-aware. The correct fix belongs in the
+  PRODUCER: wrap the writes in DEC 2026 sync mode, which `shux-vt` already
+  supports (P1 shipped `sync_present`/`SyncPresentation` — Class-A events
+  during sync are deferred and released as ONE atomic batch on `?2026l`).
+  RESOLUTION (same day, adjudicated): the F3 sync-wrap was approved as a
+  LENS-TEST-CHANGE and applied — G1 went 0/3 → 3/3 green with ZERO
+  implementation changes, confirming the diagnosis. Companion ruling: OSC
+  10/11/12 dynamic default colors were re-adjudicated Class A (they change
+  the presented frame's pixels), detected by a before/after
+  `default_colors` compare in the batch disjunction — the parser's
+  change-guards keep value-equal sets net-zero, and the existing
+  sync-deferral covers color changes under `?2026h` for free. OSC 4
+  palette redefinition stays Class B (documented known limitation).
+  When a red-suite fixture predates a new capability (glance/settle) that
+  depends on frame-level atomicity, check whether it uses sync mode before
+  assuming the RPC has a locking bug.
 - **2026-07-08 (task 077 lens P1 — ContentRevision):** Detecting a "content
   changed" event in the VT write path without diffing cell values (identical
   repaints MUST still bump) needs a value-INDEPENDENT signal. The clean solution

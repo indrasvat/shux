@@ -481,11 +481,14 @@ impl Grid {
     /// Mark the full visible viewport dirty.
     ///
     /// Deliberately does NOT advance the content tally (`mutations()`): this is
-    /// generic RENDER invalidation, also fired by Class-B events (OSC 10/11/12
-    /// dynamic default colors, OSC 110/111/112 resets, OSC 4 palette
-    /// redefinition, sync-mode leave). Class-A repaints advance the tally
-    /// through their own write calls (RIS via `clear_visible`, repaints via
-    /// row writes) or are detected by the VT's alt-flag comparison.
+    /// generic RENDER invalidation. OSC 10/11/12 dynamic default colors and
+    /// their 110/111/112 resets are Class A since the P2 re-adjudication, but
+    /// their bump comes from the VT's before/after `default_colors` compare —
+    /// never from this call. OSC 4 palette redefinition remains Class B
+    /// (adjudicated known limitation); sync-mode leave defers through the
+    /// VT's hidden-batch flag. Class-A repaints advance the tally through
+    /// their own write calls (RIS via `clear_visible`, repaints via row
+    /// writes) or are detected by the VT's alt-flag comparison.
     pub fn mark_all_dirty(&mut self) {
         self.dirty.mark_all();
     }
@@ -531,6 +534,36 @@ impl Grid {
             // A read-only clone for snapshotting; the tally is irrelevant here.
             mutations: 0,
         }
+    }
+
+    /// Lens `pane.glance` text extraction (PRD §5, LENS-R-012): the
+    /// ANSI-free viewport text of ALL `rows` (fixed count, no scrollback —
+    /// callers pass a `clone_visible()` clone so there IS no scrollback to
+    /// accidentally include), rows joined by `\n`. Blank cells push a
+    /// literal `' '`, so every row comes out PADDED to its full display
+    /// width — trailing whitespace is preserved, never trimmed. There is
+    /// deliberately no trimming mechanism here: full-width padding IS the
+    /// LENS-R-012 byte-stability contract.
+    ///
+    /// Deliberately distinct from `VirtualTerminal::capture_text`, which is
+    /// tuned for "recent visible output" (drops trailing all-blank rows,
+    /// `trim_end()`s each row) — glance wants byte-stable, fixed-shape text
+    /// so `text.lines().nth(row)` always lines up with grid row `row`.
+    pub fn glance_text(&self) -> String {
+        (0..self.rows)
+            .map(|row_idx| {
+                let row = self.visible_row(row_idx);
+                let mut line = String::with_capacity(self.cols);
+                for cell in &row.cells {
+                    if cell.is_wide_continuation() {
+                        continue;
+                    }
+                    cell.push_display_text(&mut line);
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Mutably access a visible row (0 = top of visible area).

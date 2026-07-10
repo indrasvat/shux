@@ -812,6 +812,7 @@ impl<'a> VtHandler<'a> {
                             cursor: self.cursor.clone(),
                             default_colors: *self.default_colors,
                             title: self.title.clone(),
+                            alternate_screen: self.modes.alternate_screen,
                         });
                     }
                     self.modes.synchronized_output = true;

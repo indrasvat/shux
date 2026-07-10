@@ -103,11 +103,43 @@ impl Harness {
             .join("..")
             .canonicalize()
             .expect("canonicalize repo root");
+        let xdg_config = tempfile::tempdir().expect("config dir");
+
+        // LENS-TEST-CHANGE p2-fonts (user adjudication, PRD §17): the
+        // harness daemon appends committed FIXTURE fonts to the builtin
+        // fallback chain so lens goldens carry real Devanagari + the
+        // fixtures' CJK glyphs instead of tofu boxes. This config exists
+        // only in the harness's isolated XDG dir — the default raster
+        // chain (and the vt-corpus goldens) are untouched. The bundled
+        // primary is NOT replaced, so cell metrics stay identical to the
+        // default chain. Provenance + sha256: .shux/fixtures/fonts/ and
+        // the lens evidence manifest.
+        let dev_font = repo_root.join(".shux/fixtures/fonts/NotoSansDevanagari-Regular.ttf");
+        let cjk_font = repo_root.join(".shux/fixtures/fonts/NotoSansJP-shuxlens-subset.ttf");
+        let config_dir = xdg_config.path().join("shux");
+        std::fs::create_dir_all(&config_dir).expect("create shux config dir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[appearance]\nfont_fallbacks = [\n  \
+                 \"builtin:nerd-font\",\n  \
+                 {dev:?},\n  \
+                 {cjk:?},\n  \
+                 \"builtin:math\",\n  \
+                 \"builtin:symbols\",\n  \
+                 \"builtin:symbols-legacy\",\n  \
+                 \"builtin:emoji\",\n]\n",
+                dev = dev_font.display().to_string(),
+                cjk = cjk_font.display().to_string(),
+            ),
+        )
+        .expect("write lens harness config.toml");
+
         Self {
             bin: PathBuf::from(env!("CARGO_BIN_EXE_shux")),
             repo_root,
             runtime: tempfile::tempdir().expect("runtime dir"),
-            xdg_config: tempfile::tempdir().expect("config dir"),
+            xdg_config,
             xdg_state: tempfile::tempdir().expect("state dir"),
         }
     }

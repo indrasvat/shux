@@ -40,6 +40,9 @@ pub enum ErrorCode {
     RateLimited,
     /// Name conflict (session/window name already exists).
     NameConflict,
+    /// Response payload exceeds a method's declared size cap (lens PRD §5.2,
+    /// LENS-R-*: `pane.glance`'s 8 MiB decoded-PNG cap and friends).
+    PayloadTooLarge,
 }
 
 impl ErrorCode {
@@ -58,6 +61,7 @@ impl ErrorCode {
             ErrorCode::PermissionDenied => -32005,
             ErrorCode::RateLimited => -32006,
             ErrorCode::NameConflict => -32007,
+            ErrorCode::PayloadTooLarge => -32013,
         }
     }
 
@@ -76,6 +80,7 @@ impl ErrorCode {
             ErrorCode::PermissionDenied => "permission_denied",
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::NameConflict => "name_conflict",
+            ErrorCode::PayloadTooLarge => "payload_too_large",
         }
     }
 }
@@ -214,6 +219,20 @@ impl RpcError {
             }),
         )
     }
+
+    /// Payload too large error (lens PRD §5.2: `pane.glance`'s 8 MiB
+    /// decoded-PNG cap). `size`/`max_size` are byte counts of the
+    /// oversized payload, not the base64 encoding of it.
+    pub fn payload_too_large(size: usize, max: usize) -> Self {
+        Self::with_data(
+            ErrorCode::PayloadTooLarge,
+            serde_json::json!({
+                "size": size,
+                "max_size": max,
+                "hint": "shrink the pane (pane.set_size) or set include_png=false"
+            }),
+        )
+    }
 }
 
 impl fmt::Display for RpcError {
@@ -264,5 +283,15 @@ mod tests {
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["code"], -32001);
         assert_eq!(json["data"]["size"], 20_000_000);
+    }
+
+    #[test]
+    fn test_payload_too_large_error() {
+        let err = RpcError::payload_too_large(9_000_000, 8 * 1024 * 1024);
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], -32013);
+        assert_eq!(json["message"], "payload_too_large");
+        assert_eq!(json["data"]["size"], 9_000_000);
+        assert_eq!(json["data"]["max_size"], 8 * 1024 * 1024);
     }
 }

@@ -1,0 +1,1 @@
+{"actual": ".shux/out/lens-p2-qa/artifacts/f1_glance1.png", "changed_pixels": 0, "diff": ".shux/out/lens-p2-qa/metrics/f1_glance_vs_golden.diff.png", "expected": ".shux/goldens/lens/g2_f1_80x24.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [720, 456], "status": "pass", "total_pixels": 328320}

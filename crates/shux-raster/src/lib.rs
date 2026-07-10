@@ -810,6 +810,50 @@ mod tests {
         );
     }
 
+    /// Lens PRD §5.3 P2 DoD (M4): "Determinism micro-test: same clone
+    /// rendered twice → byte-identical PNG." Exercises `pane.glance`'s
+    /// exact pipeline — a `clone_visible()` grid clone, rendered via the
+    /// rasterizer and PNG-encoded, twice from the SAME clone — both the raw
+    /// RGBA buffer and the encoded PNG bytes must match exactly.
+    #[test]
+    fn glance_clone_renders_byte_identical_twice() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let mut vt = VirtualTerminal::new(6, 30);
+        vt.process(b"\x1b[38;2;190;30;40mhello\x1b[0m \x1b[48;5;21mworld\x1b[0m\x1b[41m!\x1b[0m");
+        let clone = vt.grid().clone_visible();
+        let opts = RasterOptions {
+            cursor: Some((0, 3)),
+            ..Default::default()
+        };
+
+        fn encode_png(img: &image::RgbaImage) -> Vec<u8> {
+            use image::ImageEncoder;
+            let mut buf = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut buf)
+                .write_image(
+                    img.as_raw(),
+                    img.width(),
+                    img.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .expect("png encode");
+            buf
+        }
+
+        let img1 = r.render(&clone, &opts);
+        let img2 = r.render(&clone, &opts);
+        assert_eq!(
+            img1.as_raw(),
+            img2.as_raw(),
+            "raw RGBA buffers differ across two renders of the same clone"
+        );
+        assert_eq!(
+            encode_png(&img1),
+            encode_png(&img2),
+            "PNG-encoded bytes differ across two renders of the same clone"
+        );
+    }
+
     #[test]
     fn indexed_palette_red_is_red() {
         let rgb = indexed_to_rgb(1);

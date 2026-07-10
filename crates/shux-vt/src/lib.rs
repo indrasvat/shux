@@ -32,6 +32,11 @@ pub struct SyncPresentation {
     pub cursor: Cursor,
     pub default_colors: TerminalDefaultColors,
     pub title: Option<String>,
+    /// Alt-screen flag at freeze time (codex P2 review blocker): presented
+    /// readers (glance) must see grid/cursor/colors AND this flag from the
+    /// same frozen frame — an alt toggle inside ?2026h must not leak a
+    /// future flag against old pixels.
+    pub alternate_screen: bool,
 }
 
 /// Per-pane virtual terminal.
@@ -157,11 +162,24 @@ impl VirtualTerminal {
         // parser runs. `self.grid` is always the live writable grid (alt-screen
         // enter/leave swaps it), and its `mutations()` tally is value-independent
         // (identical repaints still advance it — §4.2 "MUST NOT diff to decide").
-        // Cursor position/visibility and the alt-screen flag are compared as the
-        // table literally states ("... change"); this is NOT cell-value diffing.
+        // Cursor position/visibility, the alt-screen flag, and the OSC 10/11/12
+        // dynamic default colors are compared as the table literally states
+        // ("... change"); this is NOT cell-value diffing. Default colors are
+        // Class A per the P2 re-adjudication (§4.2 OSC row): revision tracks
+        // the PRESENTED frame, and a dynamic-default-color change alters every
+        // rendered pixel that resolves Color::Default.
+        //
+        // The color compare uses the PRESENTED colors (the `default_colors()`
+        // accessor, sync-aware), not the raw live field (codex P2 review
+        // major): while ?2026h freezes the presentation, hidden color churn
+        // must not accumulate a deferred bump — a set-then-restore inside
+        // sync nets to NO presented change. The release batch compares the
+        // frozen colors against the now-live value, so a real net change
+        // still bumps exactly once at ?2026l, and a net-zero one never does.
         let before_writes = self.grid.mutations();
         let before_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
         let before_alt = self.modes.alternate_screen;
+        let before_colors = self.default_colors();
 
         // We need to create a VtHandler that borrows our fields mutably.
         // The vte Parser is taken out temporarily so we can pass both
@@ -189,8 +207,15 @@ impl VirtualTerminal {
         let after_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
         // Alt toggle is Class-A on its own and also invalidates the write-tally
         // comparison (the tally belongs to whichever grid is now live), so only
-        // compare tallies when the alt flag is unchanged.
-        let class_a = after_alt != before_alt
+        // compare tallies when the alt flag is unchanged. `default_colors` is a
+        // single VT-level field (not swapped by alt screen), so its compare
+        // needs no alt guard; the parser's own change-guards make a same-value
+        // OSC set a net-zero batch (no bump), per the §4.2 batching rule.
+        // PRESENTED colors on both sides: under sync this pair is frozen==
+        // frozen (hidden churn never flags), and the release batch is
+        // frozen-vs-live (net change bumps once, net-zero never).
+        let presented_colors_changed = self.default_colors() != before_colors;
+        let other_class_a = after_alt != before_alt
             || after_cursor != before_cursor
             || (before_alt == after_alt && self.grid.mutations() != before_writes);
         // §4.2 (adjudicated, PR #87 bot P1): while synchronized output
@@ -199,11 +224,27 @@ impl VirtualTerminal {
         // grid()/cursor()'s frozen view. Defer: accumulate hidden events and
         // record exactly ONE batch when the mode releases (nothing hidden →
         // release records nothing).
+        //
+        // EXCEPTION (claude P2 review minor a): the presented-colors compare
+        // is sync-aware on BOTH sides, so when it reports a change while sync
+        // is active at batch end, the PRESENTATION itself changed within this
+        // batch — e.g. `OSC 10` landing in the SAME batch that then opened
+        // ?2026h froze the new color into the presentation. Deferring that
+        // bump would lag the revision behind visibly-changed presented pixels
+        // for the whole sync window. Bump immediately; only the OTHER Class-A
+        // signals (whose compares read live state and cannot distinguish
+        // pre-freeze from post-freeze changes within the batch) defer.
         if self.sync_present.is_some() {
-            if class_a {
+            if presented_colors_changed {
+                self.record_class_a_batch();
+            }
+            if other_class_a {
                 self.sync_hidden_class_a = true;
             }
-        } else if std::mem::take(&mut self.sync_hidden_class_a) || class_a {
+        } else if std::mem::take(&mut self.sync_hidden_class_a)
+            || presented_colors_changed
+            || other_class_a
+        {
             self.record_class_a_batch();
         }
         responses
@@ -291,9 +332,18 @@ impl VirtualTerminal {
             .unwrap_or(self.default_colors)
     }
 
-    /// Whether alternate screen is active.
+    /// Whether alternate screen is active in the PRESENTED frame.
+    ///
+    /// While synchronized output (?2026) freezes the presentation, this
+    /// reads the flag captured at freeze time — the same source as
+    /// `grid()`/`cursor()`/`default_colors()` — so a presented reader
+    /// (glance) can never pair old pixels with a future alt flag (codex P2
+    /// review blocker). Live mode state is available via `modes()`.
     pub fn is_alternate_screen(&self) -> bool {
-        self.modes.alternate_screen
+        self.sync_present
+            .as_ref()
+            .map(|present| present.alternate_screen)
+            .unwrap_or(self.modes.alternate_screen)
     }
 
     /// Get the current scroll region.
@@ -2680,31 +2730,148 @@ mod content_revision_tests {
         assert_eq!(vt.content_revision(), r);
     }
 
-    // §4.2 Class B (adjudicated) — OSC 10/11/12 dynamic default fg/bg/cursor
-    // color changes mark the viewport dirty (render invalidation) but MUST NOT
-    // bump ContentRevision (lens council P1 blocker).
+    // §4.2 Class A (RE-ADJUDICATED in P2 — supersedes the P1 Class-B ruling):
+    // OSC 10/11/12 dynamic default fg/bg/cursor color changes alter the
+    // PRESENTED frame (every rendered pixel resolving Color::Default), so
+    // they bump ContentRevision — one bump per changing batch. A repeat set
+    // to the SAME color is a net-zero batch (parser change-guards) → no bump.
     #[test]
-    fn osc_10_11_12_no_bump() {
+    fn osc_10_11_12_bumps() {
         let mut vt = vt();
         let r = vt.content_revision();
         vt.process(b"\x1b]10;#ff8800\x07"); // default fg
+        assert_eq!(vt.content_revision(), r + 1);
         vt.process(b"\x1b]11;rgb:00/2b/36\x07"); // default bg
+        assert_eq!(vt.content_revision(), r + 2);
         vt.process(b"\x1b]12;#00ff00\x07"); // cursor color
-        assert_eq!(vt.content_revision(), r);
+        assert_eq!(vt.content_revision(), r + 3);
+        // Same value again → net-zero batch → no bump (§4.2 batching rule).
+        vt.process(b"\x1b]10;#ff8800\x07");
+        assert_eq!(vt.content_revision(), r + 3);
     }
 
-    // §4.2 Class B (adjudicated) — OSC 110/111/112 dynamic-color RESETS are
-    // Class B too (they also fire mark_all_dirty when a color was set).
+    // §4.2 Class A (P2 re-adjudication, both directions) — OSC 110/111/112
+    // dynamic-color RESETS also change the presented default colors when one
+    // was set, so they bump too. A reset with nothing set is a no-op batch.
     #[test]
-    fn osc_110_111_112_no_bump() {
+    fn osc_110_111_112_bumps_when_set() {
         let mut vt = vt();
-        // Set all three first so the resets actually take the invalidation path.
+        // Reset with nothing set → nothing changes → no bump.
+        let r0 = vt.content_revision();
+        vt.process(b"\x1b]110\x07");
+        assert_eq!(vt.content_revision(), r0);
+        // Set all three, then each reset changes presented colors → bump.
         vt.process(b"\x1b]10;#ff8800\x07\x1b]11;#002b36\x07\x1b]12;#00ff00\x07");
         let r = vt.content_revision();
         vt.process(b"\x1b]110\x07");
+        assert_eq!(vt.content_revision(), r + 1);
         vt.process(b"\x1b]111\x07");
+        assert_eq!(vt.content_revision(), r + 2);
         vt.process(b"\x1b]112\x07");
-        assert_eq!(vt.content_revision(), r);
+        assert_eq!(vt.content_revision(), r + 3);
+    }
+
+    // §4.2 (P2 re-adjudication) — a dynamic-color change while synchronized
+    // output is active must respect the sync-deferral: no bump while frozen,
+    // exactly one deferred bump at mode release (presented-frame semantics).
+    #[test]
+    fn osc_dynamic_color_defers_under_sync() {
+        let mut vt = vt();
+        vt.process(b"\x1b[?2026h");
+        let r = vt.content_revision();
+        vt.process(b"\x1b]10;#ff8800\x07");
+        assert_eq!(vt.content_revision(), r, "frozen: no bump during sync");
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(vt.content_revision(), r + 1, "one deferred bump at release");
+    }
+
+    // codex P2 review major — presented-colors compare: a set-then-restore of
+    // a dynamic default color INSIDE sync nets to NO presented change, so
+    // release must NOT bump. (A raw live-field compare would have flagged
+    // each hidden batch and false-bumped at ?2026l.)
+    #[test]
+    fn osc_color_net_zero_under_sync_no_bump() {
+        let mut vt = vt();
+        vt.process(b"\x1b]10;#112233\x07"); // baseline set (bumps, pre-sync)
+        vt.process(b"\x1b[?2026h");
+        let r = vt.content_revision();
+        vt.process(b"\x1b]10;#ff0000\x07"); // hidden change
+        vt.process(b"\x1b]10;#112233\x07"); // hidden restore — net zero
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(
+            vt.content_revision(),
+            r,
+            "net-zero hidden color churn must not bump at release"
+        );
+        // Control: the same churn WITHOUT the restore is a real presented
+        // change and must bump exactly once at release.
+        vt.process(b"\x1b[?2026h");
+        let r2 = vt.content_revision();
+        vt.process(b"\x1b]10;#ff0000\x07");
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(vt.content_revision(), r2 + 1);
+    }
+
+    // claude P2 review minor (a) — a color change landing in the SAME batch
+    // that opens ?2026h is frozen INTO the presentation (the presented frame
+    // visibly changed this batch), so the bump must land NOW, not lag to
+    // release; and the release itself (frozen == live) must add nothing.
+    #[test]
+    fn osc_color_set_then_sync_enter_same_batch_bumps_immediately() {
+        let mut vt = vt();
+        let r = vt.content_revision();
+        vt.process(b"\x1b]10;#ff8800\x07\x1b[?2026h"); // one batch: set + freeze
+        assert_eq!(
+            vt.default_colors().fg,
+            Some([0xff, 0x88, 0x00]),
+            "the frozen presentation carries the new color"
+        );
+        assert_eq!(
+            vt.content_revision(),
+            r + 1,
+            "presented change must bump in the same batch, not lag to release"
+        );
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(
+            vt.content_revision(),
+            r + 1,
+            "release with no hidden changes adds nothing"
+        );
+    }
+
+    // codex P2 review blocker — presented alt-screen consistency: an alt
+    // toggle inside ?2026h must not leak the future flag against the frozen
+    // frame. The presented reader surface (grid/cursor/colors/alt flag — what
+    // pane.glance clones) stays the frozen primary frame until release.
+    #[test]
+    fn sync_alt_toggle_glance_consistency() {
+        let mut vt = vt();
+        vt.process(b"primary");
+        vt.process(b"\x1b[?2026h");
+        vt.process(b"\x1b[?1049h\x1b[2JALT-CONTENT");
+        assert!(
+            vt.modes().alternate_screen,
+            "live mode flag flips immediately"
+        );
+        assert!(
+            !vt.is_alternate_screen(),
+            "presented alt flag stays frozen until release"
+        );
+        // Flag and pixels must come from the SAME frozen frame: the
+        // presented grid still shows the primary content.
+        assert!(
+            vt.capture_text(None).contains("primary"),
+            "presented grid is still the frozen primary frame"
+        );
+        vt.process(b"\x1b[?2026l");
+        assert!(
+            vt.is_alternate_screen(),
+            "release presents the alt frame's flag"
+        );
+        assert!(
+            vt.capture_text(None).contains("ALT-CONTENT"),
+            "release presents the alt frame's pixels"
+        );
     }
 
     // Guard for the mark_all_dirty decoupling: RIS (ESC c) is a real repaint
@@ -2720,7 +2887,8 @@ mod content_revision_tests {
     }
 
     // Council addendum — OSC 4 palette redefinition also fires mark_all_dirty
-    // and is Class B (dynamic-color metadata; no cell write): no bump.
+    // and REMAINS Class B (P2 re-adjudication kept it: known limitation —
+    // palette redefinition can alter indexed-color pixels without a bump).
     // (OSC 104 palette reset is not handled by the parser, so only the set
     // path exists to test.)
     #[test]

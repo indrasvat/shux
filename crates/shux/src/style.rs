@@ -1089,6 +1089,57 @@ pub fn print_run_command(result: &serde_json::Value, is_async: bool) {
     }
 }
 
+/// Print a `pane glance` summary (lens PRD §5/§10). PNG bytes are never
+/// printed here — only the file-write confirmation when `--png` was given.
+#[allow(clippy::too_many_arguments)]
+pub fn print_pane_glance(
+    pane_id: &str,
+    revision: u64,
+    cols: u64,
+    rows: u64,
+    cursor_row: u64,
+    cursor_col: u64,
+    cursor_visible: bool,
+    alt_screen: bool,
+    checkpointed: bool,
+    evicted_revision: Option<u64>,
+    text: &str,
+    png_written: Option<(&std::path::Path, u64)>,
+) {
+    println!(
+        "{} glance {} rev {} {}×{} cursor ({},{}) {} alt_screen {}",
+        success("✓"),
+        muted(&short_id(pane_id)),
+        bold(&revision.to_string()),
+        cols,
+        rows,
+        cursor_row,
+        cursor_col,
+        if cursor_visible { "visible" } else { "hidden" },
+        if alt_screen { "yes" } else { "no" },
+    );
+    if checkpointed {
+        match evicted_revision {
+            Some(ev) => println!("  {} checkpointed (evicted revision {ev})", accent("✓")),
+            None => println!("  {} checkpointed", accent("✓")),
+        }
+    }
+    if let Some((path, len)) = png_written {
+        println!(
+            "  {} png → {} ({len} bytes)",
+            success("✓"),
+            bold(&path.display().to_string()),
+        );
+    }
+    if !text.is_empty() {
+        println!();
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]

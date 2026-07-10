@@ -1,0 +1,67 @@
+{
+  "task": "077-shux-lens",
+  "phase": "P2",
+  "tool": ".claude/automations/pixel_verify.py",
+  "semantics": "exact — defaults max_pixel_diff_ratio=0.0, max_mean_channel_delta=0.0, size-mismatch hard-fail",
+  "generated_by": "shux-vt-solid-qa audit (independent release-binary drive, isolated XDG)",
+  "comparisons": [
+    {
+      "name": "f1_glance_vs_golden",
+      "kind": "independent-re-render-vs-committed-golden",
+      "actual": ".shux/out/lens-p2-qa/artifacts/f1_glance1.png (QA live drive, release binary)",
+      "expected": ".shux/goldens/lens/g2_f1_80x24.png",
+      "size": [720, 456],
+      "changed_pixels": 0,
+      "pixel_diff_ratio": 0.0,
+      "mean_rgba_channel_delta": 0.0,
+      "byte_cmp": "identical",
+      "status": "pass"
+    },
+    {
+      "name": "f5_glance_vs_golden",
+      "kind": "independent-re-render-vs-committed-golden",
+      "actual": ".shux/out/lens-p2-qa/artifacts/f5_glance1.png (QA live drive, release binary)",
+      "expected": ".shux/goldens/lens/g2w_f5_100x30.png",
+      "size": [900, 570],
+      "changed_pixels": 0,
+      "pixel_diff_ratio": 0.0,
+      "mean_rgba_channel_delta": 0.0,
+      "byte_cmp": "identical",
+      "status": "pass"
+    },
+    {
+      "name": "f1_determinism_g1_vs_g2",
+      "kind": "same-revision-double-render (rev 359)",
+      "size": [720, 456],
+      "changed_pixels": 0,
+      "byte_cmp": "identical",
+      "status": "pass"
+    },
+    {
+      "name": "f5_determinism_g1_vs_g2",
+      "kind": "same-revision-double-render (rev 216)",
+      "size": [900, 570],
+      "changed_pixels": 0,
+      "byte_cmp": "identical",
+      "status": "pass"
+    },
+    {
+      "name": "f1_glance_vs_snapshot",
+      "kind": "glance-vs-pane.snapshot parity (LENS-R-013)",
+      "size": [720, 456],
+      "changed_pixels": 0,
+      "byte_cmp": "identical",
+      "status": "pass"
+    },
+    {
+      "name": "f5_glance_vs_snapshot",
+      "kind": "glance-vs-pane.snapshot parity (LENS-R-013)",
+      "size": [900, 570],
+      "changed_pixels": 0,
+      "byte_cmp": "identical",
+      "status": "pass"
+    }
+  ],
+  "all_pass": true,
+  "per_comparison_json": "pixel_metrics/"
+}
