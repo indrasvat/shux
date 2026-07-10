@@ -138,6 +138,136 @@
         "A1 (crates/shux/tests/lens_diff.rs::a1_altscreen_semantics)"
       ]
     },
+    "k1_pos1": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6). MINTED by the P6 implementation agent from the ACTUAL pane.glance render — F4 in an ordinary session, checkpoint (cp0), one Tab press, pane.wait_settled, pane.glance{checkpoint:true}. Rendering is UNCHANGED since P4 (no raster/glance code touched in P6) — the PRD sec14 golden-ratification rule for raster-untouched phases applies: this mint is provisional pending an INDEPENDENT verifier's re-render + byte cmp + visual sign-off (recorded as a BASELINE-APPROVAL P6 addendum once ratified). Determinism proven by the implementer: two independent driver-script runs (fresh isolated daemon each time, different session names/PIDs) produced byte-identical PNGs (cmp clean; sha256 matches both runs). K1 asserts cells_changed=2 for this and every subsequent Tab press — confirmed live (2/2/2 across all three presses).",
+      "fixture": ".shux/fixtures/lens/f4_keys.sh",
+      "size": "80x24",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<test pane; checkpoint before any Tab, 1x Tab pressed, settled, checkpoint>",
+        "checkpoint": true
+      },
+      "png": "k1_pos1.png",
+      "png_sha256": "0dc75269778869e3c971233be8c11455f8dcae07dfa1e1ac0a3341548b042b1d",
+      "expected_delta_since_prior_checkpoint": { "cells_changed": 2 },
+      "used_by": [
+        "K1 (crates/shux/tests/lens_loop.rs::k1_drive_regression)"
+      ]
+    },
+    "k1_pos2": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/ratification status as k1_pos1, after a SECOND Tab press (marker moves to grid-cell index 2). Determinism proven identically (byte-identical across 2 independent driver runs).",
+      "fixture": ".shux/fixtures/lens/f4_keys.sh",
+      "size": "80x24",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<test pane; 2x Tab pressed, settled, checkpoint>",
+        "checkpoint": true
+      },
+      "png": "k1_pos2.png",
+      "png_sha256": "166d4a96fbf026792cb9532cb4d46ba9b8d03a4189a9a4312471e7f9d3ca1586",
+      "expected_delta_since_prior_checkpoint": { "cells_changed": 2 },
+      "used_by": [
+        "K1 (crates/shux/tests/lens_loop.rs::k1_drive_regression)"
+      ]
+    },
+    "k1_pos3": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/ratification status as k1_pos1, after a THIRD Tab press (marker wraps back to grid-cell index 0, i.e. F4's initial position). Determinism proven identically. NOTE (self-consistency receipt): this PNG is BYTE-IDENTICAL to e1_glance.png, because F4's freshly-launched initial frame and its post-3-Tab-wraparound frame are visually identical by fixture design (F4 comment: 'marker among cells (8,5)/(8,25)/(8,45)' cycling mod 3) — independently cross-validates both mints.",
+      "fixture": ".shux/fixtures/lens/f4_keys.sh",
+      "size": "80x24",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<test pane; 3x Tab pressed (wraps to start), settled, checkpoint>",
+        "checkpoint": true
+      },
+      "png": "k1_pos3.png",
+      "png_sha256": "0461665628f102f98aff39f91d5c8b5af11936a64448b42dfbfb5bb1a227d3c2",
+      "expected_delta_since_prior_checkpoint": { "cells_changed": 2 },
+      "used_by": [
+        "K1 (crates/shux/tests/lens_loop.rs::k1_drive_regression)"
+      ]
+    },
+    "e1_glance": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6). MINTED by the P6 implementation agent from the ACTUAL pane.glance render of F4 run via `lens.run` into a SCRATCH session (the E1 loop's own `run` step) — wait_for sentinel, pane.wait_settled, pane.glance{checkpoint:true}. Rendering UNCHANGED since P4; PRD sec14 raster-untouched rule applies — provisional pending independent verifier ratification. Determinism: byte-identical across 2 independent driver runs (fresh scratch daemon each time). Byte-identical to k1_pos3.png by fixture design (see k1_pos3 note) — cross-validates both.",
+      "fixture": ".shux/fixtures/lens/f4_keys.sh",
+      "size": "80x24",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<scratch pane from lens.run; settled, checkpoint, before any drive input>",
+        "checkpoint": true
+      },
+      "png": "e1_glance.png",
+      "png_sha256": "0461665628f102f98aff39f91d5c8b5af11936a64448b42dfbfb5bb1a227d3c2",
+      "used_by": [
+        "E1 (crates/shux/tests/lens_loop.rs::e1_whole_loop)"
+      ]
+    },
+    "e1_heat": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6). MINTED by the P6 implementation agent from the ACTUAL pane.diff_since{heat_png:true} render of the E1 loop's `drive` step (send `a` to the scratch pane, settle, diff since the e1_glance revision). Rendering UNCHANGED since P4 (heat overlay math untouched in P6); provisional pending independent verifier ratification. Determinism: byte-identical across 2 independent driver runs. STRONG cross-validation receipt: this PNG is BYTE-IDENTICAL to the already-RATIFIED P4 golden d2_heat.png (sha256 deef295d…) — expected, since both are the F4 fixture's pre-`a`-checkpoint vs. post-`a` heat diff on an unresized 80x24 pane; the E1 loop's diff independently re-derived cells_changed=10 and the exact D2 regions ({row:2,col_start:2,col_end:3},{row:5,col_start:10,col_end:19}).",
+      "fixture": ".shux/fixtures/lens/f4_keys.sh",
+      "size": "80x24",
+      "rpc": "pane.diff_since",
+      "params": {
+        "pane_id": "<scratch pane from lens.run; diffed after sending `a` and settling>",
+        "since_revision": "<e1_glance revision>",
+        "heat_png": true
+      },
+      "png": "e1_heat.png",
+      "png_sha256": "deef295d5c3d55aeadfdb974fbe96a6b385806e790a8d846a35c77e9182e503e",
+      "expected_delta": {
+        "cells_changed": 10,
+        "regions": [
+          { "row": 2, "col_start": 2, "col_end": 3 },
+          { "row": 5, "col_start": 10, "col_end": 19 }
+        ]
+      },
+      "used_by": [
+        "E1 (crates/shux/tests/lens_loop.rs::e1_whole_loop)"
+      ]
+    },
+    "t4_vivecaka_help_100x30": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6, §13 T-tier). MINTED by the P6 implementation agent from the ACTUAL pane.glance render of `vivecaka --help` run via `lens.run` at 100x30, settled, glanced. Real installed binary: vivecaka 0.1.9 (commit 515042b, go1.26.2) — network-free (DEC-18: help card only in the red suite). Rendering UNCHANGED since P2 (glance path); provisional pending independent verifier ratification. Determinism: byte-identical across 2 independent driver runs. Visual: rounded-box help card, purple/blue/cyan syntax highlighting, no tofu.",
+      "fixture": "vivecaka --help (real installed TUI, not a repo fixture)",
+      "app_version": "vivecaka 0.1.9 (commit 515042b, built 2026-05-23T01:49:21Z, go1.26.2)",
+      "size": "100x30",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<scratch pane from `lens.run -- vivecaka --help`; settled, glanced>"
+      },
+      "png": "t4_vivecaka_help_100x30.png",
+      "png_sha256": "aff4d6f20fad1a434f20a53ba58ea081a21ae20b1447dadf9531b4b1d6954ddd",
+      "used_by": [
+        "T4 (crates/shux/tests/lens_ttier.rs::t4_vivecaka_help_card)"
+      ]
+    },
+    "t4_vivecaka_help_60x20": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6, §13 T-tier) — same recipe/ratification status as t4_vivecaka_help_100x30, at 60x20. At this narrower width the help card's fixed-width box overflows the pane (vivecaka does not reflow its help text to terminal width), so the render shows a partial/wrapped view — this is vivecaka's real behavior at 60 columns, not a shux rendering defect.",
+      "fixture": "vivecaka --help (real installed TUI, not a repo fixture)",
+      "app_version": "vivecaka 0.1.9 (commit 515042b, built 2026-05-23T01:49:21Z, go1.26.2)",
+      "size": "60x20",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<scratch pane from `lens.run -- vivecaka --help`; settled, glanced>"
+      },
+      "png": "t4_vivecaka_help_60x20.png",
+      "png_sha256": "44764842b9f78b212c299d279080c616addca118562e12a0ea3754811a2b7f28",
+      "used_by": [
+        "T4 (crates/shux/tests/lens_ttier.rs::t4_vivecaka_help_card)"
+      ]
+    },
     "a1_normal": {
       "phase": "P4",
       "provisional": false,

@@ -223,3 +223,132 @@ SOLID gate).
   the P2/P3 sections above; see `evidence-manifest.json` → `goldens.{d2_heat,
   a1_alt,a1_normal}`. `shux` workspace 0.40.0, git base
   `d3b62829e55cf4ea945afaf5966a2a02d86e1e16`, rustc 1.95.0, Darwin arm64.
+
+---
+
+## P6 addendum (2026-07-10) — K1/E1 loop goldens + T4 vivecaka — PROVISIONAL
+
+**Status: PROVISIONAL.** Task 077 P6 closes the gate (K1, E1 green; T4
+green; T1/T2/T3 BLOCKED — see below). P6 changes NO raster/glance/diff
+rendering code, so the PRD §14 raster-untouched golden-ratification rule
+applies to every golden below: minted here as PROVISIONAL by the
+implementation agent, pending an INDEPENDENT verifier's re-render + byte cmp
++ full-resolution visual inspection + orchestrator sign-off (to be recorded
+as a follow-up entry in this file once that pass runs — not self-certified
+here).
+
+### Recipe (K1/E1 — ordinary + scratch sessions)
+
+Driven live via the `shux` CLI against a fresh isolated daemon (own
+`XDG_RUNTIME_DIR`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME`, the same lens harness
+fixture-font fallback chain as `lens_common::Harness::new` — Noto Sans
+Devanagari + the CJK subset appended after `builtin:nerd-font`), mirroring
+the exact steps `crates/shux/tests/lens_loop.rs` uses:
+
+- **K1** (`k1_pos1/2/3.png`): ordinary session, F4 (`f4_keys.sh`) at 80×24 →
+  `pane glance --checkpoint` (cp0, not a golden) → 3×(`pane send-keys --data
+  CQ==` [Tab] → `pane wait-settled --quiet 300ms --timeout 5s` → `pane
+  glance --checkpoint --png k1_posN.png` → `pane diff --since <prev>`).
+  Live-observed `cells_changed: 2` on every one of the 3 presses (matches
+  K1's assertion exactly); with the initial checkpoint this is the
+  LENS-R-031 4-slot cap the test comment calls out.
+- **E1** (`e1_glance.png`, `e1_heat.png`): `lens run --size 80x24 -- sh
+  f4_keys.sh` (scratch) → `pane wait-for` sentinel → `pane wait-settled` →
+  `pane glance --checkpoint --png e1_glance.png` → `pane send-keys --text a`
+  (via the CLI's own `-s/-p` resolution, which required the P6 CLI fix
+  below) → `pane wait-settled` → `pane diff --since <rev> --heat
+  e1_heat.png`. Live-observed delta: `cells_changed: 10`, `regions:
+  [{row:2,col_start:2,col_end:3},{row:5,col_start:10,col_end:19}]` —
+  byte-identical to E1's frozen `f4_expected_regions()`. Total wall clock
+  ~1s, well inside the 10s E1 budget.
+
+**Determinism:** every PNG above rendered twice from two independent driver
+invocations (fresh daemon, fresh temp dirs, different session names/PIDs
+each time) and `cmp`-compared byte-identical (sha256 matches both runs —
+see `evidence-manifest.json` per-golden `png_sha256`).
+
+**Cross-validation receipts (stronger than a single mint):**
+- `k1_pos3.png` and `e1_glance.png` are byte-identical — expected, because
+  F4's focus marker cycles through 3 grid cells and both frames land on the
+  cycle's starting position (initial launch, and after exactly 3 Tab
+  presses). Two independently-driven mints agreeing exactly is a strong
+  correctness signal.
+- `e1_heat.png` is byte-identical to the P4-RATIFIED `d2_heat.png`
+  (`deef295d…`) — expected, since both diff the same F4 fixture across the
+  same pre-/post-`a` checkpoint pair on an unresized 80×24 pane. This ties
+  the new E1 golden directly to an already-independently-ratified P4
+  baseline rather than resting solely on the implementer's own re-render.
+
+**Visual inspection (implementing agent, full resolution):** `LENS-F4-KEYS`
+sentinel top-left; cyan `▶` focus marker at each of its three grid
+positions across k1_pos1/2/3; truecolor gradient bar + 256-color strip +
+basic-ANSI legend row all in full color; `e1_heat.png` shows the red heat
+tint on exactly the changed red block + `A-PRESSED` text, remaining content
+visibly muted. No tofu, no monochrome regression, cursor hidden per fixture.
+
+### Recipe (T4 — vivecaka --help, real installed binary)
+
+`lens run --size <CxR> -- vivecaka --help` → `pane wait-settled --quiet
+400ms --timeout 10s` → `pane glance --png`, at both 100×30 and 60×20.
+`vivecaka 0.1.9` (commit `515042b`, go1.26.2) — network-free per DEC-18.
+Determinism: byte-identical across 2 independent runs. Visual: rounded-box
+help card, purple/blue/cyan syntax highlighting; the 60×20 cell shows a
+partial/wrapped view because vivecaka's help card does not reflow to a
+narrower terminal — genuine app behavior, not a shux defect.
+
+### T1/T2/T3 — BLOCKED, not minted, frozen test unmodified (§16.4)
+
+**T1, T2, T3 are NOT green and no `t1_*`/`t3_*` goldens are committed here.**
+Root cause (confirmed empirically, not a "TUI not installed" case — `nidhi
+0.1.0-alpha.1` (commit `1e5d952`) IS installed and runs): nidhi now shows a
+mandatory "Press Enter to continue" welcome screen (`internal/ui/screens/
+welcome.go`, `RenderWelcome`) on every invocation, with no CLI flag, env var,
+or config key to skip it (checked `nidhi --help` and the binary's embedded
+strings for `nidhi.*` / `NIDHI_*` keys — none exist) and no auto-advance
+timeout (confirmed idle 8s with no input: still on the welcome frame). The
+frozen `crates/shux/tests/lens_ttier.rs` T1/T2/T3 bodies call `pane.wait_for`
+for the Devanagari stash-list sentinel (`विवेचक`) immediately after
+`lens.run`, with no dismiss keystroke in between — so every run times out at
+10s with an empty capture (`last_capture_preview: ""`), confirmed live for
+all three tests. This is a real behavior drift in the `nidhi` binary since
+the frozen §13 harness was authored, not an environment or installation gap.
+
+**Per §16.2/§16.4, the frozen test file was NOT modified.** A CANDIDATE fix
+was verified out-of-band (not committed, not applied to the frozen file):
+insert `pane wait-for --text "Press Enter to continue"` then `pane send-keys
+--data DQ==` (Enter) before the existing `pane wait-for --text "विवेचक"`, at
+all three call sites (T1, T2, T3). Candidate goldens rendered cleanly under
+this recipe with real Devanagari/CJK/emoji, full color, no tofu (scratch
+evidence, not committed — see the P6 implementer's final report for paths).
+One extra finding from the candidate run: `--icons nerd` vs `--icons ascii`
+produced byte-identical renders of the stash-LIST screen in this nidhi
+version (icon glyphs apparently only affect other screens, not the top-level
+list) — worth confirming against nidhi's own docs before treating T3's
+4-way matrix as still meaningful.
+
+**This requires explicit user approval before any commit**: a
+`LENS-TEST-CHANGE: nidhi welcome-screen dismiss (T1/T2/T3)` trailer +
+one-question `dootsabha council` per §16.4, applied in a follow-up commit,
+NOT bundled into this PROVISIONAL golden mint.
+
+### CLI fix required to complete the E1 loop (see PR description for full diff)
+
+Minting E1 exposed a real gap: `lens.run`'s scratch `session_id` could not
+be used with `shux pane send-keys -s <uuid>` (its default "resolve the
+session's active window" path only queried the default, scratch-excluded
+`session.list`) — the same class of bug as issue #88 (`-s/--session`
+resolving by name only). Fixed in `crates/shux/src/cli.rs`:
+`resolve_session_id` now short-circuits on a syntactically valid UUID (no
+name-list round trip), `resolve_pane_window_id`'s active-window lookup now
+queries `session.list --include-scratch`, and `session kill` sends `id`
+instead of `name` when given a UUID (`lens.run`'s own `session_id` is now
+directly `session kill`-able). All downstream RPCs still validate existence
+server-side, so this cannot mask a real not-found error.
+
+### Provenance
+
+`shux` workspace 0.42.0, git base `eb659473869edbf9d4ae509cbad9b7456cd7788e`
+(includes `64745cf` / PR #92 and the v0.42.0 release commit, per the P6
+branch-point requirement), rustc 1.95.0, Darwin arm64. See
+`evidence-manifest.json` → `goldens.{k1_pos1,k1_pos2,k1_pos3,e1_glance,
+e1_heat,t4_vivecaka_help_100x30,t4_vivecaka_help_60x20}`.
