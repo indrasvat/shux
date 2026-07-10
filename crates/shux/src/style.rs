@@ -1176,6 +1176,22 @@ pub fn print_pane_checkpoint(pane_id: &str, revision: u64, evicted: Option<u64>)
     }
 }
 
+/// Print a `lens run` summary (lens PRD §8/§10): the scratch session/pane
+/// ids, the pane's revision right after spawn, and — only for `--wait` —
+/// the child's exit code.
+pub fn print_lens_run(session_id: &str, pane_id: &str, revision: u64, exit_code: Option<i64>) {
+    println!(
+        "{} lens run {} {} rev {}",
+        success("✓"),
+        muted(&short_id(session_id)),
+        muted(&short_id(pane_id)),
+        bold(&revision.to_string()),
+    );
+    if let Some(code) = exit_code {
+        println!("  {} exit code {}", muted("·"), bold(&code.to_string()));
+    }
+}
+
 /// Print a `pane diff` summary (lens PRD §7/§10): the revision span and the
 /// structured delta. Diff is data, not a verdict, so this always reads as a
 /// neutral ✓ (the CLI exits 0 regardless of delta size).

@@ -14,6 +14,7 @@ mod client;
 mod config_validate;
 mod daemon;
 mod features;
+mod lens_scratch;
 mod onboarding;
 mod session_meta;
 mod session_persist;
@@ -167,6 +168,12 @@ pub struct PaneIoState {
     /// awaits these sends before sampled publishing, so this path is
     /// byte-exact and intentionally applies backpressure.
     recorders: HashMap<shux_core::model::PaneId, Vec<PaneRecorder>>,
+    /// Per-pane PTY child PID (== pgid; children are session leaders, see
+    /// `shux-pty::handle::PtyHandle::terminate`). `lens.run` (P5) reads this
+    /// to populate the scratch registry's `pgid` field (LENS-R-044) without
+    /// needing its own handle to the spawned `PtyHandle`. Same lifetime as
+    /// `vts`: cleared on pane teardown.
+    pub pty_pids: HashMap<shux_core::model::PaneId, u32>,
 }
 
 impl Default for PaneIoState {
@@ -191,6 +198,7 @@ impl PaneIoState {
             render_pulse: Arc::new(tokio::sync::Notify::new()),
             event_bus: None,
             recorders: HashMap::new(),
+            pty_pids: HashMap::new(),
         }
     }
 
@@ -240,6 +248,7 @@ impl PaneIoState {
                 self.revisions.remove(pane_id);
                 self.checkpoints.remove(pane_id);
                 self.invalidations.remove(pane_id);
+                self.pty_pids.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)
@@ -1282,27 +1291,41 @@ async fn run_pane_pty_task(
 /// argv directly — this is what `shux new -s X -- vim foo.rs` lands on,
 /// so the pane runs `vim foo.rs` instead of a shell. The pane lifetime
 /// becomes the lifetime of that command (when it exits, the pane EOFs).
+///
+/// `size`/`extra_env` let `lens.run` (P5, LENS-R-040) request a non-default
+/// PTY size and environment additions for a scratch pane; every other
+/// caller passes `PtySize::default()` / an empty env, which reproduces the
+/// exact pre-P5 behavior byte-for-byte (`config.size` defaults to 80×24,
+/// same as the VT construction this replaces). Returns the raw
+/// `shux_pty::PtyError` (rather than an `RpcError`) so callers can map it
+/// to their own error code — `lens.run` needs `SPAWN_FAILED (-32014)`,
+/// every other caller keeps mapping to `internal()`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_pane_pty(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
     command: Vec<String>,
+    size: shux_pty::handle::PtySize,
+    extra_env: Vec<(String, String)>,
     io_state: Arc<Mutex<PaneIoState>>,
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
-) -> Result<(), shux_rpc::RpcError> {
-    let config = if command.is_empty() {
+) -> Result<(), shux_pty::PtyError> {
+    let mut config = if command.is_empty() {
         shux_pty::handle::PtyConfig::default_shell(cwd)
     } else {
         shux_pty::handle::PtyConfig::with_command(command, cwd)
     };
-    let handle = shux_pty::handle::PtyHandle::spawn(&config)
-        .map_err(|e| shux_rpc::RpcError::internal(&format!("PTY spawn failed: {e}")))?;
+    config.size = size;
+    config.env = extra_env;
+    let handle = shux_pty::handle::PtyHandle::spawn(&config)?;
+    let pid = handle.pid();
 
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
     let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>(16);
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let pane_shutdown = shutdown.child_token();
-    let vt = shux_vt::VirtualTerminal::new(24, 80);
+    let vt = shux_vt::VirtualTerminal::new(size.rows as usize, size.cols as usize);
     // LENS-R-003: seed the per-pane revision watch with the VT's initial
     // (content_revision=1, last_mutation_ns=creation time). The initial
     // receiver is dropped; P3 subscribers call `subscribe()` on the stored
@@ -1324,6 +1347,7 @@ pub(crate) async fn spawn_pane_pty(
         state.pty_done.insert(pane_id, done_rx);
         state.vts.insert(pane_id, vt);
         state.revisions.insert(pane_id, rev_tx);
+        state.pty_pids.insert(pane_id, pid);
     }
 
     tokio::spawn(run_pane_pty_task(
@@ -1395,8 +1419,20 @@ fn run_daemon() -> anyhow::Result<()> {
         daemon::spawn_signal_handler(cmd_tx.clone(), tokens.clone()).await?;
 
         // Ensure runtime dir and clean up stale socket
-        daemon::ensure_runtime_dir()?;
+        let runtime_dir = daemon::ensure_runtime_dir()?;
         daemon::remove_socket_file()?;
+
+        // Lens scratch registry startup reap (LENS-R-044, DEC-7): scratch
+        // sessions never survive a restart. Kill any process groups a prior
+        // daemon incarnation left registered BEFORE the RPC server starts
+        // accepting `lens.run` calls that would populate a fresh registry.
+        let reaped = lens_scratch::ScratchRegistry::startup_reap(&runtime_dir, None).await;
+        if reaped > 0 {
+            tracing::info!(
+                reaped,
+                "startup: reaped orphaned scratch sessions from a prior daemon"
+            );
+        }
 
         // Set up SessionGraph + graph loop
         let sock_path = daemon::socket_path()?;
@@ -1484,6 +1520,11 @@ async fn run_rpc_server(
     ));
     let shutdown_io_state = io_state.clone();
 
+    // Lens scratch registry (§8 SPEC-E, LENS-R-040..046). One per daemon
+    // incarnation — the startup reap in `run_daemon` already cleared any
+    // leftover registry file from a prior incarnation before this runs.
+    let scratch_registry = lens_scratch::ScratchRegistry::new(&daemon::runtime_dir()?);
+
     // Load user config (~/.config/shux/config.toml). Missing file is
     // valid — defaults match current hardcoded behavior. Spawn a watcher
     // task so edits to the file are picked up live.
@@ -1569,21 +1610,27 @@ async fn run_rpc_server(
     // circular dependency (manager holds Arc<OnceCell<Router>>).
     let plugins = shux_plugin::PluginManager::new(event_bus.clone());
 
-    // Build router: system builtins + session + window + pane + pane I/O + events + state + plugin methods
+    // Build router: system builtins + session + window + pane + pane I/O + lens.run + events + state + plugin methods
     let router = register_plugin_methods(
         register_state_methods(
             register_events_methods(
-                register_pane_io_methods(
-                    register_pane_methods(
-                        register_window_methods(
-                            register_session_methods(
-                                shux_rpc::server::register_builtin_methods(
-                                    shux_rpc::Router::builder(),
+                lens_scratch::register_lens_run_method(
+                    register_pane_io_methods(
+                        register_pane_methods(
+                            register_window_methods(
+                                register_session_methods(
+                                    shux_rpc::server::register_builtin_methods(
+                                        shux_rpc::Router::builder(),
+                                    ),
+                                    graph_handle.clone(),
+                                    io_state.clone(),
+                                    cancel.clone(),
+                                    session_meta_cache.clone(),
+                                    scratch_registry.clone(),
                                 ),
                                 graph_handle.clone(),
                                 io_state.clone(),
                                 cancel.clone(),
-                                session_meta_cache.clone(),
                             ),
                             graph_handle.clone(),
                             io_state.clone(),
@@ -1592,14 +1639,16 @@ async fn run_rpc_server(
                         graph_handle.clone(),
                         io_state.clone(),
                         cancel.clone(),
+                        config_handle.clone(),
+                        session_meta_cache.clone(),
+                        onboarding.clone(),
+                        segment_cache.clone(),
                     ),
                     graph_handle.clone(),
                     io_state.clone(),
                     cancel.clone(),
-                    config_handle.clone(),
-                    session_meta_cache.clone(),
-                    onboarding.clone(),
-                    segment_cache.clone(),
+                    event_bus.clone(),
+                    scratch_registry.clone(),
                 ),
                 event_bus,
             ),
@@ -1869,6 +1918,8 @@ fn register_state_methods(
                                 pane_id,
                                 cwd,
                                 command,
+                                shux_pty::handle::PtySize::default(),
+                                Vec::new(),
                                 spawn_io,
                                 spawn_ct,
                                 gh.clone(),
@@ -2497,7 +2548,17 @@ fn register_pane_methods(
                     .unwrap_or_else(|| {
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
-                let _ = spawn_pane_pty(new_pane_id, cwd, command, io, ct, gh.clone()).await;
+                let _ = spawn_pane_pty(
+                    new_pane_id,
+                    cwd,
+                    command,
+                    shux_pty::handle::PtySize::default(),
+                    Vec::new(),
+                    io,
+                    ct,
+                    gh.clone(),
+                )
+                .await;
 
                 let snap = gh.snapshot();
                 let new_pane = snap
@@ -3373,8 +3434,17 @@ fn register_window_methods(
                     let pane_id = window.active_pane.to_string();
 
                     // Spawn PTY for the new pane
-                    let _ =
-                        spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
+                    let _ = spawn_pane_pty(
+                        window.active_pane,
+                        cwd,
+                        command,
+                        shux_pty::handle::PtySize::default(),
+                        Vec::new(),
+                        io,
+                        ct,
+                        gh.clone(),
+                    )
+                    .await;
 
                     let mut result = window_to_json(window, index, is_active, &snap);
                     // Include pane_id at top level for convenience
@@ -3498,8 +3568,17 @@ fn register_window_methods(
                         .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
 
                     // Spawn PTY for the new pane
-                    let _ =
-                        spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
+                    let _ = spawn_pane_pty(
+                        window.active_pane,
+                        cwd,
+                        command,
+                        shux_pty::handle::PtySize::default(),
+                        Vec::new(),
+                        io,
+                        ct,
+                        gh.clone(),
+                    )
+                    .await;
 
                     let session = snap
                         .sessions
@@ -3721,6 +3800,7 @@ fn register_session_methods(
     io_state: Arc<Mutex<PaneIoState>>,
     cancel: tokio_util::sync::CancellationToken,
     meta_cache: session_meta::SessionMetaCache,
+    scratch_registry: lens_scratch::ScratchRegistry,
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
@@ -3739,18 +3819,44 @@ fn register_session_methods(
     let meta_kill = meta_cache.clone();
     let meta_ensure = meta_cache;
 
+    let scratch_list = scratch_registry.clone();
+    let scratch_kill = scratch_registry;
+
     builder
         .register_with_policy(
             "session.list",
             Policy::fixed(Sensitivity::Public),
-            move |_params: Option<serde_json::Value>| {
+            move |params: Option<serde_json::Value>| {
                 let gh = g1.clone();
+                let registry = scratch_list.clone();
                 async move {
+                    // LENS-R-041: scratch sessions are excluded from the
+                    // default listing; `include_scratch: true` reveals them
+                    // flagged `scratch: true`. Visibility is not
+                    // authorization — an id is always resolvable directly
+                    // (session.kill/snapshot/etc. never consult this filter).
+                    let include_scratch = params
+                        .as_ref()
+                        .and_then(|p| p.get("include_scratch"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let scratch_ids = registry.ids().await;
+
                     let snap = gh.snapshot();
                     let mut sessions: Vec<_> = snap.sessions.values().collect();
                     sessions.sort_by_key(|s| s.created_at);
-                    let sessions: Vec<serde_json::Value> =
-                        sessions.iter().map(|s| session_to_json(s, &snap)).collect();
+                    let sessions: Vec<serde_json::Value> = sessions
+                        .iter()
+                        .filter(|s| include_scratch || !scratch_ids.contains(&s.id))
+                        .map(|s| {
+                            let mut json = session_to_json(s, &snap);
+                            if include_scratch {
+                                json["scratch"] =
+                                    serde_json::Value::Bool(scratch_ids.contains(&s.id));
+                            }
+                            json
+                        })
+                        .collect();
                     Ok(serde_json::json!({ "sessions": sessions }))
                 }
             },
@@ -3854,6 +3960,8 @@ fn register_session_methods(
                                             w.active_pane,
                                             cwd,
                                             command.clone(),
+                                            shux_pty::handle::PtySize::default(),
+                                            Vec::new(),
                                             io,
                                             ct,
                                             gh.clone(),
@@ -3880,6 +3988,7 @@ fn register_session_methods(
                 let gh = g3.clone();
                 let io = io_kill.clone();
                 let meta = meta_kill.clone();
+                let registry = scratch_kill.clone();
                 async move {
                     let params = params.unwrap_or_default();
 
@@ -3960,6 +4069,12 @@ fn register_session_methods(
                     }
 
                     meta.remove(session_id).await;
+
+                    // LENS-R-042c: explicit session.kill reaps a scratch
+                    // session IMMEDIATELY (no post_exit_ttl_ms wait) — this
+                    // is a no-op for ordinary sessions (registry lookup
+                    // misses).
+                    lens_scratch::on_session_killed(&registry, session_id).await;
 
                     Ok(serde_json::json!({ "killed": name }))
                 }
@@ -4042,6 +4157,8 @@ fn register_session_methods(
                                             w.active_pane,
                                             cwd,
                                             command.clone(),
+                                            shux_pty::handle::PtySize::default(),
+                                            Vec::new(),
                                             io,
                                             ct,
                                             gh.clone(),
@@ -6181,9 +6298,9 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     Ok(())
                 }
             }
-            cli::SessionCommand::List => {
+            cli::SessionCommand::List { include_scratch } => {
                 let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-                cli::handle_ls(&mut stream, args.format).await
+                cli::handle_ls(&mut stream, include_scratch, args.format).await
             }
             cli::SessionCommand::Kill {
                 name_pos,
@@ -6693,6 +6810,33 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     .await
                 }
             }
+        }
+
+        Some(Command::Lens {
+            command:
+                cli::LensCommand::Run {
+                    size,
+                    ttl,
+                    max_runtime,
+                    env,
+                    cwd,
+                    wait,
+                    argv,
+                },
+        }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_lens_run(
+                &mut stream,
+                &argv,
+                size,
+                ttl,
+                max_runtime,
+                &env,
+                cwd.as_deref(),
+                wait,
+                args.format,
+            )
+            .await
         }
 
         Some(Command::Rpc {
@@ -7906,6 +8050,9 @@ mod tests {
             let config = ConfigHandle::load_or_default(&config_path);
             let onboarding = onboarding::OnboardingHandle::from_state_for_test(Default::default());
             let segments = statusbar_runner::SegmentCache::new();
+            let scratch_runtime_dir = std::env::temp_dir()
+                .join(format!("shux-rpc-test-scratch-{}", uuid::Uuid::new_v4()));
+            let scratch_registry = lens_scratch::ScratchRegistry::new(&scratch_runtime_dir);
 
             let builder = register_session_methods(
                 shux_rpc::Router::builder(),
@@ -7913,6 +8060,7 @@ mod tests {
                 io.clone(),
                 cancel.clone(),
                 meta.clone(),
+                scratch_registry,
             );
             let builder =
                 register_window_methods(builder, graph.clone(), io.clone(), cancel.clone());
