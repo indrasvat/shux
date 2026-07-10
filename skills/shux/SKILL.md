@@ -1,6 +1,6 @@
 ---
 name: shux
-description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane, run deterministic terminal UI QA, and extend shux itself with line-delimited JSON-RPC plugins in any language. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, verify terminal UI layout/keyboard/color behavior, do headless visual regression on a terminal UI, or write a process plugin that subscribes to the shux event bus and calls back through `window.rename`, `pane.send_keys`, `state.apply`, etc. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "verify a TUI", "TUI QA", "terminal UI regression", "keyboard navigation", "color bleed", "replace tmux", "iTerm2 automation", "expect script", "headless terminal test", "agent multiplexer", "asciinema record", "write a shux plugin", "extend shux", "shux plugin install".
+description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane, run the lens verify loop (run/settle/glance/diff) to prove a TUI fix actually worked with pixel proof, run deterministic terminal UI QA, and extend shux itself with line-delimited JSON-RPC plugins in any language. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, verify terminal UI layout/keyboard/color behavior, prove a visual bug is fixed before/after, do headless visual regression on a terminal UI, or write a process plugin that subscribes to the shux event bus and calls back through `window.rename`, `pane.send_keys`, `state.apply`, etc. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "verify a TUI", "TUI QA", "terminal UI regression", "keyboard navigation", "color bleed", "replace tmux", "iTerm2 automation", "expect script", "headless terminal test", "agent multiplexer", "asciinema record", "prove this UI change worked", "diff two frames of a TUI", "wait for a TUI to settle", "run a TUI in the background and glance at it", "write a shux plugin", "extend shux", "shux plugin install".
 ---
 
 # shux — terminal multiplexer with a JSON-RPC API + pixel snapshotter
@@ -101,6 +101,46 @@ command = ["vivecaka", "--repo", "cli/cli"]
 shux state apply spec.toml      # atomic — all or nothing
 ```
 
+## lens — prove a TUI change worked, with pixel proof
+
+You fixed a rendering bug, or built a new TUI screen, and need to *prove*
+it — not just "it compiled", but "here's the before/after pixels and the
+exact cells that changed". That's `lens`: **run** (spawn hidden, no shell)
+→ **settle** (block until the screen stops repainting — no sleeps) →
+**glance** (atomic PNG+text+revision of one frame) → drive
+(`pane.send_keys`, already above) → **diff** (exactly which cells changed,
+with a heat-map PNG). Five commands total, and `shux lens --help` prints
+this recipe on demand:
+
+```bash
+RUN=$(shux --format json lens run --size 120x30 -- ./my-tui)
+PANE=$(echo "$RUN" | jq -r .result.pane_id)
+
+shux pane wait-settled "$PANE" --quiet 300ms --timeout 10s
+REV=$(shux --format json pane glance "$PANE" --checkpoint --png before.png | jq -r .result.revision)
+
+shux pane send-keys -s "$(echo "$RUN" | jq -r .result.session_id)" -p "$PANE" --text 'q'
+shux pane wait-settled "$PANE" --quiet 300ms --timeout 10s
+shux pane diff "$PANE" --since "$REV" --heat delta.png
+
+shux session kill "$(echo "$RUN" | jq -r .result.session_id)"
+```
+
+`lens run` spawns into a hidden, quota-bounded, self-cleaning **scratch
+session** — excluded from `session list` unless you pass
+`--include-scratch`, auto-reaped `--ttl` after the command exits or at
+`--max-runtime` regardless. Reach for `lens run` when you're spawning
+something *new* to verify; reach for plain `session create` + `pane
+snapshot` when you're screenshotting a pane a human (or a longer-lived
+workflow) already owns.
+
+Glance/diff output is exactly what's on screen — secrets included, no
+automated redaction. Don't glance a pane you didn't spawn yourself unless
+the user asks you to.
+
+Full grammar, exit-code table, checkpoint/FIFO semantics, and the
+`--wait` signal-death caveat: [references/lens.md](references/lens.md).
+
 ## Tools shux replaces
 
 | If you'd reach for                              | For this job                                  | Use this shux primitive                                  |
@@ -116,6 +156,7 @@ shux state apply spec.toml      # atomic — all or nothing
 | `ttyrec` · `termsh`                              | Replay a recorded session                      | Re-feed VT bytes through a fresh pane → `pane snapshot`    |
 | GNU parallel `--tmux` mode                       | Run N tasks in N panes, watch in one place     | Template with N panes + RPC orchestrator                   |
 | Custom Bubbletea / ratatui test harness          | Visual regression for your TUI                 | `shux window snapshot` + golden-image diff (SSIM or raw RGBA) |
+| Manual "screenshot, eyeball it, screenshot again"| Prove a TUI fix changed exactly what you intended | `shux lens run` → `pane wait-settled` → `pane glance --checkpoint` → fix → `pane diff --since REV --heat` |
 
 ## The common RPC surface
 
@@ -132,6 +173,7 @@ shape per method.
 | Pane I/O | `pane.send_keys` · `pane.set_size` · `pane.snapshot` · `pane.capture` · `pane.output.watch` · `pane.record.start` · `pane.record.stop` |
 | Pane mgmt| `pane.split` · `pane.focus` · `pane.zoom` · `pane.swap` · `pane.kill` · `pane.set_title` |
 | Window snap | `window.snapshot` · `session.snapshot` (composed multi-pane PNG)            |
+| Lens (verify loop) | `lens.run` · `pane.wait_settled` · `pane.glance` · `pane.checkpoint` · `pane.diff_since` — [references/lens.md](references/lens.md) |
 | State    | `state.apply` (atomic batch) · `events.history` · `system.version`               |
 
 Every entity carries a `version` field. Pass `expected_version` on
@@ -169,6 +211,14 @@ Need to block until text appears?  → pane.wait_for   (shux pane wait-for --tex
 Need live sampled PTY output?      → pane.output.watch (sealed data-plane, sampled)
 Need a byte-exact transcript?      → shux pane record --to FILE (lossless recorder)
 Need repeatable TUI QA evidence?   → Sightline verifier; read references/sightline.md
+Need to spawn+verify a TUI fix
+in one hidden throwaway pane?      → shux lens run -- <argv>  (then wait-settled → glance)
+Need to block until a pane stops
+repainting (not "process exited")? → pane.wait_settled (shux pane wait-settled <PANE>)
+Need atomic PNG+text+revision of
+one frame (no glance/capture tear)?→ pane.glance (shux pane glance <PANE> --checkpoint)
+Need exactly which cells changed,
+with proof?                        → pane.checkpoint + pane.diff_since (shux pane diff <PANE> --since REV)
 Want raw RPC for a new method?     → shux rpc call <method> --params @file
 ```
 
@@ -227,6 +277,7 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 | Topic | Where |
 |--|--|
 | Full RPC inventory + JSON request/response shapes | [references/api.md](references/api.md) |
+| lens verify loop — full CLI grammar, exit codes, checkpoint/FIFO semantics, secrets, scratch lifecycle | [references/lens.md](references/lens.md) |
 | Apply-template TOML shape, lowering rules, multi-window workspaces | [references/templates.md](references/templates.md) |
 | Scenario-driver patterns (send/wait/snap loops, golden-image diff) | [references/scenarios.md](references/scenarios.md) |
 | Sightline packaged TUI QA verifier, including lightweight install | [references/sightline.md](references/sightline.md) |
@@ -234,6 +285,7 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 
 ## Worked examples
 
+- [examples/lens-verify-loop.md](examples/lens-verify-loop.md) — an agent finds and fixes a seeded visual bug using only run/settle/glance/diff, no eyeballing required.
 - [examples/headless-tui-test.md](examples/headless-tui-test.md) — drive a TUI in CI, snapshot at every step, diff against checked-in goldens.
 - [examples/vision-llm-feedback.md](examples/vision-llm-feedback.md) — agent builds a Bubbletea app, snapshots its own UI, feeds PNG to a vision model, self-corrects.
 - [examples/replace-tmux-workflow.md](examples/replace-tmux-workflow.md) — common `tmux new-session / send-keys / capture-pane` patterns translated to shux.
@@ -244,6 +296,10 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 - `pane.snapshot` caps the output at 16M pixels (~4000×4000). Resize first if you'd exceed.
 - `pane wait-for -s SESSION` targets the session's **active pane** (often the last-spawned). In multi-pane templates pass `--pane <UUID>` (from `pane list` or `state.apply`'s `spawn_results`) — otherwise the wait will silently watch the wrong pane and time out.
 - `pane.send_keys --text` is JSON-quoted text. For raw control bytes (Esc/Enter/Tab/Ctrl+letter), use `--data` with base64.
+- The four lens `pane` verbs (`glance`/`wait-settled`/`checkpoint`/`diff`) take the pane as a **bare positional UUID** — `shux pane glance <PANE>`, not `-p <PANE>`. Every OTHER pane command (`send-keys`, `set-size`, `wait-for`, `snapshot`, `capture`, …) still uses `-s/--session` (+ optional `-w/--window`, `-p/--pane`). Don't mix the two calling conventions up.
+- `session kill` and every `-s/--session` flag accept a session NAME **or** a UUID — including the `session_id` a `lens run` response hands you for its scratch session. No need to look the name up first.
+- `lens run --wait` on a signal-killed child (e.g. reaped by `--max-runtime`) reports RPC `exit_code: -1`, which the shell sees as `$? == 255` (Unix truncates negative process exits to 8 bits) — 255 there means "never exited on its own", not a literal child exit code.
+- `lens run`, `pane glance`, and `pane diff --heat` output can contain whatever the pane displays, including secrets. No automated redaction — don't glance/diff a pane you didn't spawn yourself unless asked to.
 - `shux state apply foo.toml` atomically commits the graph but PTY spawn outcomes are reported per-pane in `spawn_results`. A spawn failure does not roll back the graph.
 - The first pane of the first template window is folded into the session's auto-created initial window — there is no phantom default-shell pane.
 - PNG snapshots use a bundled font chain by default: JetBrains Mono Nerd Font

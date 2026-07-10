@@ -261,6 +261,130 @@ the PTY read source before VT processing and before sampled
 { "pane_id": "uuid", "title": "new" }    // omit for auto-derive; pass null to clear
 ```
 
+## Lens — the pixel-perfect agent verify loop
+
+Five methods that turn "I edited a TUI" into "I proved the fix worked, with
+PNG evidence": **run** (spawn hidden) → **settle** (wait for stillness) →
+**glance** (atomic pixels+text) → drive (`pane.send_keys`, unchanged) →
+**diff** (prove exactly what changed). Full workflow guide, CLI grammar,
+exit-code table, and the scratch-session lifecycle:
+[references/lens.md](lens.md). This section is the RPC contract only.
+
+### `pane.glance`
+
+Atomic `{png, text, revision}` of one pane from **one** grid clone — unlike
+`pane.snapshot` + `pane.capture` (two separate clones, can tear under
+concurrent writes), glance guarantees the PNG and text agree on the same
+frame.
+
+```json
+// Request
+{ "pane_id": "uuid",
+  "include_cursor": true,     // default true
+  "include_png": true,        // default true; false = text-only, cheaper
+  "checkpoint": false }       // default false; true = also store for pane.diff_since
+
+// Response
+{ "revision": 42, "cols": 80, "rows": 24,
+  "cursor": { "row": 23, "col": 0, "visible": false },
+  "alt_screen": false,
+  "text": "...\n...",
+  "png_base64": "iVBORw0KG...",     // null if include_png=false
+  "checkpointed": false,
+  "evicted_revision": null }        // set when checkpoint:true evicted the FIFO-oldest slot
+```
+
+### `pane.wait_settled`
+
+Block until a pane's screen has been quiet for `quiet_ms`, or time out.
+Event-driven off a `watch` channel — no polling, no sleeps. Settled means
+"stopped repainting", **not** "process finished": pair with `pane.wait_for`
+(sentinel text) when a slow-dripping process has silent gaps longer than
+`quiet_ms`.
+
+```json
+// Request
+{ "pane_id": "uuid", "quiet_ms": 300, "timeout_ms": 10000 }
+// quiet_ms ∈ [10, 60000]; timeout_ms ∈ [quiet_ms, 600000]
+
+// Response — a RESULT, never an RPC error, even on timeout
+{ "settled": true, "revision": 42, "waited_ms": 12 }
+```
+
+### `pane.checkpoint` / `pane.diff_since`
+
+`pane.checkpoint` stores the pane's current visible frame, keyed by its
+revision. At most 4 checkpoints per pane; a 5th evicts the oldest by
+creation revision (FIFO — reads never refresh recency). Re-checkpointing
+the current revision with no intervening mutation is a no-op.
+
+```json
+// pane.checkpoint request/response
+{ "pane_id": "uuid" }
+  → { "revision": 42, "evicted_revision": null }
+
+// pane.diff_since request
+{ "pane_id": "uuid", "since_revision": 42,
+  "changed_row_text": true,     // default true
+  "heat_png": false }           // default false — rendered PNG with changed
+                                 // cells tinted red, unchanged desaturated 50%
+
+// pane.diff_since response
+{ "from_revision": 42, "to_revision": 45,
+  "cells_changed": 10, "cursor_moved": false,
+  "regions": [ { "row": 5, "col_start": 10, "col_end": 19 } ],
+  "regions_truncated": false,
+  "bounding_box": { "row_start": 2, "col_start": 2, "row_end": 6, "col_end": 19 },
+  "changed_row_text": { "5": "  A-PRESSED" },
+  "heat_png_base64": null }
+```
+
+Resize or an alt-screen switch invalidates ALL checkpoints of that pane
+(`RESIZE_INVALIDATED`, `-32011`); diffing a revision with no matching
+checkpoint and no invalidation in between is `STALE_REVISION` (`-32010`,
+`data.available` lists live revisions). Checkpoints never survive a daemon
+restart.
+
+### `lens.run` — the composite "run in a hidden pane" call
+
+Allocates a hidden, quota-bounded (16 concurrent max), self-cleaning
+**scratch session** and execs `argv` directly into its PTY — no shell, ever,
+so no profile-script surprises. This is the ONLY way to create a scratch
+session; there is no scratch parameter on `session.create`.
+
+```json
+// Request
+{ "argv": ["nidhi", "-C", "/path/to/repo"],
+  "cols": 80, "rows": 24,               // default 80x24; cols [20,500], rows [5,200]
+  "env": { "NO_COLOR": "1" },           // additions only, no inherit control
+  "cwd": null,                          // default: daemon cwd
+  "post_exit_ttl_ms": 30000,            // default 30s; range [0, 300000]
+  "max_runtime_ms": 3600000,            // default 1h; range [1000, 86400000]
+  "wait": false }
+
+// Response (wait=false) — async, returns immediately
+{ "session_id": "uuid", "pane_id": "uuid", "revision": 1 }
+
+// Response (wait=true) — blocks until the command exits, adds:
+{ "exit_code": 0 }
+```
+
+Scratch sessions are excluded from default `session.list`; pass
+`include_scratch: true` to reveal them (`"scratch": true` flag). Hidden from
+listing is not the same as unauthorized — audit records and `session.kill`
+always see them, by `id` (UUID, e.g. the `session_id` this call returns) or
+`name`.
+
+### Lens error codes
+
+| Code | Meaning |
+|--|--|
+| -32010 | `STALE_REVISION` — no checkpoint at that revision; `data.available` lists live ones |
+| -32011 | `RESIZE_INVALIDATED` — a resize/alt-switch invalidated checkpoints since; `data.hint` suggests re-checkpointing |
+| -32012 | `RESOURCE_EXHAUSTED` — 16 concurrent scratch sessions already running |
+| -32013 | `PAYLOAD_TOO_LARGE` — PNG/heat-PNG would exceed the 8 MiB cap; shrink the pane or use `include_png:false` |
+| -32014 | `SPAWN_FAILED` — `argv[0]` not found / bad `cwd` / exec error; the scratch allocation is rolled back, nothing leaks |
+
 ## State
 
 ### `state.apply` — atomic batch
