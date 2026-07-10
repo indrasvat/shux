@@ -63,34 +63,52 @@ Spawn a new session with an initial window + pane.
 ### `session.list`, `session.kill`, `session.rename`, `session.ensure`
 
 ```json
-// session.list
-{} → { "sessions": [{...}, ...] }
+// session.list — scratch sessions (from lens.run) are excluded unless
+// include_scratch is true; scratch entries carry "scratch": true.
+{ "include_scratch": false } → { "sessions": [{...}, ...] }
 
-// session.kill
-{ "id": "name-or-uuid", "expected_version": 5 }   // expected_version optional
+// session.kill — `id` is a STRICT UUID; names go via the separate `name`
+// field. Pass exactly one of the two. expected_version optional.
+{ "id": "<uuid>", "expected_version": 5 }
+{ "name": "<name>", "expected_version": 5 }
 
-// session.rename
-{ "id": "name-or-uuid", "new_name": "demo2", "expected_version": 5 }
+// session.rename — same strict id-or-name split as session.kill
+{ "id": "<uuid>", "new_name": "demo2", "expected_version": 5 }
+{ "name": "<name>", "new_name": "demo2", "expected_version": 5 }
 
 // session.ensure — create-if-missing
 { "name": "demo", "cwd": "/path/to/dir", "pane_title": "demo", "command": [...] }
 ```
 
+The `shux session kill` / `-s/--session` CLI forms additionally accept a
+UUID-shaped argument and resolve it client-side: session ID first, falling
+back to a session NAMED that string; the ID wins when both match (a warning
+is printed). Raw RPC callers pick the field themselves per the shapes above.
+
 ## Window
 
 ```json
-// window.create
-{ "session_id": "uuid", "title": "editor", "command": [...], "cwd": "..." }
+// window.create — the window's name param is `name` (NOT `title`);
+// auto-generated ("0", "1", ...) when omitted. session_id is a strict UUID.
+{ "session_id": "<uuid>", "name": "editor", "command": [...], "cwd": "..." }
   → { "id": "uuid", "title": "editor", "session_id": "uuid", "pane_id": "uuid" }
 
-// window.list
-{ "session_id": "uuid-or-name" } → { "windows": [{...}, ...] }
+// window.list — session_id is a strict UUID (resolve names client-side).
+// Returns a BARE ARRAY, not a wrapper object.
+{ "session_id": "<uuid>" } → [ {...}, ... ]
 
-// window.focus
-{ "session_id": "...", "window_id": "uuid-or-index" }
+// window.focus — takes the window's own id (strict UUID) only. Name/index
+// resolution is CLI-side sugar (`shux window focus -s S -w 2`), not RPC.
+{ "id": "<window-uuid>", "expected_version": N }
 
-// window.kill / window.rename / window.ensure
-{ "session_id": "...", "id": "...", "expected_version": N }
+// window.kill — window id only (no session_id param)
+{ "id": "<window-uuid>", "expected_version": N }
+
+// window.rename
+{ "id": "<window-uuid>", "name": "new-name", "expected_version": N }
+
+// window.ensure — create-if-missing by name within a session
+{ "session_id": "<uuid>", "name": "editor", "cwd": "...", "command": [...] }
 ```
 
 ## Pane I/O — the core agent surface
@@ -179,8 +197,8 @@ active window.
 { "window_id": "uuid",
   "cols": 200, "rows": 60 }       // optional; defaults 120 × 36 cells
 
-// Request — session.snapshot
-{ "session_id": "uuid-or-name",
+// Request — session.snapshot (session_id is a strict UUID)
+{ "session_id": "<uuid>",
   "cols": 200, "rows": 60 }       // optional
 
 // Response (same shape for both)
@@ -198,14 +216,16 @@ and want to skip border / status-bar composition.
 
 ### `pane.list`
 
-Enumerate panes in a window (or across all windows of a session).
+Enumerate the panes of one window. With `session_id` (strict UUID), the
+session's ACTIVE window is used — not every window of the session; iterate
+`window.list` yourself for that. Returns a BARE ARRAY.
 
 ```json
-{ "window_id": "uuid" }                  // panes of one window
-{ "session_id": "uuid-or-name" }         // panes of all windows in a session
-  → { "panes": [{ "id": "...", "window_id": "...", "title": "...",
-                  "command": [...], "cwd": "...",
-                  "exit_status": null|0, "version": N }, ...] }
+{ "window_id": "<uuid>" }                // panes of that window
+{ "session_id": "<uuid>" }               // panes of the session's ACTIVE window
+  → [ { "id": "...", "window_id": "...", "title": "...",
+        "command": [...], "cwd": "...",
+        "exit_status": null|0, "version": N }, ... ]
 ```
 
 ### `pane.output.watch`

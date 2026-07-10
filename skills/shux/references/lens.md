@@ -143,9 +143,11 @@ shux session kill my-scratch-name # name also works, same as any other session
 ```
 
 (`session kill` and every `-s/--session` flag across the CLI accept either
-form — a syntactically valid UUID is used as-is, no `session list`
-round-trip needed. If you're driving a scratch pane with pre-lens commands
-like `pane send-keys -s <SID> -p <PANE>`, the UUID from `lens run`'s
+form. UUID-shaped input — hyphenated or 32-hex simple form — resolves as a
+session ID first, falling back to a session NAMED that string if no id
+matches; when both match, the ID wins and a warning is printed. If you're
+driving a scratch pane with pre-lens commands like
+`pane send-keys -s <SID> -p <PANE>`, the UUID from `lens run`'s
 `session_id` is exactly what `-s` wants.)
 
 Quota: 16 concurrent scratch sessions per daemon. The 17th `lens run` gets
