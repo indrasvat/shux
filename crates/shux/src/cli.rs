@@ -557,6 +557,9 @@ pub enum SessionCommand {
         /// Session name OR UUID (positional or `-s/--session`; issue #88 —
         /// a UUID (e.g. the `session_id` a `lens run` response returns for
         /// a hidden scratch session) works here too, not just names.
+        /// Precedence for UUID-shaped input: session ID first, falling back
+        /// to a session NAMED that string; when both match, the ID wins
+        /// (a warning is printed).
         #[arg(value_name = "NAME_OR_ID")]
         name_pos: Option<String>,
 
@@ -2323,12 +2326,14 @@ fn build_session_create_params(
 
 /// Handle the `shux session kill` command.
 ///
-/// Accepts either a session NAME or a session UUID (issue #88 direction,
-/// same rule as `resolve_session_id`): `lens.run` returns `session_id` as a
-/// UUID, and scratch sessions are excluded from the default `session.list`
-/// a name lookup would need, so a UUID-shaped argument is sent straight
-/// through as the RPC's `id` param — which `session.kill` has always
-/// accepted — instead of `name`.
+/// Accepts either a session NAME or a session UUID (issue #88 direction):
+/// `lens.run` returns `session_id` as a UUID, and scratch sessions are
+/// excluded from the default `session.list` a name lookup would need. A
+/// UUID-shaped argument resolves as an id FIRST with fallback to name
+/// lookup (session names may legally be UUID-shaped; id wins when both
+/// match — see `resolve_uuid_shaped_session`), then goes out as the RPC's
+/// `id` param, which `session.kill` has always accepted. Plain names go
+/// out as `name`, unchanged.
 pub async fn handle_kill(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -2336,15 +2341,15 @@ pub async fn handle_kill(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let mut params = serde_json::Map::new();
-    let key = if uuid::Uuid::parse_str(session_name).is_ok() {
-        "id"
+    let (key, value) = if let Ok(parsed) = uuid::Uuid::parse_str(session_name) {
+        (
+            "id",
+            resolve_uuid_shaped_session(stream, session_name, parsed).await?,
+        )
     } else {
-        "name"
+        ("name", session_name.to_string())
     };
-    params.insert(
-        key.to_string(),
-        serde_json::Value::String(session_name.to_string()),
-    );
+    params.insert(key.to_string(), serde_json::Value::String(value));
     if let Some(ev) = expected_version {
         params.insert("expected_version".to_string(), serde_json::Value::from(ev));
     }
@@ -2662,22 +2667,94 @@ pub fn handle_init(root: &std::path::Path, format: OutputFormat) -> anyhow::Resu
     Ok(())
 }
 
+/// Resolve a UUID-SHAPED session argument against the live session list:
+/// id resolution FIRST (the common case — ids come from `lens.run` /
+/// `session create` responses), falling back to NAME lookup when no session
+/// has that id (session names may legally be UUID-shaped strings; codex P6
+/// round-1 major 1 — a pure id short-circuit made such names unaddressable
+/// and could mistarget). Precedence when the arg matches BOTH a real id and
+/// a different session's name: the id wins, with a warning on stderr (the
+/// ambiguity is cheaply detectable here since the list is already in hand).
+/// When the arg matches NOTHING, its NORMALIZED form is passed through as
+/// an id so the server produces its canonical not-found error.
+///
+/// `parsed` is the arg's parse (claude P6 round-1 extra: `Uuid::parse_str`
+/// also accepts the 32-hex SIMPLE form and uppercase — session ids
+/// serialize hyphenated lowercase, so the id comparison MUST go through the
+/// normalized `to_string()` form, never raw string equality; the NAME
+/// comparison stays raw/exact because names are arbitrary strings).
+///
+/// Queries with `include_scratch: true` because `lens.run` ids target
+/// hidden scratch sessions (visibility for listing is not authorization to
+/// act on a known id — LENS-R-041 principle).
+async fn resolve_uuid_shaped_session(
+    stream: &mut tokio::net::UnixStream,
+    arg: &str,
+    parsed: uuid::Uuid,
+) -> Result<String, RpcClientError> {
+    // Canonical hyphenated-lowercase form — what session ids serialize as.
+    let normalized = parsed.to_string();
+    let result = rpc_call(
+        stream,
+        "session.list",
+        serde_json::json!({ "include_scratch": true }),
+    )
+    .await?;
+    let sessions = result
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .or_else(|| result.as_array());
+
+    let mut id_match = false;
+    let mut name_match_id: Option<String> = None;
+    if let Some(sessions) = sessions {
+        for s in sessions {
+            let sid = s.get("id").and_then(|v| v.as_str());
+            if sid == Some(normalized.as_str()) {
+                id_match = true;
+            }
+            if s.get("name").and_then(|v| v.as_str()) == Some(arg) {
+                if let Some(sid) = sid {
+                    name_match_id = Some(sid.to_string());
+                }
+            }
+        }
+    }
+
+    match (id_match, name_match_id) {
+        (true, Some(name_id)) if name_id != normalized => {
+            eprintln!(
+                "warning: '{arg}' matches both a session ID and a different session's \
+                 NAME; targeting the session with that ID (id wins). To target the \
+                 session named '{arg}', pass its id: {name_id}"
+            );
+            Ok(normalized)
+        }
+        (true, _) => Ok(normalized),
+        (false, Some(name_id)) => Ok(name_id),
+        // No match either way: pass the normalized form through as an id so
+        // the server emits its canonical not-found (clean, consistent).
+        (false, None) => Ok(normalized),
+    }
+}
+
 /// Resolve a session name-or-UUID to its UUID.
 ///
 /// Accepts either form (issue #88: RPC methods already take `id` OR `name` —
 /// `-s/--session` only resolved by name, so a caller holding a session UUID
 /// straight from an RPC/CLI result — e.g. `lens.run`'s `session_id`, which
-/// targets a SCRATCH session excluded from the default `session.list` this
-/// helper queries — had no CLI-side way to address it). A syntactically valid
-/// UUID is trusted as-is with no `session.list` round-trip; downstream RPCs
-/// still validate existence and return `PANE_NOT_FOUND`/`session not found`
-/// on a bogus id, so this short-circuit cannot mask a real error.
+/// targets a SCRATCH session excluded from the default `session.list` —
+/// had no CLI-side way to address it). UUID-shaped input (hyphenated OR
+/// 32-hex simple form, any case — everything `Uuid::parse_str` accepts)
+/// resolves as an id FIRST with name fallback; id wins when both match
+/// (see `resolve_uuid_shaped_session` for the precedence rules). Non-UUID
+/// input resolves by name as always.
 async fn resolve_session_id(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
 ) -> Result<String, RpcClientError> {
-    if uuid::Uuid::parse_str(session_name).is_ok() {
-        return Ok(session_name.to_string());
+    if let Ok(parsed) = uuid::Uuid::parse_str(session_name) {
+        return resolve_uuid_shaped_session(stream, session_name, parsed).await;
     }
     let result = rpc_call(stream, "session.list", serde_json::json!({})).await?;
     let sessions = result
@@ -6301,6 +6378,145 @@ mod tests {
         assert_eq!(requests[3]["params"]["new_name"], "renamed");
         assert_eq!(requests[4]["method"], "session.export_template");
         assert_eq!(requests[5]["method"], "system.version");
+    }
+
+    /// codex P6 round-1 major 1, test (a): a session whose NAME is a
+    /// UUID-shaped string (matching no real id) must remain addressable via
+    /// `-s` and killable — the id-first resolution falls back to name lookup
+    /// and targets the session's REAL id.
+    #[tokio::test]
+    async fn uuid_shaped_session_name_falls_back_to_name_lookup() {
+        let real_id = "33333333-3333-4333-8333-333333333333";
+        let uuid_shaped_name = "00000000-0000-4000-8000-000000000001";
+        let list = serde_json::json!({
+            "sessions": [{
+                "id": real_id,
+                "name": uuid_shaped_name,
+                "active_window_id": "22222222-2222-4222-8222-222222222222",
+                "created_at": 0
+            }]
+        });
+
+        // Addressable via -s (resolve_session_id path).
+        let (mut client, requests, task) = spawn_rpc_script(vec![list.clone()]);
+        let resolved = resolve_session_id(&mut client, uuid_shaped_name)
+            .await
+            .unwrap();
+        assert_eq!(resolved, real_id, "name fallback must yield the REAL id");
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert_eq!(requests[0]["method"], "session.list");
+        assert_eq!(requests[0]["params"]["include_scratch"], true);
+
+        // Killable (handle_kill path) — the kill RPC targets the real id.
+        let (mut client, requests, task) =
+            spawn_rpc_script(vec![list, serde_json::json!({"killed": uuid_shaped_name})]);
+        handle_kill(&mut client, uuid_shaped_name, None, OutputFormat::Json)
+            .await
+            .unwrap();
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert_eq!(requests[1]["method"], "session.kill");
+        assert_eq!(
+            requests[1]["params"]["id"], real_id,
+            "kill must target the session RESOLVED BY NAME, not the raw arg"
+        );
+        assert!(requests[1]["params"].get("name").is_none());
+    }
+
+    /// claude P6 round-1 extra: `Uuid::parse_str` ALSO accepts the 32-hex
+    /// SIMPLE form — a session NAMED e.g. `deadbeef…` (32 hex chars) hits
+    /// the same trap. Name fallback must cover it, AND a 32-hex arg that
+    /// denotes a REAL session id (in canonical hyphenated form) must
+    /// id-match through NORMALIZATION, not raw string equality.
+    #[tokio::test]
+    async fn simple_form_32hex_input_normalizes_and_falls_back() {
+        // (i) session NAMED a 32-hex string, matching no real id → name
+        // fallback resolves to its real id.
+        let real_id = "33333333-3333-4333-8333-333333333333";
+        let hex_name = "deadbeefdeadbeefdeadbeefdeadbeef"; // parses as a UUID
+        let list = serde_json::json!({
+            "sessions": [{ "id": real_id, "name": hex_name, "created_at": 0 }]
+        });
+        let (mut client, requests, task) = spawn_rpc_script(vec![list]);
+        let resolved = resolve_session_id(&mut client, hex_name).await.unwrap();
+        assert_eq!(
+            resolved, real_id,
+            "32-hex NAME must fall back to name lookup"
+        );
+        finish_rpc_script(client, task, requests).await;
+
+        // (ii) 32-hex arg denoting a REAL session id → id-match via the
+        // normalized hyphenated form; kill targets the canonical id.
+        let hyphenated = "11111111-1111-4111-8111-111111111111";
+        let simple = "11111111111141118111111111111111";
+        let list = serde_json::json!({
+            "sessions": [{ "id": hyphenated, "name": "dev", "created_at": 0 }]
+        });
+        let (mut client, requests, task) =
+            spawn_rpc_script(vec![list, serde_json::json!({"killed": "dev"})]);
+        handle_kill(&mut client, simple, None, OutputFormat::Json)
+            .await
+            .unwrap();
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert_eq!(requests[1]["method"], "session.kill");
+        assert_eq!(
+            requests[1]["params"]["id"], hyphenated,
+            "simple-form input must id-match through normalization and send the canonical id"
+        );
+    }
+
+    /// codex P6 round-1 major 1, test (b): when the argument matches a REAL
+    /// session id, the id wins — even when a DIFFERENT session is NAMED that
+    /// same string (documented precedence; a warning is printed).
+    #[tokio::test]
+    async fn uuid_arg_matching_real_id_wins_over_name_match() {
+        let arg = "11111111-1111-4111-8111-111111111111";
+        let other_id = "44444444-4444-4444-8444-444444444444";
+        let list = serde_json::json!({
+            "sessions": [
+                { "id": arg, "name": "dev", "created_at": 0 },
+                // A different session NAMED the same UUID string — genuine
+                // ambiguity; the id must win.
+                { "id": other_id, "name": arg, "created_at": 0 }
+            ]
+        });
+        let (mut client, requests, task) =
+            spawn_rpc_script(vec![list, serde_json::json!({"killed": "dev"})]);
+        handle_kill(&mut client, arg, None, OutputFormat::Json)
+            .await
+            .unwrap();
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert_eq!(requests[1]["method"], "session.kill");
+        assert_eq!(
+            requests[1]["params"]["id"], arg,
+            "id match must win over the name match (documented precedence)"
+        );
+    }
+
+    /// codex P6 round-1 major 1, test (c): a bogus UUID matching neither an
+    /// id nor a name is passed through as an id and surfaces the server's
+    /// canonical not-found error cleanly.
+    #[tokio::test]
+    async fn bogus_uuid_neither_id_nor_name_errors_cleanly() {
+        let bogus = "99999999-9999-4999-8999-999999999999";
+        let list = serde_json::json!({
+            "sessions": [{ "id": "11111111-1111-4111-8111-111111111111",
+                           "name": "dev", "created_at": 0 }]
+        });
+        let not_found = serde_json::json!({
+            "error": { "code": -32004, "message": "resource not found",
+                       "data": { "resource": "session", "id": bogus } }
+        });
+        let (mut client, requests, task) = spawn_rpc_script(vec![list, not_found]);
+        let err = handle_kill(&mut client, bogus, None, OutputFormat::Json)
+            .await
+            .expect_err("bogus UUID must surface the server's not-found");
+        assert!(
+            err.to_string().contains("not found"),
+            "error must be the canonical not-found, got: {err}"
+        );
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert_eq!(requests[1]["method"], "session.kill");
+        assert_eq!(requests[1]["params"]["id"], bogus);
     }
 
     #[tokio::test]

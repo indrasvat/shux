@@ -139,6 +139,12 @@ test-rpc: ## Run shux-rpc crate tests (codec/router/server/attach); optionally p
 	@bash scripts/run-cargo-test.sh -p shux-rpc -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ shux-rpc tests passed$(COLOR_RESET)"
 
+.PHONY: test-cli-unit
+test-cli-unit: ## Run shux CLI unit tests (bin target; mock-stream, no daemons); optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running shux CLI unit tests...$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh -p shux --bin shux -- $(FILTER) --test-threads=1
+	@echo "$(COLOR_GREEN)✓ shux CLI unit tests passed$(COLOR_RESET)"
+
 .PHONY: test-plugin-dx
 test-plugin-dx: ## Run focused plugin DX CLI/integration tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running plugin DX tests...$(COLOR_RESET)"
