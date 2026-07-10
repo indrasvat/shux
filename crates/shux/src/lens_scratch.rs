@@ -881,11 +881,23 @@ impl ScratchRegistry {
     ///
     /// A row whose `session_id` does not parse (P5 round-5 codex — the
     /// last clobber branch) cannot be keyed into `rows`, but the KILL only
-    /// needs the pgid: it is retried inline right here. Confirmed dead →
+    /// needs the pgid: it is retried inline in pass 2. Confirmed dead →
     /// audited (reason=registry, the raw string as session_id) and
-    /// dropped; unconfirmed → pushed onto the OPAQUE unresolved list that
-    /// `persist` serializes alongside `rows` on every write, so the next
-    /// incarnation's startup reap picks it up again. Never silently lost.
+    /// durably dropped (round-6); unconfirmed → it stays on the OPAQUE
+    /// unresolved list that `persist` serializes alongside `rows` on every
+    /// write, so the next incarnation's startup reap picks it up again.
+    /// Never silently lost.
+    ///
+    /// TWO-PASS structure (P5 round-7 codex — the multi-row clobber):
+    /// PASS 1 parks EVERY row in memory FIRST (parseable → `rows`,
+    /// unparseable → `opaque_unresolved`) with no kills and no persists;
+    /// only then does PASS 2 process rows (inline kills for opaque,
+    /// reaper arming for parseable). Sequential processing used to leave
+    /// not-yet-reached rows existing ONLY on disk — an early confirmed
+    /// resolution's persist rewrote the file from memory and dropped the
+    /// unseeded later rows (and a crash in that window lost them
+    /// entirely). With pass 1 complete, memory is a SUPERSET of the
+    /// unresolved disk rows before any persist can rewrite the file.
     ///
     /// Call BEFORE the RPC server starts serving, so seeded rows are
     /// quota-visible to the very first `lens.run`.
@@ -897,39 +909,62 @@ impl ScratchRegistry {
         event_bus: &EventBus,
         retry_delay: Duration,
     ) {
-        for row in rows {
-            let Ok(session_id) = row.session_id.parse::<SessionId>() else {
-                self.seed_opaque_row(row).await;
-                continue;
-            };
-            let explicit_kill = CancellationToken::new();
-            let ghost_pane = PaneId::new();
-            {
-                let mut inner = self.lock_inner();
-                inner.rows.insert(
-                    session_id,
-                    ScratchState {
-                        pane_id: ghost_pane,
-                        pgid: row.pgid,
-                        start_time: row.start_time,
-                        created_at_unix_ms: row.created_at,
-                        max_runtime_deadline_unix_ms: row.max_runtime_deadline,
-                        explicit_kill: explicit_kill.clone(),
-                        claimed: false,
-                    },
-                );
-                self.persist(&inner);
+        // ── PASS 1: park everything in memory. No kills, no persists. ──
+        let mut parseable: Vec<(SessionId, PaneId, CancellationToken)> = Vec::new();
+        let mut opaque: Vec<RegistryRow> = Vec::new();
+        {
+            let mut inner = self.lock_inner();
+            for row in rows {
+                match row.session_id.parse::<SessionId>() {
+                    Ok(session_id) => {
+                        let explicit_kill = CancellationToken::new();
+                        let ghost_pane = PaneId::new();
+                        inner.rows.insert(
+                            session_id,
+                            ScratchState {
+                                pane_id: ghost_pane,
+                                pgid: row.pgid,
+                                start_time: row.start_time,
+                                created_at_unix_ms: row.created_at,
+                                max_runtime_deadline_unix_ms: row.max_runtime_deadline,
+                                explicit_kill: explicit_kill.clone(),
+                                claimed: false,
+                            },
+                        );
+                        parseable.push((session_id, ghost_pane, explicit_kill));
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            session_id = %row.session_id,
+                            pgid = row.pgid,
+                            "scratch-registry seed: unparseable session id; \
+                             parked opaquely — retrying the kill inline shortly \
+                             (the sequence only needs the pgid)"
+                        );
+                        inner.opaque_unresolved.push(row.clone());
+                        opaque.push(row);
+                    }
+                }
             }
+            // No persist here: the disk file already holds exactly these
+            // rows (startup_reap re-persisted them); the invariant only
+            // requires memory ⊇ unresolved-disk-rows before the NEXT
+            // rewrite, which now holds.
+        }
+
+        // ── PASS 2a: arm the standard reaper for every parseable row. ──
+        for (session_id, ghost_pane, explicit_kill) in parseable {
             tracing::warn!(
                 %session_id,
-                pgid = row.pgid,
                 retry_in_ms = retry_delay.as_millis() as u64,
                 "scratch-registry seed: unresolved row from the previous \
                  daemon; retrying its reap shortly"
             );
             // Standard reaper, short deadline, honest audit reason: the
             // deadline arm fires (no pane-exit event can ever match the
-            // ghost pane) and the reap retries through kill_confirmed.
+            // ghost pane) and the reap retries through kill_confirmed; its
+            // confirmed resolution goes through `registry.remove`, which
+            // persists as part of itself.
             tokio::spawn(scratch_reaper(
                 session_id,
                 ghost_pane,
@@ -943,24 +978,25 @@ impl ScratchRegistry {
                 "registry",
             ));
         }
-    }
 
-    /// The unparseable-session_id arm of `seed_unresolved` (P5 round-5
-    /// codex): the kill sequence only needs the PGID, so the reap is
-    /// retried INLINE at seed time — no session-keyed reaper required.
-    /// Confirmed dead → audit + drop; unconfirmed → the row joins the
-    /// opaque unresolved list so every normal persist carries it until the
-    /// next incarnation's startup reap retries.
-    async fn seed_opaque_row(&self, row: RegistryRow) {
-        tracing::error!(
-            session_id = %row.session_id,
-            pgid = row.pgid,
-            "scratch-registry seed: unparseable session id; retrying the \
-             kill inline (the sequence only needs the pgid)"
-        );
-        let outcome = kill_with_retry(row.pgid).await;
-        if outcome != KillOutcome::Unconfirmed {
-            // Resolved: audited with the RAW id string and dropped.
+        // ── PASS 2b: resolve the opaque rows inline. ──
+        for row in opaque {
+            let outcome = kill_with_retry(row.pgid).await;
+            if outcome == KillOutcome::Unconfirmed {
+                tracing::error!(
+                    session_id = %row.session_id,
+                    pgid = row.pgid,
+                    "scratch-registry seed: inline kill UNCONFIRMED; carrying \
+                     the row opaquely through every persist for the next restart"
+                );
+                // Already parked on `opaque_unresolved` in pass 1 — every
+                // persist carries it from here on.
+                continue;
+            }
+            // Resolved: audited with the RAW id string, then durably
+            // dropped (P5 round-6 codex — startup_reap re-persisted this
+            // row to disk, so without an immediate persist a restart in
+            // the window would reprocess it and duplicate the audit).
             self.audit.append(json!({
                 "ts": iso_now(),
                 "caller": shux_rpc::current_caller(),
@@ -970,30 +1006,16 @@ impl ScratchRegistry {
                 "pgid": row.pgid,
                 "killed": outcome == KillOutcome::Died,
             }));
-            // Durable drop (P5 round-6 codex): startup_reap re-persisted
-            // this row to disk BEFORE returning it for seeding — without
-            // an immediate persist here, scratch-registry.json keeps the
-            // now-resolved row until some unrelated later persist, and a
-            // daemon restart in that window would reprocess it and
-            // duplicate the registry reap audit. The row is in neither
-            // `rows` nor `opaque_unresolved` at this point, so a plain
-            // persist reflects the drop (and removes the file when this
-            // was the last row). The PARSEABLE seeding path needs no
-            // equivalent: its resolution goes through `registry.remove`,
-            // which persists as part of itself, never incidentally.
-            let inner = self.lock_inner();
+            let mut inner = self.lock_inner();
+            inner
+                .opaque_unresolved
+                .retain(|r| !(r.session_id == row.session_id && r.pgid == row.pgid));
+            // INVARIANT (P5 round-7 codex): pass 1 parked EVERY row from
+            // the startup vector in memory before any pass-2 persist could
+            // run, so this rewrite reflects ALL still-unresolved siblings
+            // — memory ⊇ unresolved disk rows, always.
             self.persist(&inner);
-            return;
         }
-        tracing::error!(
-            session_id = %row.session_id,
-            pgid = row.pgid,
-            "scratch-registry seed: inline kill UNCONFIRMED; carrying the \
-             row opaquely through every persist for the next restart"
-        );
-        let mut inner = self.lock_inner();
-        inner.opaque_unresolved.push(row);
-        self.persist(&inner);
     }
 }
 
@@ -1055,6 +1077,12 @@ enum KillOutcome {
 pub(crate) static TEST_FORCE_UNCONFIRMED_KILL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Per-pgid variant of the force hook (P5 round-7 multi-row test): forces
+/// `Unconfirmed` only for the matching pgid, so one row in a batch can
+/// stay stubborn while its siblings confirm normally.
+#[cfg(test)]
+pub(crate) static TEST_FORCE_UNCONFIRMED_PGID: StdMutex<Option<u32>> = StdMutex::new(None);
+
 /// The LENS-R-042 kill sequence: probe → killpg(SIGTERM) → 500 ms grace
 /// (polling for group death — the only "wait for a process group to die"
 /// primitive Unix offers a non-parent; deadline-bounded, never a sync-on-
@@ -1074,6 +1102,14 @@ async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
     use nix::unistd::Pid;
     #[cfg(test)]
     if TEST_FORCE_UNCONFIRMED_KILL.load(std::sync::atomic::Ordering::SeqCst) {
+        return KillOutcome::Unconfirmed;
+    }
+    #[cfg(test)]
+    if TEST_FORCE_UNCONFIRMED_PGID
+        .lock()
+        .map(|g| *g == Some(pgid))
+        .unwrap_or(false)
+    {
         return KillOutcome::Unconfirmed;
     }
     if pgid == 0 {

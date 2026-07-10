@@ -1049,3 +1049,40 @@ IMMEDIATELY (before any other activity) the row is gone from disk, the
 quota slot is free, and exactly ONE reap audit exists → simulated
 restart (`startup_reap` again) finds nothing to reprocess and the audit
 count stays at one.
+
+## P5 convergence round 7 (2026-07-10 — codex: durable drop FIXED for single-row; multi-row clobber; fixed)
+
+Codex round 7 on the round-6 delta: the durable drop is FIXED for the
+single-row case (lock ordering and audit-before-persist crash semantics
+ruled OK; duplicate-audit-on-crash accepted as at-least-once), but the
+persist introduced a MULTI-ROW clobber: `seed_unresolved` processed rows
+sequentially, and rows not yet reached existed ONLY on disk — an early
+opaque row confirming dead triggered `persist(&inner)`, which rewrote the
+file from memory and dropped the unseeded later rows (a daemon crash in
+that window lost live/unconfirmed rows entirely). The round-6 test was
+single-row so it could not catch it. Fixed per codex's stated invariant —
+memory must be a SUPERSET of unresolved disk rows before any persist can
+rewrite the file:
+
+**Two-pass `seed_unresolved`:** PASS 1 parks EVERY row from the startup
+vector in memory first (parseable → their `rows` entries with ghost panes
+and kill tokens; unparseable → `opaque_unresolved`) with NO kills and NO
+persists; PASS 2 then processes rows — 2a arms the standard short-deadline
+reaper for each parseable row (its confirmed resolution persists via
+`registry.remove` as before), 2b resolves opaque rows inline where each
+confirmed resolution removes exactly its own row and persists, every
+persist now reflecting all still-unresolved siblings. The invariant is
+asserted in a comment at the pass-2b persist site. A new
+`TEST_FORCE_UNCONFIRMED_PGID` hook (per-pgid variant of the round-2 force
+flag) lets a test keep one row stubborn while siblings confirm.
+
+**Multi-row test** (the exact window —
+`production_multi_row_seed_never_clobbers_unprocessed_siblings`): THREE
+rows — opaque A (confirms dead immediately), opaque B (per-pgid
+forced-unconfirmed), parseable C (live orphan group). After A's
+mid-seed confirmed persist: the file still contains BOTH B and C
+(pre-fix, the sequential loop had not reached C and the rewrite dropped
+it), A durably dropped and audited exactly once. C's seeded reaper then
+resolves it (B still persisted after C's removal-persist); a simulated
+restart reaps B. End state: file gone, exactly one `scratch.reap` audit
+per row, no duplicates.

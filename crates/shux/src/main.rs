@@ -9002,6 +9002,135 @@ mod tests {
         harness.stop().await;
     }
 
+    /// P5 round-7 codex — the multi-row clobber: seed_unresolved processed
+    /// rows sequentially, so rows not yet reached existed ONLY on disk; an
+    /// early opaque row confirming dead triggered a persist that rewrote
+    /// the file from memory and dropped the unseeded later rows. The
+    /// two-pass restructure parks EVERY row in memory first (pass 1), so
+    /// every pass-2 persist reflects all still-unresolved siblings.
+    /// THREE rows exercise the exact window: one opaque that confirms
+    /// immediately, one opaque forced-unconfirmed, one parseable live.
+    #[tokio::test]
+    async fn production_multi_row_seed_never_clobbers_unprocessed_siblings() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let dir = harness._scratch_dir.path().to_path_buf();
+        let reg_path = dir.join("scratch-registry.json");
+
+        // Three real orphaned groups (leader exits; the sleep keeps each
+        // group alive, reparented away from us).
+        let spawn_orphan = || {
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", "sleep 300 & exit 0"])
+                .process_group(0)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn orphan group");
+            let pgid = child.id();
+            let _ = child.wait();
+            pgid
+        };
+        let (pgid_a, pgid_b, pgid_c) = (spawn_orphan(), spawn_orphan(), spawn_orphan());
+
+        let raw_a = "not-a-uuid-A";
+        let raw_b = "not-a-uuid-B";
+        let uuid_c = shux_core::model::SessionId::new().to_string();
+        let row = |sid: &str, pgid: u32| {
+            serde_json::json!({
+                "session_id": sid, "pgid": pgid, "start_time": 0,
+                "created_at": 1, "max_runtime_deadline": 2,
+            })
+        };
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&serde_json::json!([
+                row(raw_a, pgid_a),
+                row(raw_b, pgid_b),
+                row(&uuid_c, pgid_c),
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Forced-unconfirmed startup: all three come back unresolved.
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!((killed, unresolved.len()), (0, 3));
+
+        // Only B stays stubborn during the seed.
+        *lens_scratch::TEST_FORCE_UNCONFIRMED_PGID.lock().unwrap() = Some(pgid_b);
+        harness
+            .scratch_registry
+            .seed_unresolved(
+                unresolved,
+                &harness.graph,
+                &harness.io,
+                &harness.bus,
+                Duration::from_secs(3),
+            )
+            .await;
+        *lens_scratch::TEST_FORCE_UNCONFIRMED_PGID.lock().unwrap() = None;
+
+        // THE WINDOW: A's confirmed resolution persisted mid-seed. The
+        // file must still contain BOTH unresolved siblings — the round-7
+        // bug dropped whichever rows the sequential loop hadn't reached.
+        let text = std::fs::read_to_string(&reg_path).expect("registry persisted");
+        assert!(!text.contains(raw_a), "A resolved and durably dropped");
+        assert!(
+            text.contains(raw_b),
+            "B (unconfirmed) survives A's persist:\n{text}"
+        );
+        assert!(
+            text.contains(&uuid_c),
+            "C (unseeded sibling) survives A's persist:\n{text}"
+        );
+        let audit_path = dir.join("lens-audit.ndjson");
+        let count_reaps = |sid: &str| {
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|e| e["method"] == "scratch.reap" && e["session_id"] == sid)
+                .count()
+        };
+        assert_eq!(count_reaps(raw_a), 1, "A audited exactly once");
+        assert_eq!(count_reaps(raw_b), 0, "B not audited while unresolved");
+
+        // C's short-deadline reaper confirms and removes its row.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let text = std::fs::read_to_string(&reg_path).unwrap_or_default();
+            if !text.contains(&uuid_c) {
+                assert!(text.contains(raw_b), "B still persisted after C's removal");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "C's seeded reaper never resolved it"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(count_reaps(&uuid_c), 1, "C audited exactly once");
+
+        // Simulated restart resolves B for real: clean end state.
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        assert_eq!((killed, unresolved.len()), (1, 0), "B reaped on restart");
+        assert!(
+            !reg_path.exists(),
+            "registry cleared once every row resolved"
+        );
+        assert_eq!(count_reaps(raw_a), 1, "no duplicate audit for A");
+        assert_eq!(count_reaps(raw_b), 1, "B audited exactly once");
+        assert_eq!(count_reaps(&uuid_c), 1, "no duplicate audit for C");
+
+        harness.stop().await;
+    }
+
     /// Bare `shux` / `shux attach` target choice never lands on a scratch
     /// session (P5 round-1 minor — attach guard), whether flagged
     /// `scratch: true` or recognizable by the reserved name prefix.
