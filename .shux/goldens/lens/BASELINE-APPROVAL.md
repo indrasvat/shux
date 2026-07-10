@@ -369,12 +369,22 @@ be used with `shux pane send-keys -s <uuid>` (its default "resolve the
 session's active window" path only queried the default, scratch-excluded
 `session.list`) — the same class of bug as issue #88 (`-s/--session`
 resolving by name only). Fixed in `crates/shux/src/cli.rs`:
-`resolve_session_id` now short-circuits on a syntactically valid UUID (no
-name-list round trip), `resolve_pane_window_id`'s active-window lookup now
-queries `session.list --include-scratch`, and `session kill` sends `id`
-instead of `name` when given a UUID (`lens.run`'s own `session_id` is now
-directly `session kill`-able). All downstream RPCs still validate existence
-server-side, so this cannot mask a real not-found error.
+`resolve_session_id` resolves UUID-shaped input (hyphenated or 32-hex
+simple form, normalized before comparison) as a session ID FIRST, falling
+back to NAME lookup when no session has that id — session names may
+legally be UUID-shaped strings, so a pure id short-circuit would make such
+names unaddressable (codex/claude P6 review round; the original mint's
+"cannot mask a real error" claim was inaccurate for exactly that
+name-collision corner and is corrected here). When the argument matches
+both a real id and a different session's name, the ID wins and a warning
+is printed. `resolve_pane_window_id`'s active-window lookup now queries
+`session.list --include-scratch`, and `session kill` sends `id` instead of
+`name` for UUID-shaped input after the same resolution (`lens.run`'s own
+`session_id` is directly `session kill`-able). Unit matrix:
+`uuid_shaped_session_name_falls_back_to_name_lookup`,
+`uuid_arg_matching_real_id_wins_over_name_match`,
+`bogus_uuid_neither_id_nor_name_errors_cleanly`,
+`simple_form_32hex_input_normalizes_and_falls_back` (crates/shux/src/cli.rs).
 
 ### Provenance
 
