@@ -327,25 +327,40 @@ four T3 cells keep their own goldens as duplicate-but-valid regression
 pins, with the byte-identity documented per-golden in
 `evidence-manifest.json`.
 
-**OPEN §16.4 escalation (surfaced by the first-ever real evaluation of
-T3's grayscale assertion — awaiting orchestrator adjudication):** T3's
-no-color cells FAIL the frozen `is_grayscale_png` check (strict R==G==B on
-every pixel) even though the goldens themselves byte-match. The strict
-predicate is unsatisfiable by construction on this stack, for two
+**§16.4 escalation — RESOLVED (adjudication round 3, 2026-07-10,
+orchestrator + council APPROVED with five binding conditions):** T3's
+no-color cells FAILED the original frozen `is_grayscale_png` check (strict
+R==G==B on every pixel) even though the goldens themselves byte-match —
+surfaced by the first-ever real evaluation of the assertion. The strict
+predicate was unsatisfiable by construction on this stack, for two
 independent reasons: (a) nidhi emits OSC 11 to set its theme background —
 rendered as RGB(7,9,14), channel spread 7 — even under `--no-color` +
 `NO_COLOR=1` (the binary carries `]11;` strings; NO_COLOR conventionally
 suppresses ANSI text colors, not theme-background OSC); and (b)
-`shux-raster`'s own `bg_default` is `[16,16,24]` (also blue-tinted;
+`shux-raster`'s own `bg_default` is `[16,16,24]` (channel spread 8;
 `crates/shux-raster/src/lib.rs` RasterOptions::default), so even an
-OSC-free NO_COLOR render can never be strictly gray. Measured separation
-for a sound replacement predicate: the no-color golden's max per-pixel
-channel spread is 7 with ZERO pixels above spread 8; the color sibling's
-max spread is 159 with 8,651 pixels above 8 — a near-grayscale check
-(per-pixel `max(R,G,B) − min(R,G,B) ≤ 8`) separates the matrix decisively
-while preserving the assertion's intent (NO_COLOR suppressed the app's
-colored output). The frozen `is_grayscale_png` helper / T3 call sites were
-NOT modified for this; that change needs its own approval + trailer.
+OSC-free NO_COLOR render can never be strictly gray.
+
+Applied exactly per the approved conditions (commit carries the exact
+trailer `LENS-TEST-CHANGE: T3 grayscale predicate unsatisfiable by
+construction (OSC-11 theme bg spread 7 + raster default bg spread 8);
+replaced with evidence-anchored near-grayscale <=8 plus discriminating
+color-sibling control; purpose unchanged.`):
+1. threshold EXACTLY `max(R,G,B) − min(R,G,B) <= 8`, inline, no named
+   epsilon (`is_near_grayscale_png` in `lens_common`);
+2. predicate renamed/documented as NEAR-grayscale;
+3. its doc comment carries the measured anchors (OSC-11 theme bg spread 7;
+   raster default bg `[16,16,24]` spread 8);
+4. discriminating control added — T3's COLOR sibling cells must FAIL the
+   predicate;
+5. the control asserts meaningful signal (`max_spread > 8` AND
+   `pixels_with_spread_gt_8 > 0`, via the new `png_channel_spread_stats`
+   helper) — the measured 8,651-pixel count is deliberately NOT pinned.
+
+Measured basis: no-color golden max spread 7 with ZERO pixels above 8
+(predicate passes); color sibling max spread 159 with 8,651 pixels above 8
+(control fires). T1's NO_COLOR-poisoning tripwire uses the same predicate.
+T3 is GREEN under the amended frozen test; assertion purpose unchanged.
 
 ### CLI fix required to complete the E1 loop (see PR description for full diff)
 

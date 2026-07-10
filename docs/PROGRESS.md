@@ -104,6 +104,12 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-10 — test(lens): P6 adjudication round 3 — near-grayscale predicate applied, FULL T-tier green (task 077; test-lens 37/0, test-lens-t 4/4)**
+- Council APPROVED the near-grayscale replacement with five binding conditions — implemented exactly: threshold inline `max(R,G,B)−min(R,G,B) <= 8` (no named epsilon); predicate renamed `is_near_grayscale_png` and documented as NEAR-grayscale; doc comment carries the measured anchors (OSC-11 theme bg spread 7, raster default bg [16,16,24] spread 8); T3 color cells now a discriminating control (must FAIL the predicate with `max_spread > 8` AND `pixels_with_spread_gt_8 > 0` via new `png_channel_spread_stats`; exact 8,651 count deliberately NOT pinned). Commit carries the exact approved trailer; frozen guard confirmed it. T1's poisoning tripwire moved to the same predicate.
+- **Final gate receipts on the closing code:** `make test-lens` **37/0** (re-run, 150s) · `make test-lens-t` **4/4** · frozen guard PASS across all commits · `make lint` clean · zero shux daemons/orphans after.
+- Flake note (honest disclosure): the FIRST post-change `test-lens-t` run had a one-off `t2_nidhi_keyboard_truth` failure whose panic message was not captured (output was grep-filtered); T2 then passed once in isolation and in 4 consecutive full-lane re-runs (5/5 since). Logged for observation; not reproduced.
+- Manifest + BASELINE-APPROVAL updated: T3 nocolor entries now record the RESOLVED adjudication; the §16.4 escalation section rewritten as RESOLVED with the five conditions and measured basis.
+
 **2026-07-10 — test(lens): P6 T-tier adjudication round — welcome-dismiss applied, T1/T3 goldens minted, T3 grayscale escalation opened (task 077; T-tier now 3/4)**
 - Orchestrator + council APPROVED the T1–T3 welcome-dismiss LENS-TEST-CHANGE (conditions: bounded prompt wait IS the assertion, never speculative Enter, original sentinel wait unchanged, exact trailer wording). Applied as `dismiss_nidhi_welcome` in the frozen `lens_ttier.rs`; commit-msg frozen guard confirmed the trailer. T1 + T2 flipped green.
 - Icons-matrix adjudication: NOT re-scoped — all four T3 cells keep per-cell goldens even where byte-identical (nerd/ascii color == T1's PNG; both nocolor cells identical); byte-identity documented per-golden in the manifest as duplicate-but-valid regression pins.

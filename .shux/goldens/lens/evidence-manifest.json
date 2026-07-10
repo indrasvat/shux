@@ -282,7 +282,7 @@
     "t3_nidhi_nerd_nocolor": {
       "phase": "P6",
       "provisional": true,
-      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/receipts as t1_nidhi_nerd_color_120x40, with --no-color + NO_COLOR=1 in the scratch env. KNOWN OPEN ISSUE (escalated §16.4, awaiting orchestrator adjudication — T3 currently FAILS its frozen is_grayscale_png assertion against these bytes even though the golden itself matches): strict R==G==B grayscale is unsatisfiable by construction on this stack — (a) nidhi emits OSC 11 to set its theme background (renders as RGB(7,9,14), spread 7) even under --no-color/NO_COLOR, and (b) shux-raster's own bg_default [16,16,24] is also blue-tinted, so even an OSC-11-free NO_COLOR render could never satisfy strict grayscale. Measured separation: this PNG max channel spread = 7 with ZERO pixels above spread 8; the color sibling has max spread 159 with 8651 pixels above 8 — a near-grayscale predicate (spread <= 8) separates the matrix decisively. Byte-identical to t3_nidhi_ascii_nocolor.png (same icons-don't-affect-LIST finding; per-cell golden kept per council adjudication).",
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/receipts as t1_nidhi_nerd_color_120x40, with --no-color + NO_COLOR=1 in the scratch env. GRAYSCALE-PREDICATE ADJUDICATION (RESOLVED 2026-07-10, second approved LENS-TEST-CHANGE): the original strict R==G==B is_grayscale_png was unsatisfiable by construction — (a) nidhi emits OSC 11 to set its theme background (renders as RGB(7,9,14), spread 7) even under --no-color/NO_COLOR, and (b) shux-raster's own bg_default [16,16,24] has spread 8 — so the council approved an evidence-anchored NEAR-grayscale predicate: every pixel max(R,G,B)-min(R,G,B) <= 8, with T3's color cells as the discriminating control (must show max_spread > 8 AND at least one pixel above 8; exact count deliberately not pinned). Measured on these bytes: max channel spread = 7 with ZERO pixels above spread 8 (predicate PASSES); the color sibling measured max spread 159 with 8651 pixels above 8 (control FIRES). T3 is green under the amended frozen test. Byte-identical to t3_nidhi_ascii_nocolor.png (same icons-don't-affect-LIST finding; per-cell golden kept per council adjudication).",
       "fixture": "nidhi -C <fixture> --no-animation --icons nerd --no-color, env NO_COLOR=1 (real installed TUI)",
       "app_version": "nidhi 0.1.0-alpha.1 (commit 1e5d952e6c409b7a83ffcc62c795156a06a7a7f0)",
       "size": "120x40",
@@ -296,7 +296,7 @@
     "t3_nidhi_ascii_nocolor": {
       "phase": "P6",
       "provisional": true,
-      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/receipts/open-issue status as t3_nidhi_nerd_nocolor (see its note for the is_grayscale_png escalation). Byte-identical to t3_nidhi_nerd_nocolor.png; per-cell golden kept per council adjudication.",
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/receipts/adjudication status as t3_nidhi_nerd_nocolor (see its note for the RESOLVED near-grayscale predicate record; this PNG passes the amended predicate identically). Byte-identical to t3_nidhi_nerd_nocolor.png; per-cell golden kept per council adjudication.",
       "fixture": "nidhi -C <fixture> --no-animation --icons ascii --no-color, env NO_COLOR=1 (real installed TUI)",
       "app_version": "nidhi 0.1.0-alpha.1 (commit 1e5d952e6c409b7a83ffcc62c795156a06a7a7f0)",
       "size": "120x40",

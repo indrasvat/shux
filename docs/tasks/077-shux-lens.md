@@ -1171,7 +1171,29 @@ sign-off record: `.shux/goldens/lens/evidence-manifest.json` (`k1_pos1`,
 INDEPENDENT verifier's re-render + byte cmp + visual sign-off) is
 outstanding — not self-certified here per the repo's golden discipline.
 
-### T-tier adjudication round (2026-07-10, post-report): welcome-dismiss APPROVED + applied; T3 grayscale escalation OPEN
+### T-tier adjudication round 3 (2026-07-10): near-grayscale predicate APPROVED + applied — FULL T-tier GREEN
+
+The council approved the near-grayscale replacement with five binding
+conditions, implemented exactly (commit carries the exact approved
+trailer; frozen guard confirmed): (1) threshold inline
+`max(R,G,B)−min(R,G,B) <= 8`, no named epsilon (`is_near_grayscale_png`);
+(2) predicate renamed/documented as NEAR-grayscale; (3) doc comment
+carries the measured anchors (OSC-11 theme bg spread 7; raster default bg
+`[16,16,24]` spread 8); (4) T3's color cells became the discriminating
+control — the sibling golden must FAIL the predicate; (5) the control
+asserts meaningful signal (`max_spread > 8` AND `pixels_with_spread_gt_8
+> 0` via the new `png_channel_spread_stats` helper; the measured 8,651
+count deliberately NOT pinned). T1's NO_COLOR-poisoning tripwire moved to
+the same predicate.
+
+**Final closing receipts:** `make test-lens` 37/0 (re-run on the closing
+code) · `make test-lens-t` 4/4 · frozen guard PASS across all commits ·
+lint clean · zero leaks. Honest flake note: the first post-change T-tier
+run had a one-off `t2_nidhi_keyboard_truth` failure whose panic text was
+not captured (grep-filtered output); T2 has since passed 5/5 (1 isolated
++ 4 full-lane re-runs). Logged for observation; not reproduced.
+
+### T-tier adjudication round 2 (2026-07-10, historical): welcome-dismiss APPROVED + applied; T3 grayscale escalation opened (now RESOLVED above)
 
 The orchestrator + council APPROVED the welcome-dismiss LENS-TEST-CHANGE
 under strict conditions (bounded prompt wait IS the assertion — never send
