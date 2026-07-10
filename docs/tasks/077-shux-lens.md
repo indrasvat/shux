@@ -948,3 +948,51 @@ M14-class residual accepted). Two remaining items, both fixed on-branch:
    delete the first 2 lines of a live log → both `verify_chain` and
    `verify_chain_set` fail naming the unjustified anchor; intact log and
    the existing rotation/tamper tests stay green.
+
+## P5 convergence round 4 (2026-07-10 — codex: prefix-deletion fix CONFIRMED; N3-at-lifecycle + 1 new minor; both fixed)
+
+Codex round 4 on the round-3 delta: prefix-deletion fix CONFIRMED, but two
+remaining items, both fixed on-branch:
+
+1. **N3 STILL NOT FIXED at the daemon-lifecycle level (now fixed):**
+   round 3's `startup_reap` re-persisted unresolved rows correctly — but
+   the daemon then created a FRESH EMPTY `ScratchRegistry`, and any later
+   normal persist rewrote `scratch-registry.json` from `inner.rows` only,
+   clobbering the unresolved row before the next restart could retry (the
+   round-3 test called `startup_reap` twice directly and never crossed
+   this boundary). Fix: `startup_reap` now returns
+   `(killed, unresolved_rows)` and the daemon SEEDS its live registry via
+   the new `ScratchRegistry::seed_unresolved` (called in `run_rpc_server`
+   right after registry creation, before the RPC server accepts
+   connections): (a) seeded rows are real `inner.rows` entries, so every
+   normal persist carries them; (b) they count toward the quota (the
+   groups are genuinely alive); (c) each gets the STANDARD reaper armed
+   with a short deadline (daemon passes 1 s; the delay is a parameter) and
+   an honest audit reason — `scratch_reaper` gained a `deadline_reason`
+   param ("max_runtime" for normal scratch, "registry" for seeded
+   retries) — with row removal still conditional on confirmed death via
+   the existing honest-verdict machinery (an again-unconfirmed retry
+   leaves the row persisted for the next restart; an unparseable seeded
+   session id is ERROR-logged with the row left on disk — never silently
+   lost). The seeded pane id is a fresh ghost: pane teardown and graph
+   destroy no-op for it by construction. LIFECYCLE test
+   (`production_seeded_unresolved_rows_survive_persists_and_get_retried`):
+   real orphaned group (`sh -c 'sleep 300 & exit'`, leader reaped) +
+   forced-unconfirmed startup → seed into the live harness registry →
+   flag cleared → a NORMAL `lens.run` triggers a normal persist → the
+   seeded row is STILL in the persisted file (the round-4 bug bit exactly
+   here) alongside the new row → the 3 s retry then confirms death,
+   removes the row, and audits `reason=registry`.
+
+2. **Minor (new) — rotated-file self-justification (fixed):**
+   `verify_chain` on a rotated file (`lens-audit.ndjson.1`) delegated to
+   `verify_chain_set(path)`, which derives siblings from the LIVE path via
+   `with_extension("ndjson.N")` — handed the rotated path directly it
+   resolved the wrong set (`….ndjson.1.N`) and `TrustedStart` accepted the
+   continuation header without a verified predecessor. Fix: both
+   `verify_chain` and `verify_chain_set` now REJECT a rotated-file
+   argument (`is_rotated_audit_path`: numeric extension + `.ndjson` stem)
+   with a clear error directing to the live-path set walk. Test
+   (`verify_chain_rejects_direct_rotated_file_arguments`): a real rotation
+   → both entrypoints reject the `.1` path; the live-path set walk stays
+   the working API.

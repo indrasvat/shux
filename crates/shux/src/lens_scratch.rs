@@ -343,18 +343,49 @@ fn verify_chain_file(path: &Path, anchor: ChainAnchor<'_>) -> Result<(usize, Str
     Ok((count, prev.unwrap_or_else(|| GENESIS_HASH.to_string())))
 }
 
+/// True when `path` names a ROTATED audit file (`….ndjson.N`). Direct
+/// verification of a rotated file is rejected (P5 round-4 codex minor):
+/// `verify_chain`'s rotate-header delegation and `verify_chain_set`'s
+/// sibling resolution both derive the rotation set from the LIVE path via
+/// `with_extension("ndjson.N")` — handed `lens-audit.ndjson.1` directly,
+/// they would resolve the wrong set (`….ndjson.1.N`) and TrustedStart
+/// would accept the header without a verified predecessor.
+fn is_rotated_audit_path(path: &Path) -> bool {
+    let numeric_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit()));
+    numeric_ext
+        && path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.ends_with(".ndjson"))
+}
+
 /// Verify a standalone audit file with a STRICT external anchor (P5
 /// round-3 codex minor): genesis-rooted files verify directly; a file
 /// opening with an `audit.rotate` continuation header delegates to the
 /// full [`verify_chain_set`] walk (the anchor is only justified by its
 /// verified predecessor); anything else — e.g. the remains of a prefix
-/// deletion — is rejected.
+/// deletion — is rejected. Rotated files (`….ndjson.N`) must be verified
+/// through `verify_chain_set` on the LIVE path (P5 round-4 codex minor —
+/// a direct rotated-file argument would resolve the wrong sibling set and
+/// self-justify its continuation header).
 ///
 /// Consumed by the unit + black-box test suites today (hence the
 /// dead-code allowance on the non-test build); the natural future surface
 /// is a `shux lens audit verify` CLI verb — P6 CLI-polish material.
 #[allow(dead_code)]
 pub fn verify_chain(path: &Path) -> Result<usize, String> {
+    if is_rotated_audit_path(path) {
+        return Err(format!(
+            "{} is a rotated audit file: verify it via verify_chain_set on \
+             the live log path (a direct rotated-file verification would \
+             resolve the wrong sibling set and cannot justify its \
+             continuation anchor)",
+            path.display()
+        ));
+    }
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let Some(first_line) = text.lines().next() else {
@@ -388,6 +419,13 @@ pub fn verify_chain(path: &Path) -> Result<usize, String> {
 /// Returns the total number of verified entries across the set.
 #[allow(dead_code)]
 pub fn verify_chain_set(live_path: &Path) -> Result<usize, String> {
+    if is_rotated_audit_path(live_path) {
+        return Err(format!(
+            "{} is a rotated audit file, not the live log: the rotation set \
+             must be resolved from the live path",
+            live_path.display()
+        ));
+    }
     let mut files: Vec<PathBuf> = (1..=AUDIT_KEEP_ROTATIONS)
         .map(|n| live_path.with_extension(format!("ndjson.{n}")))
         .filter(|p| p.exists())
@@ -528,7 +566,7 @@ struct ScratchState {
 /// extension): `{session_id, pgid, start_time, created_at,
 /// max_runtime_deadline}`.
 #[derive(Serialize, Deserialize)]
-struct RegistryRow {
+pub(crate) struct RegistryRow {
     session_id: String,
     pgid: u32,
     #[serde(default)]
@@ -718,10 +756,19 @@ impl ScratchRegistry {
     /// resolved. Unconditional deletion here was the B3-class hole moved
     /// to startup: a stubborn group surviving this reap became invisible
     /// to every future restart.
-    pub async fn startup_reap(runtime_dir: &Path, audit: &LensAuditLog) -> usize {
+    ///
+    /// Returns `(killed, unresolved)` (P5 round-4 codex): the caller MUST
+    /// seed its live registry with the unresolved rows via
+    /// [`ScratchRegistry::seed_unresolved`] — otherwise the daemon's very
+    /// first normal persist (which rewrites the file from in-memory rows)
+    /// would clobber them before the next restart could retry.
+    pub async fn startup_reap(
+        runtime_dir: &Path,
+        audit: &LensAuditLog,
+    ) -> (usize, Vec<RegistryRow>) {
         let path = runtime_dir.join("scratch-registry.json");
         let Ok(text) = std::fs::read_to_string(&path) else {
-            return 0;
+            return (0, Vec::new());
         };
         let rows: Vec<RegistryRow> = match serde_json::from_str(&text) {
             Ok(r) => r,
@@ -737,7 +784,7 @@ impl ScratchRegistry {
                 if let Err(re) = std::fs::rename(&path, &corrupt) {
                     tracing::error!(error = %re, "scratch-registry: could not preserve corrupt file");
                 }
-                return 0;
+                return (0, Vec::new());
             }
         };
         let mut killed = 0usize;
@@ -800,9 +847,90 @@ impl ScratchRegistry {
             }));
         }
         // persist_rows_atomic removes the file when the list is empty —
-        // deletion happens ONLY when every row resolved.
+        // deletion happens ONLY when every row resolved. The unresolved
+        // rows also go back to the caller for live-registry seeding (P5
+        // round-4 codex: without seeding, the first normal persist of the
+        // fresh daemon would rewrite this file from its empty in-memory
+        // rows and silently lose them).
         persist_rows_atomic(&path, &unresolved);
-        killed
+        (killed, unresolved)
+    }
+
+    /// Seed the LIVE registry with rows a startup reap could not resolve
+    /// (P5 round-4 codex — the daemon-lifecycle half of N3): each row is
+    /// inserted as a real registry row, so (a) every normal persist
+    /// carries it, (b) it counts toward the quota (the group is genuinely
+    /// alive), and (c) a standard reaper is armed with a short deadline so
+    /// the RUNNING daemon retries the kill — row removal stays conditional
+    /// on confirmed death via the existing honest-verdict machinery; a
+    /// retry that is again unconfirmed leaves the row persisted for the
+    /// next restart. The seeded pane id is a fresh ghost (the pane/session
+    /// died with the previous daemon); pane teardown and graph destroy are
+    /// no-ops for it by construction.
+    ///
+    /// Call BEFORE the RPC server starts serving, so seeded rows are
+    /// quota-visible to the very first `lens.run`.
+    pub fn seed_unresolved(
+        &self,
+        rows: Vec<RegistryRow>,
+        graph: &GraphHandle,
+        io_state: &Arc<Mutex<PaneIoState>>,
+        event_bus: &EventBus,
+        retry_delay: Duration,
+    ) {
+        for row in rows {
+            let Ok(session_id) = row.session_id.parse::<SessionId>() else {
+                // Never silently lost: loud ERROR + the row is already
+                // re-persisted on disk by startup_reap for manual cleanup.
+                tracing::error!(
+                    session_id = %row.session_id,
+                    pgid = row.pgid,
+                    "scratch-registry seed: unparseable session id; row left \
+                     on disk only — inspect manually"
+                );
+                continue;
+            };
+            let explicit_kill = CancellationToken::new();
+            let ghost_pane = PaneId::new();
+            {
+                let mut inner = self.lock_inner();
+                inner.rows.insert(
+                    session_id,
+                    ScratchState {
+                        pane_id: ghost_pane,
+                        pgid: row.pgid,
+                        start_time: row.start_time,
+                        created_at_unix_ms: row.created_at,
+                        max_runtime_deadline_unix_ms: row.max_runtime_deadline,
+                        explicit_kill: explicit_kill.clone(),
+                        claimed: false,
+                    },
+                );
+                self.persist(&inner);
+            }
+            tracing::warn!(
+                %session_id,
+                pgid = row.pgid,
+                retry_in_ms = retry_delay.as_millis() as u64,
+                "scratch-registry seed: unresolved row from the previous \
+                 daemon; retrying its reap shortly"
+            );
+            // Standard reaper, short deadline, honest audit reason: the
+            // deadline arm fires (no pane-exit event can ever match the
+            // ghost pane) and the reap retries through kill_confirmed.
+            tokio::spawn(scratch_reaper(
+                session_id,
+                ghost_pane,
+                event_bus.subscribe_filtered(vec!["pane.exited".to_string()]),
+                Instant::now() + retry_delay,
+                0,
+                graph.clone(),
+                io_state.clone(),
+                self.clone(),
+                explicit_kill,
+                "registry",
+            ));
+        }
     }
 }
 
@@ -1154,6 +1282,11 @@ async fn scratch_reaper(
     io_state: Arc<Mutex<PaneIoState>>,
     registry: ScratchRegistry,
     explicit_kill: CancellationToken,
+    // Audit reason when the DEADLINE arm fires: "max_runtime" for normal
+    // scratch, "registry" for rows seeded from a prior daemon's unresolved
+    // startup reap (P5 round-4 codex — that retry is a registry recovery,
+    // not a runtime cap; the audit must say so).
+    deadline_reason: &'static str,
 ) {
     let reason = tokio::select! {
         biased;
@@ -1162,14 +1295,14 @@ async fn scratch_reaper(
             return;
         }
         _ = tokio::time::sleep_until(max_runtime_deadline.into()) => {
-            "max_runtime"
+            deadline_reason
         }
         exit_status = wait_for_pane_exit(exit_sub, pane_id) => {
             let _ = exit_status;
             tokio::select! {
                 biased;
                 _ = explicit_kill.cancelled() => return,
-                _ = tokio::time::sleep_until(max_runtime_deadline.into()) => "max_runtime",
+                _ = tokio::time::sleep_until(max_runtime_deadline.into()) => deadline_reason,
                 _ = tokio::time::sleep(Duration::from_millis(post_exit_ttl_ms as u64)) => "exit",
             }
         }
@@ -1551,6 +1684,7 @@ async fn spawn_scratch_core(
         io_state.clone(),
         registry.clone(),
         explicit_kill,
+        "max_runtime",
     ));
 
     registry.audit.append(json!({
@@ -1716,7 +1850,8 @@ mod tests {
         std::fs::write(&path, truncated).unwrap();
 
         let audit = LensAuditLog::open(dir.path());
-        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert!(unresolved.is_empty(), "corrupt file resolves nothing");
         assert_eq!(killed, 0, "corrupt registry kills nothing");
         assert!(!path.exists(), "original name freed for the new daemon");
         let preserved = corrupt_files(dir.path());
@@ -1732,7 +1867,11 @@ mod tests {
         std::fs::write(&path, "{second corruption").unwrap();
         // The timestamp suffix has ms resolution; ensure it differs.
         std::thread::sleep(Duration::from_millis(5));
-        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert!(
+            unresolved.is_empty(),
+            "second corrupt startup resolves nothing"
+        );
         assert_eq!(killed, 0);
         let preserved = corrupt_files(dir.path());
         assert_eq!(
@@ -1788,7 +1927,11 @@ mod tests {
         write_registry_row(dir.path(), pid, real_token + 1);
 
         let audit = LensAuditLog::open(dir.path());
-        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert!(
+            unresolved.is_empty(),
+            "a spared recycled-PID row is resolved (dropped)"
+        );
         assert_eq!(killed, 0, "mismatched start token must not kill");
         assert!(pid_alive(pid), "innocent recycled-PID process survives");
         assert!(
@@ -1809,7 +1952,11 @@ mod tests {
         write_registry_row(dir.path(), pid, token);
 
         let audit = LensAuditLog::open(dir.path());
-        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert!(
+            unresolved.is_empty(),
+            "a confirmed kill leaves nothing unresolved"
+        );
         assert_eq!(killed, 1, "matching start token reaps the group");
         // Reap the zombie so the liveness probe below is honest.
         let _ = child.wait();
@@ -1859,7 +2006,11 @@ mod tests {
         // leader is unreadable, which is precisely the (recorded, None) arm.
         write_registry_row(dir.path(), pgid, 98765);
         let audit = LensAuditLog::open(dir.path());
-        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert!(
+            unresolved.is_empty(),
+            "a reaped leader-gone group leaves nothing unresolved"
+        );
         assert_eq!(killed, 1, "leader-gone live group must be reaped");
         {
             use nix::sys::signal::killpg;
@@ -1921,7 +2072,13 @@ mod tests {
         // old unconditional delete made a stubborn group invisible to all
         // future restart reaps — the B3-class hole at startup).
         TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
-        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "the unconfirmed row is returned for seeding"
+        );
+        assert_eq!(unresolved[0].pgid, pid, "returned row is the original");
         TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
         assert_eq!(killed, 0, "unconfirmed rows are not counted as killed");
         assert!(
@@ -1943,7 +2100,11 @@ mod tests {
         assert_eq!(reap_audits, 0, "no reap audit for an unresolved row");
 
         // Second startup, flag cleared: the retry reaps for real.
-        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert!(
+            unresolved.is_empty(),
+            "the confirmed retry resolves the row"
+        );
         assert_eq!(killed, 1, "the re-persisted row is reaped on retry");
         let _ = child.wait(); // reap the zombie before probing
         assert!(!pid_alive(pid), "group leader killed on the retry");
@@ -2180,6 +2341,33 @@ mod tests {
         assert!(
             verify_chain_set(&path).is_err(),
             "deleted interior rotation file must fail set verification"
+        );
+    }
+
+    // ── rotated-file verification guard (round 4) ───────────────────────
+
+    #[test]
+    fn verify_chain_rejects_direct_rotated_file_arguments() {
+        let dir = tmpdir();
+        let path = dir.path().join("lens-audit.ndjson");
+        let audit = LensAuditLog::open(dir.path());
+        fill_one_rotation(&audit, &path, "gen1");
+        let rotated = path.with_extension("ndjson.1");
+        assert!(rotated.exists(), "rotation happened");
+
+        // Direct rotated-file verification is rejected — handed the .1
+        // path, the set resolution would derive `….ndjson.1.N` siblings
+        // and TrustedStart would self-justify the continuation header
+        // even with a tampered/absent predecessor (codex round-4 minor).
+        let err = verify_chain(&rotated).expect_err("rotated file must be rejected");
+        assert!(err.contains("rotated audit file"), "clear error: {err}");
+        let err = verify_chain_set(&rotated).expect_err("set walk rejects it too");
+        assert!(err.contains("rotated audit file"), "clear error: {err}");
+
+        // The right entrypoint still works: the LIVE path verifies the set.
+        assert!(
+            verify_chain_set(&path).is_ok(),
+            "live-path set walk is the API"
         );
     }
 

@@ -1432,7 +1432,8 @@ fn run_daemon() -> anyhow::Result<()> {
         // sessions never survive a restart. Kill any process groups a prior
         // daemon incarnation left registered BEFORE the RPC server starts
         // accepting `lens.run` calls that would populate a fresh registry.
-        let reaped = lens_scratch::ScratchRegistry::startup_reap(&runtime_dir, &lens_audit).await;
+        let (reaped, unresolved_scratch) =
+            lens_scratch::ScratchRegistry::startup_reap(&runtime_dir, &lens_audit).await;
         if reaped > 0 {
             tracing::info!(
                 reaped,
@@ -1443,7 +1444,8 @@ fn run_daemon() -> anyhow::Result<()> {
         // Set up SessionGraph + graph loop
         let sock_path = daemon::socket_path()?;
         let cancel = tokens.root.clone();
-        let io_state = run_rpc_server(sock_path, cancel.clone(), lens_audit).await?;
+        let io_state =
+            run_rpc_server(sock_path, cancel.clone(), lens_audit, unresolved_scratch).await?;
 
         // Run the daemon state loop (blocks until shutdown)
         shux_core::daemon::run_daemon_state_loop(cmd_rx, tokens.clone(), config_reload_notify)
@@ -1500,6 +1502,7 @@ async fn run_rpc_server(
     socket_path: PathBuf,
     cancel: tokio_util::sync::CancellationToken,
     lens_audit: Arc<lens_scratch::LensAuditLog>,
+    unresolved_scratch: Vec<lens_scratch::RegistryRow>,
 ) -> anyhow::Result<Arc<Mutex<PaneIoState>>> {
     // EventBus: typed pub/sub for lifecycle events. Wired into SessionGraph
     // so every successful mutation publishes a typed event to subscribers.
@@ -1529,9 +1532,23 @@ async fn run_rpc_server(
 
     // Lens scratch registry (§8 SPEC-E, LENS-R-040..046). One per daemon
     // incarnation — the startup reap in `run_daemon` already cleared any
-    // leftover registry file from a prior incarnation before this runs.
+    // resolvable rows from a prior incarnation before this runs.
     let scratch_registry =
         lens_scratch::ScratchRegistry::new(&daemon::runtime_dir()?, lens_audit.clone());
+
+    // Seed rows the startup reap could NOT confirm dead (P5 round-4 codex
+    // — the daemon-lifecycle half of N3): seeded rows survive normal
+    // persists, count toward the quota, and get a short-deadline standard
+    // reaper so the RUNNING daemon retries the kill. Seeding happens
+    // before the RPC server accepts connections, so the very first
+    // lens.run sees them in the quota.
+    scratch_registry.seed_unresolved(
+        unresolved_scratch,
+        &graph_handle,
+        &io_state,
+        &event_bus,
+        Duration::from_secs(1),
+    );
 
     // Load user config (~/.config/shux/config.toml). Missing file is
     // valid — defaults match current hardcoded behavior. Spawn a watcher
@@ -8147,6 +8164,7 @@ mod tests {
         cancel: CancellationToken,
         graph_task: tokio::task::JoinHandle<()>,
         scratch_registry: lens_scratch::ScratchRegistry,
+        lens_audit: Arc<lens_scratch::LensAuditLog>,
         /// Keeps the isolated scratch/audit dir alive for the harness's
         /// lifetime (registry + lens-audit files live inside).
         _scratch_dir: tempfile::TempDir,
@@ -8197,7 +8215,7 @@ mod tests {
                 meta,
                 onboarding,
                 segments,
-                lens_audit,
+                lens_audit.clone(),
             );
             let builder = lens_scratch::register_lens_run_method(
                 builder,
@@ -8207,6 +8225,7 @@ mod tests {
                 bus.clone(),
                 scratch_registry.clone(),
             );
+
             let router = register_events_methods(builder, bus.clone()).build();
             router.assert_every_route_has_policy();
 
@@ -8218,6 +8237,7 @@ mod tests {
                 cancel,
                 graph_task,
                 scratch_registry,
+                lens_audit,
                 _scratch_dir: scratch_dir,
             }
         }
@@ -8655,6 +8675,122 @@ mod tests {
         while count_procs_containing("sleep 30") > 0 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        harness.stop().await;
+    }
+
+    /// P5 round-4 codex — N3 at the DAEMON-LIFECYCLE level: startup_reap's
+    /// re-persisted unresolved rows used to be clobbered by the fresh
+    /// daemon's very first normal persist (which rewrites the file from
+    /// its empty in-memory rows). The daemon now SEEDS its live registry
+    /// with them: they survive normal persists, count toward quota, and a
+    /// short-deadline standard reaper retries the kill — with row removal
+    /// still conditional on confirmed death.
+    #[tokio::test]
+    async fn production_seeded_unresolved_rows_survive_persists_and_get_retried() {
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let dir = harness._scratch_dir.path().to_path_buf();
+        let reg_path = dir.join("scratch-registry.json");
+
+        // A real orphaned group from a "previous daemon": leader exits,
+        // the sleep survives IN the group, reparented away from us (so a
+        // later kill leaves no zombie for the death probe to trip on).
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 300 & exit 0"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan group");
+        let pgid = child.id();
+        let _ = child.wait(); // reap the leader; the sleep keeps the group alive
+
+        // The previous daemon's registry row (raw on-disk schema;
+        // start_time 0 = liveness-only fallback).
+        let seeded_sid = shux_core::model::SessionId::new().to_string();
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "session_id": seeded_sid,
+                "pgid": pgid,
+                "start_time": 0,
+                "created_at": 1,
+                "max_runtime_deadline": 2,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Startup reap under the forced-unconfirmed flag: the row comes
+        // back unresolved (and stays on disk).
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!(killed, 0);
+        assert_eq!(unresolved.len(), 1, "row returned for seeding");
+
+        // Seed the LIVE registry (test-friendly retry delay: long enough
+        // to deterministically observe the survive-a-normal-persist
+        // window first).
+        harness.scratch_registry.seed_unresolved(
+            unresolved,
+            &harness.graph,
+            &harness.io,
+            &harness.bus,
+            Duration::from_secs(3),
+        );
+        assert_eq!(
+            harness.scratch_registry.test_total(),
+            1,
+            "seeded row counts toward the quota"
+        );
+
+        // A NORMAL scratch triggers a normal persist — the round-4 bug
+        // was exactly here: the rewrite used to drop the seeded row.
+        let run = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"]}),
+        )
+        .await;
+        let normal_sid = run["session_id"].as_str().unwrap().to_string();
+        let text = std::fs::read_to_string(&reg_path).expect("registry persisted");
+        assert!(
+            text.contains(&seeded_sid),
+            "seeded row SURVIVES the normal persist:\n{text}"
+        );
+        assert!(text.contains(&normal_sid), "normal row persisted too");
+
+        // The short-deadline retry then confirms death, removes the row,
+        // and audits reason=registry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let still_there = std::fs::read_to_string(&reg_path)
+                .map(|t| t.contains(&seeded_sid))
+                .unwrap_or(false);
+            if !still_there {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded row not reaped by the running daemon's retry"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let audit_text = std::fs::read_to_string(dir.join("lens-audit.ndjson")).unwrap_or_default();
+        assert!(
+            audit_text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| e["method"] == "scratch.reap"
+                    && e["reason"] == "registry"
+                    && e["session_id"] == seeded_sid.as_str()),
+            "the completed retry audits reason=registry"
+        );
+
+        kill_scratch_and_wait(&harness, &normal_sid).await;
         harness.stop().await;
     }
 
