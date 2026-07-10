@@ -316,3 +316,48 @@ sign-off under the user's standing ship authorization; tofu limitation
 acknowledged per PRD §17); `evidence-manifest.json` `provisional: false`;
 golden bytes verified unchanged (sha256 re-check). Council verdicts
 committed at `.shux/qa/lens-p2/council/`.
+
+## PR #89 bot round + golden re-mint (2026-07-09 — user-ordered "fix everything")
+
+**Bot fixes (all four threads):**
+1. **P1 — pre-render pixel budget:** glance rasterized the full pane before
+   any size check; a max-size (1000×1000) pane forced hundreds of MB of
+   RGBA allocation + encode before the post-encode 8 MiB cap could fire.
+   The 16M-pixel budget (pane.snapshot's cap) now runs inside the lock,
+   BEFORE clone/render, mapped to `PAYLOAD_TOO_LARGE (-32013)` with
+   `{pixels, max_pixels, hint}`. Text-only glances skip it (no PNG payload
+   exists). Test: `production_glance_rejects_over_budget_panes_before_render`
+   (full production router: guard fires at 1000×1000; `include_png=false`
+   on the same pane still succeeds).
+2. **P2 — glance_text comment:** rewritten; blank cells PAD rows to full
+   display width, trailing whitespace preserved, no trimming mechanism.
+3. **P2 — CLI conflict:** `--png` now carries clap `conflicts_with =
+   "text_only"` (parse-time rejection, exit 2, zero RPC round-trips) plus
+   a defensive bail in `handle_pane_glance` for programmatic callers.
+4. **P2 — needless clone:** clone routing is a `(include_png,
+   want_checkpoint)` move-matrix — only PNG+checkpoint pays one clone;
+   text-only+checkpoint MOVES the grid into the checkpoint.
+
+**Golden re-mint with real fixture fonts (user adjudication, PRD §17):**
+- `.shux/fixtures/fonts/`: `NotoSansDevanagari-Regular.ttf` (OFL, notofonts
+  hinted static TTF) + `NotoSansJP-shuxlens-subset.ttf` (OFL, pyftsubset of
+  google/fonts NotoSansJP wght=400 instance to exactly the 9 CJK codepoints
+  the fixtures use — ステト実界真端終面 — ~4 KB; commands in README.md).
+  OFL texts committed alongside; sha256 + provenance in the evidence
+  manifest.
+- `lens_common::Harness::new` (LENS-TEST-CHANGE p2-fonts) writes the
+  isolated daemon config: `appearance.font_fallbacks = [builtin:nerd-font,
+  <devanagari>, <cjk subset>, builtin:math, builtin:symbols,
+  builtin:symbols-legacy, builtin:emoji]`. Primary stays bundled JBM →
+  cell metrics identical; DEFAULT chain + vt-corpus goldens untouched
+  (verified byte-exact).
+- Goldens re-minted (PNGs + contact sheet; TXT goldens unchanged —
+  font-independent). Devanagari/CJK tofu GONE. KNOWN + ACCEPTABLE:
+  per-codepoint rendering, no OpenType shaping (conjuncts/matras
+  decomposed) — stated in BASELINE-APPROVAL.md, which is now
+  "RE-MINTED — pending QA re-inspection" with the prior approval preserved
+  as history. A focused QA re-pass runs next.
+
+Gates: test-lens 15/22 (G1/G2/G2w green vs NEW goldens, smoke lane 10/10
+under the font config) · vt-corpus byte-exact · full lanes 18/18 · lint ·
+shellcheck · leak-guard all clean.

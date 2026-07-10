@@ -2,23 +2,36 @@
   "schema_version": 1,
   "phase": "P2",
   "task": "077-shux-lens",
-  "minted_at_utc": "2026-07-09T07:56:55Z",
-  "provisional": false,
-  "provisional_note": "APPROVED 2026-07-09: shux-vt-solid-qa VERDICT: PASS (.shux/qa/lens-p2/SOLID-QA.md, commit 1a578b4) + orchestrator sign-off under the user's standing ship authorization; tofu limitation acknowledged per PRD sec17. Golden bytes unchanged from the mint.",
-  "approved_at_utc": "2026-07-09T09:31:49Z",
-  "approval_evidence": ".shux/qa/lens-p2/SOLID-QA.md",
+  "minted_at_utc": "2026-07-10T03:40:21Z",
+  "provisional": true,
+  "provisional_note": "RE-MINTED (user-ordered golden re-mint with committed fixture fonts, PRD sec17 adjudication) \u2014 pending QA re-inspection. Prior baseline was APPROVED 2026-07-09 (shux-vt-solid-qa VERDICT: PASS, .shux/qa/lens-p2/SOLID-QA.md, commit 1a578b4) against the tofu-rendering builtin-only chain; this re-mint replaces those bytes with real-Devanagari/CJK renders and requires a fresh QA pass before approval.",
+  "render_font_chain_note": "Lens HARNESS-ONLY fallback chain (lens_common config; default raster chain unchanged): [builtin:nerd-font, fixture Devanagari, fixture CJK subset, builtin:math, builtin:symbols, builtin:symbols-legacy, builtin:emoji]. Primary remains bundled JBM NF (metrics anchor). Devanagari renders per-codepoint (no OpenType shaping) \u2014 known + acceptable per the adjudication.",
   "shux_workspace_version": "0.37.0",
   "shux_raster_crate_version": "0.37.0",
   "git_commit_base": "542101fba7daeaa6ce1c7cf63d9c3d74eb553fc4",
   "rustc_version": "rustc 1.95.0 (59807616e 2026-04-14)",
   "platform": "Darwin indrasvat 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:39:09 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T6020 arm64",
-  "font_bundle_sha256": "f7c7b8c9888c8dabfc18e65f884398a013e3eab0b83b25e0b248618c550525dc",
-  "font_files_sha256": {
+  "builtin_font_bundle_sha256": "f7c7b8c9888c8dabfc18e65f884398a013e3eab0b83b25e0b248618c550525dc",
+  "builtin_font_files_sha256": {
     "JetBrainsMonoNerdFontMono-Regular.ttf": "f01031f40e48dc29e1112e6b0b0450a2c6cd097f3f35cfff05c55cb311f8034c",
     "NotoEmoji-Regular.ttf": "3c4aea565060fa91575a851e2718a5b14b9fe8856ead696b374c5a7e672179cb",
     "NotoSansMath-Regular.ttf": "80b61fd613d3519197e64fff6f7e71fdc7f3e6526440ea4115b554ef7fd59af7",
     "NotoSansSymbols-Regular.ttf": "8f02f31959bbdf6061547a188248e13f84dc5fdd940326ec494675f453f072bb",
     "NotoSansSymbols2-Regular.ttf": "630846d528dbe4c4981370a4d0a9475a1fd1491a129bb411f8e157cdb5de13c6"
+  },
+  "fixture_fonts": {
+    "NotoSansDevanagari-Regular.ttf": {
+      "path": ".shux/fixtures/fonts/NotoSansDevanagari-Regular.ttf",
+      "sha256": "306b53ecfb182a504dd8a7446093c316387d2fd8dc350d0792ed1753fe0996cd",
+      "license": "OFL 1.1 (.shux/fixtures/fonts/OFL-NotoSansDevanagari.txt)",
+      "provenance": "https://raw.githubusercontent.com/notofonts/notofonts.github.io/main/fonts/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Regular.ttf"
+    },
+    "NotoSansJP-shuxlens-subset.ttf": {
+      "path": ".shux/fixtures/fonts/NotoSansJP-shuxlens-subset.ttf",
+      "sha256": "82e8b3a507a6d8df83ed793fb011a8e9289e72b5a84ce2b4898535ed2cc335a5",
+      "license": "OFL 1.1 (.shux/fixtures/fonts/OFL-NotoSansJP.txt)",
+      "provenance": "pyftsubset of https://raw.githubusercontent.com/google/fonts/main/ofl/notosansjp/NotoSansJP%5Bwght%5D.ttf (wght=400 instance; 9 fixture CJK codepoints; see .shux/fixtures/fonts/README.md)"
+    }
   },
   "rasterizer_font_size_px": 14.0,
   "goldens": {
@@ -31,7 +44,7 @@
         "checkpoint": true
       },
       "png": "g2_f1_80x24.png",
-      "png_sha256": "9d20e89a2a0bdc36d96d75e2eade4f3a13a5e4a66e50c80bd8e222180fb4fc84",
+      "png_sha256": "ac4caf47981c8fb3583fd3c42d36dd5d6ab13ab6371745c5b504623b4c660f93",
       "text": "g2_f1_80x24.txt",
       "text_sha256": "7ba234e9e0ee54adfbac77a7e75b1309a9ebff698c3adff3f3e93ec67b4345a9",
       "expected_cursor": {
@@ -53,7 +66,7 @@
         "checkpoint": true
       },
       "png": "g2w_f5_100x30.png",
-      "png_sha256": "87f0cd16ba91532fab054041133698f42c846842ea5933aadea8d58a59c35ec7",
+      "png_sha256": "5bf698ef152477675a2428aae870ccfab82c44340b136034cca8feffc351573a",
       "text": "g2w_f5_100x30.txt",
       "text_sha256": "092866409974f846e258799402fbd9deeb601224a0be1cd8d1edb622c226e060",
       "expected_cursor": {
