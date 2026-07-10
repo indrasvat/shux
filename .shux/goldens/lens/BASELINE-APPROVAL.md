@@ -144,12 +144,45 @@ its own golden).
 
 ---
 
-## P4 addendum — checkpoints + `pane.diff_since` (task 077) — PROVISIONAL
+## P4 addendum — checkpoints + `pane.diff_since` (task 077) — RATIFIED
 
-**Status: PROVISIONAL — minted by the P4 implementer; pending
-`shux-vt-solid-qa` (heat scope) PASS + orchestrator sign-off.** Per §16.3 the
-implementation does not self-certify; the QA gate visually inspects and the
-orchestrator ratifies before these flip to APPROVED.
+**Status: RATIFIED (2026-07-10, independent P4 verifier re-render + byte cmp +
+full-resolution visual inspection, on the orchestrator's ratification
+instruction for task 077 P4).** Prerequisites consumed: the
+`shux-vt-solid-qa` heat-scope gate PASS (`.shux/qa/lens-p4/SOLID-QA.md`,
+first line `VERDICT: PASS`) covering `d2_heat.png` (the one NEW-rendering
+golden), and PRD §14 lighter ratification for the two raster-untouched
+glance-path goldens.
+
+### Verifier ratification record (2026-07-10)
+
+- **Who:** the independent P4 verifier (not the implementer, not the QA
+  gate) — separate agent, separate re-render, separate daemon.
+- **How:** each golden re-rendered via direct RPC under a FRESH isolated
+  XDG environment (config mirroring the harness fixture-font fallback
+  chain), driving the frozen fixtures exactly as the frozen tests do:
+  `d2_heat` = F4 → `pane.glance{checkpoint:true}` → `a` →
+  `pane.wait_settled` → `pane.diff_since{heat_png:true}`;
+  `a1_alt`/`a1_normal` = F10 → `E`/`L` tokens → `pane.wait_for` →
+  `pane.glance`. Runs executed serially under
+  `.shux/scripts/no_leak_guard.sh`; zero shux processes after.
+- **Byte cmp:** all three verifier re-renders `cmp`-identical to the
+  committed goldens; sha256 matches on both sides
+  (`deef295d…` / `0a790612…` / `a27b5e05…`).
+- **Delta cross-check:** the d2 diff itself re-derived independently —
+  `cells_changed=10`, regions `[{2,2,3},{5,10,19}]`, matching the frozen
+  D2 assertion.
+- **Visual inspection (full resolution, each PNG opened as an image):**
+  d2_heat — heat tint on exactly the 10 changed cells, remainder
+  desaturated but coloured, no tofu; a1_alt — magenta ALT-SCREEN +
+  truecolor/256/basic magenta blocks, cursor block bottom-right; a1_normal
+  — restored startup frame with full 256-colour strip + basic blocks.
+- **Extra determinism receipt:** two live CLI `--heat` renders of the same
+  diff byte-identical, and the RPC `heat_png_base64` bytes equal the CLI
+  `--heat` file bytes (cross-path identity).
+
+The three P4 goldens are `provisional: false` in `evidence-manifest.json`
+as of this record.
 
 Three goldens land in P4. Two are raster-UNTOUCHED (glance path unchanged from
 P2 → PRD §14 lighter ratification: independent re-render + byte cmp + visual +

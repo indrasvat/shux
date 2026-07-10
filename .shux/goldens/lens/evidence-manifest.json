@@ -98,8 +98,8 @@
     },
     "d2_heat": {
       "phase": "P4",
-      "provisional": true,
-      "provisional_note": "MINTED in P4 (task 077) from the ACTUAL pane.diff_since heat-PNG render — the F4 fixture after `a`, diffed against the pre-`a` checkpoint. This is the ONE golden in P4 that exercises NEW rendering (the LENS-R-037 heat overlay: changed cells alpha-blended with rgba(163,38,56,128), unchanged cells desaturated 50% via Rec.601 luma). The base frame is the P2-approved glance raster + harness fixture-font chain on the FROZEN F4 fixture (unchanged rendering); only the post-render overlay is new, and its colours/desaturation are PRD-mandated. Determinism: integer-only overlay math; heat_png_is_deterministic unit test proves same-input byte-identity. Pending shux-vt-solid-qa (heat scope) PASS + orchestrator sign-off.",
+      "provisional": false,
+      "provisional_note": "RATIFIED (2026-07-10, independent P4 verifier re-render + visual inspection; SOLID VT QA heat-scope PASS at .shux/qa/lens-p4/SOLID-QA.md is the full-gate prerequisite this golden required). Verifier re-render: direct RPC (pane.glance{checkpoint:true} -> `a` -> pane.wait_settled -> pane.diff_since{heat_png:true}) under a FRESH isolated XDG daemon with the harness fixture-font chain — byte-identical to the committed golden (cmp clean; sha256 deef295d… matches); delta independently re-derived (cells_changed=10, regions [{2,2,3},{5,10,19}]). Full-res visual inspection: heat tint on exactly the 10 changed cells (red block at (2,2) + A-PRESSED at (5,10)..(5,18)); title/marker/colour legend visibly desaturated but still coloured; no tofu. Heat determinism additionally proven live: two CLI --heat renders byte-identical AND RPC base64 == CLI file bytes. Original mint record: MINTED in P4 (task 077) from the ACTUAL pane.diff_since heat-PNG render — the F4 fixture after `a`, diffed against the pre-`a` checkpoint. This is the ONE golden in P4 that exercises NEW rendering (the LENS-R-037 heat overlay: changed cells alpha-blended with rgba(163,38,56,128), unchanged cells desaturated 50% via Rec.601 luma). The base frame is the P2-approved glance raster + harness fixture-font chain on the FROZEN F4 fixture (unchanged rendering); only the post-render overlay is new, and its colours/desaturation are PRD-mandated. Determinism: integer-only overlay math; heat_png_is_deterministic unit test proves same-input byte-identity.",
       "fixture": ".shux/fixtures/lens/f4_keys.sh",
       "size": "80x24",
       "rpc": "pane.diff_since",
@@ -123,8 +123,8 @@
     },
     "a1_alt": {
       "phase": "P4",
-      "provisional": true,
-      "provisional_note": "MINTED in P4 (task 077) from the ACTUAL pane.glance render of the F10 fixture's ALTERNATE screen (after the `E` token enters alt). Rendering is UNCHANGED from P2 (the glance PNG path); this golden enshrines the P2-approved raster + harness fixture-font chain on the FROZEN F10 fixture, so it is a raster-UNTOUCHED baseline (PRD sec14: ratification = independent re-render + byte cmp + visual + orchestrator sign-off, not the full gate). Content: magenta 'ALT-SCREEN' text + magenta frame blocks (truecolor/256/basic). Pending independent ratification.",
+      "provisional": false,
+      "provisional_note": "RATIFIED (2026-07-10, independent P4 verifier re-render + visual inspection per PRD sec14 raster-untouched rule). Verifier re-render: direct RPC (F10 launch -> `E` token -> pane.wait_for ALT-SCREEN -> pane.glance) under a FRESH isolated XDG daemon with the harness fixture-font chain — byte-identical to the committed golden (cmp clean; sha256 0a790612… matches); glance reported alt_screen=true. Full-res visual inspection: magenta bold ALT-SCREEN at row 1, three magenta frame blocks at row 3 (truecolor/256/basic shades), cursor block bottom-right; full colour, no tofu. Original mint record: MINTED in P4 (task 077) from the ACTUAL pane.glance render of the F10 fixture's ALTERNATE screen (after the `E` token enters alt). Rendering is UNCHANGED from P2 (the glance PNG path); this golden enshrines the P2-approved raster + harness fixture-font chain on the FROZEN F10 fixture, so it is a raster-UNTOUCHED baseline. Content: magenta 'ALT-SCREEN' text + magenta frame blocks (truecolor/256/basic).",
       "fixture": ".shux/fixtures/lens/f10_altscreen.sh",
       "size": "80x24",
       "rpc": "pane.glance",
@@ -140,8 +140,8 @@
     },
     "a1_normal": {
       "phase": "P4",
-      "provisional": true,
-      "provisional_note": "MINTED in P4 (task 077) from the ACTUAL pane.glance render of the F10 fixture's NORMAL screen after leaving the alternate screen (the `L` token restores it). Rendering UNCHANGED from P2 (glance PNG path) — raster-UNTOUCHED baseline on the FROZEN F10 fixture. Content: 'LENS-F10-ALT' + 'NORMAL-SCREEN' + the 256-colour strip + basic-colour blocks (the restored startup frame). Pending independent ratification.",
+      "provisional": false,
+      "provisional_note": "RATIFIED (2026-07-10, independent P4 verifier re-render + visual inspection per PRD sec14 raster-untouched rule). Verifier re-render: direct RPC (continue F10 session -> `L` token -> pane.wait_for NORMAL-SCREEN -> pane.glance) under a FRESH isolated XDG daemon with the harness fixture-font chain — byte-identical to the committed golden (cmp clean; sha256 a27b5e05… matches); glance reported alt_screen=false. Full-res visual inspection: LENS-F10-ALT (white bold) + NORMAL-SCREEN (green) + 256-colour strip + basic-colour blocks — the restored startup frame in full colour, no tofu. Original mint record: MINTED in P4 (task 077) from the ACTUAL pane.glance render of the F10 fixture's NORMAL screen after leaving the alternate screen (the `L` token restores it). Rendering UNCHANGED from P2 (glance PNG path) — raster-UNTOUCHED baseline on the FROZEN F10 fixture. Content: 'LENS-F10-ALT' + 'NORMAL-SCREEN' + the 256-colour strip + basic-colour blocks (the restored startup frame).",
       "fixture": ".shux/fixtures/lens/f10_altscreen.sh",
       "size": "80x24",
       "rpc": "pane.glance",
