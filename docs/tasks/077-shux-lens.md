@@ -1,6 +1,6 @@
 # Task 077: shux lens — give every agent eyes
 
-**Status:** In Progress — P5 scratch sessions + `lens.run` on `feat/lens-p5-scratch-run` (branched from `origin/main` at the v0.41.0 release commit, includes P4 #91 "pane.checkpoint + pane.diff_since"). P0–P4 all Done and merged: P0 red suite (ff688a8, PR #86), P1 ContentRevision substrate (542101f, PR #87, v0.38.0), P2 pane.glance (0e6d611, PR #89, v0.39.0), P3 pane.wait_settled (3914dbb, PR #90, v0.40.0), P4 pane.checkpoint + pane.diff_since (80ffce8, PR #91, v0.41.0; gate 27/10 — D1–D5+A1 green, R1–R8/K1/E1 untouched). Full per-phase detail preserved in the P0–P4 sections below (P0 council rounds, P2 G1/F3 sync-wrap + OSC reclassification, P3 cancellable-RPC + PeerDeathMonitor, P4 invalidation-gating + LENS-R-038b). P5 scope: scratch registry + reap loop + `lens.run` composite RPC/CLI (§8 SPEC-E), targeting R1–R8 green.
+**Status:** In Progress — P5 scratch sessions + `lens.run` IMPLEMENTED on `feat/lens-p5-scratch-run` (branched from `origin/main` at the v0.41.0 release commit, includes P4 #91 "pane.checkpoint + pane.diff_since"); `make test-lens` **35 passed / 2 failed** — **R1–R8 all green (8/8)**; K1/E1 both red at the identical root cause (`golden not found`, not a functional failure — see P5 notes below for the full E1 trace and the pending golden-mint decision). P0–P4 all Done and merged: P0 red suite (ff688a8, PR #86), P1 ContentRevision substrate (542101f, PR #87, v0.38.0), P2 pane.glance (0e6d611, PR #89, v0.39.0), P3 pane.wait_settled (3914dbb, PR #90, v0.40.0), P4 pane.checkpoint + pane.diff_since (80ffce8, PR #91, v0.41.0; gate 27/10 — D1–D5+A1 green, R1–R8/K1/E1 untouched). Full per-phase detail preserved in the P0–P4 sections below (P0 council rounds, P2 G1/F3 sync-wrap + OSC reclassification, P3 cancellable-RPC + PeerDeathMonitor, P4 invalidation-gating + LENS-R-038b). Awaiting: independent verifier + dootsabha convergence review + E1-golden adjudication before this phase can ship.
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 016, 017, 060, 064, 074
@@ -539,3 +539,140 @@ goldens and SOLID QA PASS stand; neither blocker touches rendering.
    and SCROLLED the pane (shifting every row; observed 400/400 cells).
    Rewritten as an inline `exec`'d token-paced script (the fixtures'
    promptless pattern; EOF-safe `while read` loop).
+
+## P5 implementation notes (scratch sessions + `lens.run`, branch `feat/lens-p5-scratch-run`)
+
+**Delivered (§8 SPEC-E, LENS-R-040..046):**
+
+- New module `crates/shux/src/lens_scratch.rs`: `ScratchRegistry`
+  (in-memory `Arc<Mutex<HashMap<SessionId, ScratchState>>>` +
+  `$XDG_RUNTIME_DIR/shux/scratch-registry.json`, rewritten whole-file on
+  every insert/remove — LENS-R-044's exact schema
+  `{session_id, pgid, created_at, max_runtime_deadline}`), the `lens.run`
+  RPC handler, a per-scratch `scratch_reaper` task, and a sha256-chained
+  NDJSON audit log at `$XDG_STATE_HOME/shux/lens-audit.ndjson`
+  (LENS-R-052; mirrors `shux-plugin/src/audit.rs`'s synchronous-write
+  posture, extended with a genuine hash chain — each entry's `hash` covers
+  `prev_hash` + the entry body, genesis is 64 zeros).
+- `spawn_pane_pty` (main.rs) gained two params — `size: PtySize`,
+  `extra_env: Vec<(String,String)>` — and now returns the raw
+  `shux_pty::PtyError` instead of pre-mapping to `RpcError::internal`, so
+  `lens.run` can map spawn failure to `SPAWN_FAILED (-32014)` while every
+  other call site (session.create/ensure, window.create, `state.apply`,
+  attach's split/new-window paths) keeps its existing `internal()` mapping.
+  All 6 pre-existing call sites now pass `PtySize::default()` / `Vec::new()`
+  — byte-for-byte the same behavior as before (VT construction now reads
+  `size.rows/cols` instead of a hardcoded 24×80, which are the same values
+  for every non-lens caller). New `PaneIoState.pty_pids: HashMap<PaneId,
+  u32>` lets `lens.run` read back the spawned child's pid (== pgid; PTY
+  children are session leaders) without needing its own `PtyHandle`.
+- `lens.run` allocates via the SAME `GraphHandle::create_session_with_command`
+  entrypoint `session.create`/`session.ensure` use (DEC-21: no public
+  scratch param exists; this is an internal-only call path with a
+  `__scratch-<uuid>` session name), then execs `argv` directly (non-empty
+  argv guarantees `PtyConfig::with_command`'s no-shell path — `resolve_command`
+  only substitutes a shell when `command.is_empty()`). Spawn failure rolls
+  back via `graph.destroy_session` before returning `SPAWN_FAILED`; zero
+  residue by construction (nothing is registered until spawn succeeds).
+  `lens.run`'s response is exactly the §8.1 schema — `{session_id, pane_id,
+  revision}` (+`exit_code` when `wait:true`) — it does NOT call
+  glance/wait_settled/diff_since internally; those stay separate RPCs an
+  agent chains itself (proven end-to-end by E1's own call sequence).
+- Exit detection is event-driven (§16.1 guardrail 3 — no polling): both the
+  reaper and the `wait:true` branch subscribe to the daemon's existing
+  `pane.exited` bus event (already fired by `run_pane_pty_task` via
+  `graph.set_pane_exit_status`) — both subscriptions are created BEFORE the
+  PTY is spawned, so a fast-exiting command (F6) can't race ahead of the
+  listener. The reaper (`scratch_reaper`) is a single `tokio::select!` over
+  three deadline-bounded arms: explicit-kill cancellation, `max_runtime_ms`
+  deadline, and (after the exit event fires) a second race between
+  `post_exit_ttl_ms`, `max_runtime_ms`, and explicit-kill. Reap itself calls
+  the SAME `state.teardown_panes()` + `graph.destroy_session()` pair
+  `session.kill` already uses — LENS-R-042's "killpg(SIGTERM)…" reap
+  contract is satisfied by reusing `run_pane_pty_task`'s existing
+  SIGHUP→500ms-grace→SIGKILL escalation (triggered by cancelling the pane's
+  shutdown token) rather than re-implementing process-group signalling
+  end-to-end; only the true STARTUP-orphan path (`ScratchRegistry::startup_reap`,
+  no live PTY task to escalate through) does its own `killpg`
+  SIGTERM→500ms→SIGKILL directly.
+- `session.list` gained `include_scratch: bool` (default false): scratch
+  ids come from `ScratchRegistry::ids()` (a point-in-time snapshot,
+  building the JSON outside the registry lock); default listing filters
+  scratch out entirely, `include_scratch:true` includes them flagged
+  `"scratch": true` (LENS-R-041 — visibility only, never a substitute for
+  direct-id resolution: `session.kill`/`pane.glance`/etc. never consult
+  this filter). `session.kill` calls `lens_scratch::on_session_killed`
+  after its existing teardown — a no-op for ordinary sessions (registry
+  miss), immediate reap(reason=explicit) audit + reaper-task cancellation
+  for scratch (LENS-R-042c).
+- Daemon startup (`run_daemon`) calls `ScratchRegistry::startup_reap`
+  right after `ensure_runtime_dir()`, before the RPC server binds — reads
+  a leftover registry file, `killpg`s every registered pgid, audits
+  `reap(reason=registry)` per row, deletes the file (DEC-7: scratch never
+  survives a restart).
+- CLI: `shux lens run [--size CxR] [--ttl D] [--max-runtime D] [--env K=V]...
+  [--cwd PATH] [--wait] -- <argv...>` (new `Command::Lens{LensCommand::Run}`,
+  `cli::handle_lens_run`, `style::print_lens_run`); `shux session list
+  --include-scratch`. `shux lens` / `shux lens --help` print the five-verb
+  loop recipe (§10 discoverability requirement) via `after_help` on the
+  `LensCommand` subcommand group. `--size`/`--env` get dedicated value
+  parsers (`parse_size_cxr`, `parse_env_kv`) that validate SHAPE only —
+  range bounds stay server-side INVALID_PARAMS, matching the existing
+  `--quiet`/`--timeout` convention (`parse_duration_ms`) rather than
+  duplicating the bounds check client-side. Exit codes follow §10 exactly
+  (`lens_run_exit_code`: INVALID_PARAMS→2, PERMISSION_DENIED→4,
+  RESOURCE_EXHAUSTED/SPAWN_FAILED→5, else→3); `--wait`'s success path
+  exits with the CHILD's code per the documented precedence rule.
+- New RPC error codes (`crates/shux-rpc/src/error.rs`):
+  `ResourceExhausted` (-32012) and `SpawnFailed` (-32014), with
+  constructors + wire-shape-pinning unit tests (mirroring the P4
+  `stale_revision`/`resize_invalidated` pattern).
+- `lens.run`'s `Policy`: `Sensitivity::Grantable` (never default-allow for
+  plugins, same tier as `state.apply`) — a judgment call, since LENS-R-050's
+  `scratch:create` scope doesn't exist as a distinct tier in the current
+  4-tier permission model; P2–P4 made the same call mapping their
+  `pane:observe` intent onto the existing `ContentRead` tier rather than
+  inventing new scope strings.
+
+**Known limitation (documented, not test-gated):** `ScratchRegistry::startup_reap`
+probes pgid liveness via a signal-0 `killpg`, not a full process-start-time
+comparison against the registry's `created_at` field (LENS-R-044 says "if
+still alive and its start time matches"). A PID that wrapped around to an
+unrelated process in the exact same narrow window would be killed too. Given
+`killpg` only ever targets pgids this daemon created as scratch
+process-group leaders, the blast radius is bounded to "processes sharing a
+recycled pgid" — the same class of risk the PRD already accepts for
+double-forked escapees (§17 M14). Not covered by R7 (which only requires a
+genuinely-live scratch to be reaped after a real daemon restart, and does
+not construct a PID-reuse adversarial case).
+
+**Gate result:** `make test-lens` **35 passed / 2 failed** (was 27/10):
+**R1–R8 all green** (8/8, CLI + RPC twins, incl. R6's 16-slot quota +
+17th-rejected + retry-after-kill and R7's SIGKILL-daemon +
+restart + zero-orphan + registry-file-removed + audit(reason=registry)
+proof). The 2 reds are K1 and E1 — BOTH fail at the identical root cause,
+`golden not found` (`k1_pos1.png` / `e1_glance.png`), not a functional or
+logic failure: E1's full call sequence (`lens.run` → `wait_for` → settle →
+`glance --checkpoint` → drive `a` → settle → `diff` with `heat_png:true`)
+runs to completion and asserts `cells_changed:10` + exact regions
+successfully — it only fails at the FIRST `assert_png_golden` call, which
+mints no golden if missing (§16.3: an implementation PR may never mint a
+golden in the same PR that changes rendering code, but conversely also
+never mints one silently). Per this task's brief ("if you find you must …
+mint a golden: STOP and message the orchestrator first"), no goldens were
+minted — K1/E1 stay red pending an explicit decision on whether E1's
+goldens (raster-UNTOUCHED — `pane.glance`/`pane.diff_since`'s rendering
+code is P2/P4-approved and unmodified in this phase) get pulled into P5 via
+the same "golden ratification for raster-untouched phases" path P3 used
+for `s1_ready.png`, or deferred to P6 (where the PRD's own phase table
+places E1's green gate). Other lanes: `make lint` clean (clippy -D
+warnings + fmt-check) · `make test` 210/210 · `make test-rpc` 45/45
+(+2 new error-code tests) · `make test-vt-corpus` byte-exact (no
+raster/VT source touched) · every daemon-backed run under
+`.shux/scripts/no_leak_guard.sh -j 1`, zero leaked `shux` processes or
+orphan fixture procs (confirmed both by the leak guard's own pass-through
+exit code and a separate manual smoke test: `lens run` with real
+truecolor+256-color+basic-ANSI content, `session list --include-scratch`,
+glance text readback, registry-file schema, audit-chain readback, explicit
+`session kill`, and a daemon-restart registry-reap cycle — every artifact
+matched expectations, no residue).
