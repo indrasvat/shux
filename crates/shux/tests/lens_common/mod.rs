@@ -746,11 +746,49 @@ pub fn skip_unless_bin(bin: &str, test: &str) -> bool {
     found
 }
 
-/// True iff every pixel of `png` is grayscale (R==G==B) — the NO_COLOR anchor
-/// check (T3).
-pub fn is_grayscale_png(png: &[u8]) -> bool {
+/// Per-pixel channel-spread statistics over a PNG: `(max_spread,
+/// pixels_with_spread_gt_8)` where spread = `max(R,G,B) − min(R,G,B)`.
+/// Basis of the NEAR-grayscale predicate and its discriminating control
+/// (T3). See `is_near_grayscale_png` for the adjudication record.
+pub fn png_channel_spread_stats(png: &[u8]) -> (u8, usize) {
     let img = image::load_from_memory(png).expect("decode png").to_rgba8();
-    img.pixels().all(|p| p[0] == p[1] && p[1] == p[2])
+    let mut max_spread: u8 = 0;
+    let mut gt8: usize = 0;
+    for p in img.pixels() {
+        let hi = p[0].max(p[1]).max(p[2]);
+        let lo = p[0].min(p[1]).min(p[2]);
+        let spread = hi - lo;
+        if spread > max_spread {
+            max_spread = spread;
+        }
+        if spread > 8 {
+            gt8 += 1;
+        }
+    }
+    (max_spread, gt8)
+}
+
+/// True iff every pixel of `png` is NEAR-grayscale:
+/// `max(R,G,B) − min(R,G,B) <= 8` — the NO_COLOR anchor check (T3).
+///
+/// LENS-TEST-CHANGE (approved 2026-07-10, task 077 P6): the original strict
+/// R==G==B grayscale predicate was unsatisfiable BY CONSTRUCTION on this
+/// stack, measured on the first real evaluation of the assertion:
+/// (a) nidhi emits OSC 11 to set its theme background — rendered as
+///     RGB(7,9,14), channel spread 7 — even under `--no-color` + `NO_COLOR=1`
+///     (NO_COLOR suppresses its ANSI text colors, not theme-background OSC);
+/// (b) shux-raster's own `bg_default` is `[16,16,24]`, channel spread 8, so
+///     even an OSC-free NO_COLOR render can never be strictly gray.
+/// The threshold is EXACTLY spread <= 8 (covers both measured anchors);
+/// real color output sits far beyond it (the T3 color sibling measured max
+/// spread 159 with thousands of pixels above 8). The predicate's purpose is
+/// unchanged: prove NO_COLOR suppressed the app's colored output. T3's
+/// color cells carry the discriminating control — the sibling golden must
+/// FAIL this predicate with meaningful signal (max_spread > 8 AND
+/// pixels_with_spread_gt_8 > 0, via `png_channel_spread_stats`).
+pub fn is_near_grayscale_png(png: &[u8]) -> bool {
+    let (max_spread, _) = png_channel_spread_stats(png);
+    max_spread <= 8
 }
 
 /// Deadline-bounded condition wait. §16.1 permits "deadline-bounded event

@@ -223,3 +223,233 @@ SOLID gate).
   the P2/P3 sections above; see `evidence-manifest.json` → `goldens.{d2_heat,
   a1_alt,a1_normal}`. `shux` workspace 0.40.0, git base
   `d3b62829e55cf4ea945afaf5966a2a02d86e1e16`, rustc 1.95.0, Darwin arm64.
+
+---
+
+## P6 addendum (2026-07-10) — K1/E1 loop + T1–T4 goldens — RATIFIED
+
+**Status: RATIFIED (2026-07-10, independent P6 verifier re-render + byte cmp
++ full-resolution visual inspection per the PRD §14 raster-untouched rule —
+see the verifier ratification record below).** Task 077 P6 closes the gate
+in full: `make test-lens` 37/37 and `make test-lens-t` 4/4 (K1, E1, T1–T4
+all green under the two council-approved LENS-TEST-CHANGEs). P6 changes NO
+raster/glance/diff rendering code, so the PRD §14 raster-untouched
+golden-ratification rule applies to every golden below: minted as
+PROVISIONAL by the implementation agent, now ratified by the independent
+verifier (not self-certified).
+
+### Verifier ratification record (2026-07-10) — all 12 P6 goldens
+
+- **Who:** the independent P6 verifier (separate agent, separate re-render,
+  separate fresh daemons) — not the implementer, not the shux-tui-qa gate.
+- **Raster-untouched precondition re-proven:** `git diff d3b6282..HEAD --
+  crates/shux-raster crates/shux-vt` is EMPTY (d3b6282 = the P4 ratification
+  base), and the P6 branch diff over `origin/main` (eb65947) touches only
+  `crates/shux/src/cli.rs` + the two frozen test files under their approved
+  trailers — zero rendering code changed since the P4-ratified baselines.
+- **Re-render:** every golden re-driven via direct RPC under a FRESH
+  isolated XDG environment (config mirroring the harness fixture-font
+  fallback chain), following the frozen tests' own recipes exactly —
+  K1: ordinary session + F4 80×24, glance-checkpoint cp0, 3×(Tab → settle →
+  glance-checkpoint → diff, cells_changed=2 observed on every press);
+  E1: `lens.run` scratch + F4, sentinel → settle → glance-checkpoint →
+  `a` → settle → `diff_since{heat_png}` (cells_changed=10, regions
+  `[{2,2,3},{5,10,19}]` re-derived live);
+  T1/T3: `make_nidhi_repo.sh` (3 stashes) + `lens.run` nidhi 120×40 per
+  cell, bounded wait_for "Press Enter to continue" → Enter → sentinel
+  `विवेचक` → settle → glance (the approved welcome-dismiss recipe held on
+  all 5 drives);
+  T4: `lens.run vivecaka --help` at 100×30 and 60×20 → settle → glance.
+  Runs executed serially under `.shux/scripts/no_leak_guard.sh`; zero shux
+  processes after every window.
+- **Byte cmp:** all 12 verifier re-renders `cmp`-identical to the committed
+  goldens; sha256 matches on both sides (`0dc75269…`/`166d4a96…`/
+  `0461665628…`×2/`deef295d…`/`d97c03ed…`×3/`ced707be…`×2/`aff4d6f2…`/
+  `44764842…`).
+- **Gate receipts at HEAD 7296c23:** `make test-lens` 37 passed / 0 failed;
+  `make test-lens-t` 4/4 (0 skipped — nidhi 0.1.0-alpha.1 @ 1e5d952e and
+  vivecaka 0.1.9 @ 515042b present, versions matching this manifest);
+  `make lint` clean; `make test` full lanes green; frozen guard PASS with
+  exactly the two approved LENS-TEST-CHANGE commits touching frozen paths.
+- **Cross-receipts confirmed:** `e1_glance.png` == `k1_pos3.png`
+  (byte-identical, F4 cycle-wraparound by design) and `e1_heat.png` ==
+  the P4-RATIFIED `d2_heat.png` (`deef295d…`) — the E1 heat golden is
+  anchored to an already-independently-ratified baseline.
+- **Near-grayscale anchors re-derived independently (pixel scan):** nocolor
+  cells max channel spread 7 with ZERO pixels above 8 (predicate passes);
+  color siblings max spread 159 with 8,651 pixels above 8 (control fires) —
+  exactly the measured basis in the approved LENS-TEST-CHANGE record.
+- **Visual inspection (full resolution, every one of the 12 files opened as
+  an image):** k1_pos1/2/3 — `LENS-F4-KEYS` sentinel, cyan `▶` marker at
+  grid (8,25) → (8,45) → (8,5) (wraparound), truecolor gradient +
+  256-color strip + basic-ANSI legend in full color; e1_glance identical to
+  k1_pos3; e1_heat — heat tint confined to exactly the red block at (2,2) +
+  `A-PRESSED` at (5,10)..(5,18), remainder visibly desaturated but colored;
+  t1/t3 color cells — real nidhi stash list (3 stashes, decomposed-but-real
+  Devanagari per the adjudicated no-shaping rendering, real CJK
+  `終端テスト`, emoji fallback glyph, colored accents + footer), welcome
+  screen ABSENT; t3 nocolor cells — same list visually colorless;
+  t4 100×30 — rounded-box help card with purple/blue/cyan highlighting;
+  t4 60×20 — vivecaka's genuine no-reflow overflow at 60 cols. No tofu
+  anywhere; no monochrome regression in any color cell; no welcome frame in
+  any golden.
+
+The 12 P6 goldens are `provisional: false` in `evidence-manifest.json` as of
+this record.
+
+### Recipe (K1/E1 — ordinary + scratch sessions)
+
+Driven live via the `shux` CLI against a fresh isolated daemon (own
+`XDG_RUNTIME_DIR`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME`, the same lens harness
+fixture-font fallback chain as `lens_common::Harness::new` — Noto Sans
+Devanagari + the CJK subset appended after `builtin:nerd-font`), mirroring
+the exact steps `crates/shux/tests/lens_loop.rs` uses:
+
+- **K1** (`k1_pos1/2/3.png`): ordinary session, F4 (`f4_keys.sh`) at 80×24 →
+  `pane glance --checkpoint` (cp0, not a golden) → 3×(`pane send-keys --data
+  CQ==` [Tab] → `pane wait-settled --quiet 300ms --timeout 5s` → `pane
+  glance --checkpoint --png k1_posN.png` → `pane diff --since <prev>`).
+  Live-observed `cells_changed: 2` on every one of the 3 presses (matches
+  K1's assertion exactly); with the initial checkpoint this is the
+  LENS-R-031 4-slot cap the test comment calls out.
+- **E1** (`e1_glance.png`, `e1_heat.png`): `lens run --size 80x24 -- sh
+  f4_keys.sh` (scratch) → `pane wait-for` sentinel → `pane wait-settled` →
+  `pane glance --checkpoint --png e1_glance.png` → `pane send-keys --text a`
+  (via the CLI's own `-s/-p` resolution, which required the P6 CLI fix
+  below) → `pane wait-settled` → `pane diff --since <rev> --heat
+  e1_heat.png`. Live-observed delta: `cells_changed: 10`, `regions:
+  [{row:2,col_start:2,col_end:3},{row:5,col_start:10,col_end:19}]` —
+  byte-identical to E1's frozen `f4_expected_regions()`. Total wall clock
+  ~1s, well inside the 10s E1 budget.
+
+**Determinism:** every PNG above rendered twice from two independent driver
+invocations (fresh daemon, fresh temp dirs, different session names/PIDs
+each time) and `cmp`-compared byte-identical (sha256 matches both runs —
+see `evidence-manifest.json` per-golden `png_sha256`).
+
+**Cross-validation receipts (stronger than a single mint):**
+- `k1_pos3.png` and `e1_glance.png` are byte-identical — expected, because
+  F4's focus marker cycles through 3 grid cells and both frames land on the
+  cycle's starting position (initial launch, and after exactly 3 Tab
+  presses). Two independently-driven mints agreeing exactly is a strong
+  correctness signal.
+- `e1_heat.png` is byte-identical to the P4-RATIFIED `d2_heat.png`
+  (`deef295d…`) — expected, since both diff the same F4 fixture across the
+  same pre-/post-`a` checkpoint pair on an unresized 80×24 pane. This ties
+  the new E1 golden directly to an already-independently-ratified P4
+  baseline rather than resting solely on the implementer's own re-render.
+
+**Visual inspection (implementing agent, full resolution):** `LENS-F4-KEYS`
+sentinel top-left; cyan `▶` focus marker at each of its three grid
+positions across k1_pos1/2/3; truecolor gradient bar + 256-color strip +
+basic-ANSI legend row all in full color; `e1_heat.png` shows the red heat
+tint on exactly the changed red block + `A-PRESSED` text, remaining content
+visibly muted. No tofu, no monochrome regression, cursor hidden per fixture.
+
+### Recipe (T4 — vivecaka --help, real installed binary)
+
+`lens run --size <CxR> -- vivecaka --help` → `pane wait-settled --quiet
+400ms --timeout 10s` → `pane glance --png`, at both 100×30 and 60×20.
+`vivecaka 0.1.9` (commit `515042b`, go1.26.2) — network-free per DEC-18.
+Determinism: byte-identical across 2 independent runs. Visual: rounded-box
+help card, purple/blue/cyan syntax highlighting; the 60×20 cell shows a
+partial/wrapped view because vivecaka's help card does not reflow to a
+narrower terminal — genuine app behavior, not a shux defect.
+
+### T1/T2/T3 — welcome-dismiss APPROVED and applied; T3 grayscale-predicate escalation OPEN
+
+**Adjudication round 1 (2026-07-10, orchestrator + council): APPROVED.**
+Original diagnosis (preserved for the record): `nidhi 0.1.0-alpha.1` (commit
+`1e5d952`) shows a mandatory "Press Enter to continue" welcome screen
+(`internal/ui/screens/welcome.go`, `RenderWelcome`) on every invocation, with
+no CLI flag, env var, or config key to skip it (checked `nidhi --help` and
+the binary's embedded strings for `nidhi.*` / `NIDHI_*` keys — none exist)
+and no auto-advance timeout (confirmed idle 8s with no input). The frozen
+T1/T2/T3 bodies waited for the stash-list sentinel (`विवेचक`) with no
+dismiss in between — every run timed out at 10s with an empty capture
+(`last_capture_preview: ""`), confirmed live for all three tests. A real
+behavior drift in the `nidhi` binary since the frozen §13 harness was
+authored, not an environment or installation gap.
+
+**Applied under the approved conditions** (commit carries the exact trailer
+`LENS-TEST-CHANGE: T1-T3 dismiss mandatory nidhi 0.1.0-alpha.1 welcome
+screen before existing sentinel wait; no bypass or auto-advance exists;
+assertions and purpose unchanged.`): a `dismiss_nidhi_welcome` helper in
+`lens_ttier.rs` performs a BOUNDED `wait_for "Press Enter to continue"`
+(the prompt wait IS the assertion — Enter is never sent speculatively),
+then sends Enter (0x0d), then the caller's ORIGINAL sentinel wait runs
+unchanged. T1 and T2 flipped green immediately under this recipe.
+
+**Adjudication round 2 (2026-07-10, orchestrator + council): the T3 icons
+matrix is NOT re-scoped** even though `--icons nerd` vs `--icons ascii`
+render the stash-LIST screen byte-identically in this nidhi version — all
+four T3 cells keep their own goldens as duplicate-but-valid regression
+pins, with the byte-identity documented per-golden in
+`evidence-manifest.json`.
+
+**§16.4 escalation — RESOLVED (adjudication round 3, 2026-07-10,
+orchestrator + council APPROVED with five binding conditions):** T3's
+no-color cells FAILED the original frozen `is_grayscale_png` check (strict
+R==G==B on every pixel) even though the goldens themselves byte-match —
+surfaced by the first-ever real evaluation of the assertion. The strict
+predicate was unsatisfiable by construction on this stack, for two
+independent reasons: (a) nidhi emits OSC 11 to set its theme background —
+rendered as RGB(7,9,14), channel spread 7 — even under `--no-color` +
+`NO_COLOR=1` (the binary carries `]11;` strings; NO_COLOR conventionally
+suppresses ANSI text colors, not theme-background OSC); and (b)
+`shux-raster`'s own `bg_default` is `[16,16,24]` (channel spread 8;
+`crates/shux-raster/src/lib.rs` RasterOptions::default), so even an
+OSC-free NO_COLOR render can never be strictly gray.
+
+Applied exactly per the approved conditions (commit carries the exact
+trailer `LENS-TEST-CHANGE: T3 grayscale predicate unsatisfiable by
+construction (OSC-11 theme bg spread 7 + raster default bg spread 8);
+replaced with evidence-anchored near-grayscale <=8 plus discriminating
+color-sibling control; purpose unchanged.`):
+1. threshold EXACTLY `max(R,G,B) − min(R,G,B) <= 8`, inline, no named
+   epsilon (`is_near_grayscale_png` in `lens_common`);
+2. predicate renamed/documented as NEAR-grayscale;
+3. its doc comment carries the measured anchors (OSC-11 theme bg spread 7;
+   raster default bg `[16,16,24]` spread 8);
+4. discriminating control added — T3's COLOR sibling cells must FAIL the
+   predicate;
+5. the control asserts meaningful signal (`max_spread > 8` AND
+   `pixels_with_spread_gt_8 > 0`, via the new `png_channel_spread_stats`
+   helper) — the measured 8,651-pixel count is deliberately NOT pinned.
+
+Measured basis: no-color golden max spread 7 with ZERO pixels above 8
+(predicate passes); color sibling max spread 159 with 8,651 pixels above 8
+(control fires). T1's NO_COLOR-poisoning tripwire uses the same predicate.
+T3 is GREEN under the amended frozen test; assertion purpose unchanged.
+
+### CLI fix required to complete the E1 loop (see PR description for full diff)
+
+Minting E1 exposed a real gap: `lens.run`'s scratch `session_id` could not
+be used with `shux pane send-keys -s <uuid>` (its default "resolve the
+session's active window" path only queried the default, scratch-excluded
+`session.list`) — the same class of bug as issue #88 (`-s/--session`
+resolving by name only). Fixed in `crates/shux/src/cli.rs`:
+`resolve_session_id` resolves UUID-shaped input (hyphenated or 32-hex
+simple form, normalized before comparison) as a session ID FIRST, falling
+back to NAME lookup when no session has that id — session names may
+legally be UUID-shaped strings, so a pure id short-circuit would make such
+names unaddressable (codex/claude P6 review round; the original mint's
+"cannot mask a real error" claim was inaccurate for exactly that
+name-collision corner and is corrected here). When the argument matches
+both a real id and a different session's name, the ID wins and a warning
+is printed. `resolve_pane_window_id`'s active-window lookup now queries
+`session.list --include-scratch`, and `session kill` sends `id` instead of
+`name` for UUID-shaped input after the same resolution (`lens.run`'s own
+`session_id` is directly `session kill`-able). Unit matrix:
+`uuid_shaped_session_name_falls_back_to_name_lookup`,
+`uuid_arg_matching_real_id_wins_over_name_match`,
+`bogus_uuid_neither_id_nor_name_errors_cleanly`,
+`simple_form_32hex_input_normalizes_and_falls_back` (crates/shux/src/cli.rs).
+
+### Provenance
+
+`shux` workspace 0.42.0, git base `eb659473869edbf9d4ae509cbad9b7456cd7788e`
+(includes `64745cf` / PR #92 and the v0.42.0 release commit, per the P6
+branch-point requirement), rustc 1.95.0, Darwin arm64. See
+`evidence-manifest.json` → `goldens.{k1_pos1,k1_pos2,k1_pos3,e1_glance,
+e1_heat,t4_vivecaka_help_100x30,t4_vivecaka_help_60x20}`.

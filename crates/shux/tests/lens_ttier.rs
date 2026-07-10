@@ -57,6 +57,22 @@ fn settle(h: &Harness, pane: &str, ctx: &str) {
     );
 }
 
+/// Dismiss nidhi's mandatory welcome screen (LENS-TEST-CHANGE approved
+/// 2026-07-10, task 077 P6). nidhi 0.1.0-alpha.1 renders a "Press Enter to
+/// continue" welcome card on EVERY launch — no CLI flag, env var, or config
+/// key bypasses it (binary strings-scanned for `nidhi.*`/`NIDHI_*` keys) and
+/// it never auto-advances (verified by an 8s idle probe). The BOUNDED
+/// `wait_for` on the prompt text IS the assertion that the welcome screen
+/// rendered — Enter is only sent after it is proven on screen, never
+/// speculatively. The caller's original stash-list sentinel wait follows
+/// unchanged, so T1/T2/T3's assertions and purpose are untouched.
+fn dismiss_nidhi_welcome(h: &Harness, pane: &str, ctx: &str) {
+    h.wait_for(pane, "Press Enter to continue", 10_000)
+        .unwrap_or_else(|e| panic!("{ctx}: nidhi welcome screen never appeared: {e}"));
+    // Enter (0x0d), same byte as `pane send-keys --data DQ==`.
+    h.send_raw(pane, "\r");
+}
+
 // T1 — nidhi golden (rich + Unicode).
 #[test]
 fn t1_nidhi_golden() {
@@ -77,16 +93,18 @@ fn t1_nidhi_golden() {
         .expect_result("T1 lens.run nidhi");
     let pane = r["pane_id"].as_str().expect("pane_id").to_string();
 
+    dismiss_nidhi_welcome(&h, &pane, "T1");
     h.wait_for(&pane, "विवेचक", 10_000)
         .expect("T1: nidhi drew the stashes");
     settle(&h, &pane, "T1 settle");
     let png = glance_png(&h, &pane, "T1 glance");
     // p0-council-r1 major 2: this COLOR case must prove NO_COLOR is absent
-    // from the pane environment — a grayscale render means the harness (or
-    // daemon) leaked NO_COLOR into the scratch.
+    // from the pane environment — a near-grayscale render means the harness
+    // (or daemon) leaked NO_COLOR into the scratch. Near-grayscale predicate
+    // per the approved LENS-TEST-CHANGE (see is_near_grayscale_png).
     assert!(
-        !is_grayscale_png(&png),
-        "T1: truecolor nidhi render came out grayscale — NO_COLOR poisoning"
+        !is_near_grayscale_png(&png),
+        "T1: truecolor nidhi render came out near-grayscale — NO_COLOR poisoning"
     );
     assert_png_golden(&h, &png, "t1_nidhi_nerd_color_120x40.png");
 
@@ -112,6 +130,7 @@ fn t2_nidhi_keyboard_truth() {
         )
         .expect_result("T2 lens.run nidhi");
     let pane = r["pane_id"].as_str().expect("pane_id").to_string();
+    dismiss_nidhi_welcome(&h, &pane, "T2");
     h.wait_for(&pane, "विवेचक", 10_000).expect("T2: nidhi up");
     settle(&h, &pane, "T2 settle initial");
 
@@ -159,7 +178,7 @@ fn t2_nidhi_keyboard_truth() {
     h.rpc_raw("session.kill", serde_json::json!({ "id": r["session_id"] }));
 }
 
-// T3 — nidhi 4-way matrix (icons × color) + NO_COLOR grayscale anchor.
+// T3 — nidhi 4-way matrix (icons × color) + NO_COLOR near-grayscale anchor.
 #[test]
 fn t3_nidhi_matrix() {
     if !skip_unless_bin("nidhi", "T3 nidhi matrix") {
@@ -217,23 +236,34 @@ fn t3_nidhi_matrix() {
             )
             .expect_result("T3 lens.run nidhi");
         let pane = r["pane_id"].as_str().expect("pane_id").to_string();
+        dismiss_nidhi_welcome(&h, &pane, "T3");
         h.wait_for(&pane, "विवेचक", 10_000).expect("T3: nidhi up");
         settle(&h, &pane, "T3 settle");
         let png = glance_png(&h, &pane, "T3 glance");
-        // p0-council-r1 major 2: color cells must PROVE NO_COLOR absence
-        // (non-grayscale pixels present); no-color cells prove the inverse.
+        // p0-council-r1 major 2 + the approved near-grayscale
+        // LENS-TEST-CHANGE (see is_near_grayscale_png for the measured
+        // anchors: OSC-11 theme bg spread 7, raster default bg [16,16,24]
+        // spread 8): color cells are the DISCRIMINATING CONTROL — they must
+        // FAIL the near-grayscale predicate with meaningful signal
+        // (max_spread > 8 AND at least one pixel above spread 8; the exact
+        // pixel count is deliberately NOT pinned). No-color cells must PASS
+        // the predicate (every pixel spread <= 8).
         if !cell.no_color {
+            let (max_spread, gt8) = png_channel_spread_stats(&png);
             assert!(
-                !is_grayscale_png(&png),
-                "T3: color render came out grayscale — NO_COLOR poisoning ({})",
+                max_spread > 8 && gt8 > 0,
+                "T3: color render must carry meaningful color signal beyond \
+                 the near-grayscale threshold (max_spread {max_spread}, \
+                 pixels with spread > 8: {gt8}) — NO_COLOR poisoning ({})",
                 cell.golden
             );
         }
         assert_png_golden(&h, &png, cell.golden);
         if cell.no_color {
             assert!(
-                is_grayscale_png(&png),
-                "T3: --no-color render must contain zero non-grayscale pixels ({})",
+                is_near_grayscale_png(&png),
+                "T3: --no-color render must be NEAR-grayscale (every pixel \
+                 channel spread <= 8) ({})",
                 cell.golden
             );
         }
