@@ -106,3 +106,70 @@ No P0/P1 findings ⇒ no forced FAIL/BLOCKED.
 - One concurrent `dootsabha consult` (`agent_review_guard.sh lens-p2-claude-full`) was observed — this is the orchestrator's in-flight P2 convergence council, **not** a QA leak; left untouched.
 
 *Scratch artifacts (all PNGs, diffs, per-comparison JSON, run logs, drive script): `.shux/out/lens-p2-qa/` (gitignored).*
+
+---
+
+## Re-inspection (fd1e0d0) — re-minted goldens with committed fixture fonts
+
+**VERDICT (re-mint): PASS.** The first-line verdict stands for the re-minted P2
+goldens.
+
+**Scope:** ONLY what changed since the prior PASS (commit `1a578b4`): the golden
+RE-MINT with committed fixture fonts (`fd1e0d0`) and the PR #89 bot-fix
+pre-render pixel-budget guard (`23ab5d9`). The prior PASS covered the
+now-superseded tofu-rendering builtin-only chain; this addendum re-audits the
+real-Devanagari/CJK re-mint.
+
+**Audited commit:** `fd1e0d0` (HEAD, branch `feat/lens-p2-glance`) —
+*test(lens): golden re-mint with committed fixture fonts*.
+**Auditor:** `shux-vt-solid-qa`, independent regeneration (release binary,
+isolated XDG mirroring `lens_common::Harness` font-fallback config). Implementer
+claims were not reused as evidence.
+**User adjudication (normative):** PRD §17 font-risk row — real fixture fonts,
+per-codepoint/no-shaping (decomposed Devanagari) explicitly ACCEPTED; "no tofu"
+is the satisfied requirement, not typographic shaping.
+
+### Re-mint DoD / re-pass evidence table
+
+| Check | Item | Status | Evidence |
+|---|---|---|---|
+| 1 | Fixture-font provenance | PASS | sha256 `NotoSansDevanagari-Regular.ttf` = `306b53ec…0996cd`, `NotoSansJP-shuxlens-subset.ttf` = `82e8b3a5…c335a5` (both match golden manifest `fixture_fonts`). OFL texts present (`OFL-NotoSansDevanagari.txt`, `OFL-NotoSansJP.txt`); `README.md` documents the pyftsubset reproduction (9 CJK codepoints ステト実界真端終面) + provenance URLs. |
+| 2 | `make test-lens` 15/22, G1/G2/G2w green | PASS | 15 passed / 22 failed vs the NEW goldens; G1/G2/G2w PASS; G3/G4 + 10 smoke PASS; all 22 failures are `-32601`/`-32602` on unimplemented P3/P4/P5 methods — zero golden/pixel/byte mismatch. `.shux/out/lens-p2-qa-remint/test-lens.txt`. |
+| 3 | Independent live re-render byte-identical | PASS | Release binary driven through the exact harness steps under isolated XDG + the harness font chain: F1 (80×24) → sha256 `ac4caf47…c660f93`, F5 (100×30) → `5bf698ef…51573a`; `cmp` BYTE-IDENTICAL to committed goldens. `.shux/out/lens-p2-qa-remint/remint-f{1,5}-*.png`. |
+| 4 | Full-res visual inspection (real glyphs, no tofu) | PASS | Both goldens + contact sheet inspected as images. F1: real Devanagari `विचय · विवेचक · निधि — दृश्यते सत्यम्` (decomposed per-codepoint, actual glyphs, **zero replacement boxes**), real CJK `終端 真実 テスト`, real emoji `✓ ✗ ⚠`. F5: real CJK `終端 真実 テスト 界面`, real combining Devanagari `क्षत्रिय · संस्कृति · दृश्यत`, VS16 emoji/symbol row real, box-drawing cross-joins + gradient/256/16-color strips grid-aligned, cursor hidden, no color bleed. |
+| 4b | Layout stability vs prior baseline | PASS | New golden vs prior tofu evidence (F1): 2554 changed px (0.78%), confined to cell-rows 6–7 (Devanagari + CJK) only — y-range 117–148 within the 114–152 glyph band; box/title/gradient/strips/emoji/cursor pixel-identical. Only tofu→real changed; no layout drift. |
+| 5 | Default-chain isolation | PASS | `make test-vt-corpus` byte-exact (3 replay tests + full verify) — the fixture fonts live only in the lens harness config and do NOT leak into the default rasterizer chain. |
+| 6 | Manifest integrity | PASS | Golden `evidence-manifest.json`: 4 golden PNG/TXT sha256 + 2 fixture-font + 5 builtin-bundle sha256 ALL match on disk. Provisional semantics were consistent pre-approval ("RE-MINTED — pending QA re-inspection"); flipped to `false` on this PASS. |
+| 7 | P1 bot-fix pixel-budget guard | PASS | `production_glance_rejects_over_budget_panes_before_render` → 1 passed (full production router: guard fires `PAYLOAD_TOO_LARGE -32013` at 1000×1000 before render; `include_png=false` on the same pane still succeeds). |
+| 8 | Approvals flipped + committed | PASS | This section + `BASELINE-APPROVAL.md` → APPROVED (re-mint, 2026-07-09) + golden manifest `provisional:false`, one commit. |
+| 9 | Zero leaked processes (anchored) | PASS | `make test-lens` serial under `no_leak_guard.sh`; independent drive wrapped in `no_leak_guard.sh` (isolated XDG, guard reaped the one spawned daemon); final anchored sweep: 0 `target/{release,debug}/shux`, 0 orphan runtime dirs. |
+
+### Pixel metrics (this re-pass)
+
+| Comparison | Threshold | changed_pixels | Status |
+|---|---|---|---|
+| F1 independent re-render vs golden | 0.0 exact | 0 / 328320 | pass (`.shux/out/lens-p2-qa-remint/metrics/f1_remint_vs_golden.json`) |
+| F5 independent re-render vs golden | 0.0 exact | 0 / 513000 | pass (`.shux/out/lens-p2-qa-remint/metrics/f5_remint_vs_golden.json`) |
+| F1 new golden vs prior tofu (delta audit) | permissive | 2554 / 328320 (rows 6–7 only) | intentional, confined (`.shux/out/lens-p2-qa-remint/metrics/f1_new_vs_old_tofu.diff.png`) |
+
+### Findings (re-mint)
+
+- **P0/P1:** none.
+- **P2 — R3 (governance, NEW):** the QA-side `.shux/qa/lens-p2/evidence-manifest.json`
+  still records the SUPERSEDED tofu golden PNG sha256s
+  (`g2_f1…=9d20e89a`, `g2w…=87f0cd16`) and `audited_commit d3cd1b9` from the
+  prior pass, and its screenshot notes still describe "width-correct tofu".
+  That file is OUTSIDE this re-pass's permitted edit scope (SOLID-QA.md +
+  BASELINE-APPROVAL.md + golden manifest only), so it is left untouched; the
+  authoritative fresh evidence for the re-mint is THIS section. Orchestrator
+  should refresh the QA-side manifest's `golden_integrity`/`screenshots` to the
+  re-minted bytes. Not a raster defect.
+
+### Cleanup (re-pass)
+
+`make test-lens` + the independent live drive both ran serially under
+`.shux/scripts/no_leak_guard.sh`; the guard reaped the single isolated daemon
+spawned by the drive; final anchored `ps`/`pgrep` shows **0** leaked
+`target/{release,debug}/shux` daemons and no leftover `/tmp/lp2rq-*` runtime
+dirs. Scratch artifacts (re-render PNGs, diffs, per-comparison JSON, run log,
+drive script): `.shux/out/lens-p2-qa-remint/` (gitignored).

@@ -1,6 +1,20 @@
 # Lens goldens — baseline approval record
 
-**Status: RE-MINTED (2026-07-09) — pending QA re-inspection.**
+**Status: APPROVED (re-mint, 2026-07-09).**
+
+The re-minted goldens passed the `shux-vt-solid-qa` re-inspection gate
+(commit `fd1e0d0`) — see the "Re-inspection (fd1e0d0)" section of
+`.shux/qa/lens-p2/SOLID-QA.md` (first line `VERDICT: PASS`). Independent
+regeneration (release binary, isolated XDG mirroring the harness font chain)
+byte-matched both goldens (`cmp` identical; pixel-verify 0 changed pixels), the
+full-resolution goldens + contact sheet were inspected as images (real
+Devanagari + CJK + emoji, zero tofu, cursor hidden, no layout drift vs the
+prior baseline — the tofu→real delta is confined to the Devanagari/CJK rows),
+`make test-lens` is 15/22 with G1/G2/G2w green against these bytes, and
+`make test-vt-corpus` is byte-exact (fixture fonts do not leak into the default
+chain). Sign-off basis: the QA PASS above + the user's PRD §17 adjudication
+(real fixture fonts, per-codepoint/no-shaping decomposition explicitly
+accepted). `evidence-manifest.json` `provisional` is now `false`.
 
 The current golden bytes were RE-MINTED with committed fixture fonts
 (user-ordered adjudication, recorded in PRD §17's font-risk row): the lens
@@ -25,11 +39,25 @@ covered by the committed subset). Font provenance + sha256:
 `.shux/fixtures/fonts/README.md` and `evidence-manifest.json`
 (`fixture_fonts`).
 
-A focused QA re-pass must inspect the re-minted `contact-sheet.png` and
-the full-resolution goldens before this record flips back to APPROVED.
+The focused QA re-pass inspected the re-minted `contact-sheet.png` and the
+full-resolution goldens and PASSED (see Approval history below); this record is
+now APPROVED for the re-minted bytes.
 
 ## Approval history
 
+- **2026-07-09 — APPROVED (re-mint bytes):** the re-minted fixture-font-chain
+  goldens (real Devanagari + CJK, tofu gone) passed the `shux-vt-solid-qa`
+  re-inspection gate — `.shux/qa/lens-p2/SOLID-QA.md` "Re-inspection (fd1e0d0)"
+  section, first line `VERDICT: PASS`, audited commit `fd1e0d0`. Independent
+  release-binary regeneration under the harness font chain byte-matched both
+  goldens (`cmp` identical; `pixel_verify.py` 0 changed pixels); goldens +
+  contact sheet visually inspected (real glyphs, zero replacement boxes, cursor
+  hidden, tofu→real delta confined to the Devanagari/CJK rows); fixture-font
+  sha256 + all golden/builtin hashes matched the manifest; `make test-vt-corpus`
+  byte-exact (no default-chain leak); PR #89 P1 pixel-budget guard test green.
+  Sign-off: QA gate PASS + the user's PRD §17 adjudication (per-codepoint /
+  no-shaping decomposition explicitly accepted). This approval covers the
+  CURRENT committed bytes.
 - **2026-07-09 — APPROVED (superseded bytes):** the ORIGINAL builtin-chain
   mint (which rendered CJK/Devanagari as tofu, documented then as a known
   limitation) passed the `shux-vt-solid-qa` gate — `.shux/qa/lens-p2/
