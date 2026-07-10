@@ -104,6 +104,9 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-10 — feat(lens): P5 scratch sessions + `lens.run` — started (task 077, P5 In Progress)**
+- Branch `feat/lens-p5-scratch-run` from `origin/main` (v0.41.0 release commit, includes P4 #91). §8 SPEC-E (LENS-R-040..046): scratch session registry + `lens.run` composite RPC/CLI, targeting R1–R8 green under `no_leak_guard.sh`.
+
 **2026-07-10 — fix(lens): PR #91 bot round — heat pixel budget + LENS-R-038b default-color diffing + greptile docs/perf (task 077, gate 27/10 held)**
 - **codex P1 — heat memory:** `pane.diff_since{heat_png:true}` rasterized the full RGBA image before the 8 MiB PNG check; a 1000×1000 pane (valid per set_size) could exhaust daemon memory. Fix: shared `lens_pixel_budget_check` (the EXACT 16M-pixel glance/snapshot cap, glance refactored onto it — byte-identical error) now gates the heat path inside the lock BEFORE any allocation, AFTER the LENS-R-033 lookup (stale/invalidated wins over payload). Hint names `heat_png=false`. Tests: `lens_pixel_budget_check_guard_predicate` (unit, 162M>16M exact values) + `diff_heat_budget.rs` black-box (1000×1000 F1 pane: -32013 with `{pixels,max_pixels,hint}`, CLI `--heat` exit 5 + no file written, heat-less diff on the same pane still succeeds).
 - **codex P2 — ADJUDICATED as LENS-R-038b:** checkpoints now capture the pane's OSC 10/11/12 defaults (`PaneCheckpoint.default_colors`, read in the same critical section as the grid clone in BOTH writers); `compute_lens_diff` resolves `Color::Default` against each side's respective defaults — a changed fg/bg default marks every cell that is Default in that channel on both sides; concrete-colored cells stay unmarked; OSC 12 (cursor) never marks (DEC-11); unchanged defaults are byte-identical to raw equality (D-tier 6/6 green incl. `d2_heat.png` byte-identical — F4 never touches defaults). Tests: (a) unit `compute_lens_diff_default_color_change_marks_default_cells` + black-box `diff_default_colors.rs` (REAL OSC 11 `#204060` through a token-paced exec'd sh pane: exactly 395/400 cells, full-width regions split around the 5 truecolor COLOR cells); (b) `compute_lens_diff_unchanged_defaults_matches_raw`; (c) heat base uses CURRENT defaults — unit pixel math + black-box probes (changed blank cell = heat-over-#204060 = (97,50,75); unchanged truecolor cell = desat50 = (58,103,73)).
@@ -1624,7 +1627,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 074 | shux-vt dirty-region tracking | VT Quality | **Done** | 005, 073 |
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 | 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
-| 077 | shux lens — give every agent eyes (P0: fixtures + red suite; P1: ContentRevision substrate; P2: pane.glance; P3: pane.wait_settled) | M3 | **Partial** (P0, P1, P2 done; P3 implemented — gate 21/16, S1–S5/V1 green; `s1_ready.png` golden PROVISIONAL pending QA/council ratification; P4–P6 pending) | 016, 017, 060, 064, 074 |
+| 077 | shux lens — give every agent eyes (P0: fixtures + red suite; P1: ContentRevision substrate; P2: pane.glance; P3: pane.wait_settled; P4: pane.checkpoint + pane.diff_since) | M3 | **Partial** (P0–P4 Done and merged, v0.41.0; gate 27/10 — D1–D5+A1 green; P5 scratch sessions + `lens.run` In Progress on `feat/lens-p5-scratch-run`; P6 pending) | 016, 017, 060, 064, 074 |
 
 ---
 
