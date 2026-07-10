@@ -1455,6 +1455,42 @@ pub enum PaneCommand {
         timeout: u64,
     },
 
+    /// Capture the pane's current visible frame as a checkpoint for a later
+    /// `pane diff`. Mirrors `pane.checkpoint` RPC (lens PRD §7). At most 4
+    /// checkpoints per pane; a 5th evicts the oldest by creation revision
+    /// (FIFO). Re-checkpointing the same revision is a no-op. Prints the
+    /// keyed revision and any evicted revision.
+    Checkpoint {
+        /// Pane UUID (mirrors the RPC `pane_id`).
+        #[arg(value_name = "PANE")]
+        pane: String,
+    },
+
+    /// Diff the pane's current visible frame against a checkpointed revision.
+    /// Mirrors `pane.diff_since` RPC (lens PRD §7). Prints the structured
+    /// delta (changed cell count, per-row spans, changed row text). Exit 0 on
+    /// any delta (diff is data, not a verdict); exit 5 on STALE_REVISION /
+    /// RESIZE_INVALIDATED.
+    Diff {
+        /// Pane UUID (mirrors the RPC `pane_id`).
+        #[arg(value_name = "PANE")]
+        pane: String,
+
+        /// The checkpointed revision to diff against (from `pane checkpoint`
+        /// or a `--checkpoint` glance). Mirrors the RPC `since_revision`.
+        #[arg(long, value_name = "REV")]
+        since: u64,
+
+        /// Write the heat PNG (changed cells overlaid, unchanged desaturated)
+        /// to this path (`heat_png=true`).
+        #[arg(long, value_name = "PATH")]
+        heat: Option<std::path::PathBuf>,
+
+        /// Skip the per-row changed text (`changed_row_text=false`).
+        #[arg(long)]
+        no_row_text: bool,
+    },
+
     /// Resize a pane's PTY + VT grid to absolute (cols, rows).
     /// Mirrors `pane.set_size` RPC. Synchronous — the next snapshot
     /// sees the new dims. Use this BEFORE driving keystrokes when
@@ -3953,6 +3989,203 @@ pub async fn handle_pane_wait_settled(
             }
             std::process::exit(lens_wait_settled_exit_code(code));
         }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Map a `pane.checkpoint` RPC error code to its CLI exit code (lens PRD §10).
+/// `pane.checkpoint`'s only error surface is PANE_NOT_FOUND and
+/// PERMISSION_DENIED (§7.3 schema).
+fn lens_checkpoint_exit_code(rpc_error_code: i64) -> i32 {
+    match rpc_error_code {
+        -32602 => 2, // INVALID_PARAMS
+        -32005 => 4, // PERMISSION_DENIED
+        _ => 3,      // any other RPC error, incl. PANE_NOT_FOUND (-32004)
+    }
+}
+
+/// Map a `pane.diff_since` RPC error code to its CLI exit code (lens PRD §10
+/// exit-code table). STALE_REVISION / RESIZE_INVALIDATED / PAYLOAD_TOO_LARGE
+/// map to exit 5 (diff-specific data errors); INVALID_PARAMS → 2,
+/// PERMISSION_DENIED → 4, everything else (incl. PANE_NOT_FOUND) → 3.
+fn lens_diff_exit_code(rpc_error_code: i64) -> i32 {
+    match rpc_error_code {
+        -32602 => 2,                   // INVALID_PARAMS
+        -32005 => 4,                   // PERMISSION_DENIED
+        -32010 | -32011 | -32013 => 5, // STALE / INVALIDATED / PAYLOAD_TOO_LARGE
+        _ => 3,                        // any other RPC error, incl. PANE_NOT_FOUND
+    }
+}
+
+/// Emit the `{error}` envelope (`--format json`) or a styled error line, then
+/// exit with `exit_code`. Shared by the checkpoint/diff error arms — byte-
+/// parity with `shux rpc call` (M9), the shape the frozen lens harness parses.
+fn lens_emit_error_and_exit(
+    format: OutputFormat,
+    verb: &str,
+    code: i64,
+    message: &str,
+    data: Option<serde_json::Value>,
+    exit_code: i32,
+) -> ! {
+    match format {
+        OutputFormat::Json => {
+            let mut err_obj = serde_json::json!({ "code": code, "message": message });
+            if let Some(d) = data {
+                err_obj["data"] = d;
+            }
+            let envelope = serde_json::json!({ "error": err_obj });
+            match serde_json::to_string_pretty(&envelope) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!("failed to serialize error envelope: {e}"),
+            }
+        }
+        OutputFormat::Text | OutputFormat::Plain => {
+            crate::style::print_error(&format!("{verb} failed: {message} (code {code})"));
+        }
+    }
+    std::process::exit(exit_code);
+}
+
+/// `shux pane checkpoint` — capture a checkpoint via `pane.checkpoint` RPC
+/// (lens PRD §7, §10). `pane` is a raw pane UUID, mirroring the RPC `pane_id`.
+pub async fn handle_pane_checkpoint(
+    stream: &mut tokio::net::UnixStream,
+    pane: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({ "pane_id": pane });
+
+    match rpc_call(stream, "pane.checkpoint", params).await {
+        Ok(result) => {
+            match format {
+                OutputFormat::Json => {
+                    // §10: the `{result}` envelope, byte-identical to
+                    // `shux rpc call` (the frozen lens harness parses this).
+                    let envelope = serde_json::json!({ "result": result });
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+                OutputFormat::Text | OutputFormat::Plain => {
+                    let revision = result.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let evicted = result.get("evicted_revision").and_then(|v| v.as_u64());
+                    crate::style::print_pane_checkpoint(pane, revision, evicted);
+                }
+            }
+            Ok(())
+        }
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => lens_emit_error_and_exit(
+            format,
+            "checkpoint",
+            code,
+            &message,
+            data,
+            lens_checkpoint_exit_code(code),
+        ),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// `shux pane diff` — structured diff via `pane.diff_since` RPC (lens PRD §7,
+/// §10). `--heat <path>` writes the heat PNG; `--no-row-text` drops the
+/// per-row changed text. Exit 0 on any delta; exit 5 on stale/invalidated.
+pub async fn handle_pane_diff(
+    stream: &mut tokio::net::UnixStream,
+    pane: &str,
+    since: u64,
+    heat_path: Option<std::path::PathBuf>,
+    no_row_text: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({
+        "pane_id": pane,
+        "since_revision": since,
+        "changed_row_text": !no_row_text,
+        // Only request the heat PNG when the caller wants a file for it.
+        "heat_png": heat_path.is_some(),
+    });
+
+    match rpc_call(stream, "pane.diff_since", params).await {
+        Ok(result) => {
+            if let Some(path) = &heat_path {
+                use base64::Engine;
+                let b64 = result.get("heat_png_base64").and_then(|v| v.as_str());
+                let Some(b64) = b64 else {
+                    anyhow::bail!("--heat given but the diff result has no heat_png_base64");
+                };
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| anyhow::anyhow!("decode heat png: {e}"))?;
+                std::fs::write(path, &bytes)?;
+            }
+
+            match format {
+                OutputFormat::Json => {
+                    // §10: the `{result}` envelope, byte-identical to
+                    // `shux rpc call` (the frozen lens harness parses this).
+                    let envelope = serde_json::json!({ "result": result });
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+                OutputFormat::Text | OutputFormat::Plain => {
+                    let from = result
+                        .get("from_revision")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let to = result
+                        .get("to_revision")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cells = result
+                        .get("cells_changed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cursor_moved = result
+                        .get("cursor_moved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let regions = result
+                        .get("regions")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    let truncated = result
+                        .get("regions_truncated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let heat_written = heat_path.as_deref().map(|p| {
+                        let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        (p, len)
+                    });
+                    crate::style::print_pane_diff(
+                        pane,
+                        from,
+                        to,
+                        cells,
+                        regions,
+                        truncated,
+                        cursor_moved,
+                        heat_written,
+                    );
+                }
+            }
+            // Exit 0 on ANY delta — the diff is data, not a verdict (§10).
+            Ok(())
+        }
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => lens_emit_error_and_exit(
+            format,
+            "diff",
+            code,
+            &message,
+            data,
+            lens_diff_exit_code(code),
+        ),
         Err(other) => Err(other.into()),
     }
 }

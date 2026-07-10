@@ -1162,6 +1162,62 @@ pub fn print_pane_wait_settled(pane_id: &str, settled: bool, revision: u64, wait
     }
 }
 
+/// Print a `pane checkpoint` summary (lens PRD §7/§10): the keyed revision
+/// and, when a 5th checkpoint evicted the FIFO-oldest, the evicted revision.
+pub fn print_pane_checkpoint(pane_id: &str, revision: u64, evicted: Option<u64>) {
+    println!(
+        "{} checkpoint {} rev {}",
+        success("✓"),
+        muted(&short_id(pane_id)),
+        bold(&revision.to_string()),
+    );
+    if let Some(ev) = evicted {
+        println!("  {} evicted oldest checkpoint (revision {ev})", muted("·"));
+    }
+}
+
+/// Print a `pane diff` summary (lens PRD §7/§10): the revision span and the
+/// structured delta. Diff is data, not a verdict, so this always reads as a
+/// neutral ✓ (the CLI exits 0 regardless of delta size).
+#[allow(clippy::too_many_arguments)]
+pub fn print_pane_diff(
+    pane_id: &str,
+    from_revision: u64,
+    to_revision: u64,
+    cells_changed: u64,
+    regions: usize,
+    regions_truncated: bool,
+    cursor_moved: bool,
+    heat_written: Option<(&std::path::Path, u64)>,
+) {
+    println!(
+        "{} diff {} rev {}→{} {} cells changed",
+        success("✓"),
+        muted(&short_id(pane_id)),
+        bold(&from_revision.to_string()),
+        bold(&to_revision.to_string()),
+        bold(&cells_changed.to_string()),
+    );
+    if regions_truncated {
+        println!(
+            "  {} regions truncated (>256 spans); see bounding_box",
+            warning("·"),
+        );
+    } else {
+        println!("  {} {regions} region span(s)", muted("·"));
+    }
+    if cursor_moved {
+        println!("  {} cursor moved", muted("·"));
+    }
+    if let Some((path, len)) = heat_written {
+        println!(
+            "  {} heat png → {} ({len} bytes)",
+            success("✓"),
+            bold(&path.display().to_string()),
+        );
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
