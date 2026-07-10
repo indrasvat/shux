@@ -321,8 +321,12 @@ fn verify_chain_file(path: &Path, anchor: ChainAnchor<'_>) -> Result<(usize, Str
             .ok_or_else(|| format!("line {}: missing hash", i + 1))?
             .to_string();
         // Recompute over the entry WITHOUT its `hash` field — exactly what
-        // `append` hashed (serde_json object keys serialize sorted, so the
-        // canonical bytes are reproducible).
+        // `append` hashed. The canonical bytes are reproducible because
+        // this workspace does NOT enable serde_json's `preserve_order`
+        // feature (default BTreeMap backing ⇒ sorted keys) — enabling it
+        // would change the serialization order and break reverification
+        // of every existing chain (PR #92 greptile P2: this is a feature
+        // dependency, not an intrinsic serde_json property).
         if let Some(obj) = v.as_object_mut() {
             obj.remove("hash");
         }
@@ -1092,11 +1096,12 @@ pub(crate) static TEST_FORCE_UNCONFIRMED_PGID: StdMutex<Option<u32>> = StdMutex:
 /// CALLER's own process group — a persisted 0 would kill the daemon.
 /// (Reported as `AlreadyDead`: there is nothing this caller may kill.)
 ///
-/// Zombie caveat: a dead-but-unreaped group leader still "exists" to a
-/// signal-0 probe until its parent (the pane PTY task) reaps it, so the
-/// grace loop can conservatively run its full 500 ms for an already-dead
-/// child; the SIGKILL is then a no-op and the confirm loop exits as soon
-/// as the reap lands.
+/// Zombie caveat: a dead-but-unreaped group "exists" to the signal-0
+/// probe (as `Alive` or, on macOS zombie-only groups, `Denied`) until the
+/// parent — the pane PTY task in the daemon — reaps it. The daemon's
+/// parent reap normally lands within the bounded loops, at which point
+/// the probe flips to `Gone`; if it never lands, the outcome is honestly
+/// `Unconfirmed` and the registry row survives for the next startup reap.
 async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
@@ -1117,13 +1122,33 @@ async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
         return KillOutcome::AlreadyDead;
     }
     let pid = Pid::from_raw(pgid as i32);
-    if killpg(pid, None).is_err() {
-        return KillOutcome::AlreadyDead;
+    match probe_group(pgid) {
+        GroupProbe::Gone => return KillOutcome::AlreadyDead,
+        GroupProbe::Denied => {
+            // PR #92 greptile P2: a denied probe means the group EXISTS
+            // (EPERM) — reporting AlreadyDead would clear the registry
+            // row and silently orphan it. Denied is ambiguous, though: a
+            // foreign group we may never signal, OR our own just-died
+            // zombie whose parent reap is in flight (macOS probes
+            // zombie-only groups as EPERM). Proceed through the bounded
+            // sequence: the reap flips a transient zombie to Gone; a
+            // genuinely foreign group stays Denied and falls out as
+            // Unconfirmed — the row survives either way it should.
+            tracing::warn!(
+                pgid,
+                "scratch reap: group probe denied (exists, possibly not                  ours); continuing the bounded sequence"
+            );
+        }
+        GroupProbe::Alive => {}
     }
     let _ = killpg(pid, Signal::SIGTERM);
     let grace_deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < grace_deadline {
-        if killpg(pid, None).is_err() {
+        // Only Gone concludes inside the loops; Denied keeps polling —
+        // the transient zombie-EPERM window resolves when the parent
+        // reap lands, and the deadline delivers the honest Unconfirmed
+        // for anything that never flips.
+        if probe_group(pgid) == GroupProbe::Gone {
             return KillOutcome::Died;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1131,13 +1156,51 @@ async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
     let _ = killpg(pid, Signal::SIGKILL);
     let confirm_deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < confirm_deadline {
-        if killpg(pid, None).is_err() {
+        if probe_group(pgid) == GroupProbe::Gone {
             return KillOutcome::Died;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     KillOutcome::Unconfirmed
 }
+
+/// Errno-aware signal-0 group probe (PR #92 greptile P2): the old
+/// `is_err() == dead` collapse treated EPERM — "the group exists, you may
+/// not signal it" — as AlreadyDead, which cleared registry rows for
+/// still-live groups. Only ESRCH proves absence; every other error is
+/// `Denied` and maps to Unconfirmed at the call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupProbe {
+    Alive,
+    Gone,
+    Denied,
+}
+
+fn probe_group(pgid: u32) -> GroupProbe {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    #[cfg(test)]
+    if TEST_FORCE_PROBE_DENIED
+        .lock()
+        .map(|g| *g == Some(pgid))
+        .unwrap_or(false)
+    {
+        return GroupProbe::Denied;
+    }
+    match killpg(Pid::from_raw(pgid as i32), None) {
+        Ok(()) => GroupProbe::Alive,
+        Err(Errno::ESRCH) => GroupProbe::Gone,
+        Err(_) => GroupProbe::Denied,
+    }
+}
+
+/// Injected-probe hook for the EPERM path (PR #92 greptile P2): a real
+/// permission-denied group would need a foreign-user process — not
+/// something a test should spawn. When set, `probe_group` reports the
+/// matching pgid as `Denied` before touching the real syscall.
+#[cfg(test)]
+pub(crate) static TEST_FORCE_PROBE_DENIED: StdMutex<Option<u32>> = StdMutex::new(None);
 
 /// The kill sequence with one bounded retry of the full sequence on an
 /// unconfirmed first pass (P5 round-2 codex N3's optional retry — covers
@@ -1212,15 +1275,33 @@ fn ranged_u64_param(
 }
 
 fn parse_lens_run_params(params: &serde_json::Value) -> Result<LensRunParams, shux_rpc::RpcError> {
-    let argv: Vec<String> = params
-        .get("argv")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    // STRICT argv typing (PR #92 codex P2 + greptile P1): a filter_map here
+    // silently dropped non-string elements — {"argv":["sh",null,"-c","cmd"]}
+    // spawned a DIFFERENT command than requested. Every element must be a
+    // string; anything else is INVALID_PARAMS, never a mutated command
+    // (the same strict-typing rule ranged_u64_param documents).
+    let argv: Vec<String> = match params.get("argv") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "'argv' elements must all be strings",
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        Some(_) => {
+            return Err(shux_rpc::RpcError::invalid_params(
+                "'argv' must be an array of strings",
+            ));
+        }
+    };
     if argv.is_empty() {
         return Err(shux_rpc::RpcError::invalid_params(
             "'argv' is required and must be a non-empty array of strings",
@@ -1246,15 +1327,30 @@ fn parse_lens_run_params(params: &serde_json::Value) -> Result<LensRunParams, sh
         MAX_MAX_RUNTIME_MS,
     )? as u32;
 
-    let env: Vec<(String, String)> = params
-        .get("env")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
+    // STRICT env typing (same finding): non-string values were silently
+    // dropped, mutating the requested environment.
+    let env: Vec<(String, String)> = match params.get("env") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Object(obj)) => {
+            let mut out = Vec::with_capacity(obj.len());
+            for (k, v) in obj {
+                match v.as_str() {
+                    Some(s) => out.push((k.clone(), s.to_string())),
+                    None => {
+                        return Err(shux_rpc::RpcError::invalid_params(
+                            "'env' values must all be strings",
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        Some(_) => {
+            return Err(shux_rpc::RpcError::invalid_params(
+                "'env' must be an object with string values",
+            ));
+        }
+    };
 
     let cwd = params
         .get("cwd")
@@ -2055,6 +2151,15 @@ mod tests {
         let token = process_start_token(pid).expect("start token of live child");
         write_registry_row(dir.path(), pid, token);
 
+        // Reap the child CONCURRENTLY, like production: the daemon's PTY
+        // task (the parent) reaps its child as it dies, so the death
+        // probe sees ESRCH. A test-held zombie now honestly probes
+        // Denied (PR #92 greptile P2 errno mapping) and would read as
+        // Unconfirmed — which is the truth for a never-reaped group.
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
         let audit = LensAuditLog::open(dir.path());
         let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
         assert!(
@@ -2062,8 +2167,7 @@ mod tests {
             "a confirmed kill leaves nothing unresolved"
         );
         assert_eq!(killed, 1, "matching start token reaps the group");
-        // Reap the zombie so the liveness probe below is honest.
-        let _ = child.wait();
+        reaper.join().expect("reaper thread");
         assert!(!pid_alive(pid), "group leader killed");
         assert!(!dir.path().join("scratch-registry.json").exists());
         // Audit entry with reason=registry landed and the chain verifies.
@@ -2164,12 +2268,16 @@ mod tests {
         let dir = tmpdir();
         let path = dir.path().join("scratch-registry.json");
         // A REAL live group, so the second (unforced) startup genuinely
-        // reaps something.
+        // reaps something. Reaped concurrently, like production (see
+        // startup_reap_kills_on_matching_start_token).
         let mut child = spawn_group_leader();
         let pid = child.id();
         let token = process_start_token(pid).expect("start token of live child");
         write_registry_row(dir.path(), pid, token);
         let audit = LensAuditLog::open(dir.path());
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
 
         // First startup: the kill sequence is forced Unconfirmed — the row
         // must survive (re-persisted), with NO reap audit (round 3: the
@@ -2203,14 +2311,15 @@ mod tests {
             .count();
         assert_eq!(reap_audits, 0, "no reap audit for an unresolved row");
 
-        // Second startup, flag cleared: the retry reaps for real.
+        // Second startup, flag cleared: the retry reaps for real (the
+        // reaper thread reaps the dying child so the probe confirms).
         let (killed, unresolved) = ScratchRegistry::startup_reap(dir.path(), &audit).await;
         assert!(
             unresolved.is_empty(),
             "the confirmed retry resolves the row"
         );
         assert_eq!(killed, 1, "the re-persisted row is reaped on retry");
-        let _ = child.wait(); // reap the zombie before probing
+        reaper.join().expect("reaper thread");
         assert!(!pid_alive(pid), "group leader killed on the retry");
         assert!(!path.exists(), "registry removed once every row resolved");
         assert!(
@@ -2279,6 +2388,93 @@ mod tests {
                 .code,
             -32602
         );
+    }
+
+    #[test]
+    fn params_reject_non_string_argv_and_env_elements() {
+        // PR #92 codex P2 + greptile P1: a filter_map silently dropped
+        // non-string argv elements — {"argv":["sh",null,"-c","cmd"]}
+        // spawned a DIFFERENT command than requested. Strict typing:
+        // -32602, never a mutated command.
+        assert_eq!(
+            parse_lens_run_params(&json!({"argv": ["sh", null, "-c", "cmd"]}))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        assert_eq!(
+            parse_lens_run_params(&json!({"argv": ["sh", 42]}))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        assert_eq!(
+            parse_lens_run_params(&json!({"argv": ["sh", true]}))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        assert_eq!(
+            parse_lens_run_params(&json!({"argv": ["sh", ["nested"]]}))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        assert_eq!(
+            parse_lens_run_params(&json!({"argv": "not-an-array"}))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        // Same rule for env values.
+        assert_eq!(
+            parse_lens_run_params(&json!({"argv": ["sleep"], "env": {"K": 1}}))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        assert_eq!(
+            parse_lens_run_params(&json!({"argv": ["sleep"], "env": {"K": null}}))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        assert_eq!(
+            parse_lens_run_params(&json!({"argv": ["sleep"], "env": "not-an-object"}))
+                .unwrap_err()
+                .code,
+            -32602
+        );
+        // Well-typed shapes still pass.
+        let p = parse_lens_run_params(&json!({"argv": ["sh", "-c", "cmd"], "env": {"K": "v"}}))
+            .expect("well-typed argv/env accepted");
+        assert_eq!(p.argv, vec!["sh", "-c", "cmd"]);
+        assert_eq!(p.env, vec![("K".to_string(), "v".to_string())]);
+    }
+
+    // ── EPERM-aware probe (PR #92 greptile P2) ──────────────────────────
+
+    #[tokio::test]
+    async fn denied_probe_reports_unconfirmed_never_already_dead() {
+        // A permission-denied probe means the group EXISTS — treating it
+        // as AlreadyDead cleared the registry row and silently orphaned
+        // it. A real EPERM group needs a foreign-user process, so the
+        // PROBE is injected while the signals stay real: they target a
+        // group we own (so nothing innocent is signaled), and with every
+        // probe forced Denied the sequence can never confirm the death.
+        let mut child = spawn_group_leader();
+        let pgid = child.id();
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        *TEST_FORCE_PROBE_DENIED.lock().unwrap() = Some(pgid);
+        assert_eq!(
+            kill_pgid_lens_sequence(pgid).await,
+            KillOutcome::Unconfirmed,
+            "denied probe must map to Unconfirmed (row survives), never AlreadyDead"
+        );
+        *TEST_FORCE_PROBE_DENIED.lock().unwrap() = None;
+        reaper.join().expect("reaper thread"); // the real signals did land
     }
 
     #[test]

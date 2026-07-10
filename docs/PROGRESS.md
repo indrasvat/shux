@@ -104,6 +104,12 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-10 — fix(lens): PR #92 bot round — strict argv/env typing, errno-aware group probe, canonicalization comment (task 077, gate 35/2 held)**
+- **codex P2 ≡ greptile P1:** argv `filter_map` silently dropped non-string elements (`["sh",null,"-c","cmd"]` spawned a DIFFERENT command); same for env values. Now strict: non-string elements/values, non-array argv, non-object env → INVALID_PARAMS, never a mutated command. Unit sibling + raw-RPC-shape tests through the production router.
+- **greptile P2 (probe):** signal-0 `is_err()` treated EPERM (group EXISTS, not signalable) as AlreadyDead → row cleared, group orphaned. New errno-aware `probe_group` (ESRCH→Gone, else→Denied) with injected-probe hook; Denied polls through the bounded loops (macOS probes our own unreaped zombies as EPERM — transient) and falls out as honest Unconfirmed for genuinely foreign groups. Two startup-reap tests gained production-faithful concurrent reaper threads.
+- **greptile P2 (comment):** canonical-bytes claim reworded — sorted keys depend on `preserve_order` staying OFF; enabling it would break chain reverification.
+- Gates: `make test-lens` 35/2 (same golden-only reds) · new-test set 33/33 · full lanes 1202/1202 across 24 suites · lint clean · leak-guard clean. PUSHED to PR #92; replies on all four bot threads.
+
 **2026-07-10 — fix(lens): P5 convergence round 7 — two-pass seeding closes the multi-row clobber (task 077, gate 35/2 held)**
 - Codex round 7: round-6 durable drop FIXED for single-row, but its persist introduced a multi-row clobber — sequential seeding left unreached rows existing only on disk, and an early confirmed resolution's persist rewrote the file from memory, dropping them (crash in the window = total loss). Fixed per the stated invariant (memory ⊇ unresolved disk rows before ANY persist):
 - **Two-pass `seed_unresolved`:** PASS 1 parks every row in memory first (parseable → `rows`, unparseable → `opaque_unresolved`; no kills, no persists); PASS 2 arms reapers (parseable) and inline-resolves opaque rows — each confirmed resolution removes exactly its own row and persists, now reflecting all still-unresolved siblings. Invariant asserted in a comment at the pass-2b persist site. New per-pgid `TEST_FORCE_UNCONFIRMED_PGID` hook for mixed-outcome batches.

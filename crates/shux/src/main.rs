@@ -8449,6 +8449,24 @@ mod tests {
         .await;
         assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
 
+        // PR #92 codex P2 + greptile P1 (raw RPC shapes): non-string argv
+        // elements / env values must be rejected, never silently dropped
+        // into a DIFFERENT command or environment.
+        let err = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sh", null, "-c", "echo pwned"]}),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+        let err = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"], "env": {"K": 42}}),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+
         // And no scratch leaked from the rejected calls.
         assert_eq!(harness.scratch_registry.test_total(), 0);
         harness.stop().await;

@@ -1086,3 +1086,44 @@ it), A durably dropped and audited exactly once. C's seeded reaper then
 resolves it (B still persisted after C's removal-persist); a simulated
 restart reaps B. End state: file gone, exactly one `scratch.reap` audit
 per row, no duplicates.
+
+## PR #92 bot round (2026-07-10 — codex 1×P2 + greptile 1×P1 + 2×P2; 3 substantive, all fixed)
+
+1. **codex P2 ≡ greptile P1 — argv/env silent mutation (the important
+   one):** `filter_map` silently dropped non-string argv elements —
+   `{"argv":["sh",null,"-c","cmd"]}` spawned a DIFFERENT command than
+   requested; same silent drop for non-string env values. This violated
+   the strict-typing principle `ranged_u64_param`'s own comment documents.
+   Fix: every argv element and every env value must be a string; a
+   non-array argv or non-object env is equally rejected — INVALID_PARAMS
+   (-32602), never a mutated command. Tests: unit sibling
+   (`params_reject_non_string_argv_and_env_elements` — null/number/bool/
+   nested-array elements, non-string env values, non-array argv,
+   non-object env, plus the well-typed control) and raw RPC shapes through
+   the production router (argv-with-null, env-with-number added to
+   `production_lens_run_rejects_wrapping_params_before_cast`).
+
+2. **greptile P2 — EPERM probe mapped to AlreadyDead:** the signal-0
+   probe's `is_err()` collapse treated EPERM ("the group EXISTS, you may
+   not signal it") as AlreadyDead — clearing the registry row and silently
+   orphaning the group. Fix: errno-aware `probe_group` (ESRCH → Gone;
+   EPERM and anything else → Denied) with an injected-probe test hook
+   (`TEST_FORCE_PROBE_DENIED` — a real EPERM group would need a
+   foreign-user process). Denied is deliberately NOT an instant verdict
+   inside the kill loops: macOS probes a zombie-only group (our own
+   just-died child whose parent reap is in flight) as EPERM, so the
+   bounded loops keep polling — a transient zombie flips to Gone when the
+   reap lands (→ Died), while a genuinely foreign group stays Denied and
+   falls out as Unconfirmed (row survives). Two startup-reap tests gained
+   a concurrent reaper thread to mirror production's parent-reap shape
+   (the daemon's PTY task reaps its child as it dies). Unit test:
+   `denied_probe_reports_unconfirmed_never_already_dead` (real owned
+   group + injected Denied probe → Unconfirmed, never AlreadyDead).
+
+3. **greptile P2 — comment accuracy:** "serde_json object keys serialize
+   sorted" reworded to name the dependency: sorted keys are a consequence
+   of NOT enabling serde_json's `preserve_order` feature; enabling it
+   would change the canonical bytes and break reverification of every
+   existing chain.
+
+(4th bot thread was non-substantive; replied with the fix reference.)
