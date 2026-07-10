@@ -3862,6 +3862,26 @@ fn settle_decide(quiet: bool, past_timeout: bool, pending_revision: bool) -> Set
     SettleWake::KeepWaiting
 }
 
+/// Strict optional-u64 parameter parse (codex P3 M2): absent → default;
+/// PRESENT but not an unsigned integer (string `"5ms"`, float `5.5`, `null`,
+/// negative) → INVALID_PARAMS (-32602). The previous `and_then(as_u64)
+/// .unwrap_or(default)` silently replaced mistyped values with the default —
+/// a caller sending `quiet_ms: "5ms"` got a 300 ms wait instead of an error.
+fn settle_u64_param(
+    params: &serde_json::Value,
+    key: &str,
+    default: u64,
+) -> Result<u64, shux_rpc::RpcError> {
+    match params.get(key) {
+        None => Ok(default),
+        Some(v) => v.as_u64().ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params(&format!(
+                "{key} must be an unsigned integer of milliseconds, got {v}"
+            ))
+        }),
+    }
+}
+
 /// The settle waiter's watch sender dropped mid-wait (codex P3 M1): pane
 /// teardown removes the VT and its revision publisher together, so the normal
 /// outcome is pane-gone → NOT_FOUND (-32004) — never a `settled` verdict on a
@@ -4959,16 +4979,11 @@ fn register_pane_io_methods(
                 async move {
                     let params = params.unwrap_or_default();
 
-                    // LENS-R-025: validate bounds FIRST → INVALID_PARAMS
-                    // (-32602). CLI maps this to exit 2 (§10, V1).
-                    let quiet_ms = params
-                        .get("quiet_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(300);
-                    let timeout_ms = params
-                        .get("timeout_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(10_000);
+                    // LENS-R-025 + codex P3 M2: strict typing first (absent →
+                    // default; wrong type → INVALID_PARAMS, never a silent
+                    // default), then bounds. CLI maps -32602 to exit 2 (§10).
+                    let quiet_ms = settle_u64_param(&params, "quiet_ms", 300)?;
+                    let timeout_ms = settle_u64_param(&params, "timeout_ms", 10_000)?;
                     validate_wait_settled_params(quiet_ms, timeout_ms)?;
 
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -7798,6 +7813,93 @@ done
         );
 
         harness.stop().await;
+    }
+
+    /// P3 codex M2: mistyped `quiet_ms`/`timeout_ms` (string, float, null,
+    /// negative) must surface INVALID_PARAMS (-32602) via the raw RPC path —
+    /// never silently fall back to the defaults. Absent params still default.
+    #[tokio::test]
+    async fn production_wait_settled_rejects_mistyped_params() {
+        let harness = RpcHarness::new();
+        let (_sid, _wid, pane_id) = harness.seed_session("settle-types").await;
+        let _write_rx = harness.seed_io(pane_id, b"boot").await;
+        {
+            let mut state = harness.io.lock().await;
+            let (tx, rx0) = watch::channel(PaneRevision {
+                content_revision: 1,
+                // Ancient mutation stamp → the defaults-path call below
+                // settles immediately instead of really waiting.
+                last_mutation_ns: 1,
+            });
+            drop(rx0);
+            state.revisions.insert(pane_id, tx);
+        }
+
+        for bad in [
+            serde_json::json!("5ms"),
+            serde_json::json!(5.5),
+            serde_json::json!(null),
+            serde_json::json!(-5),
+        ] {
+            let err = dispatch_err(
+                &harness.router,
+                "pane.wait_settled",
+                serde_json::json!({ "pane_id": pane_id.to_string(), "quiet_ms": bad }),
+            )
+            .await;
+            assert_eq!(
+                err.code,
+                shux_rpc::ErrorCode::InvalidParams.code(),
+                "quiet_ms={bad} must be INVALID_PARAMS, got {err:?}"
+            );
+            let err = dispatch_err(
+                &harness.router,
+                "pane.wait_settled",
+                serde_json::json!({ "pane_id": pane_id.to_string(), "timeout_ms": bad }),
+            )
+            .await;
+            assert_eq!(
+                err.code,
+                shux_rpc::ErrorCode::InvalidParams.code(),
+                "timeout_ms={bad} must be INVALID_PARAMS, got {err:?}"
+            );
+        }
+
+        // Absent params → documented defaults (quiet 300 / timeout 10_000);
+        // the ancient mutation stamp makes this an immediate settled return.
+        let result = dispatch_ok(
+            &harness.router,
+            "pane.wait_settled",
+            serde_json::json!({ "pane_id": pane_id.to_string() }),
+        )
+        .await;
+        assert_eq!(result["settled"], serde_json::json!(true));
+
+        harness.stop().await;
+    }
+
+    #[test]
+    fn settle_u64_param_strict_typing() {
+        let params = serde_json::json!({
+            "ok": 250,
+            "str": "5ms",
+            "float": 5.5,
+            "null": null,
+            "neg": -5,
+        });
+        // Absent → default.
+        assert_eq!(settle_u64_param(&params, "missing", 300).unwrap(), 300);
+        // Present u64 → the value.
+        assert_eq!(settle_u64_param(&params, "ok", 300).unwrap(), 250);
+        // Present-but-wrong-type → INVALID_PARAMS, never the default.
+        for key in ["str", "float", "null", "neg"] {
+            let err = settle_u64_param(&params, key, 300).unwrap_err();
+            assert_eq!(
+                err.code,
+                shux_rpc::ErrorCode::InvalidParams.code(),
+                "{key} must be rejected"
+            );
+        }
     }
 
     // ── `pane.wait_settled` settle-math unit tests (§6, L0 supporting) ────
