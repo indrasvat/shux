@@ -102,6 +102,12 @@ struct PaneCheckpoint {
     /// (row, col, visible) at capture time — the §5.1 clone's cursor, not
     /// re-derived later.
     cursor: (usize, usize, bool),
+    /// The pane's OSC 10/11/12 dynamic default colors at capture time
+    /// (LENS-R-038b, PR #91 codex P2): `Color::Default` cells present
+    /// differently when the defaults change, so the diff must resolve
+    /// Default against EACH side's respective defaults — the checkpoint
+    /// carries its own.
+    default_colors: shux_vt::TerminalDefaultColors,
 }
 
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
@@ -303,6 +309,7 @@ impl PaneIoState {
         revision: u64,
         grid: shux_vt::Grid,
         cursor: (usize, usize, bool),
+        default_colors: shux_vt::TerminalDefaultColors,
     ) -> (bool, Option<u64>) {
         const MAX_CHECKPOINTS: usize = 4;
         if !self.vts.contains_key(&pane_id) {
@@ -331,6 +338,7 @@ impl PaneIoState {
                 revision,
                 grid,
                 cursor,
+                default_colors,
             },
         );
         if deque.len() > MAX_CHECKPOINTS {
@@ -368,6 +376,14 @@ impl PaneIoState {
     }
 }
 
+/// A checkpoint's stored clone as returned by `diff_lookup_checkpoint`:
+/// (grid, cursor {row, col, visible}, OSC defaults at capture — LENS-R-038b).
+type CheckpointClone = (
+    shux_vt::Grid,
+    (usize, usize, bool),
+    shux_vt::TerminalDefaultColors,
+);
+
 /// Resolve a `pane.diff_since` `since_revision` against a pane's stored
 /// checkpoints and invalidation marker (lens PRD §7.1, LENS-R-033). Existence
 /// FIRST, which makes the rule off-by-one-proof:
@@ -376,18 +392,20 @@ impl PaneIoState {
 ///   (3) else → `STALE_REVISION (-32010)` with `{requested, available}`.
 /// The pane's existence is checked by the caller BEFORE this (so a missing
 /// pane is `PANE_NOT_FOUND`, never a diff error). Returns the checkpoint's
-/// `(grid, cursor)` clone on a hit.
+/// `(grid, cursor, default_colors)` clone on a hit (defaults per
+/// LENS-R-038b — the diff resolves `Color::Default` against each side's own
+/// defaults).
 fn diff_lookup_checkpoint(
     state: &PaneIoState,
     pane_id: &shux_core::model::PaneId,
     since: u64,
-) -> Result<(shux_vt::Grid, (usize, usize, bool)), shux_rpc::RpcError> {
+) -> Result<CheckpointClone, shux_rpc::RpcError> {
     if let Some(cp) = state
         .checkpoints
         .get(pane_id)
         .and_then(|d| d.iter().find(|c| c.revision == since))
     {
-        return Ok((cp.grid.clone(), cp.cursor));
+        return Ok((cp.grid.clone(), cp.cursor, cp.default_colors));
     }
     if let Some(&marker) = state.invalidations.get(pane_id)
         && since <= marker
@@ -398,6 +416,40 @@ fn diff_lookup_checkpoint(
         since,
         &state.checkpoint_revisions(pane_id),
     ))
+}
+
+/// Pre-render pixel budget shared by every lens rasterizing path
+/// (`pane.glance` PNG, `pane.diff_since` heat PNG — PR #91 codex P1). The
+/// same 16M-pixel cap `pane.snapshot` enforces, checked BEFORE any RGBA
+/// allocation or rasterization: a 1000×1000-cell pane (valid per
+/// `pane.set_size` limits) would otherwise allocate hundreds of MB before
+/// the post-encode 8 MiB check could fire. Over budget →
+/// `PAYLOAD_TOO_LARGE (-32013)` with `{pixels, max_pixels, hint}` — the
+/// caller supplies the method-appropriate hint.
+fn lens_pixel_budget_check(
+    cols: usize,
+    rows: usize,
+    cell_w: u32,
+    cell_h: u32,
+    hint: &str,
+) -> Result<(), shux_rpc::RpcError> {
+    const MAX_PIXELS: u64 = 16_000_000;
+    let pixel_count = (cols as u64)
+        .saturating_mul(cell_w as u64)
+        .saturating_mul(rows as u64)
+        .saturating_mul(cell_h as u64);
+    if pixel_count > MAX_PIXELS {
+        return Err(shux_rpc::RpcError::with_message_and_data(
+            shux_rpc::ErrorCode::PayloadTooLarge,
+            "payload_too_large",
+            serde_json::json!({
+                "pixels": pixel_count,
+                "max_pixels": MAX_PIXELS,
+                "hint": hint,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 /// One per-row changed-column span in a `pane.diff_since` result
@@ -448,11 +500,20 @@ fn glance_row_text(grid: &shux_vt::Grid, row_idx: usize) -> String {
 /// Compute the structured diff of `cur` against the checkpoint `cp` clone
 /// (lens PRD §7.2). A cell counts as changed iff its UNDERLYING cell data
 /// differs (glyph, fg, bg, attrs — `Cell`'s full value equality, no cursor
-/// overlay: the clones carry none). Wide glyphs pair with their spacer: if
-/// either half changed, both count (LENS-R-034). Cursor position/visibility
-/// is never in the grid cells, so it is excluded from the count/regions by
-/// construction; a content change under the cursor's cell still counts.
-/// `cursor_moved` is reported separately.
+/// overlay: the clones carry none), with `Color::Default` RESOLVED against
+/// each side's respective OSC 10/11/12 defaults (LENS-R-038b, PR #91 codex
+/// P2): a default-color-only repaint presents every Default-colored cell
+/// differently, so when the two sides' fg (or bg) defaults differ, a cell
+/// whose fg (or bg) is `Default` on BOTH sides counts as changed. When the
+/// defaults are unchanged the extra clauses never fire and the comparison is
+/// byte-identical to plain `Cell` equality (D-tier gates + ratified goldens
+/// unaffected). The cursor default (OSC 12) is deliberately NOT part of the
+/// cell comparison — the cursor overlay is excluded from diffs entirely
+/// (DEC-11). Wide glyphs pair with their spacer: if either half changed,
+/// both count (LENS-R-034). Cursor position/visibility is never in the grid
+/// cells, so it is excluded from the count/regions by construction; a
+/// content change under the cursor's cell still counts. `cursor_moved` is
+/// reported separately.
 ///
 /// Max 256 spans (LENS-R-035): past the cap `regions_truncated` is set and the
 /// caller emits only `bounding_box`.
@@ -461,11 +522,20 @@ fn compute_lens_diff(
     cur: &shux_vt::Grid,
     cp_cursor: (usize, usize, bool),
     cur_cursor: (usize, usize, bool),
+    cp_defaults: shux_vt::TerminalDefaultColors,
+    cur_defaults: shux_vt::TerminalDefaultColors,
 ) -> LensDiff {
     // A valid diff (existence-first lookup hit) implies equal dims — resize
     // invalidates checkpoints. `min` is a defensive guard, not a happy path.
     let rows = cp.rows().min(cur.rows());
     let cols = cp.cols().min(cur.cols());
+
+    // LENS-R-038b: which default channels changed between the two frames.
+    // `Default`-colored cells resolve through these, so a changed channel
+    // marks every cell that is `Default` in that channel on both sides
+    // (asymmetric Default-vs-concrete pairs already differ by raw equality).
+    let fg_default_changed = cp_defaults.fg != cur_defaults.fg;
+    let bg_default_changed = cp_defaults.bg != cur_defaults.bg;
 
     let mut changed = vec![false; rows * cols];
     for r in 0..rows {
@@ -473,7 +543,15 @@ fn compute_lens_diff(
         let cur_row = cur.visible_row(r);
         for c in 0..cols {
             let differ = match (cp_row.get(c), cur_row.get(c)) {
-                (Some(a), Some(b)) => a != b,
+                (Some(a), Some(b)) => {
+                    a != b
+                        || (fg_default_changed
+                            && a.style.fg == shux_vt::Color::Default
+                            && b.style.fg == shux_vt::Color::Default)
+                        || (bg_default_changed
+                            && a.style.bg == shux_vt::Color::Default
+                            && b.style.bg == shux_vt::Color::Default)
+                }
                 (None, None) => false,
                 _ => true,
             };
@@ -5191,23 +5269,15 @@ fn register_pane_io_methods(
                         // allocate + encode hundreds of MB of RGBA before
                         // the post-encode 8 MiB check could fire. Text-only
                         // glances skip it: no PNG payload exists to cap.
+                        // Shared with the diff heat path (PR #91 codex P1).
                         if include_png {
-                            let pixel_count = (cols as u64)
-                                .saturating_mul(cw as u64)
-                                .saturating_mul(rows as u64)
-                                .saturating_mul(ch as u64);
-                            const MAX_PIXELS: u64 = 16_000_000;
-                            if pixel_count > MAX_PIXELS {
-                                return Err(shux_rpc::RpcError::with_message_and_data(
-                                    shux_rpc::ErrorCode::PayloadTooLarge,
-                                    "payload_too_large",
-                                    serde_json::json!({
-                                        "pixels": pixel_count,
-                                        "max_pixels": MAX_PIXELS,
-                                        "hint": "shrink the pane (pane.set_size) or set include_png=false",
-                                    }),
-                                ));
-                            }
+                            lens_pixel_budget_check(
+                                cols,
+                                rows,
+                                cw,
+                                ch,
+                                "shrink the pane (pane.set_size) or set include_png=false",
+                            )?;
                         }
                         let cur = vt.cursor();
                         let default_colors = vt.default_colors();
@@ -5331,6 +5401,9 @@ fn register_pane_io_methods(
                             revision,
                             grid,
                             (cursor_row, cursor_col, cursor_visible),
+                            // The §5.1 clone's OSC defaults (LENS-R-038b) —
+                            // read in the SAME critical section as the grid.
+                            default_colors,
                         )
                     } else {
                         (false, None)
@@ -5465,9 +5538,11 @@ fn register_pane_io_methods(
                             continue;
                         }
 
-                        let remaining = std::time::Duration::from_nanos(
-                            settle_remaining_quiet_ns(now_ns, rev.last_mutation_ns, quiet_ms),
-                        );
+                        let remaining = std::time::Duration::from_nanos(settle_remaining_quiet_ns(
+                            now_ns,
+                            rev.last_mutation_ns,
+                            quiet_ms,
+                        ));
                         let quiet_deadline = tokio::time::Instant::now() + remaining;
                         let wake = quiet_deadline.min(timeout_deadline);
 
@@ -5512,7 +5587,7 @@ fn register_pane_io_methods(
                     // the FIFO-oldest past the cap (LENS-R-030/031).
                     let (revision, evicted) = {
                         let mut state = io.lock().await;
-                        let (revision, grid, cursor) = {
+                        let (revision, grid, cursor, default_colors) = {
                             let vt = state.vts.get(&pane_id).ok_or_else(|| {
                                 shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                             })?;
@@ -5521,10 +5596,13 @@ fn register_pane_io_methods(
                                 vt.content_revision(),
                                 vt.grid().clone_visible(),
                                 (cur.row, cur.col, cur.visible),
+                                // OSC defaults at capture time (LENS-R-038b),
+                                // same critical section as the grid clone.
+                                vt.default_colors(),
                             )
                         };
                         let (_stored, evicted) =
-                            state.store_checkpoint(pane_id, revision, grid, cursor);
+                            state.store_checkpoint(pane_id, revision, grid, cursor, default_colors);
                         (revision, evicted)
                     };
 
@@ -5578,18 +5656,47 @@ fn register_pane_io_methods(
                     // One lock: existence check, checkpoint lookup (LENS-R-033),
                     // and the atomic current-grid clone all in one critical
                     // section so `to_revision`/grid/cursor agree.
-                    let (cp_grid, cp_cursor, cur_grid, cur_cursor, to_revision, default_colors) = {
+                    let (cw, ch) = r.cell_size();
+                    let (
+                        cp_grid,
+                        cp_cursor,
+                        cp_defaults,
+                        cur_grid,
+                        cur_cursor,
+                        to_revision,
+                        default_colors,
+                    ) = {
                         let state = io.lock().await;
                         let vt = state.vts.get(&pane_id).ok_or_else(|| {
                             shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                         })?;
                         // Existence-first lookup runs AFTER the pane check.
-                        let (cp_grid, cp_cursor) =
+                        let (cp_grid, cp_cursor, cp_defaults) =
                             diff_lookup_checkpoint(&state, &pane_id, since_revision)?;
+                        // Pre-render pixel budget for the heat path (PR #91
+                        // codex P1): the SAME 16M-pixel cap glance enforces,
+                        // checked BEFORE any RGBA allocation/rasterization —
+                        // a 1000×1000 pane (valid per pane.set_size) would
+                        // otherwise allocate hundreds of MB in
+                        // render_lens_heat_png before the post-encode 8 MiB
+                        // check could fire. Runs AFTER the LENS-R-033 lookup
+                        // so stale/invalidated (more actionable) wins over
+                        // the payload error; heat-less diffs skip it — the
+                        // cell-level diff never rasterizes.
+                        if want_heat {
+                            lens_pixel_budget_check(
+                                vt.grid().cols(),
+                                vt.grid().rows(),
+                                cw,
+                                ch,
+                                "shrink the pane (pane.set_size) or set heat_png=false",
+                            )?;
+                        }
                         let cur = vt.cursor();
                         (
                             cp_grid,
                             cp_cursor,
+                            cp_defaults,
                             vt.grid().clone_visible(),
                             (cur.row, cur.col, cur.visible),
                             vt.content_revision(),
@@ -5597,8 +5704,18 @@ fn register_pane_io_methods(
                         )
                     };
 
-                    // Diff computation outside the lock (LENS-R-034..036).
-                    let diff = compute_lens_diff(&cp_grid, &cur_grid, cp_cursor, cur_cursor);
+                    // Diff computation outside the lock (LENS-R-034..036;
+                    // LENS-R-038b: Default colors resolve against each
+                    // side's own defaults — the checkpoint's captured
+                    // defaults vs the pane's CURRENT defaults).
+                    let diff = compute_lens_diff(
+                        &cp_grid,
+                        &cur_grid,
+                        cp_cursor,
+                        cur_cursor,
+                        cp_defaults,
+                        default_colors,
+                    );
 
                     let regions: Vec<serde_json::Value> = diff
                         .regions
@@ -5626,8 +5743,15 @@ fn register_pane_io_methods(
                     };
 
                     // Heat PNG (LENS-R-037): render off the runtime worker.
+                    // The base frame uses the pane's CURRENT defaults
+                    // (`default_colors`, read in the lock above) — the heat
+                    // map depicts the PRESENTED current frame, never the
+                    // checkpoint's colors (LENS-R-038b test c). The mask is
+                    // MOVED into the closure — nothing reads it afterwards
+                    // (greptile PR #91: the clone was a needless heap copy
+                    // of rows×cols booleans).
                     let heat_png_base64 = if want_heat {
-                        let changed_mask = diff.changed_mask.clone();
+                        let changed_mask = diff.changed_mask;
                         let (rows, cols) = (diff.rows, diff.cols);
                         let heat = tokio::task::spawn_blocking(move || {
                             render_lens_heat_png(
@@ -7022,15 +7146,33 @@ mod tests {
         let grid = vt.grid().clone_visible();
 
         // No VT registered at all → refuse, and do NOT create an entry.
-        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            1,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(!stored && evicted.is_none());
         assert!(!state.checkpoints.contains_key(&pane_id));
 
         // Live VT → stores; same-revision re-store is the LENS-R-030 no-op.
         state.vts.insert(pane_id, vt);
-        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            1,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored && evicted.is_none());
-        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            1,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored && evicted.is_none(), "same-revision no-op");
         assert_eq!(state.checkpoints[&pane_id].len(), 1);
 
@@ -7038,7 +7180,13 @@ mod tests {
         // must refuse and must NOT resurrect the checkpoints entry.
         let _ = state.teardown_panes_collecting(&[pane_id], true);
         assert!(!state.checkpoints.contains_key(&pane_id));
-        let (stored, evicted) = state.store_checkpoint(pane_id, 2, grid, (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            2,
+            grid,
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(!stored && evicted.is_none());
         assert!(
             !state.checkpoints.contains_key(&pane_id),
@@ -7110,14 +7258,25 @@ mod tests {
 
         // (b) Ascending stores: cap 4, the 5th evicts the first.
         for rev in [1_u64, 2, 3, 4] {
-            let (stored, evicted) =
-                state.store_checkpoint(pane_id, rev, grid.clone(), (0, 0, true));
+            let (stored, evicted) = state.store_checkpoint(
+                pane_id,
+                rev,
+                grid.clone(),
+                (0, 0, true),
+                shux_vt::TerminalDefaultColors::default(),
+            );
             assert!(
                 stored && evicted.is_none(),
                 "rev {rev} stores without eviction"
             );
         }
-        let (stored, evicted) = state.store_checkpoint(pane_id, 5, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            5,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored);
         assert_eq!(evicted, Some(1), "5th store evicts the FIFO-oldest (rev 1)");
 
@@ -7127,14 +7286,25 @@ mod tests {
         let vt = shux_vt::VirtualTerminal::new(24, 80);
         state.vts.insert(pane_id, vt);
         for rev in [10_u64, 5, 20, 30] {
-            let (stored, evicted) =
-                state.store_checkpoint(pane_id, rev, grid.clone(), (0, 0, true));
+            let (stored, evicted) = state.store_checkpoint(
+                pane_id,
+                rev,
+                grid.clone(),
+                (0, 0, true),
+                shux_vt::TerminalDefaultColors::default(),
+            );
             assert!(stored && evicted.is_none());
         }
         // Deque must be revision-ordered despite arrival order, so the next
         // store evicts revision 5 (oldest by CREATION REVISION) — a pure
         // insertion-order FIFO would wrongly evict 10 (the first arrival).
-        let (stored, evicted) = state.store_checkpoint(pane_id, 40, grid, (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            40,
+            grid,
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored);
         assert_eq!(
             evicted,
@@ -7160,7 +7330,13 @@ mod tests {
         state.vts.insert(pane_id, vt);
 
         // One checkpoint at revision 5.
-        state.store_checkpoint(pane_id, 5, grid.clone(), (0, 0, true));
+        state.store_checkpoint(
+            pane_id,
+            5,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         // (1) exact hit → Ok clone.
         assert!(diff_lookup_checkpoint(&state, &pane_id, 5).is_ok());
         // (3) no checkpoint, no marker → STALE with available:[5].
@@ -7189,7 +7365,13 @@ mod tests {
 
         // A checkpoint created AFTER the invalidation (rev 10 ≥ marker 9) is
         // found by rule (1) before rule (2) can misfire (LENS-R-033).
-        state.store_checkpoint(pane_id, 10, grid, (0, 0, true));
+        state.store_checkpoint(
+            pane_id,
+            10,
+            grid,
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(diff_lookup_checkpoint(&state, &pane_id, 10).is_ok());
         // The marker still shadows the freed pre-9 revisions.
         assert_eq!(
@@ -7233,7 +7415,13 @@ mod tests {
         state.vts.insert(pane_id, vt);
 
         // Baseline: a checkpoint at 5 stores and is diffable.
-        let (stored, _) = state.store_checkpoint(pane_id, 5, grid.clone(), (0, 0, true));
+        let (stored, _) = state.store_checkpoint(
+            pane_id,
+            5,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored);
 
         // The invalidating event (resize/alt-switch) lands at revision 7:
@@ -7242,7 +7430,13 @@ mod tests {
 
         // The racing glance's LATE store of the pre-invalidation clone at 5
         // must be refused — no checkpoint materializes.
-        let (stored, evicted) = state.store_checkpoint(pane_id, 5, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            5,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(!stored, "pre-invalidation revision must be refused");
         assert!(evicted.is_none());
         assert!(
@@ -7262,14 +7456,192 @@ mod tests {
         // AT the marker (== 7): the post-mutation frame, storable and
         // diffable — refusing it would orphan the immediately-post-resize
         // pane.checkpoint and make diff_since(7) wrongly -32011.
-        let (stored, _) = state.store_checkpoint(pane_id, 7, grid.clone(), (0, 0, true));
+        let (stored, _) = state.store_checkpoint(
+            pane_id,
+            7,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored, "revision == marker is the post-mutation frame");
         assert!(diff_lookup_checkpoint(&state, &pane_id, 7).is_ok());
 
         // Above the marker: normal storage.
-        let (stored, _) = state.store_checkpoint(pane_id, 8, grid, (0, 0, true));
+        let (stored, _) = state.store_checkpoint(
+            pane_id,
+            8,
+            grid,
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored);
         assert!(diff_lookup_checkpoint(&state, &pane_id, 8).is_ok());
+    }
+
+    /// PR #91 codex P1 — the shared pre-render pixel budget predicate: the
+    /// SAME 16M-pixel cap `pane.glance` enforces, now also gating the diff
+    /// heat path BEFORE any RGBA allocation. Over budget → -32013 with
+    /// {pixels, max_pixels, hint}; under budget → Ok (no allocation happens
+    /// in the guard itself).
+    #[test]
+    fn lens_pixel_budget_check_guard_predicate() {
+        // Under budget: an 80×24 pane at 9×18px cells is ~311K pixels.
+        assert!(lens_pixel_budget_check(80, 24, 9, 18, "hint").is_ok());
+
+        // Over budget: 1000×1000 cells at 9×18px is 162M pixels — the
+        // pane.set_size-valid size from the codex P1 report.
+        let err = lens_pixel_budget_check(1000, 1000, 9, 18, "set heat_png=false")
+            .expect_err("162M pixels must exceed the 16M budget");
+        assert_eq!(err.code, shux_rpc::ErrorCode::PayloadTooLarge.code());
+        let data = err.data.expect("budget error carries data");
+        let pixels = data["pixels"].as_u64().expect("pixels");
+        let max = data["max_pixels"].as_u64().expect("max_pixels");
+        assert_eq!(pixels, 162_000_000);
+        assert_eq!(max, 16_000_000);
+        assert!(pixels > max);
+        assert_eq!(data["hint"], "set heat_png=false", "hint passes through");
+    }
+
+    /// LENS-R-038b (PR #91 codex P2, adjudicated) — a default-color-only
+    /// change marks every cell whose changed channel is `Color::Default` on
+    /// both sides; concrete-colored cells stay unmarked. Exercises both the
+    /// bg (OSC 11) and fg (OSC 10) channels against a grid mixing blank
+    /// cells, default-colored text, and one fully concrete-colored cell.
+    #[test]
+    fn compute_lens_diff_default_color_change_marks_default_cells() {
+        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
+        // Default-colored text at (0,0..2) + one cell at (1,2) with CONCRETE
+        // fg AND bg (never resolves through either default channel).
+        vt.process(b"\x1b[1;1HAB\x1b[2;3H\x1b[38;2;1;2;3m\x1b[48;2;4;5;6mX\x1b[0m");
+        let grid = vt.grid().clone_visible();
+        let cursor = (0, 0, true);
+        let base = shux_vt::TerminalDefaultColors::default();
+
+        // bg default changed (OSC 11): every cell except (1,2) counts.
+        let bg_changed = shux_vt::TerminalDefaultColors {
+            bg: Some([32, 64, 96]),
+            ..base
+        };
+        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, bg_changed);
+        assert_eq!(
+            diff.cells_changed, 29,
+            "3×10 grid minus the one concrete-bg cell"
+        );
+        assert!(!diff.changed_mask[10 + 2], "concrete-bg cell NOT marked");
+        assert!(diff.changed_mask[0], "default-colored glyph cell marked");
+        assert!(diff.changed_mask[9], "blank cell marked");
+        // Row 1 splits around the concrete cell: [0,2) + [3,10).
+        let spans: Vec<(u16, u16, u16)> = diff
+            .regions
+            .iter()
+            .map(|s| (s.row, s.col_start, s.col_end))
+            .collect();
+        assert_eq!(spans, vec![(0, 0, 10), (1, 0, 2), (1, 3, 10), (2, 0, 10)]);
+        assert_eq!(diff.bounding_box, (0, 0, 3, 10));
+
+        // fg default changed (OSC 10): same shape — the concrete-fg cell is
+        // the only one not resolving through the fg default.
+        let fg_changed = shux_vt::TerminalDefaultColors {
+            fg: Some([200, 10, 10]),
+            ..base
+        };
+        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, fg_changed);
+        assert_eq!(diff.cells_changed, 29);
+        assert!(!diff.changed_mask[10 + 2], "concrete-fg cell NOT marked");
+
+        // Cursor default (OSC 12) is NOT part of the cell comparison
+        // (DEC-11: the cursor overlay is excluded from diffs entirely).
+        let cursor_changed = shux_vt::TerminalDefaultColors {
+            cursor: Some([255, 0, 0]),
+            ..base
+        };
+        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, cursor_changed);
+        assert_eq!(diff.cells_changed, 0, "OSC 12 never marks cells");
+    }
+
+    /// LENS-R-038b test (b): with UNCHANGED defaults the comparison is
+    /// byte-identical to plain raw `Cell` equality — whether the shared
+    /// defaults are the builtin fallback (None) or an OSC-set value. Pins
+    /// that the D-tier gates and ratified goldens are unaffected.
+    #[test]
+    fn compute_lens_diff_unchanged_defaults_matches_raw() {
+        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
+        vt.process(b"\x1b[1;1Hhello");
+        let cp = vt.grid().clone_visible();
+        vt.process(b"\x1b[2;4H\x1b[48;5;28mZW\x1b[0m");
+        let cur = vt.grid().clone_visible();
+        let cursor = (0, 0, true);
+
+        let none = shux_vt::TerminalDefaultColors::default();
+        let osc_set = shux_vt::TerminalDefaultColors {
+            fg: Some([250, 250, 250]),
+            bg: Some([32, 64, 96]),
+            cursor: Some([255, 128, 0]),
+        };
+
+        let raw = compute_lens_diff(&cp, &cur, cursor, cursor, none, none);
+        let same_osc = compute_lens_diff(&cp, &cur, cursor, cursor, osc_set, osc_set);
+        assert_eq!(raw.cells_changed, 2, "exactly the ZW cells");
+        assert_eq!(same_osc.cells_changed, raw.cells_changed);
+        assert_eq!(same_osc.changed_mask, raw.changed_mask);
+        assert_eq!(same_osc.bounding_box, raw.bounding_box);
+        let spans = |d: &LensDiff| -> Vec<(u16, u16, u16)> {
+            d.regions
+                .iter()
+                .map(|s| (s.row, s.col_start, s.col_end))
+                .collect()
+        };
+        assert_eq!(spans(&same_osc), spans(&raw));
+    }
+
+    /// LENS-R-038b test (c), unit half — the heat base is rendered with the
+    /// defaults PASSED IN (the handler passes the pane's CURRENT defaults).
+    /// Deterministic integer expectations: a changed blank cell is the heat
+    /// colour alpha-blended over the passed bg default; an unchanged blank
+    /// cell is that bg desaturated 50% (Rec.601 luma).
+    #[test]
+    fn heat_png_base_uses_passed_defaults() {
+        let raster = shux_raster::Rasterizer::new(14.0).expect("bundled font");
+        let vt = shux_vt::VirtualTerminal::new(2, 4);
+        let grid = vt.grid().clone_visible();
+        let mut mask = vec![false; 2 * 4];
+        mask[0] = true; // (0,0) changed; (0,1) unchanged
+
+        let defaults = shux_vt::TerminalDefaultColors {
+            bg: Some([32, 64, 96]),
+            ..shux_vt::TerminalDefaultColors::default()
+        };
+        let png = render_lens_heat_png(&raster, &grid, defaults, &mask, 2, 4).unwrap();
+        let img = image::load_from_memory(&png)
+            .expect("decode heat")
+            .to_rgba8();
+        let (cw, _ch) = raster.cell_size();
+
+        // Changed cell (0,0): blend(HEAT=(163,38,56), α=128) over (32,64,96)
+        // with truncating integer math = (97, 50, 75).
+        let p = img.get_pixel(1, 1);
+        assert_eq!((p[0], p[1], p[2]), (97, 50, 75), "heat over CURRENT bg");
+
+        // Unchanged cell (0,1): desaturate((32,64,96)) — gray=(32·77+64·150+
+        // 96·29)>>8 = 58 → ((32+58)/2, (64+58)/2, (96+58)/2) = (45, 61, 77).
+        let p = img.get_pixel(cw + 1, 1);
+        assert_eq!(
+            (p[0], p[1], p[2]),
+            (45, 61, 77),
+            "desaturated CURRENT bg on unchanged cells"
+        );
+        // Same render with the builtin default bg (None) must differ — the
+        // base provably derives from the passed defaults, not a constant.
+        let png_builtin = render_lens_heat_png(
+            &raster,
+            &grid,
+            shux_vt::TerminalDefaultColors::default(),
+            &mask,
+            2,
+            4,
+        )
+        .unwrap();
+        assert_ne!(png, png_builtin);
     }
 
     /// P4 DoD (council D2) — the diff is independent of `DirtyState`: it reads
@@ -7301,7 +7673,14 @@ mod tests {
             let c = vt.cursor();
             (c.row, c.col, c.visible)
         };
-        let diff = compute_lens_diff(&cp_grid, &cur_grid, cp_cursor, cur_cursor);
+        let diff = compute_lens_diff(
+            &cp_grid,
+            &cur_grid,
+            cp_cursor,
+            cur_cursor,
+            shux_vt::TerminalDefaultColors::default(),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         // (1,1) style change + (2,4) new glyph = exactly 2 cells, despite the
         // dirty drains straddling the checkpoint.
         assert_eq!(diff.cells_changed, 2, "value-based diff, dirty-independent");
@@ -7324,7 +7703,14 @@ mod tests {
         // (spacer).
         vt.process("\x1b[1;1H\u{7d42}".as_bytes()); // 終 (width 2)
         let cur_grid = vt.grid().clone_visible();
-        let diff = compute_lens_diff(&cp_grid, &cur_grid, cp_cursor, (0, 2, true));
+        let diff = compute_lens_diff(
+            &cp_grid,
+            &cur_grid,
+            cp_cursor,
+            (0, 2, true),
+            shux_vt::TerminalDefaultColors::default(),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert_eq!(diff.cells_changed, 2, "wide head + spacer both count");
         assert!(diff.changed_mask[0], "head counts");
         assert!(diff.changed_mask[1], "spacer counts");

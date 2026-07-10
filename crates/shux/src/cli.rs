@@ -1470,7 +1470,7 @@ pub enum PaneCommand {
     /// Mirrors `pane.diff_since` RPC (lens PRD §7). Prints the structured
     /// delta (changed cell count, per-row spans, changed row text). Exit 0 on
     /// any delta (diff is data, not a verdict); exit 5 on STALE_REVISION /
-    /// RESIZE_INVALIDATED.
+    /// RESIZE_INVALIDATED / PAYLOAD_TOO_LARGE (oversized heat PNG).
     Diff {
         /// Pane UUID (mirrors the RPC `pane_id`).
         #[arg(value_name = "PANE")]
@@ -3994,8 +3994,8 @@ pub async fn handle_pane_wait_settled(
 }
 
 /// Map a `pane.checkpoint` RPC error code to its CLI exit code (lens PRD §10).
-/// `pane.checkpoint`'s only error surface is PANE_NOT_FOUND and
-/// PERMISSION_DENIED (§7.3 schema).
+/// `pane.checkpoint` error surface: INVALID_PARAMS (bad/missing pane_id →
+/// exit 2), PERMISSION_DENIED (exit 4), PANE_NOT_FOUND + anything else → exit 3.
 fn lens_checkpoint_exit_code(rpc_error_code: i64) -> i32 {
     match rpc_error_code {
         -32602 => 2, // INVALID_PARAMS
