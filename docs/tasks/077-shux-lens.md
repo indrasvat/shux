@@ -908,3 +908,43 @@ All fixed on-branch:
 **Accepted-as-documented (claude round 2):** explicit `session.kill` on a
 scratch now blocks up to ~2.5 s awaiting group-death confirmation
 (LENS-R-042 sequence + bounded retry) — intended behavior, no action.
+
+## P5 convergence round 3 (2026-07-10 — codex: N1/N2 FIXED; N3-at-startup + 1 new minor; both fixed)
+
+Codex round 3 on the round-2 delta: N1 FIXED (shield + JoinError mapping +
+cfg-gated hooks verified), N2 FIXED (killpg(0) probe semantics confirmed;
+M14-class residual accepted). Two remaining items, both fixed on-branch:
+
+1. **N3 NOT FIXED at the STARTUP path (now fixed):** round 2 preserved
+   registry rows on Unconfirmed in the timer reaper and
+   `on_session_killed`, but `startup_reap` still treated Unconfirmed as a
+   mere `killed=false`, wrote a `scratch.reap` audit row anyway, and then
+   UNCONDITIONALLY deleted `scratch-registry.json` — a stubborn group
+   surviving the startup reap became invisible to every future restart
+   reap (the B3-class hole relocated to startup). Fix: rows now resolve
+   INDIVIDUALLY — Died/AlreadyDead rows are audited and dropped;
+   Unconfirmed rows get an ERROR log, NO reap audit, and are RE-PERSISTED
+   via the shared `persist_rows_atomic` helper (temp+rename, the same B2
+   atomicity as the runtime persist); the file is deleted only when every
+   row resolved (an empty survivor list and "no file" are the same state).
+   Test (`startup_reap_repersists_unconfirmed_rows_for_the_next_restart`):
+   real live group + forced-unconfirmed flag → after the first startup the
+   row is still in the persisted file (valid JSON, same pgid), zero
+   `scratch.reap` audit entries; a second startup with the flag cleared
+   reaps it for real (group dead, file removed, reap audited).
+
+2. **Minor (new) — self-declared trust anchor (fixed):** `verify_chain`
+   adopted the FIRST line's `prev_hash` as the trust anchor, so deleting a
+   PREFIX of lines inside a single file passed verification. Fix: anchors
+   must be externally justified, never self-declared — new `ChainAnchor`
+   {`Exact(hash)` | `TrustedStart`}: `verify_chain` requires the first
+   entry to be genesis-rooted (strict `Exact(GENESIS)` verify) or an
+   `audit.rotate` continuation header (which delegates to the full
+   `verify_chain_set` walk — only a verified predecessor justifies the
+   anchor); anything else is rejected with "unjustified chain anchor".
+   `verify_chain_set`'s oldest-present file applies the same structural
+   rule (genesis or rotate header), so a prefix deletion inside the oldest
+   rotated file is caught too. Test (`audit_prefix_deletion_is_detected`):
+   delete the first 2 lines of a live log → both `verify_chain` and
+   `verify_chain_set` fail naming the unjustified anchor; intact log and
+   the existing rotation/tamper tests stay green.

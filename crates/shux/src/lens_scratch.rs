@@ -244,22 +244,41 @@ fn last_hash_in_file(path: &Path) -> Option<String> {
     v.get("hash").and_then(|h| h.as_str()).map(str::to_string)
 }
 
+/// Anchor requirement for the first entry of an audit file under
+/// verification (P5 round-3 codex minor: a freely-adopted first
+/// `prev_hash` made deleting a PREFIX of lines undetectable — the anchor
+/// must be externally justified, never self-declared).
+#[derive(Clone, Copy)]
+enum ChainAnchor<'a> {
+    /// The first entry's `prev_hash` must equal this exact hash (the zero
+    /// genesis, or the verified final hash of the predecessor file
+    /// supplied by the set walker).
+    Exact(&'a str),
+    /// The predecessor was LEGITIMATELY discarded (keep-5 rotation): the
+    /// first entry must still justify its anchor structurally — either
+    /// the zero genesis (true first file) or an `audit.rotate`
+    /// continuation header (whose stored prev is then adopted). A plain
+    /// entry with an arbitrary prev is rejected: that is exactly what a
+    /// prefix deletion leaves behind.
+    TrustedStart,
+}
+
 /// Verify one audit file's internal hash chain (P5 convergence round 1,
 /// codex M2d: a write-only chain is decoration — nothing could detect
-/// tampering). `anchor` is the required `prev_hash` of the FIRST entry:
-/// `Some(h)` enforces continuity from a predecessor file (or genesis);
-/// `None` adopts the stored first `prev_hash` as the trust anchor (used
-/// for the oldest present file, whose predecessor was legitimately
-/// discarded). Returns `(entries_verified, final_hash)` — `final_hash` is
-/// the anchor itself for an empty file. Fails on: a non-JSON line, a
-/// `prev_hash` that does not match the running head, or a stored `hash`
-/// that does not match the recomputation over
+/// tampering). Returns `(entries_verified, final_hash)` — `final_hash` is
+/// the anchor itself for an empty file (only meaningful under `Exact`).
+/// Fails on: a non-JSON line, an unjustified first anchor (see
+/// [`ChainAnchor`]), a `prev_hash` that does not match the running head,
+/// or a stored `hash` that does not match the recomputation over
 /// `sha256(prev_hash ‖ canonical(entry sans `hash`))`.
 #[allow(dead_code)]
-fn verify_chain_file(path: &Path, anchor: Option<&str>) -> Result<(usize, String), String> {
+fn verify_chain_file(path: &Path, anchor: ChainAnchor<'_>) -> Result<(usize, String), String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let mut prev: Option<String> = anchor.map(str::to_string);
+    let mut prev: Option<String> = match anchor {
+        ChainAnchor::Exact(h) => Some(h.to_string()),
+        ChainAnchor::TrustedStart => None,
+    };
     let mut count = 0usize;
     for (i, line) in text.lines().enumerate() {
         let mut v: serde_json::Value =
@@ -269,8 +288,26 @@ fn verify_chain_file(path: &Path, anchor: Option<&str>) -> Result<(usize, String
             .and_then(|h| h.as_str())
             .ok_or_else(|| format!("line {}: missing prev_hash", i + 1))?
             .to_string();
-        let expected = prev.get_or_insert_with(|| stored_prev.clone());
-        if stored_prev != *expected {
+        let expected = match &prev {
+            Some(h) => h.clone(),
+            None => {
+                // TrustedStart, first entry: the anchor must be
+                // structurally justified — genesis, or a rotation
+                // continuation header (codex round-3: never adopt an
+                // arbitrary prev; a prefix deletion leaves exactly that).
+                let is_rotate_header =
+                    v.get("method").and_then(|m| m.as_str()) == Some("audit.rotate");
+                if stored_prev != GENESIS_HASH && !is_rotate_header {
+                    return Err(format!(
+                        "line 1: unjustified chain anchor — first entry is neither \
+                         genesis-rooted nor an audit.rotate continuation \
+                         (prefix deletion?): prev_hash {stored_prev}"
+                    ));
+                }
+                stored_prev.clone()
+            }
+        };
+        if stored_prev != expected {
             return Err(format!(
                 "line {}: chain break — prev_hash {} != expected {}",
                 i + 1,
@@ -306,24 +343,48 @@ fn verify_chain_file(path: &Path, anchor: Option<&str>) -> Result<(usize, String
     Ok((count, prev.unwrap_or_else(|| GENESIS_HASH.to_string())))
 }
 
-/// Verify one audit file's internal chain, adopting its first entry's
-/// `prev_hash` as the anchor. For the FULL cross-file guarantee use
-/// [`verify_chain_set`].
+/// Verify a standalone audit file with a STRICT external anchor (P5
+/// round-3 codex minor): genesis-rooted files verify directly; a file
+/// opening with an `audit.rotate` continuation header delegates to the
+/// full [`verify_chain_set`] walk (the anchor is only justified by its
+/// verified predecessor); anything else — e.g. the remains of a prefix
+/// deletion — is rejected.
 ///
 /// Consumed by the unit + black-box test suites today (hence the
 /// dead-code allowance on the non-test build); the natural future surface
 /// is a `shux lens audit verify` CLI verb — P6 CLI-polish material.
 #[allow(dead_code)]
 pub fn verify_chain(path: &Path) -> Result<usize, String> {
-    verify_chain_file(path, None).map(|(n, _)| n)
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let Some(first_line) = text.lines().next() else {
+        return Ok(0); // empty log — nothing to verify
+    };
+    let first: serde_json::Value =
+        serde_json::from_str(first_line).map_err(|e| format!("line 1: not JSON: {e}"))?;
+    let first_prev = first.get("prev_hash").and_then(|h| h.as_str());
+    if first_prev == Some(GENESIS_HASH) {
+        return verify_chain_file(path, ChainAnchor::Exact(GENESIS_HASH)).map(|(n, _)| n);
+    }
+    if first.get("method").and_then(|m| m.as_str()) == Some("audit.rotate") {
+        // Continuation: only the set walk can justify the anchor.
+        return verify_chain_set(path);
+    }
+    Err(format!(
+        "line 1: unjustified chain anchor — first entry is neither genesis-rooted \
+         nor an audit.rotate continuation (prefix deletion?): prev_hash {:?}",
+        first_prev.unwrap_or("<missing>")
+    ))
 }
 
 /// Verify the WHOLE rotation set as one chain (P5 round-2 codex minor):
 /// oldest present rotated file (`.5` … `.1`) through the live file, each
 /// subsequent file required to chain exactly off its predecessor's final
 /// hash — so deleting or reordering an interior rotated file breaks
-/// verification. The oldest present file's first `prev_hash` is the trust
-/// anchor (its predecessor was legitimately discarded by keep-5).
+/// verification. The oldest present file's anchor must still be
+/// structurally justified (genesis or an `audit.rotate` continuation
+/// header — its predecessor was legitimately discarded by keep-5), so a
+/// prefix deletion inside the oldest file is caught too.
 /// Returns the total number of verified entries across the set.
 #[allow(dead_code)]
 pub fn verify_chain_set(live_path: &Path) -> Result<usize, String> {
@@ -337,8 +398,12 @@ pub fn verify_chain_set(live_path: &Path) -> Result<usize, String> {
     let mut anchor: Option<String> = None;
     let mut total = 0usize;
     for f in &files {
+        let file_anchor = match &anchor {
+            Some(h) => ChainAnchor::Exact(h),
+            None => ChainAnchor::TrustedStart,
+        };
         let (n, final_hash) =
-            verify_chain_file(f, anchor.as_deref()).map_err(|e| format!("{}: {e}", f.display()))?;
+            verify_chain_file(f, file_anchor).map_err(|e| format!("{}: {e}", f.display()))?;
         anchor = Some(final_hash);
         total += n;
     }
@@ -615,28 +680,7 @@ impl ScratchRegistry {
                 max_runtime_deadline: s.max_runtime_deadline_unix_ms,
             })
             .collect();
-        if rows.is_empty() {
-            let _ = std::fs::remove_file(&self.registry_path);
-            return;
-        }
-        if let Some(parent) = self.registry_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let tmp = self.registry_path.with_extension("json.tmp");
-        let json = match serde_json::to_vec_pretty(&rows) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!(error = %e, "scratch-registry: serialize failed");
-                return;
-            }
-        };
-        if let Err(e) = std::fs::write(&tmp, &json) {
-            tracing::warn!(error = %e, path = %tmp.display(), "scratch-registry: temp write failed");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &self.registry_path) {
-            tracing::warn!(error = %e, path = %self.registry_path.display(), "scratch-registry: rename failed");
-        }
+        persist_rows_atomic(&self.registry_path, &rows);
     }
 
     /// Startup reap (LENS-R-044/DEC-7): read a leftover registry file from
@@ -665,6 +709,15 @@ impl ScratchRegistry {
     /// (timestamped so repeated corrupt startups never overwrite earlier
     /// evidence — P5 round-2 codex minor), logged at ERROR, never silently
     /// deleted; nothing is killed.
+    ///
+    /// Per-row resolution (P5 round-3 codex — N3 at the startup path):
+    /// rows resolve INDIVIDUALLY. Died/AlreadyDead rows are audited and
+    /// dropped; an UNCONFIRMED row gets an ERROR log, NO reap audit, and
+    /// is RE-PERSISTED (atomic persist of the surviving subset) so the
+    /// next restart retries it — the file is deleted only when every row
+    /// resolved. Unconditional deletion here was the B3-class hole moved
+    /// to startup: a stubborn group surviving this reap became invisible
+    /// to every future restart.
     pub async fn startup_reap(runtime_dir: &Path, audit: &LensAuditLog) -> usize {
         let path = runtime_dir.join("scratch-registry.json");
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -688,7 +741,8 @@ impl ScratchRegistry {
             }
         };
         let mut killed = 0usize;
-        for row in &rows {
+        let mut unresolved: Vec<RegistryRow> = Vec::new();
+        for row in rows {
             let should_kill = match (row.start_time, process_start_token(row.pgid)) {
                 (0, _) => {
                     tracing::warn!(
@@ -720,12 +774,16 @@ impl ScratchRegistry {
                 KillOutcome::Died => true,
                 KillOutcome::AlreadyDead => false,
                 KillOutcome::Unconfirmed => {
+                    // Row NOT resolved: no reap audit (nothing was reaped),
+                    // re-persist so the next restart retries.
                     tracing::error!(
                         pgid = row.pgid,
+                        session_id = %row.session_id,
                         "scratch-registry startup reap: group death UNCONFIRMED; \
-                         processes may survive — inspect manually"
+                         re-persisting the row for the next restart's reap"
                     );
-                    false
+                    unresolved.push(row);
+                    continue;
                 }
             };
             if was_killed {
@@ -741,8 +799,40 @@ impl ScratchRegistry {
                 "killed": was_killed,
             }));
         }
-        let _ = std::fs::remove_file(&path);
+        // persist_rows_atomic removes the file when the list is empty —
+        // deletion happens ONLY when every row resolved.
+        persist_rows_atomic(&path, &unresolved);
         killed
+    }
+}
+
+/// Atomically write `rows` to `path` (temp-file + rename; P5 round-1 codex
+/// B2). An EMPTY list removes the file instead — "no registry" and
+/// "registry with zero rows" are the same state to the startup reap.
+/// Shared by `ScratchRegistry::persist` (in-memory rows) and
+/// `startup_reap`'s unresolved-row re-persist (P5 round-3 codex).
+fn persist_rows_atomic(path: &Path, rows: &[RegistryRow]) {
+    if rows.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    let json = match serde_json::to_vec_pretty(rows) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "scratch-registry: serialize failed");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        tracing::warn!(error = %e, path = %tmp.display(), "scratch-registry: temp write failed");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(error = %e, path = %path.display(), "scratch-registry: rename failed");
     }
 }
 
@@ -1811,6 +1901,63 @@ mod tests {
         TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
     }
 
+    // ── N3 at the STARTUP path (round 3): unconfirmed rows re-persist ───
+
+    #[tokio::test]
+    async fn startup_reap_repersists_unconfirmed_rows_for_the_next_restart() {
+        use std::sync::atomic::Ordering;
+        let dir = tmpdir();
+        let path = dir.path().join("scratch-registry.json");
+        // A REAL live group, so the second (unforced) startup genuinely
+        // reaps something.
+        let mut child = spawn_group_leader();
+        let pid = child.id();
+        let token = process_start_token(pid).expect("start token of live child");
+        write_registry_row(dir.path(), pid, token);
+        let audit = LensAuditLog::open(dir.path());
+
+        // First startup: the kill sequence is forced Unconfirmed — the row
+        // must survive (re-persisted), with NO reap audit (round 3: the
+        // old unconditional delete made a stubborn group invisible to all
+        // future restart reaps — the B3-class hole at startup).
+        TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!(killed, 0, "unconfirmed rows are not counted as killed");
+        assert!(
+            path.exists(),
+            "registry survives an unconfirmed startup reap"
+        );
+        let survivors: Vec<RegistryRow> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+                .expect("re-persisted registry is valid JSON");
+        assert_eq!(survivors.len(), 1, "the unresolved row was re-persisted");
+        assert_eq!(survivors[0].pgid, pid);
+        let audit_path = dir.path().join("lens-audit.ndjson");
+        let reap_audits = std::fs::read_to_string(&audit_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["method"] == "scratch.reap")
+            .count();
+        assert_eq!(reap_audits, 0, "no reap audit for an unresolved row");
+
+        // Second startup, flag cleared: the retry reaps for real.
+        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert_eq!(killed, 1, "the re-persisted row is reaped on retry");
+        let _ = child.wait(); // reap the zombie before probing
+        assert!(!pid_alive(pid), "group leader killed on the retry");
+        assert!(!path.exists(), "registry removed once every row resolved");
+        assert!(
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| e["method"] == "scratch.reap" && e["reason"] == "registry"),
+            "the completed retry IS audited"
+        );
+    }
+
     // ── M3: validate before casting ─────────────────────────────────────
 
     #[test]
@@ -1908,6 +2055,37 @@ mod tests {
             verify_chain(&path).is_err(),
             "tampered chain must fail verification"
         );
+    }
+
+    // ── prefix deletion (round 3): the anchor is never self-declared ────
+
+    #[test]
+    fn audit_prefix_deletion_is_detected() {
+        let dir = tmpdir();
+        let audit = LensAuditLog::open(dir.path());
+        for i in 0..5 {
+            audit.append(
+                json!({"ts": iso_now(), "caller": "uds", "method": "scratch.create", "i": i}),
+            );
+        }
+        let path = dir.path().join("lens-audit.ndjson");
+        assert_eq!(verify_chain(&path).expect("intact log verifies"), 5);
+
+        // Delete the first 2 lines: the remaining chain is internally
+        // consistent, but its first entry's prev_hash is neither genesis
+        // nor a rotation continuation — a freely-adopted anchor used to
+        // wave this through (codex round-3 minor).
+        let text = std::fs::read_to_string(&path).unwrap();
+        let truncated: String = text.lines().skip(2).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, truncated).unwrap();
+        let err = verify_chain(&path).expect_err("prefix deletion must fail");
+        assert!(
+            err.contains("unjustified chain anchor"),
+            "failure names the unjustified anchor: {err}"
+        );
+        // The set walker applies the same strictness to its oldest file.
+        let err = verify_chain_set(&path).expect_err("set walk rejects it too");
+        assert!(err.contains("unjustified chain anchor"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
