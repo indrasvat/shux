@@ -1171,7 +1171,35 @@ sign-off record: `.shux/goldens/lens/evidence-manifest.json` (`k1_pos1`,
 INDEPENDENT verifier's re-render + byte cmp + visual sign-off) is
 outstanding — not self-certified here per the repo's golden discipline.
 
-### T-tier — T4 green, T1/T2/T3 BLOCKED (§16.4, not silently worked around)
+### T-tier adjudication round (2026-07-10, post-report): welcome-dismiss APPROVED + applied; T3 grayscale escalation OPEN
+
+The orchestrator + council APPROVED the welcome-dismiss LENS-TEST-CHANGE
+under strict conditions (bounded prompt wait IS the assertion — never send
+Enter speculatively; original sentinel wait unchanged; exact trailer
+wording). Applied as `dismiss_nidhi_welcome` in `lens_ttier.rs` (commit
+carries the exact approved trailer; the frozen guard confirmed it). The
+icons-matrix observation was adjudicated NOT a re-scope: all four T3 cells
+keep per-cell goldens even where byte-identical (duplicate-but-valid
+regression pins, byte-identity documented per-golden in the manifest).
+
+T1/T3 goldens minted under the approved recipe (5 PNGs, double-render
+byte-cmp identical, visually inspected — real Devanagari/CJK, truecolor
+accents in the color cells, colorless-looking nocolor cells). Result:
+**T1, T2, T4 green. T3 still RED** on a NEW, distinct §16.4 contradiction
+surfaced by the first-ever real evaluation of its grayscale assertion: the
+frozen `is_grayscale_png` (strict per-pixel R==G==B) is unsatisfiable by
+construction — (a) nidhi emits OSC 11 (theme background → RGB(7,9,14),
+spread 7) even under `--no-color`+`NO_COLOR=1`, and (b) `shux-raster`'s
+`bg_default` is `[16,16,24]`, also blue-tinted, so even an OSC-free
+NO_COLOR frame can never be strictly gray. The golden itself byte-matches
+(assert_png_golden passes); only the grayscale predicate fails. Measured
+separation for a sound replacement: nocolor max channel spread 7 (zero
+pixels > 8) vs color max spread 159 (8,651 pixels > 8) — a near-grayscale
+predicate (spread ≤ 8) separates the matrix decisively while preserving
+the NO_COLOR intent. Frozen helper NOT modified; awaiting adjudication.
+Full record: BASELINE-APPROVAL.md P6 addendum.
+
+### T-tier — original P6 diagnosis (historical; superseded by the adjudication above)
 
 `t4_vivecaka_help_card` (vivecaka 0.1.9, network-free help card at 100×30
 and 60×20) is green — `t4_vivecaka_help_100x30.png` /

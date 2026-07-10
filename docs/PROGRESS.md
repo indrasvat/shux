@@ -104,6 +104,14 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-10 — test(lens): P6 T-tier adjudication round — welcome-dismiss applied, T1/T3 goldens minted, T3 grayscale escalation opened (task 077; T-tier now 3/4)**
+- Orchestrator + council APPROVED the T1–T3 welcome-dismiss LENS-TEST-CHANGE (conditions: bounded prompt wait IS the assertion, never speculative Enter, original sentinel wait unchanged, exact trailer wording). Applied as `dismiss_nidhi_welcome` in the frozen `lens_ttier.rs`; commit-msg frozen guard confirmed the trailer. T1 + T2 flipped green.
+- Icons-matrix adjudication: NOT re-scoped — all four T3 cells keep per-cell goldens even where byte-identical (nerd/ascii color == T1's PNG; both nocolor cells identical); byte-identity documented per-golden in the manifest as duplicate-but-valid regression pins.
+- T1/T3 goldens minted PROVISIONAL (5 PNGs, double-render byte-cmp identical, visually inspected, version-keyed to nidhi 0.1.0-alpha.1 with the welcome-screen behavior record in each manifest entry).
+- **NEW §16.4 escalation (OPEN):** T3 still RED — its frozen `is_grayscale_png` (strict R==G==B) is unsatisfiable by construction: nidhi emits OSC 11 theme background RGB(7,9,14) even under `--no-color`+`NO_COLOR=1`, and shux-raster's own `bg_default` [16,16,24] is blue-tinted. Golden byte-matches; only the predicate fails. Measured separation for the proposed spread≤8 replacement: nocolor max spread 7 / 0 px > 8; color max spread 159 / 8,651 px > 8. Frozen helper NOT touched; awaiting adjudication (full record in BASELINE-APPROVAL.md P6 addendum).
+- Supplementary dootsabha round (codex; agy outage, partial): CONVERGED, zero new B/M, one MINOR — stale `send-keys <pane> -t` line in the `shux lens --help` recipe — fixed (`-s SID -p PANE -t ...`).
+- Gates this round: `make lint` clean · frozen guard trailer-confirmed · T-tier observed 3/4 (T1/T2/T4 PASS, T3 grayscale RED per above). Full serial re-gate (test-lens + test-lens-t) pending the shux-tui-qa agent finishing its own leak-guarded runs (serial rule).
+
 **2026-07-10 — feat(lens): P6 skill rewrite + CLI polish + K1/E1/T4 goldens (task 077, gate 37/0 for `make test-lens`; T-tier 1/4 — T4 green, T1/T2/T3 BLOCKED)**
 - Branch `feat/lens-p6-skill-polish` from `origin/main` at `eb65947` (v0.42.0, includes P5 #92).
 - **K1/E1 goldens minted (PROVISIONAL, §14 raster-untouched rule):** `k1_pos1/2/3.png`, `e1_glance.png`, `e1_heat.png` — driven live via the CLI through the exact frozen-test steps, byte-reproducible across 2 independent runs (fresh daemon each time), live deltas match the frozen assertions exactly (K1: 2 cells/press; E1: 10 cells, exact regions). Cross-validated against already-RATIFIED P4 `d2_heat.png` (byte-identical) and against each other (`k1_pos3.png` == `e1_glance.png` by fixture design). `make test-lens` now **37/0 — full green**.
