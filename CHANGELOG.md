@@ -1,3 +1,10 @@
+# [0.42.0](https://github.com/indrasvat/shux/compare/v0.41.0...v0.42.0) (2026-07-10)
+
+
+### Features
+
+* **lens:** scratch sessions + shux lens run — self-cleaning run-and-glance composite ([#92](https://github.com/indrasvat/shux/issues/92)) ([64745cf](https://github.com/indrasvat/shux/commit/64745cf20cce622b6efcb954969a1ee970bf1481)), closes [#91](https://github.com/indrasvat/shux/issues/91)
+
 # [0.41.0](https://github.com/indrasvat/shux/compare/v0.40.0...v0.41.0) (2026-07-10)
 
 
