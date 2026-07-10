@@ -95,6 +95,65 @@
         "S1 (crates/shux/tests/lens_settle.rs::s1_settle_happy_path)",
         "S2 (crates/shux/tests/lens_settle.rs::s2_settle_flake_gate_100x)"
       ]
+    },
+    "d2_heat": {
+      "phase": "P4",
+      "provisional": true,
+      "provisional_note": "MINTED in P4 (task 077) from the ACTUAL pane.diff_since heat-PNG render — the F4 fixture after `a`, diffed against the pre-`a` checkpoint. This is the ONE golden in P4 that exercises NEW rendering (the LENS-R-037 heat overlay: changed cells alpha-blended with rgba(163,38,56,128), unchanged cells desaturated 50% via Rec.601 luma). The base frame is the P2-approved glance raster + harness fixture-font chain on the FROZEN F4 fixture (unchanged rendering); only the post-render overlay is new, and its colours/desaturation are PRD-mandated. Determinism: integer-only overlay math; heat_png_is_deterministic unit test proves same-input byte-identity. Pending shux-vt-solid-qa (heat scope) PASS + orchestrator sign-off.",
+      "fixture": ".shux/fixtures/lens/f4_keys.sh",
+      "size": "80x24",
+      "rpc": "pane.diff_since",
+      "params": {
+        "pane_id": "<test pane; checkpoint before `a`, diff after `a`+settle>",
+        "since_revision": "<checkpoint revision>",
+        "heat_png": true
+      },
+      "png": "d2_heat.png",
+      "png_sha256": "deef295d5c3d55aeadfdb974fbe96a6b385806e790a8d846a35c77e9182e503e",
+      "expected_delta": {
+        "cells_changed": 10,
+        "regions": [
+          { "row": 2, "col_start": 2, "col_end": 3 },
+          { "row": 5, "col_start": 10, "col_end": 19 }
+        ]
+      },
+      "used_by": [
+        "D2 (crates/shux/tests/lens_diff.rs::d2_diff_exact_delta)"
+      ]
+    },
+    "a1_alt": {
+      "phase": "P4",
+      "provisional": true,
+      "provisional_note": "MINTED in P4 (task 077) from the ACTUAL pane.glance render of the F10 fixture's ALTERNATE screen (after the `E` token enters alt). Rendering is UNCHANGED from P2 (the glance PNG path); this golden enshrines the P2-approved raster + harness fixture-font chain on the FROZEN F10 fixture, so it is a raster-UNTOUCHED baseline (PRD sec14: ratification = independent re-render + byte cmp + visual + orchestrator sign-off, not the full gate). Content: magenta 'ALT-SCREEN' text + magenta frame blocks (truecolor/256/basic). Pending independent ratification.",
+      "fixture": ".shux/fixtures/lens/f10_altscreen.sh",
+      "size": "80x24",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<test pane; glanced on the alternate screen after `E`>"
+      },
+      "png": "a1_alt.png",
+      "png_sha256": "0a7906120336b191ef8b22749082321b2f3b1dc75fdf925b7fa3ca17c39fe1e4",
+      "expected_alt_screen": true,
+      "used_by": [
+        "A1 (crates/shux/tests/lens_diff.rs::a1_altscreen_semantics)"
+      ]
+    },
+    "a1_normal": {
+      "phase": "P4",
+      "provisional": true,
+      "provisional_note": "MINTED in P4 (task 077) from the ACTUAL pane.glance render of the F10 fixture's NORMAL screen after leaving the alternate screen (the `L` token restores it). Rendering UNCHANGED from P2 (glance PNG path) — raster-UNTOUCHED baseline on the FROZEN F10 fixture. Content: 'LENS-F10-ALT' + 'NORMAL-SCREEN' + the 256-colour strip + basic-colour blocks (the restored startup frame). Pending independent ratification.",
+      "fixture": ".shux/fixtures/lens/f10_altscreen.sh",
+      "size": "80x24",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<test pane; glanced on the normal screen after `L`>"
+      },
+      "png": "a1_normal.png",
+      "png_sha256": "a27b5e05352f40a1ab453888dd3eebd8b630e2c1a2f25673f133aed70d8ab5b9",
+      "expected_alt_screen": false,
+      "used_by": [
+        "A1 (crates/shux/tests/lens_diff.rs::a1_altscreen_semantics)"
+      ]
     }
   }
 }

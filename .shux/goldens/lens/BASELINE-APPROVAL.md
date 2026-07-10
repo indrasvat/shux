@@ -141,3 +141,52 @@ its own golden).
   (no monochrome/NO_COLOR regression). Cursor parked/hidden per fixture.
 - **Provenance:** unchanged font chain + fixtures from the P2 section above;
   see `evidence-manifest.json` → `goldens.s1_ready`.
+
+---
+
+## P4 addendum — checkpoints + `pane.diff_since` (task 077) — PROVISIONAL
+
+**Status: PROVISIONAL — minted by the P4 implementer; pending
+`shux-vt-solid-qa` (heat scope) PASS + orchestrator sign-off.** Per §16.3 the
+implementation does not self-certify; the QA gate visually inspects and the
+orchestrator ratifies before these flip to APPROVED.
+
+Three goldens land in P4. Two are raster-UNTOUCHED (glance path unchanged from
+P2 → PRD §14 lighter ratification: independent re-render + byte cmp + visual +
+orchestrator sign-off); one exercises NEW rendering (the heat overlay → full
+SOLID gate).
+
+- **`a1_alt.png`** (80×24), sha256
+  `0a7906120336b191ef8b22749082321b2f3b1dc75fdf925b7fa3ca17c39fe1e4`.
+  The F10 fixture's ALTERNATE screen (glanced after the `E` token). Raster
+  UNTOUCHED — the P2-approved glance render on the frozen F10 fixture.
+  Visual (implementing agent): magenta `ALT-SCREEN` at grid (1,1); three
+  magenta frame blocks at row 3 (truecolor / 256 / basic magenta); cursor
+  block bottom-right. No tofu, no monochrome regression.
+
+- **`a1_normal.png`** (80×24), sha256
+  `a27b5e05352f40a1ab453888dd3eebd8b630e2c1a2f25673f133aed70d8ab5b9`.
+  The F10 fixture's NORMAL screen RESTORED after the `L` token leaves alt.
+  Raster UNTOUCHED. Visual: `LENS-F10-ALT` (white) + `NORMAL-SCREEN` (green)
+  + the full 256-colour strip (row 5) + basic-colour blocks (row 6) — the
+  restored startup frame, full colour.
+
+- **`d2_heat.png`** (80×24), sha256
+  `deef295d5c3d55aeadfdb974fbe96a6b385806e790a8d846a35c77e9182e503e`.
+  The `pane.diff_since` HEAT PNG for F4 after `a` (diffed against the pre-`a`
+  checkpoint). This is the ONE P4 golden that exercises NEW rendering: the
+  LENS-R-037 overlay. Base frame = P2-approved glance raster on the frozen
+  F4 fixture; overlay = the 10 changed cells (red block at (2,2) +
+  `A-PRESSED` at (5,10)..(5,18)) alpha-blended with `rgba(163,38,56,128)`,
+  every unchanged cell desaturated 50% (Rec.601 luma, integer math).
+  Visual (implementing agent): the two changed regions carry the red heat
+  tint; the title, focus marker, and colour legend are visibly muted/greyed;
+  determinism proven by `heat_png_is_deterministic` (byte-identical re-render)
+  and the D2 CLI/RPC twins both byte-matching this golden.
+  **This one requires the full SOLID gate (heat scope), not just §14
+  ratification.**
+
+- **Provenance:** identical harness fixture-font chain + frozen fixtures as
+  the P2/P3 sections above; see `evidence-manifest.json` → `goldens.{d2_heat,
+  a1_alt,a1_normal}`. `shux` workspace 0.40.0, git base
+  `d3b62829e55cf4ea945afaf5966a2a02d86e1e16`, rustc 1.95.0, Darwin arm64.
