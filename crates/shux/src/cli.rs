@@ -2724,9 +2724,12 @@ async fn resolve_uuid_shaped_session(
     match (id_match, name_match_id) {
         (true, Some(name_id)) if name_id != normalized => {
             eprintln!(
-                "warning: '{arg}' matches both a session ID and a different session's \
-                 NAME; targeting the session with that ID (id wins). To target the \
-                 session named '{arg}', pass its id: {name_id}"
+                "{}",
+                crate::style::warning(format!(
+                    "warning: '{arg}' matches both a session ID and a different \
+                     session's NAME; targeting the session with that ID (id wins). \
+                     To target the session named '{arg}', pass its id: {name_id}"
+                ))
             );
             Ok(normalized)
         }

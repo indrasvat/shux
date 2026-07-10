@@ -1292,8 +1292,12 @@ repo, pending that approval.
      the CLI wrapper never used it. `lens.run`'s own `session_id` is now
      directly `session kill`-able, closing the loop named in the PRD.
    - `session kill`'s positional arg help text updated (`NAME_OR_ID`).
-   All downstream RPCs still validate existence server-side (a bogus UUID
-   still gets `not_found`), so none of this can mask a real error.
+   (SUPERSEDED — the original "none of this can mask a real error" claim
+   here was refuted in the codex/claude review round: session NAMES may
+   legally be UUID-shaped, so the pure short-circuit could make such
+   sessions unaddressable or mistarget them. The shipped semantics are
+   id-first resolution with name fallback and 32-hex normalization — see
+   commit e332a84 and the corrected BASELINE-APPROVAL CLI-fix section.)
    `make test` (244 tests, non-lens) and `make test-lens` (37/37) both
    green after the change.
 2. **`--wait` exit-255-on-signal-death — documented AND empirically
