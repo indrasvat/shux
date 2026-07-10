@@ -1,3 +1,10 @@
+# [0.39.0](https://github.com/indrasvat/shux/compare/v0.38.0...v0.39.0) (2026-07-10)
+
+
+### Features
+
+* **lens:** P2 pane.glance — atomic pixel+text observation (task 077) ([#89](https://github.com/indrasvat/shux/issues/89)) ([0e6d611](https://github.com/indrasvat/shux/commit/0e6d6111ed43919b913d9319c444691909906b82))
+
 # [0.38.0](https://github.com/indrasvat/shux/compare/v0.37.0...v0.38.0) (2026-07-09)
 
 
