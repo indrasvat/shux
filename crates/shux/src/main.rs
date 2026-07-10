@@ -256,17 +256,36 @@ impl PaneIoState {
         }
     }
 
-    /// Store (or dedup) a `pane.glance{checkpoint:true}` clone (lens PRD §7,
-    /// LENS-R-030/031; P2 scope: storage + FIFO dedup only — no invalidation
-    /// tracking, that's P4). `grid`/`cursor` are the SAME atomic clone the
-    /// caller already rendered/extracted text from (LENS-R-010), keyed by
-    /// the revision read alongside it — not re-read here.
+    /// Store (or dedup) a checkpoint clone (`pane.glance{checkpoint:true}` /
+    /// `pane.checkpoint`; lens PRD §7, LENS-R-030/031). `grid`/`cursor` are
+    /// the SAME atomic clone the caller already rendered/extracted text from
+    /// (LENS-R-010), keyed by the revision read alongside it — not re-read
+    /// here.
     ///
     /// Refuses panes with no live VT (codex P2 review major): the glance
     /// handler stores under a SECOND lock acquisition, so the pane can be
     /// torn down between the clone and the store — `entry().or_default()`
     /// would silently resurrect checkpoint state for a dead pane, leaking it
     /// until daemon shutdown (teardown has already run and won't re-run).
+    ///
+    /// Refuses revisions BELOW the pane's invalidation marker (codex P4
+    /// convergence blocker — the same two-lock race, invalidation flavour):
+    /// glance clones at revision R, a concurrent resize/alt-switch
+    /// invalidates at R+1 (freeing all storage + recording the marker), then
+    /// glance's late store would re-insert pre-invalidation content and a
+    /// later `diff_since(R)` would silently diff stale-dimension frames
+    /// instead of reporting RESIZE_INVALIDATED (violating LENS-R-032/033).
+    /// The bound is STRICTLY-LESS-THAN, not ≤: LENS-R-033 pins "a checkpoint
+    /// created AFTER the invalidation (revision ≥ marker) is found by rule
+    /// (1)" — revision and clone are read in one io-lock critical section
+    /// and invalidating events bump the revision inside that same lock, so a
+    /// clone keyed at revision == marker depicts the POST-mutation frame
+    /// (e.g. `pane.checkpoint` immediately after a resize reads exactly the
+    /// marker revision; refusing it would orphan the post-resize frame and
+    /// make `diff_since(marker)` wrongly -32011). Only revision < marker
+    /// content predates the invalidation. Refusal is the same honest no-op
+    /// as the teardown race: `(false, None)` → glance reports
+    /// `checkpointed: false`.
     ///
     /// Unique per revision: a checkpoint already stored at `revision` is a
     /// no-op (stores nothing, evicts nothing). Otherwise inserts SORTED by
@@ -276,7 +295,8 @@ impl PaneIoState {
     /// can reach their second lock windows out of revision order, and
     /// insertion-order eviction would then evict the newer frame. (DEC-22:
     /// reads never refresh recency.) Returns `(stored_or_present,
-    /// evicted_revision)`: the flag is false only when the pane was gone.
+    /// evicted_revision)`: the flag is false only when the pane was gone or
+    /// the revision predates an invalidation.
     fn store_checkpoint(
         &mut self,
         pane_id: shux_core::model::PaneId,
@@ -286,6 +306,13 @@ impl PaneIoState {
     ) -> (bool, Option<u64>) {
         const MAX_CHECKPOINTS: usize = 4;
         if !self.vts.contains_key(&pane_id) {
+            return (false, None);
+        }
+        if self
+            .invalidations
+            .get(&pane_id)
+            .is_some_and(|&marker| revision < marker)
+        {
             return (false, None);
         }
         let deque = self.checkpoints.entry(pane_id).or_default();
@@ -1035,23 +1062,44 @@ async fn run_pane_pty_task(
                 let pulse = {
                     let mut state = io_state.lock().await;
                     let rev_state = if let Some(vt) = state.vts.get_mut(&pane_id) {
+                        // P4 convergence round 1 (claude blocker): gate the
+                        // invalidation on an ACTUAL dimension change, exactly
+                        // like the process branch gates on alt_switched. The
+                        // attach render loop re-fans EVERY pane of the active
+                        // window at its computed size on attach, client
+                        // resize, window switch, and zoom toggle — at an
+                        // unchanged client size those are no-op resizes, and
+                        // ungated invalidation made merely attaching (or a
+                        // same-size pane.set_size) destroy every checkpoint.
+                        // §4.2: only a dims change is the Class-A "pane
+                        // resize"; only that invalidates (LENS-R-032).
+                        let dims_before = (vt.grid().rows(), vt.grid().cols());
                         vt.resize(req.size.rows as usize, req.size.cols as usize);
-                        Some(PaneRevision {
-                            content_revision: vt.content_revision(),
-                            last_mutation_ns: vt.last_mutation_ns(),
-                        })
+                        let dims_changed = (vt.grid().rows(), vt.grid().cols()) != dims_before;
+                        Some((
+                            PaneRevision {
+                                content_revision: vt.content_revision(),
+                                last_mutation_ns: vt.last_mutation_ns(),
+                            },
+                            dims_changed,
+                        ))
                     } else {
                         None
                     };
                     // LENS-R-003: resize is Class-A — publish the bumped revision.
-                    if let Some(rev) = rev_state {
+                    if let Some((rev, dims_changed)) = rev_state {
                         state.publish_revision(pane_id, rev);
-                        // LENS-R-032/DEC-4: a resize invalidates every
+                        // LENS-R-032/DEC-4: a REAL resize invalidates every
                         // checkpoint of this pane. Record the marker at the
                         // POST-resize revision (LENS-R-033) BEFORE the ack, so
                         // a synchronous `pane.set_size` caller that immediately
                         // diffs an older checkpoint gets RESIZE_INVALIDATED.
-                        state.invalidate_checkpoints(pane_id, rev.content_revision);
+                        // Same-size requests never reach here (dims_changed
+                        // false): the frame did not change, checkpoints stay
+                        // valid.
+                        if dims_changed {
+                            state.invalidate_checkpoints(pane_id, rev.content_revision);
+                        }
                     }
                     state.render_pulse.clone()
                 };
@@ -7163,6 +7211,65 @@ mod tests {
         state.invalidate_checkpoints(pane_id, 9);
         state.invalidate_checkpoints(pane_id, 3); // stale/out-of-order
         assert_eq!(state.invalidations[&pane_id], 9);
+    }
+
+    /// codex P4 convergence blocker — checkpoint-resurrection across an
+    /// invalidation: glance clones at revision R under lock #1, a concurrent
+    /// resize invalidates at R+1, then glance's store under lock #2 arrives
+    /// with the PRE-invalidation clone. store_checkpoint must refuse any
+    /// revision BELOW the marker (deterministic — the race is replayed here
+    /// as direct calls, no timing), so the later diff reports
+    /// RESIZE_INVALIDATED instead of silently diffing stale-dimension
+    /// frames. Revisions AT the marker stay storable (LENS-R-033: "a
+    /// checkpoint created AFTER the invalidation (revision ≥ marker) is
+    /// found by rule (1)" — same-lock reads make an ==marker clone the
+    /// post-mutation frame).
+    #[test]
+    fn checkpoint_store_refuses_pre_invalidation_revisions() {
+        let pane_id = shux_core::model::PaneId::new();
+        let mut state = PaneIoState::new();
+        let vt = shux_vt::VirtualTerminal::new(24, 80);
+        let grid = vt.grid().clone_visible();
+        state.vts.insert(pane_id, vt);
+
+        // Baseline: a checkpoint at 5 stores and is diffable.
+        let (stored, _) = state.store_checkpoint(pane_id, 5, grid.clone(), (0, 0, true));
+        assert!(stored);
+
+        // The invalidating event (resize/alt-switch) lands at revision 7:
+        // frees all storage, records the marker.
+        state.invalidate_checkpoints(pane_id, 7);
+
+        // The racing glance's LATE store of the pre-invalidation clone at 5
+        // must be refused — no checkpoint materializes.
+        let (stored, evicted) = state.store_checkpoint(pane_id, 5, grid.clone(), (0, 0, true));
+        assert!(!stored, "pre-invalidation revision must be refused");
+        assert!(evicted.is_none());
+        assert!(
+            state.checkpoints.get(&pane_id).is_none_or(|d| d.is_empty()),
+            "no checkpoint may materialize below the marker"
+        );
+
+        // The diff decision path then reports RESIZE_INVALIDATED for 5 —
+        // never a stale-dimension diff (the blocker's observable).
+        let err = diff_lookup_checkpoint(&state, &pane_id, 5).unwrap_err();
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::ResizeInvalidated.code(),
+            "diff_since(R) after the refused store must be -32011"
+        );
+
+        // AT the marker (== 7): the post-mutation frame, storable and
+        // diffable — refusing it would orphan the immediately-post-resize
+        // pane.checkpoint and make diff_since(7) wrongly -32011.
+        let (stored, _) = state.store_checkpoint(pane_id, 7, grid.clone(), (0, 0, true));
+        assert!(stored, "revision == marker is the post-mutation frame");
+        assert!(diff_lookup_checkpoint(&state, &pane_id, 7).is_ok());
+
+        // Above the marker: normal storage.
+        let (stored, _) = state.store_checkpoint(pane_id, 8, grid, (0, 0, true));
+        assert!(stored);
+        assert!(diff_lookup_checkpoint(&state, &pane_id, 8).is_ok());
     }
 
     /// P4 DoD (council D2) — the diff is independent of `DirtyState`: it reads
