@@ -1,3 +1,10 @@
+# [0.41.0](https://github.com/indrasvat/shux/compare/v0.40.0...v0.41.0) (2026-07-10)
+
+
+### Features
+
+* **lens:** pane.checkpoint + pane.diff_since — exact screen diffs with invalidation semantics ([#91](https://github.com/indrasvat/shux/issues/91)) ([80ffce8](https://github.com/indrasvat/shux/commit/80ffce8f58e519dfd9792aeacb72e1221260d964)), closes [#1](https://github.com/indrasvat/shux/issues/1) [#2](https://github.com/indrasvat/shux/issues/2) [#204060](https://github.com/indrasvat/shux/issues/204060) [#204060](https://github.com/indrasvat/shux/issues/204060)
+
 # [0.40.0](https://github.com/indrasvat/shux/compare/v0.39.0...v0.40.0) (2026-07-10)
 
 
