@@ -1,0 +1,1 @@
+{"actual": ".shux/out/lens-p4/rerender/d2_heat.png", "changed_pixels": 0, "diff": ".shux/out/lens-p4/rerender/d2_heat_diff.png", "expected": ".shux/goldens/lens/d2_heat.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [720, 456], "status": "pass", "total_pixels": 328320}
