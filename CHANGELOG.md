@@ -1,3 +1,10 @@
+# [0.40.0](https://github.com/indrasvat/shux/compare/v0.39.0...v0.40.0) (2026-07-10)
+
+
+### Features
+
+* **lens:** pane.wait_settled quiescence primitive + cancellable RPC execution ([#90](https://github.com/indrasvat/shux/issues/90)) ([3914dbb](https://github.com/indrasvat/shux/commit/3914dbb1e6ab23fcb5e7f2f5a194fbf7f07dc689))
+
 # [0.39.0](https://github.com/indrasvat/shux/compare/v0.38.0...v0.39.0) (2026-07-10)
 
 
