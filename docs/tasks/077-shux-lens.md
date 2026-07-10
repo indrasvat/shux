@@ -494,3 +494,48 @@ goldens and SOLID QA PASS stand; neither blocker touches rendering.
    then flushes the pane's resize channel (its ack fires only after
    everything queued before it) — the diff is deterministic in both the red
    and green directions.
+
+## PR #91 bot round (2026-07-10 — codex P1+P2, greptile 3×P2, all fixed)
+
+1. **codex P1 (memory) — heat pre-render pixel budget:** shared
+   `lens_pixel_budget_check` (the exact 16M-pixel cap from
+   glance/snapshot; glance refactored onto it, error byte-identical) now
+   gates `pane.diff_since{heat_png:true}` inside the lock BEFORE any RGBA
+   allocation, positioned AFTER the LENS-R-033 lookup so
+   stale/invalidated wins over the payload error. Heat-less diffs never
+   hit it. Unit: `lens_pixel_budget_check_guard_predicate`. Black-box:
+   `crates/shux/tests/diff_heat_budget.rs` (1000×1000 F1 pane → -32013
+   `{pixels, max_pixels, hint(heat_png=false)}`; CLI `--heat` exit 5, no
+   file written; heat-less diff on the same oversized pane succeeds).
+
+2. **codex P2 (semantic, ADJUDICATED → LENS-R-038b):** `PaneCheckpoint`
+   gains `default_colors` (captured in the same critical section as the
+   grid clone in both `pane.checkpoint` and `pane.glance{checkpoint}`);
+   `diff_lookup_checkpoint` returns it; `compute_lens_diff` resolves
+   `Color::Default` against each side's respective defaults. Rule: a
+   changed fg/bg default marks every cell that is `Default` in that
+   channel on BOTH sides (asymmetric pairs already raw-differ);
+   concrete-colored cells stay unmarked; OSC 12 cursor default never
+   marks (DEC-11); unchanged defaults → byte-identical to raw equality.
+   Internal-only storage change; no RPC surface change beyond diff
+   behavior. Verified non-regressive: D-tier 6/6 with `d2_heat.png`
+   byte-identical (F4 touches no defaults); lens gate 27/10 identical.
+   Tests: (a) unit marks/regions/bbox + black-box
+   `crates/shux/tests/diff_default_colors.rs` — REAL OSC 11 `#204060`
+   via a token-paced `exec sh -c` script pane (40×10): exactly 395/400
+   cells, full-width regions split around the 5 truecolor cells; (b)
+   `compute_lens_diff_unchanged_defaults_matches_raw`; (c) heat base
+   uses CURRENT defaults — unit integer-math probes + black-box pixel
+   probes (changed blank = (97,50,75); unchanged truecolor = (58,103,73)).
+
+3. **greptile P2s:** `lens_checkpoint_exit_code` doc enumerates the real
+   error surface incl. INVALID_PARAMS→2 (their suggested text); `pane
+   diff` CLI help enumerates PAYLOAD_TOO_LARGE among exit-5 causes;
+   `diff.changed_mask` MOVED into the heat closure (needless clone
+   dropped).
+
+   Implementation note: the first draft of the OSC black-box test used a
+   prompt-bearing `sh` pane — the long default prompt wrapped at 40 cols
+   and SCROLLED the pane (shifting every row; observed 400/400 cells).
+   Rewritten as an inline `exec`'d token-paced script (the fixtures'
+   promptless pattern; EOF-safe `while read` loop).
