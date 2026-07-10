@@ -1,3 +1,10 @@
+# [0.43.0](https://github.com/indrasvat/shux/compare/v0.42.0...v0.43.0) (2026-07-10)
+
+
+### Features
+
+* **lens:** skill rewrite + full gate green + unaided-agent proof ([#93](https://github.com/indrasvat/shux/issues/93)) ([5cc1ca3](https://github.com/indrasvat/shux/commit/5cc1ca31d09c69a05c03c5ab4cbbdf7e50795862))
+
 # [0.42.0](https://github.com/indrasvat/shux/compare/v0.41.0...v0.42.0) (2026-07-10)
 
 
