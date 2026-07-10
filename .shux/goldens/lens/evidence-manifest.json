@@ -78,6 +78,23 @@
       "used_by": [
         "G2w (crates/shux/tests/lens_glance.rs::g2w_glance_fidelity_f5_wide)"
       ]
+    },
+    "s1_ready": {
+      "phase": "P3",
+      "provisional": true,
+      "provisional_note": "MINTED in P3 (task 077) — the F2 fixture's post-settle READY frame, glanced after pane.wait_settled returns settled=true. P3 changes NO rendering code (settle is a pure watch-channel wait + the shux-vt monotonic clock exposed public); this golden is produced by the SAME P2-approved raster + harness fixture-font chain on the FROZEN F2 fixture. Determinism proven: byte-identical across 3 standalone runs AND the S2 100x flake gate (100/100 byte-identical). Visually inspected by the implementing agent (LENS-F2-SPIN sentinel, amber braille spinner at grid (1,1), green-bold READY at grid (11,34), truecolor + 256-color + basic-color legend rows — no monochrome regression). AWAITS downstream verifier + shux QA + DootSabha council ratification per the standing chain (P3 has no SOLID VT QA gate in PRD sec14; sec16.3 approval is deferred to that chain — the implementation does NOT self-certify this as an approved baseline).",
+      "fixture": ".shux/fixtures/lens/f2_spinner.sh",
+      "size": "80x24",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<test pane; glanced after pane.wait_settled settled=true>"
+      },
+      "png": "s1_ready.png",
+      "png_sha256": "42071d0ff45a299bf1b6dc5d70c124c1abb2dbe412efe1a1a16a69fcf27cf086",
+      "used_by": [
+        "S1 (crates/shux/tests/lens_settle.rs::s1_settle_happy_path)",
+        "S2 (crates/shux/tests/lens_settle.rs::s2_settle_flake_gate_100x)"
+      ]
     }
   }
 }

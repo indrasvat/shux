@@ -3797,6 +3797,50 @@ fn snapshot_font_key(cfg: &shux_core::config::Config) -> SnapshotFontKey {
     }
 }
 
+// ── `pane.wait_settled` settle math (§6 SPEC-C; pure, unit-tested) ────────
+//
+// LENS-R-025 parameter bounds. Kept as named constants so the RPC handler and
+// the unit tests share one source of truth.
+const SETTLE_QUIET_MIN_MS: u64 = 10;
+const SETTLE_QUIET_MAX_MS: u64 = 60_000;
+const SETTLE_TIMEOUT_MAX_MS: u64 = 600_000;
+
+/// LENS-R-020: a pane is settled once it has been quiet for `quiet_ms`, i.e.
+/// `monotonic_now_ns − last_mutation_ns ≥ quiet_ms × 1_000_000`. The unit
+/// conversion is EXPLICIT and both sides are nanoseconds — the ns↔ms mixup is
+/// the councils-caught deadline-math bug class. `saturating_*` keeps a clock
+/// that briefly reads below `last_mutation_ns` (never happens on a monotonic
+/// clock, but cheap insurance) from underflowing into "settled".
+fn settle_is_quiet(now_ns: u64, last_mutation_ns: u64, quiet_ms: u64) -> bool {
+    now_ns.saturating_sub(last_mutation_ns) >= quiet_ms.saturating_mul(1_000_000)
+}
+
+/// Nanoseconds of quiet still owed before settle (0 once already settled). Used
+/// to size the event-driven sleep so it is never shorter than the remaining
+/// deadline (LENS-R-021: no polling).
+fn settle_remaining_quiet_ns(now_ns: u64, last_mutation_ns: u64, quiet_ms: u64) -> u64 {
+    quiet_ms
+        .saturating_mul(1_000_000)
+        .saturating_sub(now_ns.saturating_sub(last_mutation_ns))
+}
+
+/// LENS-R-025 parameter validation: `quiet_ms ∈ [10, 60_000]`,
+/// `timeout_ms ∈ [quiet_ms, 600_000]`. Violations → INVALID_PARAMS (-32602),
+/// which the CLI maps to exit 2 (§10 exit table, V1).
+fn validate_wait_settled_params(quiet_ms: u64, timeout_ms: u64) -> Result<(), shux_rpc::RpcError> {
+    if !(SETTLE_QUIET_MIN_MS..=SETTLE_QUIET_MAX_MS).contains(&quiet_ms) {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "quiet_ms {quiet_ms} out of range [{SETTLE_QUIET_MIN_MS}, {SETTLE_QUIET_MAX_MS}]"
+        )));
+    }
+    if !(quiet_ms..=SETTLE_TIMEOUT_MAX_MS).contains(&timeout_ms) {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "timeout_ms {timeout_ms} out of range [quiet_ms={quiet_ms}, {SETTLE_TIMEOUT_MAX_MS}]"
+        )));
+    }
+    Ok(())
+}
+
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
 #[allow(clippy::too_many_arguments)]
 fn register_pane_io_methods(
@@ -3818,6 +3862,7 @@ fn register_pane_io_methods(
     let g9 = graph.clone();
     let g10 = graph.clone();
     let g12 = graph.clone(); // pane.glance (LENS-R-010..016)
+    let g13 = graph.clone(); // pane.wait_settled (LENS-R-020..025)
     let g11 = graph;
 
     let io1 = io_state.clone();
@@ -3832,6 +3877,7 @@ fn register_pane_io_methods(
     let io10 = io_state.clone();
     let io11 = io_state.clone();
     let io13 = io_state.clone(); // pane.glance
+    let io14 = io_state.clone(); // pane.wait_settled
     let io12 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
@@ -4845,6 +4891,133 @@ fn register_pane_io_methods(
             },
         )
         .register_with_policy(
+            // `pane.wait_settled` (§6 SPEC-C, LENS-R-020..025): block until the
+            // pane has been quiet for `quiet_ms`, or return `settled=false` on
+            // the server-side timeout deadline. Pure observation — same read
+            // sensitivity as glance.
+            "pane.wait_settled",
+            Policy::fixed(Sensitivity::ContentRead),
+            move |params: Option<serde_json::Value>| {
+                let gh = g13.clone();
+                let io = io14.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+
+                    // LENS-R-025: validate bounds FIRST → INVALID_PARAMS
+                    // (-32602). CLI maps this to exit 2 (§10, V1).
+                    let quiet_ms = params
+                        .get("quiet_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(300);
+                    let timeout_ms = params
+                        .get("timeout_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(10_000);
+                    validate_wait_settled_params(quiet_ms, timeout_ms)?;
+
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                    // LENS-R-003/021: subscribe to the pane's revision watch.
+                    // `subscribe()` seeds the receiver with the CURRENT published
+                    // value AND catches every value published after — no
+                    // lost-edge race (this is why the substrate is a `watch`,
+                    // not a `Notify`). Clone the receiver out UNDER the io lock,
+                    // then drop the lock before any `.await` (never hold the io
+                    // mutex across an await — the daemon's cardinal deadlock).
+                    let mut rx = {
+                        let state = io.lock().await;
+                        state
+                            .revisions
+                            .get(&pane_id)
+                            .map(|tx| tx.subscribe())
+                            .ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                            })?
+                    };
+
+                    // LENS-R-022: server-side monotonic deadline measured from
+                    // request acceptance. `waited_ms` is elapsed against the
+                    // SAME instant. LENS-R-023: `rx` and every sleep below live
+                    // inside this future, so a client disconnect (the router
+                    // drops the future) drops the waiter — no daemon growth.
+                    let accept = tokio::time::Instant::now();
+                    let timeout_deadline = accept + std::time::Duration::from_millis(timeout_ms);
+                    let waited_ms = |now: tokio::time::Instant| -> u64 {
+                        now.saturating_duration_since(accept)
+                            .as_millis()
+                            .min(u128::from(u32::MAX)) as u64
+                    };
+
+                    // Event-driven loop (LENS-R-021): no polling, and each sleep
+                    // is exactly the remaining quiet interval (capped by the
+                    // timeout), woken early only by a genuine Class-A revision.
+                    let mut channel_open = true;
+                    loop {
+                        // `borrow_and_update` copies the latest (revision, ns)
+                        // and marks it seen, so the next `changed()` fires only
+                        // on a strictly newer Class-A batch (Class-B never
+                        // publishes — LENS-R-024, S5 comes free).
+                        let rev = *rx.borrow_and_update();
+                        let now_ns = shux_vt::monotonic_now_ns();
+                        if settle_is_quiet(now_ns, rev.last_mutation_ns, quiet_ms) {
+                            return Ok(serde_json::json!({
+                                "settled": true,
+                                "revision": rev.content_revision,
+                                "waited_ms": waited_ms(tokio::time::Instant::now()),
+                            }));
+                        }
+
+                        let remaining = std::time::Duration::from_nanos(
+                            settle_remaining_quiet_ns(now_ns, rev.last_mutation_ns, quiet_ms),
+                        );
+                        let quiet_deadline = tokio::time::Instant::now() + remaining;
+                        let wake = quiet_deadline.min(timeout_deadline);
+
+                        if channel_open {
+                            tokio::select! {
+                                changed = rx.changed() => {
+                                    if changed.is_err() {
+                                        // Sender dropped: the pane was torn down
+                                        // mid-wait. No further Class-A batch can
+                                        // arrive, so the frozen value settles
+                                        // once the remaining quiet elapses
+                                        // (still bounded by the timeout). Stop
+                                        // awaiting the closed channel — otherwise
+                                        // `changed()` would busy-return Err.
+                                        channel_open = false;
+                                    }
+                                    // Otherwise a newer revision landed — loop
+                                    // and re-evaluate against the reset clock.
+                                }
+                                _ = tokio::time::sleep_until(wake) => {
+                                    if tokio::time::Instant::now() >= timeout_deadline {
+                                        let rev = *rx.borrow();
+                                        return Ok(serde_json::json!({
+                                            "settled": false,
+                                            "revision": rev.content_revision,
+                                            "waited_ms": waited_ms(tokio::time::Instant::now()),
+                                        }));
+                                    }
+                                    // Quiet deadline hit first — loop; the
+                                    // top-of-loop check now reports settled.
+                                }
+                            }
+                        } else {
+                            tokio::time::sleep_until(wake).await;
+                            if tokio::time::Instant::now() >= timeout_deadline {
+                                let rev = *rx.borrow();
+                                return Ok(serde_json::json!({
+                                    "settled": false,
+                                    "revision": rev.content_revision,
+                                    "waited_ms": waited_ms(tokio::time::Instant::now()),
+                                }));
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .register_with_policy(
             "window.snapshot",
             Policy::fixed(Sensitivity::ContentRead),
             {
@@ -5694,6 +5867,14 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         args.format,
                     )
                     .await
+                }
+                PaneCommand::WaitSettled {
+                    pane,
+                    quiet,
+                    timeout,
+                } => {
+                    cli::handle_pane_wait_settled(&mut stream, &pane, quiet, timeout, args.format)
+                        .await
                 }
                 PaneCommand::SetSize {
                     session,
@@ -7353,5 +7534,120 @@ done
         assert_eq!(bad_command.code, shux_rpc::ErrorCode::InvalidParams.code());
 
         harness.stop().await;
+    }
+
+    // ── `pane.wait_settled` settle-math unit tests (§6, L0 supporting) ────
+    //
+    // These pin the pure decision layer the RPC handler leans on. The
+    // black-box behavior (S1–S5, V1) is proven by the frozen red suite; these
+    // guard the ns↔ms conversion, the bounds table, the already-quiet fast
+    // path, and the waiter-drop primitive against silent regression.
+
+    #[test]
+    fn settle_math_ns_conversion_is_explicit_ms_times_million() {
+        // 300 ms of quiet == 300_000_000 ns. Exactly at the boundary settles;
+        // one ns short does not. This is the councils-caught bug class: a
+        // handler comparing raw ms against ns (or forgetting ×1_000_000)
+        // would settle ~a million times too eagerly.
+        let last = 1_000_000_000u64;
+        let quiet_ms = 300u64;
+        assert!(!settle_is_quiet(last + 299_999_999, last, quiet_ms));
+        assert!(settle_is_quiet(last + 300_000_000, last, quiet_ms));
+        assert!(settle_is_quiet(last + 300_000_001, last, quiet_ms));
+    }
+
+    #[test]
+    fn settle_math_already_quiet_returns_true_immediately() {
+        // A pane whose last mutation is far in the past is settled at call
+        // time (LENS-R-020 immediate return; S4's second call). `now` well
+        // beyond last + quiet.
+        let last = 5_000_000_000u64;
+        assert!(settle_is_quiet(last + 2_000_000_000, last, 300));
+    }
+
+    #[test]
+    fn settle_math_remaining_quiet_shrinks_then_zeroes() {
+        let last = 1_000_000_000u64;
+        let quiet_ms = 300u64; // 300_000_000 ns
+        // Just after a mutation: nearly the whole window remains.
+        assert_eq!(settle_remaining_quiet_ns(last, last, quiet_ms), 300_000_000);
+        // Half elapsed → half remains.
+        assert_eq!(
+            settle_remaining_quiet_ns(last + 150_000_000, last, quiet_ms),
+            150_000_000
+        );
+        // Fully elapsed → zero (never negative/underflow).
+        assert_eq!(
+            settle_remaining_quiet_ns(last + 300_000_000, last, quiet_ms),
+            0
+        );
+        assert_eq!(
+            settle_remaining_quiet_ns(last + 900_000_000, last, quiet_ms),
+            0
+        );
+    }
+
+    #[test]
+    fn settle_math_saturates_on_backwards_clock() {
+        // A `now` below `last_mutation_ns` (impossible on a monotonic clock,
+        // but the guard must not underflow into a bogus "quiet forever").
+        assert!(!settle_is_quiet(500, 1_000, 300));
+        assert_eq!(settle_remaining_quiet_ns(500, 1_000, 300), 300_000_000);
+    }
+
+    #[test]
+    fn settle_param_bounds_accept_valid_and_defaults() {
+        // Defaults (300 / 10_000) are valid.
+        assert!(validate_wait_settled_params(300, 10_000).is_ok());
+        // Exact boundaries are inclusive.
+        assert!(validate_wait_settled_params(SETTLE_QUIET_MIN_MS, SETTLE_QUIET_MIN_MS).is_ok());
+        assert!(validate_wait_settled_params(SETTLE_QUIET_MAX_MS, SETTLE_TIMEOUT_MAX_MS).is_ok());
+        // timeout == quiet is allowed (range is [quiet, 600_000]).
+        assert!(validate_wait_settled_params(500, 500).is_ok());
+    }
+
+    #[test]
+    fn settle_param_bounds_reject_out_of_range() {
+        // quiet below min (V1 case: 5 ms) → INVALID_PARAMS.
+        let e = validate_wait_settled_params(5, 10_000).unwrap_err();
+        assert_eq!(e.code, shux_rpc::ErrorCode::InvalidParams.code());
+        // quiet above max.
+        assert!(validate_wait_settled_params(60_001, 60_001).is_err());
+        // timeout below quiet (V1 case: quiet 300, timeout 100) → INVALID_PARAMS.
+        let e = validate_wait_settled_params(300, 100).unwrap_err();
+        assert_eq!(e.code, shux_rpc::ErrorCode::InvalidParams.code());
+        // timeout above max.
+        assert!(validate_wait_settled_params(300, 600_001).is_err());
+    }
+
+    #[test]
+    fn settle_waiter_subscribe_and_drop_is_bounded() {
+        // LENS-R-023: a waiter is just a `watch::Receiver` subscription; when
+        // the waiter future is dropped (client disconnect), the receiver
+        // drops with it and the daemon does NOT grow. Prove the primitive:
+        // subscribing adds a receiver, dropping removes it, and the sender
+        // survives with zero receivers (a torn-down waiter never wedges the
+        // pane's publisher).
+        let (tx, rx0) = watch::channel(PaneRevision {
+            content_revision: 1,
+            last_mutation_ns: 1,
+        });
+        assert_eq!(tx.receiver_count(), 1);
+        let waiter_a = tx.subscribe();
+        let waiter_b = tx.subscribe();
+        assert_eq!(tx.receiver_count(), 3);
+        drop(waiter_a);
+        drop(waiter_b);
+        assert_eq!(tx.receiver_count(), 1);
+        drop(rx0);
+        assert_eq!(tx.receiver_count(), 0);
+        // Publisher still usable with no waiters — send_if_modified reports a
+        // real change and does not error on the receiver-less channel.
+        let changed = tx.send_if_modified(|cur| {
+            cur.content_revision = 2;
+            true
+        });
+        assert!(changed);
+        assert_eq!(tx.borrow().content_revision, 2);
     }
 }

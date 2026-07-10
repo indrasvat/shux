@@ -101,3 +101,33 @@ re-baselining is a LENS-TEST-CHANGE event.
   per-golden PNG/text sha256, expected cursor/alt_screen fields.
 - `contact-sheet.png` — both goldens stacked for a single-glance human
   review pass (re-generated from the re-minted bytes).
+
+---
+
+## P3 addendum (2026-07-09) — `s1_ready.png` (PROVISIONAL, task 077)
+
+**Status: PROVISIONAL — awaiting the standing downstream chain (verifier +
+shux QA + DootSabha council).** The P3 implementation does NOT self-certify
+this baseline; §16.3 approval is deferred to that chain because P3 has no
+SOLID VT QA gate in PRD §14 (settle touches no rendering code).
+
+- **Golden:** `s1_ready.png` (80×24), sha256
+  `42071d0ff45a299bf1b6dc5d70c124c1abb2dbe412efe1a1a16a69fcf27cf086`.
+- **What it is:** the F2 fixture's post-settle READY frame, captured by
+  `pane.glance` immediately after `pane.wait_settled` returned
+  `settled=true` — the S1/S2 correctness anchor.
+- **Why it is trustworthy to mint here:** P3 adds only `pane.wait_settled`
+  (a `watch`-channel wait) + a public accessor for the existing shux-vt
+  monotonic clock. It changes NO raster/grid/VT-rendering code, so this PNG
+  is the already-approved P2 rasterizer + the same harness fixture-font
+  chain applied to the FROZEN F2 fixture. (§16.3's "may never mint a golden
+  in a PR that changes rendering code" does not trip — no rendering code
+  changed.)
+- **Determinism:** byte-identical across 3 standalone renders AND the S2
+  100× flake gate (100/100 byte-identical post-settle PNGs).
+- **Visual inspection (implementing agent):** LENS-F2-SPIN sentinel row 0;
+  amber braille spinner at grid (1,1); green-bold `READY` at grid (11,34);
+  the truecolor + 256-color + basic-ANSI legend rows render in full color
+  (no monochrome/NO_COLOR regression). Cursor parked/hidden per fixture.
+- **Provenance:** unchanged font chain + fixtures from the P2 section above;
+  see `evidence-manifest.json` → `goldens.s1_ready`.
