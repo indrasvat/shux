@@ -296,40 +296,56 @@ help card, purple/blue/cyan syntax highlighting; the 60×20 cell shows a
 partial/wrapped view because vivecaka's help card does not reflow to a
 narrower terminal — genuine app behavior, not a shux defect.
 
-### T1/T2/T3 — BLOCKED, not minted, frozen test unmodified (§16.4)
+### T1/T2/T3 — welcome-dismiss APPROVED and applied; T3 grayscale-predicate escalation OPEN
 
-**T1, T2, T3 are NOT green and no `t1_*`/`t3_*` goldens are committed here.**
-Root cause (confirmed empirically, not a "TUI not installed" case — `nidhi
-0.1.0-alpha.1` (commit `1e5d952`) IS installed and runs): nidhi now shows a
-mandatory "Press Enter to continue" welcome screen (`internal/ui/screens/
-welcome.go`, `RenderWelcome`) on every invocation, with no CLI flag, env var,
-or config key to skip it (checked `nidhi --help` and the binary's embedded
-strings for `nidhi.*` / `NIDHI_*` keys — none exist) and no auto-advance
-timeout (confirmed idle 8s with no input: still on the welcome frame). The
-frozen `crates/shux/tests/lens_ttier.rs` T1/T2/T3 bodies call `pane.wait_for`
-for the Devanagari stash-list sentinel (`विवेचक`) immediately after
-`lens.run`, with no dismiss keystroke in between — so every run times out at
-10s with an empty capture (`last_capture_preview: ""`), confirmed live for
-all three tests. This is a real behavior drift in the `nidhi` binary since
-the frozen §13 harness was authored, not an environment or installation gap.
+**Adjudication round 1 (2026-07-10, orchestrator + council): APPROVED.**
+Original diagnosis (preserved for the record): `nidhi 0.1.0-alpha.1` (commit
+`1e5d952`) shows a mandatory "Press Enter to continue" welcome screen
+(`internal/ui/screens/welcome.go`, `RenderWelcome`) on every invocation, with
+no CLI flag, env var, or config key to skip it (checked `nidhi --help` and
+the binary's embedded strings for `nidhi.*` / `NIDHI_*` keys — none exist)
+and no auto-advance timeout (confirmed idle 8s with no input). The frozen
+T1/T2/T3 bodies waited for the stash-list sentinel (`विवेचक`) with no
+dismiss in between — every run timed out at 10s with an empty capture
+(`last_capture_preview: ""`), confirmed live for all three tests. A real
+behavior drift in the `nidhi` binary since the frozen §13 harness was
+authored, not an environment or installation gap.
 
-**Per §16.2/§16.4, the frozen test file was NOT modified.** A CANDIDATE fix
-was verified out-of-band (not committed, not applied to the frozen file):
-insert `pane wait-for --text "Press Enter to continue"` then `pane send-keys
---data DQ==` (Enter) before the existing `pane wait-for --text "विवेचक"`, at
-all three call sites (T1, T2, T3). Candidate goldens rendered cleanly under
-this recipe with real Devanagari/CJK/emoji, full color, no tofu (scratch
-evidence, not committed — see the P6 implementer's final report for paths).
-One extra finding from the candidate run: `--icons nerd` vs `--icons ascii`
-produced byte-identical renders of the stash-LIST screen in this nidhi
-version (icon glyphs apparently only affect other screens, not the top-level
-list) — worth confirming against nidhi's own docs before treating T3's
-4-way matrix as still meaningful.
+**Applied under the approved conditions** (commit carries the exact trailer
+`LENS-TEST-CHANGE: T1-T3 dismiss mandatory nidhi 0.1.0-alpha.1 welcome
+screen before existing sentinel wait; no bypass or auto-advance exists;
+assertions and purpose unchanged.`): a `dismiss_nidhi_welcome` helper in
+`lens_ttier.rs` performs a BOUNDED `wait_for "Press Enter to continue"`
+(the prompt wait IS the assertion — Enter is never sent speculatively),
+then sends Enter (0x0d), then the caller's ORIGINAL sentinel wait runs
+unchanged. T1 and T2 flipped green immediately under this recipe.
 
-**This requires explicit user approval before any commit**: a
-`LENS-TEST-CHANGE: nidhi welcome-screen dismiss (T1/T2/T3)` trailer +
-one-question `dootsabha council` per §16.4, applied in a follow-up commit,
-NOT bundled into this PROVISIONAL golden mint.
+**Adjudication round 2 (2026-07-10, orchestrator + council): the T3 icons
+matrix is NOT re-scoped** even though `--icons nerd` vs `--icons ascii`
+render the stash-LIST screen byte-identically in this nidhi version — all
+four T3 cells keep their own goldens as duplicate-but-valid regression
+pins, with the byte-identity documented per-golden in
+`evidence-manifest.json`.
+
+**OPEN §16.4 escalation (surfaced by the first-ever real evaluation of
+T3's grayscale assertion — awaiting orchestrator adjudication):** T3's
+no-color cells FAIL the frozen `is_grayscale_png` check (strict R==G==B on
+every pixel) even though the goldens themselves byte-match. The strict
+predicate is unsatisfiable by construction on this stack, for two
+independent reasons: (a) nidhi emits OSC 11 to set its theme background —
+rendered as RGB(7,9,14), channel spread 7 — even under `--no-color` +
+`NO_COLOR=1` (the binary carries `]11;` strings; NO_COLOR conventionally
+suppresses ANSI text colors, not theme-background OSC); and (b)
+`shux-raster`'s own `bg_default` is `[16,16,24]` (also blue-tinted;
+`crates/shux-raster/src/lib.rs` RasterOptions::default), so even an
+OSC-free NO_COLOR render can never be strictly gray. Measured separation
+for a sound replacement predicate: the no-color golden's max per-pixel
+channel spread is 7 with ZERO pixels above spread 8; the color sibling's
+max spread is 159 with 8,651 pixels above 8 — a near-grayscale check
+(per-pixel `max(R,G,B) − min(R,G,B) ≤ 8`) separates the matrix decisively
+while preserving the assertion's intent (NO_COLOR suppressed the app's
+colored output). The frozen `is_grayscale_png` helper / T3 call sites were
+NOT modified for this; that change needs its own approval + trailer.
 
 ### CLI fix required to complete the E1 loop (see PR description for full diff)
 

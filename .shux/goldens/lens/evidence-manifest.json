@@ -234,6 +234,79 @@
         "E1 (crates/shux/tests/lens_loop.rs::e1_whole_loop)"
       ]
     },
+    "t1_nidhi_nerd_color_120x40": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6, §13 T-tier). MINTED after the council-APPROVED LENS-TEST-CHANGE (T1-T3 welcome dismiss): nidhi 0.1.0-alpha.1 shows a mandatory 'Press Enter to continue' welcome screen on EVERY launch — no CLI flag, env var, or config key bypasses it (binary strings-scanned for nidhi.*/NIDHI_* keys; none exist) and it never auto-advances (8s idle probe stayed on the welcome frame). Approved recipe (mirrored by the frozen test's dismiss_nidhi_welcome helper): BOUNDED wait_for 'Press Enter to continue' (the prompt wait IS the assertion — Enter is never sent speculatively) → send Enter (0x0d) → the ORIGINAL stash-list sentinel wait unchanged → settle → glance. Rendering UNCHANGED since P2 (glance path); provisional pending independent verifier ratification. Determinism: byte-identical across 2 independent driver runs (fresh isolated daemon each). Visual: nidhi stash LIST — 3 stashes with real Devanagari (निधि संग्रह, विवेचक समीक्षा), CJK (終端テスト), emoji fallback glyphs, colored accents, keybinding footer. BYTE-IDENTITY NOTE (council-adjudicated 2026-07-10: matrix NOT collapsed): byte-identical to t3_nidhi_nerd_color.png AND t3_nidhi_ascii_color.png — in nidhi 0.1.0-alpha.1 --icons nerd/ascii does not alter the stash-LIST screen. Each cell keeps its own golden as an independent regression pin; if a future nidhi differentiates them, the per-cell goldens diverge under version-keyed re-baseline.",
+      "fixture": "nidhi -C <make_nidhi_repo.sh fixture> --no-animation --icons nerd (real installed TUI)",
+      "app_version": "nidhi 0.1.0-alpha.1 (commit 1e5d952e6c409b7a83ffcc62c795156a06a7a7f0, built 2026-05-07T03:16:49Z)",
+      "size": "120x40",
+      "rpc": "pane.glance",
+      "params": {
+        "pane_id": "<scratch pane from lens.run; welcome dismissed per LENS-TEST-CHANGE recipe, sentinel waited, settled>"
+      },
+      "png": "t1_nidhi_nerd_color_120x40.png",
+      "png_sha256": "d97c03ed45f2c99ca9dc048940acc7fdc2c7d11539dcb9b10f7d3b498af21cad",
+      "used_by": [
+        "T1 (crates/shux/tests/lens_ttier.rs::t1_nidhi_golden)"
+      ]
+    },
+    "t3_nidhi_nerd_color": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/receipts/ratification status as t1_nidhi_nerd_color_120x40. Byte-identical to t1_nidhi_nerd_color_120x40.png and t3_nidhi_ascii_color.png (see t1 note; per-cell golden kept deliberately per council adjudication — duplicate-but-valid regression pin).",
+      "fixture": "nidhi -C <fixture> --no-animation --icons nerd (real installed TUI)",
+      "app_version": "nidhi 0.1.0-alpha.1 (commit 1e5d952e6c409b7a83ffcc62c795156a06a7a7f0)",
+      "size": "120x40",
+      "rpc": "pane.glance",
+      "png": "t3_nidhi_nerd_color.png",
+      "png_sha256": "d97c03ed45f2c99ca9dc048940acc7fdc2c7d11539dcb9b10f7d3b498af21cad",
+      "used_by": [
+        "T3 (crates/shux/tests/lens_ttier.rs::t3_nidhi_matrix)"
+      ]
+    },
+    "t3_nidhi_ascii_color": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/receipts/ratification status as t1_nidhi_nerd_color_120x40, with --icons ascii. Byte-identical to the nerd color cells (see t1 note; per-cell golden kept deliberately per council adjudication).",
+      "fixture": "nidhi -C <fixture> --no-animation --icons ascii (real installed TUI)",
+      "app_version": "nidhi 0.1.0-alpha.1 (commit 1e5d952e6c409b7a83ffcc62c795156a06a7a7f0)",
+      "size": "120x40",
+      "rpc": "pane.glance",
+      "png": "t3_nidhi_ascii_color.png",
+      "png_sha256": "d97c03ed45f2c99ca9dc048940acc7fdc2c7d11539dcb9b10f7d3b498af21cad",
+      "used_by": [
+        "T3 (crates/shux/tests/lens_ttier.rs::t3_nidhi_matrix)"
+      ]
+    },
+    "t3_nidhi_nerd_nocolor": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/receipts as t1_nidhi_nerd_color_120x40, with --no-color + NO_COLOR=1 in the scratch env. KNOWN OPEN ISSUE (escalated §16.4, awaiting orchestrator adjudication — T3 currently FAILS its frozen is_grayscale_png assertion against these bytes even though the golden itself matches): strict R==G==B grayscale is unsatisfiable by construction on this stack — (a) nidhi emits OSC 11 to set its theme background (renders as RGB(7,9,14), spread 7) even under --no-color/NO_COLOR, and (b) shux-raster's own bg_default [16,16,24] is also blue-tinted, so even an OSC-11-free NO_COLOR render could never satisfy strict grayscale. Measured separation: this PNG max channel spread = 7 with ZERO pixels above spread 8; the color sibling has max spread 159 with 8651 pixels above 8 — a near-grayscale predicate (spread <= 8) separates the matrix decisively. Byte-identical to t3_nidhi_ascii_nocolor.png (same icons-don't-affect-LIST finding; per-cell golden kept per council adjudication).",
+      "fixture": "nidhi -C <fixture> --no-animation --icons nerd --no-color, env NO_COLOR=1 (real installed TUI)",
+      "app_version": "nidhi 0.1.0-alpha.1 (commit 1e5d952e6c409b7a83ffcc62c795156a06a7a7f0)",
+      "size": "120x40",
+      "rpc": "pane.glance",
+      "png": "t3_nidhi_nerd_nocolor.png",
+      "png_sha256": "ced707be0fa07226828e1dfbc8ee8ae0b1e00c4f6acad7697b041e044a93cb92",
+      "used_by": [
+        "T3 (crates/shux/tests/lens_ttier.rs::t3_nidhi_matrix)"
+      ]
+    },
+    "t3_nidhi_ascii_nocolor": {
+      "phase": "P6",
+      "provisional": true,
+      "provisional_note": "PROVISIONAL (2026-07-10, task 077 P6) — same recipe/receipts/open-issue status as t3_nidhi_nerd_nocolor (see its note for the is_grayscale_png escalation). Byte-identical to t3_nidhi_nerd_nocolor.png; per-cell golden kept per council adjudication.",
+      "fixture": "nidhi -C <fixture> --no-animation --icons ascii --no-color, env NO_COLOR=1 (real installed TUI)",
+      "app_version": "nidhi 0.1.0-alpha.1 (commit 1e5d952e6c409b7a83ffcc62c795156a06a7a7f0)",
+      "size": "120x40",
+      "rpc": "pane.glance",
+      "png": "t3_nidhi_ascii_nocolor.png",
+      "png_sha256": "ced707be0fa07226828e1dfbc8ee8ae0b1e00c4f6acad7697b041e044a93cb92",
+      "used_by": [
+        "T3 (crates/shux/tests/lens_ttier.rs::t3_nidhi_matrix)"
+      ]
+    },
     "t4_vivecaka_help_100x30": {
       "phase": "P6",
       "provisional": true,
