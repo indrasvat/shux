@@ -554,8 +554,10 @@ pub enum SessionCommand {
 
     /// Kill a session.
     Kill {
-        /// Session name (positional or `-s/--session`).
-        #[arg(value_name = "NAME")]
+        /// Session name OR UUID (positional or `-s/--session`; issue #88 —
+        /// a UUID (e.g. the `session_id` a `lens run` response returns for
+        /// a hidden scratch session) works here too, not just names.
+        #[arg(value_name = "NAME_OR_ID")]
         name_pos: Option<String>,
 
         #[arg(short, long, conflicts_with = "name_pos")]
@@ -1609,6 +1611,14 @@ pub enum LensCommand {
     /// the printed output, and the CLI process itself exits with the
     /// CHILD's exit code once the child has started (§10 precedence rule —
     /// setup failures BEFORE the child starts use the table below instead).
+    ///
+    /// Signal death (killed by `--max-runtime`, an explicit `session kill`,
+    /// or anything else that never lets the child report its own status
+    /// code) has no POSIX exit code to report: the RPC's `exit_code` field
+    /// comes back `-1`, and the CLI's process exit — like any Unix process
+    /// exit — truncates to the low 8 bits, so the shell-visible `$?` is
+    /// `255`, not `-1`. Treat 255 from `--wait` as "the process never
+    /// exited on its own", not as a literal exit-code-255 from the child.
     Run {
         /// PTY size as `COLSxROWS` (e.g. `80x24`). Bounds cols in [20,500]
         /// rows in [5,200] are enforced server-side (INVALID_PARAMS, exit 2)
@@ -2312,6 +2322,13 @@ fn build_session_create_params(
 }
 
 /// Handle the `shux session kill` command.
+///
+/// Accepts either a session NAME or a session UUID (issue #88 direction,
+/// same rule as `resolve_session_id`): `lens.run` returns `session_id` as a
+/// UUID, and scratch sessions are excluded from the default `session.list`
+/// a name lookup would need, so a UUID-shaped argument is sent straight
+/// through as the RPC's `id` param — which `session.kill` has always
+/// accepted — instead of `name`.
 pub async fn handle_kill(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -2319,8 +2336,13 @@ pub async fn handle_kill(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let mut params = serde_json::Map::new();
+    let key = if uuid::Uuid::parse_str(session_name).is_ok() {
+        "id"
+    } else {
+        "name"
+    };
     params.insert(
-        "name".to_string(),
+        key.to_string(),
         serde_json::Value::String(session_name.to_string()),
     );
     if let Some(ev) = expected_version {
@@ -2640,11 +2662,23 @@ pub fn handle_init(root: &std::path::Path, format: OutputFormat) -> anyhow::Resu
     Ok(())
 }
 
-/// Resolve a session name to its UUID by querying session.list.
+/// Resolve a session name-or-UUID to its UUID.
+///
+/// Accepts either form (issue #88: RPC methods already take `id` OR `name` —
+/// `-s/--session` only resolved by name, so a caller holding a session UUID
+/// straight from an RPC/CLI result — e.g. `lens.run`'s `session_id`, which
+/// targets a SCRATCH session excluded from the default `session.list` this
+/// helper queries — had no CLI-side way to address it). A syntactically valid
+/// UUID is trusted as-is with no `session.list` round-trip; downstream RPCs
+/// still validate existence and return `PANE_NOT_FOUND`/`session not found`
+/// on a bogus id, so this short-circuit cannot mask a real error.
 async fn resolve_session_id(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
 ) -> Result<String, RpcClientError> {
+    if uuid::Uuid::parse_str(session_name).is_ok() {
+        return Ok(session_name.to_string());
+    }
     let result = rpc_call(stream, "session.list", serde_json::json!({})).await?;
     let sessions = result
         .get("sessions")
@@ -2986,8 +3020,18 @@ async fn resolve_pane_window_id(
             Ok((session_id, wid))
         }
         None => {
-            // Get active window from session
-            let result = rpc_call(stream, "session.list", serde_json::json!({})).await?;
+            // Get active window from session. `include_scratch: true` so a
+            // scratch session's pane (e.g. from `lens.run`'s `session_id`) is
+            // still driveable without an explicit `--window` — the default
+            // `session.list` visibility rule (LENS-R-041) is about listing,
+            // not about whether a caller who already holds the id can act on
+            // it (same "visibility != authorization" principle as the RPC).
+            let result = rpc_call(
+                stream,
+                "session.list",
+                serde_json::json!({ "include_scratch": true }),
+            )
+            .await?;
             let sessions = result
                 .get("sessions")
                 .and_then(|v| v.as_array())
