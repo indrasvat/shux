@@ -90,12 +90,11 @@ const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000
 /// therefore independently verifiable end-to-end; cross-file continuity is
 /// by filename order, not by hash linkage (documented contract).
 ///
-/// Caller field: entries record `caller: "uds"` unconditionally for now —
-/// the RPC layer does not expose caller identity to handlers, and plugin-
-/// originated calls dispatch through the same router handlers. Threading a
-/// real identity (uds vs plugin:<uuid>) needs a task-local or a Handler-
-/// signature change; deferred pending orchestrator adjudication (P5
-/// round-1 claude N3 — proposal reported, plumbing not invented here).
+/// Caller field: entries read `shux_rpc::current_caller()` — a
+/// `tokio::task_local!` the plugin dispatch wrapper scopes to
+/// `plugin:<uuid>` around each router dispatch (P5 round-1 claude N3,
+/// adjudicated). UDS requests and daemon-internal tasks (reap timers,
+/// startup reap) carry no scope and default to `"uds"`.
 ///
 /// Writes are best-effort: a failure is logged, never surfaced — losing an
 /// audit line must not break the scratch lifecycle it documents (same
@@ -625,7 +624,7 @@ impl ScratchRegistry {
             }
             audit.append(json!({
                 "ts": iso_now(),
-                "caller": "uds",
+                "caller": shux_rpc::current_caller(),
                 "method": "scratch.reap",
                 "reason": "registry",
                 "session_id": row.session_id,
@@ -862,7 +861,7 @@ async fn reap_scratch(
     // 4. Audit (LENS-R-052).
     audit.append(json!({
         "ts": iso_now(),
-        "caller": "uds",
+        "caller": shux_rpc::current_caller(),
         "method": "scratch.reap",
         "reason": reason,
         "session_id": session_id.to_string(),
@@ -956,7 +955,7 @@ pub async fn on_session_killed(
     }
     registry.audit.append(json!({
         "ts": iso_now(),
-        "caller": "uds",
+        "caller": shux_rpc::current_caller(),
         "method": "scratch.reap",
         "reason": "explicit",
         "session_id": session_id.to_string(),
@@ -1162,7 +1161,7 @@ async fn handle_lens_run(
 
     registry.audit.append(json!({
         "ts": iso_now(),
-        "caller": "uds",
+        "caller": shux_rpc::current_caller(),
         "method": "scratch.create",
         "session_id": session_id.to_string(),
         "pane_id": pane_id.to_string(),

@@ -798,14 +798,27 @@ above). Codex NOT CONVERGED (3B+4M+1m), claude NOT CONVERGED (2M ≡ codex's
    put the explicit-kill arm first, and a `claimed` flag on the registry
    row makes reap ownership exactly-once (`claim()` — timer reaper and
    explicit kill can never double-audit; `claim_is_exactly_once`); the
-   stale `remove` doc-comment rewritten. (5) Audit `caller` stays
-   hard-coded `"uds"` in handler entries — the RPC layer does NOT expose
-   caller identity to handlers; per adjudication no plumbing was invented,
-   and the minimal threading proposal is reported to the orchestrator
-   (task-local set by the plugin dispatch wrapper vs a Handler-signature
-   change). Denial entries DO carry `plugin:<uuid>` (the one place
-   identity is known). (6) Docs corrected per the verifier: E1 failure
-   point, 1163/1163 count, `--wait` 255 note (all above).
+   stale `remove` doc-comment rewritten. (5) Audit `caller` identity —
+   ADJUDICATED IMPLEMENT (task-local proposal accepted): new
+   `shux_rpc::caller` module (`tokio::task_local!` `RPC_CALLER` +
+   `current_caller()` defaulting to `"uds"` + `with_caller()` scope
+   wrapper); shux-plugin's `dispatch_plugin_frame` wraps each router
+   dispatch in `with_caller("plugin:<uuid>", …)` (the dispatch already
+   runs in its own spawned task, so the scope is naturally
+   request-bounded and does NOT propagate to tasks the handler spawns —
+   reap timers correctly revert to the daemon default); all seven
+   production audit sites read `current_caller()`. Zero handler-signature
+   changes. Tests at three levels: shux-rpc unit trio (default / scope /
+   no-spawn-propagation), shux-plugin
+   `dispatch_plugin_frame_scopes_caller_identity` (probe handler observes
+   `plugin:<uuid>` through the real dispatch path; direct dispatch reads
+   `uds`), and production-router
+   `production_lens_audit_caller_identity` (two real lens.run calls — one
+   plain, one wrapped in the exact plugin scope — audit `caller: uds` vs
+   `caller: plugin:test-uuid-1234`, chain still verifies). Denial entries
+   carry `plugin:<uuid>` via the denial hook as before. (6) Docs
+   corrected per the verifier: E1 failure point, 1163/1163 count,
+   `--wait` 255 note (all above).
 
 **Policy-tier caveat for the PR description (both reviewers accepted
 Grantable):** the grant name is `lens.run`, not `scratch:create`;

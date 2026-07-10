@@ -4545,9 +4545,10 @@ fn register_pane_io_methods(
     lens_audit: Arc<lens_scratch::LensAuditLog>,
 ) -> shux_rpc::RouterBuilder {
     // LENS-R-052 audit handles for the three lens observation methods
-    // (glance / checkpoint / diff). `caller` is recorded as "uds"
-    // unconditionally — see LensAuditLog's doc comment for the identity-
-    // threading proposal (P5 round-1 claude N3, deferred by adjudication).
+    // (glance / checkpoint / diff). `caller` comes from
+    // `shux_rpc::current_caller()` — the task-local the plugin dispatch
+    // wrapper scopes to `plugin:<uuid>`; UDS requests default to "uds"
+    // (P5 round-1 claude N3, adjudicated IMPLEMENT).
     let audit_glance = lens_audit.clone();
     let audit_checkpoint = lens_audit.clone();
     let audit_diff = lens_audit;
@@ -5583,7 +5584,7 @@ fn register_pane_io_methods(
                         .unwrap_or(0);
                     audit.append(serde_json::json!({
                         "ts": lens_scratch::iso_now(),
-                        "caller": "uds",
+                        "caller": shux_rpc::current_caller(),
                         "method": "pane.glance",
                         "pane_id": pane_id.to_string(),
                         "revision": revision,
@@ -5792,7 +5793,7 @@ fn register_pane_io_methods(
                     // no pane content, so bytes_returned is 0 by definition.
                     audit.append(serde_json::json!({
                         "ts": lens_scratch::iso_now(),
-                        "caller": "uds",
+                        "caller": shux_rpc::current_caller(),
                         "method": "pane.checkpoint",
                         "pane_id": pane_id.to_string(),
                         "revision": revision,
@@ -5991,7 +5992,7 @@ fn register_pane_io_methods(
                         .unwrap_or(0);
                     audit.append(serde_json::json!({
                         "ts": lens_scratch::iso_now(),
-                        "caller": "uds",
+                        "caller": shux_rpc::current_caller(),
                         "method": "pane.diff_since",
                         "pane_id": pane_id.to_string(),
                         "from_revision": since_revision,
@@ -8428,6 +8429,60 @@ mod tests {
 
         // And no scratch leaked from the rejected calls.
         assert_eq!(harness.scratch_registry.test_total(), 0);
+        harness.stop().await;
+    }
+
+    /// LENS-R-052 caller identity through the production audit path (P5
+    /// round-1 claude N3, adjudicated task-local): a lens.run dispatched
+    /// inside `shux_rpc::with_caller("plugin:<uuid>", …)` — the exact
+    /// wrapper shux-plugin's dispatch path applies — audits
+    /// `caller: plugin:<uuid>`; a plain dispatch (the UDS server shape)
+    /// audits the `"uds"` default. (The wrapper's plugin-side half is
+    /// pinned in shux-plugin's `dispatch_plugin_frame_scopes_caller_identity`.)
+    #[tokio::test]
+    async fn production_lens_audit_caller_identity() {
+        let harness = RpcHarness::new();
+        let params = serde_json::json!({"argv": ["sleep", "30"]});
+
+        // UDS shape: no scope.
+        let uds_run = dispatch_ok(&harness.router, "lens.run", params.clone()).await;
+        let uds_sid = uds_run["session_id"].as_str().unwrap().to_string();
+
+        // Plugin shape: the same scope wrapper dispatch_plugin_frame uses.
+        let plugin_run = shux_rpc::with_caller(
+            "plugin:test-uuid-1234".to_string(),
+            harness.router.dispatch("lens.run", Some(params)),
+        )
+        .await
+        .unwrap();
+        let plugin_sid = plugin_run["session_id"].as_str().unwrap().to_string();
+
+        let audit_path = harness._scratch_dir.path().join("lens-audit.ndjson");
+        let text = std::fs::read_to_string(&audit_path).expect("audit log written");
+        let creates: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["method"] == "scratch.create")
+            .collect();
+        assert_eq!(creates.len(), 2, "one create entry per run:\n{text}");
+        let caller_for = |sid: &str| {
+            creates
+                .iter()
+                .find(|e| e["session_id"] == sid)
+                .unwrap_or_else(|| panic!("no create entry for {sid}"))["caller"]
+                .clone()
+        };
+        assert_eq!(caller_for(&uds_sid), "uds", "UDS path defaults");
+        assert_eq!(
+            caller_for(&plugin_sid),
+            "plugin:test-uuid-1234",
+            "plugin-scoped dispatch carries the identity"
+        );
+        // The chain survives mixed-caller appends.
+        lens_scratch::verify_chain(&audit_path).expect("audit chain verifies");
+
+        kill_scratch_and_wait(&harness, &uds_sid).await;
+        kill_scratch_and_wait(&harness, &plugin_sid).await;
         harness.stop().await;
     }
 

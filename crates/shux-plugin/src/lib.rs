@@ -1336,8 +1336,14 @@ fn dispatch_plugin_frame(
     }
 
     let plugin = plugin.to_string();
+    let caller = format!("plugin:{plugin_id}");
     tokio::spawn(async move {
-        let result = router.dispatch(&method, params).await;
+        // Request-scoped caller identity (lens LENS-R-052; P5 round-1
+        // claude N3 adjudication): every handler this dispatch reaches can
+        // read `shux_rpc::current_caller()` and see `plugin:<uuid>` instead
+        // of the UDS default — no handler-signature changes. The scope ends
+        // with this dispatch; tasks IT spawns revert to the default.
+        let result = shux_rpc::with_caller(caller, router.dispatch(&method, params)).await;
         let frame = match result {
             Ok(value) => serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1775,5 +1781,68 @@ mod tests {
         let frame = recv_json(&mut rx).await;
         assert_eq!(frame["error"]["code"], -32004);
         assert_eq!(frame["error"]["data"]["reason"], "no_grant_and_not_owned");
+    }
+
+    /// LENS-R-052 caller identity (P5 round-1 claude N3, adjudicated):
+    /// dispatch_plugin_frame scopes the router dispatch in
+    /// `shux_rpc::RPC_CALLER`, so any handler it reaches reads
+    /// `plugin:<uuid>` from `current_caller()` — while a direct dispatch
+    /// (the UDS server path) still reads the "uds" default.
+    #[tokio::test]
+    async fn dispatch_plugin_frame_scopes_caller_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().join("state");
+        let perm_root = dir.path().join("perm");
+        let bus = EventBus::new();
+        let plugin_id = PluginId::new();
+        let graph = Arc::new(tokio::sync::OnceCell::new());
+        let router = Arc::new(tokio::sync::OnceCell::new());
+        let (tx, mut rx) = mpsc::channel(8);
+
+        // Probe handler: echoes whatever caller identity it observes.
+        let probe_router = Router::builder()
+            .register_with_policy(
+                "system.whoami",
+                Policy::fixed(Sensitivity::Public),
+                |_params: Option<Value>| async {
+                    Ok(serde_json::json!({"caller": shux_rpc::current_caller()}))
+                },
+            )
+            .build();
+        router.set(probe_router).expect("set router");
+
+        // UDS-path control: a direct dispatch outside any scope.
+        let direct = router
+            .get()
+            .unwrap()
+            .dispatch("system.whoami", None)
+            .await
+            .unwrap();
+        assert_eq!(direct["caller"], "uds", "direct dispatch keeps the default");
+
+        // Plugin path: the wrapper must scope the identity.
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "system.whoami"
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            None,
+            tx,
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(
+            frame["result"]["caller"],
+            format!("plugin:{plugin_id}"),
+            "plugin dispatch carries plugin:<uuid>"
+        );
     }
 }
