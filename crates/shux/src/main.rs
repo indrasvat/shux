@@ -7597,6 +7597,141 @@ done
         harness.stop().await;
     }
 
+    /// Deadline-bounded wait for the pane's settle-waiter count (the watch
+    /// publisher's receiver_count — receivers exist ONLY while a
+    /// `pane.wait_settled` handler is subscribed, so this IS the waiter
+    /// registry). §16.1 permits deadline-bounded event waits.
+    async fn wait_for_settle_waiters(
+        io: &Arc<Mutex<PaneIoState>>,
+        pane_id: shux_core::model::PaneId,
+        expected: usize,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let count = {
+                let state = io.lock().await;
+                state
+                    .revisions
+                    .get(&pane_id)
+                    .map(|tx| tx.receiver_count())
+                    .unwrap_or(0)
+            };
+            if count == expected {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("settle waiter count never reached {expected} (last saw {count})");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// P3 codex B2 lens-side proof (in-process half): a client that
+    /// disconnects mid-`pane.wait_settled` must have its waiter DROPPED — the
+    /// real observable is the pane's revision-watch receiver_count, which is
+    /// exactly the set of live settle subscriptions (LENS-R-023). Runs the
+    /// PRODUCTION router behind a REAL shux-rpc UDS server, so the
+    /// connection-level cancellation path (serve_connection) is what drops
+    /// the handler future. The black-box CLI-SIGKILL half lives in
+    /// crates/shux/tests/settle_waiter_drop.rs.
+    #[tokio::test]
+    async fn production_settle_waiter_dropped_on_client_disconnect() {
+        use futures::{SinkExt, StreamExt};
+
+        let harness = RpcHarness::new();
+        let (_sid, _wid, pane_id) = harness.seed_session("settle-drop").await;
+        let _write_rx = harness.seed_io(pane_id, b"boot").await;
+        // Seed the revision publisher the per-pane PTY task normally owns.
+        // last_mutation_ns == now → the pane cannot become quiet within the
+        // 60s quiet window, so the waiter lives until dropped.
+        {
+            let mut state = harness.io.lock().await;
+            let (tx, rx0) = watch::channel(PaneRevision {
+                content_revision: 1,
+                last_mutation_ns: shux_vt::monotonic_now_ns(),
+            });
+            drop(rx0); // receiver_count now counts ONLY settle waiters
+            state.revisions.insert(pane_id, tx);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("settle-drop.sock");
+        let server_cancel = CancellationToken::new();
+        let server = shux_rpc::Server::new(
+            shux_rpc::ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            harness.router.clone(),
+            server_cancel.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        // Connect (bounded retry — no fixed bind sleep) and park a waiter.
+        let stream = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match tokio::net::UnixStream::connect(&socket_path).await {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            panic!("settle-drop server never bound: {e}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        };
+        let mut framed = tokio_util::codec::Framed::new(stream, shux_rpc::create_codec());
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "pane.wait_settled",
+            "params": {
+                "pane_id": pane_id.to_string(),
+                "quiet_ms": 60_000,
+                "timeout_ms": 600_000,
+            },
+        });
+        framed
+            .send(bytes::Bytes::from(serde_json::to_vec(&request).unwrap()))
+            .await
+            .unwrap();
+
+        // The waiter subscribes: receiver_count 0 → 1.
+        wait_for_settle_waiters(&harness.io, pane_id, 1).await;
+
+        // Client disconnect (socket-level equivalent of SIGKILLing the CLI).
+        drop(framed);
+
+        // The waiter must be GONE — not parked until settle or the 600s cap.
+        wait_for_settle_waiters(&harness.io, pane_id, 0).await;
+
+        // Daemon healthy: a fresh connection serves a normal request.
+        let stream2 = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let mut framed2 = tokio_util::codec::Framed::new(stream2, shux_rpc::create_codec());
+        let list_req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session.list", "params": {}
+        });
+        framed2
+            .send(bytes::Bytes::from(serde_json::to_vec(&list_req).unwrap()))
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&framed2.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            response["result"]["sessions"].is_array(),
+            "daemon must stay responsive after the waiter drop: {response}"
+        );
+
+        server_cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+        harness.stop().await;
+    }
+
     // ── `pane.wait_settled` settle-math unit tests (§6, L0 supporting) ────
     //
     // These pin the pure decision layer the RPC handler leans on. The

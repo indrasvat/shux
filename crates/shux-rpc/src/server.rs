@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
+#[cfg(test)]
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
@@ -196,6 +197,14 @@ impl Server {
     }
 }
 
+/// Authentication requirement for a connection (PRD §13.1).
+enum ConnAuth {
+    /// UDS (socket-owning user) or TCP without a configured token.
+    Trusted,
+    /// TCP with a configured token: the first frame must authenticate.
+    Pending(String),
+}
+
 /// Handle a UDS client connection.
 ///
 /// UDS connections are trusted (no auth needed — PRD §13.1).
@@ -204,42 +213,18 @@ async fn handle_uds_connection(
     router: Router,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut framed = Framed::new(stream, create_codec());
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            frame = framed.next() => {
-                match frame {
-                    Some(Ok(data)) => {
-                        let response = process_frame(&data, &router).await;
-                        let response_bytes = serde_json::to_vec(&response)?;
-                        framed.send(Bytes::from(response_bytes)).await?;
-                    }
-                    Some(Err(e)) => {
-                        // Frame too large or codec error.
-                        warn!(error = %e, "frame error, closing connection");
-                        // Send error response if possible.
-                        let error_response = JsonRpcResponse::error(
-                            None,
-                            RpcError::frame_too_large(0, MAX_FRAME_SIZE),
-                        );
-                        if let Ok(bytes) = serde_json::to_vec(&error_response) {
-                            let _ = framed.send(Bytes::from(bytes)).await;
-                        }
-                        break;
-                    }
-                    None => {
-                        // Client disconnected.
-                        debug!("client disconnected");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
+    let (read_half, write_half) = stream.into_split();
+    serve_connection(
+        read_half,
+        write_half,
+        router,
+        cancel,
+        ConnAuth::Trusted,
+        // Historical UDS behavior: attempt a frame_too_large error response
+        // before closing on a codec error.
+        true,
+    )
+    .await
 }
 
 /// Handle a TCP client connection.
@@ -251,58 +236,154 @@ async fn handle_tcp_connection(
     cancel: tokio_util::sync::CancellationToken,
     expected_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut framed = Framed::new(stream, create_codec());
-    let mut authenticated = expected_token.is_none(); // No token configured = no auth needed.
+    let (read_half, write_half) = stream.into_split();
+    let auth = match expected_token {
+        Some(token) => ConnAuth::Pending(token),
+        None => ConnAuth::Trusted, // No token configured = no auth needed.
+    };
+    // Historical TCP behavior: close silently on codec errors.
+    serve_connection(read_half, write_half, router, cancel, auth, false).await
+}
 
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            frame = framed.next() => {
-                match frame {
-                    Some(Ok(data)) => {
-                        // If not yet authenticated, the first message must be an auth request.
-                        if !authenticated {
-                            match try_authenticate(&data, &expected_token) {
-                                Ok(true) => {
-                                    authenticated = true;
-                                    let response = JsonRpcResponse::success(
-                                        Some(serde_json::json!(0)),
-                                        serde_json::json!({"authenticated": true}),
-                                    );
-                                    let bytes = serde_json::to_vec(&response)?;
-                                    framed.send(Bytes::from(bytes)).await?;
-                                    continue;
-                                }
-                                Ok(false) | Err(_) => {
-                                    let error_response = JsonRpcResponse::error(
-                                        None,
-                                        RpcError::new(ErrorCode::AuthRequired),
-                                    );
-                                    let bytes = serde_json::to_vec(&error_response)?;
-                                    framed.send(Bytes::from(bytes)).await?;
-                                    break; // Close connection on auth failure.
-                                }
-                            }
+/// Serve one framed JSON-RPC connection with CANCELLABLE request execution.
+///
+/// Architecture (P3 codex B2 / claude major — client disconnect must drop
+/// in-flight request futures): the connection is split so the READ side keeps
+/// running while a request executes.
+///
+/// - A spawned read task decodes frames and queues them on a bounded channel;
+///   on EOF or read error it cancels `conn_closed`. Because it reads
+///   independently of request execution, a client disconnect is observed
+///   IMMEDIATELY — not after the in-flight handler returns (previously an
+///   abandoned `pane.wait_settled` lived until settle or its 600s cap).
+/// - This executor drains the queue STRICTLY SERIALLY (response order equals
+///   request order — exactly the pre-split semantics) and races each dispatch
+///   against `conn_closed`: when the client goes away, the in-flight handler
+///   FUTURE IS DROPPED, releasing whatever it held (settle watch
+///   subscriptions, event long-polls, locks-on-await).
+///
+/// Bounded-queue note: a client pipelining more than the queue capacity can
+/// delay EOF detection until the executor drains below capacity; the common
+/// case (one request in flight) detects disconnect instantly.
+async fn serve_connection<R, W>(
+    read_half: R,
+    write_half: W,
+    router: Router,
+    cancel: tokio_util::sync::CancellationToken,
+    mut auth: ConnAuth,
+    error_response_on_bad_frame: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio_util::codec::{FramedRead, FramedWrite};
+
+    let mut framed_tx = FramedWrite::new(write_half, create_codec());
+    let (frame_tx, mut frame_rx) =
+        tokio::sync::mpsc::channel::<Result<bytes::BytesMut, std::io::Error>>(8);
+    let conn_closed = tokio_util::sync::CancellationToken::new();
+
+    let read_closed = conn_closed.clone();
+    let read_task = tokio::spawn(async move {
+        let mut framed_rx = FramedRead::new(read_half, create_codec());
+        loop {
+            match framed_rx.next().await {
+                Some(Ok(frame)) => {
+                    if frame_tx.send(Ok(frame)).await.is_err() {
+                        break; // Executor gone; stop reading.
+                    }
+                }
+                Some(Err(e)) => {
+                    let _ = frame_tx.send(Err(e)).await;
+                    break;
+                }
+                None => break, // Client closed its write side (EOF).
+            }
+        }
+        // Signal close AFTER queueing everything read so far. The dropped
+        // frame_tx also lets the executor drain to None and finish.
+        read_closed.cancel();
+    });
+
+    // Executor loop. Errors (`?` on writes) must still abort the read task,
+    // so run the loop in an inner async block and join on `result` below.
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        loop {
+            let maybe_frame = tokio::select! {
+                _ = cancel.cancelled() => break,
+                m = frame_rx.recv() => m,
+            };
+            let data = match maybe_frame {
+                None => {
+                    // Read side finished and the queue is drained.
+                    debug!("client disconnected");
+                    break;
+                }
+                Some(Err(e)) => {
+                    // Frame too large or codec error.
+                    warn!(error = %e, "frame error, closing connection");
+                    if error_response_on_bad_frame {
+                        let error_response = JsonRpcResponse::error(
+                            None,
+                            RpcError::frame_too_large(0, MAX_FRAME_SIZE),
+                        );
+                        if let Ok(bytes) = serde_json::to_vec(&error_response) {
+                            let _ = framed_tx.send(Bytes::from(bytes)).await;
                         }
+                    }
+                    break;
+                }
+                Some(Ok(data)) => data,
+            };
 
-                        let response = process_frame(&data, &router).await;
-                        let response_bytes = serde_json::to_vec(&response)?;
-                        framed.send(Bytes::from(response_bytes)).await?;
+            // If not yet authenticated, the first message must be an auth
+            // request (unchanged TCP-auth semantics).
+            if let ConnAuth::Pending(expected) = &auth {
+                let expected = Some(expected.clone());
+                match try_authenticate(&data, &expected) {
+                    Ok(true) => {
+                        auth = ConnAuth::Trusted;
+                        let response = JsonRpcResponse::success(
+                            Some(serde_json::json!(0)),
+                            serde_json::json!({"authenticated": true}),
+                        );
+                        let bytes = serde_json::to_vec(&response)?;
+                        framed_tx.send(Bytes::from(bytes)).await?;
+                        continue;
                     }
-                    Some(Err(e)) => {
-                        warn!(error = %e, "TCP frame error, closing connection");
-                        break;
-                    }
-                    None => {
-                        debug!("TCP client disconnected");
-                        break;
+                    Ok(false) | Err(_) => {
+                        let error_response =
+                            JsonRpcResponse::error(None, RpcError::new(ErrorCode::AuthRequired));
+                        let bytes = serde_json::to_vec(&error_response)?;
+                        framed_tx.send(Bytes::from(bytes)).await?;
+                        break; // Close connection on auth failure.
                     }
                 }
             }
-        }
-    }
 
-    Ok(())
+            // The B2 fix: the dispatch races the connection-close signal, so
+            // a client that disconnects mid-request DROPS the handler future
+            // instead of letting it run to completion unobserved.
+            let response = tokio::select! {
+                _ = conn_closed.cancelled() => {
+                    debug!("client disconnected mid-request; dropping in-flight handler");
+                    break;
+                }
+                response = process_frame(&data, &router) => response,
+            };
+            let response_bytes = serde_json::to_vec(&response)?;
+            framed_tx.send(Bytes::from(response_bytes)).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // Stop the read task on every exit path (server shutdown, write error,
+    // auth failure) — otherwise it would idle on a still-open socket forever.
+    read_task.abort();
+    let _ = read_task.await;
+    result
 }
 
 /// Process a single frame: parse JSON-RPC, dispatch, return response.
@@ -402,6 +483,8 @@ pub fn register_builtin_methods(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[tokio::test]
@@ -566,6 +649,268 @@ mod tests {
         assert_eq!(response["result"]["name"], "shux");
 
         // Shutdown.
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    /// Connect to a UDS server with a bounded retry loop (replaces a fixed
+    /// bind sleep with a deadline-bounded event wait).
+    async fn connect_with_retries(path: &std::path::Path) -> UnixStream {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match UnixStream::connect(path).await {
+                Ok(s) => return s,
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!("server never bound {}: {e}", path.display());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+    }
+
+    /// Drop guard for the hang handler: proves the in-flight future was
+    /// DROPPED (aborted) rather than run to completion. `notify_one` queues a
+    /// permit, so the test cannot miss the signal even if it subscribes late.
+    struct HangGuard {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for HangGuard {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.notify.notify_one();
+        }
+    }
+
+    /// Router with a `test.hang` method that signals entry, then pends
+    /// forever holding a HangGuard. Returns (router, entered, dropped,
+    /// dropped_notify).
+    #[allow(clippy::type_complexity)]
+    fn hang_router() -> (
+        Router,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_notify = Arc::new(tokio::sync::Notify::new());
+        let entered_h = entered.clone();
+        let dropped_h = dropped.clone();
+        let dropped_notify_h = dropped_notify.clone();
+        let router = register_builtin_methods(Router::builder())
+            .register("test.hang", move |_: Option<serde_json::Value>| {
+                let entered = entered_h.clone();
+                let guard = HangGuard {
+                    dropped: dropped_h.clone(),
+                    notify: dropped_notify_h.clone(),
+                };
+                async move {
+                    entered.notify_one();
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                    unreachable!("test.hang never completes")
+                }
+            })
+            .build();
+        (router, entered, dropped, dropped_notify)
+    }
+
+    fn frame_bytes(value: &serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(value).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_mid_request_drops_inflight_handler() {
+        // P3 codex B2: a client disconnecting while its request is executing
+        // must ABORT the handler future (observable via the drop guard) —
+        // previously the connection task awaited process_frame inline, so an
+        // abandoned long-running request lived until it completed on its own.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("cancel.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (router, entered, dropped, dropped_notify) = hang_router();
+
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let stream = connect_with_retries(&socket_path).await;
+        let mut framed = Framed::new(stream, create_codec());
+        framed
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "test.hang"
+            })))
+            .await
+            .unwrap();
+
+        // Deterministic: the handler signals when it is actually executing.
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("test.hang handler never entered");
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "guard must still be live while the client is connected"
+        );
+
+        // Client disconnect (the CLI-SIGKILL equivalent at socket level).
+        drop(framed);
+
+        // The in-flight future must be dropped promptly — not after the
+        // (infinite) handler completes.
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+            .await
+            .expect("in-flight handler was not dropped on client disconnect");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Server stays healthy: a fresh connection serves normal requests.
+        let stream2 = connect_with_retries(&socket_path).await;
+        let mut framed2 = Framed::new(stream2, create_codec());
+        framed2
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "system.health"
+            })))
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&framed2.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["result"]["status"], "ok");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_sequential_requests_unaffected_by_split_execution() {
+        // Post-refactor sanity: requests on one connection stay strictly
+        // serial and ordered (response i pairs with request i, ids intact).
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("serial.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let router = register_builtin_methods(Router::builder()).build();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let stream = connect_with_retries(&socket_path).await;
+        let mut framed = Framed::new(stream, create_codec());
+
+        // Pipeline both requests up front, then read both responses.
+        framed
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 10, "method": "system.version"
+            })))
+            .await
+            .unwrap();
+        framed
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 11, "method": "system.health"
+            })))
+            .await
+            .unwrap();
+
+        let first: serde_json::Value =
+            serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["id"], 10);
+        assert_eq!(first["result"]["name"], "shux");
+        let second: serde_json::Value =
+            serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(second["id"], 11);
+        assert_eq!(second["result"]["status"], "ok");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_does_not_affect_other_connections() {
+        // Connection-scoped cancellation: dropping conn A (mid-hang) must not
+        // disturb conn B's request flow, before or after the drop.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("isolate.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (router, entered, dropped, dropped_notify) = hang_router();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        // Conn A: park a hanging request.
+        let stream_a = connect_with_retries(&socket_path).await;
+        let mut framed_a = Framed::new(stream_a, create_codec());
+        framed_a
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "test.hang"
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("hang handler never entered");
+
+        // Conn B: normal request completes WHILE A's request is in flight.
+        let stream_b = connect_with_retries(&socket_path).await;
+        let mut framed_b = Framed::new(stream_b, create_codec());
+        framed_b
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "system.health"
+            })))
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&framed_b.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["result"]["status"], "ok");
+
+        // Drop A → its in-flight handler is aborted...
+        drop(framed_a);
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+            .await
+            .expect("conn A's in-flight handler was not dropped");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        // ...and B keeps working, unaffected.
+        framed_b
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "system.version"
+            })))
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&framed_b.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["id"], 3);
+        assert_eq!(response["result"]["name"], "shux");
+
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
     }
