@@ -253,8 +253,16 @@ async fn handle_tcp_connection(
 /// The cap re-bounds memory at the protocol level instead: exceeding it is a
 /// protocol violation that deliberately cancels the WHOLE connection
 /// (`conn_closed`), dropping the in-flight handler and closing the socket.
-/// Worst-case memory stays `MAX_PENDING_FRAMES × MAX_FRAME_SIZE`, and the
-/// callers are the socket-owning user (UDS 0700) or auth-gated TCP.
+/// Worst-case memory stays `MAX_PENDING_FRAMES × MAX_FRAME_SIZE`.
+///
+/// Exposure honesty (codex P3 round-3 caveat): the cap counts PRE-AUTH TCP
+/// frames too — an unauthenticated TCP peer can stage up to this many frames
+/// before the executor's first-frame auth check severs it. That window is not
+/// "already-trusted": it is bounded by this same cap (the executor dequeues
+/// and auth-rejects frame #1 immediately, closing the connection), the TCP
+/// listener is loopback + token-gated, and UDS callers are the socket-owning
+/// user (0700). A separate tighter pre-auth counter would double the state
+/// for no additional bound.
 const MAX_PENDING_FRAMES: usize = 256;
 
 /// Serve one framed JSON-RPC connection with CANCELLABLE request execution.
@@ -307,6 +315,13 @@ where
     let read_pending = pending_frames.clone();
     let read_task = tokio::spawn(async move {
         let mut framed_rx = FramedRead::new(read_half, create_codec());
+        // codex P3 round-3: decode errors and socket death are DIFFERENT
+        // events and must not share the cancel path. Enqueueing the Err and
+        // immediately cancelling `conn_closed` raced the executor's outer
+        // select — it could take the already-cancelled close branch before
+        // dequeuing the Err, making the frame_too_large error response
+        // nondeterministic. `decode_error` routes the two apart below.
+        let mut decode_error = false;
         loop {
             match framed_rx.next().await {
                 Some(Ok(frame)) => {
@@ -329,10 +344,38 @@ where
                     }
                 }
                 Some(Err(e)) => {
+                    // LengthDelimitedCodec signals an oversized/invalid frame
+                    // as io::ErrorKind::InvalidData (verified against
+                    // tokio-util 0.7's length_delimited.rs and pinned by
+                    // codec::tests::test_codec_max_frame_size); every other
+                    // kind is an IO-level read error, i.e. the socket died.
+                    decode_error = e.kind() == std::io::ErrorKind::InvalidData;
                     let _ = frame_tx.send(Err(e));
                     break;
                 }
                 None => break, // Client closed its write side (EOF).
+            }
+        }
+        if decode_error {
+            // Deterministic error response: do NOT cancel `conn_closed` — the
+            // executor must dequeue the Err SERIALLY (after any in-flight
+            // request completes, matching the original pre-split semantics)
+            // and send the frame_too_large response to the still-connected
+            // client. The frame stream is unsynchronized after a decode
+            // error, so no further frames can be parsed — but keep draining
+            // the RAW socket purely to observe EOF: a client that disconnects
+            // in this window still gets its in-flight handler dropped
+            // promptly. Exits when the client closes (EOF/error) or when
+            // serve_connection returns and aborts this task (the normal path
+            // once the error response has been written).
+            use tokio::io::AsyncReadExt;
+            let mut raw = framed_rx.into_inner();
+            let mut scratch = [0u8; 4096];
+            loop {
+                match raw.read(&mut scratch).await {
+                    Ok(0) | Err(_) => break, // EOF or socket death.
+                    Ok(_) => {}              // Discard: nothing after a decode error parses.
+                }
             }
         }
         // Signal close AFTER queueing everything read so far. The dropped
@@ -1093,6 +1136,89 @@ mod tests {
             !matches!(next, Some(Ok(_))),
             "expected EOF/error after the cap violation, got a frame: {next:?}"
         );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_frame_error_response_is_deterministic() {
+        // codex P3 round-3: on a decode error the round-2 read task enqueued
+        // the Err and IMMEDIATELY cancelled conn_closed, so the executor's
+        // outer select could take the already-ready close branch before
+        // dequeuing the Err — the UDS frame_too_large response became a coin
+        // flip. Now decode errors do NOT cancel conn_closed (only EOF/IO
+        // death and the cap do), so while the client is still connected the
+        // executor's ONLY ready branch is the queued Err: the error response
+        // is deterministic BY STRUCTURE, not by polling order. The 25
+        // iterations are a regression belt — the racy round-2 code fails
+        // this with p ≈ 1 − 2⁻²⁵. No sleeps: each iteration is pure
+        // request/response.
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("frame-err.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let router = register_builtin_methods(Router::builder()).build();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        for iteration in 0..25 {
+            let mut stream = connect_with_retries(&socket_path).await;
+            // Raw oversized frame: a 4-byte BE length prefix past the codec
+            // cap plus a little payload — the decoder rejects it from the
+            // length field alone (InvalidData).
+            let oversized_len = (MAX_FRAME_SIZE + 1) as u32;
+            stream
+                .write_all(&oversized_len.to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&[0u8; 64]).await.unwrap();
+            stream.flush().await.unwrap();
+
+            // The client MUST receive the frame_too_large error response —
+            // every iteration, never bare EOF.
+            let mut framed = Framed::new(stream, create_codec());
+            let response_frame =
+                tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("iteration {iteration}: no frame-error response within 5s")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "iteration {iteration}: bare EOF instead of the \
+                             frame_too_large error response (the round-2 race)"
+                        )
+                    })
+                    .expect("response frame decode");
+            let response: serde_json::Value = serde_json::from_slice(&response_frame).unwrap();
+            assert_eq!(
+                response["error"]["code"], -32001,
+                "iteration {iteration}: expected frame_too_large, got {response}"
+            );
+
+            // And then the server closes the connection.
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("iteration {iteration}: connection not closed after frame error")
+                });
+            assert!(
+                !matches!(next, Some(Ok(_))),
+                "iteration {iteration}: unexpected extra frame: {next:?}"
+            );
+        }
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;

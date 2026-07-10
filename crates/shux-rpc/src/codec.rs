@@ -67,7 +67,18 @@ mod tests {
 
         // Decoding should fail.
         let result = codec.decode(&mut buf);
-        assert!(result.is_err(), "expected error for oversized frame");
+        let err = result.expect_err("expected error for oversized frame");
+        // PINNED CONTRACT: the server's read task distinguishes decode errors
+        // from IO-level read errors by this exact kind (server.rs, codex P3
+        // round-3 — deterministic frame_too_large responses depend on it).
+        // If a tokio-util upgrade changes the kind, this fails loudly here
+        // instead of silently rerouting decode errors down the socket-death
+        // path.
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "LengthDelimitedCodec oversized-frame error kind changed: {err:?}"
+        );
     }
 
     #[test]
