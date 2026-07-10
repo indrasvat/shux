@@ -3862,6 +3862,24 @@ fn settle_decide(quiet: bool, past_timeout: bool, pending_revision: bool) -> Set
     SettleWake::KeepWaiting
 }
 
+/// The settle waiter's watch sender dropped mid-wait (codex P3 M1): pane
+/// teardown removes the VT and its revision publisher together, so the normal
+/// outcome is pane-gone → NOT_FOUND (-32004) — never a `settled` verdict on a
+/// frozen value from a dead pane. The re-subscribe arm is defensive: if a
+/// publisher somehow exists again for this pane id, the waiter continues on
+/// the live channel instead of erroring spuriously.
+async fn settle_reacquire_watch(
+    io: &Arc<Mutex<PaneIoState>>,
+    pane_id: shux_core::model::PaneId,
+) -> Result<watch::Receiver<PaneRevision>, shux_rpc::RpcError> {
+    let state = io.lock().await;
+    state
+        .revisions
+        .get(&pane_id)
+        .map(|tx| tx.subscribe())
+        .ok_or_else(|| shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string()))
+}
+
 /// LENS-R-025 parameter validation: `quiet_ms ∈ [10, 60_000]`,
 /// `timeout_ms ∈ [quiet_ms, 600_000]`. Violations → INVALID_PARAMS (-32602),
 /// which the CLI maps to exit 2 (§10 exit table, V1).
@@ -4996,7 +5014,6 @@ fn register_pane_io_methods(
                     // timeout can fire (`settle_decide` precedence — codex P3
                     // B1: timeout returns only when quiet is still false at
                     // the deadline).
-                    let mut channel_open = true;
                     loop {
                         // `borrow_and_update` copies the latest (revision, ns)
                         // and marks it seen, so the next `changed()` fires only
@@ -5010,21 +5027,16 @@ fn register_pane_io_methods(
                         // — returning `settled:true` from the stale snapshot
                         // would report a pane as still that has already
                         // mutated again.
-                        let pending = if channel_open {
-                            match rx.has_changed() {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    // Sender dropped: the pane was torn down
-                                    // mid-wait. No further Class-A batch can
-                                    // arrive; the frozen value settles once the
-                                    // remaining quiet elapses (still bounded by
-                                    // the timeout).
-                                    channel_open = false;
-                                    false
-                                }
+                        let pending = match rx.has_changed() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                // codex P3 M1: sender dropped ⇒ pane torn down
+                                // mid-wait → NOT_FOUND (never settle on a
+                                // frozen value); re-subscribe if a publisher
+                                // somehow lives again (defensive).
+                                rx = settle_reacquire_watch(&io, pane_id).await?;
+                                continue;
                             }
-                        } else {
-                            false
                         };
                         let past_timeout = tokio::time::Instant::now() >= timeout_deadline;
                         match settle_decide(quiet, past_timeout, pending) {
@@ -5056,23 +5068,19 @@ fn register_pane_io_methods(
                         let quiet_deadline = tokio::time::Instant::now() + remaining;
                         let wake = quiet_deadline.min(timeout_deadline);
 
-                        if channel_open {
-                            tokio::select! {
-                                changed = rx.changed() => {
-                                    if changed.is_err() {
-                                        // Stop awaiting the closed channel —
-                                        // otherwise `changed()` busy-returns Err.
-                                        channel_open = false;
-                                    }
-                                    // Loop re-evaluates on the fresh value.
+                        tokio::select! {
+                            changed = rx.changed() => {
+                                if changed.is_err() {
+                                    // codex P3 M1 (same rule as above): pane
+                                    // teardown mid-wait → NOT_FOUND.
+                                    rx = settle_reacquire_watch(&io, pane_id).await?;
                                 }
-                                _ = tokio::time::sleep_until(wake) => {
-                                    // Loop re-evaluates: quiet first, then
-                                    // timeout (settle_decide precedence).
-                                }
+                                // Loop re-evaluates on the fresh value.
                             }
-                        } else {
-                            tokio::time::sleep_until(wake).await;
+                            _ = tokio::time::sleep_until(wake) => {
+                                // Loop re-evaluates: quiet first, then
+                                // timeout (settle_decide precedence).
+                            }
                         }
                     }
                 }
@@ -7729,6 +7737,66 @@ done
 
         server_cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+        harness.stop().await;
+    }
+
+    /// P3 codex M1: a pane killed while a settle waiter is parked on it must
+    /// resolve that waiter with NOT_FOUND (-32004) — never `settled:true` on
+    /// the frozen last value of a dead pane's channel. Teardown drops the
+    /// revision publisher, the waiter's `changed()` errors, and the re-check
+    /// finds the pane gone.
+    #[tokio::test]
+    async fn production_wait_settled_pane_killed_mid_wait_returns_not_found() {
+        let harness = RpcHarness::new();
+        let (_sid, _wid, pane_id) = harness.seed_session("settle-kill").await;
+        let _write_rx = harness.seed_io(pane_id, b"boot").await;
+        {
+            let mut state = harness.io.lock().await;
+            let (tx, rx0) = watch::channel(PaneRevision {
+                content_revision: 1,
+                // Fresh mutation stamp: cannot become quiet within 60s, so
+                // the waiter is guaranteed parked when the pane dies.
+                last_mutation_ns: shux_vt::monotonic_now_ns(),
+            });
+            drop(rx0);
+            state.revisions.insert(pane_id, tx);
+        }
+
+        let router = harness.router.clone();
+        let waiter = tokio::spawn(async move {
+            router
+                .dispatch(
+                    "pane.wait_settled",
+                    Some(serde_json::json!({
+                        "pane_id": pane_id.to_string(),
+                        "quiet_ms": 60_000,
+                        "timeout_ms": 600_000,
+                    })),
+                )
+                .await
+        });
+
+        // Deterministic: the waiter has subscribed (receiver_count 0 → 1).
+        wait_for_settle_waiters(&harness.io, pane_id, 1).await;
+
+        // Kill the pane exactly the way pane/window/session kill does:
+        // teardown with remove_vts drops the VT AND the revision publisher.
+        {
+            let mut state = harness.io.lock().await;
+            let _ = state.teardown_panes(&[pane_id], true);
+        }
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("wait_settled must resolve promptly after pane teardown")
+            .expect("waiter task must not panic");
+        let err = result.expect_err("must error, not settle on a dead pane's frozen value");
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::NotFound.code(),
+            "pane killed mid-wait must surface NOT_FOUND (-32004): {err:?}"
+        );
+
         harness.stop().await;
     }
 
