@@ -5580,7 +5580,7 @@ fn register_pane_io_methods(
                     // before base64).
                     let png_decoded_len = png_base64
                         .as_ref()
-                        .map(|b64| b64.len() / 4 * 3)
+                        .map(|b64| lens_scratch::b64_decoded_len(b64))
                         .unwrap_or(0);
                     audit.append(serde_json::json!({
                         "ts": lens_scratch::iso_now(),
@@ -5988,7 +5988,7 @@ fn register_pane_io_methods(
                         .unwrap_or(0);
                     let heat_decoded_len = heat_png_base64
                         .as_ref()
-                        .map(|b64| b64.len() / 4 * 3)
+                        .map(|b64| lens_scratch::b64_decoded_len(b64))
                         .unwrap_or(0);
                     audit.append(serde_json::json!({
                         "ts": lens_scratch::iso_now(),
@@ -8483,6 +8483,178 @@ mod tests {
 
         kill_scratch_and_wait(&harness, &uds_sid).await;
         kill_scratch_and_wait(&harness, &plugin_sid).await;
+        harness.stop().await;
+    }
+
+    /// Count live processes whose argv contains `needle` (unique per test
+    /// run, so co-tenant argv text cannot collide).
+    fn count_procs_containing(needle: &str) -> usize {
+        std::process::Command::new("ps")
+            .args(["-axo", "args="])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter(|l| l.contains(needle))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// `__scratch-*` sessions currently in the GRAPH (what a leaked
+    /// phantom would show up as — an ordinary-looking session outside the
+    /// registry; claude round-2 detail).
+    fn graph_scratch_sessions(harness: &RpcHarness) -> Vec<shux_core::model::SessionId> {
+        harness
+            .graph
+            .snapshot()
+            .sessions
+            .values()
+            .filter(|s| s.name.starts_with("__scratch-"))
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// P5 round-2 codex N1 (≡ claude round-2 major): the shux-rpc server
+    /// drops in-flight handler futures on client disconnect; a drop between
+    /// graph-session creation and registry commit used to leak an
+    /// unregistered __scratch session + PTY (visible in session.list as an
+    /// ORDINARY session, uncounted by quota, invisible to the restart
+    /// registry). The core is now cancellation-shielded (own task, awaited
+    /// via JoinHandle): dropping the dispatch future at ANY interior point
+    /// lets the composite complete, after which the reaper owns the
+    /// scratch. Drives BOTH interior pause points deterministically.
+    #[tokio::test]
+    async fn production_lens_run_dropped_mid_core_leaves_no_orphan() {
+        let harness = RpcHarness::new();
+        let sleep_tag = format!("28{:03}", std::process::id() % 1000);
+
+        for (name, slot) in [
+            (
+                "after session create",
+                &lens_scratch::test_hooks::PAUSE_AFTER_CREATE,
+            ),
+            (
+                "before registry commit",
+                &lens_scratch::test_hooks::PAUSE_BEFORE_COMMIT,
+            ),
+        ] {
+            let pause = lens_scratch::test_hooks::Pause::arm(slot);
+            let params = serde_json::json!({"argv": ["sleep", sleep_tag]});
+            let router = harness.router.clone();
+            let dispatch =
+                tokio::spawn(async move { router.dispatch("lens.run", Some(params)).await });
+
+            // Wait until the core is INSIDE the window, then drop the
+            // dispatch future — the exact client-disconnect shape.
+            tokio::time::timeout(Duration::from_secs(10), pause.reached.notified())
+                .await
+                .unwrap_or_else(|_| panic!("core never reached the pause ({name})"));
+            dispatch.abort();
+            let aborted = dispatch.await;
+            assert!(aborted.is_err(), "dispatch future dropped ({name})");
+
+            // Release the shielded core: it must COMPLETE the composite.
+            pause.release.notify_one();
+            *slot.lock().unwrap() = None;
+
+            // Wait for the COMMITTED row (ids() counts rows only — the
+            // in-flight reservation itself already counts toward
+            // test_total, which would pass before the commit happened).
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while harness.scratch_registry.ids().len() != 1 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "core did not commit the scratch after the drop ({name})"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            // No phantom: every __scratch session in the graph is ALSO in
+            // the registry (claude round-2: a leaked one would show in
+            // session.list as an ordinary session, outside registry.ids()).
+            let in_graph = graph_scratch_sessions(&harness);
+            assert_eq!(
+                in_graph.len(),
+                1,
+                "exactly one scratch in the graph ({name})"
+            );
+            let ids = harness.scratch_registry.ids();
+            assert!(
+                in_graph.iter().all(|sid| ids.contains(sid)),
+                "every graph scratch is registry-owned — no phantom ({name})"
+            );
+
+            // The reaper owns it from commit: explicit kill cleans up fully.
+            kill_scratch_and_wait(&harness, &in_graph[0].to_string()).await;
+            assert!(
+                graph_scratch_sessions(&harness).is_empty(),
+                "no scratch left in the graph ({name})"
+            );
+            assert_eq!(
+                harness.scratch_registry.test_total(),
+                0,
+                "quota slot free ({name})"
+            );
+            let proc_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while count_procs_containing(&format!("sleep {sleep_tag}")) != 0 {
+                assert!(
+                    std::time::Instant::now() < proc_deadline,
+                    "stray scratch process survived ({name})"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        harness.stop().await;
+    }
+
+    /// P5 round-2 codex N3 at the caller level: when group death cannot be
+    /// confirmed, the registry row must SURVIVE (startup reap owns the
+    /// retry) and no reap may be audited — removing the row on an
+    /// unconfirmed kill would resurrect the B3 orphan window.
+    #[tokio::test]
+    async fn production_unconfirmed_kill_preserves_registry_row() {
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let run = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"]}),
+        )
+        .await;
+        let sid_str = run["session_id"].as_str().unwrap().to_string();
+        let sid: shux_core::model::SessionId = sid_str.parse().unwrap();
+
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let _ = dispatch_ok(
+            &harness.router,
+            "session.kill",
+            serde_json::json!({"id": sid_str}),
+        )
+        .await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+
+        assert!(
+            harness.scratch_registry.ids().contains(&sid),
+            "registry row must survive an unconfirmed kill"
+        );
+        let audit_path = harness._scratch_dir.path().join("lens-audit.ndjson");
+        let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        let reaped = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|e| e["method"] == "scratch.reap" && e["session_id"] == sid_str.as_str());
+        assert!(!reaped, "no reap may be audited for an unconfirmed kill");
+
+        // session.kill's own pane teardown killed the real process anyway
+        // (the forced flag only faked the lens sequence) — wait it out so
+        // the leak guard stays clean; the surviving row simply ages out
+        // with the harness tempdir, exactly like a crash-preserved row.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while count_procs_containing("sleep 30") > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         harness.stop().await;
     }
 

@@ -85,10 +85,17 @@ const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000
 /// and appends stop re-reading the whole file per entry (O(n²)).
 ///
 /// Rotation: mirrors the per-plugin audit log — at 1 MiB the current file
-/// rotates to `.1` (existing `.N` shift up; `.5` is discarded) and the NEW
-/// file starts a fresh chain from the all-zeros genesis. Each file is
-/// therefore independently verifiable end-to-end; cross-file continuity is
-/// by filename order, not by hash linkage (documented contract).
+/// rotates to `.1` (existing `.N` shift up; `.5` is discarded). The hash
+/// chain CARRIES ACROSS files (P5 round-2 codex minor): the fresh file
+/// opens with an `audit.rotate` header entry whose `prev_hash` is the
+/// rotated-out file's final hash (and which names its predecessor — a
+/// historical label; later rotations shift filenames, continuity is
+/// verified by hash, not name). `verify_chain_set` walks the whole
+/// rotation set as one chain, so deleting or reordering an interior
+/// rotated file is detectable. Inherent residual: the OLDEST file's
+/// predecessor is legitimately discarded (keep-5), so its first
+/// `prev_hash` is a trust anchor — deleting the ENTIRE rotated set (or
+/// the single oldest file) remains undetectable by construction.
 ///
 /// Caller field: entries read `shux_rpc::current_caller()` — a
 /// `tokio::task_local!` the plugin dispatch wrapper scopes to
@@ -127,7 +134,7 @@ impl LensAuditLog {
     /// Append one chained NDJSON line. `entry` must be a JSON object and
     /// must NOT set `prev_hash`/`hash` — both are computed here, under the
     /// serializing lock.
-    pub fn append(&self, mut entry: serde_json::Value) {
+    pub fn append(&self, entry: serde_json::Value) {
         // The lock is std::sync (never held across an await); the file I/O
         // under it is one small append — the same tradeoff the per-plugin
         // audit log makes on the hot path of every plugin RPC.
@@ -136,18 +143,42 @@ impl LensAuditLog {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        // Rotate BEFORE the write, under the same lock, so the new entry
-        // lands in the fresh file as its genesis-rooted first line.
+        // Rotate BEFORE the write, under the same lock. The chain head is
+        // NOT reset (P5 round-2 codex minor: independent per-file genesis
+        // chains made deleting/reordering a whole rotated file
+        // undetectable) — the fresh file's first entry is a rotation
+        // header that chains directly off the rotated-out file's final
+        // hash and names its predecessor, so `verify_chain_set` can walk
+        // the whole rotation set as ONE chain.
         if let Ok(meta) = std::fs::metadata(&self.path) {
             if meta.len() > AUDIT_ROTATE_AT_BYTES {
                 if let Err(e) = rotate_audit(&self.path) {
                     tracing::warn!(error = %e, "lens-audit: rotation failed; appending to the oversized file");
                 } else {
-                    *last = GENESIS_HASH.to_string();
+                    let predecessor = self
+                        .path
+                        .with_extension("ndjson.1")
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "lens-audit.ndjson.1".to_string());
+                    self.append_locked(
+                        &mut last,
+                        json!({
+                            "ts": iso_now(),
+                            "method": "audit.rotate",
+                            "predecessor": predecessor,
+                        }),
+                    );
                 }
             }
         }
 
+        self.append_locked(&mut last, entry);
+    }
+
+    /// The chained write itself, under the caller-held head lock: stamp
+    /// `prev_hash` from the cached head, hash, append, advance the head.
+    fn append_locked(&self, last: &mut String, mut entry: serde_json::Value) {
         let prev_hash = last.clone();
         if let Some(obj) = entry.as_object_mut() {
             obj.insert("prev_hash".into(), json!(prev_hash));
@@ -213,21 +244,22 @@ fn last_hash_in_file(path: &Path) -> Option<String> {
     v.get("hash").and_then(|h| h.as_str()).map(str::to_string)
 }
 
-/// Verify one audit file's hash chain end-to-end (P5 convergence round 1,
+/// Verify one audit file's internal hash chain (P5 convergence round 1,
 /// codex M2d: a write-only chain is decoration — nothing could detect
-/// tampering). Returns the number of verified entries. Fails on: a line
-/// that is not JSON, a `prev_hash` that does not match the running head, or
-/// a stored `hash` that does not match the recomputation over
+/// tampering). `anchor` is the required `prev_hash` of the FIRST entry:
+/// `Some(h)` enforces continuity from a predecessor file (or genesis);
+/// `None` adopts the stored first `prev_hash` as the trust anchor (used
+/// for the oldest present file, whose predecessor was legitimately
+/// discarded). Returns `(entries_verified, final_hash)` — `final_hash` is
+/// the anchor itself for an empty file. Fails on: a non-JSON line, a
+/// `prev_hash` that does not match the running head, or a stored `hash`
+/// that does not match the recomputation over
 /// `sha256(prev_hash ‖ canonical(entry sans `hash`))`.
-///
-/// Consumed by the unit + black-box test suites today (hence the
-/// dead-code allowance on the non-test build); the natural future surface
-/// is a `shux lens audit verify` CLI verb — P6 CLI-polish material.
 #[allow(dead_code)]
-pub fn verify_chain(path: &Path) -> Result<usize, String> {
+fn verify_chain_file(path: &Path, anchor: Option<&str>) -> Result<(usize, String), String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let mut prev = GENESIS_HASH.to_string();
+    let mut prev: Option<String> = anchor.map(str::to_string);
     let mut count = 0usize;
     for (i, line) in text.lines().enumerate() {
         let mut v: serde_json::Value =
@@ -237,12 +269,13 @@ pub fn verify_chain(path: &Path) -> Result<usize, String> {
             .and_then(|h| h.as_str())
             .ok_or_else(|| format!("line {}: missing prev_hash", i + 1))?
             .to_string();
-        if stored_prev != prev {
+        let expected = prev.get_or_insert_with(|| stored_prev.clone());
+        if stored_prev != *expected {
             return Err(format!(
                 "line {}: chain break — prev_hash {} != expected {}",
                 i + 1,
                 stored_prev,
-                prev
+                expected
             ));
         }
         let stored_hash = v
@@ -258,7 +291,7 @@ pub fn verify_chain(path: &Path) -> Result<usize, String> {
         }
         let canonical = serde_json::to_vec(&v).map_err(|e| e.to_string())?;
         let mut hasher = Sha256::new();
-        hasher.update(prev.as_bytes());
+        hasher.update(expected.as_bytes());
         hasher.update(&canonical);
         let recomputed = hex_encode(&hasher.finalize());
         if recomputed != stored_hash {
@@ -267,10 +300,49 @@ pub fn verify_chain(path: &Path) -> Result<usize, String> {
                 i + 1
             ));
         }
-        prev = stored_hash;
+        prev = Some(stored_hash);
         count += 1;
     }
-    Ok(count)
+    Ok((count, prev.unwrap_or_else(|| GENESIS_HASH.to_string())))
+}
+
+/// Verify one audit file's internal chain, adopting its first entry's
+/// `prev_hash` as the anchor. For the FULL cross-file guarantee use
+/// [`verify_chain_set`].
+///
+/// Consumed by the unit + black-box test suites today (hence the
+/// dead-code allowance on the non-test build); the natural future surface
+/// is a `shux lens audit verify` CLI verb — P6 CLI-polish material.
+#[allow(dead_code)]
+pub fn verify_chain(path: &Path) -> Result<usize, String> {
+    verify_chain_file(path, None).map(|(n, _)| n)
+}
+
+/// Verify the WHOLE rotation set as one chain (P5 round-2 codex minor):
+/// oldest present rotated file (`.5` … `.1`) through the live file, each
+/// subsequent file required to chain exactly off its predecessor's final
+/// hash — so deleting or reordering an interior rotated file breaks
+/// verification. The oldest present file's first `prev_hash` is the trust
+/// anchor (its predecessor was legitimately discarded by keep-5).
+/// Returns the total number of verified entries across the set.
+#[allow(dead_code)]
+pub fn verify_chain_set(live_path: &Path) -> Result<usize, String> {
+    let mut files: Vec<PathBuf> = (1..=AUDIT_KEEP_ROTATIONS)
+        .map(|n| live_path.with_extension(format!("ndjson.{n}")))
+        .filter(|p| p.exists())
+        .collect();
+    files.reverse(); // .5 (oldest) first … .1 last
+    files.push(live_path.to_path_buf());
+
+    let mut anchor: Option<String> = None;
+    let mut total = 0usize;
+    for f in &files {
+        let (n, final_hash) =
+            verify_chain_file(f, anchor.as_deref()).map_err(|e| format!("{}: {e}", f.display()))?;
+        anchor = Some(final_hash);
+        total += n;
+    }
+    Ok(total)
 }
 
 fn xdg_state_home() -> PathBuf {
@@ -294,6 +366,14 @@ pub(crate) fn iso_now() -> String {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Exact decoded byte length of a standard (padded) base64 string —
+/// `len/4*3` minus the trailing `=` padding (P5 round-2 claude nit: the
+/// unpadded formula over-reported `bytes_returned` by up to 2).
+pub(crate) fn b64_decoded_len(b64: &str) -> usize {
+    let pad = b64.bytes().rev().take_while(|&b| b == b'=').count();
+    (b64.len() / 4 * 3).saturating_sub(pad)
 }
 
 fn unix_ms(t: SystemTime) -> u64 {
@@ -560,20 +640,31 @@ impl ScratchRegistry {
     }
 
     /// Startup reap (LENS-R-044/DEC-7): read a leftover registry file from
-    /// a prior daemon incarnation; for every row whose pgid is alive AND
-    /// whose leader's OS start token matches the recorded one, run the
-    /// LENS-R-042 kill sequence; delete the file; write one audit entry per
-    /// row. Runs BEFORE the RPC server accepts `lens.run` calls.
+    /// a prior daemon incarnation; kill every row's process GROUP unless
+    /// the leader's OS start token proves the PID was recycled; delete the
+    /// file; write one audit entry per row. Runs BEFORE the RPC server
+    /// accepts `lens.run` calls.
     ///
-    /// Start-token semantics (codex M4, adjudicated): a recycled PID whose
-    /// start token differs from the recorded value is NOT killed (its row
-    /// is still cleared with the file). A recorded token of 0 means capture
-    /// failed at registration — fall back to liveness-only kill (logged),
-    /// since refusing would orphan a genuinely-live scratch.
+    /// Decision table (codex M4 + P5 round-2 codex N2):
+    /// - recorded token 0 (capture failed at registration): liveness-only
+    ///   fallback — the kill sequence's own group probe decides (logged).
+    /// - leader alive, token MATCHES: ours — kill.
+    /// - leader alive, token DIFFERS: recycled PID — spare (row still
+    ///   cleared with the file).
+    /// - leader GONE (`process_start_token` None): the group may still
+    ///   hold our descendants (`sh -c 'sleep 999 & exit'` leaves the sleep
+    ///   in the group after the leader exits) — a pgid stays allocated,
+    ///   and cannot be recycled as a new process's PID, while ANY member
+    ///   lives, so a live group with a dead leader is OURS: kill it (the
+    ///   sequence's killpg(pgid, 0) probe is the liveness check). Residual
+    ///   edge: the whole group died AND the pgid was recycled by an
+    ///   unrelated NEW group inside the restart window — same class as
+    ///   the §17 M14 double-fork tolerance, documented in the task file.
     ///
-    /// Corrupt file (codex B2): preserved as `<path>.corrupt` — renamed,
-    /// logged at ERROR, never silently deleted; nothing is killed (the
-    /// evidence is exactly what an operator needs to clean up manually).
+    /// Corrupt file (codex B2): preserved as `<path>.corrupt.<unix_ms>`
+    /// (timestamped so repeated corrupt startups never overwrite earlier
+    /// evidence — P5 round-2 codex minor), logged at ERROR, never silently
+    /// deleted; nothing is killed.
     pub async fn startup_reap(runtime_dir: &Path, audit: &LensAuditLog) -> usize {
         let path = runtime_dir.join("scratch-registry.json");
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -582,7 +673,8 @@ impl ScratchRegistry {
         let rows: Vec<RegistryRow> = match serde_json::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
-                let corrupt = path.with_extension("json.corrupt");
+                let corrupt =
+                    path.with_extension(format!("json.corrupt.{}", unix_ms(SystemTime::now())));
                 tracing::error!(
                     error = %e,
                     preserved = %corrupt.display(),
@@ -597,7 +689,7 @@ impl ScratchRegistry {
         };
         let mut killed = 0usize;
         for row in &rows {
-            let start_matches = match (row.start_time, process_start_token(row.pgid)) {
+            let should_kill = match (row.start_time, process_start_token(row.pgid)) {
                 (0, _) => {
                     tracing::warn!(
                         pgid = row.pgid,
@@ -606,18 +698,35 @@ impl ScratchRegistry {
                     );
                     true
                 }
-                (_, None) => false, // process gone — nothing to kill
-                (recorded, Some(current)) => recorded == current,
+                (recorded, Some(current)) if recorded == current => true,
+                (_, Some(_)) => {
+                    tracing::info!(
+                        pgid = row.pgid,
+                        "scratch-registry: pgid alive but start token mismatch \
+                         (recycled PID) — not killing"
+                    );
+                    false
+                }
+                // Leader gone (codex N2): kill the group if any member
+                // still lives — the sequence's own probe decides.
+                (_, None) => true,
             };
-            let was_killed = if start_matches {
+            let outcome = if should_kill {
                 kill_pgid_lens_sequence(row.pgid).await
             } else {
-                tracing::info!(
-                    pgid = row.pgid,
-                    "scratch-registry: pgid alive but start token mismatch \
-                     (recycled PID) — not killing"
-                );
-                false
+                KillOutcome::AlreadyDead
+            };
+            let was_killed = match outcome {
+                KillOutcome::Died => true,
+                KillOutcome::AlreadyDead => false,
+                KillOutcome::Unconfirmed => {
+                    tracing::error!(
+                        pgid = row.pgid,
+                        "scratch-registry startup reap: group death UNCONFIRMED; \
+                         processes may survive — inspect manually"
+                    );
+                    false
+                }
             };
             if was_killed {
                 killed += 1;
@@ -637,50 +746,103 @@ impl ScratchRegistry {
     }
 }
 
+/// Outcome of the LENS-R-042 kill sequence — an HONEST tri-state (P5
+/// round-2 codex N3: the old bool reported "killed" even when the
+/// post-SIGKILL confirmation loop timed out with the group still
+/// signalable, and callers then removed the registry row — resurrecting
+/// the B3 orphan window for stubborn/unreaped groups).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillOutcome {
+    /// The group did not exist at entry (nothing to kill).
+    AlreadyDead,
+    /// The group existed and its death was CONFIRMED (signal-0 probe
+    /// fails) within the bounded sequence.
+    Died,
+    /// The group existed and still answered the probe after SIGKILL +
+    /// the confirmation window. Callers MUST NOT treat the scratch as
+    /// reaped — in particular the registry row must survive so the next
+    /// daemon's startup reap can finish the job.
+    Unconfirmed,
+}
+
+/// Test hook (P5 round-2 codex N3 — injectable confirmation): when set,
+/// `kill_pgid_lens_sequence` short-circuits to `Unconfirmed` WITHOUT
+/// sending any signal, simulating a group that survives SIGKILL
+/// unreaped. nextest runs one process per test, so the static cannot
+/// leak across tests.
+#[cfg(test)]
+pub(crate) static TEST_FORCE_UNCONFIRMED_KILL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The LENS-R-042 kill sequence: probe → killpg(SIGTERM) → 500 ms grace
 /// (polling for group death — the only "wait for a process group to die"
 /// primitive Unix offers a non-parent; deadline-bounded, never a sync-on-
-/// output sleep) → killpg(SIGKILL) → bounded death confirmation. Returns
-/// whether the group was alive at entry.
+/// output sleep) → killpg(SIGKILL) → bounded death confirmation.
 ///
 /// pgid 0 is REJECTED (P5 round-1 claude N5): `killpg(0, sig)` signals the
 /// CALLER's own process group — a persisted 0 would kill the daemon.
+/// (Reported as `AlreadyDead`: there is nothing this caller may kill.)
 ///
 /// Zombie caveat: a dead-but-unreaped group leader still "exists" to a
 /// signal-0 probe until its parent (the pane PTY task) reaps it, so the
 /// grace loop can conservatively run its full 500 ms for an already-dead
 /// child; the SIGKILL is then a no-op and the confirm loop exits as soon
 /// as the reap lands.
-async fn kill_pgid_lens_sequence(pgid: u32) -> bool {
+async fn kill_pgid_lens_sequence(pgid: u32) -> KillOutcome {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
+    #[cfg(test)]
+    if TEST_FORCE_UNCONFIRMED_KILL.load(std::sync::atomic::Ordering::SeqCst) {
+        return KillOutcome::Unconfirmed;
+    }
     if pgid == 0 {
         tracing::warn!("scratch reap: refusing pgid 0 (would signal our own group)");
-        return false;
+        return KillOutcome::AlreadyDead;
     }
     let pid = Pid::from_raw(pgid as i32);
     if killpg(pid, None).is_err() {
-        return false; // already gone
+        return KillOutcome::AlreadyDead;
     }
     let _ = killpg(pid, Signal::SIGTERM);
     let grace_deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < grace_deadline {
         if killpg(pid, None).is_err() {
-            return true;
+            return KillOutcome::Died;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    if killpg(pid, None).is_ok() {
-        let _ = killpg(pid, Signal::SIGKILL);
-        let confirm_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < confirm_deadline {
-            if killpg(pid, None).is_err() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = killpg(pid, Signal::SIGKILL);
+    let confirm_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < confirm_deadline {
+        if killpg(pid, None).is_err() {
+            return KillOutcome::Died;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    KillOutcome::Unconfirmed
+}
+
+/// Kill the group and require CONFIRMED death, with one bounded retry of
+/// the full sequence on an unconfirmed first pass (P5 round-2 codex N3's
+/// optional retry — covers the transient case where a zombie leader's
+/// reap lands just past the first confirmation window). Returns whether
+/// the group is confirmed gone; `false` means the caller must leave the
+/// registry row in place for the next daemon's startup reap.
+async fn kill_confirmed(pgid: u32) -> bool {
+    match kill_pgid_lens_sequence(pgid).await {
+        KillOutcome::AlreadyDead | KillOutcome::Died => true,
+        KillOutcome::Unconfirmed => {
+            tracing::warn!(
+                pgid,
+                "scratch reap: group survived the kill sequence unconfirmed; retrying once"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            matches!(
+                kill_pgid_lens_sequence(pgid).await,
+                KillOutcome::AlreadyDead | KillOutcome::Died
+            )
         }
     }
-    true
 }
 
 // ── param parsing (LENS-R-040/046) ──────────────────────────────────────
@@ -825,9 +987,15 @@ async fn wait_for_pane_exit(mut sub: shux_core::bus::Subscription, pane_id: Pane
 /// Reap a claimed scratch session per LENS-R-042's exact sequence:
 /// killpg(SIGTERM) → 500 ms grace → killpg(SIGKILL) → confirm dead → close
 /// PTY (pane teardown) → remove session → audit. The registry row is NOT
-/// touched here — the caller removes it only after this returns (codex B3:
-/// the row must survive any crash window so the next daemon's startup reap
-/// can finish the job; the kill is idempotent).
+/// touched here — the caller removes it only after this returns `true`
+/// (codex B3: the row must survive any crash window so the next daemon's
+/// startup reap can finish the job; the kill is idempotent).
+///
+/// Returns `false` when the group's death could NOT be confirmed (P5
+/// round-2 codex N3) — in that case NOTHING else happens (no teardown, no
+/// session destroy, no reap audit): the scratch stays visible and its row
+/// stays persisted so the startup reap of the next daemon incarnation owns
+/// the retry. The caller must log/propagate accordingly.
 ///
 /// `reason` is one of exit|max_runtime|explicit (audited; R1/R4/R7 assert
 /// on it).
@@ -838,12 +1006,20 @@ async fn reap_scratch(
     io_state: &Arc<Mutex<PaneIoState>>,
     audit: &LensAuditLog,
     reason: &str,
-) {
+) -> bool {
     // 1. Kill the process group directly (LENS-R-042's own signal
     //    contract: SIGTERM → grace → SIGKILL, not the PTY task's
-    //    SIGHUP-flavored teardown escalation) and confirm it dead before
-    //    anything else.
-    kill_pgid_lens_sequence(claim.pgid).await;
+    //    SIGHUP-flavored teardown escalation) and CONFIRM it dead before
+    //    anything else (one bounded retry inside kill_confirmed).
+    if !kill_confirmed(claim.pgid).await {
+        tracing::error!(
+            pgid = claim.pgid,
+            session_id = %session_id,
+            "scratch reap: group death UNCONFIRMED after retry; leaving the \
+             registry row (and the session) for the next daemon's startup reap"
+        );
+        return false;
+    }
 
     // 2. Close the PTY / free the VT. The group is already dead, so the
     //    pane's PTY task sees EOF and exits promptly; teardown also clears
@@ -868,6 +1044,7 @@ async fn reap_scratch(
         "pane_id": claim.pane_id.to_string(),
         "pgid": claim.pgid,
     }));
+    true
 }
 
 /// Per-scratch reap timer (LENS-R-042 a/b): races `max_runtime_ms` against
@@ -911,7 +1088,11 @@ async fn scratch_reaper(
     let Some(claim) = registry.claim(&session_id) else {
         return;
     };
-    reap_scratch(
+    // Row removal LAST (codex B3), and ONLY on confirmed group death (P5
+    // round-2 codex N3): an unconfirmed kill leaves the row — the ERROR is
+    // logged inside reap_scratch, and the next daemon's startup reap owns
+    // the retry.
+    if reap_scratch(
         &claim,
         session_id,
         &graph,
@@ -919,9 +1100,10 @@ async fn scratch_reaper(
         &registry.audit,
         reason,
     )
-    .await;
-    // Row removal LAST (codex B3): only after the group is confirmed dead.
-    registry.remove(&session_id);
+    .await
+    {
+        registry.remove(&session_id);
+    }
 }
 
 /// Hook for `session.kill` (LENS-R-042c: explicit kill reaps immediately).
@@ -944,7 +1126,20 @@ pub async fn on_session_killed(
     // SIGKILL); this enforces the LENS-R-042 SIGTERM contract on the whole
     // group and, more importantly, CONFIRMS death before the registry row
     // disappears. Signals to an already-dead group are no-ops.
-    kill_pgid_lens_sequence(claim.pgid).await;
+    //
+    // Unconfirmed death (P5 round-2 codex N3): do NOT remove the row and
+    // do NOT audit a reap that didn't complete — the row (still claimed,
+    // still persisted) is exactly what the next daemon's startup reap
+    // needs to finish the job.
+    if !kill_confirmed(claim.pgid).await {
+        tracing::error!(
+            pgid = claim.pgid,
+            session_id = %session_id,
+            "explicit scratch kill: group death UNCONFIRMED after retry; \
+             leaving the registry row for the next daemon's startup reap"
+        );
+        return;
+    }
     // Belt-and-suspenders teardown: normally a no-op (session.kill already
     // tore the pane down); covers any future caller of this hook.
     {
@@ -1021,6 +1216,109 @@ async fn handle_lens_run(
 ) -> Result<serde_json::Value, shux_rpc::RpcError> {
     let p = parse_lens_run_params(&params)?;
 
+    // ── Cancellation shield (P5 round-2 codex N1 ≡ claude round-2 major) ─
+    // The shux-rpc server DROPS in-flight handler futures on client
+    // disconnect (the P3 cancellable-execution contract). A disconnect
+    // between graph-session creation and registry commit used to leak an
+    // unregistered __scratch session + PTY: the reservation Drop-released,
+    // but nothing owned the session — no reaper, no registry row, no
+    // startup-reap coverage (the PTY task's own shutdown binds to the ROOT
+    // daemon token, never to the request, so handler-drop cannot cascade
+    // teardown either). Fix: the non-idempotent core (reserve → create
+    // session → spawn PTY → commit + arm reaper) runs in its OWN spawned
+    // task; the handler awaits its JoinHandle. Dropping a JoinHandle does
+    // NOT abort the task, so a disconnected client simply never reads the
+    // response while the composite completes — from commit onward the
+    // ttl/max_runtime reaper owns the scratch. Everything after the core
+    // (the `--wait` tail) stays freely cancellable per P3 semantics.
+    //
+    // The task-local caller identity does not cross `tokio::spawn`, so the
+    // core future is re-wrapped in the captured caller's scope (keeps
+    // scratch.create audit attribution truthful — LENS-R-052).
+    let caller = shux_rpc::current_caller();
+    let core = tokio::spawn(shux_rpc::with_caller(
+        caller,
+        spawn_scratch_core(p, graph, io_state, cancel, event_bus, registry),
+    ));
+    let (session_id, pane_id, revision, wait_sub) = match core.await {
+        Ok(core_result) => core_result?,
+        Err(join_err) => {
+            // Only reachable on a core panic (never aborted). Repo law
+            // forbids panics; surface honestly instead of unwrapping.
+            return Err(shux_rpc::RpcError::internal(&format!(
+                "lens.run core task failed: {join_err}"
+            )));
+        }
+    };
+
+    let mut result = json!({
+        "session_id": session_id.to_string(),
+        "pane_id": pane_id.to_string(),
+        "revision": revision,
+    });
+
+    if let Some(sub) = wait_sub {
+        let exit_code = wait_for_pane_exit(sub, pane_id).await.unwrap_or(-1);
+        result["exit_code"] = json!(exit_code);
+    }
+
+    Ok(result)
+}
+
+/// Test pause points for the N1 cancellation tests: a slot, when armed,
+/// makes the core signal `reached` and block until `release` — so a test
+/// can drop the dispatching future at an exact interior point and prove
+/// the shielded core still completes. nextest's process-per-test isolates
+/// the statics.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::Notify;
+
+    pub(crate) struct Pause {
+        pub reached: Notify,
+        pub release: Notify,
+    }
+
+    impl Pause {
+        pub(crate) fn arm(slot: &StdMutex<Option<Arc<Pause>>>) -> Arc<Pause> {
+            let p = Arc::new(Pause {
+                reached: Notify::new(),
+                release: Notify::new(),
+            });
+            *slot.lock().unwrap() = Some(p.clone());
+            p
+        }
+    }
+
+    /// Between graph-session creation and PTY spawn.
+    pub(crate) static PAUSE_AFTER_CREATE: StdMutex<Option<Arc<Pause>>> = StdMutex::new(None);
+    /// Between PTY spawn and registry commit.
+    pub(crate) static PAUSE_BEFORE_COMMIT: StdMutex<Option<Arc<Pause>>> = StdMutex::new(None);
+
+    pub(crate) async fn maybe_pause(slot: &StdMutex<Option<Arc<Pause>>>) {
+        let armed = slot.lock().unwrap().clone();
+        if let Some(p) = armed {
+            p.reached.notify_one();
+            p.release.notified().await;
+        }
+    }
+}
+
+/// The non-idempotent core of `lens.run` (see the shield comment in
+/// `handle_lens_run`): reserve quota → create the graph session → spawn
+/// the PTY → commit the registry row + arm the reaper → audit. Runs as its
+/// own task so client disconnect can never leave a partially-created
+/// scratch behind; every failure path inside rolls back completely (the
+/// reservation by Drop, the session by explicit destroy).
+async fn spawn_scratch_core(
+    p: LensRunParams,
+    graph: GraphHandle,
+    io_state: Arc<Mutex<PaneIoState>>,
+    cancel: CancellationToken,
+    event_bus: EventBus,
+    registry: ScratchRegistry,
+) -> Result<(SessionId, PaneId, u64, Option<shux_core::bus::Subscription>), shux_rpc::RpcError> {
     // LENS-R-043: atomic check-and-reserve BEFORE any allocation (codex
     // B1 — a bare len() check raced concurrent lens.run calls past the
     // quota). The reservation releases itself on EVERY early return below
@@ -1054,6 +1352,9 @@ async fn handle_lens_run(
         .create_session_with_command(scratch_name, cwd.clone(), p.argv.clone())
         .await
         .map_err(|e| shux_rpc::RpcError::internal(&format!("scratch allocation failed: {e}")))?;
+
+    #[cfg(test)]
+    test_hooks::maybe_pause(&test_hooks::PAUSE_AFTER_CREATE).await;
 
     let snap = graph.snapshot();
     let pane_id = snap
@@ -1121,6 +1422,9 @@ async fn handle_lens_run(
     // falls back to liveness-only).
     let start_time = process_start_token(pgid).unwrap_or(0);
 
+    #[cfg(test)]
+    test_hooks::maybe_pause(&test_hooks::PAUSE_BEFORE_COMMIT).await;
+
     let now = SystemTime::now();
     let created_at_unix_ms = unix_ms(now);
     let max_runtime_deadline = Instant::now() + Duration::from_millis(p.max_runtime_ms as u64);
@@ -1180,18 +1484,7 @@ async fn handle_lens_run(
             .unwrap_or(1)
     };
 
-    let mut result = json!({
-        "session_id": session_id.to_string(),
-        "pane_id": pane_id.to_string(),
-        "revision": revision,
-    });
-
-    if let Some(sub) = exit_sub_for_wait {
-        let exit_code = wait_for_pane_exit(sub, pane_id).await.unwrap_or(-1);
-        result["exit_code"] = json!(exit_code);
-    }
-
-    Ok(result)
+    Ok((session_id, pane_id, revision, exit_sub_for_wait))
 }
 
 // ── test hooks ───────────────────────────────────────────────────────────
@@ -1309,6 +1602,21 @@ mod tests {
         assert!(!tmp.exists());
     }
 
+    /// Files under `dir` whose name marks them as preserved corrupt
+    /// registries (`scratch-registry.json.corrupt.<unix_ms>`).
+    fn corrupt_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".json.corrupt."))
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn startup_reap_preserves_corrupt_registry_as_evidence() {
         let dir = tmpdir();
@@ -1321,12 +1629,26 @@ mod tests {
         let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
         assert_eq!(killed, 0, "corrupt registry kills nothing");
         assert!(!path.exists(), "original name freed for the new daemon");
-        let corrupt = path.with_extension("json.corrupt");
-        assert!(corrupt.exists(), "evidence preserved");
+        let preserved = corrupt_files(dir.path());
+        assert_eq!(preserved.len(), 1, "evidence preserved (timestamped)");
         assert_eq!(
-            std::fs::read_to_string(&corrupt).unwrap(),
+            std::fs::read_to_string(&preserved[0]).unwrap(),
             truncated,
             "evidence bytes untouched"
+        );
+
+        // P5 round-2 codex minor: a SECOND corrupt startup must not
+        // overwrite the first evidence file.
+        std::fs::write(&path, "{second corruption").unwrap();
+        // The timestamp suffix has ms resolution; ensure it differs.
+        std::thread::sleep(Duration::from_millis(5));
+        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert_eq!(killed, 0);
+        let preserved = corrupt_files(dir.path());
+        assert_eq!(
+            preserved.len(),
+            2,
+            "repeated corrupt startups keep distinct evidence files: {preserved:?}"
         );
     }
 
@@ -1408,14 +1730,85 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    // ── N2 (round 2): leader-gone groups still get reaped ───────────────
+
+    #[tokio::test]
+    async fn startup_reap_kills_orphaned_descendants_when_leader_is_gone() {
+        // `sh -c 'sleep 300 & exit'` in its own group: the leader exits
+        // immediately, the sleep survives IN THE GROUP — the exact shape
+        // codex N2 proved the old start-token gate orphaned (token None →
+        // skip). A pgid stays allocated while any member lives, so the
+        // group probe must kill it.
+        use std::os::unix::process::CommandExt;
+        let dir = tmpdir();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 300 & exit 0"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn leader-exits group");
+        let pgid = child.id();
+        // Reap the leader zombie so only the live sleep keeps the group
+        // alive (a zombie leader would also hold it, masking the point).
+        let _ = child.wait();
+        assert!(
+            process_start_token(pgid).is_none(),
+            "leader must be gone (start token unreadable)"
+        );
+        {
+            use nix::sys::signal::killpg;
+            use nix::unistd::Pid;
+            assert!(
+                killpg(Pid::from_raw(pgid as i32), None).is_ok(),
+                "group must still be alive via the surviving descendant"
+            );
+        }
+
+        // Row recorded with a real (nonzero) token — by restart time the
+        // leader is unreadable, which is precisely the (recorded, None) arm.
+        write_registry_row(dir.path(), pgid, 98765);
+        let audit = LensAuditLog::open(dir.path());
+        let killed = ScratchRegistry::startup_reap(dir.path(), &audit).await;
+        assert_eq!(killed, 1, "leader-gone live group must be reaped");
+        {
+            use nix::sys::signal::killpg;
+            use nix::unistd::Pid;
+            assert!(
+                killpg(Pid::from_raw(pgid as i32), None).is_err(),
+                "descendant sleep killed with the group"
+            );
+        }
+        assert!(!dir.path().join("scratch-registry.json").exists());
+    }
+
     // ── N5: pgid 0 guard ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn kill_sequence_refuses_pgid_zero() {
         // killpg(0) would signal OUR own process group; the guard must
         // refuse before any signal is sent (the test surviving IS the
-        // assertion).
-        assert!(!kill_pgid_lens_sequence(0).await);
+        // assertion). AlreadyDead = "nothing this caller may kill".
+        assert_eq!(kill_pgid_lens_sequence(0).await, KillOutcome::AlreadyDead);
+    }
+
+    // ── N3 (round 2): honest kill confirmation ──────────────────────────
+
+    #[tokio::test]
+    async fn forced_unconfirmed_kill_is_reported_honestly() {
+        use std::sync::atomic::Ordering;
+        TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        assert_eq!(
+            kill_pgid_lens_sequence(12345).await,
+            KillOutcome::Unconfirmed,
+            "forced path reports Unconfirmed, never a false kill"
+        );
+        // kill_confirmed retries once, stays honest, returns false.
+        assert!(
+            !kill_confirmed(12345).await,
+            "unconfirmed death must not read as confirmed"
+        );
+        TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
     }
 
     // ── M3: validate before casting ─────────────────────────────────────
@@ -1538,33 +1931,78 @@ mod tests {
         assert_eq!(n, 24, "every append landed exactly once");
     }
 
+    /// Append entries with a fat padding field until the live file exceeds
+    /// the rotation cap and one more append triggers the rotation.
+    fn fill_one_rotation(audit: &LensAuditLog, live: &Path, tag: &str) {
+        let pad = "x".repeat(16 * 1024);
+        let mut i = 0usize;
+        while std::fs::metadata(live).map(|m| m.len()).unwrap_or(0) <= AUDIT_ROTATE_AT_BYTES {
+            audit.append(json!({
+                "ts": iso_now(), "caller": "uds", "method": "scratch.create",
+                "tag": tag, "n": i, "pad": pad,
+            }));
+            i += 1;
+        }
+        // One more append rotates (the size check runs BEFORE the write).
+        audit.append(json!({
+            "ts": iso_now(), "caller": "uds", "method": "scratch.create",
+            "tag": tag, "n": i, "pad": pad,
+        }));
+    }
+
     #[test]
-    fn audit_rotates_at_cap_and_restarts_the_chain() {
+    fn audit_rotation_carries_the_chain_across_files() {
         let dir = tmpdir();
         let path = dir.path().join("lens-audit.ndjson");
         let audit = LensAuditLog::open(dir.path());
-        audit.append(json!({"ts": iso_now(), "caller": "uds", "method": "scratch.create"}));
-        // Inflate the live file past the cap. The rotated-out file's chain
-        // integrity is not required — rotation is size-based.
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            let filler = vec![b'x'; (AUDIT_ROTATE_AT_BYTES as usize) + 1];
-            f.write_all(&filler).unwrap();
-        }
-        audit.append(
-            json!({"ts": iso_now(), "caller": "uds", "method": "scratch.reap", "reason": "exit"}),
-        );
+
+        // Two full rotations of REAL entries → .2, .1, live all chained.
+        fill_one_rotation(&audit, &path, "gen1");
+        assert!(path.with_extension("ndjson.1").exists(), "first rotation");
+        fill_one_rotation(&audit, &path, "gen2");
         assert!(
-            path.with_extension("ndjson.1").exists(),
-            "oversized file rotated to .1"
+            path.with_extension("ndjson.2").exists(),
+            "second rotation shifted .1 → .2"
         );
-        // The fresh live file starts a NEW genesis-rooted chain.
-        let n = verify_chain(&path).expect("fresh file chain verifies from genesis");
-        assert_eq!(n, 1);
+
+        // The live file opens with the rotation header, chained off the
+        // rotated-out file's final hash (NOT genesis — codex round-2 minor).
+        let live_text = std::fs::read_to_string(&path).unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(live_text.lines().next().unwrap()).unwrap();
+        assert_eq!(first["method"], "audit.rotate", "rotation header first");
+        assert!(first["predecessor"].as_str().unwrap().contains("ndjson.1"));
+        assert_ne!(
+            first["prev_hash"], GENESIS_HASH,
+            "chain carries across the boundary instead of restarting"
+        );
+
+        // The whole set verifies as ONE chain.
+        let total = verify_chain_set(&path).expect("cross-file chain verifies");
+        assert!(total > 0);
+
+        // Reordering rotated files (swap .1 and .2) breaks the walk.
+        let f1 = path.with_extension("ndjson.1");
+        let f2 = path.with_extension("ndjson.2");
+        let (b1, b2) = (std::fs::read(&f1).unwrap(), std::fs::read(&f2).unwrap());
+        std::fs::write(&f1, &b2).unwrap();
+        std::fs::write(&f2, &b1).unwrap();
+        assert!(
+            verify_chain_set(&path).is_err(),
+            "reordered rotation files must fail set verification"
+        );
+        std::fs::write(&f1, &b1).unwrap();
+        std::fs::write(&f2, &b2).unwrap();
+        assert!(verify_chain_set(&path).is_ok(), "restored set verifies");
+
+        // Deleting an INTERIOR rotated file (.1 — between .2 and live)
+        // breaks the walk: the live file's anchor no longer matches .2's
+        // final hash.
+        std::fs::remove_file(&f1).unwrap();
+        assert!(
+            verify_chain_set(&path).is_err(),
+            "deleted interior rotation file must fail set verification"
+        );
     }
 
     // ── reap claim dedup (N6) ───────────────────────────────────────────
