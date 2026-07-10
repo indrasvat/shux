@@ -488,14 +488,28 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
     match ctx.format {
         OutputFormat::Plain => {
             for s in sessions {
-                let _ = writeln!(
-                    out,
-                    "{}\t{}\t{}\t{}",
-                    s.name,
-                    s.window_count,
-                    s.created,
-                    short_id(&s.id),
-                );
+                if s.scratch {
+                    // 5th column only on scratch rows (which only appear
+                    // under --include-scratch) — ordinary rows keep the
+                    // stable 4-column shape scripts already parse.
+                    let _ = writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}\tscratch",
+                        s.name,
+                        s.window_count,
+                        s.created,
+                        short_id(&s.id),
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}",
+                        s.name,
+                        s.window_count,
+                        s.created,
+                        short_id(&s.id),
+                    );
+                }
             }
         }
         OutputFormat::Json => unreachable!("JSON handled before render"),
@@ -549,9 +563,15 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                     s.window_count,
                     if s.window_count == 1 { "" } else { "s" }
                 );
+                // Visible scratch tag (LENS-R-041 --include-scratch rows).
+                let name_cell = if s.scratch {
+                    format!("{} [scratch]", s.name)
+                } else {
+                    s.name.clone()
+                };
                 layout.add_row(vec![
                     diamond.to_string(),
-                    s.name.clone(),
+                    name_cell,
                     win_text,
                     s.created.clone(),
                     short_id(&s.id).to_string(),
@@ -874,6 +894,10 @@ pub struct SessionInfo {
     pub window_count: usize,
     pub created: String,
     pub is_active: bool,
+    /// Lens scratch session (only ever true under `--include-scratch`,
+    /// LENS-R-041). Text mode renders a visible `[scratch]` tag; plain
+    /// mode appends a `scratch` column so scripts can tell them apart.
+    pub scratch: bool,
 }
 
 /// Window info for list rendering.
@@ -1476,6 +1500,7 @@ mod tests {
                 window_count: 1,
                 created: "now".to_string(),
                 is_active: true,
+                scratch: false,
             },
             SessionInfo {
                 name: "ops".to_string(),
@@ -1483,6 +1508,7 @@ mod tests {
                 window_count: 2,
                 created: "later".to_string(),
                 is_active: false,
+                scratch: true,
             },
         ];
         let windows = vec![

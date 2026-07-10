@@ -1422,11 +1422,17 @@ fn run_daemon() -> anyhow::Result<()> {
         let runtime_dir = daemon::ensure_runtime_dir()?;
         daemon::remove_socket_file()?;
 
+        // Daemon-level lens audit log (LENS-R-052): ONE instance for the
+        // whole daemon — the chain head is cached in memory, so a second
+        // opener would fork the chain. Built before the startup reap so
+        // reap(reason=registry) entries chain onto the same log.
+        let lens_audit = lens_scratch::LensAuditLog::open_default();
+
         // Lens scratch registry startup reap (LENS-R-044, DEC-7): scratch
         // sessions never survive a restart. Kill any process groups a prior
         // daemon incarnation left registered BEFORE the RPC server starts
         // accepting `lens.run` calls that would populate a fresh registry.
-        let reaped = lens_scratch::ScratchRegistry::startup_reap(&runtime_dir, None).await;
+        let reaped = lens_scratch::ScratchRegistry::startup_reap(&runtime_dir, &lens_audit).await;
         if reaped > 0 {
             tracing::info!(
                 reaped,
@@ -1437,7 +1443,7 @@ fn run_daemon() -> anyhow::Result<()> {
         // Set up SessionGraph + graph loop
         let sock_path = daemon::socket_path()?;
         let cancel = tokens.root.clone();
-        let io_state = run_rpc_server(sock_path, cancel.clone()).await?;
+        let io_state = run_rpc_server(sock_path, cancel.clone(), lens_audit).await?;
 
         // Run the daemon state loop (blocks until shutdown)
         shux_core::daemon::run_daemon_state_loop(cmd_rx, tokens.clone(), config_reload_notify)
@@ -1493,6 +1499,7 @@ fn run_client(args: Cli) -> anyhow::Result<()> {
 async fn run_rpc_server(
     socket_path: PathBuf,
     cancel: tokio_util::sync::CancellationToken,
+    lens_audit: Arc<lens_scratch::LensAuditLog>,
 ) -> anyhow::Result<Arc<Mutex<PaneIoState>>> {
     // EventBus: typed pub/sub for lifecycle events. Wired into SessionGraph
     // so every successful mutation publishes a typed event to subscribers.
@@ -1523,7 +1530,8 @@ async fn run_rpc_server(
     // Lens scratch registry (§8 SPEC-E, LENS-R-040..046). One per daemon
     // incarnation — the startup reap in `run_daemon` already cleared any
     // leftover registry file from a prior incarnation before this runs.
-    let scratch_registry = lens_scratch::ScratchRegistry::new(&daemon::runtime_dir()?);
+    let scratch_registry =
+        lens_scratch::ScratchRegistry::new(&daemon::runtime_dir()?, lens_audit.clone());
 
     // Load user config (~/.config/shux/config.toml). Missing file is
     // valid — defaults match current hardcoded behavior. Spawn a watcher
@@ -1643,6 +1651,7 @@ async fn run_rpc_server(
                         session_meta_cache.clone(),
                         onboarding.clone(),
                         segment_cache.clone(),
+                        lens_audit.clone(),
                     ),
                     graph_handle.clone(),
                     io_state.clone(),
@@ -1672,6 +1681,31 @@ async fn run_rpc_server(
     // permission enforcer can look up entity ownership.
     plugins.set_router(router.clone());
     plugins.set_graph(graph_handle.clone()).await;
+
+    // LENS-R-052 denial entries: mirror plugin permission DENIALS of the
+    // lens methods into the daemon-level lens audit log (the per-plugin
+    // audit log records every denial regardless; this adds the lens view).
+    // The caller field here is the one place the identity IS known.
+    {
+        let audit = lens_audit.clone();
+        plugins.set_denial_hook(std::sync::Arc::new(move |_name, uuid, method| {
+            const LENS_METHODS: [&str; 5] = [
+                "pane.glance",
+                "pane.wait_settled",
+                "pane.checkpoint",
+                "pane.diff_since",
+                "lens.run",
+            ];
+            if LENS_METHODS.contains(&method) {
+                audit.append(serde_json::json!({
+                    "ts": lens_scratch::iso_now(),
+                    "caller": format!("plugin:{uuid}"),
+                    "method": method,
+                    "decision": "deny",
+                }));
+            }
+        }));
+    }
 
     let config = shux_rpc::ServerConfig {
         socket_path,
@@ -3840,7 +3874,7 @@ fn register_session_methods(
                         .and_then(|p| p.get("include_scratch"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    let scratch_ids = registry.ids().await;
+                    let scratch_ids = registry.ids();
 
                     let snap = gh.snapshot();
                     let mut sessions: Vec<_> = snap.sessions.values().collect();
@@ -4073,8 +4107,10 @@ fn register_session_methods(
                     // LENS-R-042c: explicit session.kill reaps a scratch
                     // session IMMEDIATELY (no post_exit_ttl_ms wait) — this
                     // is a no-op for ordinary sessions (registry lookup
-                    // misses).
-                    lens_scratch::on_session_killed(&registry, session_id).await;
+                    // misses). For scratch it enforces the LENS-R-042 kill
+                    // sequence + death confirmation before the registry row
+                    // is dropped (P5 round-1 codex B3).
+                    lens_scratch::on_session_killed(&registry, &io, session_id).await;
 
                     Ok(serde_json::json!({ "killed": name }))
                 }
@@ -4506,7 +4542,16 @@ fn register_pane_io_methods(
     meta_cache: session_meta::SessionMetaCache,
     onboarding: onboarding::OnboardingHandle,
     segments: statusbar_runner::SegmentCache,
+    lens_audit: Arc<lens_scratch::LensAuditLog>,
 ) -> shux_rpc::RouterBuilder {
+    // LENS-R-052 audit handles for the three lens observation methods
+    // (glance / checkpoint / diff). `caller` is recorded as "uds"
+    // unconditionally — see LensAuditLog's doc comment for the identity-
+    // threading proposal (P5 round-1 claude N3, deferred by adjudication).
+    let audit_glance = lens_audit.clone();
+    let audit_checkpoint = lens_audit.clone();
+    let audit_diff = lens_audit;
+
     let g1 = graph.clone();
     let g2 = graph.clone();
     let g5 = graph.clone();
@@ -5336,6 +5381,7 @@ fn register_pane_io_methods(
                 let gh = g12.clone();
                 let io = io13.clone();
                 let r = rasterizer_glance.load_full();
+                let audit = audit_glance.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -5526,6 +5572,24 @@ fn register_pane_io_methods(
                         (false, None)
                     };
 
+                    // LENS-R-052: audit the successful glance (P5 round-1
+                    // codex M2a — the spec's field list: ts, caller, method,
+                    // pane_id, revision(s), bytes_returned). bytes_returned
+                    // counts the DECODED payload (viewport text + PNG bytes
+                    // before base64).
+                    let png_decoded_len = png_base64
+                        .as_ref()
+                        .map(|b64| b64.len() / 4 * 3)
+                        .unwrap_or(0);
+                    audit.append(serde_json::json!({
+                        "ts": lens_scratch::iso_now(),
+                        "caller": "uds",
+                        "method": "pane.glance",
+                        "pane_id": pane_id.to_string(),
+                        "revision": revision,
+                        "bytes_returned": text.len() + png_decoded_len,
+                    }));
+
                     Ok(serde_json::json!({
                         "revision": revision,
                         "cols": snap_cols,
@@ -5693,6 +5757,7 @@ fn register_pane_io_methods(
             move |params: Option<serde_json::Value>| {
                 let gh = g14.clone();
                 let io = io15.clone();
+                let audit = audit_checkpoint.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -5723,6 +5788,17 @@ fn register_pane_io_methods(
                         (revision, evicted)
                     };
 
+                    // LENS-R-052: audit the checkpoint. A checkpoint returns
+                    // no pane content, so bytes_returned is 0 by definition.
+                    audit.append(serde_json::json!({
+                        "ts": lens_scratch::iso_now(),
+                        "caller": "uds",
+                        "method": "pane.checkpoint",
+                        "pane_id": pane_id.to_string(),
+                        "revision": revision,
+                        "bytes_returned": 0,
+                    }));
+
                     Ok(serde_json::json!({
                         "revision": revision,
                         "evicted_revision": evicted,
@@ -5743,6 +5819,7 @@ fn register_pane_io_methods(
                 let gh = g15.clone();
                 let io = io16.clone();
                 let r = rasterizer_diff.load_full();
+                let audit = audit_diff.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -5899,6 +5976,28 @@ fn register_pane_io_methods(
                     } else {
                         None
                     };
+
+                    // LENS-R-052: audit the diff with BOTH revisions
+                    // ("revision(s)" per the spec's field list).
+                    // bytes_returned counts the decoded payload: changed row
+                    // text + heat PNG bytes before base64.
+                    let row_text_len: usize = changed_row_text
+                        .as_object()
+                        .map(|m| m.values().filter_map(|v| v.as_str()).map(str::len).sum())
+                        .unwrap_or(0);
+                    let heat_decoded_len = heat_png_base64
+                        .as_ref()
+                        .map(|b64| b64.len() / 4 * 3)
+                        .unwrap_or(0);
+                    audit.append(serde_json::json!({
+                        "ts": lens_scratch::iso_now(),
+                        "caller": "uds",
+                        "method": "pane.diff_since",
+                        "pane_id": pane_id.to_string(),
+                        "from_revision": since_revision,
+                        "to_revision": to_revision,
+                        "bytes_returned": row_text_len + heat_decoded_len,
+                    }));
 
                     let (bb_rs, bb_cs, bb_re, bb_ce) = diff.bounding_box;
                     Ok(serde_json::json!({
@@ -6150,12 +6249,28 @@ fn register_pane_io_methods(
 /// Strategy: query the daemon for sessions; if any exist, pick the most
 /// recently created. If none, fall through to "default" (which the
 /// daemon-side attach handler will create on demand).
+/// Choose the session a bare `shux` / `shux attach` lands on from a
+/// `session.list` result. NEVER a scratch session (lens PRD LENS-R-041 —
+/// P5 round-1 minor: scratch panes are agent working surfaces; a human
+/// attaching blind must not land inside one). Defense in depth: the
+/// default `session.list` already omits scratch, and this filter also
+/// rejects `scratch: true` flags and the reserved `__scratch-` name prefix
+/// in case a future caller feeds an `--include-scratch` listing through.
+fn choose_attach_session(sessions: &[serde_json::Value]) -> Option<String> {
+    sessions
+        .iter()
+        .filter(|s| s.get("scratch").and_then(|v| v.as_bool()) != Some(true))
+        .filter_map(|s| s.get("name")?.as_str())
+        .find(|name| !name.starts_with("__scratch-"))
+        .map(str::to_string)
+}
+
 async fn pick_attach_target(socket_path: &std::path::Path) -> String {
     if let Ok(mut stream) = client::try_connect(socket_path).await {
         if let Ok(value) = cli::rpc_call(&mut stream, "session.list", serde_json::json!({})).await {
             if let Some(arr) = value.get("sessions").and_then(|v| v.as_array()) {
-                if let Some(latest) = arr.iter().filter_map(|s| s.get("name")?.as_str()).next() {
-                    return latest.to_string();
+                if let Some(target) = choose_attach_session(arr) {
+                    return target;
                 }
             }
         }
@@ -8030,6 +8145,10 @@ mod tests {
         bus: shux_core::bus::EventBus,
         cancel: CancellationToken,
         graph_task: tokio::task::JoinHandle<()>,
+        scratch_registry: lens_scratch::ScratchRegistry,
+        /// Keeps the isolated scratch/audit dir alive for the harness's
+        /// lifetime (registry + lens-audit files live inside).
+        _scratch_dir: tempfile::TempDir,
     }
 
     impl RpcHarness {
@@ -8050,9 +8169,10 @@ mod tests {
             let config = ConfigHandle::load_or_default(&config_path);
             let onboarding = onboarding::OnboardingHandle::from_state_for_test(Default::default());
             let segments = statusbar_runner::SegmentCache::new();
-            let scratch_runtime_dir = std::env::temp_dir()
-                .join(format!("shux-rpc-test-scratch-{}", uuid::Uuid::new_v4()));
-            let scratch_registry = lens_scratch::ScratchRegistry::new(&scratch_runtime_dir);
+            let scratch_dir = tempfile::tempdir().expect("scratch dir");
+            let lens_audit = lens_scratch::LensAuditLog::open(scratch_dir.path());
+            let scratch_registry =
+                lens_scratch::ScratchRegistry::new(scratch_dir.path(), lens_audit.clone());
 
             let builder = register_session_methods(
                 shux_rpc::Router::builder(),
@@ -8060,7 +8180,7 @@ mod tests {
                 io.clone(),
                 cancel.clone(),
                 meta.clone(),
-                scratch_registry,
+                scratch_registry.clone(),
             );
             let builder =
                 register_window_methods(builder, graph.clone(), io.clone(), cancel.clone());
@@ -8076,6 +8196,15 @@ mod tests {
                 meta,
                 onboarding,
                 segments,
+                lens_audit,
+            );
+            let builder = lens_scratch::register_lens_run_method(
+                builder,
+                graph.clone(),
+                io.clone(),
+                cancel.clone(),
+                bus.clone(),
+                scratch_registry.clone(),
             );
             let router = register_events_methods(builder, bus.clone()).build();
             router.assert_every_route_has_policy();
@@ -8087,6 +8216,8 @@ mod tests {
                 bus,
                 cancel,
                 graph_task,
+                scratch_registry,
+                _scratch_dir: scratch_dir,
             }
         }
 
@@ -8166,6 +8297,168 @@ mod tests {
         params: serde_json::Value,
     ) -> shux_rpc::RpcError {
         router.dispatch(method, Some(params)).await.unwrap_err()
+    }
+
+    /// Kill a lens.run scratch session through the production route and
+    /// wait for its registry slot to free (the explicit-kill reap confirms
+    /// group death before dropping the row).
+    async fn kill_scratch_and_wait(harness: &RpcHarness, session_id: &str) {
+        let _ = dispatch_ok(
+            &harness.router,
+            "session.kill",
+            serde_json::json!({"id": session_id}),
+        )
+        .await;
+        let sid: shux_core::model::SessionId = session_id.parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while harness.scratch_registry.ids().contains(&sid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scratch {session_id} not reaped within 5s of explicit kill"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// LENS-R-043 atomicity through the PRODUCTION lens.run route (P5
+    /// round-1 codex B1): with 15/16 slots occupied, two CONCURRENT
+    /// lens.run calls race for the last slot — exactly one may win,
+    /// deterministically (the check-and-reserve is one critical section;
+    /// no sleeps, no retries).
+    #[tokio::test]
+    async fn production_lens_run_quota_is_atomic_under_concurrent_calls() {
+        let harness = RpcHarness::new();
+        harness
+            .scratch_registry
+            .test_occupy(lens_scratch::SCRATCH_QUOTA - 1);
+
+        let params = serde_json::json!({"argv": ["sleep", "30"], "cols": 80, "rows": 24});
+        let (a, b) = tokio::join!(
+            harness.router.dispatch("lens.run", Some(params.clone())),
+            harness.router.dispatch("lens.run", Some(params.clone())),
+        );
+        let ok_count = [a.is_ok(), b.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(ok_count, 1, "exactly one racer wins the 16th slot");
+        let (winner, loser_err) = match (a, b) {
+            (Ok(w), Err(e)) | (Err(e), Ok(w)) => (w, e),
+            _ => unreachable!("asserted exactly-one above"),
+        };
+        assert_eq!(
+            loser_err.code,
+            shux_rpc::ErrorCode::ResourceExhausted.code(),
+            "loser gets RESOURCE_EXHAUSTED (-32012)"
+        );
+
+        // A third call while full is also rejected.
+        let third = dispatch_err(&harness.router, "lens.run", params.clone()).await;
+        assert_eq!(third.code, shux_rpc::ErrorCode::ResourceExhausted.code());
+
+        // Cleanup: kill the winner; its freed slot admits a new run.
+        let sid = winner["session_id"].as_str().unwrap().to_string();
+        kill_scratch_and_wait(&harness, &sid).await;
+        let retry = dispatch_ok(&harness.router, "lens.run", params).await;
+        let sid = retry["session_id"].as_str().unwrap().to_string();
+        kill_scratch_and_wait(&harness, &sid).await;
+
+        harness.stop().await;
+    }
+
+    /// Every lens.run failure path releases its quota reservation (codex
+    /// B1's rollback requirement): a SPAWN_FAILED at 15/16 must leave the
+    /// 16th slot reusable.
+    #[tokio::test]
+    async fn production_lens_run_failed_spawn_releases_its_reservation() {
+        let harness = RpcHarness::new();
+        harness
+            .scratch_registry
+            .test_occupy(lens_scratch::SCRATCH_QUOTA - 1);
+
+        let bad = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["/nonexistent-lens-p5-binary"]}),
+        )
+        .await;
+        assert_eq!(bad.code, shux_rpc::ErrorCode::SpawnFailed.code());
+        assert_eq!(
+            harness.scratch_registry.test_total(),
+            lens_scratch::SCRATCH_QUOTA - 1,
+            "failed spawn released its reservation"
+        );
+
+        // The freed slot admits a real run.
+        let ok = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"]}),
+        )
+        .await;
+        let sid = ok["session_id"].as_str().unwrap().to_string();
+        kill_scratch_and_wait(&harness, &sid).await;
+
+        harness.stop().await;
+    }
+
+    /// LENS-R-040 bounds are validated on the FULL u64 before any
+    /// narrowing cast (P5 round-1 codex M3): raw RPC shapes that would
+    /// wrap through `as u16`/`as u32` into legal-looking values must be
+    /// INVALID_PARAMS. (Unit twins live in lens_scratch::tests; these are
+    /// the raw-RPC-shape halves through the production router.)
+    #[tokio::test]
+    async fn production_lens_run_rejects_wrapping_params_before_cast() {
+        let harness = RpcHarness::new();
+
+        // 66000 wraps to 464 through `as u16` — inside [20,500].
+        let err = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep"], "cols": 66000}),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        // 2^32 + 1 wraps to 1 through `as u32` — inside [0, 300000].
+        let err = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep"], "post_exit_ttl_ms": 4_294_967_297u64}),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        // And no scratch leaked from the rejected calls.
+        assert_eq!(harness.scratch_registry.test_total(), 0);
+        harness.stop().await;
+    }
+
+    /// Bare `shux` / `shux attach` target choice never lands on a scratch
+    /// session (P5 round-1 minor — attach guard), whether flagged
+    /// `scratch: true` or recognizable by the reserved name prefix.
+    #[test]
+    fn choose_attach_session_never_picks_scratch() {
+        // Scratch-only listing → None (fall through to "default").
+        let scratch_only = vec![
+            serde_json::json!({"name": "__scratch-abc", "scratch": true}),
+            serde_json::json!({"name": "__scratch-def"}),
+        ];
+        assert_eq!(choose_attach_session(&scratch_only), None);
+
+        // Mixed listing → first NON-scratch name, regardless of order.
+        let mixed = vec![
+            serde_json::json!({"name": "__scratch-abc", "scratch": true}),
+            serde_json::json!({"name": "work"}),
+            serde_json::json!({"name": "other"}),
+        ];
+        assert_eq!(choose_attach_session(&mixed), Some("work".to_string()));
+
+        // Flag wins even when the name looks ordinary.
+        let flagged = vec![
+            serde_json::json!({"name": "sneaky", "scratch": true}),
+            serde_json::json!({"name": "real"}),
+        ];
+        assert_eq!(choose_attach_session(&flagged), Some("real".to_string()));
+
+        assert_eq!(choose_attach_session(&[]), None);
     }
 
     #[tokio::test]

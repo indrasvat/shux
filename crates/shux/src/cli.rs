@@ -1910,12 +1910,15 @@ pub async fn handle_ls(
                                 .get("created_at")
                                 .map(format_created_at)
                                 .unwrap_or_else(|| "?".to_string());
+                            let scratch =
+                                s.get("scratch").and_then(|v| v.as_bool()).unwrap_or(false);
                             style::SessionInfo {
                                 name,
                                 id,
                                 window_count,
                                 created,
                                 is_active: false, // no attach tracking yet
+                                scratch,
                             }
                         })
                         .collect()
