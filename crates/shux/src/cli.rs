@@ -1588,7 +1588,7 @@ THE LENS LOOP (run \u{2192} settle \u{2192} glance \u{2192} drive \u{2192} diff)
   shux lens run -- <argv...>         spawn a command in a hidden scratch session
   shux pane wait-settled <pane>      block until the screen stops changing
   shux pane glance <pane>            atomic {png, text, revision} of one frame
-  shux pane send-keys <pane> -t ...  drive the pane (keystrokes)
+  shux pane send-keys -s SID -p PANE -t ...   drive the pane (keystrokes)
   shux pane diff <pane> --since REV  prove exactly what changed, with PNG proof
 
 `lens` is a CLI noun for exactly ONE verb (`run`) \u{2014} the other four verbs
