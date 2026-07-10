@@ -386,6 +386,17 @@ pub enum Command {
         command: PaneCommand,
     },
 
+    /// The lens composite verb — spawn a command in a hidden, self-cleaning
+    /// scratch session. Mirrors `lens.run` RPC (lens PRD §8). `lens` is a
+    /// CLI noun for exactly this ONE verb (`run`); the other four verbs of
+    /// the run→settle→glance→drive→diff loop are pane primitives under
+    /// `shux pane …` (`wait-settled`, `glance`, `send-keys`, `diff`) — see
+    /// `shux lens --help` for the full recipe.
+    Lens {
+        #[command(subcommand)]
+        command: LensCommand,
+    },
+
     /// Process plugins (task 044a phase 0).
     ///
     /// `shux plugin install <path>` spawns an executable that speaks
@@ -534,7 +545,12 @@ pub enum SessionCommand {
 
     /// List sessions.
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Reveal scratch sessions (lens PRD §8, LENS-R-041). Omitted by
+        /// default; entries are flagged `scratch: true` when this is set.
+        #[arg(long)]
+        include_scratch: bool,
+    },
 
     /// Kill a session.
     Kill {
@@ -1562,6 +1578,110 @@ pub enum PaneCommand {
     },
 }
 
+/// §10 discoverability requirement: `shux lens` / `shux lens --help` prints
+/// the five-verb loop recipe (naming the full `shux pane …` commands) so the
+/// umbrella teaches the loop without duplicating commands under `lens`.
+const LENS_LOOP_RECIPE: &str = "\
+THE LENS LOOP (run \u{2192} settle \u{2192} glance \u{2192} drive \u{2192} diff):
+  shux lens run -- <argv...>         spawn a command in a hidden scratch session
+  shux pane wait-settled <pane>      block until the screen stops changing
+  shux pane glance <pane>            atomic {png, text, revision} of one frame
+  shux pane send-keys <pane> -t ...  drive the pane (keystrokes)
+  shux pane diff <pane> --since REV  prove exactly what changed, with PNG proof
+
+`lens` is a CLI noun for exactly ONE verb (`run`) \u{2014} the other four verbs
+above are pane primitives under `shux pane \u{2026}`, not `shux lens \u{2026}`.";
+
+#[derive(Subcommand, Debug)]
+#[command(after_help = LENS_LOOP_RECIPE)]
+pub enum LensCommand {
+    /// Spawn `argv` directly (no shell, ever) in a hidden, quota-bounded
+    /// scratch session. Mirrors `lens.run` RPC (lens PRD §8,
+    /// LENS-R-040/045/046).
+    ///
+    /// Async by default: prints `{session_id, pane_id, revision}` and
+    /// returns immediately. The scratch process keeps running; it is
+    /// reaped `--ttl` after it exits, or at `--max-runtime` regardless of
+    /// whether it has exited, whichever comes first (or immediately on an
+    /// explicit `shux session kill`).
+    ///
+    /// `--wait` blocks the RPC until the command exits, adds `exit_code` to
+    /// the printed output, and the CLI process itself exits with the
+    /// CHILD's exit code once the child has started (§10 precedence rule —
+    /// setup failures BEFORE the child starts use the table below instead).
+    Run {
+        /// PTY size as `COLSxROWS` (e.g. `80x24`). Bounds cols in [20,500]
+        /// rows in [5,200] are enforced server-side (INVALID_PARAMS, exit 2)
+        /// — this flag only parses the shape, it does not pre-validate range.
+        #[arg(long, value_name = "CxR", value_parser = parse_size_cxr, default_value = "80x24")]
+        size: (u16, u16),
+
+        /// How long to keep the scratch session around after the command
+        /// exits, before reaping it. Human duration (`30s`, `1m`); range
+        /// [0, 300s] enforced server-side.
+        #[arg(long, value_parser = parse_duration_ms, default_value = "30s")]
+        ttl: u64,
+
+        /// Hard cap on the scratch session's total lifetime, regardless of
+        /// whether the command has exited. Human duration (`1h`, `90s`);
+        /// range [1s, 24h] enforced server-side.
+        #[arg(long = "max-runtime", value_parser = parse_duration_ms, default_value = "1h")]
+        max_runtime: u64,
+
+        /// Extra environment variable for the spawned process,
+        /// `KEY=VALUE`. Repeatable. Additions only — no inherit control
+        /// in v1.
+        #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_kv)]
+        env: Vec<(String, String)>,
+
+        /// Working directory for the spawned process. Default: the
+        /// daemon's cwd.
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+
+        /// Block until the command exits; adds `exit_code` to the printed
+        /// output and the CLI process exits with the child's code.
+        #[arg(long)]
+        wait: bool,
+
+        /// Trailing argv after `--` — exec'd directly (no shell wrapper,
+        /// ever; `argv[0]` is resolved via PATH). Required, non-empty.
+        #[arg(last = true, num_args = 1.., required = true, value_name = "ARGV")]
+        argv: Vec<String>,
+    },
+}
+
+/// Parse a `COLSxROWS` size flag (e.g. `80x24`) into `(cols, rows)`. Shape
+/// only — range bounds are an RPC-level INVALID_PARAMS, not a clap usage
+/// error (matches the settle `--quiet`/`--timeout` convention: the CLI
+/// normalizes shape, the server owns the range contract).
+fn parse_size_cxr(s: &str) -> Result<(u16, u16), String> {
+    let (cols, rows) = s
+        .split_once('x')
+        .or_else(|| s.split_once('X'))
+        .ok_or_else(|| format!("invalid size {s:?} (expected COLSxROWS, e.g. 80x24)"))?;
+    let cols: u16 = cols
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size {s:?}: {cols:?} is not a valid column count"))?;
+    let rows: u16 = rows
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size {s:?}: {rows:?} is not a valid row count"))?;
+    Ok((cols, rows))
+}
+
+/// Parse a `KEY=VALUE` env flag into a `(String, String)` pair.
+fn parse_env_kv(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("invalid env entry {s:?} (expected KEY=VALUE)"))?;
+    if k.is_empty() {
+        return Err(format!("invalid env entry {s:?}: empty key"));
+    }
+    Ok((k.to_string(), v.to_string()))
+}
+
 impl Cli {
     /// Determine the socket path to use. Priority:
     /// 1. Explicit --socket flag / SHUX_SOCKET env (handled by clap env)
@@ -1738,12 +1858,13 @@ fn format_created_at(value: &serde_json::Value) -> String {
 /// Handle the `shux session list` command.
 pub async fn handle_ls(
     stream: &mut tokio::net::UnixStream,
+    include_scratch: bool,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let result = rpc_call(
         stream,
         "session.list",
-        serde_json::Value::Object(Default::default()),
+        serde_json::json!({ "include_scratch": include_scratch }),
     )
     .await?;
 
@@ -1789,12 +1910,15 @@ pub async fn handle_ls(
                                 .get("created_at")
                                 .map(format_created_at)
                                 .unwrap_or_else(|| "?".to_string());
+                            let scratch =
+                                s.get("scratch").and_then(|v| v.as_bool()).unwrap_or(false);
                             style::SessionInfo {
                                 name,
                                 id,
                                 window_count,
                                 created,
                                 is_active: false, // no attach tracking yet
+                                scratch,
                             }
                         })
                         .collect()
@@ -4190,6 +4314,104 @@ pub async fn handle_pane_diff(
     }
 }
 
+/// Map a `lens.run` RPC error code to its CLI exit code (lens PRD §10 exit
+/// table): INVALID_PARAMS → 2, PERMISSION_DENIED → 4,
+/// RESOURCE_EXHAUSTED/SPAWN_FAILED → 5 (setup failures BEFORE the child
+/// starts — the child-exit-code precedence rule only applies once `wait`
+/// has actually observed the process start), everything else → 3.
+fn lens_run_exit_code(rpc_error_code: i64) -> i32 {
+    match rpc_error_code {
+        -32602 => 2,          // INVALID_PARAMS
+        -32005 => 4,          // PERMISSION_DENIED
+        -32012 | -32014 => 5, // RESOURCE_EXHAUSTED / SPAWN_FAILED
+        _ => 3,
+    }
+}
+
+/// `shux lens run` — spawn `argv` in a hidden scratch session via `lens.run`
+/// RPC (lens PRD §8, §10). Async by default (prints `{session_id, pane_id,
+/// revision}`); `--wait` blocks for completion, adds `exit_code`, and once
+/// the child has started, the CLI process itself exits with the CHILD's
+/// code — authoritatively, even if it collides with the exit table below
+/// (§10's documented precedence rule; scripts needing certainty parse
+/// `--format json`, where `exit_code` is present iff the child ran).
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_lens_run(
+    stream: &mut tokio::net::UnixStream,
+    argv: &[String],
+    size: (u16, u16),
+    ttl_ms: u64,
+    max_runtime_ms: u64,
+    env: &[(String, String)],
+    cwd: Option<&std::path::Path>,
+    wait: bool,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let env_obj: serde_json::Map<String, serde_json::Value> = env
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    let mut params = serde_json::json!({
+        "argv": argv,
+        "cols": size.0,
+        "rows": size.1,
+        "env": serde_json::Value::Object(env_obj),
+        "post_exit_ttl_ms": ttl_ms,
+        "max_runtime_ms": max_runtime_ms,
+        "wait": wait,
+    });
+    if let Some(c) = cwd {
+        params["cwd"] = serde_json::Value::String(c.display().to_string());
+    }
+
+    match rpc_call(stream, "lens.run", params).await {
+        Ok(result) => {
+            match format {
+                OutputFormat::Json => {
+                    // §10: the `{result}` envelope, byte-identical to
+                    // `shux rpc call` (the frozen lens harness parses this).
+                    let envelope = serde_json::json!({ "result": result });
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+                OutputFormat::Text | OutputFormat::Plain => {
+                    let session_id = result
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let pane_id = result.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let revision = result.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let exit_code = result.get("exit_code").and_then(|v| v.as_i64());
+                    crate::style::print_lens_run(session_id, pane_id, revision, exit_code);
+                }
+            }
+            // §10 precedence: once the child has started (wait=true and the
+            // RPC returned normally — spawn already succeeded synchronously
+            // per LENS-R-045), the CLI exits with the CHILD's code.
+            if wait {
+                let exit_code = result
+                    .get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
+                std::process::exit(exit_code as i32);
+            }
+            Ok(())
+        }
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => lens_emit_error_and_exit(
+            format,
+            "lens run",
+            code,
+            &message,
+            data,
+            lens_run_exit_code(code),
+        ),
+        Err(other) => Err(other.into()),
+    }
+}
+
 /// `shux pane set-size` — call `pane.set_size` RPC with absolute dims.
 pub async fn handle_pane_set_size(
     stream: &mut tokio::net::UnixStream,
@@ -5199,7 +5421,9 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Session {
-                command: SessionCommand::List
+                command: SessionCommand::List {
+                    include_scratch: false
+                }
             })
         ));
     }
@@ -5210,7 +5434,9 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Session {
-                command: SessionCommand::List
+                command: SessionCommand::List {
+                    include_scratch: false
+                }
             })
         ));
     }
@@ -5498,14 +5724,18 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Session {
-                command: SessionCommand::List
+                command: SessionCommand::List {
+                    include_scratch: false
+                }
             })
         ));
         let cli = Cli::try_parse_from(["shux", "sess", "list"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Session {
-                command: SessionCommand::List
+                command: SessionCommand::List {
+                    include_scratch: false
+                }
             })
         ));
     }
@@ -5977,7 +6207,9 @@ mod tests {
             serde_json::json!({"version": "0.26.0", "git_sha": "abc123"}),
         ]);
 
-        handle_ls(&mut client, OutputFormat::Json).await.unwrap();
+        handle_ls(&mut client, false, OutputFormat::Json)
+            .await
+            .unwrap();
         let created = handle_new(
             &mut client,
             SessionCreateOptions {

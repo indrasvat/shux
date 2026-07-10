@@ -14,6 +14,7 @@ mod client;
 mod config_validate;
 mod daemon;
 mod features;
+mod lens_scratch;
 mod onboarding;
 mod session_meta;
 mod session_persist;
@@ -167,6 +168,12 @@ pub struct PaneIoState {
     /// awaits these sends before sampled publishing, so this path is
     /// byte-exact and intentionally applies backpressure.
     recorders: HashMap<shux_core::model::PaneId, Vec<PaneRecorder>>,
+    /// Per-pane PTY child PID (== pgid; children are session leaders, see
+    /// `shux-pty::handle::PtyHandle::terminate`). `lens.run` (P5) reads this
+    /// to populate the scratch registry's `pgid` field (LENS-R-044) without
+    /// needing its own handle to the spawned `PtyHandle`. Same lifetime as
+    /// `vts`: cleared on pane teardown.
+    pub pty_pids: HashMap<shux_core::model::PaneId, u32>,
 }
 
 impl Default for PaneIoState {
@@ -191,6 +198,7 @@ impl PaneIoState {
             render_pulse: Arc::new(tokio::sync::Notify::new()),
             event_bus: None,
             recorders: HashMap::new(),
+            pty_pids: HashMap::new(),
         }
     }
 
@@ -240,6 +248,7 @@ impl PaneIoState {
                 self.revisions.remove(pane_id);
                 self.checkpoints.remove(pane_id);
                 self.invalidations.remove(pane_id);
+                self.pty_pids.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)
@@ -1282,27 +1291,41 @@ async fn run_pane_pty_task(
 /// argv directly — this is what `shux new -s X -- vim foo.rs` lands on,
 /// so the pane runs `vim foo.rs` instead of a shell. The pane lifetime
 /// becomes the lifetime of that command (when it exits, the pane EOFs).
+///
+/// `size`/`extra_env` let `lens.run` (P5, LENS-R-040) request a non-default
+/// PTY size and environment additions for a scratch pane; every other
+/// caller passes `PtySize::default()` / an empty env, which reproduces the
+/// exact pre-P5 behavior byte-for-byte (`config.size` defaults to 80×24,
+/// same as the VT construction this replaces). Returns the raw
+/// `shux_pty::PtyError` (rather than an `RpcError`) so callers can map it
+/// to their own error code — `lens.run` needs `SPAWN_FAILED (-32014)`,
+/// every other caller keeps mapping to `internal()`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_pane_pty(
     pane_id: shux_core::model::PaneId,
     cwd: PathBuf,
     command: Vec<String>,
+    size: shux_pty::handle::PtySize,
+    extra_env: Vec<(String, String)>,
     io_state: Arc<Mutex<PaneIoState>>,
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
-) -> Result<(), shux_rpc::RpcError> {
-    let config = if command.is_empty() {
+) -> Result<(), shux_pty::PtyError> {
+    let mut config = if command.is_empty() {
         shux_pty::handle::PtyConfig::default_shell(cwd)
     } else {
         shux_pty::handle::PtyConfig::with_command(command, cwd)
     };
-    let handle = shux_pty::handle::PtyHandle::spawn(&config)
-        .map_err(|e| shux_rpc::RpcError::internal(&format!("PTY spawn failed: {e}")))?;
+    config.size = size;
+    config.env = extra_env;
+    let handle = shux_pty::handle::PtyHandle::spawn(&config)?;
+    let pid = handle.pid();
 
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
     let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>(16);
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let pane_shutdown = shutdown.child_token();
-    let vt = shux_vt::VirtualTerminal::new(24, 80);
+    let vt = shux_vt::VirtualTerminal::new(size.rows as usize, size.cols as usize);
     // LENS-R-003: seed the per-pane revision watch with the VT's initial
     // (content_revision=1, last_mutation_ns=creation time). The initial
     // receiver is dropped; P3 subscribers call `subscribe()` on the stored
@@ -1324,6 +1347,7 @@ pub(crate) async fn spawn_pane_pty(
         state.pty_done.insert(pane_id, done_rx);
         state.vts.insert(pane_id, vt);
         state.revisions.insert(pane_id, rev_tx);
+        state.pty_pids.insert(pane_id, pid);
     }
 
     tokio::spawn(run_pane_pty_task(
@@ -1395,13 +1419,33 @@ fn run_daemon() -> anyhow::Result<()> {
         daemon::spawn_signal_handler(cmd_tx.clone(), tokens.clone()).await?;
 
         // Ensure runtime dir and clean up stale socket
-        daemon::ensure_runtime_dir()?;
+        let runtime_dir = daemon::ensure_runtime_dir()?;
         daemon::remove_socket_file()?;
+
+        // Daemon-level lens audit log (LENS-R-052): ONE instance for the
+        // whole daemon — the chain head is cached in memory, so a second
+        // opener would fork the chain. Built before the startup reap so
+        // reap(reason=registry) entries chain onto the same log.
+        let lens_audit = lens_scratch::LensAuditLog::open_default();
+
+        // Lens scratch registry startup reap (LENS-R-044, DEC-7): scratch
+        // sessions never survive a restart. Kill any process groups a prior
+        // daemon incarnation left registered BEFORE the RPC server starts
+        // accepting `lens.run` calls that would populate a fresh registry.
+        let (reaped, unresolved_scratch) =
+            lens_scratch::ScratchRegistry::startup_reap(&runtime_dir, &lens_audit).await;
+        if reaped > 0 {
+            tracing::info!(
+                reaped,
+                "startup: reaped orphaned scratch sessions from a prior daemon"
+            );
+        }
 
         // Set up SessionGraph + graph loop
         let sock_path = daemon::socket_path()?;
         let cancel = tokens.root.clone();
-        let io_state = run_rpc_server(sock_path, cancel.clone()).await?;
+        let io_state =
+            run_rpc_server(sock_path, cancel.clone(), lens_audit, unresolved_scratch).await?;
 
         // Run the daemon state loop (blocks until shutdown)
         shux_core::daemon::run_daemon_state_loop(cmd_rx, tokens.clone(), config_reload_notify)
@@ -1457,6 +1501,8 @@ fn run_client(args: Cli) -> anyhow::Result<()> {
 async fn run_rpc_server(
     socket_path: PathBuf,
     cancel: tokio_util::sync::CancellationToken,
+    lens_audit: Arc<lens_scratch::LensAuditLog>,
+    unresolved_scratch: Vec<lens_scratch::RegistryRow>,
 ) -> anyhow::Result<Arc<Mutex<PaneIoState>>> {
     // EventBus: typed pub/sub for lifecycle events. Wired into SessionGraph
     // so every successful mutation publishes a typed event to subscribers.
@@ -1483,6 +1529,28 @@ async fn run_rpc_server(
         PaneIoState::new().with_event_bus(event_bus.clone()),
     ));
     let shutdown_io_state = io_state.clone();
+
+    // Lens scratch registry (§8 SPEC-E, LENS-R-040..046). One per daemon
+    // incarnation — the startup reap in `run_daemon` already cleared any
+    // resolvable rows from a prior incarnation before this runs.
+    let scratch_registry =
+        lens_scratch::ScratchRegistry::new(&daemon::runtime_dir()?, lens_audit.clone());
+
+    // Seed rows the startup reap could NOT confirm dead (P5 round-4 codex
+    // — the daemon-lifecycle half of N3): seeded rows survive normal
+    // persists, count toward the quota, and get a short-deadline standard
+    // reaper so the RUNNING daemon retries the kill. Seeding happens
+    // before the RPC server accepts connections, so the very first
+    // lens.run sees them in the quota.
+    scratch_registry
+        .seed_unresolved(
+            unresolved_scratch,
+            &graph_handle,
+            &io_state,
+            &event_bus,
+            Duration::from_secs(1),
+        )
+        .await;
 
     // Load user config (~/.config/shux/config.toml). Missing file is
     // valid — defaults match current hardcoded behavior. Spawn a watcher
@@ -1569,21 +1637,27 @@ async fn run_rpc_server(
     // circular dependency (manager holds Arc<OnceCell<Router>>).
     let plugins = shux_plugin::PluginManager::new(event_bus.clone());
 
-    // Build router: system builtins + session + window + pane + pane I/O + events + state + plugin methods
+    // Build router: system builtins + session + window + pane + pane I/O + lens.run + events + state + plugin methods
     let router = register_plugin_methods(
         register_state_methods(
             register_events_methods(
-                register_pane_io_methods(
-                    register_pane_methods(
-                        register_window_methods(
-                            register_session_methods(
-                                shux_rpc::server::register_builtin_methods(
-                                    shux_rpc::Router::builder(),
+                lens_scratch::register_lens_run_method(
+                    register_pane_io_methods(
+                        register_pane_methods(
+                            register_window_methods(
+                                register_session_methods(
+                                    shux_rpc::server::register_builtin_methods(
+                                        shux_rpc::Router::builder(),
+                                    ),
+                                    graph_handle.clone(),
+                                    io_state.clone(),
+                                    cancel.clone(),
+                                    session_meta_cache.clone(),
+                                    scratch_registry.clone(),
                                 ),
                                 graph_handle.clone(),
                                 io_state.clone(),
                                 cancel.clone(),
-                                session_meta_cache.clone(),
                             ),
                             graph_handle.clone(),
                             io_state.clone(),
@@ -1592,14 +1666,17 @@ async fn run_rpc_server(
                         graph_handle.clone(),
                         io_state.clone(),
                         cancel.clone(),
+                        config_handle.clone(),
+                        session_meta_cache.clone(),
+                        onboarding.clone(),
+                        segment_cache.clone(),
+                        lens_audit.clone(),
                     ),
                     graph_handle.clone(),
                     io_state.clone(),
                     cancel.clone(),
-                    config_handle.clone(),
-                    session_meta_cache.clone(),
-                    onboarding.clone(),
-                    segment_cache.clone(),
+                    event_bus.clone(),
+                    scratch_registry.clone(),
                 ),
                 event_bus,
             ),
@@ -1623,6 +1700,31 @@ async fn run_rpc_server(
     // permission enforcer can look up entity ownership.
     plugins.set_router(router.clone());
     plugins.set_graph(graph_handle.clone()).await;
+
+    // LENS-R-052 denial entries: mirror plugin permission DENIALS of the
+    // lens methods into the daemon-level lens audit log (the per-plugin
+    // audit log records every denial regardless; this adds the lens view).
+    // The caller field here is the one place the identity IS known.
+    {
+        let audit = lens_audit.clone();
+        plugins.set_denial_hook(std::sync::Arc::new(move |_name, uuid, method| {
+            const LENS_METHODS: [&str; 5] = [
+                "pane.glance",
+                "pane.wait_settled",
+                "pane.checkpoint",
+                "pane.diff_since",
+                "lens.run",
+            ];
+            if LENS_METHODS.contains(&method) {
+                audit.append(serde_json::json!({
+                    "ts": lens_scratch::iso_now(),
+                    "caller": format!("plugin:{uuid}"),
+                    "method": method,
+                    "decision": "deny",
+                }));
+            }
+        }));
+    }
 
     let config = shux_rpc::ServerConfig {
         socket_path,
@@ -1869,6 +1971,8 @@ fn register_state_methods(
                                 pane_id,
                                 cwd,
                                 command,
+                                shux_pty::handle::PtySize::default(),
+                                Vec::new(),
                                 spawn_io,
                                 spawn_ct,
                                 gh.clone(),
@@ -2497,7 +2601,17 @@ fn register_pane_methods(
                     .unwrap_or_else(|| {
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
-                let _ = spawn_pane_pty(new_pane_id, cwd, command, io, ct, gh.clone()).await;
+                let _ = spawn_pane_pty(
+                    new_pane_id,
+                    cwd,
+                    command,
+                    shux_pty::handle::PtySize::default(),
+                    Vec::new(),
+                    io,
+                    ct,
+                    gh.clone(),
+                )
+                .await;
 
                 let snap = gh.snapshot();
                 let new_pane = snap
@@ -3373,8 +3487,17 @@ fn register_window_methods(
                     let pane_id = window.active_pane.to_string();
 
                     // Spawn PTY for the new pane
-                    let _ =
-                        spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
+                    let _ = spawn_pane_pty(
+                        window.active_pane,
+                        cwd,
+                        command,
+                        shux_pty::handle::PtySize::default(),
+                        Vec::new(),
+                        io,
+                        ct,
+                        gh.clone(),
+                    )
+                    .await;
 
                     let mut result = window_to_json(window, index, is_active, &snap);
                     // Include pane_id at top level for convenience
@@ -3498,8 +3621,17 @@ fn register_window_methods(
                         .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
 
                     // Spawn PTY for the new pane
-                    let _ =
-                        spawn_pane_pty(window.active_pane, cwd, command, io, ct, gh.clone()).await;
+                    let _ = spawn_pane_pty(
+                        window.active_pane,
+                        cwd,
+                        command,
+                        shux_pty::handle::PtySize::default(),
+                        Vec::new(),
+                        io,
+                        ct,
+                        gh.clone(),
+                    )
+                    .await;
 
                     let session = snap
                         .sessions
@@ -3721,6 +3853,7 @@ fn register_session_methods(
     io_state: Arc<Mutex<PaneIoState>>,
     cancel: tokio_util::sync::CancellationToken,
     meta_cache: session_meta::SessionMetaCache,
+    scratch_registry: lens_scratch::ScratchRegistry,
 ) -> shux_rpc::RouterBuilder {
     let g1 = graph.clone();
     let g2 = graph.clone();
@@ -3739,18 +3872,44 @@ fn register_session_methods(
     let meta_kill = meta_cache.clone();
     let meta_ensure = meta_cache;
 
+    let scratch_list = scratch_registry.clone();
+    let scratch_kill = scratch_registry;
+
     builder
         .register_with_policy(
             "session.list",
             Policy::fixed(Sensitivity::Public),
-            move |_params: Option<serde_json::Value>| {
+            move |params: Option<serde_json::Value>| {
                 let gh = g1.clone();
+                let registry = scratch_list.clone();
                 async move {
+                    // LENS-R-041: scratch sessions are excluded from the
+                    // default listing; `include_scratch: true` reveals them
+                    // flagged `scratch: true`. Visibility is not
+                    // authorization — an id is always resolvable directly
+                    // (session.kill/snapshot/etc. never consult this filter).
+                    let include_scratch = params
+                        .as_ref()
+                        .and_then(|p| p.get("include_scratch"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let scratch_ids = registry.ids();
+
                     let snap = gh.snapshot();
                     let mut sessions: Vec<_> = snap.sessions.values().collect();
                     sessions.sort_by_key(|s| s.created_at);
-                    let sessions: Vec<serde_json::Value> =
-                        sessions.iter().map(|s| session_to_json(s, &snap)).collect();
+                    let sessions: Vec<serde_json::Value> = sessions
+                        .iter()
+                        .filter(|s| include_scratch || !scratch_ids.contains(&s.id))
+                        .map(|s| {
+                            let mut json = session_to_json(s, &snap);
+                            if include_scratch {
+                                json["scratch"] =
+                                    serde_json::Value::Bool(scratch_ids.contains(&s.id));
+                            }
+                            json
+                        })
+                        .collect();
                     Ok(serde_json::json!({ "sessions": sessions }))
                 }
             },
@@ -3854,6 +4013,8 @@ fn register_session_methods(
                                             w.active_pane,
                                             cwd,
                                             command.clone(),
+                                            shux_pty::handle::PtySize::default(),
+                                            Vec::new(),
                                             io,
                                             ct,
                                             gh.clone(),
@@ -3880,6 +4041,7 @@ fn register_session_methods(
                 let gh = g3.clone();
                 let io = io_kill.clone();
                 let meta = meta_kill.clone();
+                let registry = scratch_kill.clone();
                 async move {
                     let params = params.unwrap_or_default();
 
@@ -3960,6 +4122,14 @@ fn register_session_methods(
                     }
 
                     meta.remove(session_id).await;
+
+                    // LENS-R-042c: explicit session.kill reaps a scratch
+                    // session IMMEDIATELY (no post_exit_ttl_ms wait) — this
+                    // is a no-op for ordinary sessions (registry lookup
+                    // misses). For scratch it enforces the LENS-R-042 kill
+                    // sequence + death confirmation before the registry row
+                    // is dropped (P5 round-1 codex B3).
+                    lens_scratch::on_session_killed(&registry, &io, session_id).await;
 
                     Ok(serde_json::json!({ "killed": name }))
                 }
@@ -4042,6 +4212,8 @@ fn register_session_methods(
                                             w.active_pane,
                                             cwd,
                                             command.clone(),
+                                            shux_pty::handle::PtySize::default(),
+                                            Vec::new(),
                                             io,
                                             ct,
                                             gh.clone(),
@@ -4389,7 +4561,17 @@ fn register_pane_io_methods(
     meta_cache: session_meta::SessionMetaCache,
     onboarding: onboarding::OnboardingHandle,
     segments: statusbar_runner::SegmentCache,
+    lens_audit: Arc<lens_scratch::LensAuditLog>,
 ) -> shux_rpc::RouterBuilder {
+    // LENS-R-052 audit handles for the three lens observation methods
+    // (glance / checkpoint / diff). `caller` comes from
+    // `shux_rpc::current_caller()` — the task-local the plugin dispatch
+    // wrapper scopes to `plugin:<uuid>`; UDS requests default to "uds"
+    // (P5 round-1 claude N3, adjudicated IMPLEMENT).
+    let audit_glance = lens_audit.clone();
+    let audit_checkpoint = lens_audit.clone();
+    let audit_diff = lens_audit;
+
     let g1 = graph.clone();
     let g2 = graph.clone();
     let g5 = graph.clone();
@@ -5219,6 +5401,7 @@ fn register_pane_io_methods(
                 let gh = g12.clone();
                 let io = io13.clone();
                 let r = rasterizer_glance.load_full();
+                let audit = audit_glance.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -5409,6 +5592,24 @@ fn register_pane_io_methods(
                         (false, None)
                     };
 
+                    // LENS-R-052: audit the successful glance (P5 round-1
+                    // codex M2a — the spec's field list: ts, caller, method,
+                    // pane_id, revision(s), bytes_returned). bytes_returned
+                    // counts the DECODED payload (viewport text + PNG bytes
+                    // before base64).
+                    let png_decoded_len = png_base64
+                        .as_ref()
+                        .map(|b64| lens_scratch::b64_decoded_len(b64))
+                        .unwrap_or(0);
+                    audit.append(serde_json::json!({
+                        "ts": lens_scratch::iso_now(),
+                        "caller": shux_rpc::current_caller(),
+                        "method": "pane.glance",
+                        "pane_id": pane_id.to_string(),
+                        "revision": revision,
+                        "bytes_returned": text.len() + png_decoded_len,
+                    }));
+
                     Ok(serde_json::json!({
                         "revision": revision,
                         "cols": snap_cols,
@@ -5576,6 +5777,7 @@ fn register_pane_io_methods(
             move |params: Option<serde_json::Value>| {
                 let gh = g14.clone();
                 let io = io15.clone();
+                let audit = audit_checkpoint.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -5606,6 +5808,17 @@ fn register_pane_io_methods(
                         (revision, evicted)
                     };
 
+                    // LENS-R-052: audit the checkpoint. A checkpoint returns
+                    // no pane content, so bytes_returned is 0 by definition.
+                    audit.append(serde_json::json!({
+                        "ts": lens_scratch::iso_now(),
+                        "caller": shux_rpc::current_caller(),
+                        "method": "pane.checkpoint",
+                        "pane_id": pane_id.to_string(),
+                        "revision": revision,
+                        "bytes_returned": 0,
+                    }));
+
                     Ok(serde_json::json!({
                         "revision": revision,
                         "evicted_revision": evicted,
@@ -5626,6 +5839,7 @@ fn register_pane_io_methods(
                 let gh = g15.clone();
                 let io = io16.clone();
                 let r = rasterizer_diff.load_full();
+                let audit = audit_diff.clone();
                 async move {
                     let params = params.unwrap_or_default();
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
@@ -5782,6 +5996,28 @@ fn register_pane_io_methods(
                     } else {
                         None
                     };
+
+                    // LENS-R-052: audit the diff with BOTH revisions
+                    // ("revision(s)" per the spec's field list).
+                    // bytes_returned counts the decoded payload: changed row
+                    // text + heat PNG bytes before base64.
+                    let row_text_len: usize = changed_row_text
+                        .as_object()
+                        .map(|m| m.values().filter_map(|v| v.as_str()).map(str::len).sum())
+                        .unwrap_or(0);
+                    let heat_decoded_len = heat_png_base64
+                        .as_ref()
+                        .map(|b64| lens_scratch::b64_decoded_len(b64))
+                        .unwrap_or(0);
+                    audit.append(serde_json::json!({
+                        "ts": lens_scratch::iso_now(),
+                        "caller": shux_rpc::current_caller(),
+                        "method": "pane.diff_since",
+                        "pane_id": pane_id.to_string(),
+                        "from_revision": since_revision,
+                        "to_revision": to_revision,
+                        "bytes_returned": row_text_len + heat_decoded_len,
+                    }));
 
                     let (bb_rs, bb_cs, bb_re, bb_ce) = diff.bounding_box;
                     Ok(serde_json::json!({
@@ -6033,12 +6269,28 @@ fn register_pane_io_methods(
 /// Strategy: query the daemon for sessions; if any exist, pick the most
 /// recently created. If none, fall through to "default" (which the
 /// daemon-side attach handler will create on demand).
+/// Choose the session a bare `shux` / `shux attach` lands on from a
+/// `session.list` result. NEVER a scratch session (lens PRD LENS-R-041 —
+/// P5 round-1 minor: scratch panes are agent working surfaces; a human
+/// attaching blind must not land inside one). Defense in depth: the
+/// default `session.list` already omits scratch, and this filter also
+/// rejects `scratch: true` flags and the reserved `__scratch-` name prefix
+/// in case a future caller feeds an `--include-scratch` listing through.
+fn choose_attach_session(sessions: &[serde_json::Value]) -> Option<String> {
+    sessions
+        .iter()
+        .filter(|s| s.get("scratch").and_then(|v| v.as_bool()) != Some(true))
+        .filter_map(|s| s.get("name")?.as_str())
+        .find(|name| !name.starts_with("__scratch-"))
+        .map(str::to_string)
+}
+
 async fn pick_attach_target(socket_path: &std::path::Path) -> String {
     if let Ok(mut stream) = client::try_connect(socket_path).await {
         if let Ok(value) = cli::rpc_call(&mut stream, "session.list", serde_json::json!({})).await {
             if let Some(arr) = value.get("sessions").and_then(|v| v.as_array()) {
-                if let Some(latest) = arr.iter().filter_map(|s| s.get("name")?.as_str()).next() {
-                    return latest.to_string();
+                if let Some(target) = choose_attach_session(arr) {
+                    return target;
                 }
             }
         }
@@ -6181,9 +6433,9 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     Ok(())
                 }
             }
-            cli::SessionCommand::List => {
+            cli::SessionCommand::List { include_scratch } => {
                 let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-                cli::handle_ls(&mut stream, args.format).await
+                cli::handle_ls(&mut stream, include_scratch, args.format).await
             }
             cli::SessionCommand::Kill {
                 name_pos,
@@ -6693,6 +6945,33 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     .await
                 }
             }
+        }
+
+        Some(Command::Lens {
+            command:
+                cli::LensCommand::Run {
+                    size,
+                    ttl,
+                    max_runtime,
+                    env,
+                    cwd,
+                    wait,
+                    argv,
+                },
+        }) => {
+            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            cli::handle_lens_run(
+                &mut stream,
+                &argv,
+                size,
+                ttl,
+                max_runtime,
+                &env,
+                cwd.as_deref(),
+                wait,
+                args.format,
+            )
+            .await
         }
 
         Some(Command::Rpc {
@@ -7886,6 +8165,11 @@ mod tests {
         bus: shux_core::bus::EventBus,
         cancel: CancellationToken,
         graph_task: tokio::task::JoinHandle<()>,
+        scratch_registry: lens_scratch::ScratchRegistry,
+        lens_audit: Arc<lens_scratch::LensAuditLog>,
+        /// Keeps the isolated scratch/audit dir alive for the harness's
+        /// lifetime (registry + lens-audit files live inside).
+        _scratch_dir: tempfile::TempDir,
     }
 
     impl RpcHarness {
@@ -7906,6 +8190,10 @@ mod tests {
             let config = ConfigHandle::load_or_default(&config_path);
             let onboarding = onboarding::OnboardingHandle::from_state_for_test(Default::default());
             let segments = statusbar_runner::SegmentCache::new();
+            let scratch_dir = tempfile::tempdir().expect("scratch dir");
+            let lens_audit = lens_scratch::LensAuditLog::open(scratch_dir.path());
+            let scratch_registry =
+                lens_scratch::ScratchRegistry::new(scratch_dir.path(), lens_audit.clone());
 
             let builder = register_session_methods(
                 shux_rpc::Router::builder(),
@@ -7913,6 +8201,7 @@ mod tests {
                 io.clone(),
                 cancel.clone(),
                 meta.clone(),
+                scratch_registry.clone(),
             );
             let builder =
                 register_window_methods(builder, graph.clone(), io.clone(), cancel.clone());
@@ -7928,7 +8217,17 @@ mod tests {
                 meta,
                 onboarding,
                 segments,
+                lens_audit.clone(),
             );
+            let builder = lens_scratch::register_lens_run_method(
+                builder,
+                graph.clone(),
+                io.clone(),
+                cancel.clone(),
+                bus.clone(),
+                scratch_registry.clone(),
+            );
+
             let router = register_events_methods(builder, bus.clone()).build();
             router.assert_every_route_has_policy();
 
@@ -7939,6 +8238,9 @@ mod tests {
                 bus,
                 cancel,
                 graph_task,
+                scratch_registry,
+                lens_audit,
+                _scratch_dir: scratch_dir,
             }
         }
 
@@ -8018,6 +8320,863 @@ mod tests {
         params: serde_json::Value,
     ) -> shux_rpc::RpcError {
         router.dispatch(method, Some(params)).await.unwrap_err()
+    }
+
+    /// Kill a lens.run scratch session through the production route and
+    /// wait for its registry slot to free (the explicit-kill reap confirms
+    /// group death before dropping the row).
+    async fn kill_scratch_and_wait(harness: &RpcHarness, session_id: &str) {
+        let _ = dispatch_ok(
+            &harness.router,
+            "session.kill",
+            serde_json::json!({"id": session_id}),
+        )
+        .await;
+        let sid: shux_core::model::SessionId = session_id.parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while harness.scratch_registry.ids().contains(&sid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scratch {session_id} not reaped within 5s of explicit kill"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// LENS-R-043 atomicity through the PRODUCTION lens.run route (P5
+    /// round-1 codex B1): with 15/16 slots occupied, two CONCURRENT
+    /// lens.run calls race for the last slot — exactly one may win,
+    /// deterministically (the check-and-reserve is one critical section;
+    /// no sleeps, no retries).
+    #[tokio::test]
+    async fn production_lens_run_quota_is_atomic_under_concurrent_calls() {
+        let harness = RpcHarness::new();
+        harness
+            .scratch_registry
+            .test_occupy(lens_scratch::SCRATCH_QUOTA - 1);
+
+        let params = serde_json::json!({"argv": ["sleep", "30"], "cols": 80, "rows": 24});
+        let (a, b) = tokio::join!(
+            harness.router.dispatch("lens.run", Some(params.clone())),
+            harness.router.dispatch("lens.run", Some(params.clone())),
+        );
+        let ok_count = [a.is_ok(), b.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(ok_count, 1, "exactly one racer wins the 16th slot");
+        let (winner, loser_err) = match (a, b) {
+            (Ok(w), Err(e)) | (Err(e), Ok(w)) => (w, e),
+            _ => unreachable!("asserted exactly-one above"),
+        };
+        assert_eq!(
+            loser_err.code,
+            shux_rpc::ErrorCode::ResourceExhausted.code(),
+            "loser gets RESOURCE_EXHAUSTED (-32012)"
+        );
+
+        // A third call while full is also rejected.
+        let third = dispatch_err(&harness.router, "lens.run", params.clone()).await;
+        assert_eq!(third.code, shux_rpc::ErrorCode::ResourceExhausted.code());
+
+        // Cleanup: kill the winner; its freed slot admits a new run.
+        let sid = winner["session_id"].as_str().unwrap().to_string();
+        kill_scratch_and_wait(&harness, &sid).await;
+        let retry = dispatch_ok(&harness.router, "lens.run", params).await;
+        let sid = retry["session_id"].as_str().unwrap().to_string();
+        kill_scratch_and_wait(&harness, &sid).await;
+
+        harness.stop().await;
+    }
+
+    /// Every lens.run failure path releases its quota reservation (codex
+    /// B1's rollback requirement): a SPAWN_FAILED at 15/16 must leave the
+    /// 16th slot reusable.
+    #[tokio::test]
+    async fn production_lens_run_failed_spawn_releases_its_reservation() {
+        let harness = RpcHarness::new();
+        harness
+            .scratch_registry
+            .test_occupy(lens_scratch::SCRATCH_QUOTA - 1);
+
+        let bad = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["/nonexistent-lens-p5-binary"]}),
+        )
+        .await;
+        assert_eq!(bad.code, shux_rpc::ErrorCode::SpawnFailed.code());
+        assert_eq!(
+            harness.scratch_registry.test_total(),
+            lens_scratch::SCRATCH_QUOTA - 1,
+            "failed spawn released its reservation"
+        );
+
+        // The freed slot admits a real run.
+        let ok = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"]}),
+        )
+        .await;
+        let sid = ok["session_id"].as_str().unwrap().to_string();
+        kill_scratch_and_wait(&harness, &sid).await;
+
+        harness.stop().await;
+    }
+
+    /// LENS-R-040 bounds are validated on the FULL u64 before any
+    /// narrowing cast (P5 round-1 codex M3): raw RPC shapes that would
+    /// wrap through `as u16`/`as u32` into legal-looking values must be
+    /// INVALID_PARAMS. (Unit twins live in lens_scratch::tests; these are
+    /// the raw-RPC-shape halves through the production router.)
+    #[tokio::test]
+    async fn production_lens_run_rejects_wrapping_params_before_cast() {
+        let harness = RpcHarness::new();
+
+        // 66000 wraps to 464 through `as u16` — inside [20,500].
+        let err = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep"], "cols": 66000}),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        // 2^32 + 1 wraps to 1 through `as u32` — inside [0, 300000].
+        let err = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep"], "post_exit_ttl_ms": 4_294_967_297u64}),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        // PR #92 codex P2 + greptile P1 (raw RPC shapes): non-string argv
+        // elements / env values must be rejected, never silently dropped
+        // into a DIFFERENT command or environment.
+        let err = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sh", null, "-c", "echo pwned"]}),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+        let err = dispatch_err(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"], "env": {"K": 42}}),
+        )
+        .await;
+        assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
+
+        // And no scratch leaked from the rejected calls.
+        assert_eq!(harness.scratch_registry.test_total(), 0);
+        harness.stop().await;
+    }
+
+    /// LENS-R-052 caller identity through the production audit path (P5
+    /// round-1 claude N3, adjudicated task-local): a lens.run dispatched
+    /// inside `shux_rpc::with_caller("plugin:<uuid>", …)` — the exact
+    /// wrapper shux-plugin's dispatch path applies — audits
+    /// `caller: plugin:<uuid>`; a plain dispatch (the UDS server shape)
+    /// audits the `"uds"` default. (The wrapper's plugin-side half is
+    /// pinned in shux-plugin's `dispatch_plugin_frame_scopes_caller_identity`.)
+    #[tokio::test]
+    async fn production_lens_audit_caller_identity() {
+        let harness = RpcHarness::new();
+        let params = serde_json::json!({"argv": ["sleep", "30"]});
+
+        // UDS shape: no scope.
+        let uds_run = dispatch_ok(&harness.router, "lens.run", params.clone()).await;
+        let uds_sid = uds_run["session_id"].as_str().unwrap().to_string();
+
+        // Plugin shape: the same scope wrapper dispatch_plugin_frame uses.
+        let plugin_run = shux_rpc::with_caller(
+            "plugin:test-uuid-1234".to_string(),
+            harness.router.dispatch("lens.run", Some(params)),
+        )
+        .await
+        .unwrap();
+        let plugin_sid = plugin_run["session_id"].as_str().unwrap().to_string();
+
+        let audit_path = harness._scratch_dir.path().join("lens-audit.ndjson");
+        let text = std::fs::read_to_string(&audit_path).expect("audit log written");
+        let creates: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["method"] == "scratch.create")
+            .collect();
+        assert_eq!(creates.len(), 2, "one create entry per run:\n{text}");
+        let caller_for = |sid: &str| {
+            creates
+                .iter()
+                .find(|e| e["session_id"] == sid)
+                .unwrap_or_else(|| panic!("no create entry for {sid}"))["caller"]
+                .clone()
+        };
+        assert_eq!(caller_for(&uds_sid), "uds", "UDS path defaults");
+        assert_eq!(
+            caller_for(&plugin_sid),
+            "plugin:test-uuid-1234",
+            "plugin-scoped dispatch carries the identity"
+        );
+        // The chain survives mixed-caller appends.
+        lens_scratch::verify_chain(&audit_path).expect("audit chain verifies");
+
+        kill_scratch_and_wait(&harness, &uds_sid).await;
+        kill_scratch_and_wait(&harness, &plugin_sid).await;
+        harness.stop().await;
+    }
+
+    /// Count live processes whose argv contains `needle` (unique per test
+    /// run, so co-tenant argv text cannot collide).
+    fn count_procs_containing(needle: &str) -> usize {
+        std::process::Command::new("ps")
+            .args(["-axo", "args="])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter(|l| l.contains(needle))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// `__scratch-*` sessions currently in the GRAPH (what a leaked
+    /// phantom would show up as — an ordinary-looking session outside the
+    /// registry; claude round-2 detail).
+    fn graph_scratch_sessions(harness: &RpcHarness) -> Vec<shux_core::model::SessionId> {
+        harness
+            .graph
+            .snapshot()
+            .sessions
+            .values()
+            .filter(|s| s.name.starts_with("__scratch-"))
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// P5 round-2 codex N1 (≡ claude round-2 major): the shux-rpc server
+    /// drops in-flight handler futures on client disconnect; a drop between
+    /// graph-session creation and registry commit used to leak an
+    /// unregistered __scratch session + PTY (visible in session.list as an
+    /// ORDINARY session, uncounted by quota, invisible to the restart
+    /// registry). The core is now cancellation-shielded (own task, awaited
+    /// via JoinHandle): dropping the dispatch future at ANY interior point
+    /// lets the composite complete, after which the reaper owns the
+    /// scratch. Drives BOTH interior pause points deterministically.
+    #[tokio::test]
+    async fn production_lens_run_dropped_mid_core_leaves_no_orphan() {
+        let harness = RpcHarness::new();
+        let sleep_tag = format!("28{:03}", std::process::id() % 1000);
+
+        for (name, slot) in [
+            (
+                "after session create",
+                &lens_scratch::test_hooks::PAUSE_AFTER_CREATE,
+            ),
+            (
+                "before registry commit",
+                &lens_scratch::test_hooks::PAUSE_BEFORE_COMMIT,
+            ),
+        ] {
+            let pause = lens_scratch::test_hooks::Pause::arm(slot);
+            let params = serde_json::json!({"argv": ["sleep", sleep_tag]});
+            let router = harness.router.clone();
+            let dispatch =
+                tokio::spawn(async move { router.dispatch("lens.run", Some(params)).await });
+
+            // Wait until the core is INSIDE the window, then drop the
+            // dispatch future — the exact client-disconnect shape.
+            tokio::time::timeout(Duration::from_secs(10), pause.reached.notified())
+                .await
+                .unwrap_or_else(|_| panic!("core never reached the pause ({name})"));
+            dispatch.abort();
+            let aborted = dispatch.await;
+            assert!(aborted.is_err(), "dispatch future dropped ({name})");
+
+            // Release the shielded core: it must COMPLETE the composite.
+            pause.release.notify_one();
+            *slot.lock().unwrap() = None;
+
+            // Wait for the COMMITTED row (ids() counts rows only — the
+            // in-flight reservation itself already counts toward
+            // test_total, which would pass before the commit happened).
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while harness.scratch_registry.ids().len() != 1 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "core did not commit the scratch after the drop ({name})"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            // No phantom: every __scratch session in the graph is ALSO in
+            // the registry (claude round-2: a leaked one would show in
+            // session.list as an ordinary session, outside registry.ids()).
+            let in_graph = graph_scratch_sessions(&harness);
+            assert_eq!(
+                in_graph.len(),
+                1,
+                "exactly one scratch in the graph ({name})"
+            );
+            let ids = harness.scratch_registry.ids();
+            assert!(
+                in_graph.iter().all(|sid| ids.contains(sid)),
+                "every graph scratch is registry-owned — no phantom ({name})"
+            );
+
+            // The reaper owns it from commit: explicit kill cleans up fully.
+            kill_scratch_and_wait(&harness, &in_graph[0].to_string()).await;
+            assert!(
+                graph_scratch_sessions(&harness).is_empty(),
+                "no scratch left in the graph ({name})"
+            );
+            assert_eq!(
+                harness.scratch_registry.test_total(),
+                0,
+                "quota slot free ({name})"
+            );
+            let proc_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while count_procs_containing(&format!("sleep {sleep_tag}")) != 0 {
+                assert!(
+                    std::time::Instant::now() < proc_deadline,
+                    "stray scratch process survived ({name})"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        harness.stop().await;
+    }
+
+    /// P5 round-2 codex N3 at the caller level: when group death cannot be
+    /// confirmed, the registry row must SURVIVE (startup reap owns the
+    /// retry) and no reap may be audited — removing the row on an
+    /// unconfirmed kill would resurrect the B3 orphan window.
+    #[tokio::test]
+    async fn production_unconfirmed_kill_preserves_registry_row() {
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let run = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"]}),
+        )
+        .await;
+        let sid_str = run["session_id"].as_str().unwrap().to_string();
+        let sid: shux_core::model::SessionId = sid_str.parse().unwrap();
+
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let _ = dispatch_ok(
+            &harness.router,
+            "session.kill",
+            serde_json::json!({"id": sid_str}),
+        )
+        .await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+
+        assert!(
+            harness.scratch_registry.ids().contains(&sid),
+            "registry row must survive an unconfirmed kill"
+        );
+        let audit_path = harness._scratch_dir.path().join("lens-audit.ndjson");
+        let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        let reaped = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|e| e["method"] == "scratch.reap" && e["session_id"] == sid_str.as_str());
+        assert!(!reaped, "no reap may be audited for an unconfirmed kill");
+
+        // session.kill's own pane teardown killed the real process anyway
+        // (the forced flag only faked the lens sequence) — wait it out so
+        // the leak guard stays clean; the surviving row simply ages out
+        // with the harness tempdir, exactly like a crash-preserved row.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while count_procs_containing("sleep 30") > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        harness.stop().await;
+    }
+
+    /// P5 round-4 codex — N3 at the DAEMON-LIFECYCLE level: startup_reap's
+    /// re-persisted unresolved rows used to be clobbered by the fresh
+    /// daemon's very first normal persist (which rewrites the file from
+    /// its empty in-memory rows). The daemon now SEEDS its live registry
+    /// with them: they survive normal persists, count toward quota, and a
+    /// short-deadline standard reaper retries the kill — with row removal
+    /// still conditional on confirmed death.
+    #[tokio::test]
+    async fn production_seeded_unresolved_rows_survive_persists_and_get_retried() {
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let dir = harness._scratch_dir.path().to_path_buf();
+        let reg_path = dir.join("scratch-registry.json");
+
+        // A real orphaned group from a "previous daemon": leader exits,
+        // the sleep survives IN the group, reparented away from us (so a
+        // later kill leaves no zombie for the death probe to trip on).
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 300 & exit 0"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan group");
+        let pgid = child.id();
+        let _ = child.wait(); // reap the leader; the sleep keeps the group alive
+
+        // The previous daemon's registry row (raw on-disk schema;
+        // start_time 0 = liveness-only fallback).
+        let seeded_sid = shux_core::model::SessionId::new().to_string();
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "session_id": seeded_sid,
+                "pgid": pgid,
+                "start_time": 0,
+                "created_at": 1,
+                "max_runtime_deadline": 2,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Startup reap under the forced-unconfirmed flag: the row comes
+        // back unresolved (and stays on disk).
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!(killed, 0);
+        assert_eq!(unresolved.len(), 1, "row returned for seeding");
+
+        // Seed the LIVE registry (test-friendly retry delay: long enough
+        // to deterministically observe the survive-a-normal-persist
+        // window first).
+        harness
+            .scratch_registry
+            .seed_unresolved(
+                unresolved,
+                &harness.graph,
+                &harness.io,
+                &harness.bus,
+                Duration::from_secs(3),
+            )
+            .await;
+        assert_eq!(
+            harness.scratch_registry.test_total(),
+            1,
+            "seeded row counts toward the quota"
+        );
+
+        // A NORMAL scratch triggers a normal persist — the round-4 bug
+        // was exactly here: the rewrite used to drop the seeded row.
+        let run = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"]}),
+        )
+        .await;
+        let normal_sid = run["session_id"].as_str().unwrap().to_string();
+        let text = std::fs::read_to_string(&reg_path).expect("registry persisted");
+        assert!(
+            text.contains(&seeded_sid),
+            "seeded row SURVIVES the normal persist:\n{text}"
+        );
+        assert!(text.contains(&normal_sid), "normal row persisted too");
+
+        // The short-deadline retry then confirms death, removes the row,
+        // and audits reason=registry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let still_there = std::fs::read_to_string(&reg_path)
+                .map(|t| t.contains(&seeded_sid))
+                .unwrap_or(false);
+            if !still_there {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded row not reaped by the running daemon's retry"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let audit_text = std::fs::read_to_string(dir.join("lens-audit.ndjson")).unwrap_or_default();
+        assert!(
+            audit_text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| e["method"] == "scratch.reap"
+                    && e["reason"] == "registry"
+                    && e["session_id"] == seeded_sid.as_str()),
+            "the completed retry audits reason=registry"
+        );
+
+        kill_scratch_and_wait(&harness, &normal_sid).await;
+        harness.stop().await;
+    }
+
+    /// P5 round-5 codex — the LAST clobber branch: a recovered row whose
+    /// session_id does not parse could never enter inner.rows, so the next
+    /// normal persist rewrote the file without it. The kill only needs the
+    /// PGID: seed retries it inline; an unconfirmed kill parks the row on
+    /// the OPAQUE list that every persist serializes alongside inner.rows,
+    /// and the next startup reap resolves it (audited with the raw id).
+    #[tokio::test]
+    async fn production_opaque_malformed_id_rows_survive_persists_and_resolve() {
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let dir = harness._scratch_dir.path().to_path_buf();
+        let reg_path = dir.join("scratch-registry.json");
+
+        // A real orphaned group from a "previous daemon" (leader exits;
+        // the sleep keeps the group alive, reparented away from us so a
+        // later kill leaves no zombie for the death probe).
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 300 & exit 0"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan group");
+        let pgid = child.id();
+        let _ = child.wait();
+
+        // Well-formed row, NON-UUID session id.
+        let raw_id = "not-a-uuid-scratch-row";
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "session_id": raw_id,
+                "pgid": pgid,
+                "start_time": 0,
+                "created_at": 1,
+                "max_runtime_deadline": 2,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Forced-unconfirmed startup + seed: the inline kill is
+        // unconfirmed too, so the row parks on the opaque list.
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        assert_eq!((killed, unresolved.len()), (0, 1));
+        harness
+            .scratch_registry
+            .seed_unresolved(
+                unresolved,
+                &harness.graph,
+                &harness.io,
+                &harness.bus,
+                Duration::from_secs(3),
+            )
+            .await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!(
+            harness.scratch_registry.test_total(),
+            1,
+            "opaque row counts toward the quota"
+        );
+
+        // A NORMAL lens.run triggers a normal persist — the round-5 bug
+        // was exactly here: the rewrite dropped the opaque row.
+        let run = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"]}),
+        )
+        .await;
+        let normal_sid = run["session_id"].as_str().unwrap().to_string();
+        let text = std::fs::read_to_string(&reg_path).expect("registry persisted");
+        assert!(
+            text.contains(raw_id),
+            "opaque malformed-id row SURVIVES the normal persist:\n{text}"
+        );
+        assert!(text.contains(&normal_sid), "normal row persisted too");
+
+        // Clear the normal scratch, then the "next startup" resolves the
+        // opaque row for real: kill confirmed, row gone, audited with the
+        // RAW id.
+        kill_scratch_and_wait(&harness, &normal_sid).await;
+        let text = std::fs::read_to_string(&reg_path).expect("opaque row still persisted");
+        assert!(
+            text.contains(raw_id),
+            "opaque row survives the normal scratch's removal persist too"
+        );
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        assert_eq!(killed, 1, "the next startup confirms the kill");
+        assert!(unresolved.is_empty());
+        assert!(!reg_path.exists(), "registry cleared once resolved");
+        let audit_text = std::fs::read_to_string(dir.join("lens-audit.ndjson")).unwrap_or_default();
+        assert!(
+            audit_text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| e["method"] == "scratch.reap"
+                    && e["reason"] == "registry"
+                    && e["session_id"] == raw_id
+                    && e["killed"] == true),
+            "the resolution is audited with the raw id:\n{audit_text}"
+        );
+
+        harness.stop().await;
+    }
+
+    /// P5 round-6 codex — durable confirmed-drop: startup_reap re-persists
+    /// an unresolved row BEFORE returning it for seeding; when the seed's
+    /// inline kill then CONFIRMS death, the audit-and-return used to leave
+    /// the resolved row on disk until some unrelated later persist — a
+    /// daemon restart in that window reprocessed it and duplicated the
+    /// registry reap audit. The confirmed arm now persists immediately.
+    #[tokio::test]
+    async fn production_confirmed_opaque_resolution_is_durably_dropped() {
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let dir = harness._scratch_dir.path().to_path_buf();
+        let reg_path = dir.join("scratch-registry.json");
+
+        // Real orphaned group whose kill WILL confirm once unforced.
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 300 & exit 0"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan group");
+        let pgid = child.id();
+        let _ = child.wait();
+
+        let raw_id = "not-a-uuid-durable-drop";
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "session_id": raw_id,
+                "pgid": pgid,
+                "start_time": 0,
+                "created_at": 1,
+                "max_runtime_deadline": 2,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Forced-unconfirmed startup: the row comes back unresolved AND
+        // stays re-persisted on disk — the round-6 window's precondition.
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!((killed, unresolved.len()), (0, 1));
+        assert!(
+            std::fs::read_to_string(&reg_path).unwrap().contains(raw_id),
+            "precondition: startup left the unresolved row persisted"
+        );
+
+        // Seed with the flag CLEARED: the inline kill confirms death.
+        harness
+            .scratch_registry
+            .seed_unresolved(
+                unresolved,
+                &harness.graph,
+                &harness.io,
+                &harness.bus,
+                Duration::from_secs(3),
+            )
+            .await;
+
+        // IMMEDIATELY (before any other activity): the drop is durable —
+        // the resolved row is gone from disk (file removed: it was the
+        // only row), and the quota slot is free.
+        assert!(
+            !std::fs::read_to_string(&reg_path)
+                .map(|t| t.contains(raw_id))
+                .unwrap_or(false),
+            "confirmed-dead row must leave the disk immediately"
+        );
+        assert_eq!(harness.scratch_registry.test_total(), 0, "quota slot free");
+        let audit_path = dir.join("lens-audit.ndjson");
+        let count_reaps = || {
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|e| e["method"] == "scratch.reap" && e["session_id"] == raw_id)
+                .count()
+        };
+        assert_eq!(count_reaps(), 1, "exactly one reap audit after resolution");
+
+        // Simulated restart: nothing left to reprocess, no duplicate audit.
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        assert_eq!((killed, unresolved.len()), (0, 0), "nothing to reprocess");
+        assert_eq!(count_reaps(), 1, "no duplicate reap audit after restart");
+
+        harness.stop().await;
+    }
+
+    /// P5 round-7 codex — the multi-row clobber: seed_unresolved processed
+    /// rows sequentially, so rows not yet reached existed ONLY on disk; an
+    /// early opaque row confirming dead triggered a persist that rewrote
+    /// the file from memory and dropped the unseeded later rows. The
+    /// two-pass restructure parks EVERY row in memory first (pass 1), so
+    /// every pass-2 persist reflects all still-unresolved siblings.
+    /// THREE rows exercise the exact window: one opaque that confirms
+    /// immediately, one opaque forced-unconfirmed, one parseable live.
+    #[tokio::test]
+    async fn production_multi_row_seed_never_clobbers_unprocessed_siblings() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let dir = harness._scratch_dir.path().to_path_buf();
+        let reg_path = dir.join("scratch-registry.json");
+
+        // Three real orphaned groups (leader exits; the sleep keeps each
+        // group alive, reparented away from us).
+        let spawn_orphan = || {
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", "sleep 300 & exit 0"])
+                .process_group(0)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn orphan group");
+            let pgid = child.id();
+            let _ = child.wait();
+            pgid
+        };
+        let (pgid_a, pgid_b, pgid_c) = (spawn_orphan(), spawn_orphan(), spawn_orphan());
+
+        let raw_a = "not-a-uuid-A";
+        let raw_b = "not-a-uuid-B";
+        let uuid_c = shux_core::model::SessionId::new().to_string();
+        let row = |sid: &str, pgid: u32| {
+            serde_json::json!({
+                "session_id": sid, "pgid": pgid, "start_time": 0,
+                "created_at": 1, "max_runtime_deadline": 2,
+            })
+        };
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&serde_json::json!([
+                row(raw_a, pgid_a),
+                row(raw_b, pgid_b),
+                row(&uuid_c, pgid_c),
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Forced-unconfirmed startup: all three come back unresolved.
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!((killed, unresolved.len()), (0, 3));
+
+        // Only B stays stubborn during the seed.
+        *lens_scratch::TEST_FORCE_UNCONFIRMED_PGID.lock().unwrap() = Some(pgid_b);
+        harness
+            .scratch_registry
+            .seed_unresolved(
+                unresolved,
+                &harness.graph,
+                &harness.io,
+                &harness.bus,
+                Duration::from_secs(3),
+            )
+            .await;
+        *lens_scratch::TEST_FORCE_UNCONFIRMED_PGID.lock().unwrap() = None;
+
+        // THE WINDOW: A's confirmed resolution persisted mid-seed. The
+        // file must still contain BOTH unresolved siblings — the round-7
+        // bug dropped whichever rows the sequential loop hadn't reached.
+        let text = std::fs::read_to_string(&reg_path).expect("registry persisted");
+        assert!(!text.contains(raw_a), "A resolved and durably dropped");
+        assert!(
+            text.contains(raw_b),
+            "B (unconfirmed) survives A's persist:\n{text}"
+        );
+        assert!(
+            text.contains(&uuid_c),
+            "C (unseeded sibling) survives A's persist:\n{text}"
+        );
+        let audit_path = dir.join("lens-audit.ndjson");
+        let count_reaps = |sid: &str| {
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|e| e["method"] == "scratch.reap" && e["session_id"] == sid)
+                .count()
+        };
+        assert_eq!(count_reaps(raw_a), 1, "A audited exactly once");
+        assert_eq!(count_reaps(raw_b), 0, "B not audited while unresolved");
+
+        // C's short-deadline reaper confirms and removes its row.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let text = std::fs::read_to_string(&reg_path).unwrap_or_default();
+            if !text.contains(&uuid_c) {
+                assert!(text.contains(raw_b), "B still persisted after C's removal");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "C's seeded reaper never resolved it"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(count_reaps(&uuid_c), 1, "C audited exactly once");
+
+        // Simulated restart resolves B for real: clean end state.
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        assert_eq!((killed, unresolved.len()), (1, 0), "B reaped on restart");
+        assert!(
+            !reg_path.exists(),
+            "registry cleared once every row resolved"
+        );
+        assert_eq!(count_reaps(raw_a), 1, "no duplicate audit for A");
+        assert_eq!(count_reaps(raw_b), 1, "B audited exactly once");
+        assert_eq!(count_reaps(&uuid_c), 1, "no duplicate audit for C");
+
+        harness.stop().await;
+    }
+
+    /// Bare `shux` / `shux attach` target choice never lands on a scratch
+    /// session (P5 round-1 minor — attach guard), whether flagged
+    /// `scratch: true` or recognizable by the reserved name prefix.
+    #[test]
+    fn choose_attach_session_never_picks_scratch() {
+        // Scratch-only listing → None (fall through to "default").
+        let scratch_only = vec![
+            serde_json::json!({"name": "__scratch-abc", "scratch": true}),
+            serde_json::json!({"name": "__scratch-def"}),
+        ];
+        assert_eq!(choose_attach_session(&scratch_only), None);
+
+        // Mixed listing → first NON-scratch name, regardless of order.
+        let mixed = vec![
+            serde_json::json!({"name": "__scratch-abc", "scratch": true}),
+            serde_json::json!({"name": "work"}),
+            serde_json::json!({"name": "other"}),
+        ];
+        assert_eq!(choose_attach_session(&mixed), Some("work".to_string()));
+
+        // Flag wins even when the name looks ordinary.
+        let flagged = vec![
+            serde_json::json!({"name": "sneaky", "scratch": true}),
+            serde_json::json!({"name": "real"}),
+        ];
+        assert_eq!(choose_attach_session(&flagged), Some("real".to_string()));
+
+        assert_eq!(choose_attach_session(&[]), None);
     }
 
     #[tokio::test]

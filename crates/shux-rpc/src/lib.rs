@@ -5,6 +5,7 @@
 //! JSON payload). Includes a method router and error system.
 
 pub mod attach;
+pub mod caller;
 pub mod codec;
 pub mod error;
 pub mod policy;
@@ -16,6 +17,7 @@ pub use attach::{
     ATTACH_PROTOCOL_VERSION, ActionArgs, ActionKind, AttachClientFrame, AttachHello, AttachReady,
     AttachServerFrame, MouseButton, MouseKind,
 };
+pub use caller::{current_caller, with_caller};
 pub use codec::{MAX_FRAME_SIZE, create_codec};
 pub use error::{ErrorCode, RpcError};
 pub use policy::{Policy, Sensitivity};

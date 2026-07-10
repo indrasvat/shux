@@ -42,6 +42,11 @@ futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
 arc-swap = { workspace = true }
+sha2 = { workspace = true }
+# Already in-tree transitively via nix; direct use is the macOS
+# proc_pidinfo(PROC_PIDTBSDINFO) start-time read for the lens scratch
+# registry (LENS-R-044 "start time matches") — nix has no wrapper for it.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

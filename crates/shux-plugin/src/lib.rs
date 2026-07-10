@@ -166,6 +166,13 @@ struct Running {
     plugin_id: PluginId,
 }
 
+/// Callback fired on every plugin permission DENIAL, with
+/// `(plugin_name, plugin_uuid, method)`. The daemon wires this to its
+/// lens audit log (lens PRD LENS-R-052: denial entries) — kept generic
+/// here so shux-plugin stays ignorant of lens specifics. Must be cheap
+/// and non-blocking (called on the plugin io path).
+pub type DenialHook = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
 /// Plugin host. Cheap to clone (Arc internally).
 #[derive(Clone)]
 pub struct PluginManager {
@@ -179,6 +186,10 @@ pub struct PluginManager {
     /// up entity ownership. `None` in test harnesses that don't need
     /// ownership checks (they only exercise grant-based decisions).
     graph: Arc<tokio::sync::OnceCell<GraphHandle>>,
+    /// Optional denial observer (see [`DenialHook`]). Unset in tests and
+    /// non-daemon embeddings — denials still audit to the per-plugin log
+    /// regardless.
+    denial_hook: Arc<tokio::sync::OnceCell<DenialHook>>,
 }
 
 impl PluginManager {
@@ -197,6 +208,7 @@ impl PluginManager {
             event_bus,
             state_root: Arc::new(state_root),
             graph: Arc::new(tokio::sync::OnceCell::new()),
+            denial_hook: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -224,6 +236,13 @@ impl PluginManager {
     /// safe default for test harnesses.
     pub async fn set_graph(&self, graph: GraphHandle) {
         let _ = self.graph.set(graph);
+    }
+
+    /// Wire in a permission-denial observer (write-once, like the router).
+    /// Called by the daemon at startup to mirror denials into its own
+    /// audit surface(s).
+    pub fn set_denial_hook(&self, hook: DenialHook) {
+        let _ = self.denial_hook.set(hook);
     }
 
     /// Wire in the daemon's RPC router. Called once during daemon
@@ -464,6 +483,7 @@ impl PluginManager {
             resolved_state_root.clone(),
             Arc::new(perm_root.clone()),
             self.graph.clone(),
+            self.denial_hook.clone(),
             last_error.clone(),
         ));
 
@@ -881,6 +901,7 @@ async fn run_plugin_io(
     state_root: Arc<std::path::PathBuf>,
     perm_root: Arc<std::path::PathBuf>,
     graph: Arc<tokio::sync::OnceCell<GraphHandle>>,
+    denial_hook: Arc<tokio::sync::OnceCell<DenialHook>>,
     last_error: Arc<Mutex<Option<String>>>,
 ) {
     // Plugin→daemon RPC dispatches run in spawned tasks so a slow
@@ -957,6 +978,7 @@ async fn run_plugin_io(
                             &state_root,
                             &perm_root,
                             &graph,
+                            denial_hook.get().cloned(),
                             resp_tx.clone(),
                         );
                     }
@@ -1136,6 +1158,7 @@ fn dispatch_plugin_frame(
     state_root: &std::path::Path,
     perm_root: &std::path::Path,
     graph: &Arc<tokio::sync::OnceCell<GraphHandle>>,
+    denial_hook: Option<DenialHook>,
     resp_tx: mpsc::Sender<String>,
 ) {
     let parsed: Value = match serde_json::from_str(&line) {
@@ -1290,6 +1313,11 @@ fn dispatch_plugin_frame(
     }
 
     if let Decision::Deny { .. } = &decision {
+        // Mirror the denial to the daemon-level observer when wired (the
+        // per-plugin audit entry above always records it regardless).
+        if let Some(hook) = &denial_hook {
+            hook(plugin, &plugin_id.to_string(), &method);
+        }
         let err = serde_json::json!({
             "jsonrpc": "2.0",
             "error": {
@@ -1308,8 +1336,14 @@ fn dispatch_plugin_frame(
     }
 
     let plugin = plugin.to_string();
+    let caller = format!("plugin:{plugin_id}");
     tokio::spawn(async move {
-        let result = router.dispatch(&method, params).await;
+        // Request-scoped caller identity (lens LENS-R-052; P5 round-1
+        // claude N3 adjudication): every handler this dispatch reaches can
+        // read `shux_rpc::current_caller()` and see `plugin:<uuid>` instead
+        // of the UDS default — no handler-signature changes. The scope ends
+        // with this dispatch; tasks IT spawns revert to the default.
+        let result = shux_rpc::with_caller(caller, router.dispatch(&method, params)).await;
         let frame = match result {
             Ok(value) => serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1513,6 +1547,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         let frame = recv_json(&mut rx).await;
@@ -1533,6 +1568,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         let frame = recv_json(&mut rx).await;
@@ -1552,6 +1588,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         let frame = recv_json(&mut rx).await;
@@ -1572,6 +1609,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         let frame = recv_json(&mut rx).await;
@@ -1591,6 +1629,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         let frame = recv_json(&mut rx).await;
@@ -1610,6 +1649,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx,
         );
         let frame = recv_json(&mut rx).await;
@@ -1637,6 +1677,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         dispatch_plugin_frame(
@@ -1648,6 +1689,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         dispatch_plugin_frame(
@@ -1659,6 +1701,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         assert!(rx.try_recv().is_err());
@@ -1677,6 +1720,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         let frame = recv_json(&mut rx).await;
@@ -1710,6 +1754,7 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx.clone(),
         );
         let frame = recv_json(&mut rx).await;
@@ -1730,10 +1775,74 @@ mod tests {
             &state_root,
             &perm_root,
             &graph,
+            None,
             tx,
         );
         let frame = recv_json(&mut rx).await;
         assert_eq!(frame["error"]["code"], -32004);
         assert_eq!(frame["error"]["data"]["reason"], "no_grant_and_not_owned");
+    }
+
+    /// LENS-R-052 caller identity (P5 round-1 claude N3, adjudicated):
+    /// dispatch_plugin_frame scopes the router dispatch in
+    /// `shux_rpc::RPC_CALLER`, so any handler it reaches reads
+    /// `plugin:<uuid>` from `current_caller()` — while a direct dispatch
+    /// (the UDS server path) still reads the "uds" default.
+    #[tokio::test]
+    async fn dispatch_plugin_frame_scopes_caller_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().join("state");
+        let perm_root = dir.path().join("perm");
+        let bus = EventBus::new();
+        let plugin_id = PluginId::new();
+        let graph = Arc::new(tokio::sync::OnceCell::new());
+        let router = Arc::new(tokio::sync::OnceCell::new());
+        let (tx, mut rx) = mpsc::channel(8);
+
+        // Probe handler: echoes whatever caller identity it observes.
+        let probe_router = Router::builder()
+            .register_with_policy(
+                "system.whoami",
+                Policy::fixed(Sensitivity::Public),
+                |_params: Option<Value>| async {
+                    Ok(serde_json::json!({"caller": shux_rpc::current_caller()}))
+                },
+            )
+            .build();
+        router.set(probe_router).expect("set router");
+
+        // UDS-path control: a direct dispatch outside any scope.
+        let direct = router
+            .get()
+            .unwrap()
+            .dispatch("system.whoami", None)
+            .await
+            .unwrap();
+        assert_eq!(direct["caller"], "uds", "direct dispatch keeps the default");
+
+        // Plugin path: the wrapper must scope the identity.
+        dispatch_plugin_frame(
+            "demo",
+            &plugin_id,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "system.whoami"
+            })
+            .to_string(),
+            &router,
+            &bus,
+            &state_root,
+            &perm_root,
+            &graph,
+            None,
+            tx,
+        );
+        let frame = recv_json(&mut rx).await;
+        assert_eq!(
+            frame["result"]["caller"],
+            format!("plugin:{plugin_id}"),
+            "plugin dispatch carries plugin:<uuid>"
+        );
     }
 }
