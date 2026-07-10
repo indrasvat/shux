@@ -402,6 +402,11 @@ test-lens-diff-concurrency: ## Run the P4 diff concurrent-reader integration tes
 	@echo "$(COLOR_BLUE)▶ Running lens P4 diff concurrency test (§7.4)...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test diff_concurrent_readers
 
+.PHONY: test-lens-scratch-reap
+test-lens-scratch-reap: ## Run the P5 scratch reap signal-order test (LENS-R-042, codex B3)
+	@echo "$(COLOR_BLUE)▶ Running lens P5 scratch reap-order test (§8)...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test scratch_reap_order
+
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"
