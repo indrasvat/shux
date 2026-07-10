@@ -365,8 +365,9 @@ impl PeerDeathMonitor {
 ///   direction, (2) an IO-level read error (socket died mid-read), (3) the
 ///   pipelining caps (deliberate severing). Fallback: if the monitor could
 ///   not be built (`None` — dup failure, effectively never), EOF degrades to
-///   cancel-on-EOF so B2 promptness is never lost, trading away half-close
-///   support for that one connection.
+///   cancel-on-EOF and a decode error degrades to the raw EOF drain (codex
+///   P3 round-5) so B2 promptness is never lost in ANY degraded state,
+///   trading away half-close support for that one connection.
 /// - This executor drains the queue STRICTLY SERIALLY (response order equals
 ///   request order — exactly the pre-split semantics) and races both the
 ///   dequeue AND each dispatch against `conn_closed`: when the client DIES,
@@ -427,9 +428,14 @@ where
         // violations do; clean EOF (half-close — codex-bot PR #90 P2) and
         // decode errors (deterministic frame_too_large response — codex P3
         // round-3) do NOT. Client death in the latter states is covered by
-        // the PeerDeathMonitor (or by cancel-on-EOF in the monitor-less
-        // fallback).
+        // the PeerDeathMonitor. Monitor-less fallback (dup failure,
+        // effectively never): clean EOF degrades to cancel-on-EOF, and the
+        // decode-error exit degrades to a raw EOF drain below — codex P3
+        // round-5: without one of the two, NOTHING in degraded mode could
+        // observe a disconnect after a decode error, and an in-flight
+        // handler would run to completion.
         let mut cancel_on_exit = false;
+        let mut decode_error = false;
         loop {
             match framed_rx.next().await {
                 Some(Ok(frame)) => {
@@ -465,8 +471,9 @@ where
                     // Decode errors must NOT cancel: the executor dequeues
                     // the Err SERIALLY and answers it deterministically
                     // (codex P3 round-3); post-error client death is the
-                    // monitor's job.
-                    cancel_on_exit = e.kind() != std::io::ErrorKind::InvalidData;
+                    // monitor's job (or the degraded drain's, below).
+                    decode_error = e.kind() == std::io::ErrorKind::InvalidData;
+                    cancel_on_exit = !decode_error;
                     let _ = frame_tx.send(Err(e));
                     break;
                 }
@@ -480,6 +487,30 @@ where
                     break;
                 }
             }
+        }
+        if decode_error && !have_monitor {
+            // DEGRADED-mode decode error (codex P3 round-5 blocker): with no
+            // PeerDeathMonitor and this task about to exit, nothing else
+            // could ever observe a disconnect — a valid long request +
+            // oversized frame + disconnect would leave the in-flight handler
+            // running to completion. Restore the round-3 raw EOF drain: keep
+            // the deterministic error response (no cancel while the client is
+            // connected — the executor's only ready branch is the queued Err)
+            // and cancel only when the raw socket reports EOF/death. The
+            // frame stream is unsynchronized after a decode error, so bytes
+            // are discarded. Exits when the client closes or when
+            // serve_connection returns and aborts this task (the normal path
+            // once the error response has been written).
+            use tokio::io::AsyncReadExt;
+            let mut raw = framed_rx.into_inner();
+            let mut scratch = [0u8; 4096];
+            loop {
+                match raw.read(&mut scratch).await {
+                    Ok(0) | Err(_) => break, // EOF or socket death.
+                    Ok(_) => {}              // Discard.
+                }
+            }
+            cancel_on_exit = true;
         }
         // The dropped frame_tx lets the executor drain to None and finish.
         if cancel_on_exit {
@@ -1586,6 +1617,137 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    /// Spawn `serve_connection` DIRECTLY in monitor-less (degraded) mode on
+    /// one end of a socketpair. No public knob needed: the tests live in this
+    /// module, and `monitor: None` IS the degraded state under test (in
+    /// production it occurs only when the fd dup fails).
+    fn spawn_monitorless_connection(
+        server: UnixStream,
+        router: Router,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        let (read_half, write_half) = server.into_split();
+        tokio::spawn(serve_connection(
+            read_half,
+            write_half,
+            router,
+            cancel,
+            ConnAuth::Trusted,
+            true,
+            None, // DEGRADED: no PeerDeathMonitor.
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_monitorless_decode_error_then_disconnect_drops_inflight() {
+        // codex P3 round-5 blocker, exact scenario: DEGRADED mode (no
+        // monitor) + valid long request in flight + oversized frame (decode
+        // error) + disconnect. Without the restored raw EOF drain, nothing
+        // can observe the disconnect after the read task exits on the decode
+        // error, and the in-flight handler lives to completion — this test
+        // times out against that code.
+        use tokio::io::AsyncWriteExt;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (router, entered, dropped, dropped_notify) = hang_router();
+        let (client, server) = UnixStream::pair().unwrap();
+        let serve = spawn_monitorless_connection(server, router, cancel.clone());
+
+        let (client_read, client_write) = client.into_split();
+        let mut framed_w = tokio_util::codec::FramedWrite::new(client_write, create_codec());
+        framed_w
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "test.hang"
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("hang handler never entered");
+
+        // Oversized raw frame → decode error server-side; the read task is
+        // now past its framed loop.
+        let mut raw_w = framed_w.into_inner();
+        let oversized_len = (MAX_FRAME_SIZE + 1) as u32;
+        raw_w.write_all(&oversized_len.to_be_bytes()).await.unwrap();
+        raw_w.write_all(&[0u8; 32]).await.unwrap();
+        raw_w.flush().await.unwrap();
+
+        // Full disconnect (both halves) with the hang still in flight.
+        drop(raw_w);
+        drop(client_read);
+
+        // The degraded drain must observe EOF and drop the in-flight handler
+        // promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+            .await
+            .expect(
+                "in-flight handler not dropped: degraded mode lost disconnect \
+             detection after a decode error (codex P3 round-5)",
+            );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serve).await;
+    }
+
+    #[tokio::test]
+    async fn test_monitorless_decode_error_response_still_deterministic() {
+        // The degraded drain must NOT reintroduce the round-3 race: while the
+        // client stays CONNECTED after a decode error, the frame_too_large
+        // response is still deterministic (the drain cancels only on actual
+        // EOF, so the executor's only ready branch is the queued Err).
+        use tokio::io::AsyncWriteExt;
+
+        for iteration in 0..10 {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let router = register_builtin_methods(Router::builder()).build();
+            let (client, server) = UnixStream::pair().unwrap();
+            let serve = spawn_monitorless_connection(server, router, cancel.clone());
+
+            let (client_read, mut client_write) = client.into_split();
+            let oversized_len = (MAX_FRAME_SIZE + 1) as u32;
+            client_write
+                .write_all(&oversized_len.to_be_bytes())
+                .await
+                .unwrap();
+            client_write.write_all(&[0u8; 64]).await.unwrap();
+            client_write.flush().await.unwrap();
+            // Keep client_write ALIVE (still connected) until the response
+            // has been read — the "while connected" condition under test.
+
+            let mut framed_r = tokio_util::codec::FramedRead::new(client_read, create_codec());
+            let response_frame =
+                tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("iteration {iteration}: no frame-error response (degraded)")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "iteration {iteration}: bare EOF instead of the \
+                             frame_too_large response in degraded mode"
+                        )
+                    })
+                    .expect("decode response");
+            let response: serde_json::Value = serde_json::from_slice(&response_frame).unwrap();
+            assert_eq!(
+                response["error"]["code"], -32001,
+                "iteration {iteration}: {response}"
+            );
+
+            // Then the server closes the connection.
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+                .await
+                .expect("connection should close after the error response");
+            assert!(!matches!(next, Some(Ok(_))));
+
+            drop(client_write);
+            cancel.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serve).await;
+        }
     }
 
     #[tokio::test]
