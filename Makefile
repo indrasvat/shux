@@ -397,6 +397,11 @@ test-lens-t: ## Run the lens T-tier real-TUI suite (§13; loud-skips absent bina
 	@# are absent (nextest otherwise captures stderr of passing/skipping tests).
 	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --no-capture --test lens_ttier
 
+.PHONY: test-lens-diff-concurrency
+test-lens-diff-concurrency: ## Run the P4 diff concurrent-reader integration test (§7.4 council D2)
+	@echo "$(COLOR_BLUE)▶ Running lens P4 diff concurrency test (§7.4)...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test diff_concurrent_readers
+
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"
