@@ -40,6 +40,14 @@ pub enum ErrorCode {
     RateLimited,
     /// Name conflict (session/window name already exists).
     NameConflict,
+    /// A `pane.diff_since` `since_revision` has no live checkpoint and is not
+    /// covered by an invalidation marker (lens PRD §7.1, LENS-R-033). Carries
+    /// `{requested, available:[u64]}` so the caller can re-checkpoint.
+    StaleRevision,
+    /// A `pane.diff_since` `since_revision` predates a resize / alt-screen
+    /// switch that invalidated every checkpoint of that pane (lens PRD §7.1,
+    /// DEC-4, LENS-R-032/033).
+    ResizeInvalidated,
     /// Response payload exceeds a method's declared size cap (lens PRD §5.2,
     /// LENS-R-*: `pane.glance`'s 8 MiB decoded-PNG cap and friends).
     PayloadTooLarge,
@@ -61,6 +69,8 @@ impl ErrorCode {
             ErrorCode::PermissionDenied => -32005,
             ErrorCode::RateLimited => -32006,
             ErrorCode::NameConflict => -32007,
+            ErrorCode::StaleRevision => -32010,
+            ErrorCode::ResizeInvalidated => -32011,
             ErrorCode::PayloadTooLarge => -32013,
         }
     }
@@ -80,6 +90,8 @@ impl ErrorCode {
             ErrorCode::PermissionDenied => "permission_denied",
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::NameConflict => "name_conflict",
+            ErrorCode::StaleRevision => "stale_revision",
+            ErrorCode::ResizeInvalidated => "resize_invalidated",
             ErrorCode::PayloadTooLarge => "payload_too_large",
         }
     }
@@ -220,6 +232,35 @@ impl RpcError {
         )
     }
 
+    /// Stale-revision error (lens PRD §7.1, LENS-R-033): `pane.diff_since`'s
+    /// `since_revision` has no live checkpoint and no invalidation covers it.
+    /// `available` is the pane's live checkpoint revisions, sorted ascending,
+    /// so the caller knows exactly which revisions are still diffable.
+    pub fn stale_revision(requested: u64, available: &[u64]) -> Self {
+        Self::with_data(
+            ErrorCode::StaleRevision,
+            serde_json::json!({
+                "requested": requested,
+                "available": available,
+            }),
+        )
+    }
+
+    /// Resize-invalidated error (lens PRD §7.1, DEC-4, LENS-R-032/033): the
+    /// `since_revision` predates a resize / alt-screen switch that freed every
+    /// checkpoint of the pane. `invalidated_at` is the post-mutation revision
+    /// of the invalidating event.
+    pub fn resize_invalidated(requested: u64, invalidated_at: u64) -> Self {
+        Self::with_data(
+            ErrorCode::ResizeInvalidated,
+            serde_json::json!({
+                "requested": requested,
+                "invalidated_at": invalidated_at,
+                "hint": "re-checkpoint the pane after the resize / alt-screen switch",
+            }),
+        )
+    }
+
     /// Payload too large error (lens PRD §5.2: `pane.glance`'s 8 MiB
     /// decoded-PNG cap). `size`/`max_size` are byte counts of the
     /// oversized payload, not the base64 encoding of it.
@@ -283,6 +324,29 @@ mod tests {
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["code"], -32001);
         assert_eq!(json["data"]["size"], 20_000_000);
+    }
+
+    #[test]
+    fn test_stale_revision_error() {
+        // lens PRD §7.1 LENS-R-033: -32010 with {requested, available:[u64]}.
+        let err = RpcError::stale_revision(7, &[3, 5, 6]);
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], -32010);
+        assert_eq!(json["message"], "stale_revision");
+        assert_eq!(json["data"]["requested"], 7);
+        assert_eq!(json["data"]["available"], serde_json::json!([3, 5, 6]));
+    }
+
+    #[test]
+    fn test_resize_invalidated_error() {
+        // lens PRD §7.1 DEC-4: -32011 for a since_revision predating a
+        // resize / alt-screen switch.
+        let err = RpcError::resize_invalidated(4, 9);
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], -32011);
+        assert_eq!(json["message"], "resize_invalidated");
+        assert_eq!(json["data"]["requested"], 4);
+        assert_eq!(json["data"]["invalidated_at"], 9);
     }
 
     #[test]
