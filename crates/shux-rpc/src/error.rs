@@ -51,6 +51,15 @@ pub enum ErrorCode {
     /// Response payload exceeds a method's declared size cap (lens PRD §5.2,
     /// LENS-R-*: `pane.glance`'s 8 MiB decoded-PNG cap and friends).
     PayloadTooLarge,
+    /// A bounded daemon resource is exhausted (lens PRD §8, LENS-R-043: the
+    /// 16-concurrent-scratch-session quota). Not a param error — the request
+    /// was well-formed, the daemon just has no room right now.
+    ResourceExhausted,
+    /// `lens.run`'s synchronous spawn failed (lens PRD §8, LENS-R-040/045):
+    /// `argv[0]` did not resolve via PATH, `cwd` was invalid, or exec itself
+    /// failed. The scratch allocation is rolled back completely — no
+    /// session/pane/PTY survives a SPAWN_FAILED.
+    SpawnFailed,
 }
 
 impl ErrorCode {
@@ -72,6 +81,8 @@ impl ErrorCode {
             ErrorCode::StaleRevision => -32010,
             ErrorCode::ResizeInvalidated => -32011,
             ErrorCode::PayloadTooLarge => -32013,
+            ErrorCode::ResourceExhausted => -32012,
+            ErrorCode::SpawnFailed => -32014,
         }
     }
 
@@ -93,6 +104,8 @@ impl ErrorCode {
             ErrorCode::StaleRevision => "stale_revision",
             ErrorCode::ResizeInvalidated => "resize_invalidated",
             ErrorCode::PayloadTooLarge => "payload_too_large",
+            ErrorCode::ResourceExhausted => "resource_exhausted",
+            ErrorCode::SpawnFailed => "spawn_failed",
         }
     }
 }
@@ -274,6 +287,37 @@ impl RpcError {
             }),
         )
     }
+
+    /// Resource-exhausted error (lens PRD §8, LENS-R-043): `lens.run`'s
+    /// 16-concurrent-scratch-session quota is full. `current`/`max` let the
+    /// caller decide whether to retry after killing one of its own scratch
+    /// sessions.
+    pub fn resource_exhausted(resource: &str, current: usize, max: usize) -> Self {
+        Self::with_data(
+            ErrorCode::ResourceExhausted,
+            serde_json::json!({
+                "resource": resource,
+                "current": current,
+                "max": max,
+                "hint": "kill an existing scratch session (session.kill) and retry",
+            }),
+        )
+    }
+
+    /// Spawn-failed error (lens PRD §8, LENS-R-040/045): `lens.run`'s
+    /// synchronous PTY spawn failed (argv[0] not found via PATH, invalid
+    /// cwd, or exec error). `detail` carries the underlying OS error; the
+    /// caller's scratch allocation is guaranteed rolled back (no session,
+    /// pane, or PTY survives).
+    pub fn spawn_failed(detail: &str) -> Self {
+        Self::with_data(
+            ErrorCode::SpawnFailed,
+            serde_json::json!({
+                "detail": detail,
+                "hint": "check argv[0] resolves via PATH and cwd exists",
+            }),
+        )
+    }
 }
 
 impl fmt::Display for RpcError {
@@ -377,5 +421,32 @@ mod tests {
         assert_eq!(json["message"], "payload_too_large");
         assert_eq!(json["data"]["size"], 9_000_000);
         assert_eq!(json["data"]["max_size"], 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_resource_exhausted_error() {
+        // lens PRD §8 LENS-R-043: 17th scratch session -> -32012.
+        let err = RpcError::resource_exhausted("scratch_session", 16, 16);
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], -32012);
+        assert_eq!(json["message"], "resource_exhausted");
+        assert_eq!(json["data"]["resource"], "scratch_session");
+        assert_eq!(json["data"]["current"], 16);
+        assert_eq!(json["data"]["max"], 16);
+    }
+
+    #[test]
+    fn test_spawn_failed_error() {
+        // lens PRD §8 LENS-R-040/045: argv[0] not found -> -32014.
+        let err = RpcError::spawn_failed("No such file or directory (os error 2)");
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], -32014);
+        assert_eq!(json["message"], "spawn_failed");
+        assert!(
+            json["data"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("No such file")
+        );
     }
 }
