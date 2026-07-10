@@ -213,6 +213,9 @@ async fn handle_uds_connection(
     router: Router,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Built from the concrete stream BEFORE the generic split — the monitor
+    // needs the real socket fd for write-direction readiness.
+    let monitor = PeerDeathMonitor::try_new(&stream);
     let (read_half, write_half) = stream.into_split();
     serve_connection(
         read_half,
@@ -223,6 +226,7 @@ async fn handle_uds_connection(
         // Historical UDS behavior: attempt a frame_too_large error response
         // before closing on a codec error.
         true,
+        monitor,
     )
     .await
 }
@@ -236,13 +240,14 @@ async fn handle_tcp_connection(
     cancel: tokio_util::sync::CancellationToken,
     expected_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let monitor = PeerDeathMonitor::try_new(&stream);
     let (read_half, write_half) = stream.into_split();
     let auth = match expected_token {
         Some(token) => ConnAuth::Pending(token),
         None => ConnAuth::Trusted, // No token configured = no auth needed.
     };
     // Historical TCP behavior: close silently on codec errors.
-    serve_connection(read_half, write_half, router, cancel, auth, false).await
+    serve_connection(read_half, write_half, router, cancel, auth, false, monitor).await
 }
 
 /// Hard per-connection cap on frames queued awaiting execution (codex P3
@@ -265,26 +270,112 @@ async fn handle_tcp_connection(
 /// for no additional bound.
 const MAX_PENDING_FRAMES: usize = 256;
 
+/// Hard per-connection cap on BYTES queued awaiting execution (greptile PR #90
+/// P1): the frame-count cap alone bounds nothing in bytes — 256 × 16 MiB
+/// frames ≈ 4 GiB retained by one stalled connection. Enforced in the same
+/// accounting as the frame cap (each queued frame adds its decoded length;
+/// the executor subtracts on dequeue); exceeding it is the same deliberate
+/// connection-cancel. Worst-case retention is this cap plus ONE frame (the
+/// check runs after adding the frame that crossed it): 64 MiB + 16 MiB.
+const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+
+/// Detects PEER DEATH on the write half of a connection (codex-bot PR #90 P2:
+/// read-side EOF must NOT be conflated with client death — a half-closed
+/// client that did `shutdown(Write)` is still connected and waiting for its
+/// responses).
+///
+/// Mechanism: the socket fd is dup'ed (shared file description, independent
+/// readiness registration) and registered with `AsyncFd` for WRITABLE
+/// interest. When the PEER closes its read side — full close, process death,
+/// SIGKILL — the OS flags our WRITE direction: epoll reports EPOLLHUP/EPOLLERR
+/// (Linux), kqueue sets EV_EOF on the EVFILT_WRITE filter (macOS). Tokio
+/// surfaces both as `Ready::is_write_closed()` / `is_error()`. A mere
+/// half-close (peer `shutdown(Write)`) flags only OUR read side, which this
+/// monitor deliberately ignores.
+///
+/// No busy-spin: plain-writable wakeups call `clear_ready()`, which parks the
+/// next `.ready()` until a NEW edge event — and the only later write-direction
+/// transition on an idle connection is the peer-closure event itself.
+///
+/// Empirical verification on macOS (per the review's own caveat about
+/// epoll/kqueue semantics): every existing full-close drop-guard test
+/// (`test_disconnect_mid_request_drops_inflight_handler`, the backlog and
+/// cross-connection variants, the in-process lens waiter-drop proof, and the
+/// black-box SIGKILL test) now passes THROUGH this monitor — they fail with a
+/// 5s timeout if kqueue does not deliver write-closed. The half-close tests
+/// prove the inverse (no false positive).
+struct PeerDeathMonitor {
+    fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+}
+
+impl PeerDeathMonitor {
+    /// Dup the stream's fd and register it for write-direction readiness.
+    /// `None` (dup/registration failure — effectively never) degrades the
+    /// caller to cancel-on-EOF: B2 promptness is preserved, half-close
+    /// support is lost for that one connection.
+    fn try_new(stream: &impl std::os::fd::AsFd) -> Option<Self> {
+        let owned = stream.as_fd().try_clone_to_owned().ok()?;
+        let fd =
+            tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::WRITABLE).ok()?;
+        Some(PeerDeathMonitor { fd })
+    }
+
+    /// Resolves when the peer is DEAD (write direction closed or errored).
+    /// Never resolves for a live or merely half-closed peer.
+    async fn peer_dead(&self) {
+        loop {
+            match self.fd.ready(tokio::io::Interest::WRITABLE).await {
+                Ok(mut guard) => {
+                    let ready = guard.ready();
+                    if ready.is_write_closed() || ready.is_error() {
+                        return;
+                    }
+                    // Plain writable: park until the next edge event.
+                    guard.clear_ready();
+                }
+                // fd-level failure: treat as dead (conservative — matches
+                // the pre-monitor behavior of closing on any read error).
+                Err(_) => return,
+            }
+        }
+    }
+}
+
 /// Serve one framed JSON-RPC connection with CANCELLABLE request execution.
 ///
 /// Architecture (P3 codex B2 / claude major — client disconnect must drop
-/// in-flight request futures): the connection is split so the READ side keeps
-/// running while a request executes.
+/// in-flight request futures; codex-bot PR #90 P2 — but a HALF-CLOSED client
+/// is NOT a dead client): the connection is split so the READ side keeps
+/// running while a request executes, and CLIENT DEATH is detected on the
+/// WRITE direction, never inferred from read-side EOF.
 ///
 /// - A spawned read task decodes frames and queues them on an UNBOUNDED
-///   channel (bounded by `MAX_PENDING_FRAMES` at the protocol level, above);
-///   on EOF or read error it cancels `conn_closed`. Because it reads
-///   independently of request execution AND its queue forward never blocks,
-///   the read task is ALWAYS parked on the socket — EOF/read-error is
-///   reachable in every state, regardless of executor progress or pipelining
-///   depth (codex P3 round-2: a bounded queue broke exactly this).
+///   channel (bounded by `MAX_PENDING_FRAMES` / `MAX_PENDING_BYTES` at the
+///   protocol level, above). Because it reads independently of request
+///   execution AND its queue forward never blocks, the read task is ALWAYS
+///   parked on the socket — EOF/read-error is reachable in every state,
+///   regardless of executor progress or pipelining depth (codex P3 round-2:
+///   a bounded queue broke exactly this).
+/// - Read-side EOF does NOT cancel `conn_closed` (codex-bot PR #90 P2): a
+///   client may `shutdown(Write)` after its last request and keep reading —
+///   the executor drains the queued frames, finishes any in-flight request,
+///   writes every response, and the connection ends naturally when `recv()`
+///   returns `None`. `conn_closed` is cancelled only by: (1) the
+///   `PeerDeathMonitor` observing the peer's FULL closure on the write
+///   direction, (2) an IO-level read error (socket died mid-read), (3) the
+///   pipelining caps (deliberate severing). Fallback: if the monitor could
+///   not be built (`None` — dup failure, effectively never), EOF degrades to
+///   cancel-on-EOF so B2 promptness is never lost, trading away half-close
+///   support for that one connection.
 /// - This executor drains the queue STRICTLY SERIALLY (response order equals
 ///   request order — exactly the pre-split semantics) and races both the
-///   dequeue AND each dispatch against `conn_closed`: when the client goes
-///   away, the in-flight handler FUTURE IS DROPPED — releasing whatever it
-///   held (settle watch subscriptions, event long-polls, locks-on-await) —
-///   and any still-queued frames are discarded (the accepted fire-and-forget
-///   delta: a disconnected client's unprocessed requests are dropped).
+///   dequeue AND each dispatch against `conn_closed`: when the client DIES,
+///   the in-flight handler FUTURE IS DROPPED — releasing whatever it held
+///   (settle watch subscriptions, event long-polls, locks-on-await) — and
+///   any still-queued frames are discarded (the accepted fire-and-forget
+///   delta: a DEAD client's unprocessed requests are dropped; a half-closed
+///   client's requests are all answered).
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection<R, W>(
     read_half: R,
     write_half: W,
@@ -292,6 +383,7 @@ async fn serve_connection<R, W>(
     cancel: tokio_util::sync::CancellationToken,
     mut auth: ConnAuth,
     error_response_on_bad_frame: bool,
+    monitor: Option<PeerDeathMonitor>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -306,34 +398,55 @@ where
     let (frame_tx, mut frame_rx) =
         tokio::sync::mpsc::unbounded_channel::<Result<bytes::BytesMut, std::io::Error>>();
     let conn_closed = tokio_util::sync::CancellationToken::new();
-    // Frames queued but not yet dequeued by the executor. Written by the read
-    // task (inc) and this executor (dec); the tiny inc-before-send window can
-    // only OVER-count, so the cap can never be evaded.
+    // Frames/bytes queued but not yet dequeued by the executor. Written by
+    // the read task (inc) and this executor (dec); the tiny inc-before-send
+    // window can only OVER-count, so the caps can never be evaded.
     let pending_frames = Arc::new(AtomicUsize::new(0));
+    let pending_bytes = Arc::new(AtomicUsize::new(0));
+
+    // Client-death watcher (codex-bot PR #90 P2): cancels `conn_closed` when
+    // the peer FULLY closes — the only signal that means "nobody can receive
+    // responses anymore". Runs from connection start, so a SIGKILLed client
+    // is detected promptly whether or not the read task has seen EOF yet.
+    let monitor_task = monitor.map(|m| {
+        let monitor_closed = conn_closed.clone();
+        tokio::spawn(async move {
+            m.peer_dead().await;
+            debug!("peer fully closed; cancelling connection");
+            monitor_closed.cancel();
+        })
+    });
+    let have_monitor = monitor_task.is_some();
 
     let read_closed = conn_closed.clone();
     let read_pending = pending_frames.clone();
+    let read_bytes = pending_bytes.clone();
     let read_task = tokio::spawn(async move {
         let mut framed_rx = FramedRead::new(read_half, create_codec());
-        // codex P3 round-3: decode errors and socket death are DIFFERENT
-        // events and must not share the cancel path. Enqueueing the Err and
-        // immediately cancelling `conn_closed` raced the executor's outer
-        // select — it could take the already-cancelled close branch before
-        // dequeuing the Err, making the frame_too_large error response
-        // nondeterministic. `decode_error` routes the two apart below.
-        let mut decode_error = false;
+        // Which exits CANCEL the connection: IO-level read errors and cap
+        // violations do; clean EOF (half-close — codex-bot PR #90 P2) and
+        // decode errors (deterministic frame_too_large response — codex P3
+        // round-3) do NOT. Client death in the latter states is covered by
+        // the PeerDeathMonitor (or by cancel-on-EOF in the monitor-less
+        // fallback).
+        let mut cancel_on_exit = false;
         loop {
             match framed_rx.next().await {
                 Some(Ok(frame)) => {
                     let queued = read_pending.fetch_add(1, Ordering::SeqCst) + 1;
-                    if queued > MAX_PENDING_FRAMES {
+                    let queued_bytes =
+                        read_bytes.fetch_add(frame.len(), Ordering::SeqCst) + frame.len();
+                    if queued > MAX_PENDING_FRAMES || queued_bytes > MAX_PENDING_BYTES {
                         // Protocol violation: deliberate, observable
                         // connection cancellation (the client sees EOF).
                         warn!(
                             queued,
-                            cap = MAX_PENDING_FRAMES,
+                            queued_bytes,
+                            frame_cap = MAX_PENDING_FRAMES,
+                            byte_cap = MAX_PENDING_BYTES,
                             "pipelining cap exceeded; cancelling connection"
                         );
+                        cancel_on_exit = true;
                         break;
                     }
                     // UnboundedSender::send is non-blocking by construction:
@@ -349,38 +462,29 @@ where
                     // tokio-util 0.7's length_delimited.rs and pinned by
                     // codec::tests::test_codec_max_frame_size); every other
                     // kind is an IO-level read error, i.e. the socket died.
-                    decode_error = e.kind() == std::io::ErrorKind::InvalidData;
+                    // Decode errors must NOT cancel: the executor dequeues
+                    // the Err SERIALLY and answers it deterministically
+                    // (codex P3 round-3); post-error client death is the
+                    // monitor's job.
+                    cancel_on_exit = e.kind() != std::io::ErrorKind::InvalidData;
                     let _ = frame_tx.send(Err(e));
                     break;
                 }
-                None => break, // Client closed its write side (EOF).
-            }
-        }
-        if decode_error {
-            // Deterministic error response: do NOT cancel `conn_closed` — the
-            // executor must dequeue the Err SERIALLY (after any in-flight
-            // request completes, matching the original pre-split semantics)
-            // and send the frame_too_large response to the still-connected
-            // client. The frame stream is unsynchronized after a decode
-            // error, so no further frames can be parsed — but keep draining
-            // the RAW socket purely to observe EOF: a client that disconnects
-            // in this window still gets its in-flight handler dropped
-            // promptly. Exits when the client closes (EOF/error) or when
-            // serve_connection returns and aborts this task (the normal path
-            // once the error response has been written).
-            use tokio::io::AsyncReadExt;
-            let mut raw = framed_rx.into_inner();
-            let mut scratch = [0u8; 4096];
-            loop {
-                match raw.read(&mut scratch).await {
-                    Ok(0) | Err(_) => break, // EOF or socket death.
-                    Ok(_) => {}              // Discard: nothing after a decode error parses.
+                None => {
+                    // Clean EOF: the client closed its WRITE side. With a
+                    // monitor, this is possibly just a half-close — keep the
+                    // connection alive so every queued/in-flight request is
+                    // answered (codex-bot PR #90 P2). Without one, degrade
+                    // to the old cancel-on-EOF (B2 over half-close).
+                    cancel_on_exit = !have_monitor;
+                    break;
                 }
             }
         }
-        // Signal close AFTER queueing everything read so far. The dropped
-        // frame_tx also lets the executor drain to None and finish.
-        read_closed.cancel();
+        // The dropped frame_tx lets the executor drain to None and finish.
+        if cancel_on_exit {
+            read_closed.cancel();
+        }
     });
 
     // Executor loop. Errors (`?` on writes) must still abort the read task,
@@ -389,11 +493,11 @@ where
         loop {
             let maybe_frame = tokio::select! {
                 _ = cancel.cancelled() => break,
-                // Connection closed (EOF, read error, or cap violation):
-                // stop deterministically instead of draining a dead client's
-                // queued frames (accepted fire-and-forget delta). This is
-                // also what makes the cap violation DELIBERATE: the executor
-                // abandons the queue immediately and closes the socket.
+                // Client DEAD (peer-death monitor / IO read error) or cap
+                // violation: stop deterministically instead of draining a
+                // dead client's queued frames (accepted fire-and-forget
+                // delta). Never fires for a merely half-closed client, whose
+                // queued requests are all drained and answered below.
                 _ = conn_closed.cancelled() => {
                     debug!("connection closed; discarding queued frames");
                     break;
@@ -402,7 +506,8 @@ where
             };
             let data = match maybe_frame {
                 None => {
-                    // Read side finished and the queue is drained.
+                    // Read side finished (EOF or half-close) and every queued
+                    // frame has been drained and answered.
                     debug!("client disconnected");
                     break;
                 }
@@ -422,6 +527,7 @@ where
                 }
                 Some(Ok(data)) => {
                     pending_frames.fetch_sub(1, Ordering::SeqCst);
+                    pending_bytes.fetch_sub(data.len(), Ordering::SeqCst);
                     data
                 }
             };
@@ -468,10 +574,15 @@ where
     }
     .await;
 
-    // Stop the read task on every exit path (server shutdown, write error,
-    // auth failure) — otherwise it would idle on a still-open socket forever.
+    // Stop the read + monitor tasks on every exit path (server shutdown,
+    // write error, auth failure) — otherwise they would idle on a still-open
+    // socket forever.
     read_task.abort();
     let _ = read_task.await;
+    if let Some(task) = monitor_task {
+        task.abort();
+        let _ = task.await;
+    }
     result
 }
 
@@ -1135,6 +1246,342 @@ mod tests {
         assert!(
             !matches!(next, Some(Ok(_))),
             "expected EOF/error after the cap violation, got a frame: {next:?}"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_half_close_still_receives_response() {
+        // codex-bot PR #90 P2: client pattern `write request → shutdown(Write)
+        // → read response`. Read-side EOF must NOT be treated as client death
+        // — the half-closed client is still connected for responses. (The
+        // round-2/3 code cancelled on EOF and discarded the queued frame, so
+        // the client got bare EOF.)
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("halfclose.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let router = register_builtin_methods(Router::builder()).build();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        // Run several iterations: the old bug was a race (EOF vs dequeue), so
+        // a single pass could false-green.
+        for iteration in 0..10 {
+            let stream = connect_with_retries(&socket_path).await;
+            let (read_half, write_half) = stream.into_split();
+            let mut framed_w = tokio_util::codec::FramedWrite::new(write_half, create_codec());
+            let mut framed_r = tokio_util::codec::FramedRead::new(read_half, create_codec());
+
+            framed_w
+                .send(frame_bytes(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "system.version"
+                })))
+                .await
+                .unwrap();
+            // Half-close: dropping the write half sends FIN (tokio's
+            // OwnedWriteHalf shuts down the write direction on drop). The
+            // read half stays open for the response.
+            drop(framed_w);
+
+            let response_frame =
+                tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("iteration {iteration}: no response after half-close")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "iteration {iteration}: bare EOF — the half-closed \
+                             client's request was discarded"
+                        )
+                    })
+                    .expect("decode response");
+            let response: serde_json::Value = serde_json::from_slice(&response_frame).unwrap();
+            assert_eq!(response["id"], 1, "iteration {iteration}: {response}");
+            assert_eq!(response["result"]["name"], "shux");
+
+            // Then the connection ends naturally.
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+                .await
+                .expect("connection should close after the drain");
+            assert!(!matches!(next, Some(Ok(_))));
+        }
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_half_close_drains_backlog_behind_inflight_request() {
+        // codex-bot PR #90 P2, hard variant: the half-close lands while a
+        // SLOW request is IN FLIGHT with another request queued behind it.
+        // The executor must finish the in-flight request, drain the queued
+        // one, and deliver BOTH responses in order — read-side EOF must not
+        // abort either.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_h = entered.clone();
+        let release_h = release.clone();
+        let router = register_builtin_methods(Router::builder())
+            .register("test.gate", move |_: Option<serde_json::Value>| {
+                let entered = entered_h.clone();
+                let release = release_h.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(serde_json::json!({"gate": "released"}))
+                }
+            })
+            .build();
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("halfclose-gate.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let stream = connect_with_retries(&socket_path).await;
+        let (read_half, write_half) = stream.into_split();
+        let mut framed_w = tokio_util::codec::FramedWrite::new(write_half, create_codec());
+        let mut framed_r = tokio_util::codec::FramedRead::new(read_half, create_codec());
+
+        // Slow request enters execution...
+        framed_w
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "test.gate"
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("gate handler never entered");
+        // ...a second request queues behind it, then the client half-closes
+        // while the gate is still held.
+        framed_w
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "system.health"
+            })))
+            .await
+            .unwrap();
+        drop(framed_w); // shutdown(Write): EOF reaches the server NOW.
+
+        // Release the gate only after the half-close is in flight.
+        release.notify_one();
+
+        // Both responses must arrive, in order.
+        let first: serde_json::Value = serde_json::from_slice(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+                .await
+                .expect("gate response after half-close")
+                .expect("not bare EOF — in-flight request was dropped")
+                .expect("decode"),
+        )
+        .unwrap();
+        assert_eq!(first["id"], 1);
+        assert_eq!(first["result"]["gate"], "released");
+
+        let second: serde_json::Value = serde_json::from_slice(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+                .await
+                .expect("queued response after half-close")
+                .expect("not bare EOF — queued frame was discarded")
+                .expect("decode"),
+        )
+        .unwrap();
+        assert_eq!(second["id"], 2);
+        assert_eq!(second["result"]["status"], "ok");
+
+        // Then natural close.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed_r.next())
+            .await
+            .expect("connection should close after the drain");
+        assert!(!matches!(next, Some(Ok(_))));
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_full_close_discards_queued_backlog() {
+        // Distinguishes FULL close from half-close: a client that dies with
+        // frames still queued behind an in-flight hang gets its in-flight
+        // handler dropped AND its backlog discarded — none of the queued
+        // requests execute (a dead client's work is never run).
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+
+        let counted = Arc::new(AtomicUsize::new(0));
+        let counted_h = counted.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_notify = Arc::new(tokio::sync::Notify::new());
+        let entered_h = entered.clone();
+        let dropped_h = dropped.clone();
+        let dropped_notify_h = dropped_notify.clone();
+        let router = register_builtin_methods(Router::builder())
+            .register("test.hang", move |_: Option<serde_json::Value>| {
+                let entered = entered_h.clone();
+                let guard = HangGuard {
+                    dropped: dropped_h.clone(),
+                    notify: dropped_notify_h.clone(),
+                };
+                async move {
+                    entered.notify_one();
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                    unreachable!("test.hang never completes")
+                }
+            })
+            .register("test.count", move |_: Option<serde_json::Value>| {
+                let counted = counted_h.clone();
+                async move {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(serde_json::json!({"counted": true}))
+                }
+            })
+            .build();
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("fullclose.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let stream = connect_with_retries(&socket_path).await;
+        let mut framed = Framed::new(stream, create_codec());
+        framed
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "test.hang"
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("hang handler never entered");
+        // Queue a backlog behind the hang, then FULLY close (both halves).
+        for id in 2..8 {
+            framed
+                .send(frame_bytes(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": "test.count"
+                })))
+                .await
+                .unwrap();
+        }
+        drop(framed);
+
+        // In-flight handler dropped promptly (the moment this fires, the
+        // executor has taken the close branch — no further dequeues happen).
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+            .await
+            .expect("in-flight handler not dropped on full close");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        // The dead client's backlog was never executed.
+        assert_eq!(
+            counted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a dead client's queued requests must not run"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_pending_bytes_cap_exceeded_cancels_connection() {
+        // greptile PR #90 P1: the frame-count cap alone allows ~4 GiB
+        // (256 × 16 MiB) of retained bytes. MAX_PENDING_BYTES severs the
+        // connection on QUEUED BYTES — here ~65 MiB across only ~65 frames,
+        // far below the 256-frame cap.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("bytecap.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (router, entered, dropped, dropped_notify) = hang_router();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let stream = connect_with_retries(&socket_path).await;
+        let mut framed = Framed::new(stream, create_codec());
+        framed
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "test.hang"
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("hang handler never entered");
+
+        // ~1 MiB frames; the byte cap (64 MiB) trips at ~frame 65 — well
+        // before the 256-frame cap could. Mid-flood send errors are the
+        // severing under test.
+        let big = vec![b'x'; 1024 * 1024];
+        let frame_count = (MAX_PENDING_BYTES / big.len()) + 4;
+        assert!(
+            frame_count < MAX_PENDING_FRAMES,
+            "test must trip the BYTE cap first ({frame_count} frames)"
+        );
+        for _ in 0..frame_count {
+            if framed.send(Bytes::from(big.clone())).await.is_err() {
+                break; // Server already severed the connection.
+            }
+        }
+
+        // Deliberate cancellation: in-flight handler dropped...
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+            .await
+            .expect("byte-cap violation did not drop the in-flight handler");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        // ...and the still-open client observes server-side EOF/error.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+            .await
+            .expect("server did not close the violating connection");
+        assert!(
+            !matches!(next, Some(Ok(_))),
+            "expected EOF/error after the byte-cap violation, got a frame: {next:?}"
         );
 
         cancel.cancel();
