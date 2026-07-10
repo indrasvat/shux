@@ -4654,6 +4654,7 @@ fn register_pane_io_methods(
                     // all read from the same critical section. Render + text
                     // extraction happen from THIS clone, outside the lock
                     // (LENS-R-011): same revision guaranteed for both.
+                    let (cw, ch) = r.cell_size();
                     let (
                         revision,
                         cursor_row,
@@ -4670,6 +4671,34 @@ fn register_pane_io_methods(
                         let vt = state.vts.get(&pane_id).ok_or_else(|| {
                             shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
                         })?;
+                        let cols = vt.grid().cols();
+                        let rows = vt.grid().rows();
+                        // Pre-render pixel budget (codex PR #89 P1): reject
+                        // over-budget panes BEFORE any clone/render/encode —
+                        // same 16M-pixel cap as `pane.snapshot`, but mapped
+                        // to PAYLOAD_TOO_LARGE (-32013) per §5.2. Without
+                        // this, a 1000×1000 pane forced the daemon to
+                        // allocate + encode hundreds of MB of RGBA before
+                        // the post-encode 8 MiB check could fire. Text-only
+                        // glances skip it: no PNG payload exists to cap.
+                        if include_png {
+                            let pixel_count = (cols as u64)
+                                .saturating_mul(cw as u64)
+                                .saturating_mul(rows as u64)
+                                .saturating_mul(ch as u64);
+                            const MAX_PIXELS: u64 = 16_000_000;
+                            if pixel_count > MAX_PIXELS {
+                                return Err(shux_rpc::RpcError::with_message_and_data(
+                                    shux_rpc::ErrorCode::PayloadTooLarge,
+                                    "payload_too_large",
+                                    serde_json::json!({
+                                        "pixels": pixel_count,
+                                        "max_pixels": MAX_PIXELS,
+                                        "hint": "shrink the pane (pane.set_size) or set include_png=false",
+                                    }),
+                                ));
+                            }
+                        }
                         let cur = vt.cursor();
                         let default_colors = vt.default_colors();
                         // Visible-only clone — no scrollback (LENS-R-012).
@@ -4681,8 +4710,8 @@ fn register_pane_io_methods(
                             cur.visible,
                             cur.shape,
                             vt.is_alternate_screen(),
-                            vt.grid().cols(),
-                            vt.grid().rows(),
+                            cols,
+                            rows,
                             default_colors,
                             grid_clone,
                         )
@@ -4693,10 +4722,20 @@ fn register_pane_io_methods(
                     // by `\n`, no scrollback.
                     let text = grid_snapshot.glance_text();
 
-                    // Checkpoint storage (§7 LENS-R-030/031, P2 scope) needs
-                    // its own clone — `grid_snapshot` is about to move into
-                    // the PNG render closure below when `include_png`.
-                    let checkpoint_grid = want_checkpoint.then(|| grid_snapshot.clone());
+                    // Route the clone to its consumers without a spare copy
+                    // (greptile PR #89 P2): only the PNG+checkpoint
+                    // combination needs two owners; every other shape MOVES
+                    // the clone (the text-only+checkpoint path previously
+                    // cloned it and dropped the original).
+                    let (render_grid, checkpoint_grid) = match (include_png, want_checkpoint) {
+                        (true, true) => {
+                            let cp = grid_snapshot.clone();
+                            (Some(grid_snapshot), Some(cp))
+                        }
+                        (true, false) => (Some(grid_snapshot), None),
+                        (false, true) => (None, Some(grid_snapshot)),
+                        (false, false) => (None, None),
+                    };
 
                     // PNG rendering (LENS-R-013): reuses shux-raster
                     // unchanged, cursor drawn iff visible AND include_cursor
@@ -4711,7 +4750,7 @@ fn register_pane_io_methods(
                     // frame), so a revision-watching caller can no longer
                     // miss a color-only repaint. Residual known limitation:
                     // OSC 4 palette redefinition remains Class B.
-                    let png_base64 = if include_png {
+                    let png_base64 = if let Some(render_grid) = render_grid {
                         let render_cursor = include_cursor && cursor_visible;
                         let cursor_pos = render_cursor.then_some((cursor_row, cursor_col));
                         let cursor_shape = if render_cursor {
@@ -4731,7 +4770,7 @@ fn register_pane_io_methods(
                             }),
                         };
                         let png_buf = tokio::task::spawn_blocking(move || {
-                            let img = r.render(&grid_snapshot, &opts);
+                            let img = r.render(&render_grid, &opts);
                             let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
                             {
                                 use image::ImageEncoder;
@@ -4764,7 +4803,6 @@ fn register_pane_io_methods(
                         use base64::Engine;
                         Some(base64::engine::general_purpose::STANDARD.encode(&png_buf))
                     } else {
-                        drop(grid_snapshot);
                         None
                     };
 
@@ -6151,6 +6189,55 @@ mod tests {
             !state.checkpoints.contains_key(&pane_id),
             "dead pane's checkpoint state must not be resurrected"
         );
+    }
+
+    /// codex PR #89 P1 — the glance pixel-budget guard must fire BEFORE any
+    /// render/encode work (pane.snapshot's MAX_PIXELS equivalent, mapped to
+    /// PAYLOAD_TOO_LARGE -32013), and a text-only glance on the same
+    /// oversized pane must still succeed (no PNG payload exists to cap).
+    #[tokio::test]
+    async fn production_glance_rejects_over_budget_panes_before_render() {
+        let harness = RpcHarness::new();
+        let (_sid, _wid, pane_id) = harness.seed_session("glance-budget").await;
+        let _writer_rx = harness.seed_io(pane_id, b"budget probe").await;
+
+        // Grow the pane to pane.set_size's maximum: 1000x1000 cells is far
+        // beyond the 16M-pixel raster budget at the bundled font's metrics.
+        let resized = dispatch_ok(
+            &harness.router,
+            "pane.set_size",
+            serde_json::json!({"pane_id": pane_id.to_string(), "cols": 1000, "rows": 1000}),
+        )
+        .await;
+        assert_eq!(resized["cols"], 1000);
+
+        let err = dispatch_err(
+            &harness.router,
+            "pane.glance",
+            serde_json::json!({"pane_id": pane_id.to_string()}),
+        )
+        .await;
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::PayloadTooLarge.code(),
+            "over-budget glance must map to PAYLOAD_TOO_LARGE (-32013)"
+        );
+        let data = err.data.expect("guard error carries data");
+        assert!(data["pixels"].as_u64().unwrap() > data["max_pixels"].as_u64().unwrap());
+
+        // Text-only glance on the SAME oversized pane succeeds — the guard
+        // only protects the render path.
+        let ok = dispatch_ok(
+            &harness.router,
+            "pane.glance",
+            serde_json::json!({"pane_id": pane_id.to_string(), "include_png": false}),
+        )
+        .await;
+        assert_eq!(ok["cols"], 1000);
+        assert!(ok["png_base64"].is_null());
+        assert!(ok["text"].as_str().unwrap().contains("budget probe"));
+
+        harness.stop().await;
     }
 
     /// claude P2 review minors (b)+(c) — LENS-R-031 FIFO eviction, unit level

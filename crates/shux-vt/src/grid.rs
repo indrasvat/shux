@@ -539,9 +539,11 @@ impl Grid {
     /// Lens `pane.glance` text extraction (PRD §5, LENS-R-012): the
     /// ANSI-free viewport text of ALL `rows` (fixed count, no scrollback —
     /// callers pass a `clone_visible()` clone so there IS no scrollback to
-    /// accidentally include), each row's FULL display width reproduced
-    /// verbatim (blank cells store a literal `' '`, so trailing whitespace
-    /// falls out of the iteration for free), rows joined by `\n`.
+    /// accidentally include), rows joined by `\n`. Blank cells push a
+    /// literal `' '`, so every row comes out PADDED to its full display
+    /// width — trailing whitespace is preserved, never trimmed. There is
+    /// deliberately no trimming mechanism here: full-width padding IS the
+    /// LENS-R-012 byte-stability contract.
     ///
     /// Deliberately distinct from `VirtualTerminal::capture_text`, which is
     /// tuned for "recent visible output" (drops trailing all-blank rows,

@@ -1380,8 +1380,10 @@ pub enum PaneCommand {
         #[arg(value_name = "PANE")]
         pane: String,
 
-        /// Write the rendered PNG to this path.
-        #[arg(long, value_name = "PATH")]
+        /// Write the rendered PNG to this path. Conflicts with
+        /// `--text-only` (which disables PNG rendering entirely) — clap
+        /// rejects the combination before any RPC round-trip (exit 2).
+        #[arg(long, value_name = "PATH", conflicts_with = "text_only")]
         png: Option<std::path::PathBuf>,
 
         /// Skip PNG rendering entirely (`include_png=false`) — cheaper
@@ -3697,6 +3699,12 @@ pub async fn handle_pane_glance(
     checkpoint: bool,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
+    // clap's `conflicts_with` already rejects this combination at parse time
+    // (exit 2, no RPC); this guard keeps the invariant for any programmatic
+    // caller of the handler (greptile PR #89 P2).
+    if text_only && png_path.is_some() {
+        anyhow::bail!("--text-only and --png are mutually exclusive");
+    }
     let params = serde_json::json!({
         "pane_id": pane,
         "include_cursor": !no_cursor,
