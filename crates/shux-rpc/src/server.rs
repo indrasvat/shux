@@ -245,26 +245,38 @@ async fn handle_tcp_connection(
     serve_connection(read_half, write_half, router, cancel, auth, false).await
 }
 
+/// Hard per-connection cap on frames queued awaiting execution (codex P3
+/// round-2 major). The frame queue is UNBOUNDED so the read task's forward
+/// NEVER blocks — a bounded queue let a client pipeline past capacity, park
+/// the read task on `send()`, and starve EOF detection while the executor sat
+/// in a long dispatch (the B2 waiter-leak through the over-pipelined path).
+/// The cap re-bounds memory at the protocol level instead: exceeding it is a
+/// protocol violation that deliberately cancels the WHOLE connection
+/// (`conn_closed`), dropping the in-flight handler and closing the socket.
+/// Worst-case memory stays `MAX_PENDING_FRAMES × MAX_FRAME_SIZE`, and the
+/// callers are the socket-owning user (UDS 0700) or auth-gated TCP.
+const MAX_PENDING_FRAMES: usize = 256;
+
 /// Serve one framed JSON-RPC connection with CANCELLABLE request execution.
 ///
 /// Architecture (P3 codex B2 / claude major — client disconnect must drop
 /// in-flight request futures): the connection is split so the READ side keeps
 /// running while a request executes.
 ///
-/// - A spawned read task decodes frames and queues them on a bounded channel;
+/// - A spawned read task decodes frames and queues them on an UNBOUNDED
+///   channel (bounded by `MAX_PENDING_FRAMES` at the protocol level, above);
 ///   on EOF or read error it cancels `conn_closed`. Because it reads
-///   independently of request execution, a client disconnect is observed
-///   IMMEDIATELY — not after the in-flight handler returns (previously an
-///   abandoned `pane.wait_settled` lived until settle or its 600s cap).
+///   independently of request execution AND its queue forward never blocks,
+///   the read task is ALWAYS parked on the socket — EOF/read-error is
+///   reachable in every state, regardless of executor progress or pipelining
+///   depth (codex P3 round-2: a bounded queue broke exactly this).
 /// - This executor drains the queue STRICTLY SERIALLY (response order equals
-///   request order — exactly the pre-split semantics) and races each dispatch
-///   against `conn_closed`: when the client goes away, the in-flight handler
-///   FUTURE IS DROPPED, releasing whatever it held (settle watch
-///   subscriptions, event long-polls, locks-on-await).
-///
-/// Bounded-queue note: a client pipelining more than the queue capacity can
-/// delay EOF detection until the executor drains below capacity; the common
-/// case (one request in flight) detects disconnect instantly.
+///   request order — exactly the pre-split semantics) and races both the
+///   dequeue AND each dispatch against `conn_closed`: when the client goes
+///   away, the in-flight handler FUTURE IS DROPPED — releasing whatever it
+///   held (settle watch subscriptions, event long-polls, locks-on-await) —
+///   and any still-queued frames are discarded (the accepted fire-and-forget
+///   delta: a disconnected client's unprocessed requests are dropped).
 async fn serve_connection<R, W>(
     read_half: R,
     write_half: W,
@@ -277,25 +289,47 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use tokio_util::codec::{FramedRead, FramedWrite};
 
     let mut framed_tx = FramedWrite::new(write_half, create_codec());
     let (frame_tx, mut frame_rx) =
-        tokio::sync::mpsc::channel::<Result<bytes::BytesMut, std::io::Error>>(8);
+        tokio::sync::mpsc::unbounded_channel::<Result<bytes::BytesMut, std::io::Error>>();
     let conn_closed = tokio_util::sync::CancellationToken::new();
+    // Frames queued but not yet dequeued by the executor. Written by the read
+    // task (inc) and this executor (dec); the tiny inc-before-send window can
+    // only OVER-count, so the cap can never be evaded.
+    let pending_frames = Arc::new(AtomicUsize::new(0));
 
     let read_closed = conn_closed.clone();
+    let read_pending = pending_frames.clone();
     let read_task = tokio::spawn(async move {
         let mut framed_rx = FramedRead::new(read_half, create_codec());
         loop {
             match framed_rx.next().await {
                 Some(Ok(frame)) => {
-                    if frame_tx.send(Ok(frame)).await.is_err() {
+                    let queued = read_pending.fetch_add(1, Ordering::SeqCst) + 1;
+                    if queued > MAX_PENDING_FRAMES {
+                        // Protocol violation: deliberate, observable
+                        // connection cancellation (the client sees EOF).
+                        warn!(
+                            queued,
+                            cap = MAX_PENDING_FRAMES,
+                            "pipelining cap exceeded; cancelling connection"
+                        );
+                        break;
+                    }
+                    // UnboundedSender::send is non-blocking by construction:
+                    // the read task returns to the socket immediately, so EOF
+                    // detection can never be starved by a full queue.
+                    if frame_tx.send(Ok(frame)).is_err() {
                         break; // Executor gone; stop reading.
                     }
                 }
                 Some(Err(e)) => {
-                    let _ = frame_tx.send(Err(e)).await;
+                    let _ = frame_tx.send(Err(e));
                     break;
                 }
                 None => break, // Client closed its write side (EOF).
@@ -312,6 +346,15 @@ where
         loop {
             let maybe_frame = tokio::select! {
                 _ = cancel.cancelled() => break,
+                // Connection closed (EOF, read error, or cap violation):
+                // stop deterministically instead of draining a dead client's
+                // queued frames (accepted fire-and-forget delta). This is
+                // also what makes the cap violation DELIBERATE: the executor
+                // abandons the queue immediately and closes the socket.
+                _ = conn_closed.cancelled() => {
+                    debug!("connection closed; discarding queued frames");
+                    break;
+                }
                 m = frame_rx.recv() => m,
             };
             let data = match maybe_frame {
@@ -334,7 +377,10 @@ where
                     }
                     break;
                 }
-                Some(Ok(data)) => data,
+                Some(Ok(data)) => {
+                    pending_frames.fetch_sub(1, Ordering::SeqCst);
+                    data
+                }
             };
 
             // If not yet authenticated, the first message must be an auth
@@ -910,6 +956,143 @@ mod tests {
             serde_json::from_slice(&framed_b.next().await.unwrap().unwrap()).unwrap();
         assert_eq!(response["id"], 3);
         assert_eq!(response["result"]["name"], "shux");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_pipelined_backlog_disconnect_still_drops_inflight_handler() {
+        // codex P3 round-2 major, exact scenario: a long-running request plus
+        // 9+ PIPELINED frames on the same connection, then disconnect. With
+        // the old bounded(8) queue the read task blocked on send() before it
+        // could observe EOF, so conn_closed never fired and the in-flight
+        // handler lived until completion — this test deadlocked at the
+        // dropped_notify timeout. The unbounded queue keeps the read task
+        // parked on the SOCKET in every state, so EOF is always reachable.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("backlog.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (router, entered, dropped, dropped_notify) = hang_router();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let stream = connect_with_retries(&socket_path).await;
+        let mut framed = Framed::new(stream, create_codec());
+        framed
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "test.hang"
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("test.hang handler never entered");
+
+        // Pipeline 12 more frames while the executor is stuck in the hang —
+        // past the old bounded(8) capacity, so the old code jams right here.
+        for id in 2..14 {
+            framed
+                .send(frame_bytes(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": "system.version"
+                })))
+                .await
+                .unwrap();
+        }
+
+        // Disconnect with the backlog still queued.
+        drop(framed);
+
+        // The in-flight handler must still be dropped promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+            .await
+            .expect("in-flight handler not dropped under a pipelined backlog");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_pipelining_cap_exceeded_cancels_connection() {
+        // MAX_PENDING_FRAMES is a protocol cap: a client that floods more
+        // pending frames than the cap (while the executor is busy) has its
+        // WHOLE connection deliberately cancelled — the in-flight handler is
+        // dropped and the client observes EOF, even though the client never
+        // closed its side.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("cap.sock");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (router, entered, dropped, dropped_notify) = hang_router();
+        let server = Server::new(
+            ServerConfig {
+                socket_path: socket_path.clone(),
+                tcp_addr: String::new(),
+                auth_token: None,
+            },
+            router,
+            cancel.clone(),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let stream = connect_with_retries(&socket_path).await;
+        let mut framed = Framed::new(stream, create_codec());
+        framed
+            .send(frame_bytes(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "test.hang"
+            })))
+            .await
+            .unwrap();
+        // Ensure the hang frame has been DEQUEUED (the handler is running)
+        // before flooding, so the pending count below is purely the flood.
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("test.hang handler never entered");
+
+        // Flood past the cap while the executor is pinned in the hang. The
+        // server may sever the connection MID-flood (that severing is the
+        // behavior under test), so a send error (broken pipe / reset) here is
+        // acceptable — the flood simply stops.
+        for id in 0..(MAX_PENDING_FRAMES + 44) {
+            if framed
+                .send(frame_bytes(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": "system.version"
+                })))
+                .await
+                .is_err()
+            {
+                break; // Server already closed the violating connection.
+            }
+        }
+
+        // Deliberate cancellation: the in-flight handler is dropped...
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_notify.notified())
+            .await
+            .expect("cap violation did not drop the in-flight handler");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        // ...and the CLIENT (which never closed) observes the connection
+        // being closed by the server: EOF or a connection error — never a
+        // response frame, and never a hang.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+            .await
+            .expect("server did not close the violating connection");
+        assert!(
+            !matches!(next, Some(Ok(_))),
+            "expected EOF/error after the cap violation, got a frame: {next:?}"
+        );
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
