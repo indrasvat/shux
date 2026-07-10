@@ -3824,6 +3824,44 @@ fn settle_remaining_quiet_ns(now_ns: u64, last_mutation_ns: u64, quiet_ms: u64) 
         .saturating_sub(now_ns.saturating_sub(last_mutation_ns))
 }
 
+/// One wake of the `pane.wait_settled` loop, decided as a pure function so the
+/// precedence rules are unit-testable (codex P3 B1 + claude TOCTOU guard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleWake {
+    /// Quiet window satisfied on a snapshot with no pending revision.
+    Settled,
+    /// Quiet still unsatisfied and the timeout deadline has elapsed.
+    TimedOut,
+    /// Keep waiting (or restart evaluation on a fresh snapshot).
+    KeepWaiting,
+}
+
+/// Decide one wake of the settle loop. Priority order is the whole fix:
+///
+/// 1. `pending_revision` (claude P3 TOCTOU guard): a revision published AFTER
+///    the `borrow_and_update` snapshot was taken must RESTART evaluation on
+///    the fresh value — never settle on the stale snapshot, never report a
+///    stale revision in a timeout.
+/// 2. `quiet` (codex P3 B1: quiet precedence): on ANY wake — sleep expiry,
+///    watch wake, or late scheduler wake — a satisfied quiet window returns
+///    `settled:true` even if the timeout deadline has ALSO elapsed. With
+///    `timeout_ms == quiet_ms` allowed (LENS-R-025 lower bound), a pane quiet
+///    exactly at the shared deadline must settle, not time out.
+/// 3. `past_timeout`: only when quiet is still false may the deadline expire
+///    the wait (`settled:false` — a RESULT, not an error; DEC-19).
+fn settle_decide(quiet: bool, past_timeout: bool, pending_revision: bool) -> SettleWake {
+    if pending_revision {
+        return SettleWake::KeepWaiting;
+    }
+    if quiet {
+        return SettleWake::Settled;
+    }
+    if past_timeout {
+        return SettleWake::TimedOut;
+    }
+    SettleWake::KeepWaiting
+}
+
 /// LENS-R-025 parameter validation: `quiet_ms ∈ [10, 60_000]`,
 /// `timeout_ms ∈ [quiet_ms, 600_000]`. Violations → INVALID_PARAMS (-32602),
 /// which the CLI maps to exit 2 (§10 exit table, V1).
@@ -4951,6 +4989,13 @@ fn register_pane_io_methods(
                     // Event-driven loop (LENS-R-021): no polling, and each sleep
                     // is exactly the remaining quiet interval (capped by the
                     // timeout), woken early only by a genuine Class-A revision.
+                    //
+                    // Every wake — sleep expiry, watch wake, or a late
+                    // scheduler wake — re-enters the top of this loop, so the
+                    // quiet condition is ALWAYS re-evaluated before the
+                    // timeout can fire (`settle_decide` precedence — codex P3
+                    // B1: timeout returns only when quiet is still false at
+                    // the deadline).
                     let mut channel_open = true;
                     loop {
                         // `borrow_and_update` copies the latest (revision, ns)
@@ -4959,12 +5004,50 @@ fn register_pane_io_methods(
                         // publishes — LENS-R-024, S5 comes free).
                         let rev = *rx.borrow_and_update();
                         let now_ns = shux_vt::monotonic_now_ns();
-                        if settle_is_quiet(now_ns, rev.last_mutation_ns, quiet_ms) {
-                            return Ok(serde_json::json!({
-                                "settled": true,
-                                "revision": rev.content_revision,
-                                "waited_ms": waited_ms(tokio::time::Instant::now()),
-                            }));
+                        let quiet = settle_is_quiet(now_ns, rev.last_mutation_ns, quiet_ms);
+                        // TOCTOU guard (claude P3 review): a revision published
+                        // AFTER the snapshot above must restart the evaluation
+                        // — returning `settled:true` from the stale snapshot
+                        // would report a pane as still that has already
+                        // mutated again.
+                        let pending = if channel_open {
+                            match rx.has_changed() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    // Sender dropped: the pane was torn down
+                                    // mid-wait. No further Class-A batch can
+                                    // arrive; the frozen value settles once the
+                                    // remaining quiet elapses (still bounded by
+                                    // the timeout).
+                                    channel_open = false;
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        let past_timeout = tokio::time::Instant::now() >= timeout_deadline;
+                        match settle_decide(quiet, past_timeout, pending) {
+                            SettleWake::Settled => {
+                                return Ok(serde_json::json!({
+                                    "settled": true,
+                                    "revision": rev.content_revision,
+                                    "waited_ms": waited_ms(tokio::time::Instant::now()),
+                                }));
+                            }
+                            SettleWake::TimedOut => {
+                                return Ok(serde_json::json!({
+                                    "settled": false,
+                                    "revision": rev.content_revision,
+                                    "waited_ms": waited_ms(tokio::time::Instant::now()),
+                                }));
+                            }
+                            SettleWake::KeepWaiting => {}
+                        }
+                        if pending {
+                            // Fresh revision already queued — restart on it
+                            // immediately (no sleep, no select).
+                            continue;
                         }
 
                         let remaining = std::time::Duration::from_nanos(
@@ -4977,41 +5060,19 @@ fn register_pane_io_methods(
                             tokio::select! {
                                 changed = rx.changed() => {
                                     if changed.is_err() {
-                                        // Sender dropped: the pane was torn down
-                                        // mid-wait. No further Class-A batch can
-                                        // arrive, so the frozen value settles
-                                        // once the remaining quiet elapses
-                                        // (still bounded by the timeout). Stop
-                                        // awaiting the closed channel — otherwise
-                                        // `changed()` would busy-return Err.
+                                        // Stop awaiting the closed channel —
+                                        // otherwise `changed()` busy-returns Err.
                                         channel_open = false;
                                     }
-                                    // Otherwise a newer revision landed — loop
-                                    // and re-evaluate against the reset clock.
+                                    // Loop re-evaluates on the fresh value.
                                 }
                                 _ = tokio::time::sleep_until(wake) => {
-                                    if tokio::time::Instant::now() >= timeout_deadline {
-                                        let rev = *rx.borrow();
-                                        return Ok(serde_json::json!({
-                                            "settled": false,
-                                            "revision": rev.content_revision,
-                                            "waited_ms": waited_ms(tokio::time::Instant::now()),
-                                        }));
-                                    }
-                                    // Quiet deadline hit first — loop; the
-                                    // top-of-loop check now reports settled.
+                                    // Loop re-evaluates: quiet first, then
+                                    // timeout (settle_decide precedence).
                                 }
                             }
                         } else {
                             tokio::time::sleep_until(wake).await;
-                            if tokio::time::Instant::now() >= timeout_deadline {
-                                let rev = *rx.borrow();
-                                return Ok(serde_json::json!({
-                                    "settled": false,
-                                    "revision": rev.content_revision,
-                                    "waited_ms": waited_ms(tokio::time::Instant::now()),
-                                }));
-                            }
                         }
                     }
                 }
@@ -7618,6 +7679,94 @@ done
         assert_eq!(e.code, shux_rpc::ErrorCode::InvalidParams.code());
         // timeout above max.
         assert!(validate_wait_settled_params(300, 600_001).is_err());
+    }
+
+    #[test]
+    fn settle_equal_deadlines_prefers_settled() {
+        // codex P3 B1: with timeout_ms == quiet_ms (allowed — LENS-R-025's
+        // timeout lower bound IS quiet_ms), a pane quiet exactly at the shared
+        // deadline must return settled:true, not a timeout. Model the wake at
+        // the exact shared deadline: quiet satisfied to the nanosecond AND the
+        // timeout elapsed — quiet wins.
+        let last = 1_000_000_000u64;
+        let quiet_ms = 300u64;
+        let now_ns = last + 300_000_000; // exactly quiet
+        let quiet = settle_is_quiet(now_ns, last, quiet_ms);
+        assert!(quiet);
+        assert_eq!(
+            settle_decide(quiet, /*past_timeout*/ true, /*pending*/ false),
+            SettleWake::Settled,
+            "quiet at the shared deadline must settle, not time out"
+        );
+    }
+
+    #[test]
+    fn settle_late_wake_past_timeout_with_quiet_satisfied_settles() {
+        // codex P3 B1 second face: a scheduler that wakes the loop LATE (well
+        // past the timeout deadline) must still report settled when the quiet
+        // window was satisfied — the old code returned timeout on any
+        // post-deadline wake without re-evaluating quiet first.
+        let last = 1_000_000_000u64;
+        let quiet_ms = 300u64;
+        let now_ns = last + 5_000_000_000; // woke 4.7s late; quiet long since satisfied
+        let quiet = settle_is_quiet(now_ns, last, quiet_ms);
+        assert!(quiet);
+        assert_eq!(
+            settle_decide(quiet, /*past_timeout*/ true, /*pending*/ false),
+            SettleWake::Settled,
+            "late wake after the deadline with quiet satisfied must settle"
+        );
+    }
+
+    #[test]
+    fn settle_revision_in_return_window_does_not_settle() {
+        // claude P3 TOCTOU guard: a revision published AFTER the
+        // borrow_and_update snapshot but BEFORE the settled return must
+        // restart the evaluation. Drive the REAL mechanism: a watch channel
+        // whose pending state is read exactly the way the handler reads it.
+        let (tx, mut rx) = watch::channel(PaneRevision {
+            content_revision: 7,
+            last_mutation_ns: 1_000,
+        });
+        let snapshot = *rx.borrow_and_update();
+        // Quiet is satisfied ON THE SNAPSHOT (stale view says "still")...
+        let now_ns = snapshot.last_mutation_ns + 400_000_000;
+        let quiet = settle_is_quiet(now_ns, snapshot.last_mutation_ns, 300);
+        assert!(quiet);
+        // ...but a new revision lands in the return window.
+        tx.send(PaneRevision {
+            content_revision: 8,
+            last_mutation_ns: now_ns,
+        })
+        .expect("send");
+        let pending = rx.has_changed().expect("channel open");
+        assert!(pending, "the in-window revision must be visible as pending");
+        assert_eq!(
+            settle_decide(quiet, false, pending),
+            SettleWake::KeepWaiting,
+            "a pending revision must restart evaluation, never settle stale"
+        );
+        // The restart sees the fresh value: no longer quiet at `now_ns`.
+        let fresh = *rx.borrow_and_update();
+        assert_eq!(fresh.content_revision, 8);
+        assert!(!settle_is_quiet(now_ns, fresh.last_mutation_ns, 300));
+        // And if the timeout has ALSO elapsed by then, the restart reports an
+        // honest timeout on the fresh revision (not a stale settled).
+        assert_eq!(settle_decide(false, true, false), SettleWake::TimedOut);
+    }
+
+    #[test]
+    fn settle_decide_priority_table() {
+        use SettleWake::*;
+        // pending > quiet > timeout > wait — the full truth table.
+        assert_eq!(settle_decide(true, true, true), KeepWaiting);
+        assert_eq!(settle_decide(true, false, true), KeepWaiting);
+        assert_eq!(settle_decide(false, true, true), KeepWaiting);
+        assert_eq!(settle_decide(false, false, true), KeepWaiting);
+        assert_eq!(settle_decide(true, true, false), Settled);
+        assert_eq!(settle_decide(true, false, false), Settled);
+        assert_eq!(settle_decide(false, true, false), TimedOut);
+        assert_eq!(settle_decide(false, false, false), KeepWaiting);
     }
 
     #[test]
