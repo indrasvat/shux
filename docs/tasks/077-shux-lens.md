@@ -1,6 +1,6 @@
 # Task 077: shux lens — give every agent eyes
 
-**Status:** Partial (P0, P1, P2 complete; P3 `pane.wait_settled` implemented + verifier VERIFIED — S1–S5, V1 green, `make test-lens` 21 passed / 16 failed (remaining reds all -32601 on P4/P5 methods); `s1_ready.png` golden RATIFIED (verifier re-render byte-identical, ddebb43); P3 review round fixed on-branch: codex B1 deadline precedence + claude TOCTOU guard (bf975bc), codex B2 shux-rpc cancellable request execution — client disconnect drops in-flight waiters (04032a2), codex M1 pane-killed-mid-wait → NOT_FOUND (7ee229a), codex M2 strict param typing (1a7981b), round-2 B2 completion — unbounded frame queue + MAX_PENDING_FRAMES=256 pipelining cap so EOF detection is never starved (3dff905, mechanism pre-reviewed by claude as correct), round-3 deterministic frame-error responses — decode errors no longer race conn_closed, InvalidData-keyed split pinned in codec tests (9e21103); awaiting the lean codex pass on the frame-error commit; P4–P6 pending)
+**Status:** Done (through P4) — P4 `pane.checkpoint` + `pane.diff_since` IMPLEMENTED on `feat/lens-p4-checkpoint-diff` (branched from origin/main d3b6282, includes P3 #90 + v0.40.0); `make test-lens` **27 passed / 10 failed** (D1–D5 + A1 flipped green; the 10 reds are R1–R8 lens.run + K1/E1 P6-golden/loop, all untouched). SOLID VT QA (heat scope) **VERDICT: PASS** (08ff46b); verifier VERIFIED-WITH-NOTES, goldens **RATIFIED** (3d70a31). Convergence round 1 (codex 1B+1M, claude 1B+1m) all fixed on-branch: dims-gated resize invalidation (RED-FIRST), store-marker guard, -32011/-32010 wire-shape pins, REAL-attach survival test. Convergence round 2: codex CONVERGED + claude CONVERGED (zero new defects; `<`-boundary adjudication upheld by both). Shipping as PR. (P0, P1, P2, P3 complete; P3 `pane.wait_settled` implemented + verifier VERIFIED — S1–S5, V1 green, `make test-lens` 21 passed / 16 failed (remaining reds all -32601 on P4/P5 methods); `s1_ready.png` golden RATIFIED (verifier re-render byte-identical, ddebb43); P3 review round fixed on-branch: codex B1 deadline precedence + claude TOCTOU guard (bf975bc), codex B2 shux-rpc cancellable request execution — client disconnect drops in-flight waiters (04032a2), codex M1 pane-killed-mid-wait → NOT_FOUND (7ee229a), codex M2 strict param typing (1a7981b), round-2 B2 completion — unbounded frame queue + MAX_PENDING_FRAMES=256 pipelining cap so EOF detection is never starved (3dff905, mechanism pre-reviewed by claude as correct), round-3 deterministic frame-error responses — decode errors no longer race conn_closed, InvalidData-keyed split pinned in codec tests (9e21103); awaiting the lean codex pass on the frame-error commit; P4–P6 pending)
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 016, 017, 060, 064, 074
@@ -361,3 +361,181 @@ committed at `.shux/qa/lens-p2/council/`.
 Gates: test-lens 15/22 (G1/G2/G2w green vs NEW goldens, smoke lane 10/10
 under the font config) · vt-corpus byte-exact · full lanes 18/18 · lint ·
 shellcheck · leak-guard all clean.
+
+## P4 implementation notes (`pane.checkpoint` + `pane.diff_since`, branch `feat/lens-p4-checkpoint-diff`)
+
+**Delivered (§7 SPEC-D, LENS-R-030..038):**
+- `pane.checkpoint` RPC (`crates/shux/src/main.rs`, registered after
+  `pane.wait_settled`) + `shux pane checkpoint <pane>` CLI. Reuses the P2
+  `store_checkpoint` FIFO (cap 4, same-revision no-op, `evicted_revision`).
+- `pane.diff_since` RPC + `shux pane diff <pane> --since REV [--heat PATH]
+  [--no-row-text]` CLI. Existence-first lookup (`diff_lookup_checkpoint`):
+  PANE_NOT_FOUND (-32004) before any checkpoint lookup; then LENS-R-033 —
+  exact stored checkpoint → diff; else `since ≤ last_invalidation` →
+  RESIZE_INVALIDATED (-32011); else STALE_REVISION (-32010) with
+  `{requested, available:[u64]}`.
+- Invalidation markers (LENS-R-032/DEC-4): new `PaneIoState.invalidations:
+  HashMap<PaneId,u64>` + `invalidate_checkpoints` (frees the deque, records
+  the POST-mutation revision, monotonic). Two hook points in the PTY loop:
+  the resize branch (after `vt.resize`) and the process branch (PRESENTED
+  alt-flag compared before/after each batch — a net-zero enter+leave never
+  invalidates, matching §4.2). Cleared on pane teardown.
+- Structured diff (`compute_lens_diff`, LENS-R-034..036): value-equality of
+  underlying `Cell` data (no cursor overlay — clones carry none), wide-glyph
+  head+spacer pairing, per-row merged half-open spans (cap 256 →
+  `regions_truncated`), half-open `bounding_box` (all-zero on zero delta),
+  `changed_row_text` via `glance_row_text` (byte-parity with `glance_text`),
+  `cursor_moved` reported separately (cursor excluded from cell count/regions
+  by construction).
+- Heat PNG (LENS-R-037, `render_lens_heat_png`): current clone through the
+  P2-approved rasterizer (no cursor), then changed cells alpha-blended with
+  `rgba(163,38,56,128)` and unchanged cells desaturated 50% (Rec.601 luma).
+  Integer-only → deterministic. shux-raster/shux-vt source UNCHANGED (overlay
+  is post-processing in main.rs).
+- New error codes `crates/shux-rpc/src/error.rs`: `StaleRevision` (-32010),
+  `ResizeInvalidated` (-32011) + `stale_revision`/`resize_invalidated`
+  constructors + tests.
+- CLI exit codes (§10): checkpoint 0/2/3/4; diff 0 on any delta, 5 on
+  STALE/INVALIDATED/PAYLOAD_TOO_LARGE, 2 INVALID_PARAMS, 4 PERMISSION_DENIED,
+  3 otherwise. `crates/shux/src/style.rs`: `print_pane_checkpoint`,
+  `print_pane_diff`.
+
+**Gate result:** `make test-lens` **27 passed / 10 failed** (was 21/16):
+D1–D5 + A1 all green (CLI + RPC twins); the 10 reds are R1–R8 (lens.run
+-32601, P5) + K1 (missing P6 golden `k1_pos1.png`) + E1 (lens.run, P5) — all
+untouched. K1 root-cause confirmed clean: its checkpoint/glance/diff RPCs all
+succeed, it stops only at the P6 golden. Other lanes: `make lint` clean ·
+`make test-rpc` 43/43 (+2 error-code tests) · `make test-vt-corpus`
+byte-exact (no raster/default-chain regression) · new
+`make test-lens-diff-concurrency` green · all daemon-backed runs under
+`no_leak_guard.sh`, zero leaked daemons/processes.
+
+**P4 DoD concurrency (council D2):** two-part proof — (a) in-process unit
+test `compute_lens_diff_independent_of_dirtystate_drains` drains the VT's
+DirtyState between the checkpoint clone and the diff and asserts the delta is
+unchanged (diff reads cell VALUES via `clone_visible`, never render state);
+(b) black-box `crates/shux/tests/diff_concurrent_readers.rs` hammers the pane
+with concurrent `pane.snapshot`/`pane.glance` render reads while
+checkpoint→drive→settle→diff reports the exact 10-cell F4 delta. Plus unit
+tests: `diff_lookup_existence_first_and_invalidation_marker`,
+`invalidation_marker_is_monotonic`, `compute_lens_diff_wide_glyph_pairs_spacer`,
+`heat_png_is_deterministic`.
+
+**Goldens (PROVISIONAL, §16.3 — pending SOLID QA + orchestrator sign-off):**
+`d2_heat.png` (NEW rendering — heat overlay, full SOLID gate),
+`a1_alt.png` + `a1_normal.png` (raster-UNTOUCHED glance path — §14 lighter
+ratification). All minted from the actual implementation output, sha256 +
+provenance in `evidence-manifest.json`, visual inspection recorded in
+`BASELINE-APPROVAL.md` P4 addendum.
+
+## P4 convergence round 1 (2026-07-10 — 2 blockers + 1 major + 1 minor, all fixed)
+
+Verifier: VERIFIED-WITH-NOTES, goldens RATIFIED (3d70a31). Codex NOT
+CONVERGED (1B+1M), claude NOT CONVERGED (1B+1m). Both P4 design calls
+(cursor-less heat base, Rec.601 luma) ruled ACCEPTABLE by both reviewers —
+goldens and SOLID QA PASS stand; neither blocker touches rendering.
+
+1. **BLOCKER (codex) — checkpoint resurrection across an invalidation
+   (fixed):** `pane.glance{checkpoint:true}` clones revision R under lock #1
+   and stores under lock #2; a concurrent resize/alt-switch invalidating at
+   R+1 between the two got its invalidation silently undone —
+   `store_checkpoint` never consulted the marker, so a later `diff_since(R)`
+   silently diffed stale-dimension frames instead of -32011. Fix:
+   `store_checkpoint` refuses any revision STRICTLY BELOW the pane's
+   invalidation marker, enforced under the store lock, as the same honest
+   no-op as the teardown race (`(false, None)` → `checkpointed: false`).
+   Strictly-less-than, NOT ≤, per LENS-R-033's own text ("a checkpoint
+   created AFTER the invalidation (revision ≥ marker) is found by rule
+   (1)"): revision+clone are read in one io-lock critical section and
+   invalidating events bump the revision inside that same lock, so an
+   ==marker clone depicts the POST-mutation frame — refusing it would orphan
+   the immediately-post-resize `pane.checkpoint` and make
+   `diff_since(marker)` wrongly -32011. Deterministic unit test (direct
+   store path, manually-set marker, no timing):
+   `checkpoint_store_refuses_pre_invalidation_revisions` — refused store
+   materializes nothing, `diff_lookup_checkpoint(R)` → -32011, ==marker and
+   >marker stores stay storable/diffable.
+
+2. **BLOCKER (claude) — ungated resize invalidation (fixed):** the PTY
+   resize branch invalidated unconditionally, but `vt.resize` only changes
+   the frame when dims actually change — so the attach render loop's
+   `apply_resize_to_window` re-fan (fires on attach, client resize, window
+   switch, zoom at an unchanged client size) and same-size `pane.set_size`
+   destroyed every checkpoint on unchanged panes. Fix: capture (rows, cols)
+   across `vt.resize` and invalidate only on an actual dimension change —
+   mirroring the process branch's `alt_switched` gating. RED-FIRST receipts
+   (`.shux/out/lens-p4/red-receipt-gating.txt`, both -32011 pre-fix; note
+   `invalidated_at == requested` on the same-size repro — the no-op resize
+   invalidated at an UNCHANGED revision):
+   `crates/shux/tests/checkpoint_invalidation_gating.rs` —
+   (i) `same_size_set_size_preserves_checkpoints` (synchronous ack flush,
+   zero-delta then exact 10-cell delta), (ii)
+   `real_attach_window_switch_preserves_checkpoints_and_diff_exact`.
+
+3. **MAJOR (codex, ADJUDICATED — PRD §7.3 amended):** the -32011 payload
+   keeps `{requested, invalidated_at, hint}`. Wire-shape-pinning tests
+   added at both levels: shux-rpc unit (`data_keys` exact-set asserts in
+   `test_stale_revision_error` / `test_resize_invalidated_error`) and
+   black-box (`error_wire_shapes_pinned`: -32010 EXACTLY
+   `{requested, available}`; -32011 EXACTLY
+   `{requested, invalidated_at, hint}`, `invalidated_at` > checkpoint).
+
+4. **MINOR (claude) — real-attach coverage (folded into 2(ii)):** the
+   window-switch test drives a REAL attach client — the daemon-side
+   AttachHello/AttachReady handshake + streaming frames over `attach.sock`
+   (thinnest headless client: dedicated thread, framed codec, Action frames
+   for SwitchToWindow, Input frames for Tab/`a`, continuous drain of render
+   frames). While attached: checkpoint survives the away/back re-fans, Tab
+   delta is EXACTLY 2 cells `[{8,5,6},{8,25,26}]`, and the accumulated
+   Tab+`a` delta is EXACTLY 12 cells with exact regions. Determinism: the
+   attach loop handles client frames in order and awaits
+   `apply_resize_to_window` inline, so the observed Tab marker proves the
+   switch-back re-fans were queued; a synchronous same-size `pane.set_size`
+   then flushes the pane's resize channel (its ack fires only after
+   everything queued before it) — the diff is deterministic in both the red
+   and green directions.
+
+## PR #91 bot round (2026-07-10 — codex P1+P2, greptile 3×P2, all fixed)
+
+1. **codex P1 (memory) — heat pre-render pixel budget:** shared
+   `lens_pixel_budget_check` (the exact 16M-pixel cap from
+   glance/snapshot; glance refactored onto it, error byte-identical) now
+   gates `pane.diff_since{heat_png:true}` inside the lock BEFORE any RGBA
+   allocation, positioned AFTER the LENS-R-033 lookup so
+   stale/invalidated wins over the payload error. Heat-less diffs never
+   hit it. Unit: `lens_pixel_budget_check_guard_predicate`. Black-box:
+   `crates/shux/tests/diff_heat_budget.rs` (1000×1000 F1 pane → -32013
+   `{pixels, max_pixels, hint(heat_png=false)}`; CLI `--heat` exit 5, no
+   file written; heat-less diff on the same oversized pane succeeds).
+
+2. **codex P2 (semantic, ADJUDICATED → LENS-R-038b):** `PaneCheckpoint`
+   gains `default_colors` (captured in the same critical section as the
+   grid clone in both `pane.checkpoint` and `pane.glance{checkpoint}`);
+   `diff_lookup_checkpoint` returns it; `compute_lens_diff` resolves
+   `Color::Default` against each side's respective defaults. Rule: a
+   changed fg/bg default marks every cell that is `Default` in that
+   channel on BOTH sides (asymmetric pairs already raw-differ);
+   concrete-colored cells stay unmarked; OSC 12 cursor default never
+   marks (DEC-11); unchanged defaults → byte-identical to raw equality.
+   Internal-only storage change; no RPC surface change beyond diff
+   behavior. Verified non-regressive: D-tier 6/6 with `d2_heat.png`
+   byte-identical (F4 touches no defaults); lens gate 27/10 identical.
+   Tests: (a) unit marks/regions/bbox + black-box
+   `crates/shux/tests/diff_default_colors.rs` — REAL OSC 11 `#204060`
+   via a token-paced `exec sh -c` script pane (40×10): exactly 395/400
+   cells, full-width regions split around the 5 truecolor cells; (b)
+   `compute_lens_diff_unchanged_defaults_matches_raw`; (c) heat base
+   uses CURRENT defaults — unit integer-math probes + black-box pixel
+   probes (changed blank = (97,50,75); unchanged truecolor = (58,103,73)).
+
+3. **greptile P2s:** `lens_checkpoint_exit_code` doc enumerates the real
+   error surface incl. INVALID_PARAMS→2 (their suggested text); `pane
+   diff` CLI help enumerates PAYLOAD_TOO_LARGE among exit-5 causes;
+   `diff.changed_mask` MOVED into the heat closure (needless clone
+   dropped).
+
+   Implementation note: the first draft of the OSC black-box test used a
+   prompt-bearing `sh` pane — the long default prompt wrapped at 40 cols
+   and SCROLLED the pane (shifting every row; observed 400/400 cells).
+   Rewritten as an inline `exec`'d token-paced script (the fixtures'
+   promptless pattern; EOF-safe `while read` loop).

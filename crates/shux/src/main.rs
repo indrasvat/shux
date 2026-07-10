@@ -91,22 +91,23 @@ pub struct PaneRevision {
 }
 
 /// A stored atomic clone of a pane's visible grid at one ContentRevision
-/// (lens PRD §7 LENS-R-030/031). P2 scope only: `pane.glance{checkpoint:true}`
-/// creates these; storage + FIFO dedup is all this phase needs.
-/// `pane.diff_since` (P4) is the future consumer — invalidation tracking
-/// (resize/alt-screen, LENS-R-032) is also P4 and NOT implemented here.
-// `grid`/`cursor` are written by `store_checkpoint` and read by nothing yet
-// in P2 — `pane.diff_since` (P4) is their first consumer. Keeping them on
-// the struct now (rather than a revision-only placeholder) means the P4
-// diff implementation finds real stored frames instead of redesigning
-// storage from scratch.
-#[allow(dead_code)]
+/// (lens PRD §7 LENS-R-030/031). Created by `pane.glance{checkpoint:true}`
+/// and `pane.checkpoint`; consumed by `pane.diff_since` (P4), which diffs a
+/// fresh clone of the current grid against `grid`/`cursor` here. Resize and
+/// alt-screen switches free these and record an invalidation marker
+/// (LENS-R-032, `PaneIoState::invalidations`).
 struct PaneCheckpoint {
     revision: u64,
     grid: shux_vt::Grid,
     /// (row, col, visible) at capture time — the §5.1 clone's cursor, not
     /// re-derived later.
     cursor: (usize, usize, bool),
+    /// The pane's OSC 10/11/12 dynamic default colors at capture time
+    /// (LENS-R-038b, PR #91 codex P2): `Color::Default` cells present
+    /// differently when the defaults change, so the diff must resolve
+    /// Default against EACH side's respective defaults — the checkpoint
+    /// carries its own.
+    default_colors: shux_vt::TerminalDefaultColors,
 }
 
 /// Shared state for pane I/O operations (PTY writes, VT state, command tracking).
@@ -140,10 +141,17 @@ pub struct PaneIoState {
     /// here once per Class-A batch; `pane.wait_settled` (P3) subscribes. Same
     /// lifetime as `vts` (created with the pane, removed only on destroy).
     pub revisions: HashMap<shux_core::model::PaneId, watch::Sender<PaneRevision>>,
-    /// Per-pane lens checkpoint FIFO (PRD §7, LENS-R-030/031; P2 scope —
-    /// `pane.glance{checkpoint:true}` is the only writer so far). Same
-    /// lifetime as `vts`: cleared on pane teardown.
+    /// Per-pane lens checkpoint FIFO (PRD §7, LENS-R-030/031). Writers:
+    /// `pane.glance{checkpoint:true}` and `pane.checkpoint`. Same lifetime
+    /// as `vts`: cleared on pane teardown.
     checkpoints: HashMap<shux_core::model::PaneId, std::collections::VecDeque<PaneCheckpoint>>,
+    /// Per-pane lens checkpoint invalidation marker (PRD §7.1, LENS-R-032/033;
+    /// DEC-4). The POST-mutation `content_revision` at which a resize or
+    /// alt-screen switch freed every checkpoint of the pane. `pane.diff_since`
+    /// reports `RESIZE_INVALIDATED (-32011)` for any `since_revision ≤` this
+    /// marker that no longer has a live checkpoint. Monotonic (revisions only
+    /// increase). Same lifetime as `vts`: cleared on pane teardown.
+    invalidations: HashMap<shux_core::model::PaneId, u64>,
     /// Command execution engine for marker-based completion detection.
     pub cmd_engine: shux_pty::CommandEngine,
     /// Notify any attach-render loops that a pane's VT has new bytes to
@@ -178,6 +186,7 @@ impl PaneIoState {
             vts: HashMap::new(),
             revisions: HashMap::new(),
             checkpoints: HashMap::new(),
+            invalidations: HashMap::new(),
             cmd_engine: shux_pty::CommandEngine::new(),
             render_pulse: Arc::new(tokio::sync::Notify::new()),
             event_bus: None,
@@ -230,6 +239,7 @@ impl PaneIoState {
                 // dropping the sender closes the watch for any settle waiter.
                 self.revisions.remove(pane_id);
                 self.checkpoints.remove(pane_id);
+                self.invalidations.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)
@@ -252,17 +262,36 @@ impl PaneIoState {
         }
     }
 
-    /// Store (or dedup) a `pane.glance{checkpoint:true}` clone (lens PRD §7,
-    /// LENS-R-030/031; P2 scope: storage + FIFO dedup only — no invalidation
-    /// tracking, that's P4). `grid`/`cursor` are the SAME atomic clone the
-    /// caller already rendered/extracted text from (LENS-R-010), keyed by
-    /// the revision read alongside it — not re-read here.
+    /// Store (or dedup) a checkpoint clone (`pane.glance{checkpoint:true}` /
+    /// `pane.checkpoint`; lens PRD §7, LENS-R-030/031). `grid`/`cursor` are
+    /// the SAME atomic clone the caller already rendered/extracted text from
+    /// (LENS-R-010), keyed by the revision read alongside it — not re-read
+    /// here.
     ///
     /// Refuses panes with no live VT (codex P2 review major): the glance
     /// handler stores under a SECOND lock acquisition, so the pane can be
     /// torn down between the clone and the store — `entry().or_default()`
     /// would silently resurrect checkpoint state for a dead pane, leaking it
     /// until daemon shutdown (teardown has already run and won't re-run).
+    ///
+    /// Refuses revisions BELOW the pane's invalidation marker (codex P4
+    /// convergence blocker — the same two-lock race, invalidation flavour):
+    /// glance clones at revision R, a concurrent resize/alt-switch
+    /// invalidates at R+1 (freeing all storage + recording the marker), then
+    /// glance's late store would re-insert pre-invalidation content and a
+    /// later `diff_since(R)` would silently diff stale-dimension frames
+    /// instead of reporting RESIZE_INVALIDATED (violating LENS-R-032/033).
+    /// The bound is STRICTLY-LESS-THAN, not ≤: LENS-R-033 pins "a checkpoint
+    /// created AFTER the invalidation (revision ≥ marker) is found by rule
+    /// (1)" — revision and clone are read in one io-lock critical section
+    /// and invalidating events bump the revision inside that same lock, so a
+    /// clone keyed at revision == marker depicts the POST-mutation frame
+    /// (e.g. `pane.checkpoint` immediately after a resize reads exactly the
+    /// marker revision; refusing it would orphan the post-resize frame and
+    /// make `diff_since(marker)` wrongly -32011). Only revision < marker
+    /// content predates the invalidation. Refusal is the same honest no-op
+    /// as the teardown race: `(false, None)` → glance reports
+    /// `checkpointed: false`.
     ///
     /// Unique per revision: a checkpoint already stored at `revision` is a
     /// no-op (stores nothing, evicts nothing). Otherwise inserts SORTED by
@@ -272,16 +301,25 @@ impl PaneIoState {
     /// can reach their second lock windows out of revision order, and
     /// insertion-order eviction would then evict the newer frame. (DEC-22:
     /// reads never refresh recency.) Returns `(stored_or_present,
-    /// evicted_revision)`: the flag is false only when the pane was gone.
+    /// evicted_revision)`: the flag is false only when the pane was gone or
+    /// the revision predates an invalidation.
     fn store_checkpoint(
         &mut self,
         pane_id: shux_core::model::PaneId,
         revision: u64,
         grid: shux_vt::Grid,
         cursor: (usize, usize, bool),
+        default_colors: shux_vt::TerminalDefaultColors,
     ) -> (bool, Option<u64>) {
         const MAX_CHECKPOINTS: usize = 4;
         if !self.vts.contains_key(&pane_id) {
+            return (false, None);
+        }
+        if self
+            .invalidations
+            .get(&pane_id)
+            .is_some_and(|&marker| revision < marker)
+        {
             return (false, None);
         }
         let deque = self.checkpoints.entry(pane_id).or_default();
@@ -300,6 +338,7 @@ impl PaneIoState {
                 revision,
                 grid,
                 cursor,
+                default_colors,
             },
         );
         if deque.len() > MAX_CHECKPOINTS {
@@ -308,6 +347,379 @@ impl PaneIoState {
             (true, None)
         }
     }
+
+    /// Invalidate every checkpoint of a pane at the POST-mutation revision of a
+    /// resize or alt-screen switch (lens PRD §7.1, DEC-4, LENS-R-032/033).
+    /// Frees the stored frames and records the marker (kept monotonic — the
+    /// highest invalidating revision wins) so `pane.diff_since` can tell
+    /// "predates an invalidation" (`RESIZE_INVALIDATED`) apart from "never
+    /// checkpointed / evicted" (`STALE_REVISION`). No-op for panes with no
+    /// live VT (teardown already ran); a checkpoint created AFTER this marker
+    /// (revision ≥ marker) is still found by the diff's existence-first rule.
+    fn invalidate_checkpoints(&mut self, pane_id: shux_core::model::PaneId, at_revision: u64) {
+        if !self.vts.contains_key(&pane_id) {
+            return;
+        }
+        self.checkpoints.remove(&pane_id);
+        let marker = self.invalidations.entry(pane_id).or_insert(0);
+        *marker = (*marker).max(at_revision);
+    }
+
+    /// Live checkpoint revisions for a pane, ascending (the deque is kept
+    /// revision-sorted by `store_checkpoint`). Used to populate
+    /// `STALE_REVISION`'s `available` list (LENS-R-033).
+    fn checkpoint_revisions(&self, pane_id: &shux_core::model::PaneId) -> Vec<u64> {
+        self.checkpoints
+            .get(pane_id)
+            .map(|d| d.iter().map(|c| c.revision).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// A checkpoint's stored clone as returned by `diff_lookup_checkpoint`:
+/// (grid, cursor {row, col, visible}, OSC defaults at capture — LENS-R-038b).
+type CheckpointClone = (
+    shux_vt::Grid,
+    (usize, usize, bool),
+    shux_vt::TerminalDefaultColors,
+);
+
+/// Resolve a `pane.diff_since` `since_revision` against a pane's stored
+/// checkpoints and invalidation marker (lens PRD §7.1, LENS-R-033). Existence
+/// FIRST, which makes the rule off-by-one-proof:
+///   (1) a stored checkpoint whose revision == `since` → return its clone;
+///   (2) else `since ≤ last_invalidation` → `RESIZE_INVALIDATED (-32011)`;
+///   (3) else → `STALE_REVISION (-32010)` with `{requested, available}`.
+/// The pane's existence is checked by the caller BEFORE this (so a missing
+/// pane is `PANE_NOT_FOUND`, never a diff error). Returns the checkpoint's
+/// `(grid, cursor, default_colors)` clone on a hit (defaults per
+/// LENS-R-038b — the diff resolves `Color::Default` against each side's own
+/// defaults).
+fn diff_lookup_checkpoint(
+    state: &PaneIoState,
+    pane_id: &shux_core::model::PaneId,
+    since: u64,
+) -> Result<CheckpointClone, shux_rpc::RpcError> {
+    if let Some(cp) = state
+        .checkpoints
+        .get(pane_id)
+        .and_then(|d| d.iter().find(|c| c.revision == since))
+    {
+        return Ok((cp.grid.clone(), cp.cursor, cp.default_colors));
+    }
+    if let Some(&marker) = state.invalidations.get(pane_id)
+        && since <= marker
+    {
+        return Err(shux_rpc::RpcError::resize_invalidated(since, marker));
+    }
+    Err(shux_rpc::RpcError::stale_revision(
+        since,
+        &state.checkpoint_revisions(pane_id),
+    ))
+}
+
+/// Pre-render pixel budget shared by every lens rasterizing path
+/// (`pane.glance` PNG, `pane.diff_since` heat PNG — PR #91 codex P1). The
+/// same 16M-pixel cap `pane.snapshot` enforces, checked BEFORE any RGBA
+/// allocation or rasterization: a 1000×1000-cell pane (valid per
+/// `pane.set_size` limits) would otherwise allocate hundreds of MB before
+/// the post-encode 8 MiB check could fire. Over budget →
+/// `PAYLOAD_TOO_LARGE (-32013)` with `{pixels, max_pixels, hint}` — the
+/// caller supplies the method-appropriate hint.
+fn lens_pixel_budget_check(
+    cols: usize,
+    rows: usize,
+    cell_w: u32,
+    cell_h: u32,
+    hint: &str,
+) -> Result<(), shux_rpc::RpcError> {
+    const MAX_PIXELS: u64 = 16_000_000;
+    let pixel_count = (cols as u64)
+        .saturating_mul(cell_w as u64)
+        .saturating_mul(rows as u64)
+        .saturating_mul(cell_h as u64);
+    if pixel_count > MAX_PIXELS {
+        return Err(shux_rpc::RpcError::with_message_and_data(
+            shux_rpc::ErrorCode::PayloadTooLarge,
+            "payload_too_large",
+            serde_json::json!({
+                "pixels": pixel_count,
+                "max_pixels": MAX_PIXELS,
+                "hint": hint,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+/// One per-row changed-column span in a `pane.diff_since` result
+/// (LENS-R-035): 0-based half-open `[col_start, col_end)`.
+struct LensRowSpan {
+    row: u16,
+    col_start: u16,
+    col_end: u16,
+}
+
+/// The structured delta between a checkpoint clone and the current clone
+/// (lens PRD §7.2, LENS-R-034..036).
+struct LensDiff {
+    cells_changed: u32,
+    regions: Vec<LensRowSpan>,
+    regions_truncated: bool,
+    /// (row_start, col_start, row_end, col_end) — 0-based HALF-OPEN in both
+    /// axes; all zeros when nothing changed (the empty range, LENS-R schema).
+    bounding_box: (u16, u16, u16, u16),
+    cursor_moved: bool,
+    /// Rows (grid index) with ≥1 changed cell, ascending — the keys of
+    /// `changed_row_text`.
+    changed_rows: Vec<usize>,
+    /// Flat `rows × cols` changed mask for the heat overlay (LENS-R-037).
+    changed_mask: Vec<bool>,
+    rows: usize,
+    cols: usize,
+}
+
+/// The lens `pane.glance` text of a SINGLE grid row (LENS-R-012 byte-stability,
+/// per-row): ANSI-free, wide-continuation cells skipped, full-width, trailing
+/// whitespace preserved (no trim). Byte-identical to `Grid::glance_text`'s
+/// `row`-th line so `changed_row_text[row]` lines up with the glance text.
+fn glance_row_text(grid: &shux_vt::Grid, row_idx: usize) -> String {
+    let row = grid.visible_row(row_idx);
+    let mut line = String::with_capacity(grid.cols());
+    for col in 0..row.len() {
+        if let Some(cell) = row.get(col) {
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            cell.push_display_text(&mut line);
+        }
+    }
+    line
+}
+
+/// Compute the structured diff of `cur` against the checkpoint `cp` clone
+/// (lens PRD §7.2). A cell counts as changed iff its UNDERLYING cell data
+/// differs (glyph, fg, bg, attrs — `Cell`'s full value equality, no cursor
+/// overlay: the clones carry none), with `Color::Default` RESOLVED against
+/// each side's respective OSC 10/11/12 defaults (LENS-R-038b, PR #91 codex
+/// P2): a default-color-only repaint presents every Default-colored cell
+/// differently, so when the two sides' fg (or bg) defaults differ, a cell
+/// whose fg (or bg) is `Default` on BOTH sides counts as changed. When the
+/// defaults are unchanged the extra clauses never fire and the comparison is
+/// byte-identical to plain `Cell` equality (D-tier gates + ratified goldens
+/// unaffected). The cursor default (OSC 12) is deliberately NOT part of the
+/// cell comparison — the cursor overlay is excluded from diffs entirely
+/// (DEC-11). Wide glyphs pair with their spacer: if either half changed,
+/// both count (LENS-R-034). Cursor position/visibility is never in the grid
+/// cells, so it is excluded from the count/regions by construction; a
+/// content change under the cursor's cell still counts. `cursor_moved` is
+/// reported separately.
+///
+/// Max 256 spans (LENS-R-035): past the cap `regions_truncated` is set and the
+/// caller emits only `bounding_box`.
+fn compute_lens_diff(
+    cp: &shux_vt::Grid,
+    cur: &shux_vt::Grid,
+    cp_cursor: (usize, usize, bool),
+    cur_cursor: (usize, usize, bool),
+    cp_defaults: shux_vt::TerminalDefaultColors,
+    cur_defaults: shux_vt::TerminalDefaultColors,
+) -> LensDiff {
+    // A valid diff (existence-first lookup hit) implies equal dims — resize
+    // invalidates checkpoints. `min` is a defensive guard, not a happy path.
+    let rows = cp.rows().min(cur.rows());
+    let cols = cp.cols().min(cur.cols());
+
+    // LENS-R-038b: which default channels changed between the two frames.
+    // `Default`-colored cells resolve through these, so a changed channel
+    // marks every cell that is `Default` in that channel on both sides
+    // (asymmetric Default-vs-concrete pairs already differ by raw equality).
+    let fg_default_changed = cp_defaults.fg != cur_defaults.fg;
+    let bg_default_changed = cp_defaults.bg != cur_defaults.bg;
+
+    let mut changed = vec![false; rows * cols];
+    for r in 0..rows {
+        let cp_row = cp.visible_row(r);
+        let cur_row = cur.visible_row(r);
+        for c in 0..cols {
+            let differ = match (cp_row.get(c), cur_row.get(c)) {
+                (Some(a), Some(b)) => {
+                    a != b
+                        || (fg_default_changed
+                            && a.style.fg == shux_vt::Color::Default
+                            && b.style.fg == shux_vt::Color::Default)
+                        || (bg_default_changed
+                            && a.style.bg == shux_vt::Color::Default
+                            && b.style.bg == shux_vt::Color::Default)
+                }
+                (None, None) => false,
+                _ => true,
+            };
+            if differ {
+                changed[r * cols + c] = true;
+            }
+        }
+    }
+
+    // Wide-glyph pairing (LENS-R-034): a wide head and its spacer are one
+    // visual unit — if either half changed, both cells count.
+    for r in 0..rows {
+        let cp_row = cp.visible_row(r);
+        let cur_row = cur.visible_row(r);
+        for c in 0..cols.saturating_sub(1) {
+            let wide = cp_row.get(c).is_some_and(|x| x.is_wide())
+                || cur_row.get(c).is_some_and(|x| x.is_wide());
+            if wide {
+                let i = r * cols + c;
+                if changed[i] || changed[i + 1] {
+                    changed[i] = true;
+                    changed[i + 1] = true;
+                }
+            }
+        }
+    }
+
+    // Build spans (per row, contiguous runs → merged), count, bbox, rows.
+    const MAX_SPANS: usize = 256;
+    let mut regions: Vec<LensRowSpan> = Vec::new();
+    let mut changed_rows: Vec<usize> = Vec::new();
+    let mut cells_changed: u32 = 0;
+    let (mut min_row, mut min_col, mut max_row, mut max_col) =
+        (usize::MAX, usize::MAX, 0usize, 0usize);
+
+    for r in 0..rows {
+        let mut row_had_change = false;
+        let mut c = 0;
+        while c < cols {
+            if changed[r * cols + c] {
+                let start = c;
+                while c < cols && changed[r * cols + c] {
+                    cells_changed += 1;
+                    c += 1;
+                }
+                // `c` is now one past the run — half-open [start, c).
+                regions.push(LensRowSpan {
+                    row: r as u16,
+                    col_start: start as u16,
+                    col_end: c as u16,
+                });
+                row_had_change = true;
+                min_row = min_row.min(r);
+                max_row = max_row.max(r);
+                min_col = min_col.min(start);
+                max_col = max_col.max(c - 1);
+            } else {
+                c += 1;
+            }
+        }
+        if row_had_change {
+            changed_rows.push(r);
+        }
+    }
+
+    let regions_truncated = regions.len() > MAX_SPANS;
+    if regions_truncated {
+        regions.clear();
+    }
+
+    let bounding_box = if cells_changed == 0 {
+        (0, 0, 0, 0)
+    } else {
+        // Half-open in both axes: [min, max+1).
+        (
+            min_row as u16,
+            min_col as u16,
+            (max_row + 1) as u16,
+            (max_col + 1) as u16,
+        )
+    };
+
+    LensDiff {
+        cells_changed,
+        regions,
+        regions_truncated,
+        bounding_box,
+        cursor_moved: cp_cursor != cur_cursor,
+        changed_rows,
+        changed_mask: changed,
+        rows,
+        cols,
+    }
+}
+
+/// Render the `pane.diff_since` heat PNG (LENS-R-037): the current clone
+/// through the standard rasterizer, then changed cells overlaid with
+/// `rgba(163,38,56,128)` and unchanged cells desaturated 50%. Deterministic
+/// integer math end-to-end (same inputs → byte-identical PNG). Runs on a
+/// blocking worker; the base render intentionally draws no cursor (cursor is
+/// excluded from the diff, so a cursor block would only add noise).
+fn render_lens_heat_png(
+    rasterizer: &shux_raster::Rasterizer,
+    grid: &shux_vt::Grid,
+    default_colors: shux_vt::TerminalDefaultColors,
+    changed_mask: &[bool],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u8>, String> {
+    use image::ImageEncoder;
+
+    let opts = shux_raster::RasterOptions {
+        cursor: None,
+        cursor_shape: shux_vt::CursorShape::default(),
+        cursor_color: default_colors.cursor,
+        fg_default: default_colors
+            .fg
+            .unwrap_or_else(|| shux_raster::RasterOptions::default().fg_default),
+        bg_default: default_colors
+            .bg
+            .unwrap_or_else(|| shux_raster::RasterOptions::default().bg_default),
+    };
+    let mut img = rasterizer.render(grid, &opts);
+    let (cw, ch) = rasterizer.cell_size();
+    let (iw, ih) = (img.width(), img.height());
+
+    // Overlay foreground colour + alpha for changed cells (LENS-R-037).
+    const HEAT: [u32; 3] = [163, 38, 56];
+    const ALPHA: u32 = 128;
+
+    for r in 0..rows {
+        for c in 0..cols {
+            let cell_changed = changed_mask.get(r * cols + c).copied().unwrap_or(false);
+            let x0 = c as u32 * cw;
+            let y0 = r as u32 * ch;
+            for y in y0..(y0 + ch).min(ih) {
+                for x in x0..(x0 + cw).min(iw) {
+                    let px = img.get_pixel_mut(x, y);
+                    let [pr, pg, pb, _pa] = px.0;
+                    if cell_changed {
+                        // Alpha-blend HEAT over the pixel: integer, truncating.
+                        px.0[0] = ((HEAT[0] * ALPHA + pr as u32 * (255 - ALPHA)) / 255) as u8;
+                        px.0[1] = ((HEAT[1] * ALPHA + pg as u32 * (255 - ALPHA)) / 255) as u8;
+                        px.0[2] = ((HEAT[2] * ALPHA + pb as u32 * (255 - ALPHA)) / 255) as u8;
+                    } else {
+                        // Desaturate 50%: move each channel halfway to luma.
+                        // Weights 77/150/29 sum to 256 (≈ Rec.601), >>8.
+                        let gray = (pr as u32 * 77 + pg as u32 * 150 + pb as u32 * 29) >> 8;
+                        px.0[0] = ((pr as u32 + gray) / 2) as u8;
+                        px.0[1] = ((pg as u32 + gray) / 2) as u8;
+                        px.0[2] = ((pb as u32 + gray) / 2) as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+    encoder
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| format!("heat PNG encode failed: {e}"))?;
+    Ok(buf)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -541,21 +953,43 @@ async fn run_pane_pty_task(
                         tee_pane_recorders(&io_state, pane_id, data, &shutdown).await;
                         let (pulse, vt_title, bus_opt, terminal_responses) = {
                             let mut state = io_state.lock().await;
-                            let (vt_title, terminal_responses, rev_state) =
+                            let (vt_title, terminal_responses, rev_state, alt_switched) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
+                                    // LENS-R-032/DEC-4: detect an alt-screen
+                                    // switch by comparing the PRESENTED alt flag
+                                    // across the batch (same presented source as
+                                    // grid()/glance — frozen under DEC 2026 sync,
+                                    // so a switch is seen at the presented frame,
+                                    // never mid-sync). A net-zero enter+leave in
+                                    // one batch leaves the flag equal → no switch,
+                                    // matching §4.2's "nets to no bump".
+                                    let alt_before = vt.is_alternate_screen();
                                     let responses = vt.process_with_responses(data);
+                                    let alt_after = vt.is_alternate_screen();
                                     let rev = PaneRevision {
                                         content_revision: vt.content_revision(),
                                         last_mutation_ns: vt.last_mutation_ns(),
                                     };
-                                    (vt.title().map(|s| s.to_string()), responses, Some(rev))
+                                    (
+                                        vt.title().map(|s| s.to_string()),
+                                        responses,
+                                        Some(rev),
+                                        alt_before != alt_after,
+                                    )
                                 } else {
-                                    (None, Vec::new(), None)
+                                    (None, Vec::new(), None, false)
                                 };
                             // LENS-R-003: publish in the same critical section as
                             // the grid mutation, once per Class-A batch.
                             if let Some(rev) = rev_state {
                                 state.publish_revision(pane_id, rev);
+                                // LENS-R-032/DEC-4: an alt-screen switch
+                                // invalidates every checkpoint of this pane
+                                // (marker at the POST-switch revision,
+                                // LENS-R-033).
+                                if alt_switched {
+                                    state.invalidate_checkpoints(pane_id, rev.content_revision);
+                                }
                             }
                             let output = String::from_utf8_lossy(data);
                             let _completed = state.cmd_engine.process_output(pane_id.0, &output);
@@ -706,17 +1140,44 @@ async fn run_pane_pty_task(
                 let pulse = {
                     let mut state = io_state.lock().await;
                     let rev_state = if let Some(vt) = state.vts.get_mut(&pane_id) {
+                        // P4 convergence round 1 (claude blocker): gate the
+                        // invalidation on an ACTUAL dimension change, exactly
+                        // like the process branch gates on alt_switched. The
+                        // attach render loop re-fans EVERY pane of the active
+                        // window at its computed size on attach, client
+                        // resize, window switch, and zoom toggle — at an
+                        // unchanged client size those are no-op resizes, and
+                        // ungated invalidation made merely attaching (or a
+                        // same-size pane.set_size) destroy every checkpoint.
+                        // §4.2: only a dims change is the Class-A "pane
+                        // resize"; only that invalidates (LENS-R-032).
+                        let dims_before = (vt.grid().rows(), vt.grid().cols());
                         vt.resize(req.size.rows as usize, req.size.cols as usize);
-                        Some(PaneRevision {
-                            content_revision: vt.content_revision(),
-                            last_mutation_ns: vt.last_mutation_ns(),
-                        })
+                        let dims_changed = (vt.grid().rows(), vt.grid().cols()) != dims_before;
+                        Some((
+                            PaneRevision {
+                                content_revision: vt.content_revision(),
+                                last_mutation_ns: vt.last_mutation_ns(),
+                            },
+                            dims_changed,
+                        ))
                     } else {
                         None
                     };
                     // LENS-R-003: resize is Class-A — publish the bumped revision.
-                    if let Some(rev) = rev_state {
+                    if let Some((rev, dims_changed)) = rev_state {
                         state.publish_revision(pane_id, rev);
+                        // LENS-R-032/DEC-4: a REAL resize invalidates every
+                        // checkpoint of this pane. Record the marker at the
+                        // POST-resize revision (LENS-R-033) BEFORE the ack, so
+                        // a synchronous `pane.set_size` caller that immediately
+                        // diffs an older checkpoint gets RESIZE_INVALIDATED.
+                        // Same-size requests never reach here (dims_changed
+                        // false): the frame did not change, checkpoints stay
+                        // valid.
+                        if dims_changed {
+                            state.invalidate_checkpoints(pane_id, rev.content_revision);
+                        }
                     }
                     state.render_pulse.clone()
                 };
@@ -3939,6 +4400,8 @@ fn register_pane_io_methods(
     let g10 = graph.clone();
     let g12 = graph.clone(); // pane.glance (LENS-R-010..016)
     let g13 = graph.clone(); // pane.wait_settled (LENS-R-020..025)
+    let g14 = graph.clone(); // pane.checkpoint (LENS-R-030/031)
+    let g15 = graph.clone(); // pane.diff_since (LENS-R-033..038)
     let g11 = graph;
 
     let io1 = io_state.clone();
@@ -3954,6 +4417,8 @@ fn register_pane_io_methods(
     let io11 = io_state.clone();
     let io13 = io_state.clone(); // pane.glance
     let io14 = io_state.clone(); // pane.wait_settled
+    let io15 = io_state.clone(); // pane.checkpoint
+    let io16 = io_state.clone(); // pane.diff_since
     let io12 = io_state;
 
     // Shared rasterizer for `pane.snapshot` / `window.snapshot` / `session.snapshot`.
@@ -4042,6 +4507,7 @@ fn register_pane_io_methods(
     let rasterizer_window = rasterizer.clone();
     let rasterizer_session = rasterizer.clone();
     let rasterizer_glance = rasterizer.clone();
+    let rasterizer_diff = rasterizer.clone();
 
     builder
         .register_with_policy(
@@ -4803,23 +5269,15 @@ fn register_pane_io_methods(
                         // allocate + encode hundreds of MB of RGBA before
                         // the post-encode 8 MiB check could fire. Text-only
                         // glances skip it: no PNG payload exists to cap.
+                        // Shared with the diff heat path (PR #91 codex P1).
                         if include_png {
-                            let pixel_count = (cols as u64)
-                                .saturating_mul(cw as u64)
-                                .saturating_mul(rows as u64)
-                                .saturating_mul(ch as u64);
-                            const MAX_PIXELS: u64 = 16_000_000;
-                            if pixel_count > MAX_PIXELS {
-                                return Err(shux_rpc::RpcError::with_message_and_data(
-                                    shux_rpc::ErrorCode::PayloadTooLarge,
-                                    "payload_too_large",
-                                    serde_json::json!({
-                                        "pixels": pixel_count,
-                                        "max_pixels": MAX_PIXELS,
-                                        "hint": "shrink the pane (pane.set_size) or set include_png=false",
-                                    }),
-                                ));
-                            }
+                            lens_pixel_budget_check(
+                                cols,
+                                rows,
+                                cw,
+                                ch,
+                                "shrink the pane (pane.set_size) or set include_png=false",
+                            )?;
                         }
                         let cur = vt.cursor();
                         let default_colors = vt.default_colors();
@@ -4943,6 +5401,9 @@ fn register_pane_io_methods(
                             revision,
                             grid,
                             (cursor_row, cursor_col, cursor_visible),
+                            // The §5.1 clone's OSC defaults (LENS-R-038b) —
+                            // read in the SAME critical section as the grid.
+                            default_colors,
                         )
                     } else {
                         (false, None)
@@ -5077,9 +5538,11 @@ fn register_pane_io_methods(
                             continue;
                         }
 
-                        let remaining = std::time::Duration::from_nanos(
-                            settle_remaining_quiet_ns(now_ns, rev.last_mutation_ns, quiet_ms),
-                        );
+                        let remaining = std::time::Duration::from_nanos(settle_remaining_quiet_ns(
+                            now_ns,
+                            rev.last_mutation_ns,
+                            quiet_ms,
+                        ));
                         let quiet_deadline = tokio::time::Instant::now() + remaining;
                         let wake = quiet_deadline.min(timeout_deadline);
 
@@ -5098,6 +5561,245 @@ fn register_pane_io_methods(
                             }
                         }
                     }
+                }
+            },
+        )
+        .register_with_policy(
+            // `pane.checkpoint` (§7 SPEC-D, LENS-R-030/031, DEC-22): capture the
+            // pane's current visible grid clone keyed by its `content_revision`
+            // for a later `pane.diff_since`. Cap 4 per pane, FIFO by creation
+            // revision; re-checkpointing the same revision is a no-op
+            // (`evicted_revision: null`). Pure observation of pane content plus
+            // bounded daemon-side storage — same read sensitivity as glance.
+            "pane.checkpoint",
+            Policy::fixed(Sensitivity::ContentRead),
+            move |params: Option<serde_json::Value>| {
+                let gh = g14.clone();
+                let io = io15.clone();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                    // One lock: verify the VT exists (PANE_NOT_FOUND otherwise),
+                    // clone the current visible grid + cursor keyed by the
+                    // revision read in the SAME critical section, and store.
+                    // store_checkpoint dedups the same-revision no-op and evicts
+                    // the FIFO-oldest past the cap (LENS-R-030/031).
+                    let (revision, evicted) = {
+                        let mut state = io.lock().await;
+                        let (revision, grid, cursor, default_colors) = {
+                            let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                            })?;
+                            let cur = vt.cursor();
+                            (
+                                vt.content_revision(),
+                                vt.grid().clone_visible(),
+                                (cur.row, cur.col, cur.visible),
+                                // OSC defaults at capture time (LENS-R-038b),
+                                // same critical section as the grid clone.
+                                vt.default_colors(),
+                            )
+                        };
+                        let (_stored, evicted) =
+                            state.store_checkpoint(pane_id, revision, grid, cursor, default_colors);
+                        (revision, evicted)
+                    };
+
+                    Ok(serde_json::json!({
+                        "revision": revision,
+                        "evicted_revision": evicted,
+                    }))
+                }
+            },
+        )
+        .register_with_policy(
+            // `pane.diff_since` (§7 SPEC-D, LENS-R-033..038): diff the pane's
+            // current visible grid against a checkpointed revision. Existence
+            // FIRST — a missing pane is PANE_NOT_FOUND before any checkpoint
+            // lookup; then the LENS-R-033 rule (exact checkpoint → diff; else
+            // ≤ invalidation marker → RESIZE_INVALIDATED -32011; else
+            // STALE_REVISION -32010 with `available`). Pure observation.
+            "pane.diff_since",
+            Policy::fixed(Sensitivity::ContentRead),
+            move |params: Option<serde_json::Value>| {
+                let gh = g15.clone();
+                let io = io16.clone();
+                let r = rasterizer_diff.load_full();
+                async move {
+                    let params = params.unwrap_or_default();
+                    let pane_id = resolve_pane_id_from_params(&gh, &params)?;
+
+                    // `since_revision` is required; strict typing (missing /
+                    // wrong type → INVALID_PARAMS, CLI exit 2).
+                    let since_revision = match params.get("since_revision") {
+                        Some(v) => v.as_u64().ok_or_else(|| {
+                            shux_rpc::RpcError::invalid_params(
+                                "since_revision must be a non-negative integer",
+                            )
+                        })?,
+                        None => {
+                            return Err(shux_rpc::RpcError::invalid_params(
+                                "since_revision is required",
+                            ));
+                        }
+                    };
+                    let want_row_text = params
+                        .get("changed_row_text")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let want_heat = params
+                        .get("heat_png")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    // One lock: existence check, checkpoint lookup (LENS-R-033),
+                    // and the atomic current-grid clone all in one critical
+                    // section so `to_revision`/grid/cursor agree.
+                    let (cw, ch) = r.cell_size();
+                    let (
+                        cp_grid,
+                        cp_cursor,
+                        cp_defaults,
+                        cur_grid,
+                        cur_cursor,
+                        to_revision,
+                        default_colors,
+                    ) = {
+                        let state = io.lock().await;
+                        let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                            shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                        })?;
+                        // Existence-first lookup runs AFTER the pane check.
+                        let (cp_grid, cp_cursor, cp_defaults) =
+                            diff_lookup_checkpoint(&state, &pane_id, since_revision)?;
+                        // Pre-render pixel budget for the heat path (PR #91
+                        // codex P1): the SAME 16M-pixel cap glance enforces,
+                        // checked BEFORE any RGBA allocation/rasterization —
+                        // a 1000×1000 pane (valid per pane.set_size) would
+                        // otherwise allocate hundreds of MB in
+                        // render_lens_heat_png before the post-encode 8 MiB
+                        // check could fire. Runs AFTER the LENS-R-033 lookup
+                        // so stale/invalidated (more actionable) wins over
+                        // the payload error; heat-less diffs skip it — the
+                        // cell-level diff never rasterizes.
+                        if want_heat {
+                            lens_pixel_budget_check(
+                                vt.grid().cols(),
+                                vt.grid().rows(),
+                                cw,
+                                ch,
+                                "shrink the pane (pane.set_size) or set heat_png=false",
+                            )?;
+                        }
+                        let cur = vt.cursor();
+                        (
+                            cp_grid,
+                            cp_cursor,
+                            cp_defaults,
+                            vt.grid().clone_visible(),
+                            (cur.row, cur.col, cur.visible),
+                            vt.content_revision(),
+                            vt.default_colors(),
+                        )
+                    };
+
+                    // Diff computation outside the lock (LENS-R-034..036;
+                    // LENS-R-038b: Default colors resolve against each
+                    // side's own defaults — the checkpoint's captured
+                    // defaults vs the pane's CURRENT defaults).
+                    let diff = compute_lens_diff(
+                        &cp_grid,
+                        &cur_grid,
+                        cp_cursor,
+                        cur_cursor,
+                        cp_defaults,
+                        default_colors,
+                    );
+
+                    let regions: Vec<serde_json::Value> = diff
+                        .regions
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "row": s.row,
+                                "col_start": s.col_start,
+                                "col_end": s.col_end,
+                            })
+                        })
+                        .collect();
+
+                    let changed_row_text = if want_row_text {
+                        let mut map = serde_json::Map::new();
+                        for &row in &diff.changed_rows {
+                            map.insert(
+                                row.to_string(),
+                                serde_json::Value::String(glance_row_text(&cur_grid, row)),
+                            );
+                        }
+                        serde_json::Value::Object(map)
+                    } else {
+                        serde_json::Value::Object(serde_json::Map::new())
+                    };
+
+                    // Heat PNG (LENS-R-037): render off the runtime worker.
+                    // The base frame uses the pane's CURRENT defaults
+                    // (`default_colors`, read in the lock above) — the heat
+                    // map depicts the PRESENTED current frame, never the
+                    // checkpoint's colors (LENS-R-038b test c). The mask is
+                    // MOVED into the closure — nothing reads it afterwards
+                    // (greptile PR #91: the clone was a needless heap copy
+                    // of rows×cols booleans).
+                    let heat_png_base64 = if want_heat {
+                        let changed_mask = diff.changed_mask;
+                        let (rows, cols) = (diff.rows, diff.cols);
+                        let heat = tokio::task::spawn_blocking(move || {
+                            render_lens_heat_png(
+                                &r,
+                                &cur_grid,
+                                default_colors,
+                                &changed_mask,
+                                rows,
+                                cols,
+                            )
+                        })
+                        .await
+                        .map_err(|e| {
+                            shux_rpc::RpcError::internal(&format!("heat rasterize join: {e}"))
+                        })?
+                        .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+
+                        // §7.3 shares glance's 8 MiB decoded-PNG cap.
+                        const MAX_PNG_BYTES: usize = 8 * 1024 * 1024;
+                        if heat.len() > MAX_PNG_BYTES {
+                            return Err(shux_rpc::RpcError::payload_too_large(
+                                heat.len(),
+                                MAX_PNG_BYTES,
+                            ));
+                        }
+                        use base64::Engine;
+                        Some(base64::engine::general_purpose::STANDARD.encode(&heat))
+                    } else {
+                        None
+                    };
+
+                    let (bb_rs, bb_cs, bb_re, bb_ce) = diff.bounding_box;
+                    Ok(serde_json::json!({
+                        "from_revision": since_revision,
+                        "to_revision": to_revision,
+                        "cells_changed": diff.cells_changed,
+                        "cursor_moved": diff.cursor_moved,
+                        "regions": regions,
+                        "regions_truncated": diff.regions_truncated,
+                        "bounding_box": {
+                            "row_start": bb_rs,
+                            "col_start": bb_cs,
+                            "row_end": bb_re,
+                            "col_end": bb_ce,
+                        },
+                        "changed_row_text": changed_row_text,
+                        "heat_png_base64": heat_png_base64,
+                    }))
                 }
             },
         )
@@ -5960,6 +6662,18 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     cli::handle_pane_wait_settled(&mut stream, &pane, quiet, timeout, args.format)
                         .await
                 }
+                PaneCommand::Checkpoint { pane } => {
+                    cli::handle_pane_checkpoint(&mut stream, &pane, args.format).await
+                }
+                PaneCommand::Diff {
+                    pane,
+                    since,
+                    heat,
+                    no_row_text,
+                } => {
+                    cli::handle_pane_diff(&mut stream, &pane, since, heat, no_row_text, args.format)
+                        .await
+                }
                 PaneCommand::SetSize {
                     session,
                     window,
@@ -6432,15 +7146,33 @@ mod tests {
         let grid = vt.grid().clone_visible();
 
         // No VT registered at all → refuse, and do NOT create an entry.
-        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            1,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(!stored && evicted.is_none());
         assert!(!state.checkpoints.contains_key(&pane_id));
 
         // Live VT → stores; same-revision re-store is the LENS-R-030 no-op.
         state.vts.insert(pane_id, vt);
-        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            1,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored && evicted.is_none());
-        let (stored, evicted) = state.store_checkpoint(pane_id, 1, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            1,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored && evicted.is_none(), "same-revision no-op");
         assert_eq!(state.checkpoints[&pane_id].len(), 1);
 
@@ -6448,7 +7180,13 @@ mod tests {
         // must refuse and must NOT resurrect the checkpoints entry.
         let _ = state.teardown_panes_collecting(&[pane_id], true);
         assert!(!state.checkpoints.contains_key(&pane_id));
-        let (stored, evicted) = state.store_checkpoint(pane_id, 2, grid, (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            2,
+            grid,
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(!stored && evicted.is_none());
         assert!(
             !state.checkpoints.contains_key(&pane_id),
@@ -6520,14 +7258,25 @@ mod tests {
 
         // (b) Ascending stores: cap 4, the 5th evicts the first.
         for rev in [1_u64, 2, 3, 4] {
-            let (stored, evicted) =
-                state.store_checkpoint(pane_id, rev, grid.clone(), (0, 0, true));
+            let (stored, evicted) = state.store_checkpoint(
+                pane_id,
+                rev,
+                grid.clone(),
+                (0, 0, true),
+                shux_vt::TerminalDefaultColors::default(),
+            );
             assert!(
                 stored && evicted.is_none(),
                 "rev {rev} stores without eviction"
             );
         }
-        let (stored, evicted) = state.store_checkpoint(pane_id, 5, grid.clone(), (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            5,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored);
         assert_eq!(evicted, Some(1), "5th store evicts the FIFO-oldest (rev 1)");
 
@@ -6537,14 +7286,25 @@ mod tests {
         let vt = shux_vt::VirtualTerminal::new(24, 80);
         state.vts.insert(pane_id, vt);
         for rev in [10_u64, 5, 20, 30] {
-            let (stored, evicted) =
-                state.store_checkpoint(pane_id, rev, grid.clone(), (0, 0, true));
+            let (stored, evicted) = state.store_checkpoint(
+                pane_id,
+                rev,
+                grid.clone(),
+                (0, 0, true),
+                shux_vt::TerminalDefaultColors::default(),
+            );
             assert!(stored && evicted.is_none());
         }
         // Deque must be revision-ordered despite arrival order, so the next
         // store evicts revision 5 (oldest by CREATION REVISION) — a pure
         // insertion-order FIFO would wrongly evict 10 (the first arrival).
-        let (stored, evicted) = state.store_checkpoint(pane_id, 40, grid, (0, 0, true));
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            40,
+            grid,
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
         assert!(stored);
         assert_eq!(
             evicted,
@@ -6556,6 +7316,433 @@ mod tests {
             .map(|c| c.revision)
             .collect();
         assert_eq!(live, vec![10, 20, 30, 40], "deque stays revision-ascending");
+    }
+
+    /// LENS-R-033 existence-first lookup + LENS-R-032 invalidation marker.
+    /// Proves the -32011-vs-32010 disambiguation and that a checkpoint created
+    /// AFTER an invalidation is still found (rule 1 before rule 2).
+    #[test]
+    fn diff_lookup_existence_first_and_invalidation_marker() {
+        let pane_id = shux_core::model::PaneId::new();
+        let mut state = PaneIoState::new();
+        let vt = shux_vt::VirtualTerminal::new(24, 80);
+        let grid = vt.grid().clone_visible();
+        state.vts.insert(pane_id, vt);
+
+        // One checkpoint at revision 5.
+        state.store_checkpoint(
+            pane_id,
+            5,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
+        // (1) exact hit → Ok clone.
+        assert!(diff_lookup_checkpoint(&state, &pane_id, 5).is_ok());
+        // (3) no checkpoint, no marker → STALE with available:[5].
+        let err = diff_lookup_checkpoint(&state, &pane_id, 6).unwrap_err();
+        assert_eq!(err.code, shux_rpc::ErrorCode::StaleRevision.code());
+        assert_eq!(
+            err.data.as_ref().unwrap()["available"],
+            serde_json::json!([5])
+        );
+
+        // Invalidate at revision 9 (resize/alt-switch): frees the deque, marks 9.
+        state.invalidate_checkpoints(pane_id, 9);
+        assert!(
+            !state.checkpoints.contains_key(&pane_id) || state.checkpoints[&pane_id].is_empty()
+        );
+        // (2) since ≤ marker → RESIZE_INVALIDATED.
+        let err = diff_lookup_checkpoint(&state, &pane_id, 5).unwrap_err();
+        assert_eq!(err.code, shux_rpc::ErrorCode::ResizeInvalidated.code());
+        // since > marker but no checkpoint → STALE (available now empty).
+        let err = diff_lookup_checkpoint(&state, &pane_id, 12).unwrap_err();
+        assert_eq!(err.code, shux_rpc::ErrorCode::StaleRevision.code());
+        assert_eq!(
+            err.data.as_ref().unwrap()["available"],
+            serde_json::json!([])
+        );
+
+        // A checkpoint created AFTER the invalidation (rev 10 ≥ marker 9) is
+        // found by rule (1) before rule (2) can misfire (LENS-R-033).
+        state.store_checkpoint(
+            pane_id,
+            10,
+            grid,
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
+        assert!(diff_lookup_checkpoint(&state, &pane_id, 10).is_ok());
+        // The marker still shadows the freed pre-9 revisions.
+        assert_eq!(
+            diff_lookup_checkpoint(&state, &pane_id, 5)
+                .unwrap_err()
+                .code,
+            shux_rpc::ErrorCode::ResizeInvalidated.code()
+        );
+    }
+
+    /// Monotonic invalidation marker: a later invalidation never lowers it.
+    #[test]
+    fn invalidation_marker_is_monotonic() {
+        let pane_id = shux_core::model::PaneId::new();
+        let mut state = PaneIoState::new();
+        state
+            .vts
+            .insert(pane_id, shux_vt::VirtualTerminal::new(24, 80));
+        state.invalidate_checkpoints(pane_id, 9);
+        state.invalidate_checkpoints(pane_id, 3); // stale/out-of-order
+        assert_eq!(state.invalidations[&pane_id], 9);
+    }
+
+    /// codex P4 convergence blocker — checkpoint-resurrection across an
+    /// invalidation: glance clones at revision R under lock #1, a concurrent
+    /// resize invalidates at R+1, then glance's store under lock #2 arrives
+    /// with the PRE-invalidation clone. store_checkpoint must refuse any
+    /// revision BELOW the marker (deterministic — the race is replayed here
+    /// as direct calls, no timing), so the later diff reports
+    /// RESIZE_INVALIDATED instead of silently diffing stale-dimension
+    /// frames. Revisions AT the marker stay storable (LENS-R-033: "a
+    /// checkpoint created AFTER the invalidation (revision ≥ marker) is
+    /// found by rule (1)" — same-lock reads make an ==marker clone the
+    /// post-mutation frame).
+    #[test]
+    fn checkpoint_store_refuses_pre_invalidation_revisions() {
+        let pane_id = shux_core::model::PaneId::new();
+        let mut state = PaneIoState::new();
+        let vt = shux_vt::VirtualTerminal::new(24, 80);
+        let grid = vt.grid().clone_visible();
+        state.vts.insert(pane_id, vt);
+
+        // Baseline: a checkpoint at 5 stores and is diffable.
+        let (stored, _) = state.store_checkpoint(
+            pane_id,
+            5,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
+        assert!(stored);
+
+        // The invalidating event (resize/alt-switch) lands at revision 7:
+        // frees all storage, records the marker.
+        state.invalidate_checkpoints(pane_id, 7);
+
+        // The racing glance's LATE store of the pre-invalidation clone at 5
+        // must be refused — no checkpoint materializes.
+        let (stored, evicted) = state.store_checkpoint(
+            pane_id,
+            5,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
+        assert!(!stored, "pre-invalidation revision must be refused");
+        assert!(evicted.is_none());
+        assert!(
+            state.checkpoints.get(&pane_id).is_none_or(|d| d.is_empty()),
+            "no checkpoint may materialize below the marker"
+        );
+
+        // The diff decision path then reports RESIZE_INVALIDATED for 5 —
+        // never a stale-dimension diff (the blocker's observable).
+        let err = diff_lookup_checkpoint(&state, &pane_id, 5).unwrap_err();
+        assert_eq!(
+            err.code,
+            shux_rpc::ErrorCode::ResizeInvalidated.code(),
+            "diff_since(R) after the refused store must be -32011"
+        );
+
+        // AT the marker (== 7): the post-mutation frame, storable and
+        // diffable — refusing it would orphan the immediately-post-resize
+        // pane.checkpoint and make diff_since(7) wrongly -32011.
+        let (stored, _) = state.store_checkpoint(
+            pane_id,
+            7,
+            grid.clone(),
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
+        assert!(stored, "revision == marker is the post-mutation frame");
+        assert!(diff_lookup_checkpoint(&state, &pane_id, 7).is_ok());
+
+        // Above the marker: normal storage.
+        let (stored, _) = state.store_checkpoint(
+            pane_id,
+            8,
+            grid,
+            (0, 0, true),
+            shux_vt::TerminalDefaultColors::default(),
+        );
+        assert!(stored);
+        assert!(diff_lookup_checkpoint(&state, &pane_id, 8).is_ok());
+    }
+
+    /// PR #91 codex P1 — the shared pre-render pixel budget predicate: the
+    /// SAME 16M-pixel cap `pane.glance` enforces, now also gating the diff
+    /// heat path BEFORE any RGBA allocation. Over budget → -32013 with
+    /// {pixels, max_pixels, hint}; under budget → Ok (no allocation happens
+    /// in the guard itself).
+    #[test]
+    fn lens_pixel_budget_check_guard_predicate() {
+        // Under budget: an 80×24 pane at 9×18px cells is ~311K pixels.
+        assert!(lens_pixel_budget_check(80, 24, 9, 18, "hint").is_ok());
+
+        // Over budget: 1000×1000 cells at 9×18px is 162M pixels — the
+        // pane.set_size-valid size from the codex P1 report.
+        let err = lens_pixel_budget_check(1000, 1000, 9, 18, "set heat_png=false")
+            .expect_err("162M pixels must exceed the 16M budget");
+        assert_eq!(err.code, shux_rpc::ErrorCode::PayloadTooLarge.code());
+        let data = err.data.expect("budget error carries data");
+        let pixels = data["pixels"].as_u64().expect("pixels");
+        let max = data["max_pixels"].as_u64().expect("max_pixels");
+        assert_eq!(pixels, 162_000_000);
+        assert_eq!(max, 16_000_000);
+        assert!(pixels > max);
+        assert_eq!(data["hint"], "set heat_png=false", "hint passes through");
+    }
+
+    /// LENS-R-038b (PR #91 codex P2, adjudicated) — a default-color-only
+    /// change marks every cell whose changed channel is `Color::Default` on
+    /// both sides; concrete-colored cells stay unmarked. Exercises both the
+    /// bg (OSC 11) and fg (OSC 10) channels against a grid mixing blank
+    /// cells, default-colored text, and one fully concrete-colored cell.
+    #[test]
+    fn compute_lens_diff_default_color_change_marks_default_cells() {
+        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
+        // Default-colored text at (0,0..2) + one cell at (1,2) with CONCRETE
+        // fg AND bg (never resolves through either default channel).
+        vt.process(b"\x1b[1;1HAB\x1b[2;3H\x1b[38;2;1;2;3m\x1b[48;2;4;5;6mX\x1b[0m");
+        let grid = vt.grid().clone_visible();
+        let cursor = (0, 0, true);
+        let base = shux_vt::TerminalDefaultColors::default();
+
+        // bg default changed (OSC 11): every cell except (1,2) counts.
+        let bg_changed = shux_vt::TerminalDefaultColors {
+            bg: Some([32, 64, 96]),
+            ..base
+        };
+        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, bg_changed);
+        assert_eq!(
+            diff.cells_changed, 29,
+            "3×10 grid minus the one concrete-bg cell"
+        );
+        assert!(!diff.changed_mask[10 + 2], "concrete-bg cell NOT marked");
+        assert!(diff.changed_mask[0], "default-colored glyph cell marked");
+        assert!(diff.changed_mask[9], "blank cell marked");
+        // Row 1 splits around the concrete cell: [0,2) + [3,10).
+        let spans: Vec<(u16, u16, u16)> = diff
+            .regions
+            .iter()
+            .map(|s| (s.row, s.col_start, s.col_end))
+            .collect();
+        assert_eq!(spans, vec![(0, 0, 10), (1, 0, 2), (1, 3, 10), (2, 0, 10)]);
+        assert_eq!(diff.bounding_box, (0, 0, 3, 10));
+
+        // fg default changed (OSC 10): same shape — the concrete-fg cell is
+        // the only one not resolving through the fg default.
+        let fg_changed = shux_vt::TerminalDefaultColors {
+            fg: Some([200, 10, 10]),
+            ..base
+        };
+        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, fg_changed);
+        assert_eq!(diff.cells_changed, 29);
+        assert!(!diff.changed_mask[10 + 2], "concrete-fg cell NOT marked");
+
+        // Cursor default (OSC 12) is NOT part of the cell comparison
+        // (DEC-11: the cursor overlay is excluded from diffs entirely).
+        let cursor_changed = shux_vt::TerminalDefaultColors {
+            cursor: Some([255, 0, 0]),
+            ..base
+        };
+        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, cursor_changed);
+        assert_eq!(diff.cells_changed, 0, "OSC 12 never marks cells");
+    }
+
+    /// LENS-R-038b test (b): with UNCHANGED defaults the comparison is
+    /// byte-identical to plain raw `Cell` equality — whether the shared
+    /// defaults are the builtin fallback (None) or an OSC-set value. Pins
+    /// that the D-tier gates and ratified goldens are unaffected.
+    #[test]
+    fn compute_lens_diff_unchanged_defaults_matches_raw() {
+        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
+        vt.process(b"\x1b[1;1Hhello");
+        let cp = vt.grid().clone_visible();
+        vt.process(b"\x1b[2;4H\x1b[48;5;28mZW\x1b[0m");
+        let cur = vt.grid().clone_visible();
+        let cursor = (0, 0, true);
+
+        let none = shux_vt::TerminalDefaultColors::default();
+        let osc_set = shux_vt::TerminalDefaultColors {
+            fg: Some([250, 250, 250]),
+            bg: Some([32, 64, 96]),
+            cursor: Some([255, 128, 0]),
+        };
+
+        let raw = compute_lens_diff(&cp, &cur, cursor, cursor, none, none);
+        let same_osc = compute_lens_diff(&cp, &cur, cursor, cursor, osc_set, osc_set);
+        assert_eq!(raw.cells_changed, 2, "exactly the ZW cells");
+        assert_eq!(same_osc.cells_changed, raw.cells_changed);
+        assert_eq!(same_osc.changed_mask, raw.changed_mask);
+        assert_eq!(same_osc.bounding_box, raw.bounding_box);
+        let spans = |d: &LensDiff| -> Vec<(u16, u16, u16)> {
+            d.regions
+                .iter()
+                .map(|s| (s.row, s.col_start, s.col_end))
+                .collect()
+        };
+        assert_eq!(spans(&same_osc), spans(&raw));
+    }
+
+    /// LENS-R-038b test (c), unit half — the heat base is rendered with the
+    /// defaults PASSED IN (the handler passes the pane's CURRENT defaults).
+    /// Deterministic integer expectations: a changed blank cell is the heat
+    /// colour alpha-blended over the passed bg default; an unchanged blank
+    /// cell is that bg desaturated 50% (Rec.601 luma).
+    #[test]
+    fn heat_png_base_uses_passed_defaults() {
+        let raster = shux_raster::Rasterizer::new(14.0).expect("bundled font");
+        let vt = shux_vt::VirtualTerminal::new(2, 4);
+        let grid = vt.grid().clone_visible();
+        let mut mask = vec![false; 2 * 4];
+        mask[0] = true; // (0,0) changed; (0,1) unchanged
+
+        let defaults = shux_vt::TerminalDefaultColors {
+            bg: Some([32, 64, 96]),
+            ..shux_vt::TerminalDefaultColors::default()
+        };
+        let png = render_lens_heat_png(&raster, &grid, defaults, &mask, 2, 4).unwrap();
+        let img = image::load_from_memory(&png)
+            .expect("decode heat")
+            .to_rgba8();
+        let (cw, _ch) = raster.cell_size();
+
+        // Changed cell (0,0): blend(HEAT=(163,38,56), α=128) over (32,64,96)
+        // with truncating integer math = (97, 50, 75).
+        let p = img.get_pixel(1, 1);
+        assert_eq!((p[0], p[1], p[2]), (97, 50, 75), "heat over CURRENT bg");
+
+        // Unchanged cell (0,1): desaturate((32,64,96)) — gray=(32·77+64·150+
+        // 96·29)>>8 = 58 → ((32+58)/2, (64+58)/2, (96+58)/2) = (45, 61, 77).
+        let p = img.get_pixel(cw + 1, 1);
+        assert_eq!(
+            (p[0], p[1], p[2]),
+            (45, 61, 77),
+            "desaturated CURRENT bg on unchanged cells"
+        );
+        // Same render with the builtin default bg (None) must differ — the
+        // base provably derives from the passed defaults, not a constant.
+        let png_builtin = render_lens_heat_png(
+            &raster,
+            &grid,
+            shux_vt::TerminalDefaultColors::default(),
+            &mask,
+            2,
+            4,
+        )
+        .unwrap();
+        assert_ne!(png, png_builtin);
+    }
+
+    /// P4 DoD (council D2) — the diff is independent of `DirtyState`: it reads
+    /// cell VALUES from `clone_visible` clones, never the render-drained dirty
+    /// flags. Simulate a concurrently-attached render client by DRAINING the
+    /// VT's dirty regions between the checkpoint clone and the current clone;
+    /// the diff still reports the exact delta.
+    #[test]
+    fn compute_lens_diff_independent_of_dirtystate_drains() {
+        let mut vt = shux_vt::VirtualTerminal::new(6, 20);
+        // Frame A: a truecolor 'X' at grid (1,1).
+        vt.process(b"\x1b[2;2H\x1b[38;2;220;40;40mX\x1b[0m");
+        let cp_grid = vt.grid().clone_visible();
+        let cp_cursor = {
+            let c = vt.cursor();
+            (c.row, c.col, c.visible)
+        };
+        // A render client drains DirtyState (as the attach compositor would).
+        let _ = vt.take_dirty_regions();
+        assert!(!vt.is_dirty(), "drain cleared dirty flags");
+
+        // Frame B: recolour that SAME cell (style-only) + add a second cell.
+        vt.process(b"\x1b[2;2H\x1b[38;2;40;210;210mX\x1b[0m\x1b[3;5H\x1b[44mZ\x1b[0m");
+        // Client drains AGAIN mid-flight — the diff must not care.
+        let _ = vt.take_dirty_regions();
+
+        let cur_grid = vt.grid().clone_visible();
+        let cur_cursor = {
+            let c = vt.cursor();
+            (c.row, c.col, c.visible)
+        };
+        let diff = compute_lens_diff(
+            &cp_grid,
+            &cur_grid,
+            cp_cursor,
+            cur_cursor,
+            shux_vt::TerminalDefaultColors::default(),
+            shux_vt::TerminalDefaultColors::default(),
+        );
+        // (1,1) style change + (2,4) new glyph = exactly 2 cells, despite the
+        // dirty drains straddling the checkpoint.
+        assert_eq!(diff.cells_changed, 2, "value-based diff, dirty-independent");
+        assert_eq!(diff.changed_rows, vec![1, 2]);
+        assert!(diff.changed_mask[20 + 1], "recoloured cell (1,1) counts");
+        assert!(diff.changed_mask[2 * 20 + 4], "new cell (2,4) counts");
+        assert!(!diff.regions_truncated);
+        // Half-open bbox spanning rows 1..3, cols 1..5.
+        assert_eq!(diff.bounding_box, (1, 1, 3, 5));
+    }
+
+    /// LENS-R-034 wide-glyph pairing: if either half of a wide glyph changes,
+    /// both the head and its spacer cell count.
+    #[test]
+    fn compute_lens_diff_wide_glyph_pairs_spacer() {
+        let mut vt = shux_vt::VirtualTerminal::new(4, 20);
+        let cp_grid = vt.grid().clone_visible();
+        let cp_cursor = (0, 0, true);
+        // Draw a fullwidth CJK glyph at (0,0) — occupies cols 0 (head) + 1
+        // (spacer).
+        vt.process("\x1b[1;1H\u{7d42}".as_bytes()); // 終 (width 2)
+        let cur_grid = vt.grid().clone_visible();
+        let diff = compute_lens_diff(
+            &cp_grid,
+            &cur_grid,
+            cp_cursor,
+            (0, 2, true),
+            shux_vt::TerminalDefaultColors::default(),
+            shux_vt::TerminalDefaultColors::default(),
+        );
+        assert_eq!(diff.cells_changed, 2, "wide head + spacer both count");
+        assert!(diff.changed_mask[0], "head counts");
+        assert!(diff.changed_mask[1], "spacer counts");
+        // One merged span [0,2) on row 0.
+        assert_eq!(diff.regions.len(), 1);
+        assert_eq!(
+            (
+                diff.regions[0].row,
+                diff.regions[0].col_start,
+                diff.regions[0].col_end
+            ),
+            (0, 0, 2)
+        );
+    }
+
+    /// LENS-R-037 heat PNG is deterministic: identical inputs → byte-identical
+    /// PNG (the golden-stability contract).
+    #[test]
+    fn heat_png_is_deterministic() {
+        let raster = shux_raster::Rasterizer::new(14.0).expect("bundled font");
+        let mut vt = shux_vt::VirtualTerminal::new(4, 10);
+        vt.process(b"\x1b[1;1H\x1b[41mAB\x1b[0m");
+        let grid = vt.grid().clone_visible();
+        let mask = {
+            let mut m = vec![false; 4 * 10];
+            m[0] = true; // mark (0,0) changed
+            m
+        };
+        let a = render_lens_heat_png(&raster, &grid, vt.default_colors(), &mask, 4, 10).unwrap();
+        let b = render_lens_heat_png(&raster, &grid, vt.default_colors(), &mask, 4, 10).unwrap();
+        assert_eq!(a, b, "same inputs → byte-identical heat PNG");
+        assert!(!a.is_empty());
     }
 
     fn write_plugin_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {

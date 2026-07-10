@@ -1,0 +1,61 @@
+{
+  "task": "077-shux-lens (Phase P4 — pane.checkpoint + pane.diff_since; SOLID scope = heat-PNG rendering §14)",
+  "audited_branch": "feat/lens-p4-checkpoint-diff",
+  "audited_commit_head": "2c348e7",
+  "origin_main_base": "d3b6282",
+  "audited_at_utc": "2026-07-10",
+  "auditor": "shux-vt-solid-qa (independent SOLID VT QA gate)",
+  "solid_qa_report": ".shux/qa/lens-p4/SOLID-QA.md",
+  "dootsabha_design": {
+    "status": "NOT_PRESENT_FOR_P4",
+    "note": "No P4-specific design-council artifact is committed. The lens PRD §2.4 design convergence was run at the umbrella-task level (P0/P2 rounds documented in docs/tasks/077-shux-lens.md 'P0 phase-diff council' + 'P2 codex/ship' sections and .shux/qa/lens-p2/council/). P4 design was carried by the PRD §7 SPEC-D (LENS-R-030..038) which the frozen red suite pins.",
+    "p2_council_precedent": [".shux/qa/lens-p2/council/lens-p2-claude-full2.json", ".shux/qa/lens-p2/council/lens-p2-codex.json"],
+    "gate_owner": "orchestrator (downstream, per task Status: 'Awaiting ... convergence review ... before push')"
+  },
+  "dootsabha_implementation": {
+    "status": "PENDING_DOWNSTREAM",
+    "note": "The P4 implementation-diff converging dootsabha review is a REQUIRED task DoD (§2.4) but is explicitly sequenced AFTER this SOLID VT QA gate per the task Status ('Awaiting SOLID VT QA (heat scope) + convergence review + orchestrator golden sign-off before push'). No committed P4 impl-council verdict exists yet. This SOLID gate is a prerequisite input to that review, not a substitute for it. Flagged as an outstanding pre-push gate; OUT of the heat-PNG/VT scope the parent narrowed this gate to.",
+    "gate_owner": "orchestrator (downstream)"
+  },
+  "screenshots": [
+    {
+      "name": "d2_heat",
+      "committed_golden": ".shux/goldens/lens/d2_heat.png",
+      "audit_rerender": ".shux/qa/lens-p4/evidence/d2_heat.rerender.png",
+      "scratch_rerender": ".shux/out/lens-p4/rerender/d2_heat.png",
+      "diff_png": ".shux/out/lens-p4/rerender/d2_heat_diff.png",
+      "size": "720x456",
+      "sha256": "deef295d5c3d55aeadfdb974fbe96a6b385806e790a8d846a35c77e9182e503e",
+      "render_scope": "NEW rendering (LENS-R-037 heat overlay) — full SOLID gate",
+      "visual_verdict": "PASS — red heat tint on exactly the 10 F4 changed cells (red block at (2,2), 'A-PRESSED' at row5); title/marker/colour-legend visibly ~50% desaturated; colour present, no monochrome/tofu."
+    },
+    {
+      "name": "a1_alt",
+      "committed_golden": ".shux/goldens/lens/a1_alt.png",
+      "audit_rerender": ".shux/qa/lens-p4/evidence/a1_alt.rerender.png",
+      "scratch_rerender": ".shux/out/lens-p4/rerender/a1_alt.png",
+      "diff_png": ".shux/out/lens-p4/rerender/a1_alt_diff.png",
+      "size": "720x456",
+      "sha256": "0a7906120336b191ef8b22749082321b2f3b1dc75fdf925b7fa3ca17c39fe1e4",
+      "render_scope": "raster-UNTOUCHED (P2 glance path) — §14 ratification",
+      "visual_verdict": "PASS — magenta 'ALT-SCREEN' + three magenta frame blocks (truecolor/256/basic), cursor block bottom-right; full colour, no tofu."
+    },
+    {
+      "name": "a1_normal",
+      "committed_golden": ".shux/goldens/lens/a1_normal.png",
+      "audit_rerender": ".shux/qa/lens-p4/evidence/a1_normal.rerender.png",
+      "scratch_rerender": ".shux/out/lens-p4/rerender/a1_normal.png",
+      "diff_png": ".shux/out/lens-p4/rerender/a1_normal_diff.png",
+      "size": "720x456",
+      "sha256": "a27b5e05352f40a1ab453888dd3eebd8b630e2c1a2f25673f133aed70d8ab5b9",
+      "render_scope": "raster-UNTOUCHED (P2 glance path) — §14 ratification",
+      "visual_verdict": "PASS — 'LENS-F10-ALT' white + 'NORMAL-SCREEN' green + 256-colour strip + basic-colour blocks (restored startup frame); full colour, no tofu."
+    }
+  ],
+  "pixel_metrics": [
+    {"golden": "d2_heat", "metric_json": ".shux/qa/lens-p4/pixel-metrics/d2_heat.json", "changed_pixels": 0, "pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "byte_cmp": "identical", "status": "pass"},
+    {"golden": "a1_alt", "metric_json": ".shux/qa/lens-p4/pixel-metrics/a1_alt.json", "changed_pixels": 0, "pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "byte_cmp": "identical", "status": "pass"},
+    {"golden": "a1_normal", "metric_json": ".shux/qa/lens-p4/pixel-metrics/a1_normal.json", "changed_pixels": 0, "pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "byte_cmp": "identical", "status": "pass"}
+  ],
+  "verdict": "PASS (SOLID VT QA heat/raster scope)"
+}
