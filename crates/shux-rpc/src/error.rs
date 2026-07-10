@@ -326,6 +326,19 @@ mod tests {
         assert_eq!(json["data"]["size"], 20_000_000);
     }
 
+    /// Sorted key list of an error's `data` object (wire-shape pinning).
+    fn data_keys(err: &RpcError) -> Vec<String> {
+        let json = serde_json::to_value(err).unwrap();
+        let mut keys: Vec<String> = json["data"]
+            .as_object()
+            .expect("error data is an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
     #[test]
     fn test_stale_revision_error() {
         // lens PRD §7.1 LENS-R-033: -32010 with {requested, available:[u64]}.
@@ -335,6 +348,9 @@ mod tests {
         assert_eq!(json["message"], "stale_revision");
         assert_eq!(json["data"]["requested"], 7);
         assert_eq!(json["data"]["available"], serde_json::json!([3, 5, 6]));
+        // Wire-shape pin (codex P4 convergence major, adjudicated — PRD §7.3):
+        // EXACTLY these fields, nothing more, nothing fewer.
+        assert_eq!(data_keys(&err), vec!["available", "requested"]);
     }
 
     #[test]
@@ -347,6 +363,10 @@ mod tests {
         assert_eq!(json["message"], "resize_invalidated");
         assert_eq!(json["data"]["requested"], 4);
         assert_eq!(json["data"]["invalidated_at"], 9);
+        // Wire-shape pin (codex P4 convergence major, adjudicated — PRD §7.3
+        // amended to document the richer agent-first payload): EXACTLY
+        // {requested, invalidated_at, hint}.
+        assert_eq!(data_keys(&err), vec!["hint", "invalidated_at", "requested"]);
     }
 
     #[test]
