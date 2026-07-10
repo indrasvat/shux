@@ -996,3 +996,32 @@ remaining items, both fixed on-branch:
    (`verify_chain_rejects_direct_rotated_file_arguments`): a real rotation
    → both entrypoints reject the `.1` path; the live-path set walk stays
    the working API.
+
+## P5 convergence round 5 (2026-07-10 — codex: both round-4 items FIXED, all probes clean; ONE blocking branch; fixed)
+
+Codex round 5 on the round-4 delta: both items FIXED, all probes clean
+(ghost panes safe, seed-before-serve verified, quota starvation ruled
+intentional, no double-reap). One blocking branch left, fixed on-branch:
+
+**seed_unresolved's unparseable-session_id arm** logged and continued —
+the row never entered `inner.rows`, so the next normal persist rewrote the
+file without it: the same clobber class, one branch deep. Fix (per the
+adjudication — the kill sequence only needs the PGID, so don't skip the
+kill): `seed_opaque_row` retries the kill INLINE at seed time via
+`kill_with_retry` (the round-2 bounded-retry logic refactored to expose
+the final `KillOutcome`; `kill_confirmed` is now a thin bool wrapper).
+Confirmed → audited (`scratch.reap`, `reason=registry`, the RAW string as
+`session_id`, `killed` honest per Died/AlreadyDead) and dropped;
+Unconfirmed → the row joins a new `RegistryInner.opaque_unresolved` list
+that `persist()` serializes alongside `inner.rows` on EVERY write (and
+that counts toward the quota, consistent with seeded rows), so the next
+incarnation's startup reap — which never needed the id to parse — picks it
+up again. Never silently lost, exactly as the invariant states.
+Lifecycle test
+(`production_opaque_malformed_id_rows_survive_persists_and_resolve`):
+well-formed row with a non-UUID `session_id` + real orphaned group +
+forced-unconfirmed startup → seed (inline kill also unconfirmed → opaque)
+→ a NORMAL `lens.run` persist keeps the malformed row in the file (the
+round-5 bug bit exactly here) → the normal scratch's removal-persist keeps
+it too → flag cleared, next startup confirms the kill: row leaves, file
+cleared, audit entry present with the raw id and `killed: true`.

@@ -1542,13 +1542,15 @@ async fn run_rpc_server(
     // reaper so the RUNNING daemon retries the kill. Seeding happens
     // before the RPC server accepts connections, so the very first
     // lens.run sees them in the quota.
-    scratch_registry.seed_unresolved(
-        unresolved_scratch,
-        &graph_handle,
-        &io_state,
-        &event_bus,
-        Duration::from_secs(1),
-    );
+    scratch_registry
+        .seed_unresolved(
+            unresolved_scratch,
+            &graph_handle,
+            &io_state,
+            &event_bus,
+            Duration::from_secs(1),
+        )
+        .await;
 
     // Load user config (~/.config/shux/config.toml). Missing file is
     // valid — defaults match current hardcoded behavior. Spawn a watcher
@@ -8734,13 +8736,16 @@ mod tests {
         // Seed the LIVE registry (test-friendly retry delay: long enough
         // to deterministically observe the survive-a-normal-persist
         // window first).
-        harness.scratch_registry.seed_unresolved(
-            unresolved,
-            &harness.graph,
-            &harness.io,
-            &harness.bus,
-            Duration::from_secs(3),
-        );
+        harness
+            .scratch_registry
+            .seed_unresolved(
+                unresolved,
+                &harness.graph,
+                &harness.io,
+                &harness.bus,
+                Duration::from_secs(3),
+            )
+            .await;
         assert_eq!(
             harness.scratch_registry.test_total(),
             1,
@@ -8791,6 +8796,116 @@ mod tests {
         );
 
         kill_scratch_and_wait(&harness, &normal_sid).await;
+        harness.stop().await;
+    }
+
+    /// P5 round-5 codex — the LAST clobber branch: a recovered row whose
+    /// session_id does not parse could never enter inner.rows, so the next
+    /// normal persist rewrote the file without it. The kill only needs the
+    /// PGID: seed retries it inline; an unconfirmed kill parks the row on
+    /// the OPAQUE list that every persist serializes alongside inner.rows,
+    /// and the next startup reap resolves it (audited with the raw id).
+    #[tokio::test]
+    async fn production_opaque_malformed_id_rows_survive_persists_and_resolve() {
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let dir = harness._scratch_dir.path().to_path_buf();
+        let reg_path = dir.join("scratch-registry.json");
+
+        // A real orphaned group from a "previous daemon" (leader exits;
+        // the sleep keeps the group alive, reparented away from us so a
+        // later kill leaves no zombie for the death probe).
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 300 & exit 0"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan group");
+        let pgid = child.id();
+        let _ = child.wait();
+
+        // Well-formed row, NON-UUID session id.
+        let raw_id = "not-a-uuid-scratch-row";
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "session_id": raw_id,
+                "pgid": pgid,
+                "start_time": 0,
+                "created_at": 1,
+                "max_runtime_deadline": 2,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Forced-unconfirmed startup + seed: the inline kill is
+        // unconfirmed too, so the row parks on the opaque list.
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        assert_eq!((killed, unresolved.len()), (0, 1));
+        harness
+            .scratch_registry
+            .seed_unresolved(
+                unresolved,
+                &harness.graph,
+                &harness.io,
+                &harness.bus,
+                Duration::from_secs(3),
+            )
+            .await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!(
+            harness.scratch_registry.test_total(),
+            1,
+            "opaque row counts toward the quota"
+        );
+
+        // A NORMAL lens.run triggers a normal persist — the round-5 bug
+        // was exactly here: the rewrite dropped the opaque row.
+        let run = dispatch_ok(
+            &harness.router,
+            "lens.run",
+            serde_json::json!({"argv": ["sleep", "30"]}),
+        )
+        .await;
+        let normal_sid = run["session_id"].as_str().unwrap().to_string();
+        let text = std::fs::read_to_string(&reg_path).expect("registry persisted");
+        assert!(
+            text.contains(raw_id),
+            "opaque malformed-id row SURVIVES the normal persist:\n{text}"
+        );
+        assert!(text.contains(&normal_sid), "normal row persisted too");
+
+        // Clear the normal scratch, then the "next startup" resolves the
+        // opaque row for real: kill confirmed, row gone, audited with the
+        // RAW id.
+        kill_scratch_and_wait(&harness, &normal_sid).await;
+        let text = std::fs::read_to_string(&reg_path).expect("opaque row still persisted");
+        assert!(
+            text.contains(raw_id),
+            "opaque row survives the normal scratch's removal persist too"
+        );
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        assert_eq!(killed, 1, "the next startup confirms the kill");
+        assert!(unresolved.is_empty());
+        assert!(!reg_path.exists(), "registry cleared once resolved");
+        let audit_text = std::fs::read_to_string(dir.join("lens-audit.ndjson")).unwrap_or_default();
+        assert!(
+            audit_text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| e["method"] == "scratch.reap"
+                    && e["reason"] == "registry"
+                    && e["session_id"] == raw_id
+                    && e["killed"] == true),
+            "the resolution is audited with the raw id:\n{audit_text}"
+        );
+
         harness.stop().await;
     }
 
