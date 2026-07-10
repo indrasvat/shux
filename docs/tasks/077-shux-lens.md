@@ -1025,3 +1025,27 @@ forced-unconfirmed startup → seed (inline kill also unconfirmed → opaque)
 round-5 bug bit exactly here) → the normal scratch's removal-persist keeps
 it too → flag cleared, next startup confirms the kill: row leaves, file
 cleared, audit entry present with the raw id and `killed: true`.
+
+## P5 convergence round 6 (2026-07-10 — codex: everything clean EXCEPT one durable-drop gap; fixed)
+
+Codex round 6 on the round-5 delta: everything clean except one gap —
+`seed_opaque_row`'s confirmed-dead arm audited and returned WITHOUT
+persisting, but `startup_reap` had already re-persisted that row to disk
+before returning it for seeding. Until some unrelated later persist,
+`scratch-registry.json` still contained the resolved row; a daemon
+restart in that window would reprocess it and duplicate the registry
+reap audit. Fix: the confirmed-dead arm persists immediately after the
+audit — the row is in neither `inner.rows` nor `opaque_unresolved` at
+that point, so a plain `persist()` reflects the drop durably (and
+removes the file when it was the last row). Checked the PARSEABLE
+seeding path for the same gap (per the adjudication): its resolution
+goes through `registry.remove`, which persists as part of itself — never
+incidentally — so no equivalent change was needed (noted in the code
+comment). Test
+(`production_confirmed_opaque_resolution_is_durably_dropped`):
+forced-unconfirmed startup leaves the malformed-id row persisted (the
+window's precondition) → seed with the flag cleared confirms the kill →
+IMMEDIATELY (before any other activity) the row is gone from disk, the
+quota slot is free, and exactly ONE reap audit exists → simulated
+restart (`startup_reap` again) finds nothing to reprocess and the audit
+count stays at one.

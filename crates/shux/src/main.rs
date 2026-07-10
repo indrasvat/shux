@@ -8909,6 +8909,99 @@ mod tests {
         harness.stop().await;
     }
 
+    /// P5 round-6 codex — durable confirmed-drop: startup_reap re-persists
+    /// an unresolved row BEFORE returning it for seeding; when the seed's
+    /// inline kill then CONFIRMS death, the audit-and-return used to leave
+    /// the resolved row on disk until some unrelated later persist — a
+    /// daemon restart in that window reprocessed it and duplicated the
+    /// registry reap audit. The confirmed arm now persists immediately.
+    #[tokio::test]
+    async fn production_confirmed_opaque_resolution_is_durably_dropped() {
+        use std::sync::atomic::Ordering;
+        let harness = RpcHarness::new();
+        let dir = harness._scratch_dir.path().to_path_buf();
+        let reg_path = dir.join("scratch-registry.json");
+
+        // Real orphaned group whose kill WILL confirm once unforced.
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 300 & exit 0"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan group");
+        let pgid = child.id();
+        let _ = child.wait();
+
+        let raw_id = "not-a-uuid-durable-drop";
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "session_id": raw_id,
+                "pgid": pgid,
+                "start_time": 0,
+                "created_at": 1,
+                "max_runtime_deadline": 2,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Forced-unconfirmed startup: the row comes back unresolved AND
+        // stays re-persisted on disk — the round-6 window's precondition.
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(true, Ordering::SeqCst);
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        lens_scratch::TEST_FORCE_UNCONFIRMED_KILL.store(false, Ordering::SeqCst);
+        assert_eq!((killed, unresolved.len()), (0, 1));
+        assert!(
+            std::fs::read_to_string(&reg_path).unwrap().contains(raw_id),
+            "precondition: startup left the unresolved row persisted"
+        );
+
+        // Seed with the flag CLEARED: the inline kill confirms death.
+        harness
+            .scratch_registry
+            .seed_unresolved(
+                unresolved,
+                &harness.graph,
+                &harness.io,
+                &harness.bus,
+                Duration::from_secs(3),
+            )
+            .await;
+
+        // IMMEDIATELY (before any other activity): the drop is durable —
+        // the resolved row is gone from disk (file removed: it was the
+        // only row), and the quota slot is free.
+        assert!(
+            !std::fs::read_to_string(&reg_path)
+                .map(|t| t.contains(raw_id))
+                .unwrap_or(false),
+            "confirmed-dead row must leave the disk immediately"
+        );
+        assert_eq!(harness.scratch_registry.test_total(), 0, "quota slot free");
+        let audit_path = dir.join("lens-audit.ndjson");
+        let count_reaps = || {
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|e| e["method"] == "scratch.reap" && e["session_id"] == raw_id)
+                .count()
+        };
+        assert_eq!(count_reaps(), 1, "exactly one reap audit after resolution");
+
+        // Simulated restart: nothing left to reprocess, no duplicate audit.
+        let (killed, unresolved) =
+            lens_scratch::ScratchRegistry::startup_reap(&dir, &harness.lens_audit).await;
+        assert_eq!((killed, unresolved.len()), (0, 0), "nothing to reprocess");
+        assert_eq!(count_reaps(), 1, "no duplicate reap audit after restart");
+
+        harness.stop().await;
+    }
+
     /// Bare `shux` / `shux attach` target choice never lands on a scratch
     /// session (P5 round-1 minor — attach guard), whether flagged
     /// `scratch: true` or recognizable by the reserved name prefix.

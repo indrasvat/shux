@@ -970,6 +970,19 @@ impl ScratchRegistry {
                 "pgid": row.pgid,
                 "killed": outcome == KillOutcome::Died,
             }));
+            // Durable drop (P5 round-6 codex): startup_reap re-persisted
+            // this row to disk BEFORE returning it for seeding — without
+            // an immediate persist here, scratch-registry.json keeps the
+            // now-resolved row until some unrelated later persist, and a
+            // daemon restart in that window would reprocess it and
+            // duplicate the registry reap audit. The row is in neither
+            // `rows` nor `opaque_unresolved` at this point, so a plain
+            // persist reflects the drop (and removes the file when this
+            // was the last row). The PARSEABLE seeding path needs no
+            // equivalent: its resolution goes through `registry.remove`,
+            // which persists as part of itself, never incidentally.
+            let inner = self.lock_inner();
+            self.persist(&inner);
             return;
         }
         tracing::error!(

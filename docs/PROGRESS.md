@@ -104,6 +104,11 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-10 — fix(lens): P5 convergence round 6 — durable confirmed-drop of resolved opaque rows (task 077, gate 35/2 held)**
+- Codex round 6: everything clean except one durable-drop gap — `seed_opaque_row`'s confirmed-dead arm audited and returned without persisting, while `startup_reap` had already re-persisted the row; a restart in that window reprocessed the resolved row and duplicated the registry reap audit. Fixed: the confirmed arm persists immediately after the audit (row is in neither `rows` nor `opaque_unresolved` → the persist reflects the drop durably; file removed when it was the last row). PARSEABLE-path check per adjudication: resolution goes through `registry.remove`, which persists as part of itself — no equivalent gap.
+- Test (`production_confirmed_opaque_resolution_is_durably_dropped`): forced-unconfirmed startup leaves the row persisted → unforced seed confirms the kill → IMMEDIATELY: row gone from disk, quota free, exactly one reap audit → simulated restart reprocesses nothing, audit count stays one.
+- Gates: `make test-lens` 35/2 (same golden-only reds) · new-test set 30/30 · full lanes 1199/1199 across 24 suites · lint clean · leak-guard clean. NO push (final lean pass on this commit).
+
 **2026-07-10 — fix(lens): P5 convergence round 5 — opaque carry of malformed-id unresolved rows (task 077, gate 35/2 held)**
 - Codex round 5: both round-4 items FIXED, all probes clean; ONE blocking branch — `seed_unresolved`'s unparseable-session_id arm logged and continued, so the row never entered `inner.rows` and the next normal persist clobbered it (same class, one branch deep). Fixed:
 - The kill only needs the PGID: `seed_opaque_row` retries the kill INLINE at seed time (`kill_with_retry` exposes the final KillOutcome; `kill_confirmed` is a bool wrapper). Confirmed → audited with the RAW id (`killed` honest per Died/AlreadyDead) and dropped; Unconfirmed → the row joins the new `opaque_unresolved` list that `persist()` serializes alongside `inner.rows` on every write and that counts toward quota — the next incarnation's startup reap (which never parses the id) retries it. Never silently lost.
