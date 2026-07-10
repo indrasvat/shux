@@ -652,23 +652,26 @@ not construct a PID-reuse adversarial case).
 restart + zero-orphan + registry-file-removed + audit(reason=registry)
 proof). The 2 reds are K1 and E1 — BOTH fail at the identical root cause,
 `golden not found` (`k1_pos1.png` / `e1_glance.png`), not a functional or
-logic failure: E1's full call sequence (`lens.run` → `wait_for` → settle →
-`glance --checkpoint` → drive `a` → settle → `diff` with `heat_png:true`)
-runs to completion and asserts `cells_changed:10` + exact regions
-successfully — it only fails at the FIRST `assert_png_golden` call, which
-mints no golden if missing (§16.3: an implementation PR may never mint a
-golden in the same PR that changes rendering code, but conversely also
-never mints one silently). Per this task's brief ("if you find you must …
-mint a golden: STOP and message the orchestrator first"), no goldens were
-minted — K1/E1 stay red pending an explicit decision on whether E1's
-goldens (raster-UNTOUCHED — `pane.glance`/`pane.diff_since`'s rendering
-code is P2/P4-approved and unmodified in this phase) get pulled into P5 via
-the same "golden ratification for raster-untouched phases" path P3 used
-for `s1_ready.png`, or deferred to P6 (where the PRD's own phase table
-places E1's green gate). Other lanes: `make lint` clean (clippy -D
-warnings + fmt-check) · `make test` 210/210 · `make test-rpc` 45/45
-(+2 new error-code tests) · `make test-vt-corpus` byte-exact (no
-raster/VT source touched) · every daemon-backed run under
+logic failure. Precisely (verifier-corrected): E1 panics at its FIRST
+`assert_png_golden` call (`lens_loop.rs:99`, `e1_glance.png`) — i.e. after
+`lens.run` → `wait_for` → settle → `glance --checkpoint` succeed but
+BEFORE the drive→diff tail, so the frozen suite itself never reaches the
+`cells_changed:10` assertion. The tail's correctness was proven by the P5
+verifier's own independent live drive (send `a` → settle → diff on the E1
+scratch: exact 10-cell delta + exact regions), not by the frozen test.
+`assert_png_golden` mints no golden if missing (§16.3), and per this
+task's brief ("if you find you must … mint a golden: STOP and message the
+orchestrator first"), no goldens were minted — K1/E1 stay red pending an
+explicit decision on whether E1's goldens (raster-UNTOUCHED —
+`pane.glance`/`pane.diff_since`'s rendering code is P2/P4-approved and
+unmodified in this phase) get pulled into P5 via the same "golden
+ratification for raster-untouched phases" path P3 used for `s1_ready.png`,
+or deferred to P6 (where the PRD's own phase table places E1's green
+gate). Other lanes: `make lint` clean (clippy -D warnings + fmt-check) ·
+`make test` **1163/1163 across 23 suites** (the "210" previously reported
+here was the shux bin-lane count alone — verifier-corrected) ·
+`make test-rpc` 45/45 (+2 new error-code tests) · `make test-vt-corpus`
+byte-exact (no raster/VT source touched) · every daemon-backed run under
 `.shux/scripts/no_leak_guard.sh -j 1`, zero leaked `shux` processes or
 orphan fixture procs (confirmed both by the leak guard's own pass-through
 exit code and a separate manual smoke test: `lens run` with real
@@ -676,3 +679,135 @@ truecolor+256-color+basic-ANSI content, `session list --include-scratch`,
 glance text readback, registry-file schema, audit-chain readback, explicit
 `session kill`, and a daemon-restart registry-reap cycle — every artifact
 matched expectations, no residue).
+
+**Known CLI-polish note (P6):** `lens run --wait` on a child killed by
+`max_runtime` exits 255 — the child dies by signal, so `exit_status` is
+`None`, the handler reports `exit_code: -1`, and `std::process::exit(-1)`
+becomes 255. §10's precedence rule ("once the child has started, the CLI's
+exit code is the child's") has no defined mapping for signal deaths;
+documenting a shell-conventional `128+signo` mapping (or keeping 255) is
+P6 CLI-polish material.
+
+## P5 convergence round 1 (2026-07-10 — 3 blockers + 4 majors + 6 minors, all fixed)
+
+Verifier VERIFIED-WITH-NOTES (and REFUTED the E1-tail receipt — corrected
+above). Codex NOT CONVERGED (3B+4M+1m), claude NOT CONVERGED (2M ≡ codex's
++ 6 minors). All fixed on-branch:
+
+1. **B1 (codex ≡ claude M1) — quota TOCTOU:** `registry.len()` at the top
+   of `handle_lens_run` vs the insert after spawn let 2+ concurrent
+   `lens.run` calls at 15/16 both pass → 17 scratch. Fix: atomic
+   check-and-reserve in ONE critical section (`ScratchRegistry::try_reserve`
+   → `ScratchReservation`, a quota slot counted as `rows + reserved` under
+   one `std::sync::Mutex`); the reservation releases on EVERY failure path
+   by `Drop` and converts into the committed row via `commit()` (release +
+   insert + persist in one critical section). Tests: unit
+   (`reserve_admits_exactly_one_at_the_last_slot`,
+   `dropped_reservation_releases_its_slot`, `committed_reservation_…`) +
+   PRODUCTION-router concurrency
+   (`production_lens_run_quota_is_atomic_under_concurrent_calls`: occupy
+   15, `tokio::join!` two real lens.run dispatches → exactly one wins,
+   loser -32012, kill winner → retry succeeds; zero sleeps) and
+   `production_lens_run_failed_spawn_releases_its_reservation` (SPAWN_FAILED
+   at 15/16 → slot reusable).
+
+2. **B2 (codex ≡ claude N2) — registry not crash-safe:** `persist()` used
+   `std::fs::write` (truncate-in-place) — a crash mid-write left partial
+   JSON that `startup_reap` then discarded AND deleted, killing nothing
+   (DEC-7 violation). Fix: temp-file + `rename` atomic persist; on parse
+   failure the file is PRESERVED as `scratch-registry.json.corrupt`
+   (renamed, `tracing::error!`, never silently deleted, nothing killed —
+   the evidence is what an operator needs). Tests:
+   `persist_is_atomic_rename_and_leaves_no_temp_file`,
+   `startup_reap_preserves_corrupt_registry_as_evidence` (truncated JSON →
+   0 killed, `.corrupt` holds the original bytes).
+
+3. **B3 (codex) + SIGHUP-vs-SIGTERM major, fixed together:** the reap
+   delegated to `teardown_panes` (which only SPAWNS waiters; the actual
+   kill ran later in the PTY task via `handle.terminate()` = SIGHUP) while
+   the registry row was removed immediately — daemon death in the gap
+   orphaned the group with no row, and the signal violated LENS-R-042's
+   "killpg(SIGTERM), 500 ms grace, killpg(SIGKILL)". Fix: the scratch reap
+   path now performs its OWN synchronous LENS-R-042 sequence
+   (`kill_pgid_lens_sequence`: probe → SIGTERM → 500 ms bounded grace →
+   SIGKILL → bounded death confirmation) → close PTY (teardown) → remove
+   session → audit, and `registry.remove` runs ONLY after the group is
+   confirmed dead. Applied to both the timer reaper and
+   `on_session_killed`. Black-box proof
+   (`crates/shux/tests/scratch_reap_order.rs`, `make
+   test-lens-scratch-reap`): a TERM-trapping workload writes a marker
+   (TERM delivered first), survives into the grace window (registry row
+   still present right after the marker), then dies anyway (only SIGKILL
+   ends a TERM-ignoring loop), and the row disappears only after death;
+   audit reap(reason=max_runtime) asserted.
+
+4. **M3 (codex) — validate BEFORE casting:** cols/rows went through `as
+   u16` and ttl/runtime through `as u32` before the range check —
+   `{"cols": 66000}` wrapped to a legal 464, `{"post_exit_ttl_ms":
+   4294967297}` to 1. Fix: `ranged_u64_param` range-checks the FULL u64
+   (strict-typed: present-but-mistyped → INVALID_PARAMS, the P3 rule) and
+   only then casts (bounds provably fit). Tests: unit wrapping/type/bounds
+   quartet + production-router raw shapes
+   (`production_lens_run_rejects_wrapping_params_before_cast`).
+
+5. **M2 (codex ≡ claude M2/N1) — audit per LENS-R-052:** (a)
+   COMPLETENESS — glance/checkpoint/diff handlers now append entries with
+   the spec's fields (ts, caller, method, pane_id, revision(s),
+   bytes_returned = decoded payload); plugin permission DENIALS of lens
+   methods mirror into the daemon log via a new generic
+   `PluginManager::set_denial_hook` (shux-plugin stays lens-ignorant; the
+   per-plugin audit already recorded every denial — this adds the
+   daemon-level view with `caller: plugin:<uuid>`). (b) CONCURRENCY —
+   `LensAuditLog` serializes appends behind a mutex with the chain head
+   CACHED in memory (read once at open): no forked chains under concurrent
+   writers, no O(n²) whole-file re-read per append
+   (`audit_concurrent_appends_never_fork_the_chain`, 24 concurrent
+   appends → chain verifies, count exact). (c) ROTATION — 1 MiB cap,
+   keep-5, mirroring the plugin audit log; each rotated file carries its
+   own genesis-rooted chain (documented contract;
+   `audit_rotates_at_cap_and_restarts_the_chain`). (d) VERIFICATION —
+   `verify_chain()` recomputes every link;
+   `audit_chain_verifies_and_detects_tampering` proves a single-byte edit
+   is detected.
+
+6. **M4 (codex ≡ claude item-8, ADJUDICATED IMPLEMENT) — LENS-R-044
+   start-time match:** registry rows now carry the group leader's
+   OS-reported start token captured at registration (macOS:
+   `libc::proc_pidinfo(PROC_PIDTBSDINFO)` → `pbi_start_tvsec/usec`; Linux:
+   `/proc/<pid>/stat` field 22; cfg-gated, other platforms store 0 →
+   liveness-only fallback, logged). `startup_reap` kills only if alive AND
+   the token matches — a recycled PID is spared (row still cleared).
+   Tests with a REAL spawned group leader:
+   `startup_reap_spares_mismatched_start_token_but_clears_the_row`,
+   `startup_reap_kills_on_matching_start_token`. New direct dep: `libc`
+   (already in-tree transitively via nix; nix has no proc_pidinfo wrapper).
+
+7. **Minors:** (1) `session list` text mode renders a visible `[scratch]`
+   tag on the name and plain mode appends a 5th `scratch` column on
+   scratch rows only (ordinary rows keep the stable 4-column shape). (2)
+   Attach guard: bare `shux`/`shux attach` target choice extracted into
+   pure `choose_attach_session` — filters `scratch: true` AND the
+   `__scratch-` name prefix (defense in depth over the default-list
+   omission); unit-tested (`choose_attach_session_never_picks_scratch`).
+   PR-description note: `session.snapshot`/`events.watch` can still name a
+   scratch session by id — spec-conformant (LENS-R-041: "visibility ≠
+   authorization"). (3) pgid==0 rejected in `kill_pgid_lens_sequence`
+   (killpg(0) signals the daemon's own group) AND never persisted —
+   `handle_lens_run` rolls back if the spawned pane lost its pid
+   (`kill_sequence_refuses_pgid_zero`). (4) Reap dedup: `biased` selects
+   put the explicit-kill arm first, and a `claimed` flag on the registry
+   row makes reap ownership exactly-once (`claim()` — timer reaper and
+   explicit kill can never double-audit; `claim_is_exactly_once`); the
+   stale `remove` doc-comment rewritten. (5) Audit `caller` stays
+   hard-coded `"uds"` in handler entries — the RPC layer does NOT expose
+   caller identity to handlers; per adjudication no plumbing was invented,
+   and the minimal threading proposal is reported to the orchestrator
+   (task-local set by the plugin dispatch wrapper vs a Handler-signature
+   change). Denial entries DO carry `plugin:<uuid>` (the one place
+   identity is known). (6) Docs corrected per the verifier: E1 failure
+   point, 1163/1163 count, `--wait` 255 note (all above).
+
+**Policy-tier caveat for the PR description (both reviewers accepted
+Grantable):** the grant name is `lens.run`, not `scratch:create`;
+a Grantable-granted plugin inherits scratch-spawn authority — a
+pre-existing limit of the 4-tier permission model, not new surface.
