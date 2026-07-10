@@ -3,7 +3,7 @@
   "phase": "P2",
   "scope": "SOLID VT QA — pane.glance raster path (PRD §14 P2 row: glance PNG path vs existing snapshot goldens + F1/F5 goldens + determinism micro-test)",
   "branch": "feat/lens-p2-glance",
-  "audited_commit": "d3cd1b93afdfc00da87b8ba2130e314e662af445",
+  "audited_commit": "fd1e0d0e7ec8ecdc29335c151cff1a87d88ce162",
   "audited_utc": "2026-07-09",
   "auditor": "shux-vt-solid-qa subagent",
   "verdict": "PASS",
@@ -24,24 +24,24 @@
     {
       "id": "f1-glance-80x24",
       "path": ".shux/qa/lens-p2/evidence-f1-glance-80x24.png",
-      "source": "pane.glance, release binary, isolated XDG, fixture .shux/fixtures/lens/f1_static.sh at 80x24, revision 359",
+      "source": "pane.glance, release binary, isolated XDG + harness fixture-font chain, fixture .shux/fixtures/lens/f1_static.sh at 80x24 — RE-MINTED bytes; the QA re-pass's independent re-render was cmp byte-identical (SOLID-QA.md re-inspection, evidence row 3)",
       "size": [720, 456],
       "byte_identical_to_golden": ".shux/goldens/lens/g2_f1_80x24.png",
-      "visual_inspection": "PASS — rounded box border + LENS-F1-STATIC title; truecolor gradient bar; 256-color strip; 16-color blocks; Devanagari/CJK rows render as width-correct tofu (bundled font chain lacks those scripts, documented in BASELINE-APPROVAL + PRD §17); emoji row (checkmark/cross/warning) renders as real glyphs; cursor hidden; no corruption/bleed/artifacts."
+      "visual_inspection": "PASS — rounded box border + LENS-F1-STATIC title; truecolor gradient bar; 256-color strip; 16-color blocks; Devanagari row renders as REAL glyphs from the committed fixture font (per-codepoint, NO OpenType shaping — conjuncts/matras decomposed, KNOWN + ACCEPTABLE per the PRD §17 adjudication; zero replacement boxes); CJK row (終端 真実 テスト) renders as real fullwidth glyphs from the committed subset; emoji row (checkmark/cross/warning) real; cursor hidden; no corruption/bleed/artifacts."
     },
     {
       "id": "f5-glance-100x30",
       "path": ".shux/qa/lens-p2/evidence-f5-glance-100x30.png",
-      "source": "pane.glance, release binary, isolated XDG, fixture .shux/fixtures/lens/f5_wide.sh at 100x30, revision 216",
+      "source": "pane.glance, release binary, isolated XDG + harness fixture-font chain, fixture .shux/fixtures/lens/f5_wide.sh at 100x30 — RE-MINTED bytes; the QA re-pass's independent re-render was cmp byte-identical (SOLID-QA.md re-inspection, evidence row 3)",
       "size": [900, 570],
       "byte_identical_to_golden": ".shux/goldens/lens/g2w_f5_100x30.png",
-      "visual_inspection": "PASS — LENS-F5-WIDE title; heavy box-drawing cross joins; CJK fullwidth as width-correct tofu pairs; VS16 emoji row as real glyphs; combining Devanagari as tofu with real separators; truecolor gradient / 256-strip / 16-color blocks aligned to grid; cursor hidden; no wide-cell head/tail corruption."
+      "visual_inspection": "PASS — LENS-F5-WIDE title; heavy box-drawing cross joins; CJK fullwidth (終端 真実 テスト 界面) as REAL width-correct glyph pairs from the committed subset; VS16 emoji row real; combining Devanagari (क्षत्रिय · संस्कृति) as REAL glyphs rendered per-codepoint (decomposed, no shaping — adjudicated caveat) with real separators; truecolor gradient / 256-strip / 16-color blocks aligned to grid; cursor hidden; no wide-cell head/tail corruption."
     },
     {
       "id": "contact-sheet",
       "path": ".shux/goldens/lens/contact-sheet.png",
-      "source": "committed golden contact sheet (both goldens stacked, labelled)",
-      "visual_inspection": "PASS — both goldens readable at native resolution, labels correct."
+      "source": "committed golden contact sheet (both RE-MINTED goldens stacked, labelled)",
+      "visual_inspection": "PASS — both re-minted goldens readable at native resolution, labels correct; Devanagari/CJK tofu gone in both."
     }
   ],
   "pixel_metrics": {
@@ -54,13 +54,14 @@
   "golden_integrity": {
     "verified": true,
     "golden_sha256": {
-      "g2_f1_80x24.png": "9d20e89a2a0bdc36d96d75e2eade4f3a13a5e4a66e50c80bd8e222180fb4fc84",
+      "g2_f1_80x24.png": "ac4caf47981c8fb3583fd3c42d36dd5d6ab13ab6371745c5b504623b4c660f93",
       "g2_f1_80x24.txt": "7ba234e9e0ee54adfbac77a7e75b1309a9ebff698c3adff3f3e93ec67b4345a9",
-      "g2w_f5_100x30.png": "87f0cd16ba91532fab054041133698f42c846842ea5933aadea8d58a59c35ec7",
+      "g2w_f5_100x30.png": "5bf698ef152477675a2428aae870ccfab82c44340b136034cca8feffc351573a",
       "g2w_f5_100x30.txt": "092866409974f846e258799402fbd9deeb601224a0be1cd8d1edb622c226e060"
     },
+    "note": "PNG shas are the RE-MINTED fixture-font goldens (fd1e0d0), re-approved by the QA re-pass (SOLID-QA.md re-inspection); TXT goldens unchanged from the original mint (font-independent). Superseded tofu-mint PNG shas (9d20e89a…, 87f0cd16…) were the bytes the ORIGINAL audit passed at d3cd1b9.",
     "matches_golden_manifest": ".shux/goldens/lens/evidence-manifest.json (all 4 match)",
-    "font_bundle_verified": "all 5 OFL fonts in crates/shux-raster/assets match evidence-manifest font_files_sha256"
+    "font_bundle_verified": "all 5 builtin OFL fonts in crates/shux-raster/assets match the golden manifest builtin_font_files_sha256; both committed fixture fonts (.shux/fixtures/fonts/NotoSansDevanagari-Regular.ttf 306b53ec…, NotoSansJP-shuxlens-subset.ttf 82e8b3a5…) match its fixture_fonts entries"
   },
   "process_hygiene": {
     "leaked_shux_daemons": 0,
