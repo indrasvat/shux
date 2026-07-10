@@ -824,3 +824,87 @@ above). Codex NOT CONVERGED (3B+4M+1m), claude NOT CONVERGED (2M ≡ codex's
 Grantable):** the grant name is `lens.run`, not `scratch:create`;
 a Grantable-granted plugin inherits scratch-spawn authority — a
 pre-existing limit of the 4-tier permission model, not new surface.
+
+## P5 convergence round 2 (2026-07-10 — codex 1B+2M+2m; claude round-1 all-FIXED + 1M ≡ codex N1; all fixed)
+
+Codex round 2 on the round-1 delta: NOT CONVERGED — 1 new BLOCKER + 2 new
+MAJORS in the hard corners, 2 residual minors. Claude round 2 ruled ALL
+EIGHT round-1 findings FIXED with clean probes; its single MAJOR is
+identical to codex N1 (and it proved the window pre-exists in 27efecc).
+All fixed on-branch:
+
+1. **N1 (codex B ≡ claude M) — cancellable lens.run leaked unregistered
+   sessions/PTYs:** the shux-rpc server drops in-flight handler futures on
+   client disconnect (the P3 contract); a drop between graph-session
+   creation and registry commit leaked a phantom `__scratch-*` session —
+   visible in `session.list` as an ORDINARY session, uncounted by quota,
+   invisible to the restart registry (claude confirmed the PTY task's
+   shutdown binds to the ROOT daemon token, never the request, so
+   handler-drop can also never cascade teardown). Fix (the recommended
+   spawn-shield shape): the non-idempotent core (reserve → create session
+   → spawn PTY → commit + arm reaper → audit) now runs in its OWN spawned
+   task (`spawn_scratch_core`); the handler awaits its JoinHandle —
+   dropping a JoinHandle does not abort the task, so a disconnected client
+   simply never reads the response while the composite completes and the
+   ttl/max_runtime reaper owns the scratch from commit onward. The
+   `--wait` tail stays freely cancellable per P3 semantics. The task-local
+   caller identity is re-scoped around the spawned core (spawn does not
+   propagate task-locals), keeping scratch.create attribution truthful —
+   pinned by the existing `production_lens_audit_caller_identity`. Test
+   (`production_lens_run_dropped_mid_core_leaves_no_orphan`): two
+   deterministic interior pause points (`test_hooks::PAUSE_AFTER_CREATE`,
+   `PAUSE_BEFORE_COMMIT` — armed Notify pairs; the core signals reached
+   and blocks until released), the dispatch future is aborted mid-window
+   (the exact disconnect shape), the released core must COMMIT; asserts
+   no phantom (every `__scratch` graph session ∈ `registry.ids()`),
+   quota exact, full cleanup on kill, zero stray processes.
+
+2. **N2 (codex M) — startup reap orphaned same-group descendants:**
+   `process_start_token(pgid) == None` (leader gone) used to skip the
+   kill — but `sh -c 'sleep 999 & exit'` leaves the sleep IN the group
+   after the leader exits, and a pgid stays allocated (unrecyclable as a
+   new PID) while ANY member lives, so a live group with a dead leader is
+   OURS. Fix: leader-gone rows now go to the kill sequence, whose
+   `killpg(pgid, 0)` probe decides liveness. Residual edge (whole group
+   died AND the pgid was recycled by an unrelated NEW group inside the
+   restart window) is the same class as the §17 M14 double-fork
+   tolerance — noted here as the PRD-adjacent record. Test
+   (`startup_reap_kills_orphaned_descendants_when_leader_is_gone`): real
+   `sh -c 'sleep 300 & exit 0'` group, leader reaped, token unreadable,
+   group alive via the descendant → startup reap kills it (killpg probe
+   errs after); the recycled-PID mismatch test stays green.
+
+3. **N3 (codex M) — "kill confirmed" was not a real condition:**
+   `kill_pgid_lens_sequence` returned `true` even when the post-SIGKILL
+   confirmation loop timed out with the group still signalable, and
+   callers then removed the registry row — resurrecting the B3 orphan
+   window for stubborn/unreaped groups. Fix: honest `KillOutcome`
+   tri-state (AlreadyDead / Died / Unconfirmed); `kill_confirmed` retries
+   the full sequence once (500 ms backoff) and reports honestly;
+   `reap_scratch` returns `false` on unconfirmed (no teardown, no destroy,
+   no reap audit — ERROR log) and BOTH callers (`scratch_reaper`,
+   `on_session_killed`) leave the registry row for the next daemon's
+   startup reap. Injectable confirmation via
+   `TEST_FORCE_UNCONFIRMED_KILL` (short-circuits before any signal).
+   Tests: `forced_unconfirmed_kill_is_reported_honestly` (unit) +
+   `production_unconfirmed_kill_preserves_registry_row` (production
+   session.kill with the forced flag → row survives, no reap audited).
+
+4. **Minors:** (a) corrupt-registry evidence is timestamped
+   (`.json.corrupt.<unix_ms>`) so repeated corrupt startups never
+   overwrite earlier evidence (second-corruption case tested). (b) The
+   audit hash chain now CARRIES ACROSS rotated files: rotation writes an
+   `audit.rotate` header entry chained off the rotated-out file's final
+   hash (naming its predecessor as a historical label); new
+   `verify_chain_set` walks `.5→…→.1→live` as ONE chain, so deleting or
+   reordering an interior rotated file is detectable
+   (`audit_rotation_carries_the_chain_across_files`: two real rotations,
+   set verifies, swap `.1`/`.2` → fail, restore → pass, delete interior
+   `.1` → fail). Documented residual: the oldest file's predecessor is
+   legitimately discarded (keep-5), so deleting the ENTIRE rotated set
+   remains undetectable by construction. (c) claude nit: `bytes_returned`
+   now uses the exact padded-base64 decoded length (`b64_decoded_len`).
+
+**Accepted-as-documented (claude round 2):** explicit `session.kill` on a
+scratch now blocks up to ~2.5 s awaiting group-death confirmation
+(LENS-R-042 sequence + bounded retry) — intended behavior, no action.
