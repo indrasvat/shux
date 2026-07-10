@@ -226,16 +226,76 @@ SOLID gate).
 
 ---
 
-## P6 addendum (2026-07-10) — K1/E1 loop goldens + T4 vivecaka — PROVISIONAL
+## P6 addendum (2026-07-10) — K1/E1 loop + T1–T4 goldens — RATIFIED
 
-**Status: PROVISIONAL.** Task 077 P6 closes the gate (K1, E1 green; T4
-green; T1/T2/T3 BLOCKED — see below). P6 changes NO raster/glance/diff
-rendering code, so the PRD §14 raster-untouched golden-ratification rule
-applies to every golden below: minted here as PROVISIONAL by the
-implementation agent, pending an INDEPENDENT verifier's re-render + byte cmp
-+ full-resolution visual inspection + orchestrator sign-off (to be recorded
-as a follow-up entry in this file once that pass runs — not self-certified
-here).
+**Status: RATIFIED (2026-07-10, independent P6 verifier re-render + byte cmp
++ full-resolution visual inspection per the PRD §14 raster-untouched rule —
+see the verifier ratification record below).** Task 077 P6 closes the gate
+in full: `make test-lens` 37/37 and `make test-lens-t` 4/4 (K1, E1, T1–T4
+all green under the two council-approved LENS-TEST-CHANGEs). P6 changes NO
+raster/glance/diff rendering code, so the PRD §14 raster-untouched
+golden-ratification rule applies to every golden below: minted as
+PROVISIONAL by the implementation agent, now ratified by the independent
+verifier (not self-certified).
+
+### Verifier ratification record (2026-07-10) — all 12 P6 goldens
+
+- **Who:** the independent P6 verifier (separate agent, separate re-render,
+  separate fresh daemons) — not the implementer, not the shux-tui-qa gate.
+- **Raster-untouched precondition re-proven:** `git diff d3b6282..HEAD --
+  crates/shux-raster crates/shux-vt` is EMPTY (d3b6282 = the P4 ratification
+  base), and the P6 branch diff over `origin/main` (eb65947) touches only
+  `crates/shux/src/cli.rs` + the two frozen test files under their approved
+  trailers — zero rendering code changed since the P4-ratified baselines.
+- **Re-render:** every golden re-driven via direct RPC under a FRESH
+  isolated XDG environment (config mirroring the harness fixture-font
+  fallback chain), following the frozen tests' own recipes exactly —
+  K1: ordinary session + F4 80×24, glance-checkpoint cp0, 3×(Tab → settle →
+  glance-checkpoint → diff, cells_changed=2 observed on every press);
+  E1: `lens.run` scratch + F4, sentinel → settle → glance-checkpoint →
+  `a` → settle → `diff_since{heat_png}` (cells_changed=10, regions
+  `[{2,2,3},{5,10,19}]` re-derived live);
+  T1/T3: `make_nidhi_repo.sh` (3 stashes) + `lens.run` nidhi 120×40 per
+  cell, bounded wait_for "Press Enter to continue" → Enter → sentinel
+  `विवेचक` → settle → glance (the approved welcome-dismiss recipe held on
+  all 5 drives);
+  T4: `lens.run vivecaka --help` at 100×30 and 60×20 → settle → glance.
+  Runs executed serially under `.shux/scripts/no_leak_guard.sh`; zero shux
+  processes after every window.
+- **Byte cmp:** all 12 verifier re-renders `cmp`-identical to the committed
+  goldens; sha256 matches on both sides (`0dc75269…`/`166d4a96…`/
+  `0461665628…`×2/`deef295d…`/`d97c03ed…`×3/`ced707be…`×2/`aff4d6f2…`/
+  `44764842…`).
+- **Gate receipts at HEAD 7296c23:** `make test-lens` 37 passed / 0 failed;
+  `make test-lens-t` 4/4 (0 skipped — nidhi 0.1.0-alpha.1 @ 1e5d952e and
+  vivecaka 0.1.9 @ 515042b present, versions matching this manifest);
+  `make lint` clean; `make test` full lanes green; frozen guard PASS with
+  exactly the two approved LENS-TEST-CHANGE commits touching frozen paths.
+- **Cross-receipts confirmed:** `e1_glance.png` == `k1_pos3.png`
+  (byte-identical, F4 cycle-wraparound by design) and `e1_heat.png` ==
+  the P4-RATIFIED `d2_heat.png` (`deef295d…`) — the E1 heat golden is
+  anchored to an already-independently-ratified baseline.
+- **Near-grayscale anchors re-derived independently (pixel scan):** nocolor
+  cells max channel spread 7 with ZERO pixels above 8 (predicate passes);
+  color siblings max spread 159 with 8,651 pixels above 8 (control fires) —
+  exactly the measured basis in the approved LENS-TEST-CHANGE record.
+- **Visual inspection (full resolution, every one of the 12 files opened as
+  an image):** k1_pos1/2/3 — `LENS-F4-KEYS` sentinel, cyan `▶` marker at
+  grid (8,25) → (8,45) → (8,5) (wraparound), truecolor gradient +
+  256-color strip + basic-ANSI legend in full color; e1_glance identical to
+  k1_pos3; e1_heat — heat tint confined to exactly the red block at (2,2) +
+  `A-PRESSED` at (5,10)..(5,18), remainder visibly desaturated but colored;
+  t1/t3 color cells — real nidhi stash list (3 stashes, decomposed-but-real
+  Devanagari per the adjudicated no-shaping rendering, real CJK
+  `終端テスト`, emoji fallback glyph, colored accents + footer), welcome
+  screen ABSENT; t3 nocolor cells — same list visually colorless;
+  t4 100×30 — rounded-box help card with purple/blue/cyan highlighting;
+  t4 60×20 — vivecaka's genuine no-reflow overflow at 60 cols. No tofu
+  anywhere; no monochrome regression in any color cell; no welcome frame in
+  any golden.
+
+The 12 P6 goldens are `provisional: false` in `evidence-manifest.json` as of
+this record.
 
 ### Recipe (K1/E1 — ordinary + scratch sessions)
 
