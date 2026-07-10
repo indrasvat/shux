@@ -98,7 +98,13 @@ pub struct VirtualTerminal {
 /// `last_mutation_ns` (lens settle substrate). Clamped to ≥1: LENS-R-002 says
 /// never 0, but the caller that INITIALIZES the epoch (the first
 /// `VirtualTerminal::new()` in the process) would otherwise read elapsed == 0.
-fn monotonic_now_ns() -> u64 {
+///
+/// PUBLIC (P3, LENS-R-020): `pane.wait_settled` must read "now" on the SAME
+/// clock that stamped `last_mutation_ns`. Both callers share the one `START`
+/// epoch below, so `monotonic_now_ns() − last_mutation_ns` is a valid elapsed
+/// duration — a mismatched clock here is the councils-caught bug class the
+/// ns×1_000_000 settle math depends on avoiding.
+pub fn monotonic_now_ns() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();

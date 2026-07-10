@@ -1140,6 +1140,28 @@ pub fn print_pane_glance(
     }
 }
 
+/// Print a `pane wait-settled` summary (lens PRD §6/§10). Settled prints a
+/// green ✓; a timeout prints a yellow degraded marker (the CLI still exits 1).
+pub fn print_pane_wait_settled(pane_id: &str, settled: bool, revision: u64, waited_ms: u64) {
+    if settled {
+        println!(
+            "{} settled {} rev {} after {}ms",
+            success("✓"),
+            muted(&short_id(pane_id)),
+            bold(&revision.to_string()),
+            waited_ms,
+        );
+    } else {
+        println!(
+            "{} not settled {} rev {} after {}ms (timeout)",
+            warning("✗"),
+            muted(&short_id(pane_id)),
+            bold(&revision.to_string()),
+            waited_ms,
+        );
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]

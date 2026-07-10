@@ -1012,6 +1012,37 @@ pub enum WindowCommand {
     },
 }
 
+/// Parse a human duration into whole milliseconds (PRD §2.2: the CLI accepts
+/// human durations and normalizes to ms for the RPC). Accepts a bare integer
+/// (= milliseconds) or an integer with a `ms`/`s`/`m`/`h` suffix. A parse
+/// error surfaces as a clap usage error → CLI exit 2. Used by
+/// `pane wait-settled`'s `--quiet` / `--timeout`.
+fn parse_duration_ms(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    // `ms` MUST be checked before the single-char `s` suffix.
+    let (digits, mult) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1_000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000)
+    } else {
+        (s, 1) // bare integer == milliseconds
+    };
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?} (use e.g. 300ms, 2s, 1m)"))?;
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("duration {s:?} overflows"))
+}
+
 #[derive(Subcommand, Debug)]
 pub enum PaneCommand {
     /// List panes in a window
@@ -1399,6 +1430,29 @@ pub enum PaneCommand {
         /// (`checkpoint=true`).
         #[arg(long)]
         checkpoint: bool,
+    },
+
+    /// Block until a pane's screen has been STILL for a quiet window, or
+    /// time out. Mirrors `pane.wait_settled` RPC (lens PRD §6). "Settled"
+    /// means "quiet for --quiet", NOT "process finished": for slow-dripping
+    /// output whose gaps exceed --quiet, pair this with `pane wait-for`
+    /// (sentinel text). Exit 0 settled, exit 1 timeout.
+    #[command(name = "wait-settled")]
+    WaitSettled {
+        /// Pane UUID (mirrors the RPC `pane_id`).
+        #[arg(value_name = "PANE")]
+        pane: String,
+
+        /// Quiet window: settle once the pane has had this much silence.
+        /// Human duration (`300ms`, `2s`); normalizes to ms. Range
+        /// [10ms, 60s] — out of range → INVALID_PARAMS (exit 2).
+        #[arg(long, default_value = "300ms", value_parser = parse_duration_ms)]
+        quiet: u64,
+
+        /// Overall deadline. Human duration (`10s`, `2s`); normalizes to
+        /// ms. Range [quiet, 600s] — out of range → INVALID_PARAMS (exit 2).
+        #[arg(long, default_value = "10s", value_parser = parse_duration_ms)]
+        timeout: u64,
     },
 
     /// Resize a pane's PTY + VT grid to absolute (cols, rows).
@@ -3810,6 +3864,94 @@ pub async fn handle_pane_glance(
                 }
             }
             std::process::exit(lens_glance_exit_code(code));
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Map a `pane.wait_settled` RPC error code to its CLI exit code (lens PRD
+/// §10). A settle TIMEOUT is NOT an error — it is a `settled=false` RESULT
+/// handled in the success arm below and mapped to exit 1 there. This maps only
+/// genuine RPC errors: INVALID_PARAMS → 2, PERMISSION_DENIED → 4, everything
+/// else (incl. PANE_NOT_FOUND) → 3.
+fn lens_wait_settled_exit_code(rpc_error_code: i64) -> i32 {
+    match rpc_error_code {
+        -32602 => 2, // INVALID_PARAMS
+        -32005 => 4, // PERMISSION_DENIED
+        _ => 3,      // any other RPC error, incl. PANE_NOT_FOUND (-32004)
+    }
+}
+
+/// `shux pane wait-settled` — block until a pane is quiet via
+/// `pane.wait_settled` RPC (lens PRD §6, §10). `quiet`/`timeout` arrive here
+/// already normalized to milliseconds by `parse_duration_ms`. Exit 0 when
+/// settled, exit 1 on timeout (`settled=false`, a RESULT not an error).
+pub async fn handle_pane_wait_settled(
+    stream: &mut tokio::net::UnixStream,
+    pane: &str,
+    quiet_ms: u64,
+    timeout_ms: u64,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let params = serde_json::json!({
+        "pane_id": pane,
+        "quiet_ms": quiet_ms,
+        "timeout_ms": timeout_ms,
+    });
+
+    match rpc_call(stream, "pane.wait_settled", params).await {
+        Ok(result) => {
+            let settled = result
+                .get("settled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match format {
+                OutputFormat::Json => {
+                    // §10: byte-identical to `shux rpc call` — the `{result}`
+                    // envelope (the frozen lens harness parses this shape).
+                    let envelope = serde_json::json!({ "result": result });
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+                OutputFormat::Text | OutputFormat::Plain => {
+                    let revision = result.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let waited_ms = result
+                        .get("waited_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    crate::style::print_pane_wait_settled(pane, settled, revision, waited_ms);
+                }
+            }
+            // §10 CLI-only mapping: settled → exit 0, timeout → exit 1.
+            if settled {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) => {
+            match format {
+                OutputFormat::Json => {
+                    let mut err_obj = serde_json::json!({
+                        "code": code,
+                        "message": message,
+                    });
+                    if let Some(d) = data {
+                        err_obj["data"] = d;
+                    }
+                    let envelope = serde_json::json!({ "error": err_obj });
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+                OutputFormat::Text | OutputFormat::Plain => {
+                    crate::style::print_error(&format!(
+                        "wait-settled failed: {message} (code {code})"
+                    ));
+                }
+            }
+            std::process::exit(lens_wait_settled_exit_code(code));
         }
         Err(other) => Err(other.into()),
     }
