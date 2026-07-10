@@ -57,6 +57,22 @@ fn settle(h: &Harness, pane: &str, ctx: &str) {
     );
 }
 
+/// Dismiss nidhi's mandatory welcome screen (LENS-TEST-CHANGE approved
+/// 2026-07-10, task 077 P6). nidhi 0.1.0-alpha.1 renders a "Press Enter to
+/// continue" welcome card on EVERY launch — no CLI flag, env var, or config
+/// key bypasses it (binary strings-scanned for `nidhi.*`/`NIDHI_*` keys) and
+/// it never auto-advances (verified by an 8s idle probe). The BOUNDED
+/// `wait_for` on the prompt text IS the assertion that the welcome screen
+/// rendered — Enter is only sent after it is proven on screen, never
+/// speculatively. The caller's original stash-list sentinel wait follows
+/// unchanged, so T1/T2/T3's assertions and purpose are untouched.
+fn dismiss_nidhi_welcome(h: &Harness, pane: &str, ctx: &str) {
+    h.wait_for(pane, "Press Enter to continue", 10_000)
+        .unwrap_or_else(|e| panic!("{ctx}: nidhi welcome screen never appeared: {e}"));
+    // Enter (0x0d), same byte as `pane send-keys --data DQ==`.
+    h.send_raw(pane, "\r");
+}
+
 // T1 — nidhi golden (rich + Unicode).
 #[test]
 fn t1_nidhi_golden() {
@@ -77,6 +93,7 @@ fn t1_nidhi_golden() {
         .expect_result("T1 lens.run nidhi");
     let pane = r["pane_id"].as_str().expect("pane_id").to_string();
 
+    dismiss_nidhi_welcome(&h, &pane, "T1");
     h.wait_for(&pane, "विवेचक", 10_000)
         .expect("T1: nidhi drew the stashes");
     settle(&h, &pane, "T1 settle");
@@ -112,6 +129,7 @@ fn t2_nidhi_keyboard_truth() {
         )
         .expect_result("T2 lens.run nidhi");
     let pane = r["pane_id"].as_str().expect("pane_id").to_string();
+    dismiss_nidhi_welcome(&h, &pane, "T2");
     h.wait_for(&pane, "विवेचक", 10_000).expect("T2: nidhi up");
     settle(&h, &pane, "T2 settle initial");
 
@@ -217,6 +235,7 @@ fn t3_nidhi_matrix() {
             )
             .expect_result("T3 lens.run nidhi");
         let pane = r["pane_id"].as_str().expect("pane_id").to_string();
+        dismiss_nidhi_welcome(&h, &pane, "T3");
         h.wait_for(&pane, "विवेचक", 10_000).expect("T3: nidhi up");
         settle(&h, &pane, "T3 settle");
         let png = glance_png(&h, &pane, "T3 glance");
