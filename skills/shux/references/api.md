@@ -80,10 +80,12 @@ Spawn a new session with an initial window + pane.
 { "name": "demo", "cwd": "/path/to/dir", "pane_title": "demo", "command": [...] }
 ```
 
-The `shux session kill` / `-s/--session` CLI forms additionally accept a
-UUID-shaped argument and resolve it client-side: session ID first, falling
-back to a session NAMED that string; the ID wins when both match (a warning
-is printed). Raw RPC callers pick the field themselves per the shapes above.
+`shux session kill` and the `-s/--session` flag on the `pane`/`window`
+subcommands (incl. snapshots) additionally accept a UUID-shaped argument
+and resolve it client-side: session ID first, falling back to a session
+NAMED that string; the ID wins when both match (a warning is printed).
+`session rename` / `session save` / `session attach` take NAMEs only. Raw
+RPC callers pick the field themselves per the shapes above.
 
 ## Window
 

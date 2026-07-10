@@ -142,13 +142,15 @@ shux session kill "$SID"          # UUID from lens run's `session_id` — works 
 shux session kill my-scratch-name # name also works, same as any other session
 ```
 
-(`session kill` and every `-s/--session` flag across the CLI accept either
-form. UUID-shaped input — hyphenated or 32-hex simple form — resolves as a
-session ID first, falling back to a session NAMED that string if no id
-matches; when both match, the ID wins and a warning is printed. If you're
-driving a scratch pane with pre-lens commands like
-`pane send-keys -s <SID> -p <PANE>`, the UUID from `lens run`'s
-`session_id` is exactly what `-s` wants.)
+(`session kill` and the `-s/--session` flag on every `shux pane …` and
+`shux window …` subcommand — including the snapshot commands — accept
+either form. UUID-shaped input — hyphenated or 32-hex simple form —
+resolves as a session ID first, falling back to a session NAMED that
+string if no id matches; when both match, the ID wins and a warning is
+printed. `session rename`, `session save`, and `session attach` are the
+exceptions: they take the session NAME only. If you're driving a scratch
+pane with pre-lens commands like `pane send-keys -s <SID> -p <PANE>`, the
+UUID from `lens run`'s `session_id` is exactly what `-s` wants.)
 
 Quota: 16 concurrent scratch sessions per daemon. The 17th `lens run` gets
 `RESOURCE_EXHAUSTED` (CLI exit 5) until one is reaped or killed.

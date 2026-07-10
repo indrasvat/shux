@@ -1360,6 +1360,7 @@ seeded border break is genuinely visible via `lens run --size 120x30` →
 reading the source).
 
 ### Outstanding before P6 (and the whole task) can flip to Done
+(historical — ALL items below completed; see the Status line)
 
 - shux-tui-qa gate run and PASS.
 - dootsabha convergence review of this phase's diff (§2.4).
@@ -1367,3 +1368,15 @@ reading the source).
 - User adjudication of the T1/T2/T3 nidhi-welcome-screen blocker
   (LENS-TEST-CHANGE approval or an alternative direction).
 - The T5 unaided-agent demo itself, run by the orchestrator per m4.
+
+### Future polish (post-077, not this task)
+
+- Route the remaining name-only session commands (`session rename`,
+  `session save`, `session attach`) through `resolve_session_id` so their
+  `-s`/positional args accept UUID-or-name like `session kill` and the
+  pane/window subcommands do (PR #93 bot round, codex-bot P2: the skill
+  docs briefly overstated the current set; docs narrowed to the actual
+  resolver call sites, routing deferred as the natural next step).
+- `shux daemon stop` teardown recipe in the skill (T5 demo's honest
+  finding: `lens run` auto-starts a daemon that `session kill` does not
+  reap — see `.shux/qa/lens-p6/T5-RESULT.md`).
