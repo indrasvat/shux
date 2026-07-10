@@ -104,12 +104,22 @@ re-baselining is a LENS-TEST-CHANGE event.
 
 ---
 
-## P3 addendum (2026-07-09) — `s1_ready.png` (PROVISIONAL, task 077)
+## P3 addendum (2026-07-09) — `s1_ready.png`
 
-**Status: PROVISIONAL — awaiting the standing downstream chain (verifier +
-shux QA + DootSabha council).** The P3 implementation does NOT self-certify
-this baseline; §16.3 approval is deferred to that chain because P3 has no
-SOLID VT QA gate in PRD §14 (settle touches no rendering code).
+**Status: RATIFIED (2026-07-10, verifier re-render + visual inspection per
+PRD §14 rule).** Independent verification: re-drove the exact F2 steps
+(launch fixture, pump 20 spinner tokens + `R`, `pane wait-settled` via the
+NEW CLI, `pane glance --png`) under an isolated XDG env mirroring the
+harness's fixture-font fallback chain, using a freshly built release
+binary. The re-rendered PNG was byte-identical to the committed golden
+(`cmp` clean; sha256 `42071d0ff45a299bf1b6dc5d70c124c1abb2dbe412efe1a1a16a69fcf27cf086`
+matches on both sides) and was visually inspected at full resolution:
+`LENS-F2-SPIN` sentinel at row 0, amber spinner glyph at grid (1,1),
+green-bold `READY` centered near grid (11,34), full truecolor + 256-color +
+basic-ANSI legend strips (no monochrome/NO_COLOR regression), cursor hidden,
+no corruption or tofu. This closes the PROVISIONAL status the P3
+implementation left pending per §16.3 (implementation does not self-certify
+its own golden).
 
 - **Golden:** `s1_ready.png` (80×24), sha256
   `42071d0ff45a299bf1b6dc5d70c124c1abb2dbe412efe1a1a16a69fcf27cf086`.
