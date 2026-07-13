@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#15120e">
 <title>shux — tmux for the agentic age</title>
-<meta name="description" content="shux is tmux for the agentic age — a Rust terminal multiplexer with a JSON-RPC API and a built-in pixel snapshotter. Spawn panes, type into them, get back PNG screenshots, all over RPC. For agents, CI jobs, and any process that needs to operate the terminal.">
+<meta name="description" content="shux is tmux for the agentic age — a Rust terminal multiplexer with a JSON-RPC API and a built-in pixel snapshotter. Spawn panes, type into them, get back PNG screenshots, and run the lens verify loop — settle, glance, diff — to prove what changed, all over RPC. For agents, CI jobs, and any process that needs to operate the terminal.">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -770,11 +770,12 @@
 
 <!-- ─── Nav ─────────────────────────────────────────── -->
 <nav class="nav">
-  <a class="nav-mark" href="/">shux<span class="ver" id="ver" data-dyn="version">v0.8</span></a>
+  <a class="nav-mark" href="/">shux<span class="ver" id="ver" data-dyn="version">v0.43</span></a>
   <div class="nav-links">
     <a href="#difference"><span class="lbl">why</span></a>
     <a href="#humans"><span class="lbl">humans</span></a>
     <a href="#agents"><span class="lbl">agents</span></a>
+    <a href="#lens"><span class="lbl">lens</span></a>
     <a href="#replaces"><span class="lbl">replaces</span></a>
     <a href="#plugins"><span class="lbl">plugins</span></a>
     <a href="#quickstart"><span class="lbl">install</span></a>
@@ -786,7 +787,7 @@
 <section class="hero">
   <div class="wrap hero-grid">
     <div>
-      <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span><span data-dyn="version-full">v0.8.0</span> · stable · written in Rust</p>
+      <p class="eyebrow"><span class="dot" style="display:inline-block;width:6px;height:6px;background:var(--moss);border-radius:50%;margin-right:8px;vertical-align:middle"></span><span data-dyn="version-full">v0.43.0</span> · stable · written in Rust</p>
       <h1 class="hero-headline">
         <span class="brand-chip">shux</span>:<br>
         tmux for the<br>
@@ -795,7 +796,7 @@
       <p class="hero-sub">
         A Rust terminal multiplexer with a JSON-RPC API and a built-in
         pixel snapshotter. Spawn panes. Type into them. Get back a PNG
-        of what they look like. Keep <b>tmux</b> for your shell; use
+        of what they look like — and a pixel diff proving what changed. Keep <b>tmux</b> for your shell; use
         <b>shux</b> wherever another process — an agent, a CI job, a
         test — needs to operate the terminal.
       </p>
@@ -804,7 +805,7 @@
         <a class="btn secondary" href="#agents">Read the API</a>
       </div>
       <div class="hero-meta">
-        <span><span class="moss-dot"></span> <span data-dyn="test-count">692</span> tests passing</span>
+        <span><span class="moss-dot"></span> <span data-dyn="test-count">1206</span> tests passing</span>
         <span>macOS · Linux · arm64/amd64</span>
         <span>MIT</span>
       </div>
@@ -968,6 +969,10 @@ command = ["lazygit"]
           <li><span class="k">pane.send_keys</span><span class="v">text or base64 control bytes</span></li>
           <li><span class="k">pane.set_size</span><span class="v">synchronous, ack via oneshot</span></li>
           <li><span class="k">pane.snapshot</span><span class="v">PNG, off-lock, budget-checked</span></li>
+          <li><span class="k">pane.glance</span><span class="v">text + PNG, one atomic frame</span></li>
+          <li><span class="k">pane.wait_settled</span><span class="v">block until the screen goes quiet</span></li>
+          <li><span class="k">pane.checkpoint / diff_since</span><span class="v">cell-exact diffs, heat PNGs</span></li>
+          <li><span class="k">lens.run</span><span class="v">hidden scratch run, auto-reaped</span></li>
           <li><span class="k">pane.output.watch</span><span class="v">sampled sealed data-plane stream</span></li>
           <li><span class="k">pane.record.*</span><span class="v">lossless raw PTY transcript</span></li>
           <li><span class="k">state.apply</span><span class="v">atomic batch of typed Ops</span></li>
@@ -976,6 +981,49 @@ command = ["lazygit"]
         <p class="target" style="margin-top:var(--s-4)">All methods accept JSON in, return JSON out, on stdin/stdout.</p>
       </div>
     </div>
+  </div>
+</section>
+
+<!-- ─── Lens: the verify loop ───────────────────────── -->
+<section class="section" id="lens">
+  <div class="wrap">
+    <p class="eyebrow">the verify loop</p>
+    <h2 class="measure">Don't just drive the terminal.<br>Prove what happened.</h2>
+    <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
+      <b>shux lens</b> closes the loop: run a command in a hidden,
+      auto-reaped pane, wait for the screen to actually settle, take one
+      atomic text&#8202;+&#8202;PNG frame, then diff against a checkpoint
+      — down to the cell. No <code>sleep</code> guessing, no torn frames,
+      no "looks right to me."
+    </p>
+
+    <div class="snap-proof">
+      <pre><code><span style="color:var(--ink2-on-paper)"># run it hidden — quota'd scratch pane, reaped on TTL</span>
+<span style="color:var(--accent)">$ shux --format json lens run --size 100x14 -- ./deploy-tui</span>
+<span style="color:var(--ink2-on-paper)"># → {"session_id":…, "pane_id":…}</span>
+
+<span style="color:var(--ink2-on-paper)"># wait for pixels to go quiet — content-revision based</span>
+<span style="color:var(--accent)">$ shux pane wait-settled $PANE --quiet 300ms</span>
+<span style="color:var(--ink2-on-paper)"># → settled after 354ms</span>
+
+<span style="color:var(--ink2-on-paper)"># one atomic frame: text + PNG + checkpoint, same revision</span>
+<span style="color:var(--accent)">$ shux pane glance $PANE --checkpoint --png before.png</span>
+
+<span style="color:var(--ink2-on-paper)"># drive it, then prove exactly what changed</span>
+<span style="color:var(--accent)">$ shux pane send-keys -s $SID --data DQ==</span>
+<span style="color:var(--accent)">$ shux pane diff $PANE --since $REV --heat heat.png</span>
+<span style="color:var(--ink2-on-paper)"># → cells_changed: 61 · rows 7–8</span></code></pre>
+      <figure class="snap-out">
+        <img src="/screenshots/lens-heat.png" alt="pane diff heat map of a deploy status board — the two rows that changed since the checkpoint are highlighted in red, every unchanged cell is desaturated" width="900" height="266" loading="lazy" style="aspect-ratio:900/266">
+        <figcaption><span class="dot mossy"></span> <code>heat.png</code> — the two rows that changed, red; everything else desaturated. Real output, byte-deterministic.</figcaption>
+      </figure>
+    </div>
+
+    <p class="target" style="margin-top:var(--s-5)">
+      Proven cold: a fresh agent given only the shux skill found a
+      one-cell border bug from a glance PNG — a bug text capture can't
+      see — fixed it, and shipped pixel proof.
+    </p>
   </div>
 </section>
 
@@ -1012,7 +1060,12 @@ command = ["lazygit"]
         <tr>
           <td data-label="if you'd reach for"><code>expect</code> · <code>pexpect</code> · <code>sexpect</code></td>
           <td data-label="for this job">Scripted CLI / REPL interaction</td>
-          <td data-label="the shux call"><code>pane.send_keys</code> → <code>pane.wait_for</code> → <code>pane.capture</code></td>
+          <td data-label="the shux call"><code>pane.send_keys</code> → <code>pane.wait_for</code> / <code>pane.wait_settled</code> → <code>pane.glance</code></td>
+        </tr>
+        <tr>
+          <td data-label="if you'd reach for"><code>sleep 5</code> before a CI screenshot</td>
+          <td data-label="for this job">Wait until a TUI has finished painting</td>
+          <td data-label="the shux call"><code>pane.wait_settled</code> <span class="muted">— quiet-window, no needle</span></td>
         </tr>
         <tr>
           <td data-label="if you'd reach for">iTerm2 <code>wait_for_text</code> / <code>wait_for_absent</code></td>
@@ -1052,7 +1105,7 @@ command = ["lazygit"]
         <tr>
           <td data-label="if you'd reach for">Custom Bubbletea / ratatui test harness</td>
           <td data-label="for this job">Visual regression for your TUI</td>
-          <td data-label="the shux call"><code>window.snapshot</code> + golden-image diff</td>
+          <td data-label="the shux call"><code>pane.glance --checkpoint</code> → <code>pane diff --heat</code> · golden cmp</td>
         </tr>
       </tbody>
     </table>
@@ -1082,13 +1135,14 @@ command = ["lazygit"]
         <p class="respect">If you're a human at a keyboard and tmux works, keep using tmux.</p>
       </div>
       <div class="col win">
-        <h3>shux <span class="tag accent" data-dyn="version">v0.8</span><span class="tag accent"> · Rust</span></h3>
+        <h3>shux <span class="tag accent" data-dyn="version">v0.43</span><span class="tag accent"> · Rust</span></h3>
         <ul>
           <li>Length-prefixed JSON-RPC over UDS + TCP. Every CLI verb is a typed call.</li>
           <li>Declarative workspace templates that apply atomically.</li>
           <li>Optimistic concurrency on every entity — stale writes get rejected with a typed conflict error.</li>
           <li>Sealed event bus, sequenced, gap-detectable. Separate data plane for PTY chunks.</li>
           <li>Built-in rasterizer — one RPC returns PNG bytes of any live pane.</li>
+          <li>Verify loop built in: settle detection, atomic glance, cell-exact diffs with heat maps.</li>
           <li><span><code>xterm-256color</code> compatibility for DA/DSR, DECRQM, XTGETTCAP, OSC palette queries, and synchronized output.</span></li>
           <li>Synchronous resize: the next snapshot sees the new dims, guaranteed.</li>
         </ul>
@@ -1101,7 +1155,7 @@ command = ["lazygit"]
 <!-- ─── Gallery (tabbed) ──────────────────────────────
      Single tabbed surface that walks a visitor through every demo
      worth seeing — an animated agent-drive replay, syntax-highlight
-     proof, the self-documenting --help, the 692-test sweep, and the
+     proof, the self-documenting --help, the full test sweep, and the
      attribute / colour coverage. Every artefact is real
      `pane.snapshot` output.
 ─────────────────────────────────────────────────── -->
@@ -1379,16 +1433,20 @@ curl -sSf <a href="https://shux.pages.dev/install.sh">https://shux.pages.dev/ins
       <div class="well">
 <b># shux skill — top-of-file (≤30 lines)</b><br><br>
 <b>name:</b> shux<br>
-<b>description:</b> Drive terminal multiplexer sessions from an<br>
-&nbsp;&nbsp;agent — multiplex, send keystrokes, snapshot pixel-perfect<br>
-&nbsp;&nbsp;PNGs of any pane. Replaces tmux / screen / iTerm2 /<br>
-&nbsp;&nbsp;expect/asciinema for agent-driven workflows.<br><br>
+<b>description:</b> Drive terminal sessions, panes, and TUIs from<br>
+&nbsp;&nbsp;an agent — send keystrokes, snapshot pixel-perfect PNGs,<br>
+&nbsp;&nbsp;run the lens verify loop (run/settle/glance/diff) to prove<br>
+&nbsp;&nbsp;a TUI fix actually worked. Replaces tmux / iTerm2 / expect /<br>
+&nbsp;&nbsp;pexpect / vhs / termshot for agent-driven workflows.<br><br>
 <b>Layout:</b> <code>shux init</code> scaffolds <code>.shux/</code><br>
 &nbsp;&nbsp;(<code>templates/</code>, <code>scripts/</code>, <code>goldens/</code>, gitignored <code>out/</code>).<br><br>
 <b>Quickstart:</b> three verbs cover 80% of cases —<br>
 &nbsp;&nbsp;1. <code>shux state apply .shux/templates/spec.toml</code><br>
 &nbsp;&nbsp;2. <code>shux pane send-keys -s NAME --text '...'</code><br>
-&nbsp;&nbsp;3. <code>shux pane snapshot -s NAME -o .shux/out/frame.png</code>
+&nbsp;&nbsp;3. <code>shux pane snapshot -s NAME -o .shux/out/frame.png</code><br><br>
+<b>Verify loop:</b> <code>lens run</code> → <code>wait-settled</code> →<br>
+&nbsp;&nbsp;<code>glance --checkpoint</code> → <code>diff --heat</code> — pixel proof<br>
+&nbsp;&nbsp;that a change worked.
       </div>
     </div>
   </div>
@@ -1458,7 +1516,7 @@ curl -sSf <a href="https://shux.pages.dev/install.sh">https://shux.pages.dev/ins
   <div class="wrap">
     <div class="row">
       <div>
-        <a class="nav-mark" href="/">shux<span class="ver" id="ver-footer" data-dyn="version">v0.8</span></a>
+        <a class="nav-mark" href="/">shux<span class="ver" id="ver-footer" data-dyn="version">v0.43</span></a>
         <p style="margin-top:var(--s-3); max-width:32ch; color:var(--ink-3); font-size:13px">
           A modern, batteries-included terminal multiplexer built in
           Rust. First-class support for both humans and agents.
@@ -1486,6 +1544,7 @@ curl -sSf <a href="https://shux.pages.dev/install.sh">https://shux.pages.dev/ins
           <li><a href="#difference">vs tmux</a></li>
           <li><a href="#replaces">Tools replaced</a></li>
           <li><a href="#agents">Agent surface</a></li>
+          <li><a href="#lens">The verify loop</a></li>
           <li><a href="#plugins">Plugins</a></li>
         </ul>
       </div>
