@@ -1013,12 +1013,13 @@ command = ["lazygit"]
 
 <span style="color:var(--ink2-on-paper)"># drive it, then prove exactly what changed</span>
 <span style="color:var(--accent)">$ shux pane send-keys -s "$SID" -p "$PANE" --data DQ==</span>
+<span style="color:var(--accent)">$ shux pane wait-settled "$PANE" --quiet 300ms</span>
 <span style="color:var(--accent)">$ shux pane diff "$PANE" --since "$REV" --heat heat.png</span>
 <span style="color:var(--ink2-on-paper)"># → cells_changed: 40 · rows 6–7</span></code></pre>
       <figure class="snap-out" id="heat-proof">
         <picture>
-          <source media="(max-width: 760px)" srcset="/screenshots/lens-heat-m.png">
-          <img src="/screenshots/lens-heat-2x.png" alt="pane diff heat map of a deploy status board — the two rows that changed since the checkpoint are highlighted in red, every unchanged cell is desaturated" width="576" height="228" decoding="async" fetchpriority="high" style="aspect-ratio:auto">
+          <source media="(max-width: 760px)" srcset="/screenshots/lens-heat-m.png" width="1566" height="684">
+          <img src="/screenshots/lens-heat-2x.png" alt="pane diff heat map of a deploy status board — the two rows that changed since the checkpoint are highlighted in red, every unchanged cell is desaturated" width="576" height="228" loading="lazy" decoding="async" style="aspect-ratio:auto">
         </picture>
         <figcaption><span class="dot mossy"></span> <code>heat.png</code> — the two rows that changed, red; everything else desaturated. Real output, byte-deterministic.</figcaption>
       </figure>
