@@ -999,7 +999,7 @@ command = ["lazygit"]
 
     <div class="snap-proof">
       <pre><code><span style="color:var(--ink2-on-paper)"># run it hidden — quota'd scratch pane, reaped on TTL</span>
-<span style="color:var(--accent)">$ shux --format json lens run --size 100x14 -- ./deploy-tui</span>
+<span style="color:var(--accent)">$ shux --format json lens run --size 64x12 -- ./deploy-tui</span>
 <span style="color:var(--ink2-on-paper)"># → {"session_id":…, "pane_id":…}</span>
 
 <span style="color:var(--ink2-on-paper)"># wait for pixels to go quiet — content-revision based</span>
@@ -1012,9 +1012,9 @@ command = ["lazygit"]
 <span style="color:var(--ink2-on-paper)"># drive it, then prove exactly what changed</span>
 <span style="color:var(--accent)">$ shux pane send-keys -s $SID --data DQ==</span>
 <span style="color:var(--accent)">$ shux pane diff $PANE --since $REV --heat heat.png</span>
-<span style="color:var(--ink2-on-paper)"># → cells_changed: 61 · rows 7–8</span></code></pre>
+<span style="color:var(--ink2-on-paper)"># → cells_changed: 40 · rows 6–7</span></code></pre>
       <figure class="snap-out">
-        <img src="/screenshots/lens-heat.png" alt="pane diff heat map of a deploy status board — the two rows that changed since the checkpoint are highlighted in red, every unchanged cell is desaturated" width="900" height="266" decoding="async" fetchpriority="high" style="aspect-ratio:900/266">
+        <img src="/screenshots/lens-heat.png?v=2" alt="pane diff heat map of a deploy status board — the two rows that changed since the checkpoint are highlighted in red, every unchanged cell is desaturated" width="576" height="228" decoding="async" fetchpriority="high" style="aspect-ratio:576/228">
         <figcaption><span class="dot mossy"></span> <code>heat.png</code> — the two rows that changed, red; everything else desaturated. Real output, byte-deterministic.</figcaption>
       </figure>
     </div>
