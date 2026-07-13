@@ -1,3 +1,10 @@
+# [0.44.0](https://github.com/indrasvat/shux/compare/v0.43.0...v0.44.0) (2026-07-13)
+
+
+### Features
+
+* **website:** the lens verify loop — new section, five-verb API rows, refreshed claims ([#94](https://github.com/indrasvat/shux/issues/94)) ([b9c0595](https://github.com/indrasvat/shux/commit/b9c05958b2af7e0d2cbe65a54eb09ac86c6fea57)), closes [#lens](https://github.com/indrasvat/shux/issues/lens) [#lens](https://github.com/indrasvat/shux/issues/lens) [hi#density](https://github.com/hi/issues/density)
+
 # [0.43.0](https://github.com/indrasvat/shux/compare/v0.42.0...v0.43.0) (2026-07-10)
 
 
