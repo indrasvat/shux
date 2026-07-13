@@ -971,7 +971,7 @@ command = ["lazygit"]
           <li><span class="k">pane.snapshot</span><span class="v">PNG, off-lock, budget-checked</span></li>
           <li><span class="k">pane.glance</span><span class="v">text + PNG, one atomic frame</span></li>
           <li><span class="k">pane.wait_settled</span><span class="v">block until the screen goes quiet</span></li>
-          <li><span class="k">pane.checkpoint / diff_since</span><span class="v">cell-exact diffs, heat PNGs</span></li>
+          <li><span class="k">pane.checkpoint / pane.diff_since</span><span class="v">cell-exact diffs, heat PNGs</span></li>
           <li><span class="k">lens.run</span><span class="v">hidden scratch run, auto-reaped</span></li>
           <li><span class="k">pane.output.watch</span><span class="v">sampled sealed data-plane stream</span></li>
           <li><span class="k">pane.record.*</span><span class="v">lossless raw PTY transcript</span></li>
@@ -999,19 +999,21 @@ command = ["lazygit"]
 
     <div class="snap-proof">
       <pre><code><span style="color:var(--ink2-on-paper)"># run it hidden — quota'd scratch pane, reaped on TTL</span>
-<span style="color:var(--accent)">$ shux --format json lens run --size 64x12 -- ./deploy-tui</span>
-<span style="color:var(--ink2-on-paper)"># → {"session_id":…, "pane_id":…}</span>
+<span style="color:var(--accent)">$ RUN=$(shux --format json lens run --size 64x12 -- ./deploy-tui)</span>
+<span style="color:var(--accent)">$ SID=$(echo "$RUN" | jq -r .result.session_id)</span>
+<span style="color:var(--accent)">$ PANE=$(echo "$RUN" | jq -r .result.pane_id)</span>
 
 <span style="color:var(--ink2-on-paper)"># wait for pixels to go quiet — content-revision based</span>
-<span style="color:var(--accent)">$ shux pane wait-settled $PANE --quiet 300ms</span>
+<span style="color:var(--accent)">$ shux pane wait-settled "$PANE" --quiet 300ms</span>
 <span style="color:var(--ink2-on-paper)"># → settled after 354ms</span>
 
 <span style="color:var(--ink2-on-paper)"># one atomic frame: text + PNG + checkpoint, same revision</span>
-<span style="color:var(--accent)">$ shux pane glance $PANE --checkpoint --png before.png</span>
+<span style="color:var(--accent)">$ REV=$(shux --format json pane glance "$PANE" --checkpoint \
+    --png before.png | jq -r .result.revision)</span>
 
 <span style="color:var(--ink2-on-paper)"># drive it, then prove exactly what changed</span>
-<span style="color:var(--accent)">$ shux pane send-keys -s $SID --data DQ==</span>
-<span style="color:var(--accent)">$ shux pane diff $PANE --since $REV --heat heat.png</span>
+<span style="color:var(--accent)">$ shux pane send-keys -s "$SID" -p "$PANE" --data DQ==</span>
+<span style="color:var(--accent)">$ shux pane diff "$PANE" --since "$REV" --heat heat.png</span>
 <span style="color:var(--ink2-on-paper)"># → cells_changed: 40 · rows 6–7</span></code></pre>
       <figure class="snap-out" id="heat-proof">
         <picture>
@@ -1103,12 +1105,12 @@ command = ["lazygit"]
         <tr>
           <td data-label="if you'd reach for">GNU parallel <code>--tmux</code> mode</td>
           <td data-label="for this job">Run N tasks in N panes, watch in one place</td>
-          <td data-label="the shux call"><code>shux apply</code> a multi-pane template <span class="muted">— workflow</span></td>
+          <td data-label="the shux call"><code>shux state apply</code> a multi-pane template <span class="muted">— workflow</span></td>
         </tr>
         <tr>
           <td data-label="if you'd reach for">Custom Bubbletea / ratatui test harness</td>
           <td data-label="for this job">Visual regression for your TUI</td>
-          <td data-label="the shux call"><code>pane.glance --checkpoint</code> → <code>pane diff --heat</code> · golden cmp</td>
+          <td data-label="the shux call"><code>pane glance --png</code> → golden cmp <span class="muted">· before/after proof via</span> <code>pane diff --heat</code></td>
         </tr>
       </tbody>
     </table>
@@ -1436,7 +1438,7 @@ curl -sSf <a href="https://shux.pages.dev/install.sh">https://shux.pages.dev/ins
       <div class="well">
 <b># shux skill — top-of-file (≤30 lines)</b><br><br>
 <b>name:</b> shux<br>
-<b>description:</b> Drive terminal sessions, panes, and TUIs from<br>
+<b>description</b> <i>(abridged)</i><b>:</b> Drive terminal sessions, panes, and TUIs from<br>
 &nbsp;&nbsp;an agent — send keystrokes, snapshot pixel-perfect PNGs,<br>
 &nbsp;&nbsp;run the lens verify loop (run/settle/glance/diff) to prove<br>
 &nbsp;&nbsp;a TUI fix actually worked. Replaces tmux / iTerm2 / expect /<br>
