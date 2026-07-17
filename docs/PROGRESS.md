@@ -104,6 +104,8 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 
 ## Session Log
 
+**2026-07-17 — plan(lens-gate): tasks 078–085 authored on `feat/lens-ci-gate` (verification-as-CI).** Picked one idea from the grok-build review — a `shux lens gate` CI visual-regression gate — and ran the full council dance. Proposal (`.local/lens-ci-gate-proposal.md`) → brutal dootsabha council #1 (codex+agy) verdict REVISE → v2 → council #2 verdict CONVERGED. Decomposed into 8 numbered tasks; council #3 (task review) verdict REVISE-TASKS → all fixes folded (closed status set incl. `stale_golden`, quarantined red-suite lane, `gate init` owned by 082, hardened cold-agent gauntlet, `CellRef` by-value, determinism + mask-invariance matrices, `Quality Gate:` headers). **Next: council #4 (task-convergence verify) before implementation.** Full cold-resume state in `.local/HANDOFF-lens-ci-gate.md`. Two decisions flagged for Ārya: TOML vs YAML scenarios; insta-style `gate review`. Not Started; nothing implemented yet.
+
 **2026-07-10 — feat(lens): TASK 077 COMPLETE — P6 finale closed: T5 demo PASS, convergence CLOSED, 12 goldens RATIFIED (gate 37/0 + 4/4)**
 - **T5 unaided-agent demo: PASS, all 7 checklist items** (judged by the orchestrator against the ground-truth brief). A fresh agent, given ONLY the rewritten skill: `lens run --size 120x30` hidden spawn → `wait-settled` (no sleeps) → `glance --checkpoint` PNG → found the border gap IN THE PIXELS and localized col 80 via ImageMagick bbox (720px/9px-per-cell) BEFORE reading main.rs → clean minimal fix (seeded block + orphaned const) → before/after/zoom/diff PNG proof → teardown proven (`{"sessions": []}`, pgrep rc=1 both binaries, explicit daemon reap). Unprompted branch-first git discipline. Durable report: `.shux/qa/lens-p6/T5-RESULT.md` (first line `T5: PASS`); scratch evidence `.shux/out/lens-p6-t5-demo/` (gitignored per screenshot policy).
 - Convergence CLOSED (codex ×2 + claude ×1): round-2 ruled all round-1 findings + claude extras FIXED, zero blocking defects. Convergence-close nits folded: stale "cannot mask" copy in the 077 task file superseded; UUID-ambiguity warning now uses `style::warning()`.
@@ -1716,6 +1718,14 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 | 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
 | 077 | shux lens — give every agent eyes (P0: fixtures + red suite; P1: ContentRevision substrate; P2: pane.glance; P3: pane.wait_settled; P4: pane.checkpoint + pane.diff_since; P5: scratch sessions + lens.run; P6: skill rewrite + CLI polish + T-tier + demo) | M3 | **Done** (ALL P0–P6 complete 2026-07-10: gate 37/0 + T-tier 4/4 at ratified HEAD; 12 goldens RATIFIED (18f4b5d); two approved trailered LENS-TEST-CHANGEs (nidhi welcome-dismiss, near-grayscale predicate); tui-qa + independent verifier VERIFIED; dootsabha convergence CLOSED codex ×2 + claude ×1; T5 unaided-agent demo PASS — `.shux/qa/lens-p6/T5-RESULT.md`; P0–P5 in PRs #86–#92 / v0.38.0–v0.42.0, P6 ships from `feat/lens-p6-skill-polish`) | 016, 017, 060, 064, 074 |
+| 078 | lens gate — capture schema + frozen contract suite | M3 | **Not Started** | 077 |
+| 079 | lens gate — one comparator in shux-vt (CellGridView) | M3 | **Not Started** | 078 |
+| 080 | lens gate — capture emission + golden compare (3 tiers) | M3 | **Not Started** | 078, 079 |
+| 081 | lens gate — scenario runner + `shux lens gate` | M3 | **Not Started** | 080 |
+| 082 | lens gate — verdict / report.json / xfail governance / bless / init | M3 | **Not Started** | 081 |
+| 083 | lens gate — settle hardening + optional cast | M3 | **Not Started** | 080, 082 |
+| 084 | lens gate — cold-agent DX validation (Laghudarshi, uv+py3.14+rich) | M3 | **Not Started** | 078, 079, 080, 081, 082, 083 |
+| 085 | lens gate — skill + landing site | M3 | **Not Started** | 084 |
 
 ---
 
