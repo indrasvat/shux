@@ -63,9 +63,14 @@ cargo nextest run -p shux-vt osc_4_palette_no_bump   # the adjudicated invariant
 ## 6. Lanes excluded from the default run (make check stays green)   ⏳
 
 ```
-cargo nextest list --workspace | grep -c lens_gate    # want: 0
+# The two QUARANTINED lanes must be excluded (make check stays green):
+cargo nextest list --workspace | grep -cE 'lens_gate_(capture|contract)'   # want: 0
+# lens_gate_exit_contract IS a normal CI-run target (a frozen exit-map pin) — expected present.
 cargo nextest list --workspace | grep -c 'capture::\|gate::'   # want: >0 (L1 in CI)
 ```
+(Corrected per SOLID-QA P3: a bare `grep -c lens_gate` returns 3, not 0, because
+`lens_gate_exit_contract` runs in CI by design; the quarantine invariant is about
+the `capture`/`contract` lanes, which are 0.)
 
 ## 7. Green dogfood on real shux   ⏳
 
@@ -89,9 +94,19 @@ Transcript: `.shux/qa/078-.../RED-CONTRACT-TRANSCRIPT.md`. Each case is annotate
 make check
 ```
 
-## 10. QA gates   ⏳
-- `shux-vt-solid-qa`: `.shux/qa/078-.../SOLID-QA.md` (VERDICT: PASS).
-- Implementation-diff dootsabha convergence review: clean.
+## 10. QA gates
+- **Implementation-diff dootsabha convergence review:** the first run timed out
+  (both providers); the **v2 self-contained retry converged** — codex **CLEAN**,
+  agy flagged 3, each verified by driving the real VT: 2 were real (flag-emoji
+  width, span-overflow guard) and fixed in commit `910d8c3`, 1 was a bad test
+  assertion. Records: `.local/078-impl-v2-{codex,agy}.md`,
+  `.local/dootsabha-078-impl-review-v2.json`.
+- **`shux-vt-solid-qa`:** `.shux/qa/078-.../SOLID-QA.md`. First audit returned
+  FAIL on two governance items only (impl-diff dootsabha not-yet-converged +
+  pre-completion bookkeeping) — it certified all functional/contract criteria
+  "airtight" with fresh evidence (307/307 shux-vt, cross-path pixel proof,
+  `make check` green, pixel-determinism ratio 0.0). Those items are now closed;
+  re-audited against the final committed state (with the agy fixes) for the PASS.
 
 ---
 
