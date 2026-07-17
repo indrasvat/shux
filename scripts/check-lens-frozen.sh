@@ -40,12 +40,12 @@ set -euo pipefail
 # `lens_gate_*` change is owned by exactly one lane (the GATE lane).
 LANE_KEYS=('GATE-TEST-CHANGE' 'LENS-TEST-CHANGE')
 LANE_RES=(
-	'^(\.shux/fixtures/lens-gate/|crates/shux/tests/lens_gate_)'
+	'^(\.shux/fixtures/lens-gate/|crates/shux/tests/lens_gate(_|\.))'
 	'^(\.shux/fixtures/lens/|crates/shux/tests/lens_)'
 )
 LANE_EXCLUDES=(
 	''
-	'^crates/shux/tests/lens_gate_'
+	'^crates/shux/tests/lens_gate(_|\.)'
 )
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -150,7 +150,20 @@ if git rev-parse --verify --quiet "${base}" >/dev/null; then
 		check_commit "${sha}"
 	done
 else
-	# No usable base (shallow clone / detached / root): inspect HEAD itself.
+	# No base resolved. In CI this is a fail-OPEN hole (adv-gate M1): a
+	# multi-commit PR could hide a frozen change in an earlier commit behind a
+	# clean tip, and a HEAD-only check would pass it. So in CI, demand the
+	# pipeline fetch the base (fail CLOSED) rather than silently degrade.
+	# Locally the commit-msg hook is the authoritative per-commit guard, so
+	# degrade to a best-effort HEAD inspection with a loud warning.
+	if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+		echo "✗ lens frozen-path guard: base ref '${base}' does not resolve in CI." >&2
+		echo "  Range mode cannot inspect BASE..HEAD, which would fail OPEN. Fetch the" >&2
+		echo "  base (actions/checkout with fetch-depth: 0) or set LENS_FROZEN_BASE." >&2
+		exit 1
+	fi
+	echo "⚠ lens frozen-path guard: base ref '${base}' unresolved; degrading to a" >&2
+	echo "  HEAD-only check (the commit-msg hook is the authoritative local guard)." >&2
 	check_commit "$(git rev-parse HEAD)"
 fi
 

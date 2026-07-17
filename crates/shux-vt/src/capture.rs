@@ -937,14 +937,25 @@ fn validate_row(row: &RowRepr, cols: u16) -> Result<(), CaptureError> {
         detail,
     };
 
+    // A "coalescing key" identifies runs that MUST merge if adjacent (no gap):
+    // two cells runs with the same style, or two masks. Adjacent runs sharing a
+    // key are non-canonical (the encoder always coalesces them), so exactly one
+    // encoding exists per grid.
+    #[derive(PartialEq)]
+    enum Key<'a> {
+        Mask,
+        Style(&'a CapStyle),
+    }
+
     let mut expected_min = 0u16; // next legal start column (sorted, non-overlapping)
+    let mut prev: Option<(u16, Key)> = None; // (end_col, key) of the previous run
     for run in &row.runs {
-        let (col, span) = match run {
+        let (col, span, key) = match run {
             Run::Mask { col, cells } => {
                 if *cells == 0 {
                     return Err(err("mask covers 0 cells".into()));
                 }
-                (*col, *cells)
+                (*col, *cells, Key::Mask)
             }
             Run::Cells {
                 col,
@@ -952,7 +963,7 @@ fn validate_row(row: &RowRepr, cols: u16) -> Result<(), CaptureError> {
                 style,
             } => {
                 let span = validate_cells_run(row.row, *col, content, style)?;
-                (*col, span)
+                (*col, span, Key::Style(style))
             }
         };
 
@@ -960,6 +971,14 @@ fn validate_row(row: &RowRepr, cols: u16) -> Result<(), CaptureError> {
             return Err(err(format!(
                 "run at col {col} overlaps or is out of order (expected >= {expected_min})"
             )));
+        }
+        // Adjacent (no gap) + same key ⇒ should have been one run.
+        if let Some((prev_end, prev_key)) = &prev {
+            if *prev_end == col && *prev_key == key {
+                return Err(err(format!(
+                    "run at col {col} is adjacent to the previous run with the same style/kind; it must coalesce (non-canonical)"
+                )));
+            }
         }
         let end = col
             .checked_add(span)
@@ -970,6 +989,7 @@ fn validate_row(row: &RowRepr, cols: u16) -> Result<(), CaptureError> {
             )));
         }
         expected_min = end;
+        prev = Some((end, key));
     }
     Ok(())
 }
@@ -1298,14 +1318,61 @@ mod tests {
     }
 
     #[test]
-    fn alt_screen_and_cursor_are_captured() {
+    fn alt_screen_grid_and_flag_are_consistent() {
+        // Entering alt then writing must capture the ALT content with the alt
+        // flag set — capturing the primary grid while flagging alt would be a
+        // consistency bug (from_terminal must read the presented grid).
         let mut vt = VirtualTerminal::new(4, 20);
+        vt.process(b"primary");
         vt.process(b"\x1b[?1049h\x1b[3;5Hhi");
-        let env = capture(&vt);
-        assert!(env.alt_screen);
-        // cursor after "hi" at row 2 (0-based), col 6.
+        let env = assert_lossless(&vt);
+        assert!(env.alt_screen, "alt flag set");
+        let cells = env.to_cells();
+        // "hi" is on the alt screen at row 2, cols 4-5.
+        assert_eq!(cells[2][4].ch, 'h');
+        assert_eq!(cells[2][5].ch, 'i');
+        // "primary" must NOT appear on the captured (alt) grid.
+        let row0: String = cells[0].iter().map(|c| c.ch).collect();
+        assert!(
+            !row0.contains("primary"),
+            "captured the primary grid, not alt"
+        );
         assert_eq!(env.cursor.row, 2);
         assert_eq!(env.cursor.col, 6);
+
+        // Leaving alt restores + captures the primary content.
+        vt.process(b"\x1b[?1049l");
+        let env2 = capture(&vt);
+        assert!(!env2.alt_screen);
+        let back: String = env2.to_cells()[0].iter().map(|c| c.ch).collect();
+        assert!(back.starts_with("primary"), "primary restored on alt leave");
+    }
+
+    #[test]
+    fn differing_hyperlinks_split_runs() {
+        // Two adjacent cells whose ONLY style difference is the hyperlink target
+        // must be separate runs — merging them would lose one link (data loss).
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(
+            b"\x1b]8;;https://a.invalid/\x1b\\A\x1b]8;;https://b.invalid/\x1b\\B\x1b]8;;\x1b\\",
+        );
+        let env = assert_lossless(&vt);
+        let links: Vec<_> = env.rows[0]
+            .runs
+            .iter()
+            .filter_map(|r| match r {
+                Run::Cells { style, .. } => Some(style.hyperlink.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                Some("https://a.invalid/".to_string()),
+                Some("https://b.invalid/".to_string())
+            ],
+            "adjacent differing hyperlinks must not merge into one run"
+        );
     }
 
     #[test]
@@ -1446,6 +1513,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_coalesced_adjacent_same_style_runs() {
+        // "ab" as two adjacent default-styled runs is non-canonical — it must be
+        // one run [0,"ab"]. Two encodings for one grid → golden instability.
+        let env = env_with_row(20, vec![cells(0, "a"), cells(1, "b")]);
+        assert!(
+            env.validate().is_err(),
+            "adjacent same-style runs must coalesce (exactly one encoding)"
+        );
+    }
+
+    #[test]
+    fn allows_adjacent_runs_with_different_styles() {
+        // "AB" where A and B differ in style ARE two adjacent runs (they cannot
+        // coalesce) — this must remain valid.
+        let red = CapStyle {
+            fg: Some(CapColor::Idx(1)),
+            ..CapStyle::default()
+        };
+        let env = env_with_row(
+            20,
+            vec![
+                Run::Cells {
+                    col: 0,
+                    content: RunContent::Simple("A".into()),
+                    style: red,
+                },
+                cells(1, "B"),
+            ],
+        );
+        assert!(
+            env.validate().is_ok(),
+            "adjacent DIFFERENT-style runs are canonical"
+        );
+    }
+
+    #[test]
+    fn rejects_non_coalesced_adjacent_masks() {
+        let env = env_with_row(
+            20,
+            vec![
+                Run::Mask { col: 0, cells: 2 },
+                Run::Mask { col: 2, cells: 3 },
+            ],
+        );
+        assert!(env.validate().is_err(), "adjacent masks must coalesce");
+    }
+
+    #[test]
     fn empty_grid_round_trips() {
         let vt = VirtualTerminal::new(3, 10);
         let env = assert_lossless(&vt);
@@ -1499,6 +1614,78 @@ mod tests {
             0..40)) -> Vec<u8> {
             ops.concat()
         }
+    }
+
+    // ── Adversarial edge cases (preempting the adv-schema review) ───────────
+
+    #[test]
+    fn wide_glyph_in_last_column_round_trips() {
+        // A wide glyph with only one column left. Whatever the VT decides
+        // (wrap / drop / place), the capture must stay canonical + round-trip.
+        for cols in [1usize, 2, 3, 4] {
+            let mut vt = VirtualTerminal::new(2, cols);
+            vt.process("aa漢字bb".as_bytes());
+            let env = assert_lossless(&vt); // validate + serde + fixed point
+            // No run may claim a column past the grid width (the boundary bug).
+            for row in &env.rows {
+                for run in &row.runs {
+                    if let Run::Cells { col, content, .. } = run {
+                        let span = match content {
+                            RunContent::Simple(s) => s.chars().count(),
+                            RunContent::Complex(v) => v.len(),
+                        };
+                        assert!(
+                            *col as usize + span <= cols,
+                            "cols={cols}: run at {col} span {span} exceeds width"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mask_splitting_a_wide_glyph_stays_canonical() {
+        // A mask whose edge falls in the middle of a wide glyph must not desync
+        // columns or emit a non-canonical capture.
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process("漢字ab".as_bytes()); // 漢 at 0-1, 字 at 2-3, a=4, b=5
+        for (mcol, mwidth) in [(0u16, 1u16), (1, 1), (1, 2), (0, 3), (3, 2)] {
+            let masks = MaskSet::new().with(0, mcol, mwidth);
+            let env = FrameEnvelope::from_terminal(&vt, &masks);
+            env.validate()
+                .unwrap_or_else(|e| panic!("mask ({mcol},{mwidth}) not canonical: {e:?}"));
+            // serde round-trip still holds.
+            let json = env.to_canonical_json();
+            let back = FrameEnvelope::from_canonical_json(&json).unwrap();
+            assert_eq!(env, back);
+        }
+    }
+
+    #[test]
+    fn masked_capture_is_a_fixed_point_under_the_same_masks() {
+        // Masks are lossy w.r.t. the ORIGINAL content by design, but a masked
+        // capture must be stable: re-encoding its decoded cells UNDER THE SAME
+        // masks reproduces it (the ▮ placeholders re-mask to the same run).
+        let mut vt = VirtualTerminal::new(2, 20);
+        vt.process(b"2026-07-17T09:00 tail");
+        let masks = MaskSet::new().with(0, 0, 16);
+        let env = FrameEnvelope::from_terminal(&vt, &masks);
+        env.validate().unwrap();
+
+        let rebuilt = grid_from_cells(&env.to_cells());
+        let env2 = FrameEnvelope::from_parts(
+            &rebuilt,
+            vt.cursor(),
+            vt.default_colors(),
+            vt.is_alternate_screen(),
+            vt.palette_overridden(),
+            &masks,
+        );
+        assert_eq!(
+            env, env2,
+            "masked capture must be a fixed point under the same masks"
+        );
     }
 
     proptest! {

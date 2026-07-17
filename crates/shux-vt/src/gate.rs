@@ -102,19 +102,35 @@ impl GateStatus {
         self.exit_code() == 0
     }
 
+    /// Severity tier for the worst-frame rollup. The load-bearing invariant
+    /// (adv-gate M2): a **regression** (any exit-1 status) must never be masked
+    /// by a higher-exit operational error, or CI keyed on "exit 1 = block, exit 3
+    /// = retry" would let a real regression through. So:
+    ///
+    ///   0 = green (pass / xfail)
+    ///   1 = operational error (child_error / scenario_error / infra_error /
+    ///       update_refused) — beats green, loses to a regression
+    ///   2 = regression (exit 1) — always surfaces
+    ///
+    /// 082 may refine the intra-tier *labels*, but MUST preserve tier ordering:
+    /// a regression can never roll up to a non-regression exit code.
+    fn severity_tier(self) -> u8 {
+        if self.is_green() {
+            0
+        } else if self.exit_code() == 1 {
+            2
+        } else {
+            1
+        }
+    }
+
     /// The worst (most-severe) of two statuses, for a worst-frame scenario
-    /// rollup. Severity is defined by declaration order in [`GateStatus::ALL`]
-    /// AFTER the greens — a regression always outranks a pass/xfail. The full
-    /// rollup ordering is 082's to finalize; this is the frozen tie-break seed.
+    /// rollup. Tier-ordered (see [`GateStatus::severity_tier`]); ties broken by
+    /// declaration order in [`GateStatus::ALL`] so the rollup is deterministic.
     pub fn worst(self, other: GateStatus) -> GateStatus {
-        fn rank(s: GateStatus) -> u8 {
-            if s.is_green() {
-                0
-            } else {
-                // any non-green outranks any green; among non-greens keep a
-                // stable order by ALL-index so the rollup is deterministic.
-                1 + GateStatus::ALL.iter().position(|&x| x == s).unwrap_or(0) as u8
-            }
+        fn rank(s: GateStatus) -> u16 {
+            let idx = GateStatus::ALL.iter().position(|&x| x == s).unwrap_or(0) as u16;
+            (s.severity_tier() as u16) * 100 + idx
         }
         if rank(other) > rank(self) {
             other
@@ -302,8 +318,54 @@ mod tests {
     fn worst_prefers_regression_over_green() {
         assert_eq!(GateStatus::Pass.worst(GateStatus::Fail), GateStatus::Fail);
         assert_eq!(GateStatus::Fail.worst(GateStatus::Pass), GateStatus::Fail);
-        assert_eq!(GateStatus::Pass.worst(GateStatus::Xfail), GateStatus::Pass);
+        // Two greens roll up to a green (the exact label is a deterministic
+        // tie-break and exit-neutral).
+        assert!(GateStatus::Pass.worst(GateStatus::Xfail).is_green());
         assert_eq!(GateStatus::Xpass.worst(GateStatus::Pass), GateStatus::Xpass);
+    }
+
+    #[test]
+    fn worst_never_masks_a_regression_with_an_error(/* adv-gate M2 */) {
+        use GateStatus::*;
+        // A regression sharing a scenario with an operational error must still
+        // roll up to a regression (exit 1) — never to the error's exit code.
+        let errors = [ChildError, ScenarioError, InfraError, UpdateRefused];
+        let regressions = [
+            Fail,
+            Xpass,
+            MissingGolden,
+            XfailExpired,
+            StaleGolden,
+            SettleNeverStable,
+        ];
+        for r in regressions {
+            for e in errors {
+                assert_eq!(
+                    r.worst(e).exit_code(),
+                    1,
+                    "worst({r:?}, {e:?}) must stay a regression (exit 1), got {:?}",
+                    r.worst(e)
+                );
+                assert_eq!(e.worst(r).exit_code(), 1, "worst is order-independent");
+            }
+        }
+        // And an error still beats a green.
+        assert_eq!(Pass.worst(InfraError), InfraError);
+        assert_eq!(Xfail.worst(ChildError), ChildError);
+    }
+
+    #[test]
+    fn worst_never_returns_green_when_either_is_non_green() {
+        for a in GateStatus::ALL {
+            for b in GateStatus::ALL {
+                if !a.is_green() || !b.is_green() {
+                    assert!(
+                        !a.worst(b).is_green(),
+                        "worst({a:?}, {b:?}) masked a non-green as green"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
