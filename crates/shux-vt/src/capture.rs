@@ -753,7 +753,13 @@ impl RunBuilder {
 }
 
 fn build_row_runs(grid: &Grid, r: usize, cols: usize, masks: &MaskSet) -> Vec<Run> {
-    let row = grid.row(r);
+    // Map the visible row index to its absolute position. `from_parts` iterates
+    // `0..grid.rows()` (the VIEWPORT count), so a grid carrying scrollback must
+    // offset past it: bare `grid.row(r)` is ABSOLUTE (index 0 = oldest scrollback)
+    // and would capture scrollback instead of the visible frame this function
+    // documents — silently freezing the wrong rows for any scrolled pane (task-079
+    // adversarial finding; `scrollback_len() == 0` ⇒ identical to the old code).
+    let row = grid.row(grid.scrollback_len() + r);
     let mut runs: Vec<Run> = Vec::new();
     let mut cur: Option<RunBuilder> = None;
     let mut mask_start: Option<u16> = None;
@@ -1428,6 +1434,37 @@ mod tests {
         assert!(!env2.alt_screen);
         let back: String = env2.to_cells()[0].iter().map(|c| c.ch).collect();
         assert!(back.starts_with("primary"), "primary restored on alt leave");
+    }
+
+    #[test]
+    fn captures_visible_viewport_not_scrollback() {
+        // `from_terminal` documents "the visible frame"; a scrolled VT must
+        // serialize the VIEWPORT rows, not the oldest scrollback (task-079
+        // adversarial finding — `build_row_runs` indexed absolutely).
+        let mut vt = VirtualTerminal::new(4, 10);
+        for i in 0..20u8 {
+            vt.process(format!("line{i:02}\r\n").as_bytes());
+        }
+        assert!(
+            vt.grid().scrollback_len() > 0,
+            "precondition: the VT has scrolled"
+        );
+        let cells = capture(&vt).to_cells();
+        let row0: String = cells[0].iter().map(|c| c.ch).collect();
+        assert!(
+            !row0.contains("line00"),
+            "must NOT capture the oldest scrollback row, got {row0:?}"
+        );
+        // Every captured row equals the live viewport row it claims to snapshot.
+        for (r, captured) in cells.iter().enumerate() {
+            let row = vt.grid().visible_row(r);
+            let want: String = (0..row.len())
+                .filter_map(|c| row.get(c))
+                .map(|c| c.ch)
+                .collect();
+            let got: String = captured.iter().map(|c| c.ch).collect();
+            assert_eq!(got, want, "captured row {r} must equal the live viewport");
+        }
     }
 
     #[test]

@@ -1,0 +1,29 @@
+{
+  "bounding_box": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "cells_changed": 0,
+  "changed_mask": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+  ],
+  "changed_rows": [],
+  "cols": 5,
+  "cursor_moved": false,
+  "geometry_changed": true,
+  "palette_overridden_differs": false,
+  "regions": [],
+  "regions_truncated": false,
+  "rows": 2
+}

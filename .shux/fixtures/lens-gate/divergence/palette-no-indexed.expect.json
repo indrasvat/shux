@@ -1,0 +1,8 @@
+{
+  "cells_changed": 0,
+  "cursor_moved": false,
+  "geometry_changed": false,
+  "note": "diagnostic fires but NO indexed colour present: 080 must NOT escalate (per-frame overridden && has_indexed)",
+  "palette_overridden_differs": true,
+  "pixel_diverges": false
+}

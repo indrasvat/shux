@@ -1,0 +1,8 @@
+{
+  "cells_changed": 0,
+  "cursor_moved": true,
+  "geometry_changed": false,
+  "note": "cell tier catches cursor position; pixel tier sees the block move",
+  "palette_overridden_differs": false,
+  "pixel_diverges": true
+}

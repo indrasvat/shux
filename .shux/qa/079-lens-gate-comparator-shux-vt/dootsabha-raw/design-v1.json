@@ -1,0 +1,50 @@
+{
+  "dispatch": [
+    {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "content": "**Verdict: REVISE**\n\n1. **BLOCKER: `diff_frames` must not inherit `compute_lens_diff`’s min-crop dimension behavior.**  \n   In [main.rs](/Users/indrasvat/code/github.com/indrasvat-shux/crates/shux/src/main.rs:529), min rows/cols is safe only because `pane.diff_since` invalidates resize/alt-screen checkpoints before diff. A golden comparator has no such guarantee. A 24x80 golden vs 25x80 live frame can falsely pass if the overlap matches. Make size mismatch explicit: `Result\u003cFrameDiff, SizeMismatch\u003e` or a first-class `geometry_changed` field. The daemon adapter can still assert equal dims and preserve output.\n\n2. **BLOCKER: `palette_changed` overclaims.**  \n   `palette_overridden` is a sticky history bit, not palette state. It cannot prove “palette changed,” only “one side has ever seen a valid OSC 4 set and the other has not.” Both sides can be `true` with different discarded colours and compare equal; one side can be `true` with no indexed cells and report a false divergence. Do not fold this into `cells_changed`; that would corrupt cell-value semantics. But rename/define it as a portability diagnostic, and require indexed-colour presence before 080 turns it into `palette_unportable`.\n\n3. **MAJOR: Q4 is only non-self-referential if the oracle is generated from the old live function over the old live inputs.**  \n   Hand-mapping `LensDiff -\u003e diff.json` is the right direction. But the corpus must be produced before deletion from actual old `Grid`/cursor/default inputs, not from `FrameEnvelope::view()` or a rehydrated grid. It also needs cases for OSC 10/11 defaults, cursor visible/position, wide head+spacer, empty diff, \u003e256 span truncation, bbox boundaries, and changed-mask shape. Existing 077/showcase cases alone do not prove parity.\n\n4. **MAJOR: `FrameEnvelope::view()` cannot silently trust `to_cells()`.**  \n   [to_cells](/Users/indrasvat/code/github.com/indrasvat-shux/crates/shux-vt/src/capture.rs:642) is intentionally reconstructive and tolerant; validation is separate. A comparator view should be `try_view()` or require a validated envelope, otherwise malformed/non-canonical goldens can be normalized before comparison.\n\n5. **MAJOR: the divergence table is not proof, and one row is wrong for current shux.**  \n   `blink-only =\u003e cells_changed \u003e 0` is correct because BLINK is a `CellFlags` bit. But current PNG raster does not render blink, so “pixel would diverge: YES” is not true for shux’s static pixel tier. Font fallback / antialias / emoji fallback fixtures are acceptable in 079 only as cell-tier boundary docs with `cells_changed == 0`; actual pixel divergence must be proven in 080.\n\n6. **MAJOR: add missing boundary cases.**  \n   Include size mismatch, cursor-shape-only change, cursor visibility-only change, default-colour-only change, and palette flag with no indexed colours. These are the cases most likely to expose false pass/fail claims across tiers.\n\n7. **MINOR: Q1 wrapper resolution is correct.**  \n   A literal `impl CellGridView for \u0026Grid` cannot satisfy defaults/cursor/palette. `GridFrame` / `FrameView` wrappers are mandatory unless the trait drops required state, which would be worse.\n\n8. **MINOR: Q3 daemon `palette_overridden = false` on both sides is correct for byte-stability.**  \n   Do not read the live VT palette flag in `pane.diff_since` unless checkpoints start storing it and the RPC schema changes. Add a regression asserting an OSC 4-touched pane still emits the exact old JSON shape with no palette field.\n\n9. **MINOR: “byte-exact Cell equality” is imprecise.**  \n   The old comparison is Rust `Cell` value equality, not byte/memory equality. Say “value-exact to `Cell: Eq`,” especially because `extended: Arc\u003c_\u003e` compares inner values.\n\nNo dependency-cycle issue: `shux` already depends on `shux-vt`; moving types into `shux-vt` and using existing serde is directionally clean.\n\n",
+      "duration_ms": 223779,
+      "cost_usd": 0,
+      "tokens_in": 585068,
+      "tokens_out": 11335
+    },
+    {
+      "provider": "agy",
+      "model": "",
+      "content": "",
+      "duration_ms": 0,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "error": "invoke agy: agy: Error: timeout waiting for response"
+    }
+  ],
+  "reviews": null,
+  "synthesis": {
+    "chair": "claude",
+    "chair_fallback": "codex",
+    "content": "**Unified Verdict: REVISE**\n\nThe direction is sound: move reusable frame-diff types into `shux-vt`, keep `GridFrame` / `FrameView` wrappers, and preserve daemon byte-stability. But the comparator must not inherit assumptions that are only valid inside `pane.diff_since`.\n\nRequired changes:\n\n1. `diff_frames` must treat geometry mismatch as first-class. Do not min-crop. Return a `SizeMismatch` error or include explicit `geometry_changed` with both dimensions.\n\n2. Rename/redefine `palette_changed`. The current `palette_overridden` bit is historical, not proof of palette divergence. Keep it as a portability diagnostic, do not fold it into `cells_changed`, and only escalate to something like `palette_unportable` when indexed-color cells are present.\n\n3. `FrameEnvelope::view()` should not silently normalize via `to_cells()`. Make it `try_view()` or require a previously validated envelope so malformed goldens fail clearly.\n\n4. Generate the parity oracle from the old live implementation before deleting it, using old `Grid` / cursor / defaults inputs. Do not hand-map from new `FrameEnvelope::view()` output. Include cases for OSC 10/11 defaults, cursor visibility/position/shape, wide cells, empty diff, span truncation, bbox edges, changed-mask shape, and size mismatch.\n\n5. Fix the divergence table. Blink-only changes are cell diffs because `BLINK` is a `CellFlags` bit, but current static PNG output does not render blink, so it should not claim pixel divergence yet. Font fallback, antialiasing, and emoji fallback belong as 079 boundary docs with `cells_changed == 0`; pixel divergence claims need 080 proof.\n\n6. Preserve daemon compatibility: keep `palette_overridden = false` on both sides for current `pane.diff_since`, unless checkpoints and RPC schema start storing palette history. Add a regression that an OSC 4-touched pane still emits the exact old JSON shape with no palette field.\n\n7. Tighten wording: say “value-exact to `Cell: Eq`,” not “byte-exact Cell equality.”\n\nNet: proceed with the extraction, but gate it on strict geometry handling, validated frame views, correct palette semantics, and an oracle generated from the old live path."
+  },
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 270322,
+    "total_cost_usd": 0,
+    "total_tokens_in": 635473,
+    "total_tokens_out": 13525,
+    "providers": {
+      "agy": "error",
+      "codex": "ok"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "partial result: some agents failed"
+  }
+}

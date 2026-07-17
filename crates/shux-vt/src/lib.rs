@@ -8,6 +8,7 @@ mod capture;
 mod cell;
 mod charset;
 mod cursor;
+mod diff;
 mod gate;
 mod grid;
 mod parser;
@@ -22,6 +23,9 @@ pub use cell::{
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
+pub use diff::{
+    CellGridView, CellRef, CursorState, FrameDiff, FrameView, GridFrame, LensRowSpan, diff_frames,
+};
 pub use gate::{
     DiffRegion, DiffReport, FrameReport, GATE_REPORT_SCHEMA, GateStatus, ScenarioReport, XfailMeta,
 };

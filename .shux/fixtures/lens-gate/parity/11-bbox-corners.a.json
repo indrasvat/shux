@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "size": {
+    "rows": 6,
+    "cols": 16
+  },
+  "alt_screen": false,
+  "defaults": {},
+  "cursor": {
+    "row": 0,
+    "col": 1,
+    "visible": true,
+    "shape": "block"
+  },
+  "palette_overridden": false,
+  "rows": [
+    {
+      "row": 0,
+      "runs": []
+    },
+    {
+      "row": 1,
+      "runs": []
+    },
+    {
+      "row": 2,
+      "runs": []
+    },
+    {
+      "row": 3,
+      "runs": []
+    },
+    {
+      "row": 4,
+      "runs": []
+    },
+    {
+      "row": 5,
+      "runs": []
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "cells_changed": 0,
+  "cursor_moved": false,
+  "geometry_changed": false,
+  "note": "cell-identical (same codepoints): the CELL tier is blind to font-fallback/antialias differences — 080's pixel tier proves those",
+  "palette_overridden_differs": false,
+  "pixel_diverges": true
+}

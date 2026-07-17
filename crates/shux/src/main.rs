@@ -461,33 +461,6 @@ fn lens_pixel_budget_check(
     Ok(())
 }
 
-/// One per-row changed-column span in a `pane.diff_since` result
-/// (LENS-R-035): 0-based half-open `[col_start, col_end)`.
-struct LensRowSpan {
-    row: u16,
-    col_start: u16,
-    col_end: u16,
-}
-
-/// The structured delta between a checkpoint clone and the current clone
-/// (lens PRD §7.2, LENS-R-034..036).
-struct LensDiff {
-    cells_changed: u32,
-    regions: Vec<LensRowSpan>,
-    regions_truncated: bool,
-    /// (row_start, col_start, row_end, col_end) — 0-based HALF-OPEN in both
-    /// axes; all zeros when nothing changed (the empty range, LENS-R schema).
-    bounding_box: (u16, u16, u16, u16),
-    cursor_moved: bool,
-    /// Rows (grid index) with ≥1 changed cell, ascending — the keys of
-    /// `changed_row_text`.
-    changed_rows: Vec<usize>,
-    /// Flat `rows × cols` changed mask for the heat overlay (LENS-R-037).
-    changed_mask: Vec<bool>,
-    rows: usize,
-    cols: usize,
-}
-
 /// The lens `pane.glance` text of a SINGLE grid row (LENS-R-012 byte-stability,
 /// per-row): ANSI-free, wide-continuation cells skipped, full-width, trailing
 /// whitespace preserved (no trim). Byte-identical to `Grid::glance_text`'s
@@ -504,156 +477,6 @@ fn glance_row_text(grid: &shux_vt::Grid, row_idx: usize) -> String {
         }
     }
     line
-}
-
-/// Compute the structured diff of `cur` against the checkpoint `cp` clone
-/// (lens PRD §7.2). A cell counts as changed iff its UNDERLYING cell data
-/// differs (glyph, fg, bg, attrs — `Cell`'s full value equality, no cursor
-/// overlay: the clones carry none), with `Color::Default` RESOLVED against
-/// each side's respective OSC 10/11/12 defaults (LENS-R-038b, PR #91 codex
-/// P2): a default-color-only repaint presents every Default-colored cell
-/// differently, so when the two sides' fg (or bg) defaults differ, a cell
-/// whose fg (or bg) is `Default` on BOTH sides counts as changed. When the
-/// defaults are unchanged the extra clauses never fire and the comparison is
-/// byte-identical to plain `Cell` equality (D-tier gates + ratified goldens
-/// unaffected). The cursor default (OSC 12) is deliberately NOT part of the
-/// cell comparison — the cursor overlay is excluded from diffs entirely
-/// (DEC-11). Wide glyphs pair with their spacer: if either half changed,
-/// both count (LENS-R-034). Cursor position/visibility is never in the grid
-/// cells, so it is excluded from the count/regions by construction; a
-/// content change under the cursor's cell still counts. `cursor_moved` is
-/// reported separately.
-///
-/// Max 256 spans (LENS-R-035): past the cap `regions_truncated` is set and the
-/// caller emits only `bounding_box`.
-fn compute_lens_diff(
-    cp: &shux_vt::Grid,
-    cur: &shux_vt::Grid,
-    cp_cursor: (usize, usize, bool),
-    cur_cursor: (usize, usize, bool),
-    cp_defaults: shux_vt::TerminalDefaultColors,
-    cur_defaults: shux_vt::TerminalDefaultColors,
-) -> LensDiff {
-    // A valid diff (existence-first lookup hit) implies equal dims — resize
-    // invalidates checkpoints. `min` is a defensive guard, not a happy path.
-    let rows = cp.rows().min(cur.rows());
-    let cols = cp.cols().min(cur.cols());
-
-    // LENS-R-038b: which default channels changed between the two frames.
-    // `Default`-colored cells resolve through these, so a changed channel
-    // marks every cell that is `Default` in that channel on both sides
-    // (asymmetric Default-vs-concrete pairs already differ by raw equality).
-    let fg_default_changed = cp_defaults.fg != cur_defaults.fg;
-    let bg_default_changed = cp_defaults.bg != cur_defaults.bg;
-
-    let mut changed = vec![false; rows * cols];
-    for r in 0..rows {
-        let cp_row = cp.visible_row(r);
-        let cur_row = cur.visible_row(r);
-        for c in 0..cols {
-            let differ = match (cp_row.get(c), cur_row.get(c)) {
-                (Some(a), Some(b)) => {
-                    a != b
-                        || (fg_default_changed
-                            && a.style.fg == shux_vt::Color::Default
-                            && b.style.fg == shux_vt::Color::Default)
-                        || (bg_default_changed
-                            && a.style.bg == shux_vt::Color::Default
-                            && b.style.bg == shux_vt::Color::Default)
-                }
-                (None, None) => false,
-                _ => true,
-            };
-            if differ {
-                changed[r * cols + c] = true;
-            }
-        }
-    }
-
-    // Wide-glyph pairing (LENS-R-034): a wide head and its spacer are one
-    // visual unit — if either half changed, both cells count.
-    for r in 0..rows {
-        let cp_row = cp.visible_row(r);
-        let cur_row = cur.visible_row(r);
-        for c in 0..cols.saturating_sub(1) {
-            let wide = cp_row.get(c).is_some_and(|x| x.is_wide())
-                || cur_row.get(c).is_some_and(|x| x.is_wide());
-            if wide {
-                let i = r * cols + c;
-                if changed[i] || changed[i + 1] {
-                    changed[i] = true;
-                    changed[i + 1] = true;
-                }
-            }
-        }
-    }
-
-    // Build spans (per row, contiguous runs → merged), count, bbox, rows.
-    const MAX_SPANS: usize = 256;
-    let mut regions: Vec<LensRowSpan> = Vec::new();
-    let mut changed_rows: Vec<usize> = Vec::new();
-    let mut cells_changed: u32 = 0;
-    let (mut min_row, mut min_col, mut max_row, mut max_col) =
-        (usize::MAX, usize::MAX, 0usize, 0usize);
-
-    for r in 0..rows {
-        let mut row_had_change = false;
-        let mut c = 0;
-        while c < cols {
-            if changed[r * cols + c] {
-                let start = c;
-                while c < cols && changed[r * cols + c] {
-                    cells_changed += 1;
-                    c += 1;
-                }
-                // `c` is now one past the run — half-open [start, c).
-                regions.push(LensRowSpan {
-                    row: r as u16,
-                    col_start: start as u16,
-                    col_end: c as u16,
-                });
-                row_had_change = true;
-                min_row = min_row.min(r);
-                max_row = max_row.max(r);
-                min_col = min_col.min(start);
-                max_col = max_col.max(c - 1);
-            } else {
-                c += 1;
-            }
-        }
-        if row_had_change {
-            changed_rows.push(r);
-        }
-    }
-
-    let regions_truncated = regions.len() > MAX_SPANS;
-    if regions_truncated {
-        regions.clear();
-    }
-
-    let bounding_box = if cells_changed == 0 {
-        (0, 0, 0, 0)
-    } else {
-        // Half-open in both axes: [min, max+1).
-        (
-            min_row as u16,
-            min_col as u16,
-            (max_row + 1) as u16,
-            (max_col + 1) as u16,
-        )
-    };
-
-    LensDiff {
-        cells_changed,
-        regions,
-        regions_truncated,
-        bounding_box,
-        cursor_moved: cp_cursor != cur_cursor,
-        changed_rows,
-        changed_mask: changed,
-        rows,
-        cols,
-    }
 }
 
 /// Render the `pane.diff_since` heat PNG (LENS-R-037): the current clone
@@ -5922,14 +5745,35 @@ fn register_pane_io_methods(
                     // LENS-R-038b: Default colors resolve against each
                     // side's own defaults — the checkpoint's captured
                     // defaults vs the pane's CURRENT defaults).
-                    let diff = compute_lens_diff(
-                        &cp_grid,
-                        &cur_grid,
-                        cp_cursor,
-                        cur_cursor,
-                        cp_defaults,
-                        default_colors,
-                    );
+                    // Thin adapter over the shux-vt comparator (task 079). Both
+                    // frames are the same pane at equal dims (resize/alt-screen
+                    // invalidate the checkpoint first), and pane.diff_since has no
+                    // palette field, so `palette_overridden` is false on both sides:
+                    // `geometry_changed` / `palette_overridden_differs` stay false and
+                    // are never serialized — output byte-identical to pre-refactor.
+                    let diff = {
+                        let cp_view = shux_vt::GridFrame::new(
+                            &cp_grid,
+                            cp_defaults,
+                            shux_vt::CursorState {
+                                row: cp_cursor.0,
+                                col: cp_cursor.1,
+                                visible: cp_cursor.2,
+                            },
+                            false,
+                        );
+                        let cur_view = shux_vt::GridFrame::new(
+                            &cur_grid,
+                            default_colors,
+                            shux_vt::CursorState {
+                                row: cur_cursor.0,
+                                col: cur_cursor.1,
+                                visible: cur_cursor.2,
+                            },
+                            false,
+                        );
+                        shux_vt::diff_frames(&cp_view, &cur_view)
+                    };
 
                     let regions: Vec<serde_json::Value> = diff
                         .regions
@@ -7781,97 +7625,10 @@ mod tests {
         assert_eq!(data["hint"], "set heat_png=false", "hint passes through");
     }
 
-    /// LENS-R-038b (PR #91 codex P2, adjudicated) — a default-color-only
-    /// change marks every cell whose changed channel is `Color::Default` on
-    /// both sides; concrete-colored cells stay unmarked. Exercises both the
-    /// bg (OSC 11) and fg (OSC 10) channels against a grid mixing blank
-    /// cells, default-colored text, and one fully concrete-colored cell.
-    #[test]
-    fn compute_lens_diff_default_color_change_marks_default_cells() {
-        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
-        // Default-colored text at (0,0..2) + one cell at (1,2) with CONCRETE
-        // fg AND bg (never resolves through either default channel).
-        vt.process(b"\x1b[1;1HAB\x1b[2;3H\x1b[38;2;1;2;3m\x1b[48;2;4;5;6mX\x1b[0m");
-        let grid = vt.grid().clone_visible();
-        let cursor = (0, 0, true);
-        let base = shux_vt::TerminalDefaultColors::default();
-
-        // bg default changed (OSC 11): every cell except (1,2) counts.
-        let bg_changed = shux_vt::TerminalDefaultColors {
-            bg: Some([32, 64, 96]),
-            ..base
-        };
-        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, bg_changed);
-        assert_eq!(
-            diff.cells_changed, 29,
-            "3×10 grid minus the one concrete-bg cell"
-        );
-        assert!(!diff.changed_mask[10 + 2], "concrete-bg cell NOT marked");
-        assert!(diff.changed_mask[0], "default-colored glyph cell marked");
-        assert!(diff.changed_mask[9], "blank cell marked");
-        // Row 1 splits around the concrete cell: [0,2) + [3,10).
-        let spans: Vec<(u16, u16, u16)> = diff
-            .regions
-            .iter()
-            .map(|s| (s.row, s.col_start, s.col_end))
-            .collect();
-        assert_eq!(spans, vec![(0, 0, 10), (1, 0, 2), (1, 3, 10), (2, 0, 10)]);
-        assert_eq!(diff.bounding_box, (0, 0, 3, 10));
-
-        // fg default changed (OSC 10): same shape — the concrete-fg cell is
-        // the only one not resolving through the fg default.
-        let fg_changed = shux_vt::TerminalDefaultColors {
-            fg: Some([200, 10, 10]),
-            ..base
-        };
-        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, fg_changed);
-        assert_eq!(diff.cells_changed, 29);
-        assert!(!diff.changed_mask[10 + 2], "concrete-fg cell NOT marked");
-
-        // Cursor default (OSC 12) is NOT part of the cell comparison
-        // (DEC-11: the cursor overlay is excluded from diffs entirely).
-        let cursor_changed = shux_vt::TerminalDefaultColors {
-            cursor: Some([255, 0, 0]),
-            ..base
-        };
-        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, cursor_changed);
-        assert_eq!(diff.cells_changed, 0, "OSC 12 never marks cells");
-    }
-
-    /// LENS-R-038b test (b): with UNCHANGED defaults the comparison is
-    /// byte-identical to plain raw `Cell` equality — whether the shared
-    /// defaults are the builtin fallback (None) or an OSC-set value. Pins
-    /// that the D-tier gates and ratified goldens are unaffected.
-    #[test]
-    fn compute_lens_diff_unchanged_defaults_matches_raw() {
-        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
-        vt.process(b"\x1b[1;1Hhello");
-        let cp = vt.grid().clone_visible();
-        vt.process(b"\x1b[2;4H\x1b[48;5;28mZW\x1b[0m");
-        let cur = vt.grid().clone_visible();
-        let cursor = (0, 0, true);
-
-        let none = shux_vt::TerminalDefaultColors::default();
-        let osc_set = shux_vt::TerminalDefaultColors {
-            fg: Some([250, 250, 250]),
-            bg: Some([32, 64, 96]),
-            cursor: Some([255, 128, 0]),
-        };
-
-        let raw = compute_lens_diff(&cp, &cur, cursor, cursor, none, none);
-        let same_osc = compute_lens_diff(&cp, &cur, cursor, cursor, osc_set, osc_set);
-        assert_eq!(raw.cells_changed, 2, "exactly the ZW cells");
-        assert_eq!(same_osc.cells_changed, raw.cells_changed);
-        assert_eq!(same_osc.changed_mask, raw.changed_mask);
-        assert_eq!(same_osc.bounding_box, raw.bounding_box);
-        let spans = |d: &LensDiff| -> Vec<(u16, u16, u16)> {
-            d.regions
-                .iter()
-                .map(|s| (s.row, s.col_start, s.col_end))
-                .collect()
-        };
-        assert_eq!(spans(&same_osc), spans(&raw));
-    }
+    // The cell-diff semantics (default-color resolution, unchanged-defaults ==
+    // raw Cell equality, wide-glyph pairing) moved to `shux-vt` with the
+    // comparator in task 079; they are pinned by `shux_vt::diff::tests` and by
+    // the frozen parity corpus (`crates/shux/tests/lens_gate_parity.rs`).
 
     /// LENS-R-038b test (c), unit half — the heat base is rendered with the
     /// defaults PASSED IN (the handler passes the pane's CURRENT defaults).
@@ -7927,7 +7684,9 @@ mod tests {
     /// cell VALUES from `clone_visible` clones, never the render-drained dirty
     /// flags. Simulate a concurrently-attached render client by DRAINING the
     /// VT's dirty regions between the checkpoint clone and the current clone;
-    /// the diff still reports the exact delta.
+    /// the diff still reports the exact delta. (Name preserved: referenced by
+    /// `crates/shux/tests/diff_concurrent_readers.rs`; now drives the task-079
+    /// `shux_vt::diff_frames` through the same `GridFrame` adapter the daemon uses.)
     #[test]
     fn compute_lens_diff_independent_of_dirtystate_drains() {
         let mut vt = shux_vt::VirtualTerminal::new(6, 20);
@@ -7936,7 +7695,11 @@ mod tests {
         let cp_grid = vt.grid().clone_visible();
         let cp_cursor = {
             let c = vt.cursor();
-            (c.row, c.col, c.visible)
+            shux_vt::CursorState {
+                row: c.row,
+                col: c.col,
+                visible: c.visible,
+            }
         };
         // A render client drains DirtyState (as the attach compositor would).
         let _ = vt.take_dirty_regions();
@@ -7950,16 +7713,16 @@ mod tests {
         let cur_grid = vt.grid().clone_visible();
         let cur_cursor = {
             let c = vt.cursor();
-            (c.row, c.col, c.visible)
+            shux_vt::CursorState {
+                row: c.row,
+                col: c.col,
+                visible: c.visible,
+            }
         };
-        let diff = compute_lens_diff(
-            &cp_grid,
-            &cur_grid,
-            cp_cursor,
-            cur_cursor,
-            shux_vt::TerminalDefaultColors::default(),
-            shux_vt::TerminalDefaultColors::default(),
-        );
+        let d = shux_vt::TerminalDefaultColors::default();
+        let a = shux_vt::GridFrame::new(&cp_grid, d, cp_cursor, false);
+        let b = shux_vt::GridFrame::new(&cur_grid, d, cur_cursor, false);
+        let diff = shux_vt::diff_frames(&a, &b);
         // (1,1) style change + (2,4) new glyph = exactly 2 cells, despite the
         // dirty drains straddling the checkpoint.
         assert_eq!(diff.cells_changed, 2, "value-based diff, dirty-independent");
@@ -7969,40 +7732,6 @@ mod tests {
         assert!(!diff.regions_truncated);
         // Half-open bbox spanning rows 1..3, cols 1..5.
         assert_eq!(diff.bounding_box, (1, 1, 3, 5));
-    }
-
-    /// LENS-R-034 wide-glyph pairing: if either half of a wide glyph changes,
-    /// both the head and its spacer cell count.
-    #[test]
-    fn compute_lens_diff_wide_glyph_pairs_spacer() {
-        let mut vt = shux_vt::VirtualTerminal::new(4, 20);
-        let cp_grid = vt.grid().clone_visible();
-        let cp_cursor = (0, 0, true);
-        // Draw a fullwidth CJK glyph at (0,0) — occupies cols 0 (head) + 1
-        // (spacer).
-        vt.process("\x1b[1;1H\u{7d42}".as_bytes()); // 終 (width 2)
-        let cur_grid = vt.grid().clone_visible();
-        let diff = compute_lens_diff(
-            &cp_grid,
-            &cur_grid,
-            cp_cursor,
-            (0, 2, true),
-            shux_vt::TerminalDefaultColors::default(),
-            shux_vt::TerminalDefaultColors::default(),
-        );
-        assert_eq!(diff.cells_changed, 2, "wide head + spacer both count");
-        assert!(diff.changed_mask[0], "head counts");
-        assert!(diff.changed_mask[1], "spacer counts");
-        // One merged span [0,2) on row 0.
-        assert_eq!(diff.regions.len(), 1);
-        assert_eq!(
-            (
-                diff.regions[0].row,
-                diff.regions[0].col_start,
-                diff.regions[0].col_end
-            ),
-            (0, 0, 2)
-        );
     }
 
     /// LENS-R-037 heat PNG is deterministic: identical inputs → byte-identical

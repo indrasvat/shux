@@ -423,6 +423,12 @@ test-lens-gate-contract: ## Run the FROZEN RED lens-gate contract lane (task 078
 	@echo "$(COLOR_YELLOW)▶ Running FROZEN RED lens-gate contract lane (task 078) — cases are EXPECTED to fail until 081/082.$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test lens_gate_contract
 
+.PHONY: test-lens-gate-comparator
+test-lens-gate-comparator: ## Run the task-079 comparator suite (parity corpus + divergence fixtures + OSC-4 daemon isolation) serially under the leak guard
+	@echo "$(COLOR_BLUE)▶ Running lens-gate comparator suite (task 079)...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast \
+		--test lens_gate_parity --test lens_gate_divergence --test diff_palette_isolation
+
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"
