@@ -21,7 +21,10 @@ and redaction, sanitize the child environment, and handle child death cleanly.
 ## Scope
 
 1. **`shux lens gate <scenario.toml> [-- <argv>]`** CLI verb (CLI==API). Parse a **TOML**
-   scenario (decision recorded in proposal §13; council split — flagged for Ārya):
+   scenario — **DECIDED** (Ārya, 2026-07-17): TOML, matching the gh-hound ecosystem
+   (`~/.config/gh-hound/config.toml`, `.codex/agents/*.toml`) and shux's own
+   `.shux/templates/*.toml`. YAML appears in gh-hound only for the GitHub Actions files
+   it *consumes*, never its own authoring surface — the same split holds here. Envelope:
    `name`, `description`, `[terminal]{rows,cols,respond_to_queries}`, `[env]`, `[[steps]]`.
 2. **Agnostic step core** (~10; plugin seam for domain asserts): `wait_for_text`,
    `wait`, `settle`/`hold_settle`/`stable_frames`, `type_text`, `keys` (vim notation),

@@ -50,8 +50,16 @@ update goldens. `diff` is "data, not a verdict" — this task supplies the verdi
    never silently blesses an xfail; appends who/when/why to `BASELINE-APPROVAL.md`;
    writes a **changed-golden manifest** (names + old/new fingerprints + heat PNG links)
    for PR review.
-8. **`shux lens gate review`** (insta-adapted UX, proposal §12/§14): step through changed
-   frames interactively, accept/reject each — instead of a bespoke approval bureaucracy.
+8. **`shux lens gate review`** — **insta-style, made visual** (DECIDED, Ārya 2026-07-17,
+   proposal §12/§14). Adopt `insta`'s interaction model (step through each changed frame,
+   accept/reject/skip) — NOT its cargo/`#[test]` coupling — and elevate it with shux's
+   rasterizer: **render the before/after golden + heat overlay inline** via the
+   kitty/iTerm2 graphics protocol when the terminal supports it (this folds in "inline
+   snapshot display", field-note idea 05), else write the PNGs to `.shux/out/` and print
+   paths. This is the local human path; CI uses non-interactive `gate` (fail on drift) and
+   agents/scripts use guarded `--update [failing|<name>]` (`insta`'s `--accept` analog).
+   The inline-graphics rendering itself may land as a thin follow-on if it risks 082's
+   scope, but the review loop + accept/reject + PNG-path fallback ship here.
 9. **`shux lens gate init <scn>`** (council #3 — proposal §16 had no implementing owner):
    scaffold a scenario `.toml` from an interactive run and write its first goldens under
    the same approval-gated path as `--on-missing create`. Owned HERE (golden creation is
