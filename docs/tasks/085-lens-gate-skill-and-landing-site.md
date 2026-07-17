@@ -2,7 +2,7 @@
 
 **Status:** Not Started
 **Priority:** High
-**Milestone:** M2
+**Milestone:** M3
 **Depends On:** 084 (feature validated by cold agents)
 **Quality Gate:** shux-tui-qa
 **Touches:** `skills/shux/SKILL.md`, `skills/shux/references/` (gate reference), `skills/shux/examples/`, `pages/` (landing site), `THIRD-PARTY-NOTICES`, `docs/`
@@ -62,6 +62,7 @@ landing copy matches house voice (pixel-perfect framing, no LoC marketing, outco
 | L1 skill | `references/gate.md` grammar matches the shipped CLI/report exactly (a test or check greps for drift). |
 | L1 migration | The rewritten `headless-tui-test.md` scenario actually runs green against a fixture (doc is executable, not aspirational). |
 | L2 site | Landing page builds/deploys; new section renders in the existing theme with no layout regression. |
+| L1 attribution (council #4) | `THIRD-PARTY-NOTICES` carries the Apache-2.0 adaptation notes for the grok-build-derived scaffolding (report/xfail schema shape + exit policy, `action:` scenario envelope, skip-if-default capture discipline, condition-hold settle, cast serializer) per proposal §15; a check greps that the file exists, names Apache-2.0, and covers each adapted item. |
 | L3 visual | Hi-res gate screenshots captured via shux; desktop + full-res mobile (real WebKit) inspected; attached to the PR (browsing-as-you for authenticated upload). |
 | L3 QA | `shux-tui-qa` `VERDICT: PASS` on the docs/site workflow. |
 

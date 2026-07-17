@@ -2,7 +2,7 @@
 
 **Status:** Not Started
 **Priority:** High
-**Milestone:** M2
+**Milestone:** M3
 **Depends On:** 077
 **Quality Gate:** shux-vt-solid-qa
 **Touches:** `crates/shux-vt/src/` (new capture types), `crates/shux/tests/lens_gate_*`, `.shux/fixtures/lens-gate/`, `scripts/check-lens-frozen.sh`, `Makefile`, `docs/`
@@ -95,6 +95,7 @@ literally by-value/owned.
 | L1 mask | Masked region serializes as sentinel with stable geometry; a masked timestamp cell never appears in the golden. |
 | L1 contract (RED) | The full **closed** status set (incl. `stale_golden`) + exit map + xfail/report contract compiles and **fails** in the quarantined lane — the frozen red suite; a failing transcript is committed. |
 | L1 status set | `palette_unportable` is representable only as a `fail` reason, not a verdict status; the status enum is closed (no open-ended variants). |
+| L1 CellRef ownership (council #4) | The contract layer proves cells are yielded **owned/by-value**: a decoded cell outlives the RLE-decode temporary it came from (a borrowing signature would fail to compile — asserted via a compile-fail/trybuild case or an outlives test), and no `CellRef` API returns a reference tied to a decode buffer. |
 | L2 quarantine | `make check` is **green** with the red contract lane excluded; `make test-lens-gate-contract` shows the expected failures; each frozen case names its retiring task (079–083). |
 | L2 governance | `check-lens-frozen.sh` rejects a diff touching `.shux/fixtures/lens-gate/**` or `lens_gate_*` without the trailer; accepts with it. |
 | L1 fuzz | Property test: arbitrary grids serialize→deserialize→equal; malformed captures fail closed; Unicode normalization stable. |

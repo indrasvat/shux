@@ -2,7 +2,7 @@
 
 **Status:** Not Started
 **Priority:** High
-**Milestone:** M2
+**Milestone:** M3
 **Depends On:** 080
 **Quality Gate:** shux-tui-qa
 **Touches:** `crates/shux/src/cli.rs` (`lens gate` verb), scenario parser + runner (CLI-side), `crates/shux/tests/lens_gate_*`, `.shux/fixtures/lens-gate/`, `Makefile`
@@ -42,17 +42,22 @@ and redaction, sanitize the child environment, and handle child death cleanly.
 4. **Dynamic-region masks + redaction** as steps/scenario config, applied via task 080's
    before-serialize sentinel path.
 5. **Timeout classes**: per-step, per-frame (settle), whole-scenario, and
-   `settle_never_stable` (a frame that never stabilizes = **failure**, exit 1, not
-   infra). Child-kill + scratch cleanup on any timeout.
+   never-stabilized. Each emits a **distinct raw runner signal**; a frame that never
+   stabilizes is emitted as a *failure-class* signal, never an infra-class one (082
+   maps it to the frozen `settle_never_stable` status). Child-kill + scratch cleanup on
+   any timeout.
 6. **Child-exit handling** (council #2 residual): an **unexpected child exit
-   short-circuits before any visual compare** and yields `child_error{child_exit}`
-   (so a crash that happens to match a "crash screen" golden cannot false-pass); an
-   optional `expect_exit{code}` step makes an intended exit explicit.
+   short-circuits before any visual compare** and emits the raw `child_exit{code}`
+   signal (so a crash that happens to match a "crash screen" golden cannot false-pass);
+   an optional `expect_exit{code}` step makes an intended exit explicit.
 7. **Scratch quota + session isolation** made explicit (council #2/#3): a scenario uses
    one scratch session; the quota is the lens constant **16 concurrent scratch sessions
-   per daemon** (the 17th → `infra_error`); **parallel scenario execution is explicitly
-   deferred** (documented, not silently unsupported).
-8. **`stable_frames` is parse-only here** (council #3): the step parses and validates but
+   per daemon** (the 17th emits a raw quota-exceeded signal); **parallel scenario
+   execution is explicitly deferred** (documented, not silently unsupported).
+8. **Retries — parse only** (council #4): 081 parses and validates
+   `expect_golden.retries`; the retry *behavior* and its anti-masking semantics are
+   owned by **083**, CLI plumbing/report exposure by **082**.
+9. **`stable_frames` is parse-only here** (council #3): the step parses and validates but
    its stability behavior is a documented placeholder wired to the existing `--quiet`
    settle until task 083 implements it — with a test asserting the placeholder behavior,
    so 081 exposes no half-working mode.
@@ -82,14 +87,14 @@ and the timeout-class taxonomy.
 
 | Layer | Required Evidence |
 |---|---|
-| L1 parse | Valid scenario parses; malformed scenario → parse error (082 maps to `scenario_error`/exit 2) with an actionable message; unknown step fails closed. |
+| L1 parse | Valid scenario parses; malformed scenario → a raw parse-error signal with an actionable message; unknown step fails closed. (Status/exit mapping asserted in 082.) |
 | L1 env | Child sees sanitized `LC_ALL`/`TZ`/`TERM`/`COLORTERM`/`NO_COLOR`/`SOURCE_DATE_EPOCH`, isolated `HOME`/`XDG` with sandboxed socket/runtime-dir fallback; allow/deny honored; all recorded in `cmd_env_hash`. |
 | L1 queries | OSC 11 / DA / XTVERSION answered with byte-exact deterministic responses under `respond_to_queries` (protocol fixtures). |
 | L1 child-exit (mechanic) | A TUI that crashes (exit 139 / exit 1) short-circuits **before** compare and surfaces the raw `child_exit`; `expect_exit` records the intended-exit signal. (Mapping to `child_error` + exit code is asserted in 082.) |
 | L1 timeouts (mechanic) | Per-step/per-frame/whole-scenario/never-settle produce their distinct raw signals + child-kill + scratch cleanup. (Verdict mapping asserted in 082.) |
 | L1 stable-frames placeholder | The `stable_frames` step parses/validates and behaves as its documented `--quiet` placeholder until 083; no half-working mode is exposed. |
 | L2 CLI | `shux lens gate --help` + bad-path invocations return actionable output. |
-| L2 quota | 17th concurrent scratch (quota constant 16) → `infra_error`; scenario leaves no scratch session behind. |
+| L2 quota | 17th concurrent scratch (quota constant 16) → raw quota-exceeded signal; scenario leaves no scratch session behind. (Status/exit mapping asserted in 082.) |
 | L3 dogfood | Run a real scenario end-to-end against a fixture TUI at 80x24 and 120x40 under `no_leak_guard.sh`, serial; zero leaked daemons. |
 | L3 edge | Cursor, alt-screen, resize, and query-response fixtures exercised; mouse/focus/bracketed-paste explicitly deferred with a placeholder + a tracked issue link + defined non-support behavior (rejected, not silently ignored). |
 

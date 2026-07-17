@@ -2,7 +2,7 @@
 
 **Status:** Not Started
 **Priority:** High
-**Milestone:** M2
+**Milestone:** M3
 **Depends On:** 078, 079, 080, 081, 082, 083 (the fully-built gate)
 **Quality Gate:** acceptance (cold-agent gauntlet) + shux-tui-qa
 **Touches:** `.shux/fixtures/lens-gate/mock-rich-tui/` (uv project), validation harness under `.shux/scripts/`, `.local/` transcripts
@@ -78,6 +78,7 @@ agents succeed on both CRs with no blocking friction, zero leaked processes).
 | L3 cold-codex | Fresh `codex` drives the gate: same two outcomes; transcript captured. |
 | L3 cold-agy | Fresh `agy` drives the gate: same two outcomes; transcript captured. |
 | L3 artifact proof | For each agent: gate-produced `fail`+heat report before CR-B fix, `pass` after; CR-A changed-golden manifest limited to intended goldens; goldens changed ONLY via the gate (git-diff-vs-manifest check); no direct golden edits. |
+| L3 CR-B no-bless proof (council #4) | The regression trap is fixed by fixing the **code**, never by re-blessing: goldens are **byte-identical before and after** the whole CR-B flow (git diff over the golden tree is empty), and no `--update`/bless ran during CR-B (no changed-golden manifest emitted). An agent that blesses its way out of CR-B is a **FAIL**, not a pass. |
 | L3 friction | Every friction/issue logged and resolved; feature-affecting fixes traced back to the owning task and re-verified. |
 | L3 hygiene | Zero new shux daemons / orphan automation processes after all runs (leak guard proven). |
 

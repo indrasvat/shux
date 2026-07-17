@@ -2,7 +2,7 @@
 
 **Status:** Not Started
 **Priority:** High
-**Milestone:** M2
+**Milestone:** M3
 **Depends On:** 078
 **Quality Gate:** shux-vt-solid-qa
 **Touches:** `crates/shux-vt/src/` (comparator + trait + result types), `crates/shux/src/main.rs` (diff adapter), `crates/shux/tests/lens_gate_*`, `.shux/fixtures/lens-gate/`

@@ -2,7 +2,7 @@
 
 **Status:** Not Started
 **Priority:** High
-**Milestone:** M2
+**Milestone:** M3
 **Depends On:** 078, 079
 **Quality Gate:** shux-vt-solid-qa
 **Touches:** `crates/shux/src/main.rs` (`pane.glance` cells field), `crates/shux/src/cli.rs`, gate compare module (CLI-side), `.claude/automations/pixel_verify.py` (logic productized), `.shux/fixtures/lens-gate/`, benchmarks
@@ -34,9 +34,9 @@ compare flakes on AA (shux's own docs warn).
    `{schema, shux_version, raster_font_fingerprint, unicode_width_ver, scenario_hash,
    cmd_env_hash, capture_sha256, png_sha256?, tol, tol_params}`. A fingerprint
    mismatch yields the **`stale_golden`** status (council #3 — a first-class verdict
-   in the frozen set from 078, exit 1; the compare is refused, not silently trusted,
-   until the golden is re-blessed). `stale_golden` is defined HERE and consumed by
-   082's verdict/exit model.
+   in the frozen set from 078; the compare is refused, not silently trusted, until the
+   golden is re-blessed). The **semantics** of `stale_golden` are defined HERE; its
+   **exit-code mapping is owned by 082** (council #4 — 080 must not assert exits).
 4. **Masks + redaction applied before serialize/hash/compare/diff** (council #2): the
    sentinel from 078 is written into the capture prior to any hashing or comparison,
    so masked geometry is stable and secrets never enter a golden.
@@ -67,9 +67,10 @@ performance budget + selective-PNG policy.
 |---|---|
 | L1 capture | `pane.glance --cells` on a fixture grid produces the exact canonical `FrameEnvelope`; round-trips. |
 | L1 tiers | `cell`/`pixel`/`exact` each pass on a matching golden and fail on a seeded mismatch; `missing_golden` on absent baseline. |
-| L1 sidecar | Fingerprint written + validated; a font/shux-version bump yields `stale_golden` (exit 1), not a silent pass or a false `fail`. |
+| L1 sidecar | Fingerprint written + validated; a font/shux-version bump yields the `stale_golden` **verdict/status**, not a silent pass or a false `fail`. (CLI exit mapping is asserted in 082.) |
 | L1 mask/redact absence | A masked timestamp region and a redacted token never appear in the serialized golden or the diff. |
-| L1 mask/redact invariance (council #3) | A change *inside* a masked/redacted region does NOT alter `capture_sha256`, the pixel diff/heat regions, the report artifacts, or the `--update` changed-golden manifest — geometry and hashes are stable across masked content. |
+| L1 mask/redact invariance (council #3, scoped to 080-owned artifacts) | A change *inside* a masked/redacted region does NOT alter `capture_sha256`, the compare outcome, or the pixel diff/heat regions — geometry and hashes are stable across masked content. |
+| L1 mask invariance — downstream (RED, retired by 082) | Frozen red cases asserting mask invariance of the **report artifacts** and the `--update` changed-golden manifest. 082 owns both; these stay red in the quarantined lane until 082 turns them green. |
 | L2 perf | 10/100/1000-frame capture benchmarks recorded; max-artifact-size regression test passes; RPC payload within budget. |
 | L3 dogfood | Compare a real colored shux pane (80x24 and 120x40) against freshly-blessed `cell` goldens; leaves no daemons. |
 | L3 QA | `shux-vt-solid-qa` full-res PNG + `pixel_verify.py` metric JSON evidence for the `pixel` tier. |

@@ -2,7 +2,7 @@
 
 **Status:** Not Started
 **Priority:** Medium
-**Milestone:** M2
+**Milestone:** M3
 **Depends On:** 080, 082
 **Quality Gate:** shux-vt-solid-qa
 **Touches:** `crates/shux/src/main.rs` (`pane.wait_settled`), `crates/shux-vt/src/lib.rs` (settle substrate), `crates/shux/src/cli.rs`, cast serializer, `.shux/fixtures/lens-gate/`
@@ -27,6 +27,9 @@ gate frame also lacks a "how did we get here" artifact.
    never infra.
 3. **Retry budget** on `expect_golden` (`retries = N`): re-settle + re-capture before
    declaring `fail`, with a fingerprint so a retry cannot mask a *different* regression.
+   **Ownership (council #4):** 081 parses `expect_golden.retries`; 082 plumbs `--retries N`
+   and exposes it in `report.json`; **083 owns the retry behavior and the anti-masking
+   fingerprint rule** — the only task that may assert retry semantics.
 4. **Optional `--cast`** (asciinema v2, grok-adapted): attach a replayable `.cast` of the
    run beside the report so a reviewer can scrub how the TUI reached a failing frame.
    **Fix grok's gap**: emit resize (`"r"`) events on `resize` steps so replay geometry is

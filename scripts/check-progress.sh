@@ -261,7 +261,10 @@ if [[ -d "$TASKS_DIR" ]]; then
         if grep -q '^\*\*Status:\*\* Done' "$task_file" 2>/dev/null; then
             task_file_done=true
         fi
-        if grep -q 'Milestone:\*\* VT Quality Track' "$task_file" 2>/dev/null; then
+        # VT enforcement keys off the explicit `Quality Gate:` field; the legacy
+        # `Milestone: VT Quality Track` spelling stays honored for older tasks.
+        if grep -q 'Milestone:\*\* VT Quality Track' "$task_file" 2>/dev/null \
+            || grep -q '^\*\*Quality Gate:\*\* shux-vt-solid-qa' "$task_file" 2>/dev/null; then
             vt_quality_task=true
         fi
         progress_status="$(progress_task_status "$task_id")"

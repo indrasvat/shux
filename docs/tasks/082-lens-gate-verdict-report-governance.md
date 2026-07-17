@@ -2,7 +2,7 @@
 
 **Status:** Not Started
 **Priority:** High
-**Milestone:** M2
+**Milestone:** M3
 **Depends On:** 081
 **Quality Gate:** shux-tui-qa
 **Touches:** gate verdict/report module (CLI-side), `crates/shux/src/cli.rs`, `crates/shux/src/style.rs`, `.shux/fixtures/lens-gate/`, `BASELINE-APPROVAL.md` flow
@@ -32,11 +32,14 @@ update goldens. `diff` is "data, not a verdict" — this task supplies the verdi
    capture_png?, capture_json, child_exit?}`. This is the **source of truth**; exit
    codes are the coarse signal.
 3. **Plain-ASCII `summary_table`** to stdout (grok-adapted): one row per frame —
-   `NAME · STATUS · CHANGED-CELLS · TIME · DETAIL` — for `| tee` in CI.
+   `NAME | STATUS | CHANGED-CELLS | TIME | DETAIL` — for `| tee` in CI. Separators are
+   **ASCII only** (council #4: no middle-dots/box-drawing — the table must survive a
+   `NO_COLOR`, non-UTF-8 CI log).
 4. **Exit contract** exactly per §7.4 (0 pass · 1 regression{fail/xpass/missing(CI)/
-   xfail_expired/**stale_golden**/never_stable} · 2 usage · 3 infra · 4 perm · 5
-   child_error · 6 update_refused). No collision with `lens run --wait` (the gate owns
-   the child). **Report privacy** (council #3): reports never dump full `env`/`argv` —
+   xfail_expired/**stale_golden**/**settle_never_stable**} · 2 usage · 3 infra · 4 perm
+   · 5 child_error · 6 update_refused). Status names are exactly the frozen 078 set —
+   `settle_never_stable`, never the short form (council #4 drift fix). No collision with
+   `lens run --wait` (the gate owns the child). **Report privacy** (council #3): reports never dump full `env`/`argv` —
    only hashed provenance (`cmd_env_hash`); a test asserts no secret-bearing env/argv
    text appears in `report.json` or the summary.
 5. **First-run / `--on-missing fail|create`**: default `fail` (CI-safe) → exit 1;
@@ -87,7 +90,8 @@ the xfail metadata contract + expiry semantics, the `--update` guard set, and th
 | L1 summary | ASCII summary table is deterministic, ANSI-free, aligned. |
 | L1 stale | `stale_golden` (fingerprint mismatch from 080) maps to exit 1 and a distinct report status; not confused with `fail`. |
 | L1 privacy | `report.json` + summary carry no raw `env`/`argv`/secret text — only `cmd_env_hash`. |
-| L2 CLI flags | `--report PATH`, `--format json|text`, `--out DIR`, global `--tol`, `--update <name>` (named), `--retries N`, `--on-missing` each covered with a CLI test. |
+| L2 CLI flags | `--report PATH`, `--format json|text`, `--out DIR`, global `--tol`, `--update <name>` (named), `--on-missing` each covered with a CLI test. |
+| L2 retries (parse/plumb only) | `--retries N` parses, plumbs to the runner, and is exposed in `report.json`. Retry **behavior** + anti-masking is 083's (council #4 split); 082 asserts only that the value is carried and reported. |
 | L2 init | `gate init <scn>` scaffolds a scenario + first goldens under the approval-gated path; refuses in CI mode. |
 | L2 review | `gate review` accepts/rejects changed frames; a rejected frame stays failing. |
 | L3 dogfood | Full gate run on a fixture TUI: green run (exit 0), seeded regression (exit 1 + heat PNG + report), intended change → bless → green. |
