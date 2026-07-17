@@ -10,6 +10,8 @@ vte = { workspace = true }
 unicode-width = "0.2"
 tracing = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

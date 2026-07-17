@@ -4,18 +4,27 @@
 //! cell content, styles, cursor position, and scrollback. Driven by the
 //! vte crate parsing raw PTY output bytes.
 
+mod capture;
 mod cell;
 mod charset;
 mod cursor;
+mod gate;
 mod grid;
 mod parser;
 mod tabstops;
 
+pub use capture::{
+    CapColor, CapStyle, CaptureError, CursorRepr, CursorShapeRepr, Defaults, FrameEnvelope,
+    MaskRect, MaskSet, RowRepr, Run, RunContent, SCHEMA_VERSION, Size, UnderlineStyleRepr,
+};
 pub use cell::{
     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
 };
 pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
+pub use gate::{
+    DiffRegion, DiffReport, FrameReport, GATE_REPORT_SCHEMA, GateStatus, ScenarioReport, XfailMeta,
+};
 pub use grid::{DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 pub use tabstops::TabStops;
@@ -92,6 +101,13 @@ pub struct VirtualTerminal {
     /// batch (§4.2 adjudicated row): the counter tracks the PRESENTED frame,
     /// matching `grid()`/`cursor()`'s frozen view.
     sync_hidden_class_a: bool,
+    /// Sticky: a valid OSC 4 palette override was applied at least once. shux-vt
+    /// discards the override (Class-B limitation), so an indexed-colour capture
+    /// taken afterwards cannot be trusted to render identically elsewhere. The
+    /// lens gate reads [`VirtualTerminal::palette_overridden`] to emit the
+    /// `palette_unportable` diagnostic (task 078, R1). Deliberately NOT part of
+    /// the content-revision accounting.
+    palette_overridden: bool,
 }
 
 /// Process-monotonic nanoseconds since the first VT was created. Used for
@@ -145,6 +161,7 @@ impl VirtualTerminal {
             content_revision: 1,
             last_mutation_ns: monotonic_now_ns(),
             sync_hidden_class_a: false,
+            palette_overridden: false,
         }
     }
 
@@ -206,6 +223,7 @@ impl VirtualTerminal {
             charsets: &mut self.charsets,
             tab_stops: &mut self.tab_stops,
             responses: &mut responses,
+            palette_overridden: &mut self.palette_overridden,
         };
         self.parser.advance(&mut handler, bytes);
 
@@ -350,6 +368,16 @@ impl VirtualTerminal {
             .as_ref()
             .map(|present| present.alternate_screen)
             .unwrap_or(self.modes.alternate_screen)
+    }
+
+    /// Whether a valid OSC 4 palette override has been applied to this VT at
+    /// least once. Sticky (an override persists for the VT's life). shux-vt
+    /// discards the override colour (adjudicated Class-B limitation), so an
+    /// indexed-colour capture taken after an override is NOT portable to another
+    /// machine's palette — the lens gate flags such a capture `palette_unportable`
+    /// (task 078, R1). Independent of content-revision accounting.
+    pub fn palette_overridden(&self) -> bool {
+        self.palette_overridden
     }
 
     /// Get the current scroll region.
