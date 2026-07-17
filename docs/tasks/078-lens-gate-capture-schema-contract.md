@@ -70,22 +70,25 @@ is never persisted, and there is no notion of a gate verdict.
    failing transcript is committed. Each frozen case is annotated with the task #
    (079–083) that will turn it green, and later tasks flip cases green **without
    editing them** (the freeze guard forbids weakening) — a per-task retirement plan.
-   **Mechanism = `#[ignore]` (surveyed decision — a nextest profile does NOT work).**
-   There are five entry points and they do not share one filter: `make test` →
-   `run-cargo-test.sh` → **`cargo test`** (`Makefile:110`, ignores nextest config);
-   `make check` → `test`; pre-push → `make test`; CI → **`cargo nextest run
-   --workspace`** (`ci.yml:79,149` — bypasses the Makefile entirely); CI coverage →
-   `cargo llvm-cov nextest` (`:178`). So a **Makefile filter leaves CI red** and a
-   **nextest `default-filter` leaves `make check` red**. `#[ignore]` is honoured by
-   *both* runners with zero config and zero CI edits, and — crucially — ignored tests
-   are still **compiled**, which is exactly this task's "compile-but-fail" contract.
-   Rejected: a `#[cfg(feature)]` gate (safe from `--all-features`, which appears
-   nowhere, but it would exclude the contract from **compilation** and gut the freeze).
-   Lane runs via `cargo test -p shux --test lens_gate_contract -- --ignored` (nextest:
-   `--run-ignored all`; 0.9.133 supports it — verified). Document why this `#[ignore]`
-   is legitimate where `lens_common/mod.rs:729` forbids it: that rule targets T-tier
-   skips that would **hide a real gap**; this lane is the inverse — tests that MUST
-   fail until a named task retires them, with a committed failing transcript.
+   **Mechanism = `[[test]] … test = false` in `crates/shux/Cargo.toml` + a
+   dedicated `make` target (the EXISTING repo precedent — corrected during
+   implementation).** The lens red suite already solves exactly this problem this
+   way (`crates/shux/Cargo.toml:55-95`), and its comment is emphatic: *"This is NOT
+   `#[ignore]`, NOT a cfg feature-gate, and NOT a CI exclusion."* `test = false`
+   keeps a target out of `make test` / `make check` / `cargo nextest run
+   --workspace` (all default paths) while a dedicated `make test-lens-gate-contract`
+   runs it explicitly via `--test lens_gate_contract`. Following the established
+   pattern beats the `#[ignore]` mechanism an earlier draft of this task proposed:
+   `#[ignore]` would keep the file in the default test binaries (compiled + skipped),
+   but it contradicts the documented house rule and the daemon-backed-test handling,
+   and `lens_common/mod.rs:729` explicitly forbids `#[ignore]`. The daemon-backed
+   lens suite is `test = false` precisely so CI's *parallel* `cargo nextest run
+   --workspace` never runs it un-leak-guarded; the gate lanes join that regime.
+   Both `test = false` and `#[ignore]` were rejected in favour of *neither* being
+   novel here — `test = false` is what the repo already does. The green dogfood lane
+   (`make test-lens-gate`) and the red contract lane (`make test-lens-gate-contract`)
+   are both `test = false`; the L1 pure-schema proof runs everywhere (it lives in
+   `shux-vt` unit tests, which CI's `cargo nextest run --workspace` does execute).
 6. **Extend `check-lens-frozen.sh`** to freeze `.shux/fixtures/lens-gate/**` and
    `crates/shux/tests/lens_gate_*` under a `GATE-TEST-CHANGE:` trailer.
    **This is NOT additive — there is a prefix collision (surveyed).**

@@ -96,3 +96,18 @@ test = false
 name = "lens_ttier"
 path = "tests/lens_ttier.rs"
 test = false
+
+# Lens-gate (task 078) — same `test = false` regime as the lens suite above.
+# `lens_gate_capture` is the GREEN dogfood suite (capture on real shux TUIs +
+# cross-path PNG); `lens_gate_contract` is the FROZEN RED contract lane, run
+# only via `make test-lens-gate-contract` and EXPECTED to fail until tasks
+# 081/082 retire its cases. Both are frozen paths (GATE-TEST-CHANGE: trailer).
+[[test]]
+name = "lens_gate_capture"
+path = "tests/lens_gate_capture.rs"
+test = false
+
+[[test]]
+name = "lens_gate_contract"
+path = "tests/lens_gate_contract.rs"
+test = false

@@ -413,6 +413,16 @@ test-lens-scratch-reap: ## Run the P5 scratch reap signal-order test (LENS-R-042
 	@echo "$(COLOR_BLUE)▶ Running lens P5 scratch reap-order test (§8)...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test scratch_reap_order
 
+.PHONY: test-lens-gate
+test-lens-gate: ## Run the lens-gate GREEN dogfood suite (task 078; capture on real shux TUIs + cross-path PNG) serially under the leak guard
+	@echo "$(COLOR_BLUE)▶ Running lens-gate dogfood suite (task 078)...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test lens_gate_capture
+
+.PHONY: test-lens-gate-contract
+test-lens-gate-contract: ## Run the FROZEN RED lens-gate contract lane (task 078; EXPECTED to FAIL until tasks 081/082 retire its cases)
+	@echo "$(COLOR_YELLOW)▶ Running FROZEN RED lens-gate contract lane (task 078) — cases are EXPECTED to fail until 081/082.$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test lens_gate_contract
+
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"

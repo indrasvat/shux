@@ -1,0 +1,34 @@
+# Lens-gate scenario — the authoring surface (TOML, per the locked decision).
+#
+# This is a FROZEN placeholder that the red contract lane drives via
+# `shux lens gate <this file>`. The scenario RUNNER and the final step grammar
+# are owned by task 081; 081 may refine this file (with a GATE-TEST-CHANGE:
+# trailer). 078 freezes only that (a) the format is TOML and (b) a scenario
+# carries name/description, a terminal block, an env block, a command to spawn,
+# and an ordered list of `action`-tagged steps including `expect_golden`.
+
+name = "hello"
+description = "Minimal lens-gate scenario: spawn a shell, print a coloured line, expect the frame."
+command = ["/bin/sh", "-c", "printf '\\033[38;2;255;120;0mhello, lens gate\\033[0m\\n'"]
+
+[terminal]
+rows = 24
+cols = 80
+respond_to_queries = false
+
+[env]
+LC_ALL = "C.UTF-8"
+TZ = "UTC"
+TERM = "xterm-256color"
+COLORTERM = "truecolor"
+NO_COLOR = ""
+
+[[steps]]
+action = "wait_for_text"
+text = "hello, lens gate"
+timeout_ms = 5000
+
+[[steps]]
+action = "expect_golden"
+name = "start"
+tol = "cell"
