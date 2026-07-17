@@ -97,9 +97,23 @@ make check
 
 ## Adversarial review
 
-Parallel adversarial agents attacked the schema (round-trip/canonicalization
-holes), the gate contract (exit-map/rollup), and the freeze guard (bypass
-vectors); a grok-build research agent mined xAI's solved harness for gotchas.
-Findings + resolutions recorded below.
+Parallel agents attacked the schema, the gate contract, and the freeze guard; a
+grok-build research agent mined xAI's solved harness. Findings + resolutions:
 
-_(results appended as they land)_
+| # | Source | Finding | Resolution | Proof |
+|---|---|---|---|---|
+| 0 | **adv-schema BLOCKER** | **The validator rejected faithful captures of VS16 emoji (❤️ ⚠️ ✔️, digit keycaps).** The VT stores ❤️ as a *width-1* grapheme; the validator string-widthed the cluster to 2 (`UnicodeWidthStr`) and rejected it as "wide missing continuation" — baking the defect into the frozen validator. | The validator now widths a grapheme by its base scalar via `UnicodeWidthChar` (`grapheme_display_width`), matching the VT/encoder exactly. | `vs16_emoji_presentation_validates`; VS16 + ZWJ added to the 400-case proptest generator |
+| 0b | **adv-schema MAJOR** | **A mask on a wide glyph's *continuation* column leaked the glyph** (the `col += 2` jump skipped past the masked continuation) — a redaction/security hole. | `build_row_runs` pre-expands masks to wide-glyph boundaries: masking any column of a wide glyph redacts the whole glyph. | `mask_on_wide_continuation_does_not_leak` (leak + invariance) |
+| 1 | schema (self-run) + **adv-schema MAJOR** | **`validate()` accepted non-coalesced/split adjacent same-style runs** → two encodings for one grid (golden instability). Real bug (encoder never hit it, but a hand-edited/drifted golden could). | `validate_row` now rejects adjacent runs sharing a coalescing key (same style, or both masks). | `rejects_non_coalesced_adjacent_same_style_runs`, `rejects_split_multichar_same_style_runs`, `rejects_non_coalesced_adjacent_masks`, `allows_adjacent_runs_with_different_styles`; 400-case proptest still green |
+| 2 | adv-gate M1 | Freeze guard **failed OPEN** in a shallow CI clone (base ref unresolved → HEAD-only check a multi-commit PR could slip past). | Fails **closed** in CI (errors, demands the base); degrades with a warning only locally. | `CI=… bash check-lens-frozen.sh` → exit 1; local → graceful |
+| 3 | adv-gate M2 | `worst()` ranked by declaration order → `worst(Fail, InfraError)` = InfraError (exit 3, retryable) **masked a regression**. | Severity tiers: regression (exit 1) always outranks operational errors > greens. | `worst_never_masks_a_regression_with_an_error`, `rollup_never_masks_a_regression` |
+| 4 | adv-gate M3 | The "frozen" exit map lived in un-frozen `gate.rs`; the RED lane used `worst()` as its own oracle (tautological). | New **frozen, CI-run** `lens_gate_exit_contract.rs` hard-codes every status→exit value independently. | `exit_map_values_are_frozen`, `status_set_and_names_are_frozen` |
+| 5 | adv-gate B-min1 | GATE regex `lens_gate_` missed a hypothetical `lens_gate.rs`. | Tightened to `lens_gate(_\|\.)`. | collision re-verified (6 cases) |
+| 6 | schema (self-run) | Edge cases: wide glyph in last column, mask splitting a wide glyph, masked fixed-point, alt-screen grid/flag consistency, differing-hyperlink run split. | All handled — verified with targeted tests. | 5 edge tests pass |
+| — | grok-capture | Design validated (we keep semantic colour, explicit continuation, underline variants, full-grid, masking — all places grok loses fidelity). Env-scrub + `LC_ALL`/`TZ` gap + frame-hash settle → forward-notes for 081/083. | Recorded in `.local/078-grounding-findings.md §10`. | — |
+
+adv-gate also **verified correct** (no action): the 12-status set matches the closed contract, the exit map matches §7.4, `deny_unknown_fields` fails closed, `palette_unportable` can't be a status, and the guard's trailer parsing / `--no-renames` / merge+root handling / collision fix all hold.
+
+adv-schema did not deliver a written report; its full attack surface was covered
+independently (rows 1 and 6 above), including the one real bug it targets (#10
+coalescing).

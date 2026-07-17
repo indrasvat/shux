@@ -22,7 +22,7 @@
 //!   schema is a typed error ([`CaptureError::UnsupportedSchema`]), never a panic.
 
 use serde::{Deserialize, Serialize};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 use crate::cell::{Cell, CellFlags, CellStyle, Color, ExtendedAttrs, UnderlineStyle};
 use crate::cursor::{Cursor, CursorShape};
@@ -672,6 +672,28 @@ impl FrameEnvelope {
                 ),
             });
         }
+        // Cursor must be inside the grid (row < rows; col may be == cols for the
+        // pending-wrap "past the last column" position). A real VT clamps this,
+        // but `from_parts` is public and a consumer may index the grid by the
+        // cursor (adv-schema minor).
+        if self.cursor.row >= self.size.rows {
+            return Err(CaptureError::NonCanonical {
+                row: 0,
+                detail: format!(
+                    "cursor row {} past grid height {}",
+                    self.cursor.row, self.size.rows
+                ),
+            });
+        }
+        if self.cursor.col > self.size.cols {
+            return Err(CaptureError::NonCanonical {
+                row: 0,
+                detail: format!(
+                    "cursor col {} past grid width {}",
+                    self.cursor.col, self.size.cols
+                ),
+            });
+        }
         for (i, row) in self.rows.iter().enumerate() {
             if row.row as usize != i {
                 return Err(CaptureError::NonCanonical {
@@ -738,6 +760,27 @@ fn build_row_runs(grid: &Grid, r: usize, cols: usize, masks: &MaskSet) -> Vec<Ru
     let row_u = r as u16;
     let row_has_masks = masks.any_in_row(row_u);
 
+    // Expand masks to wide-glyph boundaries: if EITHER column of a wide glyph is
+    // masked, the whole glyph is redacted. A column-granular mask whose edge
+    // falls on a wide glyph's CONTINUATION column must not leak the head — and
+    // the wide-cell `col += 2` jump below would otherwise skip past a masked
+    // continuation column without redacting it (adv-schema MAJOR 2).
+    let masked_col: Vec<bool> = if row_has_masks {
+        let mut m: Vec<bool> = (0..cols).map(|c| masks.masked(row_u, c as u16)).collect();
+        for c in 0..cols {
+            let is_wide_head = row
+                .and_then(|rw| rw.get(c))
+                .is_some_and(|cell| cell.is_wide());
+            if is_wide_head && c + 1 < cols && (m[c] || m[c + 1]) {
+                m[c] = true;
+                m[c + 1] = true;
+            }
+        }
+        m
+    } else {
+        Vec::new()
+    };
+
     let flush_cells = |cur: &mut Option<RunBuilder>, runs: &mut Vec<Run>| {
         if let Some(b) = cur.take() {
             runs.push(b.finish());
@@ -748,7 +791,7 @@ fn build_row_runs(grid: &Grid, r: usize, cols: usize, masks: &MaskSet) -> Vec<Ru
     while col < cols {
         let colu = col as u16;
 
-        if row_has_masks && masks.masked(row_u, colu) {
+        if row_has_masks && masked_col[col] {
             flush_cells(&mut cur, &mut runs);
             if mask_start.is_none() {
                 mask_start = Some(colu);
@@ -994,6 +1037,20 @@ fn validate_row(row: &RowRepr, cols: u16) -> Result<(), CaptureError> {
     Ok(())
 }
 
+/// Display width of a grapheme entry **as the VT computes it** — the width of
+/// its base scalar via [`UnicodeWidthChar`]. The VT widths only the base char
+/// (`parser.rs`) and appends VS16/ZWJ/combining scalars without re-widening, so
+/// `UnicodeWidthStr` on the full cluster would DISAGREE for VS16 emoji-
+/// presentation sequences (❤️ ⚠️ ✔️, digit keycaps), which the VT stores width-1.
+/// The validator must match the VT/encoder's width source, not re-derive a
+/// conflicting one (adv-schema BLOCKER 1).
+fn grapheme_display_width(s: &str) -> usize {
+    s.chars()
+        .next()
+        .and_then(UnicodeWidthChar::width)
+        .unwrap_or(0)
+}
+
 /// Validate a cells run and return its column span. Enforces R2 canonicality
 /// (string form iff all-simple), R3 (`""` only after a wide head), and that no
 /// entry has an illegal display width.
@@ -1012,7 +1069,7 @@ fn validate_cells_run(
             // Every char must be a simple, width-1 single scalar; otherwise the
             // canonical form is the array (reject non-canonical).
             for ch in s.chars() {
-                let w = UnicodeWidthStr::width(ch.to_string().as_str());
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
                 if w != 1 {
                     return Err(err(format!(
                         "string-form run at col {col} contains non-simple char {ch:?} (width {w}); canonical form is the array"
@@ -1036,7 +1093,7 @@ fn validate_cells_run(
                     )));
                 }
                 let scalars = s.chars().count();
-                let w = UnicodeWidthStr::width(s.as_str());
+                let w = grapheme_display_width(s);
                 let followed_by_empty = entries.get(i + 1).is_some_and(|n| n.is_empty());
                 if followed_by_empty {
                     // wide head: must be width 2
@@ -1601,6 +1658,11 @@ mod tests {
             prop_oneof![
                 "[a-zA-Z0-9 ]{1,4}".prop_map(|s| s.into_bytes()),
                 "[漢字ありがと]{1,2}".prop_map(|s| s.into_bytes()),
+                // VS16 emoji-presentation + a ZWJ family (base-scalar vs
+                // string-width disagreement — see the BLOCKER fix).
+                Just("\u{2764}\u{fe0f}".as_bytes().to_vec()),
+                Just("\u{26a0}\u{fe0f}".as_bytes().to_vec()),
+                Just("\u{1f468}\u{200d}\u{1f4bb}".as_bytes().to_vec()),
                 Just(b"\x1b[1m".to_vec()),
                 Just(b"\x1b[3m".to_vec()),
                 Just(b"\x1b[4m".to_vec()),
@@ -1685,6 +1747,83 @@ mod tests {
         assert_eq!(
             env, env2,
             "masked capture must be a fixed point under the same masks"
+        );
+    }
+
+    #[test]
+    fn vs16_emoji_presentation_validates() {
+        // ❤️ (U+2764 U+FE0F), ⚠️, keycap 1️⃣: the VT stores a WIDTH-1 grapheme;
+        // the validator must width it as the VT does (base scalar), not
+        // string-width it to 2 and reject (adv-schema BLOCKER).
+        for seq in [
+            "\u{2764}\u{fe0f}X",
+            "\u{26a0}\u{fe0f}Y",
+            "1\u{fe0f}\u{20e3}Z",
+        ] {
+            let vt = vt_with(seq.as_bytes());
+            let env = assert_lossless(&vt); // validate + round-trip + fixed point
+            assert!(
+                env.validate().is_ok(),
+                "VS16 sequence {seq:?} must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_on_wide_continuation_does_not_leak() {
+        // A mask whose left edge is a wide glyph's CONTINUATION column must still
+        // redact the glyph (it snaps into the mask), not leak the head bytes
+        // (adv-schema MAJOR 2).
+        let mut vt = VirtualTerminal::new(1, 20);
+        vt.process("漢SECRET".as_bytes()); // 漢 at cols 0-1
+        let env = FrameEnvelope::from_terminal(&vt, &MaskSet::new().with(0, 1, 1));
+        env.validate().unwrap();
+        let json = env.to_canonical_json();
+        assert!(
+            !json.contains('漢'),
+            "masked wide glyph leaked into the golden"
+        );
+        // Invariance: changing the masked glyph does not change the bytes.
+        let mut vt2 = VirtualTerminal::new(1, 20);
+        vt2.process("字SECRET".as_bytes());
+        let json2 =
+            FrameEnvelope::from_terminal(&vt2, &MaskSet::new().with(0, 1, 1)).to_canonical_json();
+        assert_eq!(
+            json, json2,
+            "masked wide-glyph content must not affect the golden"
+        );
+    }
+
+    #[test]
+    fn rejects_split_multichar_same_style_runs() {
+        // adv-schema's exact case: [[0,"he"],[2,"llo"]] is non-canonical.
+        let env = env_with_row(20, vec![cells(0, "he"), cells(2, "llo")]);
+        assert!(
+            env.validate().is_err(),
+            "split same-style runs must coalesce"
+        );
+    }
+
+    #[test]
+    fn rejects_cursor_beyond_grid() {
+        let mut env = env_with_row(20, vec![]);
+        env.cursor.row = 5; // past height 1
+        assert!(
+            env.validate().is_err(),
+            "cursor row past grid must be rejected"
+        );
+        let mut env2 = env_with_row(4, vec![]);
+        env2.cursor.col = 99; // past width 4
+        assert!(
+            env2.validate().is_err(),
+            "cursor col past grid must be rejected"
+        );
+        // col == cols (pending wrap) is allowed.
+        let mut env3 = env_with_row(4, vec![]);
+        env3.cursor.col = 4;
+        assert!(
+            env3.validate().is_ok(),
+            "cursor at col==cols (pending wrap) is valid"
         );
     }
 
