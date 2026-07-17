@@ -1718,7 +1718,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 075 | Plugin DX v0.5 and OCP extraction | M2 | **Done** | 044a |
 | 076 | Sightline TUI QA plugin | M2 | **Done** | 075 |
 | 077 | shux lens — give every agent eyes (P0: fixtures + red suite; P1: ContentRevision substrate; P2: pane.glance; P3: pane.wait_settled; P4: pane.checkpoint + pane.diff_since; P5: scratch sessions + lens.run; P6: skill rewrite + CLI polish + T-tier + demo) | M3 | **Done** (ALL P0–P6 complete 2026-07-10: gate 37/0 + T-tier 4/4 at ratified HEAD; 12 goldens RATIFIED (18f4b5d); two approved trailered LENS-TEST-CHANGEs (nidhi welcome-dismiss, near-grayscale predicate); tui-qa + independent verifier VERIFIED; dootsabha convergence CLOSED codex ×2 + claude ×1; T5 unaided-agent demo PASS — `.shux/qa/lens-p6/T5-RESULT.md`; P0–P5 in PRs #86–#92 / v0.38.0–v0.42.0, P6 ships from `feat/lens-p6-skill-polish`) | 016, 017, 060, 064, 074 |
-| 078 | lens gate — capture schema + frozen contract suite | M3 | **Not Started** | 077 |
+| 078 | lens gate — capture schema + frozen contract suite | M3 | **In Progress** | 077 |
 | 079 | lens gate — one comparator in shux-vt (CellGridView) | M3 | **Not Started** | 078 |
 | 080 | lens gate — capture emission + golden compare (3 tiers) | M3 | **Not Started** | 078, 079 |
 | 081 | lens gate — scenario runner + `shux lens gate` | M3 | **Not Started** | 080 |
