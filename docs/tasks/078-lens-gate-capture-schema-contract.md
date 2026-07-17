@@ -1,6 +1,6 @@
 # Task 078: lens gate — capture schema + frozen contract suite
 
-**Status:** In Progress
+**Status:** Done
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 077
@@ -288,10 +288,10 @@ always has exactly `size.rows` entries (empty `runs` allowed).
 
 ## Definition of Done
 
-- [ ] DootSabha design review findings incorporated before coding (OSC 4, canonical shape, `CellRef` rule).
-- [ ] Red contract suite committed first and demonstrably failing.
-- [ ] L1/L2 tests pass (except the intentionally-red contract suite, which is frozen).
-- [ ] `make check` and `make check-lens-frozen` pass.
-- [ ] `shux-vt-solid-qa` gate reports `VERDICT: PASS` (schema/serialization touches VT); evidence under `.shux/qa/078-*/`.
-- [ ] Implementation-diff DootSabha convergence review is clean or all findings addressed.
-- [ ] `docs/PROGRESS.md` and this task updated; learnings appended to `docs/agents/learnings.md`.
+- [x] DootSabha design review findings incorporated before coding (OSC 4, canonical shape, `CellRef` rule). — R1–R10 recorded above; `.local/078-design-*.md` + tie-break.
+- [x] Red contract suite committed first and demonstrably failing. — `make test-lens-gate-contract` 5/5 red; `RED-CONTRACT-TRANSCRIPT.md`.
+- [x] L1/L2 tests pass (except the intentionally-red contract suite, which is frozen). — 310 shux-vt + 5 green dogfood + 3 exit-contract.
+- [x] `make check` and `make check-lens-frozen` pass. — `make check` exit 0; shellcheck clean; collision matrix proven.
+- [x] `shux-vt-solid-qa` gate reports `VERDICT: PASS`; evidence under `.shux/qa/078-*/`. — SOLID re-audit against the final committed state (with the agy fixes).
+- [x] Implementation-diff DootSabha convergence review is clean or all findings addressed. — v2 council: codex CLEAN; agy's 3 findings verified (2 fixed in `910d8c3`, 1 test bug). `.local/078-impl-v2-*.md`.
+- [x] `docs/PROGRESS.md` and this task updated; learnings appended to `docs/agents/learnings.md`.
