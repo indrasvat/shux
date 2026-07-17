@@ -1037,13 +1037,13 @@ fn validate_row(row: &RowRepr, cols: u16) -> Result<(), CaptureError> {
     Ok(())
 }
 
-/// Display width of a grapheme entry **as the VT computes it** — the width of
-/// its base scalar via [`UnicodeWidthChar`]. The VT widths only the base char
-/// (`parser.rs`) and appends VS16/ZWJ/combining scalars without re-widening, so
-/// `UnicodeWidthStr` on the full cluster would DISAGREE for VS16 emoji-
-/// presentation sequences (❤️ ⚠️ ✔️, digit keycaps), which the VT stores width-1.
-/// The validator must match the VT/encoder's width source, not re-derive a
-/// conflicting one (adv-schema BLOCKER 1).
+/// Base-scalar display width via [`UnicodeWidthChar`]. Authoritative ONLY for
+/// SINGLE-scalar entries — the validator uses it to reject a spurious `""` after
+/// a narrow char, or a wide single scalar (漢) missing its `""`. It is NOT used
+/// for multi-scalar graphemes: the VT stores width-1 for VS16 (❤️ ⚠️) and width-2
+/// for flags/ZWJ (🇺🇸, 👨‍💻) — neither equals `UnicodeWidthStr` of the cluster nor
+/// always the base-scalar width — so those trust the self-describing `""`
+/// structure (R3) instead (adv-schema BLOCKER + agy flag-emoji finding).
 fn grapheme_display_width(s: &str) -> usize {
     s.chars()
         .next()
@@ -1076,7 +1076,17 @@ fn validate_cells_run(
                     )));
                 }
             }
-            Ok(s.chars().count() as u16)
+            let n = s.chars().count();
+            if n > u16::MAX as usize {
+                // Guard the u16 cast: a wrapped span could otherwise slip past
+                // the col+span<=cols bounds check (agy overflow finding). A real
+                // grid is <= u16::MAX cols, so a longer run is definitively
+                // malformed.
+                return Err(err(format!(
+                    "string-form run at col {col} has {n} chars, exceeding the max grid width"
+                )));
+            }
+            Ok(n as u16)
         }
         RunContent::Complex(entries) => {
             if entries.is_empty() {
@@ -1092,15 +1102,23 @@ fn validate_cells_run(
                         "array run at col {col} has a leading/orphan \"\" at index {i}"
                     )));
                 }
-                let scalars = s.chars().count();
-                let w = grapheme_display_width(s);
+                let single = s.chars().count() == 1;
                 let followed_by_empty = entries.get(i + 1).is_some_and(|n| n.is_empty());
                 if followed_by_empty {
-                    // wide head: must be width 2
-                    if w != 2 {
-                        return Err(err(format!(
-                            "entry {s:?} at col {col} is followed by \"\" but has width {w}, not 2"
-                        )));
+                    // A wide head (width 2 per the "" structure — R3). For a
+                    // SINGLE scalar, UnicodeWidthChar is authoritative and must
+                    // be 2 — this rejects a spurious "" after a narrow char. For
+                    // a MULTI-scalar grapheme (flag / ZWJ / VS16) the VT's stored
+                    // width can exceed the base-scalar width, so TRUST the ""
+                    // and do not re-derive (agy: 🇺🇸 is stored width 2 though its
+                    // base scalar 🇺 is width 1).
+                    if single {
+                        let w = grapheme_display_width(s);
+                        if w != 2 {
+                            return Err(err(format!(
+                                "single-scalar entry {s:?} at col {col} is followed by \"\" but has width {w}, not 2"
+                            )));
+                        }
                     }
                     // a second "" immediately after is an error
                     if entries.get(i + 2).is_some_and(|n| n.is_empty()) {
@@ -1110,20 +1128,27 @@ fn validate_cells_run(
                     span = span.saturating_add(2);
                     i += 2;
                 } else {
-                    if w == 0 || w > 2 {
-                        return Err(err(format!(
-                            "entry {s:?} at col {col} has illegal display width {w}"
-                        )));
-                    }
-                    if w == 2 {
-                        return Err(err(format!(
-                            "wide entry {s:?} at col {col} is missing its \"\" continuation"
-                        )));
-                    }
-                    if scalars > 1 || w != 1 {
+                    // A width-1 cell (no "" continuation). A SINGLE scalar must
+                    // be UnicodeWidthChar == 1 — a wide single scalar like 漢 MUST
+                    // carry a "". A multi-scalar grapheme is trusted at width 1
+                    // (a wide one would carry a "") and is never the compact
+                    // string form.
+                    if single {
+                        let w = grapheme_display_width(s);
+                        if w == 0 {
+                            return Err(err(format!(
+                                "entry {s:?} at col {col} has zero display width"
+                            )));
+                        }
+                        if w == 2 {
+                            return Err(err(format!(
+                                "wide entry {s:?} at col {col} is missing its \"\" continuation"
+                            )));
+                        }
+                    } else {
                         all_simple = false;
                     }
-                    span = span.saturating_add(w as u16);
+                    span = span.saturating_add(1);
                     i += 1;
                 }
             }
@@ -1770,6 +1795,36 @@ mod tests {
     }
 
     #[test]
+    fn flag_emoji_validates() {
+        // adv-gate/agy claim: 🇺🇸 (regional indicators) — the VT stores it wide,
+        // but grapheme_display_width keys off the first scalar 🇺. Verify the VT
+        // and the validator AGREE (both use UnicodeWidthChar on the base scalar).
+        for seq in ["\u{1F1FA}\u{1F1F8}X", "\u{1F1EF}\u{1F1F5}Y"] {
+            let vt = vt_with(seq.as_bytes());
+            let env = assert_lossless(&vt);
+            assert!(env.validate().is_ok(), "flag emoji {seq:?} must validate");
+        }
+    }
+
+    #[test]
+    fn mask_true_round_trips_and_rejects_false() {
+        // agy claim: MaskTrue may fail to round-trip or accept {"mask":false}.
+        let ok = r#"{"schema":1,"size":{"rows":1,"cols":10},"alt_screen":false,"defaults":{},"cursor":{"row":0,"col":0,"visible":true,"shape":"block"},"palette_overridden":false,"rows":[{"row":0,"runs":[[0,null,{"mask":true,"cells":5}]]}]}"#;
+        let env = FrameEnvelope::from_canonical_json(ok).expect("mask:true must parse");
+        assert!(env.validate().is_ok());
+        // Round-trip is stable (serialize → parse → equal). We don't compare to
+        // the compact input — to_canonical_json is pretty-printed.
+        let re = FrameEnvelope::from_canonical_json(&env.to_canonical_json()).unwrap();
+        assert_eq!(env, re);
+        // {"mask":false} must be rejected (MaskTrue accepts only literal true).
+        let bad = ok.replace("\"mask\":true", "\"mask\":false");
+        assert!(
+            FrameEnvelope::from_canonical_json(&bad).is_err(),
+            "mask:false must be rejected"
+        );
+    }
+
+    #[test]
     fn mask_on_wide_continuation_does_not_leak() {
         // A mask whose left edge is a wide glyph's CONTINUATION column must still
         // redact the glyph (it snaps into the mask), not leak the head bytes
@@ -1801,6 +1856,18 @@ mod tests {
         assert!(
             env.validate().is_err(),
             "split same-style runs must coalesce"
+        );
+    }
+
+    #[test]
+    fn rejects_overlong_string_run() {
+        // agy overflow finding: a run longer than u16::MAX must not wrap its span
+        // past the bounds check.
+        let big = "a".repeat(70_000);
+        let env = env_with_row(80, vec![cells(0, &big)]);
+        assert!(
+            env.validate().is_err(),
+            "a 70k-char run must be rejected, not wrapped"
         );
     }
 
