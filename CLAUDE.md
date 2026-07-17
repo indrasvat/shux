@@ -241,10 +241,18 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > 4. **Verify EVERY config state.** Not just defaults — also `shux config init`
 >    output, feature-maxed config (every `[[...]]` entry populated), malformed
 >    config, mid-session hot-reload. The user-configured path is where bugs hide.
-> 5. **Local `dootsabha council` review of the implementation diff BEFORE pushing.**
+> 5. **Adversarial review (skill: `adversarial-review`).** Once the change is green
+>    and BEFORE the convergence review, spawn 2–4 parallel adversarial subagents that
+>    **drive the real system** to break it (disjoint attack surfaces; "try to break X"
+>    charters). Reproduce every finding independently, fix each with a regression test.
+>    Static review + councils miss what real hostile input exposes — this catches the
+>    sharpest bugs (a VS16-emoji validator blocker on task 078 that the author and 3
+>    councils all passed over). Standard for any nontrivial schema/contract/parser/
+>    protocol/guard change; skip only for trivial edits.
+> 6. **Local `dootsabha council` review of the implementation diff BEFORE pushing.**
 >    Don't wait for codex-bot on the PR to find issues. The goal is the PR
 >    shows up *already solid* — codex should react 👍, not write P2 reviews.
-> 6. **Visual evidence per (render path × config state) cell.** Save local
+> 7. **Visual evidence per (render path × config state) cell.** Save local
 >    screenshots under `.shux/out/<feature>/` or `.claude/screenshots/<feature>/`,
 >    name
 >    `v<N>_<render-path>_<width>_<config-state>.png` (e.g.
@@ -252,15 +260,15 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 >    path is mandatory in the filename — two cells from different paths
 >    at the same width + state would otherwise collide and silently
 >    overwrite each other, making the matrix unauditable.
-> 7. **PR evidence, not repo cruft.** Attach the review-worthy screenshots to the
+> 8. **PR evidence, not repo cruft.** Attach the review-worthy screenshots to the
 >    PR as comments. Prefer `browsing-as-you` for GitHub UI uploads when image
 >    attachment is needed. Do not commit screenshots unless they are durable
 >    goldens/baselines/product assets with explicit task and DootSabha approval.
-> 8. **Cross-path consistency assertion.** At least one test that asserts the
+> 9. **Cross-path consistency assertion.** At least one test that asserts the
 >    same logical output across render paths (e.g., snapshot at width W matches
 >    the attach renderer's bar at width W). Prevents future drift.
-> 9. **`gh-ghent` post-push, background only** (per memory `feedback-ghent-background`).
-> 10. **Post-merge `curl|sh` smoke** (per memory `feedback-post-merge-smoke-test`) —
+> 10. **`gh-ghent` post-push, background only** (per memory `feedback-ghent-background`).
+> 11. **Post-merge `curl|sh` smoke** (per memory `feedback-post-merge-smoke-test`) —
 >    verify against the *publicly-installed* binary, not local `target/release/`.
 >
 > **Paste this into every feature PR description:**
@@ -268,6 +276,7 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > ```
 > ## Verification matrix
 > - [ ] dootsabha council on design — converged
+> - [ ] adversarial review (`adversarial-review` skill) — parallel agents drove the real system; findings fixed + regression-tested
 > - [ ] dootsabha council on implementation diff — clean
 > - [ ] live attach render path
 > - [ ] window.snapshot / session.snapshot / pane.snapshot PNG paths
