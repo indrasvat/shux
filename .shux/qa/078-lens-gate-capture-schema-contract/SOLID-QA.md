@@ -120,18 +120,20 @@ regression.
 - `make check` → exit 0. Pixel: `pixel_verify.py` at threshold 0 →
   `{"changed_pixels":0,"pixel_diff_ratio":0.0,"mean_rgba_channel_delta":0.0,"status":"pass","size":[720,456]}`.
 
-## 8. Residual risk & post-PASS step
+## 8. Post-PASS bookkeeping — COMPLETE
 
 **Residual risk: low.** All functional, contract, governance, DootSabha (design + impl), and
 evidence criteria are satisfied with fresh evidence at HEAD.
 
-**Remaining action is post-PASS bookkeeping (implementer/lead, not a QA blocker):** flip the task
-`Status:` → `Done` + set the PROGRESS task-table row to `Done` (makes `make check-progress` green),
-append learnings, and `git add` the QA evidence under `.shux/qa/078-*/` (`SOLID-QA.md`,
-`evidence-manifest.json`, `dootsabha-design.md`, `dootsabha-implementation.md`,
-`pane-80x24-actual.png`, `pane-120x40-actual.png`, `diff-80x24-ab.png`,
-`pixel-metrics-determinism.json`). I cannot commit — this is a shared worktree and git is STOPPED
-per the lead's directive; the lead stages.
+**The post-PASS bookkeeping is now DONE** (both SOLID auditors independently reached PASS on the
+final committed state, and `make check-vt-qa` / `make check-progress` are green):
+- Task `Status:` → `Done`; PROGRESS task-table row → `Done`; learnings appended.
+- The QA evidence under `.shux/qa/078-*/` is committed — `SOLID-QA.md`, `evidence-manifest.json`
+  (flat path-string schema, all 6 required keys, `-actual.png` names resolve + staged),
+  `dootsabha-design.md`, `dootsabha-implementation.md`, `pane-80x24-actual.png`,
+  `pane-120x40-actual.png`, `diff-80x24-ab.png`, `pixel-metrics-determinism.json`
+  (`status:pass`, `0/0` thresholds).
+- Committed at `6792a63` (completion) after this gate re-audited the final state (`8f7c324`).
 
 ## 9. Cleanup status (shux sessions)
 
