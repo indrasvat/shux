@@ -444,6 +444,11 @@ bench-lens-gate: ## Record task-080 capture/compare/render throughput at 10/100/
 	@echo "$(COLOR_BLUE)▶ Recording lens-gate throughput (task 080 §6)...$(COLOR_RESET)"
 	@cargo nextest run -p shux --no-fail-fast --no-capture --test lens_gate_bench
 
+.PHONY: test-lens-gate-run
+test-lens-gate-run: ## Run the task-081 scenario-runner suite (drives real fixture TUIs via `shux lens gate`) serially under the leak guard
+	@echo "$(COLOR_BLUE)▶ Running lens-gate scenario-runner suite (task 081)...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test lens_gate_run
+
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"

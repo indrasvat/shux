@@ -1,6 +1,6 @@
 # Task 081: lens gate — scenario runner + `shux lens gate`
 
-**Status:** Not Started
+**Status:** Done
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 080
@@ -77,11 +77,105 @@ that those map to `child_error`/`settle_never_stable`/exit codes.
 - No parallel scenarios; no mouse/focus/bracketed-paste steps (declared deferred with a
   fixture placeholder).
 
+### Deferred behaviors — explicit non-support (081 shipped contract)
+
+Non-support is REJECTED, never silently ignored (design D10). Each is tracked for a
+later task:
+
+- **`mouse` / `focus` / `bracketed_paste` steps** → the parser REJECTS them with
+  `parse_error` ("… not supported in this runner … tracked in docs/tasks/081"). Pinned by
+  `deferred_mouse_step_is_rejected_not_ignored` (`lens_gate_run.rs`). A future step-plugin
+  task adds them.
+- **`respond_to_queries = false` (query suppression)** → RESERVED (design D9). The shux
+  terminal answers OSC 11 / DA / XTVERSION deterministically + byte-exact and CANNOT be
+  silenced in 081 (the field is parsed and its suppression semantics documented as
+  reserved; `false` = "this scenario does not rely on query responses", NOT rejected).
+  Byte-exactness pinned by `gate::queries` unit tests.
+- **`retries` (on `expect_golden`) + `stable_frames`** → PARSE-ONLY (design D6): validated
+  but behaviorally a documented `--quiet` settle placeholder until task 083. No
+  half-working retry/stability mode ships.
+- **`xfail`** → parsed OPAQUELY into the 082 `XfailMeta` shape and RESERVED; 081 takes no
+  xfail action (governance is task 082).
+- **Parallel scenario execution** → deferred; the runner runs one scenario / one scratch
+  session at a time (quota constant 16 shared with the lens scratch pool).
+
 ## Design Review Decisions
 
 DootSabha design review MUST confirm: the TOML step schema, the deterministic-env
 default set + allow/deny model, the child-exit short-circuit semantics + `expect_exit`,
 and the timeout-class taxonomy.
+
+**Incorporated (council: codex + agy; chair synthesis claude — verdict REVISE →
+architecture APPROVED after the revisions below; evidence
+`.shux/qa/081-lens-gate-scenario-runner/dootsabha-design.json`):**
+
+- **D1 — ownership boundary (confirmed).** 081 owns runner MECHANICS + RAW SIGNALS.
+  082 owns status names, `report.json`, the stdout summary/report contract, xfail
+  governance, bless/`--update`, and the exact exit-code map. The frozen
+  `lens_gate_contract.rs` lane stays RED until 082 (it is `test = false`).
+- **D2 — the raw trace vocabulary is runner signals, NEVER `GateStatus`.** The signal
+  set: compare → `frame_match` / `frame_mismatch` / `golden_absent` / `golden_untrusted`
+  (082 maps → pass/fail/missing_golden/stale_golden); child → `child_exit{code}` /
+  `expected_child_exit{code}`; four DISTINCT timeouts → `step_timeout` /
+  `frame_settle_timeout` / `scenario_timeout` / `never_stabilized`; ops → `quota_exceeded`
+  / `parse_error` / `no_visual_check`; asserts → `assert_passed` / `assert_failed`. The
+  internal compare still runs 080's `evaluate_tier` (returns `GateStatus`); an adapter
+  maps it to the runner signal for the trace, so 081 never emits a frozen status name.
+- **D3 — trace channel + privacy.** The NDJSON raw-signal trace is emitted ONLY behind
+  `--trace <path|->`; default `shux lens gate` stdout does NOT emit unconditional NDJSON
+  (082 owns the stdout summary/report). 081's exit code is provisional (documented as
+  non-final; 082 installs the frozen map). The trace carries hashes
+  (`cmd_env_hash`/`scenario_hash`), never raw env/argv; assert failures carry
+  bounded/redacted excerpts + a hash, never a full screen dump (codex privacy catch).
+- **D4 — `env_clear` (deny-by-default) is implemented.** New opt-in `env_clear` on
+  `lens.run` + `PtyConfig` (default `false` = byte-identical existing spawn). The gate
+  runner sets it; `PtyHandle::spawn` `env_clear()`s before the PTY defaults + plan.
+  Deterministic defaults (always): `LC_ALL=C.UTF-8`, `LANG=C.UTF-8`, `TZ=UTC`,
+  `TERM=xterm-256color`, `COLORTERM=truecolor`, `SOURCE_DATE_EPOCH="0"` (string), a
+  deterministic `PATH`, and sandbox `TMPDIR`/`HOME`/`XDG_*`/`XDG_RUNTIME_DIR`/`SHUX_SOCKET`
+  (no host-temp leak — agy's `TMPDIR` catch; no host daemon reach). `NO_COLOR` default
+  UNSET; scenario opts in with `NO_COLOR="1"`. `[env] KEY="v"` SETS (incl. empty string —
+  never overloaded as unset; unset = absence under `env_clear`). `[env] allow=["PATH",…]`
+  = opt-in host passthrough. Rich-TUI guardrail satisfied (opt-in, default-off).
+- **D5 — `cmd_env_hash` is release-stable; `scenario_hash` is structure-only.**
+  `cmd_env_hash` = SHA-256 over {argv, rows, cols, respond_to_queries, the resolved PLAN
+  env map (sorted)} EXCLUDING daemon-injected infra vars (`SHUX`, `TERM_PROGRAM`) and ALL
+  version-bearing values (`TERM_PROGRAM_VERSION`), so a shux release never churns it
+  (080 D5; agy's version-churn catch). `scenario_hash` = SHA-256 over the canonicalized
+  scenario STRUCTURE (name/description/terminal/steps/command), env VALUES excluded. Both
+  populate the `Fingerprint` placeholders (provenance; excluded from `is_stale_vs`).
+- **D6 — step schema.** `expect_golden` uses `tier = "cell"|"pixel"|"exact"` (default
+  cell), NOT a runtime tolerance — tolerance comes ONLY from the blessed sidecar (080).
+  `retries` parse-only (083). `stable_frames` parse-only placeholder → wired to the
+  existing `--quiet` settle until 083 (a test pins the placeholder — no half-working
+  mode). `xfail` parsed OPAQUELY into the 082 `XfailMeta` shape and RESERVED (081 takes
+  no xfail action). Masks are `ROW,COL,WIDTH` row-spans (aligned with `MaskRect` — NOT
+  `[row,col,width,height]`). Unknown action / unknown field → fail closed (`parse_error`).
+  A scenario with NO `expect_golden` emits `no_visual_check` (text asserts are smoke, not
+  visual proof). Top-level `deadline_ms` = whole-scenario budget. `hello.toml` is refined
+  (`tol`→`tier`) under a `GATE-TEST-CHANGE:` trailer.
+- **D7 — child-exit + `expect_exit` (pre-spawn cursor, strict consume).** The runner
+  captures the event head seq BEFORE `lens.run` (pre-spawn cursor) and monitors
+  `pane.exited` from that seq, so a fast-exiting child cannot publish its exit before the
+  runner listens (codex's race). An UNEXPECTED child exit during ANY step (wait / settle /
+  compare) → `child_exit{code}` + short-circuit BEFORE any visual compare + kill/reap/
+  cleanup. Only an explicit `expect_exit{code?}` step consumes a buffered/awaited exit →
+  `expected_child_exit{code}`; a mismatched code, or no exit within the step deadline, is
+  the failure. "The next step is `expect_exit`" does NOT bless an exit mid-wait.
+- **D8 — timeout taxonomy: 4 DISTINCT raw signals.** `step_timeout`,
+  `frame_settle_timeout`, `scenario_timeout`, `never_stabilized` — 081 never collapses
+  them (082 may map the two settle-class causes → `settle_never_stable`). Every timeout →
+  kill/reap/cleanup.
+- **D9 — `respond_to_queries` reserved-honest.** Parsed (bool). The shux terminal answers
+  OSC 11 / DA / XTVERSION deterministically + byte-exact UNCONDITIONALLY (pinned by a
+  `process_with_responses` fixture test). 081 does NOT plumb suppression (reserved, not a
+  half-working mode); `false` = "this scenario does not rely on query responses" (harmless,
+  NOT rejected — `hello.toml` keeps `false`). Suppression is documented as reserved.
+- **D10 — quota + isolation + deferrals.** One scenario = one scratch session; reuse
+  `SCRATCH_QUOTA=16`; the 17th → `quota_exceeded{limit:16}`; the scenario leaves no
+  scratch behind. Parallel scenarios explicitly deferred (documented). mouse / focus /
+  bracketed-paste steps → REJECTED at parse with a clear "not supported (tracked)" error
+  (non-support explicit, never silently ignored) + a fixture placeholder.
 
 ## Testing Matrix
 
@@ -100,19 +194,19 @@ and the timeout-class taxonomy.
 
 ## Acceptance Criteria
 
-- [ ] `shux lens gate <scenario.toml>` drives a TUI via the agnostic step core, no sleeps.
-- [ ] Child environment is deterministically sanitized and isolated.
-- [ ] Unexpected child exit short-circuits before compare; `expect_exit` supported.
-- [ ] All four timeout classes behave per spec; never-stable is a failure.
-- [ ] Masks + redaction apply through the before-serialize path.
-- [ ] Scratch quota + isolation explicit; parallelism explicitly deferred.
+- [x] `shux lens gate <scenario.toml>` drives a TUI via the agnostic step core, no sleeps.
+- [x] Child environment is deterministically sanitized and isolated (`env_clear` deny-by-default; `child_env_is_sanitized_and_denies_host`).
+- [x] Unexpected child exit short-circuits before compare; `expect_exit` supported (incl. signal-death — adv BLOCKER fixed).
+- [x] All four timeout classes behave per spec; never-stable is a failure.
+- [x] Masks + redaction apply through the before-serialize path (`pane.glance --mask`).
+- [x] Scratch quota + isolation explicit; parallelism explicitly deferred.
 
 ## Definition of Done
 
-- [ ] DootSabha design review incorporated before coding.
-- [ ] Red tests captured before implementation.
-- [ ] L1/L2/L3 tests pass under the serial leak guard; zero leaked daemons proven.
-- [ ] `make check` + new `make test-lens-gate` pass.
-- [ ] `shux-tui-qa` gate `VERDICT: PASS`; scratch evidence under `.shux/out/`, review shots on the PR.
-- [ ] Implementation-diff DootSabha convergence review clean or addressed.
-- [ ] `docs/PROGRESS.md` + this task updated; learnings appended.
+- [x] DootSabha design review incorporated before coding (codex+agy, chair claude; D1–D10 folded; evidence `.shux/qa/081-*/dootsabha-design.json`).
+- [x] Red tests captured before implementation (TDD; the 4-agent `adversarial-review` pass — parser · env/keys · compare/signal · runner/daemon driving the REAL system — found **1 BLOCKER + 1 BLOCKER + 5 MAJOR + several MINOR** each fixed with a regression test).
+- [x] L1/L2/L3 tests pass under the serial leak guard; zero leaked daemons proven (`lens_gate_run` 21/21; 59 gate unit tests; existing `test-lens` 37/37, `lens_gate_glance_cells`/`lens_gate_capture` 7/7 — no regression).
+- [x] `make check` + new `make test-lens-gate-run` pass.
+- [x] `shux-tui-qa` gate `VERDICT: PASS`; scratch evidence under `.shux/out/`, review shots on the PR (audit: every matrix cell PASS, 0 daemon leaks, live signal-kill + short-circuit-before-compare confirmed).
+- [x] Implementation-diff DootSabha convergence review clean or addressed (focused impl-review caught + fixed the signal-kill `-1`-vs-`code:None` drift).
+- [x] `docs/PROGRESS.md` + this task updated; learnings appended.

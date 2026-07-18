@@ -1237,6 +1237,9 @@ struct LensRunParams {
     cols: u16,
     rows: u16,
     env: Vec<(String, String)>,
+    /// Deny-by-default env inheritance (task 081 D4): the gate runner sets it so the
+    /// child sees ONLY the deterministic plan. Default false = prior behaviour.
+    env_clear: bool,
     cwd: Option<PathBuf>,
     post_exit_ttl_ms: u32,
     max_runtime_ms: u32,
@@ -1362,11 +1365,17 @@ fn parse_lens_run_params(params: &serde_json::Value) -> Result<LensRunParams, sh
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let env_clear = params
+        .get("env_clear")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Ok(LensRunParams {
         argv,
         cols,
         rows,
         env,
+        env_clear,
         cwd,
         post_exit_ttl_ms,
         max_runtime_ms,
@@ -1800,6 +1809,7 @@ async fn spawn_scratch_core(
         p.argv.clone(),
         size,
         p.env,
+        p.env_clear,
         io_state.clone(),
         cancel.clone(),
         graph.clone(),

@@ -1699,6 +1699,39 @@ pub enum LensCommand {
         #[arg(last = true, num_args = 1.., required = true, value_name = "ARGV")]
         argv: Vec<String>,
     },
+
+    /// Drive a declarative TOML scenario against a hidden scratch TUI and compare
+    /// captured frames to committed goldens (task 081).
+    ///
+    /// The scenario file (`name`, `[terminal]`, `[env]`, `command`, `[[steps]]`)
+    /// spawns `command` in a deterministic, deny-by-default sandbox (isolated
+    /// HOME/XDG, `LC_ALL=C.UTF-8`, `TZ=UTC`, `TERM=xterm-256color`), then runs the
+    /// agnostic step core (`wait_for_text`, `settle`, `type_text`, `keys`, `resize`,
+    /// `expect_golden`, `assert_contains`, `expect_exit`, …). `expect_golden` settles
+    /// the pane, captures the canonical frame, and compares it against
+    /// `<scenario-dir>/goldens/<name>/` at the cell/pixel/exact tier.
+    ///
+    /// This is the runner MECHANICS layer: `--trace` emits the raw runner-signal
+    /// stream (NDJSON). The verdict rollup, `report.json`, and the final exit-code
+    /// contract are owned by a later task; the exit here is provisional.
+    Gate {
+        /// The scenario TOML file.
+        #[arg(value_name = "SCENARIO")]
+        scenario: PathBuf,
+
+        /// Golden directory (default `<scenario-dir>/goldens/<scenario-name>/`).
+        #[arg(long, value_name = "DIR")]
+        golden_dir: Option<PathBuf>,
+
+        /// Emit the raw runner-signal NDJSON trace to a path, or `-` for stdout.
+        #[arg(long, value_name = "PATH|-")]
+        trace: Option<String>,
+
+        /// Trailing argv after `--` overrides the scenario `command` (same argv,
+        /// different binary — e.g. to point the scenario at a local build).
+        #[arg(last = true, num_args = 0.., value_name = "ARGV")]
+        argv: Vec<String>,
+    },
 }
 
 /// Parse a `COLSxROWS` size flag (e.g. `80x24`) into `(cols, rows)`. Shape

@@ -124,6 +124,11 @@ pub struct PtyConfig {
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
     pub size: PtySize,
+    /// Deny-by-default inheritance (task 081 D4): when true, `spawn` clears the
+    /// inherited environment BEFORE applying the PTY defaults + `env`, so the child
+    /// sees ONLY the deterministic plan. Default `false` = byte-identical prior
+    /// behaviour (the scratch gate runner is the only caller that sets it).
+    pub env_clear: bool,
 }
 
 /// PTY dimensions in columns and rows.
@@ -152,6 +157,7 @@ impl PtyConfig {
             cwd,
             env: Vec::new(),
             size: PtySize::default(),
+            env_clear: false,
         }
     }
 
@@ -161,6 +167,7 @@ impl PtyConfig {
             cwd,
             env: Vec::new(),
             size: PtySize::default(),
+            env_clear: false,
         }
     }
 
@@ -327,6 +334,12 @@ impl PtyHandle {
 
         let pane_term = resolve_pane_term();
         let mut cmd = Command::new(program);
+        // Deny-by-default env (task 081 D4): clear inherited vars FIRST so the child
+        // sees only the PTY defaults below + the caller's explicit `env` plan. A
+        // deterministic `PATH` MUST be in `env` for relative-program resolution.
+        if config.env_clear {
+            cmd.env_clear();
+        }
         cmd.args(args)
             .current_dir(&config.cwd)
             .stdin(stdin)

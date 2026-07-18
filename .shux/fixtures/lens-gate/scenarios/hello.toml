@@ -1,15 +1,16 @@
 # Lens-gate scenario — the authoring surface (TOML, per the locked decision).
 #
-# This is a FROZEN placeholder that the red contract lane drives via
-# `shux lens gate <this file>`. The scenario RUNNER and the final step grammar
-# are owned by task 081; 081 may refine this file (with a GATE-TEST-CHANGE:
-# trailer). 078 freezes only that (a) the format is TOML and (b) a scenario
-# carries name/description, a terminal block, an env block, a command to spawn,
-# and an ordered list of `action`-tagged steps including `expect_golden`.
+# The scenario RUNNER + step grammar are owned by task 081. 078 froze the ENVELOPE
+# (name/description/[terminal]/[env]/command/[[steps]] with an `expect_golden`); 081
+# canonicalizes the step fields (GATE-TEST-CHANGE): `expect_golden.tier` replaces the
+# 078 placeholder `tol`, and the command DRAWS then BLOCKS (`exec cat`) so the pane is
+# a live, quiet frame at capture — a one-shot print-then-exit would trip the
+# child-exit short-circuit (design D7) before any compare. `NO_COLOR` is omitted
+# entirely (design D4: color is on by default; an empty NO_COLOR would SET the var).
 
 name = "hello"
-description = "Minimal lens-gate scenario: spawn a shell, print a coloured line, expect the frame."
-command = ["/bin/sh", "-c", "printf '\\033[38;2;255;120;0mhello, lens gate\\033[0m\\n'"]
+description = "Minimal lens-gate scenario: draw a coloured line, hold the frame, expect it."
+command = ["/bin/sh", "-c", "printf '\\033[38;2;255;120;0mhello, lens gate\\033[0m\\n'; exec cat"]
 
 [terminal]
 rows = 24
@@ -21,7 +22,6 @@ LC_ALL = "C.UTF-8"
 TZ = "UTC"
 TERM = "xterm-256color"
 COLORTERM = "truecolor"
-NO_COLOR = ""
 
 [[steps]]
 action = "wait_for_text"
@@ -29,6 +29,11 @@ text = "hello, lens gate"
 timeout_ms = 5000
 
 [[steps]]
+action = "settle"
+quiet_ms = 300
+timeout_ms = 5000
+
+[[steps]]
 action = "expect_golden"
 name = "start"
-tol = "cell"
+tier = "cell"

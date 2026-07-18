@@ -14,6 +14,7 @@ mod client;
 mod config_validate;
 mod daemon;
 mod features;
+mod gate;
 mod lens_scratch;
 mod onboarding;
 mod session_meta;
@@ -1119,16 +1120,18 @@ async fn run_pane_pty_task(
         }
     };
 
-    // Propagate the captured exit code so the daemon's PaneExited
-    // event carries it. set_pane_exit_status both updates the pane
-    // and fires the lifecycle event with the populated field — the
-    // alternative path (graph.destroy_pane via API) fires PaneExited
-    // with None, which is the right thing for "killed by user", and
-    // the cascade paths in destroy_session/destroy_window do the same.
-    if let Some(code) = exit_code {
-        if let Err(e) = graph.set_pane_exit_status(pane_id, code).await {
-            tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
-        }
+    // Propagate the exit so the daemon's PaneExited event fires — set_pane_exit_status
+    // both updates the pane and fires the lifecycle event. A SIGNAL death (or a wait
+    // failure) has no POSIX code (`status.code()` is None); we still fire, with the
+    // lens sentinel `-1` (the same value `lens.run --wait` already reports for a
+    // signalled child). This is load-bearing for the lens-gate runner (task 081, adv
+    // BLOCKER): its `ExitMonitor` watches `pane.exited`, and a crash that fires no exit
+    // event would let the runner compare the crash frame instead of short-circuiting.
+    // The reaper and `--wait` also key on this event, so a signalled child is now reaped
+    // promptly rather than lingering to `max-runtime`.
+    let exit_status = exit_code.unwrap_or(-1);
+    if let Err(e) = graph.set_pane_exit_status(pane_id, exit_status).await {
+        tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
     }
 
     // Drop only the PTY-bound handles. The VT (grid + scrollback) stays
@@ -1171,6 +1174,7 @@ pub(crate) async fn spawn_pane_pty(
     command: Vec<String>,
     size: shux_pty::handle::PtySize,
     extra_env: Vec<(String, String)>,
+    env_clear: bool,
     io_state: Arc<Mutex<PaneIoState>>,
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
@@ -1182,6 +1186,7 @@ pub(crate) async fn spawn_pane_pty(
     };
     config.size = size;
     config.env = extra_env;
+    config.env_clear = env_clear;
     let handle = shux_pty::handle::PtyHandle::spawn(&config)?;
     let pid = handle.pid();
 
@@ -1837,6 +1842,7 @@ fn register_state_methods(
                                 command,
                                 shux_pty::handle::PtySize::default(),
                                 Vec::new(),
+                                false,
                                 spawn_io,
                                 spawn_ct,
                                 gh.clone(),
@@ -2471,6 +2477,7 @@ fn register_pane_methods(
                     command,
                     shux_pty::handle::PtySize::default(),
                     Vec::new(),
+                    false,
                     io,
                     ct,
                     gh.clone(),
@@ -3357,6 +3364,7 @@ fn register_window_methods(
                         command,
                         shux_pty::handle::PtySize::default(),
                         Vec::new(),
+                        false,
                         io,
                         ct,
                         gh.clone(),
@@ -3491,6 +3499,7 @@ fn register_window_methods(
                         command,
                         shux_pty::handle::PtySize::default(),
                         Vec::new(),
+                        false,
                         io,
                         ct,
                         gh.clone(),
@@ -3879,6 +3888,7 @@ fn register_session_methods(
                                             command.clone(),
                                             shux_pty::handle::PtySize::default(),
                                             Vec::new(),
+                                            false,
                                             io,
                                             ct,
                                             gh.clone(),
@@ -4078,6 +4088,7 @@ fn register_session_methods(
                                             command.clone(),
                                             shux_pty::handle::PtySize::default(),
                                             Vec::new(),
+                                            false,
                                             io,
                                             ct,
                                             gh.clone(),
@@ -6930,6 +6941,32 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 args.format,
             )
             .await
+        }
+
+        Some(Command::Lens {
+            command:
+                cli::LensCommand::Gate {
+                    scenario,
+                    golden_dir,
+                    trace,
+                    argv,
+                },
+        }) => {
+            let trace = trace.map(|t| {
+                if t == "-" {
+                    gate::runner::TraceTarget::Stdout
+                } else {
+                    gate::runner::TraceTarget::Path(std::path::PathBuf::from(t))
+                }
+            });
+            let opts = gate::runner::GateOptions {
+                scenario_path: scenario,
+                argv_override: (!argv.is_empty()).then_some(argv),
+                golden_dir,
+                trace,
+            };
+            let code = gate::runner::handle_lens_gate(&socket_path, opts).await?;
+            std::process::exit(code);
         }
 
         Some(Command::Rpc {

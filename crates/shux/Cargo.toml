@@ -47,6 +47,8 @@ sha2 = { workspace = true }
 # proc_pidinfo(PROC_PIDTBSDINFO) start-time read for the lens scratch
 # registry (LENS-R-044 "start time matches") — nix has no wrapper for it.
 libc = "0.2"
+# Per-scenario sandbox dirs for the lens gate runner (task 081 D4 deny-by-default env).
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -125,4 +127,13 @@ test = false
 [[test]]
 name = "lens_gate_bench"
 path = "tests/lens_gate_bench.rs"
+test = false
+
+# Task 081 — daemon-backed scenario runner + `shux lens gate` (L1 env/child-exit/timeout
+# mechanics, L2 CLI/quota, L3 dogfood/edge). Same `test = false` regime: out of the
+# default run; run EXPLICITLY + serially under the leak guard via `make test-lens-gate-run`.
+# Frozen path (GATE-TEST-CHANGE: trailer).
+[[test]]
+name = "lens_gate_run"
+path = "tests/lens_gate_run.rs"
 test = false
