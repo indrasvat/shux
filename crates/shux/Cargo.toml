@@ -111,3 +111,18 @@ test = false
 name = "lens_gate_contract"
 path = "tests/lens_gate_contract.rs"
 test = false
+
+# Task 080 — daemon-backed `pane.glance --cells` emission (L1-capture + L3-dogfood) and
+# the capture/compare throughput bench. Same `test = false` regime as the lens suite:
+# out of the default `cargo test` / CI parallel run; run EXPLICITLY + serially under the
+# leak guard via `make test-lens-gate-glance-cells` / `make bench-lens-gate`.
+# (`lens_gate_compare` is a PURE, CI-run test — no entry here, so it auto-discovers.)
+[[test]]
+name = "lens_gate_glance_cells"
+path = "tests/lens_gate_glance_cells.rs"
+test = false
+
+[[test]]
+name = "lens_gate_bench"
+path = "tests/lens_gate_bench.rs"
+test = false

@@ -100,6 +100,16 @@ pub trait CellGridView {
     fn cursor(&self) -> CursorState;
     /// The sticky OSC-4 palette-override *history* bit (task-078 R1).
     fn palette_overridden(&self) -> bool;
+    /// Whether this frame is the ALTERNATE screen (task-080). Defaulted to `false` so the
+    /// frozen [`diff_frames`] path and the live [`GridFrame`] (daemon `pane.diff_since`,
+    /// which never diffs across an alt-switch) are byte-unchanged; only [`FrameView`]
+    /// overrides it, so the lens gate's [`compare_cell`](crate::compare_cell) can treat an
+    /// alt/primary flip between a golden and a live capture as a difference.
+    ///
+    /// [`compare_cell`]: crate::compare_cell
+    fn alt_screen(&self) -> bool {
+        false
+    }
 }
 
 /// One per-row changed-column span (LENS-R-035): 0-based half-open
@@ -350,6 +360,7 @@ pub struct FrameView {
     defaults: TerminalDefaultColors,
     cursor: CursorState,
     palette_overridden: bool,
+    alt_screen: bool,
 }
 
 impl FrameEnvelope {
@@ -391,6 +402,7 @@ impl FrameEnvelope {
             defaults,
             cursor,
             palette_overridden: self.palette_overridden,
+            alt_screen: self.alt_screen,
         })
     }
 }
@@ -419,6 +431,9 @@ impl CellGridView for FrameView {
     }
     fn palette_overridden(&self) -> bool {
         self.palette_overridden
+    }
+    fn alt_screen(&self) -> bool {
+        self.alt_screen
     }
 }
 

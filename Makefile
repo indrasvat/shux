@@ -429,6 +429,21 @@ test-lens-gate-comparator: ## Run the task-079 comparator suite (parity corpus +
 	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast \
 		--test lens_gate_parity --test lens_gate_divergence --test diff_palette_isolation
 
+.PHONY: test-lens-gate-compare
+test-lens-gate-compare: ## Run the task-080 golden-compare suite (3 tiers + fingerprint + mask invariance + divergence pixel proofs; PURE, CI-run)
+	@echo "$(COLOR_BLUE)▶ Running lens-gate golden-compare suite (task 080)...$(COLOR_RESET)"
+	@cargo nextest run -p shux --no-fail-fast --test lens_gate_compare
+
+.PHONY: test-lens-gate-glance-cells
+test-lens-gate-glance-cells: ## Run the task-080 daemon-backed `pane.glance --cells` emission suite serially under the leak guard
+	@echo "$(COLOR_BLUE)▶ Running lens-gate glance --cells emission suite (task 080)...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test lens_gate_glance_cells
+
+.PHONY: bench-lens-gate
+bench-lens-gate: ## Record task-080 capture/compare/render throughput at 10/100/1000 frames (no daemon; prints numbers)
+	@echo "$(COLOR_BLUE)▶ Recording lens-gate throughput (task 080 §6)...$(COLOR_RESET)"
+	@cargo nextest run -p shux --no-fail-fast --no-capture --test lens_gate_bench
+
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"

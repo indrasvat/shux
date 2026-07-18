@@ -1,0 +1,17 @@
+{
+  "task": "080-lens-gate-capture-golden-compare",
+  "task_file": "docs/tasks/080-lens-gate-capture-golden-compare.md",
+  "branch": "feat/lens-ci-gate",
+  "verdict": "PASS",
+  "audited_head": "2adde0c80d47280a091236796528ff9dbc2116da",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.md",
+  "dootsabha_implementation": "dootsabha-implementation.md",
+  "screenshots": [
+    "lens-gate-frame-80x24-actual.png",
+    "diff-80x24.png"
+  ],
+  "pixel_metrics": [
+    "pixel-metrics-80x24.json"
+  ]
+}

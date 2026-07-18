@@ -1064,6 +1064,26 @@ fn parse_duration_ms(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("duration {s:?} overflows"))
 }
 
+/// Parse a `pane glance --mask ROW,COL,WIDTH` redaction rect (task 080). All three are
+/// `u16`; `WIDTH == 0` is rejected (a zero-width mask redacts nothing — likely a typo).
+fn parse_mask_rect(s: &str) -> Result<(u16, u16, u16), String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != 3 {
+        return Err(format!("mask must be ROW,COL,WIDTH, got {s:?}"));
+    }
+    let field = |name: &str, v: &str| -> Result<u16, String> {
+        v.parse::<u16>()
+            .map_err(|_| format!("mask {name} {v:?} must be a u16"))
+    };
+    let row = field("ROW", parts[0])?;
+    let col = field("COL", parts[1])?;
+    let width = field("WIDTH", parts[2])?;
+    if width == 0 {
+        return Err("mask WIDTH must be > 0 (a zero-width mask redacts nothing)".to_string());
+    }
+    Ok((row, col, width))
+}
+
 #[derive(Subcommand, Debug)]
 pub enum PaneCommand {
     /// List panes in a window
@@ -1451,6 +1471,23 @@ pub enum PaneCommand {
         /// (`checkpoint=true`).
         #[arg(long)]
         checkpoint: bool,
+
+        /// Emit the canonical captured frame (`FrameEnvelope`, task-078 schema)
+        /// as the `cells` field — the lens-gate `cell`-tier golden. Portable,
+        /// JSON-only; no PNG is written for a cell golden (task 080).
+        #[arg(long)]
+        cells: bool,
+
+        /// Write the canonical `cells` JSON to this path (implies `--cells`).
+        /// Otherwise the envelope rides inside `--format json` output.
+        #[arg(long, value_name = "PATH")]
+        cells_out: Option<std::path::PathBuf>,
+
+        /// Redact a rectangular region before serialize/hash/render, as
+        /// `ROW,COL,WIDTH` (repeatable). Masks the emitted `cells`, `text`, AND
+        /// PNG so a timestamp / token never enters a golden (task 080, D4).
+        #[arg(long = "mask", value_name = "ROW,COL,WIDTH", value_parser = parse_mask_rect)]
+        masks: Vec<(u16, u16, u16)>,
     },
 
     /// Block until a pane's screen has been STILL for a quiet window, or
@@ -4028,6 +4065,7 @@ fn lens_glance_exit_code(rpc_error_code: i64) -> i32 {
 /// `shux pane glance` — atomic {png, text, revision} of one pane via
 /// `pane.glance` RPC (lens PRD §5, §10). No session/window resolution:
 /// `pane` is always a raw pane UUID, mirroring the RPC's `pane_id` param.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_glance(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
@@ -4035,6 +4073,9 @@ pub async fn handle_pane_glance(
     text_only: bool,
     no_cursor: bool,
     checkpoint: bool,
+    include_cells: bool,
+    cells_out: Option<std::path::PathBuf>,
+    masks: Vec<(u16, u16, u16)>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     // clap's `conflicts_with` already rejects this combination at parse time
@@ -4043,15 +4084,28 @@ pub async fn handle_pane_glance(
     if text_only && png_path.is_some() {
         anyhow::bail!("--text-only and --png are mutually exclusive");
     }
+    let mask_params: Vec<serde_json::Value> = masks
+        .iter()
+        .map(|(row, col, width)| serde_json::json!({"row": row, "col": col, "width": width}))
+        .collect();
     let params = serde_json::json!({
         "pane_id": pane,
         "include_cursor": !no_cursor,
         "include_png": !text_only,
         "checkpoint": checkpoint,
+        "include_cells": include_cells,
+        "masks": mask_params,
     });
 
     match rpc_call(stream, "pane.glance", params).await {
         Ok(result) => {
+            // Write the canonical `cells` envelope to disk when requested (task 080).
+            if let Some(path) = &cells_out {
+                let Some(cells) = result.get("cells") else {
+                    anyhow::bail!("--cells-out given but the glance result has no cells field");
+                };
+                std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(cells)?))?;
+            }
             if let Some(path) = &png_path {
                 use base64::Engine;
                 let b64 = result.get("png_base64").and_then(|v| v.as_str());

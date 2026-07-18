@@ -461,6 +461,47 @@ fn lens_pixel_budget_check(
     Ok(())
 }
 
+/// Parse the `pane.glance` `masks` param (task 080): an array of
+/// `{"row":r,"col":c,"width":w}` redaction rects into a [`shux_vt::MaskSet`]. Absent →
+/// empty set. A present-but-wrong-typed `masks` (not an array, or a non-object /
+/// out-of-range entry) is `INVALID_PARAMS` (-32602 → CLI exit 2), never a silent skip
+/// that would leave a secret unredacted.
+fn parse_glance_masks(params: &serde_json::Value) -> Result<shux_vt::MaskSet, shux_rpc::RpcError> {
+    let Some(v) = params.get("masks") else {
+        return Ok(shux_vt::MaskSet::new());
+    };
+    if v.is_null() {
+        return Ok(shux_vt::MaskSet::new());
+    }
+    let arr = v
+        .as_array()
+        .ok_or_else(|| shux_rpc::RpcError::invalid_params("masks must be an array of rects"))?;
+    let mut set = shux_vt::MaskSet::new();
+    let field = |o: &serde_json::Value, k: &str| -> Result<u16, shux_rpc::RpcError> {
+        let n = o.get(k).and_then(|x| x.as_u64()).ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params(&format!("mask rect needs u16 `{k}`"))
+        })?;
+        u16::try_from(n)
+            .map_err(|_| shux_rpc::RpcError::invalid_params(&format!("mask `{k}` exceeds u16")))
+    };
+    for rect in arr {
+        let row = field(rect, "row")?;
+        let col = field(rect, "col")?;
+        let width = field(rect, "width")?;
+        // A zero-width mask redacts nothing — `MaskSet::with` would silently DROP it,
+        // turning an intended redaction into an unmasked glance. Reject it (matching the
+        // CLI's `parse_mask_rect`) so a typo fails loudly instead of leaking (council
+        // impl-review MAJOR).
+        if width == 0 {
+            return Err(shux_rpc::RpcError::invalid_params(
+                "mask width must be > 0 (a zero-width mask redacts nothing)",
+            ));
+        }
+        set = set.with(row, col, width);
+    }
+    Ok(set)
+}
+
 /// The lens `pane.glance` text of a SINGLE grid row (LENS-R-012 byte-stability,
 /// per-row): ANSI-free, wide-continuation cells skipped, full-width, trailing
 /// whitespace preserved (no trim). Byte-identical to `Grid::glance_text`'s
@@ -5241,6 +5282,17 @@ fn register_pane_io_methods(
                         .get("checkpoint")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    // Lens-gate capture emission (task 080): `include_cells` returns the
+                    // canonical `FrameEnvelope` (078 schema) for the current viewport;
+                    // `masks` are redaction rects applied BEFORE serialize/hash — and,
+                    // when present, ALSO to the returned `text`/`png` so a secret never
+                    // leaks (council D4). Default (no masks) leaves text/png byte-
+                    // identical to today.
+                    let include_cells = params
+                        .get("include_cells")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let masks = parse_glance_masks(&params)?;
 
                     // LENS-R-010: ONE atomic clone under the pane's state
                     // lock — grid, cursor {row,col,visible}, size,
@@ -5259,6 +5311,7 @@ fn register_pane_io_methods(
                         snap_cols,
                         snap_rows,
                         default_colors,
+                        palette_overridden,
                         grid_snapshot,
                     ) = {
                         let state = io.lock().await;
@@ -5287,6 +5340,10 @@ fn register_pane_io_methods(
                         }
                         let cur = vt.cursor();
                         let default_colors = vt.default_colors();
+                        // Sticky OSC-4 override bit (task 080): read in the SAME critical
+                        // section as the grid so the emitted `cells` envelope is
+                        // revision-consistent (glance did not read it before — council Q5).
+                        let palette_overridden = vt.palette_overridden();
                         // Visible-only clone — no scrollback (LENS-R-012).
                         let grid_clone = vt.grid().clone_visible();
                         (
@@ -5299,28 +5356,68 @@ fn register_pane_io_methods(
                             cols,
                             rows,
                             default_colors,
+                            palette_overridden,
                             grid_clone,
                         )
                     };
 
-                    // Text extraction (LENS-R-012), from the clone, outside
-                    // the lock: ANSI-free, full-width rows (no trim), joined
-                    // by `\n`, no scrollback.
-                    let text = grid_snapshot.glance_text();
+                    // Lens-gate capture (task 080): build the canonical envelope from
+                    // the SAME clone when `cells` are requested OR masks must redact the
+                    // emitted content. Masks are applied in `from_snapshot` — before any
+                    // serialize/hash (council D4).
+                    let capture_env = if include_cells || !masks.is_empty() {
+                        Some(shux_vt::FrameEnvelope::from_snapshot(
+                            &grid_snapshot,
+                            cursor_row as u16,
+                            cursor_col as u16,
+                            cursor_visible,
+                            cursor_shape,
+                            default_colors,
+                            alt_screen,
+                            palette_overridden,
+                            &masks,
+                        ))
+                    } else {
+                        None
+                    };
 
-                    // Route the clone to its consumers without a spare copy
-                    // (greptile PR #89 P2): only the PNG+checkpoint
-                    // combination needs two owners; every other shape MOVES
-                    // the clone (the text-only+checkpoint path previously
-                    // cloned it and dropped the original).
-                    let (render_grid, checkpoint_grid) = match (include_png, want_checkpoint) {
-                        (true, true) => {
-                            let cp = grid_snapshot.clone();
-                            (Some(grid_snapshot), Some(cp))
-                        }
-                        (true, false) => (Some(grid_snapshot), None),
-                        (false, true) => (None, Some(grid_snapshot)),
-                        (false, false) => (None, None),
+                    // When masks apply, present the MASKED reconstruction to text + PNG
+                    // so a secret never reaches `text`/`png` either (council D4). Owns a
+                    // Grid only on the masked path; the default path is byte-unchanged.
+                    let masked_present = if !masks.is_empty() {
+                        Some(capture_env.as_ref().expect("built when masked").to_grid())
+                    } else {
+                        None
+                    };
+
+                    // The cursor column to PRESENT (rendered PNG + response field): clamp
+                    // to the mask origin when the cursor sits inside a redacted rect, so a
+                    // masked secret's LENGTH does not leak via the drawn/reported cursor
+                    // (council impl-review BLOCKER — the `cells` envelope clamps in
+                    // `from_snapshot`, but the daemon's own render + response bypassed it).
+                    // Checkpoints keep the RAW cursor (internal state, never a golden).
+                    let present_cursor_col = masks
+                        .cursor_redaction_col(cursor_row as u16, cursor_col as u16)
+                        .map(|c| c as usize)
+                        .unwrap_or(cursor_col);
+
+                    // Text extraction (LENS-R-012), outside the lock: ANSI-free,
+                    // full-width rows (no trim), joined by `\n`, no scrollback.
+                    let text = match &masked_present {
+                        Some(g) => g.glance_text(),
+                        None => grid_snapshot.glance_text(),
+                    };
+
+                    // Checkpoints feed `pane.diff_since` (internal state, never a
+                    // golden), so they store the REAL (unmasked) clone. Clone first so
+                    // the render source can then MOVE the appropriate grid.
+                    let checkpoint_grid = want_checkpoint.then(|| grid_snapshot.clone());
+                    // Render source: the masked reconstruction when masks apply, else the
+                    // raw clone (moved — checkpoint already cloned it if needed).
+                    let render_grid: Option<shux_vt::Grid> = if include_png {
+                        Some(masked_present.unwrap_or(grid_snapshot))
+                    } else {
+                        None
                     };
 
                     // PNG rendering (LENS-R-013): reuses shux-raster
@@ -5338,7 +5435,7 @@ fn register_pane_io_methods(
                     // OSC 4 palette redefinition remains Class B.
                     let png_base64 = if let Some(render_grid) = render_grid {
                         let render_cursor = include_cursor && cursor_visible;
-                        let cursor_pos = render_cursor.then_some((cursor_row, cursor_col));
+                        let cursor_pos = render_cursor.then_some((cursor_row, present_cursor_col));
                         let cursor_shape = if render_cursor {
                             cursor_shape
                         } else {
@@ -5433,13 +5530,15 @@ fn register_pane_io_methods(
                         "bytes_returned": text.len() + png_decoded_len,
                     }));
 
-                    Ok(serde_json::json!({
+                    let mut result = serde_json::json!({
                         "revision": revision,
                         "cols": snap_cols,
                         "rows": snap_rows,
                         "cursor": {
                             "row": cursor_row,
-                            "col": cursor_col,
+                            // Clamped col (BLOCKER): the reported cursor must not leak a
+                            // masked secret's length either.
+                            "col": present_cursor_col,
                             "visible": cursor_visible,
                         },
                         "alt_screen": alt_screen,
@@ -5447,7 +5546,16 @@ fn register_pane_io_methods(
                         "png_base64": png_base64,
                         "checkpointed": checkpointed,
                         "evicted_revision": evicted_revision,
-                    }))
+                    });
+                    // Emit the canonical `FrameEnvelope` ONLY when requested (task 080);
+                    // absent by default keeps the frozen glance response byte-stable.
+                    if include_cells {
+                        if let Some(env) = &capture_env {
+                            result["cells"] =
+                                serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
+                        }
+                    }
+                    Ok(result)
                 }
             },
         )
@@ -6738,6 +6846,9 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     text_only,
                     no_cursor,
                     checkpoint,
+                    cells,
+                    cells_out,
+                    masks,
                 } => {
                     cli::handle_pane_glance(
                         &mut stream,
@@ -6746,6 +6857,9 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         text_only,
                         no_cursor,
                         checkpoint,
+                        cells || cells_out.is_some(),
+                        cells_out,
+                        masks,
                         args.format,
                     )
                     .await

@@ -10,6 +10,7 @@ mod charset;
 mod cursor;
 mod diff;
 mod gate;
+mod gate_compare;
 mod grid;
 mod parser;
 mod tabstops;
@@ -28,6 +29,11 @@ pub use diff::{
 };
 pub use gate::{
     DiffRegion, DiffReport, FrameReport, GATE_REPORT_SCHEMA, GateStatus, ScenarioReport, XfailMeta,
+};
+pub use gate_compare::{
+    CellVerdict, FINGERPRINT_SCHEMA, Fingerprint, RENDERER_FORMAT_VERSION, Tier, TolParams,
+    capture_sha256, compare_cell, has_indexed_colors, mask_hash, palette_unportable, sha256_hex,
+    unicode_width_version,
 };
 pub use grid::{DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};

@@ -461,6 +461,16 @@ impl CursorShapeRepr {
             CursorShape::Bar => CursorShapeRepr::Bar,
         }
     }
+
+    /// Back to the VT cursor shape — so the lens gate's pixel tier can draw the
+    /// envelope's cursor (a cursor-shape change is a pixel-tier-only signal, task 080).
+    pub fn to_vt(self) -> CursorShape {
+        match self {
+            CursorShapeRepr::Block => CursorShape::Block,
+            CursorShapeRepr::Underline => CursorShape::Underline,
+            CursorShapeRepr::Bar => CursorShape::Bar,
+        }
+    }
 }
 
 /// Cursor semantics carried in the envelope. No `blinking` (the VT does not
@@ -534,6 +544,36 @@ impl MaskSet {
     fn any_in_row(&self, row: u16) -> bool {
         self.rects.iter().any(|r| r.row == row)
     }
+
+    /// If `(row, col)` falls inside a redacted rect, the leftmost masked column of the
+    /// covering rect; else `None`. The lens gate clamps the captured cursor to this so a
+    /// masked secret's LENGTH cannot leak via cursor position — the cursor lands just
+    /// after a printed secret, so its column encodes the secret's length, which then flows
+    /// into `capture_sha256`/`rgba_sha256` (task-080 adversarial MAJOR). Clamping a
+    /// cursor that sits INSIDE the mask to the mask origin makes any content change that
+    /// keeps the cursor within the mask fully invariant; a mask must therefore be wide
+    /// enough to contain the cursor for full length-invariance.
+    pub fn cursor_redaction_col(&self, row: u16, col: u16) -> Option<u16> {
+        self.rects
+            .iter()
+            .filter(|r| r.row == row && col >= r.col && col < r.col.saturating_add(r.width))
+            .map(|r| r.col)
+            .min()
+    }
+
+    /// The redaction rectangles, sorted `(row, col, width)`. Exposed so the lens gate
+    /// can pin the applied mask policy in a golden's fingerprint (task 080 `mask_hash`)
+    /// — a change to WHICH cells are redacted must invalidate the golden.
+    pub fn sorted_rects(&self) -> Vec<MaskRect> {
+        let mut v = self.rects.clone();
+        v.sort_by_key(|r| (r.row, r.col, r.width));
+        v
+    }
+
+    /// Is any region redacted?
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
 }
 
 // ── Envelope ────────────────────────────────────────────────────────────────
@@ -600,13 +640,93 @@ impl FrameEnvelope {
             },
             cursor: CursorRepr {
                 row: cursor.row as u16,
-                col: cursor.col as u16,
+                // Clamp a cursor inside a masked rect to the mask origin so a masked
+                // secret's LENGTH cannot leak via cursor column (task-080 D4).
+                col: masks
+                    .cursor_redaction_col(cursor.row as u16, cursor.col as u16)
+                    .unwrap_or(cursor.col as u16),
                 visible: cursor.visible,
                 shape: CursorShapeRepr::from_vt(cursor.shape),
             },
             palette_overridden,
             rows: out_rows,
         }
+    }
+
+    /// Capture from an already-cloned VISIBLE grid plus primitive cursor fields — the
+    /// lens `pane.glance` path (task 080). Glance takes ONE atomic clone under the pane
+    /// lock (`grid.clone_visible()` + cursor + defaults + alt + `palette_overridden`)
+    /// and renders text/PNG from it; `--cells` builds the canonical envelope from the
+    /// SAME clone so the emitted frame is revision-consistent with the returned
+    /// text/PNG. The grid is scrollback-free (`clone_visible`) so `build_row_runs`'
+    /// `scrollback_len() == 0` path applies. Masks are applied here — before any
+    /// serialize/hash/compare (council D4) — so a secret never enters the emitted
+    /// `cells`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_snapshot(
+        grid: &Grid,
+        cursor_row: u16,
+        cursor_col: u16,
+        cursor_visible: bool,
+        cursor_shape: CursorShape,
+        defaults: TerminalDefaultColors,
+        alt_screen: bool,
+        palette_overridden: bool,
+        masks: &MaskSet,
+    ) -> Self {
+        let rows = grid.rows();
+        let cols = grid.cols();
+        let mut out_rows = Vec::with_capacity(rows);
+        for r in 0..rows {
+            out_rows.push(RowRepr {
+                row: r as u16,
+                runs: build_row_runs(grid, r, cols, masks),
+            });
+        }
+        FrameEnvelope {
+            schema: SCHEMA_VERSION,
+            size: Size {
+                rows: rows as u16,
+                cols: cols as u16,
+            },
+            alt_screen,
+            defaults: Defaults {
+                fg: defaults.fg,
+                bg: defaults.bg,
+                cursor: defaults.cursor,
+            },
+            cursor: CursorRepr {
+                row: cursor_row,
+                // Clamp a cursor inside a masked rect to the mask origin so a masked
+                // secret's LENGTH cannot leak via cursor column (task-080 D4).
+                col: masks
+                    .cursor_redaction_col(cursor_row, cursor_col)
+                    .unwrap_or(cursor_col),
+                visible: cursor_visible,
+                shape: CursorShapeRepr::from_vt(cursor_shape),
+            },
+            palette_overridden,
+            rows: out_rows,
+        }
+    }
+
+    /// Reconstruct a live [`Grid`] from this envelope's cells (task 080). The gate's
+    /// pixel tier + ephemeral heat PNG render THROUGH this grid, never the raw live
+    /// grid — because this envelope is already MASKED, a masked region decodes to the
+    /// styleless `▮` placeholder ([`to_cells`]), so a secret can never reach a rendered
+    /// gate artifact (council D4). Geometry comes entirely from the encoding (R3).
+    pub fn to_grid(&self) -> Grid {
+        let cells = self.to_cells();
+        let rows = cells.len();
+        let cols = cells.first().map(|r| r.len()).unwrap_or(0);
+        let mut g = Grid::new(rows, cols, crate::GridConfig::default());
+        for (r, row) in cells.iter().enumerate() {
+            let dst = g.visible_row_mut_marked(r);
+            for (c, cell) in row.iter().enumerate() {
+                dst.cells[c] = cell.clone();
+            }
+        }
+        g
     }
 
     /// Canonical, deterministic, pretty JSON (CI-greppable, byte-stable).
@@ -771,6 +891,13 @@ fn build_row_runs(grid: &Grid, r: usize, cols: usize, masks: &MaskSet) -> Vec<Ru
     // falls on a wide glyph's CONTINUATION column must not leak the head — and
     // the wide-cell `col += 2` jump below would otherwise skip past a masked
     // continuation column without redacting it (adv-schema MAJOR 2).
+    //
+    // KNOWN LIMITATION (task-080 adversarial MINOR): this expansion makes the emitted
+    // mask geometry depend on whether the boundary glyph is double-width — masking
+    // `ab漢ef` vs `abcdef` with the same rect yields `cells:3` vs `cells:2`. The glyph
+    // IDENTITY never leaks (`ab漢ef` vs `ab字ef` are byte-identical), only the ≤1-bit
+    // "boundary char is double-width" fact per edge. Align masks to glyph boundaries to
+    // avoid it.
     let masked_col: Vec<bool> = if row_has_masks {
         let mut m: Vec<bool> = (0..cols).map(|c| masks.masked(row_u, c as u16)).collect();
         for c in 0..cols {
