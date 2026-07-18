@@ -37,6 +37,7 @@ dist/
 .claude/automations/screenshots/
 .claude/RESUME.md
 .claude/scheduled_tasks.lock
+.claude/agent-memory/
 .codemap/
 
 .DS_Store
