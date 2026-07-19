@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, FromArgMatches};
 use shux_rpc::{Policy, Sensitivity};
@@ -44,8 +44,35 @@ const PANE_RECORD_COMPLETED_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 enum PaneRecordChunk {
-    Bytes(Vec<u8>),
-    Finish { status: PaneRecordStatus },
+    /// Raw PTY output with its ARRIVAL instant (task 083 cast — stamped at the tap, not at writer
+    /// recv, so backpressure never skews cast timing).
+    Bytes {
+        data: Vec<u8>,
+        at: Instant,
+    },
+    /// A pane resize with its arrival instant (task 083 cast — emits an asciinema `"r"` event so
+    /// replay geometry stays honest; grok's gap). Ignored by the raw writer.
+    Resize {
+        cols: u16,
+        rows: u16,
+        at: Instant,
+    },
+    Finish {
+        status: PaneRecordStatus,
+    },
+}
+
+/// Recorder output format (task 083). `Raw` is byte-identical to the pre-083 lossless recorder
+/// (timestamps + resize events ignored). `Cast` emits asciinema v2 with monotonic relative
+/// timestamps and resize events, UTF-8-boundary-safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneRecordFormat {
+    Raw,
+    /// asciinema v2, seeded with the pane's dims at record start (the cast header geometry).
+    Cast {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,12 +101,32 @@ struct PaneRecordResult {
     error: Option<String>,
 }
 
-struct PaneRecorder {
+pub(crate) struct PaneRecorder {
     id: uuid::Uuid,
     path: PathBuf,
     sender: mpsc::Sender<PaneRecordChunk>,
     outcome: Arc<StdMutex<PaneRecordResult>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Open a cast recorder (task 083) — the `lens.run` arm-at-spawn path (`spawn_scratch_core`)
+/// builds one and hands it to [`spawn_pane_pty_with_recorder`] so recording begins before the
+/// child's first byte. `overwrite` is always true here (the gate owns the ephemeral `.shux/out/`
+/// path). Returns a ready-to-register [`PaneRecorder`].
+pub(crate) async fn open_cast_recorder(
+    path: PathBuf,
+    cols: u16,
+    rows: u16,
+) -> Result<PaneRecorder, String> {
+    let (sender, outcome, task) =
+        spawn_pane_recorder(path.clone(), true, PaneRecordFormat::Cast { cols, rows }).await?;
+    Ok(PaneRecorder {
+        id: uuid::Uuid::new_v4(),
+        path,
+        sender,
+        outcome,
+        task,
+    })
 }
 
 /// Lens ContentRevision publication payload (PRD §4, LENS-R-003). Published on
@@ -605,6 +652,7 @@ enum PtyTaskExit {
 async fn spawn_pane_recorder(
     path: PathBuf,
     overwrite: bool,
+    format: PaneRecordFormat,
 ) -> Result<
     (
         mpsc::Sender<PaneRecordChunk>,
@@ -650,21 +698,90 @@ async fn spawn_pane_recorder(
         error: None,
     }));
     let writer_outcome = outcome.clone();
+    // Epoch at ARM time (not writer-task start) so the first output event's relative time honestly
+    // reflects the child's startup latency (task 083 cast; council: arm at spawn).
+    let epoch = Instant::now();
     let task = tokio::spawn(async move {
         let mut file = file;
         let mut bytes_written = 0u64;
         let mut final_status = PaneRecordStatus::Complete;
+
+        // Fail the recording, recording bytes written so far, and stop the writer.
+        macro_rules! fail {
+            ($file:expr, $written:expr, $msg:expr) => {{
+                let mut outcome = writer_outcome.lock().expect("record outcome poisoned");
+                outcome.status = PaneRecordStatus::Error;
+                outcome.bytes_written = $written;
+                outcome.error = Some($msg);
+                return;
+            }};
+        }
+
+        let mut cast = match format {
+            PaneRecordFormat::Cast { cols, rows } => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let header = serde_json::json!({
+                    "version": 2, "width": cols, "height": rows, "timestamp": ts
+                });
+                let line = format!("{header}\n");
+                if let Err(e) = file.write_all(line.as_bytes()).await {
+                    fail!(
+                        file,
+                        bytes_written,
+                        format!("failed to write cast header: {e}")
+                    );
+                }
+                bytes_written += line.len() as u64;
+                Some(shux_vt::CastWriter::new(epoch))
+            }
+            PaneRecordFormat::Raw => None,
+        };
+
         while let Some(chunk) = rx.recv().await {
             match chunk {
-                PaneRecordChunk::Bytes(bytes) => {
-                    if let Err(e) = file.write_all(&bytes).await {
-                        let mut outcome = writer_outcome.lock().expect("record outcome poisoned");
-                        outcome.status = PaneRecordStatus::Error;
-                        outcome.bytes_written = bytes_written;
-                        outcome.error = Some(format!("failed to write record chunk: {e}"));
-                        return;
+                PaneRecordChunk::Bytes { data, at } => match cast.as_mut() {
+                    // Cast: emit an "o" event for the complete-UTF-8 prefix (carry the rest).
+                    Some(c) => {
+                        if let Some(line) = c.output_line(&data, at) {
+                            let line = format!("{line}\n");
+                            if let Err(e) = file.write_all(line.as_bytes()).await {
+                                fail!(
+                                    file,
+                                    bytes_written,
+                                    format!("failed to write cast chunk: {e}")
+                                );
+                            }
+                            bytes_written += line.len() as u64;
+                        }
                     }
-                    bytes_written += bytes.len() as u64;
+                    // Raw: byte-identical to the pre-083 recorder.
+                    None => {
+                        if let Err(e) = file.write_all(&data).await {
+                            fail!(
+                                file,
+                                bytes_written,
+                                format!("failed to write record chunk: {e}")
+                            );
+                        }
+                        bytes_written += data.len() as u64;
+                    }
+                },
+                PaneRecordChunk::Resize { cols, rows, at } => {
+                    if let Some(c) = cast.as_mut() {
+                        let line = format!("{}\n", c.resize_line(cols, rows, at));
+                        if let Err(e) = file.write_all(line.as_bytes()).await {
+                            fail!(
+                                file,
+                                bytes_written,
+                                format!("failed to write cast resize: {e}")
+                            );
+                        }
+                        bytes_written += line.len() as u64;
+                    }
+                    // Raw ignores resize events.
                 }
                 PaneRecordChunk::Finish { status } => {
                     final_status = status;
@@ -672,6 +789,22 @@ async fn spawn_pane_recorder(
                 }
             }
         }
+
+        // Cast: flush any genuinely-truncated trailing UTF-8 at EOF.
+        if let Some(c) = cast.as_mut() {
+            if let Some(line) = c.flush_line() {
+                let line = format!("{line}\n");
+                if let Err(e) = file.write_all(line.as_bytes()).await {
+                    fail!(
+                        file,
+                        bytes_written,
+                        format!("failed to flush cast tail: {e}")
+                    );
+                }
+                bytes_written += line.len() as u64;
+            }
+        }
+
         let flush_error = file.flush().await.err();
         let mut outcome = writer_outcome.lock().expect("record outcome poisoned");
         outcome.bytes_written = bytes_written;
@@ -713,9 +846,12 @@ async fn tee_pane_recorders(
             .unwrap_or_default()
     };
 
+    // Stamp arrival ONCE for all sinks so a cast's timing reflects when bytes left the fd, not
+    // when a backpressured writer accepted them (task 083).
+    let at = Instant::now();
     for (sender, outcome) in sinks {
         tokio::select! {
-            result = sender.send(PaneRecordChunk::Bytes(data.to_vec())) => {
+            result = sender.send(PaneRecordChunk::Bytes { data: data.to_vec(), at }) => {
                 if result.is_err() {
                     let mut outcome = outcome.lock().expect("record outcome poisoned");
                     if outcome.status == PaneRecordStatus::Recording {
@@ -755,6 +891,43 @@ async fn finish_pane_recorders(
                 status: PaneRecordStatus::Complete,
             })
             .await;
+    }
+}
+
+/// Tee a pane resize into every active recorder (task 083 cast — a cast writer emits an `"r"`
+/// event so replay geometry stays honest; the raw writer ignores it). Routed through the SAME
+/// per-recording mpsc as the output tap and from the SAME PTY task, so it interleaves in
+/// timestamp order with output for free. Clone senders under the lock, send OUTSIDE it — never
+/// hold the io mutex across an `.await` (the daemon's cardinal deadlock). Best-effort: a full or
+/// closed channel drops the resize event (a missing cast marker is not worth stalling the pane).
+async fn tee_pane_resize_recorders(
+    io_state: &Arc<Mutex<PaneIoState>>,
+    pane_id: shux_core::model::PaneId,
+    cols: u16,
+    rows: u16,
+) {
+    let senders: Vec<mpsc::Sender<PaneRecordChunk>> = {
+        let state = io_state.lock().await;
+        state
+            .recorders
+            .get(&pane_id)
+            .map(|recorders| {
+                recorders
+                    .iter()
+                    .filter(|r| {
+                        r.outcome.lock().expect("record outcome poisoned").status
+                            == PaneRecordStatus::Recording
+                    })
+                    .map(|r| r.sender.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let at = Instant::now();
+    for sender in senders {
+        let _ = sender
+            .try_send(PaneRecordChunk::Resize { cols, rows, at })
+            .map_err(|_| tracing::debug!(%pane_id, "cast resize event dropped (recorder busy)"));
     }
 }
 
@@ -1011,7 +1184,7 @@ async fn run_pane_pty_task(
                 if let Err(e) = handle.resize(req.size) {
                     tracing::warn!(%pane_id, error = %e, "PTY resize failed");
                 }
-                let pulse = {
+                let (pulse, dims_changed) = {
                     let mut state = io_state.lock().await;
                     let rev_state = if let Some(vt) = state.vts.get_mut(&pane_id) {
                         // P4 convergence round 1 (claude blocker): gate the
@@ -1038,8 +1211,11 @@ async fn run_pane_pty_task(
                     } else {
                         None
                     };
+                    // Whether the resize actually changed the pane geometry (used below to gate
+                    // both checkpoint invalidation and the cast resize event).
+                    let dims_changed = rev_state.as_ref().map(|(_, dc)| *dc).unwrap_or(false);
                     // LENS-R-003: resize is Class-A — publish the bumped revision.
-                    if let Some((rev, dims_changed)) = rev_state {
+                    if let Some((rev, dc)) = rev_state {
                         state.publish_revision(pane_id, rev);
                         // LENS-R-032/DEC-4: a REAL resize invalidates every
                         // checkpoint of this pane. Record the marker at the
@@ -1049,11 +1225,11 @@ async fn run_pane_pty_task(
                         // Same-size requests never reach here (dims_changed
                         // false): the frame did not change, checkpoints stay
                         // valid.
-                        if dims_changed {
+                        if dc {
                             state.invalidate_checkpoints(pane_id, rev.content_revision);
                         }
                     }
-                    state.render_pulse.clone()
+                    (state.render_pulse.clone(), dims_changed)
                 };
                 pulse.notify_one();
                 // Fire the ack AFTER vt + render_pulse so a synchronous
@@ -1061,6 +1237,17 @@ async fn run_pane_pty_task(
                 // pane.snapshot it issues sees the new dimensions.
                 if let Some(ack) = req.ack {
                     let _ = ack.send(());
+                }
+                // Task 083 cast: emit an honest resize event (only on a REAL geometry change,
+                // matching the checkpoint-invalidation gate). Best-effort, non-blocking.
+                if dims_changed {
+                    tee_pane_resize_recorders(
+                        &io_state,
+                        pane_id,
+                        req.size.cols,
+                        req.size.rows,
+                    )
+                    .await;
                 }
             }
         }
@@ -1179,6 +1366,28 @@ pub(crate) async fn spawn_pane_pty(
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
 ) -> Result<(), shux_pty::PtyError> {
+    spawn_pane_pty_with_recorder(
+        pane_id, cwd, command, size, extra_env, env_clear, io_state, shutdown, graph, None,
+    )
+    .await
+}
+
+/// Like [`spawn_pane_pty`] but arms `cast_recorder` (a pre-opened recorder) BEFORE the read loop
+/// starts, so the recording captures the child's very first bytes — alt-screen setup, initial
+/// geometry, early output — with no post-spawn race (task 083 cast; council: arm at spawn).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn spawn_pane_pty_with_recorder(
+    pane_id: shux_core::model::PaneId,
+    cwd: PathBuf,
+    command: Vec<String>,
+    size: shux_pty::handle::PtySize,
+    extra_env: Vec<(String, String)>,
+    env_clear: bool,
+    io_state: Arc<Mutex<PaneIoState>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    graph: shux_core::graph::GraphHandle,
+    cast_recorder: Option<PaneRecorder>,
+) -> Result<(), shux_pty::PtyError> {
     let mut config = if command.is_empty() {
         shux_pty::handle::PtyConfig::default_shell(cwd)
     } else {
@@ -1217,6 +1426,11 @@ pub(crate) async fn spawn_pane_pty(
         state.vts.insert(pane_id, vt);
         state.revisions.insert(pane_id, rev_tx);
         state.pty_pids.insert(pane_id, pid);
+        // Arm the cast recorder in the SAME lock, before the read task spawns, so no output can
+        // race ahead of it (task 083).
+        if let Some(rec) = cast_recorder {
+            state.recorders.entry(pane_id).or_default().push(rec);
+        }
     }
 
     tokio::spawn(run_pane_pty_task(
@@ -4312,6 +4526,9 @@ fn snapshot_font_key(cfg: &shux_core::config::Config) -> SnapshotFontKey {
 const SETTLE_QUIET_MIN_MS: u64 = 10;
 const SETTLE_QUIET_MAX_MS: u64 = 60_000;
 const SETTLE_TIMEOUT_MAX_MS: u64 = 600_000;
+/// `stable_frames` upper bound (task 083). 1 = disabled (quiet mode); a small ceiling keeps a
+/// typo from demanding an unreachable contiguous run.
+const SETTLE_STABLE_FRAMES_MAX: u32 = 1_000;
 
 /// LENS-R-020: a pane is settled once it has been quiet for `quiet_ms`, i.e.
 /// `monotonic_now_ns − last_mutation_ns ≥ quiet_ms × 1_000_000`. The unit
@@ -4423,6 +4640,194 @@ fn validate_wait_settled_params(quiet_ms: u64, timeout_ms: u64) -> Result<(), sh
         )));
     }
     Ok(())
+}
+
+/// Strict optional-u32 parameter parse (task 083; mirrors [`settle_u64_param`]). Absent →
+/// default; PRESENT but not an unsigned integer that fits u32 → INVALID_PARAMS (-32602). Never
+/// a silent default on a mistyped value.
+fn settle_u32_param(
+    params: &serde_json::Value,
+    key: &str,
+    default: u32,
+) -> Result<u32, shux_rpc::RpcError> {
+    match params.get(key) {
+        None => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                shux_rpc::RpcError::invalid_params(&format!(
+                    "{key} must be an unsigned 32-bit integer, got {v}"
+                ))
+            }),
+    }
+}
+
+/// Frame-stability param validation (task 083, council #1/#2/#3). `hold_ms ∈ {0} ∪ [10, 60_000]`
+/// and ≤ `timeout_ms` (a hold longer than the budget can never succeed); `stable_frames ∈ [1,
+/// 1000]` (1 = disabled). Violations → INVALID_PARAMS (-32602 → CLI exit 2). Default quiet mode
+/// (both off) is unaffected — this is only reached when a caller opts into a stability criterion.
+fn validate_stability_params(
+    hold_ms: u64,
+    stable_frames: u32,
+    timeout_ms: u64,
+) -> Result<(), shux_rpc::RpcError> {
+    if hold_ms != 0 && !(SETTLE_QUIET_MIN_MS..=SETTLE_QUIET_MAX_MS).contains(&hold_ms) {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "hold_ms {hold_ms} out of range [{SETTLE_QUIET_MIN_MS}, {SETTLE_QUIET_MAX_MS}] (0 = off)"
+        )));
+    }
+    if hold_ms > timeout_ms {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "hold_ms {hold_ms} must be <= timeout_ms {timeout_ms}"
+        )));
+    }
+    if !(1..=SETTLE_STABLE_FRAMES_MAX).contains(&stable_frames) {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "stable_frames {stable_frames} out of range [1, {SETTLE_STABLE_FRAMES_MAX}] (1 = off)"
+        )));
+    }
+    Ok(())
+}
+
+/// Task 083 frame-stability settle (`hold_ms` / `stable_frames`). Event-driven like the quiet
+/// loop: on each revision wake it hashes the presented, mask-applied frame and folds it into
+/// [`shux_vt::FrameStability`]; it ALSO wakes on the hold deadline so a pane that goes silent
+/// still settles `hold_ms` after its last content change (silence is stability, council #2).
+/// `quiet_ms` never independently settles here (council #1). A pane that never reaches the
+/// requested stability by `timeout_deadline` returns `settled:false` — which the runner maps to
+/// `settle_never_stable` (a FAILURE, never infra; the frozen 078/082 contract).
+///
+/// The presented-frame hash is read together with `content_revision` under ONE io lock (a
+/// consistent snapshot); the lock is never held across an `.await`. A revision that skips (the
+/// watch coalesced) is detected by [`shux_vt::FrameStability::observe`] and RESETS the contiguous
+/// run — an `A→B→A` alias can never false-settle `stable_frames` (council #3).
+/// The next-wake instant for the frame-stability loop (task 083, impl-review Surface 1). Waking at
+/// the hold deadline is useful ONLY while the hold window is UNSATISFIED (`remaining_hold_ns > 0`)
+/// — it wakes exactly when hold becomes met (or a revision arrives). Once hold is satisfied, or
+/// there is no hold criterion (`remaining_hold_ns == 0`), only a new revision or the timeout can
+/// change the decision, so wake straight to the timeout: a `now + 0`-sized sleep here would
+/// busy-spin when hold is met but the stable-frame count is still pending. Pure, so the anti-spin
+/// rule is unit-tested.
+fn stability_wake(
+    now_inst: tokio::time::Instant,
+    remaining_hold_ns: u64,
+    timeout_deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    if remaining_hold_ns > 0 {
+        (now_inst + std::time::Duration::from_nanos(remaining_hold_ns)).min(timeout_deadline)
+    } else {
+        timeout_deadline
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_settled_frame_stability(
+    io: &Arc<Mutex<PaneIoState>>,
+    pane_id: shux_core::model::PaneId,
+    rx: &mut watch::Receiver<PaneRevision>,
+    masks: &shux_vt::MaskSet,
+    hold_ms: u64,
+    stable_frames: u32,
+    accept: tokio::time::Instant,
+    timeout_deadline: tokio::time::Instant,
+) -> Result<serde_json::Value, shux_rpc::RpcError> {
+    use shux_vt::{FrameEnvelope, FrameStability, frame_stability_hash};
+
+    // Read the current presented frame's (revision, hash) together under one lock so the seed is
+    // a consistent snapshot. NOT_FOUND if the pane was torn down (never settle on a dead pane).
+    let read_frame = |io: &Arc<Mutex<PaneIoState>>| {
+        let io = io.clone();
+        let masks = masks.clone();
+        async move {
+            let state = io.lock().await;
+            state
+                .vts
+                .get(&pane_id)
+                .map(|vt| {
+                    (
+                        vt.content_revision(),
+                        frame_stability_hash(&FrameEnvelope::from_terminal(vt, &masks)),
+                    )
+                })
+                .ok_or_else(|| shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string()))
+        }
+    };
+
+    // Seed the frame AND the watch cursor under ONE io lock (impl-review Surface 1 seed race):
+    // the PTY task bumps `content_revision` and publishes the watch under this SAME lock, so while
+    // we hold it the VT and the watch are frozen at the same batch. Marking the cursor here — not
+    // after releasing the lock — closes the window where the frame advances (the watch is
+    // last-value-wins, so its cursor would jump PAST the seeded frame) and the loop then settles
+    // in hold mode on a STALE seed that no longer matches the pane.
+    let (seed_rev, seed_hash) = {
+        let state = io.lock().await;
+        let vt = state
+            .vts
+            .get(&pane_id)
+            .ok_or_else(|| shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string()))?;
+        let seed = (
+            vt.content_revision(),
+            frame_stability_hash(&FrameEnvelope::from_terminal(vt, masks)),
+        );
+        rx.borrow_and_update();
+        seed
+    };
+    let mut stability = FrameStability::seed(seed_rev, seed_hash, shux_vt::monotonic_now_ns());
+
+    let waited_ms = |now: tokio::time::Instant| -> u64 {
+        now.saturating_duration_since(accept)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u64
+    };
+
+    loop {
+        let now_ns = shux_vt::monotonic_now_ns();
+        let now_inst = tokio::time::Instant::now();
+        if stability.is_settled(stable_frames, hold_ms, now_ns) {
+            return Ok(serde_json::json!({
+                "settled": true,
+                "revision": stability.last_rev(),
+                "waited_ms": waited_ms(now_inst),
+                "coalesced": stability.coalesced(),
+            }));
+        }
+        if now_inst >= timeout_deadline {
+            return Ok(serde_json::json!({
+                "settled": false,
+                "revision": stability.last_rev(),
+                "waited_ms": waited_ms(now_inst),
+                "coalesced": stability.coalesced(),
+            }));
+        }
+
+        // Next wake: the hold deadline (so a silent pane still settles) while the hold window is
+        // UNSATISFIED, else the timeout — a `now`-sized sleep when hold is already met but the
+        // count criterion is not would busy-spin (impl-review Surface 1). Woken early by a
+        // revision regardless.
+        let remaining_hold_ns = if hold_ms > 0 {
+            stability.ns_until_hold(hold_ms, now_ns)
+        } else {
+            0
+        };
+        let wake = stability_wake(now_inst, remaining_hold_ns, timeout_deadline);
+
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    // Pane teardown mid-wait → NOT_FOUND (never settle on a dead pane).
+                    *rx = settle_reacquire_watch(io, pane_id).await?;
+                    continue;
+                }
+                rx.borrow_and_update();
+                let (rev, hash) = read_frame(io).await?;
+                stability.observe(rev, hash, shux_vt::monotonic_now_ns());
+            }
+            _ = tokio::time::sleep_until(wake) => {
+                // Hold-deadline / silence wake: re-evaluate `is_settled` at the top.
+            }
+        }
+    }
 }
 
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
@@ -4961,6 +5366,22 @@ fn register_pane_io_methods(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let duration_ms = params.get("duration_ms").and_then(|v| v.as_u64());
+                    // Task 083: `format` selects the on-disk shape. "raw" (default) is the
+                    // pre-083 lossless byte stream; "cast" emits asciinema v2 (timestamped output
+                    // + honest resize events, UTF-8-safe). Unknown values fail closed.
+                    let format_str = params
+                        .get("format")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("raw");
+                    let cast = match format_str {
+                        "raw" => false,
+                        "cast" => true,
+                        other => {
+                            return Err(shux_rpc::RpcError::invalid_params(&format!(
+                                "unknown record format {other:?} (expected \"raw\" or \"cast\")"
+                            )));
+                        }
+                    };
                     if !overwrite {
                         match tokio::fs::try_exists(&path).await {
                             Ok(true) => {
@@ -4978,7 +5399,9 @@ fn register_pane_io_methods(
                         }
                     }
 
-                    {
+                    // Verify the pane is live and not already recording, and (for cast) read its
+                    // current geometry for the asciinema header — all in one critical section.
+                    let record_format = {
                         let state = io.lock().await;
                         if !state.writers.contains_key(&pane_id) {
                             return Err(shux_rpc::RpcError::not_found(
@@ -4997,11 +5420,23 @@ fn register_pane_io_methods(
                                 &pane_id.to_string(),
                             ));
                         }
-                    }
+                        if cast {
+                            let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                            })?;
+                            PaneRecordFormat::Cast {
+                                cols: vt.grid().cols() as u16,
+                                rows: vt.grid().rows() as u16,
+                            }
+                        } else {
+                            PaneRecordFormat::Raw
+                        }
+                    };
 
-                    let (sender, outcome, task) = spawn_pane_recorder(path.clone(), overwrite)
-                        .await
-                        .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+                    let (sender, outcome, task) =
+                        spawn_pane_recorder(path.clone(), overwrite, record_format)
+                            .await
+                            .map_err(|e| shux_rpc::RpcError::internal(&e))?;
                     let recording_id = uuid::Uuid::new_v4();
                     let mut state = io.lock().await;
                     if !state.writers.contains_key(&pane_id) {
@@ -5589,6 +6024,13 @@ fn register_pane_io_methods(
                     let quiet_ms = settle_u64_param(&params, "quiet_ms", 300)?;
                     let timeout_ms = settle_u64_param(&params, "timeout_ms", 10_000)?;
                     validate_wait_settled_params(quiet_ms, timeout_ms)?;
+                    // Task 083 frame-stability opt-ins (default 0/1 = off ⇒ pure quiet mode,
+                    // backward compatible). `masks` scopes the stability hash to the same
+                    // masked domain the golden compare uses (council #4).
+                    let hold_ms = settle_u64_param(&params, "hold_ms", 0)?;
+                    let stable_frames = settle_u32_param(&params, "stable_frames", 1)?;
+                    validate_stability_params(hold_ms, stable_frames, timeout_ms)?;
+                    let stability_masks = parse_glance_masks(&params)?;
 
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
 
@@ -5622,6 +6064,25 @@ fn register_pane_io_methods(
                             .as_millis()
                             .min(u128::from(u32::MAX)) as u64
                     };
+
+                    // Task 083: frame-CONTENT stability modes (hold_ms / stable_frames). Default
+                    // quiet mode (both off) falls through to the UNCHANGED loop below so S1..S5
+                    // stay byte-identical. In stability mode quiet_ms never independently settles
+                    // (council #1); it is unused here — the criteria are the frame-hash hold and
+                    // the contiguous-revision run.
+                    if hold_ms > 0 || stable_frames >= 2 {
+                        return wait_settled_frame_stability(
+                            &io,
+                            pane_id,
+                            &mut rx,
+                            &stability_masks,
+                            hold_ms,
+                            stable_frames,
+                            accept,
+                            timeout_deadline,
+                        )
+                        .await;
+                    }
 
                     // Event-driven loop (LENS-R-021): no polling, and each sleep
                     // is exactly the remaining quiet interval (capped by the
@@ -6879,9 +7340,19 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     pane,
                     quiet,
                     timeout,
+                    hold_ms,
+                    stable_frames,
                 } => {
-                    cli::handle_pane_wait_settled(&mut stream, &pane, quiet, timeout, args.format)
-                        .await
+                    cli::handle_pane_wait_settled(
+                        &mut stream,
+                        &pane,
+                        quiet,
+                        timeout,
+                        hold_ms,
+                        stable_frames,
+                        args.format,
+                    )
+                    .await
                 }
                 PaneCommand::Checkpoint { pane } => {
                     cli::handle_pane_checkpoint(&mut stream, &pane, args.format).await
@@ -6955,6 +7426,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     tol,
                     out,
                     retries,
+                    cast,
                     trace,
                     sub,
                     argv,
@@ -6985,6 +7457,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         tol,
                         out,
                         retries,
+                        cast,
                         trace,
                         argv,
                         format: args.format,
@@ -10324,6 +10797,31 @@ done
         assert_eq!(settle_decide(true, false, false), Settled);
         assert_eq!(settle_decide(false, true, false), TimedOut);
         assert_eq!(settle_decide(false, false, false), KeepWaiting);
+    }
+
+    #[test]
+    fn stability_wake_avoids_busy_spin_when_hold_is_satisfied() {
+        // impl-review Surface 1: with the hold window already met (remaining 0) but the count
+        // criterion still pending, the wake must be the TIMEOUT — a `now`-sized sleep would spin.
+        let now = tokio::time::Instant::now();
+        let timeout = now + Duration::from_secs(10);
+        assert_eq!(
+            stability_wake(now, 0, timeout),
+            timeout,
+            "hold satisfied / no-hold: wake straight to the timeout, never `now`"
+        );
+        // Hold still owed: wake at the hold deadline (before the timeout).
+        let w = stability_wake(now, 500_000_000, timeout); // 500ms owed
+        assert!(
+            w > now && w < timeout,
+            "hold unsatisfied wakes at the hold deadline"
+        );
+        // A hold deadline past the timeout is capped at the timeout.
+        assert_eq!(
+            stability_wake(now, 20_000_000_000, timeout),
+            timeout,
+            "the hold wake never exceeds the timeout"
+        );
     }
 
     #[test]

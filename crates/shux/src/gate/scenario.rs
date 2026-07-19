@@ -7,9 +7,14 @@
 //! internally-tagged-enum limitations and gives better errors than a giant union struct.
 //!
 //! Deferred steps (mouse/focus/bracketed_paste) are REJECTED with a clear message
-//! (design D10 — non-support is explicit, never silently ignored). `retries` and
-//! `stable_frames` are PARSE-ONLY (behaviour owned by 083). `xfail` is parsed opaquely
-//! into the 082 `XfailMeta` shape and RESERVED (081 takes no xfail action).
+//! (design D10 — non-support is explicit, never silently ignored). `xfail` is parsed opaquely
+//! into the 082 `XfailMeta` shape and governed by 082.
+//!
+//! Task 083 makes the settle-hardening fields REAL: `hold_settle.hold_ms` (frame-content hold),
+//! `stable_frames.n` (K contiguous identical frames), `expect_golden.retries` (re-settle/
+//! re-capture jitter budget with an anti-masking fingerprint rule), and `expect_golden`'s own
+//! optional `hold_ms`/`stable_frames` (its pre-capture settle can be frame-stability, honoring
+//! the golden's masks). See `crates/shux/src/gate/runner.rs` + `.local/083-design.md`.
 
 use std::collections::BTreeMap;
 
@@ -81,12 +86,21 @@ pub enum Step {
         quiet_ms: u64,
         timeout_ms: u64,
     },
-    /// Alias of `settle` today; a documented placeholder until 083.
+    /// Frame-content HOLD settle (task 083): settle once the presented frame has stayed UNCHANGED
+    /// for `hold_ms` (silence counts as held), even while output keeps pumping. The RECOMMENDED
+    /// animated-TUI settle — handles both a continuous repainter AND a TUI that reaches a static
+    /// steady state, and rejects a slow spinner that quiet-mode false-settles between frames.
     HoldSettle {
+        hold_ms: u64,
         quiet_ms: u64,
         timeout_ms: u64,
     },
-    /// PARSE-ONLY placeholder (design D6): wired to the `--quiet` settle until 083.
+    /// Frame-content STABLE-FRAMES settle (task 083): settle once `n` CONTIGUOUS revisions render
+    /// an identical frame — a count-based alternative to `hold_settle` for a CONTINUOUSLY-
+    /// repainting TUI. NOTE: a pane that reaches a static steady state (STOPS repainting) never
+    /// produces `n` new revisions → `settle_never_stable`; for such a TUI use `hold_settle` (or
+    /// plain `settle`). Never reaching `n` within budget is `settle_never_stable` (a failure,
+    /// never infra).
     StableFrames {
         n: u32,
         quiet_ms: u64,
@@ -109,12 +123,20 @@ pub enum Step {
     ExpectGolden {
         name: String,
         tier: Tier,
-        /// PARSE-ONLY (design D6): retry behaviour is owned by 083.
+        /// Retry budget (task 083): on a compare MISMATCH, re-settle + re-capture up to `retries`
+        /// times before declaring `fail`, with an anti-masking fingerprint rule (a retry redeems
+        /// FAIL→PASS only by matching the golden; divergent failing fingerprints never pass).
         retries: u32,
+        /// Optional frame-content HOLD for the pre-capture settle (task 083; 0 = quiet settle).
+        hold_ms: u64,
+        /// Optional frame-content STABLE-FRAMES for the pre-capture settle (task 083; 1 = quiet
+        /// settle). When set, the settle honours `masks` so an animated-but-masked region does
+        /// not block the capture.
+        stable_frames: u32,
         quiet_ms: u64,
         timeout_ms: u64,
         masks: Vec<MaskSpec>,
-        /// RESERVED (design D6): parsed for forward-compat, 081 takes no action.
+        /// Parsed into the 082 `XfailMeta` shape; governed by 082.
         xfail: Option<XfailMeta>,
     },
     AssertContains {
@@ -192,6 +214,38 @@ fn validate_name(kind: &str, name: &str) -> Result<(), ScenarioError> {
             "{kind} `name` {name:?} must be a single path component \
              (no '/', '\\', '..', or control characters)"
         )));
+    }
+    Ok(())
+}
+
+/// Validate a `hold_ms` frame-content hold (task 083): `[10, 60_000]` ms and ≤ `timeout_ms` (a
+/// hold longer than the budget can never succeed). Mirrors the daemon's `validate_stability_params`
+/// so a bad scenario fails at parse (`scenario_error`, exit 2), not mid-drive.
+fn validate_hold_ms(idx: usize, hold_ms: u64, timeout_ms: u64) -> Result<(), ScenarioError> {
+    if !(HOLD_MS_MIN..=HOLD_MS_MAX).contains(&hold_ms) {
+        return Err(ScenarioError::at(
+            idx,
+            format!("hold_ms {hold_ms} out of range [{HOLD_MS_MIN}, {HOLD_MS_MAX}]"),
+        ));
+    }
+    if hold_ms > timeout_ms {
+        return Err(ScenarioError::at(
+            idx,
+            format!("hold_ms {hold_ms} must be <= timeout_ms {timeout_ms}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a `stable_frames` count (task 083): `[2, 1000]`. `1` is a no-op (any single frame is
+/// "1 stable frame") — a stable_frames STEP with `n<2` is a likely typo; reject it. (The
+/// `expect_golden.stable_frames` field uses `1` as its OFF sentinel and validates only when `>1`.)
+fn validate_stable_frames(idx: usize, n: u32) -> Result<(), ScenarioError> {
+    if !(2..=STABLE_FRAMES_MAX).contains(&n) {
+        return Err(ScenarioError::at(
+            idx,
+            format!("stable_frames `n` out of range [2, {STABLE_FRAMES_MAX}]"),
+        ));
     }
     Ok(())
 }
@@ -306,6 +360,15 @@ struct SettleArgs {
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct HoldSettleArgs {
+    hold_ms: u64,
+    #[serde(default = "d_quiet")]
+    quiet_ms: u64,
+    #[serde(default = "d_settle_timeout")]
+    timeout_ms: u64,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StableFramesArgs {
     n: u32,
     #[serde(default = "d_quiet")]
@@ -342,6 +405,10 @@ struct ExpectGoldenArgs {
     tier: Tier,
     #[serde(default)]
     retries: u32,
+    #[serde(default)]
+    hold_ms: u64,
+    #[serde(default = "d_stable_frames")]
+    stable_frames: u32,
     #[serde(default = "d_quiet")]
     quiet_ms: u64,
     #[serde(default = "d_settle_timeout")]
@@ -377,6 +444,15 @@ fn d_wait_timeout() -> u64 {
 fn d_tier() -> Tier {
     Tier::Cell
 }
+fn d_stable_frames() -> u32 {
+    1
+}
+/// Shared bounds for the frame-stability settle params (task 083) — mirror the daemon's
+/// `validate_stability_params` so a bad scenario fails at parse (scenario_error, exit 2) instead
+/// of surfacing as an RPC error mid-drive.
+const HOLD_MS_MIN: u64 = 10;
+const HOLD_MS_MAX: u64 = 60_000;
+const STABLE_FRAMES_MAX: u32 = 1_000;
 
 // ── parse ────────────────────────────────────────────────────────────────────
 
@@ -512,17 +588,17 @@ fn parse_step(
             }
         }
         "hold_settle" => {
-            let a: SettleArgs = args!(SettleArgs);
+            let a: HoldSettleArgs = args!(HoldSettleArgs);
+            validate_hold_ms(idx, a.hold_ms, a.timeout_ms)?;
             Step::HoldSettle {
+                hold_ms: a.hold_ms,
                 quiet_ms: a.quiet_ms,
                 timeout_ms: a.timeout_ms,
             }
         }
         "stable_frames" => {
             let a: StableFramesArgs = args!(StableFramesArgs);
-            if a.n == 0 {
-                return Err(ScenarioError::at(idx, "stable_frames `n` must be >= 1"));
-            }
+            validate_stable_frames(idx, a.n)?;
             Step::StableFrames {
                 n: a.n,
                 quiet_ms: a.quiet_ms,
@@ -567,6 +643,14 @@ fn parse_step(
             let a: ExpectGoldenArgs = args!(ExpectGoldenArgs);
             // The golden name becomes a filesystem path component — must be safe.
             validate_name("expect_golden", &a.name).map_err(|e| ScenarioError::at(idx, e))?;
+            // Optional frame-stability for the pre-capture settle (task 083). hold_ms==0 /
+            // stable_frames==1 keep the default quiet settle.
+            if a.hold_ms != 0 {
+                validate_hold_ms(idx, a.hold_ms, a.timeout_ms)?;
+            }
+            if a.stable_frames != 1 {
+                validate_stable_frames(idx, a.stable_frames)?;
+            }
             // Scenario-level masks precede the per-step masks.
             let mut masks = scenario_masks.to_vec();
             for m in &a.mask {
@@ -576,6 +660,8 @@ fn parse_step(
                 name: a.name,
                 tier: a.tier,
                 retries: a.retries,
+                hold_ms: a.hold_ms,
+                stable_frames: a.stable_frames,
                 quiet_ms: a.quiet_ms,
                 timeout_ms: a.timeout_ms,
                 masks,
@@ -811,7 +897,7 @@ name="dup"
     }
 
     #[test]
-    fn stable_frames_and_retries_parse_only() {
+    fn stable_frames_and_retries_parse() {
         let toml = r#"name="x"
 command=["true"]
 [[steps]]
@@ -825,6 +911,83 @@ retries=2
         let s = parse(toml).unwrap();
         assert!(matches!(&s.steps[0], Step::StableFrames { n: 3, .. }));
         assert!(matches!(&s.steps[1], Step::ExpectGolden { retries: 2, .. }));
+    }
+
+    #[test]
+    fn hold_settle_parses_hold_ms() {
+        let toml = r#"name="x"
+command=["true"]
+[[steps]]
+action="hold_settle"
+hold_ms=600
+"#;
+        let s = parse(toml).unwrap();
+        assert!(matches!(&s.steps[0], Step::HoldSettle { hold_ms: 600, .. }));
+    }
+
+    #[test]
+    fn hold_settle_requires_hold_ms() {
+        // `hold_ms` is the whole point of hold_settle — a missing field fails closed.
+        let toml = "name=\"x\"\ncommand=[\"true\"]\n[[steps]]\naction=\"hold_settle\"\n";
+        assert!(parse(toml).is_err());
+    }
+
+    #[test]
+    fn hold_ms_out_of_range_rejected() {
+        for (hold, tmo) in [("5", "10000"), ("70000", "80000"), ("2000", "1000")] {
+            let toml = format!(
+                "name=\"x\"\ncommand=[\"true\"]\n[[steps]]\naction=\"hold_settle\"\nhold_ms={hold}\ntimeout_ms={tmo}\n"
+            );
+            assert!(
+                parse(&toml).unwrap_err().0.contains("hold_ms"),
+                "hold={hold} tmo={tmo}"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_frames_step_requires_n_ge_2() {
+        for n in ["0", "1"] {
+            let toml = format!(
+                "name=\"x\"\ncommand=[\"true\"]\n[[steps]]\naction=\"stable_frames\"\nn={n}\n"
+            );
+            assert!(
+                parse(&toml).unwrap_err().0.contains("stable_frames"),
+                "n={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn expect_golden_stability_fields_parse_and_default_off() {
+        let toml = r#"name="x"
+command=["true"]
+[[steps]]
+action="expect_golden"
+name="a"
+[[steps]]
+action="expect_golden"
+name="b"
+hold_ms=400
+stable_frames=3
+"#;
+        let s = parse(toml).unwrap();
+        assert!(matches!(
+            &s.steps[0],
+            Step::ExpectGolden {
+                hold_ms: 0,
+                stable_frames: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &s.steps[1],
+            Step::ExpectGolden {
+                hold_ms: 400,
+                stable_frames: 3,
+                ..
+            }
+        ));
     }
 
     #[test]

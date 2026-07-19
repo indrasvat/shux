@@ -24,6 +24,9 @@ pub struct GateRunOptions {
     pub tol: Option<shux_vt::TolParams>,
     pub out: Option<PathBuf>,
     pub retries: Option<u32>,
+    /// `--cast [PATH]` (task 083): `None` = off; `Some("")` = default `<out>/<scenario>.cast`;
+    /// `Some(path)` = that path. Always resolved under the gitignored out dir; never a golden.
+    pub cast: Option<String>,
     pub trace: Option<String>,
     pub argv: Vec<String>,
     pub format: OutputFormat,
@@ -150,18 +153,57 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         opts.argv.clone()
     };
 
+    // Resolve the ephemeral cast path (task 083). The daemon writes it, so pass an ABSOLUTE path
+    // under the gitignored out dir — default `<out>/<scenario>.cast`.
+    let cast_path = resolve_cast_path(&opts, &scenario.name);
+
+    // A cast is EPHEMERAL evidence and must NEVER land in the golden tree (adv-083 Agent C MINOR):
+    // it would pollute the goldens and trip the dirty-tree guard on a later `--update`. Refuse a
+    // `--cast` target inside `--golden-dir` up front (exit 2, usage), before spawning anything.
+    if let Some(cast) = &cast_path
+        && cast_is_under(cast, &golden_dir)
+    {
+        eprintln!(
+            "{}",
+            crate::style::error(format!(
+                "lens gate: --cast path {} is inside the golden dir {} — a cast is ephemeral \
+                 evidence and must not pollute goldens (write it under --out instead)",
+                cast.display(),
+                golden_dir.display()
+            ))
+        );
+        let reports = parse_error_report(
+            &opts.scenario_path,
+            "--cast path must not be inside the golden dir",
+        );
+        emit(&opts, &reports)?;
+        return Ok(GateStatus::ScenarioError.exit_code() as i32);
+    }
+
     let outcome = runner::drive_scenario(
         socket_path,
         &scenario,
         &argv,
         &golden_dir,
         trace_target(opts.trace.clone()),
+        opts.retries.unwrap_or(0),
+        cast_path.clone(),
     )
     .await?;
+
+    // Fold the runner's per-frame retry audit notes (task 083 council #5) into the scenario note
+    // BEFORE verdict rollup so a flake absorbed by a retry — or a non-deterministic frame that
+    // FAILED — is never silent in `report.json`.
+    let retry_notes: Vec<String> = outcome
+        .frames
+        .iter()
+        .filter_map(|f| f.retry_note.clone())
+        .collect();
 
     let today = chrono::Utc::now().date_naive();
     let mut reports = verdict::build_reports(&outcome, today);
     plumb_retries(&mut reports, opts.retries);
+    plumb_retry_notes(&mut reports, &retry_notes);
 
     // `--update` and `--on-missing create` re-bless through the guarded writer, which may
     // refuse (dirty tree / secret hit) → update_refused, or rewrite the affected frames'
@@ -204,12 +246,72 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         }
     }
 
+    // Note the produced cast beside the report (task 083) so a reviewer knows where to scrub.
+    if let Some(cast) = &cast_path {
+        plumb_cast_note(&mut reports, cast);
+    }
+
     emit(&opts, &reports)?;
     Ok(verdict::exit_code(&reports) as i32)
 }
 
-/// Carry `--retries` into the report (task L2: parsed + reported; retry BEHAVIOUR is 083).
-/// The frozen schema has no retries field, so it rides in the scenario `note`.
+/// Resolve `--cast [PATH]` to an ABSOLUTE path under the gitignored out dir, or `None` when the
+/// flag is absent (task 083). Bare `--cast` → `<out>/<scenario>.cast`; `--cast PATH` → PATH. The
+/// daemon writes it, so it must be absolute (the daemon's cwd may differ from the CLI's).
+fn resolve_cast_path(opts: &GateRunOptions, scenario_name: &str) -> Option<PathBuf> {
+    let spec = opts.cast.as_ref()?;
+    let rel = if spec.trim().is_empty() {
+        heat::out_dir(opts.out.as_deref(), scenario_name).join(format!("{scenario_name}.cast"))
+    } else {
+        PathBuf::from(spec)
+    };
+    Some(if rel.is_absolute() {
+        rel
+    } else {
+        std::env::current_dir().map(|d| d.join(&rel)).unwrap_or(rel)
+    })
+}
+
+/// True when the `.cast` target resolves to a path inside `golden_dir` (task 083 guard). Compares
+/// CANONICAL forms of the existing directories (`golden_dir`, and the cast's parent — both exist
+/// by the time the gate runs) so a symlinked or `.`-spelled path (e.g. macOS `/tmp` → `/private/
+/// tmp`) still compares; falls back to a lexical absolute compare when a dir does not yet exist.
+fn cast_is_under(cast: &Path, golden_dir: &Path) -> bool {
+    if let (Ok(g), Some(cp)) = (
+        golden_dir.canonicalize(),
+        cast.parent().and_then(|p| p.canonicalize().ok()),
+    ) {
+        return cp == g || cp.starts_with(&g);
+    }
+    let abs = |p: &Path| -> PathBuf {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|d| d.join(p))
+                .unwrap_or_else(|_| p.to_path_buf())
+        }
+    };
+    abs(cast).starts_with(abs(golden_dir))
+}
+
+/// Note the produced `.cast` path in every scenario report (task 083) — only when the file
+/// actually exists, so the note never claims an artifact the recorder failed to write.
+fn plumb_cast_note(reports: &mut [ScenarioReport], cast: &Path) {
+    if !cast.exists() {
+        return;
+    }
+    let tag = verdict::sanitize_note(&format!("cast={}", cast.display()));
+    for r in reports.iter_mut() {
+        r.note = Some(match r.note.take() {
+            Some(existing) => format!("{existing}; {tag}"),
+            None => tag.clone(),
+        });
+    }
+}
+
+/// Carry `--retries` into the report (082: the retry BUDGET). The frozen schema has no retries
+/// field, so it rides in the scenario `note`.
 fn plumb_retries(reports: &mut [ScenarioReport], retries: Option<u32>) {
     if let Some(n) = retries {
         for r in reports.iter_mut() {
@@ -219,5 +321,47 @@ fn plumb_retries(reports: &mut [ScenarioReport], retries: Option<u32>) {
                 None => tag,
             });
         }
+    }
+}
+
+/// Fold the runner's per-frame retry AUDIT notes (task 083 council #5) into every scenario note,
+/// sanitized (a note is user-facing report text; the same output-boundary hygiene as any note).
+/// So a retry that absorbed a flake — or a non-deterministic frame that failed — is auditable in
+/// `report.json`, never silent.
+fn plumb_retry_notes(reports: &mut [ScenarioReport], notes: &[String]) {
+    if notes.is_empty() {
+        return;
+    }
+    let joined = notes
+        .iter()
+        .map(|n| verdict::sanitize_note(n))
+        .collect::<Vec<_>>()
+        .join("; ");
+    for r in reports.iter_mut() {
+        r.note = Some(match r.note.take() {
+            Some(existing) => format!("{existing}; {joined}"),
+            None => joined.clone(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cast_is_under_catches_a_cast_inside_the_golden_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("goldens");
+        std::fs::create_dir_all(&golden).unwrap();
+        // A cast written INTO the golden dir is caught (canonicalizes through /tmp symlinks).
+        assert!(cast_is_under(&golden.join("sneaky.cast"), &golden));
+        assert!(cast_is_under(&golden.join("sub").join("x.cast"), &golden));
+        // A cast under a sibling out dir is allowed.
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        assert!(!cast_is_under(&out.join("run.cast"), &golden));
+        // A cast in the parent of the golden dir is allowed.
+        assert!(!cast_is_under(&dir.path().join("run.cast"), &golden));
     }
 }

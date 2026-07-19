@@ -325,6 +325,8 @@ pub async fn drive_scenario(
     argv: &[String],
     golden_dir: &Path,
     trace_target: Option<TraceTarget>,
+    cli_retries: u32,
+    cast: Option<PathBuf>,
 ) -> anyhow::Result<RunOutcome> {
     let start = Instant::now();
     let started_at_ms = SystemTime::now()
@@ -379,7 +381,7 @@ pub async fn drive_scenario(
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
-    let run_params = serde_json::json!({
+    let mut run_params = serde_json::json!({
         "argv": argv,
         "cols": scenario.terminal.cols,
         "rows": scenario.terminal.rows,
@@ -388,6 +390,12 @@ pub async fn drive_scenario(
         "cwd": sandbox.home.display().to_string(),
         "wait": false,
     });
+    // Task 083: arm the asciinema `.cast` recorder AT SPAWN (council) so the child's startup —
+    // alt-screen setup, initial geometry, early output — is captured. Ephemeral (a gitignored
+    // `.shux/out/` path); never a golden.
+    if let Some(cast) = cast.as_deref() {
+        run_params["cast"] = serde_json::Value::String(cast.display().to_string());
+    }
     let (session_id, pane_id) = match rpc_call(&mut stream, "lens.run", run_params).await {
         Ok(v) => (
             v.get("session_id")
@@ -487,6 +495,7 @@ pub async fn drive_scenario(
                 &mut trace,
                 &mut child_consumed,
                 &mut frames,
+                cli_retries,
             ),
         )
         .await
@@ -577,6 +586,7 @@ async fn drive_step(
     trace: &mut Trace,
     child_consumed: &mut bool,
     frames: &mut Vec<FrameOutcome>,
+    cli_retries: u32,
 ) -> StepFlow {
     match step {
         Step::WaitForText {
@@ -640,24 +650,30 @@ async fn drive_step(
         | Step::HoldSettle {
             quiet_ms,
             timeout_ms,
+            ..
         }
         | Step::StableFrames {
             quiet_ms,
             timeout_ms,
             ..
         } => {
-            // `stable_frames` is a documented placeholder wired to the `--quiet` settle
-            // until 083 (design D6). A settle that never quiets is `never_stabilized`.
-            match settle(
-                stream,
-                monitor,
-                pane_id,
-                *quiet_ms,
-                *timeout_ms,
-                *child_consumed,
-            )
-            .await
-            {
+            // Task 083: per-variant settle criteria. `settle` = quiet; `hold_settle` = frame held
+            // for `hold_ms`; `stable_frames` = `n` contiguous identical frames. A settle that
+            // never reaches its criterion within budget is `never_stabilized` → `settle_never_
+            // stable` (a FAILURE, never infra). Standalone steps hash the FULL frame (no masks).
+            let spec = SettleSpec {
+                quiet_ms: *quiet_ms,
+                timeout_ms: *timeout_ms,
+                hold_ms: match step {
+                    Step::HoldSettle { hold_ms, .. } => *hold_ms,
+                    _ => 0,
+                },
+                stable_frames: match step {
+                    Step::StableFrames { n, .. } => *n,
+                    _ => 1,
+                },
+            };
+            match settle(stream, monitor, pane_id, spec, &[], *child_consumed).await {
                 SettleOutcome::Exited(code) => {
                     trace.emit(RunnerSignal::ChildExit { code });
                     StepFlow::Stop
@@ -707,107 +723,172 @@ async fn drive_step(
         Step::ExpectGolden {
             name,
             tier,
+            retries,
+            hold_ms,
+            stable_frames,
             quiet_ms,
             timeout_ms,
             masks,
             xfail,
-            ..
         } => {
-            // Settle FIRST — a frame that never quiets is `frame_settle_timeout`.
-            match settle(
-                stream,
-                monitor,
-                pane_id,
-                *quiet_ms,
-                *timeout_ms,
-                *child_consumed,
-            )
-            .await
-            {
-                SettleOutcome::Exited(code) => {
-                    trace.emit(RunnerSignal::ChildExit { code });
-                    return StepFlow::Stop;
+            // Task 083 retry budget: CLI `--retries` raises the floor for every frame; a per-step
+            // `retries` can raise it further for one flaky frame (monotonic — never lowers it).
+            let eff_retries = (*retries).max(cli_retries);
+            // The pre-capture settle honours the golden's masks (council #4) and its optional
+            // frame-stability criteria (an animated-but-masked region does not block the capture).
+            let spec = SettleSpec {
+                quiet_ms: *quiet_ms,
+                timeout_ms: *timeout_ms,
+                hold_ms: *hold_ms,
+                stable_frames: *stable_frames,
+            };
+
+            // Anti-masking (council #5): a retry redeems FAIL→PASS ONLY by matching the golden,
+            // never by consensus among failing captures. Every failing attempt's fingerprint is
+            // recorded; ≥2 DISTINCT failing fingerprints is a non-deterministic frame that FAILS
+            // even if a later attempt matched.
+            let mut fail_fps: Vec<String> = Vec::new();
+            let mut last_fail: Option<(FrameOutcome, RunnerSignal)> = None;
+
+            for attempt in 0..=eff_retries {
+                // Each attempt RE-SETTLES + RE-CAPTURES. A settle that never reaches its criterion
+                // is `settle_never_stable` (a settle failure, NOT a compare mismatch → not retried).
+                match settle(stream, monitor, pane_id, spec, masks, *child_consumed).await {
+                    SettleOutcome::Exited(code) => {
+                        trace.emit(RunnerSignal::ChildExit { code });
+                        return StepFlow::Stop;
+                    }
+                    SettleOutcome::Timeout => {
+                        trace.emit(RunnerSignal::Timeout {
+                            class: TimeoutClass::FrameSettle,
+                            step_index: Some(idx),
+                            action: Some("expect_golden".into()),
+                            name: Some(name.clone()),
+                            elapsed_ms: None,
+                            budget_ms: Some(*timeout_ms),
+                        });
+                        return StepFlow::Stop;
+                    }
+                    SettleOutcome::Settled => {}
                 }
-                SettleOutcome::Timeout => {
-                    trace.emit(RunnerSignal::Timeout {
-                        class: TimeoutClass::FrameSettle,
-                        step_index: Some(idx),
-                        action: Some("expect_golden".into()),
-                        name: Some(name.clone()),
-                        elapsed_ms: None,
-                        budget_ms: Some(*timeout_ms),
-                    });
-                    return StepFlow::Stop;
+                // Re-check for an unexpected exit AFTER settle and BEFORE the compare (adv MAJOR 2):
+                // a child that paints, goes quiet, then exits must short-circuit the visual compare
+                // (design D7), never false-pass it.
+                if !*child_consumed {
+                    if let Some(code) = monitor.peek().await {
+                        trace.emit(RunnerSignal::ChildExit { code });
+                        return StepFlow::Stop;
+                    }
                 }
-                SettleOutcome::Settled => {}
-            }
-            // Re-check for an unexpected exit AFTER settle and BEFORE the compare (adv
-            // MAJOR 2): a child that paints, goes quiet, then exits would otherwise be
-            // compared on its final frame — an unexpected exit must short-circuit the
-            // visual compare (design D7), never false-pass it.
-            if !*child_consumed {
-                if let Some(code) = monitor.peek().await {
-                    trace.emit(RunnerSignal::ChildExit { code });
-                    return StepFlow::Stop;
-                }
-            }
-            // Capture the masked cell envelope, then compare against the golden.
-            let mask_params: Vec<serde_json::Value> = masks
-                .iter()
-                .map(|m| serde_json::json!({ "row": m.row, "col": m.col, "width": m.width }))
-                .collect();
-            let params = serde_json::json!({
-                "pane_id": pane_id,
-                "include_cells": true,
-                "include_png": false,
-                "masks": mask_params,
-            });
-            match rpc_call(stream, "pane.glance", params).await {
-                Ok(v) => match v.get("cells") {
-                    Some(cells) => match envelope_from_glance(cells) {
-                        Ok(live) => {
-                            let mset = build_mask_set(masks);
-                            let fp = current_fp(*tier, &mset, sc_hash, ce_hash);
-                            let fc = compare_frame(golden_dir, name, *tier, &live, &fp, rasterizer);
-                            // Record the STRUCTURED per-frame outcome (design D1): the rich
-                            // verdict + the live capture the trace-only signal loses, plus the
-                            // frame's declared xfail (082 governs it).
-                            frames.push(FrameOutcome {
+
+                let (mut outcome, signal) = match capture_and_compare(
+                    stream,
+                    pane_id,
+                    idx,
+                    name,
+                    *tier,
+                    masks,
+                    sc_hash,
+                    ce_hash,
+                    rasterizer,
+                    golden_dir,
+                    xfail.clone(),
+                )
+                .await
+                {
+                    CaptureResult::Ok(o, s) => (o, s),
+                    CaptureResult::Stop(s) => {
+                        trace.emit(s);
+                        return StepFlow::Stop;
+                    }
+                };
+
+                match outcome.kind {
+                    FrameKind::Match => match retry_verdict(&fail_fps, true) {
+                        RetryVerdict::Divergent => {
+                            // A later attempt matched, but the failing attempts diverged — the
+                            // frame is non-deterministic. Report the LAST real mismatch (concrete
+                            // diff for the reviewer) as a FAIL; never silently pass (council #5).
+                            let (mut fo, sig) = last_fail.take().expect("divergent implies fails");
+                            fo.retry_note = Some(format!(
+                                "expect_golden '{name}': FAIL — {attempt} retries diverged {:?}; a \
+                                 later attempt matched but the frame is non-deterministic (fix the \
+                                 settle, e.g. hold_ms/stable_frames)",
+                                short_fps(&fail_fps)
+                            ));
+                            trace.emit(RunnerSignal::RetryOutcome {
                                 name: name.clone(),
-                                tier: *tier,
-                                kind: frame_kind(&fc.signal),
-                                reason: frame_reason(&fc.signal),
-                                verdict: fc.verdict,
-                                golden_json: format!("{name}.capture.json"),
-                                live_capture_json: live.to_canonical_json(),
-                                live_capture_sha256: capture_sha256(&live),
-                                live_fingerprint: fp,
-                                xfail: xfail.clone(),
+                                attempts_used: attempt,
+                                outcome: "divergent".into(),
+                                fingerprints: short_fps(&fail_fps),
                             });
-                            trace.emit(fc.signal);
-                            StepFlow::Continue
+                            frames.push(fo);
+                            trace.emit(sig);
+                            return StepFlow::Continue;
                         }
-                        Err(e) => {
-                            trace.emit(RunnerSignal::ParseError {
-                                message: format!("step {idx}: glance cells: {e}"),
-                            });
-                            StepFlow::Stop
+                        // Clean pass, or a single-fingerprint flake absorbed by a golden match.
+                        RetryVerdict::CleanPass
+                        | RetryVerdict::Absorbed
+                        | RetryVerdict::Exhausted => {
+                            if attempt > 0 {
+                                let fp = fail_fps.first().map(|f| short_fp(f)).unwrap_or_default();
+                                outcome.retry_note = Some(format!(
+                                    "expect_golden '{name}': passed after {attempt} retr{} \
+                                     (absorbed fp {fp})",
+                                    if attempt == 1 { "y" } else { "ies" }
+                                ));
+                                trace.emit(RunnerSignal::RetryOutcome {
+                                    name: name.clone(),
+                                    attempts_used: attempt,
+                                    outcome: "absorbed".into(),
+                                    fingerprints: short_fps(&fail_fps),
+                                });
+                            }
+                            frames.push(outcome);
+                            trace.emit(signal);
+                            return StepFlow::Continue;
                         }
                     },
-                    None => {
-                        trace.emit(RunnerSignal::ParseError {
-                            message: format!("step {idx}: glance returned no cells"),
-                        });
-                        StepFlow::Stop
+                    FrameKind::Mismatch => {
+                        fail_fps.push(outcome.live_capture_sha256.clone());
+                        last_fail = Some((outcome, signal));
+                        if attempt < eff_retries {
+                            continue; // budget remains — re-settle + re-capture
+                        }
+                        // Budget exhausted — report the last mismatch as a FAIL.
+                        let (mut fo, sig) = last_fail.take().expect("just set");
+                        if eff_retries > 0 {
+                            let kind = match retry_verdict(&fail_fps, false) {
+                                RetryVerdict::Divergent => "divergent",
+                                _ => "exhausted",
+                            };
+                            fo.retry_note = Some(format!(
+                                "expect_golden '{name}': FAIL after {eff_retries} retr{} ({kind} \
+                                 fps {:?})",
+                                if eff_retries == 1 { "y" } else { "ies" },
+                                short_fps(&fail_fps)
+                            ));
+                            trace.emit(RunnerSignal::RetryOutcome {
+                                name: name.clone(),
+                                attempts_used: eff_retries,
+                                outcome: kind.into(),
+                                fingerprints: short_fps(&fail_fps),
+                            });
+                        }
+                        frames.push(fo);
+                        trace.emit(sig);
+                        return StepFlow::Continue;
                     }
-                },
-                Err(e) => {
-                    trace.emit(RunnerSignal::ParseError {
-                        message: format!("step {idx}: glance failed: {e}"),
-                    });
-                    StepFlow::Stop
+                    // Not jitter — a missing / untrusted golden is never retried (design D6).
+                    FrameKind::GoldenAbsent | FrameKind::GoldenUntrusted => {
+                        frames.push(outcome);
+                        trace.emit(signal);
+                        return StepFlow::Continue;
+                    }
                 }
             }
+            // The for loop returns on every path of its final iteration.
+            unreachable!("expect_golden retry loop always returns within 0..=eff_retries")
         }
 
         Step::AssertContains { text } | Step::AssertNotContains { text } => {
@@ -889,6 +970,26 @@ enum SettleOutcome {
     Exited(Option<i32>),
 }
 
+/// The settle criteria for one `pane.wait_settled` call (task 083). `hold_ms == 0` +
+/// `stable_frames == 1` is the default QUIET mode (unchanged); a non-default value opts into a
+/// frame-content stability criterion (§2 of `.local/083-design.md`).
+#[derive(Clone, Copy)]
+struct SettleSpec {
+    quiet_ms: u64,
+    timeout_ms: u64,
+    hold_ms: u64,
+    stable_frames: u32,
+}
+
+/// The masks for `expect_golden` / a stability settle, as the `pane.wait_settled`/`pane.glance`
+/// `masks` array shape.
+fn mask_params(masks: &[MaskSpec]) -> Vec<serde_json::Value> {
+    masks
+        .iter()
+        .map(|m| serde_json::json!({ "row": m.row, "col": m.col, "width": m.width }))
+        .collect()
+}
+
 /// A future that resolves on child exit, or never (when the exit was already consumed
 /// by a prior `expect_exit`), so `select!` falls through to the driven operation.
 async fn maybe_wait_exit(monitor: &ExitMonitor, gone: bool) -> Option<i32> {
@@ -900,23 +1001,30 @@ async fn maybe_wait_exit(monitor: &ExitMonitor, gone: bool) -> Option<i32> {
 }
 
 /// Settle via `pane.wait_settled`, racing the exit monitor. When the child was already
-/// consumed by an `expect_exit`, the pane is final → settled immediately (no re-race).
+/// consumed by an `expect_exit`, the pane is final → settled immediately (no re-race). `masks`
+/// scope the frame-content stability hash to the same masked domain the golden compare uses
+/// (task 083, council #4); an empty slice hashes the full frame.
 async fn settle(
     stream: &mut UnixStream,
     monitor: &ExitMonitor,
     pane_id: &str,
-    quiet_ms: u64,
-    timeout_ms: u64,
+    spec: SettleSpec,
+    masks: &[MaskSpec],
     child_gone: bool,
 ) -> SettleOutcome {
     if child_gone {
         return SettleOutcome::Settled;
     }
-    let params = serde_json::json!({
+    let mut params = serde_json::json!({
         "pane_id": pane_id,
-        "quiet_ms": quiet_ms,
-        "timeout_ms": timeout_ms,
+        "quiet_ms": spec.quiet_ms,
+        "timeout_ms": spec.timeout_ms,
+        "hold_ms": spec.hold_ms,
+        "stable_frames": spec.stable_frames,
     });
+    if !masks.is_empty() {
+        params["masks"] = serde_json::Value::Array(mask_params(masks));
+    }
     tokio::select! {
         biased;
         code = monitor.wait() => SettleOutcome::Exited(code),
@@ -943,6 +1051,124 @@ async fn send_keys(stream: &mut UnixStream, pane_id: &str, bytes: &[u8]) -> Step
 fn envelope_from_glance(cells: &serde_json::Value) -> Result<FrameEnvelope, String> {
     let text = serde_json::to_string(cells).map_err(|e| e.to_string())?;
     FrameEnvelope::from_canonical_json(&text).map_err(|e| format!("{e:?}"))
+}
+
+/// The result of one `expect_golden` capture+compare (task 083): either a completed compare (the
+/// `FrameOutcome.kind` says Match/Mismatch/GoldenAbsent/GoldenUntrusted) or a terminal drive
+/// error whose signal the caller emits before stopping the run. `Ok` is the common path and is
+/// destructured immediately, so boxing it to equalize variant size would only add a per-capture
+/// allocation for no real benefit (same rationale as the `LensCommand` enum).
+#[allow(clippy::large_enum_variant)]
+enum CaptureResult {
+    Ok(FrameOutcome, RunnerSignal),
+    Stop(RunnerSignal),
+}
+
+/// One masked glance + golden compare for `expect_golden` (task 083 — the retry loop calls this
+/// once per attempt; the caller settles + checks child-exit first). Never retries anything itself.
+#[allow(clippy::too_many_arguments)]
+async fn capture_and_compare(
+    stream: &mut UnixStream,
+    pane_id: &str,
+    idx: usize,
+    name: &str,
+    tier: Tier,
+    masks: &[MaskSpec],
+    sc_hash: &str,
+    ce_hash: &str,
+    rasterizer: &Rasterizer,
+    golden_dir: &Path,
+    xfail: Option<shux_vt::XfailMeta>,
+) -> CaptureResult {
+    let params = serde_json::json!({
+        "pane_id": pane_id,
+        "include_cells": true,
+        "include_png": false,
+        "masks": mask_params(masks),
+    });
+    match rpc_call(stream, "pane.glance", params).await {
+        Ok(v) => match v.get("cells") {
+            Some(cells) => match envelope_from_glance(cells) {
+                Ok(live) => {
+                    let mset = build_mask_set(masks);
+                    let fp = current_fp(tier, &mset, sc_hash, ce_hash);
+                    let fc = compare_frame(golden_dir, name, tier, &live, &fp, rasterizer);
+                    let outcome = FrameOutcome {
+                        name: name.to_string(),
+                        tier,
+                        kind: frame_kind(&fc.signal),
+                        reason: frame_reason(&fc.signal),
+                        verdict: fc.verdict,
+                        golden_json: format!("{name}.capture.json"),
+                        live_capture_json: live.to_canonical_json(),
+                        live_capture_sha256: capture_sha256(&live),
+                        live_fingerprint: fp,
+                        xfail,
+                        retry_note: None,
+                    };
+                    CaptureResult::Ok(outcome, fc.signal)
+                }
+                Err(e) => CaptureResult::Stop(RunnerSignal::ParseError {
+                    message: format!("step {idx}: glance cells: {e}"),
+                }),
+            },
+            None => CaptureResult::Stop(RunnerSignal::ParseError {
+                message: format!("step {idx}: glance returned no cells"),
+            }),
+        },
+        Err(e) => CaptureResult::Stop(RunnerSignal::ParseError {
+            message: format!("step {idx}: glance failed: {e}"),
+        }),
+    }
+}
+
+/// The anti-masking retry verdict (task 083, council #5), decided PURELY from the failing
+/// fingerprints seen and whether a later attempt matched the golden. The load-bearing rule: a
+/// match redeems FAIL→PASS ONLY when the failing attempts agreed on ONE fingerprint (a single
+/// consistent flake); ≥2 DISTINCT failing fingerprints is a non-deterministic frame that FAILS
+/// even if a later attempt matched (never silently pass a moving-target regression).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryVerdict {
+    /// Matched with no prior failure — a clean pass (no retry consumed).
+    CleanPass,
+    /// Matched after one consistent flake — pass, but noisily audited.
+    Absorbed,
+    /// A non-deterministic frame (≥2 distinct failing fingerprints) — FAIL regardless of a match.
+    Divergent,
+    /// Never matched within the budget with a single consistent fingerprint — a persistent
+    /// regression, FAIL.
+    Exhausted,
+}
+
+fn retry_verdict(fail_fps: &[String], matched: bool) -> RetryVerdict {
+    let distinct = fail_fps
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    match (matched, fail_fps.is_empty(), distinct >= 2) {
+        (true, true, _) => RetryVerdict::CleanPass,
+        (_, _, true) => RetryVerdict::Divergent,
+        (true, false, false) => RetryVerdict::Absorbed,
+        (false, _, false) => RetryVerdict::Exhausted,
+    }
+}
+
+/// A short (12-hex) `capture_sha256` prefix — enough to identify a failing frame in a retry audit
+/// without dumping the full pin (design D3 keeps trace payloads bounded).
+fn short_fp(sha: &str) -> String {
+    sha.chars().take(12).collect()
+}
+
+/// The DISTINCT short-fingerprints of the failing attempts, first-seen order, for the retry audit
+/// note / trace signal — deduped so `retries=50` against one persistent regression records ONE
+/// fingerprint, not fifty copies (adv-083 Agent C nitpick). The count-based divergence decision
+/// still uses the full list via [`retry_verdict`]; this is display-only.
+fn short_fps(fps: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    fps.iter()
+        .filter(|f| seen.insert((*f).clone()))
+        .map(|f| short_fp(f))
+        .collect()
 }
 
 /// Map a compare signal to the structured frame disposition (design D1). `compare_frame`
@@ -978,6 +1204,50 @@ mod tests {
     use super::super::signal::RunnerSignal;
     use super::*;
     use crate::gate::scenario;
+
+    fn fp(s: &str) -> String {
+        s.to_string()
+    }
+
+    #[test]
+    fn retry_verdict_anti_masking_rule() {
+        // A clean pass (matched, no prior fail).
+        assert_eq!(retry_verdict(&[], true), RetryVerdict::CleanPass);
+        // Matched after ONE consistent flake → absorbed (pass, audited).
+        assert_eq!(
+            retry_verdict(&[fp("aa"), fp("aa")], true),
+            RetryVerdict::Absorbed
+        );
+        // Matched but the failing attempts DIVERGED → FAIL (council #5: never silently pass).
+        assert_eq!(
+            retry_verdict(&[fp("aa"), fp("bb")], true),
+            RetryVerdict::Divergent
+        );
+        // Never matched, one consistent fingerprint → a persistent regression.
+        assert_eq!(
+            retry_verdict(&[fp("aa"), fp("aa"), fp("aa")], false),
+            RetryVerdict::Exhausted
+        );
+        // Never matched, divergent fingerprints → non-deterministic (still fails).
+        assert_eq!(
+            retry_verdict(&[fp("aa"), fp("bb")], false),
+            RetryVerdict::Divergent
+        );
+    }
+
+    #[test]
+    fn retry_verdict_all_fail_paths_are_failures() {
+        // Both non-match verdicts map to a failing outcome (Divergent | Exhausted), never a pass.
+        for v in [
+            retry_verdict(&[fp("x")], false),
+            retry_verdict(&[fp("x"), fp("y")], false),
+        ] {
+            assert!(matches!(
+                v,
+                RetryVerdict::Exhausted | RetryVerdict::Divergent
+            ));
+        }
+    }
 
     #[test]
     fn derive_terminal_maps_signals() {

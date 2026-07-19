@@ -648,6 +648,7 @@ mod tests {
             live_capture_sha256: sha,
             live_fingerprint: cell_fp(),
             xfail: None,
+            retry_note: None,
         }
     }
 
@@ -662,6 +663,7 @@ mod tests {
             tol: None,
             out: None,
             retries: None,
+            cast: None,
             trace: None,
             argv: vec![],
             format: crate::cli::OutputFormat::Text,

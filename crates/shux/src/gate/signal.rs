@@ -93,6 +93,19 @@ pub enum RunnerSignal {
     /// The scenario finished having compared ZERO frames — text asserts are smoke,
     /// not visual proof (design D6).
     NoVisualCheck,
+    /// Task 083 retry audit (INFORMATIONAL — 082's verdict rolls up the structured `RunOutcome`,
+    /// not the trace, so this never maps to a status). Emitted whenever an `expect_golden` retry
+    /// budget was exercised: `outcome` ∈ {`absorbed` (a retry matched the golden — the initial
+    /// mismatch was jitter), `exhausted` (all retries mismatched — a persistent regression),
+    /// `divergent` (retries produced ≥2 distinct failing fingerprints — a non-deterministic frame
+    /// that FAILS even if a later attempt matched)}. `fingerprints` are the SHORT (12-hex)
+    /// `capture_sha256` prefixes of the failing attempts — never a full screen (design D3).
+    RetryOutcome {
+        name: String,
+        attempts_used: u32,
+        outcome: String,
+        fingerprints: Vec<String>,
+    },
     /// A cheap `assert_contains`/`assert_not_contains` passed.
     AssertPassed { step_index: usize },
     /// A cheap text assert FAILED. Carries a BOUNDED (≤120-char) excerpt + a hash of the
@@ -124,6 +137,7 @@ impl RunnerSignal {
             RunnerSignal::QuotaExceeded { .. } => "quota_exceeded",
             RunnerSignal::ParseError { .. } => "parse_error",
             RunnerSignal::NoVisualCheck => "no_visual_check",
+            RunnerSignal::RetryOutcome { .. } => "retry_outcome",
             RunnerSignal::AssertPassed { .. } => "assert_passed",
             RunnerSignal::AssertFailed { .. } => "assert_failed",
         }

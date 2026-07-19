@@ -1511,6 +1511,29 @@ pub enum PaneCommand {
         /// ms. Range [quiet, 600s] — out of range → INVALID_PARAMS (exit 2).
         #[arg(long, default_value = "10s", value_parser = parse_duration_ms)]
         timeout: u64,
+
+        /// Frame-content HOLD (task 083): settle once the presented frame has
+        /// stayed UNCHANGED for this long, even while output keeps pumping
+        /// (silence counts as held). This is the RECOMMENDED settle for an
+        /// animated TUI — it handles both a continuous repainter AND a TUI that
+        /// reaches a static steady state (stops repainting), and rejects a slow
+        /// spinner that quiet-mode false-settles between frames. `0` (default)
+        /// = off. Human duration (`600ms`); range [10ms, 60s] and ≤ --timeout
+        /// — out of range → exit 2.
+        #[arg(long = "hold-ms", default_value = "0", value_parser = parse_duration_ms)]
+        hold_ms: u64,
+
+        /// Frame-content STABLE-FRAMES (task 083): settle once this many
+        /// CONTIGUOUS revisions render an identical frame — a count-based
+        /// alternative to --hold-ms for a TUI that repaints CONTINUOUSLY.
+        /// NOTE: a pane that reaches a STATIC steady state (STOPS repainting)
+        /// never produces K new revisions, so it times out as
+        /// `settle_never_stable`; for such a TUI use --hold-ms (or default
+        /// quiet), which count silence as held. `1` (default) = off; range
+        /// [1, 1000]. Never reaching K within --timeout is a FAILURE
+        /// (`settle_never_stable`), never infra.
+        #[arg(long = "stable-frames", default_value_t = 1)]
+        stable_frames: u32,
     },
 
     /// Capture the pane's current visible frame as a checkpoint for a later
@@ -1760,10 +1783,19 @@ pub enum LensCommand {
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
 
-        /// Retry budget for a flaky frame (parsed + carried into `report.json`; retry
-        /// BEHAVIOUR lands in task 083).
+        /// Retry budget for a flaky frame (task 083): on a compare MISMATCH, re-settle +
+        /// re-capture up to N times before failing. A retry redeems FAIL→PASS only by matching
+        /// the golden (never by consensus among failing captures); a per-step `expect_golden.
+        /// retries` can raise this floor further for one frame.
         #[arg(long, value_name = "N")]
         retries: Option<u32>,
+
+        /// Attach a replayable asciinema v2 `.cast` of the whole run beside the report (task
+        /// 083) so a reviewer can scrub how the TUI reached a failing frame. Optional PATH
+        /// (default `<out>/<scenario>.cast`). EPHEMERAL — written under the gitignored out dir,
+        /// never a golden. Armed at spawn (captures startup + resizes).
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+        cast: Option<String>,
 
         /// Emit the raw runner-signal NDJSON trace to a path, or `-` for stdout.
         #[arg(long, value_name = "PATH|-")]
@@ -4367,17 +4399,22 @@ fn lens_wait_settled_exit_code(rpc_error_code: i64) -> i32 {
 /// `pane.wait_settled` RPC (lens PRD §6, §10). `quiet`/`timeout` arrive here
 /// already normalized to milliseconds by `parse_duration_ms`. Exit 0 when
 /// settled, exit 1 on timeout (`settled=false`, a RESULT not an error).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_wait_settled(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
     quiet_ms: u64,
     timeout_ms: u64,
+    hold_ms: u64,
+    stable_frames: u32,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let params = serde_json::json!({
         "pane_id": pane,
         "quiet_ms": quiet_ms,
         "timeout_ms": timeout_ms,
+        "hold_ms": hold_ms,
+        "stable_frames": stable_frames,
     });
 
     match rpc_call(stream, "pane.wait_settled", params).await {
@@ -4427,8 +4464,13 @@ pub async fn handle_pane_wait_settled(
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
+                    // Surface the actionable `data.detail` (e.g. "hold_ms 5 out of range
+                    // [10, 60000]"), not just the generic "invalid_params" message — a first-timer
+                    // who mistypes --hold-ms/--stable-frames/--quiet must be told the range
+                    // (dogfood 083: error actionability).
                     crate::style::print_error(&format!(
-                        "wait-settled failed: {message} (code {code})"
+                        "wait-settled failed: {}",
+                        rpc_display(code, &message, data.as_ref())
                     ));
                 }
             }

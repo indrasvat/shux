@@ -80,6 +80,11 @@ path = "tests/lens_settle.rs"
 test = false
 
 [[test]]
+name = "lens_settle_hardening"
+path = "tests/lens_settle_hardening.rs"
+test = false
+
+[[test]]
 name = "lens_diff"
 path = "tests/lens_diff.rs"
 test = false
@@ -144,4 +149,12 @@ test = false
 [[test]]
 name = "lens_gate_verdict"
 path = "tests/lens_gate_verdict.rs"
+test = false
+
+# Task 083 — settle hardening (hold-ms / stable-frames / retries) + `--cast` at the gate level.
+# Daemon-backed; same `test = false` regime; run via `make test-lens-gate-settle`. Frozen path
+# (GATE-TEST-CHANGE: trailer).
+[[test]]
+name = "lens_gate_settle"
+path = "tests/lens_gate_settle.rs"
 test = false

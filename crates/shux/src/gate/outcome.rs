@@ -54,6 +54,11 @@ pub struct FrameOutcome {
     /// The frame's declared xfail metadata (from the scenario step), if any. 081 parses
     /// it opaque-reserved; 082 governs it.
     pub xfail: Option<XfailMeta>,
+    /// Task 083 retry audit: a concise human note when a retry budget was exercised —
+    /// `passed after N retries (absorbed fp …)` or `failed after N retries; divergent fps …`.
+    /// The driver folds it into the scenario `report.json` note so a flake is never silently
+    /// absorbed (council #5). `None` when no retry ran.
+    pub retry_note: Option<String>,
 }
 
 /// The scenario-level terminal disposition — the single fatal raw signal that ended the

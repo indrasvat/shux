@@ -52,6 +52,10 @@ pub async fn run_review(
         &scenario.command.clone(),
         &golden_dir,
         None,
+        // `gate review` has no --retries flag; per-step `expect_golden.retries` still applies.
+        0,
+        // `gate review` does not record a cast.
+        None,
     )
     .await?;
     let today = chrono::Utc::now().date_naive();
@@ -193,6 +197,7 @@ fn review_opts(
         tol: None,
         out: out_opt.clone(),
         retries: None,
+        cast: None,
         trace: None,
         argv: vec![],
         format: OutputFormat::Text,

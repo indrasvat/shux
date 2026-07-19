@@ -1,6 +1,6 @@
 # Task 083: lens gate — settle hardening + optional cast
 
-**Status:** Not Started
+**Status:** Done
 **Priority:** Medium
 **Milestone:** M3
 **Depends On:** 080, 082
@@ -60,17 +60,52 @@ the retry+fingerprint anti-masking rule, and the cast format + resize-event hand
 
 ## Acceptance Criteria
 
-- [ ] `--hold-ms` and `--stable-frames` implemented; compose with quiet mode; backward compatible.
-- [ ] Never-stable is a failure, not infra.
-- [ ] Retry budget absorbs jitter without masking real regressions.
-- [ ] `--cast` produces valid, honest asciinema v2 with resize events; ephemeral only.
+- [x] `--hold-ms` and `--stable-frames` implemented; compose with quiet mode; backward compatible.
+- [x] Never-stable is a failure, not infra.
+- [x] Retry budget absorbs jitter without masking real regressions.
+- [x] `--cast` produces valid, honest asciinema v2 with resize events; ephemeral only.
 
 ## Definition of Done
 
-- [ ] DootSabha design review incorporated before coding.
-- [ ] Red tests captured before implementation.
-- [ ] L1/L2/L3 tests pass; `make test-lens` green.
-- [ ] `make check` passes.
-- [ ] `shux-vt-solid-qa` `VERDICT: PASS`; evidence under `.shux/qa/083-*/`.
-- [ ] Implementation-diff DootSabha convergence review clean or addressed.
-- [ ] `docs/PROGRESS.md` + this task updated; learnings appended.
+- [x] DootSabha design review incorporated before coding.
+- [x] Red tests captured before implementation.
+- [x] L1/L2/L3 tests pass; `make test-lens` green.
+- [x] `make check` passes (0 test failures / no shux leaks; a leak-guard false-positive on the
+  local `peon-ping` notification hook is not a shux process).
+- [x] `shux-vt-solid-qa` `VERDICT: PASS`; evidence under `.shux/qa/083-*/`.
+- [x] Implementation-diff DootSabha convergence review clean or addressed (2 daemon settle-loop
+  bugs — seed race + busy-spin — found + fixed + pinned).
+- [x] Real-target dogfood (Feature Protocol step 10): cast on real `htop` (valid asciinema v2 +
+  alt-screen setup + honest resize event captured); `--hold-ms` settles real `vim` in ~400ms;
+  `--help` truthful; the `--cast`-into-golden and out-of-range errors are actionable (fixed the
+  wait-settled error to surface the range `detail`, pinned). Findings reproduced firsthand.
+- [x] `docs/PROGRESS.md` + this task updated; learnings appended.
+
+## Adversarial follow-up (out of 083 scope — feed forward)
+
+Surfaced by the 083 adversarial review (end-to-end daemon-driver), reproduced, and deferred as
+NOT part of 083's settle/cast scope:
+
+- **`--on-missing create` masks a non-zero child death** (082 bless/create domain). A child that
+  exits non-zero mid-settle and blesses 0 goldens still exits 0 (create mode), whereas COMPARE
+  mode correctly surfaces it (child_error/exit-non-0). The `child_error` contract is bypassed on
+  the create path. Local/non-CI only. → a 082-verdict or 084 fix.
+- **Secret-scanner entropy false-positive on long path-like strings** (082 `gate/secrets.rs`,
+  24-char floor) — a temp-dir UUID segment tripped the note redactor. Already tracked from the 082
+  dogfood; still open. → 084 / secrets tuning.
+- **No `shux daemon stop` verb; a per-XDG daemon persists after each `lens gate` run** (the scratch
+  SESSIONS self-clean; the daemon itself does not). Trips leak-guards that expect one-shot spawn.
+  Already noted from the 082 dogfood ("one-shot daemon spawn+teardown for CI"). → daemon-lifecycle
+  work.
+
+- **Sandbox `PATH` excludes Homebrew** (`gate/env_plan.rs` `DEFAULT_PATH` = `/usr/local/bin:
+  /usr/bin:/bin`) — the 083 dogfood confirmed a bare `htop`/`btop`/`vim`/`bat` (all under
+  `/opt/homebrew/bin`) → `infra_error` "No such file or directory"; today the scenario must use an
+  ABSOLUTE path. Already tracked from the 082 dogfood ("PATH passthrough"). → 084 cold-agent DX.
+
+Addressed IN 083 (adversarial + dogfood fixes, pinned): cast invalid-UTF-8-lead bytes emit
+immediately (`shux-vt/src/cast.rs`); a `--cast` target inside `--golden-dir` is refused (exit 2);
+the retry audit dedupes fingerprints; the `stable_frames` idle-pane trade-off is documented (steer
+to `--hold-ms`) and pinned; the daemon seed race + busy-spin (impl-review) are fixed; and
+`pane wait-settled` errors now surface the actionable range `detail` (e.g. "hold_ms 5 out of range
+[10, 60000]") instead of a bare "invalid_params" (dogfood; pinned).

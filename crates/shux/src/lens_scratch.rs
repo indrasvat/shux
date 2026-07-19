@@ -1244,6 +1244,10 @@ struct LensRunParams {
     post_exit_ttl_ms: u32,
     max_runtime_ms: u32,
     wait: bool,
+    /// Optional asciinema `.cast` path (task 083): when set, a cast recorder is armed AT SPAWN so
+    /// the child's first bytes (alt-screen setup, initial geometry, early output) are captured.
+    /// The gate points this at a gitignored `.shux/out/` path; never a golden.
+    cast: Option<PathBuf>,
 }
 
 /// Strict ranged u64 param: absent → default; present-but-not-a-u64 →
@@ -1370,6 +1374,22 @@ fn parse_lens_run_params(params: &serde_json::Value) -> Result<LensRunParams, sh
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Optional cast path (task 083). Strict: present-but-not-a-non-empty-string → INVALID_PARAMS.
+    let cast = match params.get("cast") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                shux_rpc::RpcError::invalid_params("'cast' must be a filesystem path string")
+            })?;
+            if s.trim().is_empty() {
+                return Err(shux_rpc::RpcError::invalid_params(
+                    "'cast' path must not be empty",
+                ));
+            }
+            Some(PathBuf::from(s))
+        }
+    };
+
     Ok(LensRunParams {
         argv,
         cols,
@@ -1380,6 +1400,7 @@ fn parse_lens_run_params(params: &serde_json::Value) -> Result<LensRunParams, sh
         post_exit_ttl_ms,
         max_runtime_ms,
         wait,
+        cast,
     })
 }
 
@@ -1803,7 +1824,22 @@ async fn spawn_scratch_core(
     drop(snap);
 
     let size = shux_pty::handle::PtySize::new(p.cols, p.rows);
-    let spawn_result = crate::spawn_pane_pty(
+    // Task 083: when a cast path is requested, arm the recorder AT SPAWN (before the read loop)
+    // so the child's first bytes are captured. A failed open rolls back the allocation (the cast
+    // is the caller's declared deliverable — silently dropping it would ship a lie).
+    let cast_recorder = match p.cast {
+        Some(cast_path) => match crate::open_cast_recorder(cast_path, p.cols, p.rows).await {
+            Ok(rec) => Some(rec),
+            Err(e) => {
+                let _ = graph.destroy_session(session_id, None).await;
+                return Err(shux_rpc::RpcError::internal(&format!(
+                    "cast recorder open failed: {e}"
+                )));
+            }
+        },
+        None => None,
+    };
+    let spawn_result = crate::spawn_pane_pty_with_recorder(
         pane_id,
         cwd,
         p.argv.clone(),
@@ -1813,6 +1849,7 @@ async fn spawn_scratch_core(
         io_state.clone(),
         cancel.clone(),
         graph.clone(),
+        cast_recorder,
     )
     .await;
 

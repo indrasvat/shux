@@ -5,6 +5,7 @@
 //! vte crate parsing raw PTY output bytes.
 
 mod capture;
+mod cast;
 mod cell;
 mod charset;
 mod cursor;
@@ -13,12 +14,14 @@ mod gate;
 mod gate_compare;
 mod grid;
 mod parser;
+mod settle;
 mod tabstops;
 
 pub use capture::{
     CapColor, CapStyle, CaptureError, CursorRepr, CursorShapeRepr, Defaults, FrameEnvelope,
     MaskRect, MaskSet, RowRepr, Run, RunContent, SCHEMA_VERSION, Size, UnderlineStyleRepr,
 };
+pub use cast::{CastWriter, cast_complete_prefix};
 pub use cell::{
     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, Rgb, TerminalDefaultColors, UnderlineStyle,
 };
@@ -37,6 +40,7 @@ pub use gate_compare::{
 };
 pub use grid::{DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
+pub use settle::{FrameStability, frame_stability_hash};
 pub use tabstops::TabStops;
 
 use vte::Parser;

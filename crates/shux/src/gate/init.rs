@@ -104,6 +104,7 @@ pub async fn run_init(
         tol: None,
         out: None,
         retries: None,
+        cast: None,
         trace: None,
         argv: vec![],
         format: OutputFormat::Text,

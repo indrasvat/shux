@@ -298,6 +298,7 @@ mod tests {
             live_capture_sha256: sha.into(),
             live_fingerprint: dummy_fp(),
             xfail,
+            retry_note: None,
         }
     }
 
