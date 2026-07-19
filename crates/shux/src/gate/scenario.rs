@@ -36,6 +36,12 @@ pub struct Scenario {
     pub name: String,
     pub description: String,
     pub command: Vec<String>,
+    /// Optional working directory for the child, RELATIVE to the scenario's own
+    /// directory (084 F2). `None` keeps the historical behaviour: the child starts in
+    /// the sandbox HOME. A relative path is the only portable way to point a scenario at
+    /// a project sitting beside it — an absolute host path would land in `cmd_env_hash`
+    /// and make the committed golden `untrusted` on every other machine.
+    pub cwd: Option<String>,
     pub terminal: TerminalCfg,
     pub env: EnvBlock,
     pub deadline_ms: u64,
@@ -276,6 +282,8 @@ struct RawScenario {
     description: String,
     command: Vec<String>,
     #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
     terminal: RawTerminal,
     #[serde(default)]
     env: RawEnv,
@@ -496,6 +504,31 @@ pub fn parse(text: &str) -> Result<Scenario, ScenarioError> {
         allow: raw.env.allow,
     };
 
+    // `cwd` is scenario-dir-relative and contained (084 F2). An absolute path is refused
+    // rather than silently honoured: it would be baked into the run identity and make the
+    // committed golden untrusted on any other machine. `..` is refused so a scenario
+    // cannot walk the runner out of its own directory.
+    let cwd = match raw.cwd {
+        None => None,
+        Some(c) => {
+            let p = std::path::Path::new(&c);
+            if p.is_absolute() {
+                return Err(ScenarioError(format!(
+                    "`cwd` must be relative to the scenario directory, got absolute `{c}` \
+                     (an absolute host path would make the golden untrusted elsewhere)"
+                )));
+            }
+            if p.components()
+                .any(|comp| matches!(comp, std::path::Component::ParentDir))
+            {
+                return Err(ScenarioError(format!(
+                    "`cwd` must stay inside the scenario directory, got `{c}`"
+                )));
+            }
+            Some(c)
+        }
+    };
+
     let scenario_masks: Vec<MaskSpec> = raw
         .mask
         .iter()
@@ -524,6 +557,7 @@ pub fn parse(text: &str) -> Result<Scenario, ScenarioError> {
         name: raw.name,
         description: raw.description,
         command: raw.command,
+        cwd,
         terminal: TerminalCfg {
             rows,
             cols,

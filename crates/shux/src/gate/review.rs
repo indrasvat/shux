@@ -49,6 +49,7 @@ pub async fn run_review(
     let outcome = drive_scenario(
         socket_path,
         &scenario,
+        scenario_path.parent().unwrap_or(Path::new(".")),
         &scenario.command.clone(),
         &golden_dir,
         None,

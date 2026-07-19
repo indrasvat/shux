@@ -31,7 +31,8 @@ pub use diff::{
     CellGridView, CellRef, CursorState, FrameDiff, FrameView, GridFrame, LensRowSpan, diff_frames,
 };
 pub use gate::{
-    DiffRegion, DiffReport, FrameReport, GATE_REPORT_SCHEMA, GateStatus, ScenarioReport, XfailMeta,
+    DiffRegion, DiffReport, FrameReport, GATE_REPORT_SCHEMA, GateStatus, ScenarioReport,
+    StyleDelta, XfailMeta, style_deltas,
 };
 pub use gate_compare::{
     CellVerdict, FINGERPRINT_SCHEMA, Fingerprint, RENDERER_FORMAT_VERSION, Tier, TolParams,

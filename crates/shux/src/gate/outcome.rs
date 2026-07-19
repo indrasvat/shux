@@ -9,7 +9,7 @@
 //! frozen `report.json` schema — it never re-parses the trace text (handoff requirement).
 
 use shux_raster::TierVerdict;
-use shux_vt::{Fingerprint, Tier, XfailMeta};
+use shux_vt::{Fingerprint, StyleDelta, Tier, XfailMeta};
 
 /// The compare disposition of one `expect_golden` frame (the four raw compare outcomes
 /// 081 can produce; 082 maps these + xfail to the frozen `GateStatus`).
@@ -51,6 +51,10 @@ pub struct FrameOutcome {
     /// run's real `scenario_hash`/`cmd_env_hash`; `capture_sha256`/`rgba_sha256`/
     /// `png_sha256` left empty — the bless writer fills them from the live capture).
     pub live_fingerprint: Fingerprint,
+    /// Expected-vs-actual STYLE at changed cells (084 F6), bounded. Empty when the frame
+    /// matched, when no compare ran, or when only TEXT changed — a colour-only regression
+    /// is invisible in a text diff, so the report must be able to name the colours.
+    pub style_deltas: Vec<StyleDelta>,
     /// The frame's declared xfail metadata (from the scenario step), if any. 081 parses
     /// it opaque-reserved; 082 governs it.
     pub xfail: Option<XfailMeta>,

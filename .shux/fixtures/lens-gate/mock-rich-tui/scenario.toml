@@ -1,0 +1,62 @@
+# Lens-gate scenario for the deploy-board mock (task 084 gauntlet target).
+#
+# The board draws and then BLOCKS on stdin, so the pane holds a live quiet frame at
+# capture — a print-then-exit child would trip the child-exit short-circuit (design D7)
+# before any compare runs.
+
+name = "mock-rich-tui"
+description = "Deterministic uv+rich deploy board: initial frame, then a j-key selection move."
+command = ["uv", "run", "--offline", "board.py"]
+# Relative to THIS file's directory (never absolute — an absolute host path would land in
+# `cmd_env_hash` and make the committed golden untrusted on every other machine).
+cwd = "."
+
+[env]
+# The gate's sandbox PATH is deliberately narrow and does NOT inherit the host's, so a
+# Homebrew / ~/.local/bin tool is invisible unless it is named here. Set literally (not
+# `allow = ["PATH"]`) so the run identity stays identical on every machine.
+PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+[terminal]
+rows = 24
+cols = 80
+respond_to_queries = false
+
+[[steps]]
+action = "wait_for_text"
+text = "shux deploy board"
+timeout_ms = 20000
+
+[[steps]]
+# hold, not plain quiet: the board CLEARS the screen and repaints it whole, so a quiet
+# settle can capture the blank mid-repaint frame (observed once as a 827-cell whole-screen
+# diff). Settling only when the frame CONTENT has held identical closes that window.
+action = "hold_settle"
+hold_ms = 300
+quiet_ms = 400
+timeout_ms = 10000
+
+[[steps]]
+action = "expect_golden"
+name = "start"
+tier = "cell"
+retries = 2
+
+[[steps]]
+action = "keys"
+keys = ["j"]
+
+[[steps]]
+# hold, not plain quiet: the board CLEARS the screen and repaints it whole, so a quiet
+# settle can capture the blank mid-repaint frame (observed once as a 827-cell whole-screen
+# diff). Settling only when the frame CONTENT has held identical closes that window.
+action = "hold_settle"
+hold_ms = 300
+quiet_ms = 400
+timeout_ms = 10000
+
+[[steps]]
+action = "expect_golden"
+name = "after-nav"
+tier = "cell"
+retries = 2

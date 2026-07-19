@@ -167,6 +167,7 @@ mod tests {
                 max_channel_delta: None,
                 heat_png: None,
                 regions: None,
+                style_deltas: None,
             }),
             reason: reason.map(String::from),
             capture_json: None,

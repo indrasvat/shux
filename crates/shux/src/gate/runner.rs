@@ -19,7 +19,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{Mutex, Notify};
 
 use super::compare::compare_frame;
-use super::env_plan::{SandboxDirs, build_env_plan, cmd_env_hash, scenario_hash};
+use super::env_plan::{EnvPlan, SandboxDirs, build_env_plan, cmd_env_hash, scenario_hash};
 use super::keys;
 use super::outcome::{FrameKind, FrameOutcome, RunOutcome, TerminalOutcome};
 use super::scenario::{MaskSpec, Scenario, Step};
@@ -250,6 +250,34 @@ fn make_sandbox(root: &Path) -> std::io::Result<SandboxDirs> {
     Ok(sb)
 }
 
+/// An ENOENT spawn failure nearly always means `command[0]` is not on the sandbox PATH,
+/// which is deliberately narrow and does NOT inherit the host's. The bare errno names
+/// neither the program nor the path it was searched on, so a reader cannot act on it
+/// (084 F1 — the same wall the 082 `bat` and 083 `htop`/`vim` dogfoods hit).
+/// Returns a REPLACEMENT message, not a suffix: the note is capped at 240 chars, and the
+/// bare errno preamble would eat the budget the actionable part needs. ASCII only — the
+/// note is sanitized at the output boundary, so a non-ASCII dash would arrive as `?`.
+fn program_not_found_message(err: &str, argv: &[String], plan: &EnvPlan) -> Option<String> {
+    if !err.contains("No such file or directory") {
+        return None;
+    }
+    let program = argv.first()?;
+    // An explicit path failed on its own merits — the search path is not the story.
+    if program.contains('/') {
+        return None;
+    }
+    let path = plan
+        .env
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or("<unset>");
+    Some(format!(
+        "lens.run failed: '{program}' not found on the sandbox PATH '{path}'. \
+         The sandbox does not inherit the host PATH. Fix: set [env] PATH, \
+         or [env] allow = [\"PATH\"], or an absolute path in `command`."
+    ))
+}
+
 /// Assemble a [`RunOutcome`] from the accumulated drive state (design D1). Timing is
 /// best-effort wall clock; provenance is the host + bundled-font identity goldens pin.
 fn finish(
@@ -319,9 +347,12 @@ fn derive_terminal(signals: &[RunnerSignal]) -> Option<TerminalOutcome> {
 /// Drive a parsed scenario against a hidden scratch TUI, emit the raw-signal trace, and
 /// return the STRUCTURED outcome (design D1). Owns 081 MECHANICS only — no verdict, no
 /// stdout, no exit code. 082's `verdict` layer rolls the outcome into `report.json`.
+#[allow(clippy::too_many_arguments)] // one knob per gate CLI flag; a params struct here
+// would only rename the same list (established precedent: attach.rs, shux-rpc server.rs).
 pub async fn drive_scenario(
     socket_path: &Path,
     scenario: &Scenario,
+    scenario_dir: &Path,
     argv: &[String],
     golden_dir: &Path,
     trace_target: Option<TraceTarget>,
@@ -374,6 +405,29 @@ pub async fn drive_scenario(
     .and_then(|s| s.as_u64())
     .unwrap_or(0);
 
+    // The child's working directory: the sandbox HOME unless the scenario asked for a
+    // directory beside itself (084 F2). `cwd` is validated relative + contained at parse
+    // time, so this join cannot escape the scenario dir.
+    let child_cwd = match &scenario.cwd {
+        Some(rel) => scenario_dir.join(rel),
+        None => sandbox.home.clone(),
+    };
+    if !child_cwd.is_dir() {
+        return Ok(finish(
+            scenario,
+            started_at_ms,
+            start,
+            frames,
+            Some(TerminalOutcome::Infra {
+                message: format!(
+                    "scenario `cwd` does not exist: '{}' (resolved relative to the scenario directory)",
+                    child_cwd.display()
+                ),
+            }),
+            has_visual,
+        ));
+    }
+
     // 4. Spawn the child (deny-by-default env; async — the runner monitors exit).
     let mut stream = crate::client::ensure_daemon_running_at(socket_path).await?;
     let env_obj: serde_json::Map<String, serde_json::Value> = plan
@@ -387,7 +441,7 @@ pub async fn drive_scenario(
         "rows": scenario.terminal.rows,
         "env": serde_json::Value::Object(env_obj),
         "env_clear": plan.env_clear,
-        "cwd": sandbox.home.display().to_string(),
+        "cwd": child_cwd.display().to_string(),
         "wait": false,
     });
     // Task 083: arm the asciinema `.cast` recorder AT SPAWN (council) so the child's startup —
@@ -423,17 +477,17 @@ pub async fn drive_scenario(
             ));
         }
         Err(e) => {
+            let raw = format!("lens.run failed: {e}");
+            let message = program_not_found_message(&raw, argv, &plan).unwrap_or(raw);
             trace.emit(RunnerSignal::ParseError {
-                message: format!("lens.run failed: {e}"),
+                message: message.clone(),
             });
             return Ok(finish(
                 scenario,
                 started_at_ms,
                 start,
                 frames,
-                Some(TerminalOutcome::Infra {
-                    message: format!("lens.run failed: {e}"),
-                }),
+                Some(TerminalOutcome::Infra { message }),
                 has_visual,
             ));
         }
@@ -1099,6 +1153,7 @@ async fn capture_and_compare(
                         kind: frame_kind(&fc.signal),
                         reason: frame_reason(&fc.signal),
                         verdict: fc.verdict,
+                        style_deltas: fc.style_deltas,
                         golden_json: format!("{name}.capture.json"),
                         live_capture_json: live.to_canonical_json(),
                         live_capture_sha256: capture_sha256(&live),
@@ -1293,5 +1348,70 @@ mod tests {
         let s = scenario::parse("name=\"demo\"\ncommand=[\"true\"]\n").unwrap();
         let d = default_golden_dir(Path::new("/x/scenarios/demo.toml"), &s);
         assert_eq!(d, Path::new("/x/scenarios/goldens/demo"));
+    }
+
+    // ── 084 F1: an ENOENT spawn must name the program, the PATH, and the remedies ──
+
+    fn plan_with_path(path: &str) -> EnvPlan {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PATH".to_string(), path.to_string());
+        EnvPlan {
+            env,
+            env_clear: true,
+        }
+    }
+
+    #[test]
+    fn enoent_spawn_names_the_program_the_path_and_the_remedies() {
+        let argv = vec!["uv".to_string(), "run".to_string()];
+        let plan = plan_with_path("/usr/local/bin:/usr/bin:/bin");
+        let msg = program_not_found_message(
+            "lens.run failed: failed to spawn child process: No such file or directory (os error 2)",
+            &argv,
+            &plan,
+        )
+        .expect("ENOENT on a bare program name must produce the actionable message");
+
+        assert!(msg.contains("'uv'"), "does not name the program: {msg}");
+        assert!(
+            msg.contains("/usr/local/bin:/usr/bin:/bin"),
+            "does not name the PATH: {msg}"
+        );
+        assert!(
+            msg.contains("[env] PATH"),
+            "does not offer the PATH remedy: {msg}"
+        );
+        assert!(
+            msg.contains("allow"),
+            "does not offer the allow remedy: {msg}"
+        );
+        assert!(
+            msg.is_ascii(),
+            "note is sanitized to ASCII at the boundary: {msg}"
+        );
+        // Must survive `sanitize_note`'s 240-char cap intact.
+        assert!(
+            msg.chars().count() <= 240,
+            "message is truncated: {} chars",
+            msg.chars().count()
+        );
+    }
+
+    #[test]
+    fn an_absolute_command_path_and_other_errors_get_no_path_hint() {
+        let plan = plan_with_path("/usr/bin");
+        // An explicit path failed on its own merits; the search path is not the story.
+        assert!(
+            program_not_found_message(
+                "No such file or directory",
+                &["/opt/homebrew/bin/uv".to_string()],
+                &plan
+            )
+            .is_none()
+        );
+        // A different failure must not be relabelled as a PATH problem.
+        assert!(
+            program_not_found_message("permission denied", &["uv".to_string()], &plan).is_none()
+        );
     }
 }

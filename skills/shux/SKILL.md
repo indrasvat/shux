@@ -141,6 +141,42 @@ the user asks you to.
 Full grammar, exit-code table, checkpoint/FIFO semantics, and the
 `--wait` signal-death caveat: [references/lens.md](references/lens.md).
 
+## lens gate — keep a TUI from regressing, in CI
+
+`lens` proves a change worked once, by hand. **`lens gate`** is the CI form: a committed
+TOML scenario drives the TUI in a deterministic sandbox, captures named frames, and
+compares them against **committed goldens** — like `insta`/`jest --ci` snapshots, except
+the snapshot is a terminal frame *including colour*. A text diff cannot see
+`bright_green` become `green`; the cell tier can.
+
+```bash
+shux lens gate scenario.toml                  # exit 0 while nothing moved
+shux lens gate scenario.toml --report -       # report.json for CI to parse
+shux lens gate scenario.toml --update         # re-bless an INTENDED change
+```
+
+Exit codes are frozen: `0` pass · `1` regression · `2` usage · `3` infra · `5` child died
+· `6` update refused. A frame with **no committed golden is a regression**, so a golden can
+never be self-minted in CI.
+
+When it fails, `--out` gets a **heat PNG per frame** marking the changed cells, and
+`report.json` carries `diff.regions` (row + column span of every changed run) — usually
+enough to localize without opening anything.
+
+Two things bite everyone on their first scenario, both because the sandbox starts from an
+empty environment in a scratch directory:
+
+- Your tool is **not** on the sandbox `PATH` (`/usr/local/bin:/usr/bin:/bin`) — anything
+  from Homebrew or `~/.local/bin` needs an explicit `[env] PATH = "…"`.
+- The child's cwd is a temp dir, not your project — set `cwd` (relative to the scenario
+  file) to run a program that lives beside it.
+
+And **blessing is for intended changes only**: if the gate is red and you did not mean to
+change the UI, `--update` hides the bug instead of fixing it. Read the heat PNG first.
+
+Full scenario grammar, step table, tiers, settle modes, and the bless guard rails:
+[references/gate.md](references/gate.md).
+
 ## Tools shux replaces
 
 | If you'd reach for                              | For this job                                  | Use this shux primitive                                  |

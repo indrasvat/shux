@@ -13,7 +13,11 @@
 //! frozen here is the total, pure [`GateStatus::exit_code`] mapping (§7.4). The
 //! verdict rollup, report emission, and CLI dispatch are owned by 082.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::capture::{CapColor, CapStyle, FrameEnvelope, RowRepr, Run, RunContent};
 
 /// `report.json` schema version. Bump only with a `GATE-TEST-CHANGE:` trailer.
 pub const GATE_REPORT_SCHEMA: u32 = 1;
@@ -168,8 +172,24 @@ pub struct DiffRegion {
     pub col_end: u16,
 }
 
+/// The expected-vs-actual STYLE at one changed cell (084 F6).
+///
+/// A colour-only regression is byte-identical as TEXT, so a report carrying only
+/// coordinates tells a text-only reader *where* something changed while every text diff
+/// of the same frames shows nothing at all. `expected`/`actual` are terse human-readable
+/// descriptors (`"fg=bright_green"`, `"fg=green bold"`, `"default"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StyleDelta {
+    pub row: u16,
+    pub col: u16,
+    pub expected: String,
+    pub actual: String,
+}
+
 /// The diff detail for a failing frame. Populated by 079's comparator (cell
-/// counts, regions) and 080's pixel tier (`max_channel_delta`, `heat_png`).
+/// counts, regions), 080's pixel tier (`max_channel_delta`, `heat_png`), and 084's
+/// `style_deltas`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiffReport {
@@ -181,6 +201,10 @@ pub struct DiffReport {
     pub heat_png: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regions: Option<Vec<DiffRegion>>,
+    /// Style changes at the first cell of each changed region, capped so a full-screen
+    /// diff cannot bloat the report. Absent when nothing but text changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_deltas: Option<Vec<StyleDelta>>,
 }
 
 /// Per-frame record in `report.json`.
@@ -228,8 +252,213 @@ pub struct ScenarioReport {
     pub note: Option<String>,
 }
 
+/// Cap on emitted style deltas: enough to characterise a regression, bounded so a
+/// full-screen recolour cannot bloat `report.json`.
+const MAX_STYLE_DELTAS: usize = 16;
+
+/// The 16 SGR colour names, so a report reads `fg=bright_green` rather than `fg=idx(10)`.
+const BASIC_COLOR_NAMES: [&str; 16] = [
+    "black",
+    "red",
+    "green",
+    "yellow",
+    "blue",
+    "magenta",
+    "cyan",
+    "white",
+    "bright_black",
+    "bright_red",
+    "bright_green",
+    "bright_yellow",
+    "bright_blue",
+    "bright_magenta",
+    "bright_cyan",
+    "bright_white",
+];
+
+fn color_name(c: &CapColor) -> String {
+    match c {
+        CapColor::Idx(i) => match BASIC_COLOR_NAMES.get(*i as usize) {
+            Some(n) => (*n).to_string(),
+            None => format!("idx({i})"),
+        },
+        CapColor::Rgb([r, g, b]) => format!("#{r:02x}{g:02x}{b:02x}"),
+    }
+}
+
+/// A terse descriptor of a cell's style: `"fg=bright_green bold"`, `"default"`.
+fn describe_style(st: &CapStyle) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(fg) = &st.fg {
+        parts.push(format!("fg={}", color_name(fg)));
+    }
+    if let Some(bg) = &st.bg {
+        parts.push(format!("bg={}", color_name(bg)));
+    }
+    for (on, name) in [
+        (st.bold, "bold"),
+        (st.dim, "dim"),
+        (st.italic, "italic"),
+        (st.underline, "underline"),
+        (st.blink, "blink"),
+        (st.inverse, "inverse"),
+        (st.hidden, "hidden"),
+    ] {
+        if on {
+            parts.push(name.to_string());
+        }
+    }
+    if parts.is_empty() {
+        "default".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Style-by-column for one row: every column a `Cells` run covers maps to that run's
+/// style. Mask runs contribute nothing (a masked cell is excluded from the compare).
+fn row_styles(row: &RowRepr) -> BTreeMap<u16, &CapStyle> {
+    let mut out = BTreeMap::new();
+    for run in &row.runs {
+        if let Run::Cells {
+            col,
+            content,
+            style,
+        } = run
+        {
+            let width = match content {
+                RunContent::Simple(s) => s.chars().count(),
+                RunContent::Complex(v) => v.len(),
+            };
+            for i in 0..width {
+                out.insert(col.saturating_add(i as u16), style);
+            }
+        }
+    }
+    out
+}
+
+/// Style changes between two frames, in row-major order, capped at [`MAX_STYLE_DELTAS`]
+/// (084 F6). Only cells whose STYLE differs are reported — a pure text change yields an
+/// empty vec, because the coordinates already tell that story and the text is visible.
+pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> Vec<StyleDelta> {
+    let mut out = Vec::new();
+    let actual_rows: BTreeMap<u16, &RowRepr> = actual.rows.iter().map(|r| (r.row, r)).collect();
+
+    for erow in &expected.rows {
+        let Some(arow) = actual_rows.get(&erow.row) else {
+            continue;
+        };
+        let (e_styles, a_styles) = (row_styles(erow), row_styles(arow));
+        // One entry per CONTIGUOUS run of the same (expected, actual) pair: a 10-column
+        // recolour is one fact, and spending the cap on ten copies of it would hide the
+        // other affected rows entirely.
+        let mut prev: Option<(u16, &CapStyle, &CapStyle)> = None;
+        for (col, e_style) in &e_styles {
+            let Some(a_style) = a_styles.get(col) else {
+                prev = None;
+                continue;
+            };
+            if e_style == a_style {
+                prev = None;
+                continue;
+            }
+            let continues = matches!(
+                prev,
+                Some((pcol, pe, pa))
+                    if pcol + 1 == *col && pe == *e_style && pa == *a_style
+            );
+            prev = Some((*col, e_style, a_style));
+            if continues {
+                continue;
+            }
+            out.push(StyleDelta {
+                row: erow.row,
+                col: *col,
+                expected: describe_style(e_style),
+                actual: describe_style(a_style),
+            });
+            if out.len() >= MAX_STYLE_DELTAS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    // ── 084 F6: style deltas name WHAT changed, not just where ──────────────
+
+    fn env_json(runs: &str) -> FrameEnvelope {
+        let j = format!(
+            r#"{{"schema":1,"size":{{"rows":1,"cols":10}},"alt_screen":false,"defaults":{{}},
+                 "cursor":{{"row":0,"col":0,"visible":true,"shape":"block"}},
+                 "palette_overridden":false,
+                 "rows":[{{"row":0,"runs":{runs}}}]}}"#
+        );
+        FrameEnvelope::from_canonical_json(&j).expect("test envelope parses")
+    }
+
+    #[test]
+    fn a_colour_only_change_is_named_expected_vs_actual() {
+        // Identical TEXT, different fg: exactly the CR-B regression shape.
+        let expected = env_json(r#"[[0,"healthy",{"fg":{"idx":10}}]]"#);
+        let actual = env_json(r#"[[0,"healthy",{"fg":{"idx":2}}]]"#);
+
+        let d = style_deltas(&expected, &actual);
+        assert_eq!(d.len(), 1, "a contiguous run collapses to one delta: {d:?}");
+        assert_eq!(d[0].row, 0);
+        assert_eq!(d[0].col, 0);
+        assert_eq!(d[0].expected, "fg=bright_green");
+        assert_eq!(d[0].actual, "fg=green");
+    }
+
+    #[test]
+    fn identical_styles_yield_no_deltas() {
+        let a = env_json(r#"[[0,"healthy",{"fg":{"idx":10}}]]"#);
+        assert!(style_deltas(&a, &a).is_empty());
+    }
+
+    #[test]
+    fn a_pure_text_change_yields_no_style_deltas() {
+        // The coordinates already tell that story, and the text is visible in a diff.
+        let expected = env_json(r#"[[0,"healthy",{"fg":{"idx":10}}]]"#);
+        let actual = env_json(r#"[[0,"HEALTHY",{"fg":{"idx":10}}]]"#);
+        assert!(style_deltas(&expected, &actual).is_empty());
+    }
+
+    #[test]
+    fn rgb_and_attributes_are_described_readably() {
+        let expected = env_json(r#"[[0,"x",{"fg":{"rgb":[255,122,24]},"bold":true}]]"#);
+        let actual = env_json(r#"[[0,"x",{"fg":{"idx":200},"italic":true}]]"#);
+        let d = style_deltas(&expected, &actual);
+        assert_eq!(d[0].expected, "fg=#ff7a18 bold");
+        assert_eq!(d[0].actual, "fg=idx(200) italic");
+    }
+
+    #[test]
+    fn deltas_are_capped_when_each_change_is_a_distinct_fact() {
+        // Each column gets a DIFFERENT colour, so no two neighbours share an
+        // (expected, actual) pair and nothing collapses -> 40 distinct facts, capped.
+        let mk = |base: u8| {
+            let runs: Vec<String> = (0..40)
+                .map(|c| format!(r#"[{c},"x",{{"fg":{{"idx":{}}}}}]"#, base + (c % 5) as u8))
+                .collect();
+            format!("[{}]", runs.join(","))
+        };
+        let j = |body: String| {
+            FrameEnvelope::from_canonical_json(&format!(
+                r#"{{"schema":1,"size":{{"rows":1,"cols":40}},"alt_screen":false,"defaults":{{}},
+                     "cursor":{{"row":0,"col":0,"visible":true,"shape":"block"}},
+                     "palette_overridden":false,"rows":[{{"row":0,"runs":{body}}}]}}"#
+            ))
+            .expect("parses")
+        };
+        let d = style_deltas(&j(mk(100)), &j(mk(200)));
+        assert_eq!(d.len(), MAX_STYLE_DELTAS, "must be capped: got {}", d.len());
+    }
+
     use super::*;
 
     #[test]
@@ -393,6 +622,7 @@ mod tests {
                         col_start: 2,
                         col_end: 5,
                     }]),
+                    style_deltas: None,
                 }),
                 reason: Some("palette_unportable".into()),
                 capture_json: Some("main.capture.json".into()),

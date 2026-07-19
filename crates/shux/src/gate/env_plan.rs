@@ -187,6 +187,9 @@ struct ScenarioStructure<'a> {
     name: &'a str,
     description: &'a str,
     command: &'a [String],
+    /// Skipped when absent so every pre-084 scenario hashes exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
     rows: u16,
     cols: u16,
     respond_to_queries: bool,
@@ -201,6 +204,7 @@ pub fn scenario_hash(scenario: &Scenario) -> String {
         name: &scenario.name,
         description: &scenario.description,
         command: &scenario.command,
+        cwd: scenario.cwd.as_deref(),
         rows: scenario.terminal.rows,
         cols: scenario.terminal.cols,
         respond_to_queries: scenario.terminal.respond_to_queries,

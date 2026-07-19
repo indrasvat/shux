@@ -47,6 +47,7 @@ pub struct BlessedEntry {
 }
 
 /// The changed-golden manifest (task §5): what was re-blessed, for PR review.
+#[derive(Default)]
 pub struct BlessManifest {
     pub entries: Vec<BlessedEntry>,
 }
@@ -85,7 +86,12 @@ pub fn create_missing(
 
 /// After a successful bless, mark the blessed frames `pass` in the report and recompute
 /// the scenario rollup (the golden now equals the capture, so a re-run would pass).
-pub fn apply_blessed(reports: &mut [ScenarioReport], manifest: &BlessManifest) {
+///
+/// `floor` is the scenario-level (non-frame) status from `verdict::scenario_floor` — the
+/// re-roll starts THERE, never at `Pass`. Blessing accepts a captured FRAME; it can never
+/// accept a crash, a `step_timeout`, or a no-visual scenario, and those contribute no
+/// frames to fold over (084 F4).
+pub fn apply_blessed(reports: &mut [ScenarioReport], manifest: &BlessManifest, floor: GateStatus) {
     let blessed: std::collections::HashSet<&str> =
         manifest.entries.iter().map(|e| e.name.as_str()).collect();
     for sr in reports.iter_mut() {
@@ -95,10 +101,7 @@ pub fn apply_blessed(reports: &mut [ScenarioReport], manifest: &BlessManifest) {
                 f.reason = Some("blessed".to_string());
             }
         }
-        let rolled = sr
-            .frames
-            .iter()
-            .fold(GateStatus::Pass, |acc, f| acc.worst(f.status));
+        let rolled = sr.frames.iter().fold(floor, |acc, f| acc.worst(f.status));
         sr.status = rolled;
         sr.note = Some(match sr.note.take() {
             Some(n) => format!("{n}; blessed {} golden(s)", manifest.entries.len()),
@@ -638,6 +641,7 @@ mod tests {
 
     fn frame(name: &str, kind: FrameKind, json: String, sha: String) -> FrameOutcome {
         FrameOutcome {
+            style_deltas: Vec::new(),
             name: name.into(),
             tier: Tier::Cell,
             kind,

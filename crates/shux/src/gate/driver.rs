@@ -183,6 +183,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     let outcome = runner::drive_scenario(
         socket_path,
         &scenario,
+        opts.scenario_path.parent().unwrap_or(Path::new(".")),
         &argv,
         &golden_dir,
         trace_target(opts.trace.clone()),
@@ -216,7 +217,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
                 return Ok(GateStatus::UpdateRefused.exit_code() as i32);
             }
             bless::BlessOutcome::Blessed(manifest) => {
-                bless::apply_blessed(&mut reports, &manifest);
+                bless::apply_blessed(&mut reports, &manifest, verdict::scenario_floor(&outcome));
             }
         }
     } else if opts.on_missing == crate::cli::OnMissing::Create {
@@ -227,7 +228,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
                 return Ok(GateStatus::UpdateRefused.exit_code() as i32);
             }
             bless::BlessOutcome::Blessed(manifest) => {
-                bless::apply_blessed(&mut reports, &manifest);
+                bless::apply_blessed(&mut reports, &manifest, verdict::scenario_floor(&outcome));
             }
         }
     }

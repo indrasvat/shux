@@ -1,6 +1,6 @@
 # Task 084: lens gate — cold-agent DX validation (Laghudarshi gauntlet)
 
-**Status:** Not Started
+**Status:** In Progress
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 078, 079, 080, 081, 082, 083 (the fully-built gate)

@@ -38,8 +38,7 @@ pub fn build_reports(outcome: &RunOutcome, today: NaiveDate) -> Vec<ScenarioRepo
     // error Displays that can carry captured text / argv — never emit it raw.
     let mut note: Option<String> = None;
     if let Some(t) = &outcome.terminal {
-        let (status, tnote) = terminal_status(t);
-        acc = acc.worst(status);
+        let (_, tnote) = terminal_status(t);
         note = Some(sanitize_note(&tnote));
     }
 
@@ -48,9 +47,12 @@ pub fn build_reports(outcome: &RunOutcome, today: NaiveDate) -> Vec<ScenarioRepo
     // timeout) IS the story and must surface, so `no_visual_check` applies only when the
     // run reached the end with no terminal disposition (adv Agent A, Finding D).
     if !outcome.has_visual_check && outcome.terminal.is_none() {
-        acc = acc.worst(GateStatus::ScenarioError);
         note = Some("no_visual_check: scenario compared 0 frames".to_string());
     }
+
+    // Both scenario-level contributions fold in through the ONE floor helper, so the
+    // post-bless re-roll cannot diverge from this rollup (084 F4).
+    acc = acc.worst(scenario_floor(outcome));
 
     vec![ScenarioReport {
         scenario: outcome.scenario_name.clone(),
@@ -148,13 +150,33 @@ fn frame_status(f: &FrameOutcome, today: NaiveDate) -> (GateStatus, Option<Strin
         FrameKind::GoldenAbsent => (
             GateStatus::MissingGolden,
             // A first-timer's DETAIL hint (dogfood: the blank column gave no next step).
-            Some("no committed golden — run with `--on-missing create`".to_string()),
+            // ASCII only: the summary sanitizes every non-ASCII char to `?` at the output
+            // boundary, so an em-dash here reaches the reader as `no committed golden ?`.
+            Some("no committed golden - run with `--on-missing create`".to_string()),
         ),
         FrameKind::GoldenUntrusted => (
             GateStatus::StaleGolden,
             Some("golden fingerprint/baseline stale — re-bless".to_string()),
         ),
     }
+}
+
+/// The scenario-level (non-frame) status floor: the terminal disposition (child died /
+/// timed out / infra / bad step) plus the `no_visual_check` guard.
+///
+/// A blessing re-roll MUST start from this floor rather than from `Pass` — a terminal
+/// failure produces NO frames, so folding over frames alone would launder a crash, a
+/// `step_timeout`, or a no-visual scenario into `pass`/exit 0 while blessing nothing
+/// (084 F4: `--on-missing create` and `--update` both hit this through `apply_blessed`).
+pub(crate) fn scenario_floor(outcome: &RunOutcome) -> GateStatus {
+    let mut acc = GateStatus::Pass;
+    if let Some(t) = &outcome.terminal {
+        acc = acc.worst(terminal_status(t).0);
+    }
+    if !outcome.has_visual_check && outcome.terminal.is_none() {
+        acc = acc.worst(GateStatus::ScenarioError);
+    }
+    acc
 }
 
 /// Map a scenario-level terminal disposition to its status + a terse, privacy-safe note.
@@ -222,6 +244,13 @@ fn diff_report(f: &FrameOutcome) -> Option<DiffReport> {
         max_channel_delta: v.pixel.as_ref().map(|p| p.max_channel_delta),
         heat_png: None,
         regions,
+        // 084 F6: a colour-only regression is byte-identical as text, so coordinates
+        // alone leave a text-only reader with nothing to act on.
+        style_deltas: if f.style_deltas.is_empty() {
+            None
+        } else {
+            Some(f.style_deltas.clone())
+        },
     })
 }
 
@@ -288,6 +317,7 @@ mod tests {
 
     fn frame(kind: FrameKind, xfail: Option<XfailMeta>, sha: &str) -> FrameOutcome {
         FrameOutcome {
+            style_deltas: Vec::new(),
             name: "main".into(),
             tier: Tier::Cell,
             kind,
@@ -743,5 +773,65 @@ mod tests {
         );
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains(secret), "report.json leaked the secret");
+    }
+
+    // ── 084 F4: blessing must never launder a scenario-level failure ─────────
+
+    #[test]
+    fn scenario_floor_carries_a_terminal_failure_with_no_frames() {
+        let o = outcome(
+            vec![],
+            Some(TerminalOutcome::StepTimeout {
+                action: "wait_for_text".into(),
+                step_index: 0,
+            }),
+        );
+        assert_eq!(scenario_floor(&o), GateStatus::Fail);
+        assert_eq!(build_reports(&o, today())[0].status, GateStatus::Fail);
+    }
+
+    #[test]
+    fn scenario_floor_carries_a_child_error_and_no_visual_check() {
+        let crashed = outcome(vec![], Some(TerminalOutcome::ChildExit { code: Some(2) }));
+        assert_eq!(scenario_floor(&crashed), GateStatus::ChildError);
+
+        // No terminal disposition and no `expect_golden` → the no-visual guard.
+        let silent = outcome(vec![], None);
+        assert_eq!(scenario_floor(&silent), GateStatus::ScenarioError);
+    }
+
+    #[test]
+    fn scenario_floor_is_pass_when_only_frames_decide() {
+        let o = outcome(vec![frame(FrameKind::Match, None, "sha")], None);
+        assert_eq!(scenario_floor(&o), GateStatus::Pass);
+    }
+
+    /// The 084 F4 blocker: `--on-missing create` / `--update` re-roll the scenario status
+    /// through `apply_blessed`. A `step_timeout` yields ZERO frames, so a fold seeded at
+    /// `Pass` returned `pass`/exit 0 while blessing nothing — CI keying on the exit code
+    /// went green over a scenario that never rendered. The re-roll must start at the floor.
+    #[test]
+    fn blessing_nothing_cannot_launder_a_step_timeout_into_pass() {
+        use super::super::bless::{BlessManifest, apply_blessed};
+
+        let o = outcome(
+            vec![],
+            Some(TerminalOutcome::StepTimeout {
+                action: "wait_for_text".into(),
+                step_index: 0,
+            }),
+        );
+        let mut reports = build_reports(&o, today());
+        assert_eq!(reports[0].status, GateStatus::Fail);
+
+        apply_blessed(&mut reports, &BlessManifest::default(), scenario_floor(&o));
+
+        assert_eq!(
+            reports[0].status,
+            GateStatus::Fail,
+            "blessing 0 goldens laundered a step_timeout into {:?}",
+            reports[0].status
+        );
+        assert_eq!(reports[0].status.exit_code(), 1);
     }
 }

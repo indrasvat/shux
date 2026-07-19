@@ -11,7 +11,9 @@
 use std::path::Path;
 
 use shux_raster::{Rasterizer, TierVerdict, evaluate_tier, os_arch, pixel_baseline_path};
-use shux_vt::{Fingerprint, FrameEnvelope, GateStatus, Tier, capture_sha256};
+use shux_vt::{
+    Fingerprint, FrameEnvelope, GateStatus, StyleDelta, Tier, capture_sha256, style_deltas,
+};
 
 use super::signal::RunnerSignal;
 
@@ -21,6 +23,9 @@ use super::signal::RunnerSignal;
 pub struct FrameCompare {
     pub signal: RunnerSignal,
     pub verdict: Option<TierVerdict>,
+    /// Expected-vs-actual style at changed cells (084 F6) — computed here because this is
+    /// where BOTH envelopes are in hand.
+    pub style_deltas: Vec<StyleDelta>,
 }
 
 /// The golden files for a frame live at `<golden_dir>/<name>.capture.json` +
@@ -61,6 +66,7 @@ pub fn compare_frame(
             tier: tname.clone(),
         },
         verdict: None,
+        style_deltas: Vec::new(),
     };
     let untrusted = || FrameCompare {
         signal: RunnerSignal::GoldenUntrusted {
@@ -68,6 +74,7 @@ pub fn compare_frame(
             tier: tname.clone(),
         },
         verdict: None,
+        style_deltas: Vec::new(),
     };
 
     let json_path = cell_json_path(golden_dir, name);
@@ -136,6 +143,7 @@ pub fn compare_frame(
                     tier: tname,
                 },
                 verdict: Some(v),
+                style_deltas: Vec::new(),
             },
             GateStatus::Fail => FrameCompare {
                 signal: RunnerSignal::FrameMismatch {
@@ -145,6 +153,8 @@ pub fn compare_frame(
                     changed_cells: Some(v.cell.diff.cells_changed),
                 },
                 verdict: Some(v),
+                // Only a FAIL needs the style story; a match has none.
+                style_deltas: style_deltas(&golden, live),
             },
             // evaluate_tier only yields Pass/Fail (missing/stale resolved above); any other
             // status is refused conservatively as untrusted rather than silently passed.
