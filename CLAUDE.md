@@ -69,7 +69,7 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 - **Leak-guarded shux checks MUST run serially:** never parallelize daemon-backed shux tests or leak-guard wrappers, because each guard intentionally kills new matching processes it did not baseline.
 - **External reviewer CLIs are process-hygiene risks:** run Claude/Codex/DootSabha/agy review commands through `.shux/scripts/agent_review_guard.sh`; do not use Gemini for shux review automation unless explicitly requested.
 - **Color probes are mandatory in shux automation:** any daemon-backed shux test or fixture that captures pane/window output MUST include explicit truecolor, indexed-color, or basic-color content so monochrome/`NO_COLOR` regressions cannot pass unnoticed.
-- **Prefer real terminal workloads:** when behavior is user-visible, tests should exercise real shux panes, Unix commands, and installed TUIs where practical; keep synthetic fixtures for narrow parser invariants, not as the only proof.
+- **Prefer real terminal workloads:** when behavior is user-visible, tests should exercise real shux panes, Unix commands, and installed TUIs; keep synthetic fixtures for narrow parser invariants, not as the only proof. For a user-facing *feature*, "where practical" is not an escape hatch — a real installed TUI/CLI IS practical, and a real-target end-to-end dogfood is required before "done" (Feature Protocol step 10). Color-probed `printf`/`cat` scenarios satisfy the letter, not the spirit.
 - **CLI output styling:** All user-facing CLI text output MUST use the style module (`crates/shux/src/style.rs`). Never use raw `println!` for styled output — use the helpers:
   - `style::accent(text)` — Cyan bold, for "shux" brand name and key identifiers
   - `style::success(text)` — Green, for confirmations (created, killed, ensured)
@@ -138,8 +138,13 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 >   re-scoped in the task file before proceeding.
 > - It MUST enforce the active task's exact Testing Matrix, Acceptance
 >   Criteria, and Definition of Done when a task file exists.
-> - It MUST use real colored shux automation and real Unix/TUI workloads where
->   practical, not synthetic fixtures alone.
+> - It MUST use real colored shux automation and real Unix/TUI workloads, not
+>   synthetic fixtures alone. For a user-facing feature this means a REAL target
+>   (a real installed TUI/CLI), not color-probed `printf`/`cat` — those satisfy
+>   the letter, not the spirit (see Feature Protocol step 10, the real-target
+>   dogfood). The gate asserts against the DoD;
+>   it does NOT replace the dogfood's judgement of consumer-facing output
+>   (help-text truthfulness, artifact legibility, error actionability).
 > - It MUST visually inspect full-resolution screenshots and use pixel-level
 >   verification whenever a baseline, expected frame, or stability contract
 >   exists.
@@ -267,9 +272,28 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > 9. **Cross-path consistency assertion.** At least one test that asserts the
 >    same logical output across render paths (e.g., snapshot at width W matches
 >    the attach renderer's bar at width W). Prevents future drift.
-> 10. **`gh-ghent` post-push, background only** (per memory `feedback-ghent-background`).
-> 11. **Post-merge `curl|sh` smoke** (per memory `feedback-post-merge-smoke-test`) —
->    verify against the *publicly-installed* binary, not local `target/release/`.
+> 10. **Real-target dogfood.** For any
+>    user-facing feature/verb/tool, once it is green + QA-passed, drive the REAL
+>    binary end-to-end against a REAL target — a real installed TUI/CLI (`bat`,
+>    `lazygit`, `vim`, a real REPL), NOT a synthetic `printf … ; exec cat`
+>    fixture — through the genuine user lifecycle (ideally a parallel agent,
+>    leak-guarded + isolated). Judge the CONSUMER-FACING output: does `--help`/
+>    docs tell the truth, does the promised artifact actually exist and read
+>    legibly (OPEN the PNG/report — do not just assert a JSON field), do errors
+>    point at the cause, would a first-timer understand it. Every other gate
+>    asserts on structured fields; a lying help string or a missing/illegible
+>    artifact is invisible to them — only a real dogfood catches the "consumer
+>    reads the output" bug class. **Reproduce every dogfood finding yourself
+>    before believing it** — an agent over- and under-claims (on task 082 a
+>    confidently-reported "silent-pass" BLOCKER was correct behaviour; a phantom
+>    fix would have been a real regression). "Where practical" is NOT an escape
+>    hatch for a user-facing surface — a real target IS practical.
+> 11. **`gh-ghent` post-push, background only.** Spawn any PR-wait poll
+>    (`gh ghent status --await-review`) in the background, never foreground.
+> 12. **Post-merge `curl|sh` smoke.** After a PR merges + semantic-release tags,
+>    install the new version via the public `curl -fsSL https://shux.pages.dev/install.sh | sh`
+>    flow and smoke-test the fix against the *publicly-installed* binary, not
+>    local `target/release/`.
 >
 > **Paste this into every feature PR description:**
 >
@@ -287,6 +311,7 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > - [ ] hot-reload state (config edit mid-session takes effect)
 > - [ ] cross-path consistency test
 > - [ ] `make check` (lint + tests)
+> - [ ] real-target dogfood (user-facing features) — real TUI/CLI end-to-end, consumer-facing output judged (help truthfulness / artifact legibility / error actionability), findings reproduced before believing
 > - [ ] visual evidence for every relevant (path × state) cell is attached to PR comments
 > - [ ] no screenshots committed unless justified as durable baselines/assets
 > ```
