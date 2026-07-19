@@ -145,7 +145,11 @@ fn frame_status(f: &FrameOutcome, today: NaiveDate) -> (GateStatus, Option<Strin
                 }
             },
         },
-        FrameKind::GoldenAbsent => (GateStatus::MissingGolden, None),
+        FrameKind::GoldenAbsent => (
+            GateStatus::MissingGolden,
+            // A first-timer's DETAIL hint (dogfood: the blank column gave no next step).
+            Some("no committed golden — run with `--on-missing create`".to_string()),
+        ),
         FrameKind::GoldenUntrusted => (
             GateStatus::StaleGolden,
             Some("golden fingerprint/baseline stale — re-bless".to_string()),

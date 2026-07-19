@@ -9,6 +9,7 @@ pub mod bless;
 pub mod compare;
 pub mod driver;
 pub mod env_plan;
+pub mod heat;
 pub mod init;
 pub mod keys;
 pub mod outcome;

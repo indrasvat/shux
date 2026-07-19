@@ -9,7 +9,7 @@ use shux_vt::{GateStatus, ScenarioReport};
 
 use super::runner::{TraceTarget, default_golden_dir};
 use super::scenario;
-use super::{bless, runner, summary, verdict};
+use super::{bless, heat, runner, summary, verdict};
 use crate::cli::OutputFormat;
 
 /// Everything the run verb needs, lifted from the CLI (agent-first noun-verb; no inline
@@ -187,6 +187,20 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             bless::BlessOutcome::Blessed(manifest) => {
                 bless::apply_blessed(&mut reports, &manifest);
             }
+        }
+    }
+
+    // Write headless heat-overlay evidence for any remaining fail frame (dogfood: the
+    // pixel-perfect proof must be producible in CI / by an agent, not only in `gate
+    // review`). Best-effort; sets `diff.heat_png` in the report.
+    if reports
+        .iter()
+        .flat_map(|s| s.frames.iter())
+        .any(|f| f.status == GateStatus::Fail)
+    {
+        if let Ok(rasterizer) = shux_raster::Rasterizer::new(16.0) {
+            let out = heat::out_dir(opts.out.as_deref(), &scenario.name);
+            heat::emit_heat_for_fails(&outcome, &mut reports, &golden_dir, &out, &rasterizer);
         }
     }
 

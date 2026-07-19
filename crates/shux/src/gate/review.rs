@@ -146,8 +146,9 @@ pub async fn run_review(
     if remaining_failing == 0 { Ok(0) } else { Ok(1) }
 }
 
-/// Render before (golden) / after (live) / heat PNGs into `out_dir`; return their paths.
-/// A missing golden simply omits the before/heat pair.
+/// Render before (golden) + after (live) PNGs into `out_dir`; return their paths. A missing
+/// golden omits the before frame. (The heat overlay is written by the non-interactive gate
+/// report path — `gate::heat` — so it is available headless, not only here.)
 fn write_evidence(
     out_dir: &Path,
     golden_dir: &Path,

@@ -135,3 +135,26 @@ the xfail metadata contract + expiry semantics, the `--update` guard set, and th
 - **Residual (→ task 083 settle-hardening):** the post-compare crash-watch is a bounded 2s
   grace; a crash beyond it while the child is idle is still missed. Robust liveness monitoring
   is 083's domain; the scenario deadline is the ultimate bound.
+
+### Dogfood follow-up (real `bat` visual-regression run, 2026-07-18)
+
+A parallel agent drove `shux lens gate` against a REAL installed tool (`bat` syntax-
+highlighting a Rust file) through the full lifecycle (init → missing → create → pass →
+seed-regression → catch → bless → CI-refuse). Verdict: **it works as a real visual-regression
+gate** — correct frozen exit contract, localized cell-diff regions, governed bless with a real
+audit trail; every seeded regression caught, zero leaks. The one reported "silent-pass
+(frames=0, exit 0)" BLOCKER was **independently disproven** (exit-0 before compare →
+`child_error`/5; exit-0 after a *matching* compare → pass with frames=1; no path to
+pass-with-0-frames). Folded from the exercise:
+
+- **Headless heat evidence (`gate::heat`)** — the pixel-perfect proof is now produced by the
+  non-interactive gate path, not only `gate review`: on a fail, `<out>/<name>.heat.png` (changed
+  cells overlaid / pixel-diff for pixel-only fails) is written and linked in `report.json`'s
+  `diff.heat_png`. Fixes the `--out` help that promised heat PNGs it never wrote. Test:
+  `fail_writes_a_heat_png_to_out_and_records_it`.
+- `missing_golden` now carries a `--on-missing create` DETAIL hint; `BASELINE-APPROVAL.md`
+  sections get a leading blank line.
+- **Deferred (tracked):** sandbox `PATH` passthrough so real installed tools aren't invisibly
+  "not found" + a `wait_for_text`-timeout PATH hint (→ 084 cold-agent DX / 085 docs); one-shot
+  daemon spawn+teardown so a CI gate doesn't leave a persistent daemon (→ 083); secret-scanner
+  entropy false-positive tuning on long `$PATH`-like strings.

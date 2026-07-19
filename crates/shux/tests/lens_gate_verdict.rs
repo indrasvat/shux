@@ -347,6 +347,47 @@ fn tampered_golden_is_stale_not_fail() {
     );
 }
 
+// ── headless heat evidence (dogfood: pixel-perfect proof in CI/agents) ─────────
+
+#[test]
+fn fail_writes_a_heat_png_to_out_and_records_it() {
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let out = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    let od = out.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "base", "ALPHA");
+    // A different capture (BRAVO vs the ALPHA golden) → cell fail → heat evidence.
+    let scn = write_scenario(d.path(), "ht", &scenario("ht", "BRAVO", None));
+    let res = gate(
+        &h,
+        &["--report", "-", "--out", &od, "--golden-dir", &gd, &scn],
+        false,
+    );
+    assert_eq!(
+        res.exit, 1,
+        "a cell mismatch is a regression; stderr:\n{}",
+        res.stderr
+    );
+    let report = res.report();
+    let diff = report[0].frames[0]
+        .diff
+        .as_ref()
+        .expect("a fail frame carries a diff");
+    let heat = diff
+        .heat_png
+        .as_ref()
+        .expect("a headless fail must record diff.heat_png");
+    // The referenced heat PNG exists on disk and is a real PNG.
+    let bytes = std::fs::read(heat).expect("heat png written to --out");
+    assert!(
+        bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "heat_png is a valid PNG"
+    );
+    assert!(bytes.len() > 100, "heat png is non-trivial");
+}
+
 // ── L1 privacy ────────────────────────────────────────────────────────────────
 
 #[test]

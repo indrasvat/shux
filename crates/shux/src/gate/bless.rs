@@ -478,7 +478,11 @@ fn write_approval_header(
     let who = git_identity();
     let when = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     let mut body = String::new();
-    if !approval_log_path(golden_dir).exists() {
+    if approval_log_path(golden_dir).exists() {
+        // Blank line before a new `##` section so strict-markdown renders the heading
+        // (dogfood: appended sections abutted the prior line).
+        body.push('\n');
+    } else {
         body.push_str("# Lens-gate goldens — baseline approval record\n\n");
     }
     body.push_str(&format!("## {when} — {} ({who})\n\n", scenario.name));
