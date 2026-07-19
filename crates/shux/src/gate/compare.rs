@@ -10,17 +10,25 @@
 
 use std::path::Path;
 
-use shux_raster::{Rasterizer, evaluate_tier, os_arch, pixel_baseline_path};
+use shux_raster::{Rasterizer, TierVerdict, evaluate_tier, os_arch, pixel_baseline_path};
 use shux_vt::{Fingerprint, FrameEnvelope, GateStatus, Tier, capture_sha256};
 
 use super::signal::RunnerSignal;
+
+/// The raw compare result for one frame: the trace SIGNAL (081's wire vocabulary) plus
+/// the rich `TierVerdict` (regions + pixel metrics) the signal loses — `None` when no
+/// compare ran (golden absent/untrusted). 082 shapes `verdict` into a `DiffReport`.
+pub struct FrameCompare {
+    pub signal: RunnerSignal,
+    pub verdict: Option<TierVerdict>,
+}
 
 /// The golden files for a frame live at `<golden_dir>/<name>.capture.json` +
 /// `<name>.fingerprint.json` (+ `<name>/<os>-<arch>/frame.png` for pixel/exact).
 pub fn cell_json_path(dir: &Path, name: &str) -> std::path::PathBuf {
     dir.join(format!("{name}.capture.json"))
 }
-fn fp_path(dir: &Path, name: &str) -> std::path::PathBuf {
+pub fn fp_path(dir: &Path, name: &str) -> std::path::PathBuf {
     dir.join(format!("{name}.fingerprint.json"))
 }
 
@@ -34,8 +42,9 @@ fn tier_name(t: Tier) -> String {
 }
 
 /// Compare a live captured frame against its golden and return the RAW runner signal
-/// (design D2). `current` is the freshly-computed fingerprint for THIS build/scenario
-/// (with the real `scenario_hash`/`cmd_env_hash` 081 populates).
+/// (design D2) PLUS the rich verdict (design D1). `current` is the freshly-computed
+/// fingerprint for THIS build/scenario (with the real `scenario_hash`/`cmd_env_hash` 081
+/// populates).
 pub fn compare_frame(
     golden_dir: &Path,
     name: &str,
@@ -43,63 +52,55 @@ pub fn compare_frame(
     live: &FrameEnvelope,
     current: &Fingerprint,
     rasterizer: &Rasterizer,
-) -> RunnerSignal {
+) -> FrameCompare {
     let tname = tier_name(tier);
+    // The two no-compare dispositions, as a `FrameCompare` with `verdict: None`.
+    let absent = || FrameCompare {
+        signal: RunnerSignal::GoldenAbsent {
+            name: name.into(),
+            tier: tname.clone(),
+        },
+        verdict: None,
+    };
+    let untrusted = || FrameCompare {
+        signal: RunnerSignal::GoldenUntrusted {
+            name: name.into(),
+            tier: tname.clone(),
+        },
+        verdict: None,
+    };
+
     let json_path = cell_json_path(golden_dir, name);
     let fp_path = fp_path(golden_dir, name);
     if !json_path.exists() || !fp_path.exists() {
-        return RunnerSignal::GoldenAbsent {
-            name: name.into(),
-            tier: tname,
-        };
+        return absent();
     }
     let Ok(golden_text) = std::fs::read_to_string(&json_path) else {
-        return RunnerSignal::GoldenUntrusted {
-            name: name.into(),
-            tier: tname,
-        };
+        return untrusted();
     };
     let Ok(golden) = FrameEnvelope::from_canonical_json(&golden_text) else {
-        return RunnerSignal::GoldenUntrusted {
-            name: name.into(),
-            tier: tname,
-        };
+        return untrusted();
     };
     let Ok(sidecar_text) = std::fs::read_to_string(&fp_path) else {
-        return RunnerSignal::GoldenUntrusted {
-            name: name.into(),
-            tier: tname,
-        };
+        return untrusted();
     };
     let Ok(sidecar) = serde_json::from_str::<Fingerprint>(&sidecar_text) else {
-        return RunnerSignal::GoldenUntrusted {
-            name: name.into(),
-            tier: tname,
-        };
+        return untrusted();
     };
 
     // Stale: build/config drift OR a golden edited without re-bless (080 D6).
     if sidecar.is_stale_vs(current) || sidecar.capture_sha256 != capture_sha256(&golden) {
-        return RunnerSignal::GoldenUntrusted {
-            name: name.into(),
-            tier: tname,
-        };
+        return untrusted();
     }
 
     // Pixel/exact: resolve + content-pin the committed platform baseline.
     let golden_png = if tier != Tier::Cell {
         let p = pixel_baseline_path(golden_dir, name, &os_arch());
         if !p.exists() {
-            return RunnerSignal::GoldenAbsent {
-                name: name.into(),
-                tier: tname,
-            };
+            return absent();
         }
         let Ok(bytes) = std::fs::read(&p) else {
-            return RunnerSignal::GoldenUntrusted {
-                name: name.into(),
-                tier: tname,
-            };
+            return untrusted();
         };
         // Enforce the baseline CONTENT PIN (080 impl-review BLOCKER): a swapped-but-valid
         // PNG must be refused; `capture_sha256` only pins the cell JSON.
@@ -112,10 +113,7 @@ pub fn compare_frame(
             Tier::Cell => true,
         };
         if !pin_ok {
-            return RunnerSignal::GoldenUntrusted {
-                name: name.into(),
-                tier: tname,
-            };
+            return untrusted();
         }
         Some(bytes)
     } else {
@@ -132,28 +130,28 @@ pub fn compare_frame(
         &sidecar.tol_params,
     ) {
         Ok(v) => match v.status {
-            GateStatus::Pass => RunnerSignal::FrameMatch {
-                name: name.into(),
-                tier: tname,
+            GateStatus::Pass => FrameCompare {
+                signal: RunnerSignal::FrameMatch {
+                    name: name.into(),
+                    tier: tname,
+                },
+                verdict: Some(v),
             },
-            GateStatus::Fail => RunnerSignal::FrameMismatch {
-                name: name.into(),
-                tier: tname,
-                reason: v.reason,
-                changed_cells: Some(v.cell.diff.cells_changed),
+            GateStatus::Fail => FrameCompare {
+                signal: RunnerSignal::FrameMismatch {
+                    name: name.into(),
+                    tier: tname,
+                    reason: v.reason.clone(),
+                    changed_cells: Some(v.cell.diff.cells_changed),
+                },
+                verdict: Some(v),
             },
             // evaluate_tier only yields Pass/Fail (missing/stale resolved above); any other
             // status is refused conservatively as untrusted rather than silently passed.
-            _ => RunnerSignal::GoldenUntrusted {
-                name: name.into(),
-                tier: tname,
-            },
+            _ => untrusted(),
         },
         // A malformed golden/live at compare time is untrusted, never a silent pass.
-        Err(_) => RunnerSignal::GoldenUntrusted {
-            name: name.into(),
-            tier: tname,
-        },
+        Err(_) => untrusted(),
     }
 }
 
@@ -239,7 +237,7 @@ mod tests {
             &current_fp(Tier::Cell),
             &r,
         );
-        assert_eq!(s.kind(), "golden_absent");
+        assert_eq!(s.signal.kind(), "golden_absent");
 
         bless_cell(dir.path(), "demo", &golden);
         // Identical → frame_match.
@@ -251,7 +249,7 @@ mod tests {
             &current_fp(Tier::Cell),
             &r,
         );
-        assert_eq!(s.kind(), "frame_match");
+        assert_eq!(s.signal.kind(), "frame_match");
 
         // One-cell change → frame_mismatch with changed_cells.
         let live = env(b"\x1b[38;2;9;9;9mhellO\x1b[0m", 3, 20);
@@ -263,8 +261,8 @@ mod tests {
             &current_fp(Tier::Cell),
             &r,
         );
-        assert_eq!(s.kind(), "frame_mismatch");
-        if let RunnerSignal::FrameMismatch { changed_cells, .. } = s {
+        assert_eq!(s.signal.kind(), "frame_mismatch");
+        if let RunnerSignal::FrameMismatch { changed_cells, .. } = s.signal {
             assert_eq!(changed_cells, Some(1));
         } else {
             panic!("expected mismatch");
@@ -280,7 +278,7 @@ mod tests {
         let mut stale = current_fp(Tier::Cell);
         stale.raster_font_fingerprint = "different-build".into();
         let s = compare_frame(dir.path(), "t", Tier::Cell, &golden, &stale, &r);
-        assert_eq!(s.kind(), "golden_untrusted");
+        assert_eq!(s.signal.kind(), "golden_untrusted");
     }
 
     #[test]
@@ -300,7 +298,7 @@ mod tests {
             &current_fp(Tier::Cell),
             &r,
         );
-        assert_eq!(s.kind(), "golden_untrusted");
+        assert_eq!(s.signal.kind(), "golden_untrusted");
     }
 
     #[test]
@@ -318,7 +316,9 @@ mod tests {
             let cur = current_fp(tier);
             // Valid baseline → frame_match.
             assert_eq!(
-                compare_frame(dir.path(), "pin", tier, &golden, &cur, &r).kind(),
+                compare_frame(dir.path(), "pin", tier, &golden, &cur, &r)
+                    .signal
+                    .kind(),
                 "frame_match"
             );
             // Swap the committed PNG with a DIFFERENT valid PNG (cell JSON + sidecar
@@ -326,7 +326,9 @@ mod tests {
             let p = pixel_baseline_path(dir.path(), "pin", &os_arch());
             std::fs::write(&p, &other).unwrap();
             assert_eq!(
-                compare_frame(dir.path(), "pin", tier, &golden, &cur, &r).kind(),
+                compare_frame(dir.path(), "pin", tier, &golden, &cur, &r)
+                    .signal
+                    .kind(),
                 "golden_untrusted",
                 "{tier:?}: a swapped baseline PNG must be refused via its content pin"
             );
@@ -354,6 +356,6 @@ mod tests {
         // The blessed sidecar tol is default (strict). is_stale_vs compares tol_params, so a
         // loosened runtime tol makes the golden STALE (refused), never a silent pass.
         let s = compare_frame(dir.path(), "t", Tier::Cell, &golden, &loose, &r);
-        assert_eq!(s.kind(), "golden_untrusted");
+        assert_eq!(s.signal.kind(), "golden_untrusted");
     }
 }

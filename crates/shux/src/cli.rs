@@ -1636,6 +1636,9 @@ above are pane primitives under `shux pane \u{2026}`, not `shux lens \u{2026}`."
 
 #[derive(Subcommand, Debug)]
 #[command(after_help = LENS_LOOP_RECIPE)]
+// A CLI arg enum parsed once per invocation, not stored hot — the `Gate` variant's rich
+// 082 flag set makes it larger than `Run`, but boxing clap-derived fields buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum LensCommand {
     /// Spawn `argv` directly (no shell, ever) in a hidden, quota-bounded
     /// scratch session. Mirrors `lens.run` RPC (lens PRD §8,
@@ -1711,27 +1714,134 @@ pub enum LensCommand {
     /// the pane, captures the canonical frame, and compares it against
     /// `<scenario-dir>/goldens/<name>/` at the cell/pixel/exact tier.
     ///
-    /// This is the runner MECHANICS layer: `--trace` emits the raw runner-signal
-    /// stream (NDJSON). The verdict rollup, `report.json`, and the final exit-code
-    /// contract are owned by a later task; the exit here is provisional.
+    /// `expect_golden` settles the pane, captures the canonical frame, compares it against
+    /// the committed golden at the cell/pixel/exact tier, and rolls the per-frame verdicts
+    /// into a governed CI outcome: a machine-readable `report.json` (`--report`), an ASCII
+    /// stdout summary, and a frozen exit-code contract (0 pass · 1 regression · 2 usage ·
+    /// 3 infra · 5 child died · 6 update refused). A frame with no committed golden is a
+    /// CI-safe regression (`missing_golden`) unless `--on-missing create`. `--update`
+    /// re-blesses failing goldens (refused in CI / on a dirty tree / on a secret hit).
+    #[command(args_conflicts_with_subcommands = true)]
     Gate {
-        /// The scenario TOML file.
+        /// The scenario TOML file (required unless a `review`/`init` subcommand is used).
         #[arg(value_name = "SCENARIO")]
-        scenario: PathBuf,
+        scenario: Option<PathBuf>,
 
         /// Golden directory (default `<scenario-dir>/goldens/<scenario-name>/`).
         #[arg(long, value_name = "DIR")]
         golden_dir: Option<PathBuf>,
 
+        /// Write the machine-readable `report.json` array to PATH, or `-` for stdout
+        /// (stdout then carries ONLY the JSON; the summary moves to stderr).
+        #[arg(long, value_name = "PATH|-")]
+        report: Option<String>,
+
+        /// First-run policy for a frame with no committed golden: `fail` (CI-safe →
+        /// exit 1) or `create` (write a first golden locally; refused in CI).
+        #[arg(long, value_enum, default_value_t = OnMissing::Fail)]
+        on_missing: OnMissing,
+
+        /// Re-bless goldens: `--update` (all failing frames) or `--update <name>` (one
+        /// frame). Refused in CI, on a dirty golden tree, or on a pre-bless secret hit.
+        #[arg(long, value_name = "failing|NAME", num_args = 0..=1, default_missing_value = "failing")]
+        update: Option<String>,
+
+        /// Reason recorded in `BASELINE-APPROVAL.md` when blessing.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+
+        /// Tolerance to record in a freshly-blessed golden sidecar as
+        /// `MAX_CHANNEL_DELTA[,MAX_CHANGED_FRAC]` (bless-only; compare tol always comes
+        /// from the blessed sidecar, never a runtime value).
+        #[arg(long, value_name = "DELTA[,FRAC]", value_parser = parse_tol)]
+        tol: Option<shux_vt::TolParams>,
+
+        /// Directory for scratch evidence (heat PNGs). Default `.shux/out/<scenario>/`.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+
+        /// Retry budget for a flaky frame (parsed + carried into `report.json`; retry
+        /// BEHAVIOUR lands in task 083).
+        #[arg(long, value_name = "N")]
+        retries: Option<u32>,
+
         /// Emit the raw runner-signal NDJSON trace to a path, or `-` for stdout.
         #[arg(long, value_name = "PATH|-")]
         trace: Option<String>,
+
+        #[command(subcommand)]
+        sub: Option<GateSubcommand>,
 
         /// Trailing argv after `--` overrides the scenario `command` (same argv,
         /// different binary — e.g. to point the scenario at a local build).
         #[arg(last = true, num_args = 0.., value_name = "ARGV")]
         argv: Vec<String>,
     },
+}
+
+/// First-run policy for a frame with no committed golden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OnMissing {
+    /// CI-safe: a missing golden is a regression (exit 1). The default.
+    Fail,
+    /// Write a first golden locally (through the approval-gated bless writer). Refused
+    /// in CI so a golden can never be self-minted there.
+    Create,
+}
+
+/// The `lens gate` sub-verbs beyond the default run (insta-style review + init).
+#[derive(Debug, Subcommand)]
+pub enum GateSubcommand {
+    /// insta-style visual review: step through each changed frame and accept (bless),
+    /// reject (leave failing), or skip. Renders before/after + heat inline where the
+    /// terminal supports graphics, else writes PNGs to `--out` and prints paths.
+    Review {
+        /// The scenario TOML file.
+        #[arg(value_name = "SCENARIO")]
+        scenario: PathBuf,
+        /// Golden directory (default `<scenario-dir>/goldens/<scenario-name>/`).
+        #[arg(long, value_name = "DIR")]
+        golden_dir: Option<PathBuf>,
+        /// Directory for review PNGs. Default `.shux/out/<scenario>/`.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+    },
+    /// Scaffold a new scenario `.toml` from a template and (approval-gated) write its
+    /// first goldens. Refused in CI.
+    Init {
+        /// The scenario name (a safe single path component).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Directory to write the scenario `.toml` into. Default the current directory.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+}
+
+/// Parse a bless tolerance `MAX_CHANNEL_DELTA[,MAX_CHANGED_FRAC]` (e.g. `8` or `8,0.01`).
+fn parse_tol(s: &str) -> Result<shux_vt::TolParams, String> {
+    let (delta, frac) = match s.split_once(',') {
+        Some((d, f)) => (d.trim(), Some(f.trim())),
+        None => (s.trim(), None),
+    };
+    let max_channel_delta: u16 = delta
+        .parse()
+        .map_err(|_| format!("invalid --tol delta {delta:?} (expected 0..=255)"))?;
+    let max_changed_frac: f64 = match frac {
+        Some(f) => f
+            .parse()
+            .map_err(|_| format!("invalid --tol frac {f:?} (expected 0.0..=1.0)"))?,
+        None => 0.0,
+    };
+    if !(0.0..=1.0).contains(&max_changed_frac) {
+        return Err(format!(
+            "--tol frac {max_changed_frac} out of range 0.0..=1.0"
+        ));
+    }
+    Ok(shux_vt::TolParams {
+        max_channel_delta,
+        max_changed_frac,
+    })
 }
 
 /// Parse a `COLSxROWS` size flag (e.g. `80x24`) into `(cols, rows)`. Shape

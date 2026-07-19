@@ -6948,24 +6948,50 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 cli::LensCommand::Gate {
                     scenario,
                     golden_dir,
+                    report,
+                    on_missing,
+                    update,
+                    reason,
+                    tol,
+                    out,
+                    retries,
                     trace,
+                    sub,
                     argv,
                 },
         }) => {
-            let trace = trace.map(|t| {
-                if t == "-" {
-                    gate::runner::TraceTarget::Stdout
-                } else {
-                    gate::runner::TraceTarget::Path(std::path::PathBuf::from(t))
+            let code = match sub {
+                Some(cli::GateSubcommand::Review {
+                    scenario,
+                    golden_dir,
+                    out,
+                }) => gate::review::run_review(&socket_path, scenario, golden_dir, out).await?,
+                Some(cli::GateSubcommand::Init { name, dir }) => {
+                    gate::init::run_init(&socket_path, name, dir).await?
                 }
-            });
-            let opts = gate::runner::GateOptions {
-                scenario_path: scenario,
-                argv_override: (!argv.is_empty()).then_some(argv),
-                golden_dir,
-                trace,
+                None => {
+                    let scenario_path = scenario.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "lens gate: a SCENARIO is required (or use `review`/`init`)"
+                        )
+                    })?;
+                    let opts = gate::driver::GateRunOptions {
+                        scenario_path,
+                        golden_dir,
+                        report,
+                        on_missing,
+                        update,
+                        reason,
+                        tol,
+                        out,
+                        retries,
+                        trace,
+                        argv,
+                        format: args.format,
+                    };
+                    gate::driver::run_gate(&socket_path, opts).await?
+                }
             };
-            let code = gate::runner::handle_lens_gate(&socket_path, opts).await?;
             std::process::exit(code);
         }
 

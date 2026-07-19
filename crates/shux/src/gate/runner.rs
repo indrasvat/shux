@@ -8,12 +8,12 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use shux_raster::Rasterizer;
 use shux_vt::{
     FINGERPRINT_SCHEMA, Fingerprint, FrameEnvelope, MaskSet, RENDERER_FORMAT_VERSION,
-    SCHEMA_VERSION, Tier, TolParams, mask_hash, unicode_width_version,
+    SCHEMA_VERSION, Tier, TolParams, capture_sha256, mask_hash, unicode_width_version,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, Notify};
@@ -21,7 +21,8 @@ use tokio::sync::{Mutex, Notify};
 use super::compare::compare_frame;
 use super::env_plan::{SandboxDirs, build_env_plan, cmd_env_hash, scenario_hash};
 use super::keys;
-use super::scenario::{self, MaskSpec, Scenario, Step};
+use super::outcome::{FrameKind, FrameOutcome, RunOutcome, TerminalOutcome};
+use super::scenario::{MaskSpec, Scenario, Step};
 use super::signal::{RunnerSignal, TimeoutClass};
 use crate::cli::{RpcClientError, rpc_call};
 
@@ -29,6 +30,12 @@ const FONT_SIZE: f32 = 16.0;
 /// The scratch quota (`lens_scratch::SCRATCH_QUOTA`) surfaced as a raw signal.
 const SCRATCH_QUOTA: usize = 16;
 const RESOURCE_EXHAUSTED: i64 = -32012;
+/// How long, after the final step of a completed run, to watch for an unexpected child
+/// exit (adv 082 Agent D: a fixed 500 ms missed a crash ~0.8 s after the final frame,
+/// false-passing a crashing TUI). Bounded by the remaining scenario deadline. This is a
+/// heuristic window; a robust liveness monitor (catch any exit before the deadline without
+/// penalizing a held-forever frame) is task 083's settle-hardening domain.
+const POST_COMPARE_GRACE_MS: u64 = 2000;
 
 /// Where the NDJSON trace goes (design D3). `None` = no trace emitted.
 pub enum TraceTarget {
@@ -36,14 +43,14 @@ pub enum TraceTarget {
     Path(PathBuf),
 }
 
-/// Options resolved from the CLI verb.
-pub struct GateOptions {
-    pub scenario_path: PathBuf,
-    /// `-- <argv>` override of the scenario `command`.
-    pub argv_override: Option<Vec<String>>,
-    /// Golden directory; defaults to `<scenario-dir>/goldens/<scenario-name>/`.
-    pub golden_dir: Option<PathBuf>,
-    pub trace: Option<TraceTarget>,
+/// Emit a single `parse_error` to the trace target (081 contract: a malformed scenario
+/// still leaves a greppable trace). 082's driver calls this before it has a `Scenario`.
+pub fn emit_parse_error_trace(trace_target: Option<TraceTarget>, message: &str) {
+    if let Ok(mut trace) = Trace::open(trace_target) {
+        trace.emit(RunnerSignal::ParseError {
+            message: message.to_string(),
+        });
+    }
 }
 
 /// The NDJSON trace writer (design D3). Line-buffered + flushed so a crash still leaves
@@ -178,34 +185,6 @@ enum StepFlow {
     Stop,
 }
 
-/// Provisional exit classes (design D3 — 082 installs the frozen map). Not the frozen
-/// `GateStatus::exit_code`; just enough that 081 never greens a real failure in CI.
-fn provisional_exit(signals: &[RunnerSignal]) -> i32 {
-    let mut had_failure = false;
-    let mut infra = false;
-    for s in signals {
-        match s {
-            RunnerSignal::ParseError { .. } => return 2,
-            RunnerSignal::QuotaExceeded { .. } => infra = true,
-            RunnerSignal::FrameMismatch { .. }
-            | RunnerSignal::GoldenAbsent { .. }
-            | RunnerSignal::GoldenUntrusted { .. }
-            | RunnerSignal::ChildExit { .. }
-            | RunnerSignal::Timeout { .. }
-            | RunnerSignal::AssertFailed { .. }
-            | RunnerSignal::NoVisualCheck => had_failure = true,
-            _ => {}
-        }
-    }
-    if infra {
-        3
-    } else if had_failure {
-        1
-    } else {
-        0
-    }
-}
-
 /// Build the freshly-computed fingerprint for THIS build/scenario at `tier`, with the
 /// real `scenario_hash`/`cmd_env_hash` (design D5). The compare uses this for staleness.
 fn current_fp(tier: Tier, masks: &MaskSet, scenario_hash: &str, cmd_env_hash: &str) -> Fingerprint {
@@ -236,7 +215,8 @@ fn build_mask_set(masks: &[MaskSpec]) -> MaskSet {
     m
 }
 
-fn default_golden_dir(scenario_path: &Path, scenario: &Scenario) -> PathBuf {
+/// The default golden directory for a scenario: `<scenario-dir>/goldens/<scenario-name>/`.
+pub fn default_golden_dir(scenario_path: &Path, scenario: &Scenario) -> PathBuf {
     scenario_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -270,40 +250,97 @@ fn make_sandbox(root: &Path) -> std::io::Result<SandboxDirs> {
     Ok(sb)
 }
 
-/// The CLI entry (`shux lens gate`). Parses, drives, traces raw signals, returns a
-/// provisional exit code.
-pub async fn handle_lens_gate(socket_path: &Path, opts: GateOptions) -> anyhow::Result<i32> {
-    // 1. Parse (a malformed scenario is a raw parse_error → provisional exit 2).
-    let scenario = match scenario::load(&opts.scenario_path) {
-        Ok(s) => s,
-        Err(e) => {
-            let mut trace = Trace::open(opts.trace)?;
-            trace.emit(RunnerSignal::ParseError {
-                message: e.to_string(),
-            });
-            eprintln!("lens gate: {e}");
-            return Ok(2);
+/// Assemble a [`RunOutcome`] from the accumulated drive state (design D1). Timing is
+/// best-effort wall clock; provenance is the host + bundled-font identity goldens pin.
+fn finish(
+    scenario: &Scenario,
+    started_at_ms: u128,
+    start: Instant,
+    frames: Vec<FrameOutcome>,
+    terminal: Option<TerminalOutcome>,
+    has_visual: bool,
+) -> RunOutcome {
+    RunOutcome {
+        scenario_name: scenario.name.clone(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        font_chain_sha256: Some(shux_raster::builtin_font_fingerprint(FONT_SIZE)),
+        font_size_px: FONT_SIZE as u16,
+        started_at_ms,
+        duration_ms: start.elapsed().as_millis() as u64,
+        frames,
+        terminal,
+        has_visual_check: has_visual,
+    }
+}
+
+/// Derive the scenario-level terminal disposition from the ordered signal list (design
+/// D1 — in-memory structured data, NOT trace-text re-parsing). The drive loop breaks on
+/// the FIRST fatal signal, so the first match here is the terminal cause. Pre-loop setup
+/// failures (quota / daemon spawn) set the terminal EXPLICITLY and never reach this.
+fn derive_terminal(signals: &[RunnerSignal]) -> Option<TerminalOutcome> {
+    for s in signals {
+        match s {
+            RunnerSignal::ChildExit { code } => {
+                return Some(TerminalOutcome::ChildExit { code: *code });
+            }
+            RunnerSignal::Timeout {
+                class,
+                action,
+                step_index,
+                ..
+            } => {
+                return Some(match class {
+                    TimeoutClass::Step => TerminalOutcome::StepTimeout {
+                        action: action.clone().unwrap_or_default(),
+                        step_index: step_index.unwrap_or(0),
+                    },
+                    TimeoutClass::Scenario => TerminalOutcome::ScenarioDeadline {
+                        step_index: step_index.unwrap_or(0),
+                    },
+                    TimeoutClass::FrameSettle | TimeoutClass::NeverStabilized => {
+                        TerminalOutcome::SettleNeverStable {
+                            action: action.clone().unwrap_or_default(),
+                        }
+                    }
+                });
+            }
+            RunnerSignal::ParseError { message } => {
+                return Some(TerminalOutcome::ScenarioError {
+                    message: message.clone(),
+                });
+            }
+            _ => {}
         }
-    };
+    }
+    None
+}
 
-    let argv = opts
-        .argv_override
-        .clone()
-        .unwrap_or_else(|| scenario.command.clone());
-    let golden_dir = opts
-        .golden_dir
-        .clone()
-        .unwrap_or_else(|| default_golden_dir(&opts.scenario_path, &scenario));
+/// Drive a parsed scenario against a hidden scratch TUI, emit the raw-signal trace, and
+/// return the STRUCTURED outcome (design D1). Owns 081 MECHANICS only — no verdict, no
+/// stdout, no exit code. 082's `verdict` layer rolls the outcome into `report.json`.
+pub async fn drive_scenario(
+    socket_path: &Path,
+    scenario: &Scenario,
+    argv: &[String],
+    golden_dir: &Path,
+    trace_target: Option<TraceTarget>,
+) -> anyhow::Result<RunOutcome> {
+    let start = Instant::now();
+    let started_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
 
-    // 2. Sandbox + deterministic env plan + provenance hashes.
+    // Sandbox + deterministic env plan + provenance hashes.
     let sandbox_root = tempfile::tempdir()?;
     let sandbox = make_sandbox(sandbox_root.path())?;
-    let plan = build_env_plan(&scenario, &sandbox, &|k| std::env::var(k).ok());
-    let sc_hash = scenario_hash(&scenario);
-    let ce_hash = cmd_env_hash(&plan, &sandbox, &argv, &scenario.terminal);
+    let plan = build_env_plan(scenario, &sandbox, &|k| std::env::var(k).ok());
+    let sc_hash = scenario_hash(scenario);
+    let ce_hash = cmd_env_hash(&plan, &sandbox, argv, &scenario.terminal);
     let rasterizer = Rasterizer::new(FONT_SIZE)?;
 
-    let mut trace = Trace::open(opts.trace)?;
+    let mut trace = Trace::open(trace_target)?;
     trace.emit(RunnerSignal::ScenarioStart {
         scenario: scenario.name.clone(),
         scenario_hash: sc_hash.clone(),
@@ -321,7 +358,9 @@ pub async fn handle_lens_gate(socket_path: &Path, opts: GateOptions) -> anyhow::
         trace.emit(RunnerSignal::NoVisualCheck);
     }
 
-    // 3. Pre-spawn cursor (design D7): head seq BEFORE lens.run.
+    let mut frames: Vec<FrameOutcome> = Vec::new();
+
+    // Pre-spawn cursor (design D7): head seq BEFORE lens.run.
     let mut mstream = crate::client::ensure_daemon_running_at(socket_path).await?;
     let from_seq = rpc_call(
         &mut mstream,
@@ -364,13 +403,31 @@ pub async fn handle_lens_gate(socket_path: &Path, opts: GateOptions) -> anyhow::
             trace.emit(RunnerSignal::QuotaExceeded {
                 limit: SCRATCH_QUOTA,
             });
-            return Ok(provisional_exit(&trace.signals));
+            return Ok(finish(
+                scenario,
+                started_at_ms,
+                start,
+                frames,
+                Some(TerminalOutcome::QuotaExceeded {
+                    limit: SCRATCH_QUOTA,
+                }),
+                has_visual,
+            ));
         }
         Err(e) => {
             trace.emit(RunnerSignal::ParseError {
                 message: format!("lens.run failed: {e}"),
             });
-            return Ok(3);
+            return Ok(finish(
+                scenario,
+                started_at_ms,
+                start,
+                frames,
+                Some(TerminalOutcome::Infra {
+                    message: format!("lens.run failed: {e}"),
+                }),
+                has_visual,
+            ));
         }
     };
 
@@ -423,12 +480,13 @@ pub async fn handle_lens_gate(socket_path: &Path, opts: GateOptions) -> anyhow::
                 idx,
                 step,
                 &pane_id,
-                &golden_dir,
+                golden_dir,
                 &sc_hash,
                 &ce_hash,
                 &rasterizer,
                 &mut trace,
                 &mut child_consumed,
+                &mut frames,
             ),
         )
         .await
@@ -447,13 +505,15 @@ pub async fn handle_lens_gate(socket_path: &Path, opts: GateOptions) -> anyhow::
     }
 
     // A child that exits UNEXPECTEDLY around the final step (e.g. a terminal
-    // `expect_golden` whose child paints its golden, settles, then crashes shortly after
-    // the compare) must still surface — otherwise a crashing TUI whose last frame matches
-    // its golden false-passes (adv MAJOR 2). Only when the run COMPLETED normally (not
-    // stopped by a terminal signal) and nothing consumed/reported an exit: give a bounded
-    // grace, capped by the remaining deadline, for a pending exit. A child still alive at
-    // the end (an interactive TUI blocked on input) simply times out the grace → no
-    // signal, correct.
+    // `expect_golden` whose child paints its golden, settles, then crashes after the
+    // compare) must still surface — otherwise a crashing TUI whose last frame matches its
+    // golden false-passes (adv MAJOR 2 / adv-082 Agent D). Only when the run COMPLETED
+    // normally (not stopped by a terminal signal) and nothing consumed/reported an exit:
+    // watch for a pending exit for `POST_COMPARE_GRACE_MS`, capped by the remaining
+    // deadline. A child still alive at the end (an interactive TUI blocked on input) times
+    // out the grace → no signal, correct. RESIDUAL (task 083 settle-hardening): a crash
+    // beyond this window while the child is idle is still missed; the scenario deadline is
+    // the ultimate bound.
     let exit_reported = trace.signals.iter().any(|s| {
         matches!(
             s,
@@ -461,10 +521,18 @@ pub async fn handle_lens_gate(socket_path: &Path, opts: GateOptions) -> anyhow::
         )
     });
     if !stopped && !child_consumed && !exit_reported {
-        let grace =
-            Duration::from_millis(500).min(deadline.saturating_duration_since(Instant::now()));
+        let grace = Duration::from_millis(POST_COMPARE_GRACE_MS)
+            .min(deadline.saturating_duration_since(Instant::now()));
         if let Ok(code) = tokio::time::timeout(grace, monitor.wait()).await {
-            trace.emit(RunnerSignal::ChildExit { code });
+            // A CLEAN exit-0 AFTER a successful compare is a healthy shutdown, not a crash —
+            // the frame was already held long enough to capture + compare, so a graceful
+            // exit is not a `child_error` (impl-review #6). Only an ABNORMAL exit (a
+            // non-zero code or a signal-kill = `None`) is surfaced. NB the pre-step /
+            // settle exit checks still treat ANY exit as fatal (design D7: the frame must be
+            // HELD until the compare) — this leniency is post-compare only.
+            if code != Some(0) {
+                trace.emit(RunnerSignal::ChildExit { code });
+            }
         }
     }
 
@@ -480,21 +548,17 @@ pub async fn handle_lens_gate(socket_path: &Path, opts: GateOptions) -> anyhow::
     }
     drop(monitor);
 
-    // A terse per-kind tally to STDERR only (diagnostic). stdout stays reserved for the
-    // 082 summary/report contract (design D3).
-    summarize_to_stderr(&scenario.name, &trace.signals);
-    Ok(provisional_exit(&trace.signals))
-}
-
-/// A one-line, per-signal-kind tally to stderr (not the 082 stdout contract).
-fn summarize_to_stderr(scenario: &str, signals: &[RunnerSignal]) {
-    use std::collections::BTreeMap;
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for s in signals {
-        *counts.entry(s.kind()).or_default() += 1;
-    }
-    let tally: Vec<String> = counts.iter().map(|(k, n)| format!("{k}={n}")).collect();
-    eprintln!("lens gate [{scenario}]: {}", tally.join(" "));
+    // The run completed (or stopped on a terminal signal). Derive the scenario-level
+    // disposition from the ordered signals and hand 082 the structured outcome.
+    let terminal = derive_terminal(&trace.signals);
+    Ok(finish(
+        scenario,
+        started_at_ms,
+        start,
+        frames,
+        terminal,
+        has_visual,
+    ))
 }
 
 /// Drive one step. Blocking waits race the exit monitor so a crash short-circuits
@@ -512,6 +576,7 @@ async fn drive_step(
     rasterizer: &Rasterizer,
     trace: &mut Trace,
     child_consumed: &mut bool,
+    frames: &mut Vec<FrameOutcome>,
 ) -> StepFlow {
     match step {
         Step::WaitForText {
@@ -645,6 +710,7 @@ async fn drive_step(
             quiet_ms,
             timeout_ms,
             masks,
+            xfail,
             ..
         } => {
             // Settle FIRST — a frame that never quiets is `frame_settle_timeout`.
@@ -702,9 +768,23 @@ async fn drive_step(
                         Ok(live) => {
                             let mset = build_mask_set(masks);
                             let fp = current_fp(*tier, &mset, sc_hash, ce_hash);
-                            let sig =
-                                compare_frame(golden_dir, name, *tier, &live, &fp, rasterizer);
-                            trace.emit(sig);
+                            let fc = compare_frame(golden_dir, name, *tier, &live, &fp, rasterizer);
+                            // Record the STRUCTURED per-frame outcome (design D1): the rich
+                            // verdict + the live capture the trace-only signal loses, plus the
+                            // frame's declared xfail (082 governs it).
+                            frames.push(FrameOutcome {
+                                name: name.clone(),
+                                tier: *tier,
+                                kind: frame_kind(&fc.signal),
+                                reason: frame_reason(&fc.signal),
+                                verdict: fc.verdict,
+                                golden_json: format!("{name}.capture.json"),
+                                live_capture_json: live.to_canonical_json(),
+                                live_capture_sha256: capture_sha256(&live),
+                                live_fingerprint: fp,
+                                xfail: xfail.clone(),
+                            });
+                            trace.emit(fc.signal);
                             StepFlow::Continue
                         }
                         Err(e) => {
@@ -865,6 +945,25 @@ fn envelope_from_glance(cells: &serde_json::Value) -> Result<FrameEnvelope, Stri
     FrameEnvelope::from_canonical_json(&text).map_err(|e| format!("{e:?}"))
 }
 
+/// Map a compare signal to the structured frame disposition (design D1). `compare_frame`
+/// only ever yields the four compare signals; any other is refused conservatively.
+fn frame_kind(signal: &RunnerSignal) -> FrameKind {
+    match signal {
+        RunnerSignal::FrameMatch { .. } => FrameKind::Match,
+        RunnerSignal::FrameMismatch { .. } => FrameKind::Mismatch,
+        RunnerSignal::GoldenAbsent { .. } => FrameKind::GoldenAbsent,
+        _ => FrameKind::GoldenUntrusted,
+    }
+}
+
+/// The diagnostic reason a mismatch carries (never a status).
+fn frame_reason(signal: &RunnerSignal) -> Option<String> {
+    match signal {
+        RunnerSignal::FrameMismatch { reason, .. } => reason.clone(),
+        _ => None,
+    }
+}
+
 /// A bounded, single-line excerpt for a failed assert (design D3 privacy).
 fn bounded_excerpt(text: &str, max: usize) -> String {
     let flat: String = text
@@ -878,43 +977,38 @@ fn bounded_excerpt(text: &str, max: usize) -> String {
 mod tests {
     use super::super::signal::RunnerSignal;
     use super::*;
+    use crate::gate::scenario;
 
     #[test]
-    fn provisional_exit_maps() {
-        assert_eq!(provisional_exit(&[RunnerSignal::NoVisualCheck]), 1);
-        assert_eq!(
-            provisional_exit(&[RunnerSignal::FrameMatch {
-                name: "f".into(),
-                tier: "cell".into()
+    fn derive_terminal_maps_signals() {
+        // 082's driver relies on this in-memory classification (not trace re-parsing).
+        assert!(matches!(
+            derive_terminal(&[RunnerSignal::ChildExit { code: Some(7) }]),
+            Some(TerminalOutcome::ChildExit { code: Some(7) })
+        ));
+        assert!(matches!(
+            derive_terminal(&[RunnerSignal::Timeout {
+                class: TimeoutClass::FrameSettle,
+                step_index: Some(1),
+                action: Some("expect_golden".into()),
+                name: None,
+                elapsed_ms: None,
+                budget_ms: None,
             }]),
-            0
-        );
-        assert_eq!(
-            provisional_exit(&[RunnerSignal::ParseError {
-                message: "x".into()
+            Some(TerminalOutcome::SettleNeverStable { .. })
+        ));
+        assert!(matches!(
+            derive_terminal(&[RunnerSignal::Timeout {
+                class: TimeoutClass::Scenario,
+                step_index: Some(2),
+                action: None,
+                name: None,
+                elapsed_ms: None,
+                budget_ms: None,
             }]),
-            2
-        );
-        assert_eq!(
-            provisional_exit(&[RunnerSignal::QuotaExceeded { limit: 16 }]),
-            3
-        );
-        // A regression among greens still fails.
-        assert_eq!(
-            provisional_exit(&[
-                RunnerSignal::FrameMatch {
-                    name: "a".into(),
-                    tier: "cell".into()
-                },
-                RunnerSignal::FrameMismatch {
-                    name: "b".into(),
-                    tier: "cell".into(),
-                    reason: None,
-                    changed_cells: Some(1)
-                },
-            ]),
-            1
-        );
+            Some(TerminalOutcome::ScenarioDeadline { step_index: 2 })
+        ));
+        assert!(derive_terminal(&[RunnerSignal::NoVisualCheck]).is_none());
     }
 
     #[test]

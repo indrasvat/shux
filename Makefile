@@ -449,6 +449,11 @@ test-lens-gate-run: ## Run the task-081 scenario-runner suite (drives real fixtu
 	@echo "$(COLOR_BLUE)▶ Running lens-gate scenario-runner suite (task 081)...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test lens_gate_run
 
+.PHONY: test-lens-gate-verdict
+test-lens-gate-verdict: ## Run the task-082 verdict/report/xfail/bless/init suite (drives `shux lens gate` end-to-end) serially under the leak guard
+	@echo "$(COLOR_BLUE)▶ Running lens-gate verdict suite (task 082)...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test lens_gate_verdict
+
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"

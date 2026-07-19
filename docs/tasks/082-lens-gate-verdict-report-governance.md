@@ -1,6 +1,6 @@
 # Task 082: lens gate — verdict, report.json, xfail governance, bless
 
-**Status:** Not Started
+**Status:** Done
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 081
@@ -108,10 +108,30 @@ the xfail metadata contract + expiry semantics, the `--update` guard set, and th
 
 ## Definition of Done
 
-- [ ] DootSabha design review incorporated before coding.
-- [ ] Red tests captured before implementation.
-- [ ] L1/L2/L3 tests pass.
-- [ ] `make check` + `make test-lens-gate` pass.
-- [ ] `shux-tui-qa` `VERDICT: PASS`; scratch evidence on the PR.
-- [ ] Implementation-diff DootSabha convergence review clean or addressed.
-- [ ] `docs/PROGRESS.md` + this task updated; learnings appended.
+- [x] DootSabha design review incorporated before coding. (verdict REVISE → all pin-downs
+      folded; `.shux/qa/082-*/dootsabha-design.json`.)
+- [x] Red tests captured before implementation. (Frozen RED `lens_gate_contract` lane +
+      per-module unit tests written test-first.)
+- [x] L1/L2/L3 tests pass. (105 gate unit + `lens_gate_verdict` 17 daemon-backed + contract 5/5.)
+- [x] `make check` + `make test-lens-gate-verdict` pass. (Full workspace green; clippy+fmt clean.)
+- [x] `shux-tui-qa` `VERDICT: PASS`; scratch evidence under `.shux/out/082-qa/` (gitignored).
+- [x] Implementation-diff DootSabha convergence review clean or addressed.
+      (`.shux/qa/082-*/dootsabha-impl.json`; #6 clean-exit fix folded, rest documented.)
+- [x] `docs/PROGRESS.md` + this task updated; learnings appended.
+
+## Notes
+
+- **Adversarial review (4 agents, real system):** fixed a BLOCKER delayed-post-compare-crash
+  false-pass (grace `500ms → min(deadline, 2s)` + abnormal-exit-only), a MAJOR secret-scanner
+  blind spot (scanned serialized JSON not reassembled visible text → wrapped/styled secret
+  slipped through), a MAJOR note secret-leak + summary `|`/ANSI/non-ASCII injection, a MAJOR
+  pixel-only-diff `max_channel_delta` loss, non-transactional bless audit, and several nits —
+  each pinned with a regression test.
+- **Divergence (impl-review #1):** on a MATCH, xfail metadata validation is skipped and the
+  frame is `xpass` regardless of expiry/accountability. Kept per the DESIGN council's rule
+  (accurate primary signal "remove the obsolete xfail"; `xpass` is exit 1 so no regression
+  escapes). Documented at `verdict.rs` frame_status. Flag for future review if consistency is
+  preferred over the match-path signal.
+- **Residual (→ task 083 settle-hardening):** the post-compare crash-watch is a bounded 2s
+  grace; a crash beyond it while the child is idle is still missed. Robust liveness monitoring
+  is 083's domain; the scenario deadline is the ultimate bound.

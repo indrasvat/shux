@@ -487,7 +487,9 @@ tier = "cell"
     // No visual compare happened.
     assert!(!run.has("frame_match"));
     assert!(!run.has("frame_mismatch"));
-    assert_eq!(run.exit, 1, "child_exit is provisionally non-green");
+    // 082 installed the frozen exit map: an unexpected child_exit → child_error → exit 5
+    // (distinct from a visual regression's exit 1). GATE-TEST-CHANGE.
+    assert_eq!(run.exit, 5, "child_exit maps to child_error (exit 5)");
     assert_no_scratch_leak(&h);
 }
 
@@ -606,7 +608,14 @@ timeout_ms = 5000
         )
     });
     assert_eq!(ce["code"].as_i64(), Some(7));
-    assert_eq!(run.exit, 1, "a trailing crash is never provisionally green");
+    // 082 frozen rollup: this frame has no committed golden (missing_golden, a regression,
+    // exit 1); the trailing crash is a child_error (exit 5, an operational error). The
+    // worst-frame rollup keeps the REGRESSION visible (M2 no-masking) → exit 1, and the
+    // child_exit signal is still surfaced (asserted above). GATE-TEST-CHANGE.
+    assert_eq!(
+        run.exit, 1,
+        "a surfaced regression is never masked by the trailing crash"
+    );
     assert_no_scratch_leak(&h);
 }
 

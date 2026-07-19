@@ -137,3 +137,11 @@ test = false
 name = "lens_gate_run"
 path = "tests/lens_gate_run.rs"
 test = false
+
+# Task 082 — verdict / report.json / summary / xfail / bless / init. Daemon-backed L1/L2/L3
+# suite; same `test = false` regime; run via `make test-lens-gate-verdict`. Frozen path
+# (GATE-TEST-CHANGE: trailer).
+[[test]]
+name = "lens_gate_verdict"
+path = "tests/lens_gate_verdict.rs"
+test = false
