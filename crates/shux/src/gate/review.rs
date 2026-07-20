@@ -87,6 +87,7 @@ pub async fn run_review(
     let rasterizer = Rasterizer::new(FONT_SIZE)?;
     let stdin = std::io::stdin();
     let mut remaining_failing = 0usize;
+    let mut accepted: Vec<String> = Vec::new();
 
     for (n, &i) in changed.iter().enumerate() {
         let f = &outcome.frames[i];
@@ -119,23 +120,11 @@ pub async fn run_review(
         }
         match line.trim().to_ascii_lowercase().as_str() {
             "a" | "accept" => {
-                let bopts = review_opts(&scenario_path, &golden_dir_opt, &out_opt);
-                match bless::run_update(
-                    &scenario,
-                    &outcome,
-                    &reports,
-                    &golden_dir,
-                    &f.name,
-                    &bopts,
-                )? {
-                    bless::BlessOutcome::Blessed(_) => {
-                        println!("  {}", style::success("accepted — golden blessed"));
-                    }
-                    bless::BlessOutcome::Refused(reason) => {
-                        println!("  {}", style::error(format!("refused: {reason}")));
-                        remaining_failing += 1;
-                    }
-                }
+                // Queued, not written now. Blessing each accept immediately dirtied the
+                // golden tree, so the dirty-tree guard refused every accept after the
+                // first and a session could only ever accept one frame.
+                accepted.push(f.name.clone());
+                println!("  {}", style::success("accepted — queued"));
             }
             "r" | "reject" => {
                 println!("  {}", style::muted("rejected — frame stays failing"));
@@ -144,6 +133,29 @@ pub async fn run_review(
             _ => {
                 println!("  {}", style::muted("skipped"));
                 remaining_failing += 1;
+            }
+        }
+    }
+
+    // One guarded write for the whole session: the guard set runs once, against the state
+    // the review started from, and produces a single approval entry + manifest.
+    if !accepted.is_empty() {
+        let bopts = review_opts(&scenario_path, &golden_dir_opt, &out_opt);
+        match bless::run_update_many(
+            &scenario,
+            &outcome,
+            &reports,
+            &golden_dir,
+            &accepted,
+            &bopts,
+        )? {
+            bless::BlessOutcome::Blessed(m) => println!(
+                "{}",
+                style::success(format!("blessed {} golden(s)", m.entries.len()))
+            ),
+            bless::BlessOutcome::Refused(reason) => {
+                println!("{}", style::error(format!("refused: {reason}")));
+                remaining_failing += accepted.len();
             }
         }
     }

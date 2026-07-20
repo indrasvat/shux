@@ -12,11 +12,42 @@
 
 : "${REPO_ROOT:="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"}"
 
+# A process's working directory, or empty when it cannot be determined.
+#
+# `/proc` first (Linux, no external tool — CI runners do not necessarily install `lsof`),
+# then `lsof` (macOS, where it is always present).
+pid_cwd() {
+  local pid="$1" cwd=""
+  if [ -r "/proc/${pid}/cwd" ]; then
+    cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+  elif command -v lsof >/dev/null 2>&1; then
+    cwd="$(lsof -a -p "${pid}" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+  fi
+  printf '%s' "${cwd}"
+}
+
 # True when PID's working directory is inside this repository.
+#
+# FAILS CLOSED. If the cwd cannot be determined at all — no `/proc`, no `lsof` — the pid is
+# treated as a candidate rather than skipped. Skipping made the guard emit NOTHING on such a
+# host, so every leak passed silently (codex review of PR #95): a guard that cannot attribute
+# must over-report, never under-report. A one-shot warning says why.
 pid_cwd_in_repo() {
   local pid="$1" cwd
-  cwd="$(lsof -a -p "${pid}" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
-  [ -n "${cwd}" ] || return 1
+  cwd="$(pid_cwd "${pid}")"
+  if [ -z "${cwd}" ]; then
+    if [ ! -r "/proc/self/cwd" ] && ! command -v lsof >/dev/null 2>&1; then
+      if [ -z "${_PROC_SCOPE_WARNED:-}" ]; then
+        echo "⚠ leak guard: neither /proc nor lsof is available; cannot attribute processes" >&2
+        echo "  to this repository, so ALL orphan candidates are reported (fail closed)." >&2
+        _PROC_SCOPE_WARNED=1
+      fi
+      return 0
+    fi
+    # The tool exists but told us nothing — the process probably exited between listing
+    # and probing. Not ours to report.
+    return 1
+  fi
   case "${cwd}" in
     "${REPO_ROOT}" | "${REPO_ROOT}"/*) return 0 ;;
     *) return 1 ;;

@@ -94,6 +94,11 @@ impl TolParams {
 /// derived `f64 == f64` reports `NaN != NaN` (task-080 adversarial: false-stale forever).
 /// `a == b` already unifies `-0.0`/`0.0` and all finite values; the `|| both NaN` arm adds
 /// the reflexive `NaN` case without regressing `-0.0`.
+/// True when `t` is the default (unspecified) tolerance — see [`Fingerprint::is_stale_vs`].
+fn tol_params_is_default(t: &TolParams) -> bool {
+    tol_params_same(t, &TolParams::default())
+}
+
 fn tol_params_same(a: &TolParams, b: &TolParams) -> bool {
     a.max_channel_delta == b.max_channel_delta
         && (a.max_changed_frac == b.max_changed_frac
@@ -164,7 +169,15 @@ impl Fingerprint {
             || self.raster_font_fingerprint != current.raster_font_fingerprint
             || self.unicode_width_ver != current.unicode_width_ver
             || self.tol != current.tol
-            || !tol_params_same(&self.tol_params, &current.tol_params)
+            // Tolerance: `--tol` is BLESS-only, so an ordinary run computes
+            // `TolParams::default()` and the sidecar is authoritative. Comparing a default
+            // runtime tol against a blessed non-default one made every `--tol` golden
+            // `stale_golden` on the very next unchanged run — a baseline CI could never
+            // trust (codex review, PR #95; reproduced). Only an EXPLICIT runtime tolerance
+            // is compared, which preserves the task-080 guard it exists for: a loosened
+            // runtime tol must make the golden stale, never silently pass a regression.
+            || (!tol_params_is_default(&current.tol_params)
+                && !tol_params_same(&self.tol_params, &current.tol_params))
             || self.mask_hash != current.mask_hash
             || self.platform != current.platform
     }

@@ -69,6 +69,34 @@ pub fn run_update(
     write_targets(scenario, outcome, golden_dir, &targets, opts)
 }
 
+/// Re-bless a SET of frames in one guarded write (used by `gate review`).
+///
+/// `gate review` blessed each accepted frame with its own `run_update`, so the first accept
+/// dirtied the golden tree and every later accept was refused by the dirty-tree guard — an
+/// interactive session could only ever accept one frame (codex review, PR #95). Collecting
+/// the accepted names and writing them together runs the guard set ONCE, against the state
+/// the session started from, and produces one approval entry and one manifest for the review.
+pub fn run_update_many(
+    scenario: &Scenario,
+    outcome: &RunOutcome,
+    reports: &[ScenarioReport],
+    golden_dir: &Path,
+    names: &[String],
+    opts: &GateRunOptions,
+) -> anyhow::Result<BlessOutcome> {
+    let statuses = frame_statuses(reports);
+    let mut targets = Vec::with_capacity(names.len());
+    for name in names {
+        match select_targets(outcome, &statuses, name) {
+            Ok(mut idx) => targets.append(&mut idx),
+            Err(reason) => return Ok(BlessOutcome::Refused(reason)),
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    write_targets(scenario, outcome, golden_dir, &targets, opts)
+}
+
 /// Write first goldens for every `missing_golden` frame (`--on-missing create`).
 pub fn create_missing(
     scenario: &Scenario,
@@ -480,11 +508,22 @@ fn git_tree_is_dirty(golden_dir: &Path) -> bool {
             None => return false,
         }
     }
+    // The pathspec MUST be absolute. `git -C <anchor>` resolves a relative pathspec against
+    // ANCHOR, and the anchor is the golden dir itself whenever it exists — so a relative
+    // `--golden-dir goldens/foo` asked git about `goldens/foo/goldens/foo`, matched nothing,
+    // and reported CLEAN. `--update` then overwrote uncommitted goldens with the dirty-tree
+    // guard silently bypassed (codex review, PR #95; reproduced).
+    let abs = golden_dir
+        .canonicalize()
+        .unwrap_or_else(|_| match std::env::current_dir() {
+            Ok(cwd) if golden_dir.is_relative() => cwd.join(golden_dir),
+            _ => golden_dir.to_path_buf(),
+        });
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(anchor)
         .args(["status", "--porcelain", "--"])
-        .arg(golden_dir)
+        .arg(&abs)
         .output();
     match out {
         Ok(o) if o.status.success() => !o.stdout.is_empty(),

@@ -1369,10 +1369,16 @@ fn parse_lens_run_params(params: &serde_json::Value) -> Result<LensRunParams, sh
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let env_clear = params
-        .get("env_clear")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Strict, like `argv`/`cast`: a present-but-non-boolean value is a usage error, not a
+    // silent `false`. `{"env_clear": "true"}` used to disable the deny-by-default
+    // environment while the caller believed it was on, so the child inherited the host env
+    // and a gate run lost its determinism guarantee without saying so (codex review, PR #95).
+    let env_clear = match params.get("env_clear") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params("'env_clear' must be a boolean (true/false)")
+        })?,
+    };
 
     // Optional cast path (task 083). Strict: present-but-not-a-non-empty-string → INVALID_PARAMS.
     let cast = match params.get("cast") {
