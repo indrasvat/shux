@@ -96,7 +96,7 @@ fn frame_status(
             // design council's rule is kept as the more actionable, equally-safe choice.)
             Some(_) => (
                 GateStatus::Xpass,
-                Some("xpass: frame matches — remove the xfail".to_string()),
+                Some("xpass: frame matches - remove the xfail".to_string()),
             ),
             None => (GateStatus::Pass, None),
         },
@@ -326,6 +326,45 @@ pub(crate) fn sanitize_note(raw: &str) -> String {
 mod tests {
     use super::*;
     use shux_raster::{PixelMetrics, TierVerdict};
+
+    #[test]
+    fn every_frame_reason_is_pure_ascii() {
+        // 085: the summary sanitizes non-ASCII to `?` at the output boundary, so an em dash
+        // in a per-frame reason reaches the user mangled — `xpass: frame matches ? remove
+        // the xfail`, and `golden ... stale ? re-bless`. Both shipped. Assert the CLASS
+        // rather than the two instances: walk every reason-producing arm.
+        let today = today();
+        let mut reasons: Vec<String> = Vec::new();
+        let kinds = [
+            FrameKind::Match,
+            FrameKind::Mismatch,
+            FrameKind::GoldenAbsent,
+            FrameKind::GoldenUntrusted,
+        ];
+        let xfails = [
+            None,
+            Some(xfail("2099-12-31", None)),
+            Some(xfail("2000-01-01", None)),
+            Some(xfail("2099-12-31", Some("nope"))),
+            Some(xfail("2099-12-31", Some(" "))),
+            Some(xfail("not-a-date", None)),
+        ];
+        for k in kinds {
+            for xf in &xfails {
+                let f = frame(k, xf.clone(), "sha");
+                if let (_, Some(r)) = frame_status(&f, today, "/tmp/goldens") {
+                    reasons.push(r);
+                }
+            }
+        }
+        assert!(!reasons.is_empty(), "the walk produced no reasons to check");
+        for r in &reasons {
+            assert!(
+                r.is_ascii(),
+                "frame reason must be pure ASCII (the summary mangles the rest to '?'): {r:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_security_refusal_survives_the_secret_scanner() {

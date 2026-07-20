@@ -173,7 +173,7 @@ fn select_targets(
                     Ok(vec![i])
                 } else {
                     Err(format!(
-                        "frame {selector:?} is {} — nothing to bless",
+                        "frame {selector:?} is {} - nothing to bless",
                         status_label(st)
                     ))
                 }
@@ -241,7 +241,7 @@ fn write_targets(
     // the golden dir means an unreviewed edit — refuse rather than clobber it.
     if git_tree_is_dirty(golden_dir) {
         return Ok(BlessOutcome::Refused(format!(
-            "golden tree {} has uncommitted changes — commit or stash before blessing",
+            "golden tree {} has uncommitted changes - commit or stash before blessing",
             golden_dir.display()
         )));
     }
