@@ -32,13 +32,23 @@ pub struct GateRunOptions {
     pub format: OutputFormat,
 }
 
-/// True when running under CI (any truthy `CI` env). A bless/create is refused here so a
-/// golden can never be self-minted in CI (task §5/§7).
+/// True when running under CI. A bless/create is refused here so a golden can never be
+/// self-minted in CI (task §5/§7).
+///
+/// This FAILS CLOSED (085 adversarial): `CI` is treated as set unless it is empty or an
+/// explicit falsey value. The previous exact-match allowlist (`1`/`true`/`TRUE`/`yes`/`YES`)
+/// missed ordinary spellings — `CI=True`, `CI=Yes`, `CI=on` all read as "not CI", and
+/// `--update` then blessed a real regression green, defeating the one guarantee this guard
+/// exists to provide. For a guard whose job is refusing a privileged write, an unrecognised
+/// value must mean "refuse", never "allow".
 pub fn is_ci() -> bool {
-    matches!(
-        std::env::var("CI").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
+    match std::env::var("CI") {
+        Err(_) => false,
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
+        }
+    }
 }
 
 fn trace_target(spec: Option<String>) -> Option<TraceTarget> {
@@ -135,6 +145,46 @@ fn report_io_failure(opts: &GateRunOptions, e: &std::io::Error) -> i32 {
         ))
     );
     4
+}
+
+#[cfg(test)]
+mod ci_tests {
+    /// 085 adversarial: the CI guard is what stops a golden self-minting in CI, so an
+    /// unrecognised `CI` value must mean REFUSE. The old exact-match allowlist let
+    /// `CI=True` / `CI=Yes` / `CI=on` through, and `--update` then blessed a real
+    /// regression green — reproduced end-to-end before this fix.
+    #[test]
+    fn ci_detection_fails_closed_on_unfamiliar_truthy_values() {
+        // Serialised via a mutex would be ideal, but these run in-process and only touch
+        // this one var; `--test-threads=1` is enforced by the Makefile target.
+        let truthy = [
+            "1",
+            "true",
+            "TRUE",
+            "True",
+            "yes",
+            "YES",
+            "Yes",
+            "on",
+            "ON",
+            "y",
+            "enabled",
+            "github-actions",
+        ];
+        for v in truthy {
+            unsafe { std::env::set_var("CI", v) };
+            assert!(
+                super::is_ci(),
+                "CI={v:?} must be treated as CI (fail closed)"
+            );
+        }
+        for v in ["", "0", "false", "FALSE", "no", "off", "  "] {
+            unsafe { std::env::set_var("CI", v) };
+            assert!(!super::is_ci(), "CI={v:?} must NOT be treated as CI");
+        }
+        unsafe { std::env::remove_var("CI") };
+        assert!(!super::is_ci(), "unset CI is not CI");
+    }
 }
 
 /// Route `report.json` + the ASCII summary to the right streams. When the report goes to
