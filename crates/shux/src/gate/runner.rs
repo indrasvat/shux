@@ -250,6 +250,19 @@ fn make_sandbox(root: &Path) -> std::io::Result<SandboxDirs> {
     Ok(sb)
 }
 
+/// The directory a scenario's relative `cwd` resolves against.
+///
+/// `Path::parent()` on a BARE filename returns `Some("")`, not `None`, so an
+/// `unwrap_or(".")` never fires and the empty path reaches `canonicalize()` as ENOENT.
+/// That broke the most natural invocation of all — `cd` into the scenario's directory and
+/// run `shux lens gate scenario.toml` — while `./scenario.toml` worked (shux-tui-qa).
+pub fn scenario_dir_of(scenario_path: &Path) -> &Path {
+    match scenario_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
 /// Resolve a scenario-relative `cwd` and prove it is CONTAINED in the scenario directory.
 ///
 /// Parse-time validation rejects absolute paths and `..` components, but that is only
@@ -1485,5 +1498,31 @@ mod tests {
         let err = resolve_contained_cwd(root.path(), "nope")
             .expect_err("a missing directory must be refused");
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    /// `Path::parent()` on a bare filename returns `Some("")`, not `None` — the trap that
+    /// broke `shux lens gate scenario.toml` while `./scenario.toml` worked (shux-tui-qa).
+    #[test]
+    fn a_bare_scenario_filename_resolves_to_the_current_directory() {
+        assert_eq!(scenario_dir_of(Path::new("scenario.toml")), Path::new("."));
+        assert_eq!(
+            scenario_dir_of(Path::new("./scenario.toml")),
+            Path::new(".")
+        );
+        assert_eq!(
+            scenario_dir_of(Path::new("sub/scenario.toml")),
+            Path::new("sub")
+        );
+        assert_eq!(
+            scenario_dir_of(Path::new("/abs/dir/scenario.toml")),
+            Path::new("/abs/dir")
+        );
+        // And the derived dir must be usable — an empty path is not.
+        assert!(
+            scenario_dir_of(Path::new("scenario.toml"))
+                .canonicalize()
+                .is_ok(),
+            "the derived scenario dir must canonicalize; an empty path is ENOENT"
+        );
     }
 }

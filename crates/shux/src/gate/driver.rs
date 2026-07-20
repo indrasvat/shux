@@ -183,7 +183,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     let outcome = runner::drive_scenario(
         socket_path,
         &scenario,
-        opts.scenario_path.parent().unwrap_or(Path::new(".")),
+        runner::scenario_dir_of(&opts.scenario_path),
         &argv,
         &golden_dir,
         trace_target(opts.trace.clone()),

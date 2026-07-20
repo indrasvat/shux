@@ -886,3 +886,115 @@ tier = "cell"
         "held scratch sessions never reaped"
     );
 }
+
+/// A scenario referenced by a BARE FILENAME must behave exactly like `./name` and like an
+/// absolute path. `Path::parent()` returns `Some("")` for a bare name, not `None`, so an
+/// `unwrap_or(".")` silently yields the empty path — which `canonicalize()` rejects as
+/// ENOENT the moment a scenario sets `cwd`. That broke the most natural invocation of all
+/// (`cd` into the scenario's directory and run it) while `./scenario.toml` still worked.
+/// Every other test here uses tempdir or absolute paths, so nothing covered this shape.
+#[test]
+fn a_cwd_scenario_runs_by_bare_filename_and_by_dot_slash() {
+    let h = Harness::new();
+    let dir = tmp();
+    // The child must actually depend on `cwd` resolving correctly, so it reads a file that
+    // exists ONLY in the scenario directory.
+    std::fs::write(dir.path().join("marker.txt"), "cwd-resolved\n").unwrap();
+    std::fs::write(
+        dir.path().join("scn.toml"),
+        r#"
+name = "bare-cwd"
+command = ["/bin/sh", "-c", "cat marker.txt; exec cat"]
+cwd = "."
+
+[[steps]]
+action = "wait_for_text"
+text = "cwd-resolved"
+timeout_ms = 5000
+
+[[steps]]
+action = "assert_contains"
+text = "cwd-resolved"
+"#,
+    )
+    .unwrap();
+
+    for form in ["scn.toml", "./scn.toml"] {
+        let out = h
+            .shux()
+            .current_dir(dir.path())
+            .args(["lens", "gate", form])
+            .output()
+            .expect("spawn shux");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let exit = out.status.code().unwrap_or(-1);
+        // `no_visual_check` (exit 2) is the expected verdict — the scenario compares no
+        // frames. What must NOT happen is an infra failure resolving the scenario dir.
+        assert!(
+            !stderr.contains("cannot resolve the scenario directory"),
+            "`{form}` failed to resolve its own directory: {stderr}"
+        );
+        assert_ne!(
+            exit, 3,
+            "`{form}` produced an infra error, so `cwd` did not resolve: {stderr}"
+        );
+    }
+    assert_no_scratch_leak(&h);
+}
+
+/// The 084 F4 blocker guard, at the DRIVER boundary. The unit test passes
+/// `scenario_floor(&outcome)` itself, so by construction it cannot catch the driver
+/// handing `apply_blessed` the wrong floor — mutating both call sites back to
+/// `GateStatus::Pass` leaves every unit and contract test green while the real binary
+/// reports `pass`/exit 0 over a scenario that timed out and blessed nothing.
+#[test]
+fn blessing_cannot_launder_a_step_timeout_through_the_driver() {
+    let h = Harness::new();
+    let dir = tmp();
+    let golden = dir.path().join("goldens");
+    std::fs::create_dir_all(&golden).unwrap();
+    let scn = dir.path().join("timeout.toml");
+    std::fs::write(
+        &scn,
+        r#"
+name = "driver-floor"
+command = ["/bin/sh", "-c", "printf 'alpha\n'; exec cat"]
+
+[[steps]]
+action = "wait_for_text"
+text = "THIS-NEVER-APPEARS"
+timeout_ms = 1500
+
+[[steps]]
+action = "expect_golden"
+name = "start"
+tier = "cell"
+"#,
+    )
+    .unwrap();
+
+    let scn_s = scn.to_string_lossy().into_owned();
+    let golden_s = golden.to_string_lossy().into_owned();
+    let out = h.cli(&[
+        "lens",
+        "gate",
+        &scn_s,
+        "--golden-dir",
+        &golden_s,
+        "--on-missing",
+        "create",
+        "--reason",
+        "driver floor probe",
+    ]);
+    let exit = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        exit, 1,
+        "a step_timeout must stay a regression through the bless path, got exit {exit}: {stderr}"
+    );
+    assert!(
+        !stderr.contains("verdict=pass"),
+        "blessing laundered a step_timeout into pass: {stderr}"
+    );
+    assert_no_scratch_leak(&h);
+}
