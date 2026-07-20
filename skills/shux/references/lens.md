@@ -164,10 +164,16 @@ checkpoint never refreshes its recency). Re-checkpointing the exact current
 revision with no intervening change is a no-op, not a new slot.
 
 ```bash
-shux pane checkpoint <PANE>              # → { revision, evicted_revision }
-shux pane diff <PANE> --since <REV>      # → structured delta, exit 0 regardless of size
+shux pane checkpoint <PANE>              # → { result: { revision, evicted_revision } }
+shux pane diff <PANE> --since <REV>      # → { result: <delta> }, exit 0 regardless of size
 shux pane diff <PANE> --since <REV> --heat delta.png   # + a heat-map PNG
 ```
+
+Note the `result` envelope: every lens verb wraps its `--format json` payload, so it is
+`jq -r .result.revision`, not `.revision` (see [Output formats](#output-formats)). Every
+NON-lens verb — `session create`, `pane snapshot`, `pane capture` — returns its payload
+bare. Reaching for the wrong one yields `null` rather than an error, so it surfaces later
+as an empty variable.
 
 A diff result's `regions` are per-row half-open spans
 (`{row, col_start, col_end}`), sorted and merged, capped at 256 — beyond

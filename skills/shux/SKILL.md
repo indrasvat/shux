@@ -131,7 +131,8 @@ shux daemon stop                    # then stop the daemon itself
   it keeps running and will show up in anyone's process-hygiene check. `daemon stop`
   SIGTERMs exactly the daemon recorded in *this* runtime dir's pidfile, waits for it to go,
   and exits 0 when none is running — so it is safe in a cleanup trap that may run twice.
-  `shux daemon status` reports whether one is up.
+  `shux daemon status` reports whether one is up. There is no `daemon start` — any client
+  command starts one on demand, creating the runtime dir if needed.
 - **Never `pkill -f shux`.** It kills other checkouts', other agents', and the user's own
   sessions. Note also that `pgrep -f "$XDG_RUNTIME_DIR"` does **not** find a shux daemon —
   the runtime dir is not in its argv, so that matches nothing and reports success while the

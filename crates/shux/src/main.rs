@@ -1551,6 +1551,26 @@ fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// True when `pid` is alive AND is actually a shux daemon.
+///
+/// The pidfile is untrusted input: it survives SIGKILL and reboots, and pids get reused, so
+/// a bare `kill(pid)` on its contents can hit a bystander. Verified by reading the process's
+/// own argv — a shux daemon runs as `<path>/shux __daemon`.
+fn is_live_shux_daemon(pid: u32) -> bool {
+    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
+        return false;
+    }
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+    else {
+        // Without a way to confirm identity, refuse to claim it is ours.
+        return false;
+    };
+    let args = String::from_utf8_lossy(&out.stdout);
+    args.contains("shux") && args.contains("__daemon")
+}
+
 /// `shux daemon stop|status` — the missing half of the daemon lifecycle (085 F5).
 ///
 /// The daemon auto-starts on first use and outlives the command, so every scripted or CI
@@ -1565,11 +1585,13 @@ fn handle_daemon_command(
     format: cli::OutputFormat,
 ) -> anyhow::Result<()> {
     let pid = daemon::read_pid_file().ok().flatten();
-    // A pidfile can outlive its process (SIGKILL, a reboot). Probe with signal 0 so a
-    // stale file never reads as "running".
-    let alive = pid.is_some_and(|p| {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(p as i32), None).is_ok()
-    });
+    // A pidfile can outlive its process (SIGKILL, a reboot) and the OS reuses pids, so the
+    // number in it may name a COMPLETELY UNRELATED process by the time we read it. Probe
+    // with signal 0, then confirm the process really is a shux daemon before believing the
+    // file — otherwise `daemon stop` becomes "SIGTERM an arbitrary pid", which is the exact
+    // failure this verb exists to avoid. pid 0 and 1 are rejected outright: `kill(0, …)`
+    // signals the whole process group and pid 1 is init.
+    let alive = pid.is_some_and(|p| p > 1 && is_live_shux_daemon(p));
 
     match command {
         cli::DaemonCommand::Status => {
@@ -7682,6 +7704,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
     //! Snapshot-path regression tests.
     //!
     //! These exercise the seam between `snapshot_window` and the
@@ -7693,6 +7716,22 @@ mod tests {
     //! If anyone removes the `populate_bar` call from
     //! `build_snapshot_status_bar` it breaks here.
     use super::*;
+
+    /// 085 adversarial: `daemon stop` must not SIGTERM whatever number the pidfile holds.
+    /// A pidfile survives SIGKILL and reboots, and the OS reuses pids — so its contents can
+    /// name a completely unrelated live process. Reproduced before the fix: `daemon stop`
+    /// killed an innocent `sleep`. The identity check is what makes the verb safe.
+    #[test]
+    fn a_live_non_daemon_pid_is_not_mistaken_for_the_daemon() {
+        // This test process is alive and is emphatically not a shux daemon.
+        assert!(
+            !super::is_live_shux_daemon(std::process::id()),
+            "a live process that is not `shux __daemon` must never be treated as the daemon"
+        );
+        // pid 1 is init; signalling it would be catastrophic and it is never our daemon.
+        assert!(!super::is_live_shux_daemon(1));
+    }
+
     use shux_core::config::{Config, ConfigHandle, SegmentDef, StatusBarConfig};
     use shux_core::graph::{GraphHandle, SessionGraph, SessionGraphSnapshot, run_graph_loop};
     use shux_core::layout::Direction;
