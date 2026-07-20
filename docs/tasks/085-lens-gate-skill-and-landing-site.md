@@ -154,11 +154,25 @@ between a light and a dark section cannot carry the wrong ink again.
 
 ### Quality gate — how it was satisfied
 
-The `shux-tui-qa` subagent was launched against this task's Testing Matrix and drove the
-system (278 scratch artifacts), but **did not return a `VERDICT:` line** before the task
-closed — the same non-reporting behaviour several agents showed in this session. Rather
-than record a verdict that was never given, every gate was re-run and verified directly,
-with the evidence above:
+The `shux-tui-qa` subagent returned **`VERDICT: FAIL`** with four P1s. It was right, and
+three of them were mine — including a mobile layout regression I had declared clean after
+measuring only at 402 CSS px. All findings are fixed; a re-gate has been requested.
+
+| Finding | Fix |
+|---|---|
+| P1 the leak-guard SELF-TEST still did a machine-wide `pgrep -x shux` + TERM/KILL — it SIGKILLed a concurrent session's `target/debug` daemon AND its in-flight `lens gate` | the rule now lives once in `.shux/scripts/lib/proc_scope.sh` (duplication was the root cause), and the self-test owns the runtime dir of the daemon it leaks so it is attributable by construction. Verified: a concurrent same-repo `target/debug` daemon survives a full run |
+| P1 the new `#gate` nav link overflowed 360px by 17px / 375px by 2px, CTA cut mid-word | at ≤720px the section links hid their labels but kept consuming flex gaps; they are invisible there, so now hidden outright. 0 overflow at 320–1440, which also fixes a pre-existing 33px at 320px |
+| P1 `headless-tui-test.md` §3 told the reader to review a FRESH baseline with `gate review` and "open the PNGs" — neither works at the cell tier | rewritten to the `lens run` + `pane glance --png` recipe; the check now sweeps ALL gate docs, which is why it slipped |
+| P1 `init.rs` said the same thing in the binary's own output, at step 1 of onboarding | corrected to name what a cell golden actually is |
+| P2 a report-write failure suppressed the verdict while claiming "the scenario itself ran" | the summary is always emitted; exit stays 4 |
+| P2 the committed mobile asset was cropped mid-`P99` | re-cropped to a clean column boundary |
+| P3 `daemon stop`'s identity check was an argv substring match | tightened to exact argv positions; `watch-for shux __daemon` now rejected |
+
+The gate also independently **confirmed all six earlier fixes** (CI fails closed, `daemon
+stop` pid safety, trace/report collision, no golden from a dead child, `stale_golden`
+diagnostics, exit 4 documented) and passed the frozen-suite and doc checks it did run.
+
+Every gate below was additionally re-run directly:
 
 | Check | Result |
 |---|---|
