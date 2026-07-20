@@ -32,7 +32,11 @@ pub fn emit_heat_for_fails(
     golden_dir: &Path,
     out_dir: &Path,
     rasterizer: &Rasterizer,
-) {
+) -> Vec<String> {
+    // Returned so the caller can also put them in `report.json` — CI reads the report, not
+    // stderr, and evidence that silently failed to appear is exactly what a machine consumer
+    // needs told (085 F23).
+    let mut problems: Vec<String> = Vec::new();
     // Only a frame whose FINAL report status is `fail` gets a heat — a blessed (now-pass),
     // xfail (green), or stale/missing frame is not a live regression to visualize.
     let fail_names: std::collections::HashSet<String> = reports
@@ -75,36 +79,39 @@ pub fn emit_heat_for_fails(
         let png = match encode_png(&img) {
             Ok(p) => p,
             Err(e) => {
-                warn_heat_skipped(&f.name, &format!("could not encode the overlay: {e}"));
+                problems.push(warn_heat_skipped(
+                    &f.name,
+                    &format!("could not encode the overlay: {e}"),
+                ));
                 continue;
             }
         };
         if let Err(e) = std::fs::create_dir_all(out_dir) {
-            warn_heat_skipped(
+            problems.push(warn_heat_skipped(
                 &f.name,
                 &format!("could not create {} ({e})", out_dir.display()),
-            );
+            ));
             continue;
         }
         let path = out_dir.join(format!("{}.heat.png", f.name));
         if let Err(e) = std::fs::write(&path, &png) {
-            warn_heat_skipped(
+            problems.push(warn_heat_skipped(
                 &f.name,
                 &format!("could not write {} ({e})", path.display()),
-            );
+            ));
             continue;
         }
         set_heat_path(reports, &f.name, &path);
     }
+    problems
 }
 
 /// Tell the reader the heat evidence was skipped, and why (085 F23). Warnings go to
 /// STDERR so the `--report -` stdout-purity contract is untouched.
-fn warn_heat_skipped(frame: &str, why: &str) {
-    eprintln!(
-        "{}",
-        crate::style::warning(format!("lens gate: no heat PNG for frame '{frame}': {why}"))
-    );
+fn warn_heat_skipped(frame: &str, why: &str) -> String {
+    let msg = format!("no heat PNG for frame '{frame}': {why}");
+    eprintln!("{}", crate::style::warning(format!("lens gate: {msg}")));
+    msg
 }
 
 /// Overlay the changed CELLS (heat red) and desaturate the rest — cell-granularity heat.

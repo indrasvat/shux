@@ -1764,8 +1764,9 @@ pub enum LensCommand {
     /// the committed golden at the cell/pixel/exact tier, and rolls the per-frame verdicts
     /// into a governed CI outcome: a machine-readable `report.json` (`--report`), an ASCII
     /// stdout summary, and a frozen exit-code contract (0 pass · 1 regression · 2 usage ·
-    /// 3 infra · 5 child died · 6 update refused). A frame with no committed golden is a
-    /// CI-safe regression (`missing_golden`) unless `--on-missing create`. `--update`
+    /// 3 infra · 4 could not write the report · 5 child died · 6 update refused). A frame
+    /// with no committed golden is a CI-safe regression (`missing_golden`) unless
+    /// `--on-missing create`. `--update`
     /// re-blesses failing goldens (refused in CI / on a dirty tree / on a secret hit).
     #[command(args_conflicts_with_subcommands = true)]
     Gate {

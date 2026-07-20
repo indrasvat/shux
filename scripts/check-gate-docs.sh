@@ -57,12 +57,15 @@ doc_codes=$(
   sed -n '/^| Code | Meaning |/,/^$/p' "$DOC" \
     | sgrep -E '^\| [0-9]+ \|' | awk -F'|' '{gsub(/ /,"",$2); print $2}' | sort -un
 )
-if [[ "$shipped_codes" == "$doc_codes" ]]; then
-  ok "exit codes match ($(echo "$shipped_codes" | tr '\n' ' ' | sed 's/ $//'))"
+# The doc must cover every STATUS code, plus 4 — which no status produces but the CLI
+# emits for an I/O failure, so a reader keying CI on exit codes has to know about it.
+expected_doc_codes=$(printf '%s\n4\n' "$shipped_codes" | sort -un)
+if [[ "$expected_doc_codes" == "$doc_codes" ]]; then
+  ok "exit codes match ($(echo "$doc_codes" | tr '\n' ' ' | sed 's/ $//'), incl. CLI-level 4)"
 else
-  err "exit-code table drifted from GateStatus::exit_code()"
-  diff <(echo "$shipped_codes") <(echo "$doc_codes") \
-    | sed 's/^</    only in code: /; s/^>/    only in doc:  /' | sgrep -E 'only in'
+  err "exit-code table drifted from GateStatus::exit_code() + the CLI-level 4"
+  diff <(echo "$expected_doc_codes") <(echo "$doc_codes") \
+    | sed 's/^</    missing from doc: /; s/^>/    extra in doc:     /' | sgrep -E 'in doc'
 fi
 
 # Exit 4 is reserved for CLI-level I/O and must never appear as a status code.

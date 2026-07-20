@@ -192,8 +192,8 @@ shux lens gate scenario.toml --report -       # report.json for CI to parse
 shux lens gate scenario.toml --update         # re-bless an INTENDED change
 ```
 
-Exit codes are frozen: `0` pass · `1` regression · `2` usage · `3` infra · `5` child died
-· `6` update refused. A frame with **no committed golden is a regression**, so a golden can
+Exit codes are frozen: `0` pass · `1` regression · `2` usage · `3` infra · `4` could not write
+the report · `5` child died · `6` update refused. A frame with **no committed golden is a regression**, so a golden can
 never be self-minted in CI.
 
 When it fails, `--out` gets a **heat PNG per frame** marking the changed cells, and

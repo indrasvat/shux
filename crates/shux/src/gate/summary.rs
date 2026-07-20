@@ -9,7 +9,7 @@
 use shux_vt::{GateStatus, ScenarioReport};
 
 /// The status label as it appears in `report.json` (frozen snake_case), for the table.
-fn status_label(s: GateStatus) -> &'static str {
+pub(crate) fn status_label(s: GateStatus) -> &'static str {
     match s {
         GateStatus::Pass => "pass",
         GateStatus::Fail => "fail",

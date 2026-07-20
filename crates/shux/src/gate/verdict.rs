@@ -164,7 +164,13 @@ fn frame_status(
         ),
         FrameKind::GoldenUntrusted => (
             GateStatus::StaleGolden,
-            Some("golden fingerprint/baseline stale — re-bless".to_string()),
+            // ASCII only, and NAME the directory — the same two corrections `missing_golden`
+            // got above. The em dash here reached users as `stale ? re-bless` because the
+            // output boundary sanitizes non-ASCII, and the sibling arm was missed when
+            // `missing_golden` was fixed.
+            Some(format!(
+                "golden fingerprint/baseline in {golden_dir} is stale - re-bless"
+            )),
         ),
     }
 }

@@ -389,6 +389,69 @@ fn update_in_ci_is_refused_before_anything_runs() {
     );
 }
 
+#[test]
+fn a_golden_is_never_minted_from_a_run_that_did_not_complete() {
+    // 085 implementation council: 084's F4 stopped a bless laundering the scenario STATUS,
+    // but the WRITE still happened — a child that crashed AFTER the capture produced
+    // `child_error: exit 9; blessed 1 golden(s)` with the golden on disk. A baseline is a
+    // claim about what correct looks like; it must not be taken from a broken run.
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    let toml = r#"name = "crashy"
+command = ["/bin/sh", "-c", "printf 'DRAWN'; sleep 2; exit 9"]
+[terminal]
+rows = 8
+cols = 24
+[[steps]]
+action = "wait_for_text"
+text = "DRAWN"
+timeout_ms = 8000
+[[steps]]
+action = "settle"
+quiet_ms = 200
+timeout_ms = 5000
+[[steps]]
+action = "expect_golden"
+name = "f"
+tier = "cell"
+[[steps]]
+action = "wait"
+ms = 4000
+"#;
+    let scn = write_scenario(d.path(), "crashy", toml);
+    let out = gate(
+        &h,
+        &[
+            "--on-missing",
+            "create",
+            "--reason",
+            "x",
+            "--report",
+            "-",
+            "--golden-dir",
+            &gd,
+            &scn,
+        ],
+        false,
+    );
+    assert_ne!(
+        out.exit, 0,
+        "a crashed run is never green; stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !g.path().join("f.capture.json").exists(),
+        "no golden may be minted from a run whose child died"
+    );
+    let note = out.report()[0].note.clone().unwrap_or_default();
+    assert!(
+        note.contains("did not complete cleanly"),
+        "the refusal must say why, got {note:?}"
+    );
+}
+
 // ── L1 xfail governance ───────────────────────────────────────────────────────
 
 /// Bless a golden for `frame` capturing `text`, into `golden_dir`.

@@ -248,6 +248,31 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         return Ok(GateStatus::UpdateRefused.exit_code() as i32);
     }
 
+    // 085: `--trace -` and a stdout JSON report both claim stdout, and the result was
+    // NDJSON signals followed by the report array — unparseable, with no usage error and
+    // exit 0. The report stream is promised to carry ONLY the JSON, so this is a usage
+    // error, refused before anything spawns.
+    let stdout_is_json =
+        matches!(opts.format, OutputFormat::Json) || opts.report.as_deref() == Some("-");
+    if stdout_is_json && opts.trace.as_deref() == Some("-") {
+        eprintln!(
+            "{}",
+            crate::style::error(
+                "lens gate: --trace - and the JSON report both write to stdout, which would \
+                 make the report unparseable. Send the trace to a file instead (--trace \
+                 run.jsonl)."
+            )
+        );
+        let reports = parse_error_report(
+            &opts.scenario_path,
+            "--trace - collides with the stdout JSON report",
+        );
+        if let Err(e) = emit(&opts, &reports) {
+            return Ok(report_io_failure(&opts, &e));
+        }
+        return Ok(GateStatus::ScenarioError.exit_code() as i32);
+    }
+
     let argv = if opts.argv.is_empty() {
         scenario.command.clone()
     } else {
@@ -312,7 +337,23 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     // `--update` and `--on-missing create` re-bless through the guarded writer, which may
     // refuse (dirty tree / secret hit) → update_refused, or rewrite the affected frames'
     // statuses after a successful bless.
-    if let Some(selector) = &opts.update {
+    // A golden is a claim that "this is what correct looks like". It may only be minted from
+    // a run that otherwise completed cleanly. 084's F4 stopped a bless from laundering the
+    // scenario STATUS, but the WRITE still happened: a child that crashed after the capture
+    // produced `child_error: exit 9; blessed 1 golden(s)` with the golden on disk — a
+    // baseline taken from a broken run (found by the 085 implementation council, reproduced).
+    let floor = verdict::scenario_floor(&outcome);
+    let blessing = opts.update.is_some() || opts.on_missing == crate::cli::OnMissing::Create;
+    if blessing && !floor.is_green() {
+        apply_refusal(
+            &mut reports,
+            &format!(
+                "the run did not complete cleanly ({}) - a golden must not be minted from it; \
+                 fix the scenario first",
+                summary::status_label(floor)
+            ),
+        );
+    } else if let Some(selector) = &opts.update {
         match bless::run_update(&scenario, &outcome, &reports, &golden_dir, selector, &opts)? {
             bless::BlessOutcome::Refused(reason) => {
                 apply_refusal(&mut reports, &reason);
@@ -340,10 +381,18 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         .flat_map(|s| s.frames.iter())
         .any(|f| f.status == GateStatus::Fail)
     {
-        if let Ok(rasterizer) = shux_raster::Rasterizer::new(16.0) {
-            let out = heat::out_dir(opts.out.as_deref(), &scenario.name);
-            heat::emit_heat_for_fails(&outcome, &mut reports, &golden_dir, &out, &rasterizer);
-        }
+        let out = heat::out_dir(opts.out.as_deref(), &scenario.name);
+        let heat_problems = match shux_raster::Rasterizer::new(16.0) {
+            Ok(rasterizer) => {
+                heat::emit_heat_for_fails(&outcome, &mut reports, &golden_dir, &out, &rasterizer)
+            }
+            Err(e) => {
+                let msg = format!("heat evidence skipped: rasterizer unavailable: {e}");
+                eprintln!("{}", crate::style::warning(format!("lens gate: {msg}")));
+                vec![msg]
+            }
+        };
+        plumb_retry_notes(&mut reports, &heat_problems);
     }
 
     // Note the produced cast beside the report (task 083) so a reviewer knows where to scrub.

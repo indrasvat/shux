@@ -27,13 +27,15 @@ whole lifecycle. This file is the reference.
 | 1 | regression — a frame differs, is missing, is stale, or never settled |
 | 2 | usage / scenario error |
 | 3 | infra error (couldn't spawn, quota, …) |
+| 4 | the run finished, but its report/trace could not be written — **not** a regression |
 | 5 | the child process died |
 | 6 | update refused (in CI, dirty golden tree, or a secret was detected) |
 
 A frame with **no committed golden is a regression** (exit 1), not a silent pass. That is
 deliberate: a golden can never be self-minted in CI.
 
-Exit `4` is reserved for CLI-level I/O failures and is never produced by a gate verdict.
+Exit `4` is a CLI-level I/O failure — a bad `--report`/`--trace` path. No gate VERDICT
+produces it, which is what makes it unambiguous: the check itself did not fail.
 
 A regression **outranks** an operational error in the rollup: a run that both fails a frame
 and has its bless refused exits `1`, not `6`, and keeps every per-frame verdict. An error
