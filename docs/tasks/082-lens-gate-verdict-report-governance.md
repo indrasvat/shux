@@ -202,3 +202,47 @@ summary — a choice that is otherwise a coin flip.
 Also: the `missing_golden` detail reached readers as `no committed golden ?`, because an
 em-dash met the ASCII output-boundary sanitizer.
 
+
+## Defects found + fixed by task 085 (2026-07-20)
+
+Task 084's adversarial round recorded ten defects on this task's already-`Done` surface.
+Per CLAUDE.md's `Correctness Is Never a Scope Question`, 085 fixed them here rather than
+deferring. Each was reproduced by hand first, fixed with a regression test **proven to fail
+against the old code**, and re-gated with `make test-lens-gate-verdict` (21/21),
+`make test-lens-gate-run` (23/23) and `make test-cli-unit`.
+
+Two were correctness holes in a gate whose job is refusing to let a regression through:
+
+**1. F17 — `--update failing` collided with a frame literally NAMED `failing`**
+(`gate/bless.rs`, `gate/scenario.rs`). `select_targets` matched the literal selector before
+trying it as a frame name, and the parser accepted `name = "failing"`. Reproduced: a request
+to re-bless one *passing* frame blanket-blessed every FAILING frame — the golden sha changed,
+the verdict flipped `fail`→`pass`, exit `1`→`0`, and a real colour-only regression was
+committed as the new baseline while the frame the author named was never touched. The name is
+now reserved at the parser (the choke point that already validates names as path components),
+with a defensive guard in `select_targets` for any other construction path. The legitimate
+blanket-bless behaviour is unchanged and pinned.
+
+**2. F16 — a bless REFUSAL erased the run's verdict** (`gate/driver.rs`). The orchestrator
+discarded the computed reports for a synthetic empty `update_refused` one and returned early,
+so a genuine regression became exit `6` with `frames: []` and no heat PNG — `report.json`, the
+documented source of truth, recorded that nothing had failed. `shux_vt`'s own
+`worst_never_masks_a_regression_with_an_error` forbids exactly this; the orchestrator bypassed
+`worst()`. Post-run refusals now roll up through `worst()` (a regression outranks an
+operational error, so the run exits 1 with every frame intact) and attach the refusal as a
+note. The **CI** refusal deliberately keeps its early return — nothing has run, so there is no
+verdict to preserve — and that distinction is now pinned by its own test so the fix cannot be
+over-applied.
+
+The rest were diagnostics that made real failures unreadable:
+
+| # | Defect | Fix |
+|---|---|---|
+| F18 | an I/O error (bad `--report` path) on a PASSING run exited **1**, the frozen regression code, with a bare errno | exit **4**, reserved for CLI-level I/O and previously unreachable, with a message saying the scenario ran and only its output could not be written |
+| F19 | a mid-batch bless failure left goldens partially written while reporting a refusal implying none were | the reason now names exactly which frames landed, and the doc comment no longer over-claims "no byte written" for that path |
+| F20 | blanket `--update` blessed a fingerprint-mismatched xfail — defeating the one thing a fingerprint exists to do — while `--update <name>` on a valid xfail was refused | no xfail-bearing frame is blessable by either selector; the message says to change the waiver deliberately |
+| F21 | `gate init .` wrote a stray `..toml`; `.` cleared every path check but names no file (`..` was already rejected) | dot-only names rejected in `validate_name`; `init` already routes through `parse`, so one fix closed both halves |
+| F22 | `-v` wrote ANSI DEBUG to **stdout**, breaking the `--report -` purity contract exactly when someone was debugging | the client's tracing subscriber writes to stderr |
+| F23 | heat evidence was dropped silently when `--out` could not be created or written, including when `--out` was explicitly requested | still best-effort (a heat failure must never change the verdict) but now warns on stderr with the path and errno |
+| F24 | `missing_golden` never named the directory it searched — the blind spot that let 084's duplicate golden tree go unnoticed | `RunOutcome` carries the golden dir; the reason names it |
+| F11 | a `cwd`-containment SECURITY refusal could be redacted to nothing, because `/` is an allowed token character so an ordinary host path is a high-entropy token | when entropy is the ONLY hit, redact the token and keep the sentence; a named rule still discards the whole note |

@@ -300,3 +300,59 @@ the files rather than trusting the harness's own manifests.
 caught a text-invisible colour regression and fixed the CODE — none reverted, none blessed
 its way out — and each independently converged on the same architecture (keep the shared
 palette, restore the deliberate table/summary divergence).
+
+- **2026-07-20 (task 085 — a documentation bug is a product bug, and greps are
+  weaker than parsers):** Nine claims in the shipped skill were wrong against the
+  binary, and the sharpest of them (`masks`, where the parser takes `mask`) fails a
+  user's run with exit 2. None of the existing tests could see any of them, because
+  no test read the docs. Two guards now close that: `make check-gate-docs` ties the
+  reference's step table, exit table and TOML keys to the parser and the frozen exit
+  map, and a Rust test runs **every fenced TOML block in the skill docs through the
+  real parser**. Prefer the parser: reintroducing `masks` fails with the parser's own
+  message listing the valid keys, whereas the grep only knows the one spelling it was
+  taught. Both were verified by reintroducing each defect and watching them fail —
+  a gate you have never seen fail is not a gate.
+
+- **2026-07-20 (task 085 — my own check was a false pass, from one `|| true`):**
+  The drift check defined `sgrep() { grep "$@" || true; }` for use under `set -e`,
+  then used it inside `if` conditions. `|| true` makes the condition unconditionally
+  true, so every attribution assertion "passed" without testing anything and one
+  check inverted. Rule: a helper that swallows exit status may only be used where you
+  CAPTURE output, never as a predicate. This is the same class as the defect the
+  check exists to catch — a gate that cannot fail is worth less than nothing.
+
+- **2026-07-20 (task 085 — `ps -o comm=` prints a PATH on macOS, which silently
+  killed a guard's name matching):** `no_leak_guard.sh` matched `$4` from
+  `ps -axo comm=` against bare names (`python3`, `sleep`, `cargo`). On macOS that
+  field is `/opt/homebrew/.../python3.13`, so the alternation NEVER matched and only
+  the tty test was doing any work — the guard was materially weaker than it read, and
+  the reported symptom ("it reaps PPID-1 python3") could not have been true. Compare
+  the basename. The wider lesson: the reported mechanism of a defect is a hypothesis;
+  reproducing it found the opposite failure (too weak, not too broad) and both halves
+  needed fixing — name matching AND scoping candidates to this repository's cwd.
+
+- **2026-07-20 (task 085 — an operational error must never outrank a regression, and
+  the pure layer already knew):** A bless refusal replaced the run's reports with an
+  empty `update_refused` and returned early, so a genuine regression exited 6 with
+  `frames: []`. `shux_vt` already had `worst_never_masks_a_regression_with_an_error`
+  asserting exactly that this cannot happen — the invariant lived in the pure layer
+  while the orchestrator bypassed `worst()` entirely. When a crate states an invariant,
+  grep for every place that constructs the same status WITHOUT going through it; the
+  test only guards the path it calls.
+
+- **2026-07-20 (task 085 — a reserved word in a selector must be reserved at the
+  parser):** `--update failing` means "bless every failing frame", and the parser
+  happily accepted a frame *named* `failing`. The selector then matched the keyword
+  first, so re-blessing one passing frame blanket-blessed every failing one and turned
+  a red run green. Ambiguity between a keyword and user data is not resolved by
+  guessing at the point of use — reject it where the data is created, and keep a
+  defensive refusal at the point of use for any other construction path.
+
+- **2026-07-20 (task 085 — a cold agent finds the documentation bugs an author
+  cannot):** A fresh `codex`, given only the repo and the skill, put real `bat` under
+  the gate and rated it 4/5. Its friction log produced four corrections no internal
+  review had caught, all of the same shape: the doc described a *plausible* workflow
+  rather than the shipped one — golden "images" that are JSON at the cell tier, an
+  instruction to "open them before committing" when there is nothing to open, and
+  "blessing is for intended changes only" written as if something enforced it. Author
+  review cannot see these because the author knows what was meant.

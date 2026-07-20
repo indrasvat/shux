@@ -213,3 +213,24 @@ colour classes, masks and tiers are all clean.
   is observable for codex alone. The pass bar is state-based, so no verdict depends on it.
   `--output-format stream-json` would capture it. **Accepted for this gauntlet.**
 
+
+## Follow-through by task 085 (2026-07-20)
+
+All ten defects this task recorded as "Recorded, deferred — pre-existing 081/082 surfaces"
+were fixed in 085 (see the tables in `docs/tasks/082-*.md` and `docs/tasks/083-*.md`), plus
+the two tooling items:
+
+- **F5** — there was no way to stop the daemon, so every gate run leaked one and the skill
+  documented `pkill -f "shux __daemon"` as the workaround. `shux daemon stop` / `shux daemon
+  status` now exist; `stop` SIGTERMs exactly this runtime dir's pidfile, is idempotent
+  (exit 0 when none is running, safe in a cleanup trap), and never auto-starts a daemon.
+- **F8** — the reported mechanism did **not** reproduce, and reproducing it found something
+  worse. The claim was that `no_leak_guard.sh` reaps PPID-1 `python3` processes. It cannot:
+  `ps -o comm=` prints a PATH on macOS, so matching it against bare names like `python3`
+  never fired — that branch was dead code and only the tty test was doing any work, making
+  the guard materially weaker than it read. Fixed both halves: compare the BASENAME so the
+  rule actually fires, and require every candidate's working directory to be inside this
+  repository so a concurrent session in another checkout can never be a candidate. Verified
+  in both directions.
+
+This task's own record stands: the 6/6 gauntlet result is unaffected by any of the above.

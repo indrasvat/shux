@@ -109,3 +109,15 @@ the retry audit dedupes fingerprints; the `stable_frames` idle-pane trade-off is
 to `--hold-ms`) and pinned; the daemon seed race + busy-spin (impl-review) are fixed; and
 `pane wait-settled` errors now surface the actionable range `detail` (e.g. "hold_ms 5 out of range
 [10, 60000]") instead of a bare "invalid_params" (dogfood; pinned).
+
+## Defect fixed by task 085 (2026-07-20)
+
+**F7 — retry vocabulary described a stable regression as a flake** (`gate/runner.rs`).
+`expect_golden{retries=N}` reported `FAIL after N retries (exhausted fps ...)`. Retries exist
+to absorb jitter, so that phrasing read as "this frame is flaky" — exactly backwards for the
+common case, where every attempt produced the SAME frame and the run is a stable, reproduced
+regression. The distinct-fingerprint count was already computed at the message site, so the
+two situations are now named: `FAIL - the same diff on all N attempts (a stable regression,
+not a flake)` versus `N attempts produced M different frames (output is non-deterministic;
+fix the scenario's determinism before trusting any verdict)`. Re-gated with
+`make test-lens-gate-settle` (6/6).

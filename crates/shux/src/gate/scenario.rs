@@ -1196,6 +1196,79 @@ expiry="2026-12-31"
         assert_eq!(parse(toml).unwrap().deadline_ms, 1234);
     }
 
+    /// Every fenced TOML block in the shipped skill docs that looks like a complete
+    /// scenario must actually PARSE. A reference is only worth having if a reader can copy
+    /// out of it — task 084 shipped a doc naming `masks` when the parser takes `mask`, which
+    /// fails a real run with exit 2 and which no test could see, because no test read the
+    /// doc. This one does.
+    fn doc_scenarios(doc: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut in_toml = false;
+        let mut buf = String::new();
+        for line in doc.lines() {
+            let fence = line.trim_start();
+            if !in_toml && (fence == "```toml" || fence == "~~~toml") {
+                in_toml = true;
+                buf.clear();
+                continue;
+            }
+            if in_toml && (fence == "```" || fence == "~~~") {
+                in_toml = false;
+                // Only complete scenarios — not the standalone `[[mask]]` / `[steps.xfail]`
+                // fragments, which are illustrative excerpts.
+                if buf.contains("name =") && buf.contains("command =") {
+                    out.push(std::mem::take(&mut buf));
+                }
+                continue;
+            }
+            if in_toml {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_scenario_in_the_skill_docs_parses() {
+        let docs: [(&str, &str); 3] = [
+            (
+                "references/gate.md",
+                include_str!("../../../../skills/shux/references/gate.md"),
+            ),
+            (
+                "references/scenarios.md",
+                include_str!("../../../../skills/shux/references/scenarios.md"),
+            ),
+            (
+                "examples/headless-tui-test.md",
+                include_str!("../../../../skills/shux/examples/headless-tui-test.md"),
+            ),
+        ];
+        let mut checked = 0;
+        for (name, body) in docs {
+            for (i, toml) in doc_scenarios(body).into_iter().enumerate() {
+                match parse(&toml) {
+                    Ok(s) => {
+                        assert!(
+                            !s.steps.is_empty(),
+                            "{name} scenario #{i} documents no steps"
+                        );
+                        checked += 1;
+                    }
+                    Err(e) => panic!(
+                        "{name} scenario #{i} does not parse: {}\n--- the documented TOML ---\n{toml}",
+                        e.0
+                    ),
+                }
+            }
+        }
+        assert!(
+            checked >= 3,
+            "expected the docs to carry runnable scenarios, found {checked}"
+        );
+    }
+
     #[test]
     fn empty_cwd_is_rejected_not_guessed() {
         // 085 F25: `cwd = ""` was silently accepted as `"."` while `name = ""` was
