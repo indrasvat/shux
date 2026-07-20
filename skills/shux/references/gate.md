@@ -291,18 +291,18 @@ or `--reason` reaches the reader as `?`.
 ## Clean up the daemon when you're done
 
 The gate talks to a `shux` daemon and starts one if none is running, so a daemon outlives
-your gate run and will show up in any process-hygiene check. Reap exactly yours via its
-pidfile:
+your gate run and will show up in any process-hygiene check:
 
 ```sh
-PIDFILE="$XDG_RUNTIME_DIR/shux/shux.pid"      # or $TMPDIR/shux-$UID/shux.pid
-[ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")"
+shux daemon stop        # SIGTERMs this runtime dir's daemon; exit 0 if none is running
 ```
 
-Set a short private `XDG_RUNTIME_DIR` (e.g. `/tmp/mygate`) before the run so this is
-precise; a long path also overruns the Unix-socket length limit. Do **not** pattern-kill
-`shux` processes — the runtime dir is not in the daemon's argv, so a `pgrep -f` on it
-matches nothing, and a broader pattern kills other checkouts' and other agents' daemons.
+It is idempotent, so it is safe in a cleanup trap. Set a short private `XDG_RUNTIME_DIR`
+(e.g. `/tmp/mygate`) before the run to keep that daemon off any other shux on the machine;
+a long path also overruns the Unix-socket length limit. Do **not** pattern-kill `shux`
+processes — a broad pattern kills other checkouts' and other agents' daemons, and
+`pgrep -f "$XDG_RUNTIME_DIR"` finds nothing at all because the runtime dir is not in the
+daemon's argv.
 
 ## Gotchas
 

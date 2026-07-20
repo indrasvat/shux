@@ -111,8 +111,9 @@ shux is a daemon plus long-lived PTY children. Anything you spawn outlives your
 command unless you kill it, so treat cleanup as part of the task, not an afterthought:
 
 ```bash
-shux session kill <name-or-id>     # every session you created, including scratch ones
+shux session kill <name-or-id>      # every session you created, including scratch ones
 shux session list --include-scratch # verify: nothing of yours is left
+shux daemon stop                    # then stop the daemon itself
 ```
 
 - **Kill scratch sessions explicitly.** `lens run` reaps its scratch session on `--ttl`
@@ -122,18 +123,15 @@ shux session list --include-scratch # verify: nothing of yours is left
   `XDG_RUNTIME_DIR` (e.g. `/tmp/mygate`) before any scripted or CI use. Your daemon then
   lives on its own socket, under its own directory. Keep the path short — a long one
   overruns the Unix-socket length limit.
-- **Reap the daemon by its pidfile, not by pattern.** Killing a session does not stop
-  the daemon; it keeps running and will show up in anyone's process-hygiene check:
-
-  ```bash
-  PIDFILE="$XDG_RUNTIME_DIR/shux/shux.pid"          # or $TMPDIR/shux-$UID/shux.pid
-  [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")"
-  ```
-
-  Do **not** reach for `pgrep -f "$XDG_RUNTIME_DIR"`: the runtime dir is not in the
-  daemon's argv, so that matches nothing and reports success while the daemon lives on.
+- **Stop the daemon with `shux daemon stop`.** Killing a session does not stop the daemon;
+  it keeps running and will show up in anyone's process-hygiene check. `daemon stop`
+  SIGTERMs exactly the daemon recorded in *this* runtime dir's pidfile, waits for it to go,
+  and exits 0 when none is running — so it is safe in a cleanup trap that may run twice.
+  `shux daemon status` reports whether one is up.
 - **Never `pkill -f shux`.** It kills other checkouts', other agents', and the user's own
-  sessions — the failure mode the pidfile exists to avoid.
+  sessions. Note also that `pgrep -f "$XDG_RUNTIME_DIR"` does **not** find a shux daemon —
+  the runtime dir is not in its argv, so that matches nothing and reports success while the
+  daemon lives on.
 
 ## lens — prove a TUI change worked, with pixel proof
 

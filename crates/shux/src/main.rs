@@ -1551,6 +1551,93 @@ fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `shux daemon stop|status` — the missing half of the daemon lifecycle (085 F5).
+///
+/// The daemon auto-starts on first use and outlives the command, so every scripted or CI
+/// invocation leaked one. There was no verb to stop it, and the documented workaround was
+/// `pkill -f "shux __daemon"` — which also kills other checkouts' and other agents'
+/// daemons. This reaps exactly the pid in this runtime dir's pidfile.
+///
+/// Deliberately never auto-starts a daemon: starting one in order to stop it would be
+/// absurd, and `status` must be able to report "not running".
+fn handle_daemon_command(
+    command: cli::DaemonCommand,
+    format: cli::OutputFormat,
+) -> anyhow::Result<()> {
+    let pid = daemon::read_pid_file().ok().flatten();
+    // A pidfile can outlive its process (SIGKILL, a reboot). Probe with signal 0 so a
+    // stale file never reads as "running".
+    let alive = pid.is_some_and(|p| {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(p as i32), None).is_ok()
+    });
+
+    match command {
+        cli::DaemonCommand::Status => {
+            match (pid, alive) {
+                (Some(p), true) => match format {
+                    cli::OutputFormat::Json => println!("{{\"running\": true, \"pid\": {p}}}"),
+                    _ => println!(
+                        "{} {}",
+                        style::success("daemon running"),
+                        style::muted(format!("pid {p}"))
+                    ),
+                },
+                _ => match format {
+                    cli::OutputFormat::Json => println!("{{\"running\": false, \"pid\": null}}"),
+                    _ => println!("{}", style::warning("daemon not running")),
+                },
+            }
+            Ok(())
+        }
+        cli::DaemonCommand::Stop => {
+            let Some(p) = pid.filter(|_| alive) else {
+                // Idempotent: safe to call from a cleanup trap that may run twice.
+                if let cli::OutputFormat::Json = format {
+                    println!("{{\"stopped\": false, \"reason\": \"not_running\"}}");
+                } else {
+                    println!("{}", style::muted("no daemon running"));
+                }
+                let _ = daemon::remove_pid_file();
+                return Ok(());
+            };
+            // SIGTERM → the daemon's signal handler runs a graceful shutdown.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(p as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            let mut gone = false;
+            for _ in 0..40 {
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(p as i32), None).is_err() {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if gone {
+                let _ = daemon::remove_pid_file();
+                let _ = daemon::remove_socket_file();
+            }
+            match (format, gone) {
+                (cli::OutputFormat::Json, _) => {
+                    println!("{{\"stopped\": {gone}, \"pid\": {p}}}")
+                }
+                (_, true) => println!(
+                    "{} {}",
+                    style::success("daemon stopped"),
+                    style::muted(format!("pid {p}"))
+                ),
+                (_, false) => println!(
+                    "{}",
+                    style::warning(format!(
+                        "daemon (pid {p}) did not exit within 2s; it may be draining a session"
+                    ))
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Client entry point — parse CLI args, ensure daemon is running, dispatch.
 fn run_client(args: Cli) -> anyhow::Result<()> {
     // Set up logging
@@ -7490,6 +7577,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
             cli::handle_api(&mut stream, &method, &resolved, args.format).await
         }
+
+        Some(Command::Daemon { command }) => handle_daemon_command(command, args.format),
 
         Some(Command::Version) => {
             // Quick probe — don't auto-start daemon just for version

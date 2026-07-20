@@ -436,6 +436,12 @@ pub enum Command {
     /// Print version information
     Version,
 
+    /// The background daemon that owns every session, pane, and PTY.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+
     /// Configuration helpers
     Config {
         #[command(subcommand)]
@@ -635,6 +641,22 @@ pub enum SessionCommand {
         #[arg(long)]
         watch: bool,
     },
+}
+
+/// Daemon lifecycle. The daemon auto-starts on first use; this is how you stop it.
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Stop the daemon for THIS runtime dir, gracefully (SIGTERM).
+    ///
+    /// Every shux invocation starts a daemon if none is running, and it outlives the
+    /// command — so a scripted or CI run leaks one unless it is stopped. This reaps
+    /// exactly the daemon recorded in `$XDG_RUNTIME_DIR/shux/shux.pid`, never other
+    /// checkouts' or other agents' daemons the way a `pkill -f shux` would. Exits 0 when
+    /// no daemon is running, so it is safe in a cleanup trap.
+    Stop,
+
+    /// Report whether a daemon is running for this runtime dir, and its pid.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]

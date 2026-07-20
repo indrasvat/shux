@@ -18,13 +18,44 @@ shux_pids() {
   pgrep -x shux 2>/dev/null || true
 }
 
+# The repository this guard is protecting (085 F8). Every orphan candidate must belong to
+# it: this guard runs alongside other repositories' agents, councils and test suites, and
+# reaping one of those costs someone else real work.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# True when PID's working directory is inside this repository.
+pid_cwd_in_repo() {
+  local pid="$1" cwd
+  cwd="$(lsof -a -p "${pid}" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+  [ -n "${cwd}" ] || return 1
+  case "${cwd}" in
+    "${REPO_ROOT}" | "${REPO_ROOT}"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Orphaned automation processes (PPID 1) that this run is responsible for.
+#
+# Two corrections over the original rule (085 F8):
+#   * `ps -o comm=` prints a PATH on macOS (`/opt/homebrew/.../python3.13`), so matching it
+#     against bare names like `python3` never fired — that whole branch was dead, and only
+#     the tty test was doing any work. Compare the BASENAME instead.
+#   * Neither test said anything about WHOSE process it is. Require the working directory to
+#     be inside this repo, so a concurrent session in another checkout is never a candidate.
 orphan_candidate_pids() {
-  ps -axo pid=,ppid=,tty=,comm=,args= |
+  ps -axo pid=,ppid=,tty=,comm= |
     awk '
-      $2 == 1 && ($3 ~ /^(ttys|pts\/)/ || $4 ~ /^(sh|bash|zsh|fish|sleep|yes|python|python3|node|cargo|shux)$/) {
-        print $1
+      $2 == 1 {
+        n = split($4, parts, "/")
+        base = parts[n]
+        if ($3 ~ /^(ttys|pts\/)/ || base ~ /^(sh|bash|zsh|fish|sleep|yes|python|python[0-9.]*|node|cargo|shux)$/) {
+          print $1
+        }
       }
-    '
+    ' |
+    while read -r pid; do
+      if pid_cwd_in_repo "${pid}"; then printf '%s\n' "${pid}"; fi
+    done
 }
 
 pid_in_list() {
@@ -57,7 +88,9 @@ kill_new_pids() {
   done
 }
 
+# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 baseline_shux=($(shux_pids))
+# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 baseline_orphans=($(orphan_candidate_pids))
 
 set +e
@@ -65,6 +98,7 @@ set +e
 cmd_status=$?
 set -e
 
+# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 after_shux=($(shux_pids))
 new_shux_pids=()
 set +u
@@ -85,6 +119,7 @@ if [ "${#new_shux_pids[@]}" -gt 0 ]; then
 fi
 
 # Re-scan after daemon cleanup: killing a daemon must not strand pane commands.
+# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 after_orphans=($(orphan_candidate_pids))
 new_orphan_pids=()
 set +u

@@ -143,12 +143,11 @@ blessing hides the bug and commits it as the new truth.
 The gate starts a daemon if none is running, and it outlives the run:
 
 ```bash
-PIDFILE="$XDG_RUNTIME_DIR/shux/shux.pid"      # or $TMPDIR/shux-$UID/shux.pid
-[ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")"
+shux daemon stop      # idempotent — exit 0 when none is running
 ```
 
-Set a short private `XDG_RUNTIME_DIR` before the run so this reaps exactly your daemon.
-Never `pkill -f shux` — it kills other checkouts and other agents.
+Set a short private `XDG_RUNTIME_DIR` before the run so this stays scoped to your own
+daemon. Never `pkill -f shux` — it kills other checkouts and other agents.
 
 ## Already have a bash + python snapshot harness?
 
