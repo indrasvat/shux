@@ -1567,8 +1567,17 @@ fn is_live_shux_daemon(pid: u32) -> bool {
         // Without a way to confirm identity, refuse to claim it is ours.
         return false;
     };
+    // Exact argv positions, not a substring match (085 QA P3): a bystander whose command
+    // line merely CONTAINS both words — say `watch-for shux __daemon` — would otherwise be
+    // accepted as the daemon and signalled. A shux daemon is `<path>/shux __daemon`.
     let args = String::from_utf8_lossy(&out.stdout);
-    args.contains("shux") && args.contains("__daemon")
+    let mut argv = args.split_whitespace();
+    let exe_is_shux = argv
+        .next()
+        .and_then(|p| p.rsplit('/').next())
+        .is_some_and(|base| base == "shux");
+    let first_arg_is_daemon = argv.next() == Some("__daemon");
+    exe_is_shux && first_arg_is_daemon
 }
 
 /// `shux daemon stop|status` — the missing half of the daemon lifecycle (085 F5).
@@ -7730,6 +7739,21 @@ mod tests {
         );
         // pid 1 is init; signalling it would be catastrophic and it is never our daemon.
         assert!(!super::is_live_shux_daemon(1));
+
+        // 085 QA P3: a bystander whose command line merely CONTAINS both words must be
+        // rejected. A substring check accepted this and killed it.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"exec -a "watch-for shux __daemon" /bin/sleep 5"#])
+            .spawn()
+            .expect("spawn crafted-argv bystander");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let verdict = super::is_live_shux_daemon(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !verdict,
+            "a process whose argv merely contains `shux` and `__daemon` is not the daemon"
+        );
     }
 
     use shux_core::config::{Config, ConfigHandle, SegmentDef, StatusBarConfig};

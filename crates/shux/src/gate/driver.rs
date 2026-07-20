@@ -194,22 +194,33 @@ fn emit(opts: &GateRunOptions, reports: &[ScenarioReport]) -> std::io::Result<()
     let stdout_is_json =
         matches!(opts.format, OutputFormat::Json) || opts.report.as_deref() == Some("-");
     let json = serde_json::to_string_pretty(reports).unwrap_or_else(|_| "[]".to_string());
-    match opts.report.as_deref() {
-        Some("-") => println!("{json}"),
-        Some(path) => std::fs::write(path, format!("{json}\n"))?,
+    let write_err = match opts.report.as_deref() {
+        Some("-") => {
+            println!("{json}");
+            None
+        }
+        Some(path) => std::fs::write(path, format!("{json}\n")).err(),
         None => {
             if stdout_is_json {
                 println!("{json}");
             }
+            None
         }
-    }
+    };
+    // The summary is emitted even when the report file could not be written (085 QA P2):
+    // returning early left a user with an errno and NO verdict at all, on a run that had
+    // actually completed and produced one. On that path it goes to stderr, since stdout
+    // may still be a JSON stream a consumer is reading.
     let table = summary::render(reports);
-    if stdout_is_json {
+    if stdout_is_json || write_err.is_some() {
         eprint!("{table}");
     } else {
         print!("{table}");
     }
-    Ok(())
+    match write_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Run the gate on one scenario and return the frozen exit code (task §4). This is the
