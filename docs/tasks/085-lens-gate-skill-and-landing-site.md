@@ -156,7 +156,19 @@ between a light and a dark section cannot carry the wrong ink again.
 
 The `shux-tui-qa` subagent returned **`VERDICT: FAIL`** with four P1s. It was right, and
 three of them were mine — including a mobile layout regression I had declared clean after
-measuring only at 402 CSS px. All findings are fixed; a re-gate has been requested.
+measuring only at 402 CSS px. All findings were fixed and the re-gate at `6d8ec22`
+returned **`VERDICT: PASS`**.
+
+The re-gate is worth reading for how it verified rather than what it concluded. It
+**mutation-tested the new doc-check rules** — reintroducing `Open them before committing`
+and `pkill -f shux` one at a time, confirming each is caught, names the right file, and
+restores clean — instead of accepting a green tick, which is exactly the norm these P1s
+existed to teach. It **built the adversary** for the leak-guard claim (a same-repo
+`target/release/shux __daemon`, first confirming it really is in scope) and watched it
+survive a full self-test run. It **re-took the 360/375px real-WebKit measurement** this
+machine could not reach (every simulator here is ≥390 CSS px): 0 overflow on the branch
+at 320–1024, versus 33px at 320px on `main`. And it ran the serial pass this task had
+left open — `make check` green in ONE run at one commit with nothing else live.
 
 | Finding | Fix |
 |---|---|
@@ -171,6 +183,11 @@ measuring only at 402 CSS px. All findings are fixed; a re-gate has been request
 The gate also independently **confirmed all six earlier fixes** (CI fails closed, `daemon
 stop` pid safety, trace/report collision, no golden from a dead child, `stale_golden`
 diagnostics, exit 4 documented) and passed the frozen-suite and doc checks it did run.
+
+Residual, recorded and not blocking: the self-test's orphan branch can still reap an
+unbaselined PPID-1 process, but it is repo-cwd-scoped now and such a process genuinely is
+a leak; and `--accent` on a light `pre` is 4.06:1, which is pre-existing and site-wide
+(15 identical spans in `#agents` on `main`), not introduced here.
 
 Every gate below was additionally re-run directly:
 
