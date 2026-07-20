@@ -43,7 +43,7 @@ if [[ "$shipped_actions" == "$doc_actions" ]]; then
   ok "step actions match ($(echo "$shipped_actions" | wc -l | tr -d ' ') actions)"
 else
   err "step actions drifted between gate.md and Step::action()"
-  diff <(echo "$shipped_actions") <(echo "$doc_actions") \
+  { diff <(echo "$shipped_actions") <(echo "$doc_actions") || true; } \
     | sed 's/^</    only in code: /; s/^>/    only in doc:  /' | sgrep -E 'only in'
 fi
 
@@ -64,7 +64,7 @@ if [[ "$expected_doc_codes" == "$doc_codes" ]]; then
   ok "exit codes match ($(echo "$doc_codes" | tr '\n' ' ' | sed 's/ $//'), incl. CLI-level 4)"
 else
   err "exit-code table drifted from GateStatus::exit_code() + the CLI-level 4"
-  diff <(echo "$expected_doc_codes") <(echo "$doc_codes") \
+  { diff <(echo "$expected_doc_codes") <(echo "$doc_codes") || true; } \
     | sed 's/^</    missing from doc: /; s/^>/    extra in doc:     /' | sgrep -E 'in doc'
 fi
 
@@ -85,10 +85,17 @@ raw_keys=$(
 )
 # Keys the doc is allowed to name because the parser genuinely accepts them.
 for key in mask steps env terminal cwd command name description deadline_ms; do
-  if echo "$raw_keys" | grep -qx "$key"; then
-    ok "scenario key \`$key\` is accepted by the parser"
-  else
+  in_parser=no; in_doc=no
+  echo "$raw_keys" | grep -qx "$key" && in_parser=yes
+  # The doc must actually TEACH the key — otherwise an emptied gate.md sails past this
+  # section, which is exactly the vacuous pass a gate must never have.
+  grep -qE "^[[:space:]]*\\[{0,2}${key}\\b|\\\`${key}\\\`" "$DOC" && in_doc=yes
+  if [[ "$in_parser" == yes && "$in_doc" == yes ]]; then
+    ok "scenario key \`$key\`: documented and accepted by the parser"
+  elif [[ "$in_parser" != yes ]]; then
     err "gate.md documents scenario key \`$key\` but no Raw* struct accepts it"
+  else
+    err "the parser accepts scenario key \`$key\` but gate.md never documents it"
   fi
 done
 # The specific 084 regression: the plural must never come back as a USABLE key — either
