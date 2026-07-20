@@ -353,6 +353,8 @@ fn row_styles(row: &RowRepr) -> BTreeMap<u16, &CapStyle> {
 pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> (Vec<StyleDelta>, u32) {
     let mut out: Vec<StyleDelta> = Vec::new();
     let mut total: u32 = 0;
+    // Whether the run currently being walked was actually pushed (false once capped).
+    let mut emitting_current = false;
     let actual_rows: BTreeMap<u16, &RowRepr> = actual.rows.iter().map(|r| (r.row, r)).collect();
 
     for erow in &expected.rows {
@@ -380,15 +382,21 @@ pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> (Vec<St
             );
             prev = Some((*col, e_style, a_style));
             if continues {
-                // Extend the run in place so `col_end` covers the whole span.
-                if let Some(last) = out.last_mut() {
-                    last.col_end = col.saturating_add(1);
+                // Extend the run in place so `col_end` covers the whole span — but ONLY if
+                // this run is the one we actually emitted. Past the cap a run is counted
+                // and dropped, and blindly extending `out.last_mut()` would rewrite the
+                // final emitted entry's `col_end` with a column from a different row.
+                if emitting_current {
+                    if let Some(last) = out.last_mut() {
+                        last.col_end = col.saturating_add(1);
+                    }
                 }
                 continue;
             }
             // Count EVERY run, even past the cap, so truncation can be reported honestly.
             total = total.saturating_add(1);
-            if out.len() < MAX_STYLE_DELTAS {
+            emitting_current = out.len() < MAX_STYLE_DELTAS;
+            if emitting_current {
                 out.push(StyleDelta {
                     row: erow.row,
                     col: *col,
@@ -457,6 +465,53 @@ mod tests {
         assert_eq!(d[0].actual, "fg=idx(200) italic");
     }
 
+    /// The cap test above uses 1-cell runs, so the continuation branch never fires and it
+    /// structurally cannot see this: past the cap, a dropped run's continuation cells were
+    /// still rewriting the LAST EMITTED entry's `col_end` — with a column from a different
+    /// row entirely. A truncated list must never corrupt what it did emit (shux-tui-qa).
+    #[test]
+    fn a_truncated_list_does_not_corrupt_the_last_emitted_run() {
+        // 20 rows. Rows 0..16 are a 5-wide run at [0,5); rows 16..20 sit at [20,25), so a
+        // post-cap continuation would be visible as a bogus col_end on the last entry.
+        let frame = |idx: u8| {
+            let rows: Vec<String> = (0..20u16)
+                .map(|r| {
+                    let start = if r < 16 { 0 } else { 20 };
+                    let runs: Vec<String> = (0..5u16)
+                        .map(|i| format!(r#"[{},"x",{{"fg":{{"idx":{idx}}}}}]"#, start + i))
+                        .collect();
+                    format!(r#"{{"row":{r},"runs":[{}]}}"#, runs.join(","))
+                })
+                .collect();
+            FrameEnvelope::from_canonical_json(&format!(
+                r#"{{"schema":1,"size":{{"rows":20,"cols":30}},"alt_screen":false,"defaults":{{}},
+                     "cursor":{{"row":0,"col":0,"visible":true,"shape":"block"}},
+                     "palette_overridden":false,"rows":[{}]}}"#,
+                rows.join(",")
+            ))
+            .expect("parses")
+        };
+
+        let (d, total) = style_deltas(&frame(100), &frame(200));
+        assert_eq!(
+            d.len(),
+            MAX_STYLE_DELTAS,
+            "must truncate for this to prove anything"
+        );
+        assert_eq!(total, 20, "every run must still be counted");
+
+        let last = d.last().expect("at least one delta");
+        assert_eq!(last.row, 15);
+        assert_eq!(last.col, 0);
+        assert_eq!(
+            last.col_end, 5,
+            "a dropped post-cap run corrupted the last emitted entry: {last:?}"
+        );
+        // And every emitted entry must describe a real 5-wide run on its own row.
+        for e in &d {
+            assert_eq!(e.col_end - e.col, 5, "bad extent on {e:?}");
+        }
+    }
     #[test]
     fn deltas_are_capped_when_each_change_is_a_distinct_fact() {
         // Each column gets a DIFFERENT colour, so no two neighbours share an

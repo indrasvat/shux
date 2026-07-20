@@ -95,8 +95,8 @@ agents succeed on both CRs with no blocking friction, zero leaked processes).
 - [x] DootSabha design review incorporated before running the gauntlet (`.local/dootsabha-084-design.json`).
 - [x] All three cold-agent runs pass both change requests; transcripts + friction log in `.local/084-gauntlet/` and `.local/084-friction-log.md`.
 - [x] Feature-affecting fixes recorded in `docs/tasks/081-*.md` + `082-*.md` and re-gated (contract 5/5, verdict 18/18, run 21/21, settle 6/6).
-- [ ] `shux-tui-qa` `VERDICT: PASS` on the overall workflow.
-- [ ] Implementation/validation DootSabha convergence review clean or addressed.
+- [x] `shux-tui-qa` `VERDICT: PASS` on the overall workflow.
+- [x] Implementation/validation DootSabha convergence review addressed (`.local/dootsabha-084-impl.json`; asks 1+2 implemented, ask 3 re-scoped below).
 - [x] `docs/PROGRESS.md` + this task updated; learnings appended.
 
 ## Results (2026-07-19)
@@ -152,6 +152,23 @@ correct half of the pair") to decide to raise the table rather than lower the su
   repository* was terminated as collateral. Pre-existing; 084 is merely the first task to
   run six long guarded agent invocations back to back. Fixing it means narrowing the kill
   set to the guard's own process group. **Deferred to tooling.**
+- **Impl-council ask #3 (report schema/version story).** The council asked for `col_end` +
+  truncation reporting (both shipped) **and** an explicit serialized schema/version marker,
+  since every report struct carries `#[serde(deny_unknown_fields)]` and an added field
+  therefore breaks an old strict reader the moment it appears. `GATE_REPORT_SCHEMA` exists
+  but is **never serialized into `report.json`**, so it signals nothing to a consumer today.
+  Giving the report a real version field is a governance change to 082's frozen schema that
+  deserves its own design pass, not a late edit inside an acceptance task — and 084 already
+  added one field to that schema under a `GATE-TEST-CHANGE:` trailer. **Deferred to 082's
+  schema-governance surface**, together with F11.
+- **F11 — a `cwd`-escape refusal can be redacted to nothing** by the secret scanner's
+  entropy heuristic when the host path carries a high-entropy segment. Exit 3 still fires,
+  so nothing passes silently, but the explanation is lost. Joins the 082 scanner-tuning
+  item. **Deferred to 082.**
+- **F12 — `style_deltas` cannot describe a purely additive colour change** (it iterates the
+  expected frame's rows, so styling where the golden was blank yields no entries). Correct
+  for its purpose — new text is visible in `regions` and the capture — but recorded so its
+  absence is not misread. **WONTFIX, documented.**
 - **F10 — `claude -p` / `agy -p` transcripts are final-message only**, so per-step friction
   is observable for codex alone. The pass bar is state-based, so no verdict depends on it.
   `--output-format stream-json` would capture it. **Accepted for this gauntlet.**

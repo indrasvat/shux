@@ -945,8 +945,10 @@ name="dup"
         );
     }
 
-    /// Containment: a scenario must not be able to walk the runner out of its own directory.
-    /// This invariant is the reason `cwd` is safe to join onto the scenario dir unchecked.
+    /// Containment, first layer: reject `..` SYNTACTICALLY at parse time. This is not
+    /// sufficient on its own — a symlink is a legal relative name that still points
+    /// anywhere — so the runner canonicalizes and re-checks containment before spawn
+    /// (`runner::resolve_contained_cwd`). Both layers are load-bearing.
     #[test]
     fn a_cwd_escaping_the_scenario_dir_is_refused() {
         for bad in ["..", "../elsewhere", "sub/../../elsewhere", "./../x"] {
