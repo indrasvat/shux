@@ -134,9 +134,24 @@ fn select_targets(
     statuses: &[GateStatus],
     selector: &str,
 ) -> Result<Vec<usize>, String> {
-    if selector == "failing" {
+    if selector == crate::gate::scenario::RESERVED_FRAME_NAME {
+        // The parser reserves this name (085 F17), so the two meanings can never both
+        // apply. Refuse rather than guess if a frame ever reaches here carrying it —
+        // silently blanket-blessing every failing frame is how a red run went green.
+        if outcome.frames.iter().any(|f| f.name == selector) {
+            return Err(format!(
+                "{selector:?} is the \"bless every failing frame\" selector, but a frame \
+                 is also named {selector:?} — rename the frame"
+            ));
+        }
         Ok((0..outcome.frames.len())
             .filter(|&i| statuses.get(i).copied().is_some_and(is_blessable))
+            // 085 F20: never blanket-bless a frame that carries an xfail. A
+            // fingerprint-mismatched waiver reports `fail`, which WAS blessable — so a
+            // sweeping `--update` re-baselined the very diff the fingerprint existed to
+            // refuse, and the run went green. A waiver is a deliberate statement about one
+            // specific diff; changing it must be deliberate too.
+            .filter(|&i| outcome.frames[i].xfail.is_none())
             .collect())
     } else {
         // A named frame.
@@ -144,10 +159,15 @@ fn select_targets(
             None => Err(format!("no expect_golden frame named {selector:?}")),
             Some(i) => {
                 let st = statuses.get(i).copied().unwrap_or(GateStatus::Pass);
-                if st == GateStatus::Xfail {
+                if outcome.frames[i].xfail.is_some() {
+                    // Consistent with the blanket rule above: an xfail-bearing frame is
+                    // never blessed as a side effect, whether the waiver currently holds
+                    // (`xfail`), has lapsed (`xfail_expired`), or no longer covers the diff
+                    // on screen (`fail`, via a fingerprint mismatch).
                     Err(format!(
-                        "frame {selector:?} is xfail (expected-failing) — bless is refused; \
-                         remove the xfail to promote it"
+                        "frame {selector:?} carries an xfail — bless is refused. The waiver \
+                         is a statement about one specific diff; update or remove the \
+                         `[steps.xfail]` block deliberately instead of re-baselining under it"
                     ))
                 } else if is_blessable(st) {
                     Ok(vec![i])
@@ -162,8 +182,14 @@ fn select_targets(
     }
 }
 
-/// Run the guard set, then atomically write each target golden + the approval log +
-/// manifest. Returns `Refused` if any guard trips (no byte written).
+/// Run the guard set, then write each target golden + the approval log + manifest.
+///
+/// Returns `Refused` if a GUARD trips — CI, secret scan, dirty tree — and those all run
+/// before the first write, so no byte lands. Each individual golden is written atomically
+/// (temp-in-dir + rename), but the BATCH is not transactional: if a write fails partway,
+/// earlier targets are already committed. That case still returns `Refused`, with the
+/// already-written frames named in the reason (085 F19) rather than implying the tree is
+/// untouched.
 fn write_targets(
     scenario: &Scenario,
     outcome: &RunOutcome,
@@ -248,7 +274,25 @@ fn write_targets(
                 append_approval_line(golden_dir, &entry)?;
                 entries.push(entry);
             }
-            Err(e) => return Ok(BlessOutcome::Refused(e)),
+            Err(e) => {
+                // 085 F19: the GUARDS above all run before any write, so a guard refusal
+                // genuinely touches no byte. A failure HERE is different — every earlier
+                // target in this batch is already committed to disk. Saying only "refused"
+                // left the author believing the tree was untouched when it had been
+                // partially re-baselined. Name what landed so `git status` has meaning.
+                if entries.is_empty() {
+                    return Ok(BlessOutcome::Refused(e));
+                }
+                let written: Vec<&str> = entries.iter().map(|x| x.name.as_str()).collect();
+                return Ok(BlessOutcome::Refused(format!(
+                    "{e} - WARNING: {} golden(s) were already written before this failure \
+                     ({}); the golden tree is PARTIALLY updated. Review `git status` in {} \
+                     and revert or complete the bless deliberately.",
+                    entries.len(),
+                    written.join(", "),
+                    golden_dir.display()
+                )));
+            }
         }
     }
 
@@ -753,6 +797,48 @@ mod tests {
         assert!(err.contains("xfail"), "{err}");
     }
 
+    /// An xfail waiver pinned to ONE diff via its fingerprint.
+    fn pinned_xfail() -> shux_vt::XfailMeta {
+        shux_vt::XfailMeta {
+            reason: "known".into(),
+            owner: "aria".into(),
+            issue: "#1".into(),
+            expiry: "2099-12-31".into(),
+            fingerprint: Some("the-one-diff-this-waiver-covers".into()),
+        }
+    }
+
+    #[test]
+    fn blanket_update_never_blesses_a_frame_carrying_an_xfail() {
+        // 085 F20: a fingerprint-mismatched waiver reports `fail`, and `fail` was
+        // blessable — so a sweeping `--update` re-baselined the exact diff the
+        // fingerprint existed to refuse, and the run went green. The fingerprint's whole
+        // purpose is that the waiver covers ONE diff; a blanket bless must not defeat it.
+        let mut f = frame("pinned", FrameKind::Mismatch, "{}".into(), "sha".into());
+        f.xfail = Some(pinned_xfail());
+        let plain = frame("plain", FrameKind::Mismatch, "{}".into(), "sha2".into());
+        let outcome = fake_outcome(vec![f, plain]);
+        let targets =
+            select_targets(&outcome, &[GateStatus::Fail, GateStatus::Fail], "failing").unwrap();
+        assert_eq!(
+            targets,
+            vec![1],
+            "only the frame with no xfail may be blanket-blessed"
+        );
+    }
+
+    #[test]
+    fn naming_an_xfail_frame_refuses_whatever_its_status() {
+        // The named path must agree with the blanket rule — it previously refused only a
+        // currently-valid `xfail`, so a fingerprint-mismatched one (status `fail`) could
+        // still be blessed by name.
+        let mut f = frame("pinned", FrameKind::Mismatch, "{}".into(), "sha".into());
+        f.xfail = Some(pinned_xfail());
+        let outcome = fake_outcome(vec![f]);
+        let err = select_targets(&outcome, &[GateStatus::Fail], "pinned").unwrap_err();
+        assert!(err.contains("xfail"), "{err}");
+    }
+
     fn envelope_w(prog: &[u8], cols: usize) -> FrameEnvelope {
         let mut vt = VirtualTerminal::new(3, cols);
         vt.process(prog);
@@ -895,6 +981,7 @@ mod tests {
             frames,
             terminal: None,
             has_visual_check: true,
+            golden_dir: "/tmp/goldens".to_string(),
         }
     }
 

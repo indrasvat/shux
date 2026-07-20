@@ -511,13 +511,13 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint test test-shux-leak-guard test-agent-review-guard check-tui-qa check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
+check: lint test test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
 
 .PHONY: ci
-ci: lint test-lib test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa ## Run CI pipeline (lint + test-lib + test-doc + process/QA guards)
+ci: lint test-lib test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs ## Run CI pipeline (lint + test-lib + test-doc + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
@@ -564,6 +564,10 @@ check-vt-qa: ## Verify completed VT tasks have tracked SOLID QA evidence
 .PHONY: check-tui-qa
 check-tui-qa: ## Verify tracked general TUI QA evidence manifests
 	@bash scripts/check-tui-qa.sh
+
+.PHONY: check-gate-docs
+check-gate-docs: ## Verify the lens-gate skill reference matches the shipped CLI + THIRD-PARTY-NOTICES
+	@bash scripts/check-gate-docs.sh
 
 .PHONY: check-progress-active
 check-progress-active: ## Verify progress (active session variant, allows In Progress)

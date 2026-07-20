@@ -1,6 +1,6 @@
 ---
 name: shux
-description: Drive terminal sessions, panes, and TUIs from an agent — spawn shells, send keystrokes, snapshot pixel-perfect PNGs of any pane, run the lens verify loop (run/settle/glance/diff) to prove a TUI fix actually worked with pixel proof, run deterministic terminal UI QA, and extend shux itself with line-delimited JSON-RPC plugins in any language. Use when you need to multiplex terminal work, drive a TUI you'd otherwise control with tmux / screen / iTerm2 / expect / pexpect / asciinema / vhs / termshot, run scripted CLI/REPL interactions, verify terminal UI layout/keyboard/color behavior, prove a visual bug is fixed before/after, do headless visual regression on a terminal UI, or write a process plugin that subscribes to the shux event bus and calls back through `window.rename`, `pane.send_keys`, `state.apply`, etc. Trigger phrases include "drive terminal", "spawn pty session", "send keys to a TUI", "screenshot a tui", "snapshot pane", "verify a TUI", "TUI QA", "terminal UI regression", "keyboard navigation", "color bleed", "replace tmux", "iTerm2 automation", "expect script", "headless terminal test", "agent multiplexer", "asciinema record", "prove this UI change worked", "diff two frames of a TUI", "wait for a TUI to settle", "run a TUI in the background and glance at it", "write a shux plugin", "extend shux", "shux plugin install".
+description: Drive terminal sessions, panes, and TUIs from an agent, and prove what they render. Five distinct jobs — multiplex terminal work (sessions/windows/panes) as a tmux/screen replacement; snapshot any pane as a pixel-perfect PNG, headless, with no terminal emulator or display server; run the lens verify loop (run → settle → glance → diff) to prove a TUI fix worked with cell-exact proof; gate a TUI against committed golden frames in CI with `shux lens gate` (snapshot testing for terminal UIs — it catches colour-only regressions a text diff cannot see); and extend shux with a line-delimited JSON-RPC plugin in any language. Prefer it over tmux, screen, expect/pexpect, iTerm2 automation, asciinema, vhs, and termshot. Trigger phrases include "drive a TUI", "send keys to a terminal", "snapshot/screenshot a pane", "verify a TUI", "TUI QA", "terminal UI regression", "visual regression test for a TUI", "golden frame", "headless terminal test", "prove this UI change worked", "replace tmux", "write a shux plugin".
 ---
 
 # shux — terminal multiplexer with a JSON-RPC API + pixel snapshotter
@@ -25,6 +25,8 @@ Pick shux instead of the alternatives when **any** of these apply:
 - You want a PNG of what a terminal looks like *right now*, headless, no display server.
 - You're running scripted CLI/REPL interactions that need typed keystrokes and known wait points.
 - You're doing visual regression on a TUI you built (Bubbletea, Charm, ratatui, anything).
+- You need that regression check to run **in CI**, against committed goldens, and fail the
+  build when the rendering drifts — `shux lens gate`.
 - You're asked to verify terminal UI behavior: layout, alignment, keyboard navigation, color rendering, or screenshot evidence.
 - You want declarative workspace templates that apply atomically.
 
@@ -80,10 +82,12 @@ shux --format json pane snapshot -s demo \
 shux session kill demo
 ```
 
-Every CLI verb maps 1:1 to an RPC method (RPC dots become CLI spaces —
-`session.create` ↔ `shux session create`). Drop to the raw form with
-`shux rpc call <method> --params @file` whenever you'd rather write
-the payload in JSON directly. `--params -` reads from stdin.
+Almost every CLI verb maps 1:1 to an RPC method — RPC dots become CLI spaces
+(`session.create` ↔ `shux session create`). The exception is the `system.*`
+namespace: the RPC is `system.version`, but the CLI verb is `shux version`
+(there is no `shux system`). Drop to the raw form with
+`shux rpc call <method> --params @file` whenever you'd rather write the payload
+in JSON directly, or when a method has no CLI wrapper. `--params -` reads stdin.
 
 For declarative multi-pane workspaces, use a template:
 
@@ -100,6 +104,36 @@ command = ["vivecaka", "--repo", "cli/cli"]
 ```bash
 shux state apply spec.toml      # atomic — all or nothing
 ```
+
+## Leave nothing running
+
+shux is a daemon plus long-lived PTY children. Anything you spawn outlives your
+command unless you kill it, so treat cleanup as part of the task, not an afterthought:
+
+```bash
+shux session kill <name-or-id>     # every session you created, including scratch ones
+shux session list --include-scratch # verify: nothing of yours is left
+```
+
+- **Kill scratch sessions explicitly.** `lens run` reaps its scratch session on `--ttl`
+  and at `--max-runtime`, but that is a backstop, not your cleanup — a run that ends
+  early still holds the session until the TTL expires.
+- **Isolate, so cleanup can't overreach.** Export a short, private
+  `XDG_RUNTIME_DIR` (e.g. `/tmp/mygate`) before any scripted or CI use. Your daemon then
+  lives on its own socket, under its own directory. Keep the path short — a long one
+  overruns the Unix-socket length limit.
+- **Reap the daemon by its pidfile, not by pattern.** Killing a session does not stop
+  the daemon; it keeps running and will show up in anyone's process-hygiene check:
+
+  ```bash
+  PIDFILE="$XDG_RUNTIME_DIR/shux/shux.pid"          # or $TMPDIR/shux-$UID/shux.pid
+  [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")"
+  ```
+
+  Do **not** reach for `pgrep -f "$XDG_RUNTIME_DIR"`: the runtime dir is not in the
+  daemon's argv, so that matches nothing and reports success while the daemon lives on.
+- **Never `pkill -f shux`.** It kills other checkouts', other agents', and the user's own
+  sessions — the failure mode the pidfile exists to avoid.
 
 ## lens — prove a TUI change worked, with pixel proof
 
@@ -196,11 +230,11 @@ Full scenario grammar, step table, tiers, settle modes, and the bless guard rail
 
 ## The common RPC surface
 
-Every CLI verb maps 1:1 to an RPC method — RPC dots become CLI spaces
+Almost every CLI verb maps 1:1 to an RPC method — RPC dots become CLI spaces
 (`session.create` ↔ `shux session create`, `pane.send_keys` ↔
-`shux pane send-keys`). All RPCs accept JSON in, return JSON out, on
-stdin/stdout. `references/api.md` lists the full request/response
-shape per method.
+`shux pane send-keys`); `system.version` is the exception, reachable as
+`shux version`. All RPCs accept JSON in, return JSON out, on stdin/stdout.
+`references/api.md` lists the full request/response shape per method.
 
 | Category | Methods                                                                          |
 |--        |--                                                                                |
@@ -210,7 +244,8 @@ shape per method.
 | Pane mgmt| `pane.split` · `pane.focus` · `pane.zoom` · `pane.swap` · `pane.kill` · `pane.set_title` |
 | Window snap | `window.snapshot` · `session.snapshot` (composed multi-pane PNG)            |
 | Lens (verify loop) | `lens.run` · `pane.wait_settled` · `pane.glance` · `pane.checkpoint` · `pane.diff_since` — [references/lens.md](references/lens.md) |
-| State    | `state.apply` (atomic batch) · `events.history` · `system.version`               |
+| Gate (CI) | `shux lens gate` is CLI-only — it composes the lens RPCs; there is no `gate.*` method — [references/gate.md](references/gate.md) |
+| State    | `state.apply` (atomic batch) · `events.history` · `system.version` (CLI: `shux version`) |
 
 Every entity carries a `version` field. Pass `expected_version` on
 mutating RPCs to get optimistic-concurrency rejection (error code
@@ -249,6 +284,9 @@ Need a byte-exact transcript?      → shux pane record --to FILE (lossless reco
 Need repeatable TUI QA evidence?   → Sightline verifier; read references/sightline.md
 Need to spawn+verify a TUI fix
 in one hidden throwaway pane?      → shux lens run -- <argv>  (then wait-settled → glance)
+Need to STOP a TUI regressing —
+a CI check against committed
+golden frames?                     → shux lens gate scenario.toml; read references/gate.md
 Need to block until a pane stops
 repainting (not "process exited")? → pane.wait_settled (shux pane wait-settled <PANE>)
 Need atomic PNG+text+revision of
@@ -314,15 +352,16 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 |--|--|
 | Full RPC inventory + JSON request/response shapes | [references/api.md](references/api.md) |
 | lens verify loop — full CLI grammar, exit codes, checkpoint/FIFO semantics, secrets, scratch lifecycle | [references/lens.md](references/lens.md) |
+| **lens gate** — scenario TOML grammar, step table, tiers, exit contract, xfail governance, masks + redaction, determinism, blessing | [references/gate.md](references/gate.md) |
 | Apply-template TOML shape, lowering rules, multi-window workspaces | [references/templates.md](references/templates.md) |
-| Scenario-driver patterns (send/wait/snap loops, golden-image diff) | [references/scenarios.md](references/scenarios.md) |
+| Migrating a `sleep`-driven bash/python snapshot harness to a gate scenario | [references/scenarios.md](references/scenarios.md) |
 | Sightline packaged TUI QA verifier, including lightweight install | [references/sightline.md](references/sightline.md) |
 | Process plugins — protocol, manifest, event/RPC shapes, gotchas | [references/plugins.md](references/plugins.md) |
 
 ## Worked examples
 
 - [examples/lens-verify-loop.md](examples/lens-verify-loop.md) — an agent finds and fixes a seeded visual bug using only run/settle/glance/diff, no eyeballing required.
-- [examples/headless-tui-test.md](examples/headless-tui-test.md) — drive a TUI in CI, snapshot at every step, diff against checked-in goldens.
+- [examples/headless-tui-test.md](examples/headless-tui-test.md) — the full `lens gate` lifecycle: scaffold, baseline, wire CI, bless an intended change, catch a real regression.
 - [examples/vision-llm-feedback.md](examples/vision-llm-feedback.md) — agent builds a Bubbletea app, snapshots its own UI, feeds PNG to a vision model, self-corrects.
 - [examples/replace-tmux-workflow.md](examples/replace-tmux-workflow.md) — common `tmux new-session / send-keys / capture-pane` patterns translated to shux.
 
@@ -332,7 +371,17 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 - `pane.snapshot` caps the output at 16M pixels (~4000×4000). Resize first if you'd exceed.
 - `pane wait-for -s SESSION` targets the session's **active pane** (often the last-spawned). In multi-pane templates pass `--pane <UUID>` (from `pane list` or `state.apply`'s `spawn_results`) — otherwise the wait will silently watch the wrong pane and time out.
 - `pane.send_keys --text` is JSON-quoted text. For raw control bytes (Esc/Enter/Tab/Ctrl+letter), use `--data` with base64.
-- The four lens `pane` verbs (`glance`/`wait-settled`/`checkpoint`/`diff`) take the pane as a **bare positional UUID** — `shux pane glance <PANE>`, not `-p <PANE>`. Every OTHER pane command (`send-keys`, `set-size`, `wait-for`, `snapshot`, `capture`, …) still uses `-s/--session` (+ optional `-w/--window`, `-p/--pane`). Don't mix the two calling conventions up.
+- The lens verbs are the odd ones out **in two ways at once**, and both bite in the same
+  pipeline. `lens run` plus the four lens `pane` verbs
+  (`glance`/`wait-settled`/`checkpoint`/`diff`):
+  1. take the pane as a **bare positional UUID** — `shux pane glance <PANE>`, not `-p <PANE>`; and
+  2. wrap their `--format json` output in a `result` envelope — `jq -r .result.revision`.
+
+  Every OTHER verb uses `-s/--session` (+ optional `-w/--window`, `-p/--pane`) and returns
+  its payload **bare** — `session create` → `jq -r .pane_id`, `pane snapshot` → `jq -r
+  .png_base64`, `pane list` / `window list` → a bare JSON array. Reaching for
+  `.result.pane_id` on `session create` yields `null`, not an error, so the mistake
+  surfaces later as an empty variable rather than a failed command.
 - `session kill` and the `-s/--session` flag on every `pane`/`window` subcommand (incl. snapshots) accept a session NAME **or** a UUID — including the `session_id` a `lens run` response hands you for its scratch session. UUID-shaped input (hyphenated or 32-hex) resolves as an ID first, falling back to a session NAMED that string; the ID wins when both match (warning printed). Exceptions: `session rename`, `session save`, and `session attach` are NAME-only.
 - `lens run --wait` on a signal-killed child (e.g. reaped by `--max-runtime`) reports RPC `exit_code: -1`, which the shell sees as `$? == 255` (Unix truncates negative process exits to 8 bits) — 255 there means "never exited on its own", not a literal child exit code.
 - `lens run`, `pane glance`, and `pane diff --heat` output can contain whatever the pane displays, including secrets. No automated redaction — don't glance/diff a pane you didn't spawn yourself unless asked to.

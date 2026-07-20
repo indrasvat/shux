@@ -1,6 +1,6 @@
 # Task 085: lens gate — skill + landing site
 
-**Status:** Not Started
+**Status:** In Progress
 **Priority:** High
 **Milestone:** M3
 **Depends On:** 084 (feature validated by cold agents)

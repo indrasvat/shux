@@ -1559,9 +1559,14 @@ fn run_client(args: Cli) -> anyhow::Result<()> {
     } else {
         EnvFilter::from_default_env()
     };
+    // 085 F22: logs go to STDERR, never stdout. stdout is the DATA channel — `--format
+    // json` and `lens gate --report -` promise it carries only the payload — and the old
+    // default writer broke that contract exactly when someone reached for `-v` to debug,
+    // emitting ANSI-coloured DEBUG lines ahead of the JSON.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let rt = tokio::runtime::Runtime::new()?;

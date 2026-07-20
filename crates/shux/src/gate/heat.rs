@@ -69,16 +69,42 @@ pub fn emit_heat_for_fails(
             continue; // cell tier with no cell change: nothing meaningful to draw
         }
 
-        let Ok(png) = encode_png(&img) else { continue };
-        if std::fs::create_dir_all(out_dir).is_err() {
+        // 085 F23: still best-effort — a heat failure must never change the verdict — but
+        // never SILENT. The heat PNG is the whole pixel-perfect proof; dropping it with no
+        // diagnostic leaves the reader believing the gate simply produced no evidence.
+        let png = match encode_png(&img) {
+            Ok(p) => p,
+            Err(e) => {
+                warn_heat_skipped(&f.name, &format!("could not encode the overlay: {e}"));
+                continue;
+            }
+        };
+        if let Err(e) = std::fs::create_dir_all(out_dir) {
+            warn_heat_skipped(
+                &f.name,
+                &format!("could not create {} ({e})", out_dir.display()),
+            );
             continue;
         }
         let path = out_dir.join(format!("{}.heat.png", f.name));
-        if std::fs::write(&path, &png).is_err() {
+        if let Err(e) = std::fs::write(&path, &png) {
+            warn_heat_skipped(
+                &f.name,
+                &format!("could not write {} ({e})", path.display()),
+            );
             continue;
         }
         set_heat_path(reports, &f.name, &path);
     }
+}
+
+/// Tell the reader the heat evidence was skipped, and why (085 F23). Warnings go to
+/// STDERR so the `--report -` stdout-purity contract is untouched.
+fn warn_heat_skipped(frame: &str, why: &str) {
+    eprintln!(
+        "{}",
+        crate::style::warning(format!("lens gate: no heat PNG for frame '{frame}': {why}"))
+    );
 }
 
 /// Overlay the changed CELLS (heat red) and desaturate the rest — cell-granularity heat.

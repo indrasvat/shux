@@ -75,7 +75,9 @@ fn parse_error_report(path: &Path, message: &str) -> Vec<ScenarioReport> {
     }]
 }
 
-/// A single `update_refused` report (exit 6) — a bless/create was refused by a guard.
+/// A single `update_refused` report (exit 6) for a refusal that fires BEFORE the scenario
+/// runs — today only the CI guard. There are no per-frame verdicts to preserve yet, so an
+/// empty report is the whole truth. Once the run has happened, use [`apply_refusal`].
 fn refused_report(scenario: &str, reason: &str) -> Vec<ScenarioReport> {
     vec![ScenarioReport {
         scenario: scenario.to_string(),
@@ -89,6 +91,50 @@ fn refused_report(scenario: &str, reason: &str) -> Vec<ScenarioReport> {
         frames: vec![],
         note: Some(verdict::sanitize_note(&format!("update_refused: {reason}"))),
     }]
+}
+
+/// Fold a bless REFUSAL into the already-computed reports (085 F16).
+///
+/// This used to replace the reports with a synthetic empty `update_refused` one and return
+/// early, which erased the run's real verdict: a genuine regression became exit 6 with
+/// `frames: []` and no heat PNG, so `report.json` — the documented source of truth —
+/// recorded that nothing had failed. `shux_vt`'s own
+/// `worst_never_masks_a_regression_with_an_error` forbids precisely that; the refusal is an
+/// operational error and ranks BELOW a regression. Roll it up through `worst()` instead, and
+/// keep every frame so the evidence survives.
+fn apply_refusal(reports: &mut [ScenarioReport], reason: &str) {
+    for r in reports.iter_mut() {
+        r.status = r.status.worst(GateStatus::UpdateRefused);
+        let refusal = format!("update_refused: {reason}");
+        r.note = Some(match r.note.take() {
+            Some(existing) if !existing.is_empty() => {
+                verdict::sanitize_note(&format!("{existing}; {refusal}"))
+            }
+            _ => verdict::sanitize_note(&refusal),
+        });
+    }
+}
+
+/// Exit code for a CLI-level I/O failure while writing the report or trace (085 F18).
+///
+/// This used to propagate as an `anyhow` error, which the client turned into exit **1** —
+/// the FROZEN regression code — so a bad `--report` path on a perfectly green run told CI
+/// "visual regression" and printed a bare errno. `4` is reserved for exactly this class
+/// (`shux_vt`'s `exit_code_never_returns_four` pins that no gate VERDICT can produce it),
+/// so it is unambiguous: the check itself did not fail, writing its output did.
+fn report_io_failure(opts: &GateRunOptions, e: &std::io::Error) -> i32 {
+    let target = match opts.report.as_deref() {
+        Some("-") | None => "the report stream".to_string(),
+        Some(p) => format!("the report file {p}"),
+    };
+    eprintln!(
+        "{}",
+        crate::style::error(format!(
+            "lens gate: could not write {target}: {e}. The scenario itself ran; only its \
+             output could not be written (exit 4, not a regression)."
+        ))
+    );
+    4
 }
 
 /// Route `report.json` + the ASCII summary to the right streams. When the report goes to
@@ -127,7 +173,9 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             runner::emit_parse_error_trace(trace_target(opts.trace.clone()), &e.to_string());
             eprintln!("{}", crate::style::error(format!("lens gate: {e}")));
             let reports = parse_error_report(&opts.scenario_path, &e.to_string());
-            emit(&opts, &reports)?;
+            if let Err(e) = emit(&opts, &reports) {
+                return Ok(report_io_failure(&opts, &e));
+            }
             return Ok(GateStatus::ScenarioError.exit_code() as i32);
         }
     };
@@ -137,13 +185,16 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         .unwrap_or_else(|| default_golden_dir(&opts.scenario_path, &scenario));
 
     // A bless/create is refused in CI up front, before spawning anything (task §5/§7):
-    // a golden must never be self-minted in CI.
+    // a golden must never be self-minted in CI. This one keeps its early return: nothing has
+    // run yet, so there is no verdict to preserve, and exit 6 fails the build loudly.
     if is_ci() && (opts.update.is_some() || opts.on_missing == crate::cli::OnMissing::Create) {
         let reports = refused_report(
             &scenario.name,
             "CI mode: goldens are never self-minted here",
         );
-        emit(&opts, &reports)?;
+        if let Err(e) = emit(&opts, &reports) {
+            return Ok(report_io_failure(&opts, &e));
+        }
         return Ok(GateStatus::UpdateRefused.exit_code() as i32);
     }
 
@@ -176,7 +227,9 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
             &opts.scenario_path,
             "--cast path must not be inside the golden dir",
         );
-        emit(&opts, &reports)?;
+        if let Err(e) = emit(&opts, &reports) {
+            return Ok(report_io_failure(&opts, &e));
+        }
         return Ok(GateStatus::ScenarioError.exit_code() as i32);
     }
 
@@ -212,9 +265,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     if let Some(selector) = &opts.update {
         match bless::run_update(&scenario, &outcome, &reports, &golden_dir, selector, &opts)? {
             bless::BlessOutcome::Refused(reason) => {
-                let reports = refused_report(&scenario.name, &reason);
-                emit(&opts, &reports)?;
-                return Ok(GateStatus::UpdateRefused.exit_code() as i32);
+                apply_refusal(&mut reports, &reason);
             }
             bless::BlessOutcome::Blessed(manifest) => {
                 bless::apply_blessed(&mut reports, &manifest, verdict::scenario_floor(&outcome));
@@ -223,9 +274,7 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
     } else if opts.on_missing == crate::cli::OnMissing::Create {
         match bless::create_missing(&scenario, &outcome, &reports, &golden_dir, &opts)? {
             bless::BlessOutcome::Refused(reason) => {
-                let reports = refused_report(&scenario.name, &reason);
-                emit(&opts, &reports)?;
-                return Ok(GateStatus::UpdateRefused.exit_code() as i32);
+                apply_refusal(&mut reports, &reason);
             }
             bless::BlessOutcome::Blessed(manifest) => {
                 bless::apply_blessed(&mut reports, &manifest, verdict::scenario_floor(&outcome));
@@ -252,7 +301,9 @@ pub async fn run_gate(socket_path: &Path, opts: GateRunOptions) -> anyhow::Resul
         plumb_cast_note(&mut reports, cast);
     }
 
-    emit(&opts, &reports)?;
+    if let Err(e) = emit(&opts, &reports) {
+        return Ok(report_io_failure(&opts, &e));
+    }
     Ok(verdict::exit_code(&reports) as i32)
 }
 

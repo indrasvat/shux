@@ -350,6 +350,7 @@ fn finish(
     frames: Vec<FrameOutcome>,
     terminal: Option<TerminalOutcome>,
     has_visual: bool,
+    golden_dir: &Path,
 ) -> RunOutcome {
     RunOutcome {
         scenario_name: scenario.name.clone(),
@@ -362,6 +363,7 @@ fn finish(
         frames,
         terminal,
         has_visual_check: has_visual,
+        golden_dir: golden_dir.display().to_string(),
     }
 }
 
@@ -482,6 +484,7 @@ pub async fn drive_scenario(
                     frames,
                     Some(TerminalOutcome::Infra { message }),
                     has_visual,
+                    golden_dir,
                 ));
             }
         },
@@ -534,6 +537,7 @@ pub async fn drive_scenario(
                     limit: SCRATCH_QUOTA,
                 }),
                 has_visual,
+                golden_dir,
             ));
         }
         Err(e) => {
@@ -549,6 +553,7 @@ pub async fn drive_scenario(
                 frames,
                 Some(TerminalOutcome::Infra { message }),
                 has_visual,
+                golden_dir,
             ));
         }
     };
@@ -681,6 +686,7 @@ pub async fn drive_scenario(
         frames,
         terminal,
         has_visual,
+        golden_dir,
     ))
 }
 
@@ -976,12 +982,33 @@ async fn drive_step(
                                 RetryVerdict::Divergent => "divergent",
                                 _ => "exhausted",
                             };
-                            fo.retry_note = Some(format!(
-                                "expect_golden '{name}': FAIL after {eff_retries} retr{} ({kind} \
-                                 fps {:?})",
-                                if eff_retries == 1 { "y" } else { "ies" },
-                                short_fps(&fail_fps)
-                            ));
+                            // 085 F7: say WHICH of the two situations this is. Retries exist
+                            // to absorb a flake, so "FAIL after N retries" read as "flaky" —
+                            // exactly backwards for the common case, where every attempt
+                            // produced the SAME frame and the run is a stable, reproduced
+                            // regression. The distinct fingerprint count already tells them
+                            // apart; use it instead of making the reader guess.
+                            let mut distinct: Vec<&String> = fail_fps.iter().collect();
+                            distinct.sort();
+                            distinct.dedup();
+                            let attempts = eff_retries + 1;
+                            fo.retry_note = Some(if distinct.len() == 1 {
+                                format!(
+                                    "expect_golden '{name}': FAIL - the same diff on all \
+                                     {attempts} attempts (a stable regression, not a flake) \
+                                     (fps {:?})",
+                                    short_fps(&fail_fps)
+                                )
+                            } else {
+                                format!(
+                                    "expect_golden '{name}': FAIL - {attempts} attempts produced \
+                                     {} different frames (output is non-deterministic; fix the \
+                                     scenario's determinism before trusting any verdict) \
+                                     ({kind} fps {:?})",
+                                    distinct.len(),
+                                    short_fps(&fail_fps)
+                                )
+                            });
                             trace.emit(RunnerSignal::RetryOutcome {
                                 name: name.clone(),
                                 attempts_used: eff_retries,

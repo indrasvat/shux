@@ -119,6 +119,15 @@ fn missing_golden_report_is_ci_safe_regression() {
     assert_eq!(report[0].frames[0].status, GateStatus::MissingGolden);
     // Exit equals the rolled-up status's frozen exit code.
     assert_eq!(out.exit as u8, report[0].status.exit_code());
+    // 085 F24: the reason must name the directory searched. Without it, a golden tree in
+    // the wrong place (084 F14 minted a duplicate one beside a symlink) looks identical
+    // to a genuine first run, and the user has nowhere to look.
+    let reason = report[0].frames[0].reason.clone().unwrap_or_default();
+    let searched = g.path().to_string_lossy().into_owned();
+    assert!(
+        reason.contains(searched.trim_start_matches("/private")),
+        "missing_golden must name the directory it searched ({searched}), got {reason:?}"
+    );
 }
 
 #[test]
@@ -172,6 +181,44 @@ fn format_json_puts_report_on_stdout() {
     let parsed: Vec<ScenarioReport> = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("--format json stdout not a report: {e}\n{stdout}"));
     assert_eq!(parsed[0].status, GateStatus::MissingGolden);
+}
+
+#[test]
+fn verbose_logging_never_pollutes_the_report_stream() {
+    // 085 F22: `-v` sent ANSI-coloured DEBUG lines to STDOUT, so `--report -` stopped
+    // being parseable JSON exactly when someone reached for verbose output to debug a
+    // failing gate. Logs belong on stderr; stdout is the data channel.
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let scn = write_scenario(d.path(), "vb", &scenario("vb", "HI", None));
+    let mut cmd = h.shux();
+    cmd.args([
+        "-v",
+        "lens",
+        "gate",
+        "--report",
+        "-",
+        "--golden-dir",
+        &g.path().to_string_lossy(),
+        &scn,
+    ]);
+    cmd.env_remove("CI");
+    let out = cmd.output().expect("spawn shux -v lens gate");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: Vec<ScenarioReport> = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("-v must not pollute stdout: {e}\nstdout:\n{stdout}");
+    });
+    assert_eq!(parsed[0].status, GateStatus::MissingGolden);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "no ANSI on the report stream:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("DEBUG"),
+        "-v must still emit debug logging, on stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -253,6 +300,92 @@ fn on_missing_create_is_refused_in_ci() {
     assert!(
         !g.path().join("frame.capture.json").exists(),
         "no golden minted in CI"
+    );
+}
+
+#[test]
+fn a_refused_bless_never_erases_a_regression() {
+    // 085 F16: a bless REFUSAL replaced the computed reports with a synthetic empty
+    // `update_refused` one and returned early — so a real regression became exit 6 with
+    // `frames: []` and no heat evidence. `shux_vt`'s own
+    // `worst_never_masks_a_regression_with_an_error` forbids exactly that; the driver
+    // bypassed `worst()`. The regression must survive the refusal.
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "base", "ALPHA");
+    // A secret-shaped frame both MISMATCHES the ALPHA golden (a real regression) and trips
+    // the pre-bless secret scan, so `--update` is refused AFTER the run has produced real
+    // per-frame verdicts. That is the path F16 erased. (The CI refusal is a different,
+    // deliberate early return: nothing has run, so there is no verdict to preserve.)
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let scn = write_scenario(d.path(), "ref", &scenario("ref", secret, None));
+
+    // Truth, with no bless involved.
+    let plain = gate(&h, &["--report", "-", "--golden-dir", &gd, &scn], false);
+    assert_eq!(
+        plain.exit, 1,
+        "setup: regression is exit 1; stderr:\n{}",
+        plain.stderr
+    );
+    assert_eq!(
+        plain.report()[0].frames.len(),
+        1,
+        "setup: one frame reported"
+    );
+
+    // Same run, but the bless is refused by the secret scan.
+    let refused = gate(
+        &h,
+        &["--update", "--report", "-", "--golden-dir", &gd, &scn],
+        false,
+    );
+    let rep = refused.report();
+    assert_eq!(
+        refused.exit, 1,
+        "a refused bless must not downgrade a regression to exit 6; stderr:\n{}",
+        refused.stderr
+    );
+    assert_eq!(
+        rep[0].status,
+        GateStatus::Fail,
+        "scenario status must roll up through worst(computed, UpdateRefused)"
+    );
+    assert_eq!(
+        rep[0].frames.len(),
+        1,
+        "the per-frame verdicts must survive the refusal, not be replaced by []"
+    );
+    assert_eq!(rep[0].frames[0].status, GateStatus::Fail);
+    let note = rep[0].note.clone().unwrap_or_default();
+    assert!(
+        note.contains("update_refused"),
+        "the refusal must still be reported as a note, got {note:?}"
+    );
+}
+
+#[test]
+fn update_in_ci_is_refused_before_anything_runs() {
+    // The companion to F16: the CI refusal is a DELIBERATE early return — nothing has been
+    // spawned, so there is no verdict to preserve and exit 6 is the whole story. Pinned so
+    // the F16 fix (which preserves verdicts for post-run refusals) cannot be over-applied
+    // here and quietly turn CI's fail-closed guard into something else.
+    let h = Harness::new();
+    let d = tmp();
+    let g = tmp();
+    let gd = g.path().to_string_lossy().into_owned();
+    bless_golden(&h, d.path(), &gd, "base", "ALPHA");
+    let scn = write_scenario(d.path(), "grn", &scenario("grn", "ALPHA", None));
+    let out = gate(
+        &h,
+        &["--update", "--report", "-", "--golden-dir", &gd, &scn],
+        true,
+    );
+    assert_eq!(
+        out.exit, 6,
+        "a refused bless with no regression stays exit 6; stderr:\n{}",
+        out.stderr
     );
 }
 

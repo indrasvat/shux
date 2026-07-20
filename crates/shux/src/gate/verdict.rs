@@ -19,7 +19,7 @@ pub fn build_reports(outcome: &RunOutcome, today: NaiveDate) -> Vec<ScenarioRepo
     let mut frames = Vec::with_capacity(outcome.frames.len());
 
     for f in &outcome.frames {
-        let (status, reason) = frame_status(f, today);
+        let (status, reason) = frame_status(f, today, &outcome.golden_dir);
         acc = acc.worst(status);
         frames.push(FrameReport {
             name: f.name.clone(),
@@ -79,7 +79,11 @@ pub fn exit_code(reports: &[ScenarioReport]) -> u8 {
 
 /// The per-frame status + optional diagnostic reason, applying xfail governance (council
 /// strict precedence). `today` (UTC) is injected for deterministic expiry.
-fn frame_status(f: &FrameOutcome, today: NaiveDate) -> (GateStatus, Option<String>) {
+fn frame_status(
+    f: &FrameOutcome,
+    today: NaiveDate,
+    golden_dir: &str,
+) -> (GateStatus, Option<String>) {
     match f.kind {
         FrameKind::Match => match &f.xfail {
             // A frame in the xfail set now MATCHES — force-promote (the bug is fixed or
@@ -149,10 +153,14 @@ fn frame_status(f: &FrameOutcome, today: NaiveDate) -> (GateStatus, Option<Strin
         },
         FrameKind::GoldenAbsent => (
             GateStatus::MissingGolden,
-            // A first-timer's DETAIL hint (dogfood: the blank column gave no next step).
-            // ASCII only: the summary sanitizes every non-ASCII char to `?` at the output
-            // boundary, so an em-dash here reaches the reader as `no committed golden ?`.
-            Some("no committed golden - run with `--on-missing create`".to_string()),
+            // A first-timer's DETAIL hint (dogfood: the blank column gave no next step),
+            // NAMING the directory searched (085 F24 — a `missing_golden` that does not
+            // say where it looked is unactionable, and is exactly what let a duplicate
+            // golden tree go unnoticed). ASCII only: the summary sanitizes every
+            // non-ASCII char to `?` at the output boundary.
+            Some(format!(
+                "no committed golden in {golden_dir} - run with `--on-missing create`"
+            )),
         ),
         FrameKind::GoldenUntrusted => (
             GateStatus::StaleGolden,
@@ -373,11 +381,12 @@ mod tests {
             frames,
             terminal,
             has_visual_check: has_visual,
+            golden_dir: "/tmp/goldens".to_string(),
         }
     }
 
     fn status_of(f: FrameOutcome) -> GateStatus {
-        frame_status(&f, today()).0
+        frame_status(&f, today(), "/tmp/goldens").0
     }
 
     // ── the council's xfail precedence table ─────────────────────────────────

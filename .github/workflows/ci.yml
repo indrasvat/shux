@@ -81,6 +81,11 @@ jobs:
           # Compare against the PR's base branch tip.
           LENS_FROZEN_BASE: origin/${{ github.base_ref }}
         run: make check-lens-frozen
+      # The gate reference documents a TOML grammar and an exit contract that no test
+      # reads, so it can drift silently — a doc naming a key the parser rejects fails a
+      # user's run with exit 2. This compares the doc against the shipped surface.
+      - name: Check lens-gate docs match the shipped CLI
+        run: make check-gate-docs
 
   test-ubuntu:
     name: Test (ubuntu)

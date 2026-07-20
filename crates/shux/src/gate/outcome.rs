@@ -109,4 +109,8 @@ pub struct RunOutcome {
     /// Did the scenario contain at least one `expect_golden` (a real visual check)? A
     /// scenario that compared zero frames proves nothing (082 → `scenario_error`).
     pub has_visual_check: bool,
+    /// The directory the goldens were read from, for diagnostics (085 F24). A
+    /// `missing_golden` that does not say WHERE it looked is unactionable — and it is
+    /// exactly what let a duplicate golden tree (084 F14) go unnoticed.
+    pub golden_dir: String,
 }

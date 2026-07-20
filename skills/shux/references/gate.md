@@ -13,15 +13,18 @@ shux lens gate scenario.toml                 # compare against committed goldens
 shux lens gate scenario.toml --report -      # report.json on stdout, summary on stderr
 shux lens gate scenario.toml --update        # re-bless the failing frames (never in CI)
 shux lens gate review scenario.toml          # step through changed frames interactively
-shux lens gate init scenario.toml            # scaffold a new scenario + first goldens
+shux lens gate init myapp                    # scaffold myapp.toml + its first goldens
 ```
+
+New to it? [../examples/headless-tui-test.md](../examples/headless-tui-test.md) walks the
+whole lifecycle. This file is the reference.
 
 ## Exit codes (frozen contract — key CI on these)
 
 | Code | Meaning |
 |--|--|
-| 0 | pass |
-| 1 | regression (a frame differs, is missing, or is stale) |
+| 0 | pass (or a valid xfail) |
+| 1 | regression — a frame differs, is missing, is stale, or never settled |
 | 2 | usage / scenario error |
 | 3 | infra error (couldn't spawn, quota, …) |
 | 5 | the child process died |
@@ -29,6 +32,12 @@ shux lens gate init scenario.toml            # scaffold a new scenario + first g
 
 A frame with **no committed golden is a regression** (exit 1), not a silent pass. That is
 deliberate: a golden can never be self-minted in CI.
+
+Exit `4` is reserved for CLI-level I/O failures and is never produced by a gate verdict.
+
+A regression **outranks** an operational error in the rollup: a run that both fails a frame
+and has its bless refused exits `1`, not `6`, and keeps every per-frame verdict. An error
+can never mask a regression.
 
 ## The scenario file
 
@@ -51,6 +60,11 @@ rows = 24
 cols = 80
 respond_to_queries = false
 
+[[mask]]                     # optional, scenario-wide redaction rects
+row = 0
+col = 60
+width = 20
+
 [[steps]]
 action = "wait_for_text"
 text = "shux deploy board"
@@ -69,21 +83,26 @@ tier = "cell"
 retries = 2                  # re-settle + re-capture on a mismatch
 ```
 
+`name` becomes a filesystem path component, so it must be a single safe segment. Two
+names are rejected outright: anything made only of dots (it names no file), and a frame
+called `failing` — that is the `--update failing` selector, and a frame with that name
+could never be blessed on its own.
+
 ### Steps
 
 | Action | Fields |
 |--|--|
-| `wait_for_text` | `text`, `timeout_ms` |
+| `wait_for_text` | one of `text` or `regex`, plus `absent` (wait until it's GONE), `timeout_ms` |
 | `wait` | `ms` |
 | `settle` | `quiet_ms`, `timeout_ms` — quiet-based; fine for a TUI that stops painting |
 | `hold_settle` | `hold_ms`, `quiet_ms`, `timeout_ms` — settles when the frame CONTENT is unchanged for `hold_ms`. **The right default for anything that repaints** |
 | `stable_frames` | `n`, `quiet_ms`, `timeout_ms` — `n` contiguous identical revisions; for a *continuous* repainter only (a static TUI never produces `n` new revisions → `settle_never_stable`) |
 | `type_text` / `paste` | `text` |
-| `keys` | `keys` — vim notation, e.g. `["j", "<C-c>", "gg"]` |
+| `keys` | `keys` — vim notation, e.g. `["j", "<CR>", "<C-c>", "<Esc>"]` |
 | `resize` | `rows`, `cols` |
-| `expect_golden` | `name`, `tier`, optional `retries`, `hold_ms`, `stable_frames`, `quiet_ms`, `timeout_ms`, `masks`, `xfail` |
+| `expect_golden` | `name`, `tier`, optional `retries`, `hold_ms`, `stable_frames`, `quiet_ms`, `timeout_ms`, `[[steps.mask]]`, `[steps.xfail]` |
 | `assert_contains` / `assert_not_contains` | `text` |
-| `expect_exit` | `code` |
+| `expect_exit` | `code`, `timeout_ms` |
 
 A scenario with **no `expect_golden` proves nothing** and is refused (exit 2).
 
@@ -95,10 +114,12 @@ A scenario with **no `expect_golden` proves nothing** and is refused (exit 2).
   are per-OS/arch.
 - `exact` — byte-exact pixels.
 
+Tiers are **conjunctive**: a matching PNG never overrides a failing cell compare.
+
 ## The normal loop
 
 ```bash
-# 1. Write scenario.toml (or: shux lens gate init scenario.toml)
+# 1. Write scenario.toml (or: shux lens gate init myapp)
 # 2. First run: no goldens yet -> exit 1, "no committed golden"
 shux lens gate scenario.toml
 
@@ -128,7 +149,7 @@ after-nav | fail   | 50      |
 ```
 
 - `--out DIR` (default `.shux/out/<scenario>/`) receives a **heat PNG per failing frame**
-  showing the changed cells. Open it — it localizes the regression instantly.
+  at `<out>/<frame>.heat.png`. Open it — it localizes the regression instantly.
 - `--report PATH|-` writes `report.json`: per frame a `status`, `diff.changed_cells`,
   `diff.regions` (row + column span of every changed run), `diff.heat_png`, and
   `diff.style_deltas` — **what** changed, not just where:
@@ -156,7 +177,7 @@ after-nav | fail   | 50      |
 ## The sandbox — read this before your first scenario
 
 The child starts from an **empty environment** in an isolated HOME/XDG, with
-`LC_ALL=C.UTF-8`, `TZ=UTC`, `TERM=xterm-256color`, `COLORTERM=truecolor`,
+`LC_ALL=C.UTF-8`, `LANG=C.UTF-8`, `TZ=UTC`, `TERM=xterm-256color`, `COLORTERM=truecolor`,
 `SOURCE_DATE_EPOCH=0`, and `PATH=/usr/local/bin:/usr/bin:/bin`.
 
 Two consequences bite everyone once:
@@ -177,30 +198,111 @@ Two consequences bite everyone once:
    that directory: `..` is rejected when the scenario is parsed, and a symlink pointing out
    of the tree is rejected at spawn, after both paths are canonicalized.
 
-Determinism is the whole game: fixed data, no clock, no network, no randomness. Derive any
-timestamp from `SOURCE_DATE_EPOCH`. A flaky scenario is worse than no scenario.
+### The determinism contract
+
+A flaky scenario is worse than no scenario — it trains everyone to ignore the gate. The
+sandbox gives you a fixed locale, timezone, terminal identity and epoch; the scenario owes
+the other half:
+
+- **Fixed data.** Point the app at a committed fixture, never at live state.
+- **No clock.** Derive any rendered timestamp from `SOURCE_DATE_EPOCH`; `TZ=UTC` alone
+  does not stop "3 minutes ago" from changing.
+- **No network.** Run offline (`uv run --offline`, `--no-network`, a stub server).
+- **No randomness.** Seed it, or mask the region.
+- **Fixed geometry.** `[terminal] rows`/`cols` — never inherit the caller's size.
+- **Pin the toolchain** that renders (a lockfile), since a library upgrade can change
+  glyphs or spacing.
+
+Anything genuinely volatile that you cannot pin — a clock, a duration, a hostname — gets a
+`[[mask]]`, not a looser tier.
+
+### Masks
+
+A mask is a row-span rectangle, `row` / `col` / `width` (there is no height — one rect per
+row). Declare them scenario-wide as `[[mask]]`, or per frame as `[[steps.mask]]`; a frame
+gets both. Masked cells are redacted **before** the capture is hashed, compared, or
+rasterized, so a masked region can't fail a compare, can't leak into a committed golden,
+and can't destabilize a settle.
+
+> The key is `mask`, singular — `[[mask]]` and `[[steps.mask]]`. `masks` is rejected with
+> `unknown field`, exit 2.
+
+## xfail — a governed, expiring waiver
+
+An `xfail` says "this frame is known-broken; don't fail the build yet". It is inline with
+the frame, and it is **accountable by construction**:
+
+```toml
+[[steps]]
+action = "expect_golden"
+name = "after-nav"
+tier = "cell"
+
+[steps.xfail]
+reason  = "status column mis-coloured after the palette refactor"
+owner   = "aria"
+issue   = "#412"
+expiry  = "2026-09-30"                      # canonical YYYY-MM-DD, zero-padded
+fingerprint = "a1b2c3…"                     # optional: pins the waiver to ONE diff
+```
+
+`reason`, `owner` and `issue` are mandatory and must be non-blank — a blank field is an
+authoring error, not a licence to differ. Then:
+
+| Situation | Status | Exit |
+|--|--|--|
+| The frame still differs, before `expiry` | `xfail` | 0 |
+| The frame **matches** again | `xpass` — force-promote | 1 |
+| Past `expiry` | `xfail_expired` | 1 |
+| Malformed / blank field / non-canonical date | `scenario_error` | 2 |
+| `fingerprint` set and the diff is a DIFFERENT one | `fail` | 1 |
+
+Two of these are the point of the design. **`xpass` fails the build**: once the frame is
+green again the waiver is a lie, and you must delete it — a waiver can never quietly
+outlive the bug. And `fingerprint` scopes the waiver to exactly the diff you inspected, so
+a *second, unrelated* regression in the same frame is not silently absorbed by it.
 
 ## Blessing is guarded
 
 `--update` and `--on-missing create` write goldens through an approval-gated writer that
 refuses when: it detects CI, the golden tree has uncommitted changes, or a **secret scan**
-over the visible frame text trips. Every bless appends to `BASELINE-APPROVAL.md`
-(who/when/why) and emits a changed-golden manifest — so a reviewer can see exactly which
-goldens moved and why. Pass `--reason "…"` to record intent.
+over the reassembled visible frame text trips. Every bless appends to
+`<golden-dir>/BASELINE-APPROVAL.md` (who/when/why) and emits a changed-golden manifest —
+so a reviewer can see exactly which goldens moved and why. Pass `--reason "…"` to record
+intent.
+
+`--update` re-blesses every failing frame; `--update <name>` re-blesses one. A refusal
+never downgrades the run's verdict: if a frame genuinely regressed, the run still exits 1
+with its per-frame verdicts and heat evidence intact, and the refusal is recorded as a note.
+
+### Redaction
+
+The scan runs over the **visible text** (reassembled from the cell runs, so a secret split
+across styled runs or wrapped across lines is still caught), plus the scenario and frame
+names and the `--reason`. It reports **rule IDs only, never the matched value** — the
+whole point is to avoid copying a secret into a log while complaining about it. There is a
+high-entropy backstop for tokens that match no specific rule.
+
+Notes that reach `report.json` are flattened to one line, stripped of control characters,
+capped at 240 characters, and replaced wholesale if anything secret-shaped survives. Note
+text is sanitized to ASCII at the output boundary, so non-ASCII in a scenario `description`
+or `--reason` reaches the reader as `?`.
 
 ## Clean up the daemon when you're done
 
-The gate talks to a `shux` daemon, and starts one if none is running. There is **no
-`shux daemon stop` verb yet**, so a daemon outlives your gate run:
+The gate talks to a `shux` daemon and starts one if none is running, so a daemon outlives
+your gate run and will show up in any process-hygiene check. Reap exactly yours via its
+pidfile:
 
 ```sh
-pkill -f "shux __daemon"
+PIDFILE="$XDG_RUNTIME_DIR/shux/shux.pid"      # or $TMPDIR/shux-$UID/shux.pid
+[ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")"
 ```
 
-This matters if you run your own no-leak / process-hygiene check after a gate invocation —
-the daemon will show up as a new process and trip it. Use an isolated, SHORT
-`XDG_RUNTIME_DIR` (e.g. `XDG_RUNTIME_DIR=/tmp/mygate`) to keep that daemon away from any
-other shux on the machine; a long path can also blow the Unix-socket path limit.
+Set a short private `XDG_RUNTIME_DIR` (e.g. `/tmp/mygate`) before the run so this is
+precise; a long path also overruns the Unix-socket length limit. Do **not** pattern-kill
+`shux` processes — the runtime dir is not in the daemon's argv, so a `pgrep -f` on it
+matches nothing, and a broader pattern kills other checkouts' and other agents' daemons.
 
 ## Gotchas
 
@@ -210,10 +312,12 @@ other shux on the machine; a long path can also blow the Unix-socket path limit.
 - **Use `hold_settle`, not `settle`, for anything that repaints.** A TUI that clears the
   screen and redraws can be captured mid-repaint by a quiet settle — an intermittent
   whole-screen diff. `hold_ms` settles only when the frame content has held still.
+- **A shell fixture starts in canonical mode.** A `read`/`head -c 1` in a `/bin/sh` prop
+  won't see a keystroke until a newline, so send `["j", "<CR>"]`, not `["j"]`. A real TUI
+  that sets raw mode is unaffected.
 - `retries` on `expect_golden` re-settles and re-captures on a mismatch, but a retry can
   only turn FAIL into PASS by **matching the golden** — it can never launder a real
   regression, and divergent failing captures always fail.
 - Changing the scenario's structure (steps, command, `cwd`, geometry) changes the run
   identity, so existing goldens become **stale** and must be re-blessed.
-- Frames are captured with masks applied; use `masks` on `expect_golden` (or a top-level
-  `[[mask]]`) for genuinely volatile regions rather than loosening the tier.
+- `shux lens gate` is CLI-only. It composes the lens RPCs; there is no `gate.*` method.

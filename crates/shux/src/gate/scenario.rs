@@ -221,6 +221,35 @@ fn validate_name(kind: &str, name: &str) -> Result<(), ScenarioError> {
              (no '/', '\\', '..', or control characters)"
         )));
     }
+    // 085 F21: `.` passes every check above but names no file — it resolves to the
+    // directory itself, so `gate init .` scaffolded a stray `..toml` and a frame named
+    // `.` broke blessing. `..` was already rejected; `.` slipped through.
+    if name.chars().all(|c| c == '.') {
+        return Err(ScenarioError(format!(
+            "{kind} `name` {name:?} is not a usable filename \
+             (a name of only dots resolves to a directory, not a file)"
+        )));
+    }
+    Ok(())
+}
+
+/// `--update failing` is the reserved selector meaning "bless every failing frame".
+/// A frame carrying that literal name is unreachable by `--update <name>`, and worse,
+/// the request blanket-blesses every OTHER failing frame — a bless that turns a red run
+/// green (085 F17, reproduced: a real regression was committed as the new baseline while
+/// the frame the author named was left untouched). Reserve it at the parser so the
+/// selector is unambiguous by construction.
+pub(crate) const RESERVED_FRAME_NAME: &str = "failing";
+
+fn validate_frame_name(name: &str) -> Result<(), ScenarioError> {
+    validate_name("expect_golden", name)?;
+    if name == RESERVED_FRAME_NAME {
+        return Err(ScenarioError(format!(
+            "expect_golden `name` {name:?} is reserved: `--update {name}` already means \
+             \"bless every failing frame\", so a frame with this name could never be \
+             blessed on its own. Rename the frame."
+        )));
+    }
     Ok(())
 }
 
@@ -675,8 +704,9 @@ fn parse_step(
         }
         "expect_golden" => {
             let a: ExpectGoldenArgs = args!(ExpectGoldenArgs);
-            // The golden name becomes a filesystem path component — must be safe.
-            validate_name("expect_golden", &a.name).map_err(|e| ScenarioError::at(idx, e))?;
+            // The golden name becomes a filesystem path component — must be safe — and
+            // must not collide with the `--update failing` selector.
+            validate_frame_name(&a.name).map_err(|e| ScenarioError::at(idx, e))?;
             // Optional frame-stability for the pre-capture settle (task 083). hold_ms==0 /
             // stable_frames==1 keep the default quiet settle.
             if a.hold_ms != 0 {
@@ -1154,6 +1184,45 @@ expiry="2026-12-31"
     fn deadline_ms_parsed() {
         let toml = "name=\"x\"\ncommand=[\"true\"]\ndeadline_ms=1234\n";
         assert_eq!(parse(toml).unwrap().deadline_ms, 1234);
+    }
+
+    #[test]
+    fn expect_golden_named_failing_is_rejected() {
+        // 085 F17: `--update failing` means "bless every failing frame". A frame with
+        // that literal name is unreachable by `--update <name>`, and the request
+        // silently blanket-blesses every OTHER failing frame — turning a red run green.
+        // Reserve the name at the parser so the selector cannot be ambiguous.
+        let toml = r#"name="x"
+command=["true"]
+[[steps]]
+action="expect_golden"
+name="failing"
+"#;
+        let err = parse(toml).unwrap_err().0;
+        assert!(err.contains("reserved"), "unexpected error: {err}");
+        // The scenario-level name is a directory, never a bless selector — still fine.
+        assert!(parse("name=\"failing\"\ncommand=[\"true\"]\n").is_ok());
+    }
+
+    #[test]
+    fn dot_only_names_are_rejected() {
+        // 085 F21: `.` clears every separator check but names no file — `gate init .`
+        // wrote a stray `..toml`, and a frame named `.` breaks blessing. `..` was
+        // already rejected; `.` was not.
+        for n in [".", "..."] {
+            let toml = format!("name={n:?}\ncommand=[\"true\"]\n");
+            assert!(
+                parse(&toml).is_err(),
+                "scenario name {n:?} must be rejected"
+            );
+        }
+        let frame = r#"name="x"
+command=["true"]
+[[steps]]
+action="expect_golden"
+name="."
+"#;
+        assert!(parse(frame).is_err(), "frame name \".\" must be rejected");
     }
 
     #[test]

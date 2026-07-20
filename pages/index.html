@@ -479,6 +479,10 @@
   margin-top: var(--s-2);
   display: inline-flex; align-items: center; gap: 8px;
 }
+/* Dark-section override, mirroring `.target` above: the paper grey at 0.85
+   opacity is illegible on `--bg`, and the caption is the line that explains
+   what the reader is looking at. */
+.section:not(.invert) .snap-out figcaption { color: var(--ink-3); opacity: 1; }
 .snap-out .dot.mossy {
   width: 7px; height: 7px;
   background: var(--moss); border-radius: 50%;
@@ -776,6 +780,7 @@
     <a href="#humans"><span class="lbl">humans</span></a>
     <a href="#agents"><span class="lbl">agents</span></a>
     <a href="#lens"><span class="lbl">lens</span></a>
+    <a href="#gate"><span class="lbl">gate</span></a>
     <a href="#replaces"><span class="lbl">replaces</span></a>
     <a href="#plugins"><span class="lbl">plugins</span></a>
     <a href="#quickstart"><span class="lbl">install</span></a>
@@ -924,8 +929,8 @@
     </p>
 
     <div class="code-panel" style="margin-top:var(--s-6)">
-      <pre><code><span style="color:var(--ink2-on-paper)"># 1 — declarative session spec (TOML).</span>
-<span style="color:var(--ink2-on-paper)"># Same spec a human <code>shux state apply</code>'s — same one an agent ships.</span>
+      <pre><code><span style="color:var(--code-comment)"># 1 — declarative session spec (TOML).</span>
+<span style="color:var(--code-comment)"># Same spec a human <code>shux state apply</code>'s — same one an agent ships.</span>
 
 [session]
 name = "review"
@@ -936,22 +941,22 @@ title = "git"
 command = ["lazygit"]
 
 <span style="color:var(--accent)">$ shux state apply review.toml</span>
-<span style="color:var(--ink2-on-paper)"># → session created atomically. Pluck the first pane id:</span>
+<span style="color:var(--code-comment)"># → session created atomically. Pluck the first pane id:</span>
 <span style="color:var(--accent)">$ PID=$(shux --format json session list \
         | jq -r '.sessions[0].pane_id')</span>
 
 <span style="color:var(--accent)">$ shux pane set-size  -s review --cols 200 --rows 60</span>
-<span style="color:var(--ink2-on-paper)"># → synchronous resize (VT + PTY).</span>
+<span style="color:var(--code-comment)"># → synchronous resize (VT + PTY).</span>
 
 <span style="color:var(--accent)">$ shux pane send-keys -s review --text 'j'</span>
-<span style="color:var(--ink2-on-paper)"># → navigate down one row.</span>
+<span style="color:var(--code-comment)"># → navigate down one row.</span>
 
 <span style="color:var(--accent)">$ shux --format json pane snapshot -s review \
     | jq -r .png_base64 \
     | base64 -d &gt; out.png</span>
-<span style="color:var(--ink2-on-paper)"># → 1800×1140 PNG of the current pane. No iTerm2 needed.</span>
+<span style="color:var(--code-comment)"># → 1800×1140 PNG of the current pane. No iTerm2 needed.</span>
 
-<span style="color:var(--ink2-on-paper)"># Or drop to raw RPC for any registered method — no shell-escaping bait.</span>
+<span style="color:var(--code-comment)"># Or drop to raw RPC for any registered method — no shell-escaping bait.</span>
 <span style="color:var(--accent)">$ shux rpc call pane.send_keys --params @keys.json</span>
 <span style="color:var(--accent)">$ echo '{"pane_id":"'$PID'","text":"j"}' | shux rpc call pane.send_keys --params -</span></code></pre>
 
@@ -998,24 +1003,24 @@ command = ["lazygit"]
     </p>
 
     <div class="snap-proof">
-      <pre><code><span style="color:var(--ink2-on-paper)"># run it hidden — quota'd scratch pane, reaped on TTL</span>
+      <pre><code><span style="color:var(--code-comment)"># run it hidden — quota'd scratch pane, reaped on TTL</span>
 <span style="color:var(--accent)">$ RUN=$(shux --format json lens run --size 64x12 -- ./deploy-tui)</span>
 <span style="color:var(--accent)">$ SID=$(echo "$RUN" | jq -r .result.session_id)</span>
 <span style="color:var(--accent)">$ PANE=$(echo "$RUN" | jq -r .result.pane_id)</span>
 
-<span style="color:var(--ink2-on-paper)"># wait for pixels to go quiet — content-revision based</span>
+<span style="color:var(--code-comment)"># wait for pixels to go quiet — content-revision based</span>
 <span style="color:var(--accent)">$ shux pane wait-settled "$PANE" --quiet 300ms</span>
-<span style="color:var(--ink2-on-paper)"># → settled after 354ms</span>
+<span style="color:var(--code-comment)"># → settled after 354ms</span>
 
-<span style="color:var(--ink2-on-paper)"># one atomic frame: text + PNG + checkpoint, same revision</span>
+<span style="color:var(--code-comment)"># one atomic frame: text + PNG + checkpoint, same revision</span>
 <span style="color:var(--accent)">$ REV=$(shux --format json pane glance "$PANE" --checkpoint \
     --png before.png | jq -r .result.revision)</span>
 
-<span style="color:var(--ink2-on-paper)"># drive it, then prove exactly what changed</span>
+<span style="color:var(--code-comment)"># drive it, then prove exactly what changed</span>
 <span style="color:var(--accent)">$ shux pane send-keys -s "$SID" -p "$PANE" --data DQ==</span>
 <span style="color:var(--accent)">$ shux pane wait-settled "$PANE" --quiet 300ms</span>
 <span style="color:var(--accent)">$ shux pane diff "$PANE" --since "$REV" --heat heat.png</span>
-<span style="color:var(--ink2-on-paper)"># → cells_changed: 40 · rows 6–7</span></code></pre>
+<span style="color:var(--code-comment)"># → cells_changed: 40 · rows 6–7</span></code></pre>
       <figure class="snap-out" id="heat-proof">
         <picture>
           <source media="(max-width: 760px)" srcset="/screenshots/lens-heat-m.png" width="1566" height="684">
@@ -1029,6 +1034,51 @@ command = ["lazygit"]
       Proven cold: a fresh agent given only the shux skill found a
       one-cell border bug from a glance PNG — a bug text capture can't
       see — fixed it, and shipped pixel proof.
+    </p>
+  </div>
+</section>
+
+<!-- ─── Gate: the CI form of the verify loop ─────────── -->
+<section class="section invert" id="gate">
+  <div class="wrap">
+    <p class="eyebrow">the ci gate</p>
+    <h2 class="measure">Byte-identical text.<br>Pixel-perfect failure.</h2>
+    <p class="lede" style="margin-top:var(--s-3); margin-bottom:var(--s-6)">
+      <b>shux lens gate</b> is the CI form of that loop. A committed scenario
+      drives your TUI in a controlled, headless run at fixed geometry and
+      compares every captured frame to a checked-in golden — cell by cell,
+      colour included. When a refactor drops one status from bright green to
+      green, the rendered text doesn't change by a single byte. Your diff sees
+      nothing. Your eyes see nothing. The gate fails the build and points at
+      the cells.
+    </p>
+
+    <div class="snap-proof">
+      <pre><code><span style="color:var(--code-comment)"># one command. CI keys on the exit code.</span>
+<span style="color:var(--accent)">$ shux lens gate board.toml --report -</span>
+<span style="color:var(--code-comment)"># → verdict=fail · frames=1 · 14 cells</span>
+
+<span style="color:var(--code-comment)"># report.json names WHAT moved, not just where:</span>
+<span style="color:var(--code-comment)">#   "expected": "fg=bright_green"</span>
+<span style="color:var(--code-comment)">#   "actual":   "fg=green"</span>
+
+<span style="color:var(--code-comment)"># meant to change it? bless it, on the record.</span>
+<span style="color:var(--accent)">$ shux lens gate board.toml --update \
+    --reason "new status palette"</span>
+<span style="color:var(--code-comment)"># → BASELINE-APPROVAL.md: who, when, why</span></code></pre>
+      <figure class="snap-out" id="gate-proof">
+        <picture>
+          <source media="(max-width: 760px)" srcset="/screenshots/gate-heat-m.png" width="520" height="300">
+          <img src="/screenshots/gate-heat-2x.png" alt="heat map of a caught terminal regression: a deploy board where the api-gateway row's HEALTHY status is marked in red because its colour changed from bright green to green — the surrounding HEALTHY entries, whose text is identical, are untouched" width="740" height="300" loading="lazy" decoding="async" style="aspect-ratio:auto">
+        </picture>
+        <figcaption><span class="dot mossy"></span> the cells that changed colour — real gate output, from a diff no text comparison can see.</figcaption>
+      </figure>
+    </div>
+
+    <p class="target" style="margin-top:var(--s-5)">
+      Goldens are checked into git. A frame with no committed golden fails the
+      build instead of minting one, and blessing is refused in CI outright —
+      so a baseline can never quietly write itself.
     </p>
   </div>
 </section>
@@ -1368,7 +1418,7 @@ command = ["lazygit"]
           <h3>Install</h3>
           <p>One pre-built binary per platform. No daemons to register,
           no plugins to vendor. The daemon auto-starts on first use.</p>
-<pre><code><span style="color:var(--ink2-on-paper)"># macOS / Linux, arm64 or amd64</span>
+<pre><code><span style="color:var(--code-comment)"># macOS / Linux, arm64 or amd64</span>
 curl -sSf <a href="https://shux.pages.dev/install.sh">https://shux.pages.dev/install.sh</a> | sh</code></pre>
         </div>
       </div>
@@ -1380,7 +1430,7 @@ curl -sSf <a href="https://shux.pages.dev/install.sh">https://shux.pages.dev/ins
           <p>One verb creates an atomic session + initial window + pane,
           with the command of your choice running in it.</p>
 <pre><code>shux --format json session create demo -d -- htop \
-  | jq -r .pane_id  <span style="color:var(--ink2-on-paper)"># save PID for next step</span></code></pre>
+  | jq -r .pane_id  <span style="color:var(--code-comment)"># save PID for next step</span></code></pre>
         </div>
       </div>
 
