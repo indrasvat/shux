@@ -81,6 +81,37 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
   - Respects `NO_COLOR` env var and `IsTerminal` detection automatically
   - When adding new CLI commands, add corresponding `print_*` helpers to `style.rs`
 
+## Correctness Is Never a Scope Question
+
+> **STRICT RULE — a correctness or robustness defect is ALWAYS fixed. Never deferred,
+> never handed off as someone else's follow-up, and never put to the user as a scope
+> question.** There is no version of "should I fix this bug?" that is a real question.
+>
+> Asking is itself the failure: it launders a decision the agent already knows the answer
+> to into the user's lap, and invites a "no" that neither party wants.
+>
+> When a defect surfaces — including one found by a review agent, an adversarial pass, or a
+> QA gate — the response is:
+>
+> 1. **Reproduce it by hand** before believing it (a report is a hypothesis; tasks 082, 083
+>    and 084 each had a confidently-reported finding that reproduction overturned).
+> 2. **Fix it on whichever task's surface owns it**, even if that task is already `Done`.
+> 3. **Add a regression test proven to FAIL against the old code** before the fix lands. A
+>    test authored after a fix and never seen failing only asserts that the code does what
+>    it does.
+> 4. **Re-gate the owning task** (its frozen suite / QA gate) and record the fix in that
+>    task's file so a reader can discover its scope grew.
+>
+> "It belongs to an already-Done task", "it's pre-existing", "it's out of this task's
+> scope", "the session is long", "it's only a P2" — these are reasons to be **careful**
+> about a fix. None of them is a reason to skip it. If a fix is genuinely large enough to
+> need sequencing, say so **while already doing it** and report the plan; do not stop and
+> ask for permission.
+>
+> This applies with full force to defects in the verification machinery itself — a gate, a
+> guard, a test harness, a golden. A CI gate whose job is refusing to let a regression
+> through is worth less than nothing when it can be talked into passing.
+
 ## Rich TUI Compatibility Guardrail
 
 > **STRICT RULE — Do not regress rich TUI rendering or interactivity.**
