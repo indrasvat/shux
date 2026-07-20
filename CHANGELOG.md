@@ -1,3 +1,10 @@
+## [0.45.1](https://github.com/indrasvat/shux/compare/v0.45.0...v0.45.1) (2026-07-20)
+
+
+### Bug Fixes
+
+* **ci:** make the lint gate tell the truth ([3beb78f](https://github.com/indrasvat/shux/commit/3beb78f868521cc0eb11675243f30352a0cd83b0))
+
 # [0.44.0](https://github.com/indrasvat/shux/compare/v0.43.0...v0.44.0) (2026-07-13)
 
 
