@@ -356,3 +356,14 @@ palette, restore the deliberate table/summary divergence).
   instruction to "open them before committing" when there is nothing to open, and
   "blessing is for intended changes only" written as if something enforced it. Author
   review cannot see these because the author knows what was meant.
+
+- **2026-07-20 (task 085 — `pgrep -f` matched a process because the PATTERN was in its
+  prompt):** While auditing for leaked daemons I ran `pgrep -f "shux __daemon"` and it
+  returned a `dootsabha council` process — because the council's prompt text, passed as
+  an argv, happened to contain the string `shux __daemon`. Nothing was wrong with the
+  daemon; the *matcher* was wrong. This is the same failure mode as the guard defects
+  fixed in this task, demonstrated live on the person fixing them: any `pgrep -f` /
+  `pkill -f` over a substring will match unrelated processes whose arguments merely quote
+  it, and an agent's prompt is exactly the kind of argv that quotes anything. Identify a
+  process by its pidfile and verify its identity (argv shape) before signalling it; never
+  by a substring search.
