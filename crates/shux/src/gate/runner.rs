@@ -216,10 +216,12 @@ fn build_mask_set(masks: &[MaskSpec]) -> MaskSet {
 }
 
 /// The default golden directory for a scenario: `<scenario-dir>/goldens/<scenario-name>/`.
+///
+/// Anchored through [`scenario_dir_of`], NOT a second hand-rolled `parent()` — the raw
+/// expression here was the last copy of the empty-parent trap, and it is exactly how a
+/// symlinked scenario minted a duplicate golden tree.
 pub fn default_golden_dir(scenario_path: &Path, scenario: &Scenario) -> PathBuf {
-    scenario_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
+    scenario_dir_of(scenario_path)
         .join("goldens")
         .join(&scenario.name)
 }
@@ -250,16 +252,30 @@ fn make_sandbox(root: &Path) -> std::io::Result<SandboxDirs> {
     Ok(sb)
 }
 
-/// The directory a scenario's relative `cwd` resolves against.
+/// The directory a scenario is anchored to — what its relative `cwd` resolves against and
+/// where its default goldens live. THE one place that answers this question.
 ///
-/// `Path::parent()` on a BARE filename returns `Some("")`, not `None`, so an
-/// `unwrap_or(".")` never fires and the empty path reaches `canonicalize()` as ENOENT.
-/// That broke the most natural invocation of all — `cd` into the scenario's directory and
-/// run `shux lens gate scenario.toml` — while `./scenario.toml` worked (shux-tui-qa).
-pub fn scenario_dir_of(scenario_path: &Path) -> &Path {
-    match scenario_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
+/// Two traps, both found in production:
+///
+/// 1. `Path::parent()` on a BARE filename returns `Some("")`, not `None`, so an
+///    `unwrap_or(".")` never fires and the empty path reaches `canonicalize()` as ENOENT.
+///    That broke `shux lens gate scenario.toml` while `./scenario.toml` worked.
+/// 2. Without canonicalizing, a SYMLINKED scenario file anchors to the link's directory,
+///    not the real one — so `cwd` resolves somewhere unintended and, worse, a second
+///    divergent golden tree gets minted beside the symlink while the real one sits
+///    untouched (adversarial review).
+///
+/// Canonicalizing the FILE (not its parent) resolves both, plus any `.`/`..` in between.
+/// If the path does not exist yet — `gate init` scaffolding a new scenario — fall back to
+/// the lexical parent so scaffolding still works.
+pub fn scenario_dir_of(scenario_path: &Path) -> PathBuf {
+    let lexical = || match scenario_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    match scenario_path.canonicalize() {
+        Ok(real) => real.parent().map(Path::to_path_buf).unwrap_or_else(lexical),
+        Err(_) => lexical(),
     }
 }
 
@@ -1498,6 +1514,50 @@ mod tests {
         let err = resolve_contained_cwd(root.path(), "nope")
             .expect_err("a missing directory must be refused");
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    /// A SYMLINKED scenario file must anchor to the REAL file's directory. Anchoring to the
+    /// link's directory silently mints a second, divergent golden tree beside the symlink
+    /// while the real one goes untouched, and resolves `cwd` somewhere unintended
+    /// (adversarial review).
+    #[test]
+    fn a_symlinked_scenario_file_anchors_to_the_real_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real_dir = root.path().join("fixtures");
+        let link_dir = root.path().join("ci");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let real = real_dir.join("scenario.toml");
+        std::fs::write(&real, "name=\"x\"\ncommand=[\"true\"]\n").unwrap();
+        let link = link_dir.join("board.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            scenario_dir_of(&link),
+            real_dir.canonicalize().unwrap(),
+            "a symlinked scenario anchored to the link's directory"
+        );
+
+        // And the golden dir follows it, so no duplicate tree can appear beside the link.
+        let scn = scenario::parse("name=\"board\"\ncommand=[\"true\"]\n").unwrap();
+        assert_eq!(
+            default_golden_dir(&link, &scn),
+            real_dir
+                .canonicalize()
+                .unwrap()
+                .join("goldens")
+                .join("board")
+        );
+    }
+
+    /// `gate init` scaffolds a scenario that does not exist yet — anchoring must still work.
+    #[test]
+    fn a_nonexistent_scenario_path_falls_back_to_its_lexical_parent() {
+        assert_eq!(
+            scenario_dir_of(Path::new("/no/such/dir/scenario.toml")),
+            Path::new("/no/such/dir")
+        );
+        assert_eq!(scenario_dir_of(Path::new("brand-new.toml")), Path::new("."));
     }
 
     /// `Path::parent()` on a bare filename returns `Some("")`, not `None` — the trap that

@@ -135,6 +135,45 @@ correct half of the pair") to decide to raise the table rather than lower the su
 | F9 | Harness: `export PATH` does not survive codex's `bash -lc` login shell | 084 |
 | — | `missing_golden` detail reached users as `no committed golden ?` | 082 |
 
+### Parallel adversarial review (4 cold agents, disjoint surfaces)
+
+Run after the QA gate reached PASS. **One parallel round produced more than four serial QA
+rounds had** — the Feature Protocol's adversarial step exists for exactly this, and skipping
+it is why earlier findings arrived one per round.
+
+Fixed here (all introduced by 084): **F13** `style_deltas` was blind to blank cells, so a
+background change painted on blanks — a selection bar, a status-bar highlight, the canonical
+TUI style regression — reported ZERO style deltas, and a run spanning blanks fragmented into
+pieces contradicting `changed_cells`; **F14** a symlinked scenario file anchored to the
+link's directory, silently minting a second divergent golden tree (this also closed the QA
+gate's P3-1, the last copy of the empty-parent trap in `default_golden_dir`); **F15** the
+harness was gameable — the supervisor gated the agent's own writable `scenario.toml`, so an
+`xfail` block passed CR-B with the regression on screen, and a deleted step passed CR-A with
+zero code changes. The supervisor now gates with its own immutable copy and reports any edit
+to the agent's; both attacks were replayed and are blocked twice over.
+
+**Bearing on the 6/6 result:** all six agents' `scenario.toml` are byte-identical to the
+pristine fixture (sha256-verified), so none used these attacks, and all six still pass under
+the hardened harness. The result stands — but on the manual audit and the QA gate's
+independent recomputation, not on the harness being ungameable.
+
+Recorded and deferred to **082's surface** (pre-existing, each reproduced twice, none a
+regression from this task): a bless REFUSAL erasing the run's verdict (a real `fail` becomes
+`update_refused`/exit 6 with `frames: []`, contradicting the crate's own
+`worst_never_masks_a_regression_with_an_error` invariant); `--update failing` colliding with
+a frame named `failing` and blanket-blessing a regression green; an I/O error on a PASSING
+run exiting 1 (the regression code) with no report; partial blessing despite a "no byte
+written" contract; `--update` promoting a fingerprint-mismatched xfail; `gate init .` and
+scenario `name = "."`; `-v` polluting `--report -` stdout; heat evidence silently dropped on
+an unwritable `--out`; `missing_golden` never naming the directory it searched. Full detail
+with reproductions in `.local/084-friction-log.md` (F16–F25).
+
+Clean bills worth recording: the **`scenario_floor` fix held** across a 35-cell matrix
+(7 failure modes × 5 bless modes) and `exit == status.exit_code()` held across 90 runs with
+zero mismatches; `cwd` containment held against every escape tried including the classic
+`starts_with` prefix bug; `style_deltas` truncation, run merging, wide chars/emoji/ZWJ,
+colour classes, masks and tiers are all clean.
+
 ### Friction: explicitly re-scoped (NOT fixed here)
 
 - **F5 — every gate run leaks a `shux __daemon`.** There is no `daemon stop` verb; this is

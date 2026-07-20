@@ -326,6 +326,11 @@ fn describe_style(st: &CapStyle) -> String {
 
 /// Style-by-column for one row: every column a `Cells` run covers maps to that run's
 /// style. Mask runs contribute nothing (a masked cell is excluded from the compare).
+///
+/// A column ABSENT from this map is a default-styled blank — the capture format does not
+/// emit runs for them. Callers MUST treat absence as [`CapStyle::default()`] rather than
+/// skipping the column, or a change that only paints blanks (a selection bar, a status-bar
+/// highlight — the canonical TUI style regression) is invisible.
 fn row_styles(row: &RowRepr) -> BTreeMap<u16, &CapStyle> {
     let mut out = BTreeMap::new();
     for run in &row.runs {
@@ -351,6 +356,8 @@ fn row_styles(row: &RowRepr) -> BTreeMap<u16, &CapStyle> {
 /// (084 F6). Only cells whose STYLE differs are reported — a pure text change yields an
 /// empty vec, because the coordinates already tell that story and the text is visible.
 pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> (Vec<StyleDelta>, u32) {
+    // A column absent from a row's runs is a default-styled blank, not "no data".
+    let blank = CapStyle::default();
     let mut out: Vec<StyleDelta> = Vec::new();
     let mut total: u32 = 0;
     // Whether the run currently being walked was actually pushed (false once capped).
@@ -362,15 +369,19 @@ pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> (Vec<St
             continue;
         };
         let (e_styles, a_styles) = (row_styles(erow), row_styles(arow));
+        // Walk the UNION of both sides' columns, not just the expected frame's. A blank
+        // default-styled cell is absent from the runs entirely, so iterating one side alone
+        // both MISSES a blanks-only change and FRAGMENTS a run that spans blanks into
+        // pieces that contradict `changed_cells` (adversarial review).
+        let columns: std::collections::BTreeSet<u16> =
+            e_styles.keys().chain(a_styles.keys()).copied().collect();
         // One entry per CONTIGUOUS run of the same (expected, actual) pair: a 10-column
         // recolour is one fact, and spending the cap on ten copies of it would hide the
         // other affected rows entirely.
         let mut prev: Option<(u16, &CapStyle, &CapStyle)> = None;
-        for (col, e_style) in &e_styles {
-            let Some(a_style) = a_styles.get(col) else {
-                prev = None;
-                continue;
-            };
+        for col in &columns {
+            let e_style = e_styles.get(col).copied().unwrap_or(&blank);
+            let a_style = a_styles.get(col).copied().unwrap_or(&blank);
             if e_style == a_style {
                 prev = None;
                 continue;
@@ -378,7 +389,7 @@ pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> (Vec<St
             let continues = matches!(
                 prev,
                 Some((pcol, pe, pa))
-                    if pcol + 1 == *col && pe == *e_style && pa == *a_style
+                    if pcol + 1 == *col && pe == e_style && pa == a_style
             );
             prev = Some((*col, e_style, a_style));
             if continues {
@@ -440,6 +451,54 @@ mod tests {
         assert_eq!(d[0].col_end, 7);
         assert_eq!(d[0].expected, "fg=bright_green");
         assert_eq!(d[0].actual, "fg=green");
+    }
+
+    /// The capture omits runs for default-styled BLANK cells, so iterating only the
+    /// expected frame's runs made a blanks-only style change invisible — and a selection
+    /// bar or status-bar highlight is exactly that: a background painted on blanks
+    /// (adversarial review). Absence must read as "default", not "no data".
+    #[test]
+    fn a_background_change_on_blank_cells_is_reported() {
+        // Expected omits the blanks entirely, mirroring what the capture format emits.
+        let expected = env_json(r#"[[0,"AA"],[7,"BB"]]"#);
+        let actual = env_json(r#"[[0,"AA"],[2,"     ",{"bg":{"idx":1}}],[7,"BB"]]"#);
+
+        let (d, total) = style_deltas(&expected, &actual);
+        assert_eq!(
+            d.len(),
+            1,
+            "a blanks-only background change was dropped: {d:?}"
+        );
+        assert_eq!(total, 1);
+        assert_eq!((d[0].row, d[0].col, d[0].col_end), (0, 2, 7));
+        assert_eq!(d[0].expected, "default");
+        assert_eq!(d[0].actual, "bg=red");
+    }
+
+    /// A run spanning blanks is ONE fact. Skipping the blanks fragmented it into pieces
+    /// that positively imply the middle cells were unchanged — contradicting the
+    /// comparator, which counts them.
+    #[test]
+    fn a_style_run_spanning_blanks_stays_one_entry() {
+        let expected = env_json(r#"[[0,"AAA    BBB"]]"#);
+        let actual = env_json(r#"[[0,"AAA    BBB",{"bg":{"idx":1}}]]"#);
+
+        let (d, _) = style_deltas(&expected, &actual);
+        assert_eq!(d.len(), 1, "run spanning blanks fragmented: {d:?}");
+        assert_eq!((d[0].col, d[0].col_end), (0, 10));
+    }
+
+    /// Styled content appearing where the expected frame had NOTHING stored (a trimmed
+    /// blank row) must still be described — previously the union was one-sided.
+    #[test]
+    fn styling_added_where_the_golden_stored_nothing_is_reported() {
+        let expected = env_json(r#"[[0,"AAA"]]"#);
+        let actual = env_json(r#"[[0,"AAABBBB",{"fg":{"idx":9}}]]"#);
+
+        let (d, _) = style_deltas(&expected, &actual);
+        assert!(!d.is_empty(), "additive styled cells produced no deltas");
+        let last = d.last().unwrap();
+        assert_eq!(last.col_end, 7, "extent must cover the added cells: {d:?}");
     }
 
     #[test]
