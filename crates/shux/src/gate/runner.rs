@@ -250,6 +250,40 @@ fn make_sandbox(root: &Path) -> std::io::Result<SandboxDirs> {
     Ok(sb)
 }
 
+/// Resolve a scenario-relative `cwd` and prove it is CONTAINED in the scenario directory.
+///
+/// Parse-time validation rejects absolute paths and `..` components, but that is only
+/// SYNTACTIC: a symlink inside the scenario directory can still point anywhere, and the
+/// child would be spawned there (impl council). So both sides are canonicalized — which
+/// resolves symlinks — and containment is re-checked on the real paths before spawn.
+fn resolve_contained_cwd(scenario_dir: &Path, rel: &str) -> Result<PathBuf, String> {
+    let joined = scenario_dir.join(rel);
+    if !joined.is_dir() {
+        return Err(format!(
+            "scenario `cwd` does not exist: '{}' (resolved relative to the scenario directory)",
+            joined.display()
+        ));
+    }
+    let root = scenario_dir.canonicalize().map_err(|e| {
+        format!(
+            "cannot resolve the scenario directory '{}': {e}",
+            scenario_dir.display()
+        )
+    })?;
+    let real = joined
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve scenario `cwd` '{}': {e}", joined.display()))?;
+    if !real.starts_with(&root) {
+        return Err(format!(
+            "scenario `cwd` escapes the scenario directory: '{rel}' resolves to '{}', outside '{}' \
+             (a symlink cannot be used to leave the scenario tree)",
+            real.display(),
+            root.display()
+        ));
+    }
+    Ok(real)
+}
+
 /// An ENOENT spawn failure nearly always means `command[0]` is not on the sandbox PATH,
 /// which is deliberately narrow and does NOT inherit the host's. The bare errno names
 /// neither the program nor the path it was searched on, so a reader cannot act on it
@@ -409,24 +443,21 @@ pub async fn drive_scenario(
     // directory beside itself (084 F2). `cwd` is validated relative + contained at parse
     // time, so this join cannot escape the scenario dir.
     let child_cwd = match &scenario.cwd {
-        Some(rel) => scenario_dir.join(rel),
+        Some(rel) => match resolve_contained_cwd(scenario_dir, rel) {
+            Ok(p) => p,
+            Err(message) => {
+                return Ok(finish(
+                    scenario,
+                    started_at_ms,
+                    start,
+                    frames,
+                    Some(TerminalOutcome::Infra { message }),
+                    has_visual,
+                ));
+            }
+        },
         None => sandbox.home.clone(),
     };
-    if !child_cwd.is_dir() {
-        return Ok(finish(
-            scenario,
-            started_at_ms,
-            start,
-            frames,
-            Some(TerminalOutcome::Infra {
-                message: format!(
-                    "scenario `cwd` does not exist: '{}' (resolved relative to the scenario directory)",
-                    child_cwd.display()
-                ),
-            }),
-            has_visual,
-        ));
-    }
 
     // 4. Spawn the child (deny-by-default env; async — the runner monitors exit).
     let mut stream = crate::client::ensure_daemon_running_at(socket_path).await?;
@@ -1154,6 +1185,7 @@ async fn capture_and_compare(
                         reason: frame_reason(&fc.signal),
                         verdict: fc.verdict,
                         style_deltas: fc.style_deltas,
+                        style_deltas_total: fc.style_deltas_total,
                         golden_json: format!("{name}.capture.json"),
                         live_capture_json: live.to_canonical_json(),
                         live_capture_sha256: capture_sha256(&live),
@@ -1413,5 +1445,45 @@ mod tests {
         assert!(
             program_not_found_message("permission denied", &["uv".to_string()], &plan).is_none()
         );
+    }
+
+    // ── impl council: `cwd` containment must survive a SYMLINK, not just `..` ──
+
+    #[test]
+    fn a_symlinked_cwd_cannot_escape_the_scenario_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scn = root.path().join("scn");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&scn).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // Parse-time validation only rejects `..` SYNTACTICALLY; a symlink is a legal
+        // relative name that still points anywhere on the filesystem.
+        std::os::unix::fs::symlink(&outside, scn.join("sneaky")).unwrap();
+
+        let err = resolve_contained_cwd(&scn, "sneaky")
+            .expect_err("a symlink out of the scenario tree must be refused");
+        assert!(err.contains("escapes the scenario directory"), "{err}");
+    }
+
+    #[test]
+    fn a_real_subdirectory_cwd_resolves() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scn = root.path().join("scn");
+        std::fs::create_dir_all(scn.join("sub")).unwrap();
+
+        let got = resolve_contained_cwd(&scn, "sub").expect("a contained subdir is fine");
+        assert!(got.ends_with("sub"), "{got:?}");
+        assert_eq!(
+            resolve_contained_cwd(&scn, ".").unwrap(),
+            scn.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_missing_cwd_is_reported_as_such() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let err = resolve_contained_cwd(root.path(), "nope")
+            .expect_err("a missing directory must be refused");
+        assert!(err.contains("does not exist"), "{err}");
     }
 }

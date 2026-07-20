@@ -251,6 +251,9 @@ fn diff_report(f: &FrameOutcome) -> Option<DiffReport> {
         } else {
             Some(f.style_deltas.clone())
         },
+        // Reported ONLY when the cap actually truncated, so a full list stays quiet.
+        style_deltas_total: (f.style_deltas_total as usize > f.style_deltas.len())
+            .then_some(f.style_deltas_total),
     })
 }
 
@@ -318,6 +321,7 @@ mod tests {
     fn frame(kind: FrameKind, xfail: Option<XfailMeta>, sha: &str) -> FrameOutcome {
         FrameOutcome {
             style_deltas: Vec::new(),
+            style_deltas_total: 0,
             name: "main".into(),
             tier: Tier::Cell,
             kind,

@@ -642,6 +642,7 @@ mod tests {
     fn frame(name: &str, kind: FrameKind, json: String, sha: String) -> FrameOutcome {
         FrameOutcome {
             style_deltas: Vec::new(),
+            style_deltas_total: 0,
             name: name.into(),
             tier: Tier::Cell,
             kind,

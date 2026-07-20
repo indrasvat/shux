@@ -182,7 +182,11 @@ pub struct DiffRegion {
 #[serde(deny_unknown_fields)]
 pub struct StyleDelta {
     pub row: u16,
+    /// First column of the run (inclusive).
     pub col: u16,
+    /// One past the last column of the run — so a consumer sees the run's EXTENT, not
+    /// just where it began (impl council).
+    pub col_end: u16,
     pub expected: String,
     pub actual: String,
 }
@@ -201,10 +205,15 @@ pub struct DiffReport {
     pub heat_png: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regions: Option<Vec<DiffRegion>>,
-    /// Style changes at the first cell of each changed region, capped so a full-screen
-    /// diff cannot bloat the report. Absent when nothing but text changed.
+    /// Style changes, one entry per contiguous run, capped so a full-screen recolour
+    /// cannot bloat the report. Absent when nothing but text changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style_deltas: Option<Vec<StyleDelta>>,
+    /// Total number of style-delta runs found, present ONLY when `style_deltas` was
+    /// truncated by the cap — so a partial list can never be mistaken for the whole
+    /// story (impl council: no silent caps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_deltas_total: Option<u32>,
 }
 
 /// Per-frame record in `report.json`.
@@ -341,8 +350,9 @@ fn row_styles(row: &RowRepr) -> BTreeMap<u16, &CapStyle> {
 /// Style changes between two frames, in row-major order, capped at [`MAX_STYLE_DELTAS`]
 /// (084 F6). Only cells whose STYLE differs are reported — a pure text change yields an
 /// empty vec, because the coordinates already tell that story and the text is visible.
-pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> Vec<StyleDelta> {
-    let mut out = Vec::new();
+pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> (Vec<StyleDelta>, u32) {
+    let mut out: Vec<StyleDelta> = Vec::new();
+    let mut total: u32 = 0;
     let actual_rows: BTreeMap<u16, &RowRepr> = actual.rows.iter().map(|r| (r.row, r)).collect();
 
     for erow in &expected.rows {
@@ -370,20 +380,26 @@ pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> Vec<Sty
             );
             prev = Some((*col, e_style, a_style));
             if continues {
+                // Extend the run in place so `col_end` covers the whole span.
+                if let Some(last) = out.last_mut() {
+                    last.col_end = col.saturating_add(1);
+                }
                 continue;
             }
-            out.push(StyleDelta {
-                row: erow.row,
-                col: *col,
-                expected: describe_style(e_style),
-                actual: describe_style(a_style),
-            });
-            if out.len() >= MAX_STYLE_DELTAS {
-                return out;
+            // Count EVERY run, even past the cap, so truncation can be reported honestly.
+            total = total.saturating_add(1);
+            if out.len() < MAX_STYLE_DELTAS {
+                out.push(StyleDelta {
+                    row: erow.row,
+                    col: *col,
+                    col_end: col.saturating_add(1),
+                    expected: describe_style(e_style),
+                    actual: describe_style(a_style),
+                });
             }
         }
     }
-    out
+    (out, total)
 }
 
 #[cfg(test)]
@@ -406,10 +422,14 @@ mod tests {
         let expected = env_json(r#"[[0,"healthy",{"fg":{"idx":10}}]]"#);
         let actual = env_json(r#"[[0,"healthy",{"fg":{"idx":2}}]]"#);
 
-        let d = style_deltas(&expected, &actual);
+        let (d, total) = style_deltas(&expected, &actual);
         assert_eq!(d.len(), 1, "a contiguous run collapses to one delta: {d:?}");
+        assert_eq!(total, 1, "nothing was truncated");
         assert_eq!(d[0].row, 0);
         assert_eq!(d[0].col, 0);
+        // `healthy` is 7 cells wide, so the run must span [0, 7) — the extent matters, not
+        // just where it started.
+        assert_eq!(d[0].col_end, 7);
         assert_eq!(d[0].expected, "fg=bright_green");
         assert_eq!(d[0].actual, "fg=green");
     }
@@ -417,7 +437,7 @@ mod tests {
     #[test]
     fn identical_styles_yield_no_deltas() {
         let a = env_json(r#"[[0,"healthy",{"fg":{"idx":10}}]]"#);
-        assert!(style_deltas(&a, &a).is_empty());
+        assert!(style_deltas(&a, &a).0.is_empty());
     }
 
     #[test]
@@ -425,14 +445,14 @@ mod tests {
         // The coordinates already tell that story, and the text is visible in a diff.
         let expected = env_json(r#"[[0,"healthy",{"fg":{"idx":10}}]]"#);
         let actual = env_json(r#"[[0,"HEALTHY",{"fg":{"idx":10}}]]"#);
-        assert!(style_deltas(&expected, &actual).is_empty());
+        assert!(style_deltas(&expected, &actual).0.is_empty());
     }
 
     #[test]
     fn rgb_and_attributes_are_described_readably() {
         let expected = env_json(r#"[[0,"x",{"fg":{"rgb":[255,122,24]},"bold":true}]]"#);
         let actual = env_json(r#"[[0,"x",{"fg":{"idx":200},"italic":true}]]"#);
-        let d = style_deltas(&expected, &actual);
+        let (d, _) = style_deltas(&expected, &actual);
         assert_eq!(d[0].expected, "fg=#ff7a18 bold");
         assert_eq!(d[0].actual, "fg=idx(200) italic");
     }
@@ -455,8 +475,15 @@ mod tests {
             ))
             .expect("parses")
         };
-        let d = style_deltas(&j(mk(100)), &j(mk(200)));
+        let (d, total) = style_deltas(&j(mk(100)), &j(mk(200)));
         assert_eq!(d.len(), MAX_STYLE_DELTAS, "must be capped: got {}", d.len());
+        // No silent caps: the TRUE run count must survive truncation so a partial list
+        // can never be mistaken for the whole story (impl council).
+        assert_eq!(total, 40, "truncation must still report every run it found");
+        assert!(
+            total as usize > d.len(),
+            "this case must actually truncate, or it proves nothing"
+        );
     }
 
     use super::*;
@@ -623,6 +650,7 @@ mod tests {
                         col_end: 5,
                     }]),
                     style_deltas: None,
+                    style_deltas_total: None,
                 }),
                 reason: Some("palette_unportable".into()),
                 capture_json: Some("main.capture.json".into()),

@@ -24,8 +24,10 @@ pub struct FrameCompare {
     pub signal: RunnerSignal,
     pub verdict: Option<TierVerdict>,
     /// Expected-vs-actual style at changed cells (084 F6) — computed here because this is
-    /// where BOTH envelopes are in hand.
+    /// where BOTH envelopes are in hand. `style_deltas_total` is the number of runs FOUND
+    /// (which can exceed the emitted list when the cap truncates).
     pub style_deltas: Vec<StyleDelta>,
+    pub style_deltas_total: u32,
 }
 
 /// The golden files for a frame live at `<golden_dir>/<name>.capture.json` +
@@ -67,6 +69,7 @@ pub fn compare_frame(
         },
         verdict: None,
         style_deltas: Vec::new(),
+        style_deltas_total: 0,
     };
     let untrusted = || FrameCompare {
         signal: RunnerSignal::GoldenUntrusted {
@@ -75,6 +78,7 @@ pub fn compare_frame(
         },
         verdict: None,
         style_deltas: Vec::new(),
+        style_deltas_total: 0,
     };
 
     let json_path = cell_json_path(golden_dir, name);
@@ -144,18 +148,23 @@ pub fn compare_frame(
                 },
                 verdict: Some(v),
                 style_deltas: Vec::new(),
+                style_deltas_total: 0,
             },
-            GateStatus::Fail => FrameCompare {
-                signal: RunnerSignal::FrameMismatch {
-                    name: name.into(),
-                    tier: tname,
-                    reason: v.reason.clone(),
-                    changed_cells: Some(v.cell.diff.cells_changed),
-                },
-                verdict: Some(v),
-                // Only a FAIL needs the style story; a match has none.
-                style_deltas: style_deltas(&golden, live),
-            },
+            GateStatus::Fail => {
+                let (deltas, deltas_total) = style_deltas(&golden, live);
+                FrameCompare {
+                    signal: RunnerSignal::FrameMismatch {
+                        name: name.into(),
+                        tier: tname,
+                        reason: v.reason.clone(),
+                        changed_cells: Some(v.cell.diff.cells_changed),
+                    },
+                    verdict: Some(v),
+                    // Only a FAIL needs the style story; a match has none.
+                    style_deltas: deltas,
+                    style_deltas_total: deltas_total,
+                }
+            }
             // evaluate_tier only yields Pass/Fail (missing/stale resolved above); any other
             // status is refused conservatively as untrusted rather than silently passed.
             _ => untrusted(),

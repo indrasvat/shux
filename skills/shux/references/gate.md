@@ -36,7 +36,8 @@ deliberate: a golden can never be self-minted in CI.
 name = "mock-rich-tui"
 description = "Deploy board: initial frame, then a j-key selection move."
 command = ["uv", "run", "--offline", "board.py"]
-cwd = "."                    # OPTIONAL, relative to THIS file's directory
+cwd = "."                    # OPTIONAL, relative to THIS file's directory, and
+                             # contained within it (symlinks out are refused)
 deadline_ms = 60000          # optional, whole-scenario budget
 
 [env]
@@ -134,15 +135,17 @@ after-nav | fail   | 50      |
 
   ```json
   "style_deltas": [
-    {"row": 4, "col": 25, "expected": "fg=bright_green", "actual": "fg=green"},
-    {"row": 5, "col": 25, "expected": "fg=bright_green", "actual": "fg=green"}
+    {"row": 4, "col": 25, "col_end": 35, "expected": "fg=bright_green", "actual": "fg=green"},
+    {"row": 5, "col": 25, "col_end": 35, "expected": "fg=bright_green", "actual": "fg=green"}
   ]
   ```
 
   This is the field to read for a **colour-only** regression: the text is byte-identical,
   so a text diff shows nothing and the coordinates alone don't say what moved. One entry
-  per contiguous run of the same change, capped so a full-screen recolour can't bloat the
-  report. Absent when only text changed.
+  per contiguous run (`[col, col_end)`), capped so a full-screen recolour can't bloat the
+  report. Absent when only text changed. If the cap truncates, `diff.style_deltas_total`
+  appears with the true number of runs — a partial list is never presented as the whole
+  story.
 - `--cast [PATH]` records a replayable asciinema v2 file of the whole run, so you can
   scrub how the TUI reached a failing frame.
 - `--trace PATH|-` emits the raw runner-signal NDJSON.
@@ -170,7 +173,9 @@ Two consequences bite everyone once:
 2. **The child's working directory is a scratch temp dir, not your project.** To run a
    program that lives beside the scenario, set `cwd` — a path **relative to the scenario
    file's directory** (absolute paths are refused, because an absolute host path in the run
-   identity makes the committed golden untrusted elsewhere).
+   identity makes the committed golden untrusted elsewhere). It must also stay *inside*
+   that directory: `..` is rejected when the scenario is parsed, and a symlink pointing out
+   of the tree is rejected at spawn, after both paths are canonicalized.
 
 Determinism is the whole game: fixed data, no clock, no network, no randomness. Derive any
 timestamp from `SOURCE_DATE_EPOCH`. A flaky scenario is worse than no scenario.

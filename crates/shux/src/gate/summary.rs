@@ -168,6 +168,7 @@ mod tests {
                 heat_png: None,
                 regions: None,
                 style_deltas: None,
+                style_deltas_total: None,
             }),
             reason: reason.map(String::from),
             capture_json: None,

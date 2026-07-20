@@ -55,6 +55,8 @@ pub struct FrameOutcome {
     /// matched, when no compare ran, or when only TEXT changed — a colour-only regression
     /// is invisible in a text diff, so the report must be able to name the colours.
     pub style_deltas: Vec<StyleDelta>,
+    /// Runs FOUND (may exceed `style_deltas.len()` when the report cap truncates).
+    pub style_deltas_total: u32,
     /// The frame's declared xfail metadata (from the scenario step), if any. 081 parses
     /// it opaque-reserved; 082 governs it.
     pub xfail: Option<XfailMeta>,
