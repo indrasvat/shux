@@ -212,3 +212,91 @@
 - **2026-07-18 (feat/lens-ci-gate, task 082 dogfood):** A real-world dogfood — driving `shux lens gate` against a REAL installed tool (`bat`) through the full lifecycle — found a class of gap the unit/integration/adversarial/QA layers structurally CANNOT: they assert on `report.json` STRUCTURED FIELDS (where `heat_png: None` is schema-valid) and never ask "can a human/agent SEE the diff / does the help text tell the truth / do errors point at the cause?". The dogfood surfaced (a) the headless heat-PNG gap — the product's differentiator (pixel-perfect proof) was inaccessible in CI/agents, only in interactive `gate review`; (b) my own `--out` help lying ("heat PNGs" it never wrote); (c) DX friction only real workloads hit (sandbox `PATH` not inherited → real tools invisibly "not found" behind an unhelpful `step_timeout`; the persistent daemon tripping the leak-guard on every run). Fix: the gate report path now writes the heat overlay to `--out` itself (`gate::heat`, cell-mask heat + a per-pixel diff-vs-golden fallback for pixel-only fails). **Sharpest lesson: reproduce a dogfood finding before believing it** — the agent confidently reported a BLOCKER "silent-pass gate that compared nothing"; independent reproduction showed it was CORRECT behavior (child_error for pre-compare exit-0; pass with frames=1 for post-compare exit-0-after-match). Trusting it would have meant "fixing" a non-bug into a real regression. For any user-facing tool, one genuine end-to-end run against a REAL target belongs INSIDE the done-definition — correctness tests prove it's CORRECT, the dogfood proves it's USABLE, and the two find disjoint bugs (the usability gaps all cluster at the "consumer reads the output" boundary that structured-field assertions are blind to).
 
 - **2026-07-18 (task 083 — lens gate: settle hardening + optional cast):** (1) **A per-pane revision `watch` is last-value-wins, so a settle SEED must mark the watch cursor UNDER the same io lock as the frame read.** The frame-stability seed read the VT `(rev N, hash)` then `rx.borrow_and_update()` SEPARATELY; because the PTY task bumps `content_revision` + publishes the watch under the io lock, a bump landing in that gap makes the cursor jump to `P > N` (last-value-wins), so revisions N+1..P are marked "seen" but never observed and hold-mode SETTLES on the STALE seed frame. Fix: read the frame AND `borrow_and_update` under ONE io lock (the PTY task can't publish while you hold it → VT and watch are frozen at the same batch). Caught by the impl-review council, NOT the adversarial pass — a race the pure-logic fuzzers structurally couldn't see. General rule: **when you snapshot state X and separately mark a coalescing edge-channel "seen", a concurrent producer can advance the channel past your snapshot; take both under the lock the producer needs.** (2) **A deadline-sized `select!` wake busy-spins when the deadline is already met but a DIFFERENT criterion is pending.** With `hold_ms>0` + `stable_frames>=2`, once hold is satisfied (`ns_until_hold==0`) but the frame count isn't, `wake = now + 0` → `sleep_until(now)` returns instantly → 100% CPU. Fix: only use the hold-deadline wake while hold is UNSATISFIED; else wake straight to the timeout (only a revision or the deadline can change the decision). Extracted the wake as a pure `stability_wake` fn so the anti-spin rule is unit-tested. **A `now`-clamped sleep in a multi-criterion wait loop is a spin; size the wake to the criterion that's actually still pending.** (3) **`stable_frames` cannot settle a pane that stops repainting — and a quiet fallback can't fix it without reintroducing the bug it exists to solve.** A count-based "K identical revisions" never reaches K on an idle pane (no new revisions) → `settle_never_stable`. A quiet fallback (settle on `quiet_ms` silence) would let a slow spinner false-settle in a between-frames gap — the exact thing the design council rejected. Resolution: `--hold-ms` is the GENERAL animated-TUI settle (silence counts as held → settles both continuous repainters AND steady-state TUIs); `--stable-frames` is the count-based niche. The idle-pane limitation is an intentional trade-off — document + pin it, don't "fix" it. (4) **UTF-8 carry across chunk boundaries must only buffer a STRUCTURALLY-VALID trailing lead byte.** The cast serializer carries a trailing incomplete multibyte sequence so a split glyph replays intact, but `0xC0`/`0xC1` (overlong) and `0xF5..=0xFF` (out of range) can NEVER complete — buffering them as "incomplete" lags their U+FFFD to the next chunk/EOF. Guard: only carry a lead in `0xC2..=0xF4`. Found by an offline fuzzer (60k+ iterations). (5) **Recording that must capture a child's FIRST bytes has to be armed before the read loop spawns, not post-hoc.** A `pane.record.start` after `lens.run` misses alt-screen setup + initial geometry (task 066: record.start excludes pre-start bytes). Register the recorder in the SAME io-lock block that inserts the pane's writer/VT/watch, before `run_pane_pty_task` spawns — a thin `spawn_pane_pty` wrapper delegates to `spawn_pane_pty_with_recorder(…, Some(rec))` so the 9 non-cast callers are untouched. Verified on real `htop`: the cast captured `?1049h` at the start. (6) **Extract bin-private pure logic to the lowest shared lib to make it adversarial-fuzzable.** The `shux` binary has no lib target, so an offline fuzz harness can't reach its private fns; moving `CastWriter`+`cast_complete_prefix` to `shux-vt` (pure byte/string, zero daemon deps) both fixed the layering AND let an agent path-dep the crate and hammer the UTF-8 carry — which found (4). Colocate pure cores in `shux-vt` like `settle`, `gate_compare`, `capture`. (7) **The real-target dogfood catches the "consumer reads the error" bug class every structured-field gate is blind to.** Driving `pane wait-settled --hold-ms 5ms` against a real pane showed only "invalid_params (code -32602)" — the actionable `data.detail` ("hold_ms 5 out of range [10, 60000]") was dropped because the Text error path printed the generic `message` not `rpc_display(code, message, data)` (the helper that surfaces `detail`, already used by other verbs). A first-timer's most likely error was unactionable; fixed + pinned. Also re-confirmed the deferred sandbox-`PATH` gap (bare Homebrew `htop`/`vim` → `infra_error`; use an absolute path until 084). **Run the dogfood against a REAL target (htop/vim), not a fixture — the fixture's argv already resolves; the consumer's doesn't.**
+
+## 2026-07-19 — Task 084: what an acceptance gauntlet finds that no other gate does
+
+**A "validation task" is where the bugs are, because the tool finally meets a real
+target.** 084 built nothing new by design — it just tried to point the finished gate at a
+real `uv`+`rich` TUI. That alone surfaced five defects, one of them a blocker, none of
+which unit tests, integration suites, adversarial review, or two prior dogfoods had found.
+The pattern from 082/083 repeated: every layer that asserts on structured fields is blind
+to whether a human or agent can ACT on those fields.
+
+**The blocker: a rollup recomputed over a subset of its inputs.** `build_reports` folded
+three contributions into the scenario status — frame statuses, the terminal disposition,
+and a no-visual guard. `apply_blessed` re-rolled after a bless by folding over FRAMES
+only, seeded at `Pass`. A `step_timeout` produces no frames at all, so the fold began and
+ended at `Pass`: `--on-missing create` returned `pass`/exit 0 over a scenario that never
+rendered, while blessing zero goldens. The note still said `step_timeout`; only the
+machine-readable status and the exit code lied — i.e. exactly the two things CI reads.
+Generalizable lesson: **when two places compute the same value, one of them will
+eventually see fewer inputs.** The fix was not "add the missing case" but to give both
+paths ONE helper (`verdict::scenario_floor`) so they cannot drift again.
+
+**Write the regression test, then prove it fails.** The F4 test was run against the old
+fold before the fix landed and confirmed RED. A test authored after a fix, never seen
+failing, is an assertion that the code does what it does.
+
+**An escape hatch that breaks the feature's purpose is not an escape hatch.** The gate
+documented `[env] allow = ["PATH"]` for reaching host tools. But an allow-listed value is
+hashed literally into `cmd_env_hash`, which is in the staleness fingerprint — so using it
+made every committed golden `untrusted` on any other machine. The documented workaround
+was unusable with the very thing the gate exists for.
+
+**"Where does the child actually start?" is a load-bearing question.** The gate hard-wired
+`cwd` to a sandbox temp dir with no knob, so it could gate a self-contained shell
+one-liner but not a project sitting beside its own scenario — which is every real repo.
+The fix (a scenario-dir-relative `cwd`) had to be relative, because an absolute host path
+in `command`/`cwd` poisons the run identity the goldens are pinned to.
+
+**Report WHERE without WHAT and the headline feature eats itself.** A colour-only
+regression is byte-identical as text: `git diff` shows nothing, a text capture shows
+nothing, an eyeball shows nothing. Only the cell tier sees it — and the report said "50
+cells changed at rows 4,5,7,9,11" and stopped. The `style_deltas` field
+(`expected: fg=bright_green` -> `actual: fg=green`) turned out to be **load-bearing, not
+cosmetic**: with two greens on screen, it is what tells an agent WHICH ONE the baseline
+blesses. Claude used precisely that — "the summary row had zero changed cells, which
+independently confirms the summary's green was the correct half of the pair" — to decide
+to raise the table rather than lower the summary. Without it, that is a coin flip that
+produces a confident, wrong fix.
+
+**Collapse repeated facts before capping them.** The first `style_deltas` cut emitted one
+entry per changed CELL, so a 16-entry cap was consumed by sixteen copies of row 4 and the
+other four affected rows were invisible. One entry per contiguous run of the same
+(expected, actual) pair made the same cap describe the whole regression.
+
+**`export PATH` does not survive a login shell.** The gauntlet exported PATH so agents
+would use the branch build. codex shells out via `bash -lc` — a LOGIN shell — which
+rebuilds PATH from the user's profile and silently discarded the prepend, so codex got the
+INSTALLED `shux` and hit "unrecognized subcommand 'gate'". Both builds report version
+`0.44.0`, so `--version` could not distinguish them. Two builds sharing a version string
+is a real hazard whenever a branch build is tested against an installed one; name the
+absolute path rather than trusting PATH order.
+
+**Throw away results gathered under a broken harness.** codex passed CR-B despite the PATH
+defect, by hunting down `target/release/shux` itself. Keeping that result would have meant
+comparing three agents across unequal environments. All six cells were re-run from scratch.
+
+**Reproduce before believing — in both directions.** A suspected missing DECAWM
+deferred-wrap in shux's VT was reproduced and DISPROVEN (80-column lines wrap correctly;
+`rich` measures the pane correctly) — the fixture's own `expand=True` table was rendering
+81 columns. That is the third task running where a confidently-formed hypothesis inverted
+on reproduction.
+
+**Harden the fixture before trusting it as an instrument.** One run in ~12 reported an
+827-cell whole-screen diff where every other run reported exactly 50: the board clears and
+repaints whole, so a quiet `settle` can capture the blank mid-repaint frame. 083's
+`hold_settle` closed it (10/10 pristine passes, 5/5 trapped fails at exactly 50). A flaky
+gauntlet fixture would have produced false signals about the agents rather than the tool.
+
+**Make the pass bar state the supervisor observed.** The gauntlet never reads a verdict out
+of a transcript: it snapshots sha256 manifests of the golden tree, re-runs the gate itself
+before and after, and counts bless audit entries. The seed also REFUSES to start unless the
+pre-agent gate is red for CR-B and green for CR-A, so a dead trap can never be mistaken for
+a passing agent. Then the six verdicts were re-audited a second time by recomputing from
+the files rather than trusting the harness's own manifests.
+
+**Result:** 6/6. Three cold agents, given only the repo, the scenario and the skill, each
+caught a text-invisible colour regression and fixed the CODE — none reverted, none blessed
+its way out — and each independently converged on the same architecture (keep the shared
+palette, restore the deliberate table/summary divergence).

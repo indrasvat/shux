@@ -918,6 +918,52 @@ name="dup"
     }
 
     #[test]
+    fn cwd_defaults_to_absent_so_the_child_keeps_the_sandbox_home() {
+        let s = parse("name=\"x\"\ncommand=[\"true\"]\n").unwrap();
+        assert_eq!(s.cwd, None);
+    }
+
+    #[test]
+    fn a_relative_cwd_parses_and_is_kept_verbatim() {
+        let s = parse("name=\"x\"\ncommand=[\"true\"]\ncwd=\"sub/dir\"\n").unwrap();
+        assert_eq!(s.cwd.as_deref(), Some("sub/dir"));
+        // `.` is the common case (the scenario's own directory) and must survive.
+        let dot = parse("name=\"x\"\ncommand=[\"true\"]\ncwd=\".\"\n").unwrap();
+        assert_eq!(dot.cwd.as_deref(), Some("."));
+    }
+
+    /// An absolute `cwd` would be baked into the run identity, making the committed golden
+    /// `untrusted` on every other machine — so it is refused, never silently honoured.
+    #[test]
+    fn an_absolute_cwd_is_refused() {
+        let e = parse("name=\"x\"\ncommand=[\"true\"]\ncwd=\"/tmp\"\n").unwrap_err();
+        assert!(e.0.contains("relative"), "unhelpful error: {}", e.0);
+        assert!(
+            e.0.contains("/tmp"),
+            "error does not name the offending path: {}",
+            e.0
+        );
+    }
+
+    /// Containment: a scenario must not be able to walk the runner out of its own directory.
+    /// This invariant is the reason `cwd` is safe to join onto the scenario dir unchecked.
+    #[test]
+    fn a_cwd_escaping_the_scenario_dir_is_refused() {
+        for bad in ["..", "../elsewhere", "sub/../../elsewhere", "./../x"] {
+            let toml = format!("name=\"x\"\ncommand=[\"true\"]\ncwd=\"{bad}\"\n");
+            let e = match parse(&toml) {
+                Err(e) => e,
+                Ok(_) => panic!("`cwd = {bad:?}` escaped containment"),
+            };
+            assert!(
+                e.0.contains("inside the scenario directory"),
+                "wrong error for {bad:?}: {}",
+                e.0
+            );
+        }
+    }
+
+    #[test]
     fn env_allow_list_parses() {
         let toml =
             "name=\"x\"\ncommand=[\"true\"]\n[env]\nallow=[\"PATH\",\"HOME\"]\nLC_ALL=\"C\"\n";

@@ -183,6 +183,20 @@ over the visible frame text trips. Every bless appends to `BASELINE-APPROVAL.md`
 (who/when/why) and emits a changed-golden manifest — so a reviewer can see exactly which
 goldens moved and why. Pass `--reason "…"` to record intent.
 
+## Clean up the daemon when you're done
+
+The gate talks to a `shux` daemon, and starts one if none is running. There is **no
+`shux daemon stop` verb yet**, so a daemon outlives your gate run:
+
+```sh
+pkill -f "shux __daemon"
+```
+
+This matters if you run your own no-leak / process-hygiene check after a gate invocation —
+the daemon will show up as a new process and trip it. Use an isolated, SHORT
+`XDG_RUNTIME_DIR` (e.g. `XDG_RUNTIME_DIR=/tmp/mygate`) to keep that daemon away from any
+other shux on the machine; a long path can also blow the Unix-socket path limit.
+
 ## Gotchas
 
 - **The command must draw and then BLOCK.** A program that prints and exits trips the

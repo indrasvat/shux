@@ -158,3 +158,47 @@ pass-with-0-frames). Folded from the exercise:
   "not found" + a `wait_for_text`-timeout PATH hint (→ 084 cold-agent DX / 085 docs); one-shot
   daemon spawn+teardown so a CI gate doesn't leave a persistent daemon (→ 083); secret-scanner
   entropy false-positive tuning on long `$PATH`-like strings.
+
+## Defects found + fixed by task 084 (2026-07-19)
+
+The 084 cold-agent gauntlet exercised this task's verdict/bless/report surface against a
+real target and found two defects. Both were fixed here and re-gated with
+`make test-lens-gate-verdict` (18/18) and `make test-lens-gate-contract` (5/5).
+
+**1. BLOCKER — blessing laundered a scenario-level failure into `pass`/exit 0**
+(`gate/bless.rs`, `gate/verdict.rs`). `build_reports` folds THREE contributions into the
+scenario status: per-frame statuses, the scenario-level terminal disposition
+(`step_timeout` / `child_error` / `infra_error`) and the `no_visual_check` guard.
+`apply_blessed` re-rolled after a bless by folding over **frames only**, seeded at `Pass` —
+and a terminal failure produces no frames at all, so the fold began and ended at `Pass`.
+`shux lens gate scn.toml --on-missing create` therefore returned `pass`/exit 0 over a
+scenario whose `wait_for_text` had timed out and which had rendered nothing, while blessing
+zero goldens. The note still said `step_timeout`; only the machine-readable `status` and
+the exit code — the two things CI reads — lied. It applied to `--update` too, via the same
+shared path, so its blast radius was wider than the "create masks a child death" item 083
+deferred forward.
+
+Fixed by extracting `verdict::scenario_floor(outcome)` (the non-frame status) and having
+`apply_blessed(reports, manifest, floor)` fold from it; `build_reports` derives its
+non-frame contribution from the same helper so the two rollups cannot drift again.
+Regression test `blessing_nothing_cannot_launder_a_step_timeout_into_pass` was proven to
+FAIL against the old fold before the fix landed.
+
+**2. A colour-only regression reported coordinates but never colours** (`shux-vt/src/gate.rs`,
+`gate/compare.rs`). The gate's headline capability is catching what a text diff cannot — but
+for a `bright_green` -> `green` change the report said only "50 cells changed at rows
+4,5,7,9,11" while every text diff of the same frames showed nothing. `DiffReport` gained
+`style_deltas: Option<Vec<StyleDelta>>` (`{row, col, expected, actual}`, terse descriptors
+like `fg=bright_green bold`), computed in `compare_frame` where both envelopes are in hand,
+only on a FAIL, one entry per CONTIGUOUS run of the same (expected, actual) pair, capped at
+16. This is a deliberate addition to the frozen `deny_unknown_fields` schema.
+
+The gauntlet proved the field **load-bearing rather than cosmetic**: with two greens on
+screen it is what identifies which one the baseline blesses. Claude's run used exactly that
+("the summary row had zero changed cells, which independently confirms the summary's green
+was the correct half of the pair") to decide to raise the table rather than lower the
+summary — a choice that is otherwise a coin flip.
+
+Also: the `missing_golden` detail reached readers as `no committed golden ?`, because an
+em-dash met the ASCII output-boundary sanitizer.
+

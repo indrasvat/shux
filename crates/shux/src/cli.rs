@@ -1729,7 +1729,8 @@ pub enum LensCommand {
     /// Drive a declarative TOML scenario against a hidden scratch TUI and compare
     /// captured frames to committed goldens (task 081).
     ///
-    /// The scenario file (`name`, `[terminal]`, `[env]`, `command`, `[[steps]]`)
+    /// The scenario file (`name`, `command`, optional `cwd` relative to the scenario dir,
+    /// `[terminal]`, `[env]`, `[[steps]]`)
     /// spawns `command` in a deterministic, deny-by-default sandbox (isolated
     /// HOME/XDG, `LC_ALL=C.UTF-8`, `TZ=UTC`, `TERM=xterm-256color`), then runs the
     /// agnostic step core (`wait_for_text`, `settle`, `type_text`, `keys`, `resize`,

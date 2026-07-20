@@ -210,3 +210,38 @@ architecture APPROVED after the revisions below; evidence
 - [x] `shux-tui-qa` gate `VERDICT: PASS`; scratch evidence under `.shux/out/`, review shots on the PR (audit: every matrix cell PASS, 0 daemon leaks, live signal-kill + short-circuit-before-compare confirmed).
 - [x] Implementation-diff DootSabha convergence review clean or addressed (focused impl-review caught + fixed the signal-kill `-1`-vs-`code:None` drift).
 - [x] `docs/PROGRESS.md` + this task updated; learnings appended.
+
+## Scope extension — landed by task 084 (2026-07-19)
+
+The 084 cold-agent gauntlet drove this runner against a real `uv`+`rich` project and hit
+two gaps in 081's own surface. Both were fixed on this task's files and re-gated with
+`make test-lens-gate-run` (21/21 green).
+
+**1. An ENOENT spawn named neither the program, the PATH, nor a remedy** (`gate/runner.rs`,
+`program_not_found_message`). The sandbox `DEFAULT_PATH` is `/usr/local/bin:/usr/bin:/bin`,
+so no Homebrew / `~/.local/bin` tool is reachable — the same wall the 082 (`bat`) and 083
+(`htop`/`vim`) dogfoods hit — and the failure surfaced as a bare "No such file or
+directory". The message is now REPLACED (not appended: the note is capped at 240 chars and
+the errno preamble ate the budget) with one naming the program, the resolved sandbox PATH
+and the three remedies, in ASCII because the summary sanitizes non-ASCII to `?` at the
+output boundary. Tests: `enoent_spawn_names_the_program_the_path_and_the_remedies`,
+`an_absolute_command_path_and_other_errors_get_no_path_hint`.
+
+**2. A scenario could not point at a program sitting beside it** (`gate/scenario.rs`,
+`gate/runner.rs`, `gate/env_plan.rs`). The child's `cwd` was hard-wired to the sandbox HOME
+with no knob, and the only workaround — an absolute host path in `command` — lands in
+`cmd_env_hash`, which is part of the staleness fingerprint, so the committed golden became
+`untrusted` on every other machine. The gate could therefore gate a self-contained shell
+one-liner but not a project in a real repo. Scenarios now take an optional **`cwd`,
+resolved relative to the scenario file's own directory**, with absolute paths and any `..`
+component refused at parse time and a clear `infra` error when the directory is missing.
+`cwd` enters `scenario_hash` under `skip_serializing_if = "Option::is_none"`, so every
+pre-084 scenario hashes exactly as before. Tests:
+`cwd_defaults_to_absent_so_the_child_keeps_the_sandbox_home`,
+`a_relative_cwd_parses_and_is_kept_verbatim`, `an_absolute_cwd_is_refused`,
+`a_cwd_escaping_the_scenario_dir_is_refused` (the containment test was proven to FAIL with
+the guard disabled).
+
+Together these are what let the gate run a real installed tool at all — verified
+end-to-end with Homebrew `bat` and with the 084 `uv`+`rich` mock.
+

@@ -465,6 +465,22 @@ test-lens-gate-verdict: ## Run the task-082 verdict/report/xfail/bless/init suit
 test-lens-gate-settle: ## Run the task-083 settle-hardening + cast gate suite (drives `shux lens gate` end-to-end) serially under the leak guard
 	$(call lens_run,Running lens-gate settle+cast suite (task 083),--test lens_gate_settle)
 
+.PHONY: test-gauntlet-seed
+test-gauntlet-seed: ## Seed one task-084 gauntlet cell: make test-gauntlet-seed AGENT=codex CR=cr-b
+	@.shux/scripts/laghudarshi_gate_gauntlet.sh seed "$(AGENT)" "$(CR)"
+
+.PHONY: test-gauntlet-run
+test-gauntlet-run: ## Drive one cold agent through a seeded cell: make test-gauntlet-run AGENT=codex CR=cr-b
+	@.shux/scripts/laghudarshi_gate_agent.sh "$(AGENT)" "$(CR)" $(if $(TIMEOUT),$(TIMEOUT),1800)
+
+.PHONY: test-gauntlet-verify
+test-gauntlet-verify: ## Verify one cell from supervisor-observed state: make test-gauntlet-verify AGENT=codex CR=cr-b
+	@.shux/scripts/laghudarshi_gate_gauntlet.sh verify "$(AGENT)" "$(CR)"
+
+.PHONY: test-gauntlet-all
+test-gauntlet-all: ## Run the whole task-084 gauntlet SERIALLY (6 cells; long). Override with CELLS="codex:cr-b …"
+	@.shux/scripts/laghudarshi_gate_all.sh $(if $(CELLS),$(CELLS),codex:cr-b codex:cr-a claude:cr-b claude:cr-a agy:cr-b agy:cr-a)
+
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
 	@bash scripts/check-lens-frozen.sh "$(MSG)"
