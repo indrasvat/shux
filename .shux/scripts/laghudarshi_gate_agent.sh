@@ -5,6 +5,12 @@
 # the shux skill — no hints about which commands to run. Its whole process tree is cleaned
 # up by `agent_review_guard.sh`, and its transcript is captured for the friction log.
 #
+# SAFETY: the agents run with approvals bypassed, because a cold agent that stops to ask
+# for permission cannot be measured unattended. That is only acceptable because the target
+# is a disposable copy this harness generated under `.local/084-gauntlet/` (gitignored) —
+# never a real checkout. The guard below enforces that, and this script is a local
+# developer tool: nothing in CI or the shipped product invokes it.
+#
 # The transcript is read for FRICTION only. Pass/fail comes from
 # `laghudarshi_gate_gauntlet.sh verify`, which re-runs the gate itself and inspects the
 # golden tree — never from anything the agent claims.
@@ -28,6 +34,18 @@ case "${cr}" in cr-a|cr-b) ;; *) die "unknown change request: ${cr}" ;; esac
 WORK="${GAUNTLET_ROOT}/${agent}/${cr}/work"
 EVID="${GAUNTLET_ROOT}/${agent}/${cr}/evidence"
 [ -d "${WORK}" ] || die "no seeded copy at ${WORK} -- run the gauntlet seed phase first"
+
+# The agents below run with approvals bypassed, which is only defensible because the
+# target is a THROWAWAY scratch copy this harness generated. Refuse to run if the working
+# copy is not inside the gauntlet root, so this can never be pointed at a real checkout.
+work_real="$(cd "${WORK}" && pwd -P)"
+root_real="$(cd "${GAUNTLET_ROOT}" && pwd -P)"
+case "${work_real}/" in
+  "${root_real}"/*) ;;
+  *) die "refusing to run: ${work_real} is outside the gauntlet scratch root ${root_real}" ;;
+esac
+[ -f "${WORK}/board.py" ] && [ -d "${WORK}/goldens" ] \
+  || die "refusing to run: ${work_real} does not look like a seeded gauntlet copy"
 
 SKILL_DIR="${GAUNTLET_ROOT}/${agent}/${cr}/shux-skill"
 
