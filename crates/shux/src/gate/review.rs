@@ -182,14 +182,14 @@ fn write_evidence(
     paths.push(after_path);
 
     // Before + heat only when a readable golden exists.
-    if let Ok(text) = std::fs::read_to_string(compare::cell_json_path(golden_dir, &f.name)) {
-        if let Ok(golden) = FrameEnvelope::from_canonical_json(&text) {
-            let before =
-                encode_png(&render_envelope(rasterizer, &golden)).map_err(|e| e.to_string())?;
-            let before_path = out_dir.join(format!("{}.before.png", f.name));
-            std::fs::write(&before_path, &before).map_err(|e| e.to_string())?;
-            paths.push(before_path);
-        }
+    if let Ok(text) = std::fs::read_to_string(compare::cell_json_path(golden_dir, &f.name))
+        && let Ok(golden) = FrameEnvelope::from_canonical_json(&text)
+    {
+        let before =
+            encode_png(&render_envelope(rasterizer, &golden)).map_err(|e| e.to_string())?;
+        let before_path = out_dir.join(format!("{}.before.png", f.name));
+        std::fs::write(&before_path, &before).map_err(|e| e.to_string())?;
+        paths.push(before_path);
     }
     Ok(paths)
 }

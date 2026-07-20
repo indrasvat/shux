@@ -182,14 +182,14 @@ impl KeybindingRegistry {
             BindingTable::Root => &mut self.root,
             BindingTable::Prefix => &mut self.prefix,
         };
-        if let Some(existing) = bindings.get(&key_press) {
-            if source != BindingSource::User || existing.source == BindingSource::User {
-                return Err(KeybindingError::Conflict {
-                    table,
-                    key: key.into(),
-                    existing: existing.source,
-                });
-            }
+        if let Some(existing) = bindings.get(&key_press)
+            && (source != BindingSource::User || existing.source == BindingSource::User)
+        {
+            return Err(KeybindingError::Conflict {
+                table,
+                key: key.into(),
+                existing: existing.source,
+            });
         }
         bindings.insert(
             key_press,

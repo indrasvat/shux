@@ -238,15 +238,15 @@ fn lower(tpl: Template) -> Result<Vec<Op>, TemplateError> {
 /// Expand `~` to the user's home dir. No env-var interpolation
 /// (codex P1 #7: explicit env modes only; cwd doesn't need them).
 fn expand_string(s: &str) -> PathBuf {
-    if let Some(stripped) = s.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(stripped);
-        }
+    if let Some(stripped) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
     }
-    if s == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
+    if s == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home);
     }
     PathBuf::from(s)
 }

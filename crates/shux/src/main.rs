@@ -791,18 +791,18 @@ async fn spawn_pane_recorder(
         }
 
         // Cast: flush any genuinely-truncated trailing UTF-8 at EOF.
-        if let Some(c) = cast.as_mut() {
-            if let Some(line) = c.flush_line() {
-                let line = format!("{line}\n");
-                if let Err(e) = file.write_all(line.as_bytes()).await {
-                    fail!(
-                        file,
-                        bytes_written,
-                        format!("failed to flush cast tail: {e}")
-                    );
-                }
-                bytes_written += line.len() as u64;
+        if let Some(c) = cast.as_mut()
+            && let Some(line) = c.flush_line()
+        {
+            let line = format!("{line}\n");
+            if let Err(e) = file.write_all(line.as_bytes()).await {
+                fail!(
+                    file,
+                    bytes_written,
+                    format!("failed to flush cast tail: {e}")
+                );
             }
+            bytes_written += line.len() as u64;
         }
 
         let flush_error = file.flush().await.err();
@@ -1059,12 +1059,11 @@ async fn run_pane_pty_task(
                         if response_write_failed {
                             break;
                         }
-                        if !terminal_responses.is_empty() {
-                            if let Err(e) = handle.flush().await {
+                        if !terminal_responses.is_empty()
+                            && let Err(e) = handle.flush().await {
                                 tracing::error!(%pane_id, error = %e, "PTY terminal response flush error");
                                 break;
                             }
-                        }
 
                         // Stage these bytes for the next sampled publish.
                         // We cap the buffered chunk at 64KB to avoid
@@ -1130,9 +1129,9 @@ async fn run_pane_pty_task(
                         // titles entirely; some apps clear with OSC 2
                         // and we don't want a blank border title.
                         if vt_title != last_osc_title {
-                            if let Some(t) = vt_title.clone() {
-                                if !t.is_empty() {
-                                    if let Err(e) =
+                            if let Some(t) = vt_title.clone()
+                                && !t.is_empty()
+                                    && let Err(e) =
                                         graph.set_pane_osc_title(pane_id, t).await
                                     {
                                         tracing::warn!(
@@ -1141,8 +1140,6 @@ async fn run_pane_pty_task(
                                             "set_pane_osc_title failed",
                                         );
                                     }
-                                }
-                            }
                             last_osc_title = vt_title;
                         }
                     }
@@ -2167,38 +2164,38 @@ fn register_state_methods(
                 let snap = gh.snapshot();
                 let mut spawn_results = Vec::new();
                 for output in &result.outputs {
-                    if let Some(pane_id) = output.pane_id {
-                        if let Some(pane) = snap.panes.get(&pane_id) {
-                            let cwd = pane.cwd.clone();
-                            let command = pane.command.clone();
-                            let spawn_io = io.clone();
-                            let spawn_ct = ct.clone();
-                            match spawn_pane_pty(
+                    if let Some(pane_id) = output.pane_id
+                        && let Some(pane) = snap.panes.get(&pane_id)
+                    {
+                        let cwd = pane.cwd.clone();
+                        let command = pane.command.clone();
+                        let spawn_io = io.clone();
+                        let spawn_ct = ct.clone();
+                        match spawn_pane_pty(
+                            pane_id,
+                            cwd,
+                            command,
+                            shux_pty::handle::PtySize::default(),
+                            Vec::new(),
+                            false,
+                            spawn_io,
+                            spawn_ct,
+                            gh.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => spawn_results.push(shux_core::apply::SpawnResult {
+                                op_index: output.op_index,
                                 pane_id,
-                                cwd,
-                                command,
-                                shux_pty::handle::PtySize::default(),
-                                Vec::new(),
-                                false,
-                                spawn_io,
-                                spawn_ct,
-                                gh.clone(),
-                            )
-                            .await
-                            {
-                                Ok(()) => spawn_results.push(shux_core::apply::SpawnResult {
-                                    op_index: output.op_index,
-                                    pane_id,
-                                    spawned: true,
-                                    error: None,
-                                }),
-                                Err(e) => spawn_results.push(shux_core::apply::SpawnResult {
-                                    op_index: output.op_index,
-                                    pane_id,
-                                    spawned: false,
-                                    error: Some(e.to_string()),
-                                }),
-                            }
+                                spawned: true,
+                                error: None,
+                            }),
+                            Err(e) => spawn_results.push(shux_core::apply::SpawnResult {
+                                op_index: output.op_index,
+                                pane_id,
+                                spawned: false,
+                                error: Some(e.to_string()),
+                            }),
                         }
                     }
                 }
@@ -2664,10 +2661,10 @@ fn register_events_methods(
                                 if c.pane_id != pane_id {
                                     continue; // not for this subscriber
                                 }
-                                if let Some(s) = from_seq {
-                                    if c.seq < s {
-                                        continue;
-                                    }
+                                if let Some(s) = from_seq
+                                    && c.seq < s
+                                {
+                                    continue;
                                 }
                                 collected.push(c);
                             }
@@ -3434,10 +3431,10 @@ async fn snapshot_window(
     let mut titles: std::collections::HashMap<shux_core::model::PaneId, String> =
         std::collections::HashMap::new();
     for pid in window.layout.tree.pane_ids() {
-        if let Some(p) = snap.panes.get(&pid) {
-            if !p.title.is_empty() {
-                titles.insert(pid, p.title.clone());
-            }
+        if let Some(p) = snap.panes.get(&pid)
+            && !p.title.is_empty()
+        {
+            titles.insert(pid, p.title.clone());
         }
     }
 
@@ -4217,21 +4214,21 @@ fn register_session_methods(
                             let snap = gh.snapshot();
                             // Spawn PTY for the initial pane
                             if let Some(s) = snap.sessions.get(&session_id) {
-                                if let Some(wid) = s.windows.first() {
-                                    if let Some(w) = snap.windows.get(wid) {
-                                        let _ = spawn_pane_pty(
-                                            w.active_pane,
-                                            cwd,
-                                            command.clone(),
-                                            shux_pty::handle::PtySize::default(),
-                                            Vec::new(),
-                                            false,
-                                            io,
-                                            ct,
-                                            gh.clone(),
-                                        )
-                                        .await;
-                                    }
+                                if let Some(wid) = s.windows.first()
+                                    && let Some(w) = snap.windows.get(wid)
+                                {
+                                    let _ = spawn_pane_pty(
+                                        w.active_pane,
+                                        cwd,
+                                        command.clone(),
+                                        shux_pty::handle::PtySize::default(),
+                                        Vec::new(),
+                                        false,
+                                        io,
+                                        ct,
+                                        gh.clone(),
+                                    )
+                                    .await;
                                 }
                                 Ok(session_to_json(s, &snap))
                             } else {
@@ -4417,21 +4414,21 @@ fn register_session_methods(
                             let snap = gh.snapshot();
                             // Spawn PTY for the initial pane
                             if let Some(s) = snap.sessions.get(&session_id) {
-                                if let Some(wid) = s.windows.first() {
-                                    if let Some(w) = snap.windows.get(wid) {
-                                        let _ = spawn_pane_pty(
-                                            w.active_pane,
-                                            cwd,
-                                            command.clone(),
-                                            shux_pty::handle::PtySize::default(),
-                                            Vec::new(),
-                                            false,
-                                            io,
-                                            ct,
-                                            gh.clone(),
-                                        )
-                                        .await;
-                                    }
+                                if let Some(wid) = s.windows.first()
+                                    && let Some(w) = snap.windows.get(wid)
+                                {
+                                    let _ = spawn_pane_pty(
+                                        w.active_pane,
+                                        cwd,
+                                        command.clone(),
+                                        shux_pty::handle::PtySize::default(),
+                                        Vec::new(),
+                                        false,
+                                        io,
+                                        ct,
+                                        gh.clone(),
+                                    )
+                                    .await;
                                 }
                                 let mut json = session_to_json(s, &snap);
                                 json["created"] = serde_json::Value::Bool(true);
@@ -6118,11 +6115,9 @@ fn register_pane_io_methods(
                     });
                     // Emit the canonical `FrameEnvelope` ONLY when requested (task 080);
                     // absent by default keeps the frozen glance response byte-stable.
-                    if include_cells {
-                        if let Some(env) = &capture_env {
-                            result["cells"] =
-                                serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
-                        }
+                    if include_cells && let Some(env) = &capture_env {
+                        result["cells"] =
+                            serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
                     }
                     Ok(result)
                 }
@@ -6833,14 +6828,12 @@ fn choose_attach_session(sessions: &[serde_json::Value]) -> Option<String> {
 }
 
 async fn pick_attach_target(socket_path: &std::path::Path) -> String {
-    if let Ok(mut stream) = client::try_connect(socket_path).await {
-        if let Ok(value) = cli::rpc_call(&mut stream, "session.list", serde_json::json!({})).await {
-            if let Some(arr) = value.get("sessions").and_then(|v| v.as_array()) {
-                if let Some(target) = choose_attach_session(arr) {
-                    return target;
-                }
-            }
-        }
+    if let Ok(mut stream) = client::try_connect(socket_path).await
+        && let Ok(value) = cli::rpc_call(&mut stream, "session.list", serde_json::json!({})).await
+        && let Some(arr) = value.get("sessions").and_then(|v| v.as_array())
+        && let Some(target) = choose_attach_session(arr)
+    {
+        return target;
     }
     "default".to_string()
 }

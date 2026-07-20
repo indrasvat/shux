@@ -2949,10 +2949,10 @@ async fn resolve_uuid_shaped_session(
             if sid == Some(normalized.as_str()) {
                 id_match = true;
             }
-            if s.get("name").and_then(|v| v.as_str()) == Some(arg) {
-                if let Some(sid) = sid {
-                    name_match_id = Some(sid.to_string());
-                }
+            if s.get("name").and_then(|v| v.as_str()) == Some(arg)
+                && let Some(sid) = sid
+            {
+                name_match_id = Some(sid.to_string());
             }
         }
     }
@@ -3003,10 +3003,10 @@ async fn resolve_session_id(
 
     if let Some(sessions) = sessions {
         for s in sessions {
-            if s.get("name").and_then(|v| v.as_str()) == Some(session_name) {
-                if let Some(id) = s.get("id").and_then(|v| v.as_str()) {
-                    return Ok(id.to_string());
-                }
+            if s.get("name").and_then(|v| v.as_str()) == Some(session_name)
+                && let Some(id) = s.get("id").and_then(|v| v.as_str())
+            {
+                return Ok(id.to_string());
             }
         }
     }
@@ -3037,12 +3037,12 @@ async fn resolve_window_id(
     })?;
 
     // Try as numeric index first
-    if let Ok(idx) = window_spec.parse::<usize>() {
-        if let Some(w) = windows.get(idx) {
-            let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            let title = w.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-            return Ok((id.to_string(), title.to_string()));
-        }
+    if let Ok(idx) = window_spec.parse::<usize>()
+        && let Some(w) = windows.get(idx)
+    {
+        let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let title = w.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+        return Ok((id.to_string(), title.to_string()));
     }
 
     // Try as window name
@@ -3354,10 +3354,10 @@ async fn resolve_pane_window_id(
                 .or_else(|| result.as_array());
             if let Some(sessions) = sessions {
                 for s in sessions {
-                    if s.get("id").and_then(|v| v.as_str()) == Some(&session_id) {
-                        if let Some(aw) = s.get("active_window_id").and_then(|v| v.as_str()) {
-                            return Ok((session_id, aw.to_string()));
-                        }
+                    if s.get("id").and_then(|v| v.as_str()) == Some(&session_id)
+                        && let Some(aw) = s.get("active_window_id").and_then(|v| v.as_str())
+                    {
+                        return Ok((session_id, aw.to_string()));
                     }
                 }
             }
@@ -3895,11 +3895,11 @@ pub async fn handle_pane_watch(
                     }
                 }
                 delivered += 1;
-                if let Some(lim) = limit {
-                    if delivered >= lim {
-                        let _ = out.flush();
-                        return Ok(());
-                    }
+                if let Some(lim) = limit
+                    && delivered >= lim
+                {
+                    let _ = out.flush();
+                    return Ok(());
                 }
             }
             let _ = out.flush();
@@ -4947,10 +4947,10 @@ pub async fn handle_events_watch(
             for ev in events {
                 println!("{}", serde_json::to_string(ev)?);
                 printed += 1;
-                if let Some(n) = limit {
-                    if printed >= n {
-                        return Ok(());
-                    }
+                if let Some(n) = limit
+                    && printed >= n
+                {
+                    return Ok(());
                 }
             }
         }

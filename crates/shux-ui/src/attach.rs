@@ -279,14 +279,13 @@ where
 
             // Periodic resize check (in case the OS missed the resize event).
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                if let Ok((c, r)) = TerminalGuard::size() {
-                    if (c, r) != last_size {
+                if let Ok((c, r)) = TerminalGuard::size()
+                    && (c, r) != last_size {
                         last_size = (c, r);
                         let frame = AttachClientFrame::Resize { cols: c, rows: r };
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();
                     }
-                }
             }
         }
     }
@@ -376,18 +375,17 @@ fn key_to_bare_action(key: KeyEvent) -> Option<(ActionKind, ActionArgs)> {
     // Alt+1..9 — switch to window N. Handled before the catch-all so a
     // user-defined `KeyModifiers::ALT + KeyCode::Char('1')` doesn't fall
     // through to "no match".
-    if let KeyCode::Char(c) = key.code {
-        if let Some(d) = c.to_digit(10) {
-            if (1..=9).contains(&d) {
-                return Some((
-                    ActionKind::SwitchToWindow,
-                    ActionArgs {
-                        window_index: Some(d as u16),
-                        ..Default::default()
-                    },
-                ));
-            }
-        }
+    if let KeyCode::Char(c) = key.code
+        && let Some(d) = c.to_digit(10)
+        && (1..=9).contains(&d)
+    {
+        return Some((
+            ActionKind::SwitchToWindow,
+            ActionArgs {
+                window_index: Some(d as u16),
+                ..Default::default()
+            },
+        ));
     }
     let kind = match key.code {
         KeyCode::Enter => ActionKind::SplitSmart,

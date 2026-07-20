@@ -330,12 +330,11 @@ fn parse_key_value(s: &str) -> Option<KeyValue> {
         "menu" => Some(KeyValue::Named(NamedKey::Menu)),
         other => {
             // Check for F-keys: "f1", "f12", etc.
-            if let Some(n_str) = other.strip_prefix('f') {
-                if let Ok(n) = n_str.parse::<u8>() {
-                    if (1..=24).contains(&n) {
-                        return Some(KeyValue::Named(NamedKey::F(n)));
-                    }
-                }
+            if let Some(n_str) = other.strip_prefix('f')
+                && let Ok(n) = n_str.parse::<u8>()
+                && (1..=24).contains(&n)
+            {
+                return Some(KeyValue::Named(NamedKey::F(n)));
             }
             // Single character.
             let chars: Vec<char> = s.chars().collect();

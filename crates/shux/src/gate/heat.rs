@@ -177,10 +177,10 @@ fn set_heat_path(reports: &mut [ScenarioReport], name: &str, path: &Path) {
     let display = path.display().to_string();
     for sr in reports.iter_mut() {
         for fr in sr.frames.iter_mut() {
-            if fr.name == name {
-                if let Some(diff) = fr.diff.as_mut() {
-                    diff.heat_png = Some(display.clone());
-                }
+            if fr.name == name
+                && let Some(diff) = fr.diff.as_mut()
+            {
+                diff.heat_png = Some(display.clone());
             }
         }
     }

@@ -237,10 +237,10 @@ pub fn has_indexed_colors(view: &dyn CellGridView) -> bool {
             if matches!(cell.fg(), Color::Indexed(_)) || matches!(cell.bg(), Color::Indexed(_)) {
                 return true;
             }
-            if let Some(ext) = cell.cell().extended.as_deref() {
-                if matches!(ext.underline_color, Some(Color::Indexed(_))) {
-                    return true;
-                }
+            if let Some(ext) = cell.cell().extended.as_deref()
+                && matches!(ext.underline_color, Some(Color::Indexed(_)))
+            {
+                return true;
             }
         }
     }

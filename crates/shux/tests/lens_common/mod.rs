@@ -538,18 +538,18 @@ impl Drop for Harness {
         // Terminate the daemon so it reaps every pane child (no leaked shux
         // processes / orphan fixtures). Best-effort; the leak guard is the net.
         let pid_path = self.runtime.path().join("shux").join("shux.pid");
-        if let Ok(txt) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = txt.trim().parse::<i32>() {
-                use nix::sys::signal::{Signal, kill};
-                use nix::unistd::Pid;
-                let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline {
-                    if kill(Pid::from_raw(pid), None).is_err() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
+        if let Ok(txt) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = txt.trim().parse::<i32>()
+        {
+            use nix::sys::signal::{Signal, kill};
+            use nix::unistd::Pid;
+            let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if kill(Pid::from_raw(pid), None).is_err() {
+                    break;
                 }
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
@@ -601,12 +601,11 @@ fn collect_audit(dir: &Path, out: &mut Vec<serde_json::Value>) {
             .and_then(|n| n.to_str())
             .map(|n| n.contains("audit"))
             .unwrap_or(false)
+            && let Ok(text) = std::fs::read_to_string(&path)
         {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                for line in text.lines() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                        out.push(v);
-                    }
+            for line in text.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    out.push(v);
                 }
             }
         }

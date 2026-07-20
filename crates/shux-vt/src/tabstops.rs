@@ -96,7 +96,7 @@ impl TabStops {
     }
 
     fn default_stop(col: usize) -> bool {
-        col > 0 && col % 8 == 0
+        col > 0 && col.is_multiple_of(8)
     }
 }
 

@@ -302,11 +302,11 @@ pub async fn run_hot_reload(
             return;
         }
     };
-    if !parent.exists() {
-        if let Err(e) = std::fs::create_dir_all(&parent) {
-            tracing::warn!(error = %e, "config hot-reload: failed to create parent");
-            return;
-        }
+    if !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(&parent)
+    {
+        tracing::warn!(error = %e, "config hot-reload: failed to create parent");
+        return;
     }
 
     // Bridge from notify (sync callback) to a tokio mpsc.

@@ -5,7 +5,12 @@ name: CI
 # - `pull_request: [main]` fires for every PR push. This is the primary
 #   per-commit gate.
 # - `push: [main]` fires once after merge — used to run the heavier signals
-#   we skip on PRs (coverage upload, clippy-beta).
+#   we skip on PRs (coverage upload).
+#   clippy-beta USED to be in that set. It is not any more: an advisory job
+#   that only reports after merge is one nobody is required to read, and a
+#   new beta lint duly landed red on main unseen. It is non-blocking via
+#   `continue-on-error`, which is the property we actually wanted — it does
+#   not need a trigger gate to be safe, only to be quiet.
 # - NO `push: [feat/**, fix/**, refactor/**]`. Previously this doubled
 #   CI runs on every PR-branch push (both `push` AND `pull_request` would
 #   fire on the same commit).
@@ -229,12 +234,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # Beta-toolchain clippy — forward-looking lint pass. continue-on-error
-  # means it never blocks; signal is purely advisory. Weekly + main-push
-  # cadence is plenty (the stable target shifts every ~6 weeks).
+  # Beta-toolchain clippy — forward-looking lint pass. `continue-on-error`
+  # alone makes it non-blocking, so it runs EVERYWHERE, PRs included.
+  # It used to be gated to schedule+main-push as well, which meant a new beta
+  # lint only ever surfaced AFTER merge, on a job nothing was required to read
+  # (`manual_slice_fill` landed on main this way). Non-blocking is the right
+  # property; invisible is not.
   lint-beta:
     name: Clippy (beta — advisory)
-    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:

@@ -397,10 +397,8 @@ pub fn style_deltas(expected: &FrameEnvelope, actual: &FrameEnvelope) -> (Vec<St
                 // this run is the one we actually emitted. Past the cap a run is counted
                 // and dropped, and blindly extending `out.last_mut()` would rewrite the
                 // final emitted entry's `col_end` with a column from a different row.
-                if emitting_current {
-                    if let Some(last) = out.last_mut() {
-                        last.col_end = col.saturating_add(1);
-                    }
+                if emitting_current && let Some(last) = out.last_mut() {
+                    last.col_end = col.saturating_add(1);
                 }
                 continue;
             }

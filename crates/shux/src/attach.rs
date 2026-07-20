@@ -929,16 +929,14 @@ async fn run_attach_loop(
         let still_alive = {
             let snap = graph.snapshot();
             let live = snap.sessions.contains_key(&session.session_id);
-            if live {
-                if let Some(s) = snap.sessions.get(&session.session_id) {
-                    session.active_window_id = s.active_window;
-                    if let Some(w) = snap.windows.get(&s.active_window) {
-                        session.active_pane_id = w.active_pane;
-                    }
-                    let mut rs = render_session.lock().await;
-                    rs.active_window_id = session.active_window_id;
-                    rs.active_pane_id = session.active_pane_id;
+            if live && let Some(s) = snap.sessions.get(&session.session_id) {
+                session.active_window_id = s.active_window;
+                if let Some(w) = snap.windows.get(&s.active_window) {
+                    session.active_pane_id = w.active_pane;
                 }
+                let mut rs = render_session.lock().await;
+                rs.active_window_id = session.active_window_id;
+                rs.active_pane_id = session.active_pane_id;
             }
             live
         };
@@ -1156,10 +1154,10 @@ async fn run_render_loop(
         // titles so panes without a title get the clean border.
         let mut pane_titles: HashMap<PaneId, String> = HashMap::new();
         for pid in win.layout.tree.pane_ids() {
-            if let Some(p) = snap.panes.get(&pid) {
-                if !p.title.is_empty() {
-                    pane_titles.insert(pid, p.title.clone());
-                }
+            if let Some(p) = snap.panes.get(&pid)
+                && !p.title.is_empty()
+            {
+                pane_titles.insert(pid, p.title.clone());
             }
         }
         // Status bar text. Start from the built-in (always-good)
@@ -2291,10 +2289,10 @@ async fn focus_dir(
     // change and would be typing into a hidden pane. Falls through as
     // a no-op (the renderer keeps showing the zoomed pane).
     let snap = graph.snapshot();
-    if let Some(win) = snap.windows.get(&attached.active_window_id) {
-        if win.layout.is_zoomed() {
-            return Ok(());
-        }
+    if let Some(win) = snap.windows.get(&attached.active_window_id)
+        && win.layout.is_zoomed()
+    {
+        return Ok(());
     }
     drop(snap);
     let new_id = graph

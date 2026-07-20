@@ -270,10 +270,10 @@ fn register_session_methods(
                         Ok(session_id) => {
                             let snap = gh.snapshot();
                             if let Some(s) = snap.sessions.get(&session_id) {
-                                if let Some(wid) = s.windows.first() {
-                                    if let Some(w) = snap.windows.get(wid) {
-                                        spawn_pane_pty(w.active_pane, cwd, io, ct).await?;
-                                    }
+                                if let Some(wid) = s.windows.first()
+                                    && let Some(w) = snap.windows.get(wid)
+                                {
+                                    spawn_pane_pty(w.active_pane, cwd, io, ct).await?;
                                 }
                                 Ok(session_to_json(s, &snap))
                             } else {

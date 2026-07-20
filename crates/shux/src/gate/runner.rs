@@ -599,12 +599,13 @@ pub async fn drive_scenario(
         // for an `expect_exit` step (allowed to consume the exit) and when a prior
         // `expect_exit` already consumed it (a trailing `expect_golden` still glances
         // the surviving VT).
-        if !child_consumed && !matches!(step, Step::ExpectExit { .. }) {
-            if let Some(code) = monitor.peek().await {
-                trace.emit(RunnerSignal::ChildExit { code });
-                stopped = true;
-                break;
-            }
+        if !child_consumed
+            && !matches!(step, Step::ExpectExit { .. })
+            && let Some(code) = monitor.peek().await
+        {
+            trace.emit(RunnerSignal::ChildExit { code });
+            stopped = true;
+            break;
         }
 
         // Race the step against the REMAINING whole-scenario budget so a single long
@@ -904,11 +905,9 @@ async fn drive_step(
                 // Re-check for an unexpected exit AFTER settle and BEFORE the compare (adv MAJOR 2):
                 // a child that paints, goes quiet, then exits must short-circuit the visual compare
                 // (design D7), never false-pass it.
-                if !*child_consumed {
-                    if let Some(code) = monitor.peek().await {
-                        trace.emit(RunnerSignal::ChildExit { code });
-                        return StepFlow::Stop;
-                    }
+                if !*child_consumed && let Some(code) = monitor.peek().await {
+                    trace.emit(RunnerSignal::ChildExit { code });
+                    return StepFlow::Stop;
                 }
 
                 let (mut outcome, signal) = match capture_and_compare(
