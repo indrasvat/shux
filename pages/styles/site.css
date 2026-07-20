@@ -267,7 +267,12 @@ strong { color: var(--ink); font-weight: 600; }
 .nav-links a.cta:hover { background: var(--accent-ink); color: #1a0e07; }
 
 @media (max-width: 720px) {
-  .nav-links .lbl { display: none; }
+  /* The section links hide their labels here, but the anchors stayed in the flex row —
+     each still consuming a `gap`, invisible and unclickable. Seven of them plus the CTA
+     overflowed a 360px viewport by 17px (real, user-reachable horizontal scroll, with the
+     CTA cut mid-word). Drop them entirely at this width and keep the mark + CTA, so the
+     row cannot be overflowed by adding a section. */
+  .nav-links a:not(.cta) { display: none; }
   .nav { padding: var(--s-2) var(--s-4); }
 }
 

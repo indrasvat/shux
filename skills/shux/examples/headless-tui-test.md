@@ -75,13 +75,23 @@ shux lens gate myapp.toml                                  # exit 1: no committe
 shux lens gate myapp.toml --on-missing create --reason "first baseline"
 ```
 
-Goldens land in `goldens/myapp/`. **Open them before committing** — a baseline is a claim
-that this is what correct looks like, and everything downstream trusts it:
+Goldens land in `goldens/myapp/`. A baseline is a claim that this is what correct looks
+like, and everything downstream trusts it — so look at it before committing. At the `cell`
+tier a golden is `<name>.capture.json`, reviewable **text**, not an image: there is no PNG
+to open. To see what was actually captured, render the same command:
 
 ```bash
-shux lens gate review myapp.toml       # renders each frame; PNG paths when inline graphics aren't available
+RUN=$(shux --format json lens run --size 100x30 -- myapp --fixtures tests/fixtures)
+PANE=$(echo "$RUN" | jq -r .result.pane_id)
+shux pane wait-settled "$PANE" --quiet 300ms
+shux pane glance "$PANE" --png baseline-preview.png     # <- open this
+shux session kill "$(echo "$RUN" | jq -r .result.session_id)"
+
 git add goldens/ myapp.toml && git commit -m "test: gate myapp rendering"
 ```
+
+`shux lens gate review` is for a run with CHANGED frames — it steps through a failing diff,
+so on a fresh baseline it correctly reports that nothing changed and shows nothing.
 
 ## 4. Wire CI
 

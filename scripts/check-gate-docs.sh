@@ -12,6 +12,15 @@ DOC="$ROOT/skills/shux/references/gate.md"
 SCENARIO_RS="$ROOT/crates/shux/src/gate/scenario.rs"
 STATUS_RS="$ROOT/crates/shux-vt/src/gate.rs"
 NOTICES="$ROOT/THIRD-PARTY-NOTICES"
+# Every skill doc that teaches the gate. The grammar checks below key off gate.md (it is
+# the reference), but the "wrong claim" checks must sweep ALL of them: task 085 fixed the
+# "review a fresh baseline with `gate review`" claim in gate.md and missed the identical
+# claim in the example, because the check only ever read one file.
+GATE_DOCS=(
+  "$ROOT/skills/shux/references/gate.md"
+  "$ROOT/skills/shux/references/scenarios.md"
+  "$ROOT/skills/shux/examples/headless-tui-test.md"
+)
 
 fail=0
 err() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=1; }
@@ -118,13 +127,28 @@ else
   ok "gate.md uses \`gate init <name>\`, not a .toml path"
 fi
 
-# The runtime dir is not in the daemon's argv, so a pattern kill is both unreliable
-# and destructive to other checkouts. The pidfile is exact.
-if grep -qE '^[^#]*pkill' "$DOC"; then
-  err "gate.md recommends pkill; teach the \$XDG_RUNTIME_DIR/shux/shux.pid reap instead"
-else
-  ok "gate.md does not recommend pattern-killing daemons"
-fi
+# Claims that must not appear in ANY gate doc, checked across all of them.
+for d in "${GATE_DOCS[@]}"; do
+  [[ -f "$d" ]] || { err "missing gate doc: ${d#"$ROOT"/}"; continue; }
+  rel="${d#"$ROOT"/}"
+  # A pattern kill is unreliable (the runtime dir is not in the daemon's argv) and
+  # destructive to other checkouts. `shux daemon stop` is exact.
+  # A doc that WARNS against pkill is doing the right thing; only flag a recommendation.
+  if grep -nE 'pkill|killall' "$d" | grep -qivE 'never|do not|don.t|instead of|rather than'; then
+    err "$rel recommends pattern-killing; teach \`shux daemon stop\`"
+    grep -nE 'pkill|killall' "$d" | grep -ivE 'never|do not|don.t|instead of|rather than' | sed 's/^/      /'
+  else
+    ok "$rel does not recommend pattern-killing daemons"
+  fi
+  # `gate review` steps through CHANGED frames; it shows nothing on a fresh baseline, and
+  # a cell-tier golden has no PNG to open. Telling a first-timer otherwise sends them to a
+  # tool that cannot do the job (085 QA P1).
+  if grep -qiE 'gate review .*(fresh|first|new) baseline|review the PNGs|Open them before committing' "$d"; then
+    err "$rel tells the reader to review a FRESH baseline with \`gate review\` / open PNGs"
+  else
+    ok "$rel does not misdescribe reviewing a fresh cell-tier baseline"
+  fi
+done
 
 # ── 4. Attribution (task 085 Testing Matrix L1) ───────────────────────────────
 printf '\033[34m▶ attribution\033[0m\n'

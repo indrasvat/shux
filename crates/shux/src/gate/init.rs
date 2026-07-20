@@ -113,7 +113,10 @@ pub async fn run_init(
     if code == 0 {
         println!(
             "{}",
-            style::success("first goldens minted — commit them after reviewing the PNGs")
+            style::success(
+                "first goldens minted - review them before committing (a `cell` golden is \
+                 <name>.capture.json, not a PNG; see references/gate.md)",
+            )
         );
     }
     Ok(code)

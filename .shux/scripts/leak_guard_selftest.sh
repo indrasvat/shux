@@ -3,6 +3,11 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC2034  # consumed by lib/proc_scope.sh
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=lib/proc_scope.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib/proc_scope.sh"
+
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 source "${repo_root}/.shux/scripts/lib/shux_harness.sh"
 
@@ -12,30 +17,27 @@ if [ ! -x "${shux_bin}" ]; then
   exit 2
 fi
 
-assert_no_new_shux() {
-  local baseline_file="$1"
-  local current pid
-  current="$(pgrep -x shux 2>/dev/null || true)"
-  while read -r pid; do
-    [ -n "${pid}" ] || continue
-    if ! grep -qx "${pid}" "${baseline_file}"; then
-      echo "leak guard self-test left a new shux process: ${pid}" >&2
-      ps -p "${pid}" -o pid=,ppid=,stat=,args= >&2 || true
-      kill -TERM "${pid}" >/dev/null 2>&1 || true
-      sleep 1
-      kill -KILL "${pid}" >/dev/null 2>&1 || true
-      exit 1
-    fi
-  done <<<"${current}"
-}
-
-orphan_candidate_pids() {
-  ps -axo pid=,ppid=,tty=,comm=,args= |
-    awk '
-      $2 == 1 && ($3 ~ /^(ttys|pts\/)/ || $4 ~ /^(sh|bash|zsh|fish|sleep|yes|python|python3|node|cargo|shux)$/) {
-        print $1
-      }
-    '
+# Assert the guard cleaned up the daemon THIS self-test intentionally leaked.
+#
+# Attributable by construction: the self-test owns the runtime dir, so it checks that
+# dir's pidfile and nothing else. It used to compare a machine-wide `pgrep -x shux`
+# against a baseline and TERM+KILL anything new — which SIGKILLed a concurrent session's
+# in-flight `shux lens gate` during task 085. A self-test must never be able to kill a
+# process it did not create.
+assert_leaked_daemon_reaped() {
+  local runtime="$1" pidfile pid
+  pidfile="${runtime}/shux/shux.pid"
+  [ -f "${pidfile}" ] || return 0
+  pid="$(cat "${pidfile}" 2>/dev/null || true)"
+  case "${pid}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${pid}" -gt 1 ] || return 0
+  kill -0 "${pid}" >/dev/null 2>&1 || return 0
+  echo "leak guard did not reap the daemon it reported: ${pid} (${runtime})" >&2
+  ps -p "${pid}" -o pid=,ppid=,stat=,args= >&2 || true
+  kill -TERM "${pid}" >/dev/null 2>&1 || true
+  sleep 1
+  kill -KILL "${pid}" >/dev/null 2>&1 || true
+  exit 1
 }
 
 assert_no_new_orphan_automation_processes() {
@@ -55,11 +57,12 @@ assert_no_new_orphan_automation_processes() {
   done <<<"${current}"
 }
 
-baseline="$(mktemp "${TMPDIR:-/tmp}/shux-leak-baseline.XXXXXX")"
 orphan_baseline="$(mktemp "${TMPDIR:-/tmp}/shux-orphan-leak-baseline.XXXXXX")"
-pgrep -x shux >"${baseline}" 2>/dev/null || true
 orphan_candidate_pids >"${orphan_baseline}" 2>/dev/null || true
-trap 'assert_no_new_shux "${baseline}"; assert_no_new_orphan_automation_processes "${orphan_baseline}"; rm -f "${baseline}" "${orphan_baseline}"' EXIT
+# The runtime dir this test's intentional leak will live in — owned here so the
+# post-condition is attributable to exactly one daemon.
+selftest_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-selftest.XXXXXX")"
+trap 'assert_leaked_daemon_reaped "${selftest_runtime}"; assert_no_new_orphan_automation_processes "${orphan_baseline}"; rm -f "${orphan_baseline}"' EXIT
 
 set +e
 SHUX_HARNESS_TIMEOUT_IMPL=bash shux_harness_timeout 1s bash -lc 'sleep 30'
@@ -73,8 +76,7 @@ fi
 set +e
 .shux/scripts/no_leak_guard.sh bash -lc "
   set -euo pipefail
-  runtime=\"\$(mktemp -d \"\${TMPDIR:-/tmp}/shux-leak-guard-selftest.XXXXXX\")\"
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR=\"\${runtime}\" \"${shux_bin}\" --format json \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR=\"${selftest_runtime}\" \"${shux_bin}\" --format json \
     session create leak-guard-selftest-\$\$ -d -- sh -lc 'sleep 60' >/dev/null
 "
 guard_status=$?
@@ -85,7 +87,7 @@ if [ "${guard_status}" -eq 0 ]; then
   exit 1
 fi
 
-assert_no_new_shux "${baseline}"
+assert_leaked_daemon_reaped "${selftest_runtime}"
 
 set +e
 .shux/scripts/no_leak_guard.sh python3 - <<'PY'

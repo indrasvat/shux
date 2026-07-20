@@ -14,73 +14,13 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
+# shellcheck disable=SC2034  # consumed by lib/proc_scope.sh
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Process scoping lives in ONE place — see the header of proc_scope.sh for why.
+# shellcheck source=lib/proc_scope.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib/proc_scope.sh"
 
-# Leaked shux DAEMONS belonging to this repository (085 F8, second half).
-#
-# This was a bare system-wide `pgrep -x shux`, which is wrong twice over:
-#   * it matched CLIENT invocations, which are transient and exit on their own — they are
-#     not leaks. A concurrent agent's in-flight `shux lens gate` was killed mid-run by this,
-#     reproduced during the 085 adversarial pass;
-#   * it matched processes from OTHER checkouts entirely.
-# Only a daemon can leak, and only one running this repo's binary is this run's business.
-#
-# Residual, accepted: two sessions driving the SAME checkout concurrently can still see each
-# other's daemons. Give each run its own XDG_RUNTIME_DIR and do not run leak-guarded suites
-# in parallel — CLAUDE.md already requires this.
-shux_pids() {
-  local pid args
-  for pid in $(pgrep -x shux 2>/dev/null || true); do
-    # `ps -o args=` pads with leading whitespace; strip it or the prefix match never fires.
-    args="$(ps -p "${pid}" -o args= 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
-    case "${args}" in
-      *"__daemon"*) ;;            # a daemon: a candidate
-      *) continue ;;              # a client: transient, never a leak
-    esac
-    case "${args}" in
-      "${REPO_ROOT}"/*) printf '%s\n' "${pid}" ;;   # built from this checkout
-      *) ;;
-    esac
-  done
-}
-
-# Every orphan candidate must belong to this repo too: this guard runs alongside other
-# repositories' agents, councils and test suites, and reaping one costs someone else real work.
-
-# True when PID's working directory is inside this repository.
-pid_cwd_in_repo() {
-  local pid="$1" cwd
-  cwd="$(lsof -a -p "${pid}" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
-  [ -n "${cwd}" ] || return 1
-  case "${cwd}" in
-    "${REPO_ROOT}" | "${REPO_ROOT}"/*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# Orphaned automation processes (PPID 1) that this run is responsible for.
-#
-# Two corrections over the original rule (085 F8):
-#   * `ps -o comm=` prints a PATH on macOS (`/opt/homebrew/.../python3.13`), so matching it
-#     against bare names like `python3` never fired — that whole branch was dead, and only
-#     the tty test was doing any work. Compare the BASENAME instead.
-#   * Neither test said anything about WHOSE process it is. Require the working directory to
-#     be inside this repo, so a concurrent session in another checkout is never a candidate.
-orphan_candidate_pids() {
-  ps -axo pid=,ppid=,tty=,comm= |
-    awk '
-      $2 == 1 {
-        n = split($4, parts, "/")
-        base = parts[n]
-        if ($3 ~ /^(ttys|pts\/)/ || base ~ /^(sh|bash|zsh|fish|sleep|yes|python|python[0-9.]*|node|cargo|shux)$/) {
-          print $1
-        }
-      }
-    ' |
-    while read -r pid; do
-      if pid_cwd_in_repo "${pid}"; then printf '%s\n' "${pid}"; fi
-    done
-}
+shux_pids() { shux_daemon_pids; }
 
 pid_in_list() {
   local needle="$1"
