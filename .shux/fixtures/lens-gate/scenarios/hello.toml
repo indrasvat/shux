@@ -1,0 +1,39 @@
+# Lens-gate scenario — the authoring surface (TOML, per the locked decision).
+#
+# The scenario RUNNER + step grammar are owned by task 081. 078 froze the ENVELOPE
+# (name/description/[terminal]/[env]/command/[[steps]] with an `expect_golden`); 081
+# canonicalizes the step fields (GATE-TEST-CHANGE): `expect_golden.tier` replaces the
+# 078 placeholder `tol`, and the command DRAWS then BLOCKS (`exec cat`) so the pane is
+# a live, quiet frame at capture — a one-shot print-then-exit would trip the
+# child-exit short-circuit (design D7) before any compare. `NO_COLOR` is omitted
+# entirely (design D4: color is on by default; an empty NO_COLOR would SET the var).
+
+name = "hello"
+description = "Minimal lens-gate scenario: draw a coloured line, hold the frame, expect it."
+command = ["/bin/sh", "-c", "printf '\\033[38;2;255;120;0mhello, lens gate\\033[0m\\n'; exec cat"]
+
+[terminal]
+rows = 24
+cols = 80
+respond_to_queries = false
+
+[env]
+LC_ALL = "C.UTF-8"
+TZ = "UTC"
+TERM = "xterm-256color"
+COLORTERM = "truecolor"
+
+[[steps]]
+action = "wait_for_text"
+text = "hello, lens gate"
+timeout_ms = 5000
+
+[[steps]]
+action = "settle"
+quiet_ms = 300
+timeout_ms = 5000
+
+[[steps]]
+action = "expect_golden"
+name = "start"
+tier = "cell"

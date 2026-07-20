@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "size": {
+    "rows": 8,
+    "cols": 40
+  },
+  "alt_screen": false,
+  "defaults": {},
+  "cursor": {
+    "row": 4,
+    "col": 29,
+    "visible": true,
+    "shape": "block"
+  },
+  "palette_overridden": false,
+  "rows": [
+    {
+      "row": 0,
+      "runs": [
+        [
+          0,
+          "TRUECOLOR",
+          {
+            "fg": {
+              "rgb": [
+                255,
+                120,
+                0
+              ]
+            },
+            "bg": {
+              "rgb": [
+                0,
+                40,
+                80
+              ]
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "row": 1,
+      "runs": [
+        [
+          9,
+          "256IDX",
+          {
+            "fg": {
+              "idx": 208
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "row": 2,
+      "runs": [
+        [
+          15,
+          "BASIC",
+          {
+            "fg": {
+              "idx": 1
+            },
+            "bold": true,
+            "underline": true,
+            "underline_style": "single"
+          }
+        ]
+      ]
+    },
+    {
+      "row": 3,
+      "runs": [
+        [
+          20,
+          [
+            "漢",
+            "",
+            "字",
+            ""
+          ]
+        ],
+        [
+          25,
+          [
+            "👍",
+            ""
+          ]
+        ],
+        [
+          28,
+          [
+            "é"
+          ]
+        ]
+      ]
+    },
+    {
+      "row": 4,
+      "runs": []
+    },
+    {
+      "row": 5,
+      "runs": []
+    },
+    {
+      "row": 6,
+      "runs": []
+    },
+    {
+      "row": 7,
+      "runs": []
+    }
+  ]
+}

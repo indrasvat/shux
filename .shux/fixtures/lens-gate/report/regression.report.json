@@ -1,0 +1,32 @@
+[
+  {
+    "scenario": "hello",
+    "status": "fail",
+    "os": "linux",
+    "arch": "x86_64",
+    "font_chain_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "font_size_px": 16,
+    "started_at_ms": 1752710400000,
+    "duration_ms": 1204,
+    "frames": [
+      {
+        "name": "start",
+        "status": "fail",
+        "golden": "hello/start.capture.json",
+        "diff": {
+          "changed_cells": 3,
+          "total_cells": 1920,
+          "max_channel_delta": 64,
+          "heat_png": "hello/start.heat.png",
+          "regions": [
+            { "row": 0, "col_start": 2, "col_end": 5 }
+          ]
+        },
+        "reason": "palette_unportable",
+        "capture_json": "hello/start.capture.json",
+        "capture_png": "hello/start.png"
+      }
+    ],
+    "note": "example regression report — a fail frame carrying a diff + a palette_unportable reason"
+  }
+]

@@ -1,0 +1,236 @@
+# Task 084: lens gate — cold-agent DX validation (Laghudarshi gauntlet)
+
+**Status:** Done
+**Priority:** High
+**Milestone:** M3
+**Depends On:** 078, 079, 080, 081, 082, 083 (the fully-built gate)
+**Quality Gate:** acceptance (cold-agent gauntlet) + shux-tui-qa
+**Touches:** `.shux/fixtures/lens-gate/mock-rich-tui/` (uv project), validation harness under `.shux/scripts/`, `.local/` transcripts
+
+> `shux lens gate` initiative — the **real-feature acceptance gate**. This is the
+> mandatory verification Ārya specified: spin up cold-context agents (claude, codex,
+> agy) and have each *actually drive the built gate* on a real mock, to get an
+> unambiguous signal on whether agents find it useful/effective. Extends the existing
+> `Laghudarshi` (लघुदर्शी) cold-context gauntlet pattern (see task 076).
+
+## Problem
+
+Unit/integration/dogfood tests prove the gate *works*. They do not prove the gate is
+*usable by a cold agent under realistic friction*. Session history repeatedly shows
+agents hand-wave TUI verification. We need an unambiguous, adversarial signal:
+does a fresh agent, given only the scenario and the shux skill, successfully use
+`shux lens gate` to ship a correct visual change and to catch a regression?
+
+## Scope
+
+1. **The mock** (Ārya's spec): a small, real **`uv` + Python 3.14 + `rich`** terminal
+   UI — a self-contained scratch project (e.g. a task/todo board or a system panel)
+   built with `rich`, run via `uv run`. Deterministic (fixed data, `SOURCE_DATE_EPOCH`,
+   no network). Ship a committed `cell` golden baseline + a `scenario.toml`.
+2. **The change requests** (shape: implement-a-change → prove-no-regression):
+   - **CR-A (intended visual change):** e.g. "add a footer status bar." The agent must
+     implement it, run `shux lens gate`, see the expected frames change, and **bless**
+     them via `gate review`/`--update` — proving the intended change and nothing else moved.
+   - **CR-B (regression trap):** a change that *looks* safe but shifts/recolors an
+     unrelated region. The gate must **catch** it; the agent must read the heat PNG +
+     report, localize, and fix until green.
+3. **Cold-context runs**: run **claude, codex, and agy** each **independently**, from a
+   fresh context, given ONLY the scenario + repo + the shux skill (no hints). Invoke
+   through `.shux/scripts/agent_review_guard.sh`; daemon-backed steps serial under
+   `no_leak_guard.sh`. Capture each transcript to `.local/`.
+4. **Signal + friction log — proven by gate-produced artifacts, not claims** (council #3
+   MAJOR — the gauntlet must not be gameable by eyeballing). Success for each agent
+   requires, from the gate itself and the git history, NOT the transcript's assertions:
+   - **CR-B:** a `report.json` showing `fail` + a heat PNG BEFORE the fix, and a `pass`
+     report AFTER — both gate-produced.
+   - **CR-A:** a `--update`/`gate review` invocation and a changed-golden manifest showing
+     ONLY the intended goldens changed.
+   - **No out-of-band edits:** goldens changed ONLY via the gate — a check fails if any
+     golden file was edited directly (git diff of goldens vs. the gate's manifest).
+   - Transcript shows *meaningful* use of `shux lens gate` + reading the report/diff — but
+     the pass bar is the artifacts, not a tool-name grep (avoid brittle `view_file`-style
+     string checks).
+   **Every friction/issue is addressed** (skill wording, CLI ergonomics, error messages,
+   defaults); a feature-affecting fix loops back to its owning task (078–083), is
+   re-gated, and only then does 084 pass.
+5. **Two-phase note**: an early lightweight *paper* DX walkthrough of the CLI + scenario
+   ergonomics happened during 081 design review (pre-implementation de-risk); this task
+   is the heavy **real-binary** phase.
+
+## Non-Goals
+
+- No new gate features invented here — only friction fixes traced to a specific task.
+- Not a benchmark of the models; a benchmark of the *feature's* usability.
+- No committed screenshots unless approved as durable assets.
+
+## Design Review Decisions
+
+DootSabha design review MUST confirm: the mock is realistic (not a toy that trivializes
+the gate), CR-A/CR-B are representative, and the pass bar is unambiguous (all three cold
+agents succeed on both CRs with no blocking friction, zero leaked processes).
+
+## Testing Matrix
+
+| Layer | Required Evidence |
+|---|---|
+| L3 mock | `uv run` builds/runs the `rich` TUI deterministically; committed `cell` golden + scenario exist. |
+| L3 cold-claude | Fresh `claude` drives the gate: ships CR-A (bless), catches+fixes CR-B; transcript captured. |
+| L3 cold-codex | Fresh `codex` drives the gate: same two outcomes; transcript captured. |
+| L3 cold-agy | Fresh `agy` drives the gate: same two outcomes; transcript captured. |
+| L3 artifact proof | For each agent: gate-produced `fail`+heat report before CR-B fix, `pass` after; CR-A changed-golden manifest limited to intended goldens; goldens changed ONLY via the gate (git-diff-vs-manifest check); no direct golden edits. |
+| L3 CR-B no-bless proof (council #4) | The regression trap is fixed by fixing the **code**, never by re-blessing: goldens are **byte-identical before and after** the whole CR-B flow (git diff over the golden tree is empty), and no `--update`/bless ran during CR-B (no changed-golden manifest emitted). An agent that blesses its way out of CR-B is a **FAIL**, not a pass. |
+| L3 friction | Every friction/issue logged and resolved; feature-affecting fixes traced back to the owning task and re-verified. |
+| L3 hygiene | Zero new shux daemons / orphan automation processes after all runs (leak guard proven). |
+
+## Acceptance Criteria
+
+- [x] A realistic `uv`+py3.14+`rich` mock with a committed golden + scenario exists.
+- [x] CR-A and CR-B are defined and representative (intended change; regression trap).
+- [x] All three cold agents independently ship CR-A (with a bless) and catch+fix CR-B.
+- [x] The friction log is complete; every item is either FIXED or explicitly re-scoped below; feature changes looped back into 081/082 + re-gated.
+- [x] No leaked daemons or orphan processes (verified independently by the `shux-tui-qa` gate).
+
+## Definition of Done
+
+- [x] DootSabha design review incorporated before running the gauntlet (`.local/dootsabha-084-design.json`).
+- [x] All three cold-agent runs pass both change requests; transcripts + friction log in `.local/084-gauntlet/` and `.local/084-friction-log.md`.
+- [x] Feature-affecting fixes recorded in `docs/tasks/081-*.md` + `082-*.md` and re-gated (contract 5/5, verdict 18/18, run 21/21, settle 6/6).
+- [x] `shux-tui-qa` `VERDICT: PASS` on the overall workflow.
+- [x] Implementation/validation DootSabha convergence review addressed (`.local/dootsabha-084-impl.json`; asks 1+2 implemented, ask 3 re-scoped below).
+- [x] `docs/PROGRESS.md` + this task updated; learnings appended.
+
+## Results (2026-07-19)
+
+**6/6.** Every cell verified from supervisor-observed state — sha256 manifests of the
+golden tree, bless audit entries, and the gate re-run by the supervisor before and after —
+never from a transcript claim, then re-audited a second time by recomputing from the files.
+
+| agent | CR-B (fix the code) | CR-A (bless the change) |
+|---|---|---|
+| codex  | goldens IDENTICAL, +0 bless, gate 1→0 | only `start`+`after-nav` blessed, +1 audit entry, gate green |
+| claude | goldens IDENTICAL, +0 bless, gate 1→0 | only `start`+`after-nav` blessed, +1 audit entry, gate green |
+| agy    | goldens IDENTICAL, +0 bless, gate 1→0 | only `start`+`after-nav` blessed, +1 audit entry, gate green |
+
+No agent blessed its way out of CR-B; no golden changed outside a bless; CR-A moved only
+row 15 (the new footer) on every frame for every agent. The `cheat` negative control
+(blessing the regression away) is correctly scored FAIL, so the bar is not gameable.
+
+All three converged independently on the same correct architecture: keep the refactor's
+shared palette module, but stop it flattening the deliberate table/summary divergence on
+`healthy`. None reverted; none blessed.
+
+**The `style_deltas` fix proved load-bearing.** With two greens on screen, it is what tells
+an agent which one the baseline blesses. Claude's report used exactly that ("the summary
+row had zero changed cells, which independently confirms the summary's green was the
+correct half of the pair") to decide to raise the table rather than lower the summary.
+
+### Friction: fixed
+
+| # | Defect | Owner |
+|---|---|---|
+| F4 | **BLOCKER** — `--on-missing create`/`--update` laundered a `step_timeout`/crash/infra/no-visual failure into `pass`/exit 0 | 082 |
+| F1 | ENOENT spawn named neither program, PATH, nor remedy | 081 |
+| F2 | The gate could not run any project-based tool (no `cwd`) | 081 |
+| F6 | Colour-only regressions reported coordinates but never colours | 082 |
+| F9 | Harness: `export PATH` does not survive codex's `bash -lc` login shell | 084 |
+| — | `missing_golden` detail reached users as `no committed golden ?` | 082 |
+
+### Parallel adversarial review (4 cold agents, disjoint surfaces)
+
+Run after the QA gate reached PASS. **One parallel round produced more than four serial QA
+rounds had** — the Feature Protocol's adversarial step exists for exactly this, and skipping
+it is why earlier findings arrived one per round.
+
+Fixed here (all introduced by 084): **F13** `style_deltas` was blind to blank cells, so a
+background change painted on blanks — a selection bar, a status-bar highlight, the canonical
+TUI style regression — reported ZERO style deltas, and a run spanning blanks fragmented into
+pieces contradicting `changed_cells`; **F14** a symlinked scenario file anchored to the
+link's directory, silently minting a second divergent golden tree (this also closed the QA
+gate's P3-1, the last copy of the empty-parent trap in `default_golden_dir`); **F15** the
+harness was gameable — the supervisor gated the agent's own writable `scenario.toml`, so an
+`xfail` block passed CR-B with the regression on screen, and a deleted step passed CR-A with
+zero code changes. The supervisor now gates with its own immutable copy and reports any edit
+to the agent's; both attacks were replayed and are blocked twice over.
+
+**Bearing on the 6/6 result:** all six agents' `scenario.toml` are byte-identical to the
+pristine fixture (sha256-verified), so none used these attacks, and all six still pass under
+the hardened harness. The result stands — but on the manual audit and the QA gate's
+independent recomputation, not on the harness being ungameable.
+
+Recorded and deferred to **082's surface** (pre-existing, each reproduced twice, none a
+regression from this task): a bless REFUSAL erasing the run's verdict (a real `fail` becomes
+`update_refused`/exit 6 with `frames: []`, contradicting the crate's own
+`worst_never_masks_a_regression_with_an_error` invariant); `--update failing` colliding with
+a frame named `failing` and blanket-blessing a regression green; an I/O error on a PASSING
+run exiting 1 (the regression code) with no report; partial blessing despite a "no byte
+written" contract; `--update` promoting a fingerprint-mismatched xfail; `gate init .` and
+scenario `name = "."`; `-v` polluting `--report -` stdout; heat evidence silently dropped on
+an unwritable `--out`; `missing_golden` never naming the directory it searched. Full detail
+with reproductions in `.local/084-friction-log.md` (F16–F25).
+
+Clean bills worth recording: the **`scenario_floor` fix held** across a 35-cell matrix
+(7 failure modes × 5 bless modes) and `exit == status.exit_code()` held across 90 runs with
+zero mismatches; `cwd` containment held against every escape tried including the classic
+`starts_with` prefix bug; `style_deltas` truncation, run merging, wide chars/emoji/ZWJ,
+colour classes, masks and tiers are all clean.
+
+### Friction: explicitly re-scoped (NOT fixed here)
+
+- **F5 — every gate run leaks a `shux __daemon`.** There is no `daemon stop` verb; this is
+  the deferred daemon-lifecycle item already owned by 083. 084 does not fix it, but the
+  skill reference cold agents read (`skills/shux/references/gate.md`) now documents the
+  `pkill -f "shux __daemon"` cleanup and the isolated `XDG_RUNTIME_DIR`, so following the
+  docs no longer silently leaks. **Deferred to the daemon-lifecycle work.**
+- **F7 — retry vocabulary.** With `retries` set, a perfectly deterministic regression reads
+  `FAIL after 2 retries (exhausted fps [...])` — flakiness vocabulary for the opposite
+  situation, and a single stable fingerprint across attempts is in fact *evidence of
+  determinism*. Cosmetic; the audit itself is correct and is 083's anti-masking contract.
+  **Deferred to 083's surface.**
+- **F8 — `agent_review_guard.sh` kills unrelated agent processes.** It baselines PIDs and
+  kills anything newly matching `LEAK_PATTERNS`, so a concurrent session in *another
+  repository* was terminated as collateral. Pre-existing; 084 is merely the first task to
+  run six long guarded agent invocations back to back. Fixing it means narrowing the kill
+  set to the guard's own process group. **Deferred to tooling.**
+- **Impl-council ask #3 (report schema/version story).** The council asked for `col_end` +
+  truncation reporting (both shipped) **and** an explicit serialized schema/version marker,
+  since every report struct carries `#[serde(deny_unknown_fields)]` and an added field
+  therefore breaks an old strict reader the moment it appears. `GATE_REPORT_SCHEMA` exists
+  but is **never serialized into `report.json`**, so it signals nothing to a consumer today.
+  Giving the report a real version field is a governance change to 082's frozen schema that
+  deserves its own design pass, not a late edit inside an acceptance task — and 084 already
+  added one field to that schema under a `GATE-TEST-CHANGE:` trailer. **Deferred to 082's
+  schema-governance surface**, together with F11.
+- **F11 — a `cwd`-escape refusal can be redacted to nothing** by the secret scanner's
+  entropy heuristic when the host path carries a high-entropy segment. Exit 3 still fires,
+  so nothing passes silently, but the explanation is lost. Joins the 082 scanner-tuning
+  item. **Deferred to 082.**
+- **F12 — `style_deltas` could not describe a purely additive colour change.**
+  **SUPERSEDED:** F13's union fix resolved this as a side effect — additive styling is now
+  described (re-verified: a CR-A footer probe reports `row 15 [0,35) default => dim` where
+  the golden stored nothing). Recorded rather than deleted so the earlier WONTFIX is not
+  read as still true.
+- **F10 — `claude -p` / `agy -p` transcripts are final-message only**, so per-step friction
+  is observable for codex alone. The pass bar is state-based, so no verdict depends on it.
+  `--output-format stream-json` would capture it. **Accepted for this gauntlet.**
+
+
+## Follow-through by task 085 (2026-07-20)
+
+All ten defects this task recorded as "Recorded, deferred — pre-existing 081/082 surfaces"
+were fixed in 085 (see the tables in `docs/tasks/082-*.md` and `docs/tasks/083-*.md`), plus
+the two tooling items:
+
+- **F5** — there was no way to stop the daemon, so every gate run leaked one and the skill
+  documented `pkill -f "shux __daemon"` as the workaround. `shux daemon stop` / `shux daemon
+  status` now exist; `stop` SIGTERMs exactly this runtime dir's pidfile, is idempotent
+  (exit 0 when none is running, safe in a cleanup trap), and never auto-starts a daemon.
+- **F8** — the reported mechanism did **not** reproduce, and reproducing it found something
+  worse. The claim was that `no_leak_guard.sh` reaps PPID-1 `python3` processes. It cannot:
+  `ps -o comm=` prints a PATH on macOS, so matching it against bare names like `python3`
+  never fired — that branch was dead code and only the tty test was doing any work, making
+  the guard materially weaker than it read. Fixed both halves: compare the BASENAME so the
+  rule actually fires, and require every candidate's working directory to be inside this
+  repository so a concurrent session in another checkout can never be a candidate. Verified
+  in both directions.
+
+This task's own record stands: the 6/6 gauntlet result is unaffected by any of the above.

@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "size": {
+    "rows": 3,
+    "cols": 10
+  },
+  "alt_screen": false,
+  "defaults": {
+    "bg": [
+      32,
+      64,
+      96
+    ]
+  },
+  "cursor": {
+    "row": 0,
+    "col": 2,
+    "visible": true,
+    "shape": "block"
+  },
+  "palette_overridden": false,
+  "rows": [
+    {
+      "row": 0,
+      "runs": [
+        [
+          0,
+          "AB"
+        ]
+      ]
+    },
+    {
+      "row": 1,
+      "runs": []
+    },
+    {
+      "row": 2,
+      "runs": []
+    }
+  ]
+}

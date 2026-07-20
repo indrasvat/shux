@@ -69,7 +69,7 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 - **Leak-guarded shux checks MUST run serially:** never parallelize daemon-backed shux tests or leak-guard wrappers, because each guard intentionally kills new matching processes it did not baseline.
 - **External reviewer CLIs are process-hygiene risks:** run Claude/Codex/DootSabha/agy review commands through `.shux/scripts/agent_review_guard.sh`; do not use Gemini for shux review automation unless explicitly requested.
 - **Color probes are mandatory in shux automation:** any daemon-backed shux test or fixture that captures pane/window output MUST include explicit truecolor, indexed-color, or basic-color content so monochrome/`NO_COLOR` regressions cannot pass unnoticed.
-- **Prefer real terminal workloads:** when behavior is user-visible, tests should exercise real shux panes, Unix commands, and installed TUIs where practical; keep synthetic fixtures for narrow parser invariants, not as the only proof.
+- **Prefer real terminal workloads:** when behavior is user-visible, tests should exercise real shux panes, Unix commands, and installed TUIs; keep synthetic fixtures for narrow parser invariants, not as the only proof. For a user-facing *feature*, "where practical" is not an escape hatch — a real installed TUI/CLI IS practical, and a real-target end-to-end dogfood is required before "done" (Feature Protocol step 10). Color-probed `printf`/`cat` scenarios satisfy the letter, not the spirit.
 - **CLI output styling:** All user-facing CLI text output MUST use the style module (`crates/shux/src/style.rs`). Never use raw `println!` for styled output — use the helpers:
   - `style::accent(text)` — Cyan bold, for "shux" brand name and key identifiers
   - `style::success(text)` — Green, for confirmations (created, killed, ensured)
@@ -80,6 +80,37 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
   - `style::print_*()` functions for common output patterns (version, session entry, errors)
   - Respects `NO_COLOR` env var and `IsTerminal` detection automatically
   - When adding new CLI commands, add corresponding `print_*` helpers to `style.rs`
+
+## Correctness Is Never a Scope Question
+
+> **STRICT RULE — a correctness or robustness defect is ALWAYS fixed. Never deferred,
+> never handed off as someone else's follow-up, and never put to the user as a scope
+> question.** There is no version of "should I fix this bug?" that is a real question.
+>
+> Asking is itself the failure: it launders a decision the agent already knows the answer
+> to into the user's lap, and invites a "no" that neither party wants.
+>
+> When a defect surfaces — including one found by a review agent, an adversarial pass, or a
+> QA gate — the response is:
+>
+> 1. **Reproduce it by hand** before believing it (a report is a hypothesis; tasks 082, 083
+>    and 084 each had a confidently-reported finding that reproduction overturned).
+> 2. **Fix it on whichever task's surface owns it**, even if that task is already `Done`.
+> 3. **Add a regression test proven to FAIL against the old code** before the fix lands. A
+>    test authored after a fix and never seen failing only asserts that the code does what
+>    it does.
+> 4. **Re-gate the owning task** (its frozen suite / QA gate) and record the fix in that
+>    task's file so a reader can discover its scope grew.
+>
+> "It belongs to an already-Done task", "it's pre-existing", "it's out of this task's
+> scope", "the session is long", "it's only a P2" — these are reasons to be **careful**
+> about a fix. None of them is a reason to skip it. If a fix is genuinely large enough to
+> need sequencing, say so **while already doing it** and report the plan; do not stop and
+> ask for permission.
+>
+> This applies with full force to defects in the verification machinery itself — a gate, a
+> guard, a test harness, a golden. A CI gate whose job is refusing to let a regression
+> through is worth less than nothing when it can be talked into passing.
 
 ## Rich TUI Compatibility Guardrail
 
@@ -138,8 +169,13 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 >   re-scoped in the task file before proceeding.
 > - It MUST enforce the active task's exact Testing Matrix, Acceptance
 >   Criteria, and Definition of Done when a task file exists.
-> - It MUST use real colored shux automation and real Unix/TUI workloads where
->   practical, not synthetic fixtures alone.
+> - It MUST use real colored shux automation and real Unix/TUI workloads, not
+>   synthetic fixtures alone. For a user-facing feature this means a REAL target
+>   (a real installed TUI/CLI), not color-probed `printf`/`cat` — those satisfy
+>   the letter, not the spirit (see Feature Protocol step 10, the real-target
+>   dogfood). The gate asserts against the DoD;
+>   it does NOT replace the dogfood's judgement of consumer-facing output
+>   (help-text truthfulness, artifact legibility, error actionability).
 > - It MUST visually inspect full-resolution screenshots and use pixel-level
 >   verification whenever a baseline, expected frame, or stability contract
 >   exists.
@@ -241,10 +277,18 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > 4. **Verify EVERY config state.** Not just defaults — also `shux config init`
 >    output, feature-maxed config (every `[[...]]` entry populated), malformed
 >    config, mid-session hot-reload. The user-configured path is where bugs hide.
-> 5. **Local `dootsabha council` review of the implementation diff BEFORE pushing.**
+> 5. **Adversarial review (skill: `adversarial-review`).** Once the change is green
+>    and BEFORE the convergence review, spawn 2–4 parallel adversarial subagents that
+>    **drive the real system** to break it (disjoint attack surfaces; "try to break X"
+>    charters). Reproduce every finding independently, fix each with a regression test.
+>    Static review + councils miss what real hostile input exposes — this catches the
+>    sharpest bugs (a VS16-emoji validator blocker on task 078 that the author and 3
+>    councils all passed over). Standard for any nontrivial schema/contract/parser/
+>    protocol/guard change; skip only for trivial edits.
+> 6. **Local `dootsabha council` review of the implementation diff BEFORE pushing.**
 >    Don't wait for codex-bot on the PR to find issues. The goal is the PR
 >    shows up *already solid* — codex should react 👍, not write P2 reviews.
-> 6. **Visual evidence per (render path × config state) cell.** Save local
+> 7. **Visual evidence per (render path × config state) cell.** Save local
 >    screenshots under `.shux/out/<feature>/` or `.claude/screenshots/<feature>/`,
 >    name
 >    `v<N>_<render-path>_<width>_<config-state>.png` (e.g.
@@ -252,22 +296,42 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 >    path is mandatory in the filename — two cells from different paths
 >    at the same width + state would otherwise collide and silently
 >    overwrite each other, making the matrix unauditable.
-> 7. **PR evidence, not repo cruft.** Attach the review-worthy screenshots to the
+> 8. **PR evidence, not repo cruft.** Attach the review-worthy screenshots to the
 >    PR as comments. Prefer `browsing-as-you` for GitHub UI uploads when image
 >    attachment is needed. Do not commit screenshots unless they are durable
 >    goldens/baselines/product assets with explicit task and DootSabha approval.
-> 8. **Cross-path consistency assertion.** At least one test that asserts the
+> 9. **Cross-path consistency assertion.** At least one test that asserts the
 >    same logical output across render paths (e.g., snapshot at width W matches
 >    the attach renderer's bar at width W). Prevents future drift.
-> 9. **`gh-ghent` post-push, background only** (per memory `feedback-ghent-background`).
-> 10. **Post-merge `curl|sh` smoke** (per memory `feedback-post-merge-smoke-test`) —
->    verify against the *publicly-installed* binary, not local `target/release/`.
+> 10. **Real-target dogfood.** For any
+>    user-facing feature/verb/tool, once it is green + QA-passed, drive the REAL
+>    binary end-to-end against a REAL target — a real installed TUI/CLI (`bat`,
+>    `lazygit`, `vim`, a real REPL), NOT a synthetic `printf … ; exec cat`
+>    fixture — through the genuine user lifecycle (ideally a parallel agent,
+>    leak-guarded + isolated). Judge the CONSUMER-FACING output: does `--help`/
+>    docs tell the truth, does the promised artifact actually exist and read
+>    legibly (OPEN the PNG/report — do not just assert a JSON field), do errors
+>    point at the cause, would a first-timer understand it. Every other gate
+>    asserts on structured fields; a lying help string or a missing/illegible
+>    artifact is invisible to them — only a real dogfood catches the "consumer
+>    reads the output" bug class. **Reproduce every dogfood finding yourself
+>    before believing it** — an agent over- and under-claims (on task 082 a
+>    confidently-reported "silent-pass" BLOCKER was correct behaviour; a phantom
+>    fix would have been a real regression). "Where practical" is NOT an escape
+>    hatch for a user-facing surface — a real target IS practical.
+> 11. **`gh-ghent` post-push, background only.** Spawn any PR-wait poll
+>    (`gh ghent status --await-review`) in the background, never foreground.
+> 12. **Post-merge `curl|sh` smoke.** After a PR merges + semantic-release tags,
+>    install the new version via the public `curl -fsSL https://shux.pages.dev/install.sh | sh`
+>    flow and smoke-test the fix against the *publicly-installed* binary, not
+>    local `target/release/`.
 >
 > **Paste this into every feature PR description:**
 >
 > ```
 > ## Verification matrix
 > - [ ] dootsabha council on design — converged
+> - [ ] adversarial review (`adversarial-review` skill) — parallel agents drove the real system; findings fixed + regression-tested
 > - [ ] dootsabha council on implementation diff — clean
 > - [ ] live attach render path
 > - [ ] window.snapshot / session.snapshot / pane.snapshot PNG paths
@@ -278,6 +342,7 @@ API surface, crate versions, and core patterns: [docs/agents/api-notes.md](docs/
 > - [ ] hot-reload state (config edit mid-session takes effect)
 > - [ ] cross-path consistency test
 > - [ ] `make check` (lint + tests)
+> - [ ] real-target dogfood (user-facing features) — real TUI/CLI end-to-end, consumer-facing output judged (help truthfulness / artifact legibility / error actionability), findings reproduced before believing
 > - [ ] visual evidence for every relevant (path × state) cell is attached to PR comments
 > - [ ] no screenshots committed unless justified as durable baselines/assets
 > ```

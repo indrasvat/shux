@@ -1,0 +1,17 @@
+{
+  "fp_schema": 1,
+  "schema": 1,
+  "renderer_format_version": 1,
+  "raster_font_fingerprint": "8c70ab6cb7a1c46c6eb1e7d03504e492ffb0cd0a2b549855e6517f4e62f8a3aa",
+  "unicode_width_ver": "17.0.0",
+  "tol": "cell",
+  "tol_params": {
+    "max_channel_delta": 0,
+    "max_changed_frac": 0.0
+  },
+  "mask_hash": "3b480ec900136e598c31df741ec406c56a61f078c4118eeddcd835d57cbd9d81",
+  "shux_version": "0.44.0",
+  "capture_sha256": "855b2aa2869d672304dce1914f5f796c2e15144d71738b3347e8969041dbcadb",
+  "scenario_hash": "1d2243b52b8024f95158e6241a24dea4d56b432c7df9c4da0e96d821d36b032b",
+  "cmd_env_hash": "569602ccd2ed7c220ed1fcb703527e93eff1643fd0bf2ba45c8ec5a47f515ddb"
+}

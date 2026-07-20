@@ -14,18 +14,13 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-shux_pids() {
-  pgrep -x shux 2>/dev/null || true
-}
+# shellcheck disable=SC2034  # consumed by lib/proc_scope.sh
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Process scoping lives in ONE place — see the header of proc_scope.sh for why.
+# shellcheck source=lib/proc_scope.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib/proc_scope.sh"
 
-orphan_candidate_pids() {
-  ps -axo pid=,ppid=,tty=,comm=,args= |
-    awk '
-      $2 == 1 && ($3 ~ /^(ttys|pts\/)/ || $4 ~ /^(sh|bash|zsh|fish|sleep|yes|python|python3|node|cargo|shux)$/) {
-        print $1
-      }
-    '
-}
+shux_pids() { shux_daemon_pids; }
 
 pid_in_list() {
   local needle="$1"
@@ -57,7 +52,9 @@ kill_new_pids() {
   done
 }
 
+# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 baseline_shux=($(shux_pids))
+# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 baseline_orphans=($(orphan_candidate_pids))
 
 set +e
@@ -65,6 +62,7 @@ set +e
 cmd_status=$?
 set -e
 
+# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 after_shux=($(shux_pids))
 new_shux_pids=()
 set +u
@@ -85,6 +83,7 @@ if [ "${#new_shux_pids[@]}" -gt 0 ]; then
 fi
 
 # Re-scan after daemon cleanup: killing a daemon must not strand pane commands.
+# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 after_orphans=($(orphan_candidate_pids))
 new_orphan_pids=()
 set +u

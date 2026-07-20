@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, FromArgMatches};
 use shux_rpc::{Policy, Sensitivity};
@@ -14,6 +14,7 @@ mod client;
 mod config_validate;
 mod daemon;
 mod features;
+mod gate;
 mod lens_scratch;
 mod onboarding;
 mod session_meta;
@@ -43,8 +44,35 @@ const PANE_RECORD_COMPLETED_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 enum PaneRecordChunk {
-    Bytes(Vec<u8>),
-    Finish { status: PaneRecordStatus },
+    /// Raw PTY output with its ARRIVAL instant (task 083 cast — stamped at the tap, not at writer
+    /// recv, so backpressure never skews cast timing).
+    Bytes {
+        data: Vec<u8>,
+        at: Instant,
+    },
+    /// A pane resize with its arrival instant (task 083 cast — emits an asciinema `"r"` event so
+    /// replay geometry stays honest; grok's gap). Ignored by the raw writer.
+    Resize {
+        cols: u16,
+        rows: u16,
+        at: Instant,
+    },
+    Finish {
+        status: PaneRecordStatus,
+    },
+}
+
+/// Recorder output format (task 083). `Raw` is byte-identical to the pre-083 lossless recorder
+/// (timestamps + resize events ignored). `Cast` emits asciinema v2 with monotonic relative
+/// timestamps and resize events, UTF-8-boundary-safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneRecordFormat {
+    Raw,
+    /// asciinema v2, seeded with the pane's dims at record start (the cast header geometry).
+    Cast {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,12 +101,32 @@ struct PaneRecordResult {
     error: Option<String>,
 }
 
-struct PaneRecorder {
+pub(crate) struct PaneRecorder {
     id: uuid::Uuid,
     path: PathBuf,
     sender: mpsc::Sender<PaneRecordChunk>,
     outcome: Arc<StdMutex<PaneRecordResult>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Open a cast recorder (task 083) — the `lens.run` arm-at-spawn path (`spawn_scratch_core`)
+/// builds one and hands it to [`spawn_pane_pty_with_recorder`] so recording begins before the
+/// child's first byte. `overwrite` is always true here (the gate owns the ephemeral `.shux/out/`
+/// path). Returns a ready-to-register [`PaneRecorder`].
+pub(crate) async fn open_cast_recorder(
+    path: PathBuf,
+    cols: u16,
+    rows: u16,
+) -> Result<PaneRecorder, String> {
+    let (sender, outcome, task) =
+        spawn_pane_recorder(path.clone(), true, PaneRecordFormat::Cast { cols, rows }).await?;
+    Ok(PaneRecorder {
+        id: uuid::Uuid::new_v4(),
+        path,
+        sender,
+        outcome,
+        task,
+    })
 }
 
 /// Lens ContentRevision publication payload (PRD §4, LENS-R-003). Published on
@@ -461,31 +509,45 @@ fn lens_pixel_budget_check(
     Ok(())
 }
 
-/// One per-row changed-column span in a `pane.diff_since` result
-/// (LENS-R-035): 0-based half-open `[col_start, col_end)`.
-struct LensRowSpan {
-    row: u16,
-    col_start: u16,
-    col_end: u16,
-}
-
-/// The structured delta between a checkpoint clone and the current clone
-/// (lens PRD §7.2, LENS-R-034..036).
-struct LensDiff {
-    cells_changed: u32,
-    regions: Vec<LensRowSpan>,
-    regions_truncated: bool,
-    /// (row_start, col_start, row_end, col_end) — 0-based HALF-OPEN in both
-    /// axes; all zeros when nothing changed (the empty range, LENS-R schema).
-    bounding_box: (u16, u16, u16, u16),
-    cursor_moved: bool,
-    /// Rows (grid index) with ≥1 changed cell, ascending — the keys of
-    /// `changed_row_text`.
-    changed_rows: Vec<usize>,
-    /// Flat `rows × cols` changed mask for the heat overlay (LENS-R-037).
-    changed_mask: Vec<bool>,
-    rows: usize,
-    cols: usize,
+/// Parse the `pane.glance` `masks` param (task 080): an array of
+/// `{"row":r,"col":c,"width":w}` redaction rects into a [`shux_vt::MaskSet`]. Absent →
+/// empty set. A present-but-wrong-typed `masks` (not an array, or a non-object /
+/// out-of-range entry) is `INVALID_PARAMS` (-32602 → CLI exit 2), never a silent skip
+/// that would leave a secret unredacted.
+fn parse_glance_masks(params: &serde_json::Value) -> Result<shux_vt::MaskSet, shux_rpc::RpcError> {
+    let Some(v) = params.get("masks") else {
+        return Ok(shux_vt::MaskSet::new());
+    };
+    if v.is_null() {
+        return Ok(shux_vt::MaskSet::new());
+    }
+    let arr = v
+        .as_array()
+        .ok_or_else(|| shux_rpc::RpcError::invalid_params("masks must be an array of rects"))?;
+    let mut set = shux_vt::MaskSet::new();
+    let field = |o: &serde_json::Value, k: &str| -> Result<u16, shux_rpc::RpcError> {
+        let n = o.get(k).and_then(|x| x.as_u64()).ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params(&format!("mask rect needs u16 `{k}`"))
+        })?;
+        u16::try_from(n)
+            .map_err(|_| shux_rpc::RpcError::invalid_params(&format!("mask `{k}` exceeds u16")))
+    };
+    for rect in arr {
+        let row = field(rect, "row")?;
+        let col = field(rect, "col")?;
+        let width = field(rect, "width")?;
+        // A zero-width mask redacts nothing — `MaskSet::with` would silently DROP it,
+        // turning an intended redaction into an unmasked glance. Reject it (matching the
+        // CLI's `parse_mask_rect`) so a typo fails loudly instead of leaking (council
+        // impl-review MAJOR).
+        if width == 0 {
+            return Err(shux_rpc::RpcError::invalid_params(
+                "mask width must be > 0 (a zero-width mask redacts nothing)",
+            ));
+        }
+        set = set.with(row, col, width);
+    }
+    Ok(set)
 }
 
 /// The lens `pane.glance` text of a SINGLE grid row (LENS-R-012 byte-stability,
@@ -504,156 +566,6 @@ fn glance_row_text(grid: &shux_vt::Grid, row_idx: usize) -> String {
         }
     }
     line
-}
-
-/// Compute the structured diff of `cur` against the checkpoint `cp` clone
-/// (lens PRD §7.2). A cell counts as changed iff its UNDERLYING cell data
-/// differs (glyph, fg, bg, attrs — `Cell`'s full value equality, no cursor
-/// overlay: the clones carry none), with `Color::Default` RESOLVED against
-/// each side's respective OSC 10/11/12 defaults (LENS-R-038b, PR #91 codex
-/// P2): a default-color-only repaint presents every Default-colored cell
-/// differently, so when the two sides' fg (or bg) defaults differ, a cell
-/// whose fg (or bg) is `Default` on BOTH sides counts as changed. When the
-/// defaults are unchanged the extra clauses never fire and the comparison is
-/// byte-identical to plain `Cell` equality (D-tier gates + ratified goldens
-/// unaffected). The cursor default (OSC 12) is deliberately NOT part of the
-/// cell comparison — the cursor overlay is excluded from diffs entirely
-/// (DEC-11). Wide glyphs pair with their spacer: if either half changed,
-/// both count (LENS-R-034). Cursor position/visibility is never in the grid
-/// cells, so it is excluded from the count/regions by construction; a
-/// content change under the cursor's cell still counts. `cursor_moved` is
-/// reported separately.
-///
-/// Max 256 spans (LENS-R-035): past the cap `regions_truncated` is set and the
-/// caller emits only `bounding_box`.
-fn compute_lens_diff(
-    cp: &shux_vt::Grid,
-    cur: &shux_vt::Grid,
-    cp_cursor: (usize, usize, bool),
-    cur_cursor: (usize, usize, bool),
-    cp_defaults: shux_vt::TerminalDefaultColors,
-    cur_defaults: shux_vt::TerminalDefaultColors,
-) -> LensDiff {
-    // A valid diff (existence-first lookup hit) implies equal dims — resize
-    // invalidates checkpoints. `min` is a defensive guard, not a happy path.
-    let rows = cp.rows().min(cur.rows());
-    let cols = cp.cols().min(cur.cols());
-
-    // LENS-R-038b: which default channels changed between the two frames.
-    // `Default`-colored cells resolve through these, so a changed channel
-    // marks every cell that is `Default` in that channel on both sides
-    // (asymmetric Default-vs-concrete pairs already differ by raw equality).
-    let fg_default_changed = cp_defaults.fg != cur_defaults.fg;
-    let bg_default_changed = cp_defaults.bg != cur_defaults.bg;
-
-    let mut changed = vec![false; rows * cols];
-    for r in 0..rows {
-        let cp_row = cp.visible_row(r);
-        let cur_row = cur.visible_row(r);
-        for c in 0..cols {
-            let differ = match (cp_row.get(c), cur_row.get(c)) {
-                (Some(a), Some(b)) => {
-                    a != b
-                        || (fg_default_changed
-                            && a.style.fg == shux_vt::Color::Default
-                            && b.style.fg == shux_vt::Color::Default)
-                        || (bg_default_changed
-                            && a.style.bg == shux_vt::Color::Default
-                            && b.style.bg == shux_vt::Color::Default)
-                }
-                (None, None) => false,
-                _ => true,
-            };
-            if differ {
-                changed[r * cols + c] = true;
-            }
-        }
-    }
-
-    // Wide-glyph pairing (LENS-R-034): a wide head and its spacer are one
-    // visual unit — if either half changed, both cells count.
-    for r in 0..rows {
-        let cp_row = cp.visible_row(r);
-        let cur_row = cur.visible_row(r);
-        for c in 0..cols.saturating_sub(1) {
-            let wide = cp_row.get(c).is_some_and(|x| x.is_wide())
-                || cur_row.get(c).is_some_and(|x| x.is_wide());
-            if wide {
-                let i = r * cols + c;
-                if changed[i] || changed[i + 1] {
-                    changed[i] = true;
-                    changed[i + 1] = true;
-                }
-            }
-        }
-    }
-
-    // Build spans (per row, contiguous runs → merged), count, bbox, rows.
-    const MAX_SPANS: usize = 256;
-    let mut regions: Vec<LensRowSpan> = Vec::new();
-    let mut changed_rows: Vec<usize> = Vec::new();
-    let mut cells_changed: u32 = 0;
-    let (mut min_row, mut min_col, mut max_row, mut max_col) =
-        (usize::MAX, usize::MAX, 0usize, 0usize);
-
-    for r in 0..rows {
-        let mut row_had_change = false;
-        let mut c = 0;
-        while c < cols {
-            if changed[r * cols + c] {
-                let start = c;
-                while c < cols && changed[r * cols + c] {
-                    cells_changed += 1;
-                    c += 1;
-                }
-                // `c` is now one past the run — half-open [start, c).
-                regions.push(LensRowSpan {
-                    row: r as u16,
-                    col_start: start as u16,
-                    col_end: c as u16,
-                });
-                row_had_change = true;
-                min_row = min_row.min(r);
-                max_row = max_row.max(r);
-                min_col = min_col.min(start);
-                max_col = max_col.max(c - 1);
-            } else {
-                c += 1;
-            }
-        }
-        if row_had_change {
-            changed_rows.push(r);
-        }
-    }
-
-    let regions_truncated = regions.len() > MAX_SPANS;
-    if regions_truncated {
-        regions.clear();
-    }
-
-    let bounding_box = if cells_changed == 0 {
-        (0, 0, 0, 0)
-    } else {
-        // Half-open in both axes: [min, max+1).
-        (
-            min_row as u16,
-            min_col as u16,
-            (max_row + 1) as u16,
-            (max_col + 1) as u16,
-        )
-    };
-
-    LensDiff {
-        cells_changed,
-        regions,
-        regions_truncated,
-        bounding_box,
-        cursor_moved: cp_cursor != cur_cursor,
-        changed_rows,
-        changed_mask: changed,
-        rows,
-        cols,
-    }
 }
 
 /// Render the `pane.diff_since` heat PNG (LENS-R-037): the current clone
@@ -740,6 +652,7 @@ enum PtyTaskExit {
 async fn spawn_pane_recorder(
     path: PathBuf,
     overwrite: bool,
+    format: PaneRecordFormat,
 ) -> Result<
     (
         mpsc::Sender<PaneRecordChunk>,
@@ -785,21 +698,90 @@ async fn spawn_pane_recorder(
         error: None,
     }));
     let writer_outcome = outcome.clone();
+    // Epoch at ARM time (not writer-task start) so the first output event's relative time honestly
+    // reflects the child's startup latency (task 083 cast; council: arm at spawn).
+    let epoch = Instant::now();
     let task = tokio::spawn(async move {
         let mut file = file;
         let mut bytes_written = 0u64;
         let mut final_status = PaneRecordStatus::Complete;
+
+        // Fail the recording, recording bytes written so far, and stop the writer.
+        macro_rules! fail {
+            ($file:expr, $written:expr, $msg:expr) => {{
+                let mut outcome = writer_outcome.lock().expect("record outcome poisoned");
+                outcome.status = PaneRecordStatus::Error;
+                outcome.bytes_written = $written;
+                outcome.error = Some($msg);
+                return;
+            }};
+        }
+
+        let mut cast = match format {
+            PaneRecordFormat::Cast { cols, rows } => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let header = serde_json::json!({
+                    "version": 2, "width": cols, "height": rows, "timestamp": ts
+                });
+                let line = format!("{header}\n");
+                if let Err(e) = file.write_all(line.as_bytes()).await {
+                    fail!(
+                        file,
+                        bytes_written,
+                        format!("failed to write cast header: {e}")
+                    );
+                }
+                bytes_written += line.len() as u64;
+                Some(shux_vt::CastWriter::new(epoch))
+            }
+            PaneRecordFormat::Raw => None,
+        };
+
         while let Some(chunk) = rx.recv().await {
             match chunk {
-                PaneRecordChunk::Bytes(bytes) => {
-                    if let Err(e) = file.write_all(&bytes).await {
-                        let mut outcome = writer_outcome.lock().expect("record outcome poisoned");
-                        outcome.status = PaneRecordStatus::Error;
-                        outcome.bytes_written = bytes_written;
-                        outcome.error = Some(format!("failed to write record chunk: {e}"));
-                        return;
+                PaneRecordChunk::Bytes { data, at } => match cast.as_mut() {
+                    // Cast: emit an "o" event for the complete-UTF-8 prefix (carry the rest).
+                    Some(c) => {
+                        if let Some(line) = c.output_line(&data, at) {
+                            let line = format!("{line}\n");
+                            if let Err(e) = file.write_all(line.as_bytes()).await {
+                                fail!(
+                                    file,
+                                    bytes_written,
+                                    format!("failed to write cast chunk: {e}")
+                                );
+                            }
+                            bytes_written += line.len() as u64;
+                        }
                     }
-                    bytes_written += bytes.len() as u64;
+                    // Raw: byte-identical to the pre-083 recorder.
+                    None => {
+                        if let Err(e) = file.write_all(&data).await {
+                            fail!(
+                                file,
+                                bytes_written,
+                                format!("failed to write record chunk: {e}")
+                            );
+                        }
+                        bytes_written += data.len() as u64;
+                    }
+                },
+                PaneRecordChunk::Resize { cols, rows, at } => {
+                    if let Some(c) = cast.as_mut() {
+                        let line = format!("{}\n", c.resize_line(cols, rows, at));
+                        if let Err(e) = file.write_all(line.as_bytes()).await {
+                            fail!(
+                                file,
+                                bytes_written,
+                                format!("failed to write cast resize: {e}")
+                            );
+                        }
+                        bytes_written += line.len() as u64;
+                    }
+                    // Raw ignores resize events.
                 }
                 PaneRecordChunk::Finish { status } => {
                     final_status = status;
@@ -807,6 +789,22 @@ async fn spawn_pane_recorder(
                 }
             }
         }
+
+        // Cast: flush any genuinely-truncated trailing UTF-8 at EOF.
+        if let Some(c) = cast.as_mut() {
+            if let Some(line) = c.flush_line() {
+                let line = format!("{line}\n");
+                if let Err(e) = file.write_all(line.as_bytes()).await {
+                    fail!(
+                        file,
+                        bytes_written,
+                        format!("failed to flush cast tail: {e}")
+                    );
+                }
+                bytes_written += line.len() as u64;
+            }
+        }
+
         let flush_error = file.flush().await.err();
         let mut outcome = writer_outcome.lock().expect("record outcome poisoned");
         outcome.bytes_written = bytes_written;
@@ -848,9 +846,12 @@ async fn tee_pane_recorders(
             .unwrap_or_default()
     };
 
+    // Stamp arrival ONCE for all sinks so a cast's timing reflects when bytes left the fd, not
+    // when a backpressured writer accepted them (task 083).
+    let at = Instant::now();
     for (sender, outcome) in sinks {
         tokio::select! {
-            result = sender.send(PaneRecordChunk::Bytes(data.to_vec())) => {
+            result = sender.send(PaneRecordChunk::Bytes { data: data.to_vec(), at }) => {
                 if result.is_err() {
                     let mut outcome = outcome.lock().expect("record outcome poisoned");
                     if outcome.status == PaneRecordStatus::Recording {
@@ -890,6 +891,43 @@ async fn finish_pane_recorders(
                 status: PaneRecordStatus::Complete,
             })
             .await;
+    }
+}
+
+/// Tee a pane resize into every active recorder (task 083 cast — a cast writer emits an `"r"`
+/// event so replay geometry stays honest; the raw writer ignores it). Routed through the SAME
+/// per-recording mpsc as the output tap and from the SAME PTY task, so it interleaves in
+/// timestamp order with output for free. Clone senders under the lock, send OUTSIDE it — never
+/// hold the io mutex across an `.await` (the daemon's cardinal deadlock). Best-effort: a full or
+/// closed channel drops the resize event (a missing cast marker is not worth stalling the pane).
+async fn tee_pane_resize_recorders(
+    io_state: &Arc<Mutex<PaneIoState>>,
+    pane_id: shux_core::model::PaneId,
+    cols: u16,
+    rows: u16,
+) {
+    let senders: Vec<mpsc::Sender<PaneRecordChunk>> = {
+        let state = io_state.lock().await;
+        state
+            .recorders
+            .get(&pane_id)
+            .map(|recorders| {
+                recorders
+                    .iter()
+                    .filter(|r| {
+                        r.outcome.lock().expect("record outcome poisoned").status
+                            == PaneRecordStatus::Recording
+                    })
+                    .map(|r| r.sender.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let at = Instant::now();
+    for sender in senders {
+        let _ = sender
+            .try_send(PaneRecordChunk::Resize { cols, rows, at })
+            .map_err(|_| tracing::debug!(%pane_id, "cast resize event dropped (recorder busy)"));
     }
 }
 
@@ -1146,7 +1184,7 @@ async fn run_pane_pty_task(
                 if let Err(e) = handle.resize(req.size) {
                     tracing::warn!(%pane_id, error = %e, "PTY resize failed");
                 }
-                let pulse = {
+                let (pulse, dims_changed) = {
                     let mut state = io_state.lock().await;
                     let rev_state = if let Some(vt) = state.vts.get_mut(&pane_id) {
                         // P4 convergence round 1 (claude blocker): gate the
@@ -1173,8 +1211,11 @@ async fn run_pane_pty_task(
                     } else {
                         None
                     };
+                    // Whether the resize actually changed the pane geometry (used below to gate
+                    // both checkpoint invalidation and the cast resize event).
+                    let dims_changed = rev_state.as_ref().map(|(_, dc)| *dc).unwrap_or(false);
                     // LENS-R-003: resize is Class-A — publish the bumped revision.
-                    if let Some((rev, dims_changed)) = rev_state {
+                    if let Some((rev, dc)) = rev_state {
                         state.publish_revision(pane_id, rev);
                         // LENS-R-032/DEC-4: a REAL resize invalidates every
                         // checkpoint of this pane. Record the marker at the
@@ -1184,11 +1225,11 @@ async fn run_pane_pty_task(
                         // Same-size requests never reach here (dims_changed
                         // false): the frame did not change, checkpoints stay
                         // valid.
-                        if dims_changed {
+                        if dc {
                             state.invalidate_checkpoints(pane_id, rev.content_revision);
                         }
                     }
-                    state.render_pulse.clone()
+                    (state.render_pulse.clone(), dims_changed)
                 };
                 pulse.notify_one();
                 // Fire the ack AFTER vt + render_pulse so a synchronous
@@ -1196,6 +1237,17 @@ async fn run_pane_pty_task(
                 // pane.snapshot it issues sees the new dimensions.
                 if let Some(ack) = req.ack {
                     let _ = ack.send(());
+                }
+                // Task 083 cast: emit an honest resize event (only on a REAL geometry change,
+                // matching the checkpoint-invalidation gate). Best-effort, non-blocking.
+                if dims_changed {
+                    tee_pane_resize_recorders(
+                        &io_state,
+                        pane_id,
+                        req.size.cols,
+                        req.size.rows,
+                    )
+                    .await;
                 }
             }
         }
@@ -1255,16 +1307,18 @@ async fn run_pane_pty_task(
         }
     };
 
-    // Propagate the captured exit code so the daemon's PaneExited
-    // event carries it. set_pane_exit_status both updates the pane
-    // and fires the lifecycle event with the populated field — the
-    // alternative path (graph.destroy_pane via API) fires PaneExited
-    // with None, which is the right thing for "killed by user", and
-    // the cascade paths in destroy_session/destroy_window do the same.
-    if let Some(code) = exit_code {
-        if let Err(e) = graph.set_pane_exit_status(pane_id, code).await {
-            tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
-        }
+    // Propagate the exit so the daemon's PaneExited event fires — set_pane_exit_status
+    // both updates the pane and fires the lifecycle event. A SIGNAL death (or a wait
+    // failure) has no POSIX code (`status.code()` is None); we still fire, with the
+    // lens sentinel `-1` (the same value `lens.run --wait` already reports for a
+    // signalled child). This is load-bearing for the lens-gate runner (task 081, adv
+    // BLOCKER): its `ExitMonitor` watches `pane.exited`, and a crash that fires no exit
+    // event would let the runner compare the crash frame instead of short-circuiting.
+    // The reaper and `--wait` also key on this event, so a signalled child is now reaped
+    // promptly rather than lingering to `max-runtime`.
+    let exit_status = exit_code.unwrap_or(-1);
+    if let Err(e) = graph.set_pane_exit_status(pane_id, exit_status).await {
+        tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
     }
 
     // Drop only the PTY-bound handles. The VT (grid + scrollback) stays
@@ -1307,9 +1361,32 @@ pub(crate) async fn spawn_pane_pty(
     command: Vec<String>,
     size: shux_pty::handle::PtySize,
     extra_env: Vec<(String, String)>,
+    env_clear: bool,
     io_state: Arc<Mutex<PaneIoState>>,
     shutdown: tokio_util::sync::CancellationToken,
     graph: shux_core::graph::GraphHandle,
+) -> Result<(), shux_pty::PtyError> {
+    spawn_pane_pty_with_recorder(
+        pane_id, cwd, command, size, extra_env, env_clear, io_state, shutdown, graph, None,
+    )
+    .await
+}
+
+/// Like [`spawn_pane_pty`] but arms `cast_recorder` (a pre-opened recorder) BEFORE the read loop
+/// starts, so the recording captures the child's very first bytes — alt-screen setup, initial
+/// geometry, early output — with no post-spawn race (task 083 cast; council: arm at spawn).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn spawn_pane_pty_with_recorder(
+    pane_id: shux_core::model::PaneId,
+    cwd: PathBuf,
+    command: Vec<String>,
+    size: shux_pty::handle::PtySize,
+    extra_env: Vec<(String, String)>,
+    env_clear: bool,
+    io_state: Arc<Mutex<PaneIoState>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    graph: shux_core::graph::GraphHandle,
+    cast_recorder: Option<PaneRecorder>,
 ) -> Result<(), shux_pty::PtyError> {
     let mut config = if command.is_empty() {
         shux_pty::handle::PtyConfig::default_shell(cwd)
@@ -1318,6 +1395,7 @@ pub(crate) async fn spawn_pane_pty(
     };
     config.size = size;
     config.env = extra_env;
+    config.env_clear = env_clear;
     let handle = shux_pty::handle::PtyHandle::spawn(&config)?;
     let pid = handle.pid();
 
@@ -1348,6 +1426,11 @@ pub(crate) async fn spawn_pane_pty(
         state.vts.insert(pane_id, vt);
         state.revisions.insert(pane_id, rev_tx);
         state.pty_pids.insert(pane_id, pid);
+        // Arm the cast recorder in the SAME lock, before the read task spawns, so no output can
+        // race ahead of it (task 083).
+        if let Some(rec) = cast_recorder {
+            state.recorders.entry(pane_id).or_default().push(rec);
+        }
     }
 
     tokio::spawn(run_pane_pty_task(
@@ -1468,6 +1551,124 @@ fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// True when `pid` is alive AND is actually a shux daemon.
+///
+/// The pidfile is untrusted input: it survives SIGKILL and reboots, and pids get reused, so
+/// a bare `kill(pid)` on its contents can hit a bystander. Verified by reading the process's
+/// own argv — a shux daemon runs as `<path>/shux __daemon`.
+fn is_live_shux_daemon(pid: u32) -> bool {
+    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
+        return false;
+    }
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+    else {
+        // Without a way to confirm identity, refuse to claim it is ours.
+        return false;
+    };
+    // Exact argv positions, not a substring match (085 QA P3): a bystander whose command
+    // line merely CONTAINS both words — say `watch-for shux __daemon` — would otherwise be
+    // accepted as the daemon and signalled. A shux daemon is `<path>/shux __daemon`.
+    let args = String::from_utf8_lossy(&out.stdout);
+    let mut argv = args.split_whitespace();
+    let exe_is_shux = argv
+        .next()
+        .and_then(|p| p.rsplit('/').next())
+        .is_some_and(|base| base == "shux");
+    let first_arg_is_daemon = argv.next() == Some("__daemon");
+    exe_is_shux && first_arg_is_daemon
+}
+
+/// `shux daemon stop|status` — the missing half of the daemon lifecycle (085 F5).
+///
+/// The daemon auto-starts on first use and outlives the command, so every scripted or CI
+/// invocation leaked one. There was no verb to stop it, and the documented workaround was
+/// `pkill -f "shux __daemon"` — which also kills other checkouts' and other agents'
+/// daemons. This reaps exactly the pid in this runtime dir's pidfile.
+///
+/// Deliberately never auto-starts a daemon: starting one in order to stop it would be
+/// absurd, and `status` must be able to report "not running".
+fn handle_daemon_command(
+    command: cli::DaemonCommand,
+    format: cli::OutputFormat,
+) -> anyhow::Result<()> {
+    let pid = daemon::read_pid_file().ok().flatten();
+    // A pidfile can outlive its process (SIGKILL, a reboot) and the OS reuses pids, so the
+    // number in it may name a COMPLETELY UNRELATED process by the time we read it. Probe
+    // with signal 0, then confirm the process really is a shux daemon before believing the
+    // file — otherwise `daemon stop` becomes "SIGTERM an arbitrary pid", which is the exact
+    // failure this verb exists to avoid. pid 0 and 1 are rejected outright: `kill(0, …)`
+    // signals the whole process group and pid 1 is init.
+    let alive = pid.is_some_and(|p| p > 1 && is_live_shux_daemon(p));
+
+    match command {
+        cli::DaemonCommand::Status => {
+            match (pid, alive) {
+                (Some(p), true) => match format {
+                    cli::OutputFormat::Json => println!("{{\"running\": true, \"pid\": {p}}}"),
+                    _ => println!(
+                        "{} {}",
+                        style::success("daemon running"),
+                        style::muted(format!("pid {p}"))
+                    ),
+                },
+                _ => match format {
+                    cli::OutputFormat::Json => println!("{{\"running\": false, \"pid\": null}}"),
+                    _ => println!("{}", style::warning("daemon not running")),
+                },
+            }
+            Ok(())
+        }
+        cli::DaemonCommand::Stop => {
+            let Some(p) = pid.filter(|_| alive) else {
+                // Idempotent: safe to call from a cleanup trap that may run twice.
+                if let cli::OutputFormat::Json = format {
+                    println!("{{\"stopped\": false, \"reason\": \"not_running\"}}");
+                } else {
+                    println!("{}", style::muted("no daemon running"));
+                }
+                let _ = daemon::remove_pid_file();
+                return Ok(());
+            };
+            // SIGTERM → the daemon's signal handler runs a graceful shutdown.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(p as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            let mut gone = false;
+            for _ in 0..40 {
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(p as i32), None).is_err() {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if gone {
+                let _ = daemon::remove_pid_file();
+                let _ = daemon::remove_socket_file();
+            }
+            match (format, gone) {
+                (cli::OutputFormat::Json, _) => {
+                    println!("{{\"stopped\": {gone}, \"pid\": {p}}}")
+                }
+                (_, true) => println!(
+                    "{} {}",
+                    style::success("daemon stopped"),
+                    style::muted(format!("pid {p}"))
+                ),
+                (_, false) => println!(
+                    "{}",
+                    style::warning(format!(
+                        "daemon (pid {p}) did not exit within 2s; it may be draining a session"
+                    ))
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Client entry point — parse CLI args, ensure daemon is running, dispatch.
 fn run_client(args: Cli) -> anyhow::Result<()> {
     // Set up logging
@@ -1476,9 +1677,14 @@ fn run_client(args: Cli) -> anyhow::Result<()> {
     } else {
         EnvFilter::from_default_env()
     };
+    // 085 F22: logs go to STDERR, never stdout. stdout is the DATA channel — `--format
+    // json` and `lens gate --report -` promise it carries only the payload — and the old
+    // default writer broke that contract exactly when someone reached for `-v` to debug,
+    // emitting ANSI-coloured DEBUG lines ahead of the JSON.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -1973,6 +2179,7 @@ fn register_state_methods(
                                 command,
                                 shux_pty::handle::PtySize::default(),
                                 Vec::new(),
+                                false,
                                 spawn_io,
                                 spawn_ct,
                                 gh.clone(),
@@ -2607,6 +2814,7 @@ fn register_pane_methods(
                     command,
                     shux_pty::handle::PtySize::default(),
                     Vec::new(),
+                    false,
                     io,
                     ct,
                     gh.clone(),
@@ -3493,6 +3701,7 @@ fn register_window_methods(
                         command,
                         shux_pty::handle::PtySize::default(),
                         Vec::new(),
+                        false,
                         io,
                         ct,
                         gh.clone(),
@@ -3627,6 +3836,7 @@ fn register_window_methods(
                         command,
                         shux_pty::handle::PtySize::default(),
                         Vec::new(),
+                        false,
                         io,
                         ct,
                         gh.clone(),
@@ -4015,6 +4225,7 @@ fn register_session_methods(
                                             command.clone(),
                                             shux_pty::handle::PtySize::default(),
                                             Vec::new(),
+                                            false,
                                             io,
                                             ct,
                                             gh.clone(),
@@ -4214,6 +4425,7 @@ fn register_session_methods(
                                             command.clone(),
                                             shux_pty::handle::PtySize::default(),
                                             Vec::new(),
+                                            false,
                                             io,
                                             ct,
                                             gh.clone(),
@@ -4437,6 +4649,9 @@ fn snapshot_font_key(cfg: &shux_core::config::Config) -> SnapshotFontKey {
 const SETTLE_QUIET_MIN_MS: u64 = 10;
 const SETTLE_QUIET_MAX_MS: u64 = 60_000;
 const SETTLE_TIMEOUT_MAX_MS: u64 = 600_000;
+/// `stable_frames` upper bound (task 083). 1 = disabled (quiet mode); a small ceiling keeps a
+/// typo from demanding an unreachable contiguous run.
+const SETTLE_STABLE_FRAMES_MAX: u32 = 1_000;
 
 /// LENS-R-020: a pane is settled once it has been quiet for `quiet_ms`, i.e.
 /// `monotonic_now_ns − last_mutation_ns ≥ quiet_ms × 1_000_000`. The unit
@@ -4548,6 +4763,194 @@ fn validate_wait_settled_params(quiet_ms: u64, timeout_ms: u64) -> Result<(), sh
         )));
     }
     Ok(())
+}
+
+/// Strict optional-u32 parameter parse (task 083; mirrors [`settle_u64_param`]). Absent →
+/// default; PRESENT but not an unsigned integer that fits u32 → INVALID_PARAMS (-32602). Never
+/// a silent default on a mistyped value.
+fn settle_u32_param(
+    params: &serde_json::Value,
+    key: &str,
+    default: u32,
+) -> Result<u32, shux_rpc::RpcError> {
+    match params.get(key) {
+        None => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                shux_rpc::RpcError::invalid_params(&format!(
+                    "{key} must be an unsigned 32-bit integer, got {v}"
+                ))
+            }),
+    }
+}
+
+/// Frame-stability param validation (task 083, council #1/#2/#3). `hold_ms ∈ {0} ∪ [10, 60_000]`
+/// and ≤ `timeout_ms` (a hold longer than the budget can never succeed); `stable_frames ∈ [1,
+/// 1000]` (1 = disabled). Violations → INVALID_PARAMS (-32602 → CLI exit 2). Default quiet mode
+/// (both off) is unaffected — this is only reached when a caller opts into a stability criterion.
+fn validate_stability_params(
+    hold_ms: u64,
+    stable_frames: u32,
+    timeout_ms: u64,
+) -> Result<(), shux_rpc::RpcError> {
+    if hold_ms != 0 && !(SETTLE_QUIET_MIN_MS..=SETTLE_QUIET_MAX_MS).contains(&hold_ms) {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "hold_ms {hold_ms} out of range [{SETTLE_QUIET_MIN_MS}, {SETTLE_QUIET_MAX_MS}] (0 = off)"
+        )));
+    }
+    if hold_ms > timeout_ms {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "hold_ms {hold_ms} must be <= timeout_ms {timeout_ms}"
+        )));
+    }
+    if !(1..=SETTLE_STABLE_FRAMES_MAX).contains(&stable_frames) {
+        return Err(shux_rpc::RpcError::invalid_params(&format!(
+            "stable_frames {stable_frames} out of range [1, {SETTLE_STABLE_FRAMES_MAX}] (1 = off)"
+        )));
+    }
+    Ok(())
+}
+
+/// Task 083 frame-stability settle (`hold_ms` / `stable_frames`). Event-driven like the quiet
+/// loop: on each revision wake it hashes the presented, mask-applied frame and folds it into
+/// [`shux_vt::FrameStability`]; it ALSO wakes on the hold deadline so a pane that goes silent
+/// still settles `hold_ms` after its last content change (silence is stability, council #2).
+/// `quiet_ms` never independently settles here (council #1). A pane that never reaches the
+/// requested stability by `timeout_deadline` returns `settled:false` — which the runner maps to
+/// `settle_never_stable` (a FAILURE, never infra; the frozen 078/082 contract).
+///
+/// The presented-frame hash is read together with `content_revision` under ONE io lock (a
+/// consistent snapshot); the lock is never held across an `.await`. A revision that skips (the
+/// watch coalesced) is detected by [`shux_vt::FrameStability::observe`] and RESETS the contiguous
+/// run — an `A→B→A` alias can never false-settle `stable_frames` (council #3).
+/// The next-wake instant for the frame-stability loop (task 083, impl-review Surface 1). Waking at
+/// the hold deadline is useful ONLY while the hold window is UNSATISFIED (`remaining_hold_ns > 0`)
+/// — it wakes exactly when hold becomes met (or a revision arrives). Once hold is satisfied, or
+/// there is no hold criterion (`remaining_hold_ns == 0`), only a new revision or the timeout can
+/// change the decision, so wake straight to the timeout: a `now + 0`-sized sleep here would
+/// busy-spin when hold is met but the stable-frame count is still pending. Pure, so the anti-spin
+/// rule is unit-tested.
+fn stability_wake(
+    now_inst: tokio::time::Instant,
+    remaining_hold_ns: u64,
+    timeout_deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    if remaining_hold_ns > 0 {
+        (now_inst + std::time::Duration::from_nanos(remaining_hold_ns)).min(timeout_deadline)
+    } else {
+        timeout_deadline
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_settled_frame_stability(
+    io: &Arc<Mutex<PaneIoState>>,
+    pane_id: shux_core::model::PaneId,
+    rx: &mut watch::Receiver<PaneRevision>,
+    masks: &shux_vt::MaskSet,
+    hold_ms: u64,
+    stable_frames: u32,
+    accept: tokio::time::Instant,
+    timeout_deadline: tokio::time::Instant,
+) -> Result<serde_json::Value, shux_rpc::RpcError> {
+    use shux_vt::{FrameEnvelope, FrameStability, frame_stability_hash};
+
+    // Read the current presented frame's (revision, hash) together under one lock so the seed is
+    // a consistent snapshot. NOT_FOUND if the pane was torn down (never settle on a dead pane).
+    let read_frame = |io: &Arc<Mutex<PaneIoState>>| {
+        let io = io.clone();
+        let masks = masks.clone();
+        async move {
+            let state = io.lock().await;
+            state
+                .vts
+                .get(&pane_id)
+                .map(|vt| {
+                    (
+                        vt.content_revision(),
+                        frame_stability_hash(&FrameEnvelope::from_terminal(vt, &masks)),
+                    )
+                })
+                .ok_or_else(|| shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string()))
+        }
+    };
+
+    // Seed the frame AND the watch cursor under ONE io lock (impl-review Surface 1 seed race):
+    // the PTY task bumps `content_revision` and publishes the watch under this SAME lock, so while
+    // we hold it the VT and the watch are frozen at the same batch. Marking the cursor here — not
+    // after releasing the lock — closes the window where the frame advances (the watch is
+    // last-value-wins, so its cursor would jump PAST the seeded frame) and the loop then settles
+    // in hold mode on a STALE seed that no longer matches the pane.
+    let (seed_rev, seed_hash) = {
+        let state = io.lock().await;
+        let vt = state
+            .vts
+            .get(&pane_id)
+            .ok_or_else(|| shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string()))?;
+        let seed = (
+            vt.content_revision(),
+            frame_stability_hash(&FrameEnvelope::from_terminal(vt, masks)),
+        );
+        rx.borrow_and_update();
+        seed
+    };
+    let mut stability = FrameStability::seed(seed_rev, seed_hash, shux_vt::monotonic_now_ns());
+
+    let waited_ms = |now: tokio::time::Instant| -> u64 {
+        now.saturating_duration_since(accept)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u64
+    };
+
+    loop {
+        let now_ns = shux_vt::monotonic_now_ns();
+        let now_inst = tokio::time::Instant::now();
+        if stability.is_settled(stable_frames, hold_ms, now_ns) {
+            return Ok(serde_json::json!({
+                "settled": true,
+                "revision": stability.last_rev(),
+                "waited_ms": waited_ms(now_inst),
+                "coalesced": stability.coalesced(),
+            }));
+        }
+        if now_inst >= timeout_deadline {
+            return Ok(serde_json::json!({
+                "settled": false,
+                "revision": stability.last_rev(),
+                "waited_ms": waited_ms(now_inst),
+                "coalesced": stability.coalesced(),
+            }));
+        }
+
+        // Next wake: the hold deadline (so a silent pane still settles) while the hold window is
+        // UNSATISFIED, else the timeout — a `now`-sized sleep when hold is already met but the
+        // count criterion is not would busy-spin (impl-review Surface 1). Woken early by a
+        // revision regardless.
+        let remaining_hold_ns = if hold_ms > 0 {
+            stability.ns_until_hold(hold_ms, now_ns)
+        } else {
+            0
+        };
+        let wake = stability_wake(now_inst, remaining_hold_ns, timeout_deadline);
+
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    // Pane teardown mid-wait → NOT_FOUND (never settle on a dead pane).
+                    *rx = settle_reacquire_watch(io, pane_id).await?;
+                    continue;
+                }
+                rx.borrow_and_update();
+                let (rev, hash) = read_frame(io).await?;
+                stability.observe(rev, hash, shux_vt::monotonic_now_ns());
+            }
+            _ = tokio::time::sleep_until(wake) => {
+                // Hold-deadline / silence wake: re-evaluate `is_settled` at the top.
+            }
+        }
+    }
 }
 
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
@@ -5086,6 +5489,22 @@ fn register_pane_io_methods(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let duration_ms = params.get("duration_ms").and_then(|v| v.as_u64());
+                    // Task 083: `format` selects the on-disk shape. "raw" (default) is the
+                    // pre-083 lossless byte stream; "cast" emits asciinema v2 (timestamped output
+                    // + honest resize events, UTF-8-safe). Unknown values fail closed.
+                    let format_str = params
+                        .get("format")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("raw");
+                    let cast = match format_str {
+                        "raw" => false,
+                        "cast" => true,
+                        other => {
+                            return Err(shux_rpc::RpcError::invalid_params(&format!(
+                                "unknown record format {other:?} (expected \"raw\" or \"cast\")"
+                            )));
+                        }
+                    };
                     if !overwrite {
                         match tokio::fs::try_exists(&path).await {
                             Ok(true) => {
@@ -5103,7 +5522,9 @@ fn register_pane_io_methods(
                         }
                     }
 
-                    {
+                    // Verify the pane is live and not already recording, and (for cast) read its
+                    // current geometry for the asciinema header — all in one critical section.
+                    let record_format = {
                         let state = io.lock().await;
                         if !state.writers.contains_key(&pane_id) {
                             return Err(shux_rpc::RpcError::not_found(
@@ -5122,11 +5543,23 @@ fn register_pane_io_methods(
                                 &pane_id.to_string(),
                             ));
                         }
-                    }
+                        if cast {
+                            let vt = state.vts.get(&pane_id).ok_or_else(|| {
+                                shux_rpc::RpcError::not_found("pane VT", &pane_id.to_string())
+                            })?;
+                            PaneRecordFormat::Cast {
+                                cols: vt.grid().cols() as u16,
+                                rows: vt.grid().rows() as u16,
+                            }
+                        } else {
+                            PaneRecordFormat::Raw
+                        }
+                    };
 
-                    let (sender, outcome, task) = spawn_pane_recorder(path.clone(), overwrite)
-                        .await
-                        .map_err(|e| shux_rpc::RpcError::internal(&e))?;
+                    let (sender, outcome, task) =
+                        spawn_pane_recorder(path.clone(), overwrite, record_format)
+                            .await
+                            .map_err(|e| shux_rpc::RpcError::internal(&e))?;
                     let recording_id = uuid::Uuid::new_v4();
                     let mut state = io.lock().await;
                     if !state.writers.contains_key(&pane_id) {
@@ -5418,6 +5851,17 @@ fn register_pane_io_methods(
                         .get("checkpoint")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    // Lens-gate capture emission (task 080): `include_cells` returns the
+                    // canonical `FrameEnvelope` (078 schema) for the current viewport;
+                    // `masks` are redaction rects applied BEFORE serialize/hash — and,
+                    // when present, ALSO to the returned `text`/`png` so a secret never
+                    // leaks (council D4). Default (no masks) leaves text/png byte-
+                    // identical to today.
+                    let include_cells = params
+                        .get("include_cells")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let masks = parse_glance_masks(&params)?;
 
                     // LENS-R-010: ONE atomic clone under the pane's state
                     // lock — grid, cursor {row,col,visible}, size,
@@ -5436,6 +5880,7 @@ fn register_pane_io_methods(
                         snap_cols,
                         snap_rows,
                         default_colors,
+                        palette_overridden,
                         grid_snapshot,
                     ) = {
                         let state = io.lock().await;
@@ -5464,6 +5909,10 @@ fn register_pane_io_methods(
                         }
                         let cur = vt.cursor();
                         let default_colors = vt.default_colors();
+                        // Sticky OSC-4 override bit (task 080): read in the SAME critical
+                        // section as the grid so the emitted `cells` envelope is
+                        // revision-consistent (glance did not read it before — council Q5).
+                        let palette_overridden = vt.palette_overridden();
                         // Visible-only clone — no scrollback (LENS-R-012).
                         let grid_clone = vt.grid().clone_visible();
                         (
@@ -5476,28 +5925,68 @@ fn register_pane_io_methods(
                             cols,
                             rows,
                             default_colors,
+                            palette_overridden,
                             grid_clone,
                         )
                     };
 
-                    // Text extraction (LENS-R-012), from the clone, outside
-                    // the lock: ANSI-free, full-width rows (no trim), joined
-                    // by `\n`, no scrollback.
-                    let text = grid_snapshot.glance_text();
+                    // Lens-gate capture (task 080): build the canonical envelope from
+                    // the SAME clone when `cells` are requested OR masks must redact the
+                    // emitted content. Masks are applied in `from_snapshot` — before any
+                    // serialize/hash (council D4).
+                    let capture_env = if include_cells || !masks.is_empty() {
+                        Some(shux_vt::FrameEnvelope::from_snapshot(
+                            &grid_snapshot,
+                            cursor_row as u16,
+                            cursor_col as u16,
+                            cursor_visible,
+                            cursor_shape,
+                            default_colors,
+                            alt_screen,
+                            palette_overridden,
+                            &masks,
+                        ))
+                    } else {
+                        None
+                    };
 
-                    // Route the clone to its consumers without a spare copy
-                    // (greptile PR #89 P2): only the PNG+checkpoint
-                    // combination needs two owners; every other shape MOVES
-                    // the clone (the text-only+checkpoint path previously
-                    // cloned it and dropped the original).
-                    let (render_grid, checkpoint_grid) = match (include_png, want_checkpoint) {
-                        (true, true) => {
-                            let cp = grid_snapshot.clone();
-                            (Some(grid_snapshot), Some(cp))
-                        }
-                        (true, false) => (Some(grid_snapshot), None),
-                        (false, true) => (None, Some(grid_snapshot)),
-                        (false, false) => (None, None),
+                    // When masks apply, present the MASKED reconstruction to text + PNG
+                    // so a secret never reaches `text`/`png` either (council D4). Owns a
+                    // Grid only on the masked path; the default path is byte-unchanged.
+                    let masked_present = if !masks.is_empty() {
+                        Some(capture_env.as_ref().expect("built when masked").to_grid())
+                    } else {
+                        None
+                    };
+
+                    // The cursor column to PRESENT (rendered PNG + response field): clamp
+                    // to the mask origin when the cursor sits inside a redacted rect, so a
+                    // masked secret's LENGTH does not leak via the drawn/reported cursor
+                    // (council impl-review BLOCKER — the `cells` envelope clamps in
+                    // `from_snapshot`, but the daemon's own render + response bypassed it).
+                    // Checkpoints keep the RAW cursor (internal state, never a golden).
+                    let present_cursor_col = masks
+                        .cursor_redaction_col(cursor_row as u16, cursor_col as u16)
+                        .map(|c| c as usize)
+                        .unwrap_or(cursor_col);
+
+                    // Text extraction (LENS-R-012), outside the lock: ANSI-free,
+                    // full-width rows (no trim), joined by `\n`, no scrollback.
+                    let text = match &masked_present {
+                        Some(g) => g.glance_text(),
+                        None => grid_snapshot.glance_text(),
+                    };
+
+                    // Checkpoints feed `pane.diff_since` (internal state, never a
+                    // golden), so they store the REAL (unmasked) clone. Clone first so
+                    // the render source can then MOVE the appropriate grid.
+                    let checkpoint_grid = want_checkpoint.then(|| grid_snapshot.clone());
+                    // Render source: the masked reconstruction when masks apply, else the
+                    // raw clone (moved — checkpoint already cloned it if needed).
+                    let render_grid: Option<shux_vt::Grid> = if include_png {
+                        Some(masked_present.unwrap_or(grid_snapshot))
+                    } else {
+                        None
                     };
 
                     // PNG rendering (LENS-R-013): reuses shux-raster
@@ -5515,7 +6004,7 @@ fn register_pane_io_methods(
                     // OSC 4 palette redefinition remains Class B.
                     let png_base64 = if let Some(render_grid) = render_grid {
                         let render_cursor = include_cursor && cursor_visible;
-                        let cursor_pos = render_cursor.then_some((cursor_row, cursor_col));
+                        let cursor_pos = render_cursor.then_some((cursor_row, present_cursor_col));
                         let cursor_shape = if render_cursor {
                             cursor_shape
                         } else {
@@ -5610,13 +6099,15 @@ fn register_pane_io_methods(
                         "bytes_returned": text.len() + png_decoded_len,
                     }));
 
-                    Ok(serde_json::json!({
+                    let mut result = serde_json::json!({
                         "revision": revision,
                         "cols": snap_cols,
                         "rows": snap_rows,
                         "cursor": {
                             "row": cursor_row,
-                            "col": cursor_col,
+                            // Clamped col (BLOCKER): the reported cursor must not leak a
+                            // masked secret's length either.
+                            "col": present_cursor_col,
                             "visible": cursor_visible,
                         },
                         "alt_screen": alt_screen,
@@ -5624,7 +6115,16 @@ fn register_pane_io_methods(
                         "png_base64": png_base64,
                         "checkpointed": checkpointed,
                         "evicted_revision": evicted_revision,
-                    }))
+                    });
+                    // Emit the canonical `FrameEnvelope` ONLY when requested (task 080);
+                    // absent by default keeps the frozen glance response byte-stable.
+                    if include_cells {
+                        if let Some(env) = &capture_env {
+                            result["cells"] =
+                                serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
+                        }
+                    }
+                    Ok(result)
                 }
             },
         )
@@ -5647,6 +6147,13 @@ fn register_pane_io_methods(
                     let quiet_ms = settle_u64_param(&params, "quiet_ms", 300)?;
                     let timeout_ms = settle_u64_param(&params, "timeout_ms", 10_000)?;
                     validate_wait_settled_params(quiet_ms, timeout_ms)?;
+                    // Task 083 frame-stability opt-ins (default 0/1 = off ⇒ pure quiet mode,
+                    // backward compatible). `masks` scopes the stability hash to the same
+                    // masked domain the golden compare uses (council #4).
+                    let hold_ms = settle_u64_param(&params, "hold_ms", 0)?;
+                    let stable_frames = settle_u32_param(&params, "stable_frames", 1)?;
+                    validate_stability_params(hold_ms, stable_frames, timeout_ms)?;
+                    let stability_masks = parse_glance_masks(&params)?;
 
                     let pane_id = resolve_pane_id_from_params(&gh, &params)?;
 
@@ -5680,6 +6187,25 @@ fn register_pane_io_methods(
                             .as_millis()
                             .min(u128::from(u32::MAX)) as u64
                     };
+
+                    // Task 083: frame-CONTENT stability modes (hold_ms / stable_frames). Default
+                    // quiet mode (both off) falls through to the UNCHANGED loop below so S1..S5
+                    // stay byte-identical. In stability mode quiet_ms never independently settles
+                    // (council #1); it is unused here — the criteria are the frame-hash hold and
+                    // the contiguous-revision run.
+                    if hold_ms > 0 || stable_frames >= 2 {
+                        return wait_settled_frame_stability(
+                            &io,
+                            pane_id,
+                            &mut rx,
+                            &stability_masks,
+                            hold_ms,
+                            stable_frames,
+                            accept,
+                            timeout_deadline,
+                        )
+                        .await;
+                    }
 
                     // Event-driven loop (LENS-R-021): no polling, and each sleep
                     // is exactly the remaining quiet interval (capped by the
@@ -5922,14 +6448,35 @@ fn register_pane_io_methods(
                     // LENS-R-038b: Default colors resolve against each
                     // side's own defaults — the checkpoint's captured
                     // defaults vs the pane's CURRENT defaults).
-                    let diff = compute_lens_diff(
-                        &cp_grid,
-                        &cur_grid,
-                        cp_cursor,
-                        cur_cursor,
-                        cp_defaults,
-                        default_colors,
-                    );
+                    // Thin adapter over the shux-vt comparator (task 079). Both
+                    // frames are the same pane at equal dims (resize/alt-screen
+                    // invalidate the checkpoint first), and pane.diff_since has no
+                    // palette field, so `palette_overridden` is false on both sides:
+                    // `geometry_changed` / `palette_overridden_differs` stay false and
+                    // are never serialized — output byte-identical to pre-refactor.
+                    let diff = {
+                        let cp_view = shux_vt::GridFrame::new(
+                            &cp_grid,
+                            cp_defaults,
+                            shux_vt::CursorState {
+                                row: cp_cursor.0,
+                                col: cp_cursor.1,
+                                visible: cp_cursor.2,
+                            },
+                            false,
+                        );
+                        let cur_view = shux_vt::GridFrame::new(
+                            &cur_grid,
+                            default_colors,
+                            shux_vt::CursorState {
+                                row: cur_cursor.0,
+                                col: cur_cursor.1,
+                                visible: cur_cursor.2,
+                            },
+                            false,
+                        );
+                        shux_vt::diff_frames(&cp_view, &cur_view)
+                    };
 
                     let regions: Vec<serde_json::Value> = diff
                         .regions
@@ -6894,6 +7441,9 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     text_only,
                     no_cursor,
                     checkpoint,
+                    cells,
+                    cells_out,
+                    masks,
                 } => {
                     cli::handle_pane_glance(
                         &mut stream,
@@ -6902,6 +7452,9 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         text_only,
                         no_cursor,
                         checkpoint,
+                        cells || cells_out.is_some(),
+                        cells_out,
+                        masks,
                         args.format,
                     )
                     .await
@@ -6910,9 +7463,19 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     pane,
                     quiet,
                     timeout,
+                    hold_ms,
+                    stable_frames,
                 } => {
-                    cli::handle_pane_wait_settled(&mut stream, &pane, quiet, timeout, args.format)
-                        .await
+                    cli::handle_pane_wait_settled(
+                        &mut stream,
+                        &pane,
+                        quiet,
+                        timeout,
+                        hold_ms,
+                        stable_frames,
+                        args.format,
+                    )
+                    .await
                 }
                 PaneCommand::Checkpoint { pane } => {
                     cli::handle_pane_checkpoint(&mut stream, &pane, args.format).await
@@ -6974,6 +7537,60 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             .await
         }
 
+        Some(Command::Lens {
+            command:
+                cli::LensCommand::Gate {
+                    scenario,
+                    golden_dir,
+                    report,
+                    on_missing,
+                    update,
+                    reason,
+                    tol,
+                    out,
+                    retries,
+                    cast,
+                    trace,
+                    sub,
+                    argv,
+                },
+        }) => {
+            let code = match sub {
+                Some(cli::GateSubcommand::Review {
+                    scenario,
+                    golden_dir,
+                    out,
+                }) => gate::review::run_review(&socket_path, scenario, golden_dir, out).await?,
+                Some(cli::GateSubcommand::Init { name, dir }) => {
+                    gate::init::run_init(&socket_path, name, dir).await?
+                }
+                None => {
+                    let scenario_path = scenario.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "lens gate: a SCENARIO is required (or use `review`/`init`)"
+                        )
+                    })?;
+                    let opts = gate::driver::GateRunOptions {
+                        scenario_path,
+                        golden_dir,
+                        report,
+                        on_missing,
+                        update,
+                        reason,
+                        tol,
+                        out,
+                        retries,
+                        cast,
+                        trace,
+                        argv,
+                        format: args.format,
+                    };
+                    gate::driver::run_gate(&socket_path, opts).await?
+                }
+            };
+            std::process::exit(code);
+        }
+
         Some(Command::Rpc {
             command: cli::RpcCommand::Call { method, params },
         }) => {
@@ -6991,6 +7608,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
             cli::handle_api(&mut stream, &method, &resolved, args.format).await
         }
+
+        Some(Command::Daemon { command }) => handle_daemon_command(command, args.format),
 
         Some(Command::Version) => {
             // Quick probe — don't auto-start daemon just for version
@@ -7094,6 +7713,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
     //! Snapshot-path regression tests.
     //!
     //! These exercise the seam between `snapshot_window` and the
@@ -7105,6 +7725,37 @@ mod tests {
     //! If anyone removes the `populate_bar` call from
     //! `build_snapshot_status_bar` it breaks here.
     use super::*;
+
+    /// 085 adversarial: `daemon stop` must not SIGTERM whatever number the pidfile holds.
+    /// A pidfile survives SIGKILL and reboots, and the OS reuses pids — so its contents can
+    /// name a completely unrelated live process. Reproduced before the fix: `daemon stop`
+    /// killed an innocent `sleep`. The identity check is what makes the verb safe.
+    #[test]
+    fn a_live_non_daemon_pid_is_not_mistaken_for_the_daemon() {
+        // This test process is alive and is emphatically not a shux daemon.
+        assert!(
+            !super::is_live_shux_daemon(std::process::id()),
+            "a live process that is not `shux __daemon` must never be treated as the daemon"
+        );
+        // pid 1 is init; signalling it would be catastrophic and it is never our daemon.
+        assert!(!super::is_live_shux_daemon(1));
+
+        // 085 QA P3: a bystander whose command line merely CONTAINS both words must be
+        // rejected. A substring check accepted this and killed it.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"exec -a "watch-for shux __daemon" /bin/sleep 5"#])
+            .spawn()
+            .expect("spawn crafted-argv bystander");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let verdict = super::is_live_shux_daemon(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !verdict,
+            "a process whose argv merely contains `shux` and `__daemon` is not the daemon"
+        );
+    }
+
     use shux_core::config::{Config, ConfigHandle, SegmentDef, StatusBarConfig};
     use shux_core::graph::{GraphHandle, SessionGraph, SessionGraphSnapshot, run_graph_loop};
     use shux_core::layout::Direction;
@@ -7781,97 +8432,10 @@ mod tests {
         assert_eq!(data["hint"], "set heat_png=false", "hint passes through");
     }
 
-    /// LENS-R-038b (PR #91 codex P2, adjudicated) — a default-color-only
-    /// change marks every cell whose changed channel is `Color::Default` on
-    /// both sides; concrete-colored cells stay unmarked. Exercises both the
-    /// bg (OSC 11) and fg (OSC 10) channels against a grid mixing blank
-    /// cells, default-colored text, and one fully concrete-colored cell.
-    #[test]
-    fn compute_lens_diff_default_color_change_marks_default_cells() {
-        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
-        // Default-colored text at (0,0..2) + one cell at (1,2) with CONCRETE
-        // fg AND bg (never resolves through either default channel).
-        vt.process(b"\x1b[1;1HAB\x1b[2;3H\x1b[38;2;1;2;3m\x1b[48;2;4;5;6mX\x1b[0m");
-        let grid = vt.grid().clone_visible();
-        let cursor = (0, 0, true);
-        let base = shux_vt::TerminalDefaultColors::default();
-
-        // bg default changed (OSC 11): every cell except (1,2) counts.
-        let bg_changed = shux_vt::TerminalDefaultColors {
-            bg: Some([32, 64, 96]),
-            ..base
-        };
-        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, bg_changed);
-        assert_eq!(
-            diff.cells_changed, 29,
-            "3×10 grid minus the one concrete-bg cell"
-        );
-        assert!(!diff.changed_mask[10 + 2], "concrete-bg cell NOT marked");
-        assert!(diff.changed_mask[0], "default-colored glyph cell marked");
-        assert!(diff.changed_mask[9], "blank cell marked");
-        // Row 1 splits around the concrete cell: [0,2) + [3,10).
-        let spans: Vec<(u16, u16, u16)> = diff
-            .regions
-            .iter()
-            .map(|s| (s.row, s.col_start, s.col_end))
-            .collect();
-        assert_eq!(spans, vec![(0, 0, 10), (1, 0, 2), (1, 3, 10), (2, 0, 10)]);
-        assert_eq!(diff.bounding_box, (0, 0, 3, 10));
-
-        // fg default changed (OSC 10): same shape — the concrete-fg cell is
-        // the only one not resolving through the fg default.
-        let fg_changed = shux_vt::TerminalDefaultColors {
-            fg: Some([200, 10, 10]),
-            ..base
-        };
-        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, fg_changed);
-        assert_eq!(diff.cells_changed, 29);
-        assert!(!diff.changed_mask[10 + 2], "concrete-fg cell NOT marked");
-
-        // Cursor default (OSC 12) is NOT part of the cell comparison
-        // (DEC-11: the cursor overlay is excluded from diffs entirely).
-        let cursor_changed = shux_vt::TerminalDefaultColors {
-            cursor: Some([255, 0, 0]),
-            ..base
-        };
-        let diff = compute_lens_diff(&grid, &grid, cursor, cursor, base, cursor_changed);
-        assert_eq!(diff.cells_changed, 0, "OSC 12 never marks cells");
-    }
-
-    /// LENS-R-038b test (b): with UNCHANGED defaults the comparison is
-    /// byte-identical to plain raw `Cell` equality — whether the shared
-    /// defaults are the builtin fallback (None) or an OSC-set value. Pins
-    /// that the D-tier gates and ratified goldens are unaffected.
-    #[test]
-    fn compute_lens_diff_unchanged_defaults_matches_raw() {
-        let mut vt = shux_vt::VirtualTerminal::new(3, 10);
-        vt.process(b"\x1b[1;1Hhello");
-        let cp = vt.grid().clone_visible();
-        vt.process(b"\x1b[2;4H\x1b[48;5;28mZW\x1b[0m");
-        let cur = vt.grid().clone_visible();
-        let cursor = (0, 0, true);
-
-        let none = shux_vt::TerminalDefaultColors::default();
-        let osc_set = shux_vt::TerminalDefaultColors {
-            fg: Some([250, 250, 250]),
-            bg: Some([32, 64, 96]),
-            cursor: Some([255, 128, 0]),
-        };
-
-        let raw = compute_lens_diff(&cp, &cur, cursor, cursor, none, none);
-        let same_osc = compute_lens_diff(&cp, &cur, cursor, cursor, osc_set, osc_set);
-        assert_eq!(raw.cells_changed, 2, "exactly the ZW cells");
-        assert_eq!(same_osc.cells_changed, raw.cells_changed);
-        assert_eq!(same_osc.changed_mask, raw.changed_mask);
-        assert_eq!(same_osc.bounding_box, raw.bounding_box);
-        let spans = |d: &LensDiff| -> Vec<(u16, u16, u16)> {
-            d.regions
-                .iter()
-                .map(|s| (s.row, s.col_start, s.col_end))
-                .collect()
-        };
-        assert_eq!(spans(&same_osc), spans(&raw));
-    }
+    // The cell-diff semantics (default-color resolution, unchanged-defaults ==
+    // raw Cell equality, wide-glyph pairing) moved to `shux-vt` with the
+    // comparator in task 079; they are pinned by `shux_vt::diff::tests` and by
+    // the frozen parity corpus (`crates/shux/tests/lens_gate_parity.rs`).
 
     /// LENS-R-038b test (c), unit half — the heat base is rendered with the
     /// defaults PASSED IN (the handler passes the pane's CURRENT defaults).
@@ -7927,7 +8491,9 @@ mod tests {
     /// cell VALUES from `clone_visible` clones, never the render-drained dirty
     /// flags. Simulate a concurrently-attached render client by DRAINING the
     /// VT's dirty regions between the checkpoint clone and the current clone;
-    /// the diff still reports the exact delta.
+    /// the diff still reports the exact delta. (Name preserved: referenced by
+    /// `crates/shux/tests/diff_concurrent_readers.rs`; now drives the task-079
+    /// `shux_vt::diff_frames` through the same `GridFrame` adapter the daemon uses.)
     #[test]
     fn compute_lens_diff_independent_of_dirtystate_drains() {
         let mut vt = shux_vt::VirtualTerminal::new(6, 20);
@@ -7936,7 +8502,11 @@ mod tests {
         let cp_grid = vt.grid().clone_visible();
         let cp_cursor = {
             let c = vt.cursor();
-            (c.row, c.col, c.visible)
+            shux_vt::CursorState {
+                row: c.row,
+                col: c.col,
+                visible: c.visible,
+            }
         };
         // A render client drains DirtyState (as the attach compositor would).
         let _ = vt.take_dirty_regions();
@@ -7950,16 +8520,16 @@ mod tests {
         let cur_grid = vt.grid().clone_visible();
         let cur_cursor = {
             let c = vt.cursor();
-            (c.row, c.col, c.visible)
+            shux_vt::CursorState {
+                row: c.row,
+                col: c.col,
+                visible: c.visible,
+            }
         };
-        let diff = compute_lens_diff(
-            &cp_grid,
-            &cur_grid,
-            cp_cursor,
-            cur_cursor,
-            shux_vt::TerminalDefaultColors::default(),
-            shux_vt::TerminalDefaultColors::default(),
-        );
+        let d = shux_vt::TerminalDefaultColors::default();
+        let a = shux_vt::GridFrame::new(&cp_grid, d, cp_cursor, false);
+        let b = shux_vt::GridFrame::new(&cur_grid, d, cur_cursor, false);
+        let diff = shux_vt::diff_frames(&a, &b);
         // (1,1) style change + (2,4) new glyph = exactly 2 cells, despite the
         // dirty drains straddling the checkpoint.
         assert_eq!(diff.cells_changed, 2, "value-based diff, dirty-independent");
@@ -7969,40 +8539,6 @@ mod tests {
         assert!(!diff.regions_truncated);
         // Half-open bbox spanning rows 1..3, cols 1..5.
         assert_eq!(diff.bounding_box, (1, 1, 3, 5));
-    }
-
-    /// LENS-R-034 wide-glyph pairing: if either half of a wide glyph changes,
-    /// both the head and its spacer cell count.
-    #[test]
-    fn compute_lens_diff_wide_glyph_pairs_spacer() {
-        let mut vt = shux_vt::VirtualTerminal::new(4, 20);
-        let cp_grid = vt.grid().clone_visible();
-        let cp_cursor = (0, 0, true);
-        // Draw a fullwidth CJK glyph at (0,0) — occupies cols 0 (head) + 1
-        // (spacer).
-        vt.process("\x1b[1;1H\u{7d42}".as_bytes()); // 終 (width 2)
-        let cur_grid = vt.grid().clone_visible();
-        let diff = compute_lens_diff(
-            &cp_grid,
-            &cur_grid,
-            cp_cursor,
-            (0, 2, true),
-            shux_vt::TerminalDefaultColors::default(),
-            shux_vt::TerminalDefaultColors::default(),
-        );
-        assert_eq!(diff.cells_changed, 2, "wide head + spacer both count");
-        assert!(diff.changed_mask[0], "head counts");
-        assert!(diff.changed_mask[1], "spacer counts");
-        // One merged span [0,2) on row 0.
-        assert_eq!(diff.regions.len(), 1);
-        assert_eq!(
-            (
-                diff.regions[0].row,
-                diff.regions[0].col_start,
-                diff.regions[0].col_end
-            ),
-            (0, 0, 2)
-        );
     }
 
     /// LENS-R-037 heat PNG is deterministic: identical inputs → byte-identical
@@ -10418,6 +10954,31 @@ done
         assert_eq!(settle_decide(true, false, false), Settled);
         assert_eq!(settle_decide(false, true, false), TimedOut);
         assert_eq!(settle_decide(false, false, false), KeepWaiting);
+    }
+
+    #[test]
+    fn stability_wake_avoids_busy_spin_when_hold_is_satisfied() {
+        // impl-review Surface 1: with the hold window already met (remaining 0) but the count
+        // criterion still pending, the wake must be the TIMEOUT — a `now`-sized sleep would spin.
+        let now = tokio::time::Instant::now();
+        let timeout = now + Duration::from_secs(10);
+        assert_eq!(
+            stability_wake(now, 0, timeout),
+            timeout,
+            "hold satisfied / no-hold: wake straight to the timeout, never `now`"
+        );
+        // Hold still owed: wake at the hold deadline (before the timeout).
+        let w = stability_wake(now, 500_000_000, timeout); // 500ms owed
+        assert!(
+            w > now && w < timeout,
+            "hold unsatisfied wakes at the hold deadline"
+        );
+        // A hold deadline past the timeout is capped at the timeout.
+        assert_eq!(
+            stability_wake(now, 20_000_000_000, timeout),
+            timeout,
+            "the hold wake never exceeds the timeout"
+        );
     }
 
     #[test]

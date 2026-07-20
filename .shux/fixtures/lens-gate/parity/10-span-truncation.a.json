@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "size": {
+    "rows": 14,
+    "cols": 40
+  },
+  "alt_screen": false,
+  "defaults": {},
+  "cursor": {
+    "row": 0,
+    "col": 1,
+    "visible": true,
+    "shape": "block"
+  },
+  "palette_overridden": false,
+  "rows": [
+    {
+      "row": 0,
+      "runs": []
+    },
+    {
+      "row": 1,
+      "runs": []
+    },
+    {
+      "row": 2,
+      "runs": []
+    },
+    {
+      "row": 3,
+      "runs": []
+    },
+    {
+      "row": 4,
+      "runs": []
+    },
+    {
+      "row": 5,
+      "runs": []
+    },
+    {
+      "row": 6,
+      "runs": []
+    },
+    {
+      "row": 7,
+      "runs": []
+    },
+    {
+      "row": 8,
+      "runs": []
+    },
+    {
+      "row": 9,
+      "runs": []
+    },
+    {
+      "row": 10,
+      "runs": []
+    },
+    {
+      "row": 11,
+      "runs": []
+    },
+    {
+      "row": 12,
+      "runs": []
+    },
+    {
+      "row": 13,
+      "runs": []
+    }
+  ]
+}

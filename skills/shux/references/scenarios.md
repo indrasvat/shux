@@ -1,155 +1,123 @@
-# Scenario-driver patterns
+# Migrating a `sleep`-driven snapshot harness to a gate scenario
 
-For repeatable scripted interactions with a TUI — drive a vivecaka /
-lazygit / bubbletea app from outside, capture a labeled PNG at each step,
-diff against a golden image in CI.
+If you already drive a TUI from bash — spawn, `sleep 3`, send a key, `sleep 0.5`,
+snapshot, then diff PNGs in python — **stop maintaining that harness**. It is what
+`shux lens gate` replaces, and the gate is strictly better at the two things the bash
+version cannot do: it waits on *frame content* instead of guessing with `sleep`, and it
+compares **cell semantics including colour** rather than pixels through a tolerance.
 
-## The pattern (bash)
+New to the gate? Read [gate.md](gate.md) first — this file is only the conversion.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-SHUX="${SHUX_BIN:-shux}"
-SESSION="${SESSION:-demo}"
-OUT_DIR="${OUT_DIR:-./snapshots}"
-mkdir -p "$OUT_DIR"
+## The 1:1 conversion
 
-# Pre-encoded control bytes.
-ESC=$(printf '\033' | base64)
-ENTER=$(printf '\r' | base64)
-TAB=$(printf '\t' | base64)
+| Your bash harness | The scenario equivalent |
+|--|--|
+| `shux session create … -- mytui --fixtures ...` | `command = ["mytui", "--fixtures", "..."]` |
+| `SOURCE_DATE_EPOCH=… ` + a hand-pruned env | `[env]` (the sandbox starts EMPTY; `SOURCE_DATE_EPOCH=0` is already set) |
+| running the tool from the project dir | `cwd = "."` — relative to the scenario file |
+| `pane set-size --cols 160 --rows 48` | `[terminal] cols = 160`, `rows = 48` |
+| `sleep 3` after spawn | `wait_for_text` on something the first frame draws |
+| `sleep 0.5` between keys | `hold_settle` — settles when the frame stops changing |
+| `send-keys --text 'j'` | `{ action = "type_text", text = "j" }` |
+| `send-keys --data "$(printf '\r' \| base64)"` | `{ action = "keys", keys = ["<CR>"] }` — vim notation, no base64 |
+| `snap 01_loaded` → `.shux/out/01_loaded.png` | `{ action = "expect_golden", name = "01_loaded", tier = "cell" }` |
+| numpy/PIL `max pixel diff > 2` comparator | built in — the `cell` tier, exact and portable |
+| `cp .shux/out/*.png .shux/goldens/` | `shux lens gate scn.toml --update --reason "…"` (audited, secret-scanned) |
+| `sys.exit(1)` on mismatch | the frozen exit contract (`0/1/2/3/5/6`) |
+| a `.png` per label in git | one `.capture.json` per frame — text + colour, diffable in review |
 
-# 1 — spawn
-"$SHUX" session kill "$SESSION" >/dev/null 2>&1 || true
-"$SHUX" session create "$SESSION" -d -- vivecaka --repo cli/cli
+Two rows deserve emphasis, because they are the reason the harness was fragile:
 
-# 2 — resize (synchronous)
-"$SHUX" pane set-size -s "$SESSION" --cols 200 --rows 60 >/dev/null
+- **Every `sleep` becomes a settle.** A fixed sleep is either too short (you capture a
+  half-painted frame — the classic intermittent whole-screen diff) or too slow. Use
+  `wait_for_text` to reach a known state and `hold_settle` to capture one.
+- **The pixel comparator becomes the `cell` tier.** Pixel tolerance exists to absorb
+  anti-aliasing drift, and that same tolerance is what silently swallows a
+  `bright_green` → `green` regression. Cell compare has no tolerance to hide in.
 
-# 3 — helpers
-snap () {
-  local label="$1"
-  "$SHUX" --format json pane snapshot -s "$SESSION" \
-    | jq -r .png_base64 | base64 -d > "$OUT_DIR/${label}.png"
-  echo "→ ${label}.png"
-}
-send_text () { "$SHUX" pane send-keys -s "$SESSION" --text "$1" >/dev/null; }
-send_b64  () { "$SHUX" pane send-keys -s "$SESSION" --data "$1" >/dev/null; }
-sleep_for () { sleep "$1"; }
+## Worked conversion
 
-# 4 — the scenario
-sleep_for 6 ; snap "01_loaded"
-send_text "j" ; sleep_for 1 ; snap "02_after_j"
-send_text "/" ; sleep_for 1
-send_text "actions" ; sleep_for 1 ; snap "03_searched"
-send_b64 "$ESC" ; sleep_for 1
-send_b64 "$ENTER" ; sleep_for 3 ; snap "04_pr_detail"
-send_b64 "$TAB" ; sleep_for 1 ; snap "05_tab_checks"
-
-# 5 — teardown
-"$SHUX" session kill "$SESSION" >/dev/null
-```
-
-## Declarative scenario array (the pattern that scales)
-
-Drop the imperative `send/snap` calls and define the scenario as
-data — easier to copy, easier to diff, easier to ship as a test fixture.
+The old harness — spawn, settle, snap, press `j`, settle, snap:
 
 ```bash
-SCENARIO=(
-  "wait :              : 6000 : -"
-  "snap :              :    0 : 01_loaded"
-  "text : \"j\"        :  800 : -"
-  "snap :              :    0 : 02_after_j"
-  "text : \"/\"        :  500 : -"
-  "text : \"actions\"  : 1500 : -"
-  "snap :              :    0 : 03_searched"
-  "esc  :              :  500 : -"
-  "enter :             : 3000 : -"
-  "snap :              :    0 : 04_pr_detail"
-  "tab  :              : 1500 : -"
-  "snap :              :    0 : 05_tab_checks"
-)
-
-for row in "${SCENARIO[@]}"; do
-  action="$(printf '%s' "$row" | awk -F: '{gsub(/^ +| +$/,"",$1); print $1}')"
-  value="$(  printf '%s' "$row" | awk -F: '{for(i=2;i<NF-1;i++) printf "%s%s",$i,(i<NF-2?":":"")}' | sed 's/^ *//;s/ *$//')"
-  sleepms="$(printf '%s' "$row" | awk -F: '{gsub(/^ +| +$/,"",$(NF-1)); print $(NF-1)}')"
-  label="$(  printf '%s' "$row" | awk -F: '{gsub(/^ +| +$/,"",$NF);   print $NF}')"
-
-  case "$action" in
-    wait)  : ;;
-    text)  send_text "$value" ;;
-    esc)   send_b64 "$ESC" ;;
-    enter) send_b64 "$ENTER" ;;
-    tab)   send_b64 "$TAB" ;;
-    snap)  snap "$label" ;;
-    *)     echo "unknown action: $action"; exit 1 ;;
-  esac
-  python3 -c "import time;time.sleep($sleepms/1000)"
-done
+shux session create visual-test -d -- mytui --fixtures tests/fixtures
+shux pane set-size -s visual-test --cols 160 --rows 48
+sleep 3    ; snap 01_loaded
+shux pane send-keys -s visual-test --text 'j'
+sleep 0.5  ; snap 02_after_j
+# …then ~30 lines of python comparing PNGs to .shux/goldens/
 ```
 
-Editing the `SCENARIO=(...)` array is the entire authoring surface for a
-new visual regression test. Copy the file, swap rows, get a new test.
+The same scenario, complete:
 
-## Golden-image comparison
+```toml
+name = "mytui"
+description = "Initial frame, then a j-key selection move."
+command = ["mytui", "--fixtures", "tests/fixtures"]
+cwd = "."
 
-In CI: render snapshots, diff against checked-in goldens, fail on
-exceeding a perceptual threshold.
+[env]
+PATH = "/usr/local/bin:/usr/bin:/bin"   # the sandbox PATH does NOT inherit yours
 
-```python
-# tests/raster_golden.py (sketch)
-import base64, json, subprocess, numpy as np
-from PIL import Image
-from io import BytesIO
+[terminal]
+cols = 160
+rows = 48
 
-def snapshot(pane_id):
-    out = subprocess.check_output(
-        ["shux", "api", "pane.snapshot", json.dumps({"pane_id": pane_id})])
-    return Image.open(BytesIO(base64.b64decode(json.loads(out)["result"]["png_base64"])))
+[[steps]]
+action = "wait_for_text"
+text = "my tui"          # something only the loaded frame draws
+timeout_ms = 20000
 
-def assert_matches_golden(img, golden_path, atol=2):
-    g = Image.open(golden_path)
-    if g.size != img.size:
-        raise AssertionError(f"size: got {img.size} want {g.size}")
-    diff = np.abs(np.asarray(img) - np.asarray(g)).max()
-    if diff > atol:
-        img.save(golden_path + ".actual.png")
-        raise AssertionError(f"pixel diff {diff} > tolerance {atol}")
+[[steps]]
+action = "hold_settle"   # replaces `sleep 3`
+hold_ms = 300
+timeout_ms = 10000
+
+[[steps]]
+action = "expect_golden"
+name = "01_loaded"
+tier = "cell"
+
+[[steps]]
+action = "type_text"
+text = "j"
+
+[[steps]]
+action = "hold_settle"   # replaces `sleep 0.5`
+hold_ms = 300
+timeout_ms = 10000
+
+[[steps]]
+action = "expect_golden"
+name = "02_after_j"
+tier = "cell"
 ```
 
-Determinism contract recommendation: compare **raw RGBA** (or
-post-decode pixels), not PNG byte streams. PNG encoder internals can
-change with crate versions; the pixel-level promise is the one shux
-upholds.
-
-## Watch a TUI process exit
+Then, once:
 
 ```bash
-# Poll the pane's PTY until process exits — checking pane.list every Ns.
-while true; do
-  state=$("$SHUX" api pane.list "{\"session_id\":\"$SID\"}" \
-          | jq -r '.result[] | select(.id=="'"$PID"'") | .exit_code')
-  if [[ "$state" != "null" && -n "$state" ]]; then
-    echo "exited: $state"; break
-  fi
-  sleep 1
-done
+shux lens gate scn.toml --on-missing create --reason "first baseline"  # mint + LOOK at them
+git add goldens/ && git commit
 ```
 
-Or — pure event-driven — use `events.history` with `count` increasing
-each poll, and watch for a `pane.exited` event matching your pane.
+and in CI, forever after: `shux lens gate scn.toml`.
 
-## Multi-pane fan-out
+Delete the bash driver and the python comparator. The scenario is the test.
 
-Send the same keystroke to every pane in a session at once
-(iTerm2-broadcast-input equivalent):
+## What is still a driver script
 
-```bash
-for pid in $("$SHUX" --format json pane list -s "$SESSION" | jq -r '.[].id'); do
-  "$SHUX" rpc call pane.send_keys \
-    --params "{\"pane_id\":\"$pid\",\"text\":\"ls\\n\"}" >/dev/null &
-done
-wait
-```
+The gate owns *repeatable regression*. A few jobs remain plain RPC work:
+
+- **One-off exploration** — spawn, look, adjust. That is the lens loop; see [lens.md](lens.md).
+- **Broadcast input** — send one keystroke to every pane at once, the iTerm2-broadcast
+  equivalent:
+
+  ```bash
+  for pid in $(shux --format json pane list -s "$SESSION" | jq -r '.[].id'); do
+    shux rpc call pane.send_keys --params "{\"pane_id\":\"$pid\",\"text\":\"ls\\n\"}" >/dev/null &
+  done
+  wait
+  ```
+
+- **Reacting to a pane exiting** — subscribe rather than poll:
+  `shux events watch --filter pane.exited`, or a process plugin ([plugins.md](plugins.md)).

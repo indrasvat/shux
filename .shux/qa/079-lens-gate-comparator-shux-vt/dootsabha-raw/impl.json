@@ -1,0 +1,62 @@
+{
+  "dispatch": [
+    {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "content": "Verdict: CHANGES-NEEDED, minor only. No BLOCKER or MAJOR findings.\n\n1. MINOR: [crates/shux-vt/src/diff.rs](/Users/indrasvat/code/github.com/indrasvat-shux/crates/shux-vt/src/diff.rs:315)  \n   `GridFrame::cell()` violates the trait contract from [line 96](/Users/indrasvat/code/github.com/indrasvat-shux/crates/shux-vt/src/diff.rs:96): out-of-range coordinates should return `Cell::EMPTY`, but this impl calls `visible_row(row)` before checking row bounds, so `row \u003e= self.grid.rows()` panics. `diff_frames()` itself does not hit this because it loops over `min(rows)`, so daemon parity is not affected. Still worth fixing because `CellGridView` is public API and this is exactly the kind of small contract mismatch a reviewer can flag.\n\nEverything else looks clean:\n\n- `diff_frames` is a faithful lift for the daemon-equal-dims case: same raw `Cell` equality, same default fg/bg clauses, same wide-head propagation, span cap, bbox, and cursor tuple semantics.\n- Daemon adapter is output-identical in shape; `GridFrame` borrows end before `cur_grid` is moved into the heat closure, so no lifetime/borrow issue.\n- `build_row_runs` scrollback fix is correct: `scrollback_len() + r` maps visible row index to absolute row, and masks remain visible-row indexed.\n- `try_view` validates before decode and caps before `to_cells()` allocation; sound.\n- Parity corpus is meaningful and non-self-referential; divergence pins are useful for cell-tier regression, with pixel-only notes kept documentary.\n- Verification passed: `make test-vt FILTER=diff` 17/17, `make test-lens-gate-comparator` 3/3, `make test-lens` 37/37.\n\n",
+      "duration_ms": 560229,
+      "cost_usd": 0,
+      "tokens_in": 2810970,
+      "tokens_out": 14950
+    },
+    {
+      "provider": "agy",
+      "model": "Gemini 3.5 Flash (High)",
+      "content": "I will pause tool calls to wait for the compilation checks and timer to complete. Let's see if the build finishes cleanly.\nI will wait for the compilation task to make progress.\nI will wait another 10 seconds for the check to complete.\nI will wait for the check to complete compile checks on the `shux` binary crate.\nI will wait for the check task to finish.\nBased on a thorough analysis of the implementation diff and a validation run of the comparator test suite, here is the review report for **shux task 079**.\n\n### Verdict: **CLEAN**\nThere are **no BLOCKER, MAJOR, or MINOR findings**. \n\n---\n\n### Focus Area Review\n\n#### 1. Diff Semantic Parity (`diff_frames` vs. `compute_lens_diff`)\n* **Status:** **CLEAN**\n* **Details:** \n  * **Cell Equality:** `CellRef` properly wraps `Cell` and utilizes derived `Eq`, matching exactly the byte-exact behavior of raw `Cell` values.\n  * **OSC-10/11 Default Color Resolution:** Default color resolving is preserved verbatim. If a default color changes on either side, all matching `Color::Default` cells are correctly marked as changed.\n  * **Wide Glyph Head/Spacer Pairing:** The lookup and bit-setting flags on `wide[idx]` propagate changes correctly to both parts of the glyph.\n  * **Regions/BBox/Truncation:** The span-building, half-open bounding box calculation `(min_row, min_col, max_row + 1, max_col + 1)`, and the `256` region truncation limit are implemented identical to the original logic.\n  * **Coloured Wide Head Over-report (B-F1):** The intentional over-report bug is correctly preserved and verified in unit tests (`default_bg_change_flips_colored_wide_head`).\n\n#### 2. Daemon Adapter Parity and Borrow/Lifetimes\n* **Status:** **CLEAN**\n* **Details:**\n  * **Parity:** In `register_pane_io_methods` (`crates/shux/src/main.rs`), `pane.diff_since` remains completely byte-identical. The newly introduced fields (`palette_overridden_differs`, `geometry_changed`) stay false and are not exposed or serialized into the daemon RPC JSON response.\n  * **Borrow/Lifetimes:** The temporary grid-frame views (`cp_view`, `cur_view`) borrow the cloned grids within a localized block scope. The scope immediately ends, releasing the borrows on `cur_grid` before the `tokio::task::spawn_blocking` closure captures and moves `cur_grid` by value. There are no compiler conflicts or runtime lifetime hazards.\n\n#### 3. Scrollback Offset Fix in `build_row_runs`\n* **Status:** **CLEAN**\n* **Details:**\n  * **Scrollback Offset:** Modifying `grid.row(r)` to `grid.row(grid.scrollback_len() + r)` is correct. Because `from_parts` iterates viewport rows (`0..grid.rows()`), it must offset past any scrollback buffer to serialize the visible frame.\n  * **Indexing Hazards:** A full sweep of `crates/shux-vt/src/capture.rs` shows no other absolute-vs-visible indexing hazards. All other viewport-based access paths correctly use `visible_row` or offset via `scrollback_len()`.\n  * **Test Coverage:** Verified by `captures_visible_viewport_not_scrollback` (which tests a scrolled VT and asserts the viewport matches captured cells exactly).\n\n#### 4. `try_view` Validation and Size Cap\n* **Status:** **CLEAN**\n* **Details:**\n  * **Validation First:** Calling `self.validate()?` ensures malformed/non-canonical frames fail early instead of being normalized by RLE decode.\n  * **Size Cap:** Enforcing the `16_000_000` cells limit (`MAX_VIEW_CELLS`) prevents potential OOM panics/allocator aborts from schema-valid but absurdly large goldens (e.g. `65535 × 65535`).\n  * **Trait Cleanliness:** The separation of concerns between `CellGridView`, `CellRef` and `CursorState` is elegant and decoupled.\n\n#### 5. Parity \u0026 Divergence Pinning\n* **Status:** **CLEAN**\n* **Details:**\n  * **Parity Corpus:** Parity tests are non-vacuous and non-self-referential. They validate the extracted `diff_frames` against frozen outputs (`.shux/fixtures/lens-gate/parity/\u003cn\u003e.diff.json`) captured from the old `compute_lens_diff` *before* it was deleted.\n  * **Divergence Tiers:** The divergence suite (`lens_gate_divergence.rs`) properly validates all 9 edge cases (blink, cursor shape/visibility/position, OSC-4 with/without indexed colors, size mismatch, identical cells). It ensures tier boundaries are correctly identified at the cell level.\n\n#### 6. Other Potential Risks\n* **Status:** **CLEAN**\n* **Details:**\n  * No dependency cycles are introduced (since `shux-vt` has no back-reference to `shux`).\n  * No new crates are added, and compilation/checks verify code soundness.\nConfirming that the background compilation check (`cargo check --tests`) has also finished successfully with zero errors/warnings. \n\nThe implementation diff for task 079 is solid, robust, and matches all correctness, parity, and safety constraints. The verdict is **CLEAN**.",
+      "duration_ms": 212033,
+      "cost_usd": 0,
+      "tokens_in": 0,
+      "tokens_out": 0
+    }
+  ],
+  "reviews": [
+    {
+      "reviewer": "codex",
+      "reviewed": [
+        "agy"
+      ],
+      "content": "",
+      "error": "review by codex: codex invoke: subprocess \"codex\": context deadline exceeded"
+    },
+    {
+      "reviewer": "agy",
+      "reviewed": [
+        "codex"
+      ],
+      "content": "",
+      "error": "review by agy: agy invoke: subprocess \"agy\": context deadline exceeded"
+    }
+  ],
+  "synthesis": null,
+  "meta": {
+    "schema_version": 1,
+    "strategy": "council",
+    "duration_ms": 772262,
+    "total_cost_usd": 0,
+    "total_tokens_in": 2810970,
+    "total_tokens_out": 14950,
+    "providers": {
+      "agy": "ok",
+      "codex": "ok"
+    }
+  }
+}
+{
+  "meta": {
+    "schema_version": 1
+  },
+  "data": {
+    "provider": "",
+    "error": "synthesis: synthesize fallback codex: codex invoke: subprocess \"codex\": context deadline exceeded"
+  }
+}

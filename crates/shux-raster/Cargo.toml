@@ -17,9 +17,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 shux-vt = { path = "../shux-vt" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
+# Lens-gate pixel/exact tiers (task 080): PNG/RGBA compare + golden content pins +
+# font-chain fingerprint. This is the lowest crate that can render a golden AND that the
+# frozen contract tests can import (design-review D1).
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
 tempfile = { workspace = true }

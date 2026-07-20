@@ -36,6 +36,13 @@ use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
 use shux_vt::{Cell, CellFlags, CellStyle, Color, CursorShape, Grid, UnderlineStyle};
 
+mod gate_pixel;
+pub use gate_pixel::{
+    GateError, PixelMetrics, TierVerdict, builtin_font_fingerprint, compare_pixels, content_pin,
+    decode_png, encode_png, evaluate_tier, os_arch, pixel_baseline_path, png_sha256,
+    render_envelope, render_envelope_png, rgba_sha256,
+};
+
 /// Embedded text font. JetBrains Mono Nerd Font Mono Regular, the
 /// upstream Nerd Fonts patched build (2.4 MB) under SIL Open Font
 /// License (see `assets/OFL.txt`). Bundles the full NF glyph set so

@@ -66,6 +66,27 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  frozen-guard:
+    name: Lens frozen-path guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so BASE..HEAD range mode can inspect every commit and
+          # its first parent — a shallow clone would blind the guard.
+          fetch-depth: 0
+      - name: Enforce lens/gate frozen-path trailers
+        env:
+          # Compare against the PR's base branch tip.
+          LENS_FROZEN_BASE: origin/${{ github.base_ref }}
+        run: make check-lens-frozen
+      # The gate reference documents a TOML grammar and an exit contract that no test
+      # reads, so it can drift silently — a doc naming a key the parser rejects fails a
+      # user's run with exit 2. This compares the doc against the shipped surface.
+      - name: Check lens-gate docs match the shipped CLI
+        run: make check-gate-docs
+
   test-ubuntu:
     name: Test (ubuntu)
     if: github.event_name != 'schedule'

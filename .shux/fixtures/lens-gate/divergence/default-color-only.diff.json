@@ -1,0 +1,41 @@
+{
+  "bounding_box": [
+    0,
+    0,
+    2,
+    4
+  ],
+  "cells_changed": 8,
+  "changed_mask": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "changed_rows": [
+    0,
+    1
+  ],
+  "cols": 4,
+  "cursor_moved": false,
+  "geometry_changed": false,
+  "palette_overridden_differs": false,
+  "regions": [
+    {
+      "col_end": 4,
+      "col_start": 0,
+      "row": 0
+    },
+    {
+      "col_end": 4,
+      "col_start": 0,
+      "row": 1
+    }
+  ],
+  "regions_truncated": false,
+  "rows": 2
+}

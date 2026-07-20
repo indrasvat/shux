@@ -1,0 +1,27 @@
+{
+  "task": "083-lens-gate-settle-hardening-cast",
+  "branch": "feat/lens-ci-gate",
+  "audit_commit": "6f9912bb0d9d7c067b61d3624f03352f2cadac60",
+  "audit_worktree_state": "uncommitted working tree under audit",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.json",
+  "dootsabha_implementation": "dootsabha-implementation.json",
+  "screenshots": [
+    "repaint-stableframes-120x40-actual.png",
+    "repaint-holdms-120x40-actual.png",
+    "static-quiet-120x40-actual.png",
+    "static-holdms-120x40-actual.png",
+    "repaint-crossmode-diff.png",
+    "static-crossmode-diff.png"
+  ],
+  "pixel_metrics": [
+    "pixel-repaint-crossmode.json",
+    "pixel-static-crossmode.json"
+  ],
+  "notes": {
+    "pixel_check": "Cross-mode CAPTURE CONSISTENCY (Feature Protocol step 9): task 083 changes settle TIMING + adds a text .cast; it does NOT change how frames render, so the meaningful pixel gate is actual-vs-actual — a frame captured after a --stable-frames / --hold-ms settle is pixel-identical (0 diff) to the SAME live content under the old quiet/hold path. Both PNGs freshly generated this audit; not a committed-baseline compare, so no golden PNG / DootSabha baseline approval is required.",
+    "repaint_pair": "repaint-stableframes-120x40-actual.png (--stable-frames 5) vs repaint-holdms-120x40-actual.png (--hold-ms 400ms) on the identical repainter -> pixel-repaint-crossmode.json (0 changed px).",
+    "static_pair": "static-quiet-120x40-actual.png (default quiet, old path) vs static-holdms-120x40-actual.png (--hold-ms, new path) on the static frame -> pixel-static-crossmode.json (0 changed px).",
+    "cast": "run.cast is the asciinema v2 validity artifact (header {version:2,width:80,height:24}; events all valid [t,\"o\"|\"r\",data] with non-decreasing t; resize step yields \"r\" 100x30; lands outside the golden dir)."
+  }
+}

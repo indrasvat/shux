@@ -1237,10 +1237,17 @@ struct LensRunParams {
     cols: u16,
     rows: u16,
     env: Vec<(String, String)>,
+    /// Deny-by-default env inheritance (task 081 D4): the gate runner sets it so the
+    /// child sees ONLY the deterministic plan. Default false = prior behaviour.
+    env_clear: bool,
     cwd: Option<PathBuf>,
     post_exit_ttl_ms: u32,
     max_runtime_ms: u32,
     wait: bool,
+    /// Optional asciinema `.cast` path (task 083): when set, a cast recorder is armed AT SPAWN so
+    /// the child's first bytes (alt-screen setup, initial geometry, early output) are captured.
+    /// The gate points this at a gitignored `.shux/out/` path; never a golden.
+    cast: Option<PathBuf>,
 }
 
 /// Strict ranged u64 param: absent → default; present-but-not-a-u64 →
@@ -1362,15 +1369,44 @@ fn parse_lens_run_params(params: &serde_json::Value) -> Result<LensRunParams, sh
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Strict, like `argv`/`cast`: a present-but-non-boolean value is a usage error, not a
+    // silent `false`. `{"env_clear": "true"}` used to disable the deny-by-default
+    // environment while the caller believed it was on, so the child inherited the host env
+    // and a gate run lost its determinism guarantee without saying so (codex review, PR #95).
+    let env_clear = match params.get("env_clear") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| {
+            shux_rpc::RpcError::invalid_params("'env_clear' must be a boolean (true/false)")
+        })?,
+    };
+
+    // Optional cast path (task 083). Strict: present-but-not-a-non-empty-string → INVALID_PARAMS.
+    let cast = match params.get("cast") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                shux_rpc::RpcError::invalid_params("'cast' must be a filesystem path string")
+            })?;
+            if s.trim().is_empty() {
+                return Err(shux_rpc::RpcError::invalid_params(
+                    "'cast' path must not be empty",
+                ));
+            }
+            Some(PathBuf::from(s))
+        }
+    };
+
     Ok(LensRunParams {
         argv,
         cols,
         rows,
         env,
+        env_clear,
         cwd,
         post_exit_ttl_ms,
         max_runtime_ms,
         wait,
+        cast,
     })
 }
 
@@ -1794,15 +1830,32 @@ async fn spawn_scratch_core(
     drop(snap);
 
     let size = shux_pty::handle::PtySize::new(p.cols, p.rows);
-    let spawn_result = crate::spawn_pane_pty(
+    // Task 083: when a cast path is requested, arm the recorder AT SPAWN (before the read loop)
+    // so the child's first bytes are captured. A failed open rolls back the allocation (the cast
+    // is the caller's declared deliverable — silently dropping it would ship a lie).
+    let cast_recorder = match p.cast {
+        Some(cast_path) => match crate::open_cast_recorder(cast_path, p.cols, p.rows).await {
+            Ok(rec) => Some(rec),
+            Err(e) => {
+                let _ = graph.destroy_session(session_id, None).await;
+                return Err(shux_rpc::RpcError::internal(&format!(
+                    "cast recorder open failed: {e}"
+                )));
+            }
+        },
+        None => None,
+    };
+    let spawn_result = crate::spawn_pane_pty_with_recorder(
         pane_id,
         cwd,
         p.argv.clone(),
         size,
         p.env,
+        p.env_clear,
         io_state.clone(),
         cancel.clone(),
         graph.clone(),
+        cast_recorder,
     )
     .await;
 

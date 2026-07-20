@@ -1,0 +1,8 @@
+{
+  "cells_changed": 2,
+  "cursor_moved": false,
+  "geometry_changed": false,
+  "note": "BLINK is a CellFlags bit → caught by CELL; shux's static raster does not render blink → NOT a pixel-tier signal",
+  "palette_overridden_differs": false,
+  "pixel_diverges": false
+}

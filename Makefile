@@ -384,34 +384,102 @@ spike-libghostty-zig: ## Install spike-local Zig 0.15.2 under .local/tools
 # Lens (separate red-suite lane — PRD §12/§13/§16)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# The lens integration tests carry `test = false` in crates/shux/Cargo.toml, so
-# `make test` / `make check` never run them (they are RED during P0–P5). These
-# dedicated targets run them EXPLICITLY, serially, under the leak guard.
+# The lens integration suites carry `test = false` in crates/shux/Cargo.toml, so the default
+# `make test` / `make check` never run them; the targets below run them EXPLICITLY. Every suite
+# is the SAME nextest invocation — the only variance is the test set, whether a real daemon is
+# spawned (→ leak guard + serial `-j 1`), and a couple of extra flags — so that invocation lives
+# in ONE place. Adding a suite is a two-line target; the recipe never repeats.
+#
+#   $(call lens_run,BANNER,--test A [--test B…],[EXTRA FLAGS],[COLOUR])   daemon-backed (guarded)
+#   $(call lens_run_pure,BANNER,--test A,[EXTRA FLAGS])                   pure (no daemon)
+#
+# BANNER must not contain a comma (GNU Make splits $(call) args on commas).
+NEXTEST := cargo nextest run -p shux --no-fail-fast
+define lens_run
+@echo "$(if $(4),$(4),$(COLOR_BLUE))▶ $(1)...$(COLOR_RESET)"
+@.shux/scripts/no_leak_guard.sh $(NEXTEST) -j 1 $(3) $(2)
+endef
+define lens_run_pure
+@echo "$(COLOR_BLUE)▶ $(1)...$(COLOR_RESET)"
+@$(NEXTEST) $(3) $(2)
+endef
 
 LENS_TESTS := --test lens_fixtures_smoke --test lens_glance --test lens_revision \
 	--test lens_settle --test lens_diff --test lens_run --test lens_loop
 
 .PHONY: test-lens
 test-lens: ## Run the lens synthetic red suite (§12) serially under the leak guard
-	@echo "$(COLOR_BLUE)▶ Running lens red suite (§12)...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast $(LENS_TESTS)
+	$(call lens_run,Running lens red suite (§12),$(LENS_TESTS))
 
+.PHONY: test-lens-settle-hardening
+test-lens-settle-hardening: ## Run the task-083 pane.wait_settled hold-ms/stable-frames suite serially under the leak guard
+	$(call lens_run,Running lens settle-hardening suite (task 083),--test lens_settle_hardening)
+
+# --no-capture so the loud skip notice (§13) is visible when nidhi/vivecaka are absent (nextest
+# otherwise captures the stderr of passing/skipping tests).
 .PHONY: test-lens-t
 test-lens-t: ## Run the lens T-tier real-TUI suite (§13; loud-skips absent binaries)
-	@echo "$(COLOR_BLUE)▶ Running lens T-tier suite (§13)...$(COLOR_RESET)"
-	@# --no-capture so the loud skip notice (§13) is visible when nidhi/vivecaka
-	@# are absent (nextest otherwise captures stderr of passing/skipping tests).
-	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --no-capture --test lens_ttier
+	$(call lens_run,Running lens T-tier suite (§13),--test lens_ttier,--no-capture)
 
 .PHONY: test-lens-diff-concurrency
 test-lens-diff-concurrency: ## Run the P4 diff concurrent-reader integration test (§7.4 council D2)
-	@echo "$(COLOR_BLUE)▶ Running lens P4 diff concurrency test (§7.4)...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test diff_concurrent_readers
+	$(call lens_run,Running lens P4 diff concurrency test (§7.4),--test diff_concurrent_readers)
 
 .PHONY: test-lens-scratch-reap
 test-lens-scratch-reap: ## Run the P5 scratch reap signal-order test (LENS-R-042, codex B3)
-	@echo "$(COLOR_BLUE)▶ Running lens P5 scratch reap-order test (§8)...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh cargo nextest run -p shux -j 1 --no-fail-fast --test scratch_reap_order
+	$(call lens_run,Running lens P5 scratch reap-order test (§8),--test scratch_reap_order)
+
+.PHONY: test-lens-gate
+test-lens-gate: ## Run the lens-gate GREEN dogfood suite (task 078; capture on real shux TUIs + cross-path PNG) serially under the leak guard
+	$(call lens_run,Running lens-gate dogfood suite (task 078),--test lens_gate_capture)
+
+.PHONY: test-lens-gate-contract
+test-lens-gate-contract: ## Run the frozen 078 lens-gate contract lane (GREEN since 081/082 built its cases)
+	$(call lens_run,Running the frozen 078 lens-gate contract lane,--test lens_gate_contract)
+
+.PHONY: test-lens-gate-comparator
+test-lens-gate-comparator: ## Run the task-079 comparator suite (parity corpus + divergence fixtures + OSC-4 daemon isolation) serially under the leak guard
+	$(call lens_run,Running lens-gate comparator suite (task 079),--test lens_gate_parity --test lens_gate_divergence --test diff_palette_isolation)
+
+.PHONY: test-lens-gate-compare
+test-lens-gate-compare: ## Run the task-080 golden-compare suite (3 tiers + fingerprint + mask invariance + divergence pixel proofs; PURE, CI-run)
+	$(call lens_run_pure,Running lens-gate golden-compare suite (task 080),--test lens_gate_compare)
+
+.PHONY: test-lens-gate-glance-cells
+test-lens-gate-glance-cells: ## Run the task-080 daemon-backed `pane.glance --cells` emission suite serially under the leak guard
+	$(call lens_run,Running lens-gate glance --cells emission suite (task 080),--test lens_gate_glance_cells)
+
+.PHONY: bench-lens-gate
+bench-lens-gate: ## Record task-080 capture/compare/render throughput at 10/100/1000 frames (no daemon; prints numbers)
+	$(call lens_run_pure,Recording lens-gate throughput (task 080 §6),--test lens_gate_bench,--no-capture)
+
+.PHONY: test-lens-gate-run
+test-lens-gate-run: ## Run the task-081 scenario-runner suite (drives real fixture TUIs via `shux lens gate`) serially under the leak guard
+	$(call lens_run,Running lens-gate scenario-runner suite (task 081),--test lens_gate_run)
+
+.PHONY: test-lens-gate-verdict
+test-lens-gate-verdict: ## Run the task-082 verdict/report/xfail/bless/init suite (drives `shux lens gate` end-to-end) serially under the leak guard
+	$(call lens_run,Running lens-gate verdict suite (task 082),--test lens_gate_verdict)
+
+.PHONY: test-lens-gate-settle
+test-lens-gate-settle: ## Run the task-083 settle-hardening + cast gate suite (drives `shux lens gate` end-to-end) serially under the leak guard
+	$(call lens_run,Running lens-gate settle+cast suite (task 083),--test lens_gate_settle)
+
+.PHONY: test-gauntlet-seed
+test-gauntlet-seed: ## Seed one task-084 gauntlet cell: make test-gauntlet-seed AGENT=codex CR=cr-b
+	@.shux/scripts/laghudarshi_gate_gauntlet.sh seed "$(AGENT)" "$(CR)"
+
+.PHONY: test-gauntlet-run
+test-gauntlet-run: ## Drive one cold agent through a seeded cell: make test-gauntlet-run AGENT=codex CR=cr-b
+	@.shux/scripts/laghudarshi_gate_agent.sh "$(AGENT)" "$(CR)" $(if $(TIMEOUT),$(TIMEOUT),1800)
+
+.PHONY: test-gauntlet-verify
+test-gauntlet-verify: ## Verify one cell from supervisor-observed state: make test-gauntlet-verify AGENT=codex CR=cr-b
+	@.shux/scripts/laghudarshi_gate_gauntlet.sh verify "$(AGENT)" "$(CR)"
+
+.PHONY: test-gauntlet-all
+test-gauntlet-all: ## Run the whole task-084 gauntlet SERIALLY (6 cells; long). Override with CELLS="codex:cr-b …"
+	@.shux/scripts/laghudarshi_gate_all.sh $(if $(CELLS),$(CELLS),codex:cr-b codex:cr-a claude:cr-b claude:cr-a agy:cr-b agy:cr-a)
 
 .PHONY: check-lens-frozen
 check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.2)
@@ -443,13 +511,13 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint test test-shux-leak-guard test-agent-review-guard check-tui-qa check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
+check: lint test test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
 
 .PHONY: ci
-ci: lint test-lib test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa ## Run CI pipeline (lint + test-lib + test-doc + process/QA guards)
+ci: lint test-lib test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs ## Run CI pipeline (lint + test-lib + test-doc + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
@@ -496,6 +564,10 @@ check-vt-qa: ## Verify completed VT tasks have tracked SOLID QA evidence
 .PHONY: check-tui-qa
 check-tui-qa: ## Verify tracked general TUI QA evidence manifests
 	@bash scripts/check-tui-qa.sh
+
+.PHONY: check-gate-docs
+check-gate-docs: ## Verify the lens-gate skill reference matches the shipped CLI + THIRD-PARTY-NOTICES
+	@bash scripts/check-gate-docs.sh
 
 .PHONY: check-progress-active
 check-progress-active: ## Verify progress (active session variant, allows In Progress)

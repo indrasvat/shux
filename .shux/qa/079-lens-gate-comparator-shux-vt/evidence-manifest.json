@@ -1,0 +1,66 @@
+{
+  "task": "079-lens-gate-comparator-shux-vt",
+  "task_file": "docs/tasks/079-lens-gate-comparator-shux-vt.md",
+  "branch": "feat/lens-ci-gate",
+  "audited_base_commit": "9742cd365992579a21725d74e6bd1f84a74c09e1",
+  "audited_state": "uncommitted-working-tree",
+  "verdict": "PASS",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.md",
+  "dootsabha_implementation": "dootsabha-implementation.md",
+  "screenshots": [
+    "d2_heat_actual.png",
+    "d2_heat_diff.png",
+    "scrollback_snapshot.png"
+  ],
+  "pixel_metrics": [
+    "d2_heat_pixelmetrics.json"
+  ],
+  "dootsabha_design_details": {
+    "raw": ["dootsabha-raw/design-v1.json", "dootsabha-raw/design-v2.json"],
+    "verdict": "R1 REVISE -> v2 CONVERGED"
+  },
+  "dootsabha_implementation_details": {
+    "raw": ["dootsabha-raw/impl.json"],
+    "verdict": "agy CLEAN; codex one MINOR (GridFrame::cell OOB) fixed + pinned"
+  },
+  "screenshot_details": [
+    {
+      "name": "d2_heat_actual.png",
+      "viewport": "80x24",
+      "source": "F4 lens fixture -> pane.diff_since{heat_png:true} after 'a', independently regenerated",
+      "sha256": "deef295d5c3d55aeadfdb974fbe96a6b385806e790a8d846a35c77e9182e503e",
+      "baseline": ".shux/goldens/lens/d2_heat.png",
+      "inspected": true
+    },
+    {
+      "name": "scrollback_snapshot.png",
+      "viewport": "80x24",
+      "source": "scrolled colored pane (seq 1..60, truecolor+256+basic) -> pane.snapshot",
+      "purpose": "scrollback capture-fix visual proof (recent viewport, not oldest scrollback)",
+      "inspected": true
+    }
+  ],
+  "pixel_metric_details": [
+    {
+      "name": "d2_heat_pixelmetrics.json",
+      "tool": ".claude/automations/pixel_verify.py",
+      "actual": "d2_heat_actual.png",
+      "expected": ".shux/goldens/lens/d2_heat.png",
+      "diff": "d2_heat_diff.png",
+      "max_pixel_diff_ratio": 0,
+      "max_mean_channel_delta": 0,
+      "changed_pixels": 0,
+      "total_pixels": 328320,
+      "status": "pass"
+    }
+  ],
+  "test_surfaces": {
+    "unit_shux_vt": "325/325 passed",
+    "integration": "lens_gate_parity + lens_gate_divergence + diff_palette_isolation passed",
+    "make_test_lens_gate_comparator": "3/3 passed (leak-guarded)",
+    "make_test_lens": "37/37 passed (frozen suite incl. d2_diff_exact_delta + d2_heat golden)",
+    "make_lint": "clippy + fmt clean"
+  },
+  "cleanup": "isolated /tmp/q079 daemon (PID 2260) killed+reaped; zero q079 sockets; no peer daemons touched"
+}

@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "size": {
+    "rows": 3,
+    "cols": 12
+  },
+  "alt_screen": false,
+  "defaults": {},
+  "cursor": {
+    "row": 0,
+    "col": 8,
+    "visible": true,
+    "shape": "block"
+  },
+  "palette_overridden": false,
+  "rows": [
+    {
+      "row": 0,
+      "runs": [
+        [
+          0,
+          "AB"
+        ],
+        [
+          6,
+          "CD"
+        ]
+      ]
+    },
+    {
+      "row": 1,
+      "runs": []
+    },
+    {
+      "row": 2,
+      "runs": []
+    }
+  ]
+}

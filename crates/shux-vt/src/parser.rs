@@ -109,6 +109,11 @@ pub struct VtHandler<'a> {
     pub charsets: &'a mut TerminalCharsets,
     pub tab_stops: &'a mut TabStops,
     pub responses: &'a mut Vec<Vec<u8>>,
+    /// Sticky flag set when a valid OSC 4 palette override is applied. shux-vt
+    /// discards the override (Class-B limitation), so an indexed-colour capture
+    /// taken afterwards is non-portable — the lens gate reads this to emit the
+    /// `palette_unportable` diagnostic (task 078, R1).
+    pub palette_overridden: &'a mut bool,
 }
 
 impl<'a> VtHandler<'a> {
@@ -1492,6 +1497,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
                             terminator
                         ));
                     } else if parse_osc_color(pair[1]).is_ok() {
+                        // The override colour is discarded (Class-B limitation),
+                        // but record that one happened so an indexed-colour
+                        // capture afterwards is flagged non-portable (078 R1).
+                        // This must NOT bump content_revision — the adjudicated
+                        // `osc_4_palette_no_bump` invariant still holds.
+                        *self.palette_overridden = true;
                         self.grid.mark_all_dirty();
                     }
                 }
@@ -1971,6 +1982,7 @@ mod tests {
         }
 
         fn process(&mut self, bytes: &[u8]) {
+            let mut palette_overridden = false;
             let mut handler = VtHandler {
                 grid: &mut self.grid,
                 cursor: &mut self.cursor,
@@ -1986,6 +1998,7 @@ mod tests {
                 charsets: &mut self.charsets,
                 tab_stops: &mut self.tab_stops,
                 responses: &mut self.responses,
+                palette_overridden: &mut palette_overridden,
             };
             self.parser.advance(&mut handler, bytes);
         }

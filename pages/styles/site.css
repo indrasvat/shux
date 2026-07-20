@@ -205,6 +205,13 @@ strong { color: var(--ink); font-weight: 600; }
   color: var(--ink-on-paper);
 }
 
+/* Comment ink inside a code block, resolved per section. Paper sections get the
+   paper grey; dark sections need `--ink-3` (the tone already tuned to clear
+   4.5:1 on `--bg`) — `--ink2-on-paper` on `--bg-2` is 2.3:1 and unreadable. One
+   variable so a block copied between sections can't carry the wrong ink. */
+:root { --code-comment: var(--ink-3); }
+.section.invert { --code-comment: var(--ink2-on-paper); }
+
 .eyebrow {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -260,7 +267,12 @@ strong { color: var(--ink); font-weight: 600; }
 .nav-links a.cta:hover { background: var(--accent-ink); color: #1a0e07; }
 
 @media (max-width: 720px) {
-  .nav-links .lbl { display: none; }
+  /* The section links hide their labels here, but the anchors stayed in the flex row —
+     each still consuming a `gap`, invisible and unclickable. Seven of them plus the CTA
+     overflowed a 360px viewport by 17px (real, user-reachable horizontal scroll, with the
+     CTA cut mid-word). Drop them entirely at this width and keep the mark + CTA, so the
+     row cannot be overflowed by adding a section. */
+  .nav-links a:not(.cta) { display: none; }
   .nav { padding: var(--s-2) var(--s-4); }
 }
 

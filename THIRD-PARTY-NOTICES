@@ -1,0 +1,89 @@
+THIRD-PARTY NOTICES
+===================
+
+shux is MIT licensed. This file records third-party work that influenced parts of
+shux, together with the license under which that work is published.
+
+Nothing listed here is vendored. shux contains no copied source from any project
+below; each entry describes a design or schema shape that was studied and then
+re-implemented in shux's own idiom, in Rust, against shux's own types.
+
+
+-------------------------------------------------------------------------------
+grok-build (xAI) — Apache License 2.0
+-------------------------------------------------------------------------------
+
+    Copyright 2023-2026 SpaceXAI
+    Licensed under the Apache License, Version 2.0
+    https://www.apache.org/licenses/LICENSE-2.0
+
+grok-build ships a mature PTY self-test harness for its terminal UI. While
+designing `shux lens gate` (tasks 078-085) we studied that harness and adapted
+five pieces of its scaffolding. Each was re-implemented; none was copied.
+
+For the record, grok-build has no frame-versus-golden visual regression: its
+verdict comes from inline substring predicates plus a log-invariant xfail matrix
+over producer-emitted JSONL, and its screenshots are written for human
+post-mortem and never compared. The golden diff at the heart of `shux lens gate`
+-- semantic per-cell capture, the three-tier compare, the tolerance model, masks,
+redaction, and the no-self-minted-baseline rule -- is shux's own.
+
+The five adapted items:
+
+1.  report.json / xfail schema shape and exit policy
+    grok-build's harness reports a per-scenario array with a status field and
+    carries expected failures inline with a reason, rather than in a separate
+    ignore list. shux adopts that overall shape and the principle that the
+    machine-readable report -- not the printed summary -- is the source of
+    truth, then extends it with its own frozen status set, exit-code map
+    (0 pass, 1 regression, 2 usage, 3 infra, 5 child died, 6 update refused),
+    and xfail governance (owner, issue, expiry, and a diff fingerprint that
+    scopes the waiver to one specific diff).
+
+2.  `action:`-tagged scenario envelope
+    grok-build's scenarios are a declarative list of steps, each tagged by an
+    action name. shux adopts that envelope for its scenario TOML, with its own
+    step vocabulary bound to shux RPC verbs.
+
+3.  Skip-if-default capture discipline
+    grok-build omits default-valued style attributes from its serialized
+    capture, keeping frames small and diffs legible. shux adopts that
+    discipline for its own capture format, which is a true per-cell grid rather
+    than grok-build's coalesced runs.
+
+4.  Condition-hold settle
+    grok-build waits for a condition to hold rather than sleeping a fixed
+    interval. shux adopts the idea in `hold_settle` and `stable_frames`, keyed
+    on shux's own frame-content revisions.
+
+5.  asciinema `.cast` serializer
+    grok-build can export a run as an asciinema v2 cast. shux adopts the idea
+    for `lens gate --cast`, in its own UTF-8-boundary-safe writer that also
+    emits resize events (grok-build's is pinned to spawn size).
+
+
+-------------------------------------------------------------------------------
+insta (Armin Ronacher) — Apache License 2.0 / MIT
+-------------------------------------------------------------------------------
+
+    https://github.com/mitsuhiko/insta
+
+`shux lens gate review` follows insta's accept / reject / skip review workflow
+for snapshot changes, in preference to a bespoke approval flow. Behaviour and
+implementation are shux's own.
+
+
+-------------------------------------------------------------------------------
+Bundled fonts — SIL Open Font License 1.1
+-------------------------------------------------------------------------------
+
+`shux-raster` embeds five font files for headless PNG rasterization, each
+redistributed unmodified under the SIL Open Font License 1.1. That is why the
+crate declares `license = "MIT AND OFL-1.1"` while the rest of the workspace is
+MIT.
+
+The per-font attribution, copyright lines, and license text live with the assets
+themselves and are the authoritative record:
+
+  crates/shux-raster/assets/NOTICE.md   per-font attribution
+  crates/shux-raster/assets/OFL.txt     the license text

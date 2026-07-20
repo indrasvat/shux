@@ -1,0 +1,17 @@
+{
+  "task": "078-lens-gate-capture-schema-contract",
+  "audited_commit": "8f7c324",
+  "verdict": "PASS",
+  "gate": "shux-vt-solid-qa",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.md",
+  "dootsabha_implementation": "dootsabha-implementation.md",
+  "screenshots": [
+    "pane-80x24-actual.png",
+    "pane-120x40-actual.png"
+  ],
+  "pixel_metrics": [
+    "pixel-metrics-determinism.json"
+  ],
+  "note": "Serialization/contract task; primary pixel proof is the Rust cross-path test semantic_capture_agrees_with_rasterized_pixels (make test-lens-gate). The pane snapshots + rasterizer-determinism metric (ratio 0.0 @ threshold 0) are auxiliary. Per-screenshot inspection findings are in SOLID-QA.md. No golden PNG is minted (task non-goal: No PNG/pixel work)."
+}

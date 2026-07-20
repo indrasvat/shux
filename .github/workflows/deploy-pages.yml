@@ -2,10 +2,23 @@ name: Deploy Pages
 
 # Production deploy path for shux.pages.dev. Triggers on Release
 # workflow completion, on pages/** pushes to main, and via manual
-# dispatch. Pages production_branch is the "production" sentinel —
-# git pushes only create preview deploys; this workflow's
-# `wrangler pages deploy --branch=production` is the sole production
-# path. No race with git auto-deploy.
+# dispatch. The Pages project is Git-connected, so every branch push
+# gets a PREVIEW deploy (and a "Cloudflare Pages" check on the PR)
+# built from `pages/` — that is how a site change gets reviewed before
+# it merges.
+#
+# Production is deliberately NOT reachable from Git, behind two
+# independent guards: `production_branch` is the "production" sentinel
+# that nothing ever pushes to, AND `production_deployments_enabled` is
+# false on the project. This workflow's `wrangler pages deploy
+# --branch=production` is the sole production path, with no race
+# against git auto-deploy.
+#
+# Both guards matter because the deployed tree is NOT `pages/` — the
+# steps below stage `install.sh`, `version.json` and `CHANGELOG.md`
+# into `deploy/`. A Git-built production deploy would publish `pages/`
+# alone and 404 the documented `curl -fsSL .../install.sh | sh` path,
+# so it must never be able to run.
 #
 # Only `github.repository` (non-attacker-controlled) is read from the
 # github context — no event payloads are interpolated into shell.

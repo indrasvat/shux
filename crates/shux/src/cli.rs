@@ -436,6 +436,12 @@ pub enum Command {
     /// Print version information
     Version,
 
+    /// The background daemon that owns every session, pane, and PTY.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+
     /// Configuration helpers
     Config {
         #[command(subcommand)]
@@ -635,6 +641,22 @@ pub enum SessionCommand {
         #[arg(long)]
         watch: bool,
     },
+}
+
+/// Daemon lifecycle. The daemon auto-starts on first use; this is how you stop it.
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Stop the daemon for THIS runtime dir, gracefully (SIGTERM).
+    ///
+    /// Every shux invocation starts a daemon if none is running, and it outlives the
+    /// command — so a scripted or CI run leaks one unless it is stopped. This reaps
+    /// exactly the daemon recorded in `$XDG_RUNTIME_DIR/shux/shux.pid`, never other
+    /// checkouts' or other agents' daemons the way a `pkill -f shux` would. Exits 0 when
+    /// no daemon is running, so it is safe in a cleanup trap.
+    Stop,
+
+    /// Report whether a daemon is running for this runtime dir, and its pid.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1064,6 +1086,26 @@ fn parse_duration_ms(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("duration {s:?} overflows"))
 }
 
+/// Parse a `pane glance --mask ROW,COL,WIDTH` redaction rect (task 080). All three are
+/// `u16`; `WIDTH == 0` is rejected (a zero-width mask redacts nothing — likely a typo).
+fn parse_mask_rect(s: &str) -> Result<(u16, u16, u16), String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != 3 {
+        return Err(format!("mask must be ROW,COL,WIDTH, got {s:?}"));
+    }
+    let field = |name: &str, v: &str| -> Result<u16, String> {
+        v.parse::<u16>()
+            .map_err(|_| format!("mask {name} {v:?} must be a u16"))
+    };
+    let row = field("ROW", parts[0])?;
+    let col = field("COL", parts[1])?;
+    let width = field("WIDTH", parts[2])?;
+    if width == 0 {
+        return Err("mask WIDTH must be > 0 (a zero-width mask redacts nothing)".to_string());
+    }
+    Ok((row, col, width))
+}
+
 #[derive(Subcommand, Debug)]
 pub enum PaneCommand {
     /// List panes in a window
@@ -1451,6 +1493,23 @@ pub enum PaneCommand {
         /// (`checkpoint=true`).
         #[arg(long)]
         checkpoint: bool,
+
+        /// Emit the canonical captured frame (`FrameEnvelope`, task-078 schema)
+        /// as the `cells` field — the lens-gate `cell`-tier golden. Portable,
+        /// JSON-only; no PNG is written for a cell golden (task 080).
+        #[arg(long)]
+        cells: bool,
+
+        /// Write the canonical `cells` JSON to this path (implies `--cells`).
+        /// Otherwise the envelope rides inside `--format json` output.
+        #[arg(long, value_name = "PATH")]
+        cells_out: Option<std::path::PathBuf>,
+
+        /// Redact a rectangular region before serialize/hash/render, as
+        /// `ROW,COL,WIDTH` (repeatable). Masks the emitted `cells`, `text`, AND
+        /// PNG so a timestamp / token never enters a golden (task 080, D4).
+        #[arg(long = "mask", value_name = "ROW,COL,WIDTH", value_parser = parse_mask_rect)]
+        masks: Vec<(u16, u16, u16)>,
     },
 
     /// Block until a pane's screen has been STILL for a quiet window, or
@@ -1474,6 +1533,29 @@ pub enum PaneCommand {
         /// ms. Range [quiet, 600s] — out of range → INVALID_PARAMS (exit 2).
         #[arg(long, default_value = "10s", value_parser = parse_duration_ms)]
         timeout: u64,
+
+        /// Frame-content HOLD (task 083): settle once the presented frame has
+        /// stayed UNCHANGED for this long, even while output keeps pumping
+        /// (silence counts as held). This is the RECOMMENDED settle for an
+        /// animated TUI — it handles both a continuous repainter AND a TUI that
+        /// reaches a static steady state (stops repainting), and rejects a slow
+        /// spinner that quiet-mode false-settles between frames. `0` (default)
+        /// = off. Human duration (`600ms`); range [10ms, 60s] and ≤ --timeout
+        /// — out of range → exit 2.
+        #[arg(long = "hold-ms", default_value = "0", value_parser = parse_duration_ms)]
+        hold_ms: u64,
+
+        /// Frame-content STABLE-FRAMES (task 083): settle once this many
+        /// CONTIGUOUS revisions render an identical frame — a count-based
+        /// alternative to --hold-ms for a TUI that repaints CONTINUOUSLY.
+        /// NOTE: a pane that reaches a STATIC steady state (STOPS repainting)
+        /// never produces K new revisions, so it times out as
+        /// `settle_never_stable`; for such a TUI use --hold-ms (or default
+        /// quiet), which count silence as held. `1` (default) = off; range
+        /// [1, 1000]. Never reaching K within --timeout is a FAILURE
+        /// (`settle_never_stable`), never infra.
+        #[arg(long = "stable-frames", default_value_t = 1)]
+        stable_frames: u32,
     },
 
     /// Capture the pane's current visible frame as a checkpoint for a later
@@ -1599,6 +1681,9 @@ above are pane primitives under `shux pane \u{2026}`, not `shux lens \u{2026}`."
 
 #[derive(Subcommand, Debug)]
 #[command(after_help = LENS_LOOP_RECIPE)]
+// A CLI arg enum parsed once per invocation, not stored hot — the `Gate` variant's rich
+// 082 flag set makes it larger than `Run`, but boxing clap-derived fields buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum LensCommand {
     /// Spawn `argv` directly (no shell, ever) in a hidden, quota-bounded
     /// scratch session. Mirrors `lens.run` RPC (lens PRD §8,
@@ -1662,6 +1747,157 @@ pub enum LensCommand {
         #[arg(last = true, num_args = 1.., required = true, value_name = "ARGV")]
         argv: Vec<String>,
     },
+
+    /// Drive a declarative TOML scenario against a hidden scratch TUI and compare
+    /// captured frames to committed goldens (task 081).
+    ///
+    /// The scenario file (`name`, `command`, optional `cwd` relative to the scenario dir,
+    /// `[terminal]`, `[env]`, `[[steps]]`)
+    /// spawns `command` in a deterministic, deny-by-default sandbox (isolated
+    /// HOME/XDG, `LC_ALL=C.UTF-8`, `TZ=UTC`, `TERM=xterm-256color`), then runs the
+    /// agnostic step core (`wait_for_text`, `settle`, `type_text`, `keys`, `resize`,
+    /// `expect_golden`, `assert_contains`, `expect_exit`, …). `expect_golden` settles
+    /// the pane, captures the canonical frame, and compares it against
+    /// `<scenario-dir>/goldens/<name>/` at the cell/pixel/exact tier.
+    ///
+    /// `expect_golden` settles the pane, captures the canonical frame, compares it against
+    /// the committed golden at the cell/pixel/exact tier, and rolls the per-frame verdicts
+    /// into a governed CI outcome: a machine-readable `report.json` (`--report`), an ASCII
+    /// stdout summary, and a frozen exit-code contract (0 pass · 1 regression · 2 usage ·
+    /// 3 infra · 4 could not write the report · 5 child died · 6 update refused). A frame
+    /// with no committed golden is a CI-safe regression (`missing_golden`) unless
+    /// `--on-missing create`. `--update`
+    /// re-blesses failing goldens (refused in CI / on a dirty tree / on a secret hit).
+    #[command(args_conflicts_with_subcommands = true)]
+    Gate {
+        /// The scenario TOML file (required unless a `review`/`init` subcommand is used).
+        #[arg(value_name = "SCENARIO")]
+        scenario: Option<PathBuf>,
+
+        /// Golden directory (default `<scenario-dir>/goldens/<scenario-name>/`).
+        #[arg(long, value_name = "DIR")]
+        golden_dir: Option<PathBuf>,
+
+        /// Write the machine-readable `report.json` array to PATH, or `-` for stdout
+        /// (stdout then carries ONLY the JSON; the summary moves to stderr).
+        #[arg(long, value_name = "PATH|-")]
+        report: Option<String>,
+
+        /// First-run policy for a frame with no committed golden: `fail` (CI-safe →
+        /// exit 1) or `create` (write a first golden locally; refused in CI).
+        #[arg(long, value_enum, default_value_t = OnMissing::Fail)]
+        on_missing: OnMissing,
+
+        /// Re-bless goldens: `--update` (all failing frames) or `--update <name>` (one
+        /// frame). Refused in CI, on a dirty golden tree, or on a pre-bless secret hit.
+        #[arg(long, value_name = "failing|NAME", num_args = 0..=1, default_missing_value = "failing")]
+        update: Option<String>,
+
+        /// Reason recorded in `BASELINE-APPROVAL.md` when blessing.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+
+        /// Tolerance to record in a freshly-blessed golden sidecar as
+        /// `MAX_CHANNEL_DELTA[,MAX_CHANGED_FRAC]` (bless-only; compare tol always comes
+        /// from the blessed sidecar, never a runtime value).
+        #[arg(long, value_name = "DELTA[,FRAC]", value_parser = parse_tol)]
+        tol: Option<shux_vt::TolParams>,
+
+        /// Directory for scratch evidence (heat PNGs). Default `.shux/out/<scenario>/`.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+
+        /// Retry budget for a flaky frame (task 083): on a compare MISMATCH, re-settle +
+        /// re-capture up to N times before failing. A retry redeems FAIL→PASS only by matching
+        /// the golden (never by consensus among failing captures); a per-step `expect_golden.
+        /// retries` can raise this floor further for one frame.
+        #[arg(long, value_name = "N")]
+        retries: Option<u32>,
+
+        /// Attach a replayable asciinema v2 `.cast` of the whole run beside the report (task
+        /// 083) so a reviewer can scrub how the TUI reached a failing frame. Optional PATH
+        /// (default `<out>/<scenario>.cast`). EPHEMERAL — written under the gitignored out dir,
+        /// never a golden. Armed at spawn (captures startup + resizes).
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+        cast: Option<String>,
+
+        /// Emit the raw runner-signal NDJSON trace to a path, or `-` for stdout.
+        #[arg(long, value_name = "PATH|-")]
+        trace: Option<String>,
+
+        #[command(subcommand)]
+        sub: Option<GateSubcommand>,
+
+        /// Trailing argv after `--` overrides the scenario `command` (same argv,
+        /// different binary — e.g. to point the scenario at a local build).
+        #[arg(last = true, num_args = 0.., value_name = "ARGV")]
+        argv: Vec<String>,
+    },
+}
+
+/// First-run policy for a frame with no committed golden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OnMissing {
+    /// CI-safe: a missing golden is a regression (exit 1). The default.
+    Fail,
+    /// Write a first golden locally (through the approval-gated bless writer). Refused
+    /// in CI so a golden can never be self-minted there.
+    Create,
+}
+
+/// The `lens gate` sub-verbs beyond the default run (insta-style review + init).
+#[derive(Debug, Subcommand)]
+pub enum GateSubcommand {
+    /// insta-style visual review: step through each changed frame and accept (bless),
+    /// reject (leave failing), or skip. Renders before/after + heat inline where the
+    /// terminal supports graphics, else writes PNGs to `--out` and prints paths.
+    Review {
+        /// The scenario TOML file.
+        #[arg(value_name = "SCENARIO")]
+        scenario: PathBuf,
+        /// Golden directory (default `<scenario-dir>/goldens/<scenario-name>/`).
+        #[arg(long, value_name = "DIR")]
+        golden_dir: Option<PathBuf>,
+        /// Directory for review PNGs. Default `.shux/out/<scenario>/`.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+    },
+    /// Scaffold a new scenario `.toml` from a template and (approval-gated) write its
+    /// first goldens. Refused in CI.
+    Init {
+        /// The scenario name (a safe single path component).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Directory to write the scenario `.toml` into. Default the current directory.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+}
+
+/// Parse a bless tolerance `MAX_CHANNEL_DELTA[,MAX_CHANGED_FRAC]` (e.g. `8` or `8,0.01`).
+fn parse_tol(s: &str) -> Result<shux_vt::TolParams, String> {
+    let (delta, frac) = match s.split_once(',') {
+        Some((d, f)) => (d.trim(), Some(f.trim())),
+        None => (s.trim(), None),
+    };
+    let max_channel_delta: u16 = delta
+        .parse()
+        .map_err(|_| format!("invalid --tol delta {delta:?} (expected 0..=255)"))?;
+    let max_changed_frac: f64 = match frac {
+        Some(f) => f
+            .parse()
+            .map_err(|_| format!("invalid --tol frac {f:?} (expected 0.0..=1.0)"))?,
+        None => 0.0,
+    };
+    if !(0.0..=1.0).contains(&max_changed_frac) {
+        return Err(format!(
+            "--tol frac {max_changed_frac} out of range 0.0..=1.0"
+        ));
+    }
+    Ok(shux_vt::TolParams {
+        max_channel_delta,
+        max_changed_frac,
+    })
 }
 
 /// Parse a `COLSxROWS` size flag (e.g. `80x24`) into `(cols, rows)`. Shape
@@ -4028,6 +4264,7 @@ fn lens_glance_exit_code(rpc_error_code: i64) -> i32 {
 /// `shux pane glance` — atomic {png, text, revision} of one pane via
 /// `pane.glance` RPC (lens PRD §5, §10). No session/window resolution:
 /// `pane` is always a raw pane UUID, mirroring the RPC's `pane_id` param.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_glance(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
@@ -4035,6 +4272,9 @@ pub async fn handle_pane_glance(
     text_only: bool,
     no_cursor: bool,
     checkpoint: bool,
+    include_cells: bool,
+    cells_out: Option<std::path::PathBuf>,
+    masks: Vec<(u16, u16, u16)>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     // clap's `conflicts_with` already rejects this combination at parse time
@@ -4043,15 +4283,28 @@ pub async fn handle_pane_glance(
     if text_only && png_path.is_some() {
         anyhow::bail!("--text-only and --png are mutually exclusive");
     }
+    let mask_params: Vec<serde_json::Value> = masks
+        .iter()
+        .map(|(row, col, width)| serde_json::json!({"row": row, "col": col, "width": width}))
+        .collect();
     let params = serde_json::json!({
         "pane_id": pane,
         "include_cursor": !no_cursor,
         "include_png": !text_only,
         "checkpoint": checkpoint,
+        "include_cells": include_cells,
+        "masks": mask_params,
     });
 
     match rpc_call(stream, "pane.glance", params).await {
         Ok(result) => {
+            // Write the canonical `cells` envelope to disk when requested (task 080).
+            if let Some(path) = &cells_out {
+                let Some(cells) = result.get("cells") else {
+                    anyhow::bail!("--cells-out given but the glance result has no cells field");
+                };
+                std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(cells)?))?;
+            }
             if let Some(path) = &png_path {
                 use base64::Engine;
                 let b64 = result.get("png_base64").and_then(|v| v.as_str());
@@ -4170,17 +4423,22 @@ fn lens_wait_settled_exit_code(rpc_error_code: i64) -> i32 {
 /// `pane.wait_settled` RPC (lens PRD §6, §10). `quiet`/`timeout` arrive here
 /// already normalized to milliseconds by `parse_duration_ms`. Exit 0 when
 /// settled, exit 1 on timeout (`settled=false`, a RESULT not an error).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_wait_settled(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
     quiet_ms: u64,
     timeout_ms: u64,
+    hold_ms: u64,
+    stable_frames: u32,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let params = serde_json::json!({
         "pane_id": pane,
         "quiet_ms": quiet_ms,
         "timeout_ms": timeout_ms,
+        "hold_ms": hold_ms,
+        "stable_frames": stable_frames,
     });
 
     match rpc_call(stream, "pane.wait_settled", params).await {
@@ -4230,8 +4488,13 @@ pub async fn handle_pane_wait_settled(
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
+                    // Surface the actionable `data.detail` (e.g. "hold_ms 5 out of range
+                    // [10, 60000]"), not just the generic "invalid_params" message — a first-timer
+                    // who mistypes --hold-ms/--stable-frames/--quiet must be told the range
+                    // (dogfood 083: error actionability).
                     crate::style::print_error(&format!(
-                        "wait-settled failed: {message} (code {code})"
+                        "wait-settled failed: {}",
+                        rpc_display(code, &message, data.as_ref())
                     ));
                 }
             }

@@ -1,0 +1,7 @@
+{
+  "reason": "known heat drift on the spinner cell while the animation lands; tracked",
+  "owner": "aria",
+  "issue": "shux#123",
+  "expiry": "2026-12-31",
+  "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}
