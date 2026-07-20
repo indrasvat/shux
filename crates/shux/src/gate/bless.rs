@@ -701,6 +701,15 @@ mod tests {
         }
     }
 
+    /// These tests exercise the guards BELOW the CI check (secret scan, dirty tree,
+    /// per-frame write), so they must run outside CI mode — `write_targets` refuses
+    /// everything under CI by design, and GitHub Actions sets `CI=true`. Without this the
+    /// tests pass on a developer machine and fail in CI, which is exactly what happened on
+    /// this branch's first PR.
+    fn outside_ci() {
+        unsafe { std::env::remove_var("CI") };
+    }
+
     fn dummy_opts() -> GateRunOptions {
         GateRunOptions {
             scenario_path: "scn.toml".into(),
@@ -758,6 +767,7 @@ mod tests {
 
     #[test]
     fn secret_in_capture_refuses_the_bless() {
+        outside_ci();
         let dir = tempfile::tempdir().unwrap();
         // A capture whose text contains an AWS key.
         let golden = envelope(b"AKIAIOSFODNN7EXAMPLE");
@@ -851,6 +861,7 @@ mod tests {
 
     #[test]
     fn wrapped_secret_is_caught_by_visible_text_scan() {
+        outside_ci();
         // adv Agent B, MAJOR-1: an AWS key that WRAPS at the pane edge is invisible in the
         // rows[].runs[] JSON envelope but must be caught via the reassembled visible text.
         let env = envelope_w(b"AKIAIOSFODNN7EXAMPLE", 12); // 20 chars → wraps at col 12
@@ -882,6 +893,7 @@ mod tests {
 
     #[test]
     fn secret_in_scenario_name_refuses() {
+        outside_ci();
         // adv Agent B, MINOR-4: the scenario name lands in the approval log — scan it.
         let dir = tempfile::tempdir().unwrap();
         let mut scenario = scn();
@@ -906,6 +918,7 @@ mod tests {
 
     #[test]
     fn partial_bless_keeps_the_audit_record() {
+        outside_ci();
         // adv Agent B, MAJOR-3: a mid-batch failure must still leave the committed golden's
         // who/when/why record (the approval line is written per-frame, before the next).
         let dir = tempfile::tempdir().unwrap();
