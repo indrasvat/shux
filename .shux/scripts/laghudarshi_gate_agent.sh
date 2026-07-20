@@ -48,21 +48,30 @@ esac
   || die "refusing to run: ${work_real} does not look like a seeded gauntlet copy"
 
 SKILL_DIR="${GAUNTLET_ROOT}/${agent}/${cr}/shux-skill"
+SHUX_BIN="${REPO_ROOT}/target/release/shux"
+[ -x "${SHUX_BIN}" ] || die "no branch build at ${SHUX_BIN} (run: make release)"
 
 BRIEF="$(cat "${FIXTURE}/gauntlet/${cr}.md")"
 PROMPT="${BRIEF}
 
 Your shell is already in the project directory; work only inside it.
 
-The project's visual gate is driven by \`shux\`, which is on your PATH. Its
-documentation is at ${SKILL_DIR} (start with SKILL.md; references/gate.md covers the
-gate specifically). Read what you need from there.
+The project's visual gate is driven by the \`shux\` tool. Use this build of it:
+
+  ${SHUX_BIN}
+
+(An older \`shux\` is also installed on PATH; it predates this project's gate, so use the
+absolute path above.) Its documentation is at ${SKILL_DIR} — start with SKILL.md;
+references/gate.md covers the gate specifically. Read what you need from there.
 
 When you believe you are done, say so and stop."
 
 # The agents MUST use this branch's build, not the released `shux` on PATH: the released
-# binary predates the scenario `cwd` key the mock depends on. An isolated XDG_RUNTIME_DIR
-# keeps the gauntlet's daemon away from any other shux on this machine.
+# binary predates BOTH `lens gate` as documented and the scenario `cwd` key the mock needs,
+# and BOTH report version 0.44.0, so they are indistinguishable by `--version`. Exporting
+# PATH is NOT sufficient — codex (and any agent that shells out via `bash -lc`) runs a
+# LOGIN shell, which rebuilds PATH from the user's profile and discards the prepend. So the
+# prompt names the absolute path; the export stays as a fallback for non-login shells.
 export PATH="${REPO_ROOT}/target/release:${PATH}"
 export XDG_RUNTIME_DIR="/tmp/sx084-gauntlet"
 mkdir -p "${XDG_RUNTIME_DIR}"
