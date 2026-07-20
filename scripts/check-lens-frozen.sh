@@ -30,8 +30,10 @@
 #       CI / range mode: inspect every commit in BASE..HEAD
 #       (BASE = $LENS_FROZEN_BASE, default origin/main) and require each lane's
 #       trailer on any commit that touches that lane. Merge commits are diffed
-#       against their FIRST PARENT — never skipped (skipping merges would be a
-#       bypass). Shallow/rootless fallback inspects HEAD itself.
+#       via their COMBINED diff (`--cc`) — the content the merge itself introduced.
+#       A clean merge adds nothing and its content is attributed to the commits the
+#       range already inspects; an EVIL merge is still caught. Shallow/rootless
+#       fallback inspects HEAD itself.
 
 set -euo pipefail
 
@@ -93,7 +95,18 @@ fail_frozen() {
 # prefix is caught as a delete.
 commit_changed_files() {
 	local sha="$1"
-	if git rev-parse --verify --quiet "${sha}^1" >/dev/null; then
+	if git rev-parse --verify --quiet "${sha}^2" >/dev/null; then
+		# MERGE commit: report only the COMBINED diff — hunks that differ from EVERY
+		# parent, i.e. content the merge itself introduced ("evil merge"). A clean
+		# merge introduces nothing, and everything it brings in is already attributed
+		# to the individual commits, which this same range inspects. Using the
+		# first-parent diff here instead made GitHub's synthetic `refs/pull/N/merge`
+		# commit — authored by nobody, carrying no trailers — look like one enormous
+		# frozen-path change, so every PR touching a frozen lane failed CI regardless
+		# of the trailers on its real commits. The anti-bypass property is kept: an
+		# evil merge that weakens a frozen test still shows up in the combined diff.
+		git diff-tree --cc --no-renames --no-commit-id --name-only -r "${sha}"
+	elif git rev-parse --verify --quiet "${sha}^1" >/dev/null; then
 		git diff --no-renames --name-only "${sha}^1" "${sha}"
 	else
 		git diff-tree --no-renames --no-commit-id --name-only -r --root "${sha}"
