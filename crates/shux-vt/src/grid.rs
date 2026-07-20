@@ -155,12 +155,8 @@ impl DirtyState {
         self.full_frame = false;
         self.any_dirty = false;
         self.last_full_row = None;
-        for row in &mut self.full_rows {
-            *row = false;
-        }
-        for row in &mut self.rows {
-            *row = None;
-        }
+        self.full_rows.fill(false);
+        self.rows.fill(None);
         regions
     }
 }
@@ -757,10 +753,10 @@ impl Grid {
             let mut removed = 0;
             while removed < excess {
                 // Remove blank rows from the bottom of the visible area.
-                if let Some(back) = self.raw.back() {
-                    if back.is_blank() {
-                        self.raw.pop_back();
-                    }
+                if let Some(back) = self.raw.back()
+                    && back.is_blank()
+                {
+                    self.raw.pop_back();
                 }
                 removed += 1;
             }
@@ -807,14 +803,14 @@ impl Grid {
                 row.cells.clone()
             };
 
-            if let Some((cursor_row, cursor_col)) = cursor_abs {
-                if cursor_row == abs_row {
-                    let row_offset = display_width_until(&row.cells, cursor_col);
-                    cursor_anchor = Some(CursorAnchor {
-                        logical_line: logical_lines.len(),
-                        display_offset: current.display_width + row_offset,
-                    });
-                }
+            if let Some((cursor_row, cursor_col)) = cursor_abs
+                && cursor_row == abs_row
+            {
+                let row_offset = display_width_until(&row.cells, cursor_col);
+                cursor_anchor = Some(CursorAnchor {
+                    logical_line: logical_lines.len(),
+                    display_offset: current.display_width + row_offset,
+                });
             }
 
             current.display_width += display_width(&row_cells);
@@ -831,10 +827,10 @@ impl Grid {
             logical_lines.push(LogicalLine::default());
         }
 
-        if let Some(anchor) = &mut cursor_anchor {
-            if let Some(line) = logical_lines.get(anchor.logical_line) {
-                anchor.display_offset = anchor.display_offset.min(line.display_width);
-            }
+        if let Some(anchor) = &mut cursor_anchor
+            && let Some(line) = logical_lines.get(anchor.logical_line)
+        {
+            anchor.display_offset = anchor.display_offset.min(line.display_width);
         }
 
         let mut reflowed = VecDeque::new();
