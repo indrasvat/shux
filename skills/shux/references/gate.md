@@ -123,7 +123,7 @@ Tiers are **conjunctive**: a matching PNG never overrides a failing cell compare
 # 2. First run: no goldens yet -> exit 1, "no committed golden"
 shux lens gate scenario.toml
 
-# 3. Mint the first goldens, then LOOK at them before committing
+# 3. Mint the first goldens, then REVIEW them before committing
 shux lens gate scenario.toml --on-missing create --reason "first baseline"
 git add goldens/ && git commit
 
@@ -135,8 +135,32 @@ shux lens gate scenario.toml            # exit 0 while nothing moves
 shux lens gate scenario.toml --update --reason "new footer status bar"
 ```
 
-**Blessing is for intended changes only.** If the gate is red and you did not mean to
-change the UI, `--update` hides the bug instead of fixing it. Read the heat PNG first.
+### What a golden is, and how to review one
+
+Goldens live in `<scenario-dir>/goldens/<scenario>/` (override with `--golden-dir`), NOT
+under `.shux/goldens/`. At the `cell` tier each frame is two text files — `<name>.capture.json`
+(the frame: characters plus colour/attributes) and `<name>.fingerprint.json` (the run
+identity) — plus a shared `BASELINE-APPROVAL.md`. **There is no PNG at the cell tier**, so
+there is nothing to "open" in an image viewer; the capture is reviewable as text and diffs
+readably in a PR.
+
+To eyeball what a fresh baseline actually captured, render the same command instead:
+
+```bash
+RUN=$(shux --format json lens run --size 96x26 -- <your command>)
+PANE=$(echo "$RUN" | jq -r .result.pane_id)
+shux pane wait-settled "$PANE" --quiet 300ms
+shux pane glance "$PANE" --png baseline-preview.png
+shux session kill "$(echo "$RUN" | jq -r .result.session_id)"
+```
+
+`shux lens gate review` is for CHANGED frames — it steps through a failing run, not a fresh
+baseline. A `pixel`/`exact` tier golden *is* a committed PNG, per OS/arch.
+
+**Blessing is for intended changes only, and nothing enforces that.** The guards are
+mechanical — CI, dirty tree, secret scan — and none of them can tell an intended
+redesign from a bug. If the gate is red and you did not mean to change the UI, `--update`
+will bless the regression, exit 0, and commit it as the new truth. Read the heat PNG first.
 
 ## Reading a failure
 
@@ -163,8 +187,8 @@ after-nav | fail   | 50      |
 
   This is the field to read for a **colour-only** regression: the text is byte-identical,
   so a text diff shows nothing and the coordinates alone don't say what moved. One entry
-  per contiguous run (`[col, col_end)`), capped so a full-screen recolour can't bloat the
-  report. Absent when only text changed. If the cap truncates, `diff.style_deltas_total`
+  per contiguous run (`[col, col_end)`), capped at **16** so a full-screen recolour can't
+  bloat the report. Absent when only text changed. If the cap truncates, `diff.style_deltas_total`
   appears with the true number of runs — a partial list is never presented as the whole
   story.
 - `--cast [PATH]` records a replayable asciinema v2 file of the whole run, so you can

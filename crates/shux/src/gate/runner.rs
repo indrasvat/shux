@@ -288,10 +288,20 @@ pub fn scenario_dir_of(scenario_path: &Path) -> PathBuf {
 fn resolve_contained_cwd(scenario_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let joined = scenario_dir.join(rel);
     if !joined.is_dir() {
-        return Err(format!(
-            "scenario `cwd` does not exist: '{}' (resolved relative to the scenario directory)",
-            joined.display()
-        ));
+        // 085 F25: distinguish "not there" from "there, but not a directory". Reporting a
+        // file as nonexistent sends the author looking for a missing path that is sitting
+        // in front of them.
+        return Err(if joined.exists() {
+            format!(
+                "scenario `cwd` is not a directory: '{}' exists but is a file",
+                joined.display()
+            )
+        } else {
+            format!(
+                "scenario `cwd` does not exist: '{}' (resolved relative to the scenario directory)",
+                joined.display()
+            )
+        });
     }
     let root = scenario_dir.canonicalize().map_err(|e| {
         format!(

@@ -299,17 +299,56 @@ pub(crate) fn sanitize_note(raw: &str) -> String {
         .collect();
     let collapsed = flat.split_whitespace().collect::<Vec<_>>().join(" ");
     let bounded: String = collapsed.chars().take(240).collect();
-    if crate::gate::secrets::scan(&bounded).is_empty() {
-        bounded
-    } else {
-        "[redacted: note carried secret-shaped content]".to_string()
+    let hits = crate::gate::secrets::scan(&bounded);
+    if hits.is_empty() {
+        return bounded;
     }
+    // 085 F11: the entropy backstop fires on ordinary host PATHS — `/` is an allowed token
+    // character, so a `mkdtemp`-style directory makes the whole path a high-entropy token.
+    // Nuking the message then destroyed the only explanation of a SECURITY refusal: a `cwd`
+    // escaping containment reported `infra_error` with nothing but "[redacted]", which reads
+    // exactly like a transient infra flake. When entropy is the ONLY reason, redact the
+    // offending token and keep the sentence. A named rule (an AWS key, a JWT, a
+    // `password=`) still nukes the note — there the whole message is suspect.
+    if hits.iter().all(|h| h == "high-entropy-token") {
+        return crate::gate::secrets::redact_high_entropy_tokens(&bounded);
+    }
+    "[redacted: note carried secret-shaped content]".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use shux_raster::{PixelMetrics, TierVerdict};
+
+    #[test]
+    fn a_security_refusal_survives_the_secret_scanner() {
+        // 085 F11: `/` is an allowed token character, so an ordinary host path under a
+        // mkdtemp-style directory IS a high-entropy token — and the note was replaced
+        // wholesale, leaving a `cwd`-containment refusal indistinguishable from a
+        // transient infra failure. Redact the token, keep the sentence.
+        let note = "infra: scenario `cwd` escapes the scenario directory: 'outside' \
+                    resolves to '/tmp/elsewhere', outside \
+                    '/private/tmp/Ab3Xy9Zq7Kp2Lm5Nv8Rt4Ws6Yc1D/scn'";
+        let out = sanitize_note(note);
+        assert!(
+            out.contains("escapes the scenario directory"),
+            "the reason must survive: {out}"
+        );
+        assert!(
+            !out.contains("Ab3Xy9Zq7Kp2Lm5Nv8Rt4Ws6Yc1D"),
+            "the high-entropy token must not: {out}"
+        );
+        assert!(out.contains("[redacted]"), "{out}");
+    }
+
+    #[test]
+    fn a_real_secret_still_nukes_the_whole_note() {
+        // The narrowing is scoped to the entropy backstop only. A NAMED rule means the
+        // whole message is suspect and must not be partially emitted.
+        let out = sanitize_note("bless failed for AKIAIOSFODNN7EXAMPLE while writing golden");
+        assert_eq!(out, "[redacted: note carried secret-shaped content]");
+    }
     use shux_vt::{CellVerdict, FrameDiff, LensRowSpan, Tier, XfailMeta};
 
     fn today() -> NaiveDate {

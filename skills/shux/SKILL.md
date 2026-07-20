@@ -45,7 +45,7 @@ Run `shux init` once per project. It creates a top-level `.shux/` dir:
 .shux/
 ├── templates/       # spec.toml files you commit            (committed)
 ├── scripts/         # automation scripts you commit         (committed)
-├── goldens/         # reference PNGs for visual regression  (committed)
+├── goldens/         # reference frames for the manual verify loop  (committed)
 ├── out/             # snapshots, diffs, logs, anything ephemeral  (gitignored)
 └── .gitignore       # ignores `out/`
 ```
@@ -55,7 +55,11 @@ When you write code that produces shux artifacts:
 - Put **templates** under `.shux/templates/` (apply with `shux state apply .shux/templates/<name>.toml`).
 - Put **driver scripts** under `.shux/scripts/`.
 - Write **snapshots, diffs, debug logs** into `.shux/out/` (gitignored by default).
-- Commit **golden images** to `.shux/goldens/` so visual-regression diffs have a ground truth.
+- Commit **reference frames** to `.shux/goldens/` when you diff by hand.
+  `shux lens gate` is different: it keeps each scenario's goldens **beside the scenario
+  file** (`goldens/<scenario>/`, overridable with `--golden-dir`), and at the `cell` tier a
+  golden is a `.capture.json` — reviewable text, not a PNG. Don't hand-place gate goldens
+  under `.shux/goldens/`.
 
 Never pollute `.claude/`, `~/`, or the project root with shux output.
 

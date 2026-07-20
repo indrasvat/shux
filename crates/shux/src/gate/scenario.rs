@@ -540,6 +540,16 @@ pub fn parse(text: &str) -> Result<Scenario, ScenarioError> {
     let cwd = match raw.cwd {
         None => None,
         Some(c) => {
+            // 085 F25: an empty `cwd` was silently treated as `"."` while an empty `name`
+            // is rejected. Say what was meant instead of guessing: omit the key for the
+            // sandbox default, or write `"."` for the scenario's own directory.
+            if c.trim().is_empty() {
+                return Err(ScenarioError(
+                    "`cwd` must not be empty — omit it to keep the sandbox home, or use \
+                     `cwd = \".\"` for the scenario's own directory"
+                        .to_string(),
+                ));
+            }
             let p = std::path::Path::new(&c);
             if p.is_absolute() {
                 return Err(ScenarioError(format!(
@@ -1184,6 +1194,25 @@ expiry="2026-12-31"
     fn deadline_ms_parsed() {
         let toml = "name=\"x\"\ncommand=[\"true\"]\ndeadline_ms=1234\n";
         assert_eq!(parse(toml).unwrap().deadline_ms, 1234);
+    }
+
+    #[test]
+    fn empty_cwd_is_rejected_not_guessed() {
+        // 085 F25: `cwd = ""` was silently accepted as `"."` while `name = ""` was
+        // rejected — two spellings of "nothing", two different answers.
+        let err = parse("name=\"x\"\ncommand=[\"true\"]\ncwd=\"\"\n")
+            .unwrap_err()
+            .0;
+        assert!(err.contains("must not be empty"), "{err}");
+        // The two meaningful spellings still parse.
+        assert_eq!(
+            parse("name=\"x\"\ncommand=[\"true\"]\ncwd=\".\"\n")
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(".")
+        );
+        assert_eq!(parse("name=\"x\"\ncommand=[\"true\"]\n").unwrap().cwd, None);
     }
 
     #[test]

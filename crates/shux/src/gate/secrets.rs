@@ -69,6 +69,40 @@ pub fn scan(text: &str) -> Vec<String> {
     hits
 }
 
+/// Replace only the high-entropy TOKENS in `text` with `[redacted]`, preserving everything
+/// else (085 F11).
+///
+/// The entropy backstop fires on ordinary host paths — a `mkdtemp` directory component is
+/// long, mixed-class and non-hex — and the caller's response was to discard the whole
+/// message. That destroyed the only explanation of a SECURITY refusal: a `cwd` escaping
+/// containment reported `infra_error` with nothing but "[redacted]", indistinguishable from
+/// a transient failure. Redacting the token keeps the sentence, and the sentence is the
+/// part the reader needs.
+pub fn redact_high_entropy_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if !token.is_empty() {
+            if is_high_entropy_token(token) {
+                out.push_str("[redacted]");
+            } else {
+                out.push_str(token);
+            }
+            token.clear();
+        }
+    };
+    for c in text.chars() {
+        if c.is_whitespace() || matches!(c, '"' | '\'' | '=' | ',' | ';' | '<' | '>') {
+            flush(&mut token, &mut out);
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
 /// True if any whitespace-delimited token looks like a high-entropy secret: length ≥ 24,
 /// mixed letters AND digits, Shannon entropy ≥ 4.2 bits/char, and NOT a plain hex/decimal
 /// hash (git shas, content digests in normal output must not block a bless). The 24-char
