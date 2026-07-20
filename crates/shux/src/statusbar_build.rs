@@ -138,14 +138,12 @@ pub fn build(snap: &SessionGraphSnapshot, theme: &Theme, ctx: &StatusBarCtx<'_>)
         to_color(theme.status_accent),
         true,
     ));
-    if show_branch {
-        if let Some(branch) = ctx.session_meta.git_branch.as_ref() {
-            bar.left.push(StatusSegment::styled(
-                format!("{icon_branch} {branch} "),
-                to_color(theme.status_branch),
-                false,
-            ));
-        }
+    if show_branch && let Some(branch) = ctx.session_meta.git_branch.as_ref() {
+        bar.left.push(StatusSegment::styled(
+            format!("{icon_branch} {branch} "),
+            to_color(theme.status_branch),
+            false,
+        ));
     }
     if show_ssh {
         bar.left.push(StatusSegment::styled(
@@ -209,15 +207,15 @@ pub fn build(snap: &SessionGraphSnapshot, theme: &Theme, ctx: &StatusBarCtx<'_>)
                 false,
             ));
 
-            if let Some((label, at)) = ctx.last_action {
-                if at.elapsed() < ACTION_FEEDBACK_DWELL {
-                    bar.center.clear();
-                    bar.center.push(StatusSegment::styled(
-                        format!(" [{}] ", label),
-                        to_color(theme.status_accent),
-                        true,
-                    ));
-                }
+            if let Some((label, at)) = ctx.last_action
+                && at.elapsed() < ACTION_FEEDBACK_DWELL
+            {
+                bar.center.clear();
+                bar.center.push(StatusSegment::styled(
+                    format!(" [{}] ", label),
+                    to_color(theme.status_accent),
+                    true,
+                ));
             }
         }
     }

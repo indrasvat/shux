@@ -469,7 +469,7 @@ fn hex_encode(bytes: Vec<u8>) -> String {
 
 fn hex_decode(hex: &str) -> Result<Vec<u8>> {
     let compact: String = hex.chars().filter(|ch| !ch.is_whitespace()).collect();
-    if compact.len() % 2 != 0 {
+    if !compact.len().is_multiple_of(2) {
         return Err(format!("hex string has odd length: {hex}").into());
     }
     let mut out = Vec::with_capacity(compact.len() / 2);

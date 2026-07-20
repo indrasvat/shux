@@ -1422,10 +1422,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
             // OSC 0 -- Set Icon Name and Window Title.
             // OSC 2 -- Set Window Title.
             b"0" | b"2" => {
-                if let Some(title_bytes) = params.get(1) {
-                    if let Ok(title) = std::str::from_utf8(title_bytes) {
-                        *self.title = Some(title.to_string());
-                    }
+                if let Some(title_bytes) = params.get(1)
+                    && let Ok(title) = std::str::from_utf8(title_bytes)
+                {
+                    *self.title = Some(title.to_string());
                 }
             }
             // OSC 10/11/12 -- Set dynamic default foreground/background/cursor.
@@ -1484,8 +1484,8 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 }
             }
             b"4" => {
-                let mut parts = params[1..].chunks_exact(2);
-                for pair in &mut parts {
+                let (pairs, _odd_trailing) = params[1..].as_chunks::<2>();
+                for pair in pairs {
                     let Ok(index) = std::str::from_utf8(pair[0]).unwrap_or("").parse::<u8>() else {
                         continue;
                     };
@@ -1870,12 +1870,15 @@ fn append_underline_color_sgr(params: &mut Vec<String>, color: Color) {
 }
 
 fn decode_hex_ascii(encoded: &str) -> Option<String> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return None;
     }
+    // Remainder is provably empty — the length guard above rejects odd input.
     let bytes = encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let hex = std::str::from_utf8(pair).ok()?;
             u8::from_str_radix(hex, 16).ok()

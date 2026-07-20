@@ -349,19 +349,19 @@ fn ansi_to_segments(bytes: &[u8]) -> Vec<StatusSegment> {
                 c.text.push_str(&seg.text);
             }
             _ => {
-                if let Some(c) = current.take() {
-                    if !c.text.is_empty() {
-                        out.push(c);
-                    }
+                if let Some(c) = current.take()
+                    && !c.text.is_empty()
+                {
+                    out.push(c);
                 }
                 current = Some(seg);
             }
         }
     }
-    if let Some(c) = current {
-        if !c.text.is_empty() {
-            out.push(c);
-        }
+    if let Some(c) = current
+        && !c.text.is_empty()
+    {
+        out.push(c);
     }
     out
 }

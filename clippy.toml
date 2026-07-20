@@ -1,2 +1,7 @@
 # clippy.toml — Clippy configuration for shux
-msrv = "1.85"
+#
+# NO `msrv` key here on purpose. Clippy reads `rust-version` from Cargo.toml
+# (workspace: 1.93). A duplicate `msrv` here overrides it and drifts: it read
+# 1.85 while the workspace required 1.93, so clippy suppressed every lint gated
+# above 1.85 and warned about the mismatch on every run.
+# One source of truth — bump `rust-version` in Cargo.toml.

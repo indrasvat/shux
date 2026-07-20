@@ -132,27 +132,28 @@ impl CommandEngine {
                     let exit_code_str = &after[..end_pos];
                     let exit_code = exit_code_str.trim().parse::<i32>().ok();
 
-                    if let Some(tracked) = self.commands.get_mut(cmd_id) {
-                        if tracked.pane_id == pane_id && tracked.state == CommandState::Running {
-                            tracked.state = CommandState::Completed;
-                            let runtime = tracked.started_at.elapsed();
+                    if let Some(tracked) = self.commands.get_mut(cmd_id)
+                        && tracked.pane_id == pane_id
+                        && tracked.state == CommandState::Running
+                    {
+                        tracked.state = CommandState::Completed;
+                        let runtime = tracked.started_at.elapsed();
 
-                            let result = CommandResult {
-                                command_id: *cmd_id,
-                                state: "completed".to_string(),
-                                exit_code,
-                                stdout: String::new(), // Filled from VT capture
-                                runtime_ms: runtime.as_millis() as u64,
-                            };
+                        let result = CommandResult {
+                            command_id: *cmd_id,
+                            state: "completed".to_string(),
+                            exit_code,
+                            stdout: String::new(), // Filled from VT capture
+                            runtime_ms: runtime.as_millis() as u64,
+                        };
 
-                            // Notify sync caller if present
-                            if let Some(tx) = tracked.completion_tx.take() {
-                                let _ = tx.send(result.clone());
-                            }
-
-                            completed.push(result);
-                            found_markers.push(marker.clone());
+                        // Notify sync caller if present
+                        if let Some(tx) = tracked.completion_tx.take() {
+                            let _ = tx.send(result.clone());
                         }
+
+                        completed.push(result);
+                        found_markers.push(marker.clone());
                     }
 
                     // Trim the buffer up to and including the marker
@@ -178,11 +179,11 @@ impl CommandEngine {
             if let Some(buf) = self.pane_buffers.get_mut(&pane_id) {
                 buf.clear();
             }
-        } else if let Some(buf) = self.pane_buffers.get_mut(&pane_id) {
-            if buf.len() > 4096 {
-                let start = buf.len() - 4096;
-                *buf = buf[start..].to_string();
-            }
+        } else if let Some(buf) = self.pane_buffers.get_mut(&pane_id)
+            && buf.len() > 4096
+        {
+            let start = buf.len() - 4096;
+            *buf = buf[start..].to_string();
         }
 
         completed
@@ -228,24 +229,24 @@ impl CommandEngine {
 
     /// Cancel a running command. Returns the pane_id if found and cancelled.
     pub fn cancel_command(&mut self, command_id: Uuid) -> Option<Uuid> {
-        if let Some(tracked) = self.commands.get_mut(&command_id) {
-            if tracked.state == CommandState::Running {
-                tracked.state = CommandState::Cancelled;
-                let pane_id = tracked.pane_id;
-                self.marker_index.remove(&tracked.marker);
+        if let Some(tracked) = self.commands.get_mut(&command_id)
+            && tracked.state == CommandState::Running
+        {
+            tracked.state = CommandState::Cancelled;
+            let pane_id = tracked.pane_id;
+            self.marker_index.remove(&tracked.marker);
 
-                if let Some(tx) = tracked.completion_tx.take() {
-                    let _ = tx.send(CommandResult {
-                        command_id,
-                        state: "cancelled".to_string(),
-                        exit_code: None,
-                        stdout: String::new(),
-                        runtime_ms: tracked.started_at.elapsed().as_millis() as u64,
-                    });
-                }
-
-                return Some(pane_id);
+            if let Some(tx) = tracked.completion_tx.take() {
+                let _ = tx.send(CommandResult {
+                    command_id,
+                    state: "cancelled".to_string(),
+                    exit_code: None,
+                    stdout: String::new(),
+                    runtime_ms: tracked.started_at.elapsed().as_millis() as u64,
+                });
             }
+
+            return Some(pane_id);
         }
         None
     }

@@ -315,15 +315,15 @@ impl LayoutNode {
             Self::Leaf { .. } => None,
             Self::Split { dir, ratio, a, b } => {
                 // Direct child removal
-                if let Self::Leaf { pane } = a.as_ref() {
-                    if *pane == target {
-                        return Some((**b).clone());
-                    }
+                if let Self::Leaf { pane } = a.as_ref()
+                    && *pane == target
+                {
+                    return Some((**b).clone());
                 }
-                if let Self::Leaf { pane } = b.as_ref() {
-                    if *pane == target {
-                        return Some((**a).clone());
-                    }
+                if let Self::Leaf { pane } = b.as_ref()
+                    && *pane == target
+                {
+                    return Some((**a).clone());
                 }
 
                 // Recurse

@@ -142,10 +142,10 @@ fn try_read_pid(path: &Path) -> Option<u32> {
 fn wait_for_pid_file(path: &Path) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if let Some(pid) = try_read_pid(path) {
-            if pid_exists(pid) {
-                return pid;
-            }
+        if let Some(pid) = try_read_pid(path)
+            && pid_exists(pid)
+        {
+            return pid;
         }
         thread::sleep(Duration::from_millis(50));
     }

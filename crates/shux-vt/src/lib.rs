@@ -437,15 +437,15 @@ impl VirtualTerminal {
                 alt.resize_canvas(rows, cols);
             }
         }
-        if let Some(ref mut present) = self.sync_present {
-            if let Some((row, col)) = present.grid.resize_with_cursor(
+        if let Some(ref mut present) = self.sync_present
+            && let Some((row, col)) = present.grid.resize_with_cursor(
                 rows,
                 cols,
                 Some((present.cursor.row, present.cursor.col)),
-            ) {
-                present.cursor.row = row;
-                present.cursor.col = col;
-            }
+            )
+        {
+            present.cursor.row = row;
+            present.cursor.col = col;
         }
         self.rows = rows;
         self.cols = cols;

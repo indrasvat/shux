@@ -611,15 +611,15 @@ impl SessionGraph {
             .get(&id)
             .ok_or(GraphError::SessionNotFound(id))?;
 
-        if let Some(ev) = expected_version {
-            if session.version != ev {
-                return Err(GraphError::VersionConflict {
-                    resource: "session",
-                    id: id.to_string(),
-                    expected: ev,
-                    actual: session.version,
-                });
-            }
+        if let Some(ev) = expected_version
+            && session.version != ev
+        {
+            return Err(GraphError::VersionConflict {
+                resource: "session",
+                id: id.to_string(),
+                expected: ev,
+                actual: session.version,
+            });
         }
 
         let killed_name = session.name.clone();
@@ -692,15 +692,15 @@ impl SessionGraph {
             .get(&id)
             .ok_or(GraphError::SessionNotFound(id))?;
 
-        if let Some(ev) = expected_version {
-            if session.version != ev {
-                return Err(GraphError::VersionConflict {
-                    resource: "session",
-                    id: id.to_string(),
-                    expected: ev,
-                    actual: session.version,
-                });
-            }
+        if let Some(ev) = expected_version
+            && session.version != ev
+        {
+            return Err(GraphError::VersionConflict {
+                resource: "session",
+                id: id.to_string(),
+                expected: ev,
+                actual: session.version,
+            });
         }
 
         if current.session_name_exists(&new_name) {
@@ -795,15 +795,15 @@ impl SessionGraph {
             .get(&id)
             .ok_or(GraphError::WindowNotFound(id))?;
 
-        if let Some(ev) = expected_version {
-            if window.version != ev {
-                return Err(GraphError::VersionConflict {
-                    resource: "window",
-                    id: id.to_string(),
-                    expected: ev,
-                    actual: window.version,
-                });
-            }
+        if let Some(ev) = expected_version
+            && window.version != ev
+        {
+            return Err(GraphError::VersionConflict {
+                resource: "window",
+                id: id.to_string(),
+                expected: ev,
+                actual: window.version,
+            });
         }
 
         let session = current
@@ -885,15 +885,15 @@ impl SessionGraph {
             .get(&id)
             .ok_or(GraphError::WindowNotFound(id))?;
 
-        if let Some(ev) = expected_version {
-            if window.version != ev {
-                return Err(GraphError::VersionConflict {
-                    resource: "window",
-                    id: id.to_string(),
-                    expected: ev,
-                    actual: window.version,
-                });
-            }
+        if let Some(ev) = expected_version
+            && window.version != ev
+        {
+            return Err(GraphError::VersionConflict {
+                resource: "window",
+                id: id.to_string(),
+                expected: ev,
+                actual: window.version,
+            });
         }
 
         let session_id = window.session_id;
@@ -905,12 +905,11 @@ impl SessionGraph {
             .ok_or(GraphError::SessionNotFound(session_id))?;
 
         for wid in &session.windows {
-            if *wid != id {
-                if let Some(w) = current.windows.get(wid) {
-                    if w.title == new_title {
-                        return Err(GraphError::WindowNameConflict(new_title));
-                    }
-                }
+            if *wid != id
+                && let Some(w) = current.windows.get(wid)
+                && w.title == new_title
+            {
+                return Err(GraphError::WindowNameConflict(new_title));
             }
         }
 
@@ -948,15 +947,15 @@ impl SessionGraph {
             .get(&id)
             .ok_or(GraphError::WindowNotFound(id))?;
 
-        if let Some(ev) = expected_version {
-            if window.version != ev {
-                return Err(GraphError::VersionConflict {
-                    resource: "window",
-                    id: id.to_string(),
-                    expected: ev,
-                    actual: window.version,
-                });
-            }
+        if let Some(ev) = expected_version
+            && window.version != ev
+        {
+            return Err(GraphError::VersionConflict {
+                resource: "window",
+                id: id.to_string(),
+                expected: ev,
+                actual: window.version,
+            });
         }
 
         let session_id = window.session_id;
@@ -1003,15 +1002,15 @@ impl SessionGraph {
             .get(&id)
             .ok_or(GraphError::WindowNotFound(id))?;
 
-        if let Some(ev) = expected_version {
-            if window.version != ev {
-                return Err(GraphError::VersionConflict {
-                    resource: "window",
-                    id: id.to_string(),
-                    expected: ev,
-                    actual: window.version,
-                });
-            }
+        if let Some(ev) = expected_version
+            && window.version != ev
+        {
+            return Err(GraphError::VersionConflict {
+                resource: "window",
+                id: id.to_string(),
+                expected: ev,
+                actual: window.version,
+            });
         }
 
         let session_id = window.session_id;
@@ -1032,12 +1031,12 @@ impl SessionGraph {
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
-        if let Some(s) = snapshot.sessions.get_mut(&session_id) {
-            if let Some(current_index) = s.windows.iter().position(|wid| *wid == id) {
-                s.windows.remove(current_index);
-                s.windows.insert(new_index, id);
-                s.version += 1;
-            }
+        if let Some(s) = snapshot.sessions.get_mut(&session_id)
+            && let Some(current_index) = s.windows.iter().position(|wid| *wid == id)
+        {
+            s.windows.remove(current_index);
+            s.windows.insert(new_index, id);
+            s.version += 1;
         }
 
         self.commit_snapshot(snapshot);
@@ -1097,15 +1096,15 @@ impl SessionGraph {
 
         let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
 
-        if let Some(ev) = expected_version {
-            if pane.version != ev {
-                return Err(GraphError::VersionConflict {
-                    resource: "pane",
-                    id: id.to_string(),
-                    expected: ev,
-                    actual: pane.version,
-                });
-            }
+        if let Some(ev) = expected_version
+            && pane.version != ev
+        {
+            return Err(GraphError::VersionConflict {
+                resource: "pane",
+                id: id.to_string(),
+                expected: ev,
+                actual: pane.version,
+            });
         }
 
         let window_pane_count = current
@@ -1571,10 +1570,10 @@ impl SessionGraph {
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
         // Unzoom first if zoomed
-        if window.layout.is_zoomed() {
-            if let Some(zoom) = window.layout.zoom.take() {
-                window.layout.tree = zoom.saved_layout;
-            }
+        if window.layout.is_zoomed()
+            && let Some(zoom) = window.layout.zoom.take()
+        {
+            window.layout.tree = zoom.saved_layout;
         }
 
         if let Some(new_tree) = window.layout.tree.resize_pane(id, direction, delta) {
@@ -1693,15 +1692,15 @@ impl SessionGraph {
             return Err(GraphError::PaneCrossWindow);
         }
 
-        if let Some(ev) = expected_version {
-            if pane_a.version != ev {
-                return Err(GraphError::VersionConflict {
-                    resource: "pane",
-                    id: a.to_string(),
-                    expected: ev,
-                    actual: pane_a.version,
-                });
-            }
+        if let Some(ev) = expected_version
+            && pane_a.version != ev
+        {
+            return Err(GraphError::VersionConflict {
+                resource: "pane",
+                id: a.to_string(),
+                expected: ev,
+                actual: pane_a.version,
+            });
         }
 
         let window_id = pane_a.window_id;
@@ -1715,10 +1714,10 @@ impl SessionGraph {
             .ok_or(GraphError::WindowNotFound(window_id))?;
 
         // Unzoom first if zoomed
-        if window.layout.is_zoomed() {
-            if let Some(zoom) = window.layout.zoom.take() {
-                window.layout.tree = zoom.saved_layout;
-            }
+        if window.layout.is_zoomed()
+            && let Some(zoom) = window.layout.zoom.take()
+        {
+            window.layout.tree = zoom.saved_layout;
         }
 
         if let Some(new_tree) = window.layout.tree.swap_panes(a, b) {
@@ -2619,11 +2618,11 @@ mod tests {
                 .await
                 .expect("event should arrive")
                 .expect("bus not closed");
-            if let crate::bus::SubscriptionEvent::Event(e) = next {
-                if let EventData::PaneCreated { command, .. } = &e.data {
-                    assert_eq!(command, &vec!["bash".to_string()]);
-                    return;
-                }
+            if let crate::bus::SubscriptionEvent::Event(e) = next
+                && let EventData::PaneCreated { command, .. } = &e.data
+            {
+                assert_eq!(command, &vec!["bash".to_string()]);
+                return;
             }
         }
         panic!("PaneCreated event with non-empty command never arrived");

@@ -582,13 +582,13 @@ pub fn parse(text: &str) -> Result<Scenario, ScenarioError> {
     // Frame names must be unique (a duplicate golden name is ambiguous).
     let mut seen = std::collections::HashSet::new();
     for (idx, s) in steps.iter().enumerate() {
-        if let Step::ExpectGolden { name, .. } = s {
-            if !seen.insert(name.clone()) {
-                return Err(ScenarioError::at(
-                    idx,
-                    format!("duplicate expect_golden name {name:?}"),
-                ));
-            }
+        if let Step::ExpectGolden { name, .. } = s
+            && !seen.insert(name.clone())
+        {
+            return Err(ScenarioError::at(
+                idx,
+                format!("duplicate expect_golden name {name:?}"),
+            ));
         }
     }
 

@@ -1149,12 +1149,13 @@ fn validate_row(row: &RowRepr, cols: u16) -> Result<(), CaptureError> {
             )));
         }
         // Adjacent (no gap) + same key ⇒ should have been one run.
-        if let Some((prev_end, prev_key)) = &prev {
-            if *prev_end == col && *prev_key == key {
-                return Err(err(format!(
-                    "run at col {col} is adjacent to the previous run with the same style/kind; it must coalesce (non-canonical)"
-                )));
-            }
+        if let Some((prev_end, prev_key)) = &prev
+            && *prev_end == col
+            && *prev_key == key
+        {
+            return Err(err(format!(
+                "run at col {col} is adjacent to the previous run with the same style/kind; it must coalesce (non-canonical)"
+            )));
         }
         let end = col
             .checked_add(span)

@@ -150,26 +150,26 @@ impl LensAuditLog {
         // header that chains directly off the rotated-out file's final
         // hash and names its predecessor, so `verify_chain_set` can walk
         // the whole rotation set as ONE chain.
-        if let Ok(meta) = std::fs::metadata(&self.path) {
-            if meta.len() > AUDIT_ROTATE_AT_BYTES {
-                if let Err(e) = rotate_audit(&self.path) {
-                    tracing::warn!(error = %e, "lens-audit: rotation failed; appending to the oversized file");
-                } else {
-                    let predecessor = self
-                        .path
-                        .with_extension("ndjson.1")
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "lens-audit.ndjson.1".to_string());
-                    self.append_locked(
-                        &mut last,
-                        json!({
-                            "ts": iso_now(),
-                            "method": "audit.rotate",
-                            "predecessor": predecessor,
-                        }),
-                    );
-                }
+        if let Ok(meta) = std::fs::metadata(&self.path)
+            && meta.len() > AUDIT_ROTATE_AT_BYTES
+        {
+            if let Err(e) = rotate_audit(&self.path) {
+                tracing::warn!(error = %e, "lens-audit: rotation failed; appending to the oversized file");
+            } else {
+                let predecessor = self
+                    .path
+                    .with_extension("ndjson.1")
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "lens-audit.ndjson.1".to_string());
+                self.append_locked(
+                    &mut last,
+                    json!({
+                        "ts": iso_now(),
+                        "method": "audit.rotate",
+                        "predecessor": predecessor,
+                    }),
+                );
             }
         }
 
@@ -1425,10 +1425,9 @@ async fn wait_for_pane_exit(mut sub: shux_core::bus::Subscription, pane_id: Pane
                     exit_status,
                     ..
                 } = ev.data
+                    && pid == pane_id
                 {
-                    if pid == pane_id {
-                        return exit_status;
-                    }
+                    return exit_status;
                 }
             }
             Some(SubscriptionEvent::Lagged(_)) => continue,

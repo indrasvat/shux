@@ -253,10 +253,10 @@ impl Pane {
         if let Some(m) = self.manual_title.as_deref() {
             return m;
         }
-        if self.auto_title {
-            if let Some(o) = self.osc_title.as_deref() {
-                return o;
-            }
+        if self.auto_title
+            && let Some(o) = self.osc_title.as_deref()
+        {
+            return o;
         }
         &self.title
     }
