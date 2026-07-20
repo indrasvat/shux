@@ -204,10 +204,11 @@ colour classes, masks and tiers are all clean.
   entropy heuristic when the host path carries a high-entropy segment. Exit 3 still fires,
   so nothing passes silently, but the explanation is lost. Joins the 082 scanner-tuning
   item. **Deferred to 082.**
-- **F12 — `style_deltas` cannot describe a purely additive colour change** (it iterates the
-  expected frame's rows, so styling where the golden was blank yields no entries). Correct
-  for its purpose — new text is visible in `regions` and the capture — but recorded so its
-  absence is not misread. **WONTFIX, documented.**
+- **F12 — `style_deltas` could not describe a purely additive colour change.**
+  **SUPERSEDED:** F13's union fix resolved this as a side effect — additive styling is now
+  described (re-verified: a CR-A footer probe reports `row 15 [0,35) default => dim` where
+  the golden stored nothing). Recorded rather than deleted so the earlier WONTFIX is not
+  read as still true.
 - **F10 — `claude -p` / `agy -p` transcripts are final-message only**, so per-step friction
   is observable for codex alone. The pass bar is state-based, so no verdict depends on it.
   `--output-format stream-json` would capture it. **Accepted for this gauntlet.**
