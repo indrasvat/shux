@@ -7041,7 +7041,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     Ok(())
                 } else {
                     let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-                    cli::handle_apply(&mut stream, ops, watch, &socket_path).await
+                    cli::handle_apply(&mut stream, ops, watch, &socket_path, args.format).await
                 }
             }
         },
@@ -7692,7 +7692,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             }
 
             let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
-            cli::handle_apply(&mut stream, ops, watch, &socket_path).await
+            cli::handle_apply(&mut stream, ops, watch, &socket_path, args.format).await
         }
 
         Some(Command::Init { dir }) => {
