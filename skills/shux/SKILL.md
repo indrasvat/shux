@@ -372,7 +372,12 @@ Full protocol — handshake, event payload shape, RPC-out direction,
 
 - `pane.set_size` is synchronous (oneshot ack). The next `pane.snapshot` sees the new dims. No sleep needed between them.
 - `pane.snapshot` caps the output at 16M pixels (~4000×4000). Resize first if you'd exceed.
+  If you pass `-o frame.png`, omit `--format json` unless you also want the full RPC JSON
+  printed to stdout; JSON mode still includes `png_base64` even though the PNG file was
+  written.
 - `pane wait-for -s SESSION` targets the session's **active pane** (often the last-spawned). In multi-pane templates pass `--pane <UUID>` (from `pane list` or `state.apply`'s `spawn_results`) — otherwise the wait will silently watch the wrong pane and time out.
+  The needle is explicit: `shux pane wait-for -s SESSION -p PANE --text 'ready'`, not a
+  positional argument. Use `--regex` for regex needles.
 - `pane.send_keys --text` is JSON-quoted text. For raw control bytes (Esc/Enter/Tab/Ctrl+letter), use `--data` with base64.
 - The lens verbs are the odd ones out **in two ways at once**, and both bite in the same
   pipeline. `lens run` plus the four lens `pane` verbs
@@ -381,10 +386,18 @@ Full protocol — handshake, event payload shape, RPC-out direction,
   2. wrap their `--format json` output in a `result` envelope — `jq -r .result.revision`.
 
   Every OTHER verb uses `-s/--session` (+ optional `-w/--window`, `-p/--pane`) and returns
-  its payload **bare** — `session create` → `jq -r .pane_id`, `pane snapshot` → `jq -r
-  .png_base64`, `pane list` / `window list` → a bare JSON array. Reaching for
-  `.result.pane_id` on `session create` yields `null`, not an error, so the mistake
-  surfaces later as an empty variable rather than a failed command.
+  its payload **bare** — but "bare" still means each verb's own RPC shape, not one uniform
+  list shape.
+  - `session create --format json` returns a session object: `jq -r .id` for the session,
+    `jq -r .window_id` for the first window, `jq -r .pane_id` for the first pane. There is
+    no `.session_id` field.
+  - `session list --format json` returns an object wrapping the array:
+    `jq -r '.sessions[].id'`.
+  - `pane list --format json` and `window list --format json` return a bare JSON array:
+    `jq -r '.[].id'`.
+
+  Reaching for `.result.pane_id` or `.session_id` on `session create` yields `null`, not an
+  error, so the mistake surfaces later as an empty variable rather than a failed command.
 - `session kill` and the `-s/--session` flag on every `pane`/`window` subcommand (incl. snapshots) accept a session NAME **or** a UUID — including the `session_id` a `lens run` response hands you for its scratch session. UUID-shaped input (hyphenated or 32-hex) resolves as an ID first, falling back to a session NAMED that string; the ID wins when both match (warning printed). Exceptions: `session rename`, `session save`, and `session attach` are NAME-only.
 - `lens run --wait` on a signal-killed child (e.g. reaped by `--max-runtime`) reports RPC `exit_code: -1`, which the shell sees as `$? == 255` (Unix truncates negative process exits to 8 bits) — 255 there means "never exited on its own", not a literal child exit code.
 - `lens run`, `pane glance`, and `pane diff --heat` output can contain whatever the pane displays, including secrets. No automated redaction — don't glance/diff a pane you didn't spawn yourself unless asked to.

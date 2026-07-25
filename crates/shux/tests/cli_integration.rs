@@ -247,6 +247,33 @@ fn register_session_methods(
         )
 }
 
+fn register_state_apply_method(builder: shux_rpc::RouterBuilder) -> shux_rpc::RouterBuilder {
+    let apply_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    builder.register("state.apply", move |params: Option<serde_json::Value>| {
+        let apply_calls = apply_calls.clone();
+        async move {
+            let call = apply_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call > 0 {
+                return Err(shux_rpc::RpcError::name_conflict("session", "apply-json"));
+            }
+
+            let ops = params
+                .as_ref()
+                .and_then(|p| p.get("ops"))
+                .and_then(|v| v.as_array())
+                .map(Vec::len)
+                .unwrap_or(0);
+            Ok(serde_json::json!({
+                "correlation_id": "apply-test",
+                "outputs": [{"session_id": "session-from-apply"}],
+                "last_event_seq": 7,
+                "spawn_results": [{"pane_id": "pane-from-apply", "spawned": true}],
+                "ops_seen": ops
+            }))
+        }
+    })
+}
+
 /// Start a real RPC server with a SessionGraph on an ephemeral UDS socket.
 /// Returns (socket_path, cancel_token) — cancel to shut down.
 async fn start_test_server(
@@ -266,10 +293,10 @@ async fn start_test_server(
     });
 
     // Build router: system builtins + session methods backed by GraphHandle
-    let router = register_session_methods(
+    let router = register_state_apply_method(register_session_methods(
         shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
         graph_handle,
-    )
+    ))
     .build();
 
     let config = shux_rpc::ServerConfig {
@@ -512,6 +539,172 @@ async fn test_cli_ls_json_against_server() {
         parsed["sessions"].is_array(),
         "expected sessions array in JSON output: {stdout}"
     );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_cli_state_apply_json_against_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let template = dir.path().join("apply.toml");
+    std::fs::write(
+        &template,
+        r#"
+[session]
+name = "apply-json"
+
+[[windows]]
+title = "main"
+
+[[windows.panes]]
+command = ["bash", "-lc", "printf apply-json"]
+"#,
+    )
+    .unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "state",
+            "apply",
+            template.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("state apply --format json stdout was not JSON: {e}\n{stdout}"));
+    assert_eq!(parsed["correlation_id"], "apply-test");
+    assert!(parsed["spawn_results"].is_array());
+    assert!(
+        !stdout.contains("Applied"),
+        "json mode should not print the human apply summary: {stdout}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_cli_state_apply_json_error_against_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let template = dir.path().join("apply.toml");
+    std::fs::write(
+        &template,
+        r#"
+[session]
+name = "apply-json"
+
+[[windows]]
+title = "main"
+
+[[windows.panes]]
+command = ["bash", "-lc", "printf apply-json"]
+"#,
+    )
+    .unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let first = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "state",
+            "apply",
+            template.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "state",
+            "apply",
+            template.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(!second.status.success());
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("state apply JSON error stdout was not JSON: {e}\n{stdout}"));
+    assert_eq!(parsed["error"]["code"], -32007);
+    assert_eq!(parsed["error"]["message"], "name_conflict");
+    assert!(
+        !stdout.contains("apply failed") && !stderr.contains("apply failed"),
+        "json mode should not print the human apply error; stdout={stdout}, stderr={stderr}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_cli_state_apply_watch_json_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let template = dir.path().join("apply.toml");
+    std::fs::write(
+        &template,
+        r#"
+[session]
+name = "apply-json"
+
+[[windows]]
+title = "main"
+
+[[windows.panes]]
+command = ["bash", "-lc", "printf apply-json"]
+"#,
+    )
+    .unwrap();
+    let (socket_path, cancel) = start_test_server(dir.path()).await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "state",
+            "apply",
+            template.to_str().unwrap(),
+            "--watch",
+            "--format",
+            "json",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(2), "stdout={stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("state apply --watch --format json stdout was not JSON: {e}\n{stdout}")
+    });
+    assert_eq!(parsed["error"]["code"], -32602);
 
     cancel.cancel();
 }

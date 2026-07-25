@@ -5548,17 +5548,54 @@ pub async fn handle_apply(
     ops: Vec<shux_core::apply::Op>,
     watch: bool,
     socket_path: &std::path::Path,
+    format: OutputFormat,
 ) -> anyhow::Result<()> {
     use crate::style;
+
+    if watch && matches!(format, OutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "error": {
+                    "code": -32602,
+                    "message": "--watch cannot be combined with --format json",
+                    "data": {
+                        "detail": "state apply --watch streams human event output; omit --watch for one JSON result"
+                    }
+                }
+            }))?
+        );
+        std::process::exit(2);
+    }
 
     let params = serde_json::json!({ "ops": ops });
     let result = match rpc_call(stream, "state.apply", params).await {
         Ok(v) => v,
+        Err(RpcClientError::Rpc {
+            code,
+            message,
+            data,
+        }) if matches!(format, OutputFormat::Json) => {
+            let mut error = serde_json::json!({ "code": code, "message": message });
+            if let Some(data) = data {
+                error["data"] = data;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "error": error }))?
+            );
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("{} {e}", style::error("✗ apply failed:"));
             return Err(anyhow::anyhow!(e));
         }
     };
+
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
 
     // Summarize result for humans. correlation_id + counts on the first
     // line; per-pane spawn rows below.
@@ -7248,6 +7285,7 @@ mod tests {
             }],
             false,
             std::path::Path::new("/tmp/shux.sock"),
+            OutputFormat::Text,
         )
         .await
         .unwrap();
