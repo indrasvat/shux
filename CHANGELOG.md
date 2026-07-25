@@ -1,3 +1,10 @@
+## [0.45.2](https://github.com/indrasvat/shux/compare/v0.45.1...v0.45.2) (2026-07-25)
+
+
+### Bug Fixes
+
+* **skill:** document shux json list shapes ([#99](https://github.com/indrasvat/shux/issues/99)) ([3848acb](https://github.com/indrasvat/shux/commit/3848acb3b3aea804d62ab891d2ef371600129d42))
+
 ## [0.45.1](https://github.com/indrasvat/shux/compare/v0.45.0...v0.45.1) (2026-07-20)
 
 
