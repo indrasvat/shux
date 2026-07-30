@@ -1746,6 +1746,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 083 | lens gate — settle hardening + optional cast | M3 | **Done** | 080, 082 |
 | 084 | lens gate — cold-agent DX validation (Laghudarshi, uv+py3.14+rich) | M3 | **Done** | 078, 079, 080, 081, 082, 083 |
 | 085 | lens gate — skill + landing site | M3 | **Done** | 084 |
+| 086 | mouse wheel scroll — scrollback + app forwarding | M3 | **In Progress** | 020, 021, 062 |
 
 ---
 

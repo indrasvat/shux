@@ -2310,6 +2310,17 @@ mod tests {
     }
 
     #[test]
+    fn test_alternate_scroll_mode() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        // Defaults on (Debian-xterm / iTerm2 / kitty convention).
+        assert!(vt.modes().alternate_scroll);
+        vt.process(b"\x1b[?1007l");
+        assert!(!vt.modes().alternate_scroll);
+        vt.process(b"\x1b[?1007h");
+        assert!(vt.modes().alternate_scroll);
+    }
+
+    #[test]
     fn test_application_keypad_mode() {
         let mut vt = VirtualTerminal::new(24, 80);
         assert!(!vt.modes().application_keypad);

@@ -882,6 +882,23 @@ async fn run_attach_loop(
                             pulse.notify_one();
                             continue;
                         }
+                        // Scroll wheel (copy mode inactive): scroll scrollback,
+                        // or forward to a mouse-aware / alt-screen app.
+                        if handle_wheel(
+                            kind,
+                            col,
+                            row,
+                            &graph,
+                            &io_state,
+                            &render_session,
+                            &client_size,
+                        )
+                        .await?
+                        {
+                            let pulse = io_state.lock().await.render_pulse.clone();
+                            pulse.notify_one();
+                            continue;
+                        }
                         if let Err(e) = handle_mouse(
                             kind,
                             button,
@@ -1916,12 +1933,188 @@ async fn handle_mouse(
         (MouseKind::Up, ProtoMouseButton::Left) => {
             *drag = None;
         }
-        // Scroll wheel: future scrollback navigation hook (task 021,
-        // copy mode). For now: noop so the protocol still flows.
-        (MouseKind::ScrollUp, _) | (MouseKind::ScrollDown, _) => {}
+        // Scroll wheel is consumed earlier by `handle_wheel`; it never
+        // reaches the layout/focus handler.
         _ => {}
     }
     Ok(())
+}
+
+/// How a wheel tick is routed, given the target pane's live VT state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelRouting {
+    /// App requested mouse tracking — forward an encoded mouse report.
+    ForwardMouse,
+    /// Alternate-screen app without mouse (alt-scroll on) — send arrow keys.
+    ArrowKeys,
+    /// Primary screen — scroll shux's own scrollback via copy mode.
+    Scrollback,
+}
+
+/// Route a wheel event by the target pane's mode state (tmux/wezterm model).
+fn route_wheel(mouse_on: bool, alt_screen: bool, alt_scroll: bool) -> WheelRouting {
+    if mouse_on {
+        WheelRouting::ForwardMouse
+    } else if alt_screen && alt_scroll {
+        WheelRouting::ArrowKeys
+    } else {
+        WheelRouting::Scrollback
+    }
+}
+
+/// Encode a wheel tick as a mouse report for the pane's application.
+/// `col`/`row` are 1-based pane-local coordinates. Button 64 = wheel up,
+/// 65 = wheel down. SGR (mode 1006) uses decimal params + `M`; legacy X10
+/// packs each value into a byte offset by 32, wire-capped at 255.
+fn encode_mouse_wheel(up: bool, sgr: bool, col: u16, row: u16) -> Vec<u8> {
+    let cb: u16 = if up { 64 } else { 65 };
+    if sgr {
+        format!("\x1b[<{cb};{col};{row}M").into_bytes()
+    } else {
+        let enc = |v: u16| -> u8 { v.saturating_add(32).min(255) as u8 };
+        vec![0x1b, b'[', b'M', enc(cb), enc(col), enc(row)]
+    }
+}
+
+/// The arrow-key bytes one wheel tick maps to on the alternate screen when the
+/// app hasn't requested mouse tracking. DECCKM chooses CSI (`ESC [ A`) vs SS3
+/// (`ESC O A`) form.
+fn wheel_arrow_seq(up: bool, app_cursor: bool) -> &'static [u8] {
+    match (up, app_cursor) {
+        (true, false) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+        (true, true) => b"\x1bOA",
+        (false, true) => b"\x1bOB",
+    }
+}
+
+/// Send bytes to a pane's PTY writer using the same non-blocking path as
+/// keystrokes (drop on backpressure rather than freeze the attach loop).
+async fn forward_bytes_to_pane(
+    io_state: &Arc<Mutex<PaneIoState>>,
+    pane_id: PaneId,
+    bytes: Vec<u8>,
+) {
+    let writer = {
+        let state = io_state.lock().await;
+        state.writers.get(&pane_id).cloned()
+    };
+    if let Some(tx) = writer
+        && let Err(e) = tx.try_send(bytes)
+    {
+        tracing::warn!(error = %e, "wheel forward dropped (pane backpressured)");
+    }
+}
+
+/// Handle a scroll-wheel event while copy mode is NOT active. Returns `Ok(true)`
+/// if the event was a wheel event (and thus consumed), `Ok(false)` otherwise so
+/// the caller falls through to the layout/focus mouse handler.
+async fn handle_wheel(
+    kind: MouseKind,
+    col: u16,
+    row: u16,
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+) -> anyhow::Result<bool> {
+    let up = match kind {
+        MouseKind::ScrollUp => true,
+        MouseKind::ScrollDown => false,
+        _ => return Ok(false),
+    };
+    let attached = session.lock().await.clone();
+    let viewport = current_viewport(client_size).await;
+
+    // Resolve the pane under the cursor (fallback: the active pane).
+    let pane_id = {
+        let snap = graph.snapshot();
+        match snap.windows.get(&attached.active_window_id) {
+            None => return Ok(true),
+            Some(win) => {
+                if win.layout.is_zoomed() {
+                    attached.active_pane_id
+                } else {
+                    pane_at(&win.layout.tree, viewport, col, row)
+                        .map(|(pid, _)| pid)
+                        .unwrap_or(attached.active_pane_id)
+                }
+            }
+        }
+    };
+    let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+        return Ok(true);
+    };
+
+    // Snapshot the target pane's live mode state + scrollback depth.
+    let (mouse_on, sgr, alt, alt_scroll, app_cursor, total_lines) = {
+        let state = io_state.lock().await;
+        match state.vts.get(&pane_id) {
+            Some(vt) => {
+                let m = vt.modes();
+                (
+                    m.mouse_tracking != shux_vt::MouseMode::None,
+                    m.sgr_mouse,
+                    vt.is_alternate_screen(),
+                    m.alternate_scroll,
+                    m.application_cursor_keys,
+                    vt.grid().total_lines(),
+                )
+            }
+            None => (false, false, false, true, false, rect.height as usize),
+        }
+    };
+
+    match route_wheel(mouse_on, alt, alt_scroll) {
+        WheelRouting::ForwardMouse => {
+            let local_col = col
+                .saturating_sub(rect.x)
+                .min(rect.width.saturating_sub(1))
+                .saturating_add(1);
+            let local_row = row
+                .saturating_sub(rect.y)
+                .min(rect.height.saturating_sub(1))
+                .saturating_add(1);
+            forward_bytes_to_pane(
+                io_state,
+                pane_id,
+                encode_mouse_wheel(up, sgr, local_col, local_row),
+            )
+            .await;
+        }
+        WheelRouting::ArrowKeys => {
+            let seq = wheel_arrow_seq(up, app_cursor);
+            let mut bytes = Vec::with_capacity(seq.len() * 3);
+            for _ in 0..3 {
+                bytes.extend_from_slice(seq);
+            }
+            forward_bytes_to_pane(io_state, pane_id, bytes).await;
+        }
+        WheelRouting::Scrollback => {
+            // Nothing above the live view — don't pointlessly enter copy mode.
+            if up && shux_ui::copy_mode::max_scroll_offset(total_lines, rect.height) == 0 {
+                return Ok(true);
+            }
+            // Scrolling a background pane focuses it (the overlay renders for the
+            // active pane), matching tmux.
+            if pane_id != attached.active_pane_id {
+                let _ = graph.focus_pane(pane_id).await;
+                session.lock().await.active_pane_id = pane_id;
+            }
+            let mut s = session.lock().await;
+            if up {
+                let cm = s.copy_mode.get_or_insert_with(shux_ui::CopyModeState::new);
+                shux_ui::copy_mode::scroll_up(cm, 3, total_lines, rect.height);
+            } else if let Some(cm) = s.copy_mode.as_mut() {
+                shux_ui::copy_mode::scroll_down(cm, 3, total_lines, rect.height);
+                if cm.scroll_offset == 0 {
+                    // Returned to the live bottom — leave scrollback.
+                    s.copy_mode = None;
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn point_in_rect(rect: Rect, col: u16, row: u16) -> bool {
@@ -2594,6 +2787,52 @@ async fn resize_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_routing_follows_pane_mode_state() {
+        // App requested the mouse → forward, regardless of screen/alt-scroll.
+        assert_eq!(route_wheel(true, false, false), WheelRouting::ForwardMouse);
+        assert_eq!(route_wheel(true, true, true), WheelRouting::ForwardMouse);
+        // Alt screen, no mouse, alt-scroll on → arrow keys (less/man/vim).
+        assert_eq!(route_wheel(false, true, true), WheelRouting::ArrowKeys);
+        // Alt screen, no mouse, alt-scroll OFF → fall back to scrollback.
+        assert_eq!(route_wheel(false, true, false), WheelRouting::Scrollback);
+        // Primary screen, no mouse → shux scrollback (the bug's fix path).
+        assert_eq!(route_wheel(false, false, true), WheelRouting::Scrollback);
+        assert_eq!(route_wheel(false, false, false), WheelRouting::Scrollback);
+    }
+
+    #[test]
+    fn encode_mouse_wheel_sgr_is_byte_exact() {
+        // Wheel up/down at pane-local (col=10, row=5), SGR encoding.
+        assert_eq!(encode_mouse_wheel(true, true, 10, 5), b"\x1b[<64;10;5M");
+        assert_eq!(encode_mouse_wheel(false, true, 10, 5), b"\x1b[<65;10;5M");
+    }
+
+    #[test]
+    fn encode_mouse_wheel_x10_offsets_by_32_and_caps() {
+        // X10: ESC [ M  Cb  Cx  Cy, each byte = value + 32.
+        // up at (1,1): Cb=64+32=96, Cx=Cy=1+32=33.
+        assert_eq!(
+            encode_mouse_wheel(true, false, 1, 1),
+            vec![0x1b, b'[', b'M', 96, 33, 33]
+        );
+        // down at (1,1): Cb=65+32=97.
+        assert_eq!(
+            encode_mouse_wheel(false, false, 1, 1),
+            vec![0x1b, b'[', b'M', 97, 33, 33]
+        );
+        // Large coord clamps to the 255 wire ceiling rather than wrapping.
+        assert_eq!(encode_mouse_wheel(true, false, 400, 1)[4], 255);
+    }
+
+    #[test]
+    fn wheel_arrow_seq_honors_application_cursor_keys() {
+        assert_eq!(wheel_arrow_seq(true, false), b"\x1b[A");
+        assert_eq!(wheel_arrow_seq(false, false), b"\x1b[B");
+        assert_eq!(wheel_arrow_seq(true, true), b"\x1bOA");
+        assert_eq!(wheel_arrow_seq(false, true), b"\x1bOB");
+    }
 
     fn overlay_stamp(cursor: (u16, u16)) -> CopyOverlayStamp {
         let mut state = shux_ui::CopyModeState::new();
