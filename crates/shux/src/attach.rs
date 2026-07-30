@@ -3924,4 +3924,145 @@ mod tests {
         assert!(saw_detach || writer_rx.try_recv().is_err());
         fixture.stop();
     }
+
+    /// Seed a pane whose VT has real scrollback (more lines than fit), plus any
+    /// mode-enabling setup bytes (e.g. `?1000h`, `?1049h`). Returns the pane's
+    /// PTY writer receiver so a test can assert what the app was sent.
+    async fn seed_scrollback_pane(
+        io_state: &Arc<Mutex<PaneIoState>>,
+        pane_id: PaneId,
+        setup: &[u8],
+    ) -> mpsc::Receiver<Vec<u8>> {
+        let (writer_tx, writer_rx) = mpsc::channel(64);
+        let (resize_tx, _resize_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let mut vt = shux_vt::VirtualTerminal::new(28, 49);
+        for i in 0..300 {
+            vt.process(format!("scrollback line {i}\r\n").as_bytes());
+        }
+        vt.process(setup);
+        let mut state = io_state.lock().await;
+        state.writers.insert(pane_id, writer_tx);
+        state.resizers.insert(pane_id, resize_tx);
+        state.shutdowns.insert(pane_id, shutdown);
+        state.vts.insert(pane_id, vt);
+        writer_rx
+    }
+
+    async fn recv_bytes(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("pane write timeout")
+            .expect("pane write channel closed")
+    }
+
+    // --- Task 086: mouse wheel behavioral regression tests ---
+    // These drive the real `handle_wheel` against a live graph + pane VT. Each
+    // asserts an outcome the pre-fix code could NOT produce (the old scroll arm
+    // was `=> {}` — no scrollback move, no PTY write). Proven red by neutering
+    // `handle_wheel` to a no-op, then green with the fix in place.
+
+    #[tokio::test]
+    async fn handle_wheel_enters_scrollback_on_primary_screen() {
+        let fixture = attach_fixture().await;
+        let _wr = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        assert!(session.lock().await.copy_mode.is_none());
+
+        let consumed = handle_wheel(
+            MouseKind::ScrollUp,
+            3,
+            3,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+        )
+        .await
+        .expect("wheel up");
+
+        assert!(consumed, "wheel event must be consumed");
+        let s = session.lock().await;
+        let cm = s
+            .copy_mode
+            .as_ref()
+            .expect("primary-screen wheel-up must enter scrollback");
+        assert!(
+            cm.scroll_offset > 0,
+            "scroll_offset must advance, got {}",
+            cm.scroll_offset
+        );
+        drop(s);
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn handle_wheel_forwards_encoded_report_to_mouse_aware_app() {
+        let fixture = attach_fixture().await;
+        // App turns on SGR mouse tracking (like vim :set mouse=a / htop).
+        let mut wr = seed_scrollback_pane(
+            &fixture.io_state,
+            fixture.first_pane,
+            b"\x1b[?1000h\x1b[?1006h",
+        )
+        .await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+
+        handle_wheel(
+            MouseKind::ScrollUp,
+            3,
+            3,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+        )
+        .await
+        .expect("wheel");
+
+        let bytes = recv_bytes(&mut wr).await;
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.starts_with("\x1b[<64;"),
+            "expected SGR wheel-up, got {s:?}"
+        );
+        assert!(s.ends_with('M'), "SGR wheel is press-only ('M'), got {s:?}");
+        assert!(
+            session.lock().await.copy_mode.is_none(),
+            "forwarding to the app must NOT enter shux scrollback"
+        );
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn handle_wheel_translates_to_arrows_on_alt_screen_without_mouse() {
+        let fixture = attach_fixture().await;
+        // Alt-screen app that did NOT request the mouse (like less / man).
+        let mut wr =
+            seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"\x1b[?1049h").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+
+        handle_wheel(
+            MouseKind::ScrollDown,
+            3,
+            3,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+        )
+        .await
+        .expect("wheel");
+
+        let bytes = recv_bytes(&mut wr).await;
+        assert_eq!(
+            bytes, b"\x1b[B\x1b[B\x1b[B",
+            "one wheel-down tick maps to three down-arrows on the alt screen"
+        );
+        assert!(session.lock().await.copy_mode.is_none());
+        fixture.stop();
+    }
 }
