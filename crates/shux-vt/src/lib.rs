@@ -836,7 +836,7 @@ mod tests {
     fn process_with_responses_answers_decrqm_for_modes() {
         let mut vt = VirtualTerminal::new(24, 80);
         let initial = vt.process_with_responses(
-            b"\x1b[4$p\x1b[20$p\x1b[?1$p\x1b[?6$p\x1b[?7$p\x1b[?25$p\x1b[?66$p\x1b[?1000$p\x1b[?1002$p\x1b[?1003$p\x1b[?1004$p\x1b[?1006$p\x1b[?1049$p\x1b[?2004$p\x1b[?2026$p\x1b[?9999$p",
+            b"\x1b[4$p\x1b[20$p\x1b[?1$p\x1b[?6$p\x1b[?7$p\x1b[?25$p\x1b[?66$p\x1b[?1000$p\x1b[?1002$p\x1b[?1003$p\x1b[?1004$p\x1b[?1006$p\x1b[?1007$p\x1b[?1049$p\x1b[?2004$p\x1b[?2026$p\x1b[?9999$p",
         );
 
         assert_eq!(
@@ -854,6 +854,8 @@ mod tests {
                 b"\x1b[?1003;2$y".to_vec(),
                 b"\x1b[?1004;2$y".to_vec(),
                 b"\x1b[?1006;2$y".to_vec(),
+                // ?1007 (alternate scroll) defaults ON → reports set (;1).
+                b"\x1b[?1007;1$y".to_vec(),
                 b"\x1b[?1049;2$y".to_vec(),
                 b"\x1b[?2004;2$y".to_vec(),
                 b"\x1b[?2026;2$y".to_vec(),
