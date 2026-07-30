@@ -1,3 +1,10 @@
+# [0.46.0](https://github.com/indrasvat/shux/compare/v0.45.2...v0.46.0) (2026-07-30)
+
+
+### Features
+
+* **attach:** mouse wheel scrolls scrollback + forwards to apps (task 086) ([#101](https://github.com/indrasvat/shux/issues/101)) ([59c02d9](https://github.com/indrasvat/shux/commit/59c02d9de66d7d0679b140ce02a61f2dbdad65c9))
+
 ## [0.45.2](https://github.com/indrasvat/shux/compare/v0.45.1...v0.45.2) (2026-07-25)
 
 
