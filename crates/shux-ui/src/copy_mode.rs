@@ -41,6 +41,12 @@ pub struct CopyModeState {
     pub last_search: Option<SearchMatch>,
     /// Tracks the first `g` for the vim-style `gg` top-of-history motion.
     pending_g: bool,
+    /// True when this copy-mode session was opened transiently by the scroll
+    /// wheel (not by `Prefix [` / the API). A wheel-initiated session returns to
+    /// the live view — and hands the keyboard back — as soon as the wheel brings
+    /// it back to the bottom; a manually-entered copy mode stays until the user
+    /// exits it, so an in-progress selection or search is never lost to a scroll.
+    pub wheel_initiated: bool,
 }
 
 impl CopyModeState {
@@ -52,6 +58,7 @@ impl CopyModeState {
             search: None,
             last_search: None,
             pending_g: false,
+            wheel_initiated: false,
         }
     }
 }

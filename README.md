@@ -126,11 +126,16 @@ Inside the TUI, the prefix key is `Ctrl+Space` by default:
 | `Ctrl+Space d` | detach |
 | click any pane | focus it |
 | drag a border | resize |
+| scroll wheel | scroll the pane's scrollback (or the app under the cursor when it uses the mouse) |
 | drag pane text | select visible text and copy on release |
 | right-click selected text | open inline Copy / Clear menu |
 
-For scrollback or keyboard-driven selection, use `Ctrl+Space [` to enter copy
-mode. Normal visible text copy is mouse-first: drag text, release, paste.
+The scroll wheel just works: over a normal pane it scrolls shux's scrollback;
+over a mouse-aware app (`vim`, `htop`, `less --mouse`) it scrolls the app; and
+over a full-screen pager on the alternate screen (`less`, `man`) it moves by
+arrow keys. For keyboard-driven selection and search, use `Ctrl+Space [` to
+enter copy mode. Normal visible text copy is mouse-first: drag text, release,
+paste.
 
 ## Extend shux with a process plugin
 

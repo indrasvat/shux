@@ -32,6 +32,11 @@ pub struct TerminalModes {
     pub mouse_tracking: MouseMode,
     /// SGR mouse coordinate encoding (Mode 1006).
     pub sgr_mouse: bool,
+    /// Alternate-scroll mode (Mode 1007): while on the alternate screen and the
+    /// app has NOT requested mouse tracking, the terminal translates wheel
+    /// events into arrow-key presses so pagers/editors scroll. Defaults on
+    /// (matches Debian-xterm / iTerm2 / kitty).
+    pub alternate_scroll: bool,
     /// Synchronized output mode (Mode 2026).
     pub synchronized_output: bool,
     /// Alternate screen buffer active.
@@ -54,6 +59,7 @@ impl Default for TerminalModes {
             focus_events: false,
             mouse_tracking: MouseMode::None,
             sgr_mouse: false,
+            alternate_scroll: true,
             synchronized_output: false,
             alternate_screen: false,
             insert_mode: false,
@@ -743,6 +749,8 @@ impl<'a> VtHandler<'a> {
             1004 => self.modes.focus_events = enable,
             // SGR mouse coordinate encoding.
             1006 => self.modes.sgr_mouse = enable,
+            // Alternate-scroll: wheel -> arrow keys on the alternate screen.
+            1007 => self.modes.alternate_scroll = enable,
             // Save cursor (1048).
             1048 => {
                 if enable {
@@ -885,6 +893,7 @@ impl<'a> VtHandler<'a> {
             1003 => mode_report(self.modes.mouse_tracking == MouseMode::AnyEvent),
             1004 => mode_report(self.modes.focus_events),
             1006 => mode_report(self.modes.sgr_mouse),
+            1007 => mode_report(self.modes.alternate_scroll),
             1047 | 1049 => mode_report(self.modes.alternate_screen),
             2004 => mode_report(self.modes.bracketed_paste),
             2026 => mode_report(self.modes.synchronized_output),

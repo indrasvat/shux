@@ -1,0 +1,35 @@
+{
+  "task": "086-mouse-wheel-scroll",
+  "commit": "f582f08",
+  "branch": "claude/shux-mouse-scrolling-eobxoh",
+  "binary": "target/debug/shux (prebuilt, not rebuilt)",
+  "solid_qa_report": ".shux/qa/086/SOLID-QA.md",
+  "dootsabha_design": {
+    "status": "N/A-substituted",
+    "reason": "Task file 086 §Definition of Done explicitly declares dootsabha council N/A in this environment (not installed), substituted with the adversarial-review skill + the two QA gate sub-agents.",
+    "substitute_evidence": "docs/tasks/086-mouse-wheel-scroll.md §'Adversarial review' — 4 parallel breakers (Vetalapancavimsati, Karpuramanjari, Rajatarangini, Mudraraksasa) drove the real binary on disjoint surfaces."
+  },
+  "dootsabha_implementation": {
+    "status": "N/A-substituted",
+    "reason": "Same explicit task-file allowance; implementation-diff review substituted by adversarial breakers who found + fixed one real bug (wheel-opened scrollback could not exit at live bottom) with red->green regression tests.",
+    "substitute_evidence": "commit f582f08 + tests wheel_initiated_scrollback_exits_when_wheeled_back_to_bottom, manual_copy_mode_survives_wheel_back_to_bottom"
+  },
+  "screenshots": [
+    {"viewport": "80x24", "app": "colored probe (truecolor+256+basic fg/bg)", "path": ".shux/qa/086/probe-glance1-80x24.png"},
+    {"viewport": "80x24", "app": "colored probe (2nd glance)", "path": ".shux/qa/086/probe-glance2-80x24.png"},
+    {"viewport": "120x40", "app": "htop (alt-screen, colored meters)", "path": ".shux/qa/086/htop-120x40.png"},
+    {"viewport": "80x24", "app": "vim -u NONE syntax on (alt-screen)", "path": ".shux/qa/086/vim-80x24.png"},
+    {"viewport": "80x24", "app": "less -R (alt-screen, ANSI colors preserved)", "path": ".shux/qa/086/less-80x24.png"}
+  ],
+  "pixel_metrics": [
+    {
+      "name": "two-glance static-pane stability (byte-identical requirement)",
+      "path": ".shux/qa/086/pixel-probe-twoglance.json",
+      "diff_png": ".shux/qa/086/probe-glance-diff.png",
+      "thresholds": {"max_pixel_diff_ratio": 0, "max_mean_channel_delta": 0},
+      "result": "pass — changed_pixels=0, pixel_diff_ratio=0.0, mean_rgba_channel_delta=0.0",
+      "md5_glance1": "ce1483862cbc6eb23325de0a8b042a58",
+      "md5_glance2": "ce1483862cbc6eb23325de0a8b042a58"
+    }
+  ]
+}
