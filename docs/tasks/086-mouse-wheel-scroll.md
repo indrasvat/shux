@@ -134,3 +134,25 @@ Four parallel breakers drove the real binary on disjoint surfaces (the
   `CopyModeState` + exit logic in that handler; regression tests
   `wheel_initiated_scrollback_exits_when_wheeled_back_to_bottom` (red→green) and
   `manual_copy_mode_survives_wheel_back_to_bottom` (guards over-fixing).
+
+## Post-PR review fix (Greptile P1 on PR #101)
+
+Greptile flagged that wheel scroll ignored the pane under the pointer once copy
+mode was active: `handle_copy_mode_mouse` (dispatched before `handle_wheel`)
+consumed every scroll against `active_pane_id` without reading `col`/`row`. So a
+wheel-opened (transient) scrollback on pane A kept scrolling A even after the
+pointer moved over pane B — B received nothing. Reproduced by reading the two
+handlers' dispatch order and confirmed with a red test.
+
+**Fix** (`handle_copy_mode_mouse`, scroll arm): resolve the pane under the
+pointer (new `pane_under_pointer` helper, mirroring `handle_wheel`'s hit-test).
+If the copy mode is *transient* (`wheel_initiated`) and the pointer is over a
+different pane, release it (`copy_mode = None`) and return `false` so the
+dispatch falls through to `handle_wheel`, which scrolls/forwards the pane
+actually under the cursor. A *deliberate* copy mode (`Prefix [` / API) keeps the
+wheel, so a stray scroll elsewhere never discards an in-progress selection.
+Regression tests: `transient_wheel_scrollback_releases_wheel_to_pane_under_pointer`
+(red→green) and `deliberate_copy_mode_keeps_wheel_when_pointer_over_other_pane`
+(guards over-fixing). This narrows the "copy mode is session-global" rough edge
+for the common casual-wheel case; the deeper per-window/per-pane copy-mode state
+remains a separate follow-up.

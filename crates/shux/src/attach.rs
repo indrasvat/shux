@@ -1494,6 +1494,27 @@ fn pane_at(
         .find(|(_, r)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
 }
 
+/// Resolve the pane under the pointer for wheel routing: the pane at
+/// `(col, row)`, falling back to the active pane when the window is zoomed
+/// (only one pane is visible) or the point lands on no pane (e.g. a border
+/// cell). Mirrors the cursor hit-test `handle_wheel` performs, so both the
+/// copy-mode and non-copy-mode wheel paths agree on which pane a scroll hits.
+fn pane_under_pointer(
+    graph: &GraphHandle,
+    attached: &AttachedSession,
+    viewport: Rect,
+    col: u16,
+    row: u16,
+) -> PaneId {
+    let snap = graph.snapshot();
+    match snap.windows.get(&attached.active_window_id) {
+        Some(win) if !win.layout.is_zoomed() => pane_at(&win.layout.tree, viewport, col, row)
+            .map(|(pid, _)| pid)
+            .unwrap_or(attached.active_pane_id),
+        _ => attached.active_pane_id,
+    }
+}
+
 /// Detect that a click landed on a vertical or horizontal border cell
 /// between two adjacent panes. Returns (the pane on the "earlier" side
 /// of the border, axis along which to resize) so the caller can adjust
@@ -1755,6 +1776,26 @@ async fn handle_copy_mode_mouse(
 
     match kind {
         MouseKind::ScrollUp | MouseKind::ScrollDown => {
+            // Wheel scroll targets the pane under the pointer. A *transient*,
+            // wheel-opened scrollback must release the wheel when the pointer
+            // moves to a different pane, so `handle_wheel` can route the scroll
+            // to the pane the user is actually pointing at (scroll its
+            // scrollback, or forward to its app) instead of the pane that
+            // happened to open scrollback first. A deliberately-entered copy
+            // mode keeps the wheel so a stray scroll over another pane never
+            // discards an in-progress selection/search (copy mode is
+            // session-global — only one is active at a time).
+            let viewport = current_viewport(client_size).await;
+            let cursor_pane = pane_under_pointer(graph, &attached, viewport, col, row);
+            let transient = attached
+                .copy_mode
+                .as_ref()
+                .is_some_and(|cm| cm.wheel_initiated);
+            if transient && cursor_pane != attached.active_pane_id {
+                session.lock().await.copy_mode = None;
+                *dragging = SelectionDrag::None;
+                return Ok(false);
+            }
             let total_lines = {
                 let state = io_state.lock().await;
                 state
@@ -4190,6 +4231,148 @@ mod tests {
             session.lock().await.copy_mode.is_some(),
             "manually-entered copy mode must survive a wheel scroll to the bottom"
         );
+        fixture.stop();
+    }
+
+    // Regression (Greptile P1 on PR #101): wheel scroll must target the pane
+    // under the pointer. A wheel-opened (transient) scrollback on pane A made
+    // copy mode session-active, and `handle_copy_mode_mouse` — dispatched before
+    // `handle_wheel` — used to consume EVERY later wheel against A's active
+    // pane, ignoring `col`/`row`. So wheeling over pane B kept scrolling A while
+    // B received nothing. The fix releases a transient scrollback when the
+    // pointer moves to another pane, so the dispatch falls through to
+    // `handle_wheel`, which scrolls the pane actually under the cursor.
+    #[tokio::test]
+    async fn transient_wheel_scrollback_releases_wheel_to_pane_under_pointer() {
+        let fixture = attach_fixture().await;
+        let _wr_a = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let _wr_b = seed_scrollback_pane(&fixture.io_state, fixture.second_pane, b"").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let mut drag = SelectionDrag::None;
+        let viewport = current_viewport(&client_size).await;
+        let (first_point, second_point, _border) =
+            find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
+
+        // Wheel-up over pane A opens a transient, wheel-initiated scrollback on A.
+        handle_wheel(
+            MouseKind::ScrollUp,
+            first_point.0,
+            first_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+        )
+        .await
+        .expect("wheel up over pane A");
+        {
+            let s = session.lock().await;
+            let cm = s.copy_mode.as_ref().expect("A enters scrollback");
+            assert!(cm.wheel_initiated, "must be wheel-initiated (transient)");
+            assert_eq!(s.active_pane_id, fixture.first_pane);
+        }
+
+        // Now the pointer is over pane B. The copy-mode handler runs first; it
+        // must NOT consume the wheel (returns false) and must release A's
+        // transient scrollback so the dispatch can route to B.
+        let consumed = handle_copy_mode_mouse(
+            MouseKind::ScrollUp,
+            ProtoMouseButton::None,
+            second_point.0,
+            second_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &out_tx,
+            &mut drag,
+        )
+        .await
+        .expect("copy-mode wheel over pane B");
+        assert!(
+            !consumed,
+            "a transient scrollback must release the wheel when the pointer is over another pane"
+        );
+        assert!(
+            session.lock().await.copy_mode.is_none(),
+            "A's transient scrollback must be dismissed before routing to B"
+        );
+
+        // The real dispatch now falls through to `handle_wheel`, which scrolls
+        // the pane under the cursor (B) and focuses it.
+        handle_wheel(
+            MouseKind::ScrollUp,
+            second_point.0,
+            second_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+        )
+        .await
+        .expect("wheel up over pane B");
+        let s = session.lock().await;
+        assert_eq!(
+            s.active_pane_id, fixture.second_pane,
+            "the pane under the pointer must scroll and take focus"
+        );
+        assert!(
+            s.copy_mode.as_ref().is_some_and(|cm| cm.scroll_offset > 0),
+            "B must now be in its own scrollback view"
+        );
+        drop(s);
+        fixture.stop();
+    }
+
+    // Counterpart guard: a DELIBERATE copy mode (Prefix [ / API — not
+    // wheel-initiated) must keep the wheel even when the pointer is over another
+    // pane, so a stray scroll elsewhere never discards an in-progress selection.
+    #[tokio::test]
+    async fn deliberate_copy_mode_keeps_wheel_when_pointer_over_other_pane() {
+        let fixture = attach_fixture().await;
+        let _wr_a = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let _wr_b = seed_scrollback_pane(&fixture.io_state, fixture.second_pane, b"").await;
+        let mut attached = fixture.attached.clone();
+        attached.copy_mode = Some(shux_ui::CopyModeState::new()); // wheel_initiated = false
+        let session = Arc::new(Mutex::new(attached));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let mut drag = SelectionDrag::None;
+        let viewport = current_viewport(&client_size).await;
+        let (_first_point, second_point, _border) =
+            find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
+
+        let consumed = handle_copy_mode_mouse(
+            MouseKind::ScrollUp,
+            ProtoMouseButton::None,
+            second_point.0,
+            second_point.1,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &out_tx,
+            &mut drag,
+        )
+        .await
+        .expect("copy-mode wheel over pane B");
+
+        assert!(
+            consumed,
+            "a deliberate copy mode keeps the wheel regardless of pointer pane"
+        );
+        let s = session.lock().await;
+        assert!(
+            s.copy_mode.is_some(),
+            "a deliberate selection must not be discarded by scrolling elsewhere"
+        );
+        assert_eq!(
+            s.active_pane_id, fixture.first_pane,
+            "focus must not jump panes while a deliberate copy mode is open"
+        );
+        drop(s);
         fixture.stop();
     }
 }
