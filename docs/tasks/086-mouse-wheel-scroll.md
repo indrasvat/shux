@@ -109,3 +109,28 @@ they require a protocol/client change beyond this daemon-side fix:
 - **Trackpad precision / momentum damping.** The host terminal already quantizes
   wheel input into discrete `ScrollUp`/`ScrollDown` events before shux sees them,
   so this is largely handled upstream; a fast-scroll modifier is a future nicety.
+- **Copy mode is session-global, not per-window** (pre-existing). `copy_mode`
+  lives on `AttachedSession`, so switching windows while scrolled carries the
+  copy indicator to the new window's active pane (agent Mudrārākṣasa's minor
+  note). It clamps safely (no crash/corruption). This predates task 086 but is
+  reached more often now that the wheel opens copy mode; a proper per-window
+  copy-mode state is a separate follow-up.
+
+## Adversarial review (agents driving the real system)
+
+Four parallel breakers drove the real binary on disjoint surfaces (the
+`adversarial-review` step of the Feature Protocol):
+- **Vetālapañcaviṃśati** (app-forwarding): 8/8 PASS — byte-exact SGR/X10, correct
+  pane-local coords in a shifted split, live per-event mode read (no cache bug).
+- **Karpūramañjarī** (alt-scroll + rich-TUI): PASS — byte-probe confirmed 3
+  arrows/tick, DECCKM SS3/CSI by live state, inert when `?1007` off; htop/top/
+  vim/less render un-regressed.
+- **Rājataraṅgiṇī** (no-regression): 6/6 PASS — click-focus, drag-resize, manual
+  copy mode + yank, copy-mode wheel, keystroke forwarding, right-click menu.
+- **Mudrārākṣasa** (scrollback edges): found ONE real bug — wheel-down could not
+  exit wheel-opened scrollback (keyboard hijacked until `q`), because an active
+  copy mode routes the wheel through `handle_copy_mode_mouse`, which lacked the
+  exit-at-bottom check. **Fixed** with the `wheel_initiated` flag on
+  `CopyModeState` + exit logic in that handler; regression tests
+  `wheel_initiated_scrollback_exits_when_wheeled_back_to_bottom` (red→green) and
+  `manual_copy_mode_survives_wheel_back_to_bottom` (guards over-fixing).

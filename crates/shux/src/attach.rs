@@ -1764,12 +1764,24 @@ async fn handle_copy_mode_mouse(
                     .unwrap_or(rect.height as usize)
             };
             let mut s = session.lock().await;
-            if let Some(ref mut cm) = s.copy_mode {
+            // A wheel-initiated scrollback view hands the keyboard back the
+            // moment the wheel brings it to the live bottom; a manually-entered
+            // copy mode (`Prefix [` / API) stays so an in-progress selection or
+            // search is never lost. `exit` is computed while `cm` is borrowed,
+            // then applied after the borrow ends.
+            let exit = if let Some(ref mut cm) = s.copy_mode {
                 if matches!(kind, MouseKind::ScrollUp) {
                     shux_ui::copy_mode::scroll_up(cm, 3, total_lines, rect.height);
+                    false
                 } else {
                     shux_ui::copy_mode::scroll_down(cm, 3, total_lines, rect.height);
+                    cm.wheel_initiated && cm.scroll_offset == 0
                 }
+            } else {
+                false
+            };
+            if exit {
+                s.copy_mode = None;
             }
             *dragging = SelectionDrag::None;
         }
@@ -2091,8 +2103,15 @@ async fn handle_wheel(
             forward_bytes_to_pane(io_state, pane_id, bytes).await;
         }
         WheelRouting::Scrollback => {
+            // This tier is only reached while copy mode is INACTIVE (an active
+            // copy mode consumes the wheel earlier, in handle_copy_mode_mouse).
+            // So wheel-down here has nothing to scroll — only wheel-up opens a
+            // transient, wheel-initiated scrollback view.
+            if !up {
+                return Ok(true);
+            }
             // Nothing above the live view — don't pointlessly enter copy mode.
-            if up && shux_ui::copy_mode::max_scroll_offset(total_lines, rect.height) == 0 {
+            if shux_ui::copy_mode::max_scroll_offset(total_lines, rect.height) == 0 {
                 return Ok(true);
             }
             // Scrolling a background pane focuses it (the overlay renders for the
@@ -2102,16 +2121,12 @@ async fn handle_wheel(
                 session.lock().await.active_pane_id = pane_id;
             }
             let mut s = session.lock().await;
-            if up {
-                let cm = s.copy_mode.get_or_insert_with(shux_ui::CopyModeState::new);
-                shux_ui::copy_mode::scroll_up(cm, 3, total_lines, rect.height);
-            } else if let Some(cm) = s.copy_mode.as_mut() {
-                shux_ui::copy_mode::scroll_down(cm, 3, total_lines, rect.height);
-                if cm.scroll_offset == 0 {
-                    // Returned to the live bottom — leave scrollback.
-                    s.copy_mode = None;
-                }
-            }
+            let cm = s.copy_mode.get_or_insert_with(|| {
+                let mut st = shux_ui::CopyModeState::new();
+                st.wheel_initiated = true;
+                st
+            });
+            shux_ui::copy_mode::scroll_up(cm, 3, total_lines, rect.height);
         }
     }
     Ok(true)
@@ -4063,6 +4078,118 @@ mod tests {
             "one wheel-down tick maps to three down-arrows on the alt screen"
         );
         assert!(session.lock().await.copy_mode.is_none());
+        fixture.stop();
+    }
+
+    // Regression (found by adversarial agent "Mudrārākṣasa"): once the wheel
+    // enters scrollback, copy mode is active, so every later wheel event is
+    // consumed by `handle_copy_mode_mouse` — NOT `handle_wheel`. The exit-at-
+    // bottom logic must therefore live in that path too, or wheel-down returns
+    // to the live view but leaves the session stuck in copy mode (keyboard
+    // hijacked until `q`). This drives the real two-handler integration path.
+    #[tokio::test]
+    async fn wheel_initiated_scrollback_exits_when_wheeled_back_to_bottom() {
+        let fixture = attach_fixture().await;
+        let _wr = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let mut drag = SelectionDrag::None;
+
+        // Wheel-up opens a wheel-initiated scrollback view (via handle_wheel).
+        handle_wheel(
+            MouseKind::ScrollUp,
+            3,
+            3,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+        )
+        .await
+        .expect("wheel up");
+        {
+            let s = session.lock().await;
+            let cm = s.copy_mode.as_ref().expect("wheel-up enters scrollback");
+            assert!(cm.wheel_initiated, "must be flagged wheel-initiated");
+            assert!(cm.scroll_offset > 0);
+        }
+
+        // Copy mode is now active, so wheel-down flows through the OTHER handler.
+        for _ in 0..40 {
+            handle_copy_mode_mouse(
+                MouseKind::ScrollDown,
+                ProtoMouseButton::None,
+                3,
+                3,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &out_tx,
+                &mut drag,
+            )
+            .await
+            .expect("copy-mode wheel down");
+        }
+
+        assert!(
+            session.lock().await.copy_mode.is_none(),
+            "wheel-down to the live bottom must exit wheel-initiated scrollback \
+             (else the keyboard stays hijacked)"
+        );
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn manual_copy_mode_survives_wheel_back_to_bottom() {
+        // The counterpart guard: a copy mode the user opened deliberately
+        // (Prefix [ / API — NOT wheel-initiated) must NOT auto-exit on a wheel,
+        // so a scroll never discards an in-progress selection/search.
+        let fixture = attach_fixture().await;
+        let _wr = seed_scrollback_pane(&fixture.io_state, fixture.first_pane, b"").await;
+        let mut attached = fixture.attached.clone();
+        attached.copy_mode = Some(shux_ui::CopyModeState::new()); // wheel_initiated = false
+        let session = Arc::new(Mutex::new(attached));
+        let client_size = Arc::new(Mutex::new((100, 30)));
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let mut drag = SelectionDrag::None;
+
+        handle_copy_mode_mouse(
+            MouseKind::ScrollUp,
+            ProtoMouseButton::None,
+            3,
+            3,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &out_tx,
+            &mut drag,
+        )
+        .await
+        .expect("copy-mode wheel up");
+        for _ in 0..40 {
+            handle_copy_mode_mouse(
+                MouseKind::ScrollDown,
+                ProtoMouseButton::None,
+                3,
+                3,
+                &fixture.graph,
+                &fixture.io_state,
+                &session,
+                &client_size,
+                &out_tx,
+                &mut drag,
+            )
+            .await
+            .expect("copy-mode wheel down");
+        }
+
+        assert!(
+            session.lock().await.copy_mode.is_some(),
+            "manually-entered copy mode must survive a wheel scroll to the bottom"
+        );
         fixture.stop();
     }
 }
