@@ -90,3 +90,22 @@ makes pagers scroll out of the box).
 - dootsabha council / gh-ghent steps: N/A in this environment (not installed) —
   substituted with `adversarial-review` skill + the two QA gate sub-agents;
   noted in PR.
+
+## Known limitations / follow-ups (validated vs wezterm/Alacritty/Ghostty)
+
+Best-practices research (agent "Kathāsaritsāgara") confirmed all core encoding
+decisions match the mature-terminal consensus (and shux is *more* correct than
+Alacritty on the DECCKM SS3/CSI rule). Three enhancements are deferred because
+they require a protocol/client change beyond this daemon-side fix:
+
+- **Shift+wheel scrollback bypass.** In xterm/wezterm/Ghostty, Shift+wheel
+  scrolls the terminal's own scrollback even while an app holds mouse mode. The
+  `AttachClientFrame::Mouse` frame carries no modifier bits, so this needs the
+  protocol + client (`shux-ui`) to forward modifiers. Deferred. (Mouse-aware
+  apps have their own navigation, so the impact is limited.)
+- **Horizontal wheel (buttons 66/67).** `shux-ui` currently drops
+  `ScrollLeft`/`ScrollRight` before they reach the daemon; forwarding them to
+  mouse-aware apps needs a client change. Deferred.
+- **Trackpad precision / momentum damping.** The host terminal already quantizes
+  wheel input into discrete `ScrollUp`/`ScrollDown` events before shux sees them,
+  so this is largely handled upstream; a fast-scroll modifier is a future nicety.

@@ -91,6 +91,10 @@ const SECTIONS: &[Section] = &[
         title: "Mouse",
         entries: &[
             Entry {
+                key: "Scroll wheel",
+                desc: "Scroll scrollback (or the focused app when it uses the mouse)",
+            },
+            Entry {
                 key: "Drag text",
                 desc: "Select visible text and copy on release",
             },
