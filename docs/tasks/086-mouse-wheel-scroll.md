@@ -1,6 +1,6 @@
 # 086 — Mouse Wheel Scroll (scrollback + app forwarding)
 
-**Status:** In Progress
+**Status:** Done
 **Priority:** High (daily-driver human UX; PRD P0 mouse "scroll-for-scrollback")
 **Milestone:** M3 polish
 **Depends On:** 020, 021, 062

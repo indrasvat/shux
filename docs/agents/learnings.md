@@ -367,3 +367,27 @@ palette, restore the deliberate table/summary divergence).
   it, and an agent's prompt is exactly the kind of argv that quotes anything. Identify a
   process by its pidfile and verify its identity (argv shape) before signalling it; never
   by a substring search.
+
+- **2026-07-30 (task 086 — a fixed no-op is dead code if a sibling handler intercepts
+  first):** The mouse wheel had never scrolled in a normal pane — `handle_mouse` had an
+  empty `ScrollUp/ScrollDown` arm (a deferred task-021 hook) and nothing forwarded mouse
+  events to a pane's PTY. The fix added `handle_wheel` (3-tier: forward to a mouse-aware
+  app / wheel→arrows on the alt screen / scroll shux scrollback). But the wheel's
+  "return to live and hand back the keyboard" logic was *dead code*: once the first
+  wheel-up opened copy mode, `handle_copy_mode_mouse` (dispatched BEFORE `handle_wheel`)
+  consumed every later wheel event, and it had no exit-at-bottom check — so wheel-down
+  reached the live bottom but left the session stuck in copy mode with the keyboard
+  hijacked. An adversarial agent driving the real binary found this; the isolated
+  `handle_wheel_*` unit tests all stayed green because they never exercised the
+  two-handler integration path. Lessons: (1) when two handlers can own the same input in
+  different states, a state-transition test MUST drive the real dispatch order, not each
+  handler alone; (2) distinguish wheel-opened scrollback from a deliberately-entered copy
+  mode (a `wheel_initiated` flag on `CopyModeState`, tied to its lifetime) so an
+  auto-exit never discards a user's in-progress selection.
+- **2026-07-30 (task 086 — validate terminal wire-encoding against real terminals, not
+  memory):** Before trusting the SGR/X10 wheel encoding, `?1007` default, arrows-per-tick,
+  and DECCKM SS3/CSI choice, a research agent cross-checked wezterm, Alacritty, Ghostty,
+  and xterm ctlseqs — all eight decisions matched the consensus, and it flagged that SGR
+  wheel buttons are `64`/`65` *directly* (the `+32` offset is X10-only) and that Alacritty
+  hard-codes `ESC O` arrows regardless of DECCKM (shux's conditional form is more correct).
+  Cheap, high-confidence validation for any protocol/wire-format work.
