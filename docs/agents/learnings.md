@@ -391,3 +391,56 @@ palette, restore the deliberate table/summary divergence).
   wheel buttons are `64`/`65` *directly* (the `+32` offset is X10-only) and that Alacritty
   hard-codes `ESC O` arrows regardless of DECCKM (shux's conditional form is more correct).
   Cheap, high-confidence validation for any protocol/wire-format work.
+
+- **2026-08-03 (issue #102 — a dependency's safety feature can be silently absent under
+  your feature flags):** shux looked like it inherited vte's OSC buffer cap
+  (`MAX_OSC_RAW`, 1 KiB). It did not: the `is_full()` guards enforcing that cap are
+  `#[cfg(not(feature = "std"))]`, and `std` is a vte *default* feature. Under `std`,
+  `osc_raw` is a plain unbounded `Vec` and an unterminated OSC retains every byte
+  streamed at it — measured at +203 MB from a 200 MiB stream. Building vte with
+  `default-features = false` restored the cap at **zero throughput cost** (77 vs 78 MB/s
+  plain text, best-of-7; an early single unwarmed run suggested ~11% and would have been
+  quoted as fact if it had not been re-measured). alacritty_terminal 0.26 opts into
+  `features = ["std", "ansi"]` and therefore has the same unbounded buffer, so this is
+  not a shux-specific oversight. Lesson: when relying on an upstream limit, verify it is
+  actually compiled in under *your* feature resolution — read the `cfg` on the guard, not
+  the constant.
+
+- **2026-08-03 (issue #102 — "truncate and still dispatch" is a different hazard from
+  unbounded growth, and can be worse):** no-std vte enforces its OSC cap by silently
+  dropping excess bytes and then dispatching the truncated payload with no overflow
+  signal. shux stores OSC 8 hyperlinks per cell, so a 4030-byte URI became a stored,
+  valid-looking 1023-byte link pointing somewhere the sender never specified — a
+  correctness/safety regression introduced *by the fix for a DoS*. Detection has to be
+  inferred: vte's buffer holds parameters concatenated, so `sum(params[].len()) >= CAP`
+  means the buffer filled. That check alone is not sufficient — vte *also* caps the
+  parameter list at `MAX_OSC_PARAMS` (16) independently of buffer space, so a semicolon
+  flood truncates the list without filling the buffer and left a cell holding
+  `";;;;;;;;;;;;;"` as its hyperlink. Fail closed on both. Mirror any private upstream
+  constant with a drift-guard test asserting both sides of the boundary.
+
+- **2026-08-03 (issue #102 — four verification artifacts that looked green were each
+  blind, in a different way):** (1) A pre/post grid *fingerprint* hashed char, colour,
+  width and flags but not the grapheme payload or hyperlink — precisely the two fields
+  the change touched — so it reported "identical" for three streams that must differ.
+  (2) A cross-pane stall harness extracted the pane id with `jq -r '.pane_id // .id'`
+  against a response actually shaped `{"pane": {...}, "split_from": ...}`; every
+  measured command was an instant *failure* masked by `|| true`, so a 1233 ms stall
+  measured as 27 ms. (3) v1-vs-v2 PNG diffing of animated TUIs is dominated by capture
+  timing, not rendering — vim showed 92k changed pixels purely because v1 caught it
+  mid-paint. (4) `wait-settled` alone races slow starters: a not-yet-started app **is**
+  quiet, so nvim and vivecaka were captured blank and only opening the PNGs revealed it.
+  Countermeasures that worked: prove the comparator DETECTS the intended change before
+  trusting it to prove absence of change; never mask failures in a measurement harness
+  (abort loudly); prefer deterministic replay of recorded PTY bytes over screenshotting
+  live animated apps; require an app to draw before settling.
+
+- **2026-08-03 (issue #102 — reproduce your own alarming findings too, not just other
+  agents'):** Attacking the new OSC truncation heuristic produced a stored truncated
+  hyperlink, which read as a blocker in the fix. Reproducing it against the pre-fix
+  commit showed byte-identical behaviour — pre-existing, from vte's separate parameter
+  cap. Likewise four "mangled" grapheme clusters (skin-tone families, Devanagari
+  conjuncts) were identical pre and post, i.e. existing segmentation scope, not damage
+  from the new 32-scalar cap. Both would have been mis-filed as self-inflicted
+  regressions without an A/B against a worktree of the base commit. Keep a built binary
+  and a path-dep worktree of the base commit on hand for any bounds/behaviour change.

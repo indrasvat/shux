@@ -1639,15 +1639,18 @@ impl<'a> vte::Perform for VtHandler<'a> {
 
     fn put(&mut self, byte: u8) {
         if let Some(dcs) = self.dcs_state.as_mut() {
-            // Bound the in-progress payload (issue #102). Past the cap we stop
-            // retaining bytes and mark the sequence poisoned; `unhook` then
-            // drops it rather than answering a truncated query. The two DCS
-            // types we support (XTGETTCAP `+q`, DECRQSS `$q`) carry capability
-            // names of tens of bytes, so the cap is unreachable in practice.
+            // Bound the in-progress payload (issue #102). Once poisoned the
+            // sequence stays poisoned until `unhook` drops it, rather than
+            // answering a truncated query. The two DCS types we support
+            // (XTGETTCAP `+q`, DECRQSS `$q`) carry capability names of tens of
+            // bytes, so the cap is unreachable in practice.
+            if dcs.overflowed {
+                return;
+            }
             if dcs.payload.len() >= MAX_DCS_PAYLOAD_BYTES {
                 dcs.overflowed = true;
-                dcs.payload.clear();
-                dcs.payload.shrink_to_fit();
+                // Release the buffer now; `unhook` will not read it.
+                dcs.payload = Vec::new();
                 return;
             }
             dcs.payload.push(byte);
