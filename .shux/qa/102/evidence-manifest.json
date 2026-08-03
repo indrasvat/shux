@@ -6,9 +6,9 @@
     "gh issue 102 #Acceptance",
     ".local/102-vt-input-bounds-plan.md #Evidence matrix"
   ],
-  "generated_at_utc": "2026-08-03T22:08:01.576741+00:00",
+  "generated_at_utc": "2026-08-03T22:43:03.128757+00:00",
   "gate": "shux-vt-solid-qa",
-  "verdict": "FAIL",
+  "verdict": "PASS",
   "solid_qa_report": ".shux/qa/102/SOLID-QA.md",
   "branch": "fix/vt-input-bounds",
   "head_commit_at_audit_start": "6ed9bc3",
@@ -20,15 +20,21 @@
   ],
   "baseline_commit": "b521f2c",
   "state_under_audit": {
-    "description": "Committed as 78192c6 mid-audit; the committed blobs hash-match the working tree state ('state A') against which every result was derived",
+    "description": "PASS is pinned to these blob hashes. parser.rs and input_bounds.rs were uncommitted at audit close; commit unchanged and confirm the committed blobs hash to these values, or re-run the gate.",
+    "committed_parent": "7638470",
+    "re_gated_states": [
+      "6ed9bc3",
+      "78192c6",
+      "7638470",
+      "final (this)"
+    ],
     "files": {
-      "crates/shux-vt/src/parser.rs": "59e0306f9b70b74169217515532ce88358f84c4eb55857061283748a6016e303",
+      "crates/shux-vt/src/parser.rs": "3079b8f9597db78cb093d3d65054de293c4634247dd59e1e05d6e6a268e9ef85",
       "crates/shux-vt/src/cell.rs": "e112c9bd14810b982c3b88ab0466f440f349ecd23e3e77c5ee0f40a2b52ed343",
       "crates/shux-vt/src/lib.rs": "dd8261319e116495ff503c8109ac2f1e217eec6df2e0813b5f003aaeed59887b",
-      "crates/shux-vt/tests/input_bounds.rs": "f70dcbde1779f54b74277328dda746ceef4c24e16cdd374b8dd7fc8de06383b9",
+      "crates/shux-vt/tests/input_bounds.rs": "37bf9bb1e9fb33f5dce6f1417328655ac20ccd8bc7fa0a08f52c740656b0d20d",
       "Cargo.toml": "1dcd27c227ca2baa05d111e97ddc3297a4c749cda9f404d376c5c687b5184cd6"
-    },
-    "committed_as": "78192c6"
+    }
   },
   "dootsabha_design": {
     "present": true,
@@ -44,9 +50,19 @@
     "note": "substantive; verdicts visibly reflected in .local/102-vt-input-bounds-plan.md"
   },
   "dootsabha_implementation": {
-    "present": false,
-    "path": null,
-    "note": "MISSING. Required by CLAUDE.md Feature Protocol step 6 and by this gate's evidence layer 8. Finding P1-B; blocks PASS."
+    "present": true,
+    "path": ".local/102-impl-council.json",
+    "diff_reviewed": "b521f2c..78192c6",
+    "chair": "claude",
+    "reviewers": [
+      "codex",
+      "agy",
+      "grok"
+    ],
+    "providers_ok": true,
+    "bytes": 44110,
+    "sha256": "29ac6c6076464849aa5381258c112812233f427916d7f50d74f7a045b891347b",
+    "note": "raised 3 open findings; all adjudicated by measurement and closed (F3, F4, reply budget)"
   },
   "screenshots": {
     "storage_policy": "CLAUDE.md: PNGs stay scratch under .shux/out/ and go to PR comments; not committed without DootSabha approval for a durable baseline",
@@ -1445,11 +1461,13 @@
     }
   },
   "other_evidence": {
-    "replay_equivalence": ".shux/out/102-qa/replay/replay_equivalence_stateA.txt",
-    "replay_sensitivity": ".shux/out/102-qa/replay/sensitivity_stateA.txt",
+    "replay_equivalence": ".shux/out/102-qa/replay/replay_equivalence_stateC.txt",
+    "replay_sensitivity": ".shux/out/102-qa/replay/sensitivity_stateC.txt",
     "live_isolation_postfix": ".shux/out/102-qa/liveA/v3_isolation_*",
     "live_isolation_prefix": ".shux/out/102-qa/live-prefix/v3_isolation_*",
-    "implementer_evidence_reviewed_not_trusted": ".shux/out/102/"
+    "implementer_evidence_reviewed_not_trusted": ".shux/out/102/",
+    "window_clip_size_sweep": ".shux/out/102-qa/wsweep/",
+    "window_clip_split_vs_size": ".shux/out/102-qa/splitvssize/"
   },
   "cleanup": {
     "repo_shux_daemons_after": 0,
@@ -1460,49 +1478,51 @@
   },
   "findings": [
     {
-      "id": "P1-A",
-      "severity": "P1 (CLEARED)",
-      "summary": "Commits e059171..6ed9bc3 dropped OSC 4 batches of >=8 pairs, voiding palette_overridden / has_indexed_colors (lens gate signal). Reproduced independently on 6ed9bc3. FIXED by 78192c6 with a regression test proven RED against 6ed9bc3. No longer blocking."
-    },
-    {
-      "id": "P1-B",
+      "id": "F1",
       "severity": "P1",
-      "summary": "No DootSabha implementation-diff council for issue #102."
+      "status": "CLOSED",
+      "summary": "OSC 4 batches of >=8 pairs were dropped, voiding palette_overridden / has_indexed_colors (lens gate signal). Found independently on 6ed9bc3; fixed in 78192c6 with a test proven RED."
     },
     {
-      "id": "P2-A",
+      "id": "F2",
+      "severity": "P3",
+      "status": "CLOSED",
+      "summary": "DCS overflow cleared+regrew instead of latching. Bounded but costly; fixed in 7638470. Throughput 284 -> 446 MB/s."
+    },
+    {
+      "id": "F3",
       "severity": "P2",
-      "summary": "Committed evidence in .shux/out/102/ is stale: RED record says 13 (actual 16); REP worst case (wide/ZWJ source) unrecorded."
+      "status": "CLOSED (documented trade-off)",
+      "summary": "A complete 16-param OSC 8 (URI with 13 semicolons) is dropped. Verified against vte 0.15 directly that complete-14 and truncated-30 dispatches are byte-identical, so the false positive is unavoidable and dropping is the correct direction. Documented and pinned by a boundary test."
     },
     {
-      "id": "P2-B",
+      "id": "F4",
       "severity": "P2",
-      "summary": ".shux/qa/102/ did not exist before this audit; these artifacts are untracked until committed."
+      "status": "CLOSED",
+      "summary": "The vte param-cap drift guard could detect neither a raised nor a lowered cap - a defect in verification machinery. Replaced by a direct behavioural probe via OSC 4 that detects both directions."
     },
     {
-      "id": "P3-A",
+      "id": "F5",
       "severity": "P3",
-      "summary": "DCS overflow clears+regrows instead of latching on `overflowed`; bounded and fast, but churns ~51k alloc cycles per 200 MiB."
+      "status": "OUT OF SCOPE (pre-existing)",
+      "summary": "window.snapshot silently clips from the TOP when a pane grid is taller than the window layout rect. NOT split-related (corrected). Deterministic, monotonic, byte-identical on a 3s retry so not a race. Byte-identical on b521f2c. Needs its own issue."
     },
     {
-      "id": "P3-B",
-      "severity": "P3",
-      "summary": "A complete 16-parameter OSC 8 is dropped though nothing was truncated; fails closed, but the code comment overstates."
-    },
-    {
-      "id": "P3-C",
-      "severity": "P3",
-      "summary": "PRE-EXISTING, not caused by #102: window.snapshot renders a pane blank after split, and when the pane grid exceeds the window layout rect. Byte-identical on b521f2c. Needs its own issue."
+      "id": "F6",
+      "severity": "P2",
+      "status": "CLOSED",
+      "summary": "Committed evidence understated the work (13 RED recorded vs 16 actual; REP worst case unrecorded). Refreshed in 7638470; refreshed figures match my measurements."
     }
   ],
   "pass_requirements": [
-    "Run dootsabha council on the implementation diff b521f2c..78192c6 (config from ~/.config/dootsabha/config.yaml, no CLI overrides) and store the output - ONLY BLOCKER",
-    "Refresh .shux/out/102/v1_RED_test_results.md (16 RED) and add wide/ZWJ-source REP numbers to v2_baseline_measurements.md",
-    "Commit .shux/qa/102/ so the evidence is tracked",
-    "Re-gate; if crates/shux-vt/** or Cargo.toml are unchanged from the hashes above, sections 4-6 need not be re-run"
+    "Commit the audited parser.rs and input_bounds.rs unchanged and confirm the committed blobs match the hashes in state_under_audit"
   ],
   "head_commit_at_audit_end": "78192c6",
-  "blocking_findings": [
-    "P1-B"
-  ]
+  "blocking_findings": [],
+  "test_totals": {
+    "binaries": 30,
+    "passed": 1535,
+    "failed": 0,
+    "ignored": 1
+  }
 }
