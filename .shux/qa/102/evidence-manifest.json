@@ -20,7 +20,7 @@
   ],
   "baseline_commit": "b521f2c",
   "state_under_audit": {
-    "description": "PASS is pinned to these blob hashes. parser.rs and input_bounds.rs were uncommitted at audit close; commit unchanged and confirm the committed blobs hash to these values, or re-run the gate.",
+    "description": "Audited blobs committed unchanged at 113b66c and hash-verified; the condition on this PASS is satisfied.",
     "committed_parent": "7638470",
     "re_gated_states": [
       "6ed9bc3",
@@ -34,7 +34,9 @@
       "crates/shux-vt/src/lib.rs": "dd8261319e116495ff503c8109ac2f1e217eec6df2e0813b5f003aaeed59887b",
       "crates/shux-vt/tests/input_bounds.rs": "37bf9bb1e9fb33f5dce6f1417328655ac20ccd8bc7fa0a08f52c740656b0d20d",
       "Cargo.toml": "1dcd27c227ca2baa05d111e97ddc3297a4c749cda9f404d376c5c687b5184cd6"
-    }
+    },
+    "committed_as": "113b66c",
+    "condition_satisfied": true
   },
   "dootsabha_design": {
     "present": true,
@@ -1512,17 +1514,22 @@
       "severity": "P2",
       "status": "CLOSED",
       "summary": "Committed evidence understated the work (13 RED recorded vs 16 actual; REP worst case unrecorded). Refreshed in 7638470; refreshed figures match my measurements."
+    },
+    {
+      "id": "F7",
+      "severity": "P0",
+      "status": "OPEN - branch level, outside gate scope",
+      "summary": "Branch tip fix/vt-input-bounds is 9ff4242 'add golden' (author t <t@t>): 1101 files changed, 1 insertion, 236294 deletions - deletes 1100 files and adds only goldens/frame.capture.json. Nothing lost: files intact on disk, audited blobs hash correctly, 113b66c and 4fbb5ad both exist, nothing pushed. Caused by a harness that runs git add -A && git commit against the working repo instead of a temp dir. Does not affect the verdict on 113b66c; must be fixed before the branch moves."
     }
   ],
-  "pass_requirements": [
-    "Commit the audited parser.rs and input_bounds.rs unchanged and confirm the committed blobs match the hashes in state_under_audit"
-  ],
+  "pass_requirements": [],
   "head_commit_at_audit_end": "78192c6",
   "blocking_findings": [],
   "test_totals": {
     "binaries": 30,
     "passed": 1535,
     "failed": 0,
-    "ignored": 1
+    "ignored": 1,
+    "run": "clean serial run on committed 113b66c"
   }
 }

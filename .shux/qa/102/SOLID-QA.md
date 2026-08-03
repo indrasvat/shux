@@ -18,6 +18,22 @@ section and the plan's Evidence matrix were used as the Definition of Done.
 
 ### The state this verdict applies to
 
+**Confirmed against the commit.** All five blobs committed at `113b66c` hash
+exactly to the pin below, so the condition attached to this verdict is satisfied:
+
+```
+git show 113b66c:crates/shux-vt/src/parser.rs        | shasum -a256 -> 3079b8f9...68e9ef85  MATCH
+git show 113b66c:crates/shux-vt/src/cell.rs          | shasum -a256 -> e112c9bd...b52ed343  MATCH
+git show 113b66c:crates/shux-vt/src/lib.rs           | shasum -a256 -> dd826131...eed59887  MATCH
+git show 113b66c:crates/shux-vt/tests/input_bounds.rs| shasum -a256 -> 37bf9bb1...656b0d20  MATCH
+git show 113b66c:Cargo.toml                          | shasum -a256 -> 1dcd27c2...5b5184cd  MATCH
+```
+
+Clean serial re-gate on `113b66c`: `make test` **1535 passed / 0 failed / 1
+ignored across 30 binaries** (exit 0); `make lint` clean; **all 9** VT golden
+gates pass; corpus goldens 0 changed pixels; 29 bounds tests.
+
+
 `crates/shux-vt` moved four times during the audit as findings landed. Each move
 was re-gated from scratch. **This PASS applies to exactly these blobs:**
 
@@ -432,9 +448,47 @@ wide-CJK and ZWJ-cluster cases are 2.5× and 7× more expensive). Both refreshed
   harness (absolute paths and timing only, `changed_pixels: 0` unchanged) and
   restored to their committed content via `git show`.
 
-## 10. Condition on this verdict
+## 10. Condition on this verdict — SATISFIED
 
-This PASS is pinned to the five blob hashes in §1. The audited `parser.rs` and
-`input_bounds.rs` are uncommitted at the time of writing. **Commit them
-unchanged, then confirm the committed blobs hash to those values.** If they
-differ, re-run the gate — §4 through §6 are the parts that must be regenerated.
+The audited blobs are committed unchanged at `113b66c` and hash-verified (§1).
+The condition is met and this PASS stands for `113b66c`.
+
+## 11. P0 on the BRANCH, outside the scope of this gate — do not push as-is
+
+Discovered while re-gating, after the audited code was verified. It does not
+affect the verdict on `113b66c`, but it must be fixed before this branch moves.
+
+The branch tip `fix/vt-input-bounds` is **`9ff4242 "add golden"`** — author
+`t <t@t>`, 2026-08-03 15:48:15 -0700 — **1101 files changed, 1 insertion,
+236 294 deletions**. It deletes 1100 files (all of `crates/`, `.claude/`,
+`docs/`, `spikes/`, …) and adds only `goldens/frame.capture.json`.
+
+```
+9ff4242 HEAD@{0}: commit: add golden                      <-- branch tip
+4fbb5ad HEAD@{1}: commit: docs(102): record SOLID QA PASS
+113b66c HEAD@{2}: fix(vt): widen reply budget, pin OSC 8 semicolon boundary
+```
+
+**Nothing is lost.** Every file is present on disk, the five audited blobs still
+hash correctly, `113b66c` and `4fbb5ad` both exist, and nothing was pushed (no
+`origin/fix/vt-input-bounds`). `4fbb5ad` is the real tip.
+
+The `t <t@t>` identity points at a harness that creates a scratch git repo and
+runs `git add -A && git commit`, executing against this worktree instead of its
+temp dir. It landed at 15:48, the same minute `test-vt-tab-stops` reported a
+spurious Error 1 and `check-progress`/`check-vt-qa` began exiting 2 — all
+symptoms of the broken HEAD, not real failures (tab-stops passes on re-run).
+
+A test harness that can commit to the working repository is the same class of
+problem as a gate that can be talked into passing, and deserves the same
+treatment. Recovery is the branch owner's to perform; this gate touched no git
+state at any point.
+
+### Note on a transient test failure during re-gating
+
+The first `make test` on `113b66c` failed `pane_kill_reaps_only_that_pane_child`
+with `pane.split -> not_found`. Cause: a **second `make test` running
+concurrently** (PID 3087). Re-run serially 5×: 5/5 pass. Daemon-backed shux tests
+must not be parallelised, per CLAUDE.md; this is what it looks like when they
+are. The clean serial run reported above was taken after the concurrent run
+drained.
