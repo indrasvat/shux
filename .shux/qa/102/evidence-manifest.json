@@ -1518,8 +1518,8 @@
     {
       "id": "F7",
       "severity": "P0",
-      "status": "OPEN - branch level, outside gate scope",
-      "summary": "Branch tip fix/vt-input-bounds is 9ff4242 'add golden' (author t <t@t>): 1101 files changed, 1 insertion, 236294 deletions - deletes 1100 files and adds only goldens/frame.capture.json. Nothing lost: files intact on disk, audited blobs hash correctly, 113b66c and 4fbb5ad both exist, nothing pushed. Caused by a harness that runs git add -A && git commit against the working repo instead of a temp dir. Does not affect the verdict on 113b66c; must be fixed before the branch moves."
+      "status": "CLOSED - verified by this gate",
+      "summary": "Branch tip was 9ff4242 'add golden' (t <t@t>): 1100 files deleted, 1 added. Root cause was crates/shux/src/gate/bless.rs, not a shell script: GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE override git -C, and git sets them in hook subprocesses, so a temp-repo test committed into the real repo under the pre-push hook. Same leak in production git_tree_is_dirty. Fixed by f740f7c (git_command() strips 8 location vars). Verified by reproducing the real attack shape (GIT_DIR alone) against a disposable decoy: pre-fix e56e989 moves decoy HEAD, creates 'add golden' by t@t, tracked 4->1; post-fix f740f7c leaves the decoy untouched with 15/15 tests passing. Pre-existing on b521f2c, outside the pinned VT file set, PASS unaffected."
     }
   ],
   "pass_requirements": [],
@@ -1531,5 +1531,12 @@
     "failed": 0,
     "ignored": 1,
     "run": "clean serial run on committed 113b66c"
+  },
+  "branch_state_at_close": {
+    "tip": "f740f7c",
+    "tracked_files": 1100,
+    "wipe_commit_reachable": false,
+    "pinned_vt_blobs_unchanged": true,
+    "verdict_applies_to": "113b66c"
   }
 }

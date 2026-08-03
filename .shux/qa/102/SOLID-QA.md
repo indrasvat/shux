@@ -484,6 +484,44 @@ problem as a gate that can be talked into passing, and deserves the same
 treatment. Recovery is the branch owner's to perform; this gate touched no git
 state at any point.
 
+### F7 resolution, verified against the real attack shape
+
+Fixed by `f740f7c` (`git_command()` strips eight repository-location variables).
+Branch recovered: tip `f740f7c`, 1100 files tracked, the wipe commit not
+reachable, no `t@t` author reachable, and all five pinned VT blobs still hash
+exactly to §1.
+
+The root cause is better than my hypothesis and belongs on the record: it was not
+a stray shell script but `crates/shux/src/gate/bless.rs` itself. `GIT_DIR`,
+`GIT_WORK_TREE` and `GIT_INDEX_FILE` **override** `git -C <path>`, and git sets
+them in hook subprocesses — so when the project's own `pre-push` hook ran
+`make test`, a temp-repo test ran `git add -A && git commit -m "add golden"`
+against the real repository. The same leak was in production `git_tree_is_dirty`,
+the bless dirty-tree safety guard: under a hook it assessed whichever repository
+the caller named rather than the golden dir's.
+
+**I verified the fix by reproducing the attack against a disposable decoy repo,
+never the real one.** Two of my own first attempts were inadequate and I discarded
+them: the first ran zero tests (`-p shux --lib` — `shux` is a bin crate), so a
+clean decoy proved nothing; the second set `GIT_DIR` + `GIT_WORK_TREE` +
+`GIT_INDEX_FILE` all at the decoy, which is the wrong shape — pre-fix merely
+failed a test rather than committing, so it would not have caught the real
+signature.
+
+The real incident shape is `GIT_DIR` alone pointing at the victim while the work
+tree resolves to the test's temp dir. Decoy repo with 4 tracked files, 15 bless
+tests:
+
+| | tests | decoy HEAD | `add golden` | author `t@t` | tracked |
+| --- | --- | --- | --- | --- | --- |
+| pre-fix `e56e989` | 11 passed, **3 failed** | **MOVED** | **1** | **1** | **4 → 1** |
+| post-fix `f740f7c` | **15 passed, 0 failed** | unchanged | 0 | 0 | 4 → 4 |
+
+The pre-fix row reproduces the incident signature exactly — everything deleted,
+one golden file added. So the probe is proven able to fail, and the fix
+demonstrably closes it. Pre-existing on `b521f2c` and outside the pinned VT file
+set, so the PASS on `113b66c` is unaffected.
+
 ### Note on a transient test failure during re-gating
 
 The first `make test` on `113b66c` failed `pane_kill_reaps_only_that_pane_child`
