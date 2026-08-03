@@ -498,6 +498,36 @@ fn safe_write(root: &Path, target: &Path, bytes: &[u8]) -> Result<(), String> {
 /// golden dir that is itself `.gitignore`d reports clean. This is bounded — an ignored
 /// golden is never committed, so a bless into it cannot clobber reviewed VCS history; a
 /// golden that matters is tracked (or its parent is), and this guard covers that.
+/// A `git` command with the repository-location environment stripped.
+///
+/// `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` OVERRIDE `-C <path>`, so a
+/// git invocation that inherits them from a caller does not operate on the
+/// directory it names — it operates on the caller's repository. Git sets all of
+/// these in hook subprocesses, so anything run from a hook (including this
+/// project's own `pre-push`, which runs `make test`) inherits them.
+///
+/// That is not hypothetical: the test below creates a temp repo and commits to
+/// it, and without this stripping it committed to the REAL repository instead,
+/// staging `git add -A` over the whole tree. In production the same leak made
+/// the bless dirty-tree guard assess the wrong repository — a safety check
+/// silently answering about somewhere else.
+fn git_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_QUARANTINE_PATH",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn git_tree_is_dirty(golden_dir: &Path) -> bool {
     // Run git from the nearest existing ancestor so a not-yet-created golden dir still
     // resolves a repo.
@@ -519,7 +549,7 @@ fn git_tree_is_dirty(golden_dir: &Path) -> bool {
             Ok(cwd) if golden_dir.is_relative() => cwd.join(golden_dir),
             _ => golden_dir.to_path_buf(),
         });
-    let out = std::process::Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(anchor)
         .args(["status", "--porcelain", "--"])
@@ -1047,7 +1077,10 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        // MUST go through git_command(): a bare Command inherits GIT_DIR from a
+        // hook, which overrides `-C dir` and points these `add -A` / `commit`
+        // calls at the caller's real repository.
+        let ok = git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -1084,6 +1117,42 @@ mod tests {
             git_tree_is_dirty(&gdir),
             "a modified tracked golden is dirty"
         );
+    }
+
+    /// `git_command()` MUST strip every repository-location variable.
+    ///
+    /// `GIT_DIR` and friends override `-C <path>`, so a git invocation that
+    /// inherits them from a hook operates on the CALLER's repository. This is
+    /// not theoretical: before this stripping, running `make test` from the
+    /// project's own `pre-push` hook made the temp-repo test below run
+    /// `git add -A` and `git commit` against the real working tree, producing a
+    /// commit that deleted 1100 files and kept one `{}` golden. The production
+    /// dirty-tree guard had the same leak and would have assessed the wrong
+    /// repository — a safety check silently answering about somewhere else.
+    #[test]
+    fn git_command_strips_inherited_repository_location() {
+        let cmd = git_command();
+        let removed: Vec<&str> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .filter_map(|(k, _)| k.to_str())
+            .collect();
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_PREFIX",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_QUARANTINE_PATH",
+            "GIT_COMMON_DIR",
+        ] {
+            assert!(
+                removed.contains(&var),
+                "{var} is not stripped; a git call inheriting it would target the \
+                 caller's repository instead of the -C path"
+            );
+        }
     }
 
     #[test]
