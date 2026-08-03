@@ -265,6 +265,83 @@ fn oversized_osc8_hyperlink_is_dropped_not_truncated() {
     }
 }
 
+/// vte caps the OSC *parameter list* at 16 independently of its byte buffer, so
+/// a semicolon flood truncates the parameter list without filling the buffer.
+/// The byte-length check alone does not see that, and the result was a cell
+/// carrying `";;;;;;;;;;;;;"` as its hyperlink.
+///
+/// Pre-existing (identical before this issue's fix), but it is junk stored as a
+/// link, and nothing shux handles legitimately uses that many parameters — so
+/// fail closed on a truncated parameter list too.
+#[test]
+fn osc8_with_truncated_parameter_list_is_dropped() {
+    for (name, seq) in [
+        ("semicolon flood", {
+            let mut s = Vec::from(&b"\x1b]8;"[..]);
+            s.extend(std::iter::repeat_n(b';', 4000));
+            s.extend_from_slice(b"https://good.invalid/tail\x1b\\");
+            s
+        }),
+        ("many named params", {
+            let mut s = Vec::from(&b"\x1b]8"[..]);
+            for i in 0..40 {
+                s.push(b';');
+                s.extend_from_slice(format!("p{i}").as_bytes());
+            }
+            s.extend_from_slice(b";https://good.invalid/tail\x1b\\");
+            s
+        }),
+    ] {
+        let mut t = vt();
+        t.process(&seq);
+        t.process(b"L");
+        assert_eq!(
+            hyperlink_at(&t, 0, 0),
+            None,
+            "{name}: a truncated OSC 8 parameter list was stored as a hyperlink"
+        );
+    }
+}
+
+/// Drift guard for the mirrored `VTE_MAX_OSC_PARAMS`.
+///
+/// vte does not export its parameter cap, so the parser hardcodes 16. If a vte
+/// upgrade changes that, the drop rule silently starts rejecting valid
+/// sequences or accepting truncated ones. Pin both sides of the boundary so the
+/// mismatch fails here rather than in production.
+#[test]
+fn vte_osc_param_cap_is_still_sixteen() {
+    // 15 total params (selector + 14) — under the cap, must be accepted.
+    let mut under = Vec::from(&b"\x1b]0"[..]);
+    for i in 0..14 {
+        under.push(b';');
+        under.extend_from_slice(format!("v{i}").as_bytes());
+    }
+    under.extend_from_slice(b"\x07");
+    let mut t = vt();
+    t.process(&under);
+    assert_eq!(
+        t.title(),
+        Some("v0"),
+        "a 15-param OSC was rejected — vte's parameter cap may have moved above 16"
+    );
+
+    // 16 total params — at the cap, list is truncated, must be dropped.
+    let mut at_cap = Vec::from(&b"\x1b]0"[..]);
+    for i in 0..15 {
+        at_cap.push(b';');
+        at_cap.extend_from_slice(format!("v{i}").as_bytes());
+    }
+    at_cap.extend_from_slice(b"\x07");
+    let mut t = vt();
+    t.process(&at_cap);
+    assert_eq!(
+        t.title(),
+        None,
+        "a 16-param OSC was accepted — vte's parameter cap may have moved below 16"
+    );
+}
+
 /// Negative control: a normal title still round-trips.
 #[test]
 fn normal_title_is_stored() {

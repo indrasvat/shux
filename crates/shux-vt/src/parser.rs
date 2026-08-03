@@ -111,6 +111,12 @@ pub const MAX_OSC_PAYLOAD_BYTES: usize = 4096;
 /// Maximum characters retained for a window title inside the VT.
 pub const MAX_TITLE_CHARS: usize = 256;
 
+/// vte's private `MAX_OSC_PARAMS`. Mirrored here because vte does not export it
+/// and gives no overflow signal; reaching it means the parameter list was cut
+/// short. Must track vte's value — see the version pinned in the workspace
+/// `Cargo.toml`.
+const VTE_MAX_OSC_PARAMS: usize = 16;
+
 /// The VT parser type, with its OSC buffer sized to [`MAX_OSC_PAYLOAD_BYTES`].
 ///
 /// vte only enforces this cap when built without its `std` feature — see the
@@ -1680,16 +1686,24 @@ impl<'a> vte::Perform for VtHandler<'a> {
     }
 }
 
-/// Whether an OSC dispatch carries a payload that vte truncated to fit its
-/// buffer.
+/// Whether an OSC dispatch carries content vte truncated.
 ///
-/// vte offers no overflow signal, but its buffer holds every parameter
-/// concatenated, so a dispatch whose parameters sum to the buffer size is one
-/// that filled it — i.e. was cut short. A legitimate sequence landing exactly
-/// on the cap is dropped too; that false positive fails safe, which is the only
-/// acceptable direction here.
+/// vte offers no overflow signal, and it truncates in two independent ways:
+///
+/// 1. **Byte buffer full.** Its buffer holds every parameter concatenated, so a
+///    dispatch whose parameters sum to the buffer size is one that filled it.
+/// 2. **Parameter list full.** vte tracks at most `MAX_OSC_PARAMS` (16)
+///    parameters regardless of buffer space. A semicolon flood truncates the
+///    list without ever filling the buffer, which check 1 cannot see — that
+///    left a cell holding `";;;;;;;;;;;;;"` as its hyperlink.
+///
+/// Nothing shux handles legitimately uses 16 parameters (OSC 8 uses three,
+/// colours two), so treating a full list as untrustworthy costs nothing. A
+/// legitimate sequence landing exactly on either cap is dropped too; that false
+/// positive fails safe, which is the only acceptable direction here.
 fn osc_payload_was_truncated(params: &[&[u8]]) -> bool {
-    params.iter().map(|p| p.len()).sum::<usize>() >= MAX_OSC_PAYLOAD_BYTES
+    params.len() >= VTE_MAX_OSC_PARAMS
+        || params.iter().map(|p| p.len()).sum::<usize>() >= MAX_OSC_PAYLOAD_BYTES
 }
 
 /// Bound a window title at VT storage time.
