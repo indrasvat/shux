@@ -346,6 +346,50 @@ fn real_zwj_family_emoji_is_preserved() {
     );
 }
 
+/// Negative control: the real-world worst case must sit well under the cap.
+///
+/// `MAX_GRAPHEME_SCALARS` has no prior art to lean on — alacritty_terminal
+/// 0.26 caps grapheme accumulation not at all — so the cap's safety rests
+/// entirely on this test. Each cluster below is one a real application emits;
+/// none may be clipped, and the headroom is recorded so a future reduction of
+/// the cap fails loudly rather than silently truncating someone's text.
+#[test]
+fn real_world_grapheme_clusters_are_never_clipped() {
+    const ZWJ: &str = "\u{200D}";
+    const VS16: &str = "\u{FE0F}";
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "ZWJ family",
+            format!("\u{1F468}{ZWJ}\u{1F469}{ZWJ}\u{1F467}{ZWJ}\u{1F466}"),
+        ),
+        (
+            "England tag flag",
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}".to_string(),
+        ),
+        ("rainbow flag", format!("\u{1F3F3}{VS16}{ZWJ}\u{1F308}")),
+        ("Vietnamese decomposed", "e\u{0302}\u{0323}".to_string()),
+        ("stacked accents", "a\u{0301}\u{0302}\u{0303}".to_string()),
+    ];
+
+    for (name, cluster) in &cases {
+        let mut t = vt();
+        t.process(cluster.as_bytes());
+        let stored = t.grid().visible_row(0)[0].grapheme().unwrap_or("");
+        assert_eq!(
+            stored,
+            cluster,
+            "{name} ({} scalars) was clipped by the {}-scalar cap",
+            cluster.chars().count(),
+            32
+        );
+        assert!(
+            cluster.chars().count() < 32,
+            "{name} needs {} scalars, which leaves no headroom under the cap",
+            cluster.chars().count()
+        );
+    }
+}
+
 /// Negative control: ordinary combining marks must still compose.
 #[test]
 fn ordinary_combining_marks_still_compose() {
