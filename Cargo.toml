@@ -37,7 +37,11 @@ crossterm = "0.29"
 ratatui = "0.30"
 
 # VT parsing
-vte = { version = "0.15", features = ["ansi"] }
+# default-features = false is load-bearing, not cosmetic: vte only enforces its
+# OSC buffer cap when built without `std` (the `is_full()` guards are
+# `#[cfg(not(feature = "std"))]`). Under `std` the buffer is an unbounded Vec and
+# an unterminated OSC retains every byte streamed at it — see issue #102.
+vte = { version = "0.15", default-features = false, features = ["ansi"] }
 
 # Plugin (Wasm)
 wasmtime = "41"

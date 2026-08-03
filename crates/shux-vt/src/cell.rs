@@ -1,6 +1,14 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+/// Maximum Unicode scalars retained in one cell's grapheme payload.
+///
+/// Unicode's stream-safe format (UAX #15) caps a sensible grapheme at 30
+/// non-starters; the longest real ZWJ sequences (family emoji with skin-tone
+/// modifiers) are well under that. Anything beyond this is a pane streaming
+/// combining marks to grow cell state without bound (issue #102).
+pub const MAX_GRAPHEME_SCALARS: usize = 32;
+
 /// Compact cell flags packed into a single byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CellFlags(u8);
@@ -211,10 +219,32 @@ impl Cell {
     }
 
     /// Append one scalar to this cell's rare grapheme payload.
+    ///
+    /// Bounded at [`MAX_GRAPHEME_SCALARS`] and appended in place: the previous
+    /// clone-the-whole-string-per-scalar form let one cell accumulate unbounded
+    /// text at quadratic cost (issue #102). Once the cap is reached further
+    /// continuation scalars are dropped — the cell keeps the grapheme it has
+    /// rather than growing or resetting.
     pub fn append_grapheme_scalar(&mut self, ch: char) {
-        let mut text = self.display_text().into_owned();
-        text.push(ch);
-        self.set_grapheme_payload(text);
+        match self.extended.as_ref().and_then(|e| e.grapheme.as_deref()) {
+            Some(existing) => {
+                if existing.chars().count() >= MAX_GRAPHEME_SCALARS {
+                    return;
+                }
+                // Safe to unwrap: the match arm proves `extended` is Some.
+                let extended = self.extended.as_mut().expect("grapheme payload present");
+                if let Some(text) = Arc::make_mut(extended).grapheme.as_mut() {
+                    text.push(ch);
+                }
+            }
+            None => {
+                // First continuation scalar: seed from the base char.
+                let mut text = String::with_capacity(8);
+                text.push(self.ch);
+                text.push(ch);
+                self.set_grapheme_payload(text);
+            }
+        }
     }
 
     /// Remove extended storage when every rare field has returned to default.
