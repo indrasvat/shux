@@ -371,6 +371,98 @@ fn osc4_palette_batches_survive_the_truncation_guard() {
     }
 }
 
+/// Pins the semicolon boundary for OSC 8 URIs, including the deliberate false
+/// positive at the parameter cap.
+///
+/// A URI path may legally contain semicolons, and vte splits on them. Up to 12
+/// the link round-trips. At 13 it produces exactly 16 parameters — complete,
+/// nothing lost — and is nonetheless DROPPED, because vte discards everything
+/// past its cap with no signal, so a complete 14-segment URI and a truncated
+/// 30-segment one arrive as byte-identical dispatches. Verified: both give 16
+/// params, 33 bytes, identical values.
+///
+/// Dropping a rare valid link degrades to plain text; storing a truncated one
+/// is a wrong destination a user may click. This test exists so that trade-off
+/// is visible and cannot be "fixed" without re-admitting truncated URIs.
+#[test]
+fn osc8_semicolon_boundary_is_pinned_including_the_false_positive() {
+    let build = |segments: usize| {
+        let uri = (0..segments)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        (format!("\x1b]8;;{uri}\x1b\\"), uri)
+    };
+
+    // Up to 12 semicolons (15 params) — must round-trip intact.
+    for segments in [2usize, 6, 13] {
+        let (seq, uri) = build(segments);
+        let mut t = vt();
+        t.process(seq.as_bytes());
+        t.process(b"L");
+        assert_eq!(
+            hyperlink_at(&t, 0, 0).as_deref(),
+            Some(uri.as_str()),
+            "a URI with {} semicolons ({} params) should round-trip intact",
+            segments - 1,
+            segments + 2
+        );
+    }
+
+    // 14 segments (16 params) — complete, but indistinguishable from truncated,
+    // so dropped. Documented trade-off, not an oversight.
+    let (seq, _) = build(14);
+    let mut t = vt();
+    t.process(seq.as_bytes());
+    t.process(b"L");
+    assert_eq!(
+        hyperlink_at(&t, 0, 0),
+        None,
+        "a 16-param OSC 8 must fail closed: it cannot be told apart from a \
+         truncated one, and storing a truncated URI is a wrong destination"
+    );
+
+    // Genuinely truncated — must also be dropped.
+    let (seq, _) = build(30);
+    let mut t = vt();
+    t.process(seq.as_bytes());
+    t.process(b"L");
+    assert_eq!(
+        hyperlink_at(&t, 0, 0),
+        None,
+        "a truncated OSC 8 URI was stored"
+    );
+}
+
+/// Direct behavioural probe of vte's OSC parameter cap, via a selector that has
+/// NO parameter guard of its own.
+///
+/// The OSC 8 boundary test below catches a future cap DECREASE (a truncated
+/// sequence would be stored and fail the assertion) but is blind to an
+/// INCREASE: if vte raised its cap, shux would keep over-dropping at the
+/// mirrored 16 and every assertion would still pass. OSC 4 replies count one
+/// per surviving pair, so this observes the real cap directly.
+#[test]
+fn vte_osc_param_cap_observed_directly_via_osc4() {
+    // 20 pairs sent. With params capped at 16, params[1..] holds 15 entries,
+    // which is 7 whole pairs -> 7 replies. A larger cap yields more.
+    let mut query = Vec::from(&b"\x1b]4"[..]);
+    for i in 1..=20 {
+        query.extend_from_slice(format!(";{i};?").as_bytes());
+    }
+    query.push(0x07);
+
+    let mut t = vt();
+    let replies = t.process_with_responses(&query).len();
+    assert_eq!(
+        replies, 7,
+        "vte returned {replies} OSC 4 replies for 20 pairs; 7 means a 16-param \
+         cap. A different count means vte's MAX_OSC_PARAMS moved and the \
+         mirrored VTE_MAX_OSC_PARAMS in parser.rs is now wrong — which would \
+         make shux over-drop (cap raised) or under-drop (cap lowered) OSC 8."
+    );
+}
+
 /// Drift guard for the mirrored `VTE_MAX_OSC_PARAMS`.
 ///
 /// vte does not export its parameter cap, so the parser hardcodes 16. If a vte
@@ -566,8 +658,53 @@ fn response_count_is_bounded_per_batch() {
     }
     let responses = t.process_with_responses(&seq);
     assert!(
-        responses.len() <= 256,
+        responses.len() <= 512,
         "5,000 DSR queries in one batch produced {} responses; expected a bounded reply budget",
         responses.len()
+    );
+}
+
+/// Negative control for the reply budget: the largest LEGITIMATE burst must not
+/// be clipped. An application probing the full 256-colour palette emits exactly
+/// 256 replies in one batch — that sat exactly on an earlier 256 budget, so any
+/// additional startup query would have silently truncated a valid probe.
+#[test]
+fn full_palette_probe_is_not_clipped_by_the_reply_budget() {
+    let mut seq = Vec::new();
+    let mut idx = 0u32;
+    while idx < 256 {
+        let mut s = String::from("\x1b]4");
+        // vte caps OSC parameters at 16, so at most 7 pairs fit per sequence.
+        for _ in 0..7 {
+            if idx < 256 {
+                s.push_str(&format!(";{idx};?"));
+                idx += 1;
+            }
+        }
+        s.push('\x07');
+        seq.extend_from_slice(s.as_bytes());
+    }
+
+    let mut t = vt();
+    let replies = t.process_with_responses(&seq);
+    assert_eq!(
+        replies.len(),
+        256,
+        "a full 256-colour palette probe was clipped to {} replies",
+        replies.len()
+    );
+
+    // Plus ordinary startup chatter in the same batch — still must not clip.
+    let mut with_chatter = seq.clone();
+    for _ in 0..64 {
+        with_chatter.extend_from_slice(b"\x1b[6n");
+    }
+    let mut t = vt();
+    let replies = t.process_with_responses(&with_chatter);
+    assert_eq!(
+        replies.len(),
+        256 + 64,
+        "a palette probe plus 64 DSR queries was clipped to {} replies",
+        replies.len()
     );
 }

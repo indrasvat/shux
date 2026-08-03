@@ -98,7 +98,14 @@ pub const MAX_DCS_PAYLOAD_BYTES: usize = 4096;
 /// Maximum terminal replies produced from a single `process` batch (issue
 /// #102). One PTY read can carry thousands of `ESC[6n`-style queries, each of
 /// which would otherwise push a reply.
-pub const MAX_RESPONSES_PER_BATCH: usize = 256;
+///
+/// Sized against the largest LEGITIMATE burst, not the smallest safe number: an
+/// application probing the full 256-colour palette emits exactly 256 replies in
+/// one batch, which sat precisely on an earlier 256 budget — adding any other
+/// startup query (DA, DA2, DSR, XTVERSION, DECRQM) would have clipped a valid
+/// probe. 512 leaves headroom for a full palette probe plus normal startup
+/// chatter while still cutting a 5,000-query flood by an order of magnitude.
+pub const MAX_RESPONSES_PER_BATCH: usize = 512;
 
 /// Size of vte's OSC buffer, and therefore the largest OSC payload we accept.
 ///
@@ -1709,8 +1716,24 @@ impl<'a> vte::Perform for VtHandler<'a> {
 ///    list without ever filling the buffer — check 1 cannot see that, and it
 ///    left a cell holding `";;;;;;;;;;;;;"` as its hyperlink.
 ///
-/// A legitimate hyperlink landing exactly on either cap is dropped too; that
-/// false positive fails safe, which is the only acceptable direction here.
+/// **The parameter-count case is deliberately fail-closed, and the false
+/// positive is unavoidable.** A URI whose path legitimately contains 13
+/// semicolons produces exactly 16 parameters with nothing lost, and is dropped
+/// here. That is not a missed refinement: vte discards everything past the cap
+/// with no signal, so a *complete* 14-segment URI and a *truncated* 30-segment
+/// one arrive as byte-identical dispatches — same parameter count, same total
+/// bytes, same parameter values. Verified directly against vte 0.15:
+///
+/// ```text
+/// A "s0;s1;...;s13"            -> 16 params, 33 bytes, [.., "s12", "s13"]
+/// B "s0;s1;...;s13;...;s29"    -> 16 params, 33 bytes, [.., "s12", "s13"]
+/// ```
+///
+/// Nothing at this boundary can tell them apart, so the choice is only which
+/// error to make: drop a rare valid link, or store a link to a destination the
+/// sender never specified. Dropping degrades to plain text; storing is a wrong
+/// destination a user may click. Semicolons in URI paths are legal but
+/// uncommon, and 13 of them is rarer still.
 ///
 /// Note the DoS bound does NOT depend on this: memory is bounded by vte's
 /// buffer cap (see the workspace `Cargo.toml`), which applies to every OSC
