@@ -145,6 +145,29 @@ fn rep_clamps_work_to_one_screen() {
     );
 }
 
+/// REP's clamp is on ITERATIONS, but mutations per iteration vary with the
+/// source cell — a wide char writes two cells, a grapheme cluster also writes a
+/// payload. The narrow-char test above would not catch a blow-up on those, so
+/// pin every width. Measured: narrow 1945, wide 1993, ZWJ cluster 3913 —
+/// against 65535+ unclamped.
+#[test]
+fn rep_stays_bounded_for_wide_and_cluster_sources() {
+    let budget = 4 * (ROWS * COLS) as u64;
+    for (name, seed) in [
+        ("narrow", "A"),
+        ("wide CJK", "\u{4F60}"),
+        ("ZWJ cluster", "\u{1F468}\u{200D}\u{1F469}"),
+    ] {
+        let mut t = vt();
+        t.process(seed.as_bytes());
+        let did = work(&mut t, b"\x1b[65535b");
+        assert!(
+            did <= budget,
+            "REP with a {name} source did {did} mutations; expected <= {budget}"
+        );
+    }
+}
+
 /// Negative control: REP must still wrap onto following lines. Clamping to the
 /// current line would be simpler but breaks legitimate REP semantics.
 #[test]
