@@ -1511,15 +1511,6 @@ impl<'a> vte::Perform for VtHandler<'a> {
             return;
         }
         let terminator = osc_terminator(bell_terminated);
-        // The OSC buffer is vte's, and it truncates silently rather than
-        // signalling overflow (issue #102). A sequence that filled the buffer
-        // cannot be trusted: acting on it would mean setting a half title or —
-        // far worse — storing a truncated OSC 8 URI, which is a valid-looking
-        // link to somewhere the sender never specified. Fail closed.
-        if osc_payload_was_truncated(params) {
-            trace!("oversized OSC sequence discarded without dispatch");
-            return;
-        }
         match params[0] {
             // OSC 0 -- Set Icon Name and Window Title.
             // OSC 2 -- Set Window Title.
@@ -1613,6 +1604,15 @@ impl<'a> vte::Perform for VtHandler<'a> {
             }
             // OSC 8 -- Set/clear hyperlink for subsequent cells.
             b"8" => {
+                // vte truncates silently and still dispatches (issue #102). A
+                // cut-short URI is a valid-looking link to somewhere the sender
+                // never specified, so drop it rather than store it. Scoped to
+                // OSC 8: for other selectors truncation only loses trailing
+                // content, and dropping outright is the worse outcome.
+                if osc8_payload_was_truncated(params) {
+                    trace!("truncated OSC 8 hyperlink discarded without dispatch");
+                    return;
+                }
                 if params.len() >= 3 {
                     let uri_bytes = join_osc_parts(&params[2..]);
                     if uri_bytes.is_empty() {
@@ -1686,22 +1686,33 @@ impl<'a> vte::Perform for VtHandler<'a> {
     }
 }
 
-/// Whether an OSC dispatch carries content vte truncated.
+/// Whether an OSC 8 dispatch carries content vte truncated.
 ///
-/// vte offers no overflow signal, and it truncates in two independent ways:
+/// **Scoped to OSC 8 deliberately.** Truncation is only *dangerous* for
+/// hyperlinks: a cut-short URI is a valid-looking link to somewhere the sender
+/// never specified, so it must be dropped rather than stored. Everywhere else
+/// truncation merely loses trailing content, and dropping the whole sequence
+/// would be the bigger regression — a blanket guard silently voided OSC 4
+/// palette batches of 8+ pairs, which in turn voided `palette_overridden` and
+/// the `has_indexed_colors` portability signal that `shux lens gate` depends
+/// on.
+///
+/// vte offers no overflow signal and truncates in two independent ways:
 ///
 /// 1. **Byte buffer full.** Its buffer holds every parameter concatenated, so a
 ///    dispatch whose parameters sum to the buffer size is one that filled it.
 /// 2. **Parameter list full.** vte tracks at most `MAX_OSC_PARAMS` (16)
-///    parameters regardless of buffer space. A semicolon flood truncates the
-///    list without ever filling the buffer, which check 1 cannot see — that
+///    parameters regardless of buffer space, so a semicolon flood truncates the
+///    list without ever filling the buffer — check 1 cannot see that, and it
 ///    left a cell holding `";;;;;;;;;;;;;"` as its hyperlink.
 ///
-/// Nothing shux handles legitimately uses 16 parameters (OSC 8 uses three,
-/// colours two), so treating a full list as untrustworthy costs nothing. A
-/// legitimate sequence landing exactly on either cap is dropped too; that false
-/// positive fails safe, which is the only acceptable direction here.
-fn osc_payload_was_truncated(params: &[&[u8]]) -> bool {
+/// A legitimate hyperlink landing exactly on either cap is dropped too; that
+/// false positive fails safe, which is the only acceptable direction here.
+///
+/// Note the DoS bound does NOT depend on this: memory is bounded by vte's
+/// buffer cap (see the workspace `Cargo.toml`), which applies to every OSC
+/// regardless. This function is purely about hyperlink safety.
+fn osc8_payload_was_truncated(params: &[&[u8]]) -> bool {
     params.len() >= VTE_MAX_OSC_PARAMS
         || params.iter().map(|p| p.len()).sum::<usize>() >= MAX_OSC_PAYLOAD_BYTES
 }

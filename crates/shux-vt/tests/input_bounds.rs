@@ -326,6 +326,51 @@ fn osc8_with_truncated_parameter_list_is_dropped() {
     }
 }
 
+/// OSC 4 (palette set/query) legitimately carries `1 + 2N` parameters — its
+/// handler is written to loop over `params[1..].as_chunks::<2>()`. A blanket
+/// parameter-count guard therefore silently voids any batch of 8 or more pairs.
+///
+/// This is not cosmetic: `palette_overridden` feeds `has_indexed_colors` in
+/// `gate_compare.rs`, the non-portability signal for `shux lens gate`. Voiding
+/// it lets a capture that IS non-portable be judged portable — a defect inside
+/// the verification machinery.
+///
+/// The truncation-drop rule exists to stop a truncated OSC 8 URI becoming a
+/// valid-looking link to somewhere the sender never specified. Losing trailing
+/// palette pairs carries no such hazard, so OSC 4 must degrade to partial
+/// application, exactly as it did before the bounds work.
+#[test]
+fn osc4_palette_batches_survive_the_truncation_guard() {
+    for pairs in [1usize, 4, 7, 8, 9, 16] {
+        let mut set = Vec::from(&b"\x1b]4"[..]);
+        for i in 1..=pairs {
+            set.extend_from_slice(format!(";{i};rgb:00/ff/00").as_bytes());
+        }
+        set.push(0x07);
+
+        let mut t = vt();
+        t.process(&set);
+        assert!(
+            t.palette_overridden(),
+            "OSC 4 with {pairs} pairs did not set palette_overridden; \
+             lens gate would judge a non-portable capture portable"
+        );
+
+        let mut query = Vec::from(&b"\x1b]4"[..]);
+        for i in 1..=pairs {
+            query.extend_from_slice(format!(";{i};?").as_bytes());
+        }
+        query.push(0x07);
+
+        let mut t = vt();
+        let replies = t.process_with_responses(&query);
+        assert!(
+            !replies.is_empty(),
+            "OSC 4 query with {pairs} pairs produced no reply at all"
+        );
+    }
+}
+
 /// Drift guard for the mirrored `VTE_MAX_OSC_PARAMS`.
 ///
 /// vte does not export its parameter cap, so the parser hardcodes 16. If a vte
@@ -334,34 +379,35 @@ fn osc8_with_truncated_parameter_list_is_dropped() {
 /// mismatch fails here rather than in production.
 #[test]
 fn vte_osc_param_cap_is_still_sixteen() {
-    // 15 total params (selector + 14) — under the cap, must be accepted.
-    let mut under = Vec::from(&b"\x1b]0"[..]);
-    for i in 0..14 {
-        under.push(b';');
-        under.extend_from_slice(format!("v{i}").as_bytes());
-    }
-    under.extend_from_slice(b"\x07");
+    // Probe through OSC 8, which is where the parameter-count guard lives.
+    // `ESC]8` + N `;seg` gives N+1 total parameters.
+    let build = |segments: usize| {
+        let mut s = Vec::from(&b"\x1b]8"[..]);
+        for i in 0..segments {
+            s.push(b';');
+            s.extend_from_slice(format!("s{i}").as_bytes());
+        }
+        s.extend_from_slice(b"\x1b\\");
+        s
+    };
+
+    // 15 total params — under the cap, must be accepted and stored.
     let mut t = vt();
-    t.process(&under);
-    assert_eq!(
-        t.title(),
-        Some("v0"),
-        "a 15-param OSC was rejected — vte's parameter cap may have moved above 16"
+    t.process(&build(14));
+    t.process(b"L");
+    assert!(
+        hyperlink_at(&t, 0, 0).is_some(),
+        "a 15-param OSC 8 was dropped — vte's parameter cap may have moved above 16"
     );
 
-    // 16 total params — at the cap, list is truncated, must be dropped.
-    let mut at_cap = Vec::from(&b"\x1b]0"[..]);
-    for i in 0..15 {
-        at_cap.push(b';');
-        at_cap.extend_from_slice(format!("v{i}").as_bytes());
-    }
-    at_cap.extend_from_slice(b"\x07");
+    // 16 total params — at the cap, the list is truncated, must be dropped.
     let mut t = vt();
-    t.process(&at_cap);
+    t.process(&build(15));
+    t.process(b"L");
     assert_eq!(
-        t.title(),
+        hyperlink_at(&t, 0, 0),
         None,
-        "a 16-param OSC was accepted — vte's parameter cap may have moved below 16"
+        "a 16-param OSC 8 was stored — vte's parameter cap may have moved below 16"
     );
 }
 
