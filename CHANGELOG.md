@@ -1,3 +1,10 @@
+## [0.46.1](https://github.com/indrasvat/shux/compare/v0.46.0...v0.46.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* **vt:** bound attacker-controlled pane input ([#102](https://github.com/indrasvat/shux/issues/102)) ([#109](https://github.com/indrasvat/shux/issues/109)) ([4f9d188](https://github.com/indrasvat/shux/commit/4f9d188895ed65ae798fcc5faa85bceb18c4d71f))
+
 # [0.46.0](https://github.com/indrasvat/shux/compare/v0.45.2...v0.46.0) (2026-07-30)
 
 
