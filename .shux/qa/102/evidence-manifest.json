@@ -1,0 +1,1542 @@
+{
+  "task": "102",
+  "task_kind": "github-issue",
+  "issue": "https://github.com/indrasvat/shux/issues/102",
+  "spec_sources": [
+    "gh issue 102 #Acceptance",
+    ".local/102-vt-input-bounds-plan.md #Evidence matrix"
+  ],
+  "generated_at_utc": "2026-08-03T22:43:03.128757+00:00",
+  "gate": "shux-vt-solid-qa",
+  "verdict": "PASS",
+  "solid_qa_report": ".shux/qa/102/SOLID-QA.md",
+  "branch": "fix/vt-input-bounds",
+  "head_commit_at_audit_start": "6ed9bc3",
+  "commits_named_for_audit": [
+    "e059171",
+    "49b75ff",
+    "61075c6",
+    "6ed9bc3"
+  ],
+  "baseline_commit": "b521f2c",
+  "state_under_audit": {
+    "description": "Audited blobs committed unchanged at 113b66c and hash-verified; the condition on this PASS is satisfied.",
+    "committed_parent": "7638470",
+    "re_gated_states": [
+      "6ed9bc3",
+      "78192c6",
+      "7638470",
+      "final (this)"
+    ],
+    "files": {
+      "crates/shux-vt/src/parser.rs": "3079b8f9597db78cb093d3d65054de293c4634247dd59e1e05d6e6a268e9ef85",
+      "crates/shux-vt/src/cell.rs": "e112c9bd14810b982c3b88ab0466f440f349ecd23e3e77c5ee0f40a2b52ed343",
+      "crates/shux-vt/src/lib.rs": "dd8261319e116495ff503c8109ac2f1e217eec6df2e0813b5f003aaeed59887b",
+      "crates/shux-vt/tests/input_bounds.rs": "37bf9bb1e9fb33f5dce6f1417328655ac20ccd8bc7fa0a08f52c740656b0d20d",
+      "Cargo.toml": "1dcd27c227ca2baa05d111e97ddc3297a4c749cda9f404d376c5c687b5184cd6"
+    },
+    "committed_as": "113b66c",
+    "condition_satisfied": true
+  },
+  "dootsabha_design": {
+    "present": true,
+    "path": ".local/102-council.json",
+    "chair": "claude",
+    "reviewers": [
+      "codex",
+      "agy",
+      "grok"
+    ],
+    "bytes": 57077,
+    "sha256": "9855aa1b995d25e8b552ee43a2318411a9665c5d0341bc0019d6df0f20ae9d44",
+    "note": "substantive; verdicts visibly reflected in .local/102-vt-input-bounds-plan.md"
+  },
+  "dootsabha_implementation": {
+    "present": true,
+    "path": ".local/102-impl-council.json",
+    "diff_reviewed": "b521f2c..78192c6",
+    "chair": "claude",
+    "reviewers": [
+      "codex",
+      "agy",
+      "grok"
+    ],
+    "providers_ok": true,
+    "bytes": 44110,
+    "sha256": "29ac6c6076464849aa5381258c112812233f427916d7f50d74f7a045b891347b",
+    "note": "raised 3 open findings; all adjudicated by measurement and closed (F3, F4, reply budget)"
+  },
+  "screenshots": {
+    "storage_policy": "CLAUDE.md: PNGs stay scratch under .shux/out/ and go to PR comments; not committed without DootSabha approval for a durable baseline",
+    "root": ".shux/out/102-qa/",
+    "count": 192,
+    "sets": {
+      "liveA": "post-fix rich-TUI matrix, 11 targets x 3 breakpoints, pane+window",
+      "liveA-prefix": "pre-fix deterministic probe + bat, 3 breakpoints",
+      "fixed-post": "post-fix deterministic probe, fixed session name (status bar identical)",
+      "fixed-pre": "pre-fix deterministic probe, fixed session name",
+      "splitprobe": "post-fix window-vs-pane snapshot disagreement repro",
+      "splitprobe-prefix": "same repro on pre-fix binary (proves P3-C pre-existing)",
+      "pixel": "diffs for the varying-session-name comparison",
+      "pixel-fixed": "diffs for the fixed-session-name comparison"
+    },
+    "files": [
+      {
+        "path": ".shux/out/102-qa/fixed-post/probe_120x40_pane.png",
+        "bytes": 46764,
+        "sha256": "45e2bcfc13fbd363522e5599b552ef65611643a99778b64ef9caceabad54676d"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-post/probe_120x40_window.png",
+        "bytes": 33086,
+        "sha256": "93c8f5368a99a5fb58ccbd79b31d3c5b135a06409a7165b9653dffee8e1c08b9"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-post/probe_200x60_pane.png",
+        "bytes": 71297,
+        "sha256": "138a95ee128c50690105844fc2420f0d318a9269ff987a0d9eb4af152de08368"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-post/probe_200x60_window.png",
+        "bytes": 30964,
+        "sha256": "01c43191bc2095ba5bd5526d94e958e63f8408a27cfcd0fd33a60c32a58ebb5d"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-post/probe_80x24_pane.png",
+        "bytes": 36618,
+        "sha256": "3168f0c83dc7c844824b9291c99da1c21a36d455144a41334bef6439319acf20"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-post/probe_80x24_window.png",
+        "bytes": 60330,
+        "sha256": "329fdc286aebef2d4746a9dae719bab8d74e114a679f340bc116c61a868c11a3"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-pre/probe_120x40_pane.png",
+        "bytes": 46764,
+        "sha256": "45e2bcfc13fbd363522e5599b552ef65611643a99778b64ef9caceabad54676d"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-pre/probe_120x40_window.png",
+        "bytes": 33086,
+        "sha256": "93c8f5368a99a5fb58ccbd79b31d3c5b135a06409a7165b9653dffee8e1c08b9"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-pre/probe_200x60_pane.png",
+        "bytes": 71297,
+        "sha256": "138a95ee128c50690105844fc2420f0d318a9269ff987a0d9eb4af152de08368"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-pre/probe_200x60_window.png",
+        "bytes": 30964,
+        "sha256": "01c43191bc2095ba5bd5526d94e958e63f8408a27cfcd0fd33a60c32a58ebb5d"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-pre/probe_80x24_pane.png",
+        "bytes": 36618,
+        "sha256": "3168f0c83dc7c844824b9291c99da1c21a36d455144a41334bef6439319acf20"
+      },
+      {
+        "path": ".shux/out/102-qa/fixed-pre/probe_80x24_window.png",
+        "bytes": 60330,
+        "sha256": "329fdc286aebef2d4746a9dae719bab8d74e114a679f340bc116c61a868c11a3"
+      },
+      {
+        "path": ".shux/out/102-qa/live-prefix/v3_isolation_window.png",
+        "bytes": 100194,
+        "sha256": "8e467a1fefaa506919452a286fc274b8da3e96f54c9ff1e06c58b293f18d6a3c"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_bat_120x40_pane.png",
+        "bytes": 151854,
+        "sha256": "0845b8ee92f99b7ef6476b241901dff2dad8b090357b21d4458bfa979221b647"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_bat_120x40_window.png",
+        "bytes": 127272,
+        "sha256": "b75aae4a48ff06b12ca74d20fa3f09ec5f49a34bbd847013a6cc591ea72917b2"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_bat_200x60_pane.png",
+        "bytes": 287682,
+        "sha256": "7ec92c6179f002448382b75982a264a777abebb3c7d4e631dd693e5217553dc9"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_bat_200x60_window.png",
+        "bytes": 127480,
+        "sha256": "b58d1195f0feb5b9ac3cd36992ee25b34b368c7e739e59b7e0f997a910b38929"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_bat_80x24_pane.png",
+        "bytes": 74195,
+        "sha256": "de20f742e8b50224b09e60eafc5879e701373d27e777008452faee042e303fad"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_bat_80x24_window.png",
+        "bytes": 100862,
+        "sha256": "1f8c074db5af7ade40cec184c75419de86efd0a4a622a62d40ff672e9c055e31"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_btop_120x40_pane.png",
+        "bytes": 399421,
+        "sha256": "b3d5c7df6fee7e608655300d9d6d969c49e9f0c92254f1eb64500424af0dd7f3"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_btop_120x40_window.png",
+        "bytes": 377152,
+        "sha256": "024b332f4fe851d1ef3af45f47b7c90031856c3899509142a7c3d55bee1e8703"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_btop_200x60_pane.png",
+        "bytes": 792176,
+        "sha256": "c9efef8bf41dabd560e6d4ee6a3412cc5274bb787dd4d00839c5ca234e03a18a"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_btop_200x60_window.png",
+        "bytes": 259140,
+        "sha256": "c51ac26942b7fc93c1b61a7a74d559f31497624140e1103f7a391f21bd7af731"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_btop_80x24_pane.png",
+        "bytes": 166589,
+        "sha256": "0b8eaaa891a91f41baab3f856eebd9c069df556bf71356330425782a25aa1fcb"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_btop_80x24_window.png",
+        "bytes": 194310,
+        "sha256": "32f85d0878aef4acbc95a82bb737397b3da2c2a872531663a53e10ef78dd3460"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_gitui_120x40_pane.png",
+        "bytes": 70537,
+        "sha256": "cd81faa6504663a977246d2bdb25a63022f5f2eb4c941d50aa79d2cf1d590ef1"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_gitui_120x40_window.png",
+        "bytes": 59908,
+        "sha256": "b00a591c064d0aa094cce7674e7883b7fa5280b07036825b4bd797ca206c05a3"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_gitui_200x60_pane.png",
+        "bytes": 115311,
+        "sha256": "29471e7e12b551af802d8bf0d9ed2708bca4557fe32967016eda1019644cf500"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_gitui_200x60_window.png",
+        "bytes": 62432,
+        "sha256": "62efa1419bdbc9391d91cd6543f74757d8abf0488cd764bf08f0d1f6a185a77f"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_gitui_80x24_pane.png",
+        "bytes": 45945,
+        "sha256": "80cd6183a3040277f048f944780a499597ed3091dda70214d9ec1591307f806c"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_gitui_80x24_window.png",
+        "bytes": 73163,
+        "sha256": "eb77838eef74677b90c3c7b55cd1969818206202e86aaed9a16bb34b56d995a0"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_htop_120x40_pane.png",
+        "bytes": 585597,
+        "sha256": "a4fc439917c35103223b3bbd6cc9551b0f823398816d2d4980cce89304af946a"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_htop_120x40_window.png",
+        "bytes": 560223,
+        "sha256": "b40c9b8d21a47a929e7ec39ea69eb17d5cb3cb69afd5f41a36eb62f12de4a704"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_htop_200x60_pane.png",
+        "bytes": 1440787,
+        "sha256": "1e571f305ed1f8decc1fbb821d0e883a5c28ecc3fef20bafcc2301b5dfa64271"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_htop_200x60_window.png",
+        "bytes": 594155,
+        "sha256": "f407800bc3a0ea0bb567cacd16bbc493da3b33cd299f4645886a8724edef38e0"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_htop_80x24_pane.png",
+        "bytes": 203591,
+        "sha256": "17f4fcf3d0997e7372ed2f01dd5165a4db50efdc0775d35f4611e1afb451061a"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_htop_80x24_window.png",
+        "bytes": 233124,
+        "sha256": "906ec0e79417dc1f1850ecbc9bdc80a3eda762cd098325e8f8f245025ae25858"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_isolation_window.png",
+        "bytes": 98041,
+        "sha256": "c8506c45ed190ec1d485b2d4533fc3695bbc2c9f902fbf0ccd1806a94c924c5d"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_lazygit_120x40_pane.png",
+        "bytes": 361821,
+        "sha256": "24d8995331d9930df081ea2b09109a5f7f95fa0ee54ab476cc395e0a41638564"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_lazygit_120x40_window.png",
+        "bytes": 311849,
+        "sha256": "02d2768204bc6388e3b55da38e1155b59b72d198f5a3144f1c5be6eaa1b37290"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_lazygit_200x60_pane.png",
+        "bytes": 790794,
+        "sha256": "25ee609ba185af93d5e3dfc6f8d8bc156416776183f2639533109158636df79d"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_lazygit_200x60_window.png",
+        "bytes": 405019,
+        "sha256": "6979f3d840a9738ca1a63500d0996ad7d2315fcd7246753134e2a016f8fd3cf1"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_lazygit_80x24_pane.png",
+        "bytes": 171182,
+        "sha256": "a2e7d3b629c4e12450c1e872b17a177e2661028687c3847b218b81ce0995b824"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_lazygit_80x24_window.png",
+        "bytes": 200109,
+        "sha256": "1b8a85dc341bd0a8c3dde56110cfe07065842328cbd3a657243e4d0d985cce02"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_nvim_120x40_pane.png",
+        "bytes": 239071,
+        "sha256": "4c2aa21ee82f40353a2839874a28d1d0e718b96b79d964f4e7539dcd10026259"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_nvim_120x40_window.png",
+        "bytes": 229234,
+        "sha256": "97b3be122f8f1891c14f6111654954ea2a4451f40e0b2b5390827347f6f59c6c"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_nvim_200x60_pane.png",
+        "bytes": 337986,
+        "sha256": "709df38b0221418accb8f8f6ffa157d6c30cf26ad948bac81ef39afff4a4e5ae"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_nvim_200x60_window.png",
+        "bytes": 189670,
+        "sha256": "db787bb1cd8bc48c337a6e06846357893bbd7a934160f9c3b8dc3feb6e08f058"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_nvim_80x24_pane.png",
+        "bytes": 118049,
+        "sha256": "3cc2ead770e2b4e886b3928a91efb41dd13047c746f60a428aab645ccf57acad"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_nvim_80x24_window.png",
+        "bytes": 145926,
+        "sha256": "f2bad8ff77a39a6c78a0ce40fdf6d95e9d86c1dcda7540a62da788aa06a59794"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_probe_120x40_pane.png",
+        "bytes": 39358,
+        "sha256": "447baac363c05f1f0310a115a5d792ebdc712604eea29f290abb043992c4de42"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_probe_120x40_window.png",
+        "bytes": 34712,
+        "sha256": "e6ff5e80ec28487ecc766c106427274f16ad5119dc427d598d5367fefe345321"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_probe_200x60_pane.png",
+        "bytes": 63887,
+        "sha256": "3c56b13f415943e2d9d509cc6268c21d948a162f09aec8da84a885caeeb8c7c7"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_probe_200x60_window.png",
+        "bytes": 34919,
+        "sha256": "d8c3dd01784ca19c6ba93e78efecd19bd193f21782dfcb2aba22d1b81ea2898a"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_probe_80x24_pane.png",
+        "bytes": 29221,
+        "sha256": "378d85f653e194ab3efd7cf7e8e9438f0f25c17a18ac682bc44b59368f9cf907"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_probe_80x24_window.png",
+        "bytes": 56467,
+        "sha256": "4bcc44de5479778c264286287272524e7030dff71091d16b0ff736e386e1cb7b"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vicaya_120x40_pane.png",
+        "bytes": 77863,
+        "sha256": "8f5dd76c29011a9b9bdc8f2df60f79ecf193e387f7621f52e101d82fdf1aec1c"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vicaya_120x40_window.png",
+        "bytes": 73941,
+        "sha256": "f77e86ed116a70c5e826235a55f9cd60fa5a3092204574b0099da37eeaa4639b"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vicaya_200x60_pane.png",
+        "bytes": 116913,
+        "sha256": "5ccf54a52d5368ac10495752f418093d68933c543041e7412b51800036852ddb"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vicaya_200x60_window.png",
+        "bytes": 53650,
+        "sha256": "3127eef81bf004f83cacdc5fa54e66845e2d56a12725135a9442dc4669f3beea"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vicaya_80x24_pane.png",
+        "bytes": 56268,
+        "sha256": "0e98e6a5b4c9e10e457c024da12377a03421775be46860321e081607d9489ad6"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vicaya_80x24_window.png",
+        "bytes": 84622,
+        "sha256": "76b61fb5ca7e91d18e53a71638400c326cc817a9db7fe32535986d73f08b59d9"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vim_120x40_pane.png",
+        "bytes": 180378,
+        "sha256": "5ec34c81b862e92b4d046509172f110e4fd6376f3bb804be5de6fe942487d1bc"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vim_120x40_window.png",
+        "bytes": 159725,
+        "sha256": "8db2b5da614765f8c13a5df942ebc7287d06d95542209fabb6ab50e44dc4c44b"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vim_200x60_pane.png",
+        "bytes": 256706,
+        "sha256": "d485e2335d8afbfcdb91bff351017b7facfc1feee908825c326251cee34b8449"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vim_200x60_window.png",
+        "bytes": 119568,
+        "sha256": "8ebbdf56ad354f6b65026bb014e99081981395ecc3550389f911a020b25d7b71"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vim_80x24_pane.png",
+        "bytes": 133381,
+        "sha256": "2b69aac44f626abef6bee225a0a6f3ea48454f2582fe98cadfd79d4ddabcfacf"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vim_80x24_window.png",
+        "bytes": 160696,
+        "sha256": "e87c22af9d1e1670991958ef9e82a9154894ec728c70cea3fb297d82736669e1"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vivecaka_120x40_pane.png",
+        "bytes": 54151,
+        "sha256": "256d86ad0897a2e7a24705059c9ea9909249e99ee9c546a2a911168de5818c65"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vivecaka_120x40_window.png",
+        "bytes": 46569,
+        "sha256": "2efec4220965a091d6538e85554d36ba3df7dbd4f3257f39c00eec18b7040456"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vivecaka_200x60_pane.png",
+        "bytes": 80824,
+        "sha256": "319a7352c6a3a310199cb72e709aec73630cd87573e4e071921f1bd3d960a7cf"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vivecaka_200x60_window.png",
+        "bytes": 46777,
+        "sha256": "68d3c327c73302894085a6c99718bd6013d22e890bd595596d48eb2dd11ff5e0"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vivecaka_80x24_pane.png",
+        "bytes": 32832,
+        "sha256": "aa21dfb0dc7a9741bb8a7f30b5167504ff9ca6389b62586010b256ff1314bebf"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_vivecaka_80x24_window.png",
+        "bytes": 61359,
+        "sha256": "fb6add35ae3fb3932bb6ed0bd50b2e37d36f0c56acd7696e87c2161b6f2f10f2"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_yazi_120x40_pane.png",
+        "bytes": 85904,
+        "sha256": "7c9317f7f72fda85c88aa58368fc6f243df31111aa250e87abec7e1775759bf5"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_yazi_120x40_window.png",
+        "bytes": 84390,
+        "sha256": "4dbebf96c7caf387e1438cfaa34d71e23abef26dab51969e72d8669be44fcf5b"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_yazi_200x60_pane.png",
+        "bytes": 111529,
+        "sha256": "412fe23dddd96b2bfa798047267fdc4a036420fe1966c653dd9e5df6ef611077"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_yazi_200x60_window.png",
+        "bytes": 42017,
+        "sha256": "2631411821b1a187ea76e62dbd718908b3d2ea81101184b4c53a326fa1714661"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_yazi_80x24_pane.png",
+        "bytes": 60859,
+        "sha256": "d445874066d3a4a10530e4d5630e320b073a9f0431a511a43f41def25173e323"
+      },
+      {
+        "path": ".shux/out/102-qa/live/v3_yazi_80x24_window.png",
+        "bytes": 88228,
+        "sha256": "542816b2bc12fb88c8db23d5c87ac3706a206adc8929fbe4a5376f2c2dc925a9"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_bat_120x40_pane.png",
+        "bytes": 151854,
+        "sha256": "0845b8ee92f99b7ef6476b241901dff2dad8b090357b21d4458bfa979221b647"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_bat_120x40_window.png",
+        "bytes": 127455,
+        "sha256": "af3a31b0c27bd17002db625bff9ff03078b067f05801a80361bba4b6dabd9315"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_bat_200x60_pane.png",
+        "bytes": 287682,
+        "sha256": "7ec92c6179f002448382b75982a264a777abebb3c7d4e631dd693e5217553dc9"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_bat_200x60_window.png",
+        "bytes": 127663,
+        "sha256": "f969d18f8081d025bf16dada5628d637a74aa2f40016365034688de978475b46"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_bat_80x24_pane.png",
+        "bytes": 74195,
+        "sha256": "de20f742e8b50224b09e60eafc5879e701373d27e777008452faee042e303fad"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_bat_80x24_window.png",
+        "bytes": 101047,
+        "sha256": "1243f02027906ed232b2248ded6ca4d40dc1ee76ddc4e6132f8338f9439e2595"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_probe_120x40_pane.png",
+        "bytes": 39358,
+        "sha256": "447baac363c05f1f0310a115a5d792ebdc712604eea29f290abb043992c4de42"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_probe_120x40_window.png",
+        "bytes": 34895,
+        "sha256": "37e4a89aaf574b2e851ef562f4a25f4719f407244f5ad7202382a7d232ff2a27"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_probe_200x60_pane.png",
+        "bytes": 63887,
+        "sha256": "3c56b13f415943e2d9d509cc6268c21d948a162f09aec8da84a885caeeb8c7c7"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_probe_200x60_window.png",
+        "bytes": 35102,
+        "sha256": "2342bf047afaeb1f31baf2931e90f06defa4e53c5352353485c07b8b8f9fde01"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_probe_80x24_pane.png",
+        "bytes": 29221,
+        "sha256": "378d85f653e194ab3efd7cf7e8e9438f0f25c17a18ac682bc44b59368f9cf907"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA-prefix/v3_probe_80x24_window.png",
+        "bytes": 56651,
+        "sha256": "355db3d86d4ed64f2fd72630b8ef19f94afee4b901347d7f9bdfb0929fba2f33"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_bat_120x40_pane.png",
+        "bytes": 151854,
+        "sha256": "0845b8ee92f99b7ef6476b241901dff2dad8b090357b21d4458bfa979221b647"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_bat_120x40_window.png",
+        "bytes": 127125,
+        "sha256": "b9e3daeb38ef56a8a7ba3dc488072f7cc7b3013b2b70b297db9add6eb055d6db"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_bat_200x60_pane.png",
+        "bytes": 287682,
+        "sha256": "7ec92c6179f002448382b75982a264a777abebb3c7d4e631dd693e5217553dc9"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_bat_200x60_window.png",
+        "bytes": 127328,
+        "sha256": "fc3d2ffbbce06d3e0d470cbf8d4d9eb5913111b5532ab8e5eec786afd0ddccf7"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_bat_80x24_pane.png",
+        "bytes": 74195,
+        "sha256": "de20f742e8b50224b09e60eafc5879e701373d27e777008452faee042e303fad"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_bat_80x24_window.png",
+        "bytes": 100713,
+        "sha256": "7674be298b40957f27f40e446ec4d69ed573dd3b7a5ab9ee43f8df535a0d62f1"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_btop_120x40_pane.png",
+        "bytes": 395883,
+        "sha256": "ed91241be254274349588913a57c27ba15a161c796e2c43b22a9ae4e4a99cb51"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_btop_120x40_window.png",
+        "bytes": 373597,
+        "sha256": "7a25c63ff89be1a099e0524182e7d27d37c79510bb36a1a46321542079e1febd"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_btop_200x60_pane.png",
+        "bytes": 792358,
+        "sha256": "219abb803d79e533aaaeb92d6a1414e72b493fcfc0bbe49c9a9029b15ecfa4c5"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_btop_200x60_window.png",
+        "bytes": 251270,
+        "sha256": "132c0db3ca1d908a9247213263f016cd1701a1692e4c74ec85c9a691fb00e6a8"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_btop_80x24_pane.png",
+        "bytes": 166673,
+        "sha256": "2bf560a4c4e0621502a090a7ff8066c60fd154ff35e41945526506038c9bf03a"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_btop_80x24_window.png",
+        "bytes": 194364,
+        "sha256": "15a0b755b3f2c931846e37b1d542a7206aa0cdb025d28b09c25fbe5a230291a8"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_gitui_120x40_pane.png",
+        "bytes": 70537,
+        "sha256": "cd81faa6504663a977246d2bdb25a63022f5f2eb4c941d50aa79d2cf1d590ef1"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_gitui_120x40_window.png",
+        "bytes": 59763,
+        "sha256": "549c597567a647088df3a1c93d41b5ff64a181c172d3e2c2cc306303ebdebbb7"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_gitui_200x60_pane.png",
+        "bytes": 115311,
+        "sha256": "29471e7e12b551af802d8bf0d9ed2708bca4557fe32967016eda1019644cf500"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_gitui_200x60_window.png",
+        "bytes": 62281,
+        "sha256": "681e487ddbc79cea20e4fdae5b84a66635a0f103ceb340cac1320e87a366c75a"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_gitui_80x24_pane.png",
+        "bytes": 45945,
+        "sha256": "80cd6183a3040277f048f944780a499597ed3091dda70214d9ec1591307f806c"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_gitui_80x24_window.png",
+        "bytes": 73000,
+        "sha256": "169626af93c9017c6a1738978564560756c8baf1cfe330c4dc4bbc452bf57c52"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_htop_120x40_pane.png",
+        "bytes": 587533,
+        "sha256": "5d9b6b1d4e704f70d3df7c43e6ca7c70f4d4147ae04a59935a5662a89e5d3b53"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_htop_120x40_window.png",
+        "bytes": 563368,
+        "sha256": "e8957a1ecd3fc6ad88e60e59fb39a3658f40a9c256d99e09f571a9a42a57d762"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_htop_200x60_pane.png",
+        "bytes": 1464313,
+        "sha256": "93f96b150ee46faf91651ab3010a0080a2d05625c58edaa270ee5db6d43e32d2"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_htop_200x60_window.png",
+        "bytes": 604079,
+        "sha256": "963256c020e1b9908a09aa5c3345742b5034ce175f013d31401d49042718ae4c"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_htop_80x24_pane.png",
+        "bytes": 203974,
+        "sha256": "b40873c0bb289ffd3929f8c449025668c4c20dd1c0adad7b545330dd3420ee67"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_htop_80x24_window.png",
+        "bytes": 231756,
+        "sha256": "1eced5af4015fa0c7636e02614ca5ecd76877120102a9edc18abbab7d88263a2"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_isolation_window.png",
+        "bytes": 109299,
+        "sha256": "583740b8b678d8f678616eb38cd0d7c5c0493723a0238742d73a745e1603a000"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_lazygit_120x40_pane.png",
+        "bytes": 357978,
+        "sha256": "ac7769c62dedb613ac420b03c499629af6c4471f7949f8cb1e1af806b762aa58"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_lazygit_120x40_window.png",
+        "bytes": 307845,
+        "sha256": "adef66de3d376de459f163fc9d3164336727c6f7efadb70312de0eb008f0f02c"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_lazygit_200x60_pane.png",
+        "bytes": 802099,
+        "sha256": "54d75eeb8118ff904e0e3511bf71cc17806ed1208a0814aed3eb42c001dce83b"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_lazygit_200x60_window.png",
+        "bytes": 413464,
+        "sha256": "004acb2a4a3271a3b4dd3f6129904710411016f72cbe7d8f4fe50134a83e19c8"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_lazygit_80x24_pane.png",
+        "bytes": 171149,
+        "sha256": "ed85826a66d892c158374cb78c556b4989bf8cbab9ed2316e7c59dd3b11fa462"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_lazygit_80x24_window.png",
+        "bytes": 199917,
+        "sha256": "e2970a9bb3a83c7ef379a662339ca0838c55a01e6de174f34de4f84958ba3435"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_nvim_120x40_pane.png",
+        "bytes": 239071,
+        "sha256": "4c2aa21ee82f40353a2839874a28d1d0e718b96b79d964f4e7539dcd10026259"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_nvim_120x40_window.png",
+        "bytes": 229091,
+        "sha256": "e45348eeac264022abce3f6400decffdbe438df2378d2604194d05c748e615c6"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_nvim_200x60_pane.png",
+        "bytes": 337986,
+        "sha256": "709df38b0221418accb8f8f6ffa157d6c30cf26ad948bac81ef39afff4a4e5ae"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_nvim_200x60_window.png",
+        "bytes": 189522,
+        "sha256": "4acf0ecfcbd267896562add91c2169a0a2b9648255d56eae5a3e10c1d285d27c"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_nvim_80x24_pane.png",
+        "bytes": 118049,
+        "sha256": "3cc2ead770e2b4e886b3928a91efb41dd13047c746f60a428aab645ccf57acad"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_nvim_80x24_window.png",
+        "bytes": 145762,
+        "sha256": "02642cb380dc9d56c7d582825a33b4ed09a0b6c7f9e1e9a96334bb48e56ad9e5"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_probe_120x40_pane.png",
+        "bytes": 39358,
+        "sha256": "447baac363c05f1f0310a115a5d792ebdc712604eea29f290abb043992c4de42"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_probe_120x40_window.png",
+        "bytes": 34563,
+        "sha256": "761cbd69a3d54ec65ebcc9454aac803b9539207870f1c6e385e671e794576a8a"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_probe_200x60_pane.png",
+        "bytes": 63887,
+        "sha256": "3c56b13f415943e2d9d509cc6268c21d948a162f09aec8da84a885caeeb8c7c7"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_probe_200x60_window.png",
+        "bytes": 34765,
+        "sha256": "50b1590891dff126d68e48133eb34580c54d78455f1073b3617db5a9266de966"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_probe_80x24_pane.png",
+        "bytes": 29221,
+        "sha256": "378d85f653e194ab3efd7cf7e8e9438f0f25c17a18ac682bc44b59368f9cf907"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_probe_80x24_window.png",
+        "bytes": 56316,
+        "sha256": "34b12bb0cfb686e18c8cae3fc07087704cfed0a592dbda29b95fecdbedc078c2"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vicaya_120x40_pane.png",
+        "bytes": 77863,
+        "sha256": "8f5dd76c29011a9b9bdc8f2df60f79ecf193e387f7621f52e101d82fdf1aec1c"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vicaya_120x40_window.png",
+        "bytes": 73788,
+        "sha256": "bbb51db60303cfc928a2ba0d9b3c8ee475f2e42f636281d6b53d0ad23101e29f"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vicaya_200x60_pane.png",
+        "bytes": 116913,
+        "sha256": "5ccf54a52d5368ac10495752f418093d68933c543041e7412b51800036852ddb"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vicaya_200x60_window.png",
+        "bytes": 53496,
+        "sha256": "b941735a8deacb4c4105342aa3fe1550162a83ec1857bfc71607ca252a470aa1"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vicaya_80x24_pane.png",
+        "bytes": 56268,
+        "sha256": "0e98e6a5b4c9e10e457c024da12377a03421775be46860321e081607d9489ad6"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vicaya_80x24_window.png",
+        "bytes": 84453,
+        "sha256": "fb910e83e52d1700f0e657f4fdde56750084fcdd48349b24890b84e9a7046b3a"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vim_120x40_pane.png",
+        "bytes": 180378,
+        "sha256": "5ec34c81b862e92b4d046509172f110e4fd6376f3bb804be5de6fe942487d1bc"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vim_120x40_window.png",
+        "bytes": 159581,
+        "sha256": "607d286b396e0c9b9d22725ce0e1139fbb9c7b9d82f3e6b3d652938f2f421d7f"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vim_200x60_pane.png",
+        "bytes": 256706,
+        "sha256": "d485e2335d8afbfcdb91bff351017b7facfc1feee908825c326251cee34b8449"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vim_200x60_window.png",
+        "bytes": 119420,
+        "sha256": "dd223a252c95578c7276b0231a78ae7e81f7fbe770f34515177a498b034c3816"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vim_80x24_pane.png",
+        "bytes": 133381,
+        "sha256": "2b69aac44f626abef6bee225a0a6f3ea48454f2582fe98cadfd79d4ddabcfacf"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vim_80x24_window.png",
+        "bytes": 160529,
+        "sha256": "06d127b6b3249863fb755bf4bab3c5abcc10e35ebcee4e0f393bdc64e7db6a28"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vivecaka_120x40_pane.png",
+        "bytes": 54151,
+        "sha256": "256d86ad0897a2e7a24705059c9ea9909249e99ee9c546a2a911168de5818c65"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vivecaka_120x40_window.png",
+        "bytes": 46421,
+        "sha256": "51b9e4b573b14c90a9f8016ec0dc95b7bb01ea9a494b10384a39f1301456776d"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vivecaka_200x60_pane.png",
+        "bytes": 80824,
+        "sha256": "319a7352c6a3a310199cb72e709aec73630cd87573e4e071921f1bd3d960a7cf"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vivecaka_200x60_window.png",
+        "bytes": 46629,
+        "sha256": "e7755477c95caba089c204c9b6d3c5ad8c31e5f2a4ed2df4bab3cbdd1dcec684"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vivecaka_80x24_pane.png",
+        "bytes": 32832,
+        "sha256": "aa21dfb0dc7a9741bb8a7f30b5167504ff9ca6389b62586010b256ff1314bebf"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_vivecaka_80x24_window.png",
+        "bytes": 61207,
+        "sha256": "4672107905bf2447d4d574ef2dc5e4e49e7d52dfa569b67b1213501898ea7bba"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_yazi_120x40_pane.png",
+        "bytes": 85904,
+        "sha256": "7c9317f7f72fda85c88aa58368fc6f243df31111aa250e87abec7e1775759bf5"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_yazi_120x40_window.png",
+        "bytes": 84248,
+        "sha256": "93f948ef7767f1e69209c492a72d4c5a3213ae61c2b52cf4055a32070c182abf"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_yazi_200x60_pane.png",
+        "bytes": 111529,
+        "sha256": "412fe23dddd96b2bfa798047267fdc4a036420fe1966c653dd9e5df6ef611077"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_yazi_200x60_window.png",
+        "bytes": 41870,
+        "sha256": "e9a55575b835085d3c88085651c8552b58043b4c4def89f254475b5e8cb89546"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_yazi_80x24_pane.png",
+        "bytes": 60859,
+        "sha256": "d445874066d3a4a10530e4d5630e320b073a9f0431a511a43f41def25173e323"
+      },
+      {
+        "path": ".shux/out/102-qa/liveA/v3_yazi_80x24_window.png",
+        "bytes": 88064,
+        "sha256": "b6b7a56dedc986362ceb8deef49b3de934bf3ee5d0c7d58da3055254dfec9137"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel-fixed/probe_120x40_pane_diff.png",
+        "bytes": 3262,
+        "sha256": "7e9a5a747d47499f2ee1e02c24192c5f02d98e7bc37835e91a4875e4b5226f22"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel-fixed/probe_120x40_window_diff.png",
+        "bytes": 2944,
+        "sha256": "a52352791fefc0b61a6e69fcaf46eeca20a02c7906b3be1654df15f28e37903b"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel-fixed/probe_200x60_pane_diff.png",
+        "bytes": 8035,
+        "sha256": "2dca02e5ebfebf5571daa5a62826497abfdb319c381c959fd81aa77bbfdfc2d0"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel-fixed/probe_200x60_window_diff.png",
+        "bytes": 2944,
+        "sha256": "a52352791fefc0b61a6e69fcaf46eeca20a02c7906b3be1654df15f28e37903b"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel-fixed/probe_80x24_pane_diff.png",
+        "bytes": 1352,
+        "sha256": "8f177a89e5bd8463d4d5864b03affbcf43ac6b666a13ac1fddb2f009a9612355"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel-fixed/probe_80x24_window_diff.png",
+        "bytes": 2944,
+        "sha256": "a52352791fefc0b61a6e69fcaf46eeca20a02c7906b3be1654df15f28e37903b"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/bat_120x40_pane_diff.png",
+        "bytes": 3262,
+        "sha256": "7e9a5a747d47499f2ee1e02c24192c5f02d98e7bc37835e91a4875e4b5226f22"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/bat_120x40_window_diff.png",
+        "bytes": 3590,
+        "sha256": "00a4f6d982543f1699fc8cc40504d5ad9de83790a417c9cf3f3d411cc9dd59ab"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/bat_200x60_pane_diff.png",
+        "bytes": 8035,
+        "sha256": "2dca02e5ebfebf5571daa5a62826497abfdb319c381c959fd81aa77bbfdfc2d0"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/bat_200x60_window_changedband.png",
+        "bytes": 18613,
+        "sha256": "cb3aac57f5175d16d3e4ca6cf1b182f0a541d2284da1f2d92a75ea3e11693b84"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/bat_200x60_window_diff.png",
+        "bytes": 3590,
+        "sha256": "00a4f6d982543f1699fc8cc40504d5ad9de83790a417c9cf3f3d411cc9dd59ab"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/bat_80x24_pane_diff.png",
+        "bytes": 1352,
+        "sha256": "8f177a89e5bd8463d4d5864b03affbcf43ac6b666a13ac1fddb2f009a9612355"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/bat_80x24_window_diff.png",
+        "bytes": 3593,
+        "sha256": "f6c162f912bda04942976b19347e96482f090d1f325c50041f53911f5e42c203"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/probe_120x40_pane_diff.png",
+        "bytes": 3262,
+        "sha256": "7e9a5a747d47499f2ee1e02c24192c5f02d98e7bc37835e91a4875e4b5226f22"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/probe_120x40_window_changedband.png",
+        "bytes": 19091,
+        "sha256": "97066c3d4ca93ff72abc35fb88c40cf8a810f549e887e02c12dfab178b0618ff"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/probe_120x40_window_diff.png",
+        "bytes": 3849,
+        "sha256": "d0a0544f5cf831efb3ba60415128b62efed7ecfd12669587f8677e9d218eeed0"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/probe_200x60_pane_diff.png",
+        "bytes": 8035,
+        "sha256": "2dca02e5ebfebf5571daa5a62826497abfdb319c381c959fd81aa77bbfdfc2d0"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/probe_200x60_window_diff.png",
+        "bytes": 3849,
+        "sha256": "d0a0544f5cf831efb3ba60415128b62efed7ecfd12669587f8677e9d218eeed0"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/probe_80x24_pane_diff.png",
+        "bytes": 1352,
+        "sha256": "8f177a89e5bd8463d4d5864b03affbcf43ac6b666a13ac1fddb2f009a9612355"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/probe_80x24_window_changedband.png",
+        "bytes": 19591,
+        "sha256": "ebf81dd5ebe12aa14cc9dd10fc0414c0d0c103b9cba0d84aafacf16f586472a2"
+      },
+      {
+        "path": ".shux/out/102-qa/pixel/probe_80x24_window_diff.png",
+        "bytes": 3588,
+        "sha256": "58cd5699aaf5d80f67be92d1fb3770bf3a34ea2630e0b2dac23213e1d5e4deeb"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe-prefix/split_0_initial_pane.png",
+        "bytes": 23502,
+        "sha256": "5a8f0848b513c4f1feb1128a4e448ec4f382338d0df6098b26d07e29f4d34d3c"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe-prefix/split_0_initial_window.png",
+        "bytes": 32231,
+        "sha256": "87adfd21855118ef7d0de7ff0756d1b16ef04207a56e9425aa511733e33bae32"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe-prefix/split_1_after_vsplit_pane.png",
+        "bytes": 23502,
+        "sha256": "5a8f0848b513c4f1feb1128a4e448ec4f382338d0df6098b26d07e29f4d34d3c"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe-prefix/split_1_after_vsplit_window.png",
+        "bytes": 34270,
+        "sha256": "32326b6c10ecafbad9bfbd8b389f1b12a9ef0fc2441254e5f482ff62648df805"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe-prefix/split_2_after_hsplit_pane.png",
+        "bytes": 23502,
+        "sha256": "5a8f0848b513c4f1feb1128a4e448ec4f382338d0df6098b26d07e29f4d34d3c"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe-prefix/split_2_after_hsplit_window.png",
+        "bytes": 45913,
+        "sha256": "e33ebd99de2193b935fef8ec813a115599c0fdcb32049267641a03101cd9696e"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe/split_0_initial_pane.png",
+        "bytes": 23502,
+        "sha256": "5a8f0848b513c4f1feb1128a4e448ec4f382338d0df6098b26d07e29f4d34d3c"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe/split_0_initial_window.png",
+        "bytes": 32368,
+        "sha256": "88f81f4d717520a7b8ef9c4db29dbfc3d521b5987267c1dcffbb9fa6fbea0c18"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe/split_1_after_vsplit_pane.png",
+        "bytes": 23502,
+        "sha256": "5a8f0848b513c4f1feb1128a4e448ec4f382338d0df6098b26d07e29f4d34d3c"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe/split_1_after_vsplit_window.png",
+        "bytes": 34407,
+        "sha256": "7a7f744ec59b1c8430e72a52025041d7c6d64696cf6ab276f008bbe3d41b904f"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe/split_2_after_hsplit_pane.png",
+        "bytes": 23502,
+        "sha256": "5a8f0848b513c4f1feb1128a4e448ec4f382338d0df6098b26d07e29f4d34d3c"
+      },
+      {
+        "path": ".shux/out/102-qa/splitprobe/split_2_after_hsplit_window.png",
+        "bytes": 46026,
+        "sha256": "dea696353a05bf7db35cc328b112f0a4977a91759d6092f5ce231cf0bbe9ae0a"
+      }
+    ]
+  },
+  "pixel_metrics": {
+    "tool": ".claude/automations/pixel_verify.py",
+    "thresholds": {
+      "max_pixel_diff_ratio": 0,
+      "max_mean_channel_delta": 0
+    },
+    "prefix_vs_postfix": [
+      {
+        "metric_file": ".shux/qa/102/pixel-bat_120x40_pane.json",
+        "actual": ".shux/out/102-qa/liveA/v3_bat_120x40_pane.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_bat_120x40_pane.png",
+        "diff": ".shux/out/102-qa/pixel/bat_120x40_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1080,
+          760
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-bat_120x40_window.json",
+        "actual": ".shux/out/102-qa/liveA/v3_bat_120x40_window.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_bat_120x40_window.png",
+        "diff": ".shux/out/102-qa/pixel/bat_120x40_window_diff.png",
+        "status": "fail",
+        "changed_pixels": 1360,
+        "pixel_diff_ratio": 0.0018410223088585662,
+        "mean_rgba_channel_delta": 0.09629663471951484,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": false,
+        "note": "window snapshot at this size renders near-empty on BOTH builds (pre-existing compositor gap P3-C); comparison is not load-bearing"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-bat_200x60_pane.json",
+        "actual": ".shux/out/102-qa/liveA/v3_bat_200x60_pane.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_bat_200x60_pane.png",
+        "diff": ".shux/out/102-qa/pixel/bat_200x60_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1800,
+          1140
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-bat_200x60_window.json",
+        "actual": ".shux/out/102-qa/liveA/v3_bat_200x60_window.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_bat_200x60_window.png",
+        "diff": ".shux/out/102-qa/pixel/bat_200x60_window_diff.png",
+        "status": "fail",
+        "changed_pixels": 1360,
+        "pixel_diff_ratio": 0.0018410223088585662,
+        "mean_rgba_channel_delta": 0.09629663471951484,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": false,
+        "note": "window snapshot at this size renders near-empty on BOTH builds (pre-existing compositor gap P3-C); comparison is not load-bearing"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-bat_80x24_pane.json",
+        "actual": ".shux/out/102-qa/liveA/v3_bat_80x24_pane.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_bat_80x24_pane.png",
+        "diff": ".shux/out/102-qa/pixel/bat_80x24_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          720,
+          456
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-bat_80x24_window.json",
+        "actual": ".shux/out/102-qa/liveA/v3_bat_80x24_window.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_bat_80x24_window.png",
+        "diff": ".shux/out/102-qa/pixel/bat_80x24_window_diff.png",
+        "status": "fail",
+        "changed_pixels": 1360,
+        "pixel_diff_ratio": 0.0018410223088585662,
+        "mean_rgba_channel_delta": 0.09629663471951484,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-fixed-probe_120x40_pane.json",
+        "actual": ".shux/out/102-qa/fixed-post/probe_120x40_pane.png",
+        "expected": ".shux/out/102-qa/fixed-pre/probe_120x40_pane.png",
+        "diff": ".shux/out/102-qa/pixel-fixed/probe_120x40_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1080,
+          760
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-fixed-probe_120x40_window.json",
+        "actual": ".shux/out/102-qa/fixed-post/probe_120x40_window.png",
+        "expected": ".shux/out/102-qa/fixed-pre/probe_120x40_window.png",
+        "diff": ".shux/out/102-qa/pixel-fixed/probe_120x40_window_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": false,
+        "note": "window snapshot at this size renders near-empty on BOTH builds (pre-existing compositor gap P3-C); comparison is not load-bearing"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-fixed-probe_200x60_pane.json",
+        "actual": ".shux/out/102-qa/fixed-post/probe_200x60_pane.png",
+        "expected": ".shux/out/102-qa/fixed-pre/probe_200x60_pane.png",
+        "diff": ".shux/out/102-qa/pixel-fixed/probe_200x60_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1800,
+          1140
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-fixed-probe_200x60_window.json",
+        "actual": ".shux/out/102-qa/fixed-post/probe_200x60_window.png",
+        "expected": ".shux/out/102-qa/fixed-pre/probe_200x60_window.png",
+        "diff": ".shux/out/102-qa/pixel-fixed/probe_200x60_window_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": false,
+        "note": "window snapshot at this size renders near-empty on BOTH builds (pre-existing compositor gap P3-C); comparison is not load-bearing"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-fixed-probe_80x24_pane.json",
+        "actual": ".shux/out/102-qa/fixed-post/probe_80x24_pane.png",
+        "expected": ".shux/out/102-qa/fixed-pre/probe_80x24_pane.png",
+        "diff": ".shux/out/102-qa/pixel-fixed/probe_80x24_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          720,
+          456
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-fixed-probe_80x24_window.json",
+        "actual": ".shux/out/102-qa/fixed-post/probe_80x24_window.png",
+        "expected": ".shux/out/102-qa/fixed-pre/probe_80x24_window.png",
+        "diff": ".shux/out/102-qa/pixel-fixed/probe_80x24_window_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-probe_120x40_pane.json",
+        "actual": ".shux/out/102-qa/liveA/v3_probe_120x40_pane.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_probe_120x40_pane.png",
+        "diff": ".shux/out/102-qa/pixel/probe_120x40_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1080,
+          760
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-probe_120x40_window.json",
+        "actual": ".shux/out/102-qa/liveA/v3_probe_120x40_window.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_probe_120x40_window.png",
+        "diff": ".shux/out/102-qa/pixel/probe_120x40_window_diff.png",
+        "status": "fail",
+        "changed_pixels": 2201,
+        "pixel_diff_ratio": 0.0029794780160277237,
+        "mean_rgba_channel_delta": 0.1662954163959281,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": false,
+        "note": "window snapshot at this size renders near-empty on BOTH builds (pre-existing compositor gap P3-C); comparison is not load-bearing"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-probe_200x60_pane.json",
+        "actual": ".shux/out/102-qa/liveA/v3_probe_200x60_pane.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_probe_200x60_pane.png",
+        "diff": ".shux/out/102-qa/pixel/probe_200x60_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          1800,
+          1140
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-probe_200x60_window.json",
+        "actual": ".shux/out/102-qa/liveA/v3_probe_200x60_window.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_probe_200x60_window.png",
+        "diff": ".shux/out/102-qa/pixel/probe_200x60_window_diff.png",
+        "status": "fail",
+        "changed_pixels": 2201,
+        "pixel_diff_ratio": 0.0029794780160277237,
+        "mean_rgba_channel_delta": 0.1662954163959281,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": false,
+        "note": "window snapshot at this size renders near-empty on BOTH builds (pre-existing compositor gap P3-C); comparison is not load-bearing"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-probe_80x24_pane.json",
+        "actual": ".shux/out/102-qa/liveA/v3_probe_80x24_pane.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_probe_80x24_pane.png",
+        "diff": ".shux/out/102-qa/pixel/probe_80x24_pane_diff.png",
+        "status": "pass",
+        "changed_pixels": 0,
+        "pixel_diff_ratio": 0.0,
+        "mean_rgba_channel_delta": 0.0,
+        "size": [
+          720,
+          456
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      },
+      {
+        "metric_file": ".shux/qa/102/pixel-probe_80x24_window.json",
+        "actual": ".shux/out/102-qa/liveA/v3_probe_80x24_window.png",
+        "expected": ".shux/out/102-qa/liveA-prefix/v3_probe_80x24_window.png",
+        "diff": ".shux/out/102-qa/pixel/probe_80x24_window_diff.png",
+        "status": "fail",
+        "changed_pixels": 1360,
+        "pixel_diff_ratio": 0.0018410223088585662,
+        "mean_rgba_channel_delta": 0.09629663471951484,
+        "size": [
+          1080,
+          684
+        ],
+        "load_bearing": true,
+        "note": "load-bearing: full content rendered on both builds"
+      }
+    ],
+    "committed_goldens": {
+      "source": ".shux/qa/073-shux-vt-corpus-regression-harness/pixel-report.json",
+      "baseline_dir": ".shux/goldens/073-vt-corpus",
+      "baseline_provenance": "committed before this change; not minted by this implementation",
+      "cases": [
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-plain-crlf-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-wide-cjk-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-wide-cjk-ansi-dec-edit-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-grapheme-storage-current-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-dec-special-graphics-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-tabs-current-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-tab-stops-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-origin-response-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-origin-scroll-region-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-osc-default-colors-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-alternate-screen-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-scroll-region-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-sync-output-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/synthetic-resize-smoke-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/rich-tui-btop-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/rich-tui-lazygit-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/rich-tui-nvim-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/rich-tui-vicaya-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        },
+        {
+          "expected": ".shux/goldens/073-vt-corpus/rich-tui-vivecaka-expected.png",
+          "changed_pixels": 0,
+          "pixel_diff_ratio": 0.0,
+          "status": "pass"
+        }
+      ],
+      "all_zero": true
+    }
+  },
+  "other_evidence": {
+    "replay_equivalence": ".shux/out/102-qa/replay/replay_equivalence_stateC.txt",
+    "replay_sensitivity": ".shux/out/102-qa/replay/sensitivity_stateC.txt",
+    "live_isolation_postfix": ".shux/out/102-qa/liveA/v3_isolation_*",
+    "live_isolation_prefix": ".shux/out/102-qa/live-prefix/v3_isolation_*",
+    "implementer_evidence_reviewed_not_trusted": ".shux/out/102/",
+    "window_clip_size_sweep": ".shux/out/102-qa/wsweep/",
+    "window_clip_split_vs_size": ".shux/out/102-qa/splitvssize/"
+  },
+  "cleanup": {
+    "repo_shux_daemons_after": 0,
+    "repo_orphan_processes_after": 0,
+    "leftover_runtime_dirs": 0,
+    "leak_guard_selftest": "pass",
+    "pkill_used": false
+  },
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "P1",
+      "status": "CLOSED",
+      "summary": "OSC 4 batches of >=8 pairs were dropped, voiding palette_overridden / has_indexed_colors (lens gate signal). Found independently on 6ed9bc3; fixed in 78192c6 with a test proven RED."
+    },
+    {
+      "id": "F2",
+      "severity": "P3",
+      "status": "CLOSED",
+      "summary": "DCS overflow cleared+regrew instead of latching. Bounded but costly; fixed in 7638470. Throughput 284 -> 446 MB/s."
+    },
+    {
+      "id": "F3",
+      "severity": "P2",
+      "status": "CLOSED (documented trade-off)",
+      "summary": "A complete 16-param OSC 8 (URI with 13 semicolons) is dropped. Verified against vte 0.15 directly that complete-14 and truncated-30 dispatches are byte-identical, so the false positive is unavoidable and dropping is the correct direction. Documented and pinned by a boundary test."
+    },
+    {
+      "id": "F4",
+      "severity": "P2",
+      "status": "CLOSED",
+      "summary": "The vte param-cap drift guard could detect neither a raised nor a lowered cap - a defect in verification machinery. Replaced by a direct behavioural probe via OSC 4 that detects both directions."
+    },
+    {
+      "id": "F5",
+      "severity": "P3",
+      "status": "OUT OF SCOPE (pre-existing)",
+      "summary": "window.snapshot silently clips from the TOP when a pane grid is taller than the window layout rect. NOT split-related (corrected). Deterministic, monotonic, byte-identical on a 3s retry so not a race. Byte-identical on b521f2c. Needs its own issue."
+    },
+    {
+      "id": "F6",
+      "severity": "P2",
+      "status": "CLOSED",
+      "summary": "Committed evidence understated the work (13 RED recorded vs 16 actual; REP worst case unrecorded). Refreshed in 7638470; refreshed figures match my measurements."
+    },
+    {
+      "id": "F7",
+      "severity": "P0",
+      "status": "CLOSED - verified by this gate",
+      "summary": "Branch tip was 9ff4242 'add golden' (t <t@t>): 1100 files deleted, 1 added. Root cause was crates/shux/src/gate/bless.rs, not a shell script: GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE override git -C, and git sets them in hook subprocesses, so a temp-repo test committed into the real repo under the pre-push hook. Same leak in production git_tree_is_dirty. Fixed by f740f7c (git_command() strips 8 location vars). Verified by reproducing the real attack shape (GIT_DIR alone) against a disposable decoy: pre-fix e56e989 moves decoy HEAD, creates 'add golden' by t@t, tracked 4->1; post-fix f740f7c leaves the decoy untouched with 15/15 tests passing. Pre-existing on b521f2c, outside the pinned VT file set, PASS unaffected."
+    }
+  ],
+  "pass_requirements": [],
+  "head_commit_at_audit_end": "78192c6",
+  "blocking_findings": [],
+  "test_totals": {
+    "binaries": 30,
+    "passed": 1535,
+    "failed": 0,
+    "ignored": 1,
+    "run": "clean serial run on committed 113b66c"
+  },
+  "branch_state_at_close": {
+    "tip": "f740f7c",
+    "tracked_files": 1100,
+    "wipe_commit_reachable": false,
+    "pinned_vt_blobs_unchanged": true,
+    "verdict_applies_to": "113b66c"
+  }
+}

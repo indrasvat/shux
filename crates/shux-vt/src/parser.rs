@@ -88,11 +88,58 @@ pub struct ScrollRegion {
     pub bottom: usize,
 }
 
+/// Maximum bytes retained for one in-progress DCS payload (issue #102).
+///
+/// XTGETTCAP and DECRQSS payloads are capability names — tens of bytes. This is
+/// generous headroom; anything past it is a pane streaming an unterminated
+/// control string to grow parser state without bound.
+pub const MAX_DCS_PAYLOAD_BYTES: usize = 4096;
+
+/// Maximum terminal replies produced from a single `process` batch (issue
+/// #102). One PTY read can carry thousands of `ESC[6n`-style queries, each of
+/// which would otherwise push a reply.
+///
+/// Sized against the largest LEGITIMATE burst, not the smallest safe number: an
+/// application probing the full 256-colour palette emits exactly 256 replies in
+/// one batch, which sat precisely on an earlier 256 budget — adding any other
+/// startup query (DA, DA2, DSR, XTVERSION, DECRQM) would have clipped a valid
+/// probe. 512 leaves headroom for a full palette probe plus normal startup
+/// chatter while still cutting a 5,000-query flood by an order of magnitude.
+pub const MAX_RESPONSES_PER_BATCH: usize = 512;
+
+/// Size of vte's OSC buffer, and therefore the largest OSC payload we accept.
+///
+/// This MUST stay equal to the const generic passed to `vte::Parser` — the
+/// truncation check compares against it, and a mismatch would either miss real
+/// truncation or reject valid sequences. 4 KiB leaves room for genuine OSC 8
+/// deep links and signed URLs while keeping parser state bounded.
+pub const MAX_OSC_PAYLOAD_BYTES: usize = 4096;
+
+/// Maximum characters retained for a window title inside the VT.
+pub const MAX_TITLE_CHARS: usize = 256;
+
+/// vte's private `MAX_OSC_PARAMS`. Mirrored here because vte does not export it
+/// and gives no overflow signal; reaching it means the parameter list was cut
+/// short. Must track vte's value — see the version pinned in the workspace
+/// `Cargo.toml`.
+const VTE_MAX_OSC_PARAMS: usize = 16;
+
+/// The VT parser type, with its OSC buffer sized to [`MAX_OSC_PAYLOAD_BYTES`].
+///
+/// vte only enforces this cap when built without its `std` feature — see the
+/// workspace `Cargo.toml`. Under `std` the buffer is an unbounded `Vec` and the
+/// cap silently does not exist.
+pub type VtParser = vte::Parser<MAX_OSC_PAYLOAD_BYTES>;
+
 #[derive(Debug, Clone)]
 pub struct DcsState {
     intermediates: Vec<u8>,
     action: char,
     payload: Vec<u8>,
+    /// Set when the payload exceeded [`MAX_DCS_PAYLOAD_BYTES`]. A poisoned
+    /// sequence is discarded at `unhook` rather than answered, because
+    /// replying to a truncated capability query is worse than not replying.
+    overflowed: bool,
 }
 
 /// The VT handler that translates escape sequences into grid operations.
@@ -207,6 +254,31 @@ impl<'a> VtHandler<'a> {
         } else {
             self.grid_last_row()
         }
+    }
+
+    /// Rows in the active scroll region. Scrolling further than this only
+    /// shuffles blank rows, so it is the work bound for SU/SD (issue #102).
+    fn scroll_region_height(&self) -> usize {
+        self.scroll_region
+            .bottom
+            .saturating_sub(self.scroll_region.top)
+            .saturating_add(1)
+    }
+
+    /// Rows from the cursor to the bottom of the scroll region, or `None` when
+    /// the cursor sits outside the region — where IL/DL must do nothing.
+    /// Returning `None` rather than 0 keeps "outside the region" distinct from
+    /// "at the last row", and stops the subtraction underflowing.
+    fn lines_from_cursor_to_region_bottom(&self) -> Option<usize> {
+        if self.cursor.row < self.scroll_region.top || self.cursor.row > self.scroll_region.bottom {
+            return None;
+        }
+        Some(
+            self.scroll_region
+                .bottom
+                .saturating_sub(self.cursor.row)
+                .saturating_add(1),
+        )
     }
 
     fn move_cursor_up(&mut self, n: usize) {
@@ -443,7 +515,12 @@ impl<'a> VtHandler<'a> {
         {
             let bg = self.cursor.style.bg;
             let row_ref = self.grid.visible_row_mut_marked(row);
-            row_ref[col].append_grapheme_scalar(ch);
+            // A full payload rejects the scalar. Reporting it as consumed would
+            // swallow this character and every one after it, because the stored
+            // grapheme still ends in ZWJ and keeps requesting the join (#109).
+            if !row_ref[col].append_grapheme_scalar(ch) {
+                return false;
+            }
             row_ref[col].width = target_width as u8;
             if target_width == 2 {
                 if !row_ref[col + 1].is_wide_continuation() {
@@ -486,7 +563,12 @@ impl<'a> VtHandler<'a> {
         {
             let bg = self.cursor.style.bg;
             let row_ref = self.grid.visible_row_mut_marked(row);
-            row_ref[col].append_grapheme_scalar(ch);
+            // A full payload rejects the scalar. Reporting it as consumed would
+            // swallow this character and every one after it, because the stored
+            // grapheme still ends in ZWJ and keeps requesting the join (#109).
+            if !row_ref[col].append_grapheme_scalar(ch) {
+                return false;
+            }
             row_ref[col].width = target_width as u8;
             if col + 1 < cols {
                 if !row_ref[col + 1].is_wide_continuation() {
@@ -577,7 +659,12 @@ impl<'a> VtHandler<'a> {
             source_col
         };
         let source = row.get(source_col).cloned().unwrap_or(Cell::EMPTY);
-        for _ in 0..count {
+        // Bound the repeat to one screenful (issue #102). REP legitimately
+        // wraps onto following lines, so clamping to the current row would
+        // break it; a full screen is the largest repeat that can still leave
+        // a visible mark, and no real application exceeds it.
+        let budget = self.grid.rows().saturating_mul(self.grid.cols()).max(1);
+        for _ in 0..count.min(budget) {
             self.write_cell_from_source(&source);
         }
     }
@@ -839,7 +926,17 @@ impl<'a> VtHandler<'a> {
         }
     }
 
+    /// Queue a terminal reply, bounded per batch (issue #102).
+    ///
+    /// A pane controls how many query sequences one read carries, so an
+    /// unbounded reply queue is a write/CPU amplifier. Past the budget replies
+    /// are dropped: a pane spamming thousands of DSR queries in one batch is
+    /// not doing anything that needs answering.
     fn push_response(&mut self, response: impl Into<Vec<u8>>) {
+        if self.responses.len() >= MAX_RESPONSES_PER_BATCH {
+            trace!("terminal response budget exhausted for this batch; reply dropped");
+            return;
+        }
         self.responses.push(response.into());
     }
 
@@ -1092,34 +1189,38 @@ impl<'a> vte::Perform for VtHandler<'a> {
                     _ => {}
                 }
             }
-            // IL -- Insert Lines.
+            // IL -- Insert Lines. Ignored when the cursor sits outside the
+            // scroll region (matches xterm, and keeps the clamp below from
+            // underflowing).
             ('L', []) => {
-                let n = p(0, 1) as usize;
-                for _ in 0..n {
-                    self.grid
-                        .scroll_down(self.cursor.row, self.scroll_region.bottom);
+                if let Some(limit) = self.lines_from_cursor_to_region_bottom() {
+                    for _ in 0..(p(0, 1) as usize).min(limit) {
+                        self.grid
+                            .scroll_down(self.cursor.row, self.scroll_region.bottom);
+                    }
                 }
             }
             // DL -- Delete Lines.
             ('M', []) => {
-                let n = p(0, 1) as usize;
-                for _ in 0..n {
-                    self.grid
-                        .scroll_up(self.cursor.row, self.scroll_region.bottom);
+                if let Some(limit) = self.lines_from_cursor_to_region_bottom() {
+                    for _ in 0..(p(0, 1) as usize).min(limit) {
+                        self.grid
+                            .scroll_up(self.cursor.row, self.scroll_region.bottom);
+                    }
                 }
             }
             // SU -- Scroll Up.
             ('S', []) => {
-                let n = p(0, 1) as usize;
-                for _ in 0..n {
+                let limit = self.scroll_region_height();
+                for _ in 0..(p(0, 1) as usize).min(limit) {
                     self.grid
                         .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
                 }
             }
             // SD -- Scroll Down.
             ('T', []) => {
-                let n = p(0, 1) as usize;
-                for _ in 0..n {
+                let limit = self.scroll_region_height();
+                for _ in 0..(p(0, 1) as usize).min(limit) {
                     self.grid
                         .scroll_down(self.scroll_region.top, self.scroll_region.bottom);
                 }
@@ -1434,7 +1535,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 if let Some(title_bytes) = params.get(1)
                     && let Ok(title) = std::str::from_utf8(title_bytes)
                 {
-                    *self.title = Some(title.to_string());
+                    // Clamp at parse time: the 64-char clamp in shux-core is a
+                    // display concern and is not a bound on VT memory.
+                    *self.title = Some(clamp_title(title));
                 }
             }
             // OSC 10/11/12 -- Set dynamic default foreground/background/cursor.
@@ -1518,6 +1621,15 @@ impl<'a> vte::Perform for VtHandler<'a> {
             }
             // OSC 8 -- Set/clear hyperlink for subsequent cells.
             b"8" => {
+                // vte truncates silently and still dispatches (issue #102). A
+                // cut-short URI is a valid-looking link to somewhere the sender
+                // never specified, so drop it rather than store it. Scoped to
+                // OSC 8: for other selectors truncation only loses trailing
+                // content, and dropping outright is the worse outcome.
+                if osc8_payload_was_truncated(params) {
+                    trace!("truncated OSC 8 hyperlink discarded without dispatch");
+                    return;
+                }
                 if params.len() >= 3 {
                     let uri_bytes = join_osc_parts(&params[2..]);
                     if uri_bytes.is_empty() {
@@ -1538,11 +1650,26 @@ impl<'a> vte::Perform for VtHandler<'a> {
             intermediates: intermediates.to_vec(),
             action,
             payload: Vec::new(),
+            overflowed: false,
         });
     }
 
     fn put(&mut self, byte: u8) {
         if let Some(dcs) = self.dcs_state.as_mut() {
+            // Bound the in-progress payload (issue #102). Once poisoned the
+            // sequence stays poisoned until `unhook` drops it, rather than
+            // answering a truncated query. The two DCS types we support
+            // (XTGETTCAP `+q`, DECRQSS `$q`) carry capability names of tens of
+            // bytes, so the cap is unreachable in practice.
+            if dcs.overflowed {
+                return;
+            }
+            if dcs.payload.len() >= MAX_DCS_PAYLOAD_BYTES {
+                dcs.overflowed = true;
+                // Release the buffer now; `unhook` will not read it.
+                dcs.payload = Vec::new();
+                return;
+            }
             dcs.payload.push(byte);
         }
     }
@@ -1551,6 +1678,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
         let Some(dcs) = self.dcs_state.take() else {
             return;
         };
+        if dcs.overflowed {
+            trace!("oversized DCS payload discarded without dispatch");
+            return;
+        }
         match (dcs.intermediates.as_slice(), dcs.action) {
             ([b'+'], 'q') => {
                 if let Some(response) = xtgettcap_response(&dcs.payload) {
@@ -1573,6 +1704,61 @@ impl<'a> vte::Perform for VtHandler<'a> {
             ),
         }
     }
+}
+
+/// Whether an OSC 8 dispatch carries content vte truncated.
+///
+/// **Scoped to OSC 8 deliberately.** Truncation is only *dangerous* for
+/// hyperlinks: a cut-short URI is a valid-looking link to somewhere the sender
+/// never specified, so it must be dropped rather than stored. Everywhere else
+/// truncation merely loses trailing content, and dropping the whole sequence
+/// would be the bigger regression — a blanket guard silently voided OSC 4
+/// palette batches of 8+ pairs, which in turn voided `palette_overridden` and
+/// the `has_indexed_colors` portability signal that `shux lens gate` depends
+/// on.
+///
+/// vte offers no overflow signal and truncates in two independent ways:
+///
+/// 1. **Byte buffer full.** Its buffer holds every parameter concatenated, so a
+///    dispatch whose parameters sum to the buffer size is one that filled it.
+/// 2. **Parameter list full.** vte tracks at most `MAX_OSC_PARAMS` (16)
+///    parameters regardless of buffer space, so a semicolon flood truncates the
+///    list without ever filling the buffer — check 1 cannot see that, and it
+///    left a cell holding `";;;;;;;;;;;;;"` as its hyperlink.
+///
+/// **The parameter-count case is deliberately fail-closed, and the false
+/// positive is unavoidable.** A URI whose path legitimately contains 13
+/// semicolons produces exactly 16 parameters with nothing lost, and is dropped
+/// here. That is not a missed refinement: vte discards everything past the cap
+/// with no signal, so a *complete* 14-segment URI and a *truncated* 30-segment
+/// one arrive as byte-identical dispatches — same parameter count, same total
+/// bytes, same parameter values. Verified directly against vte 0.15:
+///
+/// ```text
+/// A "s0;s1;...;s13"            -> 16 params, 33 bytes, [.., "s12", "s13"]
+/// B "s0;s1;...;s13;...;s29"    -> 16 params, 33 bytes, [.., "s12", "s13"]
+/// ```
+///
+/// Nothing at this boundary can tell them apart, so the choice is only which
+/// error to make: drop a rare valid link, or store a link to a destination the
+/// sender never specified. Dropping degrades to plain text; storing is a wrong
+/// destination a user may click. Semicolons in URI paths are legal but
+/// uncommon, and 13 of them is rarer still.
+///
+/// Note the DoS bound does NOT depend on this: memory is bounded by vte's
+/// buffer cap (see the workspace `Cargo.toml`), which applies to every OSC
+/// regardless. This function is purely about hyperlink safety.
+fn osc8_payload_was_truncated(params: &[&[u8]]) -> bool {
+    params.len() >= VTE_MAX_OSC_PARAMS
+        || params.iter().map(|p| p.len()).sum::<usize>() >= MAX_OSC_PAYLOAD_BYTES
+}
+
+/// Bound a window title at VT storage time.
+fn clamp_title(title: &str) -> String {
+    if title.chars().count() <= MAX_TITLE_CHARS {
+        return title.to_string();
+    }
+    title.chars().take(MAX_TITLE_CHARS).collect()
 }
 
 fn format_osc_rgb(rgb: [u8; 3]) -> String {
@@ -1966,7 +2152,7 @@ mod tests {
         charsets: TerminalCharsets,
         tab_stops: TabStops,
         responses: Vec<Vec<u8>>,
-        parser: vte::Parser,
+        parser: VtParser,
     }
 
     impl TestTerminal {
@@ -1989,7 +2175,7 @@ mod tests {
                 charsets: TerminalCharsets::default(),
                 tab_stops: TabStops::new(cols),
                 responses: Vec::new(),
-                parser: vte::Parser::new(),
+                parser: VtParser::new_with_size(),
             }
         }
 

@@ -44,7 +44,7 @@ pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 pub use settle::{FrameStability, frame_stability_hash};
 pub use tabstops::TabStops;
 
-use vte::Parser;
+use crate::parser::VtParser;
 
 use crate::parser::DcsState;
 
@@ -86,7 +86,7 @@ pub struct VirtualTerminal {
     /// Dynamic default foreground/background/cursor set via OSC 10/11/12.
     default_colors: TerminalDefaultColors,
     /// vte parser state machine.
-    parser: Parser,
+    parser: VtParser,
     /// In-progress DCS payload, preserved across partial PTY chunks.
     dcs_state: Option<DcsState>,
     /// Frozen presentation while synchronized output mode is active.
@@ -163,7 +163,7 @@ impl VirtualTerminal {
             },
             title: None,
             default_colors: TerminalDefaultColors::default(),
-            parser: Parser::new(),
+            parser: VtParser::new_with_size(),
             dcs_state: None,
             sync_present: None,
             active_grapheme_cell: None,
