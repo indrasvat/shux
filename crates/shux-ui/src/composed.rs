@@ -14,6 +14,7 @@ use shux_vt::{Cell, CellFlags, CellStyle, Color, Cursor, Grid, GridConfig};
 use crate::borders::{BorderColors, BorderStyle, compute_borders};
 use crate::buffer::RenderCell;
 use crate::statusbar::StatusBar;
+use crate::viewport::pane_view_row_offset;
 use crate::vt_convert::crossterm_to_vt;
 
 /// A fully composed window frame ready for ANSI emission or rasterization.
@@ -82,8 +83,8 @@ pub fn compose(
     };
 
     for (pid, rect) in &pane_rects {
-        if let Some((src_grid, _)) = inputs.panes.get(pid) {
-            compose_pane(&mut grid, *rect, src_grid);
+        if let Some((src_grid, src_cursor)) = inputs.panes.get(pid) {
+            compose_pane(&mut grid, *rect, src_grid, src_cursor);
         } else {
             compose_placeholder(&mut grid, *rect, "(no output)");
         }
@@ -174,16 +175,18 @@ pub fn compose(
         .iter()
         .find(|(id, _)| *id == inputs.focused)
         .and_then(|(_, rect)| {
-            let (_, cur) = inputs.panes.get(&inputs.focused)?;
+            let (src_grid, cur) = inputs.panes.get(&inputs.focused)?;
             if !cur.visible {
                 return None;
             }
+            // Map the cursor through the SAME vertical viewport the pane
+            // content used (issue #108) so the two never disagree.
+            let row_offset = pane_view_row_offset(src_grid.rows(), rect.height as usize, cur.row);
+            let vy = (cur.row.saturating_sub(row_offset) as u16).min(rect.height.saturating_sub(1));
             let sx = rect
                 .x
                 .saturating_add((cur.col as u16).min(rect.width.saturating_sub(1)));
-            let sy = rect
-                .y
-                .saturating_add((cur.row as u16).min(rect.height.saturating_sub(1)));
+            let sy = rect.y.saturating_add(vy);
             (sx < rect.x.saturating_add(rect.width)
                 && sy < rect.y.saturating_add(rect.height)
                 && sx < cols
@@ -199,12 +202,16 @@ pub fn compose(
     }
 }
 
-fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid) {
+fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid, cursor: &Cursor) {
     let total_rows = src.rows();
     let total_cols = src.cols();
     let visible_rows = rect.height as usize;
     let visible_cols = rect.width as usize;
-    let row_offset = total_rows.saturating_sub(visible_rows);
+    // Cursor-following viewport: show the region the cursor lives in, so
+    // content and cursor agree and top-of-grid content never renders blank
+    // (issue #108). Degrades to top-anchored for a top cursor, bottom-anchored
+    // for a bottom cursor.
+    let row_offset = pane_view_row_offset(total_rows, visible_rows, cursor.row);
 
     for r in 0..visible_rows {
         let src_row_idx = row_offset + r;
@@ -506,5 +513,147 @@ mod tests {
         let bottom = composed.grid.visible_row(23);
         let text: String = (0..5).map(|c| bottom[c].ch).collect();
         assert_eq!(text, "hello");
+    }
+
+    // ── issue #108: pane grid taller than the layout rect ────────────────
+
+    /// A pane whose grid is TALLER than the window layout rect, with its
+    /// content at the TOP, must render that content in `window snapshot` —
+    /// clipped to the top-left region, never blank.
+    ///
+    /// Red before the fix: `compose_pane` bottom-anchored the grid
+    /// (`row_offset = total_rows - visible_rows`), so the top content scrolled
+    /// off and the content area came back blank while the top-clamped cursor
+    /// still painted — exactly the reported "blank with a cursor" frame.
+    #[test]
+    fn compose_oversized_pane_top_content_is_not_blank() {
+        let pid = PaneId::new();
+        // Grid deliberately larger than any 120x36 window layout rect.
+        let mut vt = VirtualTerminal::new(60, 200);
+        vt.process(b"OVERSIZE\r\nrow2\r\n"); // cursor ends at row 2, col 0
+        let layout = single_pane_layout(pid);
+        let panes = pane_map(pid, &vt);
+        let inputs = ComposeInputs {
+            layout: &layout,
+            zoom: None,
+            focused: pid,
+            panes: &panes,
+            titles: None,
+            status_bar: None,
+        };
+        // Rounded border + 1 status row → pane viewport is (1,1,118,33): the
+        // 60-row grid overflows its 33-row rect.
+        let composed = compose(
+            &inputs,
+            120,
+            36,
+            BorderStyle::Rounded,
+            BorderColors::default(),
+            1,
+        );
+
+        // First content row (inside the top border) must carry the marker.
+        let row1: String = (1..9).map(|c| composed.grid.visible_row(1)[c].ch).collect();
+        assert_eq!(row1, "OVERSIZE", "top content dropped from window compose");
+        let row2: String = (1..5).map(|c| composed.grid.visible_row(2)[c].ch).collect();
+        assert_eq!(row2, "row2", "second content row dropped");
+
+        // Cursor (VT row 2) maps into the same top-anchored region, not a
+        // clamped position disconnected from the content.
+        assert_eq!(
+            composed.cursor,
+            Some((3, 1)),
+            "cursor must land on the row that shows VT row 2"
+        );
+    }
+
+    /// When the cursor sits near the BOTTOM of an oversized grid (a shell
+    /// prompt), the viewport follows it so the most-recent output stays
+    /// visible. Guards that the fix does not regress the documented
+    /// "resize-down shows recent output" behavior.
+    #[test]
+    fn compose_oversized_pane_cursor_at_bottom_keeps_recent_output() {
+        let pid = PaneId::new();
+        let mut vt = VirtualTerminal::new(60, 200);
+        // Jump to the last grid row and write there; cursor ends at row 59.
+        vt.process(b"\x1b[60;1HBOTTOMLINE");
+        let layout = single_pane_layout(pid);
+        let panes = pane_map(pid, &vt);
+        let inputs = ComposeInputs {
+            layout: &layout,
+            zoom: None,
+            focused: pid,
+            panes: &panes,
+            titles: None,
+            status_bar: None,
+        };
+        let composed = compose(
+            &inputs,
+            120,
+            36,
+            BorderStyle::Rounded,
+            BorderColors::default(),
+            1,
+        );
+
+        // With a 33-row viewport and the cursor on VT row 59, the offset is
+        // 27, so VT row 59 lands on the last content row (dst row 33).
+        let row33: String = (1..11)
+            .map(|c| composed.grid.visible_row(33)[c].ch)
+            .collect();
+        assert_eq!(
+            row33, "BOTTOMLINE",
+            "recent output at the bottom must survive"
+        );
+        assert_eq!(
+            composed.cursor,
+            Some((33, 11)),
+            "cursor must remain on the visible last row"
+        );
+    }
+
+    /// The `pane split` case is the same defect: splitting shrinks the layout
+    /// rect below the (unchanged) oversized pane grid. An oversized child of a
+    /// split must still show its top content.
+    #[test]
+    fn compose_split_with_oversized_child_shows_content() {
+        let left = PaneId::new();
+        let right = PaneId::new();
+        let mut left_vt = VirtualTerminal::new(60, 200);
+        left_vt.process(b"SPLITMARK\r\n"); // cursor row 1, top content on row 0
+        let right_vt = VirtualTerminal::new(10, 10);
+
+        let layout = LayoutNode::Split {
+            dir: shux_core::layout::Direction::Vertical,
+            ratio: 0.5,
+            a: Box::new(LayoutNode::Leaf { pane: left }),
+            b: Box::new(LayoutNode::Leaf { pane: right }),
+        };
+        let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
+        panes.insert(left, (left_vt.grid(), left_vt.cursor()));
+        panes.insert(right, (right_vt.grid(), right_vt.cursor()));
+
+        let inputs = ComposeInputs {
+            layout: &layout,
+            zoom: None,
+            focused: left,
+            panes: &panes,
+            titles: None,
+            status_bar: None,
+        };
+        let composed = compose(
+            &inputs,
+            120,
+            36,
+            BorderStyle::Rounded,
+            BorderColors::default(),
+            1,
+        );
+
+        // The left pane's top content sits at its content origin (col 1, row 1).
+        let row1: String = (1..10)
+            .map(|c| composed.grid.visible_row(1)[c].ch)
+            .collect();
+        assert_eq!(row1, "SPLITMARK", "oversized split child rendered blank");
     }
 }

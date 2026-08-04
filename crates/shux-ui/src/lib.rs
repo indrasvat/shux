@@ -20,6 +20,7 @@ pub mod keys;
 pub mod render;
 pub mod statusbar;
 pub mod terminal;
+pub mod viewport;
 pub mod vt_convert;
 
 // Re-export commonly used types.
@@ -40,3 +41,4 @@ pub use keys::{KeyPress, KeyValue, Modifiers, NamedKey};
 pub use render::RenderBackend;
 pub use statusbar::{StatusBar, StatusSegment};
 pub use terminal::TerminalGuard;
+pub use viewport::pane_view_row_offset;
