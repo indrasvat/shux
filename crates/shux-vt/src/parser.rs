@@ -515,7 +515,12 @@ impl<'a> VtHandler<'a> {
         {
             let bg = self.cursor.style.bg;
             let row_ref = self.grid.visible_row_mut_marked(row);
-            row_ref[col].append_grapheme_scalar(ch);
+            // A full payload rejects the scalar. Reporting it as consumed would
+            // swallow this character and every one after it, because the stored
+            // grapheme still ends in ZWJ and keeps requesting the join (#109).
+            if !row_ref[col].append_grapheme_scalar(ch) {
+                return false;
+            }
             row_ref[col].width = target_width as u8;
             if target_width == 2 {
                 if !row_ref[col + 1].is_wide_continuation() {
@@ -558,7 +563,12 @@ impl<'a> VtHandler<'a> {
         {
             let bg = self.cursor.style.bg;
             let row_ref = self.grid.visible_row_mut_marked(row);
-            row_ref[col].append_grapheme_scalar(ch);
+            // A full payload rejects the scalar. Reporting it as consumed would
+            // swallow this character and every one after it, because the stored
+            // grapheme still ends in ZWJ and keeps requesting the join (#109).
+            if !row_ref[col].append_grapheme_scalar(ch) {
+                return false;
+            }
             row_ref[col].width = target_width as u8;
             if col + 1 < cols {
                 if !row_ref[col + 1].is_wide_continuation() {

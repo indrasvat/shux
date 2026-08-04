@@ -225,17 +225,21 @@ impl Cell {
     /// text at quadratic cost (issue #102). Once the cap is reached further
     /// continuation scalars are dropped — the cell keeps the grapheme it has
     /// rather than growing or resetting.
-    pub fn append_grapheme_scalar(&mut self, ch: char) {
+    /// Returns `false` when the payload is already full and the scalar was
+    /// rejected. Callers driving a join MUST stop joining on `false` — treating
+    /// a rejected scalar as consumed silently swallows pane output.
+    pub fn append_grapheme_scalar(&mut self, ch: char) -> bool {
         match self.extended.as_ref().and_then(|e| e.grapheme.as_deref()) {
             Some(existing) => {
                 if existing.chars().count() >= MAX_GRAPHEME_SCALARS {
-                    return;
+                    return false;
                 }
                 // Safe to unwrap: the match arm proves `extended` is Some.
                 let extended = self.extended.as_mut().expect("grapheme payload present");
                 if let Some(text) = Arc::make_mut(extended).grapheme.as_mut() {
                     text.push(ch);
                 }
+                true
             }
             None => {
                 // First continuation scalar: seed from the base char.
@@ -243,6 +247,7 @@ impl Cell {
                 text.push(self.ch);
                 text.push(ch);
                 self.set_grapheme_payload(text);
+                true
             }
         }
     }

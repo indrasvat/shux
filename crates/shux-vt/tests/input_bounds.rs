@@ -628,6 +628,33 @@ fn real_world_grapheme_clusters_are_never_clipped() {
     }
 }
 
+/// Reaching the grapheme cap must never swallow subsequent output.
+///
+/// The cap's early return left the stored grapheme ending in ZWJ, and the join
+/// state machine treats "ends with ZWJ" as "keep joining" — so every following
+/// printable character was handed to a no-op append and reported as consumed.
+/// A pane could lose arbitrary text after 32 scalars. Found by review on #109.
+#[test]
+fn hitting_the_grapheme_cap_does_not_swallow_following_text() {
+    // base + 30 combining marks + ZWJ == exactly the 32-scalar cap, with the
+    // payload ending in ZWJ — the state the join machine wants to continue.
+    let mut seq = String::from("A");
+    for _ in 0..30 {
+        seq.push('\u{0301}');
+    }
+    seq.push('\u{200D}');
+
+    let mut t = vt();
+    t.process(seq.as_bytes());
+    t.process(b"HELLO");
+
+    let text = t.capture_text(None);
+    assert!(
+        text.contains("HELLO"),
+        "text after a capped trailing-ZWJ grapheme was swallowed; captured: {text:?}"
+    );
+}
+
 /// Negative control: ordinary combining marks must still compose.
 #[test]
 fn ordinary_combining_marks_still_compose() {
