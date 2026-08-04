@@ -689,8 +689,12 @@ async fn run_attach_loop(
                                 let action = {
                                     let state = io_state.lock().await;
                                     let vt = state.vts.get(&active_pane);
-                                    let total_lines =
-                                        vt.map(|vt| vt.grid().total_lines()).unwrap_or(rows as usize);
+                                    // #108: anchor copy-mode scrolling to the region the
+                                    // attach frame shows for an oversized pane (identical to
+                                    // grid.total_lines() when the grid fits its rect).
+                                    let total_lines = vt
+                                        .map(|vt| shux_ui::copy_mode::effective_total_lines(vt, rows))
+                                        .unwrap_or(rows as usize);
                                     let mut s = render_session.lock().await;
                                     if let Some(ref mut cm) = s.copy_mode {
                                         shux_ui::copy_mode_key_with_vt(

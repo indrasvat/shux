@@ -330,7 +330,9 @@ fn find_and_focus(
         return false;
     };
     let grid = vt.grid();
-    let total_lines = grid.total_lines();
+    // #108: map the copy cursor through the same region the frame shows. Search
+    // itself (search_forward/backward) still scans the full grid.total_lines().
+    let total_lines = effective_total_lines(vt, pane_rows);
     if total_lines == 0 {
         return false;
     }
@@ -529,6 +531,38 @@ pub fn view_start(total_lines: usize, pane_rows: u16, scroll_offset: usize) -> u
         .saturating_sub(scroll_offset.min(max_scroll_offset(total_lines, pane_rows)))
 }
 
+/// The number of lines the copy-mode viewport spans for `vt` at `pane_rows` —
+/// scrollback plus the region the live attach frame actually shows.
+///
+/// Issue #108 made the attach/snapshot frame **cursor-following**: when a pane's
+/// grid is taller than the rect it is drawn into, the frame shows the
+/// `pane_view_row_offset` window rather than the bottom `pane_rows`. Copy mode
+/// maps a screen selection to a grid line off the BOTTOM (`total_lines`), so on
+/// such a pane the row you see and the row you yank diverge. Anchoring copy
+/// mode's coordinate space to this value (instead of `grid.total_lines()`) keeps
+/// the two in lockstep: `view_start(effective, ..)` at `scroll_offset 0` lands
+/// on the same grid row the frame's first row shows.
+///
+/// For a pane whose grid fits its viewport (the overwhelmingly common case) this
+/// is exactly `grid.total_lines()`, so copy mode is byte-for-byte unchanged.
+pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
+    let grid = vt.grid();
+    let total = grid.total_lines();
+    let grid_rows = grid.rows();
+    let visible = pane_rows as usize;
+    if grid_rows <= visible {
+        return total; // grid fits — coordinate space is unchanged
+    }
+    let row_offset = crate::viewport::pane_view_row_offset(grid_rows, visible, vt.cursor().row);
+    // Scrollback lines + the live viewport's bottom edge. Excludes any grid rows
+    // below the live frame (they are past the visible screen), matching what the
+    // attach frame shows. `row_offset + visible <= grid_rows`, so this never
+    // exceeds `total`.
+    total
+        .saturating_sub(grid_rows)
+        .saturating_add(row_offset + visible)
+}
+
 pub fn scroll_up(
     state: &mut CopyModeState,
     lines: usize,
@@ -569,8 +603,9 @@ fn row_for_view(
     view_row: u16,
 ) -> Option<&Row> {
     let grid = vt.grid();
-    let abs =
-        view_start(grid.total_lines(), pane_rows, scroll_offset).saturating_add(view_row as usize);
+    // #108: anchor to the region the live frame shows, not the grid bottom.
+    let total = effective_total_lines(vt, pane_rows);
+    let abs = view_start(total, pane_rows, scroll_offset).saturating_add(view_row as usize);
     grid.row(abs)
 }
 
@@ -678,7 +713,12 @@ pub fn render_copy_view_into(
         return;
     }
     let grid = vt.grid();
-    let start = view_start(grid.total_lines(), pane.height, state.scroll_offset);
+    // #108: match the cursor-following frame region (see effective_total_lines).
+    let start = view_start(
+        effective_total_lines(vt, pane.height),
+        pane.height,
+        state.scroll_offset,
+    );
     for row in 0..pane.height {
         let abs = start + row as usize;
         let Some(row_ref) = grid.row(abs) else {
@@ -1434,5 +1474,66 @@ mod tests {
         let state = CopyModeState::new();
         render_copy_overlay_into(&mut buf, pane, &state, &Theme::DEFAULT);
         assert!(buf.is_empty());
+    }
+
+    // ── issue #108 follow-up: copy mode on an oversized pane ─────────────
+    //
+    // When the pane grid is TALLER than the copy-mode viewport (the same
+    // oversized geometry as #108), the live attach frame is cursor-following:
+    // with content + cursor at the TOP it shows the top rows. Copy mode maps a
+    // screen selection to grid rows via `row_for_view`; if that still
+    // bottom-anchors while the frame top-anchors, selecting the row you SEE
+    // yanks a different (blank) row. Copy mode must read the SAME region the
+    // frame shows.
+
+    #[test]
+    fn extract_selection_reads_shown_rows_when_grid_exceeds_viewport() {
+        // 60-row grid, content + cursor at the top, shown in a 20-row viewport.
+        let mut vt = VirtualTerminal::new(60, 40);
+        vt.process(b"TOPLINE-UNIQUE\r\n"); // grid row 0, cursor ends at row 1
+        let pane_rows = 20u16;
+        let mut state = CopyModeState::new();
+        // Select all 14 chars of the FIRST visible screen row.
+        state.anchor = Some((0, 0));
+        state.cursor = (13, 0);
+        let sel = extract_selection(&vt, &state, 40, pane_rows);
+        assert_eq!(
+            sel, "TOPLINE-UNIQUE",
+            "copy mode selected the wrong region of an oversized pane (read the \
+             bottom-anchored band instead of the cursor-following frame)"
+        );
+    }
+
+    #[test]
+    fn copy_view_render_matches_frame_for_oversized_pane() {
+        // The scrolled copy view must draw the top content, not the blank tail.
+        let mut vt = VirtualTerminal::new(60, 40);
+        vt.process(b"TOPLINE-UNIQUE\r\n");
+        let pane = Rect::new(0, 0, 40, 20);
+        // Nudge into "scrolled" so render_copy_view_into is exercised, then back
+        // to the live anchor: the first visible row must be the top content.
+        let state = CopyModeState::new();
+        let mut buf = Vec::new();
+        render_copy_view_into(&mut buf, pane, &vt, &state);
+        let plain = strip_ansi(&String::from_utf8_lossy(&buf));
+        assert!(
+            plain.contains("TOPLINE-UNIQUE"),
+            "copy view drew the blank bottom band instead of the frame's top rows: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn effective_total_lines_is_unchanged_when_grid_fits() {
+        // Guard: for a normally-sized pane (grid == viewport) the copy-mode
+        // coordinate space is identical to before, so existing behavior and
+        // all the tests above/below are unaffected.
+        let vt = VirtualTerminal::new(24, 80);
+        assert_eq!(effective_total_lines(&vt, 24), vt.grid().total_lines());
+        // And with scrollback present but the grid fitting the viewport.
+        let mut vt2 = VirtualTerminal::new(24, 80);
+        for _ in 0..50 {
+            vt2.process(b"line\r\n");
+        }
+        assert_eq!(effective_total_lines(&vt2, 24), vt2.grid().total_lines());
     }
 }

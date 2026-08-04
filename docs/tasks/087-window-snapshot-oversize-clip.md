@@ -106,3 +106,20 @@ case), fixed when content/cursor sit at the top.
 - **Visual proof:** before/after evidence matrix captured at full resolution and
   showcased in a Claude Artifact linked from the PR. No screenshots committed
   (`.shux/out` scratch discipline).
+
+### Follow-up — copy mode on an oversized pane (Codex PR review, P2)
+
+Aligning the live-attach frame (`render_multi_pane`) to the cursor-following
+viewport surfaced a downstream inconsistency the review agent caught: copy mode's
+screen↔grid mapping (`copy_mode::row_for_view` → `extract_selection`) still
+bottom-anchored via `view_start(grid.total_lines(), …)`. On an oversized pane the
+attach frame showed the top rows while a selection read the bottom-anchored band —
+so on a `set-size`-oversized attached pane you could see one row and yank another.
+**Reproduced first** as a red unit test (`extract_selection_reads_shown_rows_
+when_grid_exceeds_viewport`). Fixed by anchoring copy mode's coordinate space to
+`copy_mode::effective_total_lines(vt, pane_rows)` — scrollback + the live viewport
+the frame shows — used by `row_for_view`, `render_copy_view_into`, `find_and_focus`
+and the attach scroll path. It is exactly `grid.total_lines()` when the grid fits
+its viewport, so normal copy mode is byte-for-byte unchanged (guarded by
+`effective_total_lines_is_unchanged_when_grid_fits`). All 26 copy-mode unit tests
+green.

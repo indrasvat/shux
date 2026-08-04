@@ -473,3 +473,16 @@ palette, restore the deliberate table/summary divergence).
   opened. Also: `XDG_RUNTIME_DIR` for daemon-backed captures MUST be a short `/tmp` path —
   the long scratchpad path overflows the Unix-socket `SUN_LEN` (~108) with "path must be
   shorter than SUN_LEN".
+- **2026-08-04 (issue #108 follow-up — fixing one render path can desync a sibling
+  path):** Aligning the live-attach frame to the new cursor-following viewport made
+  `window snapshot`, `session snapshot` and live attach agree — but copy mode reads the
+  focused pane through its OWN screen↔grid mapping (`copy_mode::row_for_view` →
+  `extract_selection`), still bottom-anchored via `view_start(grid.total_lines(), …)`. On
+  an oversized attached pane the frame showed the top rows while a selection yanked the
+  bottom-anchored band. A Codex PR-review bot flagged it; reproduced as a red unit test
+  before believing. Lesson: when you change how a grid is clipped into a rect, grep for
+  EVERY consumer of that mapping — the attach frame, the snapshot compositor, AND copy
+  mode / mouse-selection / search all map screen coords back to grid rows, and they must
+  share one anchor. Fix: a single `effective_total_lines(vt, pane_rows)` (scrollback + the
+  live viewport the frame shows) that every copy-mode coordinate site routes through; it
+  equals `grid.total_lines()` exactly when the grid fits, so the common path is unchanged.
