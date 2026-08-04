@@ -1,3 +1,10 @@
+## [0.46.2](https://github.com/indrasvat/shux/compare/v0.46.1...v0.46.2) (2026-08-04)
+
+
+### Bug Fixes
+
+* **ui:** render oversized pane content in window snapshot ([#108](https://github.com/indrasvat/shux/issues/108)) ([#111](https://github.com/indrasvat/shux/issues/111)) ([3aff8a9](https://github.com/indrasvat/shux/commit/3aff8a91eab6ce2d2c609e24004807d27ef7379a))
+
 ## [0.46.1](https://github.com/indrasvat/shux/compare/v0.46.0...v0.46.1) (2026-08-04)
 
 
