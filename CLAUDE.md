@@ -53,6 +53,9 @@ crates/shux-ui/     TUI client (crossterm, ratatui chrome, compositor)
 defer, hand off, or ask the user whether to fix. "Pre-existing" / "out of scope" /
 "already Done" / "only a P2" → be careful, not skip. Needs sequencing? Say so while
 already doing it. Applies hardest to defects in verification machinery.
+Fix it on whichever task's surface owns it, then **re-run that task's gate and frozen
+suite and record the fix in its task file** — a fix on a Done task leaves its committed
+QA evidence stale and its scope undocumented otherwise.
 
 **Reproduce before believing — including your own findings.** Every report is a
 hypothesis: review agent, QA gate, dogfood, council, or you. A/B against a worktree of
@@ -116,7 +119,7 @@ re-scoped in the task file first.
 | Gate | Applies to |
 |---|---|
 | `shux-vt-solid-qa` | `shux-vt`, `shux-raster`, PTY output, pane sizing/resize, capture, snapshot pixels, Unicode width, default colours, cursor, alt screen, scroll regions, terminal responses |
-| `shux-tui-qa` | attach UI, keyboard/mouse, copy mode, palette, help, status bar, themes, pane/window/session UX, plugin UX, CLI flows, templates, recordings — when the VT gate doesn't apply |
+| `shux-tui-qa` | attach UI, keyboard/mouse, copy mode, palette, help, status bar, themes, pane/window/session UX, plugin UX, CLI flows, **agent workflows**, templates, recordings, **rich-TUI compatibility** — when the VT gate doesn't apply |
 
 Defined in `.claude/agents/<name>.md` and `.codex/agents/<name>.toml`.
 
@@ -150,9 +153,14 @@ Every feature/fix PR.
    council. 2–4 parallel agents on **disjoint** surfaces that drive the real system.
    Reproduce each finding; fix with a regression test.
 6. **Council on the implementation diff, before pushing.**
-7. **Name evidence `v<N>_<render-path>_<width>_<config-state>.png`** — render path is
-   mandatory or cells collide silently.
-8. **Visual proof in a PR comment — MANDATORY.** Load `browsing-as-you`;
+7. **Capture evidence for every relevant (render path × config state) cell**, named
+   `v<N>_<render-path>_<width>_<config-state>.png`. Render path is mandatory in the name
+   or two cells collide silently. One default-state screenshot is not the matrix — drift
+   hides in the feature-maxed and malformed cells.
+8. **Visual proof in a PR comment — MANDATORY for any user-visible change.**
+   Non-visual changes (CI config, docs, resource limits, protocol validation) are
+   exempt; say so in one line in the PR rather than attaching an artifact that proves
+   nothing. Load `browsing-as-you`;
    `cdp.py --json gh-attach --repo O/R --pr N -f shot.png` uploads, then post via
    `gh api repos/O/R/issues/N/comments`. **Skill unavailable (cloud/headless) or
    attachment fails → publish a Claude Artifact, link it in the comment.** Prose-only
@@ -184,7 +192,7 @@ Paste into every feature PR:
 - [ ] cross-path consistency test
 - [ ] `make check` (lint + tests)
 - [ ] real-target dogfood — consumer-facing output judged; findings reproduced
-- [ ] visual proof attached as a PR comment (or Claude Artifact link)
+- [ ] visual proof for every (render path × config state) cell, attached as a PR comment (or Claude Artifact link); non-visual change → exemption stated
 - [ ] `gh ghent status --await-review` from PR creation; all threads answered
 - [ ] no screenshots committed unless justified as durable baselines
 ```
