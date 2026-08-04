@@ -588,12 +588,19 @@ impl<W: Write> RenderCompositor<W> {
                 if let Some(vt) = frame.vts.get(&frame.focused) {
                     let cur = vt.cursor();
                     let defaults = vt.default_colors();
+                    // Same cursor-following viewport the pane content used, so
+                    // the cursor lands on the row that actually shows it (#108).
+                    let row_offset = crate::viewport::pane_view_row_offset(
+                        vt.grid().rows(),
+                        rect.height as usize,
+                        cur.row,
+                    );
+                    let vy = (cur.row.saturating_sub(row_offset) as u16)
+                        .min(rect.height.saturating_sub(1));
                     let sx = rect
                         .x
                         .saturating_add((cur.col as u16).min(rect.width.saturating_sub(1)));
-                    let sy = rect
-                        .y
-                        .saturating_add((cur.row as u16).min(rect.height.saturating_sub(1)));
+                    let sy = rect.y.saturating_add(vy);
                     if cur.visible
                         && sx < rect.x.saturating_add(rect.width)
                         && sy < rect.y.saturating_add(rect.height)
@@ -644,10 +651,13 @@ impl<W: Write> RenderCompositor<W> {
         let visible_rows = rect.height as usize;
         let visible_cols = rect.width as usize;
 
-        // VT keeps `rows` visible rows. If the pane rect is smaller than
-        // the VT (because the user resized down), we render the bottom
-        // portion (most recent output).
-        let row_offset = total_rows.saturating_sub(visible_rows);
+        // The VT grid can be taller than the pane rect (an oversized
+        // `pane set-size`, a split that shrank the rect, or a transient
+        // resize-down). Use a cursor-following viewport so content and the
+        // cursor mapping below agree — a plain bottom anchor rendered
+        // top-of-grid content blank while the cursor still painted (#108).
+        let row_offset =
+            crate::viewport::pane_view_row_offset(total_rows, visible_rows, vt.cursor().row);
 
         for r in 0..visible_rows {
             let grid_row = row_offset + r;
@@ -1178,6 +1188,94 @@ mod tests {
             .render_frame(|_, _| RenderCell::text('Z'), 5, 3, None)
             .unwrap();
         assert_eq!(stats.dirty_cells, 0);
+    }
+
+    /// issue #108 (attach path): a pane whose grid is taller than its layout
+    /// rect must render its top content in a live `render_multi_pane` frame,
+    /// not just the bottom-anchored (blank) tail. Red before the fix.
+    #[test]
+    fn test_multi_pane_oversized_pane_renders_top_content() {
+        let pid = PaneId::new();
+        let layout = LayoutNode::Leaf { pane: pid };
+        // 60-row grid, top content, composited into a 36-row buffer.
+        let mut vt = VirtualTerminal::new(60, 200);
+        vt.process(b"OVERSIZE-MARKER\r\nrow2\r\n");
+        let mut vts = HashMap::new();
+        vts.insert(pid, &vt);
+        let frame = MultiPaneFrame {
+            layout: &layout,
+            zoom: None,
+            focused: pid,
+            vts: &vts,
+            titles: None,
+            status_bar: None,
+        };
+        // No border / status bar so the pane rect is the whole 200x36 buffer:
+        // isolates compose_pane's vertical clipping.
+        let mut compositor = RenderCompositor::new(
+            200,
+            36,
+            Vec::new(),
+            CompositorConfig {
+                border_style: BorderStyle::None,
+                ..CompositorConfig::default()
+            },
+        );
+        compositor.render_multi_pane(frame).unwrap();
+
+        // The diff renderer emits each cell preceded by a cursor-move escape,
+        // so glyphs aren't a contiguous substring — strip CSI/OSC and read the
+        // painted characters back.
+        let painted = strip_ansi(&String::from_utf8_lossy(compositor.inner()));
+        assert!(
+            painted.contains("OVERSIZE-MARKER"),
+            "attach dropped the oversized pane's top content: painted={painted:?}"
+        );
+        assert!(
+            painted.contains("row2"),
+            "attach dropped the oversized pane's second row: painted={painted:?}"
+        );
+    }
+
+    /// Strip ANSI escape sequences (CSI `\x1b[...<final>` and OSC
+    /// `\x1b]...\x07`/`\x1b\\`) so a test can read the glyphs a diff render
+    /// actually painted.
+    fn strip_ansi(s: &str) -> String {
+        let bytes: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == '\u{1b}' {
+                i += 1;
+                match bytes.get(i) {
+                    Some('[') => {
+                        // CSI: params until a final byte in 0x40..=0x7E.
+                        i += 1;
+                        while i < bytes.len() && !('\u{40}'..='\u{7e}').contains(&bytes[i]) {
+                            i += 1;
+                        }
+                        i += 1; // consume the final byte
+                    }
+                    Some(']') => {
+                        // OSC: until BEL or ST (ESC \).
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != '\u{07}' {
+                            if bytes[i] == '\u{1b}' && bytes.get(i + 1) == Some(&'\\') {
+                                i += 1;
+                                break;
+                            }
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
     }
 
     #[test]

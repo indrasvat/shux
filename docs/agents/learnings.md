@@ -444,3 +444,45 @@ palette, restore the deliberate table/summary divergence).
   from the new 32-scalar cap. Both would have been mis-filed as self-inflicted
   regressions without an A/B against a worktree of the base commit. Keep a built binary
   and a path-dep worktree of the base commit on hand for any bounds/behaviour change.
+
+- **2026-08-04 (issue #108 — two render paths disagreed because content and cursor were
+  anchored differently):** `window snapshot` showed an oversized pane (grid taller than
+  the window layout rect) as blank-with-a-cursor, while `pane snapshot`/`pane capture`
+  showed full content. Root cause: `compose_pane` bottom-anchored the grid
+  (`row_offset = total_rows - visible_rows`) but the cursor was TOP-clamped
+  (`cur.row.min(rect.height-1)`) — so with content+cursor at the top, the content
+  window was the blank tail while the cursor still painted at its clamped position. The
+  two disagreements are the bug. Fix: one shared cursor-following viewport
+  (`shux_ui::pane_view_row_offset`) drives BOTH the content clip AND the cursor mapping
+  in BOTH compose paths (snapshot `composed::compose` and attach
+  `compositor::render_multi_pane`), so they can never diverge again. It degrades to
+  top-anchored when the cursor is near the top (fixes the bug — content at top now
+  shows) and bottom-anchored when the cursor is at the bottom (a shell prompt — recent
+  output stays visible), strictly dominating both fixed anchors. Lesson: when two paths
+  clip the same grid, route them through ONE function; an internally inconsistent single
+  path (content anchored one way, cursor another) is a latent blank-frame bug.
+- **2026-08-04 (issue #108 — a colour-probe fixture that used space cells silently
+  measured nothing):** The first cut of the acceptance test drew coloured *background*
+  bars out of trailing spaces so an interior probe would read pure bg. But trailing
+  whitespace with a background is trimmed on the `pane set-size` grid reflow, so the bars
+  vanished and both render paths agreed on "blank" — the test would have passed for the
+  wrong reason on a still-broken build. Glyph-filled bars (`AAAA…`) survive reflow;
+  `probe_cell_bg_img` samples the cell's top-left interior and reads the solid background
+  even under a glyph (this is what the lens F3 fixture does). Always prove a colour probe
+  is reading real cells: I only caught it because the "after" PNG was visibly blank when
+  opened. Also: `XDG_RUNTIME_DIR` for daemon-backed captures MUST be a short `/tmp` path —
+  the long scratchpad path overflows the Unix-socket `SUN_LEN` (~108) with "path must be
+  shorter than SUN_LEN".
+- **2026-08-04 (issue #108 follow-up — fixing one render path can desync a sibling
+  path):** Aligning the live-attach frame to the new cursor-following viewport made
+  `window snapshot`, `session snapshot` and live attach agree — but copy mode reads the
+  focused pane through its OWN screen↔grid mapping (`copy_mode::row_for_view` →
+  `extract_selection`), still bottom-anchored via `view_start(grid.total_lines(), …)`. On
+  an oversized attached pane the frame showed the top rows while a selection yanked the
+  bottom-anchored band. A Codex PR-review bot flagged it; reproduced as a red unit test
+  before believing. Lesson: when you change how a grid is clipped into a rect, grep for
+  EVERY consumer of that mapping — the attach frame, the snapshot compositor, AND copy
+  mode / mouse-selection / search all map screen coords back to grid rows, and they must
+  share one anchor. Fix: a single `effective_total_lines(vt, pane_rows)` (scrollback + the
+  live viewport the frame shows) that every copy-mode coordinate site routes through; it
+  equals `grid.total_lines()` exactly when the grid fits, so the common path is unchanged.

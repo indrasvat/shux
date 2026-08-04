@@ -127,6 +127,12 @@ test-vt: ## Run focused virtual terminal tests; optionally pass FILTER=<test-nam
 	@bash scripts/run-cargo-test.sh -p shux-vt --lib -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Virtual terminal tests passed$(COLOR_RESET)"
 
+.PHONY: test-window-snapshot
+test-window-snapshot: ## Run the window-snapshot oversize cross-path integration test; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running window snapshot oversize integration tests...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test window_snapshot_oversize -- $(FILTER) --test-threads=1
+	@echo "$(COLOR_GREEN)✓ Window snapshot oversize tests passed$(COLOR_RESET)"
+
 .PHONY: test-pane-io
 test-pane-io: ## Run pane I/O integration tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running pane I/O integration tests...$(COLOR_RESET)"
