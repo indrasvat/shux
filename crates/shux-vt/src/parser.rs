@@ -8,7 +8,8 @@ use crate::cell::{
 };
 use crate::charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 use crate::cursor::{Cursor, CursorShape};
-use crate::grid::{Grid, GridConfig};
+use crate::grid::Grid;
+use crate::screen::ScreenSwap;
 use crate::tabstops::TabStops;
 
 /// Terminal mode flags (DECSET/DECRST).
@@ -167,9 +168,28 @@ pub struct VtHandler<'a> {
     /// taken afterwards is non-portable — the lens gate reads this to emit the
     /// `palette_unportable` diagnostic (task 078, R1).
     pub palette_overridden: &'a mut bool,
+    /// The retired alternate-screen buffer, reused by the next entry
+    /// (issue #106). At most one, ever.
+    pub alt_spare: &'a mut Option<Grid>,
+    /// Whether retired buffers may be recycled. Always `true` in production;
+    /// the differential tests drive a second terminal with it off.
+    pub reuse_retired_grids: bool,
 }
 
 impl<'a> VtHandler<'a> {
+    /// Borrow everything the alternate-screen swap needs. One definition, used
+    /// by `DECSET 1047/1049` and by `RIS`.
+    fn screen_swap(&mut self) -> ScreenSwap<'_> {
+        ScreenSwap {
+            grid: self.grid,
+            cursor: self.cursor,
+            stashed_grid: self.alt_grid,
+            stashed_cursor: self.alt_cursor,
+            spare: self.alt_spare,
+            reuse: self.reuse_retired_grids,
+        }
+    }
+
     fn clear_active_grapheme_cell(&mut self) {
         *self.active_grapheme_cell = None;
     }
@@ -868,37 +888,15 @@ impl<'a> VtHandler<'a> {
                         }
                         return;
                     }
-                    // Enter alternate screen: swap grids.
-                    let rows = self.grid.rows();
-                    let cols = self.grid.cols();
-                    let config = GridConfig {
-                        max_scrollback: 0,
-                        ..GridConfig::default()
-                    };
-                    let mut alt_grid = Grid::new(rows, cols, config);
-                    alt_grid.mark_all_dirty();
-                    *self.alt_grid = Some(std::mem::replace(self.grid, alt_grid));
-                    if mode == 1049 {
-                        let alt_cursor = Cursor::new();
-                        *self.alt_cursor = Some(std::mem::replace(self.cursor, alt_cursor));
-                    } else {
-                        self.alt_cursor.take();
-                    }
+                    // Enter alternate screen: swap grids. 1049 parks the
+                    // primary cursor and homes the alternate one; 1047 carries
+                    // the cursor across and parks nothing.
+                    self.screen_swap().enter(mode == 1049);
                     self.modes.alternate_screen = true;
                 } else {
                     // Leave alternate screen: restore grids.
                     if self.modes.alternate_screen {
-                        if let Some(primary_grid) = self.alt_grid.take() {
-                            *self.grid = primary_grid;
-                            self.grid.mark_all_dirty();
-                        }
-                        if mode == 1049 {
-                            if let Some(primary_cursor) = self.alt_cursor.take() {
-                                *self.cursor = primary_cursor;
-                            }
-                        } else {
-                            self.alt_cursor.take();
-                        }
+                        self.screen_swap().leave(mode == 1049);
                         self.modes.alternate_screen = false;
                     }
                     if mode == 1049 {
@@ -1508,6 +1506,19 @@ impl<'a> vte::Perform for VtHandler<'a> {
             }
             // RIS -- Full Reset (ESC c).
             (b'c', []) => {
+                // The initial state RIS restores is the PRIMARY screen, so the
+                // swap has to happen before anything is cleared. Resetting
+                // `modes` alone only lowered the alt-screen flag: the
+                // alternate buffer stayed live and the primary one stayed
+                // parked and unreachable. Because the alternate buffer is
+                // built with no scrollback budget, it then became the pane's
+                // primary buffer — and the pane lost scrollback permanently,
+                // which `reset(1)` and a crashed full-screen app both trigger.
+                // The cursor is homed a few lines down, so there is nothing
+                // worth restoring from the parked one.
+                if self.modes.alternate_screen {
+                    self.screen_swap().leave(false);
+                }
                 self.grid.clear_visible(Color::Default);
                 self.grid.clear_scrollback();
                 self.grid.mark_all_dirty();
@@ -2152,6 +2163,7 @@ mod tests {
         title: Option<String>,
         default_colors: TerminalDefaultColors,
         alt_grid: Option<Grid>,
+        alt_spare: Option<Grid>,
         alt_cursor: Option<Cursor>,
         dcs_state: Option<DcsState>,
         sync_present: Option<SyncPresentation>,
@@ -2175,6 +2187,7 @@ mod tests {
                 title: None,
                 default_colors: TerminalDefaultColors::default(),
                 alt_grid: None,
+                alt_spare: None,
                 alt_cursor: None,
                 dcs_state: None,
                 sync_present: None,
@@ -2204,6 +2217,8 @@ mod tests {
                 tab_stops: &mut self.tab_stops,
                 responses: &mut self.responses,
                 palette_overridden: &mut palette_overridden,
+                alt_spare: &mut self.alt_spare,
+                reuse_retired_grids: true,
             };
             self.parser.advance(&mut handler, bytes);
         }

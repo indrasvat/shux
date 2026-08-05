@@ -43,6 +43,20 @@ impl DirtyState {
         self.rows.resize(rows, None);
     }
 
+    /// Return to the state of `DirtyState::new(rows, enabled)` without giving
+    /// the two row vectors back to the allocator. Used when a retired grid is
+    /// recycled (issue #106).
+    fn reset(&mut self, rows: usize, enabled: bool) {
+        self.enabled = enabled;
+        self.full_frame = false;
+        self.any_dirty = false;
+        self.last_full_row = None;
+        self.full_rows.clear();
+        self.full_rows.resize(rows, false);
+        self.rows.clear();
+        self.rows.resize(rows, None);
+    }
+
     fn mark_all(&mut self) {
         if !self.enabled {
             return;
@@ -260,6 +274,16 @@ impl Row {
         self.cells.resize(cols, template);
     }
 
+    /// Return the row to the state of `Row::new(cols)`, keeping the cell
+    /// vector's allocation. `clear` + `resize` reuses the existing buffer
+    /// whenever it is already wide enough, which it is for every recycled
+    /// alternate-screen buffer at an unchanged pane width.
+    pub(crate) fn reset_blank(&mut self, cols: usize) {
+        self.cells.clear();
+        self.cells.resize(cols, Cell::default());
+        self.wrapped = false;
+    }
+
     /// Reset all cells in the row to the given background color.
     pub fn reset(&mut self, bg: Color) {
         for cell in &mut self.cells {
@@ -358,7 +382,7 @@ impl IndexMut<usize> for Row {
 }
 
 /// Configuration for the grid.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GridConfig {
     /// Maximum number of scrollback lines. Default: 5000 (PRD 5.5).
     pub max_scrollback: usize,
@@ -432,6 +456,49 @@ impl Grid {
             config,
             mutations: 0,
         }
+    }
+
+    /// Whether this grid is indistinguishable from a freshly built
+    /// `Grid::new(rows, cols, config)`.
+    ///
+    /// `mutations` is the load-bearing half: it advances on every cell write,
+    /// scroll, erase and clear, and it is value-INDEPENDENT, so it cannot be
+    /// fooled by a write that happened to restore the previous value. A grid
+    /// that starts blank and has a tally of zero therefore still IS blank. The
+    /// dimensions and line count cover the two restructuring operations that
+    /// deliberately do not advance the tally (`resize*` and `clear_scrollback`).
+    ///
+    /// Used to recycle a retired alternate-screen buffer without re-blanking
+    /// it (issue #106): a pane that toggles the alternate screen without
+    /// drawing gets the same buffer back untouched.
+    pub(crate) fn is_blank_canvas(&self, rows: usize, cols: usize, config: &GridConfig) -> bool {
+        self.mutations == 0
+            && self.rows == rows
+            && self.cols == cols
+            && self.raw.len() == rows
+            && &self.config == config
+    }
+
+    /// Return this grid to the state of `Grid::new(rows, cols, config)`,
+    /// reusing the row allocations it already holds.
+    ///
+    /// The point is the allocator, not the writes: blanking the cells costs
+    /// the same as zeroing a fresh grid would, but the malloc/free round trip
+    /// per row disappears — and that round trip is what a pane could buy in
+    /// bulk with an eight-byte escape sequence (issue #106).
+    pub(crate) fn reset_blank(&mut self, rows: usize, cols: usize, config: GridConfig) {
+        self.raw.truncate(rows);
+        for row in self.raw.iter_mut() {
+            row.reset_blank(cols);
+        }
+        while self.raw.len() < rows {
+            self.raw.push_back(Row::new(cols));
+        }
+        self.rows = rows;
+        self.cols = cols;
+        self.dirty.reset(rows, config.track_dirty);
+        self.config = config;
+        self.mutations = 0;
     }
 
     /// Monotonic count of cell/scroll/clear write operations on this grid
@@ -1789,6 +1856,148 @@ mod tests {
                 DirtyRegion { row: 3, cols: 0..5 },
             ]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Retired-buffer recycling primitives (issue #106)
+    // -----------------------------------------------------------------
+
+    /// Everything about a grid that a consumer can reach. `reset_blank` claims
+    /// to produce a grid indistinguishable from a fresh one; this is what
+    /// "indistinguishable" is checked against.
+    #[derive(Debug, PartialEq, Eq)]
+    struct GridSnapshot {
+        rows: usize,
+        cols: usize,
+        total_lines: usize,
+        mutations: u64,
+        dirty: bool,
+        cells: Vec<(char, bool)>,
+        config: GridConfig,
+    }
+
+    fn snapshot(grid: &Grid) -> GridSnapshot {
+        GridSnapshot {
+            rows: grid.rows(),
+            cols: grid.cols(),
+            total_lines: grid.total_lines(),
+            mutations: grid.mutations(),
+            dirty: grid.is_dirty(),
+            cells: (0..grid.total_lines())
+                .flat_map(|r| {
+                    let row = grid.row(r).expect("row in range");
+                    (0..row.len())
+                        .map(|c| (row[c].ch, row.wrapped))
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            config: grid.config.clone(),
+        }
+    }
+
+    fn alt_config() -> GridConfig {
+        GridConfig {
+            max_scrollback: 0,
+            ..GridConfig::default()
+        }
+    }
+
+    #[test]
+    fn reset_blank_is_indistinguishable_from_a_fresh_grid() {
+        let mut used = Grid::new(6, 10, alt_config());
+        used.visible_row_mut(0)[0].ch = 'X';
+        used.visible_row_mut(3).wrapped = true;
+        used.scroll_up_n(0, 5, 4);
+        used.take_dirty_regions();
+
+        used.reset_blank(6, 10, alt_config());
+        let fresh = Grid::new(6, 10, alt_config());
+        assert_eq!(snapshot(&used), snapshot(&fresh));
+    }
+
+    #[test]
+    fn reset_blank_retargets_geometry_in_both_directions() {
+        for (from, to) in [((6usize, 10usize), (12usize, 30usize)), ((12, 30), (3, 4))] {
+            let mut grid = Grid::new(from.0, from.1, alt_config());
+            grid.visible_row_mut(0)[0].ch = 'X';
+            grid.reset_blank(to.0, to.1, alt_config());
+            assert_eq!(
+                snapshot(&grid),
+                snapshot(&Grid::new(to.0, to.1, alt_config())),
+                "reset_blank {from:?} -> {to:?}"
+            );
+        }
+    }
+
+    /// A grid carrying scrollback must lose it: the alternate screen has none,
+    /// and a recycled buffer that kept rows would report a history it does not
+    /// have.
+    #[test]
+    fn reset_blank_discards_scrollback() {
+        let mut grid = Grid::new(4, 8, GridConfig::default());
+        for _ in 0..40 {
+            grid.scroll_up(0, 3);
+        }
+        assert!(grid.scrollback_len() > 0);
+        grid.reset_blank(4, 8, alt_config());
+        assert_eq!(grid.scrollback_len(), 0);
+        assert_eq!(grid.total_lines(), 4);
+    }
+
+    /// `is_blank_canvas` is the licence to skip re-blanking entirely, so it
+    /// must say no to every grid that is not, in fact, a blank canvas —
+    /// including one whose cells were written and then written back.
+    #[test]
+    fn is_blank_canvas_rejects_anything_that_was_touched() {
+        let fresh = Grid::new(4, 8, alt_config());
+        assert!(fresh.is_blank_canvas(4, 8, &alt_config()));
+
+        // Wrong geometry.
+        assert!(!fresh.is_blank_canvas(5, 8, &alt_config()));
+        assert!(!fresh.is_blank_canvas(4, 9, &alt_config()));
+        // Wrong scrollback budget: a primary buffer must never be mistaken
+        // for a recyclable alternate one.
+        assert!(!fresh.is_blank_canvas(4, 8, &GridConfig::default()));
+
+        // Written, then restored to the original value. The write tally is
+        // value-independent on purpose: this must still be rejected.
+        let mut restored = Grid::new(4, 8, alt_config());
+        let original = restored.visible_row(0)[0].ch;
+        restored.visible_row_mut(0)[0].ch = 'X';
+        restored.visible_row_mut(0)[0].ch = original;
+        assert!(!restored.is_blank_canvas(4, 8, &alt_config()));
+
+        // Scrolled but visually identical (blank rows shifting past blank rows).
+        let mut scrolled = Grid::new(4, 8, alt_config());
+        scrolled.scroll_up(0, 3);
+        assert!(!scrolled.is_blank_canvas(4, 8, &alt_config()));
+
+        // Cleared: `clear_visible` writes, so the tally moves.
+        let mut cleared = Grid::new(4, 8, alt_config());
+        cleared.clear_visible(Color::Default);
+        assert!(!cleared.is_blank_canvas(4, 8, &alt_config()));
+    }
+
+    /// The one case the tally alone cannot see: restructuring operations do
+    /// not advance it, so the geometry and line count carry that half of the
+    /// proof.
+    #[test]
+    fn is_blank_canvas_rejects_restructured_grids() {
+        let mut resized = Grid::new(4, 8, alt_config());
+        resized.resize_canvas(6, 8);
+        assert_eq!(resized.mutations(), 0, "resize is not a write, by design");
+        assert!(
+            !resized.is_blank_canvas(4, 8, &alt_config()),
+            "a resized grid passed as a blank canvas at its OLD geometry"
+        );
+
+        let mut trimmed = Grid::new(4, 8, GridConfig::default());
+        for _ in 0..10 {
+            trimmed.scroll_up(0, 3);
+        }
+        trimmed.reset_blank(4, 8, alt_config());
+        trimmed.clear_scrollback();
+        assert!(trimmed.is_blank_canvas(4, 8, &alt_config()));
     }
 
     #[test]
