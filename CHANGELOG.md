@@ -1,3 +1,10 @@
+## [0.46.5](https://github.com/indrasvat/shux/compare/v0.46.4...v0.46.5) (2026-08-05)
+
+
+### Bug Fixes
+
+* **vt:** a pane driven to zero rows panics on ordinary output ([#107](https://github.com/indrasvat/shux/issues/107)) ([#114](https://github.com/indrasvat/shux/issues/114)) ([853074c](https://github.com/indrasvat/shux/commit/853074cd98d180088bb67cae6acb9dde6add73af)), closes [#102](https://github.com/indrasvat/shux/issues/102) [#102](https://github.com/indrasvat/shux/issues/102)
+
 ## [0.46.4](https://github.com/indrasvat/shux/compare/v0.46.3...v0.46.4) (2026-08-05)
 
 
