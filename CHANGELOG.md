@@ -1,3 +1,10 @@
+## [0.46.3](https://github.com/indrasvat/shux/compare/v0.46.2...v0.46.3) (2026-08-05)
+
+
+### Bug Fixes
+
+* **statusbar:** inline starship_config written to a predictable /tmp path — CWE-59 ([#105](https://github.com/indrasvat/shux/issues/105)) ([#112](https://github.com/indrasvat/shux/issues/112)) ([78d152e](https://github.com/indrasvat/shux/commit/78d152e3e7c8855d0a38736cfe27eb719a6c7df3))
+
 ## [0.46.2](https://github.com/indrasvat/shux/compare/v0.46.1...v0.46.2) (2026-08-04)
 
 
