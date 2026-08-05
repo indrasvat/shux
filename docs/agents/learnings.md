@@ -529,3 +529,36 @@ palette, restore the deliberate table/summary divergence).
   pair came out **byte-identical** (same MD5), which is a far stronger no-regression claim
   than "looks the same". Also: pick capture text the snapshot font actually has — CJK and
   Arabic rendered as tofu boxes and made a *passing* control panel look like damage.
+- **2026-08-05 (issue #106 — an allocation bound stated as `== 0` measures the wrong thing):**
+  The first cut of the bounds test asserted zero allocations per alternate-screen toggle and
+  failed after the fix at ~6 per toggle. The residue was not the swap: a bare `ESC[H` costs
+  the same three allocations inside `vte`'s CSI parsing. Restating every bound *relative to an
+  inert control sequence* (`ESC[?1000h ESC[?1000l`, same parse shape, no buffer work) isolated
+  the thing under test and made the assertions survive changes to a cost that isn't ours.
+  Added a second bound that needs no baseline at all — per-toggle cost must be identical on a
+  24×80 and a 240×64 pane — which is the property that actually protects the daemon.
+- **2026-08-05 (issue #106 — a global counter in a test binary tallies the other tests):**
+  The allocation harness used `static AtomicU64` counters with an `ARMED` flag. `cargo test`
+  runs test functions on several threads in one process, so armed measurements absorbed every
+  other test's allocations: a 24×80 pane "cost" 21,709 allocations against a 240×240 pane's
+  12,160, and one control subtraction came out *negative*. Thread-local `Cell<u64>` with const
+  init fixed it (and `try_with`, since TLS is gone during thread teardown). Under nextest each
+  test gets its own process and the bug is invisible — it only appears under plain `cargo test`,
+  which is what a contributor runs.
+- **2026-08-05 (issue #106 — a differential test cannot see a bug both arms share):**
+  The reuse-on/reuse-off proptest caught a broken pristine check in four steps and shrank it to
+  a minimal case. It did *not* catch deleting `mark_all_dirty()` from the swap — both arms call
+  the same `ScreenSwap`, so shared-path defects are structurally invisible to it. The existing
+  `dirty_alternate_screen_enter_and_leave_are_full_frame` caught that one. Differential testing
+  proves an *optimisation* is unobservable; it is not a substitute for absolute assertions on
+  the path both sides run.
+- **2026-08-05 (issue #106 — a frame-dropping recorder hides the freeze you are recording):**
+  The first demo video recorded a counter in a shux pane and showed it ticking happily under
+  attack. VHS emits fewer frames when the screen stops changing, so a stall compresses into
+  nothing — the recorder erases exactly the evidence. Fix: put the proof in a *single frame*
+  instead of in motion. Two copies of one animation whose position is a pure function of the
+  wall clock, one rendered through shux and one not, stay in phase on their own; any lag the
+  daemon adds shows up as the two bars being in different places. 0.76 s apart before, 0.04 s
+  after, legible in a still. Also: a pane's geometry is capped, and one 240×64 pane on a 4-core
+  box only produced ~90 ms of lag — six of them were needed to make it watchable, which is
+  itself an honest scenario.
