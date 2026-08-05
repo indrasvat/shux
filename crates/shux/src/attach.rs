@@ -99,6 +99,13 @@ fn copy_overlay_needs_repaint(
 /// Status-bar rows reserved at the bottom of the client screen.
 const STATUS_BAR_ROWS: u16 = 1;
 
+/// Floor on the size any pane is ever told it has. The client chooses the
+/// terminal size it reports, so every path from a client-supplied size to a
+/// `PtySize` clamps here — `pane.set_size` enforces the same floor server-side
+/// (issue #107). Matches the floor the tiled layout has always applied.
+const MIN_PANE_ROWS: u16 = 2;
+const MIN_PANE_COLS: u16 = 2;
+
 /// Total time the daemon will wait for the AttachHello frame before
 /// dropping the connection. Prevents slowloris-style blocking.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -452,6 +459,11 @@ async fn apply_resize_to_window(
         // Zoomed: every pane in the tree reports the full content area
         // size so apps in the zoomed pane lay out correctly, while
         // others stay at the same nominal size (cheap, harmless).
+        //
+        // The floor matters as much here as in the tiled branch below: the
+        // client picks `rows`, and a zoomed window subtracts the status bar
+        // from it with no layout arithmetic in between, so `rows <= 1` used to
+        // reach the PTY and the VT as a pane of height 0 (issue #107).
         let state = io_state.lock().await;
         let pane_ids = win
             .layout
@@ -461,7 +473,13 @@ async fn apply_resize_to_window(
             .unwrap_or_else(|| win.layout.tree.pane_ids());
         for pid in pane_ids {
             if let Some(tx) = state.resizers.get(&pid) {
-                to_send.push((tx.clone(), PtySize::new(content.width, content.height)));
+                to_send.push((
+                    tx.clone(),
+                    PtySize::new(
+                        content.width.max(MIN_PANE_COLS),
+                        content.height.max(MIN_PANE_ROWS),
+                    ),
+                ));
             }
         }
     } else {
@@ -469,8 +487,8 @@ async fn apply_resize_to_window(
         let state = io_state.lock().await;
         for (pid, rect) in rects {
             if let Some(tx) = state.resizers.get(&pid) {
-                let r_cols = rect.width.max(2);
-                let r_rows = rect.height.max(2);
+                let r_cols = rect.width.max(MIN_PANE_COLS);
+                let r_rows = rect.height.max(MIN_PANE_ROWS);
                 to_send.push((tx.clone(), PtySize::new(r_cols, r_rows)));
             }
         }
@@ -3217,6 +3235,63 @@ mod tests {
             (second_zoomed.size.cols, second_zoomed.size.rows),
             (100, 29)
         );
+
+        fixture.stop();
+    }
+
+    /// The client picks the size it reports. A zoomed window subtracts the
+    /// status bar from it with no layout arithmetic in between, so a tiny
+    /// `rows` used to reach the PTY and the VT as a pane of height 0 — where a
+    /// single printable byte of pane output panicked the pane I/O task and
+    /// DECSTBM could grow the grid without bound (issue #107).
+    ///
+    /// Both branches must apply the same floor, tiled and zoomed.
+    #[tokio::test]
+    async fn resize_fanout_never_reports_a_degenerate_pane_size() {
+        let fixture = attach_fixture().await;
+        let (_, mut first_resize_rx, _) =
+            seed_io_for_pane(&fixture.io_state, fixture.first_pane).await;
+        let (_, mut second_resize_rx, _) =
+            seed_io_for_pane(&fixture.io_state, fixture.second_pane).await;
+
+        for zoomed in [false, true] {
+            if zoomed {
+                fixture
+                    .graph
+                    .zoom_pane(fixture.first_pane, None)
+                    .await
+                    .expect("zoom active pane");
+            }
+            // rows=0/1 make content_h saturate to 0; cols=0/1 do the same
+            // horizontally. Each must still yield a usable pane.
+            for (cols, rows) in [(0u16, 0u16), (1, 1), (0, 1), (1, 0), (2, 2), (100, 1)] {
+                apply_resize_to_window(
+                    &fixture.graph,
+                    &fixture.io_state,
+                    &fixture.attached,
+                    cols,
+                    rows,
+                )
+                .await;
+
+                for (label, rx) in [
+                    ("first", &mut first_resize_rx),
+                    ("second", &mut second_resize_rx),
+                ] {
+                    let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                        .await
+                        .unwrap_or_else(|_| panic!("{label} resize (zoomed={zoomed})"))
+                        .unwrap_or_else(|| panic!("{label} resize request"));
+                    assert!(
+                        req.size.rows >= MIN_PANE_ROWS && req.size.cols >= MIN_PANE_COLS,
+                        "zoomed={zoomed} client {cols}x{rows} produced pane size \
+                         {}x{} for the {label} pane; floor is {MIN_PANE_COLS}x{MIN_PANE_ROWS}",
+                        req.size.cols,
+                        req.size.rows
+                    );
+                }
+            }
+        }
 
         fixture.stop();
     }

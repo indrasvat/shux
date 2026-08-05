@@ -1,0 +1,438 @@
+//! Bounds and safety on region scrolling driven by attacker-controlled pane
+//! input (issue #107, follow-up to #102).
+//!
+//! #102 clamped *how many times* a scroll runs. It did not bound the cost of
+//! one scroll, and it did not make `Grid` safe against a scroll region that no
+//! longer fits the grid. Both are reachable from pane bytes:
+//!
+//!   * a pane that is 0 rows tall (a client can drive one through the zoomed
+//!     attach resize path) makes DECSTBM's clamp underflow, so the region can
+//!     name rows the grid does not have. `Grid::scroll_up` then removed
+//!     nothing and inserted anyway — the deque grew without bound, or the
+//!     insert index was past the end and the pane I/O task panicked.
+//!   * one region scroll shifted O(rows) deque slots, so scrolling a whole
+//!     region cost O(rows^2). That is quadratic work bought with a
+//!     fixed-size escape sequence, under the daemon-wide `PaneIoState` lock.
+//!
+//! Everything here is deterministic except the final scaling test, which
+//! asserts a *ratio* between two pane heights rather than an absolute time, so
+//! it self-calibrates to the machine it runs on.
+
+use shux_vt::{Grid, GridConfig, VirtualTerminal};
+
+const COLS: usize = 80;
+
+fn vt(rows: usize) -> VirtualTerminal {
+    VirtualTerminal::new(rows, COLS)
+}
+
+/// The structural invariant every grid must hold: the backing deque is exactly
+/// the scrollback plus the visible window, and never grows past the visible
+/// window plus the configured scrollback cap.
+fn assert_grid_invariant(g: &Grid, max_scrollback: usize, what: &str) {
+    let rows = g.rows();
+    let total = g.total_lines();
+    assert!(
+        total >= rows,
+        "{what}: grid holds {total} lines but claims {rows} visible rows"
+    );
+    assert_eq!(
+        g.scrollback_len(),
+        total - rows,
+        "{what}: scrollback_len must be total - rows"
+    );
+    let cap = rows + max_scrollback;
+    assert!(
+        total <= cap,
+        "{what}: grid retains {total} lines on a {rows}-row pane; cap is {cap}"
+    );
+}
+
+fn assert_vt_invariant(t: &VirtualTerminal, what: &str) {
+    assert_grid_invariant(t.grid(), GridConfig::default().max_scrollback, what);
+}
+
+// ---------------------------------------------------------------------------
+// A degenerate (zero-row) pane must not panic and must not grow the grid.
+// ---------------------------------------------------------------------------
+
+const SCROLLERS: &[(&str, &[u8])] = &[
+    ("SU", b"\x1b[999999S"),
+    ("SD", b"\x1b[999999T"),
+    ("IL", b"\x1b[999999L"),
+    ("DL", b"\x1b[999999M"),
+    ("RI", b"\x1bM"),
+    ("IND", b"\x1bD"),
+    ("NEL", b"\x1bE"),
+    ("LF", b"\n"),
+    ("text+LF", b"hello\r\n"),
+];
+
+const REGIONS: &[(&str, &[u8])] = &[
+    ("none", b""),
+    ("stbm 1;9999", b"\x1b[1;9999r"),
+    ("stbm 2;9999", b"\x1b[2;9999r"),
+    ("stbm 1;65535", b"\x1b[1;65535r"),
+    ("stbm 5;3", b"\x1b[5;3r"),
+    ("stbm 0;0", b"\x1b[0;0r"),
+    ("alt+stbm", b"\x1b[?1049h\x1b[1;9999r"),
+    ("stbm+alt", b"\x1b[1;9999r\x1b[?1049h"),
+    ("stbm+origin", b"\x1b[2;9999r\x1b[?6h"),
+];
+
+#[test]
+fn zero_row_pane_survives_every_scroll_sequence() {
+    for (rname, region) in REGIONS {
+        for (sname, seq) in SCROLLERS {
+            let what = format!("rows=0 region={rname} seq={sname}");
+            let mut t = vt(24);
+            t.resize(0, COLS);
+            t.process(region);
+            // Repeat: a single pass can look innocent while the grid creeps.
+            for _ in 0..8 {
+                t.process(seq);
+            }
+            assert_vt_invariant(&t, &what);
+            // A degenerate size is clamped to the smallest real terminal; it
+            // never yields a grid with no rows to address.
+            assert_eq!(
+                t.grid().rows(),
+                1,
+                "{what}: degenerate pane must clamp to 1 row"
+            );
+        }
+    }
+}
+
+#[test]
+fn zero_row_pane_does_not_grow_the_grid() {
+    let mut t = vt(24);
+    t.resize(0, COLS);
+    let before = t.grid().total_lines();
+    // These 19 bytes bought ~65535 rows of allocation before the fix.
+    t.process(b"\x1b[1;65535r\x1b[999999T");
+    let after = t.grid().total_lines();
+    assert!(
+        after <= before,
+        "a 0-row pane grew from {before} to {after} retained lines on 19 bytes of input"
+    );
+}
+
+/// A sustained flood must converge on the scrollback cap rather than climbing
+/// past it. Scrolling a one-row screen *does* legitimately push lines into
+/// scrollback — the bug was never that the grid grew, but that it grew without
+/// a ceiling.
+#[test]
+fn degenerate_pane_scroll_flood_stays_under_the_scrollback_cap() {
+    let mut t = vt(24);
+    t.resize(0, COLS);
+    t.process(b"\x1b[1;65535r");
+    for _ in 0..2000 {
+        t.process(b"\x1b[999999S\x1b[999999T\x1b[999999L\x1b[999999M\n\x1bM");
+        assert_vt_invariant(&t, "degenerate pane flood");
+    }
+    // Converged: the cap is the ceiling, and further input does not move it.
+    let settled = t.grid().total_lines();
+    for _ in 0..500 {
+        t.process(b"\x1b[999999S\n");
+    }
+    assert_eq!(
+        t.grid().total_lines(),
+        settled,
+        "grid kept growing after the scrollback cap was reached"
+    );
+}
+
+/// A one-row pane is the smallest *legal* pane and exercises the degenerate
+/// region (top == bottom) on every path.
+#[test]
+fn one_row_pane_survives_every_scroll_sequence() {
+    for (rname, region) in REGIONS {
+        for (sname, seq) in SCROLLERS {
+            let what = format!("rows=1 region={rname} seq={sname}");
+            let mut t = vt(1);
+            t.process(region);
+            for _ in 0..8 {
+                t.process(seq);
+            }
+            assert_vt_invariant(&t, &what);
+            assert_eq!(t.grid().rows(), 1, "{what}");
+        }
+    }
+}
+
+/// Shrinking to zero rows and back must leave a working terminal, not a
+/// corrupted deque.
+#[test]
+fn resize_through_zero_rows_leaves_a_sane_grid() {
+    let mut t = vt(24);
+    t.process(b"hello\r\nworld\r\n");
+    for rows in [0usize, 1, 0, 2, 0, 40, 0, 24] {
+        t.resize(rows, COLS);
+        t.process(b"\x1b[1;9999r\x1b[999999S\x1b[999999T\x1b[999999L\x1b[999999M");
+        assert_vt_invariant(&t, &format!("resize churn rows={rows}"));
+        assert_eq!(t.grid().rows(), rows.max(1));
+    }
+    t.process(b"\x1b[r\x1b[Hrecovered");
+    assert!(
+        t.grid().glance_text().contains("recovered"),
+        "terminal must still render after resize churn: {:?}",
+        t.grid().glance_text()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bulk scrolling must be indistinguishable from the same number of one-line
+// scrolls, on every region shape.
+// ---------------------------------------------------------------------------
+
+/// A grid with identifiable per-row content plus `scrollback` lines behind it.
+fn seeded(rows: usize, scrollback: usize) -> Grid {
+    let mut g = Grid::new(rows, COLS, GridConfig::default());
+    for i in 0..scrollback {
+        stamp(&mut g, 0, &format!("sb{i}"));
+        g.scroll_up_n(0, rows.saturating_sub(1), 1);
+    }
+    for r in 0..rows {
+        stamp(&mut g, r, &format!("row{r}"));
+    }
+    g
+}
+
+fn stamp(g: &mut Grid, row: usize, text: &str) {
+    let mut r = g.visible_row_mut(row);
+    for (i, ch) in text.chars().enumerate() {
+        r[i].ch = ch;
+    }
+}
+
+/// Every retained line, trailing blanks trimmed — scrollback included, so a
+/// scroll that leaks a row into or out of scrollback is caught.
+fn all_lines(g: &Grid) -> Vec<String> {
+    (0..g.total_lines())
+        .filter_map(|i| g.row(i))
+        .map(|r| {
+            (0..r.len())
+                .filter_map(|c| r.get(c))
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn bulk_scroll_up_matches_repeated_single_line_scroll() {
+    for rows in [1usize, 2, 3, 8, 24] {
+        for scrollback in [0usize, 3, 40] {
+            for top in 0..rows {
+                for bottom in top..rows {
+                    for n in 0..=(rows + 2) {
+                        let mut bulk = seeded(rows, scrollback);
+                        let mut single = seeded(rows, scrollback);
+                        bulk.scroll_up_n(top, bottom, n);
+                        for _ in 0..n.min(bottom - top + 1) {
+                            single.scroll_up(top, bottom);
+                        }
+                        assert_eq!(
+                            all_lines(&bulk),
+                            all_lines(&single),
+                            "scroll_up_n(rows={rows} sb={scrollback} top={top} bottom={bottom} n={n})"
+                        );
+                        assert_grid_invariant(
+                            &bulk,
+                            GridConfig::default().max_scrollback,
+                            "bulk scroll_up_n",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn bulk_scroll_down_matches_repeated_single_line_scroll() {
+    for rows in [1usize, 2, 3, 8, 24] {
+        for scrollback in [0usize, 3, 40] {
+            for top in 0..rows {
+                for bottom in top..rows {
+                    for n in 0..=(rows + 2) {
+                        let mut bulk = seeded(rows, scrollback);
+                        let mut single = seeded(rows, scrollback);
+                        bulk.scroll_down_n(top, bottom, n);
+                        for _ in 0..n.min(bottom - top + 1) {
+                            single.scroll_down(top, bottom);
+                        }
+                        assert_eq!(
+                            all_lines(&bulk),
+                            all_lines(&single),
+                            "scroll_down_n(rows={rows} sb={scrollback} top={top} bottom={bottom} n={n})"
+                        );
+                        assert_grid_invariant(
+                            &bulk,
+                            GridConfig::default().max_scrollback,
+                            "bulk scroll_down_n",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A region scroll larger than the region blanks exactly the region.
+#[test]
+fn scroll_beyond_region_height_blanks_the_region_and_nothing_else() {
+    let mut g = seeded(10, 5);
+    g.scroll_up_n(3, 6, 999_999);
+    let sb = g.scrollback_len();
+    let lines = all_lines(&g);
+    for (i, line) in lines.iter().enumerate().skip(sb) {
+        let visible = i - sb;
+        if (3..=6).contains(&visible) {
+            assert_eq!(line, "", "row {visible} should be blank");
+        } else {
+            assert_eq!(
+                line,
+                &format!("row{visible}"),
+                "row {visible} must be untouched"
+            );
+        }
+    }
+    assert_grid_invariant(&g, GridConfig::default().max_scrollback, "over-scroll");
+}
+
+/// Out-of-range regions are the grid's own responsibility: it is the last
+/// thing between a bad index and the deque.
+#[test]
+fn out_of_range_regions_are_clamped_not_trusted() {
+    for rows in [1usize, 4, 24] {
+        for (top, bottom, n) in [
+            (0usize, usize::MAX, 5usize),
+            (usize::MAX, usize::MAX, 5),
+            (rows + 10, rows + 20, 5),
+            (0, rows + 100, usize::MAX),
+            (5, 2, 3),
+        ] {
+            let what = format!("rows={rows} region={top}..{bottom} n={n}");
+            let mut up = seeded(rows, 4);
+            let before = up.total_lines();
+            up.scroll_up_n(top, bottom, n);
+            assert_grid_invariant(&up, GridConfig::default().max_scrollback, &what);
+            assert!(
+                up.total_lines() <= before + rows,
+                "{what}: scroll_up_n must not balloon the grid"
+            );
+
+            let mut down = seeded(rows, 4);
+            let before = down.total_lines();
+            down.scroll_down_n(top, bottom, n);
+            assert_grid_invariant(&down, GridConfig::default().max_scrollback, &what);
+            assert_eq!(
+                down.total_lines(),
+                before,
+                "{what}: scroll_down_n must never change the retained line count"
+            );
+        }
+    }
+}
+
+/// A zero-row grid has no rows to scroll; every region is out of range.
+#[test]
+fn zero_row_grid_scrolls_are_inert() {
+    for (top, bottom, n) in [(0usize, 0usize, 1usize), (0, 65535, 999), (1, 9999, 999)] {
+        let mut g = Grid::new(0, COLS, GridConfig::default());
+        g.scroll_up_n(top, bottom, n);
+        g.scroll_down_n(top, bottom, n);
+        assert_eq!(
+            g.total_lines(),
+            0,
+            "0-row grid grew from scroll_up_n/scroll_down_n({top}..{bottom}, {n})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Work accounting stays exact: the #102 bound is per scrolled line, and the
+// bulk path must not under-report it (content_revision depends on this).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bulk_scroll_reports_one_mutation_per_scrolled_line() {
+    let mut g = seeded(10, 0);
+    let before = g.mutations();
+    g.scroll_up_n(2, 6, 3);
+    assert_eq!(
+        g.mutations() - before,
+        3,
+        "scrolling 3 lines must count as 3 mutations"
+    );
+
+    let before = g.mutations();
+    g.scroll_up_n(2, 6, 999);
+    assert_eq!(
+        g.mutations() - before,
+        5,
+        "a scroll clamped to a 5-row region must count 5 mutations, not 999"
+    );
+
+    let before = g.mutations();
+    g.scroll_up_n(2, 6, 0);
+    assert_eq!(
+        g.mutations() - before,
+        0,
+        "a zero-line scroll must not count as work"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cost: scrolling a region must be linear in the region, not quadratic.
+// ---------------------------------------------------------------------------
+
+/// Nanoseconds for `reps` full-region scrolls on a `rows`-tall pane with a
+/// full default scrollback behind it.
+fn scroll_cost_ns(rows: usize, reps: usize) -> u128 {
+    let mut t = vt(rows);
+    for i in 0..5000 {
+        t.process(format!("sb{i}\r\n").as_bytes());
+    }
+    t.process(format!("\x1b[2;{}r", rows - 1).as_bytes());
+    let payload = b"\x1b[999999S".repeat(reps);
+    let start = std::time::Instant::now();
+    t.process(&payload);
+    start.elapsed().as_nanos().max(1)
+}
+
+/// Multiplying the pane height by 8 must multiply the cost of scrolling it by
+/// roughly 8, not by 64. Asserted as a ratio so it does not depend on machine
+/// speed, and taken as the best of three runs so a scheduling hiccup in one
+/// sample cannot fail the build.
+///
+/// Calibration on this surface, best-of-three: 8.1x after the bulk rotate,
+/// 19.9x before it. The 12x threshold sits ~1.5x above the fixed measurement
+/// and ~1.6x below the broken one, so it has margin on both sides rather than
+/// just being loose.
+#[test]
+fn region_scroll_cost_is_linear_in_pane_height() {
+    let small = 128usize;
+    let large = 1024usize;
+    let reps = 40;
+    scroll_cost_ns(small, 4); // warm up allocator / page faults
+
+    let mut best_ratio = f64::MAX;
+    for _ in 0..3 {
+        let s = scroll_cost_ns(small, reps) as f64;
+        let l = scroll_cost_ns(large, reps) as f64;
+        best_ratio = best_ratio.min(l / s);
+    }
+    let growth = (large / small) as f64;
+    assert!(
+        best_ratio < growth * 1.5,
+        "scrolling a {large}-row region cost {best_ratio:.1}x a {small}-row region; \
+         linear is ~{growth:.0}x, quadratic ~{:.0}x — region scroll is still \
+         super-linear in pane height",
+        growth * growth
+    );
+}

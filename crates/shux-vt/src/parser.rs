@@ -1194,36 +1194,30 @@ impl<'a> vte::Perform for VtHandler<'a> {
             // underflowing).
             ('L', []) => {
                 if let Some(limit) = self.lines_from_cursor_to_region_bottom() {
-                    for _ in 0..(p(0, 1) as usize).min(limit) {
-                        self.grid
-                            .scroll_down(self.cursor.row, self.scroll_region.bottom);
-                    }
+                    let n = (p(0, 1) as usize).min(limit);
+                    self.grid
+                        .scroll_down_n(self.cursor.row, self.scroll_region.bottom, n);
                 }
             }
             // DL -- Delete Lines.
             ('M', []) => {
                 if let Some(limit) = self.lines_from_cursor_to_region_bottom() {
-                    for _ in 0..(p(0, 1) as usize).min(limit) {
-                        self.grid
-                            .scroll_up(self.cursor.row, self.scroll_region.bottom);
-                    }
+                    let n = (p(0, 1) as usize).min(limit);
+                    self.grid
+                        .scroll_up_n(self.cursor.row, self.scroll_region.bottom, n);
                 }
             }
             // SU -- Scroll Up.
             ('S', []) => {
-                let limit = self.scroll_region_height();
-                for _ in 0..(p(0, 1) as usize).min(limit) {
-                    self.grid
-                        .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
-                }
+                let n = (p(0, 1) as usize).min(self.scroll_region_height());
+                self.grid
+                    .scroll_up_n(self.scroll_region.top, self.scroll_region.bottom, n);
             }
             // SD -- Scroll Down.
             ('T', []) => {
-                let limit = self.scroll_region_height();
-                for _ in 0..(p(0, 1) as usize).min(limit) {
-                    self.grid
-                        .scroll_down(self.scroll_region.top, self.scroll_region.bottom);
-                }
+                let n = (p(0, 1) as usize).min(self.scroll_region_height());
+                self.grid
+                    .scroll_down_n(self.scroll_region.top, self.scroll_region.bottom, n);
             }
             // ICH -- Insert Characters.
             ('@', []) => {
@@ -1391,12 +1385,18 @@ impl<'a> vte::Perform for VtHandler<'a> {
             }
             // DECSTBM -- Set Scrolling Region.
             ('r', []) => {
-                let top = (p(0, 1) as usize).saturating_sub(1);
-                let bottom = (p(1, rows as u16) as usize).saturating_sub(1).min(rows - 1);
-                if top < bottom {
-                    self.scroll_region.top = top;
-                    self.scroll_region.bottom = bottom;
-                    self.home_cursor_to_origin();
+                // `rows - 1` underflowed on a 0-row grid, wrapping the clamp to
+                // usize::MAX and letting DECSTBM name a region of ~65535 rows
+                // the grid does not have (issue #107). A grid with no rows has
+                // no region to set.
+                if let Some(last_row) = rows.checked_sub(1) {
+                    let top = (p(0, 1) as usize).saturating_sub(1);
+                    let bottom = (p(1, rows as u16) as usize).saturating_sub(1).min(last_row);
+                    if top < bottom {
+                        self.scroll_region.top = top;
+                        self.scroll_region.bottom = bottom;
+                        self.home_cursor_to_origin();
+                    }
                 }
             }
             // SM -- Set Mode (standard modes).
