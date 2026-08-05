@@ -698,14 +698,23 @@ impl Grid {
 
     /// Scroll a region up by `n` lines in one bulk operation.
     ///
-    /// `n` is clamped to the region height — scrolling a region further than
-    /// its own height only shuffles blank rows, so the extra lines are not
-    /// work anyone can buy (issue #102). The mutation tally still advances
-    /// once per line actually scrolled, so `content_revision` accounting is
-    /// identical to `n` separate [`Grid::scroll_up`] calls.
+    /// `n` is clamped to the region height (issue #102): that is the bound on
+    /// work an escape sequence can buy, and it is load-bearing, not an
+    /// optimisation.
     ///
-    /// When the region is the whole screen the scrolled-off lines go to
-    /// scrollback, exactly as a one-line full-screen scroll does.
+    /// For a PARTIAL region the clamp is invisible — scrolling further than
+    /// the region's height only shuffles blank rows — so `scroll_up_n(t, b, n)`
+    /// is exactly `n` calls to [`Grid::scroll_up`].
+    ///
+    /// For a FULL-SCREEN region it is deliberately NOT equivalent: `n` separate
+    /// one-line scrolls would push `n` lines into scrollback, of which
+    /// everything past the screen height is blank. This clamps to the screen
+    /// height instead, so a single sequence cannot flush the scrollback buffer
+    /// with blanks. `CSI S`/`T`/`L`/`M` already clamp `n` before calling, so no
+    /// parser path can observe the difference; a direct `Grid` caller can.
+    /// `region_scroll_beyond_screen_height_does_not_flood_scrollback` pins it.
+    ///
+    /// The mutation tally advances once per line actually scrolled.
     pub fn scroll_up_n(&mut self, region_top: usize, region_bottom: usize, n: usize) {
         let Some((top, bottom)) = self.clamp_region(region_top, region_bottom) else {
             return;

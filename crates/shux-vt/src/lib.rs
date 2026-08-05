@@ -430,18 +430,31 @@ impl VirtualTerminal {
         self.active_grapheme_cell = None;
         if self.modes.alternate_screen {
             self.grid.resize_canvas(rows, cols);
-            if let (Some(primary), Some(primary_cursor)) =
-                (&mut self.alt_grid, &mut self.alt_cursor)
-            {
-                if let Some((row, col)) = primary.resize_with_cursor(
-                    rows,
-                    cols,
-                    Some((primary_cursor.row, primary_cursor.col)),
-                ) {
-                    primary_cursor.row = row;
-                    primary_cursor.col = col;
+            // The stashed primary grid is resized whether or not a saved
+            // cursor came with it. DECSET 1047 enters the alternate screen
+            // WITHOUT saving a cursor, so gating the whole branch on
+            // `alt_cursor` left the primary grid at its pre-resize size: on
+            // leaving 1047 the pane reported one geometry and rendered
+            // another, and the next erase/insert indexed a row that was no
+            // longer there (issue #107 adversarial review). 1049 was never
+            // affected, which is why this survived.
+            if let Some(primary) = &mut self.alt_grid {
+                match &mut self.alt_cursor {
+                    Some(primary_cursor) => {
+                        if let Some((row, col)) = primary.resize_with_cursor(
+                            rows,
+                            cols,
+                            Some((primary_cursor.row, primary_cursor.col)),
+                        ) {
+                            primary_cursor.row = row;
+                            primary_cursor.col = col;
+                        }
+                        primary_cursor.clamp(rows, cols);
+                    }
+                    None => {
+                        primary.resize_with_cursor(rows, cols, None);
+                    }
                 }
-                primary_cursor.clamp(rows, cols);
             }
         } else {
             if let Some((row, col)) =

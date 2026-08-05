@@ -347,7 +347,14 @@ impl<'a> VtHandler<'a> {
         if self.cursor.row == self.scroll_region.bottom {
             self.grid
                 .scroll_up(self.scroll_region.top, self.scroll_region.bottom);
-        } else {
+        } else if self.cursor.row + 1 < self.grid.rows() {
+            // Same guard `linefeed` has, and for the same reason: when the
+            // cursor sits BELOW the scroll region — a bottom status line
+            // outside the region is the common case — it is not equal to
+            // `region.bottom`, so without this it walked off the grid and the
+            // next cell write panicked. `write_char` clamps the cursor before
+            // the wide-character wrap branch, not after, so only wide glyphs
+            // at the right edge reached it (issue #107 adversarial review).
             self.cursor.row += 1;
         }
     }

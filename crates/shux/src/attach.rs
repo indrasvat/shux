@@ -99,12 +99,33 @@ fn copy_overlay_needs_repaint(
 /// Status-bar rows reserved at the bottom of the client screen.
 const STATUS_BAR_ROWS: u16 = 1;
 
-/// Floor on the size any pane is ever told it has. The client chooses the
-/// terminal size it reports, so every path from a client-supplied size to a
-/// `PtySize` clamps here — `pane.set_size` enforces the same floor server-side
-/// (issue #107). Matches the floor the tiled layout has always applied.
+/// Bounds on the terminal size a client is allowed to declare.
+///
+/// The client picks these numbers and the daemon allocates against them, so
+/// they are untrusted input: `cols` and `rows` are `u16`, and a 93-byte attach
+/// handshake declaring 65535x65535 asks for ~4.3e9 cells — enough to OOM-kill
+/// the daemon and every session with it. Measured before this ceiling existed:
+/// 8000x8000 peaked at 8.9 GB, 65535x65535 killed the daemon in 2.5 s.
+///
+/// The ceiling matches the range `pane.set_size` has always validated
+/// (`4..=1000` cols, `2..=1000` rows), so the two paths that can size a pane
+/// now agree at BOTH ends. It also keeps every pane inside the pixel budget
+/// `pane.snapshot` assumes — above it, snapshots failed permanently.
+///
+/// Clamped once, where the size enters, so the layout arithmetic, the PTY
+/// winsize, the VT allocation and the render buffer all inherit the bound.
 const MIN_PANE_ROWS: u16 = 2;
 const MIN_PANE_COLS: u16 = 2;
+const MAX_CLIENT_ROWS: u16 = 1000;
+const MAX_CLIENT_COLS: u16 = 1000;
+
+/// Clamp a client-declared terminal size into the supported range.
+fn clamp_client_dims(cols: u16, rows: u16) -> (u16, u16) {
+    (
+        cols.clamp(MIN_PANE_COLS, MAX_CLIENT_COLS),
+        rows.clamp(MIN_PANE_ROWS, MAX_CLIENT_ROWS),
+    )
+}
 
 /// Total time the daemon will wait for the AttachHello frame before
 /// dropping the connection. Prevents slowloris-style blocking.
@@ -436,6 +457,7 @@ async fn apply_resize_to_window(
     cols: u16,
     rows: u16,
 ) {
+    let (cols, rows) = clamp_client_dims(cols, rows);
     let snap = graph.snapshot();
     let win = match snap.windows.get(&session.active_window_id) {
         Some(w) => w,
@@ -559,7 +581,7 @@ async fn run_attach_loop(
 
     // Authoritative client screen size. Updated only by Resize frames;
     // the renderer reads but never writes it.
-    let client_size: ClientSize = Arc::new(Mutex::new((hello.cols, hello.rows)));
+    let client_size: ClientSize = Arc::new(Mutex::new(clamp_client_dims(hello.cols, hello.rows)));
 
     // Spawn the renderer task.
     let render_cancel = cancel.child_token();
@@ -802,6 +824,7 @@ async fn run_attach_loop(
                         }
                     }
                     AttachClientFrame::Resize { cols, rows } => {
+                        let (cols, rows) = clamp_client_dims(cols, rows);
                         {
                             let mut cs = client_size.lock().await;
                             *cs = (cols, rows);
@@ -3245,7 +3268,9 @@ mod tests {
     /// single printable byte of pane output panicked the pane I/O task and
     /// DECSTBM could grow the grid without bound (issue #107).
     ///
-    /// Both branches must apply the same floor, tiled and zoomed.
+    /// Both branches must apply the same floor AND the same ceiling, tiled and
+    /// zoomed. The ceiling matters as much: `cols`/`rows` are `u16`, the client
+    /// picks them, and the daemon allocates a grid against them.
     #[tokio::test]
     async fn resize_fanout_never_reports_a_degenerate_pane_size() {
         let fixture = attach_fixture().await;
@@ -3264,7 +3289,19 @@ mod tests {
             }
             // rows=0/1 make content_h saturate to 0; cols=0/1 do the same
             // horizontally. Each must still yield a usable pane.
-            for (cols, rows) in [(0u16, 0u16), (1, 1), (0, 1), (1, 0), (2, 2), (100, 1)] {
+            for (cols, rows) in [
+                (0u16, 0u16),
+                (1, 1),
+                (0, 1),
+                (1, 0),
+                (2, 2),
+                (100, 1),
+                // A 93-byte handshake declaring this asked for ~4.3e9 cells
+                // and OOM-killed the daemon with every session on it.
+                (u16::MAX, u16::MAX),
+                (1200, 1200),
+                (4000, 4000),
+            ] {
                 apply_resize_to_window(
                     &fixture.graph,
                     &fixture.io_state,
@@ -3286,6 +3323,14 @@ mod tests {
                         req.size.rows >= MIN_PANE_ROWS && req.size.cols >= MIN_PANE_COLS,
                         "zoomed={zoomed} client {cols}x{rows} produced pane size \
                          {}x{} for the {label} pane; floor is {MIN_PANE_COLS}x{MIN_PANE_ROWS}",
+                        req.size.cols,
+                        req.size.rows
+                    );
+                    assert!(
+                        req.size.rows <= MAX_CLIENT_ROWS && req.size.cols <= MAX_CLIENT_COLS,
+                        "zoomed={zoomed} client {cols}x{rows} produced pane size \
+                         {}x{} for the {label} pane; ceiling is \
+                         {MAX_CLIENT_COLS}x{MAX_CLIENT_ROWS}",
                         req.size.cols,
                         req.size.rows
                     );

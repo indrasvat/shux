@@ -26,6 +26,10 @@ fn vt(rows: usize) -> VirtualTerminal {
     VirtualTerminal::new(rows, COLS)
 }
 
+fn vt_rc(rows: usize, cols: usize) -> VirtualTerminal {
+    VirtualTerminal::new(rows, cols)
+}
+
 /// The structural invariant every grid must hold: the backing deque is exactly
 /// the scrollback plus the visible window, and never grows past the visible
 /// window plus the configured scrollback cap.
@@ -434,5 +438,114 @@ fn region_scroll_cost_is_linear_in_pane_height() {
          linear is ~{growth:.0}x, quadratic ~{:.0}x — region scroll is still \
          super-linear in pane height",
         growth * growth
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Defects found by the #107 adversarial review. All three are reachable from
+// pane bytes or a client resize, and all three predate this change — they are
+// the same class the issue is about, so they are fixed here rather than filed.
+// ---------------------------------------------------------------------------
+
+/// A cursor BELOW the scroll region is not equal to `region.bottom`, so the
+/// auto-wrap path incremented it straight off the grid. `write_char` clamps
+/// the cursor before the wide-character wrap branch and not after, so only a
+/// wide glyph at the right edge reached the bad row — the shape any app with a
+/// bottom status line outside its scroll region produces when it draws CJK or
+/// emoji at the last column.
+#[test]
+fn wide_char_at_right_edge_below_the_scroll_region_does_not_walk_off_the_grid() {
+    for (rows, cols, region_bottom) in [(24usize, 80usize, 23u16), (4, 6, 2), (2, 2, 1)] {
+        for glyph in ["中", "🙂", "a"] {
+            let what = format!("{rows}x{cols} region 1;{region_bottom} glyph {glyph}");
+            let mut t = vt_rc(rows, cols);
+            t.process(format!("\x1b[1;{region_bottom}r").as_bytes());
+            t.process(format!("\x1b[{rows};{cols}H").as_bytes());
+            t.process(glyph.as_bytes());
+            // The real assertion is "did not panic"; the invariant catches any
+            // corruption that stopped short of a panic.
+            assert_vt_invariant(&t, &what);
+            assert_eq!(t.grid().rows(), rows, "{what}");
+        }
+    }
+}
+
+/// The realistic shape: an app with a bottom status line outside its scroll
+/// region, repainting the region and then drawing a wide glyph at the last
+/// column of the status line. The trigger is the glyph landing ON the final
+/// column — filling the row and letting it overflow takes a different path and
+/// does NOT reproduce, which an earlier version of this test got wrong.
+#[test]
+fn status_line_below_the_region_survives_a_wide_glyph_at_the_last_column() {
+    let mut t = vt_rc(24, 80);
+    t.process(b"\x1b[1;23r");
+    for row in 1..=23 {
+        t.process(format!("\x1b[{row};1H").as_bytes());
+        t.process("scrollable content ".repeat(4).as_bytes());
+    }
+    // Status line, row 24, wide glyph in the last cell.
+    t.process(b"\x1b[24;1H status \x1b[24;80H");
+    t.process("中".as_bytes());
+    assert_vt_invariant(&t, "status line wide glyph at last column");
+
+    t.process(b"\x1b[r\x1b[Hstill alive");
+    assert!(
+        t.grid().glance_text().contains("still alive"),
+        "pane stopped parsing: {:?}",
+        t.grid().glance_text()
+    );
+}
+
+/// DECSET 1047 enters the alternate screen WITHOUT saving a cursor. Resizing
+/// while it is active left the stashed primary grid at its old size, so on
+/// leaving 1047 the pane reported one geometry and rendered another — and the
+/// next erase or insert indexed a row that was no longer there.
+#[test]
+fn alternate_screen_without_a_saved_cursor_still_resizes_the_primary_grid() {
+    for mode in ["1047", "1049", "47"] {
+        for (from, to) in [((3usize, 1usize), (9usize, 2usize)), ((2, 80), (24, 80))] {
+            let what = format!("mode {mode} {from:?} -> {to:?}");
+            let mut t = vt_rc(from.0, from.1);
+            t.process(format!("\x1b[?{mode}h").as_bytes());
+            t.resize(to.0, to.1);
+            t.process(format!("\x1b[?{mode}l").as_bytes());
+            assert_eq!(
+                (t.grid().rows(), t.grid().cols()),
+                to,
+                "{what}: primary grid kept its pre-resize size"
+            );
+            // The desync used to surface as a panic on the next cell write.
+            t.process(format!("\x1b[{};1H\x1b[5X\x1b[5@\x1b[5P", to.0).as_bytes());
+            assert_vt_invariant(&t, &what);
+        }
+    }
+}
+
+/// `n` is clamped to the region height, and for a full-screen region that is a
+/// deliberate divergence from `n` separate one-line scrolls: the loop would
+/// push `n` lines into scrollback, all but a screenful of them blank. Pinning
+/// it so the clamp cannot be "fixed" into a scrollback flood.
+#[test]
+fn region_scroll_beyond_screen_height_does_not_flood_scrollback() {
+    let cfg = GridConfig {
+        max_scrollback: 1000,
+        track_dirty: true,
+    };
+    let mut bulk = Grid::new(4, 4, cfg.clone());
+    bulk.scroll_up_n(0, 3, 100);
+    assert_eq!(
+        (bulk.total_lines(), bulk.scrollback_len()),
+        (8, 4),
+        "one sequence must not push more than a screenful into scrollback"
+    );
+
+    let mut loops = Grid::new(4, 4, cfg);
+    for _ in 0..100 {
+        loops.scroll_up(0, 3);
+    }
+    assert_eq!(
+        (loops.total_lines(), loops.scrollback_len()),
+        (104, 100),
+        "the documented divergence changed — update the scroll_up_n docs"
     );
 }
