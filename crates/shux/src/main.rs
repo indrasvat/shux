@@ -1852,11 +1852,19 @@ async fn run_rpc_server(
                             })
                         })
                         .collect();
-                    for (pane_id, rev) in expired {
-                        tracing::debug!(%pane_id, "released a stale synchronized-output window");
-                        state.publish_revision(pane_id, rev);
+                    // Only when a frame actually moved. Pulsing every tick
+                    // would wake the renderer once a second on an idle daemon
+                    // for nothing.
+                    if !expired.is_empty() {
+                        for (pane_id, rev) in expired {
+                            tracing::debug!(
+                                %pane_id,
+                                "released a stale synchronized-output window"
+                            );
+                            state.publish_revision(pane_id, rev);
+                        }
+                        state.render_pulse.notify_waiters();
                     }
-                    state.render_pulse.notify_waiters();
                 }
                 _ = timeout_cancel.cancelled() => break,
             }
