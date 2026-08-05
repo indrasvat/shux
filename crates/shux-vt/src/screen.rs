@@ -66,7 +66,19 @@ impl ScreenSwap<'_> {
             // not moved: it is already the blank canvas a fresh grid would be.
             // This is the toggle-without-drawing case, and it is the one an
             // abusive pane can drive at speed.
-            Some(spare) if spare.is_blank_canvas(rows, cols, &config) => spare,
+            Some(spare) if spare.is_blank_canvas(rows, cols, &config) => {
+                // The cheap check reasons from the write tally; this is the
+                // O(cells) truth it stands in for. Debug-only, so the whole
+                // test suite proves the two agree on every single reuse and a
+                // future write path that forgot to advance the tally shows up
+                // as a failing test rather than as one pane's screen appearing
+                // inside another's.
+                debug_assert!(
+                    spare.is_actually_blank(cols),
+                    "recycled a retired alternate-screen buffer that was not blank"
+                );
+                spare
+            }
             // Drawn on, or the pane was resized while it sat in the slot.
             // Blank it in place — same cell writes, no allocator traffic.
             Some(mut spare) => {

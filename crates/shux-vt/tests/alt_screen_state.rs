@@ -34,12 +34,11 @@ fn ris_on_the_alt_screen_returns_to_the_primary_buffer() {
     t.process(b"ALTERNATE");
     t.process(b"\x1bc");
 
-    assert!(!t.is_alternate_screen(), "RIS must leave the alternate screen");
-    assert_eq!(
-        screen(&t),
-        "",
-        "RIS must clear the screen it returns to"
+    assert!(
+        !t.is_alternate_screen(),
+        "RIS must leave the alternate screen"
     );
+    assert_eq!(screen(&t), "", "RIS must clear the screen it returns to");
 
     // The primary buffer is the live one now, so a later 1049l has nothing to
     // restore and must not resurrect the alternate buffer's contents.
@@ -301,8 +300,15 @@ fn alt_switch_inside_a_sync_window_stays_frozen() {
     t.process(b"\x1b[?1049h");
     t.process(b"ALT");
 
-    assert!(!t.is_alternate_screen(), "frozen frame leaked a future alt flag");
-    assert_eq!(screen(&t), "PRIMARY", "frozen frame leaked alternate pixels");
+    assert!(
+        !t.is_alternate_screen(),
+        "frozen frame leaked a future alt flag"
+    );
+    assert_eq!(
+        screen(&t),
+        "PRIMARY",
+        "frozen frame leaked alternate pixels"
+    );
 
     t.process(b"\x1b[?2026l");
     assert!(t.is_alternate_screen());

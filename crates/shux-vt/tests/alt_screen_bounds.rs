@@ -140,7 +140,10 @@ fn excess_over_inert(rows: usize, cols: usize, seq: &[u8], csi_count: usize) -> 
 /// eight bytes of pane output, inside the daemon-wide pane-IO mutex.
 #[test]
 fn alt_screen_toggling_costs_no_more_than_parsing_it() {
-    for seq in [&b"\x1b[?1049h\x1b[?1049l"[..], &b"\x1b[?1047h\x1b[?1047l"[..]] {
+    for seq in [
+        &b"\x1b[?1049h\x1b[?1049l"[..],
+        &b"\x1b[?1047h\x1b[?1047l"[..],
+    ] {
         let (calls, bytes) = excess_over_inert(ROWS, COLS, seq, 2);
         assert!(
             calls <= 0,

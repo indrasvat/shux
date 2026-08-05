@@ -127,7 +127,7 @@ const SEQUENCES: &[&[u8]] = &[
     b"\x1b[1;38;2;200;40;40;48;5;236m", // truecolor fg + indexed bg
     b"\x1b[0m",
     b"\x1b]0;alt-screen differential\x07", // OSC title
-    b"\x1b]11;#112233\x07",               // OSC dynamic default background
+    b"\x1b]11;#112233\x07",                // OSC dynamic default background
     b"\x1b[10S",
     b"\x1b[10T",
     b"\x1b[3L",

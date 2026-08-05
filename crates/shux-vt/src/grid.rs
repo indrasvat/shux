@@ -471,12 +471,31 @@ impl Grid {
     /// Used to recycle a retired alternate-screen buffer without re-blanking
     /// it (issue #106): a pane that toggles the alternate screen without
     /// drawing gets the same buffer back untouched.
+    ///
+    /// The tally argument is about PROVENANCE, not content — it says "nothing
+    /// wrote here since this grid was built blank", which is only a blankness
+    /// proof for a grid that started blank. [`Grid::clone_visible`] produces a
+    /// grid with content and a zero tally and would fail that premise; it
+    /// cannot reach the recycling slot, and [`Grid::assert_blank`] is asserted
+    /// on every reuse in debug builds so a future path that could is caught by
+    /// the test suite rather than by a user.
     pub(crate) fn is_blank_canvas(&self, rows: usize, cols: usize, config: &GridConfig) -> bool {
         self.mutations == 0
             && self.rows == rows
             && self.cols == cols
             && self.raw.len() == rows
             && &self.config == config
+    }
+
+    /// Whether every cell really is a default cell on an unwrapped, full-width
+    /// row. The direct O(cells) check that [`Grid::is_blank_canvas`] stands in
+    /// for; asserted behind `debug_assertions` wherever the cheap check licenses
+    /// skipping work, so the tests prove the two agree on every reuse instead
+    /// of the invariant being argued in a comment.
+    pub(crate) fn is_actually_blank(&self, cols: usize) -> bool {
+        self.raw.iter().all(|row| {
+            !row.wrapped && row.len() == cols && row.cells.iter().all(|c| *c == Cell::EMPTY)
+        })
     }
 
     /// Return this grid to the state of `Grid::new(rows, cols, config)`,
