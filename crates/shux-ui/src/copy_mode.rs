@@ -155,10 +155,11 @@ pub fn handle_key_with_vt(
     if bytes.len() >= 4 && bytes[0] == 0x1b && bytes[1] == b'[' && bytes[3] == b'~' {
         match bytes[2] {
             b'5' => {
-                return scroll_up(state, pane_rows as usize, total_lines, pane_rows).then_updated();
+                return scroll_up(state, readable_rows(pane_rows), total_lines, pane_rows)
+                    .then_updated();
             }
             b'6' => {
-                return scroll_down(state, pane_rows as usize, total_lines, pane_rows)
+                return scroll_down(state, readable_rows(pane_rows), total_lines, pane_rows)
                     .then_updated();
             }
             _ => {}
@@ -189,18 +190,18 @@ pub fn handle_key_with_vt(
         b'n' => repeat_search(state, pane_cols, pane_rows, vt, false).then_updated(),
         b'N' => repeat_search(state, pane_cols, pane_rows, vt, true).then_updated(),
         // Ctrl-b / Ctrl-f: full-page up/down. Ctrl-u / Ctrl-d: half-page.
-        0x02 => scroll_up(state, pane_rows as usize, total_lines, pane_rows).then_updated(),
-        0x06 => scroll_down(state, pane_rows as usize, total_lines, pane_rows).then_updated(),
+        0x02 => scroll_up(state, readable_rows(pane_rows), total_lines, pane_rows).then_updated(),
+        0x06 => scroll_down(state, readable_rows(pane_rows), total_lines, pane_rows).then_updated(),
         0x15 => scroll_up(
             state,
-            (pane_rows as usize).max(1) / 2,
+            readable_rows(pane_rows).div_ceil(2),
             total_lines,
             pane_rows,
         )
         .then_updated(),
         0x04 => scroll_down(
             state,
-            (pane_rows as usize).max(1) / 2,
+            readable_rows(pane_rows).div_ceil(2),
             total_lines,
             pane_rows,
         )
@@ -563,6 +564,18 @@ pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
     total
         .saturating_sub(grid_rows)
         .saturating_add(row_offset + visible)
+}
+
+/// Rows of the copy view a person can actually READ.
+///
+/// `render_copy_view_into` draws `pane_rows` lines, and the copy-mode hint bar
+/// is then written over the bottom one — so the last line drawn is never seen.
+/// Paging by the full height therefore steps over exactly one line per page:
+/// a 30-row pane showed 0001..0030 and then started the next page at 0032.
+/// Paging by the readable height instead makes consecutive pages tile, with
+/// the line that sat under the bar becoming the top of the next page.
+pub fn readable_rows(pane_rows: u16) -> usize {
+    (pane_rows as usize).saturating_sub(1).max(1)
 }
 
 pub fn scroll_up(
@@ -1221,10 +1234,57 @@ mod tests {
     #[test]
     fn page_keys_adjust_scroll_offset() {
         let mut s = CopyModeState::new();
+        // A page is the READABLE height: the bottom row of the rect carries the
+        // copy-mode hint bar, so five rows show four lines.
         assert_eq!(handle_key(b"\x1b[5~", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(s.scroll_offset, 5);
+        assert_eq!(s.scroll_offset, 4);
         assert_eq!(handle_key(b"\x1b[6~", &mut s, 10, 5, 20), CopyKey::Updated);
         assert_eq!(s.scroll_offset, 0);
+    }
+
+    /// Paging must TILE the lines a person can read: no line skipped between
+    /// one page and the next, and none shown twice.
+    ///
+    /// The copy view draws `pane_rows` lines and the hint bar is written over
+    /// the last of them, so paging by the full height stepped over exactly one
+    /// line per page — a 30-row pane showed 0001..0030 and then began the next
+    /// page at 0032. Asserted on the visible line RANGES rather than on the
+    /// offset, so it stays true if the offset arithmetic is ever rewritten.
+    #[test]
+    fn paging_tiles_the_readable_lines_without_skipping_any() {
+        const TOTAL: usize = 400;
+        for pane_rows in [3u16, 5, 12, 24, 30] {
+            // Stated here, NOT taken from `readable_rows`: a test that asks the
+            // code under test how many lines are readable moves with the bug
+            // and passes either way. The hint bar is written over the bottom
+            // row of the rect (`render_copy_overlay_inner`), so one fewer line
+            // than the rect is tall can be read.
+            let readable = pane_rows as usize - 1;
+            let mut s = CopyModeState::new();
+            let mut seen: Vec<usize> = Vec::new();
+
+            // Page back through history, recording the lines actually readable
+            // on each page (the bottom drawn row is hidden by the hint bar).
+            for _ in 0..6 {
+                let start = view_start(TOTAL, pane_rows, s.scroll_offset);
+                seen.extend(start..start + readable);
+                if handle_key(b"\x1b[5~", &mut s, 40, pane_rows, TOTAL) != CopyKey::Updated {
+                    break;
+                }
+            }
+
+            seen.sort_unstable();
+            seen.dedup();
+            let lo = *seen.first().expect("some lines were readable");
+            let hi = *seen.last().expect("some lines were readable");
+            assert_eq!(
+                seen.len(),
+                hi - lo + 1,
+                "paging a {pane_rows}-row pane skipped lines: readable set spans {lo}..={hi} \
+                 but only {} distinct lines were reachable",
+                seen.len(),
+            );
+        }
     }
 
     #[test]

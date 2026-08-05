@@ -636,6 +636,15 @@ palette, restore the deliberate table/summary divergence).
   a pure function of wall clock — and normalise the two clips' playback speed afterwards so
   they are comparable. Also: redraw the demo pane in place rather than clearing it, or a
   frame grabbed mid-redraw shows a half-erased screen and reads as a bug in the demo.
+- **A regression test that asks the code under test for its expectation is vacuous.**
+  The copy-mode paging fix came with a test that recomputed "how many lines are readable"
+  by calling `readable_rows` — the very function being fixed — so it tiled perfectly with
+  the bug reintroduced and passed either way. Stating `pane_rows - 1` literally, with the
+  reason (the hint bar covers the bottom row), made it fail against the defect. Whenever a
+  test derives its expected value from the implementation, check what it does when the
+  implementation is wrong; that is the only thing that distinguishes a bound from a
+  tautology.
+
 - **Open the frames, every time.** The first take recorded `shux attach victim` — not a
   subcommand — and produced 20 seconds of a usage error. `ffprobe` said the file was
   valid, the right size and the right duration.

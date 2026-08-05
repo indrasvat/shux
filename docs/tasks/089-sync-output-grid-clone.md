@@ -155,6 +155,19 @@ longer exists. Releasing costs one torn frame where a repaint is already on its 
 pane can emit one. A resize to the size the pane already has is not a resize and leaves
 the window alone.
 
+### 6. Copy-mode paging skipped a line per page
+
+Found by adversarial review driving copy mode over deep scrollback, and independent of
+synchronized output — reproduced on a quiet pane with no mode-2026 traffic at all. It is
+fixed here rather than deferred because it is in `copy_mode.rs`, which this change
+already rewrites the coordinate space of.
+
+`render_copy_view_into` draws `pane_rows` lines and the copy-mode hint bar is then
+written over the bottom one, so a person reads `pane_rows - 1` lines. Paging moved by
+the full height, stepping over exactly one line per page: a 30-row pane showed
+`0001..0030` and began the next page at `0032`. Paging now moves by the readable height,
+so the line that sat under the bar becomes the top of the next page.
+
 ### Also fixed on the way
 
 - A window title set inside a window leaked into the frozen frame when the pane had no
@@ -223,6 +236,7 @@ lines of scrollback each, victim `pane capture` latency in another session):
 | 28 | No write path reaches a row's cells without unsharing | `cow_aliasing_adversarial.rs` (22 tests; proven able to fail by reintroducing the defect in a sandbox) |
 | 29 | A resize releases the window and presents what an unsynced terminal would | `cow_aliasing_adversarial.rs::a_resize_releases_the_window_and_presents_the_live_frame`, `..::alt_screen_resize_releases_...`, `lib.rs::synchronized_output_resize_*` |
 | 30 | A same-size resize does NOT release the window | `cow_aliasing_adversarial.rs::a_same_size_resize_leaves_the_window_open` |
+| 31a | Copy-mode paging tiles the readable lines, skipping none | `copy_mode.rs::paging_tiles_the_readable_lines_without_skipping_any` (shown failing against the reintroduced defect) |
 | 31 | History stays reachable while a window is open | `lib.rs::synchronized_output_keeps_presented_scrollback_reachable` |
 
 ## Acceptance criteria
