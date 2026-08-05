@@ -495,7 +495,7 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                     let _ = writeln!(
                         out,
                         "{}\t{}\t{}\t{}\tscratch",
-                        s.name,
+                        safe_label(&s.name),
                         s.window_count,
                         s.created,
                         short_id(&s.id),
@@ -504,7 +504,7 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                     let _ = writeln!(
                         out,
                         "{}\t{}\t{}\t{}",
-                        s.name,
+                        safe_label(&s.name),
                         s.window_count,
                         s.created,
                         short_id(&s.id),
@@ -565,9 +565,9 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
                 );
                 // Visible scratch tag (LENS-R-041 --include-scratch rows).
                 let name_cell = if s.scratch {
-                    format!("{} [scratch]", s.name)
+                    format!("{} [scratch]", safe_label(&s.name))
                 } else {
-                    s.name.clone()
+                    safe_label(&s.name)
                 };
                 layout.add_row(vec![
                     diamond.to_string(),

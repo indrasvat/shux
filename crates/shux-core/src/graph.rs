@@ -126,8 +126,7 @@ impl SessionGraphSnapshot {
         self.sessions.values().any(|s| s.name == name)
     }
 
-    /// Find a window by name within a specific session.
-    /// Find a window by title within a session.
+    /// Find a window by title within a specific session.
     ///
     /// The query is normalized with [`crate::model::sanitize_title`], the
     /// same rule that normalized the stored titles. Lookup and storage have
