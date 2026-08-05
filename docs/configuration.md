@@ -103,8 +103,11 @@ format = "[ ip $output ](bold #8aadf4) "
 '''
 ```
 
-The runner materializes `starship_config` to `$TMPDIR/shux-segment-<idx>.toml`
-and exports `STARSHIP_CONFIG=<that file>` for the spawn. For inline
+The runner materializes `starship_config` into the daemon's private
+per-user runtime directory (the same `$XDG_RUNTIME_DIR/shux/` — or
+`$TMPDIR/shux-$UID/` — 0700 dir that holds its socket), as a mode-0600 file
+created with exclusive, no-follow semantics, and exports
+`STARSHIP_CONFIG=<that file>` for the spawn. For inline
 Starship segments, shux also defaults `STARSHIP_SHELL=cmd` and
 `TERM=xterm-256color` unless you override them in `env`. That makes
 Starship emit plain ANSI for the status bar instead of shell prompt guards

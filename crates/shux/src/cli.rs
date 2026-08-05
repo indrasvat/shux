@@ -2271,9 +2271,10 @@ prefix = "ctrl-space"
 # named zone. Fallback text shows when the command is missing or
 # fails — keeps the bar pretty even on machines without the binary.
 #
-# `starship_config` is an INLINE TOML string. shux materialises it to
-# a tempfile per segment and exports `STARSHIP_CONFIG=<tempfile>` for
-# the spawned `starship prompt` invocation. The runner also defaults
+# `starship_config` is an INLINE TOML string. shux materialises it into
+# the daemon's private runtime dir (mode 0600) and exports
+# `STARSHIP_CONFIG=<that file>` for the spawned `starship prompt`
+# invocation. The runner also defaults
 # Starship status-bar spawns to raw ANSI output (`STARSHIP_SHELL=cmd`,
 # `TERM=xterm-256color`) so shell prompt guards like Bash `\[` / `\]`
 # never leak into the bar. Your shell PS1 (driven by

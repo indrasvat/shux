@@ -174,8 +174,9 @@ pub struct SegmentDef {
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
     /// Inline starship config (TOML text). When set, the runner writes
-    /// this to a tempfile at startup and exports
-    /// `STARSHIP_CONFIG=<tempfile>` for the spawned command. Lets the
+    /// this into the daemon's private runtime directory at startup (mode
+    /// 0600, created with exclusive/no-follow semantics) and exports
+    /// `STARSHIP_CONFIG=<that file>` for the spawned command. Lets the
     /// status-bar starship be configured **inside the same shux config
     /// file** as everything else — no second `~/.config/shux/statusbar.toml`
     /// to maintain. The user's actual PS1 starship (`~/.config/starship.toml`)

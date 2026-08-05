@@ -63,26 +63,59 @@ pub fn attach_socket_path() -> Result<PathBuf, DaemonError> {
 }
 
 /// Ensure the runtime directory exists with mode 0700.
+///
+/// Security (CWE-59): the runtime dir is predictable, and in the fallback
+/// (`$TMPDIR/shux-$UID/`, used when `XDG_RUNTIME_DIR` is unset) it lives in
+/// shared `/tmp`. A local attacker could pre-plant the final component as a
+/// symlink to a directory they control; a naive `chmod(0700)` would *follow*
+/// it (tightening someone else's dir) and the daemon would then write its
+/// socket, pidfile, and materialised segment configs into an attacker-chosen
+/// location — defeating the "daemon's own private dir" guarantee the statusbar
+/// fix relies on. We therefore open the final component with `O_NOFOLLOW`
+/// (refusing a symlink outright) and `fchmod` the resulting handle, which acts
+/// on the real directory with no path re-resolution (no TOCTOU window).
 pub fn ensure_runtime_dir() -> Result<PathBuf, DaemonError> {
     let dir = runtime_dir()?;
+    // `create_dir_all` treats a pre-existing symlink-to-dir as the dir and
+    // succeeds, so the no-follow check below (not this call) is what refuses it.
     fs::create_dir_all(&dir).map_err(DaemonError::CreateDir)?;
 
-    // Set permissions to 0700 (owner-only) for security
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o700);
-        fs::set_permissions(&dir, perms).map_err(DaemonError::CreateDir)?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(&dir)
+            .map_err(DaemonError::CreateDir)?;
+        handle
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(DaemonError::CreateDir)?;
     }
 
     Ok(dir)
 }
 
 /// Write the current process PID to the PID file.
+///
+/// Opened `O_NOFOLLOW` (CWE-59): even though `ensure_runtime_dir` now guarantees
+/// a real 0700 directory, refusing to write through a symlink at the pidfile
+/// path is cheap defense-in-depth against an arbitrary-file clobber. A stale
+/// regular pidfile from a previous run is still overwritten (create + truncate).
 pub fn write_pid_file() -> Result<(), DaemonError> {
+    use std::io::Write;
     let path = pid_file_path()?;
     let pid = std::process::id();
-    fs::write(&path, pid.to_string()).map_err(DaemonError::PidFile)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let mut file = opts.open(&path).map_err(DaemonError::PidFile)?;
+    file.write_all(pid.to_string().as_bytes())
+        .map_err(DaemonError::PidFile)?;
     Ok(())
 }
 
@@ -269,6 +302,70 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/tmp/test-shux-xdg/shux"));
 
         unsafe { restore_xdg_runtime_dir(original) };
+    }
+
+    // ── issue #105 hardening: the runtime-dir + pidfile writes must not follow
+    //    a planted symlink (CWE-59), so the segment-config fix's "private 0700
+    //    dir" invariant actually holds. ─────────────────────────────────────────
+
+    #[test]
+    fn ensure_runtime_dir_refuses_symlinked_runtime_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = env_lock().lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Attacker's target directory (they want it chmod'd / written into).
+        let victim = tmp.path().join("victim_dir");
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        // XDG_RUNTIME_DIR/shux is pre-planted as a symlink to the victim dir.
+        let xdg = tmp.path().join("xdg");
+        fs::create_dir(&xdg).unwrap();
+        std::os::unix::fs::symlink(&victim, xdg.join("shux")).unwrap();
+
+        let original = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: guarded by ENV_LOCK, restored before releasing it.
+        unsafe { set_xdg_runtime_dir(&xdg) };
+        let result = ensure_runtime_dir();
+        unsafe { restore_xdg_runtime_dir(original) };
+
+        assert!(
+            result.is_err(),
+            "ensure_runtime_dir must refuse a symlinked runtime dir, not follow it"
+        );
+        let mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "victim dir was chmod-followed through the symlink (got {mode:o})"
+        );
+    }
+
+    #[test]
+    fn write_pid_file_refuses_symlink_and_does_not_clobber() {
+        let _guard = env_lock().lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg");
+        let shuxdir = xdg.join("shux");
+        fs::create_dir_all(&shuxdir).unwrap();
+        // Victim file the pidfile path is symlinked onto.
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"KEEP ME").unwrap();
+        std::os::unix::fs::symlink(&victim, shuxdir.join("shux.pid")).unwrap();
+
+        let original = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: guarded by ENV_LOCK, restored before releasing it.
+        unsafe { set_xdg_runtime_dir(&xdg) };
+        let result = write_pid_file();
+        unsafe { restore_xdg_runtime_dir(original) };
+
+        assert!(
+            result.is_err(),
+            "write_pid_file must refuse to write through a symlink"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"KEEP ME",
+            "pidfile write followed the symlink and clobbered the victim"
+        );
     }
 
     #[test]

@@ -17,6 +17,10 @@
 //! path, but the fallback story is real so OOTB still looks good.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,6 +105,12 @@ impl SegmentCache {
 /// down on daemon exit.
 pub fn spawn_segment_runners(config: ConfigHandle, cache: SegmentCache, cancel: CancellationToken) {
     tokio::spawn(async move {
+        // Reclaim segment configs orphaned by a previous daemon that died
+        // without cleanup (issue #105 hardening). Once per daemon, before any
+        // runner materialises its own file.
+        if let Ok(dir) = crate::daemon::runtime_dir() {
+            sweep_stale_segment_configs(&dir);
+        }
         let change_notify = config.change_notify();
         loop {
             let cfg_snap = config.current();
@@ -148,25 +158,27 @@ async fn run_one_segment(
         return;
     }
 
-    // If the user supplied an inline starship config, materialise it
-    // to a tempfile and inject STARSHIP_CONFIG. The tempfile lives for
-    // this segment's lifetime; on config reload the runner is torn down
-    // and rebuilt, which gives us a clean rewrite. We do NOT delete the
-    // file on drop — daemon shutdown wipes /tmp/shux-segment-* via
-    // best-effort cleanup at startup (idempotent, cheap).
+    // If the user supplied an inline starship config, materialise it into the
+    // daemon's own per-user runtime directory (the 0700 dir that already holds
+    // the socket) and inject STARSHIP_CONFIG. The file is created with
+    // exclusive, symlink-refusing semantics at mode 0600; its handle is held
+    // for this segment's lifetime (see `StarshipConfigFile`) and it is unlinked
+    // when the task tears down — on config reload the runner is rebuilt, which
+    // gives us a clean rewrite. Issue #105: this used to write to a fully
+    // predictable path in shared temp with a symlink-following call, which a
+    // local user could redirect onto any file the daemon can write.
     let starship_tmp = if let Some(toml_text) = seg.starship_config.clone() {
-        let path = std::env::temp_dir().join(format!("shux-segment-{idx}.toml"));
-        match std::fs::write(&path, toml_text.as_bytes()) {
-            Ok(()) => {
+        match materialise_inline_starship_config(idx, toml_text.as_bytes()) {
+            Ok(file) => {
                 seg.env
                     .entry("STARSHIP_CONFIG".to_string())
-                    .or_insert_with(|| path.to_string_lossy().into_owned());
+                    .or_insert_with(|| file.path().to_string_lossy().into_owned());
                 apply_starship_statusbar_env_defaults(&mut seg);
-                Some(path)
+                Some(file)
             }
             Err(e) => {
                 warn!(idx, error = %e,
-                    "statusbar segment: failed to write inline starship config");
+                    "statusbar segment: failed to materialise inline starship config");
                 None
             }
         }
@@ -201,10 +213,162 @@ async fn run_one_segment(
             _ = tick.tick() => {}
         }
     }
-    // Best-effort cleanup of the materialised starship config tempfile.
-    if let Some(p) = starship_tmp {
-        let _ = std::fs::remove_file(p);
+    // The materialised starship config (if any) is unlinked here as
+    // `starship_tmp` drops — see `StarshipConfigFile::drop`.
+    drop(starship_tmp);
+}
+
+/// A starship config materialised into the daemon's private runtime directory.
+///
+/// Issue #105: inline `starship_config` used to be written to a fully
+/// predictable path in shared temp (`$TMPDIR/shux-segment-<idx>.toml`) with a
+/// symlink-following `std::fs::write`. On a shared `/tmp` a local user could
+/// pre-plant that path as a symlink and redirect the daemon's write onto any
+/// file the daemon user can write — an arbitrary-file clobber primitive
+/// (CWE-59). We now materialise into the same per-user 0700 runtime directory
+/// that holds the socket, create the file with exclusive + no-follow semantics
+/// at mode 0600, keep the open handle for the file's lifetime (never reopening
+/// by name), and unlink it on teardown.
+struct StarshipConfigFile {
+    path: PathBuf,
+    /// Held open for the file's lifetime; we never reopen by name. Dropping the
+    /// handle closes the fd; `Drop` on the struct unlinks the path.
+    _handle: File,
+}
+
+impl StarshipConfigFile {
+    /// Materialise `contents` for segment `idx` inside `dir` — a directory the
+    /// daemon owns (mode 0700). The filename carries the daemon PID so two
+    /// concurrent daemons never share a file, and the create refuses to follow
+    /// a symlink or open an existing entry (see `create_private_file`).
+    fn materialise(dir: &Path, idx: usize, contents: &[u8]) -> std::io::Result<Self> {
+        let path = dir.join(segment_config_name(std::process::id(), idx));
+        let handle = create_private_file(&path, contents)?;
+        Ok(Self {
+            path,
+            _handle: handle,
+        })
     }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StarshipConfigFile {
+    fn drop(&mut self) {
+        // `remove_file` unlinks the name itself (it never follows a symlink),
+        // and the file lives in a dir only the daemon user can write, so this
+        // is safe best-effort cleanup.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Resolve the daemon's private runtime directory and materialise `contents`
+/// for segment `idx` inside it. `ensure_runtime_dir` creates the dir at mode
+/// 0700 if needed (idempotent — the daemon already made it for the socket).
+fn materialise_inline_starship_config(
+    idx: usize,
+    contents: &[u8],
+) -> std::io::Result<StarshipConfigFile> {
+    let dir = crate::daemon::ensure_runtime_dir().map_err(std::io::Error::other)?;
+    StarshipConfigFile::materialise(&dir, idx, contents)
+}
+
+/// Per-daemon, per-segment filename. The PID keeps two concurrent daemons — or
+/// a fresh daemon that inherited a crashed one's PID — from colliding on a
+/// shared name.
+fn segment_config_name(pid: u32, idx: usize) -> String {
+    format!("segment-{pid}-{idx}.toml")
+}
+
+/// Reclaim `segment-<pid>-<idx>.toml` files left behind by daemons that died
+/// without running `StarshipConfigFile::drop` (SIGKILL, power loss, OOM). The
+/// PID-scoped name means a fresh daemon never reuses them, so without this sweep
+/// they accumulate in the runtime dir across crashes. Only files whose embedded
+/// PID is no longer alive are removed, so a (theoretical) concurrent daemon's
+/// live file is never touched. The dir is 0700 — nothing hostile can appear
+/// here — and `remove_file` unlinks by name without following symlinks; we
+/// still restrict removal to plain files so a stray symlink is never traversed.
+fn sweep_stale_segment_configs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(pid) = parse_segment_config_pid(name) else {
+            continue;
+        };
+        // Never remove our own (not yet created) or a live daemon's file.
+        if pid == me || pid_is_alive(pid) {
+            continue;
+        }
+        // Regular files only — `file_type()` does not follow symlinks, so a
+        // stray link is left in place rather than traversed.
+        if matches!(entry.file_type(), Ok(ft) if ft.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Parse the PID out of a `segment-<pid>-<idx>.toml` name; `None` if it does not
+/// match the exact shape (so unrelated files in the runtime dir are ignored).
+fn parse_segment_config_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("segment-")?.strip_suffix(".toml")?;
+    let (pid, idx) = rest.split_once('-')?;
+    // Require the index to be numeric too, so we only match our own names.
+    idx.parse::<usize>().ok()?;
+    pid.parse::<u32>().ok()
+}
+
+/// True unless the process is known-dead (`ESRCH`). `EPERM` (a live process we
+/// can't signal) counts as alive — we err toward keeping files, never toward
+/// deleting a live daemon's.
+fn pid_is_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+/// Create `path` as a fresh, private (0600) regular file with exclusive,
+/// symlink-refusing semantics and write `contents` through the returned handle.
+///
+/// `O_NOFOLLOW` makes the open fail if `path` is a symlink; `create_new`
+/// (`O_CREAT | O_EXCL`) makes it fail if `path` exists at all. Together they
+/// guarantee we created a brand-new regular file and never traversed a link, so
+/// a pre-planted symlink can never redirect the write. A pre-existing entry can
+/// only be a stale file left by a previous daemon that shared our PID — the
+/// parent dir is 0700, so nothing hostile can appear there — which we unlink
+/// (`remove_file` does not follow symlinks) and recreate exactly once; a second
+/// collision is a real error and propagates.
+#[cfg(unix)]
+fn create_private_file(path: &Path, contents: &[u8]) -> std::io::Result<File> {
+    fn open_exclusive(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_CREAT | O_EXCL
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(path)
+    }
+
+    let mut handle = match open_exclusive(path) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            open_exclusive(path)?
+        }
+        Err(e) => return Err(e),
+    };
+    handle.write_all(contents)?;
+    Ok(handle)
 }
 
 fn apply_starship_statusbar_env_defaults(seg: &mut SegmentDef) {
@@ -390,6 +554,171 @@ fn vt_color(c: shux_vt::Color) -> Option<crossterm::style::Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── issue #105: secure materialisation of inline starship config ──────────
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A 0700 directory the "daemon" owns, standing in for the runtime dir.
+    fn owner_dir() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        d
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn create_private_file_writes_a_0600_regular_file() {
+        let dir = owner_dir();
+        let path = dir.path().join("segment-1-0.toml");
+        let handle = create_private_file(&path, b"add_newline = false\n").unwrap();
+        drop(handle);
+        assert_eq!(std::fs::read(&path).unwrap(), b"add_newline = false\n");
+        assert_eq!(mode_of(&path), 0o600, "materialised file must be 0600");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn create_private_file_never_writes_through_a_planted_symlink() {
+        // The heart of the fix: a symlink at the target path must never be
+        // followed, so the victim it points at is never clobbered.
+        let dir = owner_dir();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"KEEP ME").unwrap();
+        let target = dir.path().join("segment-1-0.toml");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        let handle = create_private_file(&target, b"attacker payload").unwrap();
+        drop(handle);
+
+        // Victim is byte-for-byte intact — the write did not follow the link.
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"KEEP ME",
+            "write followed the symlink and clobbered the victim"
+        );
+        // The path now holds a fresh regular file with our content, not a link.
+        assert!(
+            !std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "target is still a symlink"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"attacker payload");
+        assert_eq!(mode_of(&target), 0o600);
+    }
+
+    #[test]
+    fn create_private_file_self_heals_a_stale_regular_file() {
+        // A leftover file from a previous same-PID daemon is replaced in place.
+        let dir = owner_dir();
+        let path = dir.path().join("segment-1-0.toml");
+        std::fs::write(&path, b"stale contents from a crashed daemon").unwrap();
+        let handle = create_private_file(&path, b"fresh").unwrap();
+        drop(handle);
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn materialise_uses_a_pid_scoped_name_and_unlinks_on_drop() {
+        let dir = owner_dir();
+        let file = StarshipConfigFile::materialise(dir.path(), 0, b"x = 1\n").unwrap();
+        let path = file.path().to_path_buf();
+        assert!(path.exists());
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            segment_config_name(std::process::id(), 0),
+            "filename must be PID- and index-scoped"
+        );
+        assert_eq!(mode_of(&path), 0o600);
+        drop(file);
+        assert!(
+            !path.exists(),
+            "file must be unlinked when the handle drops"
+        );
+    }
+
+    #[test]
+    fn segment_config_names_are_distinct_across_daemons_and_segments() {
+        // Two concurrent daemons (distinct PIDs) never share a file; neither do
+        // two segments of the same daemon.
+        assert_ne!(segment_config_name(1000, 0), segment_config_name(1001, 0));
+        assert_ne!(segment_config_name(1000, 0), segment_config_name(1000, 1));
+    }
+
+    #[test]
+    fn sweep_reclaims_dead_pid_files_but_keeps_live_and_unrelated() {
+        let dir = owner_dir();
+        // A guaranteed-dead PID: spawn a trivial child and reap it.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        let me = std::process::id();
+        let dead = dir.path().join(segment_config_name(dead_pid, 0));
+        let live = dir.path().join(segment_config_name(me, 0));
+        let unrelated = dir.path().join("config.toml");
+        let malformed = dir.path().join("segment-notanumber-0.toml");
+        for p in [&dead, &live, &unrelated, &malformed] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        sweep_stale_segment_configs(dir.path());
+
+        assert!(!dead.exists(), "dead-PID orphan must be reclaimed");
+        assert!(live.exists(), "a live daemon's file must be kept");
+        assert!(unrelated.exists(), "non-segment files must be untouched");
+        assert!(malformed.exists(), "non-matching names must be untouched");
+    }
+
+    #[test]
+    fn sweep_never_follows_a_stray_symlink() {
+        let dir = owner_dir();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"KEEP").unwrap();
+        // A dead-PID-named symlink pointing at the victim.
+        let link = dir.path().join(segment_config_name(dead_pid, 3));
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        sweep_stale_segment_configs(dir.path());
+
+        // We neither followed the link (victim intact) nor removed the target.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"KEEP");
+    }
+
+    #[test]
+    fn parse_segment_config_pid_matches_only_our_shape() {
+        assert_eq!(parse_segment_config_pid("segment-1234-0.toml"), Some(1234));
+        assert_eq!(parse_segment_config_pid("segment-1-42.toml"), Some(1));
+        assert_eq!(parse_segment_config_pid("segment-x-0.toml"), None);
+        assert_eq!(parse_segment_config_pid("segment-1234-x.toml"), None);
+        assert_eq!(parse_segment_config_pid("config.toml"), None);
+        assert_eq!(parse_segment_config_pid("segment-1234-0.txt"), None);
+    }
+
+    #[test]
+    fn materialise_two_segments_coexist_as_distinct_files() {
+        let dir = owner_dir();
+        let a = StarshipConfigFile::materialise(dir.path(), 0, b"a").unwrap();
+        let b = StarshipConfigFile::materialise(dir.path(), 1, b"b").unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(a.path().exists() && b.path().exists());
+        assert_eq!(std::fs::read(a.path()).unwrap(), b"a");
+        assert_eq!(std::fs::read(b.path()).unwrap(), b"b");
+    }
 
     #[test]
     fn test_ansi_red_text_becomes_one_segment() {
