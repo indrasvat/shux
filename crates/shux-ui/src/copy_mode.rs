@@ -329,9 +329,8 @@ fn find_and_focus(
     let Some(vt) = vt else {
         return false;
     };
-    let grid = vt.grid();
     // #108: map the copy cursor through the same region the frame shows. Search
-    // itself (search_forward/backward) still scans the full grid.total_lines().
+    // itself (search_forward/backward) still scans the whole presented span.
     let total_lines = effective_total_lines(vt, pane_rows);
     if total_lines == 0 {
         return false;
@@ -343,11 +342,9 @@ fn find_and_focus(
         .min(total_lines.saturating_sub(1));
     let current_col = state.cursor.0 as usize;
     let found = match direction {
-        SearchDirection::Forward => {
-            search_forward(grid, pane_cols, current_row, current_col, query)
-        }
+        SearchDirection::Forward => search_forward(vt, pane_cols, current_row, current_col, query),
         SearchDirection::Backward => {
-            search_backward(grid, pane_cols, current_row, current_col, query)
+            search_backward(vt, pane_cols, current_row, current_col, query)
         }
     };
     if let Some((row, col)) = found {
@@ -359,13 +356,13 @@ fn find_and_focus(
 }
 
 fn search_forward(
-    grid: &shux_vt::Grid,
+    vt: &VirtualTerminal,
     pane_cols: u16,
     current_row: usize,
     current_col: usize,
     query: &str,
 ) -> Option<(usize, usize)> {
-    let total = grid.total_lines();
+    let total = vt.presented_total_lines();
     for step in 0..total {
         let row_idx = (current_row + step) % total;
         let start_col = if step == 0 {
@@ -373,7 +370,8 @@ fn search_forward(
         } else {
             0
         };
-        let Some((col, _)) = search_row_forward(grid.row(row_idx)?, pane_cols, start_col, query)
+        let Some((col, _)) =
+            search_row_forward(vt.presented_row(row_idx)?, pane_cols, start_col, query)
         else {
             continue;
         };
@@ -383,13 +381,13 @@ fn search_forward(
 }
 
 fn search_backward(
-    grid: &shux_vt::Grid,
+    vt: &VirtualTerminal,
     pane_cols: u16,
     current_row: usize,
     current_col: usize,
     query: &str,
 ) -> Option<(usize, usize)> {
-    let total = grid.total_lines();
+    let total = vt.presented_total_lines();
     for step in 0..total {
         let row_idx = (current_row + total - (step % total)) % total;
         let before_col = if step == 0 {
@@ -397,7 +395,8 @@ fn search_backward(
         } else {
             pane_cols as usize
         };
-        let Some((col, _)) = search_row_backward(grid.row(row_idx)?, pane_cols, before_col, query)
+        let Some((col, _)) =
+            search_row_backward(vt.presented_row(row_idx)?, pane_cols, before_col, query)
         else {
             continue;
         };
@@ -546,9 +545,12 @@ pub fn view_start(total_lines: usize, pane_rows: u16, scroll_offset: usize) -> u
 /// For a pane whose grid fits its viewport (the overwhelmingly common case) this
 /// is exactly `grid.total_lines()`, so copy mode is byte-for-byte unchanged.
 pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
-    let grid = vt.grid();
-    let total = grid.total_lines();
-    let grid_rows = grid.rows();
+    // The PRESENTED span, not `grid().total_lines()`. While a
+    // synchronized-output window is open the frozen frame is the viewport
+    // alone; history stays live and is reached through `presented_row`
+    // (issue #115), so the grid's own line count describes only the frame.
+    let total = vt.presented_total_lines();
+    let grid_rows = vt.grid().rows();
     let visible = pane_rows as usize;
     if grid_rows <= visible {
         return total; // grid fits — coordinate space is unchanged
@@ -602,11 +604,10 @@ fn row_for_view(
     scroll_offset: usize,
     view_row: u16,
 ) -> Option<&Row> {
-    let grid = vt.grid();
     // #108: anchor to the region the live frame shows, not the grid bottom.
     let total = effective_total_lines(vt, pane_rows);
     let abs = view_start(total, pane_rows, scroll_offset).saturating_add(view_row as usize);
-    grid.row(abs)
+    vt.presented_row(abs)
 }
 
 trait BoolExt {
@@ -712,7 +713,6 @@ pub fn render_copy_view_into(
     if pane.width == 0 || pane.height == 0 {
         return;
     }
-    let grid = vt.grid();
     // #108: match the cursor-following frame region (see effective_total_lines).
     let start = view_start(
         effective_total_lines(vt, pane.height),
@@ -721,7 +721,7 @@ pub fn render_copy_view_into(
     );
     for row in 0..pane.height {
         let abs = start + row as usize;
-        let Some(row_ref) = grid.row(abs) else {
+        let Some(row_ref) = vt.presented_row(abs) else {
             continue;
         };
         let _ = write!(buf, "\x1b[{};{}H", pane.y + row + 1, pane.x + 1);

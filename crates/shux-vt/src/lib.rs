@@ -16,6 +16,7 @@ mod grid;
 mod parser;
 mod screen;
 mod settle;
+mod sync;
 mod tabstops;
 
 pub use capture::{
@@ -46,23 +47,36 @@ pub use settle::{FrameStability, frame_stability_hash};
 pub use tabstops::TabStops;
 
 use crate::parser::VtParser;
+use std::sync::atomic::Ordering;
+
+/// How long synchronized output (`CSI ?2026h`) may hold the presented frame
+/// before shux shows the live one anyway.
+///
+/// `?2026h` is a promise to finish and send `?2026l`. A pane that breaks that
+/// promise — an application killed mid-redraw, a script that emits the open
+/// and nothing else — would otherwise leave its pane showing one frame for
+/// ever, with a copy of that frame pinned in daemon memory for just as long.
+/// So the promise has a deadline, as it does in every other terminal that
+/// implements the mode: releasing early costs one torn frame, and not
+/// releasing costs the pane.
+///
+/// 150 ms is the value the ecosystem settled on (it is Alacritty's
+/// `SYNC_UPDATE_TIMEOUT`). It is an order of magnitude longer than a
+/// full-screen redraw by `vim`, `lazygit` or `btop`, which is what the mode
+/// exists to protect, and short enough that a broken pane looks like a glitch
+/// rather than a hang.
+pub const SYNC_UPDATE_TIMEOUT_MS: u64 = 150;
+
+/// How much pane output one synchronized-output window may absorb before the
+/// presented frame is released regardless of the clock.
+///
+/// A second guard on a different axis from the timeout, so that neither has to
+/// be trusted alone: a clock can be read wrong, and a pane that produces
+/// megabytes without finishing its redraw is not mid-redraw. 2 MiB is
+/// Alacritty's `SYNC_BUFFER_SIZE`.
+pub const SYNC_UPDATE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 use crate::parser::DcsState;
-
-/// Frozen presentation state while synchronized output mode is active.
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct SyncPresentation {
-    pub grid: Grid,
-    pub cursor: Cursor,
-    pub default_colors: TerminalDefaultColors,
-    pub title: Option<String>,
-    /// Alt-screen flag at freeze time (codex P2 review blocker): presented
-    /// readers (glance) must see grid/cursor/colors AND this flag from the
-    /// same frozen frame — an alt toggle inside ?2026h must not leak a
-    /// future flag against old pixels.
-    pub alternate_screen: bool,
-}
 
 /// Per-pane virtual terminal.
 ///
@@ -95,8 +109,43 @@ pub struct VirtualTerminal {
     parser: VtParser,
     /// In-progress DCS payload, preserved across partial PTY chunks.
     dcs_state: Option<DcsState>,
-    /// Frozen presentation while synchronized output mode is active.
-    sync_present: Option<SyncPresentation>,
+    /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
+    /// open. Shared by reference with every [`sync::Presented`] wrapper handed
+    /// to the parser, which is why it is a cell rather than a plain `bool`;
+    /// atomic only so `VirtualTerminal` stays `Sync` (issue #115).
+    sync_armed: std::sync::atomic::AtomicBool,
+    /// The presented frame, one component per slot, each filled lazily by the
+    /// first write that would change it and empty while the presented value is
+    /// still the live one. `None` everywhere is the normal state, including for
+    /// most of a `?2026h`/`?2026l` window that draws nothing.
+    ///
+    /// Each component freezes independently and that is still coherent: a
+    /// component is snapshotted on its FIRST change after `?2026h`, and it did
+    /// not change before that, so every slot holds its `?2026h` value whether
+    /// it was filled at `?2026h` or long after.
+    frozen_grid: Option<sync::FrozenScreen>,
+    frozen_cursor: Option<Cursor>,
+    frozen_colors: Option<TerminalDefaultColors>,
+    /// `Some(None)` is a real state: no window title at freeze time. The outer
+    /// `Option` is "is it frozen", the inner one is "was there a title".
+    frozen_title: Option<Option<String>>,
+    /// Alt-screen flag at freeze time (codex P2 review blocker): presented
+    /// readers (glance) must see grid/cursor/colors AND this flag from the
+    /// same frozen frame — an alt toggle inside ?2026h must not leak a
+    /// future flag against old pixels.
+    frozen_alt: Option<bool>,
+    /// Whether to take the whole snapshot at `?2026h` rather than at the first
+    /// write. Always `false` outside the differential tests — see
+    /// [`VirtualTerminal::set_eager_sync_freeze`].
+    eager_sync_freeze: bool,
+    /// Monotonic nanoseconds at which the open synchronized-output window was
+    /// first seen to still be open at the end of a batch, or 0 when no window
+    /// is open. Stamped once per window rather than at `?2026h`, so a pane
+    /// toggling the mode millions of times a second does not buy a clock read
+    /// per toggle.
+    sync_opened_ns: u64,
+    /// Pane output absorbed since the open window started.
+    sync_bytes: u64,
     /// Visible cell currently accepting zero-width/joined grapheme scalars.
     active_grapheme_cell: Option<(usize, usize)>,
     /// VT100 G0/G1 charset designations and active locking shift.
@@ -192,7 +241,15 @@ impl VirtualTerminal {
             default_colors: TerminalDefaultColors::default(),
             parser: VtParser::new_with_size(),
             dcs_state: None,
-            sync_present: None,
+            sync_armed: std::sync::atomic::AtomicBool::new(false),
+            frozen_grid: None,
+            frozen_cursor: None,
+            frozen_colors: None,
+            frozen_title: None,
+            frozen_alt: None,
+            eager_sync_freeze: false,
+            sync_opened_ns: 0,
+            sync_bytes: 0,
             active_grapheme_cell: None,
             charsets: TerminalCharsets::default(),
             tab_stops: TabStops::new(cols),
@@ -222,6 +279,116 @@ impl VirtualTerminal {
         if !enabled {
             self.alt_spare = None;
         }
+    }
+
+    /// Take the synchronized-output snapshot at `CSI ?2026h` instead of at the
+    /// first write that would change the presented frame (issue #115).
+    ///
+    /// Deferring the snapshot is required to be UNOBSERVABLE: a terminal that
+    /// freezes lazily must behave identically to one that freezes the instant
+    /// the mode opens. That is a property, not a hope, so the differential
+    /// tests drive the same byte stream through two terminals — one eager, one
+    /// lazy — and compare every observable after every step. This exists for
+    /// that oracle. Production never calls it.
+    #[doc(hidden)]
+    pub fn set_eager_sync_freeze(&mut self, enabled: bool) {
+        self.eager_sync_freeze = enabled;
+        if enabled && self.sync_armed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.freeze_whole_presentation();
+        }
+    }
+
+    /// Snapshot every still-unfrozen component of the presented frame.
+    ///
+    /// Called by the paths that mutate presented state from OUTSIDE the parser
+    /// — `resize` and the direct alternate-screen API — where there is no
+    /// [`sync::Presented`] wrapper to do it. Both are daemon-driven: a pane
+    /// cannot emit bytes that reach them, so neither is an amplification
+    /// route.
+    fn freeze_whole_presentation(&mut self) {
+        if !self.sync_armed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if self.frozen_grid.is_none() {
+            self.frozen_grid = Some(sync::PresentedFrame::snapshot(&self.grid));
+        }
+        if self.frozen_cursor.is_none() {
+            self.frozen_cursor = Some(self.cursor.clone());
+        }
+        if self.frozen_colors.is_none() {
+            self.frozen_colors = Some(self.default_colors);
+        }
+        if self.frozen_title.is_none() {
+            self.frozen_title = Some(self.title.clone());
+        }
+        if self.frozen_alt.is_none() {
+            self.frozen_alt = Some(self.modes.alternate_screen);
+        }
+    }
+
+    /// Drop the frozen presentation and show the live frame again, as
+    /// `CSI ?2026l` would.
+    ///
+    /// Returns whether the presented frame actually moved, which is what a
+    /// caller outside the parse loop needs in order to publish a revision.
+    fn force_release_sync(&mut self) -> bool {
+        let revealed = self.sync_hidden_class_a
+            || self.frozen_grid.is_some()
+            || self.frozen_cursor.is_some()
+            || self.frozen_colors.is_some()
+            || self.frozen_title.is_some()
+            || self.frozen_alt.is_some();
+        self.sync_armed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.frozen_grid = None;
+        self.frozen_cursor = None;
+        self.frozen_colors = None;
+        self.frozen_title = None;
+        self.frozen_alt = None;
+        self.modes.synchronized_output = false;
+        self.sync_opened_ns = 0;
+        self.sync_bytes = 0;
+        // The presentation jumps from the frozen frame to the live one, so
+        // every cell on screen may differ and the renderer repaints in full.
+        self.grid.mark_all_dirty();
+        revealed
+    }
+
+    /// Whether an open synchronized-output window has outlived
+    /// [`SYNC_UPDATE_TIMEOUT_MS`] or absorbed more than
+    /// [`SYNC_UPDATE_MAX_BYTES`].
+    fn sync_window_expired(&self) -> bool {
+        if !self.sync_armed.load(std::sync::atomic::Ordering::Relaxed) || self.sync_opened_ns == 0 {
+            return false;
+        }
+        self.sync_bytes >= SYNC_UPDATE_MAX_BYTES
+            || monotonic_now_ns().saturating_sub(self.sync_opened_ns)
+                >= SYNC_UPDATE_TIMEOUT_MS * 1_000_000
+    }
+
+    /// Release a synchronized-output window that has outlived its deadline,
+    /// reporting whether the presented frame moved.
+    ///
+    /// The parse loop enforces the deadline itself on every batch, which is
+    /// enough for a pane that is still producing output — including every
+    /// abusive one, since abuse means output. This exists for the pane that
+    /// opened a window and then went silent: no bytes arrive, so nothing calls
+    /// `process`, and without an outside nudge that pane would show the same
+    /// frame until it was closed. The daemon sweeps its terminals with it.
+    pub fn release_expired_sync(&mut self) -> bool {
+        if !self.sync_window_expired() {
+            return false;
+        }
+        let revealed = self.force_release_sync();
+        if std::mem::take(&mut self.sync_hidden_class_a) || revealed {
+            self.record_class_a_batch();
+        }
+        revealed
+    }
+
+    /// Whether synchronized output is currently holding the presented frame.
+    pub fn sync_output_active(&self) -> bool {
+        self.sync_armed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Process raw PTY output bytes through the VT parser.
@@ -258,6 +425,13 @@ impl VirtualTerminal {
         // sync nets to NO presented change. The release batch compares the
         // frozen colors against the now-live value, so a real net change
         // still bumps exactly once at ?2026l, and a net-zero one never does.
+        // A window that has outlived its deadline is released BEFORE this
+        // batch lands, so the bytes about to be parsed are shown rather than
+        // hidden behind a frame the pane has stopped maintaining.
+        if self.sync_window_expired() {
+            self.force_release_sync();
+        }
+
         let before_writes = self.grid.mutations();
         let before_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
         let before_alt = self.modes.alternate_screen;
@@ -268,16 +442,26 @@ impl VirtualTerminal {
         // the parser and the handler without conflicting borrows.
         let mut responses = Vec::new();
         let mut handler = VtHandler {
-            grid: &mut self.grid,
-            cursor: &mut self.cursor,
+            grid: sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
+            cursor: sync::Presented::new(
+                &mut self.cursor,
+                &mut self.frozen_cursor,
+                &self.sync_armed,
+            ),
             modes: &mut self.modes,
             scroll_region: &mut self.scroll_region,
-            title: &mut self.title,
-            default_colors: &mut self.default_colors,
+            title: sync::Presented::new(&mut self.title, &mut self.frozen_title, &self.sync_armed),
+            default_colors: sync::Presented::new(
+                &mut self.default_colors,
+                &mut self.frozen_colors,
+                &self.sync_armed,
+            ),
             alt_grid: &mut self.alt_grid,
             alt_cursor: &mut self.alt_cursor,
             dcs_state: &mut self.dcs_state,
-            sync_present: &mut self.sync_present,
+            sync_armed: &self.sync_armed,
+            frozen_alt: &mut self.frozen_alt,
+            eager_sync_freeze: self.eager_sync_freeze,
             active_grapheme_cell: &mut self.active_grapheme_cell,
             charsets: &mut self.charsets,
             tab_stops: &mut self.tab_stops,
@@ -319,7 +503,7 @@ impl VirtualTerminal {
         // for the whole sync window. Bump immediately; only the OTHER Class-A
         // signals (whose compares read live state and cannot distinguish
         // pre-freeze from post-freeze changes within the batch) defer.
-        if self.sync_present.is_some() {
+        if self.sync_armed.load(std::sync::atomic::Ordering::Relaxed) {
             if presented_colors_changed {
                 self.record_class_a_batch();
             }
@@ -331,6 +515,20 @@ impl VirtualTerminal {
             || other_class_a
         {
             self.record_class_a_batch();
+        }
+
+        // Deadline bookkeeping. Stamped here rather than at `?2026h` so that a
+        // pane toggling the mode does not buy a clock read per toggle: a window
+        // that opens and closes inside one batch is never stamped at all, and
+        // one that survives the batch is stamped exactly once.
+        if self.sync_armed.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.sync_opened_ns == 0 {
+                self.sync_opened_ns = monotonic_now_ns();
+            }
+            self.sync_bytes = self.sync_bytes.saturating_add(bytes.len() as u64);
+        } else {
+            self.sync_opened_ns = 0;
+            self.sync_bytes = 0;
         }
         responses
     }
@@ -361,19 +559,62 @@ impl VirtualTerminal {
 
     /// Access the current (active) grid.
     pub fn grid(&self) -> &Grid {
-        self.sync_present
+        self.frozen_grid
             .as_ref()
-            .map(|present| &present.grid)
+            .map(|frozen| &frozen.grid)
             .unwrap_or(&self.grid)
+    }
+
+    /// How many lines of history stand behind the presented frame right now.
+    ///
+    /// While a synchronized-output window is open this is the history the pane
+    /// had when the window opened, less anything that has since fallen off the
+    /// front of the scrollback — which is the truth: a line that has been
+    /// evicted is gone from the pane, frozen frame or not.
+    fn presented_history_len(&self) -> usize {
+        let Some(ref frozen) = self.frozen_grid else {
+            return self.grid.scrollback_len();
+        };
+        let dropped = self.grid.evicted().saturating_sub(frozen.evicted);
+        frozen
+            .history_len
+            .saturating_sub(usize::try_from(dropped).unwrap_or(usize::MAX))
+    }
+
+    /// Total lines the PRESENTED frame spans: history plus the frame itself.
+    ///
+    /// Copy mode's coordinate space. Distinct from `grid().total_lines()`,
+    /// which while a window is open describes the frozen VIEWPORT alone —
+    /// history is not part of the frame and is read live (issue #115).
+    pub fn presented_total_lines(&self) -> usize {
+        match self.frozen_grid {
+            Some(ref frozen) => self.presented_history_len() + frozen.grid.total_lines(),
+            None => self.grid.total_lines(),
+        }
+    }
+
+    /// One line of the presented frame by absolute index, counting history
+    /// from 0. The companion to [`VirtualTerminal::presented_total_lines`].
+    pub fn presented_row(&self, abs: usize) -> Option<&Row> {
+        let Some(ref frozen) = self.frozen_grid else {
+            return self.grid.row(abs);
+        };
+        let history = self.presented_history_len();
+        if abs < history {
+            // History lives in the live grid and has shifted by whatever was
+            // evicted since the freeze.
+            let dropped = self.grid.evicted().saturating_sub(frozen.evicted);
+            self.grid
+                .row(abs.saturating_add(usize::try_from(dropped).unwrap_or(0)))
+        } else {
+            frozen.grid.row(abs - history)
+        }
     }
 
     /// Whether the currently presented viewport has changed since the last
     /// dirty drain.
     pub fn is_dirty(&self) -> bool {
-        self.sync_present
-            .as_ref()
-            .map(|present| present.grid.is_dirty())
-            .unwrap_or_else(|| self.grid.is_dirty())
+        self.grid().is_dirty()
     }
 
     /// Consume and clear dirty regions for the currently presented viewport.
@@ -381,19 +622,16 @@ impl VirtualTerminal {
     /// This reports visible grid changes only. Cursor-only movement is outside
     /// this API because renderers draw cursor presentation as an overlay.
     pub fn take_dirty_regions(&mut self) -> Vec<DirtyRegion> {
-        if let Some(ref mut present) = self.sync_present {
-            present.grid.take_dirty_regions()
-        } else {
-            self.grid.take_dirty_regions()
-        }
+        self.frozen_grid
+            .as_mut()
+            .map(|frozen| &mut frozen.grid)
+            .unwrap_or(&mut self.grid)
+            .take_dirty_regions()
     }
 
     /// Access the cursor state.
     pub fn cursor(&self) -> &Cursor {
-        self.sync_present
-            .as_ref()
-            .map(|present| &present.cursor)
-            .unwrap_or(&self.cursor)
+        self.frozen_cursor.as_ref().unwrap_or(&self.cursor)
     }
 
     /// Access terminal modes.
@@ -403,18 +641,19 @@ impl VirtualTerminal {
 
     /// Get the window title (set by OSC 0/2).
     pub fn title(&self) -> Option<&str> {
-        self.sync_present
-            .as_ref()
-            .and_then(|present| present.title.as_deref())
-            .or(self.title.as_deref())
+        // The frozen slot wins even when it is `Some(None)` — a pane that had
+        // no title when `?2026h` opened still has none until `?2026l`. Falling
+        // through to the live title in that case leaked a title set inside the
+        // synchronized window into the frozen frame.
+        match self.frozen_title {
+            Some(ref frozen) => frozen.as_deref(),
+            None => self.title.as_deref(),
+        }
     }
 
     /// Dynamic default foreground/background/cursor set by OSC 10/11/12.
     pub fn default_colors(&self) -> TerminalDefaultColors {
-        self.sync_present
-            .as_ref()
-            .map(|present| present.default_colors)
-            .unwrap_or(self.default_colors)
+        self.frozen_colors.unwrap_or(self.default_colors)
     }
 
     /// Whether alternate screen is active in the PRESENTED frame.
@@ -425,10 +664,7 @@ impl VirtualTerminal {
     /// (glance) can never pair old pixels with a future alt flag (codex P2
     /// review blocker). Live mode state is available via `modes()`.
     pub fn is_alternate_screen(&self) -> bool {
-        self.sync_present
-            .as_ref()
-            .map(|present| present.alternate_screen)
-            .unwrap_or(self.modes.alternate_screen)
+        self.frozen_alt.unwrap_or(self.modes.alternate_screen)
     }
 
     /// Whether a valid OSC 4 palette override has been applied to this VT at
@@ -452,6 +688,26 @@ impl VirtualTerminal {
     /// region, and clamps the cursor position.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let (rows, cols) = clamp_dims(rows, cols);
+        // A resize RELEASES any open synchronized-output window.
+        //
+        // The frame an application asked shux to hold still is a frame drawn
+        // for a geometry that no longer exists. Reflowing it instead is not
+        // just extra work, it is wrong in two ways that adversarial review
+        // found: the frozen frame holds no history to rewrap against, so a
+        // widening resize cannot pull soft-wrapped lines back up the way the
+        // live grid does; and on the ALTERNATE screen the live grid is
+        // canvas-resized rather than reflowed, so reflowing the frozen copy
+        // presented `vim` and `lazygit` content rewrapped in a way the
+        // application never drew (that one predates the lazy freeze).
+        //
+        // Releasing costs one torn frame in a situation where the application
+        // is about to repaint anyway — `SIGWINCH` is on its way — and it is
+        // not an amplification route, because resizes come from the daemon and
+        // no pane can emit one.
+        if (rows != self.rows || cols != self.cols) && self.sync_armed.load(Ordering::Relaxed) {
+            self.force_release_sync();
+            std::mem::take(&mut self.sync_hidden_class_a);
+        }
         // §4.2: "Pane resize" is Class-A. A resize to the SAME dimensions is not
         // a resize event (avoids spurious bumps when the daemon re-fans an
         // unchanged winsize) — compare dims, which is not cell-value diffing.
@@ -504,16 +760,11 @@ impl VirtualTerminal {
                 alt.resize_canvas(rows, cols);
             }
         }
-        if let Some(ref mut present) = self.sync_present
-            && let Some((row, col)) = present.grid.resize_with_cursor(
-                rows,
-                cols,
-                Some((present.cursor.row, present.cursor.col)),
-            )
-        {
-            present.cursor.row = row;
-            present.cursor.col = col;
-        }
+        // No frozen frame can survive to here: a dimension change released it.
+        debug_assert!(
+            self.frozen_grid.is_none() || (rows == self.rows && cols == self.cols),
+            "a synchronized-output window survived a resize"
+        );
         self.rows = rows;
         self.cols = cols;
         self.tab_stops.resize(cols);
@@ -525,8 +776,8 @@ impl VirtualTerminal {
         if let Some(ref mut saved_cursor) = self.alt_cursor {
             saved_cursor.clamp(rows, cols);
         }
-        if let Some(ref mut present) = self.sync_present {
-            present.cursor.clamp(rows, cols);
+        if let Some(ref mut frozen_cursor) = self.frozen_cursor {
+            frozen_cursor.clamp(rows, cols);
         }
         if dims_changed {
             self.record_class_a_batch();
@@ -549,6 +800,7 @@ impl VirtualTerminal {
 
     /// Switch to alternate screen buffer (DECSET 1049).
     pub fn enter_alternate_screen(&mut self) {
+        self.freeze_whole_presentation();
         self.active_grapheme_cell = None;
         if !self.modes.alternate_screen {
             self.screen_swap().enter(true);
@@ -558,6 +810,7 @@ impl VirtualTerminal {
 
     /// Switch back to primary screen buffer (DECRST 1049).
     pub fn leave_alternate_screen(&mut self) {
+        self.freeze_whole_presentation();
         self.active_grapheme_cell = None;
         if self.modes.alternate_screen {
             self.screen_swap().leave(true);
@@ -608,7 +861,7 @@ impl VirtualTerminal {
         for row_idx in start..end {
             let row = grid.visible_row(row_idx);
             let mut line = String::new();
-            for cell in &row.cells {
+            for cell in row.cells.iter() {
                 if cell.is_wide_continuation() {
                     continue;
                 }
@@ -1029,28 +1282,41 @@ mod tests {
         assert_eq!(vt.capture_text(Some(1)).trim_end(), "new");
     }
 
+    /// History stays reachable while a window is open.
+    ///
+    /// Since issue #115 the frozen frame is the VIEWPORT alone — history is
+    /// not part of the frame and is read live, through `presented_row`. This
+    /// is the property that matters (copy mode must still work while `btop`
+    /// redraws), and it is the one a viewport-only snapshot with no
+    /// indirection would have broken.
     #[test]
-    fn synchronized_output_preserves_presented_scrollback() {
+    fn synchronized_output_keeps_presented_scrollback_reachable() {
         let mut vt = VirtualTerminal::new(2, 10);
         vt.process(b"first\r\nsecond\r\nthird");
-        let presented_total = vt.grid().total_lines();
-        let presented_scrollback = vt.grid().scrollback_len();
+        let presented_total = vt.presented_total_lines();
 
         vt.process(b"\x1b[?2026h\x1b[1;1Hpending\r\nwork  ");
 
         assert!(vt.modes().synchronized_output);
-        assert_eq!(vt.grid().total_lines(), presented_total);
-        assert_eq!(vt.grid().scrollback_len(), presented_scrollback);
+        assert_eq!(vt.presented_total_lines(), presented_total);
+        let oldest: String = vt
+            .presented_row(0)
+            .expect("the oldest retained line must still be reachable")
+            .cells
+            .iter()
+            .map(|cell| cell.ch)
+            .collect();
         assert!(
-            vt.grid()
-                .scrollback_row(0)
-                .expect("scrollback row should remain visible")
-                .cells
-                .iter()
-                .map(|cell| cell.ch)
-                .collect::<String>()
-                .contains("first")
+            oldest.contains("first"),
+            "oldest line read back as {oldest:?}"
         );
+        // Every line the presented coordinate space claims must resolve.
+        for line in 0..vt.presented_total_lines() {
+            assert!(
+                vt.presented_row(line).is_some(),
+                "presented line {line} did not resolve"
+            );
+        }
         assert_eq!(vt.capture_text(Some(1)).trim_end(), "third");
 
         vt.process(b"\x1b[?2026l");
@@ -1059,35 +1325,66 @@ mod tests {
         assert_eq!(vt.capture_text(Some(1)).trim_end(), "work");
     }
 
+    /// A resize RELEASES an open window (issue #115): the frame the pane asked
+    /// shux to hold still was drawn for a geometry that no longer exists, and
+    /// `SIGWINCH` means a repaint is on its way regardless.
     #[test]
-    fn synchronized_output_resize_keeps_presented_dimensions_valid() {
+    fn synchronized_output_resize_releases_the_window() {
         let mut vt = VirtualTerminal::new(3, 10);
         vt.process(b"stable\x1b[?2026h\x1b[1;1Hpending");
+        assert_eq!(
+            vt.grid().visible_row(0)[0].ch,
+            's',
+            "frozen before the resize"
+        );
 
         vt.resize(5, 12);
 
+        assert!(
+            !vt.modes().synchronized_output,
+            "the resize must release it"
+        );
+        assert!(!vt.sync_output_active());
         assert_eq!(vt.grid().rows(), 5);
         assert_eq!(vt.grid().cols(), 12);
-        assert_eq!(vt.grid().visible_row(0)[0].ch, 's');
+        assert_eq!(
+            vt.grid().visible_row(0)[0].ch,
+            'p',
+            "live frame is presented"
+        );
 
+        // And a later `?2026l` from the pane, which now arrives with no window
+        // open, is simply inert.
         vt.process(b"\x1b[?2026l");
-
         assert_eq!(vt.grid().rows(), 5);
         assert_eq!(vt.grid().cols(), 12);
         assert_eq!(vt.grid().visible_row(0)[0].ch, 'p');
     }
 
+    /// The frame presented after a resize is indistinguishable from a terminal
+    /// that never opened a window — reflow included. Before, the frozen copy
+    /// was reflowed on its own, which on a widening resize could not rewrap
+    /// against history and on the alternate screen rewrapped a canvas that is
+    /// never reflowed at all.
     #[test]
-    fn synchronized_output_resize_reflows_presented_frame() {
+    fn synchronized_output_resize_presents_what_an_unsynced_terminal_would() {
+        let script = b"ABCDEFGHIJK\x1b[?2026h\x1b[1;1Hpending";
+        let mut reference = VirtualTerminal::new(4, 5);
+        reference.process(b"ABCDEFGHIJK\x1b[1;1Hpending");
+        reference.resize(5, 4);
+
         let mut vt = VirtualTerminal::new(4, 5);
-        vt.process(b"ABCDEFGHIJK");
-        vt.process(b"\x1b[?2026h\x1b[1;1Hpending");
+        vt.process(script);
+        assert_eq!(
+            compact_capture(&vt),
+            "ABCDEFGHIJK",
+            "frozen before the resize"
+        );
 
         vt.resize(5, 4);
 
-        assert!(vt.modes().synchronized_output);
-        assert_eq!(compact_capture(&vt), "ABCDEFGHIJK");
-        vt.process(b"\x1b[?2026l");
+        assert!(!vt.modes().synchronized_output);
+        assert_eq!(compact_capture(&vt), compact_capture(&reference));
         assert!(compact_capture(&vt).starts_with("pending"));
     }
 
@@ -1108,6 +1405,280 @@ mod tests {
         assert_eq!(vt.grid().visible_row(2)[0].ch, 'Y');
         assert_eq!(vt.cursor().row, 2);
         assert_eq!(vt.cursor().col, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #115: the freeze is taken by the first write, not by `?2026h`
+    // -----------------------------------------------------------------
+
+    /// The presented frame must not move while a window is open, whether or
+    /// not a copy has been taken yet — which is the whole claim the deferral
+    /// rests on.
+    #[test]
+    fn sync_window_that_writes_nothing_still_presents_the_same_frame() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"before");
+        let frame = compact_capture(&vt);
+
+        vt.process(b"\x1b[?2026h");
+        assert_eq!(compact_capture(&vt), frame);
+        // Sequences that parse but change nothing presented must not disturb
+        // it either, and must not cause a copy to be taken.
+        vt.process(b"\x1b[6n\x1b[?1000h\x1b[?1000l\x1b[?9999h");
+        assert_eq!(compact_capture(&vt), frame);
+
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(compact_capture(&vt), frame);
+    }
+
+    /// The copy has to be of the frame as it stood at `?2026h`, not as it
+    /// stands when the copy is finally taken. Several writes in a row inside
+    /// one window must all be hidden, not just the ones after the first.
+    #[test]
+    fn every_write_in_a_sync_window_is_hidden_not_just_the_first() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"original");
+
+        vt.process(b"\x1b[?2026h");
+        for text in [
+            "\x1b[1;1Hfirst   ",
+            "\x1b[1;1Hsecond  ",
+            "\x1b[1;1Hthird   ",
+        ] {
+            vt.process(text.as_bytes());
+            assert_eq!(
+                compact_capture(&vt),
+                "original",
+                "the presented frame moved mid-window"
+            );
+        }
+
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(compact_capture(&vt), "third");
+    }
+
+    /// Splitting the sequence across two `process` calls is not exotic: a PTY
+    /// read boundary can fall anywhere. Both the open and the close must
+    /// survive it.
+    #[test]
+    fn sync_mode_survives_an_escape_split_across_reads() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"before");
+
+        vt.process(b"\x1b[?20");
+        vt.process(b"26h");
+        assert!(vt.modes().synchronized_output);
+        vt.process(b"\x1b[1;1Hafter   ");
+        assert_eq!(compact_capture(&vt), "before");
+
+        vt.process(b"\x1b[?2026");
+        vt.process(b"l");
+        assert!(!vt.modes().synchronized_output);
+        assert_eq!(compact_capture(&vt), "after");
+    }
+
+    /// The mode arrives in a parameter LIST as often as alone — `?1049;2026h`
+    /// is one sequence a full-screen application can reasonably emit. Arming
+    /// on an exact byte match would miss it, and freezing on the sequence
+    /// rather than on the write would freeze the wrong frame.
+    #[test]
+    fn sync_mode_arms_and_releases_from_a_combined_parameter_list() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"primary");
+
+        // Alt screen first, then sync: the frozen frame is the alt screen.
+        vt.process(b"\x1b[?1049;2026h");
+        assert!(vt.modes().synchronized_output);
+        assert!(vt.is_alternate_screen());
+        vt.process(b"\x1b[1;1Halt     ");
+        assert_eq!(compact_capture(&vt), "");
+
+        // And the release also comes out of a list.
+        vt.process(b"\x1b[?2026;1l");
+        assert!(!vt.modes().synchronized_output);
+        assert_eq!(compact_capture(&vt), "alt");
+    }
+
+    /// The other order: sync first, then the alt-screen switch happens INSIDE
+    /// the window. The presented frame — pixels and the alt-screen flag alike
+    /// — must stay on the primary screen until release.
+    #[test]
+    fn an_alt_screen_switch_inside_a_sync_window_stays_hidden() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"primary");
+
+        vt.process(b"\x1b[?2026;1049h");
+        assert!(
+            !vt.is_alternate_screen(),
+            "presented alt flag must stay on the frozen frame"
+        );
+        assert_eq!(compact_capture(&vt), "primary");
+        vt.process(b"\x1b[1;1Halt     ");
+        assert_eq!(compact_capture(&vt), "primary");
+
+        vt.process(b"\x1b[?2026l");
+        assert!(vt.is_alternate_screen());
+        assert_eq!(compact_capture(&vt), "alt");
+    }
+
+    /// A window title set inside a window must stay hidden even when the pane
+    /// had NO title at freeze time. The frozen slot has to win over the live
+    /// one on its own account rather than only when it holds a value —
+    /// otherwise "no title yet" reads as "not frozen" and the new title leaks
+    /// straight through.
+    #[test]
+    fn a_title_set_inside_a_sync_window_does_not_leak_when_there_was_none() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        assert_eq!(vt.title(), None);
+
+        vt.process(b"\x1b[?2026h\x1b]2;pending\x07");
+        assert_eq!(
+            vt.title(),
+            None,
+            "a pane with no title at freeze time still has none until release"
+        );
+
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(vt.title(), Some("pending"));
+    }
+
+    /// Replacing a title inside a window is the same rule in the other
+    /// direction. (`OSC 2` with an empty payload sets an empty title rather
+    /// than removing one — that is shux's existing behaviour and not what
+    /// this test is about; what matters is that the change stays hidden.)
+    #[test]
+    fn a_title_replaced_inside_a_sync_window_does_not_leak() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"\x1b]2;stable\x07");
+
+        vt.process(b"\x1b[?2026h\x1b]2;\x07");
+        assert_eq!(vt.title(), Some("stable"));
+
+        vt.process(b"\x1b[?2026l");
+        assert_eq!(vt.title(), Some(""));
+    }
+
+    /// RIS inside a window resets everything, including the mode itself.
+    #[test]
+    fn full_reset_inside_a_sync_window_releases_it() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"before");
+
+        vt.process(b"\x1b[?2026h\x1b[1;1Hafter   \x1bc");
+
+        assert!(!vt.modes().synchronized_output);
+        assert!(!vt.sync_output_active());
+        assert_eq!(compact_capture(&vt), "");
+        vt.process(b"live");
+        assert_eq!(compact_capture(&vt), "live");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #115: a window cannot be held open for ever
+    // -----------------------------------------------------------------
+
+    /// `?2026h` is a promise to send `?2026l`. A pane that breaks it — an
+    /// application killed mid-redraw — must not leave its pane showing one
+    /// frame for ever.
+    #[test]
+    fn a_sync_window_is_released_once_it_outlives_its_deadline() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"before");
+        vt.process(b"\x1b[?2026h\x1b[1;1Hafter   ");
+        assert_eq!(compact_capture(&vt), "before");
+
+        std::thread::sleep(std::time::Duration::from_millis(
+            SYNC_UPDATE_TIMEOUT_MS + 40,
+        ));
+
+        // The next byte of pane output is enough: the deadline is enforced on
+        // the way into every batch.
+        vt.process(b"!");
+        assert!(!vt.modes().synchronized_output);
+        assert!(compact_capture(&vt).starts_with("after"));
+    }
+
+    /// The pane that goes completely silent is the case `process` cannot
+    /// catch, because nothing calls it. The daemon sweeps for it.
+    #[test]
+    fn a_silent_pane_holding_a_sync_window_is_swept() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        vt.process(b"before");
+        vt.process(b"\x1b[?2026h\x1b[1;1Hafter   ");
+
+        assert!(
+            !vt.release_expired_sync(),
+            "a window inside its deadline must not be swept"
+        );
+        assert_eq!(compact_capture(&vt), "before");
+
+        std::thread::sleep(std::time::Duration::from_millis(
+            SYNC_UPDATE_TIMEOUT_MS + 40,
+        ));
+
+        let revision_before = vt.content_revision();
+        assert!(vt.release_expired_sync(), "an expired window must be swept");
+        assert_eq!(compact_capture(&vt), "after");
+        assert!(
+            vt.content_revision() > revision_before,
+            "revealing hidden writes moves the presented frame and must bump the revision"
+        );
+        assert!(
+            !vt.release_expired_sync(),
+            "sweeping twice must not keep reporting a release"
+        );
+    }
+
+    /// A pane can also hold the window open while pouring out output, which
+    /// the clock alone would let it do for as long as it liked if the clock
+    /// were ever read wrong. The byte cap is the independent guard.
+    #[test]
+    fn a_sync_window_is_released_once_it_absorbs_too_much_output() {
+        let mut vt = VirtualTerminal::new(3, 4_000);
+        vt.process(b"before");
+        vt.process(b"\x1b[?2026h");
+
+        // Deliberately well inside the time deadline: this must be the BYTE
+        // cap firing, not the clock. Each chunk is one screen of plain text,
+        // so no chunk is itself unusual.
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut fed = 0u64;
+        while vt.modes().synchronized_output && fed < SYNC_UPDATE_MAX_BYTES * 2 {
+            vt.process(&chunk);
+            fed += chunk.len() as u64;
+        }
+
+        assert!(
+            !vt.modes().synchronized_output,
+            "a window absorbed {fed} bytes without being released; the cap is {SYNC_UPDATE_MAX_BYTES}"
+        );
+        assert!(
+            fed <= SYNC_UPDATE_MAX_BYTES + chunk.len() as u64,
+            "the window absorbed {fed} bytes before releasing, over the {SYNC_UPDATE_MAX_BYTES} cap"
+        );
+    }
+
+    /// The deadline must be per WINDOW, not per pane: a pane that opens and
+    /// closes windows normally for longer than the timeout must never be
+    /// force-released, or every long-lived TUI would tear.
+    #[test]
+    fn the_deadline_resets_with_every_window() {
+        let mut vt = VirtualTerminal::new(3, 10);
+        let deadline = std::time::Duration::from_millis(SYNC_UPDATE_TIMEOUT_MS);
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < deadline * 2 {
+            vt.process(b"\x1b[?2026h");
+            vt.process(b"\x1b[1;1Hframe   ");
+            assert!(
+                vt.modes().synchronized_output,
+                "a window was force-released {} ms into its own life",
+                start.elapsed().as_millis()
+            );
+            vt.process(b"\x1b[?2026l");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(compact_capture(&vt), "frame");
     }
 
     #[test]

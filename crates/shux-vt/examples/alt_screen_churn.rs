@@ -145,13 +145,99 @@ fn main() {
         // Same defect class, different sequence: DEC 2026 synchronized output
         // snapshots the presented frame by cloning the WHOLE grid, scrollback
         // included, so its per-toggle cost scales with retained history rather
-        // than screen size.
+        // than screen size (issue #115).
         {
             let seq = &b"\x1b[?2026h\x1b[?2026l"[..];
             let mut vt = with_scrollback(rows, cols, 5_000);
             vt.process(seq);
             let m = measure(&mut vt, iters / 20, seq);
             report("sync_toggle_2026", rows, cols, iters / 20, seq, m);
+        }
+
+        // The sharp version of the same attack. Deferring the snapshot alone
+        // would leave this one untouched: the interleaved character IS a
+        // change to the presented frame, so it legitimately takes the copy.
+        // What makes it survivable is that the copy itself no longer walks the
+        // scrollback's cells. Reported separately so a regression in EITHER
+        // half of the fix has its own number.
+        {
+            let seq = &b"\x1b[?2026ha\x1b[?2026l"[..];
+            let mut vt = with_scrollback(rows, cols, 5_000);
+            vt.process(seq);
+            let m = measure(&mut vt, iters / 20, seq);
+            report(
+                "sync_toggle_2026_with_write",
+                rows,
+                cols,
+                iters / 20,
+                seq,
+                m,
+            );
+        }
+
+        // Adversarial review, issue #115: a window that SCROLLS the whole
+        // retained history. Every recycled line is a line the frozen frame
+        // still holds, so each one unshares. This is the most expensive thing
+        // a pane can do inside one window, and it is what the per-window
+        // ceiling has to be judged on — not the empty toggle.
+        {
+            let mut seq: Vec<u8> = b"\x1b[?2026h".to_vec();
+            for _ in 0..80 {
+                seq.extend_from_slice(format!("\x1b[{rows}S").as_bytes());
+            }
+            seq.extend_from_slice(b"\x1b[?2026l");
+            let mut vt = with_scrollback(rows, cols, 5_000);
+            vt.process(&seq);
+            let m = measure(&mut vt, iters / 400, &seq);
+            report(
+                "sync_scroll_all_history_2026",
+                rows,
+                cols,
+                iters / 400,
+                &seq,
+                m,
+            );
+        }
+
+        // The same scroll with NO window open: the floor this costs anyway.
+        {
+            let mut seq: Vec<u8> = b"\x1b[?1000h".to_vec();
+            for _ in 0..80 {
+                seq.extend_from_slice(format!("\x1b[{rows}S").as_bytes());
+            }
+            seq.extend_from_slice(b"\x1b[?1000l");
+            let mut vt = with_scrollback(rows, cols, 5_000);
+            vt.process(&seq);
+            let m = measure(&mut vt, iters / 400, &seq);
+            report(
+                "scroll_all_history_no_sync",
+                rows,
+                cols,
+                iters / 400,
+                &seq,
+                m,
+            );
+        }
+
+        // A full-screen clear inside a window: every visible row unshares.
+        {
+            let seq = &b"\x1b[?2026h\x1b[2J\x1b[?2026l"[..];
+            let mut vt = with_scrollback(rows, cols, 5_000);
+            vt.process(seq);
+            let m = measure(&mut vt, iters / 20, seq);
+            report("sync_clear_screen_2026", rows, cols, iters / 20, seq, m);
+        }
+
+        // Sequences that PARSE inside an open synchronized-output window but
+        // change nothing presented. A coarse "any callback re-arms the copy"
+        // hook would pay a full snapshot for each of these; a precise one pays
+        // nothing. Bytes chosen so the window stays open across the whole run.
+        {
+            let seq = &b"\x1b[?2026h\x1b[6n\x1b[?1000h\x1b[?1000l\x1b[?2026l"[..];
+            let mut vt = with_scrollback(rows, cols, 5_000);
+            vt.process(seq);
+            let m = measure(&mut vt, iters / 20, seq);
+            report("sync_inert_traffic_2026", rows, cols, iters / 20, seq, m);
         }
 
         // Baseline for scale: a pane printing one ordinary character.

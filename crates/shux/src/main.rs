@@ -1828,6 +1828,35 @@ async fn run_rpc_server(
                 _ = interval.tick() => {
                     let mut state = timeout_io.lock().await;
                     let _timed_out = state.cmd_engine.check_timeouts();
+                    // Issue #115: a pane that opened a synchronized-output
+                    // window (`CSI ?2026h`) and then went silent — an
+                    // application killed mid-redraw — shows the frame it froze
+                    // and nothing else, for ever. The VT enforces the deadline
+                    // itself on every batch of pane output, which covers every
+                    // pane that is still saying anything; this covers the one
+                    // that is not, because no output means nothing calls
+                    // `process`. Same critical section as the PTY write path,
+                    // so a revealed frame publishes its revision the same way.
+                    let expired: Vec<_> = state
+                        .vts
+                        .iter_mut()
+                        .filter_map(|(pane_id, vt)| {
+                            vt.release_expired_sync().then(|| {
+                                (
+                                    *pane_id,
+                                    PaneRevision {
+                                        content_revision: vt.content_revision(),
+                                        last_mutation_ns: vt.last_mutation_ns(),
+                                    },
+                                )
+                            })
+                        })
+                        .collect();
+                    for (pane_id, rev) in expired {
+                        tracing::debug!(%pane_id, "released a stale synchronized-output window");
+                        state.publish_revision(pane_id, rev);
+                    }
+                    state.render_pulse.notify_waiters();
                 }
                 _ = timeout_cancel.cancelled() => break,
             }
