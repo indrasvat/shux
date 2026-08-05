@@ -139,6 +139,12 @@ pub fn build(snap: &SessionGraphSnapshot, theme: &Theme, ctx: &StatusBarCtx<'_>)
         true,
     ));
     if show_branch && let Some(branch) = ctx.session_meta.git_branch.as_ref() {
+        // A branch name comes from whatever repo the operator cloned, and
+        // `git check-refname-format` only forbids ASCII controls — C1,
+        // U+2028 and the bidi overrides all survive into a ref. The status
+        // bar paints each char straight into a cell on the outer terminal,
+        // so it goes through the shared title rule (issue #104).
+        let branch = shux_core::model::sanitize_title(branch);
         bar.left.push(StatusSegment::styled(
             format!("{icon_branch} {branch} "),
             to_color(theme.status_branch),

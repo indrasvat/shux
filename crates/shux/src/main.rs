@@ -2001,7 +2001,9 @@ fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
         GraphError::EmptySessionName
         | GraphError::SessionNameTooLong(_)
         | GraphError::InvalidSessionName(_) => shux_rpc::RpcError::invalid_params(&e.to_string()),
-        GraphError::EmptyWindowName | GraphError::WindowIndexOutOfRange { .. } => {
+        GraphError::EmptyWindowName
+        | GraphError::WindowNameTooLong(_)
+        | GraphError::WindowIndexOutOfRange { .. } => {
             shux_rpc::RpcError::invalid_params(&e.to_string())
         }
         GraphError::LastWindow | GraphError::LastPane => {
@@ -6916,7 +6918,10 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         "shux rpc call <method> --params @file"
                     ]
                 });
-                println!("{}", serde_json::to_string_pretty(&help)?);
+                println!(
+                    "{}",
+                    style::json_safe(&serde_json::to_string_pretty(&help)?)
+                );
                 return Ok(());
             }
             // Recursion guard. Every pane shux spawns gets `SHUX=1`
@@ -7037,7 +7042,7 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             } => {
                 let ops = template::load_and_lower(&template)?;
                 if dry_run {
-                    println!("{}", serde_json::to_string_pretty(&ops)?);
+                    println!("{}", style::json_safe(&serde_json::to_string_pretty(&ops)?));
                     Ok(())
                 } else {
                     let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
@@ -7678,15 +7683,27 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             let ops = match template::load_and_lower(&template) {
                 Ok(ops) => ops,
                 Err(e) => {
-                    eprintln!("{} {e}", style::error("✗ template error:"));
+                    // The TOML diagnostic quotes the offending source
+                    // line verbatim; this runs before the daemon exists,
+                    // so ingress sanitizing cannot reach it (issue #104).
+                    eprintln!(
+                        "{} {}",
+                        style::error("✗ template error:"),
+                        style::safe_diagnostic(&e.to_string())
+                    );
                     std::process::exit(1);
                 }
             };
 
             if dry_run {
+                // `--dry-run` prints the ops BEFORE the graph sanitizes
+                // them — it is the one place a hostile title is meant to
+                // be shown verbatim, so it must be shown inertly.
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({"ops": ops}))?
+                    style::json_safe(&serde_json::to_string_pretty(
+                        &serde_json::json!({"ops": ops})
+                    )?)
                 );
                 return Ok(());
             }

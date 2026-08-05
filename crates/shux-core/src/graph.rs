@@ -18,6 +18,13 @@ use crate::layout::{Direction, NavDirection, Rect};
 use crate::model::*;
 
 /// Errors that can occur during graph mutations.
+///
+/// Variants that carry attacker-controllable free text render it through
+/// [`str::escape_debug`]. These fire on input the graph **rejected**, so the
+/// value never met [`crate::model::sanitize_title`] or the session-name
+/// allowlist — yet the message is printed straight to the operator's
+/// terminal by the CLI. Escaping keeps the payload visible (the operator
+/// still learns what the template asked for) and inert (issue #104).
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum GraphError {
     #[error("session not found: {0}")]
@@ -29,16 +36,16 @@ pub enum GraphError {
     #[error("pane not found: {0}")]
     PaneNotFound(PaneId),
 
-    #[error("session name already exists: {0}")]
+    #[error("session name already exists: {}", .0.escape_debug())]
     SessionNameExists(String),
 
     #[error("session name is empty")]
     EmptySessionName,
 
-    #[error("session name too long (max 128 characters): {0}")]
+    #[error("session name too long (max 128 characters): {}", .0.escape_debug())]
     SessionNameTooLong(String),
 
-    #[error("session name contains invalid characters: {0}")]
+    #[error("session name contains invalid characters: {}", .0.escape_debug())]
     InvalidSessionName(String),
 
     #[error("version conflict on {resource} {id}: expected {expected}, found {actual}")]
@@ -55,11 +62,14 @@ pub enum GraphError {
     #[error("cannot remove last pane from window")]
     LastPane,
 
-    #[error("window name already exists in session: {0}")]
+    #[error("window name already exists in session: {}", .0.escape_debug())]
     WindowNameConflict(String),
 
     #[error("window name is empty")]
     EmptyWindowName,
+
+    #[error("window name too long (max 128 characters): {}", .0.escape_debug())]
+    WindowNameTooLong(String),
 
     #[error("window index {index} out of range (session has {count} windows)")]
     WindowIndexOutOfRange { index: usize, count: usize },
@@ -119,9 +129,17 @@ impl SessionGraphSnapshot {
         self.sessions.values().any(|s| s.name == name)
     }
 
-    /// Find a window by name within a specific session.
+    /// Find a window by title within a specific session.
+    ///
+    /// The query is normalized with [`crate::model::sanitize_title`], the
+    /// same rule that normalized the stored titles. Lookup and storage have
+    /// to agree: `window.ensure` is idempotent *by name*, so if a caller
+    /// passes the raw title from a template while the graph holds the
+    /// sanitized form, every `ensure` would miss and stack up another
+    /// window with an identical displayed title (issue #104).
     pub fn find_window_by_name(&self, session_id: &SessionId, name: &str) -> Option<&Window> {
         let session = self.sessions.get(session_id)?;
+        let name = crate::model::sanitize_title(name);
         session
             .windows
             .iter()
@@ -505,7 +523,11 @@ impl SessionGraph {
         if name.is_empty() {
             return Err(GraphError::EmptySessionName);
         }
-        if name.len() > 128 {
+        // Count CHARACTERS, not bytes — the message promises characters,
+        // and `is_alphanumeric()` below admits non-ASCII scripts, so a
+        // 100-character Japanese name is 300 bytes and used to be refused
+        // by a limit that claimed it had room.
+        if name.chars().count() > 128 {
             return Err(GraphError::SessionNameTooLong(name.to_string()));
         }
         if !name
@@ -515,6 +537,49 @@ impl SessionGraph {
             return Err(GraphError::InvalidSessionName(name.to_string()));
         }
         Ok(())
+    }
+
+    /// Longest window title the graph will store. A window title is a
+    /// **lookup key**, so unlike a pane title it is bounded by rejection
+    /// rather than by truncation — see below. Matches the session-name
+    /// bound for consistency.
+    pub const MAX_WINDOW_TITLE_CHARS: usize = 128;
+
+    /// Normalize a window title at ingress: **sanitize, then validate**.
+    ///
+    /// Order is load-bearing (issue #104). A title made entirely of control
+    /// bytes — `"\u{1b}\u{7}"` — is non-empty as a raw string, so validating
+    /// first would wave it through and store the escape sequence. Stripping
+    /// first collapses it to `""`, which the existing [`GraphError::
+    /// EmptyWindowName`] check then rejects.
+    ///
+    /// Strip rather than reject the hostile *characters*, matching what
+    /// pane titles do ([`crate::model::sanitize_title`]): input that works
+    /// today keeps working, and the two entity kinds stay on one rule.
+    ///
+    /// **Length is the one place windows deliberately diverge from panes.**
+    /// A pane title is pure chrome, so it is clamped. A window title is
+    /// also a lookup key — `window.ensure` is idempotent *by name* and
+    /// `shux window … -w <name>` selects by it — and truncating a lookup
+    /// key is not cosmetic: two distinct requested names that differ only
+    /// past the cut collapse onto one stored value, so `ensure` hands back
+    /// the wrong window and a rename mutates the wrong window, silently.
+    /// Over-long titles are therefore **rejected**, loudly, the way
+    /// over-long session names already are.
+    ///
+    /// Every window-title ingress goes through here — `create_window`,
+    /// `rename_window`, and the staged `state.apply` paths — so the value
+    /// that lands in the graph is also the value used for conflict
+    /// detection and published in the lifecycle event.
+    pub(crate) fn validate_window_title(raw: &str) -> Result<String, GraphError> {
+        let cleaned = crate::model::sanitize_title(raw);
+        if cleaned.is_empty() {
+            return Err(GraphError::EmptyWindowName);
+        }
+        if cleaned.chars().count() > Self::MAX_WINDOW_TITLE_CHARS {
+            return Err(GraphError::WindowNameTooLong(cleaned));
+        }
+        Ok(cleaned)
     }
 
     /// Convenience wrapper for `create_session_with_command(name, cwd, vec![])`.
@@ -733,6 +798,8 @@ impl SessionGraph {
         title: String,
         cwd: std::path::PathBuf,
     ) -> Result<WindowId, GraphError> {
+        let title = Self::validate_window_title(&title)?;
+
         let current = self.current();
 
         if !current.sessions.contains_key(&session_id) {
@@ -874,9 +941,9 @@ impl SessionGraph {
         new_title: String,
         expected_version: Option<Version>,
     ) -> Result<(), GraphError> {
-        if new_title.is_empty() {
-            return Err(GraphError::EmptyWindowName);
-        }
+        // Sanitize BEFORE the empty check, or a title made entirely of
+        // control bytes passes `is_empty()` and lands raw (issue #104).
+        let new_title = Self::validate_window_title(&new_title)?;
 
         let current = self.current();
 
@@ -1779,7 +1846,18 @@ fn stage_create_session(
     };
     pane.id = pane_id;
 
-    let title = initial_window_title.unwrap_or_else(|| "1".to_string());
+    // A template supplies this title (`[[windows]][0].title`), so it is as
+    // untrusted as any other window title — sanitize then validate.
+    //
+    // `None` and `Some("")` both mean "unspecified": `title` is a required
+    // TOML field, so a template that has nothing to say writes `""`, and
+    // that used to apply cleanly. Both take the default. A title that had
+    // real content and sanitized away to nothing is a different story —
+    // that is the attack case, and it is rejected.
+    let title = match initial_window_title {
+        Some(raw) if !raw.is_empty() => SessionGraph::validate_window_title(&raw)?,
+        _ => "1".to_string(),
+    };
     let mut window = Window::new(SessionId::new(), &title, pane_id);
     window.id = window_id;
 
@@ -1825,9 +1903,8 @@ fn stage_create_window(
     if !snapshot.sessions.contains_key(&session_id) {
         return Err(GraphError::SessionNotFound(session_id));
     }
-    if title.is_empty() {
-        return Err(GraphError::EmptyWindowName);
-    }
+    // Sanitize then validate — see `SessionGraph::validate_window_title`.
+    let title = SessionGraph::validate_window_title(&title)?;
     snapshot.version += 1;
 
     let pane_id = PaneId::new();
@@ -3147,6 +3224,365 @@ mod tests {
 
         let err = graph.rename_window(wid, "".into(), None).unwrap_err();
         assert!(matches!(err, GraphError::EmptyWindowName));
+    }
+
+    // ── issue #104: window titles must go through the shared sanitizer ──
+
+    /// A hostile title the operator would otherwise see executed.
+    const OSC_PAYLOAD: &str = "\u{1b}]0;PWNED\u{7}deploy";
+    /// What `sanitize_title` leaves of it: the control bytes are gone, the
+    /// printable OSC syntax is inert text.
+    const OSC_SANITIZED: &str = "]0;PWNEDdeploy";
+
+    fn assert_inert(label: &str, s: &str) {
+        assert!(
+            !s.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
+            "{label} carries a hostile character: {s:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_window_sanitizes_title() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph
+            .create_window(sid, OSC_PAYLOAD.into(), home())
+            .unwrap();
+        let snap = state.load();
+        assert_eq!(snap.windows[&wid].title, OSC_SANITIZED);
+        assert_inert("create_window stored title", &snap.windows[&wid].title);
+    }
+
+    #[test]
+    fn test_create_window_rejects_control_only_title() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        // Sanitizes to "" — must be rejected, not stored as garbage.
+        let err = graph
+            .create_window(sid, "\u{1b}\u{7}".into(), home())
+            .unwrap_err();
+        assert!(matches!(err, GraphError::EmptyWindowName), "{err:?}");
+    }
+
+    #[test]
+    fn test_create_window_rejects_empty_title() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let err = graph.create_window(sid, String::new(), home()).unwrap_err();
+        assert!(matches!(err, GraphError::EmptyWindowName), "{err:?}");
+    }
+
+    /// Drain up to `n` published events into their JSON payloads. Events are
+    /// what `events.watch` ships to every subscriber — a hostile title has to
+    /// be inert there too, not just in the stored graph.
+    async fn drain_event_json(
+        sub: &mut crate::bus::Subscription,
+        n: usize,
+    ) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await {
+                Ok(Some(crate::bus::SubscriptionEvent::Event(e))) => {
+                    out.push(serde_json::to_value(&e).expect("event serializes"));
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_window_events_carry_sanitized_titles() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph
+            .create_window(sid, OSC_PAYLOAD.into(), home())
+            .unwrap();
+        graph
+            .rename_window(wid, "\u{1b}]0;RENAMED\u{7}build".into(), None)
+            .unwrap();
+
+        let events = drain_event_json(&mut sub, 16).await;
+        // `create_session` fires a WindowCreated for its own default window
+        // too — select ours by id.
+        let wid_s = wid.to_string();
+        let created: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e["data"]["type"] == "WindowCreated" && e["data"]["data"]["window_id"] == wid_s
+            })
+            .collect();
+        let renamed: Vec<_> = events
+            .iter()
+            .filter(|e| e["data"]["type"] == "WindowRenamed")
+            .collect();
+        assert_eq!(created.len(), 1, "events: {events:#?}");
+        assert_eq!(renamed.len(), 1, "events: {events:#?}");
+        assert_eq!(created[0]["data"]["data"]["title"], OSC_SANITIZED);
+        assert_eq!(renamed[0]["data"]["data"]["old_title"], OSC_SANITIZED);
+        assert_eq!(renamed[0]["data"]["data"]["new_title"], "]0;RENAMEDbuild");
+
+        for e in &events {
+            assert_inert("published event payload", &e.to_string());
+        }
+    }
+
+    #[test]
+    fn test_rename_window_sanitizes_title() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph.create_window(sid, "old".into(), home()).unwrap();
+        graph.rename_window(wid, OSC_PAYLOAD.into(), None).unwrap();
+        let snap = state.load();
+        assert_eq!(snap.windows[&wid].title, OSC_SANITIZED);
+        assert_inert("rename_window stored title", &snap.windows[&wid].title);
+    }
+
+    /// The ordering the issue calls out: strip FIRST, then run the existing
+    /// empty check. Checking emptiness on the raw string lets a title made
+    /// entirely of control bytes through as "non-empty".
+    #[test]
+    fn test_rename_window_rejects_title_that_sanitizes_to_empty() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph.create_window(sid, "keepme".into(), home()).unwrap();
+
+        for hostile in ["\u{1b}\u{7}", "\u{9b}", "\u{202e}\u{2028}", "   \t  "] {
+            let err = graph.rename_window(wid, hostile.into(), None).unwrap_err();
+            assert!(
+                matches!(err, GraphError::EmptyWindowName),
+                "{hostile:?} → {err:?}"
+            );
+        }
+        assert_eq!(
+            state.load().windows[&wid].title,
+            "keepme",
+            "a rejected rename must not mutate the window"
+        );
+    }
+
+    /// Conflict detection has to compare the value that will actually be
+    /// stored, or two windows end up with the same displayed title.
+    #[test]
+    fn test_rename_window_conflict_uses_sanitized_title() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        graph.create_window(sid, "deploy".into(), home()).unwrap();
+        let w2 = graph.create_window(sid, "other".into(), home()).unwrap();
+
+        // "\u{1b}deploy" sanitizes to "deploy", which is taken.
+        let err = graph
+            .rename_window(w2, "\u{1b}deploy".into(), None)
+            .unwrap_err();
+        assert!(matches!(err, GraphError::WindowNameConflict(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_apply_batch_create_window_sanitizes_title() {
+        use crate::apply::{Op, SessionRef};
+        let (graph, state) = SessionGraph::new();
+        let res = graph
+            .apply_batch(vec![
+                Op::CreateSession {
+                    name: Some("tpl".into()),
+                    cwd: home(),
+                    initial_command: vec![],
+                    initial_window_title: Some(OSC_PAYLOAD.into()),
+                },
+                Op::CreateWindow {
+                    session: SessionRef::BackRef { op_index: 0 },
+                    title: "\u{1b}]0;SECOND\u{7}build".into(),
+                    cwd: Some(home()),
+                    initial_command: vec![],
+                },
+            ])
+            .unwrap();
+        assert_eq!(res.outputs.len(), 2);
+
+        let snap = state.load();
+        let mut titles: Vec<_> = snap.windows.values().map(|w| w.title.clone()).collect();
+        titles.sort();
+        assert_eq!(titles, vec!["]0;PWNEDdeploy", "]0;SECONDbuild"]);
+        for t in &titles {
+            assert_inert("apply_batch stored title", t);
+        }
+    }
+
+    #[test]
+    fn test_apply_batch_rejects_window_title_that_sanitizes_to_empty() {
+        use crate::apply::{Op, SessionRef};
+        let (graph, state) = SessionGraph::new();
+
+        let err = graph
+            .apply_batch(vec![Op::CreateSession {
+                name: Some("tpl".into()),
+                cwd: home(),
+                initial_command: vec![],
+                initial_window_title: Some("\u{1b}\u{7}".into()),
+            }])
+            .unwrap_err();
+        assert!(format!("{err}").contains("window name is empty"), "{err}");
+
+        let err = graph
+            .apply_batch(vec![
+                Op::CreateSession {
+                    name: Some("tpl2".into()),
+                    cwd: home(),
+                    initial_command: vec![],
+                    initial_window_title: None,
+                },
+                Op::CreateWindow {
+                    session: SessionRef::BackRef { op_index: 0 },
+                    title: "\u{9b}".into(),
+                    cwd: Some(home()),
+                    initial_command: vec![],
+                },
+            ])
+            .unwrap_err();
+        assert!(format!("{err}").contains("window name is empty"), "{err}");
+
+        // Batches are atomic — neither partial session may survive.
+        assert!(
+            state.load().sessions.is_empty(),
+            "batch was not rolled back"
+        );
+    }
+
+    /// A window title is a **lookup key** (`window.ensure` is idempotent
+    /// by name, `-w <name>` selects by it), so it must never be silently
+    /// truncated: two distinct requested names that differ only past the
+    /// cut would collapse onto one stored value, and `ensure` would hand
+    /// back the wrong window. Distinct long titles stay distinct.
+    #[test]
+    fn test_long_window_titles_stay_distinct() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let alpha = format!("{}-alpha", "A".repeat(100));
+        let beta = format!("{}-beta", "A".repeat(100));
+
+        let w1 = graph.create_window(sid, alpha.clone(), home()).unwrap();
+        let w2 = graph.create_window(sid, beta.clone(), home()).unwrap();
+        assert_ne!(w1, w2);
+
+        let snap = state.load();
+        assert_eq!(snap.windows[&w1].title, alpha);
+        assert_eq!(snap.windows[&w2].title, beta);
+        // …and each name resolves to its own window.
+        assert_eq!(
+            snap.find_window_by_name(&sid, &alpha).map(|w| w.id),
+            Some(w1)
+        );
+        assert_eq!(
+            snap.find_window_by_name(&sid, &beta).map(|w| w.id),
+            Some(w2)
+        );
+    }
+
+    /// Bounded by rejection rather than by truncation. Loud beats silent
+    /// when the value is a lookup key.
+    #[test]
+    fn test_window_title_over_the_bound_is_rejected() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let max = SessionGraph::MAX_WINDOW_TITLE_CHARS;
+
+        // Exactly at the bound is fine.
+        graph.create_window(sid, "o".repeat(max), home()).unwrap();
+        // One over is not.
+        let err = graph
+            .create_window(sid, "o".repeat(max + 1), home())
+            .unwrap_err();
+        assert!(matches!(err, GraphError::WindowNameTooLong(_)), "{err:?}");
+        // The rejection message escapes any payload it quotes.
+        let err = graph
+            .create_window(sid, format!("\u{1b}{}", "o".repeat(max + 1)), home())
+            .unwrap_err();
+        assert_inert("WindowNameTooLong display", &err.to_string());
+    }
+
+    /// `title` is a required TOML field, so a template with nothing to say
+    /// writes `""` — and that used to apply cleanly. It still does: an
+    /// absent-or-blank title takes the default. A title that had content
+    /// and sanitized away to nothing is the attack case, and is rejected.
+    #[test]
+    fn test_apply_batch_blank_initial_window_title_falls_back_to_default() {
+        use crate::apply::Op;
+        let (graph, state) = SessionGraph::new();
+        graph
+            .apply_batch(vec![Op::CreateSession {
+                name: Some("blank".into()),
+                cwd: home(),
+                initial_command: vec![],
+                initial_window_title: Some(String::new()),
+            }])
+            .unwrap();
+        let snap = state.load();
+        assert_eq!(snap.windows.values().next().unwrap().title, "1");
+    }
+
+    /// The bound is in characters, matching what the error message says.
+    #[test]
+    fn test_session_name_length_is_measured_in_characters() {
+        let (graph, _state) = SessionGraph::new();
+        // 128 multi-byte characters = 384 bytes, but 128 characters.
+        let name: String = "\u{65e5}".repeat(128);
+        graph.create_session(name, home()).unwrap();
+
+        let (graph2, _state2) = SessionGraph::new();
+        let over: String = "\u{65e5}".repeat(129);
+        let err = graph2.create_session(over, home()).unwrap_err();
+        assert!(matches!(err, GraphError::SessionNameTooLong(_)), "{err:?}");
+    }
+
+    /// Lookup normalizes the same way storage does — otherwise
+    /// `window.ensure`, which is idempotent *by name*, misses its own
+    /// window and stacks up duplicates with identical displayed titles.
+    #[test]
+    fn test_find_window_by_name_normalizes_the_query() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph
+            .create_window(sid, OSC_PAYLOAD.into(), home())
+            .unwrap();
+
+        let snap = state.load();
+        // By the raw name a template/script would carry…
+        assert_eq!(
+            snap.find_window_by_name(&sid, OSC_PAYLOAD).map(|w| w.id),
+            Some(wid)
+        );
+        // …and by the sanitized name the operator actually sees.
+        assert_eq!(
+            snap.find_window_by_name(&sid, OSC_SANITIZED).map(|w| w.id),
+            Some(wid)
+        );
+        assert!(snap.window_name_exists_in_session(&sid, OSC_PAYLOAD));
+        // A genuinely different name still misses.
+        assert!(snap.find_window_by_name(&sid, "nope").is_none());
+    }
+
+    /// Rejected input never reaches a sanitizer, so the rejection message
+    /// itself has to be inert before it is printed to the operator.
+    #[test]
+    fn test_graph_error_display_escapes_hostile_names() {
+        let cases = [
+            GraphError::InvalidSessionName(OSC_PAYLOAD.into()),
+            GraphError::SessionNameTooLong(OSC_PAYLOAD.into()),
+            GraphError::SessionNameExists(OSC_PAYLOAD.into()),
+            GraphError::WindowNameConflict(OSC_PAYLOAD.into()),
+        ];
+        for err in cases {
+            let msg = err.to_string();
+            assert_inert("GraphError display", &msg);
+            assert!(
+                msg.contains("\\u{1b}"),
+                "payload should be visible-but-escaped: {msg:?}"
+            );
+        }
     }
 
     #[test]
