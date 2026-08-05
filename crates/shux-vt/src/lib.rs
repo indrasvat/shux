@@ -14,6 +14,7 @@ mod gate;
 mod gate_compare;
 mod grid;
 mod parser;
+mod screen;
 mod settle;
 mod tabstops;
 
@@ -73,6 +74,11 @@ pub struct VirtualTerminal {
     grid: Grid,
     /// Alternate screen grid (for fullscreen apps like vim).
     alt_grid: Option<Grid>,
+    /// The retired alternate-screen buffer, held for the next entry so that
+    /// toggling the alternate screen stops costing a full grid allocation per
+    /// eight-byte escape sequence (issue #106). At most one, ever: this is a
+    /// slot, not a cache.
+    alt_spare: Option<Grid>,
     /// Current cursor state.
     cursor: Cursor,
     /// Saved cursor for alternate screen.
@@ -123,6 +129,9 @@ pub struct VirtualTerminal {
     /// `palette_unportable` diagnostic (task 078, R1). Deliberately NOT part of
     /// the content-revision accounting.
     palette_overridden: bool,
+    /// Whether retired screen buffers may be recycled. Always `true` outside
+    /// the differential tests — see [`VirtualTerminal::set_retired_grid_reuse`].
+    reuse_retired_grids: bool,
 }
 
 /// Process-monotonic nanoseconds since the first VT was created. Used for
@@ -171,6 +180,7 @@ impl VirtualTerminal {
         VirtualTerminal {
             grid: Grid::new(rows, cols, config),
             alt_grid: None,
+            alt_spare: None,
             cursor: Cursor::new(),
             alt_cursor: None,
             modes: TerminalModes::default(),
@@ -194,6 +204,23 @@ impl VirtualTerminal {
             last_mutation_ns: monotonic_now_ns(),
             sync_hidden_class_a: false,
             palette_overridden: false,
+            reuse_retired_grids: true,
+        }
+    }
+
+    /// Turn retired-buffer recycling (issue #106) off or on.
+    ///
+    /// Recycling is required to be UNOBSERVABLE: a terminal that reuses its
+    /// retired alternate-screen buffer must behave identically to one that
+    /// allocates a fresh buffer every time. That is a property, not a hope, so
+    /// the differential tests drive the same byte stream through two terminals
+    /// — one with this off, one with it on — and compare every observable.
+    /// This exists for that oracle. Production never calls it.
+    #[doc(hidden)]
+    pub fn set_retired_grid_reuse(&mut self, enabled: bool) {
+        self.reuse_retired_grids = enabled;
+        if !enabled {
+            self.alt_spare = None;
         }
     }
 
@@ -256,6 +283,8 @@ impl VirtualTerminal {
             tab_stops: &mut self.tab_stops,
             responses: &mut responses,
             palette_overridden: &mut self.palette_overridden,
+            alt_spare: &mut self.alt_spare,
+            reuse_retired_grids: self.reuse_retired_grids,
         };
         self.parser.advance(&mut handler, bytes);
 
@@ -428,6 +457,13 @@ impl VirtualTerminal {
         // unchanged winsize) — compare dims, which is not cell-value diffing.
         let dims_changed = rows != self.rows || cols != self.cols;
         self.active_grapheme_cell = None;
+        // A retired alternate-screen buffer is sized for the geometry it was
+        // retired at. Rather than reason about a stale one surviving a reflow,
+        // drop it: resizes come from the daemon, never from pane output, so
+        // nothing a pane emits can turn this into churn.
+        if dims_changed {
+            self.alt_spare = None;
+        }
         if self.modes.alternate_screen {
             self.grid.resize_canvas(rows, cols);
             // The stashed primary grid is resized whether or not a saved
@@ -497,19 +533,25 @@ impl VirtualTerminal {
         }
     }
 
+    /// Borrow everything the alternate-screen swap needs. Shares one
+    /// definition with the parser's `DECSET 1047/1049` and `RIS` paths, so a
+    /// buffer retired through one route is reused by the other.
+    fn screen_swap(&mut self) -> screen::ScreenSwap<'_> {
+        screen::ScreenSwap {
+            grid: &mut self.grid,
+            cursor: &mut self.cursor,
+            stashed_grid: &mut self.alt_grid,
+            stashed_cursor: &mut self.alt_cursor,
+            spare: &mut self.alt_spare,
+            reuse: self.reuse_retired_grids,
+        }
+    }
+
     /// Switch to alternate screen buffer (DECSET 1049).
     pub fn enter_alternate_screen(&mut self) {
         self.active_grapheme_cell = None;
         if !self.modes.alternate_screen {
-            let config = GridConfig {
-                max_scrollback: 0,
-                ..GridConfig::default()
-            }; // No scrollback on alt screen.
-            let mut alt_grid = Grid::new(self.rows, self.cols, config);
-            alt_grid.mark_all_dirty();
-            let alt_cursor = Cursor::new();
-            self.alt_grid = Some(std::mem::replace(&mut self.grid, alt_grid));
-            self.alt_cursor = Some(std::mem::replace(&mut self.cursor, alt_cursor));
+            self.screen_swap().enter(true);
             self.modes.alternate_screen = true;
         }
     }
@@ -518,13 +560,7 @@ impl VirtualTerminal {
     pub fn leave_alternate_screen(&mut self) {
         self.active_grapheme_cell = None;
         if self.modes.alternate_screen {
-            if let Some(primary_grid) = self.alt_grid.take() {
-                self.grid = primary_grid;
-                self.grid.mark_all_dirty();
-            }
-            if let Some(primary_cursor) = self.alt_cursor.take() {
-                self.cursor = primary_cursor;
-            }
+            self.screen_swap().leave(true);
             self.modes.alternate_screen = false;
         }
     }
