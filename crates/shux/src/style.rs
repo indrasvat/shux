@@ -958,7 +958,11 @@ pub fn print_version(version: &str, git_sha: Option<&str>, daemon_status: Option
 pub fn print_success(action: &str, subject: &str, id: Option<&str>) {
     let mut out = io::stdout().lock();
     let _ = write!(out, "{} ", success("\u{2713}")); // ✓
-    let _ = write!(out, "{action} {}", bold(subject));
+    // Guard here, not only in the callers: this is the funnel every
+    // confirmation goes through, so the invariant holds for future callers
+    // too. `safe_label` is idempotent, so the wrappers that already escape
+    // their name or title are unaffected (issue #104).
+    let _ = write!(out, "{action} {}", bold(safe_label(subject)));
     if let Some(id) = id {
         let _ = write!(out, "  {}", muted(short_id(id)));
     }
@@ -1528,6 +1532,23 @@ mod tests {
     fn test_json_safe_is_identity_for_clean_documents() {
         let doc = serde_json::to_string_pretty(&serde_json::json!({"a": "plain", "b": 1})).unwrap();
         assert_eq!(json_safe(&doc), doc);
+    }
+
+    /// The egress guard is applied at the funnel as well as at the
+    /// wrappers, so it has to be idempotent or the double application
+    /// would mangle an already-escaped payload.
+    #[test]
+    fn test_safe_label_is_idempotent() {
+        for s in [
+            "\u{1b}]0;PWNED\u{7}deploy",
+            "plain",
+            "\u{202e}spoof",
+            "a\u{9b}b",
+            "",
+        ] {
+            let once = safe_label(s);
+            assert_eq!(safe_label(&once), once, "not a fixed point: {s:?}");
+        }
     }
 
     #[test]
