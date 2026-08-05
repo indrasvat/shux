@@ -1,3 +1,10 @@
+## [0.46.6](https://github.com/indrasvat/shux/compare/v0.46.5...v0.46.6) (2026-08-05)
+
+
+### Bug Fixes
+
+* **vt:** alternate-screen switching allocated a whole grid per toggle ([#106](https://github.com/indrasvat/shux/issues/106)) ([#116](https://github.com/indrasvat/shux/issues/116)) ([daab8a4](https://github.com/indrasvat/shux/commit/daab8a4271faf5f2b15b54308ea093b609fd019b))
+
 ## [0.46.5](https://github.com/indrasvat/shux/compare/v0.46.4...v0.46.5) (2026-08-05)
 
 
