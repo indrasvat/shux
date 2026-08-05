@@ -601,6 +601,17 @@ palette, restore the deliberate table/summary divergence).
   the differential oracle written for this change. A safety argument of the form "X is the
   only way to do Y" needs a test that reintroduces a violation of it, per path, in a
   sandbox. `crates/shux-vt/tests/cow_aliasing_adversarial.rs` now walks 27 write paths.
+- **The differential oracle could not see this one, because both arms shared it.** The
+  viewport-only freeze reads history out of the live grid at a shifted index, and the shift
+  went the wrong way: eviction removes lines from the FRONT, so survivors slide down to
+  meet index 0 rather than the index sliding up to meet them. Adding the eviction count
+  instead walked past the survivors into the live viewport, so content written *after* the
+  freeze appeared inside the frame that exists to hide it. Both arms of the proptest call
+  the same accessor, so 800 generated programs stayed green; it took an absolute assertion
+  on real content under partial eviction. A differential proves an optimisation is
+  unobservable. It is not a correctness test for the shared path, and the shared path is
+  exactly where a refactor puts its new arithmetic.
+
 - **Read the other implementations before designing.** Alacritty had already tried the
   snapshot-on-`?2026h` design and abandoned it, and their commit says why in one line
   ("this can happen thousands of times per frame"). They also carry two liveness bounds

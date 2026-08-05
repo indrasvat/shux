@@ -601,11 +601,13 @@ impl VirtualTerminal {
         };
         let history = self.presented_history_len();
         if abs < history {
-            // History lives in the live grid and has shifted by whatever was
-            // evicted since the freeze.
-            let dropped = self.grid.evicted().saturating_sub(frozen.evicted);
-            self.grid
-                .row(abs.saturating_add(usize::try_from(dropped).unwrap_or(0)))
+            // History lives in the live grid, and eviction removes lines from
+            // its FRONT — so the surviving lines slide DOWN to meet index 0
+            // rather than the index needing to slide up to meet them. Adding
+            // the eviction count here instead walks straight past the survivors
+            // and into the live viewport, putting content written after the
+            // freeze inside the frame that exists to hide it.
+            self.grid.row(abs)
         } else {
             frozen.grid.row(abs - history)
         }
@@ -1679,6 +1681,75 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(compact_capture(&vt), "frame");
+    }
+
+    /// History behind a frozen frame is read out of the LIVE grid, so its
+    /// indices move as lines fall off the front of the scrollback.
+    ///
+    /// Getting the shift backwards does not just reorder history — it walks
+    /// the index PAST the surviving lines and into the live viewport, so the
+    /// content the frozen frame exists to hide appears above it. This pins the
+    /// mapping with real content: the surviving lines, in order, and nothing
+    /// written after the freeze.
+    #[test]
+    fn presented_history_survives_partial_eviction_without_leaking_live_content() {
+        let cfg = GridConfig {
+            max_scrollback: 8,
+            track_dirty: true,
+        };
+        let mut vt = VirtualTerminal::with_config(2, 12, cfg);
+        for i in 0..20 {
+            vt.process(format!("line-{i:03}\r\n").as_bytes());
+        }
+
+        vt.process(b"\x1b[?2026h");
+        vt.process(b"\x1b[1;1Hx"); // force the freeze
+
+        // Enough scrolling to evict SOME of the history the freeze spans, not
+        // all of it: partial eviction is where the index shift shows.
+        for i in 0..4 {
+            vt.process(format!("post-{i:03}\r\n").as_bytes());
+        }
+
+        let lines: Vec<String> = (0..vt.presented_total_lines())
+            .map(|i| {
+                vt.presented_row(i)
+                    .map(|row| {
+                        (0..row.len())
+                            .map(|c| row[c].ch)
+                            .collect::<String>()
+                            .trim_end()
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "<missing>".into())
+            })
+            .collect();
+
+        assert!(
+            !lines.iter().any(|l| l == "<missing>"),
+            "presented span claims lines it cannot resolve: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("post-")),
+            "content written after the freeze leaked into the presented frame: {lines:?}"
+        );
+
+        let numbers: Vec<usize> = lines
+            .iter()
+            .filter(|l| l.starts_with("line-"))
+            .filter_map(|l| l.trim_start_matches("line-").parse().ok())
+            .collect();
+        assert!(
+            numbers.len() >= 2,
+            "expected surviving original history, got {lines:?}"
+        );
+        for pair in numbers.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "presented history skipped a line: {numbers:?} (full span {lines:?})"
+            );
+        }
     }
 
     #[test]
