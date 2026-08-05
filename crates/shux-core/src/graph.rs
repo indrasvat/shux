@@ -3420,6 +3420,27 @@ mod tests {
         );
     }
 
+    /// Window titles inherit the pane sanitizer's 64-char clamp, so two
+    /// titles that differ only past char 64 now collapse onto one value.
+    /// That is deliberate: they would render identically in the border and
+    /// in `window list`, so treating them as distinct only moves the
+    /// ambiguity somewhere the operator cannot see it. `rename_window`'s
+    /// conflict check compares the clamped value and refuses the collision.
+    #[test]
+    fn test_window_title_clamp_makes_long_titles_collide_and_conflict() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let long_a = format!("{}A", "x".repeat(64));
+        let long_b = format!("{}B", "x".repeat(64));
+
+        let w1 = graph.create_window(sid, long_a, home()).unwrap();
+        let w2 = graph.create_window(sid, "other".into(), home()).unwrap();
+        assert_eq!(state.load().windows[&w1].title, "x".repeat(64));
+
+        let err = graph.rename_window(w2, long_b, None).unwrap_err();
+        assert!(matches!(err, GraphError::WindowNameConflict(_)), "{err:?}");
+    }
+
     /// Lookup normalizes the same way storage does — otherwise
     /// `window.ensure`, which is idempotent *by name*, misses its own
     /// window and stacks up duplicates with identical displayed titles.

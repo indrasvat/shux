@@ -95,6 +95,21 @@ Rejected input never passes a sanitizer, so ingress alone cannot close row 7.
 Either layer alone stops the attack; both together mean a future unsanitized path
 cannot become an injection.
 
+### Accepted behaviour changes
+
+Three, all deliberate, all tested:
+
+1. **Window titles are now clamped to 64 chars** (they inherit the pane rule). Two titles
+   that differ only past char 64 collapse onto one value; `rename_window`'s conflict check
+   compares the clamped value and refuses the collision. They would have rendered
+   identically in the border and in `window list` anyway, so treating them as distinct only
+   moved the ambiguity somewhere the operator could not see it. IDs, not titles, are the
+   identifiers.
+2. **`create_window` now rejects an empty title.** It previously had no validation at all —
+   `stage_create_window` did, so the two paths disagreed. Whitespace-only titles are
+   rejected too, since they trim to empty.
+3. **Titles are trimmed.** `--name "  padded  "` stores `padded`.
+
 ## Testing matrix
 
 | Level | Coverage |
