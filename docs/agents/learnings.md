@@ -486,3 +486,46 @@ palette, restore the deliberate table/summary divergence).
   share one anchor. Fix: a single `effective_total_lines(vt, pane_rows)` (scrollback + the
   live viewport the frame shows) that every copy-mode coordinate site routes through; it
   equals `grid.total_lines()` exactly when the grid fits, so the common path is unchanged.
+- **2026-08-05 (issue #104 — a fixture built from raw bytes makes a real vector look
+  imaginary):** The reported attack is a window title carrying `ESC ] 0 ; … BEL`, delivered
+  by a workspace template. Writing that fixture with real control bytes gets a **TOML parse
+  error** — TOML forbids `U+0000..U+0008`, `U+000A..U+001F`, `U+007F` inside a basic string
+  — which reads as "the format already blocks this, no bug". It does not: `\uXXXX` is
+  TOML's *own* escape and the parser decodes it to a live ESC before shux sees the value.
+  Every hostile fixture has to be written the way an attacker would write it, in the
+  format's escape syntax, not in raw bytes. The same trap hides the vector from a reviewer
+  skimming the test file.
+- **2026-08-05 (issue #104 — sanitize THEN validate; the order is the bug):**
+  `rename_window` checked `new_title.is_empty()` on the **raw** string and only then
+  assigned it. A title of `"\u{1b}\u{7}"` is not empty, so it sailed through and was stored
+  as two live control bytes. Strip first and it collapses to `""`, which the *existing*
+  empty check rejects with no new error type. Whenever a validator and a normalizer both
+  run on untrusted input, normalize first — otherwise the validator is inspecting a string
+  that will never be the one you store.
+- **2026-08-05 (issue #104 — ingress sanitizing cannot cover input you REJECT):** The
+  daemon's session-name allowlist correctly refused an OSC-bearing name — and then
+  `GraphError::InvalidSessionName(name)` interpolated the payload with `{0}` into a message
+  the CLI printed straight to the terminal, hijacking it *three times* on one failed
+  `state apply`. Rejected values never meet a sanitizer by definition, so a security fix
+  that only hardens the write path leaves the loudest echo untouched. Two layers:
+  `str::escape_debug` in the error's `#[error(...)]` (visible but inert, and the operator
+  can finally read which bytes were invalid), plus a `style::safe_label` applied inside
+  every `print_*` helper. Grep the error enum, not just the setters.
+- **2026-08-05 (issue #104 — normalizing at ingress silently breaks by-name lookup):**
+  Sanitizing titles on write while `find_window_by_name` still compared the caller's **raw**
+  string broke `window.ensure`'s whole contract: idempotent *by name*. Every `ensure` with a
+  hostile name missed its own window and created another one with an identical displayed
+  title. Any time you normalize on the way in, normalize the lookup key with the same
+  function on the way out — storage and lookup have to agree or "find or create" becomes
+  "create, forever". Caught by writing the idempotency test before believing the fix was
+  complete; the CLI's `-w <name>` selector had the same gap.
+- **2026-08-05 (issue #104 — shux is its own terminal emulator, so it can photograph the
+  attack):** Escape injection is invisible in captured *text* (the payload is consumed by
+  the terminal, which is the point) and there was no `xterm`/`Xvfb` in the container. But
+  `shux-vt` honours OSC 0/2 and shux draws the pane title in the border — so running the
+  vulnerable command inside a shux pane and taking a `window snapshot` shows the hijack in
+  shux's own render path, with the pane border standing in for the window title bar. A/B
+  against a pre-fix worktree build gave twelve before/after PNGs; the legitimate-unicode
+  pair came out **byte-identical** (same MD5), which is a far stronger no-regression claim
+  than "looks the same". Also: pick capture text the snapshot font actually has — CJK and
+  Arabic rendered as tofu boxes and made a *passing* control panel look like damage.
