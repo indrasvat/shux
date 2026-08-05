@@ -637,11 +637,19 @@ pub fn render_session_list(ctx: &TerminalContext, sessions: &[SessionInfo]) {
 /// Render a rich window list with box frame, context header, and summary footer.
 pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[WindowInfo]) {
     let mut out = io::stdout().lock();
+    // Egress guard (issue #104) — see `safe_label`.
+    let session_name = &safe_label(session_name);
 
     match ctx.format {
         OutputFormat::Plain => {
             for w in windows {
-                let _ = writeln!(out, "{}\t{}\t{}", w.index, w.title, w.pane_count,);
+                let _ = writeln!(
+                    out,
+                    "{}\t{}\t{}",
+                    w.index,
+                    safe_label(&w.title),
+                    w.pane_count,
+                );
             }
         }
         OutputFormat::Json => unreachable!("JSON handled before render"),
@@ -685,7 +693,7 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
                 };
                 layout.add_row(vec![
                     w.index.to_string(),
-                    w.title.clone(),
+                    safe_label(&w.title),
                     w.pane_count.to_string(),
                     marker,
                 ]);
@@ -744,6 +752,9 @@ pub fn render_pane_list(
     panes: &[PaneInfo],
 ) {
     let mut out = io::stdout().lock();
+    // Egress guard (issue #104) — see `safe_label`.
+    let session_name = &safe_label(session_name);
+    let window_name = &safe_label(window_name);
 
     match ctx.format {
         OutputFormat::Plain => {
@@ -948,7 +959,47 @@ pub fn print_success(action: &str, subject: &str, id: Option<&str>) {
 pub fn print_error(msg: &str) {
     let mut err = io::stderr().lock();
     let _ = write!(err, "{} ", error("\u{2717}")); // ✗
-    let _ = writeln!(err, "{msg}");
+    let _ = writeln!(err, "{}", safe_label(msg));
+}
+
+// ── Egress Guard (issue #104) ──────────────────────────────────
+
+/// Render an untrusted label — an entity name, a title, an error message
+/// quoting one — so it cannot carry an active control sequence into the
+/// operator's terminal.
+///
+/// The daemon sanitizes every title it *stores*
+/// ([`shux_core::model::sanitize_title`]), which handles the reported
+/// vector at its source. This is the second, independent layer, and it
+/// covers the case ingress sanitizing structurally cannot: input the
+/// daemon **rejected** is echoed back in an error message without ever
+/// having met a sanitizer. Applied inside every `print_*` helper that
+/// interpolates a name or a title.
+///
+/// Hostile characters become their visible `\u{...}` form, so the operator
+/// still sees what was in the template. The escaped classes match
+/// `sanitize_title`'s: C0/DEL/C1 controls, `U+2028`/`U+2029` separators,
+/// and the bidi override/isolate formatting characters. Everything else —
+/// including quotes, backslashes and every non-Latin script — is passed
+/// through byte for byte, so wiring this in cannot change normal output.
+pub fn safe_label(raw: &str) -> String {
+    fn hostile(c: char) -> bool {
+        c.is_control()
+            || matches!(c, '\u{2028}' | '\u{2029}')
+            || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }
+    if !raw.chars().any(hostile) {
+        return raw.to_string();
+    }
+    raw.chars()
+        .map(|c| {
+            if hostile(c) {
+                format!("\\u{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 // ── Legacy Confirmation Helpers (now using ✓ prefix + short IDs) ──
@@ -956,16 +1007,19 @@ pub fn print_error(msg: &str) {
 /// Print a session creation confirmation.
 pub fn print_session_created(name: &str, id: &str, ensured: bool) {
     let action = if ensured { "Ensured" } else { "Created" };
+    let name = safe_label(name);
     print_success(action, &format!("session '{name}'"), Some(id));
 }
 
 /// Print a session kill confirmation.
 pub fn print_session_killed(name: &str) {
+    let name = safe_label(name);
     print_success("Killed", &format!("session '{name}'"), None);
 }
 
 /// Print a session rename confirmation.
 pub fn print_session_renamed(old_name: &str, new_name: &str) {
+    let (old_name, new_name) = (safe_label(old_name), safe_label(new_name));
     print_success(
         "Renamed",
         &format!("session '{old_name}' -> '{new_name}'"),
@@ -977,18 +1031,20 @@ pub fn print_session_renamed(old_name: &str, new_name: &str) {
 pub fn print_window_created(title: &str, index: u64) {
     let mut out = io::stdout().lock();
     let _ = write!(out, "{} ", success("\u{2713}"));
-    let _ = write!(out, "Created window '{}' ", bold(title));
+    let _ = write!(out, "Created window '{}' ", bold(safe_label(title)));
     let _ = write!(out, "{}", muted(format!("(index {index})")));
     let _ = writeln!(out);
 }
 
 /// Print a window kill confirmation.
 pub fn print_window_killed(title: &str) {
+    let title = safe_label(title);
     print_success("Killed", &format!("window '{title}'"), None);
 }
 
 /// Print a window rename confirmation.
 pub fn print_window_renamed(old_name: &str, new_name: &str) {
+    let (old_name, new_name) = (safe_label(old_name), safe_label(new_name));
     print_success(
         "Renamed",
         &format!("window '{old_name}' -> '{new_name}'"),
@@ -998,6 +1054,7 @@ pub fn print_window_renamed(old_name: &str, new_name: &str) {
 
 /// Print a window focus confirmation.
 pub fn print_window_focused(title: &str) {
+    let title = safe_label(title);
     print_success("Focused", &format!("window '{title}'"), None);
 }
 
@@ -1005,7 +1062,12 @@ pub fn print_window_focused(title: &str) {
 pub fn print_window_reordered(title: &str, new_index: usize) {
     let mut out = io::stdout().lock();
     let _ = write!(out, "{} ", success("\u{2713}"));
-    let _ = write!(out, "Moved window '{}' to index {}", bold(title), new_index);
+    let _ = write!(
+        out,
+        "Moved window '{}' to index {}",
+        bold(safe_label(title)),
+        new_index
+    );
     let _ = writeln!(out);
 }
 
@@ -1060,7 +1122,7 @@ pub fn print_pane_title_set(pane_id: &str, displayed: &str) {
         "{} Set title on pane {} → {}",
         success("✓"),
         muted(&short_id(pane_id)),
-        bold(displayed),
+        bold(safe_label(displayed)),
     );
     let _ = writeln!(out);
 }
@@ -1263,6 +1325,72 @@ pub fn print_pane_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── issue #104: egress guard ────────────────────────────────
+
+    /// `safe_label` is the CLI's last line of defence. Ingress sanitising
+    /// covers everything the daemon stores; this covers everything the CLI
+    /// prints, including values the daemon *rejected* and echoed back in an
+    /// error, which by definition never met a sanitiser.
+    #[test]
+    fn test_safe_label_escapes_control_bytes() {
+        assert_eq!(
+            safe_label("\u{1b}]0;PWNED\u{7}deploy"),
+            "\\u{1b}]0;PWNED\\u{7}deploy"
+        );
+        for ch in [
+            '\u{0}', '\u{7}', '\u{8}', '\u{a}', '\u{d}', '\u{1b}', '\u{7f}',
+        ] {
+            let out = safe_label(&format!("a{ch}b"));
+            assert!(
+                !out.chars().any(|c| c.is_control()),
+                "U+{:04X} survived: {out:?}",
+                ch as u32
+            );
+        }
+    }
+
+    /// C1 (0x80..=0x9F) is CSI/OSC with no ESC in an 8-bit terminal.
+    #[test]
+    fn test_safe_label_escapes_c1_and_separators_and_bidi() {
+        for ch in [
+            '\u{80}', '\u{9b}', '\u{9d}', '\u{9f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{202e}',
+            '\u{2066}', '\u{2069}',
+        ] {
+            let out = safe_label(&format!("a{ch}b"));
+            assert_eq!(
+                out,
+                format!("a\\u{{{:x}}}b", ch as u32),
+                "U+{:04X} not escaped",
+                ch as u32
+            );
+        }
+    }
+
+    /// Byte-identical for anything an operator would legitimately type, so
+    /// wiring it into every `print_*` helper cannot change normal output.
+    #[test]
+    fn test_safe_label_is_identity_for_clean_input() {
+        for s in [
+            "deploy",
+            "agent-1 · build",
+            "日本語 セッション",
+            "مرحبا",
+            "build ✓ 🚀",
+            "",
+            "a\"b\\c",
+        ] {
+            assert_eq!(safe_label(s), s, "mutated clean input: {s:?}");
+        }
+    }
+
+    /// A sanitised title is already inert, so the two layers compose without
+    /// double-escaping.
+    #[test]
+    fn test_safe_label_of_sanitized_title_is_unchanged() {
+        let sanitized = shux_core::model::sanitize_title("\u{1b}]0;PWNED\u{7}deploy");
+        assert_eq!(safe_label(&sanitized), sanitized);
+    }
 
     #[test]
     fn test_styled_plain_text() {

@@ -3046,9 +3046,13 @@ async fn resolve_window_id(
         return Ok((id.to_string(), title.to_string()));
     }
 
-    // Try as window name
+    // Try as window name. Titles are stored sanitized (issue #104), so
+    // normalize the selector the same way — the operator types what they
+    // see in `window list`, but a script may pass the raw value straight
+    // from the template. Both have to land on the same window.
+    let wanted = shux_core::model::sanitize_title(window_spec);
     for w in windows {
-        if w.get("title").and_then(|v| v.as_str()) == Some(window_spec) {
+        if w.get("title").and_then(|v| v.as_str()) == Some(wanted.as_str()) {
             let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
             let title = w.get("title").and_then(|v| v.as_str()).unwrap_or("?");
             return Ok((id.to_string(), title.to_string()));
@@ -3252,7 +3256,16 @@ pub async fn handle_window_rename(
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_window_renamed(&old_title, new_name);
+            // Report the title the daemon actually STORED, not the one we
+            // asked for. The daemon sanitizes on ingress (issue #104), so
+            // echoing the raw argument would both replay an escape payload
+            // through this terminal and misreport what the window is now
+            // called.
+            let stored = result
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(new_name);
+            crate::style::print_window_renamed(&old_title, stored);
         }
     }
 

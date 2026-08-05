@@ -139,11 +139,20 @@ pub struct Window {
 }
 
 impl Window {
+    /// Construct a window. The title is run through [`sanitize_title`] —
+    /// the same rule pane titles use — so no construction site can mint a
+    /// window whose title carries an escape sequence into the operator's
+    /// terminal (issue #104).
+    ///
+    /// Sanitizing here may yield an **empty** title. Callers that need a
+    /// non-empty one validate before constructing; see
+    /// `SessionGraph::validate_window_title`, which is what every graph
+    /// mutation path uses.
     pub fn new(session_id: SessionId, title: impl Into<String>, initial_pane_id: PaneId) -> Self {
         Self {
             id: WindowId::new(),
             session_id,
-            title: title.into(),
+            title: sanitize_title(&title.into()),
             active_pane: initial_pane_id,
             layout: crate::layout::WindowLayout::new(initial_pane_id),
             cwd: None,
@@ -333,21 +342,57 @@ impl Pane {
     }
 }
 
-/// Clamp a title to a sane single-line ASCII-ish display. Newlines,
-/// nulls and other control bytes inside an OSC payload are an attack
-/// surface (some terminals render them and re-trigger parsing); the
-/// border-draw code also assumes a single line. Hard cap at 64 chars
-/// — the border has limited room and very long titles squeeze out
-/// the rest of the chrome.
-pub(crate) fn sanitize_title(raw: &str) -> String {
-    let cleaned: String = raw
+/// Characters that must never survive into a stored title.
+///
+/// A title is (a) drawn into **one row** of border chrome and (b) echoed
+/// to the operator's terminal by the CLI, so it has to be a single line of
+/// inert text. Three classes break that:
+///
+/// - **`char::is_control()`** — C0, DEL and C1. The reported vector
+///   (issue #104) is a C0 `ESC` opening an OSC set-title payload, but C1
+///   matters just as much: a terminal in 8-bit mode reads `U+009B` as CSI
+///   and `U+009D` as OSC with no `ESC` anywhere in sight.
+/// - **`U+2028` / `U+2029`** — line and paragraph separators. Not
+///   `is_control()`, but they end a line in exactly the place the
+///   border-draw code assumes there is none.
+/// - **`U+202A`–`U+202E`, `U+2066`–`U+2069`** — bidi embedding, override
+///   and isolate formatting. These reorder the *rendered* title without
+///   changing its bytes, which is how a title spoofs another one
+///   (the Trojan Source class, CVE-2021-42574). Only the explicit
+///   formatting characters are dropped; the implicit bidi algorithm is
+///   untouched, so ordinary RTL titles still render correctly.
+fn is_title_hostile(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{2028}' | '\u{2029}')
+        || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Clamp a title to a sane single-line display.
+///
+/// **The single title rule for panes and windows alike** — pane manual
+/// titles ([`Pane::set_manual_title`]), pane OSC titles
+/// ([`Pane::set_osc_title`]) and window titles ([`Window::new`], plus
+/// every `SessionGraph` window-title ingress) all funnel through here, so
+/// the two entity kinds cannot drift apart (issue #104).
+///
+/// Drops every [`is_title_hostile`] character, trims, then hard-caps at 64
+/// chars — the border has limited room and very long titles squeeze out
+/// the rest of the chrome. The strip runs **before** the clamp so an
+/// attacker cannot push a payload past the 64-char window behind filler
+/// that later disappears.
+///
+/// The result may be **empty** (a title made entirely of hostile
+/// characters collapses). Callers that require a non-empty title must
+/// sanitize first and validate second — see
+/// `SessionGraph::validate_window_title`.
+pub fn sanitize_title(raw: &str) -> String {
+    let cleaned = raw
         .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .to_string();
+        .filter(|c| !is_title_hostile(*c))
+        .collect::<String>();
+    let cleaned = cleaned.trim();
     if cleaned.chars().count() <= 64 {
-        cleaned
+        cleaned.to_string()
     } else {
         cleaned.chars().take(64).collect()
     }
@@ -572,6 +617,141 @@ mod tests {
         let long: String = "x".repeat(120);
         pane.set_manual_title(Some(long));
         assert_eq!(pane.title.chars().count(), 64);
+    }
+
+    // ── issue #104: one shared title sanitizer for panes AND windows ──
+
+    /// The reported vector, at the sanitizer: a TOML ``/``
+    /// pair decodes to real ESC/BEL bytes before shux sees them.
+    #[test]
+    fn test_sanitize_title_strips_osc_set_title_payload() {
+        let out = sanitize_title("\u{1b}]0;attacker-controlled\u{7}deploy");
+        assert_eq!(out, "]0;attacker-controlleddeploy");
+        assert!(
+            !out.chars().any(|c| c.is_control()),
+            "no control byte may survive: {out:?}"
+        );
+    }
+
+    /// C0, DEL and C1 all have to go. C1 (0x80..=0x9F) matters because a
+    /// terminal in 8-bit mode treats 0x9B as CSI and 0x9D as OSC with no
+    /// ESC in sight.
+    #[test]
+    fn test_sanitize_title_strips_c0_del_and_c1() {
+        for (label, ch) in [
+            ("NUL", '\u{0}'),
+            ("BEL", '\u{7}'),
+            ("BS", '\u{8}'),
+            ("TAB", '\u{9}'),
+            ("LF", '\u{a}'),
+            ("CR", '\u{d}'),
+            ("ESC", '\u{1b}'),
+            ("DEL", '\u{7f}'),
+            ("C1-CSI", '\u{9b}'),
+            ("C1-OSC", '\u{9d}'),
+            ("C1-PAD", '\u{80}'),
+            ("C1-APC", '\u{9f}'),
+        ] {
+            let out = sanitize_title(&format!("a{ch}b"));
+            assert_eq!(out, "ab", "{label} (U+{:04X}) survived", ch as u32);
+        }
+    }
+
+    /// A title is a single line drawn into one row of border chrome, and
+    /// it names a thing the operator makes trust decisions about. Line
+    /// separators and bidi overrides break both invariants without ever
+    /// being `char::is_control()`.
+    #[test]
+    fn test_sanitize_title_strips_separators_and_bidi_overrides() {
+        for (label, ch) in [
+            ("LINE SEPARATOR", '\u{2028}'),
+            ("PARAGRAPH SEPARATOR", '\u{2029}'),
+            ("LRE", '\u{202a}'),
+            ("RLE", '\u{202b}'),
+            ("PDF", '\u{202c}'),
+            ("LRO", '\u{202d}'),
+            ("RLO", '\u{202e}'),
+            ("LRI", '\u{2066}'),
+            ("RLI", '\u{2067}'),
+            ("FSI", '\u{2068}'),
+            ("PDI", '\u{2069}'),
+        ] {
+            let out = sanitize_title(&format!("a{ch}b"));
+            assert_eq!(out, "ab", "{label} (U+{:04X}) survived", ch as u32);
+        }
+    }
+
+    /// Ordinary RTL text must still work — we drop the explicit override
+    /// characters, not the script.
+    #[test]
+    fn test_sanitize_title_keeps_ordinary_unicode() {
+        assert_eq!(sanitize_title("مرحبا"), "مرحبا");
+        assert_eq!(sanitize_title("日本語 セッション"), "日本語 セッション");
+        assert_eq!(sanitize_title("build ✓ 🚀"), "build ✓ 🚀");
+    }
+
+    /// A title made only of hostile bytes collapses to empty. Callers
+    /// rely on this to reject rather than store `""`.
+    #[test]
+    fn test_sanitize_title_all_hostile_collapses_to_empty() {
+        assert_eq!(sanitize_title("\u{1b}\u{7}"), "");
+        assert_eq!(sanitize_title("\u{9b}\u{202e}\u{2028}"), "");
+        assert_eq!(sanitize_title("   \n\t  "), "");
+    }
+
+    /// Sanitizing twice must equal sanitizing once, or a value that
+    /// round-trips through the graph could drift.
+    #[test]
+    fn test_sanitize_title_is_idempotent() {
+        for raw in [
+            "\u{1b}]0;x\u{7}deploy",
+            &"x".repeat(200),
+            "  padded  ",
+            "\u{202e}gnp.exe",
+            "plain",
+        ] {
+            let once = sanitize_title(raw);
+            assert_eq!(sanitize_title(&once), once, "not a fixed point: {raw:?}");
+        }
+    }
+
+    /// The clamp counts characters, not bytes — a multi-byte title must
+    /// not be cut mid-scalar, and must not exceed the border budget.
+    #[test]
+    fn test_sanitize_title_clamps_multibyte_by_chars() {
+        let out = sanitize_title(&"日".repeat(120));
+        assert_eq!(out.chars().count(), 64);
+        assert_eq!(out, "日".repeat(64));
+    }
+
+    /// Hostile bytes are removed BEFORE the clamp, so an attacker cannot
+    /// push payload past the 64-char window with filler that later
+    /// disappears.
+    #[test]
+    fn test_sanitize_title_strips_before_clamping() {
+        let raw = format!("{}\u{1b}]0;PWNED\u{7}", "\u{1b}".repeat(100));
+        let out = sanitize_title(&raw);
+        assert!(!out.chars().any(|c| c.is_control()), "{out:?}");
+        assert_eq!(out, "]0;PWNED");
+    }
+
+    /// `Window::new` is the single construction site for windows; it
+    /// sanitizes so no code path can mint a window with a hostile title.
+    #[test]
+    fn test_window_new_sanitizes_title() {
+        let sid = SessionId::new();
+        let pid = PaneId::new();
+        let w = Window::new(sid, "\u{1b}]0;PWNED\u{7}deploy", pid);
+        assert_eq!(w.title, "]0;PWNEDdeploy");
+        assert!(!w.title.chars().any(|c| c.is_control()));
+    }
+
+    #[test]
+    fn test_window_new_clamps_long_title() {
+        let sid = SessionId::new();
+        let pid = PaneId::new();
+        let w = Window::new(sid, "z".repeat(200), pid);
+        assert_eq!(w.title.chars().count(), 64);
     }
 
     #[test]
