@@ -1,3 +1,10 @@
+## [0.46.4](https://github.com/indrasvat/shux/compare/v0.46.3...v0.46.4) (2026-08-05)
+
+
+### Bug Fixes
+
+* **core:** window titles reached the terminal with control bytes intact — CWE-150 ([#104](https://github.com/indrasvat/shux/issues/104)) ([#113](https://github.com/indrasvat/shux/issues/113)) ([e9730ed](https://github.com/indrasvat/shux/commit/e9730ed1a63eb1914e82d853c17cad71f94c7423))
+
 ## [0.46.3](https://github.com/indrasvat/shux/compare/v0.46.2...v0.46.3) (2026-08-05)
 
 
