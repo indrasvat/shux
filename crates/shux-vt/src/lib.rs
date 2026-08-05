@@ -143,6 +143,22 @@ pub fn monotonic_now_ns() -> u64 {
     (start.elapsed().as_nanos() as u64).max(1)
 }
 
+/// A terminal with no rows or no columns has no cell to put anything in, and
+/// every addressing path in the parser assumes at least one of each: a bare
+/// printable character on a 0-row grid indexed row 0 and panicked, and
+/// DECSTBM's `rows - 1` clamp underflowed into a region of rows that did not
+/// exist (issue #107).
+///
+/// Rather than teach several dozen parser paths to survive a terminal that
+/// cannot display anything, a degenerate size is made unrepresentable at the
+/// two places a size enters: construction and resize. Callers that hand shux a
+/// 0 get the smallest real terminal instead of a panicking one. The daemon
+/// separately refuses to *ask* for a degenerate pane; this is the backstop
+/// under it, not a substitute for it.
+fn clamp_dims(rows: usize, cols: usize) -> (usize, usize) {
+    (rows.max(1), cols.max(1))
+}
+
 impl VirtualTerminal {
     /// Create a new virtual terminal with the given dimensions.
     pub fn new(rows: usize, cols: usize) -> Self {
@@ -151,6 +167,7 @@ impl VirtualTerminal {
 
     /// Create a new virtual terminal with custom grid configuration.
     pub fn with_config(rows: usize, cols: usize, config: GridConfig) -> Self {
+        let (rows, cols) = clamp_dims(rows, cols);
         VirtualTerminal {
             grid: Grid::new(rows, cols, config),
             alt_grid: None,
@@ -405,6 +422,7 @@ impl VirtualTerminal {
     /// This resizes both primary and alternate grids, adjusts the scroll
     /// region, and clamps the cursor position.
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        let (rows, cols) = clamp_dims(rows, cols);
         // §4.2: "Pane resize" is Class-A. A resize to the SAME dimensions is not
         // a resize event (avoids spurious bumps when the daemon re-fans an
         // unchanged winsize) — compare dims, which is not cell-value diffing.
@@ -412,18 +430,31 @@ impl VirtualTerminal {
         self.active_grapheme_cell = None;
         if self.modes.alternate_screen {
             self.grid.resize_canvas(rows, cols);
-            if let (Some(primary), Some(primary_cursor)) =
-                (&mut self.alt_grid, &mut self.alt_cursor)
-            {
-                if let Some((row, col)) = primary.resize_with_cursor(
-                    rows,
-                    cols,
-                    Some((primary_cursor.row, primary_cursor.col)),
-                ) {
-                    primary_cursor.row = row;
-                    primary_cursor.col = col;
+            // The stashed primary grid is resized whether or not a saved
+            // cursor came with it. DECSET 1047 enters the alternate screen
+            // WITHOUT saving a cursor, so gating the whole branch on
+            // `alt_cursor` left the primary grid at its pre-resize size: on
+            // leaving 1047 the pane reported one geometry and rendered
+            // another, and the next erase/insert indexed a row that was no
+            // longer there (issue #107 adversarial review). 1049 was never
+            // affected, which is why this survived.
+            if let Some(primary) = &mut self.alt_grid {
+                match &mut self.alt_cursor {
+                    Some(primary_cursor) => {
+                        if let Some((row, col)) = primary.resize_with_cursor(
+                            rows,
+                            cols,
+                            Some((primary_cursor.row, primary_cursor.col)),
+                        ) {
+                            primary_cursor.row = row;
+                            primary_cursor.col = col;
+                        }
+                        primary_cursor.clamp(rows, cols);
+                    }
+                    None => {
+                        primary.resize_with_cursor(rows, cols, None);
+                    }
                 }
-                primary_cursor.clamp(rows, cols);
             }
         } else {
             if let Some((row, col)) =
