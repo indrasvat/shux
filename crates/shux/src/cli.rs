@@ -2119,7 +2119,10 @@ pub async fn handle_ls(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             use crate::style;
@@ -2502,7 +2505,10 @@ pub async fn handle_new(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             use crate::style;
@@ -2595,7 +2601,10 @@ pub async fn handle_kill(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_session_killed(session_name);
@@ -2630,7 +2639,10 @@ pub async fn handle_rename(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_session_renamed(session_name, new_name);
@@ -2720,7 +2732,10 @@ pub async fn handle_wait_for(
                     let env = serde_json::json!({
                         "error": { "code": code, "message": message, "data": data }
                     });
-                    println!("{}", serde_json::to_string_pretty(&env)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&env)?)
+                    );
                 }
                 _ => {
                     eprintln!("{} {message}", crate::style::error("✗ wait-for:"));
@@ -2742,7 +2757,10 @@ pub async fn handle_wait_for(
     };
 
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
         _ => {
             let elapsed = result
                 .get("elapsed_ms")
@@ -2822,11 +2840,17 @@ pub async fn handle_snapshot(
                     png.len(),
                 );
             } else {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!(
+                    "{}",
+                    crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+                );
             }
         }
         (None, OutputFormat::Json) => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         (None, _) => {
             // Default no-`--output` behaviour: print base64 to stdout so the
@@ -2877,10 +2901,10 @@ pub fn handle_init(root: &std::path::Path, format: OutputFormat) -> anyhow::Resu
         OutputFormat::Json => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+                crate::style::json_safe(&serde_json::to_string_pretty(&serde_json::json!({
                     "shux_dir": shux_dir.display().to_string(),
                     "created": created.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-                }))?
+                }))?)
             );
         }
         _ => {
@@ -3082,7 +3106,10 @@ pub async fn handle_window_list(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             use crate::style;
@@ -3183,7 +3210,10 @@ pub async fn handle_window_new(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let title = result
@@ -3218,7 +3248,10 @@ pub async fn handle_window_kill(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_window_killed(&window_title);
@@ -3253,7 +3286,10 @@ pub async fn handle_window_rename(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             // Report the title the daemon actually STORED, not the one we
@@ -3292,7 +3328,10 @@ pub async fn handle_window_focus(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_window_focused(&window_title);
@@ -3327,7 +3366,10 @@ pub async fn handle_window_reorder(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_window_reordered(&window_title, new_index);
@@ -3473,7 +3515,10 @@ pub async fn handle_pane_list(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             use crate::style;
@@ -3495,11 +3540,21 @@ pub async fn handle_pane_list(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            // `pane.list` returns `command` as a JSON
+                            // ARRAY; reading it with `as_str()` made this
+                            // column permanently blank. Join the argv the
+                            // way a shell would show it (issue #104
+                            // adversarial review).
                             let command = p
                                 .get("command")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| x.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                })
+                                .unwrap_or_default();
                             let is_focused = p
                                 .get("is_focused")
                                 .and_then(|v| v.as_bool())
@@ -3558,7 +3613,10 @@ pub async fn handle_pane_split(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let pane_id = result
@@ -3594,7 +3652,10 @@ pub async fn handle_pane_focus(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_pane_focused(pane_id);
@@ -3627,7 +3688,10 @@ pub async fn handle_pane_focus_dir(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let pane_id = result
@@ -3675,7 +3739,10 @@ pub async fn handle_pane_resize(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let pane_id = result
@@ -3716,7 +3783,10 @@ pub async fn handle_pane_zoom(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let pane_id = result
@@ -3763,7 +3833,10 @@ pub async fn handle_pane_swap(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_pane_swapped(pane_id, target_id);
@@ -3826,7 +3899,10 @@ pub async fn handle_pane_title(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let pid = result
@@ -3996,7 +4072,10 @@ pub async fn handle_pane_record(
     .await?;
 
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&stopped)?),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&stopped)?)
+        ),
         OutputFormat::Plain => {
             let path = stopped.get("path").and_then(|v| v.as_str()).unwrap_or("?");
             let bytes = stopped
@@ -4056,7 +4135,10 @@ pub async fn handle_pane_kill(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_pane_killed(pane_id);
@@ -4086,7 +4168,10 @@ pub async fn handle_api(
             let envelope = serde_json::json!({"result": result});
             match format {
                 OutputFormat::Json | OutputFormat::Text | OutputFormat::Plain => {
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+                    );
                 }
             }
             Ok(())
@@ -4104,7 +4189,10 @@ pub async fn handle_api(
                 err_obj["data"] = d;
             }
             let envelope = serde_json::json!({"error": err_obj});
-            println!("{}", serde_json::to_string_pretty(&envelope)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+            );
             // Non-zero exit so shell pipelines can branch, but the
             // structured error is still on stdout for parsers.
             std::process::exit(2);
@@ -4146,7 +4234,10 @@ pub async fn handle_pane_send_keys(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let bytes = result
@@ -4194,7 +4285,10 @@ pub async fn handle_pane_run(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             crate::style::print_run_command(&result, is_async);
@@ -4249,11 +4343,17 @@ pub async fn handle_pane_snapshot(
                     png.len(),
                 );
             } else {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!(
+                    "{}",
+                    crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+                );
             }
         }
         (None, OutputFormat::Json) => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         (None, _) => {
             println!("{b64}");
@@ -4348,7 +4448,10 @@ pub async fn handle_pane_glance(
                     // evidence; changing shape requires a LENS-TEST-CHANGE
                     // to the frozen harness first).
                     let envelope = serde_json::json!({"result": result});
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+                    );
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
                     let revision = result.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -4408,7 +4511,10 @@ pub async fn handle_pane_glance(
                         err_obj["data"] = d;
                     }
                     let envelope = serde_json::json!({"error": err_obj});
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+                    );
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
                     crate::style::print_error(&format!("glance failed: {message} (code {code})"));
@@ -4466,7 +4572,10 @@ pub async fn handle_pane_wait_settled(
                     // §10: byte-identical to `shux rpc call` — the `{result}`
                     // envelope (the frozen lens harness parses this shape).
                     let envelope = serde_json::json!({ "result": result });
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+                    );
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
                     let revision = result.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -4499,7 +4608,10 @@ pub async fn handle_pane_wait_settled(
                         err_obj["data"] = d;
                     }
                     let envelope = serde_json::json!({ "error": err_obj });
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+                    );
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
                     // Surface the actionable `data.detail` (e.g. "hold_ms 5 out of range
@@ -4588,7 +4700,10 @@ pub async fn handle_pane_checkpoint(
                     // §10: the `{result}` envelope, byte-identical to
                     // `shux rpc call` (the frozen lens harness parses this).
                     let envelope = serde_json::json!({ "result": result });
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+                    );
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
                     let revision = result.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -4652,7 +4767,10 @@ pub async fn handle_pane_diff(
                     // §10: the `{result}` envelope, byte-identical to
                     // `shux rpc call` (the frozen lens harness parses this).
                     let envelope = serde_json::json!({ "result": result });
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+                    );
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
                     let from = result
@@ -4772,7 +4890,10 @@ pub async fn handle_lens_run(
                     // §10: the `{result}` envelope, byte-identical to
                     // `shux rpc call` (the frozen lens harness parses this).
                     let envelope = serde_json::json!({ "result": result });
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    println!(
+                        "{}",
+                        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+                    );
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
                     let session_id = result
@@ -4838,7 +4959,10 @@ pub async fn handle_pane_set_size(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             println!(
@@ -4876,7 +5000,10 @@ pub async fn handle_pane_capture(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let text = result.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -5144,9 +5271,14 @@ pub async fn handle_plugin_install(
     let result = rpc_call(stream, "plugin.install", serde_json::Value::Object(params)).await?;
 
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
         OutputFormat::Plain => {
-            let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = &crate::style::safe_label(
+                result.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+            );
             let ver = result
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -5155,7 +5287,9 @@ pub async fn handle_plugin_install(
             println!("{name}\t{ver}\t{pid}");
         }
         OutputFormat::Text => {
-            let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = &crate::style::safe_label(
+                result.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+            );
             let ver = result
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -5212,10 +5346,13 @@ pub async fn handle_plugin_reload(
     let result = rpc_call(stream, "plugin.reload", params).await?;
 
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
         OutputFormat::Plain => {
             let pid = result.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-            println!("{name}\t{pid}");
+            println!("{}\t{pid}", crate::style::safe_label(name));
         }
         OutputFormat::Text => {
             let pid = result.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -5246,11 +5383,16 @@ pub async fn handle_plugin_list(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Plain => {
             for p in &plugins {
-                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = &crate::style::safe_label(
+                    p.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                );
                 let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("?");
                 let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -5265,7 +5407,9 @@ pub async fn handle_plugin_list(
             }
             println!("{}", style::muted(&format!("{} plugin(s)", plugins.len())));
             for p in &plugins {
-                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = &crate::style::safe_label(
+                    p.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                );
                 let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("?");
                 let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -5303,12 +5447,15 @@ pub async fn handle_plugin_kill(
     let result = rpc_call(stream, "plugin.kill", params).await?;
 
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
-        OutputFormat::Plain => println!("{name}\tkilled"),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
+        OutputFormat::Plain => println!("{}\tkilled", crate::style::safe_label(name)),
         OutputFormat::Text => println!(
             "{} {}",
             style::success("✓ killed plugin"),
-            style::bold(name)
+            style::bold(style::safe_label(name))
         ),
     }
     Ok(())
@@ -5326,12 +5473,15 @@ pub async fn handle_plugin_stop(
     let result = rpc_call(stream, "plugin.kill", params).await?;
 
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
-        OutputFormat::Plain => println!("{name}\tstopped"),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
+        OutputFormat::Plain => println!("{}\tstopped", crate::style::safe_label(name)),
         OutputFormat::Text => println!(
             "{} {}",
             style::success("✓ stopped plugin"),
-            style::bold(name)
+            style::bold(style::safe_label(name))
         ),
     }
     Ok(())
@@ -5358,7 +5508,10 @@ pub async fn handle_plugin_grant(
     }
     let result = rpc_call(stream, "plugin.grant", serde_json::Value::Object(params)).await?;
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
         OutputFormat::Plain => {
             let scope = target.unwrap_or("*");
             let kind = if subscribe { "subscribe" } else { "method" };
@@ -5401,7 +5554,10 @@ pub async fn handle_plugin_revoke(
     }
     let result = rpc_call(stream, "plugin.revoke", serde_json::Value::Object(params)).await?;
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
         OutputFormat::Plain => {
             let scope = target.unwrap_or("*");
             let kind = if subscribe { "subscribe" } else { "method" };
@@ -5433,7 +5589,10 @@ pub async fn handle_plugin_grants(
     let params = serde_json::json!({"plugin": plugin});
     let result = rpc_call(stream, "plugin.grants", params).await?;
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
         OutputFormat::Plain => {
             if let Some(g) = result.get("grants").and_then(|v| v.as_object()) {
                 for (method, scope) in g {
@@ -5513,7 +5672,10 @@ pub async fn handle_plugin_audit(
     let params = serde_json::json!({"plugin": plugin, "tail": tail});
     let result = rpc_call(stream, "plugin.audit", params).await?;
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        ),
         OutputFormat::Plain => {
             if let Some(entries) = result.get("entries").and_then(|v| v.as_array()) {
                 for e in entries {
@@ -5607,7 +5769,10 @@ pub async fn handle_apply(
     };
 
     if matches!(format, OutputFormat::Json) {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        println!(
+            "{}",
+            crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+        );
         return Ok(());
     }
 
@@ -5707,7 +5872,10 @@ pub async fn handle_version(
 
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!(
+                "{}",
+                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+            );
         }
         OutputFormat::Text | OutputFormat::Plain => {
             let version = result

@@ -587,28 +587,220 @@ fn every_hostile_character_class_is_neutralised_end_to_end() {
     }
 }
 
-/// A very long title must not blow past the 64-char border budget that
-/// `sanitize_title` enforces for panes, and the clamp must run AFTER the
-/// strip so filler cannot push payload out of the window.
+/// A window title is a lookup key, so it is bounded by **rejection**, not
+/// by truncation: silently cutting it would make two distinct requested
+/// names resolve to one window.
 #[test]
-fn long_and_padded_titles_are_clamped_like_pane_titles() {
+fn over_long_window_titles_are_rejected_not_truncated() {
     let env = Env::new();
-    let long = "x".repeat(200);
-    env.apply("len", &hostile_template("len", &long));
+    let out = env.apply("len", &hostile_template("len", &"x".repeat(200)));
+    assert!(
+        !out.status.success(),
+        "a 200-char title should be refused: {}",
+        combined(&out)
+    );
+    assert!(
+        combined(&out).contains("too long"),
+        "expected a length error, got: {}",
+        combined(&out)
+    );
+    assert_output_inert("over-long rejection", &out);
 
-    let json = stdout_of(&env.run(&["--format", "json", "window", "list", "-s", "len"]));
-    let v: serde_json::Value = serde_json::from_str(&json).expect("json");
-    let stored = v[0]["title"].as_str().unwrap();
-    assert_eq!(stored.chars().count(), 64, "stored {stored:?}");
-
-    // 100 ESC bytes of filler in front of the payload: if the clamp ran
-    // first, the payload would be pushed out and the title would be empty.
+    // At the bound, the title is stored WHOLE — no silent shortening.
+    let at_bound = "y".repeat(128);
     let env2 = Env::new();
+    let out = env2.apply("bound", &hostile_template("bound", &at_bound));
+    assert!(out.status.success(), "{}", combined(&out));
+    let json = stdout_of(&env2.run(&["--format", "json", "window", "list", "-s", "bound"]));
+    let v: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(v[0]["title"], at_bound);
+}
+
+/// The strip runs BEFORE the length check, so an attacker cannot use
+/// hostile filler to change how the bound is applied — and cannot push a
+/// payload out of a window that no longer exists.
+#[test]
+fn hostile_filler_does_not_survive_or_shift_the_payload() {
+    let env = Env::new();
     let filler = "\\u001B".repeat(100);
-    env2.apply("pad", &hostile_template("pad", &format!("{filler}MARKER")));
-    let json = stdout_of(&env2.run(&["--format", "json", "window", "list", "-s", "pad"]));
+    env.apply("pad", &hostile_template("pad", &format!("{filler}MARKER")));
+    let json = stdout_of(&env.run(&["--format", "json", "window", "list", "-s", "pad"]));
     let v: serde_json::Value = serde_json::from_str(&json).expect("json");
     assert_eq!(v[0]["title"], "MARKER");
+}
+
+/// Two titles that differ only past the old 64-char clamp must stay two
+/// windows, and each name must resolve to its own. Truncating the lookup
+/// key made `window rename -w <B>` silently rename window A.
+#[test]
+fn long_titles_differing_past_the_old_clamp_stay_distinct() {
+    let env = Env::new();
+    env.apply("sel", &hostile_template("sel", "seed"));
+    let one = format!("{}-one", "B".repeat(100));
+    let two = format!("{}-two", "B".repeat(100));
+
+    for name in [&one, &two] {
+        let out = env
+            .shux()
+            .args(["window", "create", "-s", "sel", "--name"])
+            .arg(name)
+            .output()
+            .expect("spawn");
+        assert!(out.status.success(), "{}", combined(&out));
+    }
+
+    let out = env
+        .shux()
+        .args(["window", "rename", "-s", "sel", "-w"])
+        .arg(&two)
+        .args(["--name", "RESOLVED"])
+        .output()
+        .expect("spawn");
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let json = stdout_of(&env.run(&["--format", "json", "window", "list", "-s", "sel"]));
+    let v: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let titles: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.contains(&one.as_str()),
+        "the '-one' window was renamed instead: {titles:?}"
+    );
+    assert!(titles.contains(&"RESOLVED"), "{titles:?}");
+    assert!(!titles.contains(&two.as_str()), "{titles:?}");
+}
+
+/// `window.ensure` is idempotent BY NAME. Two long names that differ only
+/// past the old clamp must not alias onto one window.
+#[test]
+fn ensure_does_not_alias_long_names() {
+    let env = Env::new();
+    env.apply("ens", &hostile_template("ens", "seed"));
+    let sessions = stdout_of(&env.run(&["--format", "json", "session", "list"]));
+    let sid =
+        serde_json::from_str::<serde_json::Value>(&sessions).expect("json")["sessions"][0]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+    let alpha = format!("{}-alpha", "A".repeat(100));
+    let beta = format!("{}-beta", "A".repeat(100));
+    let out = env
+        .shux()
+        .args(["window", "create", "-s", "ens", "--name"])
+        .arg(&alpha)
+        .output()
+        .expect("spawn");
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let params = serde_json::json!({ "session_id": sid, "name": beta }).to_string();
+    let out = env.run(&[
+        "--format",
+        "json",
+        "rpc",
+        "call",
+        "window.ensure",
+        "--params",
+        &params,
+    ]);
+    let body: serde_json::Value = serde_json::from_str(&stdout_of(&out)).expect("json");
+    assert_eq!(
+        body["result"]["created"],
+        true,
+        "ensure handed back the wrong window: {}",
+        stdout_of(&out)
+    );
+    assert_eq!(body["result"]["title"], beta);
+}
+
+// ── egress paths the ingress sanitizer structurally cannot reach ────────
+
+/// `cwd` and `command` are caller-supplied and legitimately arbitrary, so
+/// they are never sanitized on the way in. `pane list` prints both.
+#[test]
+fn pane_list_never_prints_a_raw_cwd_or_command() {
+    let env = Env::new();
+    // JSON's own \u escapes decode to real control bytes before shux sees
+    // them — the same trap TOML sets. A raw byte in the request is refused.
+    let params = r#"{"name":"pl","cwd":"/tmp/\u001b]0;PWNED-CWD\u0007","command":["sh\u001b]0;PWNED-CMD\u0007","-c","sleep 30"]}"#;
+    let out = env.run(&["rpc", "call", "session.create", "--params", params]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    for args in [
+        &["pane", "list", "-s", "pl"][..],
+        &["--format", "plain", "pane", "list", "-s", "pl"][..],
+        &["--format", "json", "pane", "list", "-s", "pl"][..],
+    ] {
+        let out = env.run(args);
+        assert_output_inert(&format!("{args:?}"), &out);
+    }
+
+    // The auto-derived pane title goes through the shared sanitizer too.
+    let json = stdout_of(&env.run(&["--format", "json", "pane", "list", "-s", "pl"]));
+    let v: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let title = v[0]["title"].as_str().unwrap();
+    assert!(
+        !title.chars().any(|c| c.is_control()),
+        "auto title kept control bytes: {title:?}"
+    );
+}
+
+/// A TOML parse error quotes the offending source line verbatim, and it
+/// is printed before the daemon is ever contacted — no ingress sanitizer
+/// can reach it.
+#[test]
+fn template_parse_errors_never_replay_the_source_line_raw() {
+    let env = Env::new();
+    let path = env.work().join("raw.toml");
+    // A RAW ESC byte. TOML forbids it inside a basic string, which is
+    // exactly why this is a parse error — and why the diagnostic quotes it.
+    std::fs::write(
+        &path,
+        b"[session]\nname = \"raw\"\ntitle = \"\x1b]0;PWNED-RAW\x07\"\n".as_slice(),
+    )
+    .expect("write");
+
+    let out = env.run(&["state", "apply", path.to_str().unwrap()]);
+    assert!(!out.status.success(), "{}", combined(&out));
+    assert_output_inert("toml parse error", &out);
+    // The multi-line diagnostic layout survives — \n and \t are structure.
+    assert!(
+        combined(&out).lines().count() >= 3,
+        "diagnostic layout was flattened: {}",
+        combined(&out).escape_debug()
+    );
+    assert!(
+        combined(&out).contains("\\u{1b}"),
+        "payload should be shown escaped: {}",
+        combined(&out).escape_debug()
+    );
+}
+
+/// `--dry-run` is the advertised way to inspect an untrusted template. It
+/// prints the ops BEFORE the graph sanitizes them, so it is the one place
+/// a hostile title is meant to be shown verbatim — and must be inert.
+#[test]
+fn dry_run_output_is_inert_and_still_valid_json() {
+    let env = Env::new();
+    let path = env.work().join("dry.toml");
+    std::fs::write(
+        &path,
+        "[session]\nname = \"dry\"\n\n[[windows]]\n\
+         title = \"A\\u009BB\\u0085C\\u2028D\\u202EE\\u001BF\"\n\n\
+         [[windows.panes]]\ncommand = [\"sh\"]\n",
+    )
+    .expect("write");
+
+    let out = env.run(&["state", "apply", "--dry-run", path.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert_output_inert("dry-run", &out);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout_of(&out)).expect("dry-run must stay valid JSON");
+    assert_eq!(v["ops"][0]["op"], "create_session");
 }
 
 /// Ordinary Unicode titles keep working — the sanitiser drops explicit

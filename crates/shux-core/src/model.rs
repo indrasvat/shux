@@ -274,7 +274,7 @@ impl Pane {
     /// sources (OSC + command/cwd) flow back into `title`. Setting
     /// `Some` overrides them.
     pub fn set_manual_title(&mut self, title: Option<String>) {
-        self.manual_title = title.map(|t| sanitize_title(&t));
+        self.manual_title = title.map(|t| sanitize_title_clamped(&t));
         self.recalculate_title();
     }
 
@@ -284,7 +284,7 @@ impl Pane {
     /// differs) — callers use this to decide whether to fire a
     /// `PaneTitleChanged` event without re-computing the priority.
     pub fn set_osc_title(&mut self, title: String) -> bool {
-        let sanitized = sanitize_title(&title);
+        let sanitized = sanitize_title_clamped(&title);
         let new_osc = if sanitized.is_empty() {
             None
         } else {
@@ -324,16 +324,23 @@ impl Pane {
                 return;
             }
             // Auto from command (first arg basename) or cwd basename.
+            //
+            // These are as untrusted as the OSC and manual sources: a
+            // template picks the argv and the cwd, and neither is
+            // validated as an existing path. They go through the same
+            // sanitizer, or `sanitize_title` is not "the single title
+            // rule" it claims to be (issue #104).
             if let Some(cmd) = self.command.first() {
-                self.title = std::path::Path::new(cmd)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(cmd)
-                    .to_string();
+                self.title = sanitize_title_clamped(
+                    std::path::Path::new(cmd)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(cmd),
+                );
                 return;
             }
             if let Some(name) = self.cwd.file_name().and_then(|s| s.to_str()) {
-                self.title = name.to_string();
+                self.title = sanitize_title_clamped(name);
             }
         }
         // Auto disabled and no manual override → keep whatever we had.
@@ -355,46 +362,71 @@ impl Pane {
 /// - **`U+2028` / `U+2029`** — line and paragraph separators. Not
 ///   `is_control()`, but they end a line in exactly the place the
 ///   border-draw code assumes there is none.
-/// - **`U+202A`–`U+202E`, `U+2066`–`U+2069`** — bidi embedding, override
-///   and isolate formatting. These reorder the *rendered* title without
-///   changing its bytes, which is how a title spoofs another one
-///   (the Trojan Source class, CVE-2021-42574). Only the explicit
+/// - **`U+202A`–`U+202E`, `U+2066`–`U+2069`, `U+200E`, `U+200F`,
+///   `U+061C`** — bidi embedding, override, isolate and mark formatting.
+///   These reorder the *rendered* title without changing its bytes, which
+///   is how a title spoofs another one (the Trojan Source class,
+///   CVE-2021-42574). This is the same set `rustc`'s
+///   `text_direction_codepoint_in_literal` lint covers. Only the explicit
 ///   formatting characters are dropped; the implicit bidi algorithm is
 ///   untouched, so ordinary RTL titles still render correctly.
-fn is_title_hostile(c: char) -> bool {
+///
+/// Deliberately **not** dropped: `U+200D` ZERO WIDTH JOINER, which is
+/// load-bearing inside emoji sequences — removing it would split a
+/// perfectly legitimate title into separate glyphs.
+pub(crate) fn is_title_hostile(c: char) -> bool {
     c.is_control()
         || matches!(c, '\u{2028}' | '\u{2029}')
         || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}')
 }
 
-/// Clamp a title to a sane single-line display.
+/// The longest title a pane will display. The border has limited room
+/// and a very long title squeezes out the rest of the chrome.
+pub const MAX_TITLE_CHARS: usize = 64;
+
+/// Neutralize a title: drop every [`is_title_hostile`] character, then
+/// trim.
 ///
 /// **The single title rule for panes and windows alike** — pane manual
 /// titles ([`Pane::set_manual_title`]), pane OSC titles
-/// ([`Pane::set_osc_title`]) and window titles ([`Window::new`], plus
-/// every `SessionGraph` window-title ingress) all funnel through here, so
-/// the two entity kinds cannot drift apart (issue #104).
+/// ([`Pane::set_osc_title`]), auto-derived pane titles, and window titles
+/// ([`Window::new`] plus every `SessionGraph` window-title ingress) all
+/// funnel through here, so the two entity kinds cannot drift apart
+/// (issue #104).
 ///
-/// Drops every [`is_title_hostile`] character, trims, then hard-caps at 64
-/// chars — the border has limited room and very long titles squeeze out
-/// the rest of the chrome. The strip runs **before** the clamp so an
-/// attacker cannot push a payload past the 64-char window behind filler
-/// that later disappears.
+/// This does **not** shorten the title. Length is a display concern and
+/// the two entity kinds want different answers: a pane title is pure
+/// chrome, so it is clamped ([`sanitize_title_clamped`]); a **window**
+/// title is also a *lookup key* — `window.ensure` is idempotent by name
+/// and `shux window … -w <name>` selects by it — and silently truncating
+/// a lookup key makes two distinct requested names resolve to one window,
+/// so over-long window titles are rejected instead
+/// (`SessionGraph::validate_window_title`).
 ///
 /// The result may be **empty** (a title made entirely of hostile
-/// characters collapses). Callers that require a non-empty title must
-/// sanitize first and validate second — see
-/// `SessionGraph::validate_window_title`.
+/// characters collapses). Callers that require a non-empty title
+/// sanitize first and validate second.
 pub fn sanitize_title(raw: &str) -> String {
-    let cleaned = raw
-        .chars()
+    raw.chars()
         .filter(|c| !is_title_hostile(*c))
-        .collect::<String>();
-    let cleaned = cleaned.trim();
-    if cleaned.chars().count() <= 64 {
-        cleaned.to_string()
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// [`sanitize_title`] plus the [`MAX_TITLE_CHARS`] display clamp, for
+/// pane titles.
+///
+/// The strip runs **before** the clamp so an attacker cannot push a
+/// payload past the window behind filler that later disappears. The clamp
+/// counts characters, so a multi-byte title is never cut mid-scalar.
+pub fn sanitize_title_clamped(raw: &str) -> String {
+    let cleaned = sanitize_title(raw);
+    if cleaned.chars().count() <= MAX_TITLE_CHARS {
+        cleaned
     } else {
-        cleaned.chars().take(64).collect()
+        cleaned.chars().take(MAX_TITLE_CHARS).collect()
     }
 }
 
@@ -715,13 +747,27 @@ mod tests {
         }
     }
 
-    /// The clamp counts characters, not bytes — a multi-byte title must
-    /// not be cut mid-scalar, and must not exceed the border budget.
+    /// The pane clamp counts characters, not bytes — a multi-byte title
+    /// must not be cut mid-scalar, and must not exceed the border budget.
     #[test]
-    fn test_sanitize_title_clamps_multibyte_by_chars() {
-        let out = sanitize_title(&"日".repeat(120));
-        assert_eq!(out.chars().count(), 64);
-        assert_eq!(out, "日".repeat(64));
+    fn test_sanitize_title_clamped_counts_multibyte_by_chars() {
+        let out = sanitize_title_clamped(&"日".repeat(120));
+        assert_eq!(out.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(out, "日".repeat(MAX_TITLE_CHARS));
+    }
+
+    /// `sanitize_title` itself does NOT shorten. Length is a display
+    /// policy, and windows need the full string intact because they use
+    /// it as a lookup key (issue #104 adversarial review).
+    #[test]
+    fn test_sanitize_title_does_not_shorten() {
+        let long = "x".repeat(500);
+        assert_eq!(sanitize_title(&long), long);
+        let hostile = format!("{}\u{1b}{}", "a".repeat(100), "b".repeat(100));
+        assert_eq!(
+            sanitize_title(&hostile),
+            format!("{}{}", "a".repeat(100), "b".repeat(100))
+        );
     }
 
     /// Hostile bytes are removed BEFORE the clamp, so an attacker cannot
@@ -746,12 +792,54 @@ mod tests {
         assert!(!w.title.chars().any(|c| c.is_control()));
     }
 
+    /// `Window::new` sanitizes but does NOT clamp — see
+    /// `sanitize_title`. The graph rejects over-long window titles at
+    /// ingress instead, so a lookup key is never silently truncated.
     #[test]
-    fn test_window_new_clamps_long_title() {
+    fn test_window_new_does_not_clamp_long_title() {
         let sid = SessionId::new();
         let pid = PaneId::new();
         let w = Window::new(sid, "z".repeat(200), pid);
-        assert_eq!(w.title.chars().count(), 64);
+        assert_eq!(w.title.chars().count(), 200);
+    }
+
+    /// The bidi MARKS travel with the overrides — same class, same lint
+    /// (`rustc`'s `text_direction_codepoint_in_literal`).
+    #[test]
+    fn test_sanitize_title_strips_bidi_marks() {
+        for (label, ch) in [("LRM", '\u{200e}'), ("RLM", '\u{200f}'), ("ALM", '\u{61c}')] {
+            assert_eq!(sanitize_title(&format!("a{ch}b")), "ab", "{label} survived");
+        }
+    }
+
+    /// ZWJ is load-bearing inside emoji sequences — stripping it would
+    /// split a legitimate title into separate glyphs.
+    #[test]
+    fn test_sanitize_title_keeps_zero_width_joiner() {
+        let family = "build \u{1f468}\u{200d}\u{1f4bb} ok";
+        assert_eq!(sanitize_title(family), family);
+    }
+
+    /// Auto-derived pane titles are as untrusted as the OSC and manual
+    /// sources: a template picks both the argv and the cwd.
+    #[test]
+    fn test_pane_auto_title_from_command_is_sanitized() {
+        let wid = WindowId::new();
+        let pane = Pane::with_command(
+            wid,
+            "/home/test",
+            vec!["sh\u{1b}]0;CMDPWN\u{7}".into(), "-c".into()],
+        );
+        assert_eq!(pane.title, "sh]0;CMDPWN");
+        assert!(!pane.title.chars().any(|c| c.is_control()));
+    }
+
+    #[test]
+    fn test_pane_auto_title_from_cwd_is_sanitized() {
+        let wid = WindowId::new();
+        let pane = Pane::new(wid, "/tmp/dir\u{1b}]0;CWDPWN\u{7}x");
+        assert_eq!(pane.title, "dir]0;CWDPWNx");
+        assert!(!pane.title.chars().any(|c| c.is_control()));
     }
 
     #[test]

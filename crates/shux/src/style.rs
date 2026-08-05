@@ -759,7 +759,17 @@ pub fn render_pane_list(
     match ctx.format {
         OutputFormat::Plain => {
             for p in panes {
-                let _ = writeln!(out, "{}\t{}\t{}", short_id(&p.id), p.cwd, p.command,);
+                // `cwd` and `command` are caller-supplied and are NOT
+                // sanitized on the way in — a path or an argv is
+                // legitimately arbitrary text, so the guard has to be here
+                // (issue #104).
+                let _ = writeln!(
+                    out,
+                    "{}\t{}\t{}",
+                    short_id(&p.id),
+                    safe_label(&p.cwd),
+                    safe_label(&p.command),
+                );
             }
         }
         OutputFormat::Json => unreachable!("JSON handled before render"),
@@ -959,7 +969,7 @@ pub fn print_success(action: &str, subject: &str, id: Option<&str>) {
 pub fn print_error(msg: &str) {
     let mut err = io::stderr().lock();
     let _ = write!(err, "{} ", error("\u{2717}")); // ✗
-    let _ = writeln!(err, "{}", safe_label(msg));
+    let _ = writeln!(err, "{}", safe_diagnostic(msg));
 }
 
 // ── Egress Guard (issue #104) ──────────────────────────────────
@@ -982,18 +992,84 @@ pub fn print_error(msg: &str) {
 /// and the bidi override/isolate formatting characters. Everything else —
 /// including quotes, backslashes and every non-Latin script — is passed
 /// through byte for byte, so wiring this in cannot change normal output.
-pub fn safe_label(raw: &str) -> String {
-    fn hostile(c: char) -> bool {
-        c.is_control()
-            || matches!(c, '\u{2028}' | '\u{2029}')
-            || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-    }
-    if !raw.chars().any(hostile) {
+/// True for characters that must never reach the terminal as themselves.
+/// Mirrors `shux_core::model::sanitize_title`'s rule.
+fn is_hostile_out(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{2028}' | '\u{2029}')
+        || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}')
+}
+
+/// Like [`safe_label`], but for multi-line diagnostic text: `\n` and `\t`
+/// are structure here, not payload, so they survive.
+///
+/// A TOML parse error is three lines of source excerpt with a caret, and
+/// it quotes the offending line **verbatim** — including any escape
+/// sequence the attacker put there. That excerpt is printed before the
+/// daemon is ever contacted, so no amount of ingress sanitizing reaches
+/// it; this is where it gets neutralized (issue #104).
+pub fn safe_diagnostic(raw: &str) -> String {
+    if !raw
+        .chars()
+        .any(|c| is_hostile_out(c) && c != '\n' && c != '\t')
+    {
         return raw.to_string();
     }
     raw.chars()
         .map(|c| {
-            if hostile(c) {
+            if c == '\n' || c == '\t' {
+                c.to_string()
+            } else if is_hostile_out(c) {
+                format!("\\u{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Re-escape a **serialized JSON** document so it cannot carry an active
+/// control sequence.
+///
+/// `serde_json` escapes C0 and DEL **inside strings**, but not
+/// `U+0080`–`U+009F`, `U+2028`/`U+2029` or the bidi formatting characters
+/// — a terminal in 8-bit mode reads `U+009B` as CSI. Rewriting those to
+/// their `\uXXXX` form keeps the document valid JSON with identical
+/// semantics for any parser, while making it inert for a human piping it
+/// to a terminal.
+///
+/// The pretty-printer's own newlines, carriage returns and tabs are
+/// **structure**, not payload, and are left alone: any C0 that came from
+/// the data is already `\n`-style escaped by `serde_json`, so a raw one
+/// in the serialized document can only be layout. Escaping it would emit
+/// a `\u000a` outside a string literal and produce invalid JSON.
+pub fn json_safe(serialized: &str) -> String {
+    fn hostile_in_json(c: char) -> bool {
+        !matches!(c, '\n' | '\r' | '\t') && is_hostile_out(c)
+    }
+    if !serialized.chars().any(hostile_in_json) {
+        return serialized.to_string();
+    }
+    serialized
+        .chars()
+        .map(|c| {
+            if hostile_in_json(c) {
+                format!("\\u{:04x}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+pub fn safe_label(raw: &str) -> String {
+    if !raw.chars().any(is_hostile_out) {
+        return raw.to_string();
+    }
+    raw.chars()
+        .map(|c| {
+            if is_hostile_out(c) {
                 format!("\\u{{{:x}}}", c as u32)
             } else {
                 c.to_string()
@@ -1386,6 +1462,74 @@ mod tests {
 
     /// A sanitised title is already inert, so the two layers compose without
     /// double-escaping.
+    /// A TOML diagnostic is three lines of source excerpt with a caret.
+    /// Escaping its newlines would turn it into an unreadable ribbon, so
+    /// `\n` and `\t` are structure here and survive.
+    #[test]
+    fn test_safe_diagnostic_preserves_layout_but_neutralises_payload() {
+        let diag = "TOML parse error at line 3\n  |\n3 | title = \"\u{1b}]0;PWNED\u{7}\"\n  |\t^";
+        let out = safe_diagnostic(diag);
+        assert_eq!(out.matches('\n').count(), 3, "layout lost: {out:?}");
+        assert!(out.contains('\t'), "tab lost: {out:?}");
+        assert!(out.contains("\\u{1b}") && out.contains("\\u{7}"), "{out:?}");
+        assert!(
+            !out.chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn test_safe_diagnostic_is_identity_for_clean_text() {
+        for s in ["plain", "two\nlines", "tab\there", ""] {
+            assert_eq!(safe_diagnostic(s), s);
+        }
+    }
+
+    /// `serde_json` escapes C0 inside strings but not C1, the separators
+    /// or the bidi class — a terminal in 8-bit mode reads U+009B as CSI.
+    #[test]
+    fn test_json_safe_escapes_what_serde_json_leaves_raw() {
+        let doc = serde_json::to_string_pretty(&serde_json::json!({
+            "cwd": "/tmp/d\u{9b}31m\u{202e}x",
+            "title": "a\u{2028}b",
+        }))
+        .unwrap();
+        let out = json_safe(&doc);
+        assert!(out.contains("\\u009b"), "{out}");
+        assert!(out.contains("\\u202e"), "{out}");
+        assert!(out.contains("\\u2028"), "{out}");
+        assert!(
+            !out.chars()
+                .any(|c| matches!(c, '\u{80}'..='\u{9f}' | '\u{2028}' | '\u{2029}')),
+            "{out}"
+        );
+    }
+
+    /// The pretty-printer's own newlines are STRUCTURE. Escaping them
+    /// emits `\u000a` outside a string literal and produces invalid JSON.
+    #[test]
+    fn test_json_safe_keeps_the_document_valid_and_pretty() {
+        let doc = serde_json::to_string_pretty(&serde_json::json!({
+            "cwd": "/tmp/\u{9b}evil",
+            "nested": { "k": [1, 2] },
+        }))
+        .unwrap();
+        let out = json_safe(&doc);
+        assert!(out.contains('\n'), "pretty layout lost");
+        let back: serde_json::Value =
+            serde_json::from_str(&out).expect("json_safe must emit valid JSON");
+        // Semantics are preserved exactly — an escape is the same value.
+        assert_eq!(back["cwd"], "/tmp/\u{9b}evil");
+        assert_eq!(back["nested"]["k"][1], 2);
+    }
+
+    #[test]
+    fn test_json_safe_is_identity_for_clean_documents() {
+        let doc = serde_json::to_string_pretty(&serde_json::json!({"a": "plain", "b": 1})).unwrap();
+        assert_eq!(json_safe(&doc), doc);
+    }
+
     #[test]
     fn test_safe_label_of_sanitized_title_is_unchanged() {
         let sanitized = shux_core::model::sanitize_title("\u{1b}]0;PWNED\u{7}deploy");

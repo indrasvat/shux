@@ -68,6 +68,9 @@ pub enum GraphError {
     #[error("window name is empty")]
     EmptyWindowName,
 
+    #[error("window name too long (max 128 characters): {}", .0.escape_debug())]
+    WindowNameTooLong(String),
+
     #[error("window index {index} out of range (session has {count} windows)")]
     WindowIndexOutOfRange { index: usize, count: usize },
 
@@ -520,7 +523,11 @@ impl SessionGraph {
         if name.is_empty() {
             return Err(GraphError::EmptySessionName);
         }
-        if name.len() > 128 {
+        // Count CHARACTERS, not bytes — the message promises characters,
+        // and `is_alphanumeric()` below admits non-ASCII scripts, so a
+        // 100-character Japanese name is 300 bytes and used to be refused
+        // by a limit that claimed it had room.
+        if name.chars().count() > 128 {
             return Err(GraphError::SessionNameTooLong(name.to_string()));
         }
         if !name
@@ -532,6 +539,12 @@ impl SessionGraph {
         Ok(())
     }
 
+    /// Longest window title the graph will store. A window title is a
+    /// **lookup key**, so unlike a pane title it is bounded by rejection
+    /// rather than by truncation — see below. Matches the session-name
+    /// bound for consistency.
+    pub const MAX_WINDOW_TITLE_CHARS: usize = 128;
+
     /// Normalize a window title at ingress: **sanitize, then validate**.
     ///
     /// Order is load-bearing (issue #104). A title made entirely of control
@@ -540,9 +553,19 @@ impl SessionGraph {
     /// first collapses it to `""`, which the existing [`GraphError::
     /// EmptyWindowName`] check then rejects.
     ///
-    /// Strip rather than reject, matching what pane titles already do
-    /// ([`crate::model::sanitize_title`]): input that works today keeps
-    /// working, and the two entity kinds stay on one rule.
+    /// Strip rather than reject the hostile *characters*, matching what
+    /// pane titles do ([`crate::model::sanitize_title`]): input that works
+    /// today keeps working, and the two entity kinds stay on one rule.
+    ///
+    /// **Length is the one place windows deliberately diverge from panes.**
+    /// A pane title is pure chrome, so it is clamped. A window title is
+    /// also a lookup key — `window.ensure` is idempotent *by name* and
+    /// `shux window … -w <name>` selects by it — and truncating a lookup
+    /// key is not cosmetic: two distinct requested names that differ only
+    /// past the cut collapse onto one stored value, so `ensure` hands back
+    /// the wrong window and a rename mutates the wrong window, silently.
+    /// Over-long titles are therefore **rejected**, loudly, the way
+    /// over-long session names already are.
     ///
     /// Every window-title ingress goes through here — `create_window`,
     /// `rename_window`, and the staged `state.apply` paths — so the value
@@ -552,6 +575,9 @@ impl SessionGraph {
         let cleaned = crate::model::sanitize_title(raw);
         if cleaned.is_empty() {
             return Err(GraphError::EmptyWindowName);
+        }
+        if cleaned.chars().count() > Self::MAX_WINDOW_TITLE_CHARS {
+            return Err(GraphError::WindowNameTooLong(cleaned));
         }
         Ok(cleaned)
     }
@@ -1822,9 +1848,15 @@ fn stage_create_session(
 
     // A template supplies this title (`[[windows]][0].title`), so it is as
     // untrusted as any other window title — sanitize then validate.
+    //
+    // `None` and `Some("")` both mean "unspecified": `title` is a required
+    // TOML field, so a template that has nothing to say writes `""`, and
+    // that used to apply cleanly. Both take the default. A title that had
+    // real content and sanitized away to nothing is a different story —
+    // that is the attack case, and it is rejected.
     let title = match initial_window_title {
-        Some(raw) => SessionGraph::validate_window_title(&raw)?,
-        None => "1".to_string(),
+        Some(raw) if !raw.is_empty() => SessionGraph::validate_window_title(&raw)?,
+        _ => "1".to_string(),
     };
     let mut window = Window::new(SessionId::new(), &title, pane_id);
     window.id = window_id;
@@ -3420,25 +3452,90 @@ mod tests {
         );
     }
 
-    /// Window titles inherit the pane sanitizer's 64-char clamp, so two
-    /// titles that differ only past char 64 now collapse onto one value.
-    /// That is deliberate: they would render identically in the border and
-    /// in `window list`, so treating them as distinct only moves the
-    /// ambiguity somewhere the operator cannot see it. `rename_window`'s
-    /// conflict check compares the clamped value and refuses the collision.
+    /// A window title is a **lookup key** (`window.ensure` is idempotent
+    /// by name, `-w <name>` selects by it), so it must never be silently
+    /// truncated: two distinct requested names that differ only past the
+    /// cut would collapse onto one stored value, and `ensure` would hand
+    /// back the wrong window. Distinct long titles stay distinct.
     #[test]
-    fn test_window_title_clamp_makes_long_titles_collide_and_conflict() {
+    fn test_long_window_titles_stay_distinct() {
         let (graph, state) = SessionGraph::new();
         let sid = graph.create_session("work".into(), home()).unwrap();
-        let long_a = format!("{}A", "x".repeat(64));
-        let long_b = format!("{}B", "x".repeat(64));
+        let alpha = format!("{}-alpha", "A".repeat(100));
+        let beta = format!("{}-beta", "A".repeat(100));
 
-        let w1 = graph.create_window(sid, long_a, home()).unwrap();
-        let w2 = graph.create_window(sid, "other".into(), home()).unwrap();
-        assert_eq!(state.load().windows[&w1].title, "x".repeat(64));
+        let w1 = graph.create_window(sid, alpha.clone(), home()).unwrap();
+        let w2 = graph.create_window(sid, beta.clone(), home()).unwrap();
+        assert_ne!(w1, w2);
 
-        let err = graph.rename_window(w2, long_b, None).unwrap_err();
-        assert!(matches!(err, GraphError::WindowNameConflict(_)), "{err:?}");
+        let snap = state.load();
+        assert_eq!(snap.windows[&w1].title, alpha);
+        assert_eq!(snap.windows[&w2].title, beta);
+        // …and each name resolves to its own window.
+        assert_eq!(
+            snap.find_window_by_name(&sid, &alpha).map(|w| w.id),
+            Some(w1)
+        );
+        assert_eq!(
+            snap.find_window_by_name(&sid, &beta).map(|w| w.id),
+            Some(w2)
+        );
+    }
+
+    /// Bounded by rejection rather than by truncation. Loud beats silent
+    /// when the value is a lookup key.
+    #[test]
+    fn test_window_title_over_the_bound_is_rejected() {
+        let (graph, _state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let max = SessionGraph::MAX_WINDOW_TITLE_CHARS;
+
+        // Exactly at the bound is fine.
+        graph.create_window(sid, "o".repeat(max), home()).unwrap();
+        // One over is not.
+        let err = graph
+            .create_window(sid, "o".repeat(max + 1), home())
+            .unwrap_err();
+        assert!(matches!(err, GraphError::WindowNameTooLong(_)), "{err:?}");
+        // The rejection message escapes any payload it quotes.
+        let err = graph
+            .create_window(sid, format!("\u{1b}{}", "o".repeat(max + 1)), home())
+            .unwrap_err();
+        assert_inert("WindowNameTooLong display", &err.to_string());
+    }
+
+    /// `title` is a required TOML field, so a template with nothing to say
+    /// writes `""` — and that used to apply cleanly. It still does: an
+    /// absent-or-blank title takes the default. A title that had content
+    /// and sanitized away to nothing is the attack case, and is rejected.
+    #[test]
+    fn test_apply_batch_blank_initial_window_title_falls_back_to_default() {
+        use crate::apply::Op;
+        let (graph, state) = SessionGraph::new();
+        graph
+            .apply_batch(vec![Op::CreateSession {
+                name: Some("blank".into()),
+                cwd: home(),
+                initial_command: vec![],
+                initial_window_title: Some(String::new()),
+            }])
+            .unwrap();
+        let snap = state.load();
+        assert_eq!(snap.windows.values().next().unwrap().title, "1");
+    }
+
+    /// The bound is in characters, matching what the error message says.
+    #[test]
+    fn test_session_name_length_is_measured_in_characters() {
+        let (graph, _state) = SessionGraph::new();
+        // 128 multi-byte characters = 384 bytes, but 128 characters.
+        let name: String = "\u{65e5}".repeat(128);
+        graph.create_session(name, home()).unwrap();
+
+        let (graph2, _state2) = SessionGraph::new();
+        let over: String = "\u{65e5}".repeat(129);
+        let err = graph2.create_session(over, home()).unwrap_err();
+        assert!(matches!(err, GraphError::SessionNameTooLong(_)), "{err:?}");
     }
 
     /// Lookup normalizes the same way storage does — otherwise
