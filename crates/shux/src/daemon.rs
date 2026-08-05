@@ -73,7 +73,12 @@ pub fn attach_socket_path() -> Result<PathBuf, DaemonError> {
 /// location — defeating the "daemon's own private dir" guarantee the statusbar
 /// fix relies on. We therefore open the final component with `O_NOFOLLOW`
 /// (refusing a symlink outright) and `fchmod` the resulting handle, which acts
-/// on the real directory with no path re-resolution (no TOCTOU window).
+/// on the real directory with no path re-resolution (no TOCTOU window). We also
+/// require the opened directory to be **owned by us** — a symlink is not the
+/// only squat: a local user can pre-create the predictable fallback path as a
+/// real directory they own, which `O_NOFOLLOW` accepts and `fchmod` cannot
+/// re-own. Refusing a foreign-owned dir fails closed rather than running out of
+/// attacker-controlled storage.
 pub fn ensure_runtime_dir() -> Result<PathBuf, DaemonError> {
     let dir = runtime_dir()?;
     // `create_dir_all` treats a pre-existing symlink-to-dir as the dir and
@@ -82,12 +87,34 @@ pub fn ensure_runtime_dir() -> Result<PathBuf, DaemonError> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
         let handle = fs::OpenOptions::new()
             .read(true)
             .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
             .open(&dir)
             .map_err(DaemonError::CreateDir)?;
+        // Require the directory to be owned by us. `O_NOFOLLOW` refused a
+        // symlink, but a local user can pre-create the predictable fallback path
+        // (`$TMPDIR/shux-$UID`, in shared /tmp) as a real directory THEY own;
+        // opening it succeeds and `fchmod(0700)` tightens the mode but CANNOT
+        // change the owner. A daemon (esp. as root) would then run its socket,
+        // pidfile and materialised segment configs out of an attacker-owned
+        // directory whose owner can unlink/replace those entries by pathname —
+        // e.g. swap `segment-<pid>-<idx>.toml` and feed root's starship an
+        // attacker-controlled config. `metadata()` here is an `fstat` on the
+        // open handle (no path re-resolution), so the owner we check is the
+        // directory we will actually write into.
+        let owner = handle.metadata().map_err(DaemonError::CreateDir)?.uid();
+        let me = nix::unistd::geteuid().as_raw();
+        if owner != me {
+            return Err(DaemonError::CreateDir(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "runtime directory {} is owned by uid {owner}, not {me}; refusing to use it",
+                    dir.display()
+                ),
+            )));
+        }
         handle
             .set_permissions(fs::Permissions::from_mode(0o700))
             .map_err(DaemonError::CreateDir)?;
@@ -337,6 +364,46 @@ mod tests {
             mode, 0o755,
             "victim dir was chmod-followed through the symlink (got {mode:o})"
         );
+    }
+
+    #[test]
+    fn ensure_runtime_dir_refuses_dir_owned_by_another_uid() {
+        use std::os::unix::fs::PermissionsExt;
+        // A local user can pre-create the predictable fallback path as a real
+        // directory THEY own; O_NOFOLLOW passes it (not a symlink) and fchmod
+        // can't change the owner. Creating a foreign-owned dir needs CAP_CHOWN,
+        // so this runs only as root (locally / maintainers); it is a no-op on
+        // the unprivileged CI runner.
+        if !nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let _guard = env_lock().lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg");
+        let shuxdir = xdg.join("shux");
+        fs::create_dir_all(&shuxdir).unwrap();
+        fs::set_permissions(&shuxdir, fs::Permissions::from_mode(0o777)).unwrap();
+        let foreign = 12345;
+        nix::unistd::chown(
+            &shuxdir,
+            Some(nix::unistd::Uid::from_raw(foreign)),
+            Some(nix::unistd::Gid::from_raw(foreign)),
+        )
+        .unwrap();
+
+        let original = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: guarded by ENV_LOCK, restored before releasing it.
+        unsafe { set_xdg_runtime_dir(&xdg) };
+        let result = ensure_runtime_dir();
+        unsafe { restore_xdg_runtime_dir(original) };
+
+        assert!(
+            result.is_err(),
+            "ensure_runtime_dir must refuse a runtime dir owned by another uid"
+        );
+        // Untouched: not chmod-tightened to 0700, still owned by the attacker.
+        let meta = fs::metadata(&shuxdir).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o777);
     }
 
     #[test]
