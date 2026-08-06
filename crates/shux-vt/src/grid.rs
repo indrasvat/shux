@@ -338,9 +338,7 @@ impl Row {
     /// `ch` — is what drops the extended payload and the wide-pair widths that
     /// the previous contents may have carried.
     pub(crate) fn fill_alignment_pattern(&mut self) {
-        for cell in self.cells_mut() {
-            *cell = Cell::ALIGNMENT;
-        }
+        self.cells_mut().fill(Cell::ALIGNMENT);
         self.wrapped = false;
     }
 
