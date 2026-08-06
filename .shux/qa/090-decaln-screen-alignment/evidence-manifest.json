@@ -1,0 +1,44 @@
+{
+  "task": "090-decaln-screen-alignment",
+  "issue": 117,
+  "base_commit": "6866fec",
+  "branch": "claude/shux-issue-117-fix-phh1vs",
+  "binary": "target/release/shux (rebuilt from this branch) vs a release build of 6866fec",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": {
+    "status": "N/A-substituted",
+    "reason": "DootSabha is not available in this cloud environment; the operator directed that all design/implementation review be done with parallel adversarial agents instead.",
+    "substitute_evidence": "Four adversarial agents on disjoint surfaces (escape-sequence space; terminal state + cross-boundary leaks; render paths + rich TUIs; cost, memory and test quality), each required to drive the real shux binary rather than reason from source, plus the shux-vt-solid-qa gate agent. Gate findings and their disposition are tabulated in SOLID-QA.md."
+  },
+  "dootsabha_implementation": {
+    "status": "N/A-substituted",
+    "reason": "Same. The implementation-diff review is carried by the gate agent's independent re-run (it re-derived all 10 original mutations plus one of its own design) and by the adversarial agents.",
+    "substitute_evidence": "12 mutations of the shipped fix, 12 killed by named tests — table in SOLID-QA.md. Two tests that initially passed vacuously were found and strengthened."
+  },
+  "screenshots": {
+    "status": "deliberately-not-committed",
+    "reason": "CLAUDE.md permits committing a PNG only as a true baseline/golden with DootSabha approval, which does not exist in this environment; the repo PR checklist requires 'no screenshots committed unless justified as durable baselines'; and the operator explicitly directed that no screenshots be checked in. These are A/B evidence for one fix, not durable baselines.",
+    "location": ".shux/out/issue-117/{before,after,tall,qa-crosspath}/ (gitignored scratch)",
+    "published": "Claude Artifact — 10 high-resolution before/after shots plus a before/after screen recording, every image opened and visually verified; linked from the pull request.",
+    "regenerate": "SHUX_BIN=<binary> LABEL=<label> .shux/scripts/issue_117_evidence.sh  (add EXPECT_DEFECT=1 for the pre-fix baseline arm)"
+  },
+  "pixel_metrics": [
+    "pixel-snapshot-determinism.json",
+    "pixel-glance-vs-snapshot.json"
+  ],
+  "pixel_metric_notes": {
+    "thresholds": "exact — max_pixel_diff_ratio 0, max_mean_channel_delta 0",
+    "scene": "80x24 pane: colour probe, DECSTBM rows 4-9, SGR bold + red on blue, DECALN, then 'HOME'",
+    "pixel-snapshot-determinism.json": "two consecutive pane.snapshot calls on a still pane — 0 of 349920 pixels changed",
+    "pixel-glance-vs-snapshot.json": "pane.glance PNG vs pane.snapshot PNG of the same frame — 0 of 349920 pixels changed",
+    "text_cross_path": "pane capture --lines 24 is byte-identical to pane glance --text-only after trailing-space normalisation",
+    "tool_fix": "Both metrics were produced AFTER fixing .claude/automations/pixel_verify.py, which had been writing fully transparent diff PNGs (gate finding P1-3)."
+  },
+  "harness": {
+    "evidence_script": ".shux/scripts/issue_117_evidence.sh",
+    "geometries": ["48x14", "200x60"],
+    "assertions": "10 per geometry; 10/10 on the fixed binary, 5/10 fail on 6866fec",
+    "vacuity_guards": "EXPECT_DEFECT=1 fails if the defect does NOT reproduce; a plain run fails if any assertion fails. All four combinations were exercised and each returned the expected exit code."
+  },
+  "leaks": "zero — every run wrapped in .shux/scripts/no_leak_guard.sh; daemons identified by pidfile, never by command-line match"
+}

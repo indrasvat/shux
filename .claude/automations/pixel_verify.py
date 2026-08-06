@@ -80,7 +80,17 @@ def main() -> int:
     if args.diff:
         args.diff.parent.mkdir(parents=True, exist_ok=True)
         # Amplify nonzero deltas for human review while keeping exact geometry.
-        diff = ImageChops.difference(actual, expected)
+        #
+        # The amplification runs on RGB and the result is saved OPAQUE. Doing it
+        # on RGBA silently produced a fully transparent PNG: both inputs are
+        # opaque, so the alpha band of the difference is 0 in every pixel, and
+        # `point` maps 0 to 0 — alpha 0 everywhere. The file was a valid PNG of
+        # the right size that rendered blank in every viewer, so the gate clause
+        # "the diff image reveals obvious defects even if the numeric threshold
+        # is permissive" could not be exercised by any task using this tool.
+        # The numeric metrics below were always right; only the human-readable
+        # artifact was empty. (issue #117 QA gate, P1-3.)
+        diff = ImageChops.difference(actual.convert("RGB"), expected.convert("RGB"))
         diff.point(lambda value: 255 if value else 0).save(args.diff)
 
     passed = (

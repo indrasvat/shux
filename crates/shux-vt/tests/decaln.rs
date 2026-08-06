@@ -253,6 +253,44 @@ fn decaln_leaves_the_saved_cursor_alone() {
     assert_eq!((vt.cursor().row, vt.cursor().col), (2, 4));
 }
 
+/// Tab stops are terminal state, not screen content. DECALN resets the
+/// MARGINS; nothing in VT510 says it resets the tab stops, and a conformance
+/// suite that sets custom stops before the alignment test then tabs across the
+/// pattern would silently get the default every-8 grid instead.
+#[test]
+fn decaln_leaves_tab_stops_alone() {
+    let mut vt = VirtualTerminal::new(4, 20);
+    vt.process(b"\x1b[3g"); // TBC 3 -- clear every stop
+    vt.process(b"\x1b[1;12H\x1bH"); // HTS -- one stop at column 12 (0-based 11)
+    vt.process(DECALN);
+    // Home, then tab: the custom stop must still be the one that answers.
+    vt.process(b"\x1b[1;1H\tX");
+    assert_eq!(vt.cursor().row, 0);
+    let row = row_chars(vt.grid(), 0);
+    assert_eq!(
+        row.find('X'),
+        Some(11),
+        "tab landed at {:?}, not the custom stop at column 12: {row:?}",
+        row.find('X')
+    );
+}
+
+/// The window title is presented state that belongs to the application, not to
+/// the page. Filling the screen must not clear or change it.
+#[test]
+fn decaln_leaves_the_window_title_alone() {
+    let mut vt = VirtualTerminal::new(3, 10);
+    vt.process(b"\x1b]0;DECALN-TITLE-PROBE\x07");
+    assert_eq!(vt.title(), Some("DECALN-TITLE-PROBE"));
+    vt.process(DECALN);
+    assert_eq!(
+        vt.title(),
+        Some("DECALN-TITLE-PROBE"),
+        "the alignment fill changed the window title"
+    );
+    assert_screen_is_alignment_pattern(vt.grid(), "with a title set");
+}
+
 /// Cursor visibility and shape are not part of the alignment pattern.
 #[test]
 fn decaln_leaves_cursor_visibility_and_shape_alone() {

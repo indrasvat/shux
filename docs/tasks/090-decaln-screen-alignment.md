@@ -9,7 +9,10 @@ synchronized-output lazy freeze) — the fill has to satisfy both
 `crates/shux-vt/src/cell.rs`, `crates/shux-vt/tests/decaln.rs` (new),
 `crates/shux-vt/tests/cow_aliasing_adversarial.rs`,
 `crates/shux/tests/decaln_pane_e2e.rs` (new),
-`.shux/scripts/issue_117_evidence.sh` (new)
+`.shux/scripts/issue_117_evidence.sh` (new), `.shux/scripts/issue_117_shots.py` (new),
+`.claude/automations/pixel_verify.py` (defect in shared verification machinery),
+`.shux/qa/090-decaln-screen-alignment/` (new)
+**QA record:** `.shux/qa/090-decaln-screen-alignment/SOLID-QA.md` — `VERDICT: PASS`
 
 ---
 
@@ -117,7 +120,7 @@ application selected.
 | Level | Where | What |
 |---|---|---|
 | Unit (grid) | `crates/shux-vt/src/grid.rs` | every visible cell written; scrollback untouched; wide pairs dissolved; extended attrs dropped; not a blank canvas afterwards; shared rows copied first; viewport dirtied; empty grid inert |
-| Integration (VT) | `crates/shux-vt/tests/decaln.rs` | 39 cases across 11 groups — the fill, the scroll region, the cursor, attributes, grid invariants, change notification, alternate screen, synchronized output, the sequence space around `ESC # 8`, RIS/idempotence/resize, consumer-visible capture |
+| Integration (VT) | `crates/shux-vt/tests/decaln.rs` | 41 cases across 11 groups — the fill, the scroll region, the cursor, attributes, grid invariants, change notification, alternate screen, synchronized output, the sequence space around `ESC # 8`, RIS/idempotence/resize, consumer-visible capture |
 | Property | `crates/shux-vt/tests/decaln.rs::properties` | 256 random programs over a 30-sequence alphabet, chunked at random boundaries: after DECALN the page is the pattern, margins are the extremes, the cursor is home |
 | Adversarial (existing) | `cow_aliasing_adversarial.rs` | DECALN promoted out of the vacuity list; the freeze assertion around it is now non-vacuous |
 | End-to-end | `crates/shux/tests/decaln_pane_e2e.rs` | real daemon, real PTY, real shell, colour-probed: the fill through `pane capture`/`pane glance`; region + pen + homed cursor in one pane; the alternate-screen recycle; the primary screen across an alternate-screen round trip |
@@ -125,7 +128,7 @@ application selected.
 
 ### Every guard was proven able to fail
 
-Ten mutations applied to the fix in turn, each re-running the suite:
+Twelve mutations applied to the fix in turn, each re-running the suite:
 
 | # | Mutation | Killed by |
 |---|---|---|
@@ -139,6 +142,13 @@ Ten mutations applied to the fix in turn, each re-running the suite:
 | 8 | bypass the synchronized-output freeze | `decaln_inside_a_sync_window_does_not_disturb_the_frozen_frame` |
 | 9 | drop the dirty mark | `decaln_marks_the_whole_viewport_dirty` |
 | 10 | fill with the current SGR pen | `decaln_ignores_the_current_sgr_state` |
+| 11 | also reset tab stops | `decaln_leaves_tab_stops_alone` |
+| 12 | also clear the window title | `decaln_leaves_the_window_title_alone` |
+
+Mutations 5 and 10 initially SURVIVED: the tests that should have caught them were
+asserting against a screen that was already blank and unstyled, so the mutated code
+produced the same result as the correct code. Both tests were strengthened to draw
+first. A test that has only ever been seen passing is not evidence.
 
 ## Acceptance criteria
 
@@ -156,3 +166,73 @@ Ten mutations applied to the fix in turn, each re-running the suite:
 - [x] `ESC 8` is still DECRC; no other `ESC #` sequence fills the screen.
 - [x] Rich TUIs (vim) repaint over the pattern with no residue.
 - [x] `make check` green; zero leaked daemons.
+
+---
+
+## QA gate outcome (`shux-vt-solid-qa`)
+
+The gate's first pass returned **FAIL**. It did not dispute the DECALN change; it
+found that the task shipped with no tracked QA record and that two pieces of shared
+verification machinery were themselves defective. Full disposition table lives in
+`.shux/qa/090-decaln-screen-alignment/SOLID-QA.md`. The load-bearing items:
+
+**Fixed — `pixel_verify.py` wrote fully transparent diff PNGs.** Both inputs are
+opaque, so the alpha band of `ImageChops.difference` is 0 everywhere and `point`
+mapped it to 0. Every diff image the tool has ever produced rendered blank in any
+viewer, so the gate clause "the diff image reveals obvious defects even if the
+numeric threshold is permissive" could not be exercised by any task. The numeric
+metrics were always correct. Reproduced (alpha 0/0 while RGB carried 34,778 changed
+pixels), fixed by diffing on RGB, and proven both directions. This is a defect in
+verification machinery, so it is fixed here rather than filed.
+
+Of the ~50 diff PNGs committed under `.shux/qa/` by tasks 067-086, the 19 whose
+`-actual`/`-expected` pair is also committed were regenerated with the fixed tool
+and their metrics reproduced exactly: **all 19 are genuine zero-difference cases**,
+so those artefacts were blank because the truth is blank. They are left as-is rather
+than rewritten inside a DECALN change; the other 53 compare against uncommitted
+goldens and belong to their own tasks.
+
+**Fixed — the evidence harness truncated its own captures.** `pane capture` defaults
+to `--lines 50`; on a pane taller than that it silently returns the last 50 rows.
+The harness now passes `--lines "${rows}"`. The gate read this as a 50-row grid clamp
+losing content — that diagnosis did **not** reproduce: a 60-row pane keeps a 60-row
+grid, `stty size` reports 60, and `ESC[60;1H` lands on row 60. The 200x60 breakpoint
+the gate reported as unusable now runs 10/10 with a captured line count equal to the
+pane height.
+
+**Fixed — the harness masked its own failures.** Assertions only incremented the
+failure counter when `LABEL` was literally `after`, so any other label printed FAIL
+lines and still exited 0. Assertions now always count, and recording a known-broken
+baseline is an explicit `EXPECT_DEFECT=1` which fails if the defect does *not*
+reproduce. All four combinations were exercised and each returned the expected exit
+code.
+
+**Fixed — two DoD clauses had no regression test.** Tab stops and the window title
+were verified behaviourally but nothing would have caught a future regression;
+`decaln_leaves_tab_stops_alone` and `decaln_leaves_the_window_title_alone` now do,
+and both were proven able to fail.
+
+## Explicitly re-scoped
+
+**The committed QA subset omits baseline PNGs and the `**Quality Gate:**` marker.**
+CLAUDE.md permits committing a PNG "only as a true baseline/golden with task
+documentation + DootSabha approval"; DootSabha is unavailable in this environment, so
+that approval cannot exist, and the PR checklist requires "no screenshots committed
+unless justified as durable baselines". `scripts/check-progress.sh` keys its evidence
+check off the `Quality Gate:` marker and then hard-requires a committed `*-actual.png`
+— so adding the marker without a PNG fails the pre-push hook, and adding both commits
+a screenshot this task is not entitled to commit. Tasks 087, 088 and 089 (the closest
+analogue: a shux-vt parser + grid fix for an issue) carry no `.shux/qa/` directory at
+all; this task commits the report, manifest and pixel metrics, and publishes the
+images as a Claude Artifact.
+
+**Follow-up worth its own task, found by the gate:** an M3 task can touch `shux-vt`,
+capture, cursor, alt screen and scroll regions — every row of CLAUDE.md's VT gate
+table — and `make check-progress` will not ask for any evidence, because enforcement
+keys off a marker no M3 task carries. Enforcement should follow the touched surface,
+not a hand-written field.
+
+**DootSabha councils (feature protocol steps 1 and 6) are N/A in this environment**
+and were substituted, on the operator's instruction, with five parallel agents that
+drive the real binary: four adversarial reviewers on disjoint surfaces plus the
+`shux-vt-solid-qa` gate agent.

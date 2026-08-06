@@ -694,3 +694,48 @@ palette, restore the deliberate table/summary divergence).
   lands gets *reflowed*, which for a screen of `E` means rows of 48 alternating with
   rows of 32 — a picture that looks like a rendering bug and is not one. The scenes now
   block on a go-file the harness touches after `pane set-size`.
+
+### Gate round two — what the QA gate found that the implementer's own review did not
+
+- **A gate that returns FAIL on the evidence rather than the code is still right.**
+  The `shux-vt-solid-qa` gate did not dispute one line of the DECALN change. It failed
+  the task for shipping with no tracked QA record — and on the way there it found two
+  defects in *shared verification machinery* that had been wrong for eight tasks.
+
+- **`.claude/automations/pixel_verify.py` had been writing fully transparent diff
+  PNGs.** `ImageChops.difference` on two opaque RGBA images yields alpha 0 in every
+  pixel, and `point(lambda v: 255 if v else 0)` maps 0 to 0. Every diff image the tool
+  ever produced was a valid PNG of the right size that rendered blank. The numeric
+  metrics were always correct, which is exactly why nobody noticed: the JSON said
+  `changed_pixels: 34778` while the picture beside it showed nothing. **The gate clause
+  "the diff image reveals obvious defects even if the numeric threshold is permissive"
+  was unexercisable repo-wide.** Fix: diff on RGB so the saved PNG is opaque. Of the ~50
+  committed diffs, the 19 with a committed input pair were regenerated and their metrics
+  reproduced exactly — all 19 are genuine zero-difference cases, so nothing was hidden;
+  but that was luck, not design.
+
+- **`pane capture` defaults to `--lines 50`.** A harness that captures a pane taller
+  than 50 rows and asserts on row 1 fails for a reason that has nothing to do with the
+  thing under test — and looks exactly like a grid silently dropping its top rows. The
+  gate reported it as a 50-row grid clamp with content loss. It is not: a 60-row pane
+  keeps a 60-row grid, `stty size` says 60, and `ESC[60;1H` lands on row 60. **Reproduce
+  before believing — including a gate's findings.** Four of its six substantive findings
+  were real and fixed; one was a misdiagnosis of my own harness bug; one was a follow-up.
+
+- **Gating assertions on the output label masks failures.** `if [ "$label" = after ]`
+  around the failure counter meant every other label printed FAIL lines and exited 0.
+  Recording a known-broken baseline has to be an explicit opt-in (`EXPECT_DEFECT=1`),
+  and that mode must fail when the defect does *not* reproduce — otherwise the baseline
+  arm passes vacuously too. Both directions were exercised: four label/flag combinations,
+  four expected exit codes.
+
+- **Measure the measurement.** The first run of that four-way check printed `exit=0` for
+  a case that had actually exited 1 — `cmd | tail -4; echo $?` reports `tail`'s status.
+  The check that verifies a harness can fail is itself a harness that can fail silently.
+
+- **VT gate enforcement keys off a hand-written task-file field, not the touched
+  surface.** `scripts/check-progress.sh` only demands QA artifacts when a task file says
+  `**Quality Gate:** shux-vt-solid-qa` or `Milestone: VT Quality Track`. An M3 task can
+  touch `shux-vt`, capture, cursor, alt screen and scroll regions — every row of
+  CLAUDE.md's gate table — and be waved through. Tasks 087, 088, 089 all did. Worth its
+  own task: enforcement should follow the diff, not the prose.
