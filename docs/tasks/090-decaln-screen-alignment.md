@@ -236,3 +236,94 @@ not a hand-written field.
 and were substituted, on the operator's instruction, with five parallel agents that
 drive the real binary: four adversarial reviewers on disjoint surfaces plus the
 `shux-vt-solid-qa` gate agent.
+
+## Fixed after adversarial review: `ESC[?47h` never entered the alternate screen
+
+Private mode `47` — the ORIGINAL xterm "use alternate screen buffer", still
+emitted by anything built against pre-1049 terminfo (the old termcap `ti`/`te`
+pair) — was not implemented. `set_private_mode` matched `1047 | 1049` only, so
+`?47h` fell through unhandled and a program that asked for the alternate screen
+the old way was drawing on the PRIMARY one, with `?47l` restoring nothing.
+
+The gap predates this change: plain text under `?47` corrupted the primary too,
+verified with a control arm containing no DECALN. But DECALN is what turns it
+from "an application overwrote part of your screen" into "the whole page is
+gone and there is nothing to restore" — so it is fixed here.
+
+```
+SECRET-LINE / SECOND-LINE   on the primary screen
+ESC[?47h                    (before) is_alternate_screen == false
+ESC#8                       fills the PRIMARY page
+ESC[?47l                    restores nothing
+                            -> SECRET-LINE is gone, permanently
+```
+
+`47` now joins the `1047 | 1049` arm and behaves as `1047` does — the cursor is
+carried across rather than parked, because only `1049` saves and restores one —
+and `DECRQM ?47` reports the mode's real state instead of "not recognized".
+
+**This test suite did not catch it, and that is the more useful finding.**
+`no_alternate_screen_mode_combination_recycles_the_pattern` drove `?47` in its
+matrix but asserted only that the NEXT application got a blank screen — which is
+true even when the fill never reached an alternate screen at all, because
+entering `?1049` always yields a fresh one. It passed while `?47` destroyed the
+primary. The test now also asserts the primary survived the round trip, and
+reverting the `47` arm fails four tests including that one.
+
+### A note for whoever screenshots a TUI after a DECALN
+
+`less` legitimately shows `E` residue after repainting over the pattern, and it
+is not a shux defect. Adversarial review recorded the raw PTY bytes both ways:
+`less` emits a byte-identical repaint stream whether or not the pattern is
+there, with no per-line erase and no `ED` — it relies on being at the bottom row
+so each newline scrolls a fresh blank line in. DECALN homes the cursor, so
+nothing scrolls and the columns past the text keep their `E`s. Any conforming
+terminal does the same. shux's erase primitives after a fill were checked
+separately and are correct.
+
+## Found in passing, pre-existing, NOT fixed here
+
+Both were surfaced by the adversarial pass and both were reproduced with control
+arms that contain no DECALN at all, so neither is in this change's blast radius.
+Recorded with reproductions rather than fixed, because each is a behavioural
+change to a different sequence and would need its own design and test surface.
+
+### The scroll region is global terminal state, not per-screen
+
+```
+ESC[3;6r            primary margins -> rows 3..6
+ESC[?1049h          enter the alternate screen
+ESC[5;7r            the alternate screen sets its own margins
+ESC[?1049l          leave
+                    -> primary margins are now 5..7, not 3..6
+```
+
+No DECALN anywhere. `?1047`/`?1049` save and restore the CURSOR (that is what
+the mode number means) and shux keeps `ScrollRegion` outside that, so a
+full-screen application's margins outlive it. DECALN's own margin reset rides
+the same channel — a DECALN on the alternate screen leaves the primary at the
+extremes of the page — but it is not the cause.
+
+Whether this is a defect depends on a reference terminal, which is not
+available in this environment: DECSC/DECRC (which is what `?1049` restores)
+carry cursor position, attributes, charsets, origin mode and the wrap flag —
+not margins — so "margins are global" may well be correct. It should be settled
+against a real xterm before anything is changed. Owner: alternate-screen state,
+not the VT fill.
+
+### REP (`CSI b`) derives its source from the screen, not the data stream
+
+```
+X                   print a graphic character
+ESC[1;1H            home the cursor
+ESC[3b              REP 3  ->  no-op
+X ESC[3b            (no cursor move)  ->  "XXXX", works
+```
+
+`repeat_preceding_char` reads the cell to the LEFT of the cursor, so at column 0
+`checked_sub(1)` returns `None` and the repeat is dropped. ECMA-48 defines REP
+as repeating "the preceding character in the data stream", which would survive a
+cursor move. DECALN only surfaces this by homing the cursor; the divergence is
+in REP and predates this change. Fixing it means carrying a `last_graphic` cell
+in parser state and deciding what invalidates it — a change to REP's semantics
+that does not belong in a DECALN fix.

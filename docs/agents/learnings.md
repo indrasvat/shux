@@ -739,3 +739,35 @@ palette, restore the deliberate table/summary divergence).
   touch `shux-vt`, capture, cursor, alt screen and scroll regions — every row of
   CLAUDE.md's gate table — and be waved through. Tasks 087, 088, 089 all did. Worth its
   own task: enforcement should follow the diff, not the prose.
+
+### Gate round three — what the adversarial agents found
+
+- **The dangerous finding was on a surface the fix made dangerous, not one it
+  touched.** `ESC[?47h` — the original xterm alternate-screen mode — was never
+  implemented, so it fell through unhandled and apps using it drew on the primary
+  screen. That was survivable while DECALN was a no-op. The moment DECALN worked,
+  the same gap destroyed the user's whole page with nothing to restore. **Ask not
+  only "what did I change" but "what did I make load-bearing".**
+
+- **A matrix test can drive the broken case and still pass.** The alternate-screen
+  permutation test included `?47` and asserted the next application got a blank
+  screen. Entering `?1049` always yields a blank screen, so the assertion held
+  while `?47` was destroying the primary. The missing assertion was the boring
+  one: *did the thing we were protecting survive?* Coverage of an input is not
+  coverage of an outcome.
+
+- **Losing two hours of agents to a container restart cost nothing because the
+  commits were already pushed.** Transcript mtime is NOT a liveness signal — a
+  completed agent stops writing exactly like a dead one, and a working agent's
+  transcript can sit unflushed for 7 minutes while it starts daemons. Watch the
+  work (runtime dirs, probe files, daemon ages), and detect restarts directly by
+  reading `/proc/uptime` going backwards.
+
+- **An agent's root-cause can be wrong while its observation is right.** One
+  reported a "50-row pane grid clamp losing content"; the grid was fine and the 50
+  was `pane capture`'s documented `--lines` default — but that default WAS
+  silently truncating my harness. Another reported `less` leaving `E` residue,
+  then recorded the raw PTY bytes both ways and dismissed its own finding: `less`
+  emits an identical repaint stream either way and relies on being at the bottom
+  row to scroll blank lines in, which DECALN's cursor-home prevents. That second
+  one is the standard to aim for.

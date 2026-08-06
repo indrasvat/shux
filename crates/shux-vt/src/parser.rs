@@ -965,8 +965,19 @@ impl<'a> VtHandler<'a> {
                     self.restore_cursor_state();
                 }
             }
-            // Alternate screen buffer (1047, 1049).
-            1047 | 1049 => {
+            // Alternate screen buffer (47, 1047, 1049).
+            //
+            // `47` is the original xterm mode and is still emitted by anything
+            // built against pre-1049 terminfo — it is the old termcap `ti`/`te`
+            // pair. It was previously unhandled, so a program that asked for
+            // the alternate screen the old way drew on the PRIMARY one and its
+            // `?47l` restored nothing. Harmless-looking until something wrote
+            // the whole page: a screen-alignment test under `?47` destroyed the
+            // user's screen outright (issue #117 adversarial review).
+            //
+            // It behaves as `1047` does here: the cursor is carried across
+            // rather than parked, because only `1049` saves and restores one.
+            47 | 1047 | 1049 => {
                 if enable {
                     if mode == 1049 {
                         self.save_cursor_state();
@@ -1092,7 +1103,7 @@ impl<'a> VtHandler<'a> {
             1004 => mode_report(self.modes.focus_events),
             1006 => mode_report(self.modes.sgr_mouse),
             1007 => mode_report(self.modes.alternate_scroll),
-            1047 | 1049 => mode_report(self.modes.alternate_screen),
+            47 | 1047 | 1049 => mode_report(self.modes.alternate_screen),
             2004 => mode_report(self.modes.bracketed_paste),
             2026 => mode_report(self.modes.synchronized_output),
             _ => 0,

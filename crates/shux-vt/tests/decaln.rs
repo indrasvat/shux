@@ -994,9 +994,16 @@ fn a_cursor_position_report_after_decaln_says_row_one_column_one() {
 }
 
 /// The alternate-screen recycle, across every mode number, every ordering, and
-/// with a full reset thrown in: 18 permutations, none may hand the pattern on.
+/// with a full reset thrown in: 18 permutations, two assertions each.
+///
+/// The FIRST assertion is the one that matters, and an earlier version of this
+/// test did not have it. It checked only that the next application got a blank
+/// screen — which is true even when the fill never reached an alternate screen
+/// at all, because entering `?1049` always yields a fresh one. So it passed
+/// while `?47` was silently destroying the primary screen. Adversarial review
+/// caught what this test could not.
 #[test]
-fn no_alternate_screen_mode_combination_recycles_the_pattern() {
+fn no_alternate_screen_mode_combination_damages_the_primary_or_recycles_the_pattern() {
     let enters: [&[u8]; 3] = [b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
     let leaves: [&[u8]; 3] = [b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
     let mut bad = vec![];
@@ -1005,16 +1012,30 @@ fn no_alternate_screen_mode_combination_recycles_the_pattern() {
             for &ris in &[false, true] {
                 let mut vt = VirtualTerminal::new(5, 10);
                 vt.process(b"primary-x\r\n");
+                let primary = visible_rows(vt.grid());
                 vt.process(enter);
                 vt.process(DECALN);
                 if ris {
                     vt.process(b"\x1bc");
                 }
                 vt.process(leave);
+
+                // 1. The primary screen survived. RIS is the one exception:
+                //    clearing the primary screen is what RIS is for.
+                if !ris && visible_rows(vt.grid()) != primary {
+                    bad.push(format!(
+                        "enter{i}/leave{j}: the fill reached the PRIMARY screen -> {:?}",
+                        visible_rows(vt.grid())
+                    ));
+                }
+
+                // 2. The next application gets a clean canvas.
                 vt.process(enters[0]);
                 let rows = visible_rows(vt.grid());
                 if !rows.iter().all(|r| r.trim().is_empty()) {
-                    bad.push(format!("enter{i}/leave{j}/ris={ris}: {rows:?}"));
+                    bad.push(format!(
+                        "enter{i}/leave{j}/ris={ris}: recycled dirty -> {rows:?}"
+                    ));
                 }
                 vt.process(leaves[0]);
             }
@@ -1022,7 +1043,7 @@ fn no_alternate_screen_mode_combination_recycles_the_pattern() {
     }
     assert!(
         bad.is_empty(),
-        "recycled a dirty alternate screen:\n{}",
+        "alternate-screen defects:\n{}",
         bad.join("\n")
     );
 }
@@ -1121,4 +1142,121 @@ fn a_sync_window_holds_through_fill_and_alternate_screen_switch() {
     );
     vt.process(b"\x1b[?2026l");
     assert_screen_is_alignment_pattern(vt.grid(), "after the window closed");
+}
+
+// ---------------------------------------------------------------------------
+// 14. DECSET 47 — the older alternate-screen mode (found by adversarial review)
+// ---------------------------------------------------------------------------
+//
+// `ESC[?47h` is the original xterm "use alternate screen buffer" mode, still
+// emitted by applications built against pre-1049 terminfo (it is the old
+// termcap `ti`/`te` pair). shux implemented `?1047` and `?1049` and let `?47`
+// fall through unhandled, so a program that asked for the alternate screen the
+// old way was silently drawing on the PRIMARY one and `?47l` restored nothing.
+//
+// That gap predates DECALN — plain text under `?47` corrupted the primary too
+// — but DECALN is what turns it from "an application overwrote part of your
+// screen" into "your whole page is gone and there is nothing to restore".
+
+/// The reported case: a full-screen application takes the screen the old way,
+/// runs the alignment test, and gives the screen back.
+#[test]
+fn mode_47_round_trip_leaves_the_primary_screen_intact() {
+    let mut vt = VirtualTerminal::new(4, 12);
+    vt.process(b"SECRET-LINE\r\nSECOND-LINE");
+    let before = visible_rows(vt.grid());
+
+    vt.process(b"\x1b[?47h");
+    assert!(
+        vt.is_alternate_screen(),
+        "?47h did not enter the alternate screen"
+    );
+    vt.process(DECALN);
+    assert_screen_is_alignment_pattern(vt.grid(), "the alternate screen under ?47");
+
+    vt.process(b"\x1b[?47l");
+    assert!(
+        !vt.is_alternate_screen(),
+        "?47l did not leave the alternate screen"
+    );
+    assert_eq!(
+        visible_rows(vt.grid()),
+        before,
+        "the primary screen was destroyed by an alignment test run under ?47"
+    );
+}
+
+/// `?47` carries the cursor across, like `?1047` and unlike `?1049`.
+#[test]
+fn mode_47_carries_the_cursor_across_like_1047() {
+    let mut vt = VirtualTerminal::new(6, 10);
+    vt.process(b"\x1b[4;5H");
+    vt.process(b"\x1b[?47h");
+    assert_eq!(
+        (vt.cursor().row, vt.cursor().col),
+        (3, 4),
+        "?47h should not home or park the cursor"
+    );
+    vt.process(DECALN); // homes it
+    vt.process(b"\x1b[?47l");
+    assert_eq!(
+        (vt.cursor().row, vt.cursor().col),
+        (0, 0),
+        "?47l should not restore a cursor it never saved"
+    );
+}
+
+/// Ordinary content under `?47` must reach the alternate screen too — the fill
+/// was only the loudest symptom.
+#[test]
+fn mode_47_keeps_ordinary_writes_off_the_primary_screen() {
+    let mut vt = VirtualTerminal::new(4, 12);
+    vt.process(b"SECRET-LINE\r\nSECOND-LINE");
+    let before = visible_rows(vt.grid());
+    vt.process(b"\x1b[?47h");
+    vt.process(b"\x1b[1;1HOVERWRITTEN");
+    vt.process(b"\x1b[?47l");
+    assert_eq!(visible_rows(vt.grid()), before);
+}
+
+/// A retired `?47` alternate screen goes through the same one-slot spare as
+/// `?1047`/`?1049`, so the fill must not survive into the next application.
+#[test]
+fn a_retired_mode_47_screen_filled_by_decaln_is_not_recycled_as_blank() {
+    let mut vt = VirtualTerminal::new(5, 10);
+    vt.process(b"\x1b[?47h");
+    vt.process(DECALN);
+    vt.process(b"\x1b[?47l");
+    vt.process(b"\x1b[?1049h");
+    let rows = visible_rows(vt.grid());
+    assert!(
+        rows.iter().all(|r| r.trim().is_empty()),
+        "the pattern survived a ?47 retirement into the next application: {rows:?}"
+    );
+}
+
+/// `DECRQM ?47` must report the mode's real state now that it has one.
+#[test]
+fn decrqm_reports_mode_47() {
+    let mut vt = VirtualTerminal::new(3, 6);
+    let replies = vt.process_with_responses(b"\x1b[?47$p");
+    let joined: Vec<String> = replies
+        .iter()
+        .map(|r| String::from_utf8_lossy(r).to_string())
+        .collect();
+    assert!(
+        joined.iter().any(|r| r == "\x1b[?47;2$y"),
+        "expected ?47 reported as reset(2), got {joined:?}"
+    );
+
+    vt.process(b"\x1b[?47h");
+    let replies = vt.process_with_responses(b"\x1b[?47$p");
+    let joined: Vec<String> = replies
+        .iter()
+        .map(|r| String::from_utf8_lossy(r).to_string())
+        .collect();
+    assert!(
+        joined.iter().any(|r| r == "\x1b[?47;1$y"),
+        "expected ?47 reported as set(1), got {joined:?}"
+    );
 }
