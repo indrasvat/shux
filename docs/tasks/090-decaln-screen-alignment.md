@@ -11,6 +11,7 @@ synchronized-output lazy freeze) — the fill has to satisfy both
 `crates/shux/tests/decaln_pane_e2e.rs` (new),
 `.shux/scripts/issue_117_evidence.sh` (new), `.shux/scripts/issue_117_shots.py` (new),
 `.shux/scripts/issue_117_richtui_check.sh` (new),
+`.shux/scripts/issue_117_release_smoke.sh` (new),
 `.claude/automations/pixel_verify.py` (defect in shared verification machinery),
 `.shux/qa/090-decaln-screen-alignment/` (new)
 **QA record:** `.shux/qa/090-decaln-screen-alignment/SOLID-QA.md` — `VERDICT: PASS`
@@ -394,3 +395,23 @@ lazygit"` produced `exec sh -c cd DIR && exec lazygit` — the first `exec`
 replaced the shell and lazygit never ran. The harness now emits `cd` as its own
 line, and asserts the TUI's marker is on the FINAL screen rather than merely
 having flashed past, which is what caught the second bug instead of passing it.
+
+## Post-merge smoke (feature protocol step 12)
+
+`.shux/scripts/issue_117_release_smoke.sh` installs via the real
+`curl -fsSL https://shux.pages.dev/install.sh | sh` path and drives the
+PUBLISHED binary, not the one left in `./target` by the branch that was merged.
+
+The step order matters more than the steps. It asserts the installed version has
+advanced past `v0.46.7` — the release this fix was branched from — and **aborts
+non-zero if it has not**, before running any behavioural check. If the release
+did not pick up the merge, the installed binary is the OLD code: DECALN would
+not fill, `?47` would still corrupt the primary screen, and a run that reported
+those as failures would look like a regression rather than what it is. Worse, a
+run that somehow reported them green would be reporting on code that was never
+merged. Checking the version first is what stops the smoke from lying in either
+direction.
+
+After that: DECALN fills a real 40x10 pane end to end, `ESC[?47h` takes the
+alternate screen and hands the primary back intact (the second fix riding the
+same release), and the daemon is verified gone by pidfile.
