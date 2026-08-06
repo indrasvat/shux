@@ -144,6 +144,48 @@ pub struct DcsState {
     overflowed: bool,
 }
 
+/// The preceding character in the data stream — what REP (`CSI Pn b`) repeats.
+///
+/// ECMA-48 §8.3.103 defines REP against the DATA STREAM: it repeats "the
+/// preceding character in the data stream", which survives anything that
+/// happens between the character and the `CSI b` — a cursor move, an erase, a
+/// line feed, a change of pen. shux re-read the cell to the LEFT OF THE CURSOR
+/// instead, which agrees only while nothing has moved the cursor since. At
+/// column 0 there is no cell to the left at all, so the repeat was dropped
+/// silently (issue #122); anywhere else, a cursor move made REP repeat whatever
+/// was parked next to the new position — a blank, half a wide character, or an
+/// unrelated glyph from an earlier frame.
+///
+/// Only the CHARACTER is remembered. Colours, attributes and the hyperlink come
+/// from the pen that is current at the `CSI b`, because the pen belongs to the
+/// terminal rather than to the character — which is also what a copy of the
+/// character arriving in the stream would pick up.
+///
+/// What is stored is the exact scalar sequence that was printed, so a repeat can
+/// be replayed through the ordinary printing path and is therefore, by
+/// construction, indistinguishable from the character arriving again. A grapheme
+/// cluster keeps all of its scalars (`e` + U+0301, a flag pair, a ZWJ sequence);
+/// they are stored as PRINTED, after charset translation, so `ESC ( 0 q`
+/// followed by REP draws more horizontal line rather than more `q`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastGraphic {
+    /// Base scalar, always present.
+    ch: char,
+    /// The rest of the cluster, when the character grew one.
+    rest: Option<String>,
+}
+
+impl LastGraphic {
+    /// The scalars to replay, in the order they were printed.
+    fn scalars(&self) -> impl Iterator<Item = char> + '_ {
+        std::iter::once(self.ch).chain(self.rest.iter().flat_map(|rest| rest.chars()))
+    }
+
+    fn scalar_count(&self) -> usize {
+        1 + self.rest.as_ref().map_or(0, |rest| rest.chars().count())
+    }
+}
+
 /// The VT handler that translates escape sequences into grid operations.
 ///
 /// This struct is NOT the public API -- VirtualTerminal (in lib.rs) owns this
@@ -176,6 +218,11 @@ pub struct VtHandler<'a> {
     /// [`crate::VirtualTerminal::set_eager_sync_freeze`].
     pub(crate) eager_sync_freeze: bool,
     pub(crate) active_grapheme_cell: &'a mut Option<(usize, usize)>,
+    /// The preceding character in the data stream, for REP. Deliberately NOT
+    /// cleared alongside `active_grapheme_cell` — that one tracks a position on
+    /// the screen and every control sequence invalidates it, while this one
+    /// tracks the stream and only RIS ends the stream (issue #122).
+    pub(crate) last_graphic: &'a mut Option<LastGraphic>,
     pub(crate) charsets: &'a mut TerminalCharsets,
     pub(crate) tab_stops: &'a mut TabStops,
     pub(crate) responses: &'a mut Vec<Vec<u8>>,
@@ -256,6 +303,28 @@ impl<'a> VtHandler<'a> {
 
     fn set_active_grapheme_cell(&mut self, row: usize, col: usize) {
         *self.active_grapheme_cell = Some((row, col));
+    }
+
+    /// Remember a single-scalar character as the preceding one in the data
+    /// stream. See [`LastGraphic`].
+    fn remember_graphic_scalar(&mut self, ch: char) {
+        *self.last_graphic = Some(LastGraphic { ch, rest: None });
+    }
+
+    /// Remember the grapheme cluster a cell now holds, after a combining mark,
+    /// a zero-width joiner or a regional indicator grew it. The cluster is the
+    /// unit REP repeats, so the record has to follow it as it grows rather than
+    /// stopping at the base scalar it started from.
+    fn remember_graphic_cluster(&mut self, row: usize, col: usize) {
+        let remembered = self.grid.visible_row(row).get(col).map(|cell| {
+            let rest = cell
+                .grapheme()
+                .and_then(|text| text.chars().next().map(|_| text.chars().skip(1).collect()));
+            LastGraphic { ch: cell.ch, rest }
+        });
+        if let Some(remembered) = remembered {
+            *self.last_graphic = Some(remembered);
+        }
     }
 
     fn cursor_blank_cell(&self) -> Cell {
@@ -480,6 +549,13 @@ impl<'a> VtHandler<'a> {
             self.append_zero_width_scalar(ch);
             return;
         }
+        // Recorded BEFORE the write, so the degenerate paths below -- a wide
+        // character with nowhere to put it on a one-column terminal -- still
+        // remember the character the data stream carried. A repeat of it then
+        // does the same harmless nothing another copy in the stream would have
+        // done. The join paths below overwrite this with the whole cluster once
+        // they have grown it (issue #122).
+        self.remember_graphic_scalar(ch);
         if self.try_append_to_active_grapheme(ch, width) {
             return;
         }
@@ -606,6 +682,7 @@ impl<'a> VtHandler<'a> {
             }
         }
         self.set_active_grapheme_cell(row, col);
+        self.remember_graphic_cluster(row, col);
     }
 
     fn try_append_to_active_grapheme(&mut self, ch: char, width: usize) -> bool {
@@ -648,6 +725,7 @@ impl<'a> VtHandler<'a> {
                 row_ref[col + 1] = Cell::wide_continuation();
             }
         }
+        self.remember_graphic_cluster(row, col);
         let next_col = col + target_width;
         if next_col >= cols {
             self.cursor.col = cols.saturating_sub(1);
@@ -697,6 +775,7 @@ impl<'a> VtHandler<'a> {
             }
         }
         self.set_active_grapheme_cell(row, col);
+        self.remember_graphic_cluster(row, col);
         self.cursor.col = (col + target_width).min(cols.saturating_sub(1));
         self.cursor.auto_wrap_pending = col + target_width >= cols;
         true
@@ -756,70 +835,47 @@ impl<'a> VtHandler<'a> {
         self.prune_cursor_extended();
     }
 
-    /// REP -- repeat the preceding graphic character at the current cursor.
+    /// REP -- repeat the preceding character in the data stream.
+    ///
+    /// The source is [`LastGraphic`], recorded when the character was printed,
+    /// and it is replayed SCALAR BY SCALAR through the ordinary printing path.
+    /// That is not an implementation detail, it is the specification: REP means
+    /// "n more copies of that character arrived", so anything the printing path
+    /// does to an arriving character — wrapping at the right margin, scrolling
+    /// at the bottom of the region, inserting under IRM, growing a grapheme
+    /// cluster — must happen to a repeat identically. Re-deriving the placement
+    /// here instead is how the old implementation ended up writing a
+    /// two-column grapheme into a one-column cell.
     fn repeat_preceding_char(&mut self, count: usize) {
         if count == 0 {
             return;
         }
-        let source_col = if self.cursor.auto_wrap_pending {
-            self.cursor.col
-        } else if let Some(col) = self.cursor.col.checked_sub(1) {
-            col
-        } else {
+        // Nothing has been printed yet, or a RIS ended the stream. There is no
+        // preceding character, so REP repeats nothing -- as opposed to
+        // repeating whatever the cursor happens to be parked next to.
+        let Some(source) = self.last_graphic.clone() else {
             return;
         };
-        let row = self.grid.visible_row(self.cursor.row);
-        let source_col = if row
-            .get(source_col)
-            .is_some_and(|cell| cell.is_wide_continuation())
-        {
-            source_col.saturating_sub(1)
-        } else {
-            source_col
-        };
-        let source = row.get(source_col).cloned().unwrap_or(Cell::EMPTY);
-        // Bound the repeat to one screenful (issue #102). REP legitimately
-        // wraps onto following lines, so clamping to the current row would
-        // break it; a full screen is the largest repeat that can still leave
-        // a visible mark, and no real application exceeds it.
-        let budget = self.grid.rows().saturating_mul(self.grid.cols()).max(1);
-        for _ in 0..count.min(budget) {
-            self.write_cell_from_source(&source);
+        for _ in 0..self.repeat_iterations(count, &source) {
+            for ch in source.scalars() {
+                self.write_char(ch);
+            }
         }
     }
 
-    fn write_cell_from_source(&mut self, source: &Cell) {
-        let source_width = source.width.clamp(1, 2) as usize;
-        self.write_char(source.ch);
-        let Some(text) = source.grapheme().map(str::to_owned) else {
-            return;
-        };
-        let Some((row, col)) = self.preceding_cell_position() else {
-            return;
-        };
-        let cols = self.grid.cols();
-        let bg = self.cursor.style.bg;
-        {
-            let row_ref = self.grid.visible_row_mut_marked(row);
-            row_ref[col].set_grapheme_payload(text);
-            if source_width == 2 && col + 1 < cols {
-                row_ref[col].width = 2;
-                if !row_ref[col + 1].is_wide_continuation() {
-                    row_ref.clear_wide_pair_around(col + 1, bg);
-                }
-                row_ref[col + 1] = Cell::wide_continuation();
-            }
-        }
-        if source_width == 2 && col + 1 < cols {
-            let next_col = col + 2;
-            if next_col >= cols {
-                self.cursor.col = cols.saturating_sub(1);
-                self.cursor.auto_wrap_pending = true;
-            } else {
-                self.cursor.col = next_col;
-                self.cursor.auto_wrap_pending = false;
-            }
-        }
+    /// How many copies REP is allowed to write (issue #102).
+    ///
+    /// Ten bytes of pane output must not buy unbounded work. One screenful of
+    /// cells is the largest repeat that can still leave a visible mark -- REP
+    /// legitimately wraps onto following lines, so clamping to the current row
+    /// would break it -- and no real application exceeds that. A multi-scalar
+    /// cluster costs more per copy, so the total number of scalars written is
+    /// bounded a second time; the two together cap the work at two screenfuls
+    /// however pathological the remembered character is.
+    fn repeat_iterations(&self, count: usize, source: &LastGraphic) -> usize {
+        let cells = self.grid.rows().saturating_mul(self.grid.cols()).max(1);
+        let scalar_budget = cells.saturating_mul(2) / source.scalar_count();
+        count.min(cells).min(scalar_budget.max(1))
     }
 
     fn next_tab_col(&self, count: usize) -> usize {
@@ -1152,7 +1208,17 @@ impl<'a> vte::Perform for VtHandler<'a> {
         _ignore: bool,
         action: char,
     ) {
-        if !(action == 'm' && intermediates.is_empty()) {
+        // A control sequence ends the grapheme cluster under construction: a
+        // combining mark arriving after a cursor move belongs to whatever is at
+        // the new position, not to the character before the move.
+        //
+        // SGR and REP are the exceptions. SGR changes the pen without moving
+        // anything. REP is not a break either -- it is MORE OF THE SAME
+        // CHARACTER, so it has to join a cluster exactly as the character
+        // arriving again would; breaking here made `a ZWJ CSI 3 b` land in a
+        // different cell from `a ZWJ a ZWJ a ZWJ a ZWJ` (issue #122).
+        let continues_the_cluster = intermediates.is_empty() && (action == 'm' || action == 'b');
+        if !continues_the_cluster {
             self.clear_active_grapheme_cell();
         }
         let params_groups: Vec<Vec<u16>> =
@@ -1645,6 +1711,11 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 *self.cursor = Cursor::new();
                 *self.modes = TerminalModes::default();
                 *self.default_colors = TerminalDefaultColors::default();
+                // RIS ends the data stream as far as REP is concerned: a
+                // terminal that has just been switched on has no preceding
+                // character, so a REP straight after one repeats nothing
+                // (issue #122).
+                *self.last_graphic = None;
                 self.reset_charsets();
                 self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
@@ -2292,6 +2363,7 @@ mod tests {
         frozen_title: Option<Option<String>>,
         frozen_alt: Option<bool>,
         active_grapheme_cell: Option<(usize, usize)>,
+        last_graphic: Option<LastGraphic>,
         charsets: TerminalCharsets,
         tab_stops: TabStops,
         responses: Vec<Vec<u8>>,
@@ -2321,6 +2393,7 @@ mod tests {
                 frozen_title: None,
                 frozen_alt: None,
                 active_grapheme_cell: None,
+                last_graphic: None,
                 charsets: TerminalCharsets::default(),
                 tab_stops: TabStops::new(cols),
                 responses: Vec::new(),
@@ -2348,6 +2421,7 @@ mod tests {
                 frozen_alt: &mut self.frozen_alt,
                 eager_sync_freeze: false,
                 active_grapheme_cell: &mut self.active_grapheme_cell,
+                last_graphic: &mut self.last_graphic,
                 charsets: &mut self.charsets,
                 tab_stops: &mut self.tab_stops,
                 responses: &mut self.responses,
