@@ -326,18 +326,30 @@ impl VirtualTerminal {
         }
     }
 
-    /// Drop the frozen presentation and show the live frame again, as
-    /// `CSI ?2026l` would.
+    /// Whether releasing the window right now would reveal a **Class-A**
+    /// change (PRD §4.2) — one that moves `ContentRevision`.
     ///
-    /// Returns whether the presented frame actually moved, which is what a
-    /// caller outside the parse loop needs in order to publish a revision.
-    fn force_release_sync(&mut self) -> bool {
-        let revealed = self.sync_hidden_class_a
+    /// The window title is deliberately NOT in this list. A title is Class B,
+    /// and it stays Class B whether the pane closes its own window or the
+    /// deadline closes it: otherwise the same `OSC 2` would move the revision
+    /// or not depending on nothing but whether `?2026l` arrived, which is the
+    /// `class_b_osc_title_no_bump` contract read two ways.
+    fn sync_release_reveals_class_a(&self) -> bool {
+        self.sync_hidden_class_a
             || self.frozen_grid.is_some()
             || self.frozen_cursor.is_some()
             || self.frozen_colors.is_some()
-            || self.frozen_title.is_some()
-            || self.frozen_alt.is_some();
+            || self.frozen_alt.is_some()
+    }
+
+    /// Drop the frozen presentation and show the live frame again, as
+    /// `CSI ?2026l` would.
+    ///
+    /// Returns whether ANYTHING the pane had hidden is now visible — including
+    /// a Class-B title, which a caller outside the parse loop still has to
+    /// forward even though it moves no revision.
+    fn force_release_sync(&mut self) -> bool {
+        let revealed = self.sync_release_reveals_class_a() || self.frozen_title.is_some();
         self.sync_armed
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.frozen_grid = None;
@@ -379,8 +391,10 @@ impl VirtualTerminal {
         if !self.sync_window_expired() {
             return false;
         }
+        let class_a = self.sync_release_reveals_class_a();
         let revealed = self.force_release_sync();
-        if std::mem::take(&mut self.sync_hidden_class_a) || revealed {
+        self.sync_hidden_class_a = false;
+        if class_a {
             self.record_class_a_batch();
         }
         revealed
@@ -571,11 +585,33 @@ impl VirtualTerminal {
     /// had when the window opened, less anything that has since fallen off the
     /// front of the scrollback — which is the truth: a line that has been
     /// evicted is gone from the pane, frozen frame or not.
+    /// The grid the presented frame's history actually lives in.
+    ///
+    /// Entering the alternate screen inside a window swaps which grid is live,
+    /// so a frame frozen on the primary screen leaves its history in the
+    /// STASHED grid. Reading it from the live one hands back alternate-screen
+    /// rows as "history" — content the frozen frame exists to hide — and holes
+    /// where the alternate screen is shorter (it is built with no scrollback).
+    ///
+    /// The reverse case needs nothing: a frame frozen on the alternate screen
+    /// has no history to read, for the same reason.
+    fn presented_history_grid(&self) -> &Grid {
+        if self
+            .frozen_alt
+            .is_some_and(|frozen_alt| frozen_alt != self.modes.alternate_screen)
+        {
+            self.alt_grid.as_ref().unwrap_or(&self.grid)
+        } else {
+            &self.grid
+        }
+    }
+
     fn presented_history_len(&self) -> usize {
         let Some(ref frozen) = self.frozen_grid else {
             return self.grid.scrollback_len();
         };
-        let dropped = self.grid.evicted().saturating_sub(frozen.evicted);
+        let history_grid = self.presented_history_grid();
+        let dropped = history_grid.evicted().saturating_sub(frozen.evicted);
         frozen
             .history_len
             .saturating_sub(usize::try_from(dropped).unwrap_or(usize::MAX))
@@ -607,7 +643,7 @@ impl VirtualTerminal {
             // the eviction count here instead walks straight past the survivors
             // and into the live viewport, putting content written after the
             // freeze inside the frame that exists to hide it.
-            self.grid.row(abs)
+            self.presented_history_grid().row(abs)
         } else {
             frozen.grid.row(abs - history)
         }
@@ -1681,6 +1717,60 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(compact_capture(&vt), "frame");
+    }
+
+    fn row_text(vt: &VirtualTerminal, abs: usize) -> String {
+        vt.presented_row(abs)
+            .map(|row| {
+                (0..row.len())
+                    .map(|c| row[c].ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "<missing>".into())
+    }
+
+    /// A synchronized window that enters the ALTERNATE screen swaps which grid
+    /// is live — so the history behind the frozen primary frame is no longer in
+    /// `self.grid` at all, it is in the stashed one. Reading it from the live
+    /// grid exposes alternate-screen rows as "history", or loses history
+    /// entirely (the alternate screen is built with no scrollback).
+    #[test]
+    fn presented_history_comes_from_the_screen_the_frame_was_frozen_on() {
+        let mut vt = VirtualTerminal::new(3, 16);
+        for i in 0..12 {
+            vt.process(format!("hist-{i:02}\r\n").as_bytes());
+        }
+        let history_before: Vec<String> = (0..vt.presented_total_lines())
+            .map(|i| row_text(&vt, i))
+            .collect();
+
+        // Freeze on the PRIMARY screen, then enter the alternate screen and
+        // draw on it — all inside the window.
+        vt.process(b"\x1b[?2026h");
+        vt.process(b"\x1b[1;1Hx"); // take the freeze on the primary screen
+        vt.process(b"\x1b[?1049hALT-SECRET-ONE\x1b[2;1HALT-SECRET-TWO");
+
+        assert!(
+            !vt.is_alternate_screen(),
+            "the presented frame is still the primary one"
+        );
+        let history_now: Vec<String> = (0..vt.presented_total_lines())
+            .map(|i| row_text(&vt, i))
+            .collect();
+        assert!(
+            !history_now.iter().any(|l| l.contains("ALT-SECRET")),
+            "alternate-screen content leaked into the presented primary frame: {history_now:?}"
+        );
+        assert_eq!(
+            history_now, history_before,
+            "the presented frame moved while the window was open"
+        );
+
+        vt.process(b"\x1b[?2026l");
+        assert!(vt.is_alternate_screen());
+        assert!(compact_capture(&vt).contains("ALT-SECRET-ONE"));
     }
 
     /// History behind a frozen frame is read out of the LIVE grid, so its
@@ -3481,6 +3571,51 @@ mod content_revision_tests {
         vt.process(b"\x1b]2;my title\x07");
         vt.process(b"\x1b]0;icon+title\x07");
         assert_eq!(vt.content_revision(), r);
+    }
+
+    // §4.2 Class B — a title change is Class B whether the pane closes its own
+    // synchronized-output window or the deadline closes it. Releasing on the
+    // timeout used to record a Class-A batch for a window that had only
+    // retitled, so the same OSC moved `ContentRevision` or not depending on
+    // nothing but whether `?2026l` arrived.
+    #[test]
+    fn class_b_osc_title_no_bump_when_a_window_times_out() {
+        let mut vt = vt();
+        vt.process(b"\x1b[?2026h");
+        vt.process(b"\x1b]2;set inside the window\x07");
+        let r = vt.content_revision();
+
+        std::thread::sleep(std::time::Duration::from_millis(
+            SYNC_UPDATE_TIMEOUT_MS + 40,
+        ));
+        assert!(vt.release_expired_sync(), "the window must expire");
+
+        assert_eq!(vt.title(), Some("set inside the window"));
+        assert_eq!(
+            vt.content_revision(),
+            r,
+            "a title-only window must not bump the revision when it times out"
+        );
+    }
+
+    // The companion: a window that hid a REAL Class-A change still bumps when
+    // the deadline closes it, so the guard above cannot pass by doing nothing.
+    #[test]
+    fn a_timed_out_window_that_hid_a_write_does_bump() {
+        let mut vt = vt();
+        vt.process(b"\x1b[?2026h");
+        vt.process(b"\x1b[1;1Hhidden write");
+        let r = vt.content_revision();
+
+        std::thread::sleep(std::time::Duration::from_millis(
+            SYNC_UPDATE_TIMEOUT_MS + 40,
+        ));
+        assert!(vt.release_expired_sync());
+
+        assert!(
+            vt.content_revision() > r,
+            "revealing a hidden write must bump the revision"
+        );
     }
 
     // §4.2 Class B — Bell (no bump).

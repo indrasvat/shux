@@ -1821,6 +1821,7 @@ async fn run_rpc_server(
     // Spawn timeout checker (1s interval)
     let timeout_io = io_state.clone();
     let timeout_cancel = cancel.clone();
+    let timeout_graph = graph_handle.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -1837,33 +1838,70 @@ async fn run_rpc_server(
                     // that is not, because no output means nothing calls
                     // `process`. Same critical section as the PTY write path,
                     // so a revealed frame publishes its revision the same way.
+                    // Whatever the release reveals has to travel the SAME
+                    // routes the PTY read loop would have sent it down, or a
+                    // pane that went silent inside a window keeps a stale
+                    // title and stale checkpoints for ever. The alt flag and
+                    // the title are read on both sides of the release for
+                    // exactly that reason.
                     let expired: Vec<_> = state
                         .vts
                         .iter_mut()
                         .filter_map(|(pane_id, vt)| {
-                            vt.release_expired_sync().then(|| {
-                                (
-                                    *pane_id,
-                                    PaneRevision {
-                                        content_revision: vt.content_revision(),
-                                        last_mutation_ns: vt.last_mutation_ns(),
-                                    },
-                                )
-                            })
+                            let alt_before = vt.is_alternate_screen();
+                            if !vt.release_expired_sync() {
+                                return None;
+                            }
+                            Some((
+                                *pane_id,
+                                PaneRevision {
+                                    content_revision: vt.content_revision(),
+                                    last_mutation_ns: vt.last_mutation_ns(),
+                                },
+                                alt_before != vt.is_alternate_screen(),
+                                vt.title().map(str::to_string),
+                            ))
                         })
                         .collect();
                     // Only when a frame actually moved. Pulsing every tick
                     // would wake the renderer once a second on an idle daemon
                     // for nothing.
                     if !expired.is_empty() {
-                        for (pane_id, rev) in expired {
+                        let mut revealed_titles = Vec::new();
+                        for (pane_id, rev, alt_switched, title) in expired {
                             tracing::debug!(
                                 %pane_id,
+                                alt_switched,
                                 "released a stale synchronized-output window"
                             );
                             state.publish_revision(pane_id, rev);
+                            // LENS-R-032/DEC-4: the switch was hidden by the
+                            // frozen frame, so the PTY path never saw it. A
+                            // checkpoint taken on the other screen buffer must
+                            // not be diffable against this one.
+                            if alt_switched {
+                                state.invalidate_checkpoints(pane_id, rev.content_revision);
+                            }
+                            if let Some(title) = title.filter(|t| !t.is_empty()) {
+                                revealed_titles.push((pane_id, title));
+                            }
                         }
                         state.render_pulse.notify_waiters();
+                        // Outside the io_state lock: holding it across the
+                        // graph's mpsc send is the deadlock pattern from PR #7.
+                        drop(state);
+                        for (pane_id, title) in revealed_titles {
+                            if let Err(e) =
+                                timeout_graph.set_pane_osc_title(pane_id, title).await
+                            {
+                                tracing::warn!(
+                                    %pane_id,
+                                    error = %e,
+                                    "set_pane_osc_title failed after a synchronized-output \
+                                     window timed out",
+                                );
+                            }
+                        }
                     }
                 }
                 _ = timeout_cancel.cancelled() => break,
