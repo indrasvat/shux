@@ -1260,3 +1260,34 @@ fn decrqm_reports_mode_47() {
         "expected ?47 reported as set(1), got {joined:?}"
     );
 }
+
+/// Mixing the alternate-screen aliases must not lose the parked cursor.
+///
+/// `?1049h` does two independent things: it fills the DECSC save slot and it
+/// parks the primary cursor for the screen swap. The park used to swallow the
+/// save slot whole (`mem::take` leaves a default cursor behind), so the slot
+/// became unreachable — and `?1047l`/`?47l` drop the stash by design, having no
+/// cursor of their own to give back. An application that opened the alternate
+/// screen with `?1049h` and closed it with either alias lost its cursor.
+///
+/// Pre-existing: `?1049h` + `?1047l` lost it identically, and `?1047l` was
+/// implemented long before `?47`. Adding the `47` alias gave the hazard one
+/// more spelling, which is how review found it.
+#[test]
+fn mixing_alternate_screen_aliases_keeps_the_parked_cursor() {
+    for leave in [&b"\x1b[?47l"[..], b"\x1b[?1047l", b"\x1b[?1049l"] {
+        let mut vt = VirtualTerminal::new(10, 20);
+        vt.process(b"\x1b[6;9H"); // primary cursor at (5,8)
+        vt.process(b"\x1b[?1049h");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0), "1049h homes");
+        vt.process(DECALN);
+        vt.process(b"\x1b[3;4H"); // move around on the alternate screen
+        vt.process(leave);
+        vt.process(b"\x1b[?1049l"); // the application's real close
+        assert_eq!(
+            (vt.cursor().row, vt.cursor().col),
+            (5, 8),
+            "closing a ?1049 alternate screen via {leave:?} lost the parked cursor"
+        );
+    }
+}

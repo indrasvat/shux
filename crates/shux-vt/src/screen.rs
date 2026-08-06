@@ -91,7 +91,22 @@ impl ScreenSwap<'_> {
 
         *self.stashed_grid = Some(std::mem::replace(self.grid, alt));
         if save_cursor {
-            *self.stashed_cursor = Some(std::mem::take(self.cursor));
+            let parked = std::mem::take(self.cursor);
+            // The DECSC save slot is TERMINAL state, not screen state, and
+            // `1049h` fills it (via `save_cursor_state`) immediately before
+            // parking the cursor here. Letting the park swallow it makes it
+            // unreachable to `restore_cursor_state`, so any later path that
+            // drops the stash destroys the saved cursor along with it — and
+            // `?1047l`/`?47l` do exactly that, by design, because they have no
+            // cursor of their own to give back. An application that opens the
+            // alternate screen with `?1049h` and closes it with either alias
+            // then loses its cursor entirely.
+            //
+            // Carrying the slot across keeps the two mechanisms independent:
+            // the stash restores the screen's cursor, DECSC restores the
+            // terminal's, and neither can eat the other.
+            self.cursor.saved = parked.saved.clone();
+            *self.stashed_cursor = Some(parked);
         } else {
             // 1047 keeps the cursor where it is, and leaves nothing to restore.
             self.stashed_cursor.take();

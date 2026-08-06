@@ -79,19 +79,29 @@ def main() -> int:
 
     if args.diff:
         args.diff.parent.mkdir(parents=True, exist_ok=True)
-        # Amplify nonzero deltas for human review while keeping exact geometry.
+        # The diff image is derived from `diff_arr` — the SAME RGBA array the
+        # metrics above are computed from — so the picture and the numbers can
+        # never disagree. A pixel is marked white when ANY channel differs,
+        # alpha included, and the result is saved opaque RGB so it is visible.
         #
-        # The amplification runs on RGB and the result is saved OPAQUE. Doing it
-        # on RGBA silently produced a fully transparent PNG: both inputs are
-        # opaque, so the alpha band of the difference is 0 in every pixel, and
-        # `point` maps 0 to 0 — alpha 0 everywhere. The file was a valid PNG of
-        # the right size that rendered blank in every viewer, so the gate clause
-        # "the diff image reveals obvious defects even if the numeric threshold
-        # is permissive" could not be exercised by any task using this tool.
-        # The numeric metrics below were always right; only the human-readable
-        # artifact was empty. (issue #117 QA gate, P1-3.)
-        diff = ImageChops.difference(actual.convert("RGB"), expected.convert("RGB"))
-        diff.point(lambda value: 255 if value else 0).save(args.diff)
+        # Both halves of that matter, and each was wrong at some point:
+        #
+        #  * `ImageChops.difference` on RGBA + `point` produced a fully
+        #    TRANSPARENT PNG. Both inputs are opaque, so the alpha band of the
+        #    difference is 0 everywhere and `point` maps 0 to 0. Every diff
+        #    image any task ever produced was a valid PNG of the right size
+        #    that rendered blank, which made the gate clause "the diff image
+        #    reveals obvious defects even if the numeric threshold is
+        #    permissive" unexercisable repo-wide. (#117 QA gate, P1-3.)
+        #  * Converting both inputs to RGB first fixed that but discarded
+        #    alpha-only differences, which the RGBA metrics still counted — a
+        #    blank artifact again, for a narrower but explicitly supported
+        #    class of difference. (#119 review, P2.)
+        #
+        # Deriving the mask from `diff_arr` is immune to both: whatever the
+        # metrics counted as changed is exactly what lights up.
+        mask = (np.any(diff_arr > 0, axis=-1).astype(np.uint8)) * 255
+        Image.fromarray(np.repeat(mask[:, :, None], 3, axis=2), mode="RGB").save(args.diff)
 
     passed = (
         pixel_diff_ratio <= args.max_pixel_diff_ratio

@@ -327,3 +327,31 @@ cursor move. DECALN only surfaces this by homing the cursor; the divergence is
 in REP and predates this change. Fixing it means carrying a `last_graphic` cell
 in parser state and deciding what invalidates it — a change to REP's semantics
 that does not belong in a DECALN fix.
+
+## Review round (PR #119, Codex bot) — two P2s, both real, both fixed
+
+**Alpha-only differences were still invisible in the diff image.** The P1-3 fix
+converted both inputs to RGB before amplifying, which cured the transparent-PNG
+bug but discarded the one channel that carries an alpha-only difference — the
+RGBA metrics counted those pixels while the picture beside them stayed blank. A
+narrower blind spot, but the same class of defect. The mask is now derived from
+`diff_arr`, the SAME array the metrics come from, so the picture and the numbers
+cannot disagree: any channel differing lights the pixel, and the result is saved
+opaque. Verified on three fixtures — identical (0/0), RGB-only (28/28) and
+alpha-only (68/68) — and on the real #117 A/B (34,778/34,778).
+
+**Mixing the alternate-screen aliases lost the parked cursor.** `?1049h` fills
+the DECSC save slot and then parks the primary cursor for the screen swap; the
+park used `mem::take`, which swallowed the save slot whole and left a default
+cursor behind, so the slot became unreachable. `?1047l` and `?47l` drop the
+stash by design — they have no cursor of their own to hand back — and took the
+save slot with it. An application opening the alternate screen with `?1049h` and
+closing it with either alias lost its cursor entirely.
+
+Pre-existing: `?1049h` + `?1047l` lost it identically, and `?1047l` shipped long
+before `?47`. Adding the alias gave the hazard one more spelling, which is how
+review found it. `ScreenSwap::enter` now carries the save slot across the swap,
+keeping the two mechanisms independent — the stash restores the screen's cursor,
+DECSC restores the terminal's, neither can eat the other. The deliberate
+`mode_1047_does_not_restore_primary_cursor_on_leave` behaviour is unchanged.
+Reverting the one line fails `mixing_alternate_screen_aliases_keeps_the_parked_cursor`.
