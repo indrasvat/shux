@@ -379,6 +379,38 @@ impl<'a> VtHandler<'a> {
         self.cursor.auto_wrap_pending = false;
     }
 
+    /// DECALN -- Screen Alignment Pattern (`ESC # 8`, issue #117).
+    ///
+    /// The DEC screen-alignment test: fill the page with `E` so the margins can
+    /// be seen. It is the first sequence a conformance suite emits — `vttest`
+    /// opens with it — so a terminal that ignores it reports a blank screen
+    /// where every other terminal reports a full one.
+    ///
+    /// VT510 §DECALN spells out three things beyond the fill, and each is a
+    /// separate way to get it wrong:
+    ///
+    /// * the pattern covers the COMPLETE page — the scroll region does not
+    ///   clip it (that is the whole point: the operator is looking at where the
+    ///   margins fall);
+    /// * it "sets the margins to the extremes of the page"; and
+    /// * it "moves the cursor to the home position".
+    ///
+    /// The margins are reset BEFORE the cursor is homed so that home means the
+    /// top-left of the page under origin mode too, rather than the top-left of
+    /// whatever region the application had set.
+    ///
+    /// The fill carries default attributes, not the current SGR pen: DECALN
+    /// draws a fixed test pattern, not text. The pen itself is untouched — the
+    /// next printable character still uses it.
+    fn screen_alignment_pattern(&mut self) {
+        self.grid.fill_alignment_pattern();
+        self.scroll_region.top = 0;
+        self.scroll_region.bottom = self.grid.rows().saturating_sub(1);
+        self.cursor.row = 0;
+        self.cursor.col = 0;
+        self.cursor.auto_wrap_pending = false;
+    }
+
     fn clamp_cursor_to_grid(&mut self) {
         let row = self.cursor.row.min(self.grid_last_row());
         let col = self.cursor.col.min(self.grid_last_col());
@@ -933,8 +965,19 @@ impl<'a> VtHandler<'a> {
                     self.restore_cursor_state();
                 }
             }
-            // Alternate screen buffer (1047, 1049).
-            1047 | 1049 => {
+            // Alternate screen buffer (47, 1047, 1049).
+            //
+            // `47` is the original xterm mode and is still emitted by anything
+            // built against pre-1049 terminfo — it is the old termcap `ti`/`te`
+            // pair. It was previously unhandled, so a program that asked for
+            // the alternate screen the old way drew on the PRIMARY one and its
+            // `?47l` restored nothing. Harmless-looking until something wrote
+            // the whole page: a screen-alignment test under `?47` destroyed the
+            // user's screen outright (issue #117 adversarial review).
+            //
+            // It behaves as `1047` does here: the cursor is carried across
+            // rather than parked, because only `1049` saves and restores one.
+            47 | 1047 | 1049 => {
                 if enable {
                     if mode == 1049 {
                         self.save_cursor_state();
@@ -1060,7 +1103,7 @@ impl<'a> VtHandler<'a> {
             1004 => mode_report(self.modes.focus_events),
             1006 => mode_report(self.modes.sgr_mouse),
             1007 => mode_report(self.modes.alternate_scroll),
-            1047 | 1049 => mode_report(self.modes.alternate_screen),
+            47 | 1047 | 1049 => mode_report(self.modes.alternate_screen),
             2004 => mode_report(self.modes.bracketed_paste),
             2026 => mode_report(self.modes.synchronized_output),
             _ => 0,
@@ -1550,6 +1593,13 @@ impl<'a> vte::Perform for VtHandler<'a> {
             (b'7', []) => self.save_cursor_state(),
             // DECRC -- Restore Cursor (ESC 8).
             (b'8', []) => self.restore_cursor_state(),
+            // DECALN -- Screen Alignment Pattern (ESC # 8).
+            //
+            // Must stay BELOW the bare `ESC 8` arm above and be matched on the
+            // `#` intermediate: the two sequences differ only by that byte, and
+            // this one used to fall through to the "unhandled" arm entirely
+            // (issue #117).
+            (b'8', [b'#']) => self.screen_alignment_pattern(),
             // Designate G0/G1 character sets.
             (byte, [b'(']) => self.designate_charset(CharsetSlot::G0, byte),
             (byte, [b')']) => self.designate_charset(CharsetSlot::G1, byte),

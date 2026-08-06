@@ -648,3 +648,126 @@ palette, restore the deliberate table/summary divergence).
 - **Open the frames, every time.** The first take recorded `shux attach victim` — not a
   subcommand — and produced 20 seconds of a usage error. `ffprobe` said the file was
   valid, the right size and the right duration.
+
+## 2026-08-06 — issue #117, DECALN (task 090)
+
+- **A "silently ignored" sequence is not automatically a small fix.** DECALN's own
+  semantics are four lines. What made the change worth care is that a full-screen write
+  in shux has to satisfy invariants owned by two *other* issues: the write tally that
+  licenses alternate-screen buffer reuse (#106) and the copy-on-write row sharing the
+  synchronized-output freeze depends on (#115). The interesting failure mode was never
+  "the fill is wrong" — it was "the fill is right and the next application in that pane
+  inherits it".
+
+- **`Grid::is_blank_canvas` reasons from `mutations == 0`.** Any new path that writes
+  cells must go through something that bumps the tally, or a retired alternate buffer
+  full of that content reads as a blank canvas and is handed to the next program. The
+  `debug_assert!(is_actually_blank)` in `ScreenSwap::enter` is the backstop, and it only
+  fires if a test happens to drive that exact sequence — so the tally bump is the
+  invariant, not the assert.
+
+- **A no-op in the alphabet of a differential test is a hole in it.** Both
+  `sync_output_differential.rs` and `cow_aliasing_adversarial.rs` already fed `\x1b#8`
+  as "a sequence that touches the grid". `cow_aliasing_adversarial.rs` was honest about
+  it — it listed `DECALN` in an explicit vacuity guard naming the hammer cases known to
+  write nothing. That guard is what turned "implement DECALN" into "and now remove the
+  entry, and the surrounding assertion becomes real". **Write the vacuity guard.** A
+  test suite that cannot tell you which of its cases proved nothing will not tell you
+  when one of them starts mattering.
+
+- **Mutation-test the fix, not just the bug.** Ten mutations (drop the tally bump, drop
+  the wrap clear, drop the margin reset, drop the cursor home, assign `ch` only, fill
+  scrollback, clip to the scroll region, bypass the freeze, drop the dirty mark, fill
+  with the SGR pen) were each applied and each killed by a *named* test. Two of them
+  (`ch`-only, and filling with the pen) initially survived — the tests that should have
+  caught them were passing vacuously, because the screen under test started blank and
+  unstyled. Both tests were strengthened to draw first.
+
+- **`wait-settled` cannot tell "finished" from "not started".** The first evidence run
+  photographed panes mid-script and produced a scene that looked exactly like the
+  content leak the fix prevents — a screen of `E` where the next application should
+  have been. It was the harness. Every scene now has its pane touch a done-file after
+  its last write; the harness waits for the file, *then* settles.
+
+- **And the pane must be the right size before it draws.** A pane spawns at the daemon's
+  default geometry and is resized a moment later. A script that draws before the resize
+  lands gets *reflowed*, which for a screen of `E` means rows of 48 alternating with
+  rows of 32 — a picture that looks like a rendering bug and is not one. The scenes now
+  block on a go-file the harness touches after `pane set-size`.
+
+### Gate round two — what the QA gate found that the implementer's own review did not
+
+- **A gate that returns FAIL on the evidence rather than the code is still right.**
+  The `shux-vt-solid-qa` gate did not dispute one line of the DECALN change. It failed
+  the task for shipping with no tracked QA record — and on the way there it found two
+  defects in *shared verification machinery* that had been wrong for eight tasks.
+
+- **`.claude/automations/pixel_verify.py` had been writing fully transparent diff
+  PNGs.** `ImageChops.difference` on two opaque RGBA images yields alpha 0 in every
+  pixel, and `point(lambda v: 255 if v else 0)` maps 0 to 0. Every diff image the tool
+  ever produced was a valid PNG of the right size that rendered blank. The numeric
+  metrics were always correct, which is exactly why nobody noticed: the JSON said
+  `changed_pixels: 34778` while the picture beside it showed nothing. **The gate clause
+  "the diff image reveals obvious defects even if the numeric threshold is permissive"
+  was unexercisable repo-wide.** Fix: diff on RGB so the saved PNG is opaque. Of the ~50
+  committed diffs, the 19 with a committed input pair were regenerated and their metrics
+  reproduced exactly — all 19 are genuine zero-difference cases, so nothing was hidden;
+  but that was luck, not design.
+
+- **`pane capture` defaults to `--lines 50`.** A harness that captures a pane taller
+  than 50 rows and asserts on row 1 fails for a reason that has nothing to do with the
+  thing under test — and looks exactly like a grid silently dropping its top rows. The
+  gate reported it as a 50-row grid clamp with content loss. It is not: a 60-row pane
+  keeps a 60-row grid, `stty size` says 60, and `ESC[60;1H` lands on row 60. **Reproduce
+  before believing — including a gate's findings.** Four of its six substantive findings
+  were real and fixed; one was a misdiagnosis of my own harness bug; one was a follow-up.
+
+- **Gating assertions on the output label masks failures.** `if [ "$label" = after ]`
+  around the failure counter meant every other label printed FAIL lines and exited 0.
+  Recording a known-broken baseline has to be an explicit opt-in (`EXPECT_DEFECT=1`),
+  and that mode must fail when the defect does *not* reproduce — otherwise the baseline
+  arm passes vacuously too. Both directions were exercised: four label/flag combinations,
+  four expected exit codes.
+
+- **Measure the measurement.** The first run of that four-way check printed `exit=0` for
+  a case that had actually exited 1 — `cmd | tail -4; echo $?` reports `tail`'s status.
+  The check that verifies a harness can fail is itself a harness that can fail silently.
+
+- **VT gate enforcement keys off a hand-written task-file field, not the touched
+  surface.** `scripts/check-progress.sh` only demands QA artifacts when a task file says
+  `**Quality Gate:** shux-vt-solid-qa` or `Milestone: VT Quality Track`. An M3 task can
+  touch `shux-vt`, capture, cursor, alt screen and scroll regions — every row of
+  CLAUDE.md's gate table — and be waved through. Tasks 087, 088, 089 all did. Worth its
+  own task: enforcement should follow the diff, not the prose.
+
+### Gate round three — what the adversarial agents found
+
+- **The dangerous finding was on a surface the fix made dangerous, not one it
+  touched.** `ESC[?47h` — the original xterm alternate-screen mode — was never
+  implemented, so it fell through unhandled and apps using it drew on the primary
+  screen. That was survivable while DECALN was a no-op. The moment DECALN worked,
+  the same gap destroyed the user's whole page with nothing to restore. **Ask not
+  only "what did I change" but "what did I make load-bearing".**
+
+- **A matrix test can drive the broken case and still pass.** The alternate-screen
+  permutation test included `?47` and asserted the next application got a blank
+  screen. Entering `?1049` always yields a blank screen, so the assertion held
+  while `?47` was destroying the primary. The missing assertion was the boring
+  one: *did the thing we were protecting survive?* Coverage of an input is not
+  coverage of an outcome.
+
+- **Losing two hours of agents to a container restart cost nothing because the
+  commits were already pushed.** Transcript mtime is NOT a liveness signal — a
+  completed agent stops writing exactly like a dead one, and a working agent's
+  transcript can sit unflushed for 7 minutes while it starts daemons. Watch the
+  work (runtime dirs, probe files, daemon ages), and detect restarts directly by
+  reading `/proc/uptime` going backwards.
+
+- **An agent's root-cause can be wrong while its observation is right.** One
+  reported a "50-row pane grid clamp losing content"; the grid was fine and the 50
+  was `pane capture`'s documented `--lines` default — but that default WAS
+  silently truncating my harness. Another reported `less` leaving `E` residue,
+  then recorded the raw PTY bytes both ways and dismissed its own finding: `less`
+  emits an identical repaint stream either way and relies on being at the bottom
+  row to scroll blank lines in, which DECALN's cursor-home prevents. That second
+  one is the standard to aim for.
