@@ -1846,7 +1846,7 @@ async fn handle_copy_mode_mouse(
                 state
                     .vts
                     .get(&attached.active_pane_id)
-                    .map(|vt| vt.grid().total_lines())
+                    .map(|vt| vt.presented_total_lines())
                     .unwrap_or(rect.height as usize)
             };
             let mut s = session.lock().await;
@@ -2156,7 +2156,7 @@ async fn handle_wheel(
                     vt.is_alternate_screen(),
                     m.alternate_scroll,
                     m.application_cursor_keys,
-                    vt.grid().total_lines(),
+                    vt.presented_total_lines(),
                 )
             }
             None => (false, false, false, true, false, rect.height as usize),

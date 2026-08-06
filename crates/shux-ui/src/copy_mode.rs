@@ -155,10 +155,11 @@ pub fn handle_key_with_vt(
     if bytes.len() >= 4 && bytes[0] == 0x1b && bytes[1] == b'[' && bytes[3] == b'~' {
         match bytes[2] {
             b'5' => {
-                return scroll_up(state, pane_rows as usize, total_lines, pane_rows).then_updated();
+                return scroll_up(state, readable_rows(pane_rows), total_lines, pane_rows)
+                    .then_updated();
             }
             b'6' => {
-                return scroll_down(state, pane_rows as usize, total_lines, pane_rows)
+                return scroll_down(state, readable_rows(pane_rows), total_lines, pane_rows)
                     .then_updated();
             }
             _ => {}
@@ -189,18 +190,18 @@ pub fn handle_key_with_vt(
         b'n' => repeat_search(state, pane_cols, pane_rows, vt, false).then_updated(),
         b'N' => repeat_search(state, pane_cols, pane_rows, vt, true).then_updated(),
         // Ctrl-b / Ctrl-f: full-page up/down. Ctrl-u / Ctrl-d: half-page.
-        0x02 => scroll_up(state, pane_rows as usize, total_lines, pane_rows).then_updated(),
-        0x06 => scroll_down(state, pane_rows as usize, total_lines, pane_rows).then_updated(),
+        0x02 => scroll_up(state, readable_rows(pane_rows), total_lines, pane_rows).then_updated(),
+        0x06 => scroll_down(state, readable_rows(pane_rows), total_lines, pane_rows).then_updated(),
         0x15 => scroll_up(
             state,
-            (pane_rows as usize).max(1) / 2,
+            readable_rows(pane_rows).div_ceil(2),
             total_lines,
             pane_rows,
         )
         .then_updated(),
         0x04 => scroll_down(
             state,
-            (pane_rows as usize).max(1) / 2,
+            readable_rows(pane_rows).div_ceil(2),
             total_lines,
             pane_rows,
         )
@@ -329,9 +330,8 @@ fn find_and_focus(
     let Some(vt) = vt else {
         return false;
     };
-    let grid = vt.grid();
     // #108: map the copy cursor through the same region the frame shows. Search
-    // itself (search_forward/backward) still scans the full grid.total_lines().
+    // itself (search_forward/backward) still scans the whole presented span.
     let total_lines = effective_total_lines(vt, pane_rows);
     if total_lines == 0 {
         return false;
@@ -343,11 +343,9 @@ fn find_and_focus(
         .min(total_lines.saturating_sub(1));
     let current_col = state.cursor.0 as usize;
     let found = match direction {
-        SearchDirection::Forward => {
-            search_forward(grid, pane_cols, current_row, current_col, query)
-        }
+        SearchDirection::Forward => search_forward(vt, pane_cols, current_row, current_col, query),
         SearchDirection::Backward => {
-            search_backward(grid, pane_cols, current_row, current_col, query)
+            search_backward(vt, pane_cols, current_row, current_col, query)
         }
     };
     if let Some((row, col)) = found {
@@ -359,13 +357,13 @@ fn find_and_focus(
 }
 
 fn search_forward(
-    grid: &shux_vt::Grid,
+    vt: &VirtualTerminal,
     pane_cols: u16,
     current_row: usize,
     current_col: usize,
     query: &str,
 ) -> Option<(usize, usize)> {
-    let total = grid.total_lines();
+    let total = vt.presented_total_lines();
     for step in 0..total {
         let row_idx = (current_row + step) % total;
         let start_col = if step == 0 {
@@ -373,7 +371,8 @@ fn search_forward(
         } else {
             0
         };
-        let Some((col, _)) = search_row_forward(grid.row(row_idx)?, pane_cols, start_col, query)
+        let Some((col, _)) =
+            search_row_forward(vt.presented_row(row_idx)?, pane_cols, start_col, query)
         else {
             continue;
         };
@@ -383,13 +382,13 @@ fn search_forward(
 }
 
 fn search_backward(
-    grid: &shux_vt::Grid,
+    vt: &VirtualTerminal,
     pane_cols: u16,
     current_row: usize,
     current_col: usize,
     query: &str,
 ) -> Option<(usize, usize)> {
-    let total = grid.total_lines();
+    let total = vt.presented_total_lines();
     for step in 0..total {
         let row_idx = (current_row + total - (step % total)) % total;
         let before_col = if step == 0 {
@@ -397,7 +396,8 @@ fn search_backward(
         } else {
             pane_cols as usize
         };
-        let Some((col, _)) = search_row_backward(grid.row(row_idx)?, pane_cols, before_col, query)
+        let Some((col, _)) =
+            search_row_backward(vt.presented_row(row_idx)?, pane_cols, before_col, query)
         else {
             continue;
         };
@@ -546,9 +546,12 @@ pub fn view_start(total_lines: usize, pane_rows: u16, scroll_offset: usize) -> u
 /// For a pane whose grid fits its viewport (the overwhelmingly common case) this
 /// is exactly `grid.total_lines()`, so copy mode is byte-for-byte unchanged.
 pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
-    let grid = vt.grid();
-    let total = grid.total_lines();
-    let grid_rows = grid.rows();
+    // The PRESENTED span, not `grid().total_lines()`. While a
+    // synchronized-output window is open the frozen frame is the viewport
+    // alone; history stays live and is reached through `presented_row`
+    // (issue #115), so the grid's own line count describes only the frame.
+    let total = vt.presented_total_lines();
+    let grid_rows = vt.grid().rows();
     let visible = pane_rows as usize;
     if grid_rows <= visible {
         return total; // grid fits — coordinate space is unchanged
@@ -561,6 +564,18 @@ pub fn effective_total_lines(vt: &VirtualTerminal, pane_rows: u16) -> usize {
     total
         .saturating_sub(grid_rows)
         .saturating_add(row_offset + visible)
+}
+
+/// Rows of the copy view a person can actually READ.
+///
+/// `render_copy_view_into` draws `pane_rows` lines, and the copy-mode hint bar
+/// is then written over the bottom one — so the last line drawn is never seen.
+/// Paging by the full height therefore steps over exactly one line per page:
+/// a 30-row pane showed 0001..0030 and then started the next page at 0032.
+/// Paging by the readable height instead makes consecutive pages tile, with
+/// the line that sat under the bar becoming the top of the next page.
+pub fn readable_rows(pane_rows: u16) -> usize {
+    (pane_rows as usize).saturating_sub(1).max(1)
 }
 
 pub fn scroll_up(
@@ -602,11 +617,10 @@ fn row_for_view(
     scroll_offset: usize,
     view_row: u16,
 ) -> Option<&Row> {
-    let grid = vt.grid();
     // #108: anchor to the region the live frame shows, not the grid bottom.
     let total = effective_total_lines(vt, pane_rows);
     let abs = view_start(total, pane_rows, scroll_offset).saturating_add(view_row as usize);
-    grid.row(abs)
+    vt.presented_row(abs)
 }
 
 trait BoolExt {
@@ -712,7 +726,6 @@ pub fn render_copy_view_into(
     if pane.width == 0 || pane.height == 0 {
         return;
     }
-    let grid = vt.grid();
     // #108: match the cursor-following frame region (see effective_total_lines).
     let start = view_start(
         effective_total_lines(vt, pane.height),
@@ -721,7 +734,7 @@ pub fn render_copy_view_into(
     );
     for row in 0..pane.height {
         let abs = start + row as usize;
-        let Some(row_ref) = grid.row(abs) else {
+        let Some(row_ref) = vt.presented_row(abs) else {
             continue;
         };
         let _ = write!(buf, "\x1b[{};{}H", pane.y + row + 1, pane.x + 1);
@@ -1221,10 +1234,57 @@ mod tests {
     #[test]
     fn page_keys_adjust_scroll_offset() {
         let mut s = CopyModeState::new();
+        // A page is the READABLE height: the bottom row of the rect carries the
+        // copy-mode hint bar, so five rows show four lines.
         assert_eq!(handle_key(b"\x1b[5~", &mut s, 10, 5, 20), CopyKey::Updated);
-        assert_eq!(s.scroll_offset, 5);
+        assert_eq!(s.scroll_offset, 4);
         assert_eq!(handle_key(b"\x1b[6~", &mut s, 10, 5, 20), CopyKey::Updated);
         assert_eq!(s.scroll_offset, 0);
+    }
+
+    /// Paging must TILE the lines a person can read: no line skipped between
+    /// one page and the next, and none shown twice.
+    ///
+    /// The copy view draws `pane_rows` lines and the hint bar is written over
+    /// the last of them, so paging by the full height stepped over exactly one
+    /// line per page — a 30-row pane showed 0001..0030 and then began the next
+    /// page at 0032. Asserted on the visible line RANGES rather than on the
+    /// offset, so it stays true if the offset arithmetic is ever rewritten.
+    #[test]
+    fn paging_tiles_the_readable_lines_without_skipping_any() {
+        const TOTAL: usize = 400;
+        for pane_rows in [3u16, 5, 12, 24, 30] {
+            // Stated here, NOT taken from `readable_rows`: a test that asks the
+            // code under test how many lines are readable moves with the bug
+            // and passes either way. The hint bar is written over the bottom
+            // row of the rect (`render_copy_overlay_inner`), so one fewer line
+            // than the rect is tall can be read.
+            let readable = pane_rows as usize - 1;
+            let mut s = CopyModeState::new();
+            let mut seen: Vec<usize> = Vec::new();
+
+            // Page back through history, recording the lines actually readable
+            // on each page (the bottom drawn row is hidden by the hint bar).
+            for _ in 0..6 {
+                let start = view_start(TOTAL, pane_rows, s.scroll_offset);
+                seen.extend(start..start + readable);
+                if handle_key(b"\x1b[5~", &mut s, 40, pane_rows, TOTAL) != CopyKey::Updated {
+                    break;
+                }
+            }
+
+            seen.sort_unstable();
+            seen.dedup();
+            let lo = *seen.first().expect("some lines were readable");
+            let hi = *seen.last().expect("some lines were readable");
+            assert_eq!(
+                seen.len(),
+                hi - lo + 1,
+                "paging a {pane_rows}-row pane skipped lines: readable set spans {lo}..={hi} \
+                 but only {} distinct lines were reachable",
+                seen.len(),
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut, Index, IndexMut, Range};
+use std::sync::Arc;
 
 use crate::cell::{Cell, Color};
 
@@ -12,7 +13,7 @@ pub struct DirtyRegion {
     pub cols: Range<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DirtyState {
     enabled: bool,
     full_frame: bool,
@@ -205,10 +206,31 @@ struct ReflowedCellPosition {
 }
 
 /// A single row of terminal cells.
+///
+/// ## Why the cells sit behind an `Arc` (issue #115)
+///
+/// A row is the unit shux copies. Cloning a `Grid` — which synchronized
+/// output (`CSI ?2026h`), `pane capture` and every snapshot path do — used to
+/// deep-copy every cell of every line, scrollback included: 29 MB for a
+/// 240x64 pane holding 5000 lines of history, bought by sixteen bytes a pane
+/// chooses to emit.
+///
+/// The cells are shared instead, and copied only when a shared row is written
+/// to (`Row::cells_mut` -> `Arc::make_mut`). A grid clone is then a walk of
+/// line pointers rather than of cells: proportional to the number of lines,
+/// not to their contents. A row that is never written after a clone is never
+/// copied at all, and a row that IS written pays exactly one copy of itself —
+/// the same bytes the write was always going to touch.
+///
+/// The uniqueness check `Arc::make_mut` performs on every write is two
+/// relaxed atomic loads on the uncontended path, which is the hot path: a row
+/// with a refcount of one is mutated in place exactly as before.
 #[derive(Debug, Clone)]
 pub struct Row {
-    /// Cell storage. `pub(crate)` for access from `Grid::insert_chars`/`Grid::delete_chars`.
-    pub(crate) cells: Vec<Cell>,
+    /// Cell storage, shared copy-on-write with every clone of this row.
+    /// Read through `Deref` (`row.cells.len()`, `row.cells.iter()`); written
+    /// only through [`Row::cells_mut`], which unshares first.
+    pub(crate) cells: Arc<Vec<Cell>>,
     /// Whether this row soft-wraps into the next row.
     pub wrapped: bool,
 }
@@ -252,9 +274,20 @@ impl Drop for RowMut<'_> {
 impl Row {
     pub fn new(cols: usize) -> Self {
         Row {
-            cells: vec![Cell::default(); cols],
+            cells: Arc::new(vec![Cell::default(); cols]),
             wrapped: false,
         }
+    }
+
+    /// Unshare and borrow the cells for writing.
+    ///
+    /// This is the ONLY way to mutate a row's cells, which is what makes the
+    /// copy-on-write sharing safe: a row still shared with a frozen
+    /// presentation or a snapshot is copied here, before the write lands, so
+    /// no reader of the other side can ever see the write.
+    #[inline]
+    pub(crate) fn cells_mut(&mut self) -> &mut Vec<Cell> {
+        Arc::make_mut(&mut self.cells)
     }
 
     pub fn len(&self) -> usize {
@@ -271,7 +304,7 @@ impl Row {
 
     /// Resize the row, filling new cells with the given template.
     pub fn resize(&mut self, cols: usize, template: Cell) {
-        self.cells.resize(cols, template);
+        self.cells_mut().resize(cols, template);
     }
 
     /// Return the row to the state of `Row::new(cols)`, keeping the cell
@@ -279,14 +312,15 @@ impl Row {
     /// whenever it is already wide enough, which it is for every recycled
     /// alternate-screen buffer at an unchanged pane width.
     pub(crate) fn reset_blank(&mut self, cols: usize) {
-        self.cells.clear();
-        self.cells.resize(cols, Cell::default());
+        let cells = self.cells_mut();
+        cells.clear();
+        cells.resize(cols, Cell::default());
         self.wrapped = false;
     }
 
     /// Reset all cells in the row to the given background color.
     pub fn reset(&mut self, bg: Color) {
-        for cell in &mut self.cells {
+        for cell in self.cells_mut() {
             cell.reset(bg);
         }
         self.wrapped = false;
@@ -297,32 +331,34 @@ impl Row {
             return;
         }
 
-        if self.cells[col].is_wide_continuation() {
-            self.cells[col].reset(bg);
-            if col > 0 && self.cells[col - 1].is_wide() {
-                self.cells[col - 1].reset(bg);
+        let cells = self.cells_mut();
+        if cells[col].is_wide_continuation() {
+            cells[col].reset(bg);
+            if col > 0 && cells[col - 1].is_wide() {
+                cells[col - 1].reset(bg);
             }
-        } else if self.cells[col].is_wide() {
-            self.cells[col].reset(bg);
-            if col + 1 < self.cells.len() && self.cells[col + 1].is_wide_continuation() {
-                self.cells[col + 1].reset(bg);
+        } else if cells[col].is_wide() {
+            cells[col].reset(bg);
+            if col + 1 < cells.len() && cells[col + 1].is_wide_continuation() {
+                cells[col + 1].reset(bg);
             }
         }
     }
 
     pub(crate) fn sanitize_wide_pairs(&mut self, bg: Color) {
-        for col in 0..self.cells.len() {
-            if self.cells[col].is_wide() {
-                let has_tail = col + 1 < self.cells.len()
-                    && self.cells[col + 1].is_wide_continuation()
-                    && self.cells[col + 1].ch == ' ';
+        let cells = self.cells_mut();
+        for col in 0..cells.len() {
+            if cells[col].is_wide() {
+                let has_tail = col + 1 < cells.len()
+                    && cells[col + 1].is_wide_continuation()
+                    && cells[col + 1].ch == ' ';
                 if !has_tail {
-                    self.cells[col].reset(bg);
+                    cells[col].reset(bg);
                 }
-            } else if self.cells[col].is_wide_continuation() {
-                let has_head = col > 0 && self.cells[col - 1].is_wide();
-                if !has_head || self.cells[col].ch != ' ' {
-                    self.cells[col].reset(bg);
+            } else if cells[col].is_wide_continuation() {
+                let has_head = col > 0 && cells[col - 1].is_wide();
+                if !has_head || cells[col].ch != ' ' {
+                    cells[col].reset(bg);
                 }
             }
         }
@@ -353,8 +389,9 @@ impl Row {
             end += 1;
         }
 
-        for col in start..end {
-            self.cells[col].reset(bg);
+        let cells = self.cells_mut();
+        for cell in &mut cells[start..end] {
+            cell.reset(bg);
         }
         Some(start..end)
     }
@@ -377,7 +414,7 @@ impl Index<usize> for Row {
 
 impl IndexMut<usize> for Row {
     fn index_mut(&mut self, col: usize) -> &mut Cell {
-        &mut self.cells[col]
+        &mut self.cells_mut()[col]
     }
 }
 
@@ -426,6 +463,14 @@ pub struct Grid {
     /// never drained/coalesced, so a concurrently attached render client that
     /// drains dirty regions cannot make a lens reader miss a write (§4.4).
     mutations: u64,
+    /// Monotonic count of lines that have fallen off the FRONT of `raw` —
+    /// scrolled past the scrollback cap, reflowed away, or cleared.
+    ///
+    /// A frozen presentation (issue #115) holds only the viewport and reads
+    /// history straight out of this grid, so it needs to know how far the
+    /// history it remembers has shifted underneath it. Never decreases, so the
+    /// difference between two readings is the number of lines that went.
+    evicted: u64,
 }
 
 impl Clone for Grid {
@@ -437,6 +482,68 @@ impl Clone for Grid {
             config: self.config.clone(),
             dirty: DirtyState::new(self.rows, self.config.track_dirty),
             mutations: self.mutations,
+            evicted: self.evicted,
+        }
+    }
+}
+
+impl Grid {
+    /// Clone this grid AND its pending repaint state.
+    ///
+    /// The ordinary clone hands back a grid nothing is known to be stale in,
+    /// which is right for a snapshot that is about to be rendered once and
+    /// dropped. The synchronized-output freeze is the other case: the frozen
+    /// buffer takes over as the thing a live renderer is incrementally
+    /// tracking, so it has to inherit the rows that renderer has not drawn yet
+    /// or they are never drawn at all.
+    /// Lines that have fallen off the front of this grid over its lifetime.
+    pub(crate) fn evicted(&self) -> u64 {
+        self.evicted
+    }
+
+    /// Clone JUST the visible viewport, and its pending repaint state, as a
+    /// grid of its own.
+    ///
+    /// This is what a synchronized-output freeze keeps (issue #115). It
+    /// deliberately does NOT keep history, for two reasons that are really the
+    /// same reason:
+    ///
+    /// - **Taking it would cost history.** Copying the whole grid means one
+    ///   pointer per retained line — 5,000 of them on a pane that has been
+    ///   used — for every window a pane opens, and a pane opens them as fast
+    ///   as it can write sixteen bytes.
+    /// - **Holding it would cost history twice over.** Every line the frozen
+    ///   frame keeps a reference to is a line the live grid can no longer
+    ///   recycle as it scrolls, so it must allocate a replacement instead. A
+    ///   pane that scrolls its whole history inside one window would pay for a
+    ///   copy of all of it.
+    ///
+    /// Neither applies to the viewport: it is a fixed number of rows, and it
+    /// is the only part of the grid the frozen frame actually has to hold
+    /// still. History is not part of the presented FRAME — it is read live,
+    /// through [`crate::VirtualTerminal::presented_row`], which shifts its
+    /// indices by whatever has been evicted since the freeze.
+    ///
+    /// The scrollback budget is `rows` rather than zero so that a reflow
+    /// landing inside a window (a resize) has somewhere to put lines that no
+    /// longer fit, exactly as it would in the full grid.
+    pub(crate) fn clone_presented_viewport(&self) -> Grid {
+        let sb = self.scrollback_len();
+        let mut raw = VecDeque::with_capacity(self.rows);
+        for row in self.raw.iter().skip(sb) {
+            raw.push_back(row.clone());
+        }
+        Grid {
+            raw,
+            rows: self.rows,
+            cols: self.cols,
+            config: GridConfig {
+                max_scrollback: self.rows,
+                track_dirty: self.config.track_dirty,
+            },
+            dirty: self.dirty.clone(),
+            mutations: self.mutations,
+            evicted: self.evicted,
         }
     }
 }
@@ -453,6 +560,7 @@ impl Grid {
             rows,
             cols,
             dirty: DirtyState::new(rows, config.track_dirty),
+            evicted: 0,
             config,
             mutations: 0,
         }
@@ -615,6 +723,7 @@ impl Grid {
             dirty: DirtyState::new(self.rows, self.config.track_dirty),
             // A read-only clone for snapshotting; the tally is irrelevant here.
             mutations: 0,
+            evicted: self.evicted,
         }
     }
 
@@ -636,7 +745,7 @@ impl Grid {
             .map(|row_idx| {
                 let row = self.visible_row(row_idx);
                 let mut line = String::with_capacity(self.cols);
-                for cell in &row.cells {
+                for cell in row.cells.iter() {
                     if cell.is_wide_continuation() {
                         continue;
                     }
@@ -836,6 +945,7 @@ impl Grid {
                     Some(row) => row,
                     None => break,
                 };
+                self.evicted = self.evicted.saturating_add(1);
                 if row.len() == cols {
                     row.reset(Color::Default);
                 } else {
@@ -847,6 +957,7 @@ impl Grid {
             // change can leave the deque over the line); a no-op otherwise.
             while self.raw.len() > max_total {
                 self.raw.pop_front();
+                self.evicted = self.evicted.saturating_add(1);
             }
         } else {
             let sb = self.scrollback_len();
@@ -1029,7 +1140,7 @@ impl Grid {
             let row_cells = if is_tail {
                 trim_default_trailing_cells(&row.cells)
             } else {
-                row.cells.clone()
+                row.cells.as_ref().clone()
             };
 
             if let Some((cursor_row, cursor_col)) = cursor_abs
@@ -1090,6 +1201,7 @@ impl Grid {
             dropped_rows += 1;
         }
 
+        self.evicted = self.evicted.saturating_add(dropped_rows as u64);
         self.raw = reflowed;
         self.rows = new_rows;
         self.cols = new_cols;
@@ -1128,6 +1240,7 @@ impl Grid {
         for _ in 0..sb {
             self.raw.pop_front();
         }
+        self.evicted = self.evicted.saturating_add(sb as u64);
     }
 }
 
@@ -1268,15 +1381,16 @@ impl Grid {
             r.clear_wide_pair_around(col, Color::Default);
         }
         // Shift right from the end.
+        let cells = r.cells_mut();
         for i in (col..len).rev() {
             let target = i + count;
             if target < len {
-                r.cells[target] = r.cells[i].clone();
+                cells[target] = cells[i].clone();
             }
         }
         // Fill inserted positions with blanks.
-        for i in col..(col + count).min(len) {
-            r.cells[i] = Cell::default();
+        for cell in cells.iter_mut().take((col + count).min(len)).skip(col) {
+            *cell = Cell::default();
         }
         r.sanitize_wide_pairs(Color::Default);
         if count > 0 && col < len {
@@ -1296,12 +1410,13 @@ impl Grid {
             return;
         }
         // Shift left.
+        let cells = r.cells_mut();
         for i in col..(len - actual) {
-            r.cells[i] = r.cells[i + actual].clone();
+            cells[i] = cells[i + actual].clone();
         }
         // Fill right edge with blanks.
-        for i in (len - actual)..len {
-            r.cells[i] = Cell::default();
+        for cell in cells.iter_mut().skip(len - actual) {
+            *cell = Cell::default();
         }
         r.sanitize_wide_pairs(Color::Default);
         self.dirty
@@ -1775,7 +1890,7 @@ mod tests {
         }
         assert!(grid.scrollback_len() >= 5, "scrollback was set up");
         // Mark a visible row so we can verify it survives the clone.
-        grid.visible_row_mut(2).cells[0].ch = 'V';
+        grid.visible_row_mut(2)[0].ch = 'V';
 
         let snap = grid.clone_visible();
         assert_eq!(snap.rows(), 3);

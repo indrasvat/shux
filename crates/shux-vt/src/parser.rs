@@ -1,8 +1,8 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::trace;
 
-use crate::SyncPresentation;
 use crate::cell::{
     Cell, CellFlags, CellStyle, Color, ExtendedAttrs, TerminalDefaultColors, UnderlineStyle,
 };
@@ -10,6 +10,7 @@ use crate::charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 use crate::cursor::{Cursor, CursorShape};
 use crate::grid::Grid;
 use crate::screen::ScreenSwap;
+use crate::sync::Presented;
 use crate::tabstops::TabStops;
 
 /// Terminal mode flags (DECSET/DECRST).
@@ -149,31 +150,46 @@ pub struct DcsState {
 /// and delegates parsed bytes to it. The handler modifies the grid and cursor
 /// directly.
 pub struct VtHandler<'a> {
-    pub grid: &'a mut Grid,
-    pub cursor: &'a mut Cursor,
-    pub modes: &'a mut TerminalModes,
-    pub scroll_region: &'a mut ScrollRegion,
-    pub title: &'a mut Option<String>,
-    pub default_colors: &'a mut TerminalDefaultColors,
-    pub alt_grid: &'a mut Option<Grid>,
-    pub alt_cursor: &'a mut Option<Cursor>,
-    pub dcs_state: &'a mut Option<DcsState>,
-    pub sync_present: &'a mut Option<SyncPresentation>,
-    pub active_grapheme_cell: &'a mut Option<(usize, usize)>,
-    pub charsets: &'a mut TerminalCharsets,
-    pub tab_stops: &'a mut TabStops,
-    pub responses: &'a mut Vec<Vec<u8>>,
+    /// The live grid, wrapped so that a write to it takes the
+    /// synchronized-output snapshot first (issue #115, see [`crate::sync`]).
+    pub(crate) grid: Presented<'a, Grid>,
+    /// The live cursor, wrapped for the same reason: cursor position and
+    /// visibility are part of the presented frame.
+    pub(crate) cursor: Presented<'a, Cursor>,
+    pub(crate) modes: &'a mut TerminalModes,
+    pub(crate) scroll_region: &'a mut ScrollRegion,
+    pub(crate) title: Presented<'a, Option<String>>,
+    pub(crate) default_colors: Presented<'a, TerminalDefaultColors>,
+    pub(crate) alt_grid: &'a mut Option<Grid>,
+    pub(crate) alt_cursor: &'a mut Option<Cursor>,
+    pub(crate) dcs_state: &'a mut Option<DcsState>,
+    /// Whether synchronized output is currently holding the presentation
+    /// open. Shared with every [`Presented`] above, which is how a `?2026h`
+    /// arriving mid-batch arms snapshots taken later in the same batch.
+    pub(crate) sync_armed: &'a AtomicBool,
+    /// Frozen alternate-screen flag. Not a [`Presented`] because the live flag
+    /// lives inside `TerminalModes` among fields that are not presented state;
+    /// written only via [`VtHandler::set_alternate_screen`].
+    pub(crate) frozen_alt: &'a mut Option<bool>,
+    /// Take the whole snapshot at `?2026h` instead of at the first write.
+    /// Always `false` in production — see
+    /// [`crate::VirtualTerminal::set_eager_sync_freeze`].
+    pub(crate) eager_sync_freeze: bool,
+    pub(crate) active_grapheme_cell: &'a mut Option<(usize, usize)>,
+    pub(crate) charsets: &'a mut TerminalCharsets,
+    pub(crate) tab_stops: &'a mut TabStops,
+    pub(crate) responses: &'a mut Vec<Vec<u8>>,
     /// Sticky flag set when a valid OSC 4 palette override is applied. shux-vt
     /// discards the override (Class-B limitation), so an indexed-colour capture
     /// taken afterwards is non-portable — the lens gate reads this to emit the
     /// `palette_unportable` diagnostic (task 078, R1).
-    pub palette_overridden: &'a mut bool,
+    pub(crate) palette_overridden: &'a mut bool,
     /// The retired alternate-screen buffer, reused by the next entry
     /// (issue #106). At most one, ever.
-    pub alt_spare: &'a mut Option<Grid>,
+    pub(crate) alt_spare: &'a mut Option<Grid>,
     /// Whether retired buffers may be recycled. Always `true` in production;
     /// the differential tests drive a second terminal with it off.
-    pub reuse_retired_grids: bool,
+    pub(crate) reuse_retired_grids: bool,
 }
 
 impl<'a> VtHandler<'a> {
@@ -181,13 +197,57 @@ impl<'a> VtHandler<'a> {
     /// by `DECSET 1047/1049` and by `RIS`.
     fn screen_swap(&mut self) -> ScreenSwap<'_> {
         ScreenSwap {
-            grid: self.grid,
-            cursor: self.cursor,
+            grid: &mut self.grid,
+            cursor: &mut self.cursor,
             stashed_grid: self.alt_grid,
             stashed_cursor: self.alt_cursor,
             spare: self.alt_spare,
             reuse: self.reuse_retired_grids,
         }
+    }
+
+    /// Freeze the alternate-screen flag, if synchronized output is armed and
+    /// it has not been frozen yet. Counterpart of [`Presented::freeze`] for
+    /// the one presented component that is not wrapped.
+    #[inline]
+    fn freeze_alt_flag(&mut self) {
+        if self.sync_armed.load(Ordering::Relaxed) && self.frozen_alt.is_none() {
+            *self.frozen_alt = Some(self.modes.alternate_screen);
+        }
+    }
+
+    /// The only writer of the live alternate-screen flag.
+    ///
+    /// Presented readers must never see a future alt flag against the frozen
+    /// pixels of a past frame, so the flag is snapshotted on the way in — the
+    /// same rule [`Presented`] enforces for the grid, cursor, title and
+    /// default colours.
+    fn set_alternate_screen(&mut self, on: bool) {
+        self.freeze_alt_flag();
+        self.modes.alternate_screen = on;
+    }
+
+    /// Snapshot every component of the presented frame at once.
+    ///
+    /// Used by the eager mode the differential oracle runs as its reference
+    /// arm, and by the `?2026h` path when that mode is on.
+    fn freeze_whole_presentation(&mut self) {
+        self.grid.freeze();
+        self.cursor.freeze();
+        self.title.freeze();
+        self.default_colors.freeze();
+        self.freeze_alt_flag();
+    }
+
+    /// Release synchronized output: disarm first, then drop every snapshot, so
+    /// that nothing done afterwards on the way out can re-take one.
+    fn release_sync_presentation(&mut self) {
+        self.sync_armed.store(false, Ordering::Relaxed);
+        self.grid.discard();
+        self.cursor.discard();
+        self.title.discard();
+        self.default_colors.discard();
+        *self.frozen_alt = None;
     }
 
     fn clear_active_grapheme_cell(&mut self) {
@@ -509,7 +569,7 @@ impl<'a> VtHandler<'a> {
         }
         {
             let row_ref = self.grid.visible_row_mut_marked(row);
-            if let Some(cell) = row_ref.cells.get_mut(col) {
+            if let Some(cell) = row_ref.cells_mut().get_mut(col) {
                 cell.append_grapheme_scalar(ch);
             }
         }
@@ -892,12 +952,12 @@ impl<'a> VtHandler<'a> {
                     // primary cursor and homes the alternate one; 1047 carries
                     // the cursor across and parks nothing.
                     self.screen_swap().enter(mode == 1049);
-                    self.modes.alternate_screen = true;
+                    self.set_alternate_screen(true);
                 } else {
                     // Leave alternate screen: restore grids.
                     if self.modes.alternate_screen {
                         self.screen_swap().leave(mode == 1049);
-                        self.modes.alternate_screen = false;
+                        self.set_alternate_screen(false);
                     }
                     if mode == 1049 {
                         self.restore_cursor_state();
@@ -909,22 +969,26 @@ impl<'a> VtHandler<'a> {
             // Synchronized output mode (2026).
             2026 => {
                 if enable {
-                    if self.sync_present.is_none() {
-                        let mut presented_grid = self.grid.clone();
-                        presented_grid.mark_all_dirty();
-                        *self.sync_present = Some(SyncPresentation {
-                            grid: presented_grid,
-                            cursor: self.cursor.clone(),
-                            default_colors: *self.default_colors,
-                            title: self.title.clone(),
-                            alternate_screen: self.modes.alternate_screen,
-                        });
+                    if !self.sync_armed.load(Ordering::Relaxed) {
+                        // The presented buffer the renderer is about to be
+                        // shown is a different buffer from the one it has been
+                        // tracking, so it repaints in full. O(1): a flag on the
+                        // dirty state, not a walk of the grid. Marked BEFORE
+                        // arming, so it is not itself a reason to take a copy.
+                        self.grid.live_mut_unfrozen().mark_all_dirty();
+                        self.sync_armed.store(true, Ordering::Relaxed);
+                        if self.eager_sync_freeze {
+                            self.freeze_whole_presentation();
+                        }
                     }
                     self.modes.synchronized_output = true;
                 } else {
                     self.modes.synchronized_output = false;
-                    self.sync_present.take();
-                    self.grid.mark_all_dirty();
+                    self.release_sync_presentation();
+                    // Presentation jumps from the frozen frame to the live one:
+                    // every cell on screen may differ, so the renderer repaints
+                    // in full. Disarmed above, so this cannot take a snapshot.
+                    self.grid.live_mut_unfrozen().mark_all_dirty();
                 }
             }
             _ => trace!(mode, enable, "unhandled private mode"),
@@ -1516,6 +1580,12 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 // which `reset(1)` and a crashed full-screen app both trigger.
                 // The cursor is homed a few lines down, so there is nothing
                 // worth restoring from the parked one.
+                // Release synchronized output FIRST. RIS discards the frozen
+                // presentation outright, so freezing on the way through it
+                // would be a full grid copy taken only to be dropped — and a
+                // pane can emit `ESC[?2026h ESC c` as readily as any other ten
+                // bytes (issue #115).
+                self.release_sync_presentation();
                 if self.modes.alternate_screen {
                     self.screen_swap().leave(false);
                 }
@@ -1525,7 +1595,6 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 *self.cursor = Cursor::new();
                 *self.modes = TerminalModes::default();
                 *self.default_colors = TerminalDefaultColors::default();
-                self.sync_present.take();
                 self.reset_charsets();
                 self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
@@ -2166,7 +2235,12 @@ mod tests {
         alt_spare: Option<Grid>,
         alt_cursor: Option<Cursor>,
         dcs_state: Option<DcsState>,
-        sync_present: Option<SyncPresentation>,
+        sync_armed: AtomicBool,
+        frozen_grid: Option<crate::sync::FrozenScreen>,
+        frozen_cursor: Option<Cursor>,
+        frozen_colors: Option<TerminalDefaultColors>,
+        frozen_title: Option<Option<String>>,
+        frozen_alt: Option<bool>,
         active_grapheme_cell: Option<(usize, usize)>,
         charsets: TerminalCharsets,
         tab_stops: TabStops,
@@ -2190,7 +2264,12 @@ mod tests {
                 alt_spare: None,
                 alt_cursor: None,
                 dcs_state: None,
-                sync_present: None,
+                sync_armed: AtomicBool::new(false),
+                frozen_grid: None,
+                frozen_cursor: None,
+                frozen_colors: None,
+                frozen_title: None,
+                frozen_alt: None,
                 active_grapheme_cell: None,
                 charsets: TerminalCharsets::default(),
                 tab_stops: TabStops::new(cols),
@@ -2202,16 +2281,22 @@ mod tests {
         fn process(&mut self, bytes: &[u8]) {
             let mut palette_overridden = false;
             let mut handler = VtHandler {
-                grid: &mut self.grid,
-                cursor: &mut self.cursor,
+                grid: Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
+                cursor: Presented::new(&mut self.cursor, &mut self.frozen_cursor, &self.sync_armed),
                 modes: &mut self.modes,
                 scroll_region: &mut self.scroll_region,
-                title: &mut self.title,
-                default_colors: &mut self.default_colors,
+                title: Presented::new(&mut self.title, &mut self.frozen_title, &self.sync_armed),
+                default_colors: Presented::new(
+                    &mut self.default_colors,
+                    &mut self.frozen_colors,
+                    &self.sync_armed,
+                ),
                 alt_grid: &mut self.alt_grid,
                 alt_cursor: &mut self.alt_cursor,
                 dcs_state: &mut self.dcs_state,
-                sync_present: &mut self.sync_present,
+                sync_armed: &self.sync_armed,
+                frozen_alt: &mut self.frozen_alt,
+                eager_sync_freeze: false,
                 active_grapheme_cell: &mut self.active_grapheme_cell,
                 charsets: &mut self.charsets,
                 tab_stops: &mut self.tab_stops,

@@ -562,3 +562,89 @@ palette, restore the deliberate table/summary divergence).
   after, legible in a still. Also: a pane's geometry is capped, and one 240×64 pane on a 4-core
   box only produced ~90 ms of lag — six of them were needed to make it watchable, which is
   itself an honest scenario.
+
+## 2026-08-05 — issue #115, DEC 2026 synchronized output (task 089)
+
+- **A deferral fixes the trigger, not the ceiling.** Deferring the synchronized-output
+  freeze to the first write took `ESC[?2026h ESC[?2026l` to the parse floor and left
+  `ESC[?2026h a ESC[?2026l` at 87 KB and a **51x** end-to-end latency regression, because
+  the interleaved character legitimately takes the copy. Ask separately what the cheapest
+  trigger costs and what the WORST window costs; a fix can move one a millionfold and the
+  other not at all.
+- **A retained snapshot has a second, invisible price.** Holding a frozen grid does not
+  just cost what it cost to take. Every line it references is a line the live grid can no
+  longer recycle as it scrolls, so the live side allocates a replacement instead —
+  29 MB for 416 bytes, spread across the scrolls rather than paid up front, and therefore
+  invisible to a benchmark that only measures the freeze. Copy-on-write moves the cost, it
+  does not remove it; the only way to remove it is to reference fewer rows.
+- **"Presented frame" and "everything a reader can see" are different sets.** The frame
+  mode 2026 promises to hold still is the viewport. Scrollback is reachable from copy mode
+  but is not part of the frame, and freezing it was the whole expense. Splitting the two —
+  frame frozen, history read live through one indirection — was tractable only because
+  every history read already funnelled through `Grid::row(abs)` + `total_lines()`. Count
+  the funnel before assuming a reader-surface change is too big.
+- **Make the hook unforgettable rather than exhaustive.** A hand-maintained list of
+  "places that mutate the presented frame" fails silently the first time someone adds a
+  path. Wrapping each component in a guard whose `DerefMut` snapshots first means the
+  parser's existing code is unchanged, reads stay free, and there is no way to reach the
+  mutable state except through the freeze. It is also precise in the direction a coarse
+  hook is not: `ESC[6n` never reaches `DerefMut`, so it cannot re-arm the copy.
+- **A differential oracle only compares what you hand it.** The lazy-vs-eager proptest
+  passed 400 cases while comparing `grid().scrollback_len()` — which both arms agreed on
+  and which stopped describing anything real once the frame went viewport-only. It had to
+  be re-pointed at `presented_total_lines()`/`presented_row()`, the surface a reader
+  actually uses. When the shape of an observable changes, the oracle's `observe()` is the
+  first thing to re-derive, not the last.
+- **The suite could not detect a single write path escaping `Row::cells_mut`.** An
+  adversarial agent injected a raw-pointer write into `Row::reset` alone — the path behind
+  every clear and behind scrollback recycling — and all 459 tests stayed green, including
+  the differential oracle written for this change. A safety argument of the form "X is the
+  only way to do Y" needs a test that reintroduces a violation of it, per path, in a
+  sandbox. `crates/shux-vt/tests/cow_aliasing_adversarial.rs` now walks 27 write paths.
+- **The differential oracle could not see this one, because both arms shared it.** The
+  viewport-only freeze reads history out of the live grid at a shifted index, and the shift
+  went the wrong way: eviction removes lines from the FRONT, so survivors slide down to
+  meet index 0 rather than the index sliding up to meet them. Adding the eviction count
+  instead walked past the survivors into the live viewport, so content written *after* the
+  freeze appeared inside the frame that exists to hide it. Both arms of the proptest call
+  the same accessor, so 800 generated programs stayed green; it took an absolute assertion
+  on real content under partial eviction. A differential proves an optimisation is
+  unobservable. It is not a correctness test for the shared path, and the shared path is
+  exactly where a refactor puts its new arithmetic.
+
+- **Read the other implementations before designing.** Alacritty had already tried the
+  snapshot-on-`?2026h` design and abandoned it, and their commit says why in one line
+  ("this can happen thousands of times per frame"). They also carry two liveness bounds
+  shux had none of — a 150 ms deadline and a 2 MiB cap — which turned "a crashed app
+  freezes its pane for ever" from an unknown into a fixed defect in the same PR.
+- **Then measure the constant against your own workload rather than copying it.** btop is
+  the one installed application that genuinely drives mode 2026 (`vim` and `htop` gate on a
+  terminfo `Sync` capability that shux's `TERM` does not advertise, so they are regression
+  coverage for the row change, not for this path). It holds a window for **0–6.3 ms**,
+  which is what makes 150 ms defensible rather than borrowed.
+- **A resize is not a state to preserve through, it is a reason to stop.** Reflowing a
+  frozen frame is wrong in two ways at once — no history to rewrap against, and the
+  alternate screen is canvas-resized rather than reflowed — and both disappear if the
+  resize simply releases the window. Deleting the interaction beat getting it right.
+- **A wedged daemon hangs the harness that is measuring it.** `subprocess.run` with no
+  timeout turned "the victim never answered" into a run that never finished and left
+  orphans. A ceiling that RECORDS the timeout ("15 of 15 captures never returned within
+  8 s") is the measurement; waiting it out is not, and neither is `|| true`.
+- **VHS compresses a still screen and will erase the freeze you are filming.** A 43-second
+  tape came out as 7 seconds on the fixed build and 17 on the broken one, because the
+  recorder drops duplicate frames. Put the proof in a single frame — a bar whose length is
+  a pure function of wall clock — and normalise the two clips' playback speed afterwards so
+  they are comparable. Also: redraw the demo pane in place rather than clearing it, or a
+  frame grabbed mid-redraw shows a half-erased screen and reads as a bug in the demo.
+- **A regression test that asks the code under test for its expectation is vacuous.**
+  The copy-mode paging fix came with a test that recomputed "how many lines are readable"
+  by calling `readable_rows` — the very function being fixed — so it tiled perfectly with
+  the bug reintroduced and passed either way. Stating `pane_rows - 1` literally, with the
+  reason (the hint bar covers the bottom row), made it fail against the defect. Whenever a
+  test derives its expected value from the implementation, check what it does when the
+  implementation is wrong; that is the only thing that distinguishes a bound from a
+  tautology.
+
+- **Open the frames, every time.** The first take recorded `shux attach victim` — not a
+  subcommand — and produced 20 seconds of a usage error. `ffprobe` said the file was
+  valid, the right size and the right duration.

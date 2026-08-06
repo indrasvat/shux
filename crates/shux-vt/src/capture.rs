@@ -723,7 +723,7 @@ impl FrameEnvelope {
         for (r, row) in cells.iter().enumerate() {
             let dst = g.visible_row_mut_marked(r);
             for (c, cell) in row.iter().enumerate() {
-                dst.cells[c] = cell.clone();
+                dst.cells_mut()[c] = cell.clone();
             }
         }
         g
@@ -1315,7 +1315,7 @@ mod tests {
         for (r, row) in cells.iter().enumerate() {
             let dst = g.visible_row_mut_marked(r);
             for (c, cell) in row.iter().enumerate() {
-                dst.cells[c] = cell.clone();
+                dst.cells_mut()[c] = cell.clone();
             }
         }
         g
