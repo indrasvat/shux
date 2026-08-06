@@ -147,6 +147,23 @@ impl Cell {
         extended: None,
     };
 
+    /// One cell of the DECALN screen-alignment pattern (`ESC # 8`, issue #117).
+    ///
+    /// A single-width `E` in DEFAULT attributes with no extended payload:
+    /// DECALN draws a fixed test pattern, not text, so it carries neither the
+    /// application's SGR pen nor anything left behind by the cell it replaces
+    /// (a hyperlink, a grapheme payload, half of a wide pair).
+    pub const ALIGNMENT: Cell = Cell {
+        ch: 'E',
+        width: 1,
+        style: CellStyle {
+            fg: Color::Default,
+            bg: Color::Default,
+            flags: CellFlags(0),
+        },
+        extended: None,
+    };
+
     /// A wide-character continuation cell (placeholder for the second column).
     pub fn wide_continuation() -> Cell {
         Cell {

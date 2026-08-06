@@ -648,3 +648,49 @@ palette, restore the deliberate table/summary divergence).
 - **Open the frames, every time.** The first take recorded `shux attach victim` — not a
   subcommand — and produced 20 seconds of a usage error. `ffprobe` said the file was
   valid, the right size and the right duration.
+
+## 2026-08-06 — issue #117, DECALN (task 090)
+
+- **A "silently ignored" sequence is not automatically a small fix.** DECALN's own
+  semantics are four lines. What made the change worth care is that a full-screen write
+  in shux has to satisfy invariants owned by two *other* issues: the write tally that
+  licenses alternate-screen buffer reuse (#106) and the copy-on-write row sharing the
+  synchronized-output freeze depends on (#115). The interesting failure mode was never
+  "the fill is wrong" — it was "the fill is right and the next application in that pane
+  inherits it".
+
+- **`Grid::is_blank_canvas` reasons from `mutations == 0`.** Any new path that writes
+  cells must go through something that bumps the tally, or a retired alternate buffer
+  full of that content reads as a blank canvas and is handed to the next program. The
+  `debug_assert!(is_actually_blank)` in `ScreenSwap::enter` is the backstop, and it only
+  fires if a test happens to drive that exact sequence — so the tally bump is the
+  invariant, not the assert.
+
+- **A no-op in the alphabet of a differential test is a hole in it.** Both
+  `sync_output_differential.rs` and `cow_aliasing_adversarial.rs` already fed `\x1b#8`
+  as "a sequence that touches the grid". `cow_aliasing_adversarial.rs` was honest about
+  it — it listed `DECALN` in an explicit vacuity guard naming the hammer cases known to
+  write nothing. That guard is what turned "implement DECALN" into "and now remove the
+  entry, and the surrounding assertion becomes real". **Write the vacuity guard.** A
+  test suite that cannot tell you which of its cases proved nothing will not tell you
+  when one of them starts mattering.
+
+- **Mutation-test the fix, not just the bug.** Ten mutations (drop the tally bump, drop
+  the wrap clear, drop the margin reset, drop the cursor home, assign `ch` only, fill
+  scrollback, clip to the scroll region, bypass the freeze, drop the dirty mark, fill
+  with the SGR pen) were each applied and each killed by a *named* test. Two of them
+  (`ch`-only, and filling with the pen) initially survived — the tests that should have
+  caught them were passing vacuously, because the screen under test started blank and
+  unstyled. Both tests were strengthened to draw first.
+
+- **`wait-settled` cannot tell "finished" from "not started".** The first evidence run
+  photographed panes mid-script and produced a scene that looked exactly like the
+  content leak the fix prevents — a screen of `E` where the next application should
+  have been. It was the harness. Every scene now has its pane touch a done-file after
+  its last write; the harness waits for the file, *then* settles.
+
+- **And the pane must be the right size before it draws.** A pane spawns at the daemon's
+  default geometry and is resized a moment later. A script that draws before the resize
+  lands gets *reflowed*, which for a screen of `E` means rows of 48 alternating with
+  rows of 32 — a picture that looks like a rendering bug and is not one. The scenes now
+  block on a go-file the harness touches after `pane set-size`.

@@ -326,6 +326,24 @@ impl Row {
         self.wrapped = false;
     }
 
+    /// Overwrite every cell with the DECALN alignment pattern (issue #117).
+    ///
+    /// Structurally identical to [`Row::reset`], and deliberately so: it goes
+    /// through `cells_mut`, so a row still shared with a frozen presentation or
+    /// a snapshot is copied before the write lands, and it clears `wrapped`,
+    /// because a screen of independent `E`s is not a soft-wrapped logical line
+    /// and must not be reflowed back into one on the next resize.
+    ///
+    /// Writing a whole `Cell::ALIGNMENT` per cell — rather than assigning
+    /// `ch` — is what drops the extended payload and the wide-pair widths that
+    /// the previous contents may have carried.
+    pub(crate) fn fill_alignment_pattern(&mut self) {
+        for cell in self.cells_mut() {
+            *cell = Cell::ALIGNMENT;
+        }
+        self.wrapped = false;
+    }
+
     pub(crate) fn clear_wide_pair_around(&mut self, col: usize, bg: Color) {
         if col >= self.cells.len() {
             return;
@@ -1017,6 +1035,25 @@ impl Grid {
         let sb = self.scrollback_len();
         for i in sb..self.raw.len() {
             self.raw[i].reset(bg);
+        }
+        self.dirty.mark_rows(0, self.rows, self.rows, self.cols);
+    }
+
+    /// Fill the whole visible viewport with the DECALN alignment pattern
+    /// (`ESC # 8`, issue #117). History is not part of the page and is left
+    /// alone.
+    ///
+    /// Mirrors [`Grid::clear_visible`] exactly — same row range, same single
+    /// tally bump, same full-viewport dirty mark. The tally bump is not
+    /// bookkeeping: [`Grid::is_blank_canvas`] reads it to decide whether a
+    /// retired alternate-screen buffer can be handed to the next application
+    /// as-is, so a fill that did not advance it would leak a screen of `E`
+    /// across that boundary.
+    pub fn fill_alignment_pattern(&mut self) {
+        self.bump_mutations();
+        let sb = self.scrollback_len();
+        for i in sb..self.raw.len() {
+            self.raw[i].fill_alignment_pattern();
         }
         self.dirty.mark_rows(0, self.rows, self.rows, self.cols);
     }
@@ -2132,6 +2169,123 @@ mod tests {
         trimmed.reset_blank(4, 8, alt_config());
         trimmed.clear_scrollback();
         assert!(trimmed.is_blank_canvas(4, 8, &alt_config()));
+    }
+
+    // ── DECALN alignment fill (issue #117) ──────────────────────────────
+
+    #[test]
+    fn fill_alignment_pattern_writes_every_visible_cell() {
+        let mut grid = Grid::new(3, 5, GridConfig::default());
+        write_text(grid.visible_row_mut(1), "abcde");
+        grid.fill_alignment_pattern();
+
+        for r in 0..3 {
+            let row = grid.visible_row(r);
+            assert!(!row.wrapped);
+            for c in 0..5 {
+                assert_eq!(row[c], Cell::ALIGNMENT, "cell ({r},{c})");
+            }
+        }
+    }
+
+    /// The fill is the page, not the pane's history.
+    #[test]
+    fn fill_alignment_pattern_leaves_scrollback_alone() {
+        let mut grid = Grid::new(2, 6, GridConfig::default());
+        write_text(grid.visible_row_mut(0), "keepme");
+        grid.scroll_up(0, 1);
+        assert_eq!(grid.scrollback_len(), 1);
+
+        grid.fill_alignment_pattern();
+        assert_eq!(row_text(grid.scrollback_row(0).expect("history")), "keepme");
+    }
+
+    /// A wide pair spans two cells; the fill replaces both with single-width
+    /// `E`, so no continuation cell may be orphaned.
+    #[test]
+    fn fill_alignment_pattern_dissolves_wide_pairs() {
+        let mut grid = Grid::new(1, 4, GridConfig::default());
+        put_wide(grid.visible_row_mut(0), 0, '日');
+        put_wide(grid.visible_row_mut(0), 2, '本');
+        grid.fill_alignment_pattern();
+        assert_row_wide_invariants(grid.visible_row(0));
+        assert_eq!(row_text(grid.visible_row(0)), "EEEE");
+    }
+
+    /// Extended attributes are a heap payload hanging off a cell. The pattern
+    /// must drop them rather than inherit them.
+    #[test]
+    fn fill_alignment_pattern_drops_extended_attributes() {
+        let mut grid = Grid::new(1, 3, GridConfig::default());
+        grid.visible_row_mut(0)[1].extended = Some(Arc::new(ExtendedAttrs {
+            grapheme: Some("e\u{0301}".into()),
+            hyperlink: Some("https://example.invalid".into()),
+            underline_color: Some(Color::Indexed(9)),
+            underline_style: UnderlineStyle::Curly,
+        }));
+        grid.fill_alignment_pattern();
+        for c in 0..3 {
+            assert!(grid.visible_row(0)[c].extended.is_none(), "cell {c}");
+        }
+    }
+
+    /// The write tally is what licenses recycling a retired alternate-screen
+    /// buffer as a blank canvas (issue #106). A fill that did not advance it
+    /// would hand the next application a screen it never drew.
+    #[test]
+    fn fill_alignment_pattern_is_not_a_blank_canvas_afterwards() {
+        let config = alt_config();
+        let mut grid = Grid::new(4, 6, config.clone());
+        assert!(grid.is_blank_canvas(4, 6, &config));
+
+        let before = grid.mutations();
+        grid.fill_alignment_pattern();
+        assert!(grid.mutations() > before, "write tally did not advance");
+        assert!(
+            !grid.is_blank_canvas(4, 6, &config),
+            "a screen full of `E` still reads as a blank canvas"
+        );
+        assert!(!grid.is_actually_blank(6));
+    }
+
+    /// A row still shared with a snapshot must be copied before the fill lands.
+    #[test]
+    fn fill_alignment_pattern_copies_shared_rows_first() {
+        let mut grid = Grid::new(2, 4, GridConfig::default());
+        write_text(grid.visible_row_mut(0), "held");
+        let held = grid.clone();
+
+        grid.fill_alignment_pattern();
+        assert_eq!(row_text(held.visible_row(0)), "held");
+        assert_eq!(row_text(grid.visible_row(0)), "EEEE");
+    }
+
+    #[test]
+    fn fill_alignment_pattern_marks_the_viewport_dirty() {
+        let mut grid = Grid::new(3, 5, GridConfig::default());
+        grid.take_dirty_regions();
+        assert!(!grid.is_dirty());
+        grid.fill_alignment_pattern();
+        let regions = grid.take_dirty_regions();
+        for r in 0..3 {
+            assert!(
+                regions
+                    .iter()
+                    .any(|d| d.row == r && d.cols.start == 0 && d.cols.end >= 5),
+                "row {r} not reported dirty: {regions:?}"
+            );
+        }
+    }
+
+    /// A grid with no cells has nothing to fill and must not panic doing it.
+    #[test]
+    fn fill_alignment_pattern_on_an_empty_grid_is_inert() {
+        for (rows, cols) in [(0usize, 0usize), (0, 4), (4, 0)] {
+            let mut grid = Grid::new(rows, cols, GridConfig::default());
+            grid.fill_alignment_pattern();
+            assert_eq!(grid.rows(), rows);
+            assert_eq!(grid.cols(), cols);
+        }
     }
 
     #[test]

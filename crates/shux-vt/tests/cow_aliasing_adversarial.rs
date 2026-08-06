@@ -218,19 +218,19 @@ fn sync_frozen_frame_is_byte_identical_under_every_write_path() {
             inert.push(name);
         }
     }
-    // DECALN (`ESC # 8`) is not implemented by this parser at all — verified
-    // on the base commit too — so it writes nothing with or without a sync
-    // window. Any OTHER inert case means the hammer never reached the grid
-    // and the corresponding freeze assertion above was vacuous.
-    // `DECALN` (`ESC # 8`) is not implemented by this parser at all (verified
-    // on the base commit too), and an alt-screen enter/leave pair that draws
-    // nothing legitimately returns the pane to the frame it started on.
+    // An alt-screen enter/leave pair that draws nothing legitimately returns
+    // the pane to the frame it started on. Every OTHER inert case means the
+    // hammer never reached the grid and the corresponding freeze assertion
+    // above was vacuous.
+    //
+    // `DECALN` (`ESC # 8`) used to be on this list: the parser dropped the
+    // sequence, so it wrote nothing with or without a sync window and its
+    // freeze assertion proved nothing (issue #117). It is a real full-screen
+    // write now, so it must NOT be inert — which is what keeps the fill honest
+    // about copy-on-write.
     assert_eq!(
         inert,
-        vec![
-            "DECALN",
-            "alt screen churn with no draw (recycles the spare)"
-        ],
+        vec!["alt screen churn with no draw (recycles the spare)"],
         "these hammer cases wrote nothing to the live grid, so their freeze \
          assertions proved nothing: {inert:?}"
     );
