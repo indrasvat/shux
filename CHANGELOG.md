@@ -1,3 +1,10 @@
+## [0.46.8](https://github.com/indrasvat/shux/compare/v0.46.7...v0.46.8) (2026-08-06)
+
+
+### Bug Fixes
+
+* **vt:** DECALN (`ESC # 8`) was parsed and dropped ([#117](https://github.com/indrasvat/shux/issues/117)) ([#119](https://github.com/indrasvat/shux/issues/119)) ([e856793](https://github.com/indrasvat/shux/commit/e856793da61655208d49841ebff6c7728b0d9ae0))
+
 ## [0.46.7](https://github.com/indrasvat/shux/compare/v0.46.6...v0.46.7) (2026-08-06)
 
 
