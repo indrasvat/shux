@@ -33,6 +33,11 @@ SCENES = [
     "richtui-vim",
 ]
 
+# Rich-TUI shots live in their own directory and are already 900x570 native, so
+# they are upscaled less than the small evidence panes.
+RICH_TUIS = ["vim", "nvim", "htop", "btop", "lazygit", "less"]
+RICH_SCALE = 2
+
 
 def ink_ratio(img: Image.Image) -> float:
     """Fraction of pixels that are not the single most common colour."""
@@ -86,6 +91,45 @@ def main() -> int:
             }
             print(f"{label:6s} {scene:20s} {big.width}x{big.height} "
                   f"{dst.stat().st_size:8d}B ink={ratio:.3f}")
+
+    # Rich TUIs, from their own directory.
+    rich_root = root / "richtui"
+    for tui in RICH_TUIS:
+        src = rich_root / f"{tui}.png"
+        if not src.exists():
+            failures.append(f"missing {src}")
+            continue
+        img = Image.open(src)
+        big = img.resize(
+            (img.width * RICH_SCALE, img.height * RICH_SCALE),
+            Image.Resampling.NEAREST,
+        )
+        dst = out / f"richtui-{tui}.png"
+        big.save(dst, optimize=True)
+        # A rich-TUI shot is NOT judged by ink alone. `vim` showing a two-line
+        # file on a 100x30 pane is legitimately sparse (0.6% ink) while `btop`
+        # is dense; an ink threshold tuned for one calls the other blank. The
+        # real question is whether the TUI drew, so the sibling capture the
+        # harness wrote is checked for content, and ink only has to be nonzero.
+        ratio = ink_ratio(img)
+        text = (rich_root / f"{tui}.txt")
+        drawn = [ln for ln in text.read_text().splitlines() if ln.strip()] if text.exists() else []
+        if not drawn:
+            failures.append(f"richtui/{tui}: capture has no content")
+        if ratio <= 0.0:
+            failures.append(f"richtui/{tui}: shot is entirely one colour")
+        manifest[f"richtui-{tui}"] = {
+            "content_lines": len(drawn),
+            "src": str(src),
+            "png": str(dst),
+            "size": [big.width, big.height],
+            "bytes": dst.stat().st_size,
+            "ink": round(ratio, 4),
+            "data_uri": "data:image/png;base64,"
+            + base64.b64encode(dst.read_bytes()).decode("ascii"),
+        }
+        print(f"richtui {tui:20s} {big.width}x{big.height} "
+              f"{dst.stat().st_size:8d}B ink={ratio:.3f}")
 
     # The `after` alignment shots are meant to be a wall of glyphs. A pattern
     # that renders as almost-nothing would still be a valid PNG of the right
