@@ -869,3 +869,256 @@ mod properties {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 13. Adversarial battery
+// ---------------------------------------------------------------------------
+//
+// Written to break the fix rather than to demonstrate it, and kept because
+// probing that finds nothing is only worth something if it leaves the probes
+// behind. Every case here was run against the finished implementation; none of
+// them found a defect, and each one is a way a plausible future change could
+// introduce one.
+
+/// The full negative space in one table: everything that looks like `ESC # 8`
+/// without being it. The bar is "did not draw the alignment pattern" rather
+/// than "screen is blank", because some of these legitimately print text —
+/// `#8` with no ESC in front of it is two ordinary characters.
+#[test]
+fn the_whole_near_miss_table_leaves_the_screen_unfilled() {
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("ESC 8 (DECRC)", b"\x1b8".to_vec()),
+        ("ESC # 3", b"\x1b#3".to_vec()),
+        ("ESC # 4", b"\x1b#4".to_vec()),
+        ("ESC # 5", b"\x1b#5".to_vec()),
+        ("ESC # 6", b"\x1b#6".to_vec()),
+        ("ESC # 0", b"\x1b#0".to_vec()),
+        ("ESC # 7", b"\x1b#7".to_vec()),
+        ("ESC # 9", b"\x1b#9".to_vec()),
+        ("CSI # 8", b"\x1b[#8".to_vec()),
+        ("CSI 8 #", b"\x1b[8#".to_vec()),
+        ("ESC ( 8", b"\x1b(8".to_vec()),
+        ("ESC ) 8", b"\x1b)8".to_vec()),
+        ("ESC % 8", b"\x1b%8".to_vec()),
+        ("ESC * 8", b"\x1b*8".to_vec()),
+        ("ESC + 8", b"\x1b+8".to_vec()),
+        ("ESC SP 8", b"\x1b 8".to_vec()),
+        ("ESC # SP 8", b"\x1b# 8".to_vec()),
+        ("bare #8", b"#8".to_vec()),
+        ("ESC # truncated", b"\x1b#".to_vec()),
+        ("ESC ESC # cancelled", b"\x1b\x1b#".to_vec()),
+        ("CSI aborted by ESC", b"\x1b[1;2\x1b#".to_vec()),
+        ("C1 0x9b # 8", b"\x9b#8".to_vec()),
+        // Control-string payloads with NO embedded ESC are swallowed whole.
+        ("DCS payload #8", b"\x1bP#8\x1b\\".to_vec()),
+        ("OSC payload #8", b"\x1b]0;#8\x07".to_vec()),
+        ("APC payload #8", b"\x1b_#8\x1b\\".to_vec()),
+        ("PM payload #8", b"\x1b^#8\x1b\\".to_vec()),
+        ("SOS payload #8", b"\x1bX#8\x1b\\".to_vec()),
+    ];
+    let mut bad = vec![];
+    for (name, bytes) in &cases {
+        let mut vt = VirtualTerminal::new(4, 8);
+        vt.process(bytes);
+        let rows = visible_rows(vt.grid());
+        if rows.iter().any(|r| r.contains("EEEE")) {
+            bad.push(format!("{name}: {rows:?}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "these filled the screen:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// `ESC` inside a control string ABORTS the string — that is the VT500 state
+/// machine, and it is not specific to DECALN: the same construction makes ED,
+/// RIS and CUP fire too. So `ESC P ESC # 8 ESC \` legitimately fills the
+/// screen, and this is pinned so that a future "harden the parser" change
+/// cannot quietly make DECALN the one exception in either direction.
+#[test]
+fn esc_inside_a_control_string_aborts_it_and_decaln_then_fires() {
+    for wrapper in [
+        &b"\x1bP\x1b#8\x1b\\"[..],
+        b"\x1b]0;\x1b#8\x07",
+        b"\x1b_\x1b#8\x1b\\",
+        b"\x1b^\x1b#8\x1b\\",
+        b"\x1bX\x1b#8\x1b\\",
+    ] {
+        let mut vt = VirtualTerminal::new(3, 6);
+        vt.process(wrapper);
+        assert_screen_is_alignment_pattern(vt.grid(), &format!("{wrapper:?}"));
+    }
+}
+
+/// Modes and designations are terminal state, not page content.
+#[test]
+fn decaln_preserves_modes_and_charset_designation() {
+    let mut vt = VirtualTerminal::new(2, 4);
+    vt.process(b"\x1b(0"); // DEC graphics into G0
+    vt.process(DECALN);
+    vt.process(b"\x1b[1;1Hq");
+    assert_ne!(
+        vt.grid().visible_row(0)[0].ch,
+        'q',
+        "charset designation lost across DECALN"
+    );
+
+    let mut vt = VirtualTerminal::new(2, 6);
+    vt.process(b"\x1b[4h\x1b[?7l\x1b[?1002h\x1b[?2004h");
+    vt.process(DECALN);
+    assert!(vt.modes().insert_mode, "IRM reset by DECALN");
+    assert!(!vt.modes().auto_wrap, "DECAWM reset by DECALN");
+    assert!(
+        vt.modes().bracketed_paste,
+        "bracketed paste reset by DECALN"
+    );
+}
+
+/// An application that asks where the cursor is right after the fill must be
+/// told the home position — this is the reply an alignment test reads.
+#[test]
+fn a_cursor_position_report_after_decaln_says_row_one_column_one() {
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"\x1b[7;13H");
+    let replies = vt.process_with_responses(b"\x1b#8\x1b[6n");
+    let joined: Vec<String> = replies
+        .iter()
+        .map(|r| String::from_utf8_lossy(r).to_string())
+        .collect();
+    assert!(
+        joined.iter().any(|r| r == "\x1b[1;1R"),
+        "expected CPR 1;1, got {joined:?}"
+    );
+}
+
+/// The alternate-screen recycle, across every mode number, every ordering, and
+/// with a full reset thrown in: 18 permutations, none may hand the pattern on.
+#[test]
+fn no_alternate_screen_mode_combination_recycles_the_pattern() {
+    let enters: [&[u8]; 3] = [b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
+    let leaves: [&[u8]; 3] = [b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
+    let mut bad = vec![];
+    for (i, enter) in enters.iter().enumerate() {
+        for (j, leave) in leaves.iter().enumerate() {
+            for &ris in &[false, true] {
+                let mut vt = VirtualTerminal::new(5, 10);
+                vt.process(b"primary-x\r\n");
+                vt.process(enter);
+                vt.process(DECALN);
+                if ris {
+                    vt.process(b"\x1bc");
+                }
+                vt.process(leave);
+                vt.process(enters[0]);
+                let rows = visible_rows(vt.grid());
+                if !rows.iter().all(|r| r.trim().is_empty()) {
+                    bad.push(format!("enter{i}/leave{j}/ris={ris}: {rows:?}"));
+                }
+                vt.process(leaves[0]);
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "recycled a dirty alternate screen:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// A resize landing between leaving and re-entering the alternate screen must
+/// not let the retired buffer come back as a blank canvas with content on it.
+#[test]
+fn a_resize_between_alternate_screen_cycles_still_yields_a_clean_canvas() {
+    for (rows, cols) in [(3usize, 6usize), (9, 20), (5, 10), (1, 1)] {
+        let mut vt = VirtualTerminal::new(5, 10);
+        vt.process(b"\x1b[?1049h");
+        vt.process(DECALN);
+        vt.process(b"\x1b[?1049l");
+        vt.resize(rows, cols);
+        vt.process(b"\x1b[?1049h");
+        let seen = visible_rows(vt.grid());
+        assert!(
+            seen.iter().all(|r| r.trim().is_empty()),
+            "resize to {rows}x{cols} then re-enter showed: {seen:?}"
+        );
+        vt.process(b"\x1b[?1049l");
+    }
+}
+
+/// Five thousand fills in one write: bounded work, no growth, no panic.
+#[test]
+fn a_flood_of_decaln_grows_nothing() {
+    let mut vt = VirtualTerminal::new(24, 80);
+    let before_lines = vt.grid().total_lines();
+    vt.process(&DECALN.repeat(5000));
+    assert_eq!(
+        vt.grid().total_lines(),
+        before_lines,
+        "the flood grew the grid"
+    );
+    assert_eq!(vt.grid().scrollback_len(), 0, "the flood created history");
+    assert_screen_is_alignment_pattern(vt.grid(), "after 5000 fills");
+}
+
+/// Margins, origin mode and the save/restore slot in every order of three,
+/// always ending in the fill: 216 programs, one invariant.
+#[test]
+fn decaln_normalises_every_ordering_of_margins_origin_and_save_restore() {
+    let ops: [&[u8]; 6] = [
+        b"\x1b[2;5r",
+        b"\x1b[?6h",
+        b"\x1b7",
+        b"\x1b8",
+        b"\x1b[?6l",
+        b"\x1b#8",
+    ];
+    for a in 0..6 {
+        for b in 0..6 {
+            for c in 0..6 {
+                let mut vt = VirtualTerminal::new(8, 10);
+                vt.process(ops[a]);
+                vt.process(ops[b]);
+                vt.process(ops[c]);
+                vt.process(DECALN);
+                assert_screen_is_alignment_pattern(vt.grid(), &format!("{a},{b},{c}"));
+                assert_eq!((vt.cursor().row, vt.cursor().col), (0, 0), "{a},{b},{c}");
+                assert_eq!(vt.scroll_region().top, 0, "{a},{b},{c}");
+                assert_eq!(vt.scroll_region().bottom, 7, "{a},{b},{c}");
+            }
+        }
+    }
+}
+
+/// A synchronized window containing a fill, an alternate-screen switch and
+/// another fill: the presented frame may not move until the window closes.
+#[test]
+fn a_sync_window_holds_through_fill_and_alternate_screen_switch() {
+    let mut vt = VirtualTerminal::new(4, 10);
+    vt.process(b"\x1b[1;1Hbefore-one\x1b[2;1Hbefore-two");
+    let frozen = visible_rows(vt.grid());
+
+    vt.process(b"\x1b[?2026h");
+    vt.process(DECALN);
+    assert_eq!(
+        visible_rows(vt.grid()),
+        frozen,
+        "the fill moved the frozen frame"
+    );
+    vt.process(b"\x1b[?1049h");
+    vt.process(DECALN);
+    assert_eq!(
+        visible_rows(vt.grid()),
+        frozen,
+        "alt + fill moved the frozen frame"
+    );
+    vt.process(b"\x1b[?1049l");
+    assert_eq!(
+        visible_rows(vt.grid()),
+        frozen,
+        "alt leave moved the frozen frame"
+    );
+    vt.process(b"\x1b[?2026l");
+    assert_screen_is_alignment_pattern(vt.grid(), "after the window closed");
+}
