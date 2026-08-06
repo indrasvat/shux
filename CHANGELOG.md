@@ -1,3 +1,10 @@
+## [0.46.7](https://github.com/indrasvat/shux/compare/v0.46.6...v0.46.7) (2026-08-06)
+
+
+### Bug Fixes
+
+* **vt:** synchronized output cloned the whole grid, scrollback included ([#115](https://github.com/indrasvat/shux/issues/115)) ([#118](https://github.com/indrasvat/shux/issues/118)) ([27e5b82](https://github.com/indrasvat/shux/commit/27e5b82d7d640f40c7b03fba525a801b625754e9)), closes [#106](https://github.com/indrasvat/shux/issues/106)
+
 ## [0.46.6](https://github.com/indrasvat/shux/compare/v0.46.5...v0.46.6) (2026-08-05)
 
 
