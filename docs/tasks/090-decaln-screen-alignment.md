@@ -10,6 +10,7 @@ synchronized-output lazy freeze) — the fill has to satisfy both
 `crates/shux-vt/tests/cow_aliasing_adversarial.rs`,
 `crates/shux/tests/decaln_pane_e2e.rs` (new),
 `.shux/scripts/issue_117_evidence.sh` (new), `.shux/scripts/issue_117_shots.py` (new),
+`.shux/scripts/issue_117_richtui_check.sh` (new),
 `.claude/automations/pixel_verify.py` (defect in shared verification machinery),
 `.shux/qa/090-decaln-screen-alignment/` (new)
 **QA record:** `.shux/qa/090-decaln-screen-alignment/SOLID-QA.md` — `VERDICT: PASS`
@@ -355,3 +356,41 @@ keeping the two mechanisms independent — the stash restores the screen's curso
 DECSC restores the terminal's, neither can eat the other. The deliberate
 `mode_1047_does_not_restore_primary_cursor_on_leave` behaviour is unchanged.
 Reverting the one line fails `mixing_alternate_screen_aliases_keeps_the_parked_cursor`.
+
+## Rich-TUI matrix, completed
+
+CLAUDE.md makes `vim`/`nvim`, `lazygit` and `btop`/`htop` a REQUIRED pass for any
+change to VT parsing. The first pass of this task reported four of them as "not
+installed on this host" and moved on. That was wrong — they install fine
+(`apt-get install neovim htop btop`, and lazygit from its release tarball), and
+"the tool is missing" is not a reason to skip a required check when the tool can
+be fetched. `.shux/scripts/issue_117_richtui_check.sh` now runs the whole matrix.
+
+Each TUI is started in a pane whose page has just been filled edge to edge with
+the alignment pattern, and must repaint over it with no residue. All six pass at
+100x30, every screenshot opened and inspected:
+
+| TUI | result |
+|---|---|
+| `vim` | clean repaint |
+| `nvim` | clean repaint |
+| `htop` | clean repaint, colour meters intact |
+| `btop` | clean repaint, box-drawing + colour meters intact |
+| `lazygit` | clean repaint, panels + colour + hyperlinks intact |
+| `less` | clean repaint |
+
+Most of these take the ALTERNATE screen, which makes the check sharper than it
+looks: the buffer they are handed comes out of the one-slot spare, so a
+pattern-filled buffer wrongly recycled as blank would show straight through
+their UI. That is the #106 interaction this task's fill had to get right.
+
+**Two harness bugs found on the way, both mine, neither a shux defect.**
+`btop` refuses to start without a UTF-8 locale and `lazygit` exits before
+drawing; the container sets no `LANG`, and the panes inherited that. Locale is
+named in CLAUDE.md's pane-env list alongside `TERM` and `COLORTERM` precisely
+because of this, so the harness sets `LANG=C.utf8`. Second, the script built its
+exec line with `printf 'exec %s' "$*"`, so passing `sh -c "cd DIR && exec
+lazygit"` produced `exec sh -c cd DIR && exec lazygit` — the first `exec`
+replaced the shell and lazygit never ran. The harness now emits `cd` as its own
+line, and asserts the TUI's marker is on the FINAL screen rather than merely
+having flashed past, which is what caught the second bug instead of passing it.
