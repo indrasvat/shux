@@ -314,13 +314,22 @@ fn short_pane_id_from_pane_list_is_accepted_by_every_pane_command() {
         "`pane title -p <B's short id>` retitled the WRONG pane"
     );
 
-    // `pane watch` is a STREAM: with no `--limit` it never returns, so running
-    // it like the one-shot verbs above would hang rather than test anything.
-    // Drive it properly — start the watcher on the short id, make the pane
-    // emit, and require the bytes to come back out. That proves the id
-    // resolved AND that the stream is wired to the pane it named.
+    // `pane watch` is a STREAM, so it cannot be run like the one-shot verbs
+    // above: with no `--limit` it never returns. Drive it properly — start the
+    // watcher on the short id, make the pane speak, and require those bytes to
+    // come back out. That proves the id resolved AND that the stream is wired
+    // to the pane it named.
+    //
+    // Deliberately NOT `--limit 1`: the pane may still be flushing output from
+    // the verbs above, so the first chunk to arrive is whatever was already in
+    // flight. Watch until the marker shows up, then stop.
     {
-        use std::io::Read;
+        h.rpc_ok(
+            "pane.wait_settled",
+            serde_json::json!({ "pane_id": f.pane_b, "quiet_ms": 300, "timeout_ms": 5000 }),
+        );
+        let log = h.state_dir().join("watch.out");
+        let sink = std::fs::File::create(&log).expect("create watch log");
         let mut child = h
             .shux()
             .args([
@@ -330,55 +339,42 @@ fn short_pane_id_from_pane_list_is_accepted_by_every_pane_command() {
                 &f.name,
                 "-p",
                 &short,
-                "--limit",
-                "1",
                 "--timeout-ms",
-                "3000",
+                "1000",
             ])
-            .stdout(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(sink))
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn pane watch");
 
-        // Give the watcher a moment to subscribe, then make pane B speak.
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Give the watcher a moment to subscribe — the data plane keeps no
+        // history, so anything emitted before it attaches is simply gone.
+        std::thread::sleep(std::time::Duration::from_millis(600));
         h.rpc_ok(
             "pane.send_keys",
             serde_json::json!({ "pane_id": f.pane_b, "text": "printf 'WATCHED\n'
 " }),
         );
 
-        // Hard bound: a watcher that never returns is a failure, not a hang.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let status = loop {
-            match child.try_wait().expect("try_wait") {
-                Some(st) => break Some(st),
-                None if std::time::Instant::now() > deadline => {
-                    let _ = child.kill();
-                    break None;
-                }
-                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline {
+            seen = std::fs::read_to_string(&log).unwrap_or_default();
+            if seen.contains("WATCHED") {
+                break;
             }
-        };
-        let mut err = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut err);
+            // A watcher that died is a failure, not something to wait out.
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                panic!("`pane watch` exited early ({st}) — output so far: {seen:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
         }
-        let mut got = String::new();
-        if let Some(mut o) = child.stdout.take() {
-            let _ = o.read_to_string(&mut got);
-        }
-        let status = status.unwrap_or_else(|| {
-            panic!("`pane watch` never returned after --limit 1; stderr: {err}")
-        });
+        let _ = child.kill();
+        let _ = child.wait();
         assert!(
-            status.success(),
-            "`pane watch` rejected the short id `{short}`: {err}"
-        );
-        assert!(
-            got.contains("WATCHED"),
-            "`pane watch` returned no bytes from the pane it named; \
-             stdout: {got:?} stderr: {err}"
+            seen.contains("WATCHED"),
+            "`pane watch` on the short id `{short}` never delivered the pane's \
+             output; saw: {seen:?}"
         );
     }
 
