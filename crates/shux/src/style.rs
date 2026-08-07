@@ -1358,8 +1358,11 @@ pub fn print_pane_checkpoint(pane_id: &str, revision: u64, evicted: Option<u64>)
 /// ids, the pane's revision right after spawn, and — only for `--wait` —
 /// the child's exit code.
 pub fn print_lens_run(session_id: &str, pane_id: &str, revision: u64, exit_code: Option<i64>) {
+    // Label both ids. This line is step ONE of the documented loop, and two
+    // bare hex tokens leave the reader unable to tell which is which without
+    // re-running under --format json (issue #120 dogfood).
     println!(
-        "{} lens run {} {} rev {}",
+        "{} lens run  session {}  pane {}  rev {}",
         success("✓"),
         muted(&short_id(session_id)),
         muted(&short_id(pane_id)),

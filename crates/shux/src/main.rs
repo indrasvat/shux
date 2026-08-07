@@ -2065,9 +2065,14 @@ async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
 fn graph_error_to_rpc(e: shux_core::graph::GraphError) -> shux_rpc::RpcError {
     use shux_core::graph::GraphError;
     match e {
-        GraphError::SessionNotFound(_) => shux_rpc::RpcError::not_found("session", &e.to_string()),
-        GraphError::WindowNotFound(_) => shux_rpc::RpcError::not_found("window", &e.to_string()),
-        GraphError::PaneNotFound(_) => shux_rpc::RpcError::not_found("pane", &e.to_string()),
+        // `data.id` is an ID, not a sentence. Passing `e.to_string()` here
+        // ("pane not found: <uuid>") made the rendered message read
+        // `pane 'pane not found: <uuid>' not found`.
+        GraphError::SessionNotFound(id) => {
+            shux_rpc::RpcError::not_found("session", &id.to_string())
+        }
+        GraphError::WindowNotFound(id) => shux_rpc::RpcError::not_found("window", &id.to_string()),
+        GraphError::PaneNotFound(id) => shux_rpc::RpcError::not_found("pane", &id.to_string()),
         GraphError::SessionNameExists(ref name) => {
             shux_rpc::RpcError::name_conflict("session", name)
         }
@@ -3322,10 +3327,46 @@ fn required_str<'a>(
     params: &'a serde_json::Value,
     key: &str,
 ) -> Result<&'a str, shux_rpc::RpcError> {
-    params
-        .get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| shux_rpc::RpcError::invalid_params(&format!("missing '{key}' parameter")))
+    match optional_ref_param(params, key)? {
+        Some(s) => Ok(s),
+        None => Err(shux_rpc::RpcError::invalid_params(&format!(
+            "missing '{key}' parameter"
+        ))),
+    }
+}
+
+/// Read an OPTIONAL id parameter that must be a string when present.
+///
+/// The distinction matters: an ABSENT id means "use the active one", but a
+/// PRESENT id of the wrong JSON type is a caller mistake. Treating the two the
+/// same — which `params.get(k).and_then(|v| v.as_str())` does — silently
+/// retargets the call at whatever happens to be active, so
+/// `{"pane_id": 12345, "session_id": "..."}` used to zoom, resize or send
+/// keystrokes to a pane the caller never named, and report success.
+fn optional_ref_param<'a>(
+    params: &'a serde_json::Value,
+    key: &str,
+) -> Result<Option<&'a str>, shux_rpc::RpcError> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(shux_rpc::RpcError::invalid_params(&format!(
+            "{key} must be a string id, got {}",
+            json_type_name(other)
+        ))),
+    }
+}
+
+/// The JSON type name of a value, for parameter-type errors.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Resolve a pane_id from params: either explicit `pane_id` or active pane of resolved window.
@@ -3333,7 +3374,7 @@ fn resolve_pane_id_from_params(
     gh: &shux_core::graph::GraphHandle,
     params: &serde_json::Value,
 ) -> Result<shux_core::model::PaneId, shux_rpc::RpcError> {
-    if let Some(pane_id_str) = params.get("pane_id").and_then(|v| v.as_str()) {
+    if let Some(pane_id_str) = optional_ref_param(params, "pane_id")? {
         return resolve_pane_ref(gh, pane_id_str);
     }
 
@@ -3352,19 +3393,16 @@ fn resolve_window_id_from_params(
     gh: &shux_core::graph::GraphHandle,
     params: &serde_json::Value,
 ) -> Result<shux_core::model::WindowId, shux_rpc::RpcError> {
-    if let Some(wid_str) = params.get("window_id").and_then(|v| v.as_str()) {
+    if let Some(wid_str) = optional_ref_param(params, "window_id")? {
         return resolve_window_ref(gh, wid_str, "window_id");
     }
 
     // Resolve from session
-    let session_id_str = params
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            shux_rpc::RpcError::invalid_params(
-                "missing 'pane_id' or 'window_id' or 'session_id' parameter",
-            )
-        })?;
+    let session_id_str = optional_ref_param(params, "session_id")?.ok_or_else(|| {
+        shux_rpc::RpcError::invalid_params(
+            "missing 'pane_id' or 'window_id' or 'session_id' parameter",
+        )
+    })?;
 
     let session_id = resolve_session_ref(gh, session_id_str, "session_id")?;
 
@@ -4320,8 +4358,7 @@ fn register_session_methods(
                     let params = params.unwrap_or_default();
 
                     // Accept name or id — try UUID parse first, fall back to name lookup
-                    let session_id = if let Some(id_str) = params.get("id").and_then(|v| v.as_str())
-                    {
+                    let session_id = if let Some(id_str) = optional_ref_param(&params, "id")? {
                         let parsed = resolve_session_ref(&gh, id_str, "id")?;
                         // Verify it exists
                         let snap = gh.snapshot();
@@ -4329,7 +4366,7 @@ fn register_session_methods(
                             return Err(shux_rpc::RpcError::not_found("session", id_str));
                         }
                         parsed
-                    } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                    } else if let Some(name) = optional_ref_param(&params, "name")? {
                         let snap = gh.snapshot();
                         let session = snap
                             .find_session_by_name(name)
@@ -4517,9 +4554,9 @@ fn register_session_methods(
                 async move {
                     let params = params.unwrap_or_default();
                     let snap = gh.snapshot();
-                    let session_id = if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
+                    let session_id = if let Some(id) = optional_ref_param(&params, "id")? {
                         resolve_session_ref(&gh, id, "id")?
-                    } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                    } else if let Some(name) = optional_ref_param(&params, "name")? {
                         snap.find_session_by_name(name)
                             .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?
                             .id
@@ -4550,14 +4587,13 @@ fn register_session_methods(
                         .to_string();
 
                     // Resolve session by name or id
-                    let session_id = if let Some(name) = params.get("name").and_then(|v| v.as_str())
-                    {
+                    let session_id = if let Some(name) = optional_ref_param(&params, "name")? {
                         let snap = gh.snapshot();
                         let session = snap
                             .find_session_by_name(name)
                             .ok_or_else(|| shux_rpc::RpcError::not_found("session", name))?;
                         session.id
-                    } else if let Some(id_str) = params.get("id").and_then(|v| v.as_str()) {
+                    } else if let Some(id_str) = optional_ref_param(&params, "id")? {
                         resolve_session_ref(&gh, id_str, "id")?
                     } else {
                         return Err(shux_rpc::RpcError::invalid_params(

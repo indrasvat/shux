@@ -148,30 +148,6 @@ impl SessionGraphSnapshot {
         .map(SessionId::from_uuid)
     }
 
-    /// Resolve a window reference against one session's windows only.
-    ///
-    /// Narrower than [`Self::resolve_window_ref`]: a prefix that collides
-    /// globally can still be unique inside the session the caller named, and
-    /// refusing it there would be pedantry. An unknown session resolves
-    /// nothing rather than silently widening to the whole graph.
-    pub fn resolve_window_ref_in_session(
-        &self,
-        session_id: &SessionId,
-        input: &str,
-    ) -> Result<WindowId, crate::idref::RefError> {
-        let windows = self
-            .sessions
-            .get(session_id)
-            .map(|s| s.windows.clone())
-            .unwrap_or_default();
-        crate::idref::resolve_ref(
-            crate::idref::RefKind::Window,
-            input,
-            windows.into_iter().map(|id| id.0),
-        )
-        .map(WindowId::from_uuid)
-    }
-
     pub fn session_windows(&self, session_id: &SessionId) -> Vec<&Window> {
         self.sessions
             .get(session_id)

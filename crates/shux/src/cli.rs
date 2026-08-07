@@ -220,8 +220,8 @@ fn render_agent_help(colorize: bool) -> String {
         "  {dim}# 2. Drive it. (Synchronous resize — next snapshot sees new dims.){r}\n"
     ));
     s.push_str(&format!(
-        "  {} --params '{{\"pane_id\":\"$PID\",\"cols\":200,\"rows\":60}}'\n",
-        shux("rpc call pane.set_size"),
+        "  {} -p b57c601b --cols 200 --rows 60\n",
+        shux("pane set-size -s demo"),
     ));
     s.push_str(&format!(
         "  {} -s demo --text 'j'\n",
@@ -1169,7 +1169,7 @@ pub enum PaneCommand {
         ratio: Option<f64>,
     },
 
-    /// Focus a specific pane by UUID
+    /// Focus a specific pane by id (full UUID or short form)
     Focus {
         /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
@@ -2036,6 +2036,34 @@ fn rpc_display_raw(code: i64, message: &str, data: Option<&serde_json::Value>) -
                 _ => format!("{resource} version_conflict — re-read state and retry"),
             }
         }
+        // stale_revision — `data` already carries the revisions that ARE
+        // diffable. Falling through to the generic arm printed the bare code
+        // and threw the answer away.
+        -32010 => {
+            let requested = data
+                .and_then(|d| d.get("requested"))
+                .and_then(|v| v.as_u64());
+            let available: Vec<String> = data
+                .and_then(|d| d.get("available"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|v| v.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            match (requested, available.is_empty()) {
+                (Some(r), false) => format!(
+                    "revision {r} was not checkpointed (available: {})",
+                    available.join(", ")
+                ),
+                (Some(r), true) => format!(
+                    "revision {r} was not checkpointed, and this pane has no live checkpoints"
+                ),
+                (None, _) => "that revision was not checkpointed".to_string(),
+            }
+        }
         // name_conflict — `data.name` carries the colliding name.
         // -32007, not -32003: -32003 is auth_required. Keyed on the wrong
         // code, this arm never fired for a real duplicate name (which fell
@@ -2651,8 +2679,19 @@ pub async fn handle_kill(
             "id",
             resolve_uuid_shaped_session(stream, session_name, parsed).await?,
         )
-    } else {
+    } else if session_exists_by_name(stream, session_name).await? {
+        // An exact NAME always wins over a partial id (issue #120).
         ("name", session_name.to_string())
+    } else {
+        // Not a name. It may still be the short id `session list` printed —
+        // and `session kill` is where the documented agent loop ENDS, so it
+        // has to take the same reference every other verb does. A miss here
+        // reports "not found" against the name, exactly as before.
+        match resolve_session_id_prefix(stream, session_name).await {
+            Ok(id) => ("id", id),
+            Err(RpcClientError::Rpc { code: -32004, .. }) => ("name", session_name.to_string()),
+            Err(e) => return Err(e.into()),
+        }
     };
     params.insert(key.to_string(), serde_json::Value::String(value));
     if let Some(ev) = expected_version {
@@ -2684,11 +2723,11 @@ pub async fn handle_rename(
     expected_version: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
+    // Resolve first so `-s` takes the same reference every other verb does:
+    // an exact name, a full uuid, or the short id `session list` prints.
+    let target = resolve_session_id(stream, session_name).await?;
     let mut params = serde_json::Map::new();
-    params.insert(
-        "name".to_string(),
-        serde_json::Value::String(session_name.to_string()),
-    );
+    params.insert("id".to_string(), serde_json::Value::String(target));
     params.insert(
         "new_name".to_string(),
         serde_json::Value::String(new_name.to_string()),
@@ -2720,10 +2759,11 @@ pub async fn handle_session_save(
     session_name: &str,
     output: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
+    let target = resolve_session_id(stream, session_name).await?;
     let result = rpc_call(
         stream,
         "session.export_template",
-        serde_json::json!({ "name": session_name }),
+        serde_json::json!({ "id": target }),
     )
     .await?;
     let template = result
@@ -3108,6 +3148,32 @@ async fn resolve_session_id(
     // fragment for a hidden scratch session may still act on it — visibility
     // is not authorization (LENS-R-041).
     resolve_session_id_prefix(stream, session_name).await
+}
+
+/// Does a session with exactly this NAME exist?
+///
+/// `include_scratch` so a hidden lens session is visible here: an exact name
+/// is an exact match either way, and letting the prefix pass claim it instead
+/// would be a silent mistarget.
+async fn session_exists_by_name(
+    stream: &mut tokio::net::UnixStream,
+    name: &str,
+) -> Result<bool, RpcClientError> {
+    let result = rpc_call(
+        stream,
+        "session.list",
+        serde_json::json!({ "include_scratch": true }),
+    )
+    .await?;
+    let sessions = result
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .or_else(|| result.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(sessions
+        .iter()
+        .any(|s| s.get("name").and_then(|v| v.as_str()) == Some(name)))
 }
 
 /// Resolve a non-UUID, non-name session argument as an id prefix.
@@ -3648,9 +3714,12 @@ async fn resolve_pane_window_id(
                     }
                 }
             }
+            // The session is not in the list at all — say THAT. Blaming
+            // window resolution points the reader at the wrong thing, and
+            // it is the message a nonexistent session id produced.
             Err(RpcClientError::Rpc {
                 code: -32004,
-                message: "could not determine active window".to_string(),
+                message: format!("session '{session_name}' not found"),
                 data: None,
             })
         }
@@ -3674,7 +3743,9 @@ async fn validate_pane_belongs_to_session(
     let parsed = parse_ref(RefKind::Pane, pane_id).map_err(|e| RpcClientError::Rpc {
         code: -32602,
         message: e.to_string(),
-        data: None,
+        // `detail` so this renders as the message alone rather than
+        // "RPC error -32602: …" — same reason `ambiguous_ref_error` carries it.
+        data: Some(serde_json::json!({ "detail": e.to_string() })),
     })?;
     let matches = |candidate: &str| -> bool {
         let bare = candidate.replace('-', "").to_ascii_lowercase();
@@ -4188,7 +4259,7 @@ pub async fn handle_pane_title(
 /// PR 2c / data-plane consumer.
 pub async fn handle_pane_watch(
     stream: &mut tokio::net::UnixStream,
-    _session_name: &str,
+    session_name: &str,
     pane_id: &str,
     timeout_ms: u64,
     limit: Option<u64>,
@@ -4197,11 +4268,14 @@ pub async fn handle_pane_watch(
     use base64::Engine;
     use std::io::Write;
 
-    // Validate the UUID early so we fail fast on typos instead of
-    // round-tripping to the daemon to discover an invalid_params.
-    let _: uuid::Uuid = pane_id
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid pane uuid: {e}"))?;
+    // Validate the reference early so we fail fast on typos instead of
+    // round-tripping to the daemon. `--session` is documented as validating
+    // that the pane belongs to a live session, so actually do that — and take
+    // the canonical id back, so the long-poll below is keyed on the full uuid
+    // rather than whatever fragment the caller typed.
+    shux_core::idref::parse_ref(shux_core::idref::RefKind::Pane, pane_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pane_id = &validate_pane_belongs_to_session(stream, session_name, pane_id).await?;
 
     let mut next_seq: Option<u64> = None;
     let mut delivered: u64 = 0;
@@ -7082,11 +7156,16 @@ mod tests {
         let sid = "11111111-1111-4111-8111-111111111111";
         let wid = "22222222-2222-4222-8222-222222222222";
         let template = "[session]\nname = \"dev\"\n";
+        // `kill`, `rename` and `save` each resolve `-s` first now (issue #120),
+        // so each is preceded by its own `session.list`.
         let (mut client, requests, task) = spawn_rpc_script(vec![
             session_list_response(sid, wid),
             serde_json::json!({"id": sid, "name": "dev", "created": true}),
+            session_list_response(sid, wid), // kill: is "dev" a NAME?
             serde_json::json!({"killed": "dev"}),
+            session_list_response(sid, wid), // rename: resolve -s
             serde_json::json!({"id": sid, "name": "renamed"}),
+            session_list_response(sid, wid), // save: resolve -s
             serde_json::json!({"template": template}),
             serde_json::json!({"version": "0.26.0", "git_sha": "abc123"}),
         ]);
@@ -7135,12 +7214,20 @@ mod tests {
             requests[1]["params"]["command"],
             serde_json::json!(["vim", "main.rs"])
         );
-        assert_eq!(requests[2]["method"], "session.kill");
-        assert_eq!(requests[2]["params"]["expected_version"], 7);
-        assert_eq!(requests[3]["method"], "session.rename");
-        assert_eq!(requests[3]["params"]["new_name"], "renamed");
-        assert_eq!(requests[4]["method"], "session.export_template");
-        assert_eq!(requests[5]["method"], "system.version");
+        assert_eq!(requests[2]["method"], "session.list");
+        assert_eq!(requests[3]["method"], "session.kill");
+        // An exact NAME still wins, so kill targets by name, not by id.
+        assert_eq!(requests[3]["params"]["name"], "dev");
+        assert_eq!(requests[3]["params"]["expected_version"], 7);
+        assert_eq!(requests[4]["method"], "session.list");
+        assert_eq!(requests[5]["method"], "session.rename");
+        assert_eq!(requests[5]["params"]["new_name"], "renamed");
+        // …while rename and save resolve to the id, so a short id works there.
+        assert_eq!(requests[5]["params"]["id"], sid);
+        assert_eq!(requests[6]["method"], "session.list");
+        assert_eq!(requests[7]["method"], "session.export_template");
+        assert_eq!(requests[7]["params"]["id"], sid);
+        assert_eq!(requests[8]["method"], "system.version");
     }
 
     /// codex P6 round-1 major 1, test (a): a session whose NAME is a

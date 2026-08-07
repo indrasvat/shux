@@ -11,10 +11,15 @@
 //! `pane wait-settled` → `pane glance`) was unfollowable from the listing it
 //! starts with.
 //!
-//! This module is the single place that decides what an id reference means.
+//! This module is the single place that decides what an *id reference* means.
 //! Both the daemon (RPC parameters) and the CLI (`-s` / `-w` / `-p`) route
-//! through it, so the two can never drift into disagreeing about which string
-//! names which entity.
+//! through it, so the two cannot disagree about which id a given string names.
+//!
+//! It deliberately does NOT know about names. Sessions and windows also answer
+//! to a name, and that resolution lives with the caller — the CLI tries an
+//! exact name first and only then asks this module, because an exact match
+//! must beat a partial one. A daemon parameter literally called `id` takes an
+//! id and nothing else.
 //!
 //! # The rules
 //!
@@ -26,7 +31,9 @@
 //!    entity exists stays the handler's question to answer.
 //! 2. **Anything else is a prefix**, after trimming surrounding whitespace,
 //!    removing hyphens and lowercasing. It must be [`MIN_PREFIX_LEN`]..=31 hex
-//!    digits — 32 would be a complete UUID and rule 1 would have taken it.
+//!    digits. A string that normalizes to a full 32 is a UUID with its hyphens
+//!    in the wrong places — rule 1 already took every well-formed spelling, so
+//!    what is left is malformed, not a prefix.
 //! 3. A prefix matches an entity when it is a prefix of that entity's id in
 //!    **hyphen-free** form. Exactly one match resolves; none is
 //!    [`RefError::NotFound`]; more than one is [`RefError::Ambiguous`], which
@@ -71,15 +78,6 @@ impl RefKind {
             RefKind::Pane => "pane",
         }
     }
-
-    /// The RPC parameter this kind of reference arrives in.
-    pub const fn param(self) -> &'static str {
-        match self {
-            RefKind::Session => "session_id",
-            RefKind::Window => "window_id",
-            RefKind::Pane => "pane_id",
-        }
-    }
 }
 
 impl fmt::Display for RefKind {
@@ -97,6 +95,8 @@ impl fmt::Display for RefKind {
 pub enum MalformedReason {
     /// Empty or whitespace-only.
     Empty,
+    /// Non-empty, but nothing survives hyphen-stripping (e.g. `"----"`).
+    NoDigits,
     /// Fewer than [`MIN_PREFIX_LEN`] hex digits after normalization.
     TooShort { len: usize },
     /// Contains something that is not a hex digit (hyphens are stripped first).
@@ -109,14 +109,17 @@ impl fmt::Display for MalformedReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MalformedReason::Empty => f.write_str("it is empty"),
+            MalformedReason::NoDigits => f.write_str("it is all hyphens, with no hex digits"),
             MalformedReason::TooShort { len } => write!(
                 f,
                 "an id prefix needs at least {MIN_PREFIX_LEN} hex characters, got {len}"
             ),
             MalformedReason::NotHex => f.write_str("an id is hex digits and hyphens only"),
-            MalformedReason::TooLong { len } => {
-                write!(f, "a uuid has {UUID_HEX_LEN} hex characters, got {len}")
-            }
+            MalformedReason::TooLong { len } => write!(
+                f,
+                "an id prefix is at most {} hex characters (a whole uuid is {UUID_HEX_LEN}), got {len}",
+                UUID_HEX_LEN - 1
+            ),
         }
     }
 }
@@ -182,7 +185,8 @@ impl RefError {
 pub enum ParsedRef {
     /// A complete UUID. Returned verbatim without consulting any graph.
     Exact(Uuid),
-    /// A normalized hex prefix: lowercase, no hyphens, [`MIN_PREFIX_LEN`]..32.
+    /// A normalized hex prefix: lowercase, no hyphens,
+    /// [`MIN_PREFIX_LEN`]..=31 characters.
     Prefix(String),
 }
 
@@ -220,7 +224,7 @@ pub fn parse_ref(kind: RefKind, input: &str) -> Result<ParsedRef, RefError> {
         .collect();
 
     if hex.is_empty() {
-        return Err(malformed(MalformedReason::Empty));
+        return Err(malformed(MalformedReason::NoDigits));
     }
     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(malformed(MalformedReason::NotHex));
@@ -228,7 +232,10 @@ pub fn parse_ref(kind: RefKind, input: &str) -> Result<ParsedRef, RefError> {
     if hex.len() < MIN_PREFIX_LEN {
         return Err(malformed(MalformedReason::TooShort { len: hex.len() }));
     }
-    if hex.len() > UUID_HEX_LEN {
+    // `>=`, not `>`: 32 hex digits are a whole UUID's worth. Every spelling
+    // `Uuid::parse_str` accepts was taken by rule 1, so reaching here with 32
+    // means the hyphens are in non-UUID positions — malformed, not a prefix.
+    if hex.len() >= UUID_HEX_LEN {
         return Err(malformed(MalformedReason::TooLong { len: hex.len() }));
     }
 
@@ -436,6 +443,41 @@ mod tests {
         assert_eq!(resolve_ref(RefKind::Pane, thirty_one, fleet()), Ok(id));
     }
 
+    /// A whole UUID's worth of hex with the hyphens in the wrong places is a
+    /// MALFORMED uuid, not a 32-character prefix. `Uuid::parse_str` already
+    /// took every well-formed spelling, so anything left at 32 is a typo — and
+    /// accepting it would contradict the documented 4..=31 range.
+    #[test]
+    fn thirty_two_hex_with_misplaced_hyphens_is_malformed_not_a_prefix() {
+        for bad in [
+            "bbbb4444-00-00-4000-8000-000000000004", // hyphens shifted
+            "-bbbb4444-0000-4000-8000-000000000004", // leading hyphen
+            "bbbb4444-0000-4000-8000-000000000004-", // trailing hyphen
+            "bbbb44440000400080000000000000-04",     // one hyphen, wrong spot
+        ] {
+            assert!(
+                matches!(
+                    parse_ref(RefKind::Pane, bad),
+                    Err(RefError::Malformed {
+                        reason: MalformedReason::TooLong { len: 32 },
+                        ..
+                    })
+                ),
+                "{bad} normalizes to 32 hex and must be malformed, got {:?}",
+                parse_ref(RefKind::Pane, bad)
+            );
+        }
+        // …while the same id spelled correctly still resolves.
+        assert_eq!(
+            resolve_ref(
+                RefKind::Pane,
+                "bbbb4444-0000-4000-8000-000000000004",
+                fleet()
+            ),
+            Ok(u("bbbb4444-0000-4000-8000-000000000004"))
+        );
+    }
+
     #[test]
     fn non_hex_is_malformed() {
         for bad in ["zzzzzzzz", "not-an-id", "aaaa111g", "b57c601b!"] {
@@ -453,8 +495,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_whitespace_and_bare_hyphens_are_malformed() {
-        for bad in ["", "   ", "\t\n", "-", "----"] {
+    fn empty_and_whitespace_are_malformed_as_empty() {
+        for bad in ["", "   ", "\t\n"] {
             assert!(
                 matches!(
                     parse_ref(RefKind::Pane, bad),
@@ -464,6 +506,29 @@ mod tests {
                     })
                 ),
                 "{bad:?} should be Empty"
+            );
+        }
+    }
+
+    /// A string of hyphens is not empty, and saying "it is empty" to someone
+    /// looking at `----` reads as a bug in the error rather than in the input.
+    #[test]
+    fn a_string_of_only_hyphens_says_so_rather_than_claiming_to_be_empty() {
+        for bad in ["-", "----", " --- "] {
+            let err = parse_ref(RefKind::Pane, bad).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    RefError::Malformed {
+                        reason: MalformedReason::NoDigits,
+                        ..
+                    }
+                ),
+                "{bad:?} should be NoDigits, got {err:?}"
+            );
+            assert!(
+                !err.to_string().contains("is empty"),
+                "{bad:?} is not empty: {err}"
             );
         }
     }
@@ -478,6 +543,10 @@ mod tests {
                 ..
             })
         ));
+        // The message must name the real ceiling for a prefix, not the uuid
+        // length — a reader who typed 32 needs to know 31 is the limit.
+        let msg = parse_ref(RefKind::Pane, &too_long).unwrap_err().to_string();
+        assert!(msg.contains("31"), "{msg}");
     }
 
     // ── Rule 3: matching, and refusing to guess ──────────────────────────
@@ -596,13 +665,12 @@ mod tests {
 
     #[test]
     fn error_wording_names_the_entity_kind() {
-        for (kind, noun, param) in [
-            (RefKind::Session, "session", "session_id"),
-            (RefKind::Window, "window", "window_id"),
-            (RefKind::Pane, "pane", "pane_id"),
+        for (kind, noun) in [
+            (RefKind::Session, "session"),
+            (RefKind::Window, "window"),
+            (RefKind::Pane, "pane"),
         ] {
             assert_eq!(kind.as_str(), noun);
-            assert_eq!(kind.param(), param);
             let msg = resolve_ref(kind, "cccc", fleet()).unwrap_err().to_string();
             assert!(msg.contains(noun), "{msg} should name a {noun}");
         }

@@ -19,8 +19,11 @@
 # an explicit opt-in: `EXPECT_DEFECT=1`. In that mode the script fails if the
 # defect does NOT reproduce, so the baseline arm cannot pass vacuously either.
 #
-# NO MASKED FAILURES. Nothing here is `|| true`. A daemon that will not start,
-# a pane that never prints, a command that hangs — all abort loudly.
+# NO MASKED FAILURES ON ANY ASSERTION. No check is written `|| true`; a daemon
+# that will not start, a pane that never prints, or a command that hangs aborts
+# loudly. Teardown is the one place that tolerates failure — killing an already
+# dead daemon is not an error — and the leak check that follows it is strict and
+# exits non-zero.
 #
 # SYNCHRONISATION. The fixture pane prints a colour probe and only then parks.
 # The harness waits for that text before it looks at anything, because a
@@ -146,9 +149,27 @@ check "capture by printed pane id"       ok  sx pane capture -s "${session}" -p 
 check "wait-settled by printed pane id"  ok  sx pane wait-settled "${short_pane}" --quiet 100 --timeout 5000
 check "checkpoint by printed pane id"    ok  sx pane checkpoint "${short_pane}"
 check "title by printed pane id"         ok  sx pane title -s "${session}" -p "${short_pane}" -t probe
+check "send-keys by printed pane id"     ok  sx pane send-keys -s "${session}" -p "${short_pane}" --text " "
+check "set-size by printed pane id"      ok  sx pane set-size -s "${session}" -p "${short_pane}" --cols 80 --rows 24
+check "resize by printed pane id"        ok  sx pane resize -s "${session}" -p "${short_pane}" --direction horizontal --delta 1
+check "run by printed pane id"           ok  sx pane run -s "${session}" -p "${short_pane}" --command true
+# `pane watch` is deliberately NOT here: with no `--limit` it streams forever,
+# and its chunks only reach subscribers that were already listening (the data
+# plane keeps no history), so a bounded one-shot check would either hang or
+# pass vacuously. It is covered properly in `id_prefix_resolution.rs`, which
+# starts the watcher first and then makes the pane speak.
+check "record by printed pane id"        ok  sx pane record -s "${session}" -p "${short_pane}" --to "${out_dir}/rec.bin" --force --duration-ms 300
+check "snapshot by printed pane id"      ok  sx pane snapshot -s "${session}" -p "${short_pane}" -o "${out_dir}/pane.png"
 check "pane list by printed session id"  ok  sx pane list -s "${short_sess}"
 check "pane list by window uuid"         ok  sx pane list -s "${session}" -w "${full_win}"
 check "pane list by short window id"     ok  sx pane list -s "${session}" -w "${full_win:0:8}"
+check "session save by printed id"       ok  sx session save -s "${short_sess}"
+check "session rename by printed id"     ok  sx session rename -s "${short_sess}" -n "${session}-r"
+# The rename took effect, so every later check must use the NEW name — the id
+# is unchanged, which is the point.
+if [ "${expect_defect}" != "1" ]; then
+  session="${session}-r"
+fi
 say ""
 
 # ── the round trip lands on the RIGHT entity ─────────────────────────────
@@ -183,6 +204,20 @@ check "non-hex is not an id"              err sx pane glance zzzzzzzz --text-onl
 check "empty is not an id"                err sx pane glance "" --text-only
 check "a prefix matching nothing"         err sx pane glance ffffffffff --text-only
 check "an unknown full uuid"              err sx pane glance 00000000-0000-4000-8000-000000000001 --text-only
+say ""
+
+# The teardown verb, driven the same way. It ends the session, so it runs after
+# everything that needs it alive — and the check that it actually died follows.
+check "session kill by printed id"       ok  sx session kill "${short_sess}"
+if [ "${expect_defect}" != "1" ]; then
+  if sx session list --format plain | grep -q "^${session}	"; then
+    say "  FAIL  session kill by short id left the session alive"
+    fail=$((fail + 1))
+  else
+    say "  PASS  session kill by short id actually killed it"
+    pass=$((pass + 1))
+  fi
+fi
 say ""
 
 say "pass ${pass}  fail ${fail}"
