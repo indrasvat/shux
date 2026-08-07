@@ -908,8 +908,11 @@ impl<'a> VtHandler<'a> {
     /// legitimately wraps onto following lines, so clamping to the current row
     /// would break it -- and no real application exceeds that. A multi-scalar
     /// cluster costs more per copy, so the total number of scalars written is
-    /// bounded a second time; the two together cap the work at two screenfuls
-    /// however pathological the remembered character is.
+    /// bounded a second time. The two together cap the work at
+    /// `max(2 * rows * cols, MAX_GRAPHEME_SCALARS)` scalars -- the floor matters
+    /// only on a grid so small that two screenfuls is fewer scalars than one
+    /// cluster holds, where it forces a single whole copy through rather than
+    /// writing nothing at all.
     fn repeat_iterations(&self, count: usize, source: &LastGraphic) -> usize {
         let cells = self.grid.rows().saturating_mul(self.grid.cols()).max(1);
         let scalar_budget = cells.saturating_mul(2) / source.scalar_count();

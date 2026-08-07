@@ -5,6 +5,7 @@
 **Milestone:** M3 polish
 **Depends On:** 090 (`e856793`, DECALN) — DECALN homes the cursor, which is how the
 column-0 case surfaced
+**Quality Gate:** shux-vt-solid-qa — `VERDICT: PASS`, `.shux/qa/091-rep-data-stream-source/SOLID-QA.md`
 **Touches:** `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`,
 `crates/shux-vt/tests/rep.rs` (new), `crates/shux/tests/rep_pane_e2e.rs` (new),
 `.shux/scripts/issue_122_evidence.sh` (new)
@@ -108,8 +109,12 @@ screenful of cells is still the iteration cap — a repeat legitimately wraps on
 following lines, so clamping to the current row would break it, and no real
 application exceeds a screen. A multi-scalar cluster costs more per copy, so the
 total number of scalars written is capped at two screenfuls as well. Together they
-bound the work at two screenfuls however pathological the remembered character is,
-where the old code's per-iteration cost was unbounded above by the cluster length.
+bound the work at `max(2 x rows x cols, MAX_GRAPHEME_SCALARS)` scalars, where the old
+code's per-iteration cost was unbounded above by the cluster length. The floor is
+reachable only on a grid so small that two screenfuls is fewer scalars than one cluster
+holds; there it forces a single whole copy through rather than writing nothing, and it
+is pinned by `a_cluster_longer_than_the_budget_still_writes_one_whole_copy` (VT gate
+P3-1, which caught the prose overstating the bound and the branch being untested).
 
 ### A defect the rewrite removed
 
@@ -126,7 +131,7 @@ removes the second placement entirely.
 | Level | Where | What |
 |---|---|---|
 | Unit (VT) | `crates/shux-vt/src/lib.rs` | source survives a cursor move; survives an erase; no-op with nothing to repeat; RIS clears it; repeats take the current pen |
-| Integration (VT) | `crates/shux-vt/tests/rep.rs` | 57 cases across 10 groups — the data-stream source, nothing-to-repeat, the pen, character sets, grapheme clusters and wide characters, cursor/wrap/scroll/origin/insert, counts and bounds, the sequence space around `CSI b`, grid invariants (write tally, sync freeze, held clones, dirty regions) |
+| Integration (VT) | `crates/shux-vt/tests/rep.rs` | 64 cases across 10 groups — the data-stream source, nothing-to-repeat, the pen, character sets, grapheme clusters and wide characters, cursor/wrap/scroll/origin/insert, counts and bounds, the sequence space around `CSI b`, grid invariants (write tally, sync freeze, held clones, dirty regions) |
 | Differential | `crates/shux-vt/tests/rep.rs` | the oracle over 8 source shapes × 7 prefixes × 4 counts, and over 23 intervening sequences × 3 sources |
 | Property | `crates/shux-vt/tests/rep.rs::properties` | 512 random programs against the same oracle, plus 256 chunked at random byte boundaries |
 | End-to-end | `crates/shux/tests/rep_pane_e2e.rs` | real daemon, real PTY, real shell, colour-probed: a rule drawn with REP, the issue's column-0 reproduction, a progress bar redrawn in place, a line-drawing box rule, and a flood that must stay bounded |

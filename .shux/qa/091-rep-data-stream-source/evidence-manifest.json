@@ -1,0 +1,113 @@
+{
+  "task": "091-rep-data-stream-source",
+  "issue": 122,
+  "pull_request": 129,
+  "branch": "claude/shux-issue-122-33umu5",
+  "head_commit": "8f5ebf81e2e7df4d6ec8466728dcca7362f3a358",
+  "base_commit": "e856793",
+  "gate": "shux-vt-solid-qa",
+  "audited_binaries": {
+    "head": "target/release/shux rebuilt from 8f5ebf8 during this audit \u2014 `shux version` reports `0.46.7 (8f5ebf8)`",
+    "base": "/tmp/shux-122-evidence-base/target/debug/shux \u2014 `shux version` reports `0.46.7 (e856793)`"
+  },
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.md",
+  "dootsabha_implementation": "dootsabha-implementation.md",
+  "screenshots": [
+    "rep-oracle-80x24-actual.png",
+    "rep-oracle-80x24-expected.png",
+    "rep-oracle-80x24-diff.png",
+    "rep-oracle-120x40-actual.png",
+    "rep-oracle-120x40-expected.png",
+    "rep-oracle-120x40-diff.png",
+    "rep-oracle-200x60-actual.png",
+    "rep-oracle-200x60-expected.png",
+    "rep-oracle-200x60-diff.png",
+    "negative-control-base-80x24-actual.png",
+    "negative-control-base-80x24-expected.png",
+    "negative-control-base-80x24-diff.png",
+    "pen-unchanged-head-actual.png",
+    "pen-unchanged-base-expected.png",
+    "pen-unchanged-diff.png",
+    "richtui-btop-120x40-actual.png",
+    "richtui-lazygit-120x40-actual.png"
+  ],
+  "screenshot_provenance": {
+    "generated_by": "this audit, from the daemon's own rasterizer via `pane snapshot`",
+    "harness": "/tmp/.../qa_rep_oracle.sh (gate-authored) + .shux/scripts/issue_122_evidence.sh (task harness) + a live rich-TUI matrix",
+    "baseline_policy": "No expected PNG was minted. Every `-expected.png` is the SAME scene with each `CSI n b` replaced by n literal copies of the character, shot through the SAME binary \u2014 ECMA-48 8.3.103's own definition of REP used as the oracle. The `-diff.png` files are pixel_verify output.",
+    "naming": "<scene>-<geometry>-{actual,expected,diff}.png",
+    "arm_labelling": "Every metric JSON carries `binary`, `role` and `expected_status`; base-binary artifacts are prefixed `negative-control-`."
+  },
+  "pixel_metrics": [
+    "pixel-rep-vs-literal-80x24.json",
+    "pixel-rep-vs-literal-120x40.json",
+    "pixel-rep-vs-literal-200x60.json",
+    "pixel-pen-unchanged-head-vs-base.json"
+  ],
+  "pixel_metric_thresholds": "exact \u2014 max_pixel_diff_ratio 0, max_mean_channel_delta 0, on every entry",
+  "negative_control": {
+    "file": "negative-control-base-rep-vs-literal-80x24.json",
+    "binary": "base@e856793",
+    "expected_status": "fail",
+    "observed_status": "fail",
+    "changed_pixels": 4810,
+    "why_not_in_pixel_metrics": "It is the comparator's fail-proof, not a gate result. Listing it under pixel_metrics would trip scripts/check-progress.sh, which requires every pixel_metrics entry to have status == \"pass\". A reader must not mistake it for the gate finding a defect in the fix: status=fail is this arm's PASS condition.",
+    "what_it_proves": "The identical scene through the PRE-FIX binary loses its rule, CJK run, combining cluster, DEC line-drawing edge and ZWJ run. The comparator therefore detects the real issue-122 defect, not merely injected noise."
+  },
+  "colour_probes": "Every daemon-backed capture in this audit emits and asserts truecolor (rgb 120,220,180), 256-indexed (idx 208 and idx 1) and basic ANSI (idx 4). Verified in the canonical cell frame, not just the text capture.",
+  "geometries": [
+    "80x24",
+    "120x40",
+    "200x60"
+  ],
+  "rich_tui": {
+    "live": [
+      "vim",
+      "nvim",
+      "htop",
+      "btop",
+      "lazygit",
+      "less",
+      "tput rep (terminfo REP)"
+    ],
+    "replayed_fixtures": [
+      "btop",
+      "lazygit",
+      "nvim",
+      "vicaya",
+      "vivecaka"
+    ],
+    "replay_result": "byte-identical text, cells and pixels between base@e856793 and head@8f5ebf8"
+  },
+  "leaks": "zero \u2014 every daemon-backed run used an isolated XDG_RUNTIME_DIR and shux_harness_assert_no_daemon (pidfile only, never a pgrep/pkill substring match). Post-run process table carries no shux, vim, nvim, htop, btop, lazygit or less residue.",
+  "artifact_sha256_16": {
+    "rep-oracle-80x24-actual.png": "e0c3ad6acd6d2e30",
+    "rep-oracle-80x24-expected.png": "e0c3ad6acd6d2e30",
+    "rep-oracle-80x24-diff.png": "6527c6f36ae33cf1",
+    "rep-oracle-120x40-actual.png": "68bcc64ad8fd8507",
+    "rep-oracle-120x40-expected.png": "68bcc64ad8fd8507",
+    "rep-oracle-120x40-diff.png": "f455e67f7af2f102",
+    "rep-oracle-200x60-actual.png": "ddb5b0970a496941",
+    "rep-oracle-200x60-expected.png": "ddb5b0970a496941",
+    "rep-oracle-200x60-diff.png": "701baf295299eee9",
+    "negative-control-base-80x24-actual.png": "92d79e685c81d9b5",
+    "negative-control-base-80x24-expected.png": "e0c3ad6acd6d2e30",
+    "negative-control-base-80x24-diff.png": "79ab605865208c4e",
+    "pen-unchanged-head-actual.png": "c0fa3faee278d22a",
+    "pen-unchanged-base-expected.png": "c0fa3faee278d22a",
+    "pen-unchanged-diff.png": "8881c2d8a5ec0174",
+    "richtui-btop-120x40-actual.png": "6aa5aebedad0d452",
+    "richtui-lazygit-120x40-actual.png": "d149adc5a5513bff",
+    "pixel-rep-vs-literal-80x24.json": "9b047d1d8242b2c0",
+    "pixel-rep-vs-literal-120x40.json": "ba75b759a2d23a10",
+    "pixel-rep-vs-literal-200x60.json": "a649ab9eff88e9e1",
+    "pixel-pen-unchanged-head-vs-base.json": "959bae096e9faffe"
+  },
+  "scratch_location": ".shux/out/091-rep-data-stream-source/{head,base,corpus,tui}/ and .shux/out/issue-122/{before,after}/ (gitignored)",
+  "regenerate": [
+    "SHUX_BIN=<binary> LABEL=<label> .shux/scripts/issue_122_evidence.sh   (EXPECT_DEFECT=1 for the base arm)",
+    ".shux/scripts/issue_122_mutation_check.sh",
+    "cargo test -p shux-vt --test rep && cargo test -p shux --test rep_pane_e2e"
+  ]
+}

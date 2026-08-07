@@ -17,6 +17,19 @@ cd "${repo_root}"
 
 PARSER=crates/shux-vt/src/parser.rs
 
+# EXCLUSIVE LOCK. This script rewrites a tracked source file in place, over and
+# over, for several minutes. Anything else compiling or testing the workspace at
+# the same time sees a mutant and reports a failure that does not exist -- the
+# VT gate hit exactly that during the issue #122 audit, measuring `parser.rs`
+# dirty in 49 of 60 one-second samples and nearly filing a phantom P0. Take the
+# lock or refuse to run; never mutate a shared tree opportunistically.
+LOCK=.git/shux-mutation-check.lock
+exec 9>"${LOCK}"
+if ! flock -n 9; then
+  echo "FATAL: another mutation run holds ${LOCK}; refusing to rewrite ${PARSER} underneath it" >&2
+  exit 1
+fi
+
 if ! git diff --quiet -- "${PARSER}"; then
   echo "FATAL: ${PARSER} differs from the index; refusing to mutate" >&2
   exit 1
@@ -66,7 +79,7 @@ open(p, "w").write(s)
   return 0
 }
 
-echo "==> mutation check, issue #122"
+echo "==> mutation check, issue #122 (holding ${LOCK}; ${PARSER} is rewritten in place)"
 
 mutate "source the screen again (the original bug)" <<'EDIT'
 s = s.replace(
@@ -208,6 +221,21 @@ EDIT
 mutate "a repeat is written once regardless of the count" <<'EDIT'
 s = s.replace("""        for _ in 0..self.repeat_iterations(count, &source) {""",
               """        for _ in 0..self.repeat_iterations(count, &source).min(1) {""")
+EDIT
+
+mutate "scalar budget loses its .max(1) floor" <<'EDIT'
+old = "        count.min(cells).min(scalar_budget.max(1))"
+assert old in s, "anchor moved"
+s = s.replace(old, "        count.min(cells).min(scalar_budget)")
+EDIT
+
+mutate "a wide char dropped for want of room is not remembered" <<'EDIT'
+# The faithful mutant is NOT `last_graphic = None` -- that makes REP a no-op,
+# which looks identical to the correct behaviour. It is failing to record the
+# dropped character at all, so the OLDER one survives and REP draws that.
+old = "        self.remember_graphic_scalar(ch);"
+assert s.count(old) == 1, "anchor moved or is no longer unique"
+s = s.replace(old, "        if !(width == 2 && self.grid.cols() < 2) {\n            self.remember_graphic_scalar(ch);\n        }")
 EDIT
 
 revert

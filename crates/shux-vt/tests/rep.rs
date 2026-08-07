@@ -770,6 +770,57 @@ fn rep_is_clamped_for_cluster_sources_too() {
     }
 }
 
+/// The scalar budget has a `.max(1)` floor, and on a very small grid that floor
+/// is what does the work: a cluster longer than two screenfuls of scalars makes
+/// the budget compute to zero, and one full copy is forced through anyway.
+/// Without it a repeat on such a grid would write nothing at all. The true bound
+/// is therefore `max(2 * rows * cols, MAX_GRAPHEME_SCALARS)`, not two screenfuls
+/// flat — trivial either way, but the branch is real and was unpinned until the
+/// VT gate's own mutation survived on it (P3-1).
+#[test]
+fn a_cluster_longer_than_the_budget_still_writes_one_whole_copy() {
+    let mut seed = String::from("a");
+    for _ in 0..31 {
+        seed.push('\u{0301}');
+    }
+    // 2x4 = 8 cells, so the budget is 16 scalars against a 32-scalar cluster.
+    let mut t = vt(2, 4);
+    t.process(seed.as_bytes());
+    // No cursor move: the copy has to land in its OWN cell at column 1, or the
+    // assertion below cannot tell it apart from the original.
+    let before = t.grid().mutations();
+    t.process(b"\x1b[1b");
+    assert!(
+        t.grid().mutations() > before,
+        "the floor was lost: a repeat on a tiny grid wrote nothing"
+    );
+    assert_eq!(
+        t.grid().visible_row(0)[1]
+            .grapheme()
+            .map(|g| g.chars().count()),
+        Some(32),
+        "the copy that was forced through is not the whole cluster"
+    );
+}
+
+/// A wide character on a one-column terminal has nowhere to go and is dropped —
+/// but the STREAM still carried it, so it is still the preceding character. A
+/// repeat of it does the same harmless nothing another copy would have done,
+/// rather than falling back to whatever was printed before it (P3-2).
+#[test]
+fn a_wide_character_with_nowhere_to_go_is_still_what_rep_repeats() {
+    let mut t = vt(2, 1);
+    t.process("A\u{754C}".as_bytes());
+    t.process(b"\x1b[3b");
+
+    assert_eq!(t.grid().visible_row(0)[0].ch, 'A');
+    assert_eq!(
+        t.grid().visible_row(1)[0].ch,
+        ' ',
+        "REP fell back to the character before the dropped one"
+    );
+}
+
 /// The clamp is a deliberate deviation from the oracle, so it is pinned in the one
 /// place the two disagree: past one screenful, the literal stream keeps scrolling
 /// and a clamped repeat stops. Ten bytes of pane output buying unbounded work is

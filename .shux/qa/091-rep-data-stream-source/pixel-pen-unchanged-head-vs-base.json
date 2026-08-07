@@ -1,0 +1,20 @@
+{
+  "actual": ".shux/qa/091-rep-data-stream-source/pen-unchanged-head-actual.png",
+  "binary": "head@8f5ebf8 vs base@e856793",
+  "changed_pixels": 0,
+  "diff": ".shux/qa/091-rep-data-stream-source/pen-unchanged-diff.png",
+  "expected": ".shux/qa/091-rep-data-stream-source/pen-unchanged-base-expected.png",
+  "expected_status": "pass",
+  "max_mean_channel_delta": 0.0,
+  "max_pixel_diff_ratio": 0.0,
+  "mean_rgba_channel_delta": 0.0,
+  "note": "The pen scene has no cursor move between the character and the CSI b, so the fix must not change it at all. head vs base, 0 changed pixels -- the fix is surgical.",
+  "pixel_diff_ratio": 0.0,
+  "role": "unchanged-control",
+  "size": [
+    396,
+    228
+  ],
+  "status": "pass",
+  "total_pixels": 90288
+}
