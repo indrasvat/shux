@@ -1,6 +1,6 @@
 # 091 — REP (`CSI b`) repeated the cell left of the cursor instead of the preceding character in the data stream
 
-**Status:** In Progress
+**Status:** Done
 **Priority:** High (conformance; silently drops output a real application asked for)
 **Milestone:** M3 polish
 **Depends On:** 090 (`e856793`, DECALN) — DECALN homes the cursor, which is how the
@@ -149,6 +149,67 @@ removes the second placement entirely.
 - [x] The work a single REP can buy stays bounded (issue #102).
 - [x] `make check` green; zero leaked daemons.
 
+## Adversarial review — four agents on the real binary, three findings
+
+DootSabha councils (feature protocol steps 1 and 6) are N/A in this environment and were
+substituted, on the operator's instruction, with parallel agents that drive the shipped
+binary rather than reasoning from source: rich-TUI compatibility, grapheme/wide-cell
+invariants, resource bounds, and an A/B regression sweep against `e856793`.
+
+**Fixed — a stray combining mark redefined what REP repeats.**
+`remember_graphic_cluster` re-read the grown cluster out of the SCREEN cell that
+`append_zero_width_scalar` had chosen, and that function falls back to the cell left of
+the cursor when there is no active grapheme cell. The screen-derived reasoning this issue
+exists to remove, surviving in the cluster path.
+
+```
+ABCZ  ESC[1;2H  U+0301  ESC[3b   ->  ÁÁÁÁ   (B, C and Z destroyed)
+                                     expected ÁZZZ
+```
+
+A second route needs no cursor move: with auto-wrap off a wide character in the last
+column is dropped, which clears the active cell and strands the variation selector
+behind it on an earlier cell. Both reproduced, then fixed by extending the record only
+when the scalar joined the cell the record already describes. That is xterm's rule —
+**REP repeats the last character that occupied at least one column**, together with the
+marks that joined it — and it is the one precondition on the oracle besides #124.
+Regression tests for both routes, seen failing first.
+
+**Fixed — a 10–24% throughput regression on cluster-heavy text.** Measured independently
+by two reviewers. Re-reading the cell allocated a fresh `String` per cluster-growing
+scalar, on the hot path for ALL terminal output rather than just REP. Extending the
+record is now an O(1) push into a reused buffer. Best-of-7 over 24 MB streams, release:
+
+| 24 MB of | `e856793` | this branch |
+|---|---|---|
+| ASCII | 32.5 MB/s | 31.9 MB/s |
+| wide CJK | 50.0 MB/s | 49.7 MB/s |
+| ZWJ emoji | 40.6 MB/s | 40.2 MB/s |
+| combining marks | 23.8 MB/s | 22.8 MB/s |
+
+What remains on combining marks (~4%) is the irreducible cost of tracking the cluster,
+and it only appears on a stream where every second scalar is a mark.
+
+**Fixed — two tests were green on the pre-fix commit.** Both parked the cursor at column
+0, where the old code bailed for its own unrelated reason and looked correct. Both now
+sit at a non-zero column and assert on the write tally, which is what sees the old code
+cloning a blank and writing it.
+
+**Corrected, not fixed — the pen was never wrong.** The first cut of this task claimed
+the old code "cloned the source cell, colour included". It did clone the cell, but took
+only its character, width and grapheme payload and wrote through `write_char`, which
+uses the current pen. The evidence harness caught it: the `pen` scene passes on both
+binaries and its two PNGs are byte-identical. The task file, the commit message and the
+`pen` scene's own comment were corrected, and the two pen tests are now documented as
+pins on unchanged behaviour rather than proof of the fix.
+
+**Cleared — 15,120-input A/B sweep.** The whole `vt-corpus` rich-TUI and synthetic
+fixture set at 5 geometries × 4 chunkings plus 9,500 generated streams, replayed through
+both builds and diffed cell for cell. 1,422 differences, every one containing a
+REP-shaped `CSI b`; the same inputs with REP stripped gave 0. All six rich TUIs (`vim`,
+`nvim`, `htop`, `btop`, `lazygit`, `less`) render byte-identically, including over a
+page the repeat command had just filled.
+
 ## Found in passing, filed separately
 
 **An incrementally built grapheme cluster is torn in half at the right margin.**
@@ -159,3 +220,9 @@ belongs to the grapheme printing path (task 069), not here. REP's side of it is
 pinned by `rep_after_a_cluster_torn_by_the_right_margin_repeats_the_surviving_half`
 so a fix there shows up as a test change rather than a silent behaviour change, and
 the property test documents it as the one precondition on its oracle.
+
+**A CSI sequence with too many parameters executes truncated (issue #126).** `vte` raises
+an `ignore` flag on a sequence it could not represent; shux binds it to `_ignore` in all
+three dispatch handlers and never reads it, so an overflowed sequence runs with whatever
+parameters survived. Shared by every sequence, not just this one, and the diff here does
+not touch `_ignore`.
