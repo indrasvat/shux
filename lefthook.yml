@@ -21,7 +21,9 @@ commit-msg:
       run: make check-lens-frozen MSG={1}
 
 # pre-push mirrors CI exactly so a clean local push survives CI:
-#   - `make test`       → matches CI Test job (`cargo nextest run --workspace`)
+#   - `make test`       → the CI Test job runs this exact target, not a
+#                         hand-written cargo line, so the two cannot drift
+#                         apart again (issue #130).
 #   - `make test-doc`   → matches CI Test job's doc-test step
 #   - `make deny`       → matches CI Deny job (strict — was `deny-soft` until
 #                         a license issue slipped through to CI; pushes now

@@ -38,8 +38,8 @@ crates/shux-core/   SessionGraph, LayoutEngine, EventBus, config, theme
 crates/shux-pty/    PTY manager (openpty, async I/O, lifecycle)
 crates/shux-vt/     VT grid (vte parser, VecDeque grid, scrollback)
 crates/shux-rpc/    JSON-RPC (UDS + TCP, length-prefixed framing)
-crates/shux-plugin/ Plugin host (wasmtime, WIT, process plugins, permissions)
-crates/shux-ui/     TUI client (crossterm, ratatui chrome, compositor)
+crates/shux-plugin/ Plugin host (process plugins over stdio JSON-RPC, permissions)
+crates/shux-ui/     TUI client (crossterm, hand-rolled chrome, compositor)
 ```
 
 - Client/server: single binary, daemon auto-starts on first use.
@@ -65,10 +65,24 @@ the base commit before attributing a regression.
 only that the code does what it does.
 
 **Process hygiene.** Zero leaked daemons or child processes. Use
-`.shux/scripts/no_leak_guard.sh` + isolated short `XDG_RUNTIME_DIR`. Daemon-backed checks
-run **serially** — never two suites at once. Identify processes by **pidfile**; never
-`pgrep -f`/`pkill -f` on a substring (your own argv matches it → phantom leaks). Never
-`pkill -f shux`.
+`.shux/scripts/no_leak_guard.sh` + isolated short `XDG_RUNTIME_DIR`.
+
+Daemon-backed **shell** suites (`.shux/scripts/*_check.sh`, `make test-lens*`, the QA
+gates) run **serially** — never two at once. Daemon-backed **cargo tests** do not: they
+are scheduled by nextest under the `daemon-pty` group in `.config/nextest.toml`, capped
+at 12 concurrent, and each isolates its own `XDG_RUNTIME_DIR`. That cap is measured, not
+chosen — see `docs/tasks/093-parallel-test-suite.md`; if you change it there, change it
+here, and `make check-test-groups` will tell you if the group's membership drifts. Do not add
+`--test-threads=1` or `-j 1` to a cargo test invocation to "be safe" — that was the
+house pattern until issue #130, it cost 461s a run, and it protected nothing that
+nextest's process-per-test model does not already protect. If a test genuinely needs a
+machine-global resource, put it in a group and give it an expected member count in
+`scripts/check-test-groups.sh`.
+
+Identify processes by **pidfile**; never `pgrep -f`/`pkill -f` on a substring (your own
+argv matches it → phantom leaks). Never `pkill -f shux`. A test that counts processes
+with `ps` MUST use a per-run unique needle — `ps` is a machine-wide view, and a shared
+needle silently reads other suites' processes.
 
 **Rich TUIs must not regress.** `vim`/`nvim`, `lazygit`, `btop`/`htop`, `vicaya`,
 `vivecaka` must render correctly in panes. Required pass for any change to PTY spawn,
@@ -86,6 +100,11 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
 
 - **Prove a check can FAIL before trusting it to pass.** Run every gate/guard/comparator
   against a reintroduced defect AND empty input.
+- **Anything that parses cargo output pins `--color never` at the call site.** CI
+  exports `CARGO_TERM_COLOR=always`; cargo colours on a TTY and not through a pipe, so
+  the coloured path is the one local runs never see. A guard that only fails in CI is
+  the worst shape a guard can have — `make check-ci-parity` runs the parsers under CI's
+  environment so that failure lands on your machine instead.
 - **Never mask failures in a measurement harness.** `|| true` turns an instant error into
   a fast success. Abort loudly.
 - **A not-yet-started app is quiet.** `wait-settled` alone races slow starters and

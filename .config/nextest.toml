@@ -1,6 +1,13 @@
 # cargo-nextest config — repo-scoped.
 #
 # https://nexte.st/book/configuration
+#
+# This file is the whole reason `make test` and CI can be the same command.
+# nextest runs every test in its own process, which buys two things libtest's
+# threads cannot: process-global state (env vars, cwd, signal disposition)
+# stops being shared, and concurrency becomes schedulable per test rather than
+# per binary. What remains genuinely shared — the machine's process table, the
+# PTY pool, wall-clock headroom — is bounded explicitly by the groups below.
 
 [profile.default]
 # Tests that spin up real PTYs are inherently timing-sensitive on
@@ -22,6 +29,154 @@ retries = 0
 # minutes of subsequent successes.
 fail-fast = false
 
+# A test that outruns this is not slow, it is stuck. The longest honest test in
+# the workspace is the plugin handshake timeout at ~5s and the daemon-lifecycle
+# cases at ~15s; 120s is far above any of them, and terminating means a wedged
+# daemon fails the run in two minutes instead of hanging a CI job for six hours.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[test-groups]
+# ── Why these groups exist ────────────────────────────────────────────────
+#
+# Nothing here is about "integration tests are scary". Each group names one
+# specific resource that is genuinely global to the machine and therefore
+# cannot be handed out per-test.
+#
+# A test belongs to AT MOST ONE group, and the first matching override wins.
+# That is easy to get wrong in a way nothing reports: an earlier, looser group
+# silently captures binaries a later, tighter one names, and the tighter group's
+# carefully-reasoned comment then describes a membership that does not exist.
+# It happened here — `pty-pool` and `daemon-backed` started out as separate
+# groups listing many of the same binaries, and every heavyweight suite
+# (`m0_integration`, `pane_io_integration`, `decaln_pane_e2e`, `rep_pane_e2e`)
+# resolved into the earlier one. The two are now a single group, and
+# `make check-test-groups` asserts each group's exact member count so the next
+# overlap fails loudly instead of quietly re-tuning the suite.
+#
+#   process-table — these tests decide whether they passed by running `ps` and
+#     counting matching processes. `ps` sees the whole machine. Two of them at
+#     once can read each other's processes and reach a confident, wrong verdict.
+#     Needles are per-run unique now (`unique_marker` in shux-plugin's tests,
+#     the `sleep_tag` pattern in shux's), so this is defence in depth rather
+#     than the only thing holding the suite up — but a scan is still a scan.
+#     Listed FIRST because it is the tightest: the binaries here would
+#     otherwise be captured by `daemon-pty` below.
+#
+#   daemon-pty — everything that boots a real shux daemon, allocates real PTYs,
+#     or both. In this workspace that is one set, not two: every daemon-backed
+#     suite but `statusbar_starship_symlink` also allocates PTYs, because
+#     creating a session creates a pane. Modelling them as one group is what
+#     makes the cap mean something — as two, the effective concurrency was the
+#     sum of both caps and neither number described the machine.
+#
+#     They isolate their own XDG_RUNTIME_DIR, so this is not about collision.
+#     It is about starvation: each carries a wall-clock budget for a pane to
+#     show something, and a budget only means anything if the test gets
+#     scheduled. Measured on a 4-core box at 6x oversubscription with no cap,
+#     `decaln_pane_e2e` spent 62.8s inside a 60s wait budget and failed, having
+#     done nothing wrong.
+#
+#     The cap is a flat count, deliberately not `num-cpus`. What these tests
+#     contend for is not CPU — they are asleep almost the whole time — it is
+#     daemon startup, PTYs and memory, and the right ceiling for that is a
+#     resource count, not a core count. `max-threads` accepts only an integer
+#     or `num-cpus` anyway, so "twice the cores" is not expressible.
+#
+#     Measured on a 4-core box, whole suite, all 1,933 passing at every point:
+#
+#         cap  8   41.9s     cap is the critical path; cores idle
+#         cap 12   29.3s     <- chosen
+#         cap 16   31.4s     past the knee; contention costs more than it buys
+#
+#     Re-measure this after merging or splitting the group. When `pty-pool` and
+#     `daemon-pty` were two groups the effective ceiling was the SUM of their
+#     caps, so merging them at the old number silently halved concurrency and
+#     cost 12 seconds a run.
+#
+#   wall-clock — tests that decide their verdict by timing a workload. A ratio
+#     cancels out machine speed but not *contention*: with more runnable tests
+#     than cores, which arm gets descheduled is luck, and the measurement is of
+#     the scheduler rather than of the code.
+#
+# Everything else — the ~1,700 in-memory VT, layout, parser, raster, rpc and
+# core tests — runs unbounded. Serializing those was never buying safety; it
+# was buying six minutes.
+process-table = { max-threads = 1 }
+daemon-pty = { max-threads = 12 }
+wall-clock = { max-threads = 1 }
+
+# ── Group membership ──────────────────────────────────────────────────────
+
+# Tests that count processes machine-wide to decide their verdict.
+[[profile.default.overrides]]
+# `test()` matches the test NAME, never the `binary-id name` pair nextest
+# prints — `test(=shux::bin/shux::tests::foo)` is not a stricter version of
+# `test(=tests::foo)`, it is a filter that matches nothing, and a group whose
+# filter matches nothing silently applies to nobody. Membership is asserted by
+# `make check-test-groups`, which fails on an empty group for exactly that
+# reason. Scope by binary first, then by name.
+filter = '''
+    (binary_id(=shux::bin/shux) & (
+        test(=tests::production_unconfirmed_kill_preserves_registry_row)
+      + test(=tests::production_lens_run_dropped_mid_core_leaves_no_orphan)
+    ))
+  + binary_id(=shux::scratch_reap_order)
+  + (binary_id(=shux-plugin::plugin_lifecycle) & (
+        test(=a_killed_plugin_takes_its_whole_process_tree_with_it)
+      + test(=install_times_out_on_silent_plugin)
+    ))
+'''
+test-group = 'process-table'
+
+# Everything that drives a real daemon and/or a real PTY.
+#
+# `shux::scratch_reap_order` belongs here by nature but is claimed by
+# `process-table` above, which is strictly tighter (1 thread, not 12). Listing it
+# in both would be harmless-looking and wrong: the first match wins, so the
+# second listing would be inert documentation.
+[[profile.default.overrides]]
+filter = '''
+    binary_id(=shux::checkpoint_invalidation_gating)
+  + binary_id(=shux::cli_integration)
+  + binary_id(=shux::daemon_lifecycle_integration)
+  + binary_id(=shux::decaln_pane_e2e)
+  + binary_id(=shux::diff_concurrent_readers)
+  + binary_id(=shux::diff_default_colors)
+  + binary_id(=shux::diff_heat_budget)
+  + binary_id(=shux::diff_palette_isolation)
+  + binary_id(=shux::id_prefix_resolution)
+  + binary_id(=shux::m0_integration)
+  + binary_id(=shux::pane_io_integration)
+  + binary_id(=shux::rep_pane_e2e)
+  + binary_id(=shux::settle_waiter_drop)
+  + binary_id(=shux::statusbar_starship_symlink)
+  + binary_id(=shux::window_snapshot_oversize)
+  + binary_id(=shux::window_title_escape_injection)
+  + binary_id(=shux-pty::integration)
+'''
+test-group = 'daemon-pty'
+
+# Tests whose assertion is a wall-clock measurement.
+#
+# Deliberately enumerated one by one rather than matched by a `_cost_` name
+# pattern: most of the other `*_cost_*` tests in `shux-vt` count allocations,
+# not nanoseconds, and those are perfectly happy in parallel. Sweeping them in
+# by name would throttle a dozen tests to buy safety for one.
+#
+# `threads-required`, not just the group, is what actually isolates it. A group
+# with `max-threads = 1` serializes members against EACH OTHER and nothing
+# else — with one member that is a no-op, and the test goes on competing with
+# the ~1,900 tests outside the group. Measured: it read 8.1x at one thread per
+# core and 30.8x at four, against a 12x threshold, purely from contention.
+# `threads-required = "num-test-threads"` reserves the whole run's budget, so
+# it is the only thing on the machine while it measures.
+[[profile.default.overrides]]
+filter = '''
+  binary_id(=shux-vt::scroll_region_bounds) & test(=region_scroll_cost_is_linear_in_pane_height)
+'''
+test-group = 'wall-clock'
+threads-required = "num-test-threads"
+
 # Override: tests with known external timing dependencies (PTY
 # spawn jitter, TCP bind→drop→re-bind TOCTOU race) get up to 2
 # retries (3 total attempts). If a test in this list flakes more
@@ -32,3 +187,17 @@ fail-fast = false
 [[profile.default.overrides]]
 filter = "test(test_spawn_echo) | test(test_m0_pty_spawn_echo) | test(test_tcp_auth_required)"
 retries = 2
+
+# ── CI profile ────────────────────────────────────────────────────────────
+# Same scheduling as local; only the reporting differs. Keeping the groups
+# shared is the point — a CI-only relaxation would put the divergence this
+# config exists to remove straight back in.
+[profile.ci]
+retries = 0
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "retry"
+final-status-level = "slow"
+
+[profile.ci.junit]
+path = "junit.xml"

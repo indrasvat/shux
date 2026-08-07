@@ -1245,6 +1245,7 @@ version = "0.46.10"
 dependencies = [
  "anyhow",
  "chrono",
+ "nix",
  "notify",
  "serde",
  "serde_json",

@@ -20,5 +20,10 @@ toml = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 
+# Process-group signalling. A plugin is a process TREE, and `Child::kill`
+# only ever reaches its root — see `kill_plugin_tree` in src/lib.rs.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

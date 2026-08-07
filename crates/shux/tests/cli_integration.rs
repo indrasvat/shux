@@ -746,8 +746,71 @@ async fn test_cli_api_raw_against_server() {
 // Smoke tests (no daemon needed) — use binary path from env
 // ══════════════════════════════════════════════════════════════
 
-fn shux_bin() -> std::process::Command {
-    std::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+/// The real binary, pointed at a sandbox instead of at the developer.
+///
+/// These are the "no daemon needed" smoke cases, but "needed" is not the same
+/// as "reachable": anything that gets past clap into dispatch will happily
+/// auto-start a daemon, and with an inherited environment that daemon lands in
+/// the *operator's* real `XDG_RUNTIME_DIR`, next to the sessions they are
+/// actually using — while also reading their real `~/.config/shux/config.toml`,
+/// so a local config could decide whether the assertion holds.
+///
+/// Every spawn therefore gets a per-binary sandbox for the three roots shux
+/// resolves state from, and `SHUX_SOCKET` is cleared so an exported one cannot
+/// redirect the test back out of it. This is what makes the suite safe to run
+/// beside anything else; it was never actually safe serially either, it just
+/// had less company.
+/// A `Command` that owns the sandbox it points at.
+///
+/// The sandbox is a real `TempDir` held BY VALUE here, so it is removed when the
+/// command is done with. The obvious alternative — a `static OnceLock<TempDir>`
+/// shared by the whole test binary — does not work, and it fails in a way that
+/// reads as working: **Rust never runs destructors on statics**, so the
+/// `TempDir` is never dropped and every test process leaves a `shux-cli*`
+/// directory in `/tmp` for good. Wrapping the cleanup in a second static with a
+/// `Drop` impl does not help either; that static is never dropped for exactly
+/// the same reason. (Both were written here before this comment was.)
+///
+/// Every call site is a single `shux_bin().…().output()` expression, so the
+/// temporary lives to the end of the statement — the child has run and been
+/// waited on before the sandbox goes away.
+struct Sandboxed {
+    cmd: std::process::Command,
+    _root: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Sandboxed {
+    type Target = std::process::Command;
+    fn deref(&self) -> &Self::Target {
+        &self.cmd
+    }
+}
+
+impl std::ops::DerefMut for Sandboxed {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cmd
+    }
+}
+
+/// A sandbox directory, for tests that need to name a path inside one.
+fn sandbox_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        // Unix socket paths cap out near 104 bytes, so the prefix stays short:
+        // a long one truncates the daemon socket and the failure reads as a
+        // hang rather than a name-too-long error.
+        .prefix("shux-cli")
+        .tempdir()
+        .expect("sandbox tempdir")
+}
+
+fn shux_bin() -> Sandboxed {
+    let root = sandbox_dir();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_shux"));
+    cmd.env("XDG_RUNTIME_DIR", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .env("XDG_STATE_HOME", root.path())
+        .env_remove("SHUX_SOCKET");
+    Sandboxed { cmd, _root: root }
 }
 
 #[test]
@@ -990,13 +1053,10 @@ this is not valid toml
 
 #[test]
 fn test_cli_config_validate_missing_file() {
+    let dir = sandbox_dir();
+    let missing = dir.path().join("nonexistent-validate.toml");
     let output = shux_bin()
-        .args([
-            "config",
-            "validate",
-            "--config",
-            "/tmp/nonexistent-shux-validate-xyz.toml",
-        ])
+        .args(["config", "validate", "--config", missing.to_str().unwrap()])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1006,9 +1066,11 @@ fn test_cli_config_validate_missing_file() {
 
 #[test]
 fn test_cli_version_without_daemon() {
+    let dir = sandbox_dir();
+    let missing = dir.path().join("nonexistent.sock");
     let output = shux_bin()
         .arg("version")
-        .env("SHUX_SOCKET", "/tmp/nonexistent-shux-cli-test.sock")
+        .env("SHUX_SOCKET", missing.to_str().unwrap())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1019,9 +1081,11 @@ fn test_cli_version_without_daemon() {
 
 #[test]
 fn test_cli_version_json_without_daemon() {
+    let dir = sandbox_dir();
+    let missing = dir.path().join("nonexistent.sock");
     let output = shux_bin()
         .args(["--format", "json", "version"])
-        .env("SHUX_SOCKET", "/tmp/nonexistent-shux-cli-test.sock")
+        .env("SHUX_SOCKET", missing.to_str().unwrap())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

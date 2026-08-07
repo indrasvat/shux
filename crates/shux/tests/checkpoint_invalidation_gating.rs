@@ -41,6 +41,42 @@ fn checkpoint(h: &Harness, pane: &str, ctx: &str) -> u64 {
         .expect("checkpoint revision")
 }
 
+/// Wait until a keystroke sent to `pane` has actually reached the screen, then
+/// wait for the pane to go quiet.
+///
+/// Settling alone is not enough and the failure is silent. `pane.wait_settled`
+/// answers "has this pane stopped writing" — and a pane that has not yet STARTED
+/// writing is, by that measure, perfectly settled. Sending `a` and settling
+/// immediately can therefore return before the byte has been through the PTY at
+/// all, and the diff that follows reports `cells_changed: 0` and blames the
+/// checkpoint. Observed once in 36 full-suite runs.
+///
+/// So: require the content first (the revision has moved past the checkpoint),
+/// then require the stillness. This is the house rule from CLAUDE.md, applied
+/// to an input rather than to an app's startup.
+fn settle_after_input(h: &Harness, pane: &str, since_revision: u64, ctx: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let changed = h
+            .rpc_raw(
+                "pane.diff_since",
+                serde_json::json!({ "pane_id": pane, "since_revision": since_revision }),
+            )
+            .result
+            .and_then(|d| d["cells_changed"].as_u64())
+            .unwrap_or(0);
+        if changed > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{ctx}: the pane never rendered the input at all"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    settle(h, pane, ctx);
+}
+
 fn settle(h: &Harness, pane: &str, ctx: &str) {
     let env = h.rpc_raw(
         "pane.wait_settled",
@@ -112,7 +148,7 @@ fn same_size_set_size_preserves_checkpoints() {
 
     // And the checkpoint still yields an exact delta for a real change.
     h.send_raw(&f.pane_id, "a");
-    settle(&h, &f.pane_id, "settle after a");
+    settle_after_input(&h, &f.pane_id, r, "settle after a");
     let d = h
         .rpc_raw(
             "pane.diff_since",
