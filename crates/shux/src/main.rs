@@ -2239,6 +2239,26 @@ fn register_state_methods(
                         shux_rpc::RpcError::invalid_params(&format!("ops parse error: {e}"))
                     })?;
 
+                // serde proves each command is a `Vec<String>`; it does not
+                // prove the strings can reach `execve`. `[""]` and a NUL-bearing
+                // argument used to commit the whole batch and then leave a pane
+                // that never spawned — reported as one line of `spawn_results`
+                // among many, with the session, window and dead pane kept
+                // (issue #125 follow-up). Rejected up front, before anything is
+                // committed.
+                for (i, op) in ops.iter().enumerate() {
+                    let (argv, field) = match op {
+                        shux_core::apply::Op::CreateSession {
+                            initial_command, ..
+                        }
+                        | shux_core::apply::Op::CreateWindow {
+                            initial_command, ..
+                        } => (initial_command, "initial_command"),
+                        shux_core::apply::Op::SplitPane { command, .. } => (command, "command"),
+                    };
+                    pane_command::validate_argv(argv, &format!("ops[{i}].{field}"))?;
+                }
+
                 // Run the staged transaction through the single-writer task.
                 let mut result = gh.apply_batch(ops).await.map_err(batch_error_to_rpc)?;
 
@@ -2884,7 +2904,12 @@ fn register_pane_methods(
                     .await
                     .map_err(graph_error_to_rpc)?;
 
-                let _ = spawn_pane_pty(
+                // A PTY that never started is not a pane. Discarding this
+                // error left a phantom in the graph — `pane list` showed it
+                // with `exit_status: null`, every later verb answered "pane VT
+                // not found", and the RPC had already returned success
+                // (issue #125 follow-up).
+                if let Err(e) = spawn_pane_pty(
                     new_pane_id,
                     cwd,
                     command,
@@ -2895,7 +2920,11 @@ fn register_pane_methods(
                     ct,
                     gh.clone(),
                 )
-                .await;
+                .await
+                {
+                    let _ = gh.destroy_pane(new_pane_id, None).await;
+                    return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
+                }
 
                 let snap = gh.snapshot();
                 let new_pane = snap
@@ -3840,8 +3869,11 @@ fn register_window_methods(
                     let is_active = session.active_window == window_id;
                     let pane_id = window.active_pane.to_string();
 
-                    // Spawn PTY for the new pane
-                    let _ = spawn_pane_pty(
+                    // Spawn PTY for the new pane. A window whose only pane
+                    // never started is not a window — surface the failure and
+                    // undo the create rather than returning success on a
+                    // phantom (issue #125 follow-up).
+                    if let Err(e) = spawn_pane_pty(
                         window.active_pane,
                         cwd,
                         command,
@@ -3852,7 +3884,11 @@ fn register_window_methods(
                         ct,
                         gh.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        let _ = gh.destroy_window(window_id, None).await;
+                        return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
+                    }
 
                     let mut result = window_to_json(window, index, is_active, &snap);
                     // Include pane_id at top level for convenience
@@ -3913,6 +3949,14 @@ fn register_window_methods(
                         })?
                         .to_string();
 
+                    // Validate BEFORE the already-exists shortcut. Parsing after
+                    // it made `window.ensure` the one spawning RPC that accepted
+                    // `{"command": 42}` without complaint whenever the window
+                    // happened to exist — the same input it rejects when the
+                    // window does not (issue #125 follow-up). `session.ensure`
+                    // has always parsed first; this matches it.
+                    let command = pane_command::parse_pane_command(&params)?;
+
                     // Check if window with this name already exists
                     let snap = gh.snapshot();
                     if let Some(w) = snap.find_window_by_name(&session_id, &name) {
@@ -3937,7 +3981,6 @@ fn register_window_methods(
                         .unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                         });
-                    let command = pane_command::parse_pane_command(&params)?;
                     let window_id = gh
                         .create_window_with_command(session_id, name, cwd.clone(), command.clone())
                         .await
@@ -3949,8 +3992,11 @@ fn register_window_methods(
                         .get(&window_id)
                         .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
 
-                    // Spawn PTY for the new pane
-                    let _ = spawn_pane_pty(
+                    // Spawn PTY for the new pane. A window whose only pane
+                    // never started is not a window — surface the failure and
+                    // undo the create rather than returning success on a
+                    // phantom (issue #125 follow-up).
+                    if let Err(e) = spawn_pane_pty(
                         window.active_pane,
                         cwd,
                         command,
@@ -3961,7 +4007,11 @@ fn register_window_methods(
                         ct,
                         gh.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        let _ = gh.destroy_window(window_id, None).await;
+                        return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
+                    }
 
                     let session = snap
                         .sessions
@@ -4292,12 +4342,15 @@ fn register_session_methods(
                             });
 
                             let snap = gh.snapshot();
-                            // Spawn PTY for the initial pane
+                            // Spawn PTY for the initial pane. A session whose
+                            // only pane never started is not a session — the
+                            // CLI printed "✓ Created session" over a phantom
+                            // that answered "pane VT not found" to everything
+                            // afterwards (issue #125 follow-up).
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 if let Some(wid) = s.windows.first()
                                     && let Some(w) = snap.windows.get(wid)
-                                {
-                                    let _ = spawn_pane_pty(
+                                    && let Err(e) = spawn_pane_pty(
                                         w.active_pane,
                                         cwd,
                                         command.clone(),
@@ -4308,7 +4361,11 @@ fn register_session_methods(
                                         ct,
                                         gh.clone(),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    let _ = gh.destroy_session(session_id, None).await;
+                                    meta.remove(session_id).await;
+                                    return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
                                 }
                                 Ok(session_to_json(s, &snap))
                             } else {
@@ -4480,12 +4537,13 @@ fn register_session_methods(
                             });
 
                             let snap = gh.snapshot();
-                            // Spawn PTY for the initial pane
+                            // Spawn PTY for the initial pane. Same contract as
+                            // session.create: a failed spawn is an error, not a
+                            // session (issue #125 follow-up).
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 if let Some(wid) = s.windows.first()
                                     && let Some(w) = snap.windows.get(wid)
-                                {
-                                    let _ = spawn_pane_pty(
+                                    && let Err(e) = spawn_pane_pty(
                                         w.active_pane,
                                         cwd,
                                         command.clone(),
@@ -4496,7 +4554,11 @@ fn register_session_methods(
                                         ct,
                                         gh.clone(),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    let _ = gh.destroy_session(session_id, None).await;
+                                    meta.remove(session_id).await;
+                                    return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
                                 }
                                 let mut json = session_to_json(s, &snap);
                                 json["created"] = serde_json::Value::Bool(true);
@@ -7225,6 +7287,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     pane,
                     direction,
                     ratio,
+                    cmd,
+                    argv,
                 } => {
                     cli::handle_pane_split(
                         &mut stream,
@@ -7233,6 +7297,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         pane.as_deref(),
                         direction.as_deref(),
                         ratio,
+                        cmd,
+                        argv,
                         args.format,
                     )
                     .await

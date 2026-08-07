@@ -408,61 +408,95 @@ fn is_shell_command_flag(flag: &str) -> bool {
         && letters.chars().all(|c| matches!(c, 'c' | 'l' | 'i'))
 }
 
-/// The first word of a shell script that names a program to run, or `None` when
-/// the script does not start with one.
+/// The first word of a shell script that names the program it runs, or `None`
+/// when the script does not start with one.
+///
+/// Only the script's **first simple command** is considered — everything up to
+/// the first shell operator. Reading past one is how `A=1;htop -d 10` produced
+/// the title `-d`: the leading token is a complete assignment, and the scanner
+/// walked on into a *flag* belonging to a command it never established.
 fn script_leading_word(script: &str) -> Option<&str> {
-    for token in script.split_whitespace() {
-        if token == "exec" || is_env_assignment(token) {
+    let segment = script.split(is_shell_operator).next()?;
+    for token in segment.split_whitespace() {
+        // `exec top` and `time make` run `top` and `make`.
+        if token == "exec" || token == "time" || is_env_assignment(token) {
             continue;
         }
-        if token.chars().any(is_shell_syntax) {
+        // `for`, `if`, `while` … introduce a compound command. There is no
+        // single program to name, and naming the loop variable would be worse
+        // than saying nothing.
+        if is_shell_keyword(token) || token.chars().any(is_shell_syntax) {
             return None;
         }
         let name = basename(token);
-        return (!name.is_empty()).then_some(name);
+        // A bare number is a file descriptor (`2>&1 make`), never a program.
+        if name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        return Some(name);
     }
     None
 }
 
+/// Characters that end a simple command. Splitting on these first is what keeps
+/// `ls|wc` readable as `ls` while `(cd x && make)` correctly yields nothing.
+fn is_shell_operator(c: char) -> bool {
+    matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`' | '\n')
+}
+
+/// Reserved words that open a compound command.
+fn is_shell_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "in"
+            | "select"
+            | "function"
+            | "coproc"
+            | "{"
+            | "}"
+            | "[["
+            | "]]"
+    )
+}
+
 /// `NAME=value` in the leading position — a per-command environment override,
 /// not the program.
+///
+/// The **value** is checked too. `A=1;htop` reaches here only if the operator
+/// split above missed it, and a value carrying `$`, a quote or a glob is not a
+/// plain assignment this code can reason about.
 fn is_env_assignment(token: &str) -> bool {
-    let Some((name, _)) = token.split_once('=') else {
+    let Some((name, value)) = token.split_once('=') else {
         return false;
     };
-    !name.is_empty()
+    let name_ok = !name.is_empty()
         && name
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    // '=' is itself in `is_shell_syntax`; `A=b=c` is a legal assignment.
+    name_ok && !value.chars().any(|c| c != '=' && is_shell_syntax(c))
 }
 
-/// Characters that mean the token is shell syntax rather than a program name.
+/// Characters that mean a token is shell syntax rather than a program name.
+/// The command *operators* are not here — [`is_shell_operator`] has already
+/// removed them by the time a token is examined.
 fn is_shell_syntax(c: char) -> bool {
     matches!(
         c,
-        '|' | '&'
-            | ';'
-            | '<'
-            | '>'
-            | '('
-            | ')'
-            | '$'
-            | '`'
-            | '\\'
-            | '"'
-            | '\''
-            | '*'
-            | '?'
-            | '['
-            | ']'
-            | '{'
-            | '}'
-            | '~'
-            | '#'
-            | '!'
-            | '='
+        '$' | '\\' | '"' | '\'' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '#' | '!' | '='
     )
 }
 
@@ -724,18 +758,59 @@ mod tests {
 
     #[test]
     fn shell_wrapper_falls_back_to_the_shell_when_the_script_is_not_a_plain_command() {
-        // A subshell, a redirection, a variable, a loop: no honest short name.
+        // A subshell, a redirection, a variable: no honest short name.
         assert_eq!(title_of(&["sh", "-c", "(cd x && make)"]), "sh");
         assert_eq!(title_of(&["bash", "-c", "> log 2>&1 make"]), "bash");
         assert_eq!(title_of(&["sh", "-c", "$EDITOR notes"]), "sh");
-        assert_eq!(
-            title_of(&["sh", "-c", "for i in 1 2; do echo $i; done"]),
-            "for"
-        );
         assert_eq!(title_of(&["sh", "-c", "   "]), "sh");
         assert_eq!(title_of(&["sh", "-c", ""]), "sh");
         // Only assignments, no command.
         assert_eq!(title_of(&["sh", "-c", "FOO=1"]), "sh");
+        // A leading file descriptor is not a program.
+        assert_eq!(title_of(&["sh", "-c", "2>&1 make"]), "sh");
+    }
+
+    /// A compound command has no single program to name. Naming the loop
+    /// variable or the branch keyword would be worse than saying nothing.
+    #[test]
+    fn shell_keywords_are_not_titles() {
+        assert_eq!(
+            title_of(&["sh", "-c", "for i in 1 2; do echo $i; done"]),
+            "sh"
+        );
+        assert_eq!(title_of(&["sh", "-c", "if true; then htop; fi"]), "sh");
+        assert_eq!(
+            title_of(&["bash", "-c", "while true; do htop; done"]),
+            "bash"
+        );
+        assert_eq!(title_of(&["sh", "-c", "until false; do :; done"]), "sh");
+        assert_eq!(title_of(&["sh", "-c", "case $x in a) :; esac"]), "sh");
+        assert_eq!(title_of(&["bash", "-c", "{ htop; }"]), "bash");
+    }
+
+    /// Only the FIRST simple command is read. Walking past a complete leading
+    /// assignment is how `A=1;htop -d 10` came out titled `-d` — a flag
+    /// belonging to a command the scanner never established.
+    #[test]
+    fn only_the_first_simple_command_is_considered() {
+        assert_eq!(title_of(&["bash", "-c", "A=1;htop -d 10"]), "bash");
+        assert_eq!(title_of(&["bash", "-c", "A=1;htop"]), "bash");
+        assert_eq!(title_of(&["bash", "-c", "cd /x && make"]), "cd");
+        assert_eq!(title_of(&["bash", "-c", "make; htop"]), "make");
+    }
+
+    /// Spacing around an operator must not change the answer.
+    #[test]
+    fn an_operator_without_surrounding_spaces_still_ends_the_command() {
+        assert_eq!(title_of(&["bash", "-c", "ls|wc"]), "ls");
+        assert_eq!(title_of(&["bash", "-c", "ls | wc"]), "ls");
+        assert_eq!(title_of(&["bash", "-c", "make&&test"]), "make");
+        assert_eq!(title_of(&["bash", "-c", "npm run dev>log"]), "npm");
+    }
+
+    #[test]
+    fn time_is_skipped_like_exec() {
+        assert_eq!(title_of(&["sh", "-c", "time make -j4"]), "make");
     }
 
     #[test]

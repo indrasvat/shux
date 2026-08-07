@@ -26,13 +26,26 @@
 //! | anything else | [`RpcError::invalid_params`] naming what was wrong |
 //!
 //! The string form uses `$SHELL` because that is the shell a pane opened by hand
-//! already runs (`PtyConfig::resolve_command` spawns `$SHELL -l -i`); a `--cmd` line
-//! therefore behaves the way the identical line behaves when typed into a pane.
+//! already runs (`PtyConfig::resolve_command` spawns `$SHELL -l -i`), so a `--cmd`
+//! line gets the same *language* — bash syntax under bash, fish syntax under fish.
+//!
+//! It is `-c`, not `-l -c` or `-i -c`, which is what tmux's `new-session
+//! <shell-command>` does and what `system(3)` does. That means **no startup files
+//! are read**: a shell function or alias defined in `~/.bashrc`, and a `PATH` entry
+//! added there, are not visible to a `--cmd` string. Interactive startup would drag
+//! in job control, prompt setup and `$-`-conditional rc branches, none of which a
+//! one-shot command wants. Callers that need their rc file can ask for it:
+//! `-- bash -lic "…"`.
 
 use shux_rpc::RpcError;
 
 /// Fallback when `$SHELL` is unset or blank. POSIX guarantees this path.
 const FALLBACK_SHELL: &str = "/bin/sh";
+
+/// Longest single argument the kernel will accept (`MAX_ARG_STRLEN` on Linux —
+/// `PAGE_SIZE * 32`). Past this, `execve` fails with `E2BIG` and the pane never
+/// spawns; caught here so the caller gets a parameter error naming the field.
+const MAX_ARG_BYTES: usize = 128 * 1024;
 
 /// The shell that interprets a string-form `command`.
 ///
@@ -71,7 +84,7 @@ pub(crate) fn parse_pane_command_with_shell(
             if s.trim().is_empty() {
                 return Ok(Vec::new());
             }
-            reject_nul(s, "'command'")?;
+            reject_unexecutable(s, "'command'")?;
             Ok(vec![shell.to_string(), "-c".to_string(), s.clone()])
         }
 
@@ -87,14 +100,16 @@ pub(crate) fn parse_pane_command_with_shell(
                         describe(item)
                     )));
                 };
-                reject_nul(s, &format!("'command[{i}]'"))?;
+                reject_unexecutable(s, &format!("'command[{i}]'"))?;
                 argv.push(s.to_string());
             }
-            // `[""]` execs the empty program name: the pane dies instantly with an
-            // error that names neither the pane nor the cause.
-            if argv.first().is_some_and(|p| p.is_empty()) {
+            // `[""]` and `["   "]` both exec a program name that cannot resolve:
+            // the pane dies instantly with an error naming neither the pane nor
+            // the cause. Blank is checked with `trim`, matching how the string
+            // form treats a blank command.
+            if argv.first().is_some_and(|p| p.trim().is_empty()) {
                 return Err(RpcError::invalid_params(
-                    "'command[0]' is empty — argv[0] must name a program to execute",
+                    "'command[0]' is blank — argv[0] must name a program to execute",
                 ));
             }
             Ok(argv)
@@ -108,12 +123,38 @@ pub(crate) fn parse_pane_command_with_shell(
     }
 }
 
-/// A NUL cannot survive the `CString` conversion `execvp` needs. Caught here so the
-/// caller gets a parameter error instead of a pane that fails to spawn.
-fn reject_nul(s: &str, what: &str) -> Result<(), RpcError> {
+/// Validate an argv that did NOT come through [`parse_pane_command`].
+///
+/// `state.apply` takes its ops as typed structs, so serde already guarantees
+/// `Vec<String>` and the JSON-shape errors above cannot arise. What serde does
+/// not check is whether the strings can actually reach `execve`: `[""]` and a
+/// NUL-bearing argument both commit a session, a window and a pane whose PTY
+/// then fails to spawn — the exact outcomes this module exists to turn into
+/// parameter errors (issue #125 follow-up).
+pub(crate) fn validate_argv(argv: &[String], what: &str) -> Result<(), RpcError> {
+    for (i, arg) in argv.iter().enumerate() {
+        reject_unexecutable(arg, &format!("{what}[{i}]"))?;
+    }
+    if argv.first().is_some_and(|p| p.trim().is_empty()) {
+        return Err(RpcError::invalid_params(&format!(
+            "{what}[0] is blank — argv[0] must name a program to execute"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject the two strings `execve` cannot carry, so the caller gets a parameter
+/// error instead of a pane that silently fails to spawn.
+fn reject_unexecutable(s: &str, what: &str) -> Result<(), RpcError> {
     if s.contains('\0') {
         return Err(RpcError::invalid_params(&format!(
             "{what} contains a NUL byte, which cannot be passed to a program"
+        )));
+    }
+    if s.len() > MAX_ARG_BYTES {
+        return Err(RpcError::invalid_params(&format!(
+            "{what} is {} bytes; a single argument cannot exceed {MAX_ARG_BYTES}",
+            s.len()
         )));
     }
     Ok(())
@@ -240,9 +281,29 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_program_name_is_rejected() {
-        let err = parse(json!([""])).unwrap_err();
-        assert!(format!("{err:?}").contains("command[0]"));
+    fn a_blank_program_name_is_rejected() {
+        for blank in [json!([""]), json!(["   "]), json!(["\t"])] {
+            let err = parse(blank.clone()).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("command[0]"),
+                "{blank} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_argument_too_long_for_execve_is_rejected() {
+        let huge = "x".repeat(MAX_ARG_BYTES + 1);
+        let err = parse(json!(huge)).unwrap_err();
+        assert!(format!("{err:?}").contains("cannot exceed"), "{err:?}");
+
+        let err = parse(json!(["echo", huge])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("command[1]"), "{msg}");
+
+        // Exactly at the limit is fine.
+        let ok = "x".repeat(MAX_ARG_BYTES);
+        assert!(parse(json!(["echo", ok])).is_ok());
     }
 
     #[test]
@@ -285,6 +346,24 @@ mod tests {
     #[test]
     fn interpreting_shell_is_absolute_or_a_name_never_empty() {
         assert!(!interpreting_shell().trim().is_empty());
+    }
+
+    // ── validate_argv, the `state.apply` entry point ────────────────────
+
+    #[test]
+    fn validate_argv_rejects_what_execve_cannot_carry() {
+        assert!(validate_argv(&[], "op[0].command").is_ok());
+        assert!(validate_argv(&["vim".into()], "op[0].command").is_ok());
+
+        let err = validate_argv(&["".into()], "op[0].command").unwrap_err();
+        assert!(format!("{err:?}").contains("op[0].command[0]"), "{err:?}");
+
+        let err = validate_argv(&["   ".into()], "op[0].command").unwrap_err();
+        assert!(format!("{err:?}").contains("blank"), "{err:?}");
+
+        let err = validate_argv(&["echo".into(), "a\u{0}b".into()], "c").unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("NUL") && msg.contains("c[1]"), "{msg}");
     }
 
     #[test]

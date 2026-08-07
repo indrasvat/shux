@@ -683,3 +683,296 @@ fn a_failing_shell_command_ends_the_pane_without_wedging_the_daemon() {
     }
     panic!("daemon stopped answering after a --cmd pane exited non-zero");
 }
+
+// ── follow-ups found by adversarial review ──────────────────────────────
+//
+// Every case below was a live defect on the first cut of the fix (or a
+// pre-existing one the fix made newly reachable), reproduced against the real
+// binary before it was fixed.
+
+/// `session.ensure` parsed `command` before its already-exists shortcut;
+/// `window.ensure` parsed it after. So `window.ensure` accepted every
+/// malformed shape without complaint — but only when the window happened to
+/// exist, which is the case the verb is named for.
+#[test]
+fn window_ensure_validates_command_even_when_the_window_already_exists() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "ens", "-d"]);
+    env.sessions.push("ens".to_string());
+    let sid = env.json(&["session", "list"])["sessions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["window", "create", "-s", "ens", "-n", "already"]);
+
+    for bad in ["42", "true", r#"{"a":1}"#, r#"["vim",null]"#, r#"[""]"#] {
+        let params = format!(r#"{{"session_id":"{sid}","name":"already","command":{bad}}}"#);
+        let msg = env.rpc_rejected("window.ensure", &params);
+        assert!(msg.to_lowercase().contains("command"), "{bad}: {msg}");
+    }
+}
+
+/// `[""]` was rejected but `["   "]` was not, and both exec a program name
+/// that cannot resolve.
+#[test]
+fn a_blank_program_name_is_rejected_not_just_an_empty_one() {
+    let env = Env::new();
+    for bad in [r#"[""]"#, r#"["   "]"#, r#"["\t"]"#] {
+        let msg = env.rpc_rejected(
+            "session.create",
+            &format!(r#"{{"name":"blank","command":{bad}}}"#),
+        );
+        assert!(msg.contains("command[0]"), "{bad}: {msg}");
+    }
+    let v = env.json(&["session", "list"]);
+    assert!(v["sessions"].as_array().map(Vec::is_empty).unwrap_or(true));
+}
+
+/// An argument too long for `execve` was accepted and then failed silently.
+///
+/// Sent via `--params @FILE`, not inline: 128 KiB on a command line is itself
+/// past `MAX_ARG_STRLEN`, so an inline attempt fails inside `shux`'s own exec
+/// and never reaches the daemon.
+#[test]
+fn an_argument_too_long_for_execve_is_rejected_up_front() {
+    let env = Env::new();
+    let huge = "x".repeat(128 * 1024 + 1);
+    let path = env.work().join("huge.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({"name": "big", "command": huge}).to_string(),
+    )
+    .unwrap();
+    let out = env.run(&[
+        "rpc",
+        "call",
+        "session.create",
+        "--params",
+        &format!("@{}", path.display()),
+        "--format",
+        "json",
+    ]);
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "oversize command accepted:\n{joined}"
+    );
+    assert!(joined.contains("cannot exceed"), "{joined}");
+}
+
+/// The headline follow-up: a PTY that never started is not a pane. The RPC
+/// returned success, the CLI printed "✓ Created session", and every later verb
+/// answered "pane VT not found" against a phantom.
+#[test]
+fn a_program_that_cannot_be_executed_is_an_error_not_a_phantom_session() {
+    let env = Env::new();
+    let out = env.run(&[
+        "session",
+        "create",
+        "ghost",
+        "-d",
+        "--",
+        "no-such-binary-xyz",
+    ]);
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "creating a session whose program does not exist reported success:\n{joined}"
+    );
+    assert!(
+        joined.contains("No such file") || joined.to_lowercase().contains("spawn"),
+        "error does not say what went wrong:\n{joined}"
+    );
+    // …and nothing was left behind.
+    let v = env.json(&["session", "list"]);
+    assert!(
+        v["sessions"].as_array().map(Vec::is_empty).unwrap_or(true),
+        "a failed create left a phantom session: {v}"
+    );
+}
+
+/// Same contract for the other three spawning verbs.
+#[test]
+fn a_failed_spawn_leaves_no_phantom_window_or_pane() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "host", "-d"]);
+    env.sessions.push("host".to_string());
+    let sid = env.json(&["session", "list"])["sessions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pane = env.first_pane("host");
+
+    let windows_before = env
+        .json(&["window", "list", "-s", "host"])
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let panes_before = env.panes("host", "0").len();
+
+    let bad = serde_json::json!(["no-such-binary-xyz"]);
+    for (method, extra) in [
+        (
+            "window.create",
+            serde_json::json!({"session_id": sid, "name": "ghostw"}),
+        ),
+        (
+            "window.ensure",
+            serde_json::json!({"session_id": sid, "name": "ghostw2"}),
+        ),
+        ("pane.split", serde_json::json!({"pane_id": pane})),
+    ] {
+        let mut params = extra.as_object().unwrap().clone();
+        params.insert("command".into(), bad.clone());
+        env.rpc_rejected(method, &serde_json::Value::Object(params).to_string());
+    }
+
+    assert_eq!(
+        env.json(&["window", "list", "-s", "host"])
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        windows_before,
+        "a failed window spawn left a window behind"
+    );
+    assert_eq!(
+        env.panes("host", "0").len(),
+        panes_before,
+        "a failed split left a pane behind"
+    );
+}
+
+/// `state.apply` is a sixth way to give a pane a command, and it took its ops
+/// as typed structs — so serde proved `Vec<String>` and nothing proved the
+/// strings could reach `execve`. `[""]` committed a session, a window and a
+/// pane whose PTY then failed to spawn.
+#[test]
+fn state_apply_rejects_an_argv_that_cannot_be_executed() {
+    let env = Env::new();
+    for bad in [r#"[""]"#, r#"["   "]"#] {
+        let params = format!(
+            r#"{{"ops":[{{"op":"create_session","name":"tpl","cwd":"/tmp","initial_command":{bad}}}]}}"#
+        );
+        let msg = env.rpc_rejected("state.apply", &params);
+        assert!(msg.contains("initial_command"), "{bad}: {msg}");
+    }
+    let v = env.json(&["session", "list"]);
+    assert!(
+        v["sessions"].as_array().map(Vec::is_empty).unwrap_or(true),
+        "a rejected apply still committed a session: {v}"
+    );
+}
+
+/// `pane.split` has accepted a `command` since it was written; the CLI had no
+/// way to say it, which broke "every subcommand is a thin JSON-RPC call".
+#[test]
+fn pane_split_cli_accepts_a_shell_command_and_trailing_argv() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "splitcli", "-d"]);
+    env.sessions.push("splitcli".to_string());
+    let first = env.first_pane("splitcli");
+
+    env.ok(&[
+        "pane",
+        "split",
+        "-s",
+        "splitcli",
+        "-p",
+        &first,
+        "-d",
+        "vertical",
+        "--cmd",
+        &format!("{}; echo 'split by cmd'{PARK}", probe()),
+    ]);
+    let panes = env.panes("splitcli", "0");
+    let split = panes
+        .iter()
+        .find(|(id, _)| *id != first)
+        .expect("split pane present");
+    env.expect_screen("splitcli", &split.0, "split by cmd", &["'split by cmd'"]);
+    assert_eq!(
+        split.1.first().map(String::as_str),
+        Some("/bin/sh"),
+        "{:?}",
+        split.1
+    );
+}
+
+/// A set-but-EMPTY `$SHELL` used to give a working `--cmd` pane and a DEAD
+/// default pane, from the same daemon: the string form treated blank as unset,
+/// `PtyConfig::resolve_command` did not, and `env::var` returns `Ok("")` rather
+/// than an error. Both paths now agree.
+#[test]
+fn a_blank_shell_env_still_opens_a_working_default_pane() {
+    let mut env = Env::new();
+    let out = env
+        .shux()
+        .env("SHELL", "")
+        .args(["session", "create", "blankshell", "-d"])
+        .output()
+        .expect("spawn shux");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    env.sessions.push("blankshell".to_string());
+
+    // The pane is genuinely alive: it answers a write.
+    let pane = env.first_pane("blankshell");
+    let out = env.run(&[
+        "pane",
+        "send-keys",
+        "-s",
+        "blankshell",
+        "-p",
+        &pane,
+        "-t",
+        "",
+    ]);
+    assert!(
+        out.status.success(),
+        "default pane was dead under a blank $SHELL: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--cmd` had no `allow_hyphen_values`, so a command starting with a
+/// flag-shaped word was refused outright — and clap's suggestion (`-- -n`)
+/// points at the argv form, which is a different execution model, silently.
+///
+/// The assertion is that the value ARRIVES verbatim; whether that particular
+/// script then succeeds is the shell's business, not the flag parser's.
+#[test]
+fn a_cmd_starting_with_a_hyphen_is_taken_as_the_command_not_a_flag() {
+    let mut env = Env::new();
+    let script = "-n never runs";
+    let out = env.run(&["session", "create", "hyphen", "-d", "--cmd", script]);
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !joined.contains("unexpected argument"),
+        "--cmd rejected a hyphen-leading command:\n{joined}"
+    );
+    assert!(out.status.success(), "{joined}");
+    env.sessions.push("hyphen".to_string());
+
+    let panes = env.panes("hyphen", "0");
+    assert_eq!(
+        panes[0].1.get(2).map(String::as_str),
+        Some(script),
+        "{:?}",
+        panes[0].1
+    );
+}

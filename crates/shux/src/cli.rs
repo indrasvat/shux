@@ -570,7 +570,12 @@ pub enum SessionCommand {
         /// Omitted or empty opens your login+interactive shell.
         /// For exec-style passthrough with no shell at all, use trailing
         /// `--` instead.
-        #[arg(long, value_name = "SHELL_COMMAND")]
+        ///
+        /// `allow_hyphen_values` so a command that starts with a flag-shaped
+        /// word (`--cmd "-n is a valid sed script"`) is taken as the value.
+        /// Without it clap suggests `-- -n`, which is the *argv* form — a
+        /// different execution model, silently.
+        #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
         cmd: Option<String>,
 
         /// Trailing argv after `--` — exec'd directly (no shell wrapper, no
@@ -976,7 +981,9 @@ pub enum WindowCommand {
         /// Empty / omitted spawns the user's login+interactive shell.
         /// For exec-style passthrough use trailing `--` instead:
         /// `shux window create -s X -n W -- vim foo.rs`.
-        #[arg(long, value_name = "SHELL_COMMAND")]
+        ///
+        /// `allow_hyphen_values` — see `shux session create --help`.
+        #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
         cmd: Option<String>,
 
         /// Create-if-missing semantics (maps to window.ensure)
@@ -1176,6 +1183,19 @@ pub enum PaneCommand {
         /// Split ratio (0.0-1.0, default 0.5)
         #[arg(short, long)]
         ratio: Option<f64>,
+
+        /// Shell command for the new pane, run by your shell (`$SHELL -c`,
+        /// falling back to `/bin/sh`) — pipes, `;`, `&&`, quoting, globs and
+        /// redirection all work. Omitted opens your login+interactive shell.
+        ///
+        /// `allow_hyphen_values` — see `shux session create --help`.
+        #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
+        cmd: Option<String>,
+
+        /// Trailing argv after `--` — exec'd directly (no shell wrapper, no
+        /// splitting, no expansion). Takes precedence over `--cmd`.
+        #[arg(last = true, num_args = 0..)]
+        argv: Vec<String>,
     },
 
     /// Focus a specific pane by id (full UUID or short form)
@@ -3925,6 +3945,7 @@ pub async fn handle_pane_list(
 }
 
 /// Handle the `shux pane split` command.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_split(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -3932,6 +3953,8 @@ pub async fn handle_pane_split(
     pane_spec: Option<&str>,
     direction: Option<&str>,
     ratio: Option<f64>,
+    cmd: Option<String>,
+    argv: Vec<String>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
@@ -3949,6 +3972,16 @@ pub async fn handle_pane_split(
     }
     if let Some(r) = ratio {
         params["ratio"] = serde_json::json!(r);
+    }
+    // Same two forms and the same precedence as `session create` /
+    // `window create`: trailing argv is exec'd, `--cmd` is a shell command.
+    // `pane.split` has always accepted `command`; only the CLI had no way to
+    // say it (issue #125 follow-up).
+    if !argv.is_empty() {
+        params["command"] =
+            serde_json::Value::Array(argv.into_iter().map(serde_json::Value::String).collect());
+    } else if let Some(c) = cmd {
+        params["command"] = serde_json::Value::String(c);
     }
 
     let result = rpc_call(stream, "pane.split", params).await?;
@@ -7519,6 +7552,8 @@ mod tests {
             Some(pane),
             Some("horizontal"),
             Some(0.4),
+            Some("echo split".to_string()),
+            Vec::new(),
             OutputFormat::Json,
         )
         .await
@@ -7620,6 +7655,11 @@ mod tests {
             .unwrap();
         assert_eq!(pane_split["params"]["direction"], "horizontal");
         assert_eq!(pane_split["params"]["ratio"], 0.4);
+        // `--cmd` reaches `pane.split` as a string, same as the other verbs.
+        assert_eq!(
+            pane_split["params"]["command"],
+            serde_json::json!("echo split")
+        );
         let pane_title = requests
             .iter()
             .find(|r| r["method"] == "pane.set_title")
