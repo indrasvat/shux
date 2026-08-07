@@ -1,0 +1,20 @@
+{
+  "actual": ".shux/qa/092-rep-data-stream-source/negative-control-base-80x24-actual.png",
+  "binary": "base@e856793",
+  "changed_pixels": 4810,
+  "diff": ".shux/qa/092-rep-data-stream-source/negative-control-base-80x24-diff.png",
+  "expected": ".shux/qa/092-rep-data-stream-source/negative-control-base-80x24-expected.png",
+  "expected_status": "fail",
+  "max_mean_channel_delta": 0.0,
+  "max_pixel_diff_ratio": 0.0,
+  "mean_rgba_channel_delta": 1.19393198708577,
+  "note": "NEGATIVE CONTROL, NOT A GATE FAILURE. The identical 80x24 scene shot through the PRE-FIX binary. status=fail is the PASS condition for this arm: it proves the comparator detects the real issue-122 defect (the REP arm loses its rule, its CJK run, its combining cluster, its line-drawing edge and its ZWJ run) rather than only injected noise. status=pass here would invalidate the three head-arm metrics. This file is deliberately NOT listed under pixel_metrics in the manifest.",
+  "pixel_diff_ratio": 0.014650341130604289,
+  "role": "negative-control",
+  "size": [
+    720,
+    456
+  ],
+  "status": "fail",
+  "total_pixels": 328320
+}

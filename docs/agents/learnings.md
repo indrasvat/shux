@@ -772,7 +772,7 @@ palette, restore the deliberate table/summary divergence).
   row to scroll blank lines in, which DECALN's cursor-home prevents. That second
   one is the standard to aim for.
 
-## 2026-08-07 — issue #120, entity id references (task 091)
+## 2026-08-07 — issue #120, entity id references (task 092)
 
 - **A one-way abbreviation is a bug even when both halves are correct.** Every
   listing printed the first 8 characters of an id; every id parameter demanded all

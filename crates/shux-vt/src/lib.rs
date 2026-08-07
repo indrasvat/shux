@@ -76,7 +76,7 @@ pub const SYNC_UPDATE_TIMEOUT_MS: u64 = 150;
 /// Alacritty's `SYNC_BUFFER_SIZE`.
 pub const SYNC_UPDATE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-use crate::parser::DcsState;
+use crate::parser::{DcsState, LastGraphic};
 
 /// Per-pane virtual terminal.
 ///
@@ -148,6 +148,11 @@ pub struct VirtualTerminal {
     sync_bytes: u64,
     /// Visible cell currently accepting zero-width/joined grapheme scalars.
     active_grapheme_cell: Option<(usize, usize)>,
+    /// The preceding character in the data stream, which is what REP (`CSI b`)
+    /// repeats (issue #122). Unlike `active_grapheme_cell` this is NOT a
+    /// position on the screen and survives everything that moves the cursor;
+    /// only RIS clears it.
+    last_graphic: Option<LastGraphic>,
     /// VT100 G0/G1 charset designations and active locking shift.
     charsets: TerminalCharsets,
     /// Mutable horizontal tab-stop state.
@@ -251,6 +256,7 @@ impl VirtualTerminal {
             sync_opened_ns: 0,
             sync_bytes: 0,
             active_grapheme_cell: None,
+            last_graphic: None,
             charsets: TerminalCharsets::default(),
             tab_stops: TabStops::new(cols),
             rows,
@@ -477,6 +483,7 @@ impl VirtualTerminal {
             frozen_alt: &mut self.frozen_alt,
             eager_sync_freeze: self.eager_sync_freeze,
             active_grapheme_cell: &mut self.active_grapheme_cell,
+            last_graphic: &mut self.last_graphic,
             charsets: &mut self.charsets,
             tab_stops: &mut self.tab_stops,
             responses: &mut responses,
@@ -2109,6 +2116,65 @@ mod tests {
             !rendered.contains("had "),
             "REP failed to clear stale prefix: {rendered:?}"
         );
+    }
+
+    /// REP's source is the data stream, not the screen (issue #122). Homing the
+    /// cursor puts it at column 0, where the old screen-derived source had
+    /// nothing to the left to read and dropped the repeat entirely.
+    #[test]
+    fn rep_repeats_across_a_cursor_move() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process(b"X\x1b[1;1H\x1b[3b");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "XXX");
+    }
+
+    /// The character is not on the screen any more. It is still the preceding
+    /// character in the stream.
+    #[test]
+    fn rep_repeats_a_character_that_has_been_erased() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process(b"Y\x1b[2J\x1b[1;1H\x1b[3b");
+
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "YYY");
+    }
+
+    /// Nothing has been printed, so there is no preceding character. REP must
+    /// not fall back to whatever the cursor is parked next to.
+    #[test]
+    fn rep_without_a_preceding_character_writes_nothing() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        let before = vt.grid().mutations();
+        vt.process(b"\x1b[9b");
+
+        assert_eq!(vt.grid().mutations(), before);
+        assert_eq!(vt.capture_text(Some(1)).trim_end(), "");
+    }
+
+    /// RIS ends the stream: a terminal that has just been switched on has no
+    /// preceding character.
+    #[test]
+    fn ris_clears_the_character_rep_would_repeat() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process(b"Z\x1bc");
+        let before = vt.grid().mutations();
+        vt.process(b"\x1b[4b");
+
+        assert_eq!(vt.grid().mutations(), before);
+    }
+
+    /// The pen belongs to the terminal, not to the remembered character, so the
+    /// repeats take the colour that is current at the `CSI b`. Reading the
+    /// source cell off the screen copied the original's colour with it.
+    #[test]
+    fn rep_paints_with_the_pen_current_at_the_sequence() {
+        let mut vt = VirtualTerminal::new(2, 10);
+        vt.process(b"\x1b[31mX\x1b[32m\x1b[2b");
+
+        let row = vt.grid().visible_row(0);
+        assert_eq!(row[0].style.fg, Color::Indexed(1));
+        assert_eq!(row[1].style.fg, Color::Indexed(2));
+        assert_eq!(row[2].style.fg, Color::Indexed(2));
     }
 
     #[test]

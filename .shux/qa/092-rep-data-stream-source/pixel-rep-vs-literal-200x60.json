@@ -1,0 +1,20 @@
+{
+  "actual": ".shux/qa/092-rep-data-stream-source/rep-oracle-200x60-actual.png",
+  "binary": "head@8f5ebf8",
+  "changed_pixels": 0,
+  "diff": ".shux/qa/092-rep-data-stream-source/rep-oracle-200x60-diff.png",
+  "expected": ".shux/qa/092-rep-data-stream-source/rep-oracle-200x60-expected.png",
+  "expected_status": "pass",
+  "max_mean_channel_delta": 0.0,
+  "max_pixel_diff_ratio": 0.0,
+  "mean_rgba_channel_delta": 0.0,
+  "note": "REP(n) arm vs the same stream with the character sent n more times, both shot through the SAME binary at 200x60. Exact equality is the specification's own oracle (ECMA-48 8.3.103), so the expected PNG is derived, not minted: 0 changed pixels is the pass condition.",
+  "pixel_diff_ratio": 0.0,
+  "role": "rep-vs-literal-oracle",
+  "size": [
+    1800,
+    1140
+  ],
+  "status": "pass",
+  "total_pixels": 2052000
+}

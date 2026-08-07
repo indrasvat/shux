@@ -16,7 +16,7 @@ synchronized-output lazy freeze) — the fill has to satisfy both
 **QA record:** `.shux/qa/090-decaln-screen-alignment/SOLID-QA.md` — `VERDICT: PASS`
 
 
-## Follow-up (2026-08-07, during task 091)
+## Follow-up (2026-08-07, during task 092)
 
 `decaln_pane_e2e`'s `wait_for` deadline was raised from 20s to 60s. It timed
 out in the `Coverage (llvm-cov)` job on PR #128 while the SAME test on the SAME
