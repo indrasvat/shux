@@ -11,7 +11,8 @@
 `.shux/scripts/issue_120_evidence.sh` (new),
 `Makefile` (`test-id-refs`, `test-id-refs-evidence`)
 **Adversarial review:** 4 parallel agents on disjoint surfaces, all driving the
-real binary — see "Found by adversarial review" below
+real binary, plus the PR's automated reviewer — see "Found by adversarial
+review" below
 
 ---
 
@@ -131,6 +132,19 @@ Every finding below was reproduced independently before being believed.
   message fix below stopped swallowing it.
 * **`lens run` printed two unlabelled ids.** Step one of the loop handed you
   `2686a718 eb9c6c3e` with no way to tell session from pane.
+* **`session attach <short id>` created a blank session named after the id.**
+  Found by the PR's automated reviewer. Worse than a rejection: `attach`
+  creates on a miss, so the id resolved to nothing, a fresh session called
+  `906230d8` appeared, and the session the operator meant sat untouched — while
+  the new `shux --help` section told them to type exactly that. The attach path
+  now resolves an id before it considers creating, refuses an ambiguous one,
+  and still creates for a genuinely new NAME.
+* **Plugin ownership checks used a strict parse.** `resolve_owners` runs
+  BEFORE the router handler, so a plugin addressing its own entity by short id
+  would fail the ownership lookup and be denied `NoGrantAndNotOwned` without
+  ever reaching the resolver. Latent rather than live — nothing yet writes
+  `created_by_plugin`, so the lookup returns `None` either way — and fixed
+  anyway, because the trap springs the moment ownership grants are wired.
 * Dead API removed (`resolve_window_ref_in_session`, `RefKind::param()` — the
   latter would have been *wrong* where used, since `window.rename` and friends
   take a parameter called `id`); a 32-hex string with misplaced hyphens is now

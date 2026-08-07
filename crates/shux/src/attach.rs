@@ -378,12 +378,12 @@ async fn resolve_or_create_session(
     let snap = graph.snapshot();
     let target_name = name.clone().unwrap_or_else(|| "default".to_string());
 
-    if let Some(sess) = snap.find_session_by_name(&target_name) {
+    let attached = |sess: &shux_core::model::Session| -> anyhow::Result<AttachedSession> {
         let win = snap
             .windows
             .get(&sess.active_window)
             .ok_or_else(|| anyhow::anyhow!("active window missing from snapshot"))?;
-        return Ok(AttachedSession {
+        Ok(AttachedSession {
             session_id: sess.id,
             name: sess.name.clone(),
             active_window_id: win.id,
@@ -397,7 +397,34 @@ async fn resolve_or_create_session(
             // time by reading the onboarding state file; this stays
             // true here so the render loop can flip it off after dwell.
             show_welcome_toast: true,
-        });
+        })
+    };
+
+    // An exact NAME first — unchanged, and it still beats a partial id.
+    if let Some(sess) = snap.find_session_by_name(&target_name) {
+        return attached(sess);
+    }
+
+    // Not a name. Before creating anything, try it as an ID — the short form
+    // every listing prints (issue #120). This branch matters more here than
+    // anywhere else: `attach` CREATES on a miss, so an unresolved id does not
+    // produce an error, it produces a blank session named after the id while
+    // the session the user meant sits untouched.
+    match snap.resolve_session_ref(&target_name) {
+        Ok(id) => {
+            if let Some(sess) = snap.sessions.get(&id) {
+                return attached(sess);
+            }
+            // A syntactically valid uuid that names nothing. Creating a session
+            // whose NAME is a uuid is almost certainly not what was meant.
+            anyhow::bail!("session '{}' not found", target_name.escape_debug());
+        }
+        Err(e @ shux_core::idref::RefError::Ambiguous { .. }) => {
+            anyhow::bail!("{e}");
+        }
+        // Malformed or unmatched prefix: it is just a name. Fall through and
+        // create it, which is what `attach` has always done.
+        Err(_) => {}
     }
 
     drop(snap);

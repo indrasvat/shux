@@ -977,3 +977,66 @@ fn a_failed_reference_names_what_was_missing() {
 
     h.kill_session(&f.session_id);
 }
+
+/// `session attach` resolves its argument like every other verb, and — this is
+/// the dangerous part — creates a session when it matches nothing. Feed it the
+/// short id `session list` prints and it must ATTACH, never mint a blank
+/// session named after the id.
+///
+/// Attaching needs a terminal, which the test harness has not got, so the
+/// attach itself fails at raw-mode setup. That is fine: the defect is what
+/// happens BEFORE that, and it is visible in `session list`.
+#[test]
+fn session_attach_resolves_an_id_instead_of_creating_a_session_named_after_it() {
+    let h = Harness::new();
+    let f = fixture(&h, "attach");
+
+    let before = h.rpc_ok("session.list", serde_json::json!({}));
+    let before_n = before["sessions"].as_array().expect("sessions").len();
+
+    // Fails on raw mode; we only care that it did not create anything.
+    let _ = h.cli(&["session", "attach", f.short_session()]);
+
+    let after = h.rpc_ok("session.list", serde_json::json!({}));
+    let names: Vec<String> = after["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == f.short_session()),
+        "`session attach <short id>` created a blank session NAMED after the \
+         id instead of attaching to it; sessions are now {names:?}"
+    );
+    assert_eq!(
+        after["sessions"].as_array().expect("sessions").len(),
+        before_n,
+        "`session attach <short id>` changed the session count"
+    );
+
+    // The same argument by full uuid must behave identically.
+    let _ = h.cli(&["session", "attach", &f.session_id]);
+    let after = h.rpc_ok("session.list", serde_json::json!({}));
+    assert_eq!(
+        after["sessions"].as_array().expect("sessions").len(),
+        before_n,
+        "`session attach <full uuid>` created a session"
+    );
+
+    // …while a genuinely new NAME still creates one, which is the documented
+    // behaviour this must not break.
+    let fresh = format!("{}-fresh", f.name);
+    let _ = h.cli(&["session", "attach", &fresh]);
+    let after = h.rpc_ok("session.list", serde_json::json!({}));
+    assert!(
+        after["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .any(|s| s["name"].as_str() == Some(fresh.as_str())),
+        "`session attach <new name>` must still create that session"
+    );
+
+    h.kill_session(&f.session_id);
+}
