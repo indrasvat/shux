@@ -3081,6 +3081,95 @@ mod tests {
         }
     }
 
+    /// Issue #120 — `session attach` resolves a reference before it considers
+    /// creating. It is the one verb where an unresolved id is not an error: it
+    /// CREATES, so a short id used to produce a blank session named after the
+    /// id while the session the operator meant sat untouched.
+    ///
+    /// Driven here rather than end-to-end because attaching needs a terminal,
+    /// and how far the attach path gets without one is environment-dependent.
+    #[tokio::test]
+    async fn attach_resolves_an_id_before_it_creates() {
+        let (graph_inner, state) = shux_core::graph::SessionGraph::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(128);
+        let cancel = CancellationToken::new();
+        let task = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                shux_core::graph::run_graph_loop(graph_inner, cmd_rx, cancel).await
+            })
+        };
+        let graph = GraphHandle::new(cmd_tx, state);
+        let meta = crate::session_meta::SessionMetaCache::new();
+        let cwd = std::env::temp_dir();
+
+        let target = graph
+            .create_session("work".to_string(), cwd.clone())
+            .await
+            .expect("create session");
+        let short = target.to_string()[..8].to_string();
+        let before = graph.snapshot().sessions.len();
+
+        // The short id `session list` prints attaches to that session.
+        let got = resolve_or_create_session(&graph, &Some(short.clone()), &meta)
+            .await
+            .expect("attach by short id");
+        assert_eq!(
+            got.session_id, target,
+            "short id resolved to another session"
+        );
+        assert_eq!(got.name, "work");
+        assert_eq!(
+            graph.snapshot().sessions.len(),
+            before,
+            "attaching by short id created a session"
+        );
+
+        // …and so does the full uuid.
+        let got = resolve_or_create_session(&graph, &Some(target.to_string()), &meta)
+            .await
+            .expect("attach by full uuid");
+        assert_eq!(got.session_id, target);
+        assert_eq!(graph.snapshot().sessions.len(), before);
+
+        // A genuinely new NAME still creates — the behaviour the id branch
+        // must not have swallowed.
+        let got = resolve_or_create_session(&graph, &Some("brand-new".to_string()), &meta)
+            .await
+            .expect("attach by new name");
+        assert_ne!(got.session_id, target);
+        assert_eq!(got.name, "brand-new");
+        assert_eq!(
+            graph.snapshot().sessions.len(),
+            before + 1,
+            "attaching by a new name must still create that session"
+        );
+
+        // An exact NAME still beats a partial id, even when the name IS one.
+        let impostor = graph
+            .create_session(short.clone(), cwd.clone())
+            .await
+            .expect("create impostor");
+        let got = resolve_or_create_session(&graph, &Some(short.clone()), &meta)
+            .await
+            .expect("attach by ambiguous-looking name");
+        assert_eq!(
+            got.session_id, impostor,
+            "an exact name must beat an id prefix"
+        );
+
+        // A well-formed uuid naming nothing is refused, not turned into a
+        // session called after itself.
+        let orphan = "00000000-0000-4000-8000-000000000001";
+        let err = resolve_or_create_session(&graph, &Some(orphan.to_string()), &meta)
+            .await
+            .expect_err("an unknown uuid must not create a session");
+        assert!(err.to_string().contains(orphan), "{err}");
+
+        cancel.cancel();
+        task.abort();
+    }
+
     async fn attach_fixture() -> AttachFixture {
         let (graph_inner, state) = shux_core::graph::SessionGraph::new();
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
