@@ -39,7 +39,13 @@
 //!     ends in a zero-width joiner, or a lone regional indicator, must not fuse
 //!     with the repeat before it.
 //!
-//! **Zero-width scalars are the one precondition on that oracle.** A combining
+//! **Two preconditions on that oracle**, both deliberate and both pinned by tests
+//! below. First, the repeat count must be no larger than one screenful: past that
+//! the count is clamped, because ten bytes of pane output must not buy unbounded
+//! work (issue #102), and a clamped repeat necessarily scrolls less than the
+//! literal stream would. Second, zero-width scalars.
+//!
+//! **Zero-width scalars.** A combining
 //! mark extends the remembered character when it joins the character that was
 //! just printed — so `e` + U+0301 then REP repeats `é`. A mark that lands
 //! somewhere else does not. shux attaches a stray mark to whatever cell is left
@@ -737,6 +743,34 @@ fn rep_is_clamped_for_cluster_sources_too() {
         let budget = 4 * (6 * 10) as u64;
         assert!(did <= budget, "{seed:?}: {did} writes, budget {budget}");
     }
+}
+
+/// The clamp is a deliberate deviation from the oracle, so it is pinned in the one
+/// place the two disagree: past one screenful, the literal stream keeps scrolling
+/// and a clamped repeat stops. Ten bytes of pane output buying unbounded work is
+/// the worse failure (issue #102), and no real application repeats past a screen.
+#[test]
+fn a_repeat_larger_than_one_screenful_scrolls_less_than_the_literal_stream() {
+    let mut clamped = vt(3, 10);
+    clamped.process(b"X\x1b[100b");
+
+    let mut literal = vt(3, 10);
+    literal.process(&[b'X'; 101]);
+
+    assert_eq!(
+        clamped.scrollback_len(),
+        1,
+        "the clamp stopped after one screenful"
+    );
+    assert_eq!(
+        literal.scrollback_len(),
+        8,
+        "the literal stream kept scrolling"
+    );
+    assert!(
+        clamped.scrollback_len() < literal.scrollback_len(),
+        "the clamp is supposed to do LESS work, not more"
+    );
 }
 
 /// The iteration clamp alone is not enough. A grapheme cluster carries up to 32

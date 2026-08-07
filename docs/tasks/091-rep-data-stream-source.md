@@ -210,6 +210,61 @@ REP-shaped `CSI b`; the same inputs with REP stripped gave 0. All six rich TUIs 
 `nvim`, `htop`, `btop`, `lazygit`, `less`) render byte-identically, including over a
 page the repeat command had just filled.
 
+## Reference cross-check: Alacritty
+
+Alacritty `1b2b36a6` builds on the same `vte` crate at the same version (0.15.0) that
+shux pins, and since `cb7ad5b7` its ANSI layer *is* `vte::ansi` — so `crates/shux-vt/src/parser.rs`
+is a hand-written replacement for the exact module Alacritty uses. The comparison is
+direct. Every claim below was read from source and then re-verified by running Alacritty.
+
+**The central question: shux has converged on the reference.** Alacritty has sourced REP
+from remembered state (`ProcessorState::preceding_char`, written only in `Perform::print`)
+and replayed it through `handler.input()` — the ordinary print path — since `2bfb3f70`
+(2017). The screen has never been consulted. The approach this task removed has no
+precedent.
+
+Where the two differ substantively, shux is the stricter implementation:
+
+| | Alacritty | shux |
+|---|---|---|
+| what is remembered | one scalar | the whole grapheme cluster |
+| `e` U+0301 then `CSI 3 b` | three more acutes stacked on one `e` | `éééé` |
+| RIS clears it | no — `preceding_char` lives in the `Processor`, `reset_state` is on the `Handler` | yes |
+| a stray combining mark redefines it | yes | no (xterm's rule) |
+| repeat bound | `u16::MAX` per sequence, no screen-relative clamp | one screenful of cells, two screenfuls of scalars |
+
+Alacritty's bound is a deliberate security fix (`a2727d06`, "Fix DoS caused by excessive
+CSI parameter values", whose changelog names `CSI Ps b`) but it narrows the counter rather
+than clamping the work: measured on the real emulator, `一` followed by 1,000 repeats of
+`ESC[65535b` — **8,003 input bytes — stalls it for 11.4 seconds**. shux's clamp bounds the
+work per sequence and per scalar, and is strictly stronger.
+
+**One real divergence, left as-is deliberately.** Alacritty stores the character BEFORE
+character-set translation and re-maps it through whatever set is active at the `CSI b`;
+shux stores it as printed. `ESC(0 q ESC(B ESC[3b` gives Alacritty `─qqq` and shux `────`.
+Both readings are literal — Alacritty follows ECMA-48's "the preceding character in the
+data stream", shux follows xterm's "the preceding graphic character" — and each is
+self-consistent with its own oracle. They agree in every ordering a real application
+emits, because the switch back to ASCII comes after the repeat, not before. Recorded here
+so a future reader who checks Alacritty first does not mistake it for a defect.
+
+**A caution about the reference's own tests.** Alacritty's only REP test,
+`alacritty_terminal/tests/ref/csi_rep/`, is a real zsh recording whose expected grid
+contains no output at all — the prompt redraw erases it before the recording ends. Making
+`('b', [])` a no-op in a patched copy leaves the test passing. That is the likeliest
+reason the cluster, RIS and stray-mark defects above have survived nine years, and it is
+the argument for this task's differential oracle over a recorded-golden harness.
+
+## Explicitly not changed
+
+**The iteration clamp diverges from the oracle above one screenful, and stays.** `REP 100`
+on a 3x10 grid produces one line of scrollback; 101 literal `X`s produce eight. Raising
+the cap to include scrollback capacity would close it and would also let ten bytes write
+`scrollback_capacity x cols` cells, which is the amplification issue #102 exists to
+prevent. Pinned by `a_repeat_larger_than_one_screenful_scrolls_less_than_the_literal_stream`
+so it is a documented choice rather than an untested edge, and stated as a precondition in
+the test module's own documentation.
+
 ## Found in passing, filed separately
 
 **An incrementally built grapheme cluster is torn in half at the right margin.**
@@ -220,6 +275,14 @@ belongs to the grapheme printing path (task 069), not here. REP's side of it is
 pinned by `rep_after_a_cluster_torn_by_the_right_margin_repeats_the_surviving_half`
 so a fix there shows up as a test change rather than a silent behaviour change, and
 the property test documents it as the one precondition on its oracle.
+
+**DEL (0x7F) is stored as a printable cell (issue #127).** `unicode-width` returns `None`
+only for C0, DEL and C1, so `write_char`'s `.unwrap_or(1)` is the control-character path.
+C1 never reaches `print`, but DEL does: it takes a column, REP repeats it, and
+`pane capture`'s text output writes the raw control byte to the operator's terminal
+(`--format json` escapes it). Alacritty drops width-`None` scalars outright. No recorded
+capture in `.shux/fixtures/vt-corpus/rich-tui/` contains one, so nothing is mis-rendering
+today. A one-line change with a print-path blast radius of its own.
 
 **A CSI sequence with too many parameters executes truncated (issue #126).** `vte` raises
 an `ignore` flag on a sequence it could not represent; shux binds it to `_ignore` in all
