@@ -64,7 +64,13 @@ open(p, "w").write(s)
   fi
 
   local out status
-  out="$(cargo test -p shux-vt --test rep --lib 2>&1)"
+  # `--color never`: the grep below anchors on `^    <test name>`, and cargo
+  # colours that line whenever CARGO_TERM_COLOR=always is exported — which CI
+  # does workflow-wide, and which a developer may well have in their profile.
+  # An ANSI prefix makes the anchor miss and every killed mutant gets reported
+  # as "<did not compile>". A parser pins its own input format; it cannot rely
+  # on the environment to leave the bytes alone.
+  out="$(cargo test --color never -p shux-vt --test rep --lib 2>&1)"
   status=$?
   if [ "${status}" -eq 0 ]; then
     printf '  SURVIVED %-52s <-- no test caught this\n' "${current_name}"

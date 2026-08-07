@@ -111,6 +111,12 @@ jobs:
         run: make test-doc
       - name: Test-group membership
         run: make check-test-groups
+      # Belt and braces: this job already runs with CARGO_TERM_COLOR=always, so
+      # the step above is the real colour test. This one fails with an
+      # explanation instead of a bare parse mismatch, and keeps the local and CI
+      # invariant literally the same command.
+      - name: CI-environment parity for cargo-output parsers
+        run: make check-ci-parity
 
   e2e-ubuntu:
     name: E2E smoke (ubuntu)

@@ -100,6 +100,11 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
 
 - **Prove a check can FAIL before trusting it to pass.** Run every gate/guard/comparator
   against a reintroduced defect AND empty input.
+- **Anything that parses cargo output pins `--color never` at the call site.** CI
+  exports `CARGO_TERM_COLOR=always`; cargo colours on a TTY and not through a pipe, so
+  the coloured path is the one local runs never see. A guard that only fails in CI is
+  the worst shape a guard can have — `make check-ci-parity` runs the parsers under CI's
+  environment so that failure lands on your machine instead.
 - **Never mask failures in a measurement harness.** `|| true` turns an instant error into
   a fast success. Abort loudly.
 - **A not-yet-started app is quiet.** `wait-settled` alone races slow starters and

@@ -130,6 +130,10 @@ setup-nextest: ## Install cargo-nextest (pre-built binary; seconds, not minutes)
 setup-bench: ## Install hyperfine, the benchmark harness `make bench-test-suite` uses
 	@bash scripts/ensure-hyperfine.sh
 
+.PHONY: check-ci-parity
+check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's environment (colour on)
+	@bash scripts/check-ci-parity.sh
+
 .PHONY: check-test-groups
 check-test-groups: nextest-ready ## Assert every nextest test-group still matches the tests it bounds
 	@bash scripts/check-test-groups.sh
@@ -598,13 +602,13 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint test check-test-groups test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
+check: lint test check-test-groups check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
 
 .PHONY: ci
-ci: lint test check-test-groups test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint test check-test-groups check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
