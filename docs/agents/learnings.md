@@ -902,3 +902,62 @@ palette, restore the deliberate table/summary divergence).
   `Permission denied` — the recorder ran as an unprivileged user against a
   root-owned socket. It would have shipped as "proof of the bug" and every failure
   in it would have been the wrong failure.
+
+## 2026-08-07 — issue #125, `--cmd` shell semantics
+
+**A test's colour probe can pass on text and fail on colour.** The pre-fix screen for
+`--cmd "printf '<probe>'; …"` reads
+`'TRUECOLORprintf: warning: ignoring excess arguments, starting with '\033[38;5;208mINDEXED\033[0m'`
+— printf quotes the arguments it refused back at the screen, so the literal words
+`INDEXED` and `BASIC` appear as **uncoloured text inside an error message**. A
+`grep INDEXED` on `pane capture` calls that a passing colour probe. `pane glance
+--cells` gives style runs; asserting "a run reading INDEXED carries 256-colour 208"
+is the assertion that cannot be satisfied by a mangled screen. Beware also that a
+run is `[col, text]` when it carries the default pen and `[col, text, style]` when
+it does not — an unconditional three-way unpack raises on exactly the uncoloured
+rows the check exists to reject.
+
+**A before/after evidence harness cannot always resize the pre-fix pane.** The
+defect here killed the pane's PTY immediately, so `pane set-size` failed outright
+and took the harness down before it could shoot anything. Both arms now shoot at
+the daemon's default 80x24, which removes the failure and makes the two sides
+pixel-comparable for free.
+
+**`env::var` returns `Ok("")` for a set-but-empty variable.** `std::env::var("SHELL")
+.unwrap_or_else(|_| "/bin/sh")` therefore never fires its fallback for `SHELL=""`
+and the pane execs the empty program name. Two places in this repo resolved `$SHELL`
+and only one of them filtered blank, so one daemon gave a working `--cmd` pane and a
+dead default pane. Filter blank, always.
+
+**Deriving a display name from a shell script needs the first *simple command*, not
+the first token.** The first cut skipped `NAME=value` prefixes token by token, so
+`A=1;htop -d 10` — one token that is a complete assignment — was skipped and the
+scanner landed on `-d`, a flag belonging to a command it had never established.
+Splitting on shell operators first (`| & ; < > ( ) \``) bounds the search to one
+command, and it also makes `ls|wc` read as `ls` rather than falling back to the
+shell's name.
+
+**`pkill -f <pattern>` matched the checking shell itself and killed this session.**
+The pattern `/tmp/vhs/shux __daemon` appeared in the invoking bash's own argv, so
+`pkill -f` reaped the caller. Identify processes by pidfile; the repo rule exists
+because this really happens.
+
+**VHS: overwriting the binary between takes fails with ETXTBSY** when the previous
+take's daemon is still executing it, and `cp && … && clear` swallows the failure —
+the second take silently records the FIRST binary. Put each build in its own
+directory and switch `PATH`, so nothing is ever overwritten, and verify by md5 that
+the take used the binary you meant.
+
+**A spawn failure that returns success is worse than a crash.** `let _ =
+spawn_pane_pty(...)` at five call sites turned "your program does not exist" into a
+session that reported `✓ Created`, listed a pane with `exit_status: null`, and
+failed every subsequent verb with "pane VT not found". `state.apply` already had the
+right instinct (per-pane `spawn_results`); the single-pane verbs now roll back and
+return `SPAWN_FAILED`.
+
+**Attach was resurrecting dead panes.** The spawn-if-no-writer branch exists to close
+a race with a freshly created session, but a pane that *exited* is indistinguishable
+from one that has not started yet if you only look at the writer table. `exit_status`
+is the discriminator. It was also spawning with `Vec::new()` and the daemon's cwd
+rather than the pane's own — so the race it closed, it closed with the wrong process
+in the wrong place.

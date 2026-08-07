@@ -28,6 +28,9 @@
 #                bare login shell) and the `-- sh -c` escape hatch (titled `sh`
 #                pre-fix, `cat` now). Its content is a file of colour bytes, so
 #                the panes stay alive and the probe is in the picture.
+#   errors       what a caller sees when the command cannot work. Pre-fix all
+#                three of these succeeded — two silently ran the default shell
+#                and one left a session whose pane never spawned.
 #   argv         the escape hatch `-- sh -c '…'`. Unchanged by the fix, shot on
 #                both binaries, and the control that proves the harness is not
 #                simply reporting whatever it sees.
@@ -91,6 +94,7 @@ trap cleanup EXIT
 sx() {
   env -u SHUX_SOCKET \
     XDG_RUNTIME_DIR="${runtime}" \
+    PATH="$(cd "$(dirname "${shux_bin}")" && pwd):${PATH}" \
     SHELL=/bin/bash \
     TERM=xterm-256color COLORTERM=truecolor LANG=C.utf8 \
     "${shux_bin}" "$@"
@@ -326,7 +330,28 @@ expect_pen_always titles "BASIC" '"idx": 4' "basic-ANSI pen reached the grid"
 expect titles.panes.json yes '"title": "cat"' "the split panes are titled after the program, not the shell"
 finish
 
-# ── scene 7: the argv escape hatch (control) ────────────────────────────
+# ── scene 7: what a rejection looks like ────────────────────────────────
+#
+# Shot from inside a pane so the picture is the operator's own terminal, not a
+# transcript. Each line is a `command` that cannot do what it says; pre-fix each
+# one was accepted.
+echo "  scene: errors"
+sx session create ev125-errors -d --cwd "${work}" --cmd "$(lead); \
+  shux rpc call session.create --params '{\"name\":\"a\",\"command\":42}' 2>&1 | jq -r '.error.data.detail // .' | fold -w 78; \
+  shux rpc call session.create --params '{\"name\":\"b\",\"command\":[\"vim\",null]}' 2>&1 | jq -r '.error.data.detail // .' | fold -w 78; \
+  shux session create c -d -- no-such-binary-xyz 2>&1 | head -1; \
+  exec sleep 900" >/dev/null
+sessions+=("ev125-errors")
+session_of="ev125-errors"
+pane_of="$(sx --format json pane list -s ev125-errors | jq -r '.[0].id')"
+shoot errors
+expect errors.txt yes "must be a string" "a number is refused, with a reason"
+expect errors.txt yes "command[1]" "the offending array element is named"
+expect errors.txt yes "spawn" "a program that cannot start is refused"
+expect_pen_always errors "TRUECOLOR" '"rgb": [120, 220, 180]' "truecolor pen reached the grid"
+finish
+
+# ── scene 8: the argv escape hatch (control) ────────────────────────────
 #
 # Unchanged by the fix. It shoots identically on both binaries, which is what
 # makes it a control: a harness that reported a difference here would be

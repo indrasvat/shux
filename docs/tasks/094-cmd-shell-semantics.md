@@ -1,13 +1,15 @@
 # 094 — `--cmd` promised a shell command and delivered a whitespace split
 
-**Status:** In Progress
+**Status:** Done
 **Priority:** High (silent wrong execution; the pane starts, so nothing looks broken)
 **Milestone:** M3 polish
 **Depends On:** —
 **Quality Gate:** shux-tui-qa — CLI/agent-workflow surface, no VT/raster change
 **Touches:** `crates/shux/src/pane_command.rs` (new), `crates/shux/src/main.rs`,
-`crates/shux/src/cli.rs`, `crates/shux-core/src/graph.rs`,
-`crates/shux-core/src/model.rs`, `crates/shux/tests/pane_command_e2e.rs` (new),
+`crates/shux/src/cli.rs`, `crates/shux/src/attach.rs`,
+`crates/shux-core/src/graph.rs`, `crates/shux-core/src/model.rs`,
+`crates/shux-pty/src/handle.rs`, `crates/shux/tests/pane_command_e2e.rs` (new),
+`crates/shux/tests/window_title_escape_injection.rs`,
 `.shux/scripts/issue_125_evidence.sh` (new)
 
 ---
@@ -87,6 +89,29 @@ the shell's own name when the script does not start with a plain command word. T
 long-documented escape hatch `-- sh -c "npm run dev"` gains the same benefit: it used
 to title the pane `sh`, now `npm`.
 
+### Follow-ups from adversarial review
+
+Three parallel agents drove the real binary on disjoint surfaces (shell semantics,
+the RPC contract, titles + rich TUIs). Each finding was reproduced before it was
+believed and fixed with a regression test. All are the same shape as the issue.
+
+| # | Surface | Before |
+|---|---|---|
+| 6 | `window.ensure` on an **existing** window | parsed `command` after the already-exists shortcut, so every malformed shape was accepted in exactly the case the verb is named for |
+| 7 | all five spawning RPCs | a PTY that never started returned **success**: `✓ Created session` over a pane that answered "pane VT not found" to everything afterwards. Now `SPAWN_FAILED` + rollback |
+| 8 | `session attach` | respawned the active pane whenever no PTY was registered, sweeping up panes that had genuinely **exited** — a pane that ran `make` and finished came back as a login shell in the daemon's cwd |
+| 9 | `PtyConfig::resolve_command` | `env::var` returns `Ok("")` for a set-but-empty `$SHELL`, so `unwrap_or_else` never fired: `SHELL=""` gave a working `--cmd` pane and a **dead** default pane from one daemon |
+| 10 | argv validation | `["   "]` accepted where `[""]` was rejected; both exec a program name that cannot resolve |
+| 11 | argv validation | an argument past `MAX_ARG_STRLEN` accepted, then `E2BIG` at `execve` with no diagnosis |
+| 12 | `state.apply` | a **sixth** spawner. Typed ops, so serde proved `Vec<String>` and nothing proved the strings could reach `execve` |
+| 13 | titles (introduced by this task) | `A=1;htop -d 10` titled `-d` — the scanner skipped a complete leading assignment and walked into a flag belonging to a command it never established. `if`/`for`/`while` became titles, contradicting the function's own doc |
+| 14 | `pane split` CLI | `pane.split` has always accepted `command`; the CLI had no way to say it |
+| 15 | `--cmd` flag parsing | no `allow_hyphen_values`, so a flag-shaped command was refused — and clap's tip pointed at `--`, which is the argv form, a different execution model |
+
+Title derivation now reads **only the first simple command** (everything before the
+first shell operator), treats shell keywords as "no single program to name", and
+splits on operators so `ls|wc` still reads as `ls`.
+
 ## Testing Matrix
 
 | Level | Coverage |
@@ -97,7 +122,10 @@ to title the pane `sh`, now `npm`.
 | Unit — `cli.rs` | `session create` / `window create` param building: `--cmd` goes out as a string, trailing argv as an array, argv wins |
 | E2E — `tests/pane_command_e2e.rs` | real daemon, real PTYs: `;`, `|`, `&&`, `||`, quotes, glob, redirect+read-back, `$VAR`, subshell, heredoc, multi-line, unicode, exit code, argv-with-spaces passthrough, `--cmd ""`, all five RPCs, every rejection over the wire, `pane list` truthfulness, auto-title |
 | E2E — colour | every capture case includes truecolor + 256-indexed + basic SGR so a monochrome regression cannot pass |
-| Shell — `.shux/scripts/issue_125_evidence.sh` | the issue's own reproduction, before/after, through the shipped binary, under the leak guard |
+| Unit — `attach.rs` | attach spawns a pane that never ran, never one that exited (every exit status) |
+| Unit — `handle.rs` | blank/whitespace/unset `$SHELL` all fall back; an explicit command is never replaced |
+| E2E — follow-ups | `window.ensure` on an existing window; blank argv[0]; oversize argument; a program that cannot be executed on all five verbs, with no phantom left behind; `state.apply` argv validation; `pane split --cmd` and trailing argv; a hyphen-leading `--cmd`; a blank `$SHELL` still opening a working default pane |
+| Shell — `.shux/scripts/issue_125_evidence.sh` | eight scenes, both binaries, through the shipped binary, under the leak guard. Colour is asserted on the **pen** via `pane glance --cells`, not on the word: the pre-fix screen prints the literal text `INDEXED` inside printf's own error message, so a `grep` would have called that a colour probe. `EXPECT_DEFECT=1` inverts the verdict, so the baseline arm fails if the defect has already gone away |
 
 ## Acceptance Criteria
 
@@ -107,6 +135,8 @@ to title the pane `sh`, now `npm`.
 - [x] `window.create` / `window.ensure` / `pane.split` persist the command they ran.
 - [x] `--cmd top` still titles the pane `top`.
 - [x] Trailing `-- argv...` is unchanged: exec'd directly, no shell.
+- [x] A `command` that cannot be executed is an error, not a session.
+- [x] Attaching never silently replaces a pane's program.
 - [x] Zero leaked daemons or child processes.
 
 ## DoD
