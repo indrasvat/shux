@@ -100,8 +100,10 @@ fn fixture(h: &Harness, tag: &str) -> Fixed {
     let pane_a = s["pane_id"].as_str().expect("pane id").to_string();
 
     // Content, THEN settle: a not-yet-started pane and a quiet one look
-    // identical to a wait on stillness alone.
-    h.wait_for(&pane_a, "ALPHA", 15_000)
+    // identical to a wait on stillness alone. The budget is generous because
+    // the coverage job runs the workspace instrumented and in parallel; it is
+    // a deadline for reporting failure, not an assertion.
+    h.wait_for(&pane_a, "ALPHA", 60_000)
         .expect("pane A never printed its colour probe");
 
     // A second pane in the same window, with its own marker on screen.
@@ -117,7 +119,7 @@ fn fixture(h: &Harness, tag: &str) -> Fixed {
         "pane.send_keys",
         serde_json::json!({ "pane_id": pane_b, "text": "printf 'BRAVO\\n'\n" }),
     );
-    h.wait_for(&pane_b, "BRAVO", 15_000)
+    h.wait_for(&pane_b, "BRAVO", 60_000)
         .expect("pane B never printed its marker");
 
     // A second window, so `-w 0` has something to be wrong about.
