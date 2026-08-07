@@ -1,3 +1,10 @@
+## [0.46.10](https://github.com/indrasvat/shux/compare/v0.46.9...v0.46.10) (2026-08-07)
+
+
+### Bug Fixes
+
+* **vt:** REP (`CSI b`) repeated the cell left of the cursor, not the preceding character ([#122](https://github.com/indrasvat/shux/issues/122)) ([#129](https://github.com/indrasvat/shux/issues/129)) ([e5c9ebf](https://github.com/indrasvat/shux/commit/e5c9ebfc091fe7bee588e521d38b0492cc125840))
+
 ## [0.46.9](https://github.com/indrasvat/shux/compare/v0.46.8...v0.46.9) (2026-08-07)
 
 
