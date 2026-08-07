@@ -29,7 +29,7 @@ use serde_json::Value;
 use shux_core::bus::{EventBus, Subscription, SubscriptionEvent};
 use shux_core::event::EventData;
 use shux_core::graph::GraphHandle;
-use shux_core::model::{PaneId, PluginId, SessionId, WindowId};
+use shux_core::model::PluginId;
 use shux_rpc::router::Router;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -1370,20 +1370,31 @@ fn dispatch_plugin_frame(
 /// from the current graph snapshot.
 fn resolve_owners(graph: &GraphHandle, targets: &Targets) -> TargetOwners {
     let snap = graph.snapshot();
+    // Resolve through the shared id-reference rules, not a strict `parse`
+    // (issue #120). Authorization runs BEFORE the router handler, so a plugin
+    // addressing its own entity by the short id every listing prints would
+    // fail the ownership lookup here, be denied `NoGrantAndNotOwned`, and
+    // never reach the resolver that would have understood it.
+    //
+    // Latent rather than live today: nothing yet WRITES `created_by_plugin`
+    // (see `shux_core::model`), so every lookup returns `None` either way.
+    // Fixed here anyway — the trap springs the moment ownership grants are
+    // wired, and by then the connection to id resolution is easy to miss.
+    // A full uuid resolves exactly as `parse` did.
     let pane_owner = targets
         .pane_id
         .as_ref()
-        .and_then(|s| s.parse::<PaneId>().ok())
+        .and_then(|s| snap.resolve_pane_ref(s).ok())
         .and_then(|id| snap.panes.get(&id).and_then(|p| p.created_by_plugin));
     let window_owner = targets
         .window_id
         .as_ref()
-        .and_then(|s| s.parse::<WindowId>().ok())
+        .and_then(|s| snap.resolve_window_ref(s).ok())
         .and_then(|id| snap.windows.get(&id).and_then(|w| w.created_by_plugin));
     let session_owner = targets
         .session_id
         .as_ref()
-        .and_then(|s| s.parse::<SessionId>().ok())
+        .and_then(|s| snap.resolve_session_ref(s).ok())
         .and_then(|id| snap.sessions.get(&id).and_then(|s| s.created_by_plugin));
     TargetOwners {
         pane_owner,
@@ -1395,6 +1406,9 @@ fn resolve_owners(graph: &GraphHandle, targets: &Targets) -> TargetOwners {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests need the concrete id types now that `resolve_owners`
+    // goes through the shared reference resolver.
+    use shux_core::model::PaneId;
     use shux_rpc::{Policy, Sensitivity};
 
     #[test]

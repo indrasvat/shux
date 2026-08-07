@@ -106,6 +106,48 @@ impl SessionGraphSnapshot {
         self.sessions.values().find(|s| s.name == name)
     }
 
+    // ── Entity id references (issue #120) ────────────────────────────────
+    //
+    // Every id shux prints is truncated to 8 characters; these turn that back
+    // into a real id. A complete UUID passes straight through without a graph
+    // lookup — see `crate::idref` for the full contract. Resolution reads one
+    // snapshot, so a reference can never be matched against a graph that is
+    // half-way through a mutation.
+
+    /// Resolve a pane reference — full UUID or unambiguous id prefix.
+    pub fn resolve_pane_ref(&self, input: &str) -> Result<PaneId, crate::idref::RefError> {
+        crate::idref::resolve_ref(
+            crate::idref::RefKind::Pane,
+            input,
+            self.panes.keys().map(|id| id.0),
+        )
+        .map(PaneId::from_uuid)
+    }
+
+    /// Resolve a window reference — full UUID or unambiguous id prefix.
+    pub fn resolve_window_ref(&self, input: &str) -> Result<WindowId, crate::idref::RefError> {
+        crate::idref::resolve_ref(
+            crate::idref::RefKind::Window,
+            input,
+            self.windows.keys().map(|id| id.0),
+        )
+        .map(WindowId::from_uuid)
+    }
+
+    /// Resolve a session reference — full UUID or unambiguous id prefix.
+    ///
+    /// Ids only. Session *names* are resolved separately (and first) by
+    /// [`Self::find_session_by_name`]; a name is an exact match and always
+    /// beats a partial one.
+    pub fn resolve_session_ref(&self, input: &str) -> Result<SessionId, crate::idref::RefError> {
+        crate::idref::resolve_ref(
+            crate::idref::RefKind::Session,
+            input,
+            self.sessions.keys().map(|id| id.0),
+        )
+        .map(SessionId::from_uuid)
+    }
+
     pub fn session_windows(&self, session_id: &SessionId) -> Vec<&Window> {
         self.sessions
             .get(session_id)
