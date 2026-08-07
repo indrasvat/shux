@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod event;
 pub mod graph;
+pub mod idref;
 pub mod layout;
 pub mod model;
 pub mod theme;

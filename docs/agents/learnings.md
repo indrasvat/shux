@@ -771,3 +771,67 @@ palette, restore the deliberate table/summary divergence).
   emits an identical repaint stream either way and relies on being at the bottom
   row to scroll blank lines in, which DECALN's cursor-home prevents. That second
   one is the standard to aim for.
+
+## 2026-08-07 — issue #120, entity id references (task 091)
+
+- **A one-way abbreviation is a bug even when both halves are correct.** Every
+  listing printed the first 8 characters of an id; every id parameter demanded all
+  32. Neither piece was wrong on its own, and nothing in either code path looked
+  suspicious. The defect only exists in the seam. **Whenever output is shortened,
+  ask what happens when someone types it back** — for ids, filenames, hashes,
+  anything a person is meant to copy.
+
+- **`glance` echoed the short form in its own SUCCESS line.** That is the
+  strongest possible signal and it had been on screen the whole time. A command
+  whose success output cannot be fed back into the same command is worth a second
+  look.
+
+- **Making the change strictly additive is what made it safe.** A complete UUID
+  resolves *without consulting the graph at all* — same code path, same errors as
+  before. Only prefixes take a lookup. That single rule means no currently-working
+  call can change behaviour, which is worth far more than the tidiness of routing
+  everything through one uniform path.
+
+- **The fix exposed three defects in the error-reporting machinery that had been
+  invisible because nothing informative ever reached it.** `rpc_display` threw
+  away the message of every error the CLI composed itself and printed
+  `resource not found` instead; its `name_conflict` arm was keyed on `-32003`
+  (`auth_required`) instead of `-32007`, so a duplicate session name printed a raw
+  error code with the colliding name sitting unused in `data`; and the lens verbs
+  printed only the error's code name, discarding the actionable `data.detail`.
+  **Adding a good message to a channel nobody had tested is how you discover the
+  channel is broken.**
+
+- **Echoing the caller's own text back is a new egress path.** The moment
+  `rpc_display` started printing client-composed messages, the escape-injection
+  suite (issue #104) went red — a hostile window selector was being quoted
+  verbatim to the terminal. The guard belongs in `rpc_display`, the single funnel
+  every printed RPC error passes through, not at the dozen sites that compose one.
+  That the existing suite caught it immediately is the argument for keeping such
+  suites broad.
+
+- **`--cmd` is documented as a shell command and is split on whitespace.** Cost
+  an hour: the test fixture `--cmd "printf 'X\n'; sleep 300"` exec'd `printf` with
+  `sleep` and `300` as arguments, `printf` exited, the pane's PTY went away, and
+  `pane send-keys` failed with `pane PTY not found` — which reads like a bug in
+  the thing under test. **Use trailing `-- sh -c '...'` for anything with shell
+  syntax.** Filed as #125.
+
+- **Statistically rare is not unreachable — measure before declaring it
+  unstageable.** The ambiguity path (one prefix, two entities) looked impossible
+  to demonstrate with random v4 ids. It took 1,000 concurrent sessions to force a
+  4-hex collision (620 produced none), but it took 40 seconds and 150 MB to find
+  out, and it turned "covered by unit tests, trust me" into a screenshot of the
+  real binary refusing a real collision. **Try the brute-force route once before
+  writing the paragraph explaining why you did not.**
+
+- **The background shell's exit code is not the command's.** `make check > log
+  2>&1; echo "EXIT=$?"` reported success while clippy had failed — the task
+  notification reports the *shell's* status. Grep the log for `Error`/`FAILED`
+  rather than trusting the wrapper's exit code.
+
+- **Open the video frame, not the file listing.** The first before/after take was
+  a valid 15-second MP4 in which every single command failed with
+  `Permission denied` — the recorder ran as an unprivileged user against a
+  root-owned socket. It would have shipped as "proof of the bug" and every failure
+  in it would have been the wrong failure.

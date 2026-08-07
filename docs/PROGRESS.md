@@ -1769,6 +1769,7 @@ shux is a usable interactive multiplexer end-to-end (multi-pane render, attach c
 | 088 | window title escape injection (issue #104) — one shared title sanitizer + egress guard | M3 | **Done** | 027, 033 |
 | 089 | DEC 2026 synchronized-output grid clone (issue #115) — lazy viewport freeze + copy-on-write rows + window deadline | M3 | **Done** | 088 |
 | 090 | DECALN screen-alignment pattern (issue #117) — `ESC # 8` parsed and dropped; fill + margin reset + cursor home, through COW rows and the write tally | M3 | **Done** | 089 |
+| 091 | entity id references (issue #120) — the 8-char short id every listing prints was accepted nowhere; one resolver for full uuid + unambiguous prefix, across every RPC id parameter and the CLI's `-s`/`-w`/`-p` | M3 | **In Progress** | 088 |
 
 ---
 

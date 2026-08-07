@@ -643,12 +643,17 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
     match ctx.format {
         OutputFormat::Plain => {
             for w in windows {
+                // The id column is last so the three columns scripts already
+                // parse keep their positions (issue #120 added it: `--window`
+                // takes an id, and this was the only listing that printed
+                // none).
                 let _ = writeln!(
                     out,
-                    "{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}",
                     w.index,
                     safe_label(&w.title),
                     w.pane_count,
+                    short_id(&w.id),
                 );
             }
         }
@@ -677,6 +682,11 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
                     min_width: 5,
                 },
                 Column {
+                    header: "ID".to_string(),
+                    align: Align::Left,
+                    min_width: 8,
+                },
+                Column {
                     header: String::new(),
                     align: Align::Left,
                     min_width: 0,
@@ -695,6 +705,7 @@ pub fn render_window_list(ctx: &TerminalContext, session_name: &str, windows: &[
                     w.index.to_string(),
                     safe_label(&w.title),
                     w.pane_count.to_string(),
+                    short_id(&w.id).to_string(),
                     marker,
                 ]);
             }
@@ -923,6 +934,7 @@ pub struct SessionInfo {
 
 /// Window info for list rendering.
 pub struct WindowInfo {
+    pub id: String,
     pub title: String,
     pub index: usize,
     pub pane_count: usize,
@@ -1806,12 +1818,14 @@ mod tests {
         ];
         let windows = vec![
             WindowInfo {
+                id: "11111111-2222-3333-4444-555555555555".to_string(),
                 title: "editor".to_string(),
                 index: 1,
                 pane_count: 2,
                 is_active: true,
             },
             WindowInfo {
+                id: "66666666-7777-8888-9999-aaaaaaaaaaaa".to_string(),
                 title: "logs".to_string(),
                 index: 2,
                 pane_count: 1,

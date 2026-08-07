@@ -178,6 +178,29 @@ fn render_agent_help(colorize: bool) -> String {
         shux("rpc call")
     ));
 
+    // Issue #120: every listing prints ids truncated to 8 characters, and
+    // for a long time nothing accepted them back. Say the rule once, here,
+    // where a reader meets the ids for the first time.
+    s.push_str(&format!(
+        "{}\n",
+        h("REFERRING TO SESSIONS, WINDOWS AND PANES")
+    ));
+    s.push_str(&format!(
+        "  {dim}Lists print ids shortened to 8 characters, like git commit SHAs.{r}\n"
+    ));
+    s.push_str(&format!(
+        "  {dim}Pass that short form back anywhere an id is wanted — or any\n  \
+         unambiguous prefix of at least 4 characters, or the full uuid.{r}\n\n"
+    ));
+    s.push_str(&format!("  {} -s demo\n", shux("pane list")));
+    s.push_str(&format!("  {dim}b57c601b  /home/you/project  nvim{r}\n"));
+    s.push_str(&format!("  {} b57c601b\n", shux("pane glance")));
+    s.push_str(&format!(
+        "  {dim}Sessions and windows also answer to their name; an exact name\n  \
+         wins over a partial id. A prefix two entities share is refused, and\n  \
+         the error names them both.{r}\n\n"
+    ));
+
     s.push_str(&format!("{}\n", h("TYPICAL AGENT WORKFLOW")));
     s.push_str(&format!(
         "  {dim}# 1. Spawn a session in the caller's cwd running any command.{r}\n"
@@ -560,12 +583,13 @@ pub enum SessionCommand {
 
     /// Kill a session.
     Kill {
-        /// Session name OR UUID (positional or `-s/--session`; issue #88 —
+        /// Session name OR id (positional or `-s/--session`; issue #88 —
         /// a UUID (e.g. the `session_id` a `lens run` response returns for
-        /// a hidden scratch session) works here too, not just names.
-        /// Precedence for UUID-shaped input: session ID first, falling back
-        /// to a session NAMED that string; when both match, the ID wins
-        /// (a warning is printed).
+        /// a hidden scratch session) works here too, not just names, and
+        /// issue #120 — so does the 8-character short id `session list`
+        /// prints, or any unambiguous prefix.
+        /// Precedence: an exact NAME or a full UUID beats an id prefix.
+        /// Between the two exact forms the ID wins, with a warning.
         #[arg(value_name = "NAME_OR_ID")]
         name_pos: Option<String>,
 
@@ -606,7 +630,7 @@ pub enum SessionCommand {
     /// `shux window snapshot -s NAME` without `-w`, but namespaced
     /// under `session` per the "RPC dots become CLI spaces" invariant.
     Snapshot {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
         /// Output PNG path. If omitted, base64 is printed to stdout.
@@ -919,14 +943,14 @@ pub enum WindowCommand {
     /// List windows in a session
     #[command(alias = "ls")]
     List {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
     },
 
     /// Create a new window in a session. Mirrors `window.create` RPC.
     Create {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
@@ -959,11 +983,11 @@ pub enum WindowCommand {
 
     /// Kill a window
     Kill {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index
+        /// Window name, index, or id
         #[arg(short, long)]
         window: String,
 
@@ -975,11 +999,11 @@ pub enum WindowCommand {
 
     /// Rename a window
     Rename {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Current window name or index
+        /// Window name, index, or id (full UUID or short form)
         #[arg(short, long)]
         window: String,
 
@@ -995,11 +1019,11 @@ pub enum WindowCommand {
 
     /// Focus (select) a window
     Focus {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index
+        /// Window name, index, or id
         #[arg(short, long)]
         window: String,
 
@@ -1011,11 +1035,11 @@ pub enum WindowCommand {
 
     /// Reorder (move) a window to a new index
     Reorder {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index
+        /// Window name, index, or id
         #[arg(short, long)]
         window: String,
 
@@ -1039,7 +1063,8 @@ pub enum WindowCommand {
         /// Session to snapshot (defaults to the session's active window).
         #[arg(short, long)]
         session: Option<String>,
-        /// Explicit window id or index. If omitted, the session's
+        /// Window index, name, or id (full UUID or the short form
+        /// `window list` prints). If omitted, the session's
         /// active window is used.
         #[arg(short, long)]
         window: Option<String>,
@@ -1111,26 +1136,27 @@ pub enum PaneCommand {
     /// List panes in a window
     #[command(alias = "ls")]
     List {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
     },
 
     /// Split a pane
     Split {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID to split (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
 
@@ -1145,26 +1171,26 @@ pub enum PaneCommand {
 
     /// Focus a specific pane by UUID
     Focus {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID to focus
+        /// Pane id — full UUID or the short form `pane list` prints
         #[arg(short, long)]
         pane: String,
     },
 
     /// Move focus in a direction (up/down/left/right)
     FocusDir {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
@@ -1175,15 +1201,16 @@ pub enum PaneCommand {
 
     /// Resize a pane
     Resize {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID to resize (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
 
@@ -1204,15 +1231,16 @@ pub enum PaneCommand {
 
     /// Toggle zoom on a pane
     Zoom {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID to zoom (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
 
@@ -1224,19 +1252,19 @@ pub enum PaneCommand {
 
     /// Swap two panes
     Swap {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// First pane UUID
+        /// First pane id — full UUID or short form
         #[arg(short, long)]
         pane: String,
 
-        /// Second pane UUID (target to swap with)
+        /// Second pane id (target to swap with) — full UUID or short form
         #[arg(short, long)]
         target: String,
 
@@ -1248,15 +1276,15 @@ pub enum PaneCommand {
 
     /// Kill a pane
     Kill {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID to kill
+        /// Pane id to kill — full UUID or the short form `pane list` prints
         #[arg(short, long)]
         pane: String,
 
@@ -1274,15 +1302,16 @@ pub enum PaneCommand {
     /// pins whatever is currently displayed and stops automatic
     /// re-derivation; `--auto` re-enables it.
     Title {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
 
@@ -1320,7 +1349,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Pane UUID to watch.
+        /// Pane id to watch — full UUID or the short form `pane list` prints.
         #[arg(short, long)]
         pane: String,
 
@@ -1346,7 +1375,7 @@ pub enum PaneCommand {
         #[arg(short, long)]
         session: String,
 
-        /// Pane UUID to record.
+        /// Pane id to record — full UUID or the short form `pane list` prints.
         #[arg(short, long)]
         pane: String,
 
@@ -1366,15 +1395,16 @@ pub enum PaneCommand {
 
     /// Send keystrokes to a pane
     SendKeys {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
 
@@ -1393,15 +1423,16 @@ pub enum PaneCommand {
 
     /// Run a command in a pane and capture output
     Run {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
 
@@ -1420,15 +1451,16 @@ pub enum PaneCommand {
 
     /// Capture the current text content of a pane
     Capture {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
 
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
 
-        /// Pane UUID (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
 
@@ -1447,13 +1479,14 @@ pub enum PaneCommand {
     /// Use `shux pane set-size --cols N --rows M` first if you need
     /// the snapshot wider/taller.
     Snapshot {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
-        /// Pane UUID (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
         /// Output PNG path. If omitted, base64 is printed to stdout.
@@ -1470,7 +1503,8 @@ pub enum PaneCommand {
     /// PNG bytes are never printed to stdout: use `--png <path>` to save
     /// them, or `--format json` for base64 inside the RPC result.
     Glance {
-        /// Pane UUID.
+        /// Pane id — full UUID, or any unambiguous prefix of one such as
+        /// the 8-character short form `pane list` prints.
         #[arg(value_name = "PANE")]
         pane: String,
 
@@ -1519,7 +1553,9 @@ pub enum PaneCommand {
     /// (sentinel text). Exit 0 settled, exit 1 timeout.
     #[command(name = "wait-settled")]
     WaitSettled {
-        /// Pane UUID (mirrors the RPC `pane_id`).
+        /// Pane id — full UUID or any unambiguous prefix, such as the
+        /// 8-character short form `pane list` prints (mirrors the RPC
+        /// `pane_id`).
         #[arg(value_name = "PANE")]
         pane: String,
 
@@ -1564,7 +1600,9 @@ pub enum PaneCommand {
     /// (FIFO). Re-checkpointing the same revision is a no-op. Prints the
     /// keyed revision and any evicted revision.
     Checkpoint {
-        /// Pane UUID (mirrors the RPC `pane_id`).
+        /// Pane id — full UUID or any unambiguous prefix, such as the
+        /// 8-character short form `pane list` prints (mirrors the RPC
+        /// `pane_id`).
         #[arg(value_name = "PANE")]
         pane: String,
     },
@@ -1575,7 +1613,9 @@ pub enum PaneCommand {
     /// any delta (diff is data, not a verdict); exit 5 on STALE_REVISION /
     /// RESIZE_INVALIDATED / PAYLOAD_TOO_LARGE (oversized heat PNG).
     Diff {
-        /// Pane UUID (mirrors the RPC `pane_id`).
+        /// Pane id — full UUID or any unambiguous prefix, such as the
+        /// 8-character short form `pane list` prints (mirrors the RPC
+        /// `pane_id`).
         #[arg(value_name = "PANE")]
         pane: String,
 
@@ -1600,13 +1640,14 @@ pub enum PaneCommand {
     /// you need the pane wider/taller than the daemon default.
     #[command(name = "set-size")]
     SetSize {
-        /// Session name
+        /// Session name or id (full UUID, or the short form `session list` prints)
         #[arg(short, long)]
         session: String,
-        /// Window name or index (uses active window if not provided)
+        /// Window name, index, or id (uses active window if not provided)
         #[arg(short, long)]
         window: Option<String>,
-        /// Pane UUID (uses active pane if not provided)
+        /// Pane id — full UUID or the short form `pane list` prints
+        /// (uses active pane if not provided)
         #[arg(short, long)]
         pane: Option<String>,
         /// New width in cells (4..=1000).
@@ -1632,10 +1673,10 @@ pub enum PaneCommand {
         /// resolve a pane. With session alone, targets the active pane.
         #[arg(short, long)]
         session: Option<String>,
-        /// Window id or index within the session.
+        /// Window index, name, or id (full UUID or short form).
         #[arg(short, long)]
         window: Option<String>,
-        /// Explicit pane id (UUID). REQUIRED for multi-pane workspaces
+        /// Explicit pane id — full UUID or short form. REQUIRED for multi-pane workspaces
         /// — the active pane is rarely the one you want to wait on.
         #[arg(short, long)]
         pane: Option<String>,
@@ -1949,7 +1990,18 @@ impl Cli {
 /// `id`+`resource` envelope as `not_found` (-32004), so a
 /// presence-of-fields heuristic mis-reports concurrency conflicts as
 /// "not found" (issue #25 §3).
+///
+/// EGRESS GUARD (issue #104). Everything this returns is printed to a
+/// terminal, and most of it quotes something a caller supplied — a session
+/// name, a window selector, an id fragment. This is the single funnel for
+/// every RPC error the CLI prints, so the guard belongs here rather than at
+/// each of the dozen sites that compose one: a message that reaches a
+/// terminal with a live `ESC ]0;` in it can retitle the user's window.
 fn rpc_display(code: i64, message: &str, data: Option<&serde_json::Value>) -> String {
+    crate::style::safe_diagnostic(&rpc_display_raw(code, message, data))
+}
+
+fn rpc_display_raw(code: i64, message: &str, data: Option<&serde_json::Value>) -> String {
     let resource = data
         .and_then(|d| d.get("resource"))
         .and_then(|v| v.as_str())
@@ -1960,6 +2012,12 @@ fn rpc_display(code: i64, message: &str, data: Option<&serde_json::Value>) -> St
         // not_found
         -32004 => match id_field {
             Some(id) => format!("{resource} '{id}' not found"),
+            // No structured data at all means the CLI composed this error
+            // itself — `resolve_session_id`, `resolve_window_id` and the
+            // pane-membership check all do, and all of them say which name
+            // was missing. Collapsing that to a contentless "resource not
+            // found" was what a mistyped session name actually printed.
+            None if data.is_none() && !message.is_empty() => message.to_string(),
             None => format!("{resource} not found"),
         },
         // version_conflict
@@ -1978,8 +2036,12 @@ fn rpc_display(code: i64, message: &str, data: Option<&serde_json::Value>) -> St
                 _ => format!("{resource} version_conflict — re-read state and retry"),
             }
         }
-        // name_conflict — `data.name` carries the colliding name
-        -32003 => {
+        // name_conflict — `data.name` carries the colliding name.
+        // -32007, not -32003: -32003 is auth_required. Keyed on the wrong
+        // code, this arm never fired for a real duplicate name (which fell
+        // through to the raw "RPC error -32007: name_conflict") and instead
+        // rendered auth failures as name conflicts.
+        -32007 => {
             if let Some(name) = data.and_then(|d| d.get("name")).and_then(|v| v.as_str()) {
                 format!("{resource} name '{name}' already exists")
             } else {
@@ -3036,11 +3098,115 @@ async fn resolve_session_id(
         }
     }
 
-    Err(RpcClientError::Rpc {
+    // No session by that NAME. Before giving up, try it as an id prefix —
+    // `session list` prints the 8-char short id in its own last column, and
+    // before issue #120 that column was decorative (issue #120). An exact
+    // name always wins over a partial id, which is why this runs second and
+    // never changes the outcome of a call that already worked.
+    //
+    // `include_scratch` mirrors the full-uuid path: a caller holding an id
+    // fragment for a hidden scratch session may still act on it — visibility
+    // is not authorization (LENS-R-041).
+    resolve_session_id_prefix(stream, session_name).await
+}
+
+/// Resolve a non-UUID, non-name session argument as an id prefix.
+///
+/// Split out so both this and `handle_kill`'s id/name routing share one
+/// definition of "what a short session id means".
+async fn resolve_session_id_prefix(
+    stream: &mut tokio::net::UnixStream,
+    arg: &str,
+) -> Result<String, RpcClientError> {
+    use shux_core::idref::{RefKind, parse_ref};
+
+    let not_found = || RpcClientError::Rpc {
         code: -32004,
-        message: format!("session '{session_name}' not found"),
+        message: format!("session '{arg}' not found"),
         data: None,
-    })
+    };
+
+    // Anything that is not prefix-shaped keeps the old "not found" wording:
+    // for a name that simply does not exist, "not a hex prefix" would be a
+    // confusing thing to say.
+    let Ok(shux_core::idref::ParsedRef::Prefix(prefix)) = parse_ref(RefKind::Session, arg) else {
+        return Err(not_found());
+    };
+
+    let result = rpc_call(
+        stream,
+        "session.list",
+        serde_json::json!({ "include_scratch": true }),
+    )
+    .await?;
+    let sessions = result
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .or_else(|| result.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut hits: Vec<String> = sessions
+        .iter()
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()))
+        .filter(|id| {
+            id.replace('-', "")
+                .to_ascii_lowercase()
+                .starts_with(&prefix)
+        })
+        .map(|id| id.to_string())
+        .collect();
+    hits.sort();
+
+    match hits.len() {
+        0 => Err(not_found()),
+        1 => Ok(hits.remove(0)),
+        _ => Err(ambiguous_ref_error("session", arg, &hits, None)),
+    }
+}
+
+/// Build the client-side twin of the daemon's ambiguous-reference error
+/// (`RpcError::ambiguous_ref`).
+///
+/// Same code, same `data` shape — so a script sees one contract whether the
+/// collision was detected in the CLI (which resolves `-s` / `-w` against a
+/// listing before it sends anything) or in the daemon. Carrying `detail` also
+/// keeps the rendered message clean: without it the display falls back to
+/// "RPC error -32602: <message>", and the code number is noise on an error a
+/// person is meant to act on.
+fn ambiguous_ref_error(
+    resource: &str,
+    id: &str,
+    candidates: &[String],
+    scope: Option<&str>,
+) -> RpcClientError {
+    let total = candidates.len();
+    let listed: Vec<String> = candidates
+        .iter()
+        .take(shux_core::idref::MAX_LISTED_CANDIDATES)
+        .cloned()
+        .collect();
+    let ellipsis = if total > listed.len() { ", …" } else { "" };
+    let where_ = scope
+        .map(|s| format!(" in session {s}"))
+        .unwrap_or_default();
+    let detail = format!(
+        "{resource} id '{id}' is ambiguous: {total} {resource}s{where_} share that \
+         prefix ({}{ellipsis}). Use more characters.",
+        listed.join(", ")
+    );
+    RpcClientError::Rpc {
+        code: -32602,
+        message: detail.clone(),
+        data: Some(serde_json::json!({
+            "detail": detail,
+            "resource": resource,
+            "id": id,
+            "candidates": listed,
+            "total": total,
+            "hint": "Pass more characters of the id, or the full uuid",
+        })),
+    }
 }
 
 /// Resolve a window specifier (name or index) to (window_id, window_title).
@@ -3083,11 +3249,70 @@ async fn resolve_window_id(
         }
     }
 
-    Err(RpcClientError::Rpc {
+    // Finally, as an id — full UUID or the short form `window list` prints.
+    // `--window`'s help has always said "window id or index"; before issue
+    // #120 the id half of that promise was not implemented, so a UUID read
+    // out of `window list --format json` was rejected. Index and title are
+    // tried first, so no spec that resolved before resolves differently now.
+    resolve_window_id_by_id(windows, window_spec)
+}
+
+/// Match a window spec against the window ids in a `window.list` response.
+///
+/// Scoped to one session's windows: a prefix that would collide across the
+/// whole daemon can still be unique inside the session the caller named.
+fn resolve_window_id_by_id(
+    windows: &[serde_json::Value],
+    window_spec: &str,
+) -> Result<(String, String), RpcClientError> {
+    use shux_core::idref::{ParsedRef, RefKind, parse_ref};
+
+    let not_found = || RpcClientError::Rpc {
         code: -32004,
         message: format!("window '{window_spec}' not found in session"),
         data: None,
-    })
+    };
+
+    let matches: Vec<&serde_json::Value> = match parse_ref(RefKind::Window, window_spec) {
+        Ok(ParsedRef::Exact(uuid)) => {
+            let canonical = uuid.hyphenated().to_string();
+            windows
+                .iter()
+                .filter(|w| w.get("id").and_then(|v| v.as_str()) == Some(canonical.as_str()))
+                .collect()
+        }
+        Ok(ParsedRef::Prefix(prefix)) => windows
+            .iter()
+            .filter(|w| {
+                w.get("id").and_then(|v| v.as_str()).is_some_and(|id| {
+                    id.replace('-', "")
+                        .to_ascii_lowercase()
+                        .starts_with(&prefix)
+                })
+            })
+            .collect(),
+        // Not id-shaped at all — it was a name that does not exist.
+        Err(_) => return Err(not_found()),
+    };
+
+    match matches.len() {
+        0 => Err(not_found()),
+        1 => {
+            let w = matches[0];
+            let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let title = w.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+            Ok((id.to_string(), title.to_string()))
+        }
+        _ => {
+            let mut ids: Vec<String> = matches
+                .iter()
+                .filter_map(|w| w.get("id").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .collect();
+            ids.sort();
+            Err(ambiguous_ref_error("window", window_spec, &ids, None))
+        }
+    }
 }
 
 /// Handle the `shux window list` command.
@@ -3134,7 +3359,13 @@ pub async fn handle_window_list(
                                 .get("is_active")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
+                            let id = w
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
                             style::WindowInfo {
+                                id,
                                 title,
                                 index,
                                 pane_count,
@@ -3426,11 +3657,33 @@ async fn resolve_pane_window_id(
     }
 }
 
+/// Confirm the pane reference names a pane inside the session, and return its
+/// canonical full id.
+///
+/// The caller may hold a short id (issue #120), so the comparison is a
+/// reference match rather than string equality — and the resolved id is
+/// handed back so callers forward the canonical form to the daemon instead of
+/// the fragment the user typed.
 async fn validate_pane_belongs_to_session(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
     pane_id: &str,
-) -> Result<(), RpcClientError> {
+) -> Result<String, RpcClientError> {
+    use shux_core::idref::{ParsedRef, RefKind, parse_ref};
+
+    let parsed = parse_ref(RefKind::Pane, pane_id).map_err(|e| RpcClientError::Rpc {
+        code: -32602,
+        message: e.to_string(),
+        data: None,
+    })?;
+    let matches = |candidate: &str| -> bool {
+        let bare = candidate.replace('-', "").to_ascii_lowercase();
+        match &parsed {
+            ParsedRef::Exact(uuid) => bare == uuid.simple().to_string(),
+            ParsedRef::Prefix(prefix) => bare.starts_with(prefix),
+        }
+    };
+
     let session_id = resolve_session_id(stream, session_name).await?;
     let windows = rpc_call(
         stream,
@@ -3446,6 +3699,7 @@ async fn validate_pane_belongs_to_session(
         });
     };
 
+    let mut hits: Vec<String> = Vec::new();
     for window in windows {
         let Some(window_id) = window.get("id").and_then(|v| v.as_str()) else {
             continue;
@@ -3456,20 +3710,32 @@ async fn validate_pane_belongs_to_session(
             serde_json::json!({"session_id": session_id, "window_id": window_id}),
         )
         .await?;
-        if panes.as_array().is_some_and(|panes| {
-            panes
-                .iter()
-                .any(|p| p.get("id").and_then(|v| v.as_str()) == Some(pane_id))
-        }) {
-            return Ok(());
+        if let Some(panes) = panes.as_array() {
+            hits.extend(
+                panes
+                    .iter()
+                    .filter_map(|p| p.get("id").and_then(|v| v.as_str()))
+                    .filter(|id| matches(id))
+                    .map(|id| id.to_string()),
+            );
         }
     }
+    hits.sort();
 
-    Err(RpcClientError::Rpc {
-        code: -32004,
-        message: format!("pane {pane_id} does not belong to session {session_name}"),
-        data: None,
-    })
+    match hits.len() {
+        0 => Err(RpcClientError::Rpc {
+            code: -32004,
+            message: format!("pane {pane_id} does not belong to session {session_name}"),
+            data: None,
+        }),
+        1 => Ok(hits.remove(0)),
+        _ => Err(ambiguous_ref_error(
+            "pane",
+            pane_id,
+            &hits,
+            Some(session_name),
+        )),
+    }
 }
 
 /// Handle the `shux pane list` command.
@@ -4022,11 +4288,12 @@ pub async fn handle_pane_record(
     duration_ms: Option<u64>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    // Validate the UUID early so typos don't create files.
-    let _: uuid::Uuid = pane_id
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid pane uuid: {e}"))?;
-    validate_pane_belongs_to_session(stream, session_name, pane_id).await?;
+    // Validate the reference early so typos don't create files. Resolving it
+    // here also means the recorder is started against the canonical id rather
+    // than whatever fragment the caller typed.
+    shux_core::idref::parse_ref(shux_core::idref::RefKind::Pane, pane_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pane_id = &validate_pane_belongs_to_session(stream, session_name, pane_id).await?;
 
     let path = if to.is_absolute() {
         to.to_path_buf()
@@ -4517,7 +4784,14 @@ pub async fn handle_pane_glance(
                     );
                 }
                 OutputFormat::Text | OutputFormat::Plain => {
-                    crate::style::print_error(&format!("glance failed: {message} (code {code})"));
+                    // Render `data.detail`, not just the generic code name:
+                    // "invalid_params (code -32602)" does not tell someone who
+                    // pasted a three-character id what to do about it
+                    // (issue #120; same rule wait-settled already followed).
+                    crate::style::print_error(&format!(
+                        "glance failed: {} (code {code})",
+                        rpc_display(code, &message, data.as_ref())
+                    ));
                 }
             }
             std::process::exit(lens_glance_exit_code(code));
@@ -4678,7 +4952,11 @@ fn lens_emit_error_and_exit(
             }
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_error(&format!("{verb} failed: {message} (code {code})"));
+            // As above: the actionable text lives in `data.detail`.
+            crate::style::print_error(&format!(
+                "{verb} failed: {} (code {code})",
+                rpc_display(code, message, data.as_ref())
+            ));
         }
     }
     std::process::exit(exit_code);
@@ -7547,5 +7825,343 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RpcClientError::FrameTooLarge(_)));
         oversized.await.unwrap();
+    }
+
+    // ── Entity id references (issue #120) ────────────────────────────────
+    //
+    // The daemon owns the authoritative resolver (`shux_core::idref`); these
+    // pin the CLI half, which resolves `-s` and `-w` locally against a listing
+    // before it ever sends a request.
+
+    fn multi_session_list(ids: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "sessions": ids.iter().map(|(id, name)| serde_json::json!({
+                "id": id,
+                "name": name,
+                "active_window_id": "22222222-2222-4222-8222-222222222222",
+                "windows": ["22222222-2222-4222-8222-222222222222"],
+                "window_count": 1,
+                "created_at": 0
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    /// The short id printed in `session list`'s last column resolves via `-s`.
+    #[tokio::test]
+    async fn short_session_id_resolves_after_the_name_lookup_misses() {
+        let real = "abcd1234-1111-4111-8111-111111111111";
+        let (mut client, requests, task) = spawn_rpc_script(vec![
+            multi_session_list(&[(real, "work")]),
+            multi_session_list(&[(real, "work")]),
+        ]);
+        let resolved = resolve_session_id(&mut client, "abcd1234").await.unwrap();
+        assert_eq!(resolved, real);
+        let requests = finish_rpc_script(client, task, requests).await;
+        // Name lookup first (default visibility), then the prefix pass with
+        // scratch included — visibility is not authorization.
+        assert_eq!(requests[0]["method"], "session.list");
+        assert!(requests[0]["params"].get("include_scratch").is_none());
+        assert_eq!(requests[1]["params"]["include_scratch"], true);
+    }
+
+    /// An exact NAME always beats a partial id, even when the name is itself a
+    /// valid hex prefix of a different session's id.
+    #[tokio::test]
+    async fn an_exact_name_beats_an_id_prefix() {
+        let prefixed = "abcd1234-1111-4111-8111-111111111111";
+        let named = "99999999-2222-4222-8222-222222222222";
+        let (mut client, requests, task) = spawn_rpc_script(vec![multi_session_list(&[
+            (prefixed, "other"),
+            (named, "abcd1234"),
+        ])]);
+        let resolved = resolve_session_id(&mut client, "abcd1234").await.unwrap();
+        assert_eq!(
+            resolved, named,
+            "the session literally NAMED abcd1234 must win"
+        );
+        // One call only: the name matched, so the prefix pass never ran.
+        let requests = finish_rpc_script(client, task, requests).await;
+        assert_eq!(requests.len(), 1);
+    }
+
+    /// Two sessions sharing a prefix must produce a named collision, not a
+    /// coin flip.
+    #[tokio::test]
+    async fn an_ambiguous_session_prefix_is_refused_with_candidates() {
+        let a = "abcd1111-1111-4111-8111-111111111111";
+        let b = "abcd2222-2222-4222-8222-222222222222";
+        let list = multi_session_list(&[(a, "one"), (b, "two")]);
+        let (mut client, requests, task) = spawn_rpc_script(vec![list.clone(), list]);
+        let err = resolve_session_id(&mut client, "abcd").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "{msg}");
+        assert!(msg.contains(a), "{msg}");
+        assert!(msg.contains(b), "{msg}");
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    /// A name that does not exist and is not id-shaped keeps the old wording —
+    /// telling someone their session name "is not hex" would be nonsense.
+    #[tokio::test]
+    async fn a_missing_name_still_reports_not_found() {
+        // One response only: "typo" is not hex-shaped, so the prefix pass
+        // never issues a second `session.list`.
+        let list = multi_session_list(&[("abcd1234-1111-4111-8111-111111111111", "work")]);
+        let (mut client, requests, task) = spawn_rpc_script(vec![list]);
+        let err = resolve_session_id(&mut client, "typo").await.unwrap_err();
+        assert!(
+            err.to_string().contains("session 'typo' not found"),
+            "{err}"
+        );
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    /// A prefix below the four-character floor is not silently resolved.
+    #[tokio::test]
+    async fn a_two_character_session_ref_is_not_treated_as_a_prefix() {
+        let list = multi_session_list(&[("abcd1234-1111-4111-8111-111111111111", "work")]);
+        let (mut client, requests, task) = spawn_rpc_script(vec![list]);
+        let err = resolve_session_id(&mut client, "ab").await.unwrap_err();
+        assert!(err.to_string().contains("session 'ab' not found"), "{err}");
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    fn two_window_list() -> serde_json::Value {
+        serde_json::json!([
+            {"id": "aaaa1111-1111-4111-8111-111111111111", "title": "editor",
+             "index": 0, "pane_count": 1, "is_active": true, "version": 1},
+            {"id": "aaaa2222-2222-4222-8222-222222222222", "title": "logs",
+             "index": 1, "pane_count": 1, "is_active": false, "version": 1},
+        ])
+    }
+
+    /// `--window` accepts an index, a title, a full UUID and a short id — in
+    /// that precedence, so nothing that resolved before resolves differently.
+    #[tokio::test]
+    async fn window_specs_resolve_by_index_title_uuid_and_prefix() {
+        let cases = [
+            ("0", "aaaa1111-1111-4111-8111-111111111111"),
+            ("1", "aaaa2222-2222-4222-8222-222222222222"),
+            ("logs", "aaaa2222-2222-4222-8222-222222222222"),
+            (
+                "aaaa2222-2222-4222-8222-222222222222",
+                "aaaa2222-2222-4222-8222-222222222222",
+            ),
+            ("AAAA2222", "aaaa2222-2222-4222-8222-222222222222"),
+            ("aaaa2222-2222", "aaaa2222-2222-4222-8222-222222222222"),
+        ];
+        for (spec, expect) in cases {
+            let (mut client, requests, task) = spawn_rpc_script(vec![two_window_list()]);
+            let (id, _title) = resolve_window_id(&mut client, "sid", spec).await.unwrap();
+            assert_eq!(id, expect, "spec {spec}");
+            finish_rpc_script(client, task, requests).await;
+        }
+    }
+
+    /// A window prefix shared by two windows in the session is refused.
+    #[tokio::test]
+    async fn an_ambiguous_window_prefix_is_refused() {
+        let (mut client, requests, task) = spawn_rpc_script(vec![two_window_list()]);
+        let err = resolve_window_id(&mut client, "sid", "aaaa")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "{msg}");
+        assert!(
+            msg.contains("aaaa1111-1111-4111-8111-111111111111"),
+            "{msg}"
+        );
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    /// A window title that is not id-shaped and matches nothing stays a plain
+    /// not-found.
+    #[tokio::test]
+    async fn an_unknown_window_name_is_not_found() {
+        let (mut client, requests, task) = spawn_rpc_script(vec![two_window_list()]);
+        let err = resolve_window_id(&mut client, "sid", "nope")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    /// A numeric index that is out of range must fall through to the title and
+    /// id passes rather than resolving to the wrong window.
+    #[tokio::test]
+    async fn an_out_of_range_index_falls_through_instead_of_wrapping() {
+        let (mut client, requests, task) = spawn_rpc_script(vec![two_window_list()]);
+        let err = resolve_window_id(&mut client, "sid", "9")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    /// `validate_pane_belongs_to_session` hands back the CANONICAL id, so a
+    /// caller that was given a short id forwards the full one to the daemon.
+    #[tokio::test]
+    async fn pane_membership_check_accepts_a_prefix_and_returns_the_full_id() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let wid = "22222222-2222-4222-8222-222222222222";
+        let pid = "33333333-3333-4333-8333-333333333333";
+        let (mut client, requests, task) = spawn_rpc_script(vec![
+            session_list_response(sid, wid),
+            window_list_response(wid, pid),
+            serde_json::json!([{"id": pid, "window_id": wid, "cwd": "/tmp",
+                                "command": [], "title": "sh", "is_focused": true,
+                                "is_zoomed": false, "version": 1}]),
+        ]);
+        let resolved = validate_pane_belongs_to_session(&mut client, "dev", "33333333")
+            .await
+            .unwrap();
+        assert_eq!(resolved, pid);
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    /// A pane that belongs to a different session is still rejected — the
+    /// prefix match must not widen the membership check.
+    #[tokio::test]
+    async fn pane_membership_check_still_rejects_a_foreign_pane() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let wid = "22222222-2222-4222-8222-222222222222";
+        let pid = "33333333-3333-4333-8333-333333333333";
+        let (mut client, requests, task) = spawn_rpc_script(vec![
+            session_list_response(sid, wid),
+            window_list_response(wid, pid),
+            serde_json::json!([{"id": pid, "window_id": wid, "cwd": "/tmp",
+                                "command": [], "title": "sh", "is_focused": true,
+                                "is_zoomed": false, "version": 1}]),
+        ]);
+        let err = validate_pane_belongs_to_session(&mut client, "dev", "44444444")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not belong"),
+            "the message names the mismatch instead of collapsing to a bare \
+             \"resource not found\": {err}"
+        );
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    /// Two panes in the session sharing a prefix collide rather than picking.
+    #[tokio::test]
+    async fn pane_membership_check_refuses_an_ambiguous_prefix() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let wid = "22222222-2222-4222-8222-222222222222";
+        let p1 = "33333333-1111-4111-8111-111111111111";
+        let p2 = "33333333-2222-4222-8222-222222222222";
+        let (mut client, requests, task) = spawn_rpc_script(vec![
+            session_list_response(sid, wid),
+            window_list_response(wid, p1),
+            serde_json::json!([
+                {"id": p1, "window_id": wid, "cwd": "/tmp", "command": [],
+                 "title": "sh", "is_focused": true, "is_zoomed": false, "version": 1},
+                {"id": p2, "window_id": wid, "cwd": "/tmp", "command": [],
+                 "title": "sh", "is_focused": false, "is_zoomed": false, "version": 1},
+            ]),
+        ]);
+        let err = validate_pane_belongs_to_session(&mut client, "dev", "33333333")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "{msg}");
+        assert!(msg.contains(p1) && msg.contains(p2), "{msg}");
+        finish_rpc_script(client, task, requests).await;
+    }
+
+    // ── Error rendering (found while fixing issue #120) ──────────────────
+
+    /// A not-found the CLI composed itself carries its text in `message` and
+    /// has no `data`. Rendering must not throw that away: "resource not
+    /// found" tells a reader neither what was missing nor what they typed,
+    /// and it is what a mistyped session name, window name, or short id
+    /// produced.
+    #[test]
+    fn a_client_side_not_found_keeps_its_own_message() {
+        let rendered = rpc_display(-32004, "session 'nosuch' not found", None);
+        assert_eq!(rendered, "session 'nosuch' not found");
+
+        let rendered = rpc_display(-32004, "window 'nope' not found in session", None);
+        assert_eq!(rendered, "window 'nope' not found in session");
+
+        let rendered = rpc_display(
+            -32004,
+            "pane b57c601b does not belong to session demo",
+            None,
+        );
+        assert_eq!(rendered, "pane b57c601b does not belong to session demo");
+    }
+
+    /// The server's own not-found still renders from its structured data, so
+    /// the fix above is additive.
+    #[test]
+    fn a_server_not_found_still_renders_from_its_data() {
+        let data = serde_json::json!({"resource": "pane", "id": "abc-123"});
+        assert_eq!(
+            rpc_display(-32004, "not_found", Some(&data)),
+            "pane 'abc-123' not found"
+        );
+        // Data present but id-less keeps the generic shape rather than
+        // leaking the bare code name.
+        let data = serde_json::json!({"resource": "session"});
+        assert_eq!(
+            rpc_display(-32004, "not_found", Some(&data)),
+            "session not found"
+        );
+    }
+
+    /// `name_conflict` is -32007; the renderer's arm was keyed on -32003,
+    /// which is `auth_required`. So a duplicate session name printed the raw
+    /// "RPC error -32007: name_conflict" while the name it collided with sat
+    /// unused in `data`.
+    #[test]
+    fn a_name_conflict_renders_the_colliding_name() {
+        let data = serde_json::json!({"resource": "session", "name": "dup"});
+        assert_eq!(
+            rpc_display(-32007, "name_conflict", Some(&data)),
+            "session name 'dup' already exists"
+        );
+    }
+
+    /// …and -32003 is `auth_required`, which must not masquerade as a name
+    /// conflict.
+    #[test]
+    fn auth_required_does_not_render_as_a_name_conflict() {
+        let rendered = rpc_display(-32003, "auth_required", None);
+        assert!(
+            !rendered.contains("name"),
+            "-32003 is auth_required, not name_conflict: {rendered}"
+        );
+        assert!(rendered.contains("auth_required"), "{rendered}");
+    }
+
+    /// Every RPC error the CLI prints funnels through `rpc_display`, and most
+    /// of them quote something the caller typed. A live escape sequence in
+    /// there would reach the terminal (issue #104).
+    #[test]
+    fn rendered_rpc_errors_are_inert() {
+        let hostile = "\u{1b}]0;PWNED\u{7}nosuchwindow";
+
+        // Client-composed not-found, which now echoes its own message.
+        let rendered = rpc_display(-32004, &format!("window '{hostile}' not found"), None);
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{7}'), "{rendered:?}");
+        assert!(rendered.contains("nosuchwindow"), "{rendered:?}");
+
+        // Server-composed, via `data`.
+        let data = serde_json::json!({"resource": "window", "id": hostile});
+        let rendered = rpc_display(-32004, "not_found", Some(&data));
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+
+        // …and via `detail`, the invalid_params path.
+        let data = serde_json::json!({"detail": hostile});
+        let rendered = rpc_display(-32602, "invalid_params", Some(&data));
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+
+        // …and a hostile session NAME in a name_conflict.
+        let data = serde_json::json!({"resource": "session", "name": hostile});
+        let rendered = rpc_display(-32007, "name_conflict", Some(&data));
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
     }
 }
