@@ -1,3 +1,10 @@
+## [0.46.9](https://github.com/indrasvat/shux/compare/v0.46.8...v0.46.9) (2026-08-07)
+
+
+### Bug Fixes
+
+* **cli,rpc:** accept the short entity id every listing prints ([#120](https://github.com/indrasvat/shux/issues/120)) ([#128](https://github.com/indrasvat/shux/issues/128)) ([3625e5e](https://github.com/indrasvat/shux/commit/3625e5eac4ea899009207cbcdf70fc106f7464af))
+
 ## [0.46.8](https://github.com/indrasvat/shux/compare/v0.46.7...v0.46.8) (2026-08-06)
 
 
