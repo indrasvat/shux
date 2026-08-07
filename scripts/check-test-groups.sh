@@ -38,7 +38,7 @@ fi
 #   <group>:<expected test count>
 REQUIRED_GROUPS=(
   process-table:5
-  daemon-pty:183
+  daemon-pty:209
   wall-clock:1
 )
 

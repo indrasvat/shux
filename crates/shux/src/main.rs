@@ -17,6 +17,7 @@ mod features;
 mod gate;
 mod lens_scratch;
 mod onboarding;
+mod pane_command;
 mod session_meta;
 mod session_persist;
 mod statusbar_build;
@@ -2863,20 +2864,10 @@ fn register_pane_methods(
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.5) as f32;
 
-                let new_pane_id = gh
-                    .split_pane(pane_id, direction, ratio)
-                    .await
-                    .map_err(graph_error_to_rpc)?;
-
-                let command: Vec<String> = params
-                    .get("command")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| s.as_str().map(|x| x.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // Parse BEFORE splitting. A malformed `command` used to be
+                // noticed after the graph had already grown a pane, leaving a
+                // half-made split behind on an error path (issue #125).
+                let command = pane_command::parse_pane_command(&params)?;
                 let cwd = params
                     .get("cwd")
                     .and_then(|v| v.as_str())
@@ -2884,6 +2875,15 @@ fn register_pane_methods(
                     .unwrap_or_else(|| {
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
+
+                // `_with_command` persists the argv on the new pane, so
+                // `pane list` and the `PaneCreated` event report what is
+                // really running instead of a blank.
+                let new_pane_id = gh
+                    .split_pane_with_command(pane_id, direction, ratio, command.clone())
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
                 let _ = spawn_pane_pty(
                     new_pane_id,
                     cwd,
@@ -3813,18 +3813,13 @@ fn register_window_methods(
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                         });
 
-                    let command: Vec<String> = params
-                        .get("command")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|s| s.as_str().map(|x| x.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let command = pane_command::parse_pane_command(&params)?;
 
+                    // `_with_command` persists the argv on the window's initial
+                    // pane, so `pane list` and `PaneCreated` report what is really
+                    // running instead of a blank (issue #125).
                     let window_id = gh
-                        .create_window(session_id, title, cwd.clone())
+                        .create_window_with_command(session_id, title, cwd.clone(), command.clone())
                         .await
                         .map_err(graph_error_to_rpc)?;
 
@@ -3942,17 +3937,9 @@ fn register_window_methods(
                         .unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                         });
-                    let command: Vec<String> = params
-                        .get("command")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|s| s.as_str().map(|x| x.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let command = pane_command::parse_pane_command(&params)?;
                     let window_id = gh
-                        .create_window(session_id, name, cwd.clone())
+                        .create_window_with_command(session_id, name, cwd.clone(), command.clone())
                         .await
                         .map_err(graph_error_to_rpc)?;
 
@@ -4240,20 +4227,9 @@ fn register_session_methods(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
 
-                    // Optional pane command. Accepts:
-                    //   {"command": ["vim", "foo.rs"]}     — preferred (passthrough)
-                    //   {"command": "top"}                 — convenience: split on whitespace
-                    //   omitted / null                     — spawn the user's default shell
-                    let command: Vec<String> = match params.get("command") {
-                        Some(serde_json::Value::Array(arr)) => arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect(),
-                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
-                            s.split_whitespace().map(|s| s.to_string()).collect()
-                        }
-                        _ => Vec::new(),
-                    };
+                    // Optional pane command — see `pane_command` for the
+                    // contract every spawning RPC shares (issue #125).
+                    let command = pane_command::parse_pane_command(&params)?;
                     let pane_title = parse_initial_pane_title(&params)?;
 
                     // Auto-generate name if not provided (None).
@@ -4460,17 +4436,8 @@ fn register_session_methods(
                         .unwrap_or("default")
                         .to_string();
 
-                    // Optional pane command (same shape as session.create).
-                    let command: Vec<String> = match params.get("command") {
-                        Some(serde_json::Value::Array(arr)) => arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect(),
-                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
-                            s.split_whitespace().map(|s| s.to_string()).collect()
-                        }
-                        _ => Vec::new(),
-                    };
+                    // Optional pane command (same contract as session.create).
+                    let command = pane_command::parse_pane_command(&params)?;
                     let pane_title = parse_initial_pane_title(&params)?;
 
                     // Check if session already exists

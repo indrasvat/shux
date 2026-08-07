@@ -563,11 +563,18 @@ pub enum SessionCommand {
         #[arg(long, value_name = "TITLE")]
         title: Option<String>,
 
-        /// Shell command to run in the initial pane (single string).
-        #[arg(long)]
+        /// Shell command for the initial pane, run by your shell
+        /// (`$SHELL -c`, falling back to `/bin/sh`) — so pipes, `;`, `&&`,
+        /// quoting, globs and redirection all work:
+        /// `--cmd "cargo watch -x test 2>&1 | tee build.log"`.
+        /// Omitted or empty opens your login+interactive shell.
+        /// For exec-style passthrough with no shell at all, use trailing
+        /// `--` instead.
+        #[arg(long, value_name = "SHELL_COMMAND")]
         cmd: Option<String>,
 
-        /// Trailing argv after `--` — exec'd directly (no shell wrapper).
+        /// Trailing argv after `--` — exec'd directly (no shell wrapper, no
+        /// splitting, no expansion). Takes precedence over `--cmd`.
         #[arg(last = true, num_args = 0..)]
         argv: Vec<String>,
     },
@@ -963,11 +970,13 @@ pub enum WindowCommand {
         #[arg(long)]
         cwd: Option<std::path::PathBuf>,
 
-        /// Shell command to run in the new window's initial pane.
+        /// Shell command for the new window's initial pane, run by your
+        /// shell (`$SHELL -c`, falling back to `/bin/sh`) — pipes, `;`,
+        /// `&&`, quoting, globs and redirection all work.
         /// Empty / omitted spawns the user's login+interactive shell.
         /// For exec-style passthrough use trailing `--` instead:
         /// `shux window create -s X -n W -- vim foo.rs`.
-        #[arg(long)]
+        #[arg(long, value_name = "SHELL_COMMAND")]
         cmd: Option<String>,
 
         /// Create-if-missing semantics (maps to window.ensure)
@@ -3484,23 +3493,19 @@ pub async fn handle_window_new(
     }
     // Trailing argv (after `--`) wins over --cmd, matching the
     // `shux session create` behavior so muscle memory carries over.
-    let command_vec: Vec<String> = if !argv.is_empty() {
-        argv
-    } else if let Some(c) = cmd {
-        vec!["sh".into(), "-c".into(), c]
-    } else {
-        Vec::new()
-    };
-    if !command_vec.is_empty() {
+    //
+    // `--cmd` goes out as a JSON *string* and the daemon turns it into
+    // `$SHELL -c <string>`. It used to be wrapped as `["sh","-c",c]` right
+    // here, which made this verb the only one whose CLI did something its RPC
+    // did not, and pinned every user to `/bin/sh` rather than their own shell
+    // (issue #125).
+    if !argv.is_empty() {
         params.insert(
             "command".to_string(),
-            serde_json::Value::Array(
-                command_vec
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
+            serde_json::Value::Array(argv.into_iter().map(serde_json::Value::String).collect()),
         );
+    } else if let Some(c) = cmd {
+        params.insert("command".to_string(), serde_json::Value::String(c));
     }
 
     let result = rpc_call(stream, method, serde_json::Value::Object(params)).await?;
@@ -6545,6 +6550,55 @@ mod tests {
         assert_eq!(params.get("command"), Some(&serde_json::json!(["pwd"])));
     }
 
+    // ── issue #125: what `--cmd` and trailing argv put on the wire ────
+    //
+    // The CLI does not transform either one. `--cmd` travels as a JSON string
+    // (the daemon runs it through `$SHELL -c`), trailing argv travels as an
+    // array (exec'd directly). Anything else here would be a CLI-only
+    // behaviour the RPC does not have.
+
+    #[test]
+    fn cmd_is_sent_as_a_string_never_pre_split() {
+        let params = build_session_create_params(
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            Some("printf 'X\n'; sleep 300".to_string()),
+            Vec::new(),
+        );
+        assert_eq!(
+            params.get("command"),
+            Some(&serde_json::json!("printf 'X\n'; sleep 300"))
+        );
+    }
+
+    #[test]
+    fn trailing_argv_is_sent_as_an_array_and_beats_cmd() {
+        let params = build_session_create_params(
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            Some("echo from-cmd".to_string()),
+            vec!["nvim".to_string(), "a b.rs".to_string()],
+        );
+        assert_eq!(
+            params.get("command"),
+            Some(&serde_json::json!(["nvim", "a b.rs"]))
+        );
+    }
+
+    #[test]
+    fn no_cmd_and_no_argv_sends_no_command_at_all() {
+        let params = build_session_create_params(
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            None,
+            Vec::new(),
+        );
+        assert!(params.get("command").is_none());
+    }
+
     #[test]
     fn test_agent_help_raw_rpc_cwd_example_is_copy_safe() {
         let help = render_agent_help(false);
@@ -7552,9 +7606,13 @@ mod tests {
             .iter()
             .find(|r| r["method"] == "window.create")
             .unwrap();
+        // `--cmd` goes out as a STRING; the daemon is what turns it into
+        // `$SHELL -c <string>`. It used to be wrapped into `["sh","-c",…]`
+        // client-side, which made this the one verb whose CLI transformed a
+        // parameter its RPC did not (issue #125).
         assert_eq!(
             window_create["params"]["command"],
-            serde_json::json!(["sh", "-c", "echo hi"])
+            serde_json::json!("echo hi")
         );
         let pane_split = requests
             .iter()

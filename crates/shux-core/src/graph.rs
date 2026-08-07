@@ -223,6 +223,11 @@ pub enum GraphCommand {
         session_id: SessionId,
         title: String,
         cwd: std::path::PathBuf,
+        /// Initial-pane command to persist on `Pane.command`. Empty vector
+        /// means "spawn the user's default shell" (issue #125 — `window.create`
+        /// exec'd the command but recorded nothing, so `pane list` showed a
+        /// blank column and the auto-title fell back to the cwd basename).
+        initial_command: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<WindowId, GraphError>>,
     },
     DestroyWindow {
@@ -300,6 +305,10 @@ pub enum GraphCommand {
         target_pane: PaneId,
         direction: Direction,
         ratio: f32,
+        /// Command to persist on the new pane. Empty vector means "spawn the
+        /// user's default shell" (issue #125 — the same recording gap as
+        /// `CreateWindow` above).
+        command: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<PaneId, GraphError>>,
     },
     FocusPane {
@@ -840,6 +849,23 @@ impl SessionGraph {
         title: String,
         cwd: std::path::PathBuf,
     ) -> Result<WindowId, GraphError> {
+        self.create_window_with_command(session_id, title, cwd, Vec::new())
+    }
+
+    /// Create a window and persist `command` on its initial pane (issue #125).
+    ///
+    /// `window.create --cmd` used to exec the command without recording it, so
+    /// `pane list` showed an empty command column and the pane's auto-title
+    /// fell back to the cwd basename. Mirrors
+    /// [`Self::create_session_with_command`]; empty `command` behaves exactly
+    /// like [`Self::create_window`].
+    pub fn create_window_with_command(
+        &self,
+        session_id: SessionId,
+        title: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
+    ) -> Result<WindowId, GraphError> {
         let title = Self::validate_window_title(&title)?;
 
         let current = self.current();
@@ -854,7 +880,11 @@ impl SessionGraph {
         let pane_id = PaneId::new();
         let window_id = WindowId::new();
 
-        let mut pane = Pane::new(window_id, cwd);
+        let mut pane = if command.is_empty() {
+            Pane::new(window_id, cwd)
+        } else {
+            Pane::with_command(window_id, cwd, command.clone())
+        };
         pane.id = pane_id;
 
         let event_title = title.clone();
@@ -886,7 +916,7 @@ impl SessionGraph {
             pane_id,
             window_id,
             session_id,
-            command: Vec::new(),
+            command,
         });
         info!(%window_id, %session_id, "Window created");
         Ok(window_id)
@@ -1516,6 +1546,19 @@ impl SessionGraph {
         direction: Direction,
         ratio: f32,
     ) -> Result<PaneId, GraphError> {
+        self.split_pane_with_command(target_pane, direction, ratio, Vec::new())
+    }
+
+    /// Split and persist `command` on the new pane (issue #125 — `pane.split`
+    /// spawned the caller's command but recorded nothing). Empty `command`
+    /// behaves exactly like [`Self::split_pane`].
+    pub fn split_pane_with_command(
+        &self,
+        target_pane: PaneId,
+        direction: Direction,
+        ratio: f32,
+        command: Vec<String>,
+    ) -> Result<PaneId, GraphError> {
         let (current, window_id) = self.find_pane_window(target_pane)?;
 
         let target = current
@@ -1527,7 +1570,11 @@ impl SessionGraph {
         let mut snapshot = (*current).clone();
         snapshot.version += 1;
 
-        let new_pane = Pane::new(window_id, target.cwd.clone());
+        let new_pane = if command.is_empty() {
+            Pane::new(window_id, target.cwd.clone())
+        } else {
+            Pane::with_command(window_id, target.cwd.clone(), command.clone())
+        };
         let new_pane_id = new_pane.id;
 
         let window = snapshot
@@ -1558,13 +1605,12 @@ impl SessionGraph {
         self.commit_snapshot(snapshot);
         // Split spawns a brand-new pane: surface as PaneCreated so subscribers
         // tracking pane lifecycle see the new id arrive in the same event class
-        // they got from `create_pane`. The empty `command` mirrors create_pane
-        // when no explicit command was given.
+        // they got from `create_pane`.
         self.fire(EventData::PaneCreated {
             pane_id: new_pane_id,
             window_id,
             session_id: split_session_id,
-            command: Vec::new(),
+            command,
         });
         info!(%new_pane_id, %target_pane, %window_id, "Pane split");
         Ok(new_pane_id)
@@ -2118,8 +2164,8 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::RenameSession { id, new_name, expected_version, reply }) => {
                         let _ = reply.send(graph.rename_session(id, new_name, expected_version));
                     }
-                    Some(GraphCommand::CreateWindow { session_id, title, cwd, reply }) => {
-                        let _ = reply.send(graph.create_window(session_id, title, cwd));
+                    Some(GraphCommand::CreateWindow { session_id, title, cwd, initial_command, reply }) => {
+                        let _ = reply.send(graph.create_window_with_command(session_id, title, cwd, initial_command));
                     }
                     Some(GraphCommand::DestroyWindow { id, expected_version, reply }) => {
                         let _ = reply.send(graph.destroy_window(id, expected_version));
@@ -2160,8 +2206,8 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::SetPaneOscTitle { id, title, reply }) => {
                         let _ = reply.send(graph.set_pane_osc_title(id, title));
                     }
-                    Some(GraphCommand::SplitPane { target_pane, direction, ratio, reply }) => {
-                        let _ = reply.send(graph.split_pane(target_pane, direction, ratio));
+                    Some(GraphCommand::SplitPane { target_pane, direction, ratio, command, reply }) => {
+                        let _ = reply.send(graph.split_pane_with_command(target_pane, direction, ratio, command));
                     }
                     Some(GraphCommand::FocusPane { id, reply }) => {
                         let _ = reply.send(graph.focus_pane(id));
@@ -2296,12 +2342,27 @@ impl GraphHandle {
         title: String,
         cwd: std::path::PathBuf,
     ) -> Result<WindowId, GraphError> {
+        self.create_window_with_command(session_id, title, cwd, Vec::new())
+            .await
+    }
+
+    /// Create a window and persist `command` on its initial pane (issue #125 —
+    /// the parallel of [`Self::create_session_with_command`]). When `command`
+    /// is empty the behavior matches [`Self::create_window`].
+    pub async fn create_window_with_command(
+        &self,
+        session_id: SessionId,
+        title: String,
+        cwd: std::path::PathBuf,
+        command: Vec<String>,
+    ) -> Result<WindowId, GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(GraphCommand::CreateWindow {
                 session_id,
                 title,
                 cwd,
+                initial_command: command,
                 reply: tx,
             })
             .await
@@ -2552,12 +2613,26 @@ impl GraphHandle {
         direction: Direction,
         ratio: f32,
     ) -> Result<PaneId, GraphError> {
+        self.split_pane_with_command(target_pane, direction, ratio, Vec::new())
+            .await
+    }
+
+    /// Split and persist `command` on the new pane (issue #125). When `command`
+    /// is empty the behavior matches [`Self::split_pane`].
+    pub async fn split_pane_with_command(
+        &self,
+        target_pane: PaneId,
+        direction: Direction,
+        ratio: f32,
+        command: Vec<String>,
+    ) -> Result<PaneId, GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(GraphCommand::SplitPane {
                 target_pane,
                 direction,
                 ratio,
+                command,
                 reply: tx,
             })
             .await
@@ -2809,6 +2884,128 @@ mod tests {
         assert_eq!(snap.windows[&wid].title, "editor");
         let panes: Vec<_> = snap.panes.values().filter(|p| p.window_id == wid).collect();
         assert_eq!(panes.len(), 1);
+    }
+
+    // ── issue #125: a window's / split's command must be recorded ──────
+    //
+    // `window.create --cmd` and `pane.split {command}` exec'd the command and
+    // recorded nothing, so `pane list` showed a blank column and the pane's
+    // auto-title fell back to the cwd basename.
+
+    #[test]
+    fn create_window_with_command_persists_it_on_the_initial_pane() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+
+        let wid = graph
+            .create_window_with_command(
+                sid,
+                "dev".into(),
+                home(),
+                vec!["/bin/sh".into(), "-c".into(), "npm run dev".into()],
+            )
+            .unwrap();
+
+        let snap = state.load();
+        let pid = snap.windows[&wid].active_pane;
+        assert_eq!(
+            snap.panes[&pid].command,
+            vec!["/bin/sh".to_string(), "-c".into(), "npm run dev".into()]
+        );
+        // …and the title names the program, not the shell.
+        assert_eq!(snap.panes[&pid].title, "npm");
+    }
+
+    #[test]
+    fn create_window_without_a_command_is_unchanged() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = graph
+            .create_window_with_command(sid, "plain".into(), home(), Vec::new())
+            .unwrap();
+        let snap = state.load();
+        let pid = snap.windows[&wid].active_pane;
+        assert!(snap.panes[&pid].command.is_empty());
+    }
+
+    #[test]
+    fn split_pane_with_command_persists_it_on_the_new_pane() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let target = state.load().windows[&wid].active_pane;
+
+        let new_pane = graph
+            .split_pane_with_command(
+                target,
+                Direction::Vertical,
+                0.5,
+                vec!["htop".into(), "-d".into(), "10".into()],
+            )
+            .unwrap();
+
+        let snap = state.load();
+        assert_eq!(
+            snap.panes[&new_pane].command,
+            vec!["htop".to_string(), "-d".into(), "10".into()]
+        );
+        assert_eq!(snap.panes[&new_pane].title, "htop");
+        // The pane it split from is untouched.
+        assert!(snap.panes[&target].command.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_window_pane_created_event_carries_the_command() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, _state) = SessionGraph::new_with_event_bus(Some(bus));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        graph
+            .create_window_with_command(sid, "dev".into(), home(), vec!["lazygit".into()])
+            .unwrap();
+
+        for _ in 0..8 {
+            let next = tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+                .await
+                .expect("event should arrive")
+                .expect("bus not closed");
+            if let crate::bus::SubscriptionEvent::Event(e) = next
+                && let EventData::PaneCreated { command, .. } = &e.data
+                && !command.is_empty()
+            {
+                assert_eq!(command, &vec!["lazygit".to_string()]);
+                return;
+            }
+        }
+        panic!("PaneCreated from create_window never carried the command");
+    }
+
+    #[tokio::test]
+    async fn split_pane_pane_created_event_carries_the_command() {
+        let bus = crate::bus::EventBus::new();
+        let mut sub = bus.subscribe();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let target = state.load().windows[&wid].active_pane;
+        graph
+            .split_pane_with_command(target, Direction::Vertical, 0.5, vec!["btop".into()])
+            .unwrap();
+
+        for _ in 0..8 {
+            let next = tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+                .await
+                .expect("event should arrive")
+                .expect("bus not closed");
+            if let crate::bus::SubscriptionEvent::Event(e) = next
+                && let EventData::PaneCreated { command, .. } = &e.data
+                && !command.is_empty()
+            {
+                assert_eq!(command, &vec!["btop".to_string()]);
+                return;
+            }
+        }
+        panic!("PaneCreated from split_pane never carried the command");
     }
 
     #[test]

@@ -146,6 +146,7 @@ filter = '''
   + binary_id(=shux::diff_palette_isolation)
   + binary_id(=shux::id_prefix_resolution)
   + binary_id(=shux::m0_integration)
+  + binary_id(=shux::pane_command_e2e)
   + binary_id(=shux::pane_io_integration)
   + binary_id(=shux::rep_pane_e2e)
   + binary_id(=shux::settle_waiter_drop)

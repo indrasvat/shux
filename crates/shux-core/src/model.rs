@@ -323,20 +323,16 @@ impl Pane {
                 self.title = o.clone();
                 return;
             }
-            // Auto from command (first arg basename) or cwd basename.
+            // Auto from the command's program name, or the cwd basename.
             //
             // These are as untrusted as the OSC and manual sources: a
             // template picks the argv and the cwd, and neither is
             // validated as an existing path. They go through the same
             // sanitizer, or `sanitize_title` is not "the single title
             // rule" it claims to be (issue #104).
-            if let Some(cmd) = self.command.first() {
-                self.title = sanitize_title_clamped(
-                    std::path::Path::new(cmd)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(cmd),
-                );
+            if let Some(name) = command_display_name(&self.command) {
+                let name = name.to_string();
+                self.title = sanitize_title_clamped(&name);
                 return;
             }
             if let Some(name) = self.cwd.file_name().and_then(|s| s.to_str()) {
@@ -347,6 +343,127 @@ impl Pane {
         // If title is empty (fresh pane with no command and no cwd
         // basename), leave it empty rather than dropping garbage in.
     }
+}
+
+/// The program name to show for a pane running `command`.
+///
+/// The obvious answer — the basename of `command[0]` — is the right one for an
+/// argv like `["nvim", "src/main.rs"]`. It is the wrong one whenever the argv is
+/// a **shell wrapper**, which is now the normal shape for a pane started from a
+/// shell command string (`shux session create --cmd "npm run dev"` runs
+/// `$SHELL -c "npm run dev"`, issue #125) and has always been the shape of the
+/// documented escape hatch `-- sh -c "npm run dev"`. Titling those panes `bash`
+/// and `sh` tells the operator nothing: every one of them looks the same.
+///
+/// So a wrapper is unwrapped and the title comes from the first real word of the
+/// script — skipping an `exec` prefix and any leading `NAME=value` assignments,
+/// the two things that routinely sit in front of the actual program. When the
+/// script does not begin with a plain command word (a subshell, a redirection, a
+/// `for` loop) there is no honest short answer and the shell's own name is used.
+///
+/// ```text
+/// ["nvim", "a.rs"]                    -> nvim
+/// ["/bin/bash", "-lc", "npm run dev"] -> npm
+/// ["sh", "-c", "exec TERM=x top"]     -> top
+/// ["sh", "-c", "(cd x && make)"]      -> sh
+/// ["/usr/local/bin/my-c", "-c", "x"]  -> my-c   (not a shell; not unwrapped)
+/// ```
+pub(crate) fn command_display_name(command: &[String]) -> Option<&str> {
+    let program = basename(command.first()?);
+    if is_shell(program)
+        && command.len() >= 3
+        && is_shell_command_flag(&command[1])
+        && let Some(word) = script_leading_word(&command[2])
+    {
+        return Some(word);
+    }
+    Some(program)
+}
+
+fn basename(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+}
+
+/// Shells whose `-c` takes a script as one argument. Deliberately a fixed list:
+/// guessing from the argument shape would unwrap `openssl -c ...` too.
+fn is_shell(program: &str) -> bool {
+    matches!(
+        program,
+        "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "ksh93" | "mksh" | "fish" | "busybox"
+    )
+}
+
+/// `-c` and the login/interactive variants shells accept as one cluster:
+/// `-c`, `-lc`, `-ic`, `-lic`, `-cl`, … Anything else (including `--command`,
+/// which is a different, non-shell convention) is not a wrapper.
+fn is_shell_command_flag(flag: &str) -> bool {
+    let Some(letters) = flag.strip_prefix('-') else {
+        return false;
+    };
+    !letters.is_empty()
+        && letters.contains('c')
+        && letters.chars().all(|c| matches!(c, 'c' | 'l' | 'i'))
+}
+
+/// The first word of a shell script that names a program to run, or `None` when
+/// the script does not start with one.
+fn script_leading_word(script: &str) -> Option<&str> {
+    for token in script.split_whitespace() {
+        if token == "exec" || is_env_assignment(token) {
+            continue;
+        }
+        if token.chars().any(is_shell_syntax) {
+            return None;
+        }
+        let name = basename(token);
+        return (!name.is_empty()).then_some(name);
+    }
+    None
+}
+
+/// `NAME=value` in the leading position — a per-command environment override,
+/// not the program.
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Characters that mean the token is shell syntax rather than a program name.
+fn is_shell_syntax(c: char) -> bool {
+    matches!(
+        c,
+        '|' | '&'
+            | ';'
+            | '<'
+            | '>'
+            | '('
+            | ')'
+            | '$'
+            | '`'
+            | '\\'
+            | '"'
+            | '\''
+            | '*'
+            | '?'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '~'
+            | '#'
+            | '!'
+            | '='
+    )
 }
 
 /// Characters that must never survive into a stored title.
@@ -560,6 +677,89 @@ mod tests {
         let wid = WindowId::new();
         let pane = Pane::with_command(wid, "/home/test", vec!["/usr/bin/htop".into()]);
         assert_eq!(pane.effective_title(), "htop");
+    }
+
+    // ── issue #125: a shell wrapper must not become the title ─────────
+    //
+    // `--cmd "npm run dev"` runs `$SHELL -c "npm run dev"`. Titling the pane
+    // after the shell would make every `--cmd` pane in a session look
+    // identical.
+
+    #[track_caller]
+    fn title_of(argv: &[&str]) -> String {
+        let pane = Pane::with_command(
+            WindowId::new(),
+            "/home/test/proj",
+            argv.iter().map(|s| s.to_string()).collect(),
+        );
+        pane.effective_title().to_string()
+    }
+
+    #[test]
+    fn shell_wrapper_titles_after_the_program_the_script_runs() {
+        assert_eq!(title_of(&["/bin/bash", "-c", "npm run dev"]), "npm");
+        assert_eq!(title_of(&["sh", "-c", "top"]), "top");
+        assert_eq!(title_of(&["/usr/bin/zsh", "-lc", "cargo watch"]), "cargo");
+        assert_eq!(title_of(&["dash", "-ic", "htop"]), "htop");
+        assert_eq!(title_of(&["fish", "-lic", "btop"]), "btop");
+    }
+
+    #[test]
+    fn shell_wrapper_skips_exec_and_environment_prefixes() {
+        assert_eq!(title_of(&["sh", "-c", "exec top"]), "top");
+        assert_eq!(title_of(&["sh", "-c", "RUST_LOG=debug cargo run"]), "cargo");
+        assert_eq!(
+            title_of(&["sh", "-c", "exec FOO=1 BAR=2 btop -p 1"]),
+            "btop"
+        );
+    }
+
+    #[test]
+    fn shell_wrapper_takes_the_basename_of_an_absolute_program() {
+        assert_eq!(
+            title_of(&["sh", "-c", "/usr/local/bin/lazygit -p ."]),
+            "lazygit"
+        );
+    }
+
+    #[test]
+    fn shell_wrapper_falls_back_to_the_shell_when_the_script_is_not_a_plain_command() {
+        // A subshell, a redirection, a variable, a loop: no honest short name.
+        assert_eq!(title_of(&["sh", "-c", "(cd x && make)"]), "sh");
+        assert_eq!(title_of(&["bash", "-c", "> log 2>&1 make"]), "bash");
+        assert_eq!(title_of(&["sh", "-c", "$EDITOR notes"]), "sh");
+        assert_eq!(
+            title_of(&["sh", "-c", "for i in 1 2; do echo $i; done"]),
+            "for"
+        );
+        assert_eq!(title_of(&["sh", "-c", "   "]), "sh");
+        assert_eq!(title_of(&["sh", "-c", ""]), "sh");
+        // Only assignments, no command.
+        assert_eq!(title_of(&["sh", "-c", "FOO=1"]), "sh");
+    }
+
+    #[test]
+    fn a_program_that_merely_takes_dash_c_is_not_unwrapped() {
+        // `is_shell` is a fixed list precisely so this does not happen.
+        assert_eq!(title_of(&["openssl", "-c", "req"]), "openssl");
+        assert_eq!(title_of(&["/opt/tool/shush", "-c", "start"]), "shush");
+    }
+
+    #[test]
+    fn a_shell_without_a_dash_c_script_titles_after_the_shell() {
+        assert_eq!(title_of(&["bash", "-l", "-i"]), "bash");
+        assert_eq!(title_of(&["sh"]), "sh");
+        assert_eq!(title_of(&["sh", "-c"]), "sh"); // truncated wrapper
+        assert_eq!(title_of(&["bash", "--command", "top"]), "bash");
+        assert_eq!(title_of(&["bash", "-x", "top"]), "bash");
+    }
+
+    #[test]
+    fn an_unwrapped_script_word_is_still_sanitized() {
+        // The script is as untrusted as any other title source (issue #104).
+        let title = title_of(&["sh", "-c", "ev\u{1b}]0;spoof\u{7}il --now"]);
+        assert!(!title.contains('\u{1b}'), "{title:?}");
+        assert!(!title.contains('\u{7}'), "{title:?}");
     }
 
     #[test]
