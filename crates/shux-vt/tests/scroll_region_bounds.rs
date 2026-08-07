@@ -409,27 +409,48 @@ fn scroll_cost_ns(rows: usize, reps: usize) -> u128 {
     start.elapsed().as_nanos().max(1)
 }
 
+/// Nanoseconds for the SAME total scrolling done one line at a time.
+///
+/// This models the defect. `Grid::scroll_up` rotates the region by one line,
+/// which is O(region height); doing that once per line is O(height^2) — exactly
+/// the cost the bulk API replaced. It is measured live, in this run, on this
+/// machine, at this optimisation level, so it can serve as a calibrated upper
+/// reference rather than a number recorded once in a comment.
+fn per_line_scroll_cost_ns(rows: usize, reps: usize) -> u128 {
+    let mut t = vt(rows);
+    for i in 0..5000 {
+        t.process(format!("sb{i}\r\n").as_bytes());
+    }
+    t.process(format!("\x1b[2;{}r", rows - 1).as_bytes());
+    // One line at a time, region height times, `reps` times over: the same
+    // total displacement `\x1b[999999S` achieves in one bulk operation.
+    let payload = b"\x1b[1S".repeat(reps * (rows - 2));
+    let start = std::time::Instant::now();
+    t.process(&payload);
+    start.elapsed().as_nanos().max(1)
+}
+
 /// Multiplying the pane height by 8 must multiply the cost of scrolling it by
-/// roughly 8, not by 64. Asserted as a ratio so it does not depend on machine
-/// speed.
+/// roughly 8, not by 64.
 ///
-/// Calibration on this surface: 8.1x after the bulk rotate, 19.9x before it.
-/// The 12x threshold sits ~1.5x above the fixed measurement and ~1.6x below the
-/// broken one, so it has margin on both sides rather than just being loose.
+/// **Both reference points are measured in the same run.** The obvious version
+/// of this test compares one ratio against a threshold recorded in a comment —
+/// and that threshold is only valid under the machine, cache and codegen it was
+/// taken on. It bit exactly that way here: the recorded calibration (8.1x
+/// linear, 19.9x quadratic, 12x threshold) was taken at `opt-level = 0`, and
+/// when test targets moved to `opt-level = 1` the same, still-linear
+/// implementation started reading 11-12.8x and failing about one run in ten.
+/// Nothing had regressed. 1024 rows of blanking exceeds L2 where 128 rows does
+/// not, and optimising away the interpreter overhead stopped masking it. A
+/// ratio cancels out machine SPEED; it does not cancel out the memory
+/// hierarchy.
 ///
-/// **Each arm is minimised separately.** This used to take the best of three
-/// *paired* ratios — `min(l₁/s₁, l₂/s₂, l₃/s₃)` — which only rejects noise that
-/// happens to land on the small arm. Noise on the large arm inflates every
-/// pair, and the minimum of three inflated ratios is still inflated. Taking
-/// `min(l) / min(s)` over N samples instead lets each arm converge to its own
-/// uncontended cost independently, which is what the ratio is supposed to be
-/// comparing.
-///
-/// That mattered as soon as test targets started building at `opt-level = 1`
-/// (workspace `Cargo.toml`): measured over 20 solo runs, the paired estimator
-/// read above 12x once, and the separated one has not. The optimisation did not
-/// make the scroll super-linear — it shortened both arms until the paired
-/// estimator's noise floor was a meaningful share of the measurement.
+/// So the quadratic reference is measured too, from the per-line path that is
+/// genuinely O(height^2), and the verdict is which of the two the bulk path
+/// resembles. Both arms feel the same cache behaviour and the same codegen, so
+/// whatever moves one moves the other and the comparison survives it. The only
+/// way this test goes red is if bulk scrolling actually starts scaling like the
+/// per-line path — which is the regression it exists to catch.
 #[test]
 fn region_scroll_cost_is_linear_in_pane_height() {
     let small = 128usize;
@@ -437,27 +458,62 @@ fn region_scroll_cost_is_linear_in_pane_height() {
     let reps = 40;
     const SAMPLES: usize = 5;
 
-    // Warm BOTH arms: allocator growth and first-touch page faults are paid
-    // once per size, and charging them to the large arm's first sample is the
-    // same bias the estimator above exists to avoid.
+    // Warm BOTH sizes: allocator growth and first-touch page faults are paid
+    // once per size, and charging them to the large arm's first sample is a
+    // bias, not a measurement.
     scroll_cost_ns(small, 4);
     scroll_cost_ns(large, 4);
 
-    let mut best_small = u128::MAX;
-    let mut best_large = u128::MAX;
+    // Each arm minimised independently. Taking the best of N *paired* ratios
+    // only rejects noise that lands on the small arm; noise on the large arm
+    // inflates every pair, and the minimum of inflated pairs is still inflated.
+    let (mut bulk_s, mut bulk_l) = (u128::MAX, u128::MAX);
     for _ in 0..SAMPLES {
-        best_small = best_small.min(scroll_cost_ns(small, reps));
-        best_large = best_large.min(scroll_cost_ns(large, reps));
+        bulk_s = bulk_s.min(scroll_cost_ns(small, reps));
+        bulk_l = bulk_l.min(scroll_cost_ns(large, reps));
     }
-    let best_ratio = best_large as f64 / best_small as f64;
+    let bulk_ratio = bulk_l as f64 / bulk_s as f64;
+
+    // The quadratic reference. Fewer reps — it is ~(height) times more work per
+    // rep by construction, and the point is its SHAPE, not its absolute cost.
+    let q_reps = 1;
+    per_line_scroll_cost_ns(small, q_reps);
+    let (mut pl_s, mut pl_l) = (u128::MAX, u128::MAX);
+    for _ in 0..3 {
+        pl_s = pl_s.min(per_line_scroll_cost_ns(small, q_reps));
+        pl_l = pl_l.min(per_line_scroll_cost_ns(large, q_reps));
+    }
+    let per_line_ratio = pl_l as f64 / pl_s as f64;
 
     let growth = (large / small) as f64;
-    assert!(
-        best_ratio < growth * 1.5,
-        "scrolling a {large}-row region cost {best_ratio:.1}x a {small}-row region; \
-         linear is ~{growth:.0}x, quadratic ~{:.0}x — region scroll is still \
-         super-linear in pane height",
+    eprintln!(
+        "region scroll: bulk grows {bulk_ratio:.1}x from {small} to {large} rows; \
+         the per-line path grows {per_line_ratio:.1}x. \
+         Linear is ~{growth:.0}x, quadratic ~{:.0}x.",
         growth * growth
+    );
+
+    // The per-line reference must actually behave quadratically, or it is not a
+    // reference and this test would pass against anything. If it ever stops
+    // doing so, that is a signal in its own right and deserves a human.
+    assert!(
+        per_line_ratio > growth * 1.5,
+        "the per-line reference grew only {per_line_ratio:.1}x from {small} to {large} rows; \
+         it is supposed to be the QUADRATIC arm (~{:.0}x) and can no longer calibrate \
+         anything. Did `Grid::scroll_up` stop being O(region height)?",
+        growth * growth
+    );
+
+    // The verdict: bulk must sit far closer to linear than to the measured
+    // quadratic arm. The geometric mean of the two is the neutral midpoint on a
+    // scale where both are multiplicative, so it does not favour either.
+    let midpoint = (growth * per_line_ratio).sqrt();
+    assert!(
+        bulk_ratio < midpoint,
+        "bulk region scrolling grew {bulk_ratio:.1}x from {small} to {large} rows. \
+         Linear is ~{growth:.0}x and the per-line path measured {per_line_ratio:.1}x \
+         on this machine, so anything under {midpoint:.1}x is linear-shaped — \
+         region scroll is scaling like the per-line path again"
     );
 }
 

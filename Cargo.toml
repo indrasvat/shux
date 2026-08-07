@@ -86,4 +86,4 @@ opt-level = 2
 debug = false
 
 [profile.test]
-opt-level = 0
+opt-level = 1

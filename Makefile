@@ -132,6 +132,10 @@ check-test-groups: nextest-ready ## Assert every nextest test-group still matche
 bench-test-suite: nextest-ready setup-bench ## hyperfine A/B: legacy serial runner vs the parallel one
 	@bash .shux/scripts/bench_test_suite.sh
 
+.PHONY: bench-edit-loop
+bench-edit-loop: nextest-ready ## Time the real loop: change code, run tests, repeat
+	@bash .shux/scripts/bench_edit_loop.sh
+
 .PHONY: test-fallback
 test-fallback: ## Legacy serial runner (no nextest). Kept for hosts where nextest cannot run.
 	@echo "$(COLOR_YELLOW)▶ Legacy serial runner — this is the slow path, and it is NOT what CI runs.$(COLOR_RESET)"
