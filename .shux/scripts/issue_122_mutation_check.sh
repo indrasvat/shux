@@ -101,6 +101,16 @@ assert old in s, "anchor moved"
 s = s.replace(old, "")
 EDIT
 
+mutate "flag pairs form across a cursor move again" <<'EDIT'
+# Anchored on the RI function's own body -- the bare `active_grapheme_position()`
+# line appears three times, and replacing the first one mutates a different join.
+old = """        // way; this one was not.
+        let Some((row, col)) = self.active_grapheme_position() else {"""
+assert s.count(old) == 1, "anchor moved or is no longer unique"
+s = s.replace(old, """        // way; this one was not.
+        let Some((row, col)) = self.preceding_cell_position() else {""")
+EDIT
+
 mutate "a stray mark redefines the preceding character" <<'EDIT'
 old = """        if *self.active_grapheme_cell != Some(joined) {
             return;

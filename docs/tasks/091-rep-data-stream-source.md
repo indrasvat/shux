@@ -210,6 +210,28 @@ REP-shaped `CSI b`; the same inputs with REP stripped gave 0. All six rich TUIs 
 `nvim`, `htop`, `btop`, `lazygit`, `less`) render byte-identically, including over a
 page the repeat command had just filled.
 
+## Review round (PR #129, Codex bot): one more screen-derived join
+
+`try_append_regional_indicator_pair` located its target with `preceding_cell_position()`
+— the cursor, not the stream. A cursor move that lands exactly one column past an older
+lone regional indicator therefore fused the two into a flag across a gap the data stream
+never had, and because the move had cleared `active_grapheme_cell`, the record was left
+pointing at whatever was printed before it:
+
+```
+ESC[1;5H U+1F1FA      a lone indicator at column 5, cursor now at column 6
+ESC[2;1H X            print elsewhere -- X becomes the preceding character
+ESC[1;6H U+1F1F8      lands one past the indicator; joins it into a flag
+ESC[1b                REP -> writes `X`, where a literal U+1F1F8 writes the indicator
+```
+
+The same screen-derived reasoning as the combining-mark defect above, in the one join
+that had not been gated. The ZWJ join has always used `active_grapheme_position()`; this
+one now does too, so a pair only forms out of two indicators that ARRIVED together.
+Reported at the wrong column (the join needs the cursor exactly one past the indicator,
+not two), reproduced at the right one, then fixed and pinned by
+`a_regional_indicator_does_not_join_across_a_cursor_move`.
+
 ## Reference cross-check: Alacritty
 
 Alacritty `1b2b36a6` builds on the same `vte` crate at the same version (0.15.0) that

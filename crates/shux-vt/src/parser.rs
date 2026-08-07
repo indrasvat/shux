@@ -770,7 +770,15 @@ impl<'a> VtHandler<'a> {
         if !is_regional_indicator(ch) {
             return false;
         }
-        let Some((row, col)) = self.preceding_cell_position() else {
+        // The pair has to form out of two indicators that ARRIVED together, not
+        // out of two that merely ended up adjacent. `preceding_cell_position` is
+        // derived from the cursor, so a cursor move landing exactly one past an
+        // older lone indicator fused the two across a gap the data stream never
+        // had -- and left the remembered character pointing at whatever was
+        // printed before the move, so REP drew that instead of the indicator
+        // (Codex review on PR #129). The ZWJ join has always been gated this
+        // way; this one was not.
+        let Some((row, col)) = self.active_grapheme_position() else {
             return false;
         };
         let previous_is_single_ri = self

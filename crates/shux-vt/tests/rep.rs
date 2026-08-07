@@ -516,6 +516,31 @@ fn rep_of_a_zwj_terminated_cluster_matches_the_literal_stream() {
     );
 }
 
+/// The last screen-derived join. A regional indicator pairs with whatever is
+/// immediately left of the CURSOR, so a cursor move that happens to land one
+/// past an older lone indicator fuses the two — across a gap the data stream
+/// never had. The stream's preceding character is then the arriving indicator,
+/// but the record still pointed at whatever was printed before the move, so REP
+/// drew that instead (Codex review on PR #129).
+#[test]
+fn a_regional_indicator_does_not_join_across_a_cursor_move() {
+    // The indicator at column 5 leaves the cursor at column 6; the move puts it
+    // back there, which is exactly where the screen-derived join fires.
+    let prefix = "\x1b[1;5H\u{1F1FA}\x1b[2;1HX\x1b[1;6H\u{1F1F8}";
+    assert_rep_equals_literal(2, 10, prefix.as_bytes(), "\u{1F1F8}", 1);
+
+    let mut t = vt(2, 10);
+    t.process(prefix.as_bytes());
+    let row = t.grid().visible_row(0);
+    assert_eq!(row[4].ch, '\u{1F1FA}', "the older indicator was fused into");
+    assert!(!row[4].is_wide(), "a flag was built across a cursor move");
+    assert_eq!(
+        row[5].ch, '\u{1F1F8}',
+        "the arriving indicator lost its own cell"
+    );
+    assert_wide_pairs_intact(&t, "regional indicator across a move");
+}
+
 /// A lone regional indicator is half a flag. Two of them arriving in sequence
 /// fuse into one, and a repeat is an arrival, so they fuse here too — three
 /// repeats of one indicator are two flag cells, exactly as four indicators in
