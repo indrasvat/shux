@@ -40,56 +40,59 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 #
 # Nothing here is about "integration tests are scary". Each group names one
 # specific resource that is genuinely global to the machine and therefore
-# cannot be handed out per-test:
+# cannot be handed out per-test.
+#
+# A test belongs to AT MOST ONE group, and the first matching override wins.
+# That is easy to get wrong in a way nothing reports: an earlier, looser group
+# silently captures binaries a later, tighter one names, and the tighter group's
+# carefully-reasoned comment then describes a membership that does not exist.
+# It happened here — `pty-pool` and `daemon-backed` started out as separate
+# groups listing many of the same binaries, and every heavyweight suite
+# (`m0_integration`, `pane_io_integration`, `decaln_pane_e2e`, `rep_pane_e2e`)
+# resolved into the earlier one. The two are now a single group, and
+# `make check-test-groups` asserts each group's exact member count so the next
+# overlap fails loudly instead of quietly re-tuning the suite.
 #
 #   process-table — these tests decide whether they passed by running `ps` and
-#     counting matching processes. `ps` sees the whole machine. Two of them
-#     running at once can read each other's processes and reach a confident,
-#     wrong verdict. Needles are now per-run unique (see
-#     `unique_marker` in shux-plugin's tests and the `sleep_tag` pattern in
-#     shux's), so this cap is defence in depth rather than the only thing
-#     holding the suite up — but a scan is still a scan.
+#     counting matching processes. `ps` sees the whole machine. Two of them at
+#     once can read each other's processes and reach a confident, wrong verdict.
+#     Needles are per-run unique now (`unique_marker` in shux-plugin's tests,
+#     the `sleep_tag` pattern in shux's), so this is defence in depth rather
+#     than the only thing holding the suite up — but a scan is still a scan.
+#     Listed FIRST because it is the tightest: the binaries here would
+#     otherwise be captured by `daemon-pty` below.
 #
-#   pty-pool — real `openpty` allocations come from a fixed kernel table.
-#     Linux is generous (`kernel.pty.max`, thousands); macOS is not, and a
-#     laptop that has been running for a while has less of it left than CI
-#     does. Capping this is what keeps the same number from meaning different
-#     things on the two platforms.
+#   daemon-pty — everything that boots a real shux daemon, allocates real PTYs,
+#     or both. In this workspace that is one set, not two: every daemon-backed
+#     suite but `statusbar_starship_symlink` also allocates PTYs, because
+#     creating a session creates a pane. Modelling them as one group is what
+#     makes the cap mean something — as two, the effective concurrency was the
+#     sum of both caps and neither number described the machine.
 #
-# Everything else — the ~1,900 in-memory VT, layout, parser, raster, rpc and
-# core tests, and every daemon-backed suite that isolates its own
-# XDG_RUNTIME_DIR — runs at full parallelism, exactly as CI has been running
-# it. Serializing those was never buying safety; it was buying six minutes.
-#   wall-clock — one test in the workspace decides its verdict by timing two
-#     workloads and comparing the ratio. A ratio cancels out machine speed but
-#     it does not cancel out *contention*: with more runnable tests than cores,
-#     which of the two arms gets descheduled is luck, and the measurement is of
-#     the scheduler rather than of the code. Running it alone is the only way
-#     the number means what the assertion says it means.
-#   daemon-backed — these boot a real shux daemon, spawn real panes, and then
-#     wait on them with real deadlines. They are not CPU-hungry (they are
-#     mostly asleep), which is exactly why the suite as a whole is worth
-#     oversubscribing — but they are STARVABLE. Measured on a 4-core box at 6x
-#     oversubscription: `decaln_pane_e2e` spent 62.8s inside a 60s wait budget
-#     and failed, having done nothing wrong.
+#     They isolate their own XDG_RUNTIME_DIR, so this is not about collision.
+#     It is about starvation: each carries a wall-clock budget for a pane to
+#     show something, and a budget only means anything if the test gets
+#     scheduled. Measured on a 4-core box at 6x oversubscription with no cap,
+#     `decaln_pane_e2e` spent 62.8s inside a 60s wait budget and failed, having
+#     done nothing wrong.
 #
-#     The cap is a flat 8, deliberately NOT `num-cpus`. What these tests
+#     The cap is a flat count, deliberately not `num-cpus`. What these tests
 #     contend for is not CPU — they are asleep almost the whole time — it is
 #     daemon startup, PTYs and memory, and the right ceiling for that is a
-#     resource count, not a core count. Measured on the 4-core box: cap 4 gives
-#     35.5s (the cap is the critical path and the cores sit idle), cap 8 gives
-#     22.0s, and no cap at all gives 23.8s but falls off a cliff into
-#     starvation at 6x oversubscription. Verified under `taskset -c 0,1` — a
-#     simulated 2-core machine — at 43.7s with all 1,933 passing, so 8 is not
-#     merely tuned to the box it was measured on.
+#     resource count, not a core count. `max-threads` accepts only an integer
+#     or `num-cpus` anyway, so "twice the cores" is not expressible.
 #
-#     `threads-required = 2` on the members was tried instead and is worse
-#     (42.9s): booking two slots per daemon test starves the ~1,800 in-memory
-#     tests out of the budget rather than running beside them.
+#   wall-clock — tests that decide their verdict by timing a workload. A ratio
+#     cancels out machine speed but not *contention*: with more runnable tests
+#     than cores, which arm gets descheduled is luck, and the measurement is of
+#     the scheduler rather than of the code.
+#
+# Everything else — the ~1,700 in-memory VT, layout, parser, raster, rpc and
+# core tests — runs unbounded. Serializing those was never buying safety; it
+# was buying six minutes.
 process-table = { max-threads = 1 }
-pty-pool = { max-threads = 4 }
+daemon-pty = { max-threads = 8 }
 wall-clock = { max-threads = 1 }
-daemon-backed = { max-threads = 8 }
 
 # ── Group membership ──────────────────────────────────────────────────────
 
@@ -114,23 +117,12 @@ filter = '''
 '''
 test-group = 'process-table'
 
-# Tests that allocate real PTYs from the kernel's pool.
-[[profile.default.overrides]]
-filter = '''
-    binary_id(=shux-pty::integration)
-  + binary_id(=shux::pane_io_integration)
-  + binary_id(=shux::decaln_pane_e2e)
-  + binary_id(=shux::rep_pane_e2e)
-  + binary_id(=shux::m0_integration)
-'''
-test-group = 'pty-pool'
-
-# Suites that boot a real daemon and wait on real panes.
+# Everything that drives a real daemon and/or a real PTY.
 #
-# Every one of them isolates its own XDG_RUNTIME_DIR, so this is not about
-# collision — they are safe beside each other and beside everything else. It is
-# about starvation: each carries a wall-clock budget for a pane to show
-# something, and a budget only means anything if the test gets scheduled.
+# `shux::scratch_reap_order` belongs here by nature but is claimed by
+# `process-table` above, which is strictly tighter (1 thread, not 8). Listing it
+# in both would be harmless-looking and wrong: the first match wins, so the
+# second listing would be inert documentation.
 [[profile.default.overrides]]
 filter = '''
     binary_id(=shux::checkpoint_invalidation_gating)
@@ -145,13 +137,13 @@ filter = '''
   + binary_id(=shux::m0_integration)
   + binary_id(=shux::pane_io_integration)
   + binary_id(=shux::rep_pane_e2e)
-  + binary_id(=shux::scratch_reap_order)
   + binary_id(=shux::settle_waiter_drop)
   + binary_id(=shux::statusbar_starship_symlink)
   + binary_id(=shux::window_snapshot_oversize)
   + binary_id(=shux::window_title_escape_injection)
+  + binary_id(=shux-pty::integration)
 '''
-test-group = 'daemon-backed'
+test-group = 'daemon-pty'
 
 # Tests whose assertion is a wall-clock measurement.
 #

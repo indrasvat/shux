@@ -762,18 +762,45 @@ async fn test_cli_api_raw_against_server() {
 /// had less company.
 fn sandbox_root() -> &'static std::path::Path {
     use std::sync::OnceLock;
-    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    // Held by value, and the guard below is what removes it. A `static
+    // TempDir` would never be dropped — Rust does not run destructors on
+    // statics — so every test PROCESS (and under nextest that is every test)
+    // would leave an empty directory behind for good.
+    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        tempfile::Builder::new()
+        let dir = tempfile::Builder::new()
             // Unix socket paths cap out near 104 bytes, so the prefix stays
             // short: a long one truncates the daemon socket and the failure
             // reads as a hang rather than a name-too-long error.
             .prefix("shux-cli")
             .tempdir()
-            .expect("sandbox tempdir")
+            .expect("sandbox tempdir");
+        // `into_path` hands us ownership of a directory tempfile will no longer
+        // clean, so we clean it at process exit ourselves.
+        let path = dir.keep();
+        let cleanup = path.clone();
+        // Registering at first use rather than in a `main` we do not control.
+        // Best effort: if the process is SIGKILLed the tempdir survives, which
+        // is the same guarantee tempfile itself offers.
+        let _ = std::panic::catch_unwind(|| {
+            SANDBOX_CLEANUP
+                .set(SandboxCleanup(cleanup))
+                .map_err(|_| ())
+                .ok();
+        });
+        path
     })
-    .path()
+    .as_path()
 }
+
+/// Removes the sandbox when the test binary's statics are torn down.
+struct SandboxCleanup(std::path::PathBuf);
+impl Drop for SandboxCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+static SANDBOX_CLEANUP: std::sync::OnceLock<SandboxCleanup> = std::sync::OnceLock::new();
 
 fn shux_bin() -> std::process::Command {
     let root = sandbox_root();
@@ -1030,7 +1057,10 @@ fn test_cli_config_validate_missing_file() {
             "config",
             "validate",
             "--config",
-            "/tmp/nonexistent-shux-validate-xyz.toml",
+            sandbox_root()
+                .join("nonexistent-validate.toml")
+                .to_str()
+                .unwrap(),
         ])
         .output()
         .unwrap();
@@ -1043,7 +1073,10 @@ fn test_cli_config_validate_missing_file() {
 fn test_cli_version_without_daemon() {
     let output = shux_bin()
         .arg("version")
-        .env("SHUX_SOCKET", "/tmp/nonexistent-shux-cli-test.sock")
+        .env(
+            "SHUX_SOCKET",
+            sandbox_root().join("nonexistent.sock").to_str().unwrap(),
+        )
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1056,7 +1089,10 @@ fn test_cli_version_without_daemon() {
 fn test_cli_version_json_without_daemon() {
     let output = shux_bin()
         .args(["--format", "json", "version"])
-        .env("SHUX_SOCKET", "/tmp/nonexistent-shux-cli-test.sock")
+        .env(
+            "SHUX_SOCKET",
+            sandbox_root().join("nonexistent.sock").to_str().unwrap(),
+        )
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -411,26 +411,46 @@ fn scroll_cost_ns(rows: usize, reps: usize) -> u128 {
 
 /// Multiplying the pane height by 8 must multiply the cost of scrolling it by
 /// roughly 8, not by 64. Asserted as a ratio so it does not depend on machine
-/// speed, and taken as the best of three runs so a scheduling hiccup in one
-/// sample cannot fail the build.
+/// speed.
 ///
-/// Calibration on this surface, best-of-three: 8.1x after the bulk rotate,
-/// 19.9x before it. The 12x threshold sits ~1.5x above the fixed measurement
-/// and ~1.6x below the broken one, so it has margin on both sides rather than
-/// just being loose.
+/// Calibration on this surface: 8.1x after the bulk rotate, 19.9x before it.
+/// The 12x threshold sits ~1.5x above the fixed measurement and ~1.6x below the
+/// broken one, so it has margin on both sides rather than just being loose.
+///
+/// **Each arm is minimised separately.** This used to take the best of three
+/// *paired* ratios — `min(l₁/s₁, l₂/s₂, l₃/s₃)` — which only rejects noise that
+/// happens to land on the small arm. Noise on the large arm inflates every
+/// pair, and the minimum of three inflated ratios is still inflated. Taking
+/// `min(l) / min(s)` over N samples instead lets each arm converge to its own
+/// uncontended cost independently, which is what the ratio is supposed to be
+/// comparing.
+///
+/// That mattered as soon as test targets started building at `opt-level = 1`
+/// (workspace `Cargo.toml`): measured over 20 solo runs, the paired estimator
+/// read above 12x once, and the separated one has not. The optimisation did not
+/// make the scroll super-linear — it shortened both arms until the paired
+/// estimator's noise floor was a meaningful share of the measurement.
 #[test]
 fn region_scroll_cost_is_linear_in_pane_height() {
     let small = 128usize;
     let large = 1024usize;
     let reps = 40;
-    scroll_cost_ns(small, 4); // warm up allocator / page faults
+    const SAMPLES: usize = 5;
 
-    let mut best_ratio = f64::MAX;
-    for _ in 0..3 {
-        let s = scroll_cost_ns(small, reps) as f64;
-        let l = scroll_cost_ns(large, reps) as f64;
-        best_ratio = best_ratio.min(l / s);
+    // Warm BOTH arms: allocator growth and first-touch page faults are paid
+    // once per size, and charging them to the large arm's first sample is the
+    // same bias the estimator above exists to avoid.
+    scroll_cost_ns(small, 4);
+    scroll_cost_ns(large, 4);
+
+    let mut best_small = u128::MAX;
+    let mut best_large = u128::MAX;
+    for _ in 0..SAMPLES {
+        best_small = best_small.min(scroll_cost_ns(small, reps));
+        best_large = best_large.min(scroll_cost_ns(large, reps));
     }
+    let best_ratio = best_large as f64 / best_small as f64;
+
     let growth = (large / small) as f64;
     assert!(
         best_ratio < growth * 1.5,

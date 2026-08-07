@@ -1,13 +1,26 @@
-[build]
-# Use mold linker on Linux for faster linking (if available)
-# Uncomment below for your platform:
-# [target.x86_64-unknown-linux-gnu]
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-# [target.aarch64-unknown-linux-gnu]
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# Cargo configuration.
+#
+# There is deliberately NO linker override here.
+#
+# This file used to carry a commented-out mold/lld block, copied around as
+# folklore, which had never been enabled and therefore had never sped anything
+# up. Measured on this workspace before deleting it — `rust-lld` (which ships
+# with the toolchain, so it needs no install) against the default linker, warm
+# cache, three touch-and-relink cycles of the largest binary:
+#
+#     rust-lld          2.50s  2.33s
+#     default linker    2.33s  2.41s
+#
+# No difference worth a portability risk. The reason is in `Cargo.toml`:
+# `[profile.dev] debug = "line-tables-only"` plus `debug = false` on
+# dependencies removed most of the debug info a linker spends its time on, so
+# the link stopped being the bottleneck. Fixing the profile made the linker
+# swap redundant rather than the other way round.
+#
+# If you revisit this: measure a WARM cache. Changing `RUSTFLAGS` is part of
+# cargo's fingerprint, so the first build after a flag change rebuilds the
+# whole graph — comparing that against a warm default build reports a 35x
+# slowdown that is entirely an artifact of the measurement.
 
 [alias]
 xt = "nextest run"

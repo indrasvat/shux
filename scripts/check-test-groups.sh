@@ -23,10 +23,24 @@ if ! command -v cargo-nextest >/dev/null 2>&1; then
   exit 2
 fi
 
-# Groups that must exist and must not be empty. Add a group here when you add
-# one to .config/nextest.toml — a group nobody asserts on is a group that can
-# quietly stop matching.
-REQUIRED_GROUPS=(process-table pty-pool wall-clock daemon-backed)
+# Groups that must exist, with the EXACT number of tests each must hold.
+#
+# An exact count, not just "non-empty". A test belongs to at most one group and
+# the first matching override wins, so a group listed earlier silently swallows
+# binaries a later one names — and both groups still look healthy. That is not
+# hypothetical: `pty-pool` and `daemon-backed` shipped as two groups sharing
+# four binaries, the earlier one took all of them, and the later one's tuning
+# comments described a membership it did not have. Nothing was red.
+#
+# Update these when you deliberately add or remove tests. The number moving on
+# its own is the signal.
+#
+#   <group>:<expected test count>
+REQUIRED_GROUPS=(
+  process-table:5
+  daemon-pty:183
+  wall-clock:1
+)
 
 # Largest share of the suite any single throttled group may hold, in percent.
 MAX_GROUP_PERCENT=${MAX_GROUP_PERCENT:-30}
@@ -34,19 +48,24 @@ MAX_GROUP_PERCENT=${MAX_GROUP_PERCENT:-30}
 # Deliberately NOT `raw=$(... )` under `set -e`: that aborts the script with
 # nextest's own exit code and no explanation, which is the one failure mode a
 # guard must never have. Capture, then report.
+# A per-run file, not a fixed literal. Two concurrent `make check` runs sharing
+# one path clobber and then delete each other's diagnostic — in the guard.
+err_file="$(mktemp "${TMPDIR:-/tmp}/shux-test-groups.XXXXXX")"
+trap 'rm -f "${err_file}"' EXIT
+
 set +e
-raw="$(cargo nextest show-config test-groups --workspace 2>/tmp/.shux-test-groups.err)"
+raw="$(cargo nextest show-config test-groups --workspace 2>"${err_file}")"
 show_status=$?
 set -e
 
 if [[ "${show_status}" -ne 0 ]]; then
   echo "✗ 'cargo nextest show-config test-groups' failed (exit ${show_status})." >&2
   echo "  .config/nextest.toml is almost certainly invalid — nextest said:" >&2
-  sed 's/^/    /' /tmp/.shux-test-groups.err >&2 || true
-  rm -f /tmp/.shux-test-groups.err
+  sed 's/^/    /' ${err_file} >&2 || true
+  rm -f ${err_file}
   exit 1
 fi
-rm -f /tmp/.shux-test-groups.err
+rm -f ${err_file}
 
 if [[ -z "${raw}" ]]; then
   echo "✗ 'cargo nextest show-config test-groups' produced no output — no groups" >&2
@@ -59,7 +78,9 @@ status=0
 total="$(cargo nextest list --workspace --message-format json 2>/dev/null |
   python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(len(v["testcases"]) for v in d["rust-suites"].values()))')"
 
-for group in "${REQUIRED_GROUPS[@]}"; do
+for entry in "${REQUIRED_GROUPS[@]}"; do
+  group="${entry%%:*}"
+  expected="${entry##*:}"
   # Slice the block between this group's header and the next one, counting the
   # test lines (indented deeper than the binary-id headers, which end in ':').
   # Declared-ness and membership come from the SAME pass: two independent
@@ -107,7 +128,18 @@ for group in "${REQUIRED_GROUPS[@]}"; do
     continue
   fi
 
-  echo "✓ test-group '${group}': ${count} test(s) of ${total}"
+  if [[ "${count}" -ne "${expected}" ]]; then
+    echo "✗ test-group '${group}' holds ${count} tests; expected ${expected}." >&2
+    echo "  Either a test moved in or out of the group, or an EARLIER group in" >&2
+    echo "  .config/nextest.toml is now capturing binaries this one names —" >&2
+    echo "  first match wins, so overlap is silent. Run:" >&2
+    echo "      cargo nextest show-config test-groups --workspace" >&2
+    echo "  If the change is intentional, update REQUIRED_GROUPS in $0." >&2
+    status=1
+    continue
+  fi
+
+  echo "✓ test-group '${group}': ${count} test(s) of ${total} (expected ${expected})"
 done
 
 if [[ "${status}" -ne 0 ]]; then

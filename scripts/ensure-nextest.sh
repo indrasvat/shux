@@ -25,23 +25,35 @@ if [ -x "${cargo_bin}/cargo-nextest" ]; then
   exit 0
 fi
 
-case "$(uname -s)" in
-  Linux) platform="linux" ;;
-  Darwin) platform="mac" ;;
+# get.nexte.st serves ONE tarball per (os, arch). The mac build is universal so
+# it needs no arch; the linux ones do NOT — `/latest/linux` is x86_64-only and
+# aarch64 lives at `/latest/linux-arm`. Getting this wrong is quiet in the worst
+# way: curl and tar both succeed, an x86_64 binary lands on an arm64 host, and
+# every later `make test` dies with "Exec format error" having skipped the
+# fallbacks that exist for exactly this.
+case "$(uname -s)/$(uname -m)" in
+  Darwin/*) platform="mac" ;;
+  Linux/x86_64 | Linux/amd64) platform="linux" ;;
+  Linux/aarch64 | Linux/arm64) platform="linux-arm" ;;
   *) platform="" ;;
 esac
 
-# get.nexte.st serves a single universal tarball per platform (the mac one is a
-# universal binary; the linux one is x86_64/aarch64 aware via the same URL).
 if [ -n "${platform}" ] && command -v curl >/dev/null 2>&1; then
   echo "▶ Installing cargo-nextest (pre-built) into ${cargo_bin}..."
   tmp="$(mktemp -d)"
   trap 'rm -rf "${tmp}"' EXIT
+  # The version check is part of the success condition, not a victory lap after
+  # it. Inside a bare `echo "$(...)"` a broken binary's failure is swallowed by
+  # the enclosing echo, `set -e` never fires, and the script exits 0 having
+  # installed something that cannot run.
   if curl -fsSL --retry 3 "https://get.nexte.st/latest/${platform}" -o "${tmp}/nextest.tar.gz" \
-     && tar zxf "${tmp}/nextest.tar.gz" -C "${cargo_bin}"; then
-    echo "✓ $("${cargo_bin}/cargo-nextest" nextest --version)"
+     && tar zxf "${tmp}/nextest.tar.gz" -C "${cargo_bin}" \
+     && version="$("${cargo_bin}/cargo-nextest" nextest --version 2>/dev/null)" \
+     && [ -n "${version}" ]; then
+    echo "✓ ${version}"
     exit 0
   fi
+  rm -f "${cargo_bin}/cargo-nextest"
   echo "warning: pre-built download failed; falling back to a source install" >&2
 fi
 

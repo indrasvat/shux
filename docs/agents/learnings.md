@@ -3,6 +3,73 @@
 > **STRICT RULE:** This section MUST be updated at the end of every coding session.
 > Each entry should be a concrete, actionable insight. Delete entries that become obsolete.
 
+- **2026-08-07 (issue #130 — a slow suite is a BLIND suite, not just a slow one):**
+  `make test` took 461s serially and hid three real defects, one of them in
+  production code. The plugin host leaked its children on every failed handshake
+  (`Child::kill` signals one process; a plugin is a process tree) — and the leak
+  guard could not see it because the stray `sleep 30` expired during the
+  remaining 400 seconds of serial execution. Cutting the suite to 22s is what
+  made the guard start failing. **When a guard starts firing after a speedup,
+  the speedup did not break anything — it removed the delay that was hiding the
+  break.** Reproduce the finding serially and in isolation before blaming
+  parallelism; all three of these reproduced with `-j 1`.
+
+- **2026-08-07 (nextest test-groups fail SILENTLY, in two different ways):**
+  A group whose filterset matches nothing is not an error — nextest prints an
+  empty group and runs everything unbounded, and nothing goes red. `test(=...)`
+  matches the test NAME only, so `test(=shux::bin/shux::tests::foo)` — which
+  reads exactly like the identifier `cargo nextest list` PRINTS — matches every
+  test in the workspace, not the one it names. Separately, a test belongs to at
+  most ONE group and the first matching override wins, so an earlier group
+  silently swallows binaries a later one names and both still look healthy.
+  Both shipped here. `scripts/check-test-groups.sh` now asserts each group's
+  EXACT member count; a non-empty check would have caught neither. Scope
+  filtersets by `binary_id()` first, then by name.
+
+- **2026-08-07 (killpg is only safe while the child is UNREAPED):** An unreaped
+  child pins its pid; `Child::wait()` reaps it and hands the pid straight back
+  to the kernel's free pool. Keeping the (now-empty) `Child` value in scope does
+  NOT pin anything — the pid is freed by `waitpid`, not by the Rust value's
+  lifetime. Since shux makes every plugin a process-group leader (as does every
+  job-control shell), a `killpg` on a recycled pid can SIGKILL an unrelated
+  group. Wait out a shutdown grace by polling the group with signal 0
+  (`killpg(pgid, None)`), never by `wait()`ing, and reap only after signalling.
+
+- **2026-08-07 (optimisation moves timing-RATIO thresholds, not just runtimes):**
+  `region_scroll_cost_is_linear_in_pane_height` compares a 1024-row scroll
+  against a 128-row one and asserts the ratio is under 12x. The threshold was
+  calibrated at `opt-level = 0` (8.1x fixed, 19.9x broken). At `opt-level = 1`
+  the honest ratio rises to ~11-12.8x — the small arm fits in cache and
+  optimises well, the large arm is memory-bandwidth-bound and cannot. A ratio
+  cancels out machine SPEED but not cache behaviour and not contention. Measured
+  A/B: 1/20 solo failures at opt-level 1, 0/20 at opt-level 0. If you change a
+  build profile, re-run every test whose assertion is a measurement.
+
+- **2026-08-07 (`max-threads = 1` does NOT give a test exclusivity):** A
+  test-group's `max-threads` serializes its members against EACH OTHER and
+  nothing else. For a group with one member it is a complete no-op — the test
+  still competes with every test outside the group. Measured: the timing-ratio
+  test read 8.1x at one thread per core and 30.8x at four, against a 12x
+  threshold, purely from contention, while nominally "serialized".
+  `threads-required = "num-test-threads"` is the knob that reserves the whole
+  run's budget and actually makes a test run alone.
+
+- **2026-08-07 (measure a WARM cache when comparing RUSTFLAGS):** `RUSTFLAGS` is
+  part of cargo's fingerprint, so the first build after any flag change rebuilds
+  the entire graph. Comparing that against a warm default build reported
+  `rust-lld` as 35x SLOWER than the default linker. Warm on both sides, the real
+  answer was "no measurable difference" (2.50s/2.33s vs 2.33s/2.41s) — because
+  `debug = "line-tables-only"` had already removed most of what a linker spends
+  its time on. Fixing the profile made the linker swap redundant; the
+  long-commented-out mold block was deleted rather than enabled.
+
+- **2026-08-07 (a unique `ps` needle must not change the process's LIFETIME):**
+  Encoding uniqueness into a sleep duration (`sleep 29456`, from
+  `format!("29{:03}", pid % 1000)`) makes every leaked marker outlive the run by
+  eight hours, and `pid % 1000` collides across runs anyway — so a stale process
+  from a Ctrl-C'd run gets attributed to the code under test. Put the marker in
+  `argv[0]` instead (`sh -c 'exec -a <marker> sleep 30'`) and use the full pid.
+
 - **2026-07-09 (task 077 lens P2 — `pane.glance` atomicity vs. unsynchronized
   multi-write frame producers):** A per-pane RPC can be PROVABLY atomic (one
   lock, one clone, render+text both derived from that frozen clone — verified
@@ -185,7 +252,7 @@
 - **2026-05-18 (task 061 — render parity + mouse copy):** Crossterm's `EnableMouseCapture` is broader than shux needs: it emits `?1000h`, `?1002h`, `?1003h`, `?1015h`, and `?1006h`. Any-motion tracking (`?1003h`) is unnecessary for SHUX's current click-to-focus / border-drag model and can interfere with host-terminal modifier selection. Prefer an explicit mouse-capture profile (`?1000h` + `?1002h` + `?1006h`) and keep `DisableMouseCapture` for cleanup. For copy UX, reuse `CopyModeState` as the selection geometry/data type, but keep normal mouse selection as separate attach-layer state from modal copy mode; visible text copy must not trap keyboard input.
 - **2026-05-18 (tasks 031/062/063 — human interactive core):** (1) Copy mode should treat `scrollback + visible` as one logical row space and render an overlay view only in live attach; snapshot RPCs should stay literal VT snapshots unless the API explicitly asks for an interactive mode. (2) Search in copy mode needs the current `VirtualTerminal` at key-handling time; routing attach input through a registry/helper that can borrow the focused VT avoids duplicating scrollback text extraction. (3) Attach keybinding config is best split into root and prefix tables, with config strings like `"prefix c"` normalized against the configured prefix; this keeps tmux-style config readable while preserving the existing action model. (4) Session save/restore should reuse the existing template + `state.apply` lowering path instead of inventing a second persistence format; exported split ratios should be rounded for human review because raw `f32` serialization leaks values like `0.44999998807907104`. (5) Dogfood scripts should write to `.shux/out/` and use `pane wait-for` against the active pane after template apply — split templates often leave the newly-created pane active, so waiting on the first pane's marker can falsely time out.
 - **2026-05-18 (fix/copy-selection-and-cursor-churn):** (1) Copy-mode selection overlays must redraw the selected glyphs from the VT, not just paint a background rectangle. A block overlay can make text illegible depending on theme contrast; the regression should assert both the selected text byte and the expected fg/bg ANSI are present. (2) A render loop with a fallback tick must not emit cursor hide/show/move bytes when the framebuffer diff is empty and the cursor target is unchanged. Track terminal cursor state inside the compositor; first render initializes state, dirty frames hide-before-diff, idle frames emit nothing, and cursor-only movement emits just `MoveTo`. (3) Expect harnesses do not populate `log_file` unless output is actively read; `after` sleeps are not reads. Use fixed-duration drain loops and enable `log_user 1` while redirecting expect stdout to `/dev/null` so proof logs are captured without flooding CI output. (4) Parent agent environments can poison pane color (`TERM=dumb`, `NO_COLOR=1`). Multiplexers should normalize pane PTY env (`TERM`, `COLORTERM`, `CLICOLOR`, remove `NO_COLOR`) while still letting explicit per-pane env override those defaults.
-- **2026-05-19 (test/coverage infra):** On macOS, `cargo-nextest` discovery can leave freshly built test binaries parked in dyld before libtest emits `--list --format terse`; direct binary execution may still work, so a simple exec preflight is not sufficient. Keep CI on nextest if stable there, but route local Makefile/pre-push tests through serial `cargo test -- --test-threads=1` plus a process-tree watchdog so local pushes cannot wedge, orphan sleeping discovery children, or trip plugin handshake timing races.
+- **2026-05-19 (test/coverage infra):** On macOS, `cargo-nextest` discovery can leave freshly built test binaries parked in dyld before libtest emits `--list --format terse`; direct binary execution may still work, so a simple exec preflight is not sufficient. Keep CI on nextest if stable there, but route local Makefile/pre-push tests through serial `cargo test -- --test-threads=1` plus a process-tree watchdog so local pushes cannot wedge, orphan sleeping discovery children, or trip plugin handshake timing races. **SUPERSEDED 2026-08-07 (issue #130).** This is the entry that installed the serial house pattern, and it cost 461s a run on every local gate since May. Two of its three fears were misdiagnosed: the "orphaned sleeping children" and the "plugin handshake timing races" were both the `Child::kill` process-tree leak in `crates/shux-plugin/src/lib.rs`, not a nextest problem — the serial suite simply ran long enough for the orphans to expire before anyone looked. `make test` is nextest now, matching CI, with machine-global resources bounded by test groups instead of by serializing everything.
 - **2026-05-20 (fix/shux-launch-lag):** Multiplexers should not advertise `TERM=xterm-256color` unless they implement xterm request/response behavior. Some CLIs probe xterm-like terminals and wait for a timeout when no emulator answers; `tmux-256color` avoids that class, matches multiplexer semantics, and preserves richer TUI capabilities than `screen-256color` (for example italics). Guard that default with a runtime terminfo check (`tmux-256color` → `screen-256color` → `xterm-256color`) so minimal hosts do not inherit an unknown terminal type. Benchmark terminal startup through a controlling PTY, not only a raw PTY, because app probing behavior can differ.
 - **2026-05-20 (feat/xterm-256color-support):** Truthful `TERM=xterm-256color` support requires a bidirectional VT layer, not just better rendering. Parse app-emitted DA/DSR/OSC/DCS probes, return response bytes from `VirtualTerminal::process_with_responses()`, and write them back to the PTY after releasing the pane I/O mutex. Keep the test-only PTY task mirror in sync with `main.rs`; otherwise integration tests can miss response-path regressions.
 - **2026-05-20 (feat/xterm-256color-sync):** Modern TUI frameworks now treat synchronized output as part of terminal capability negotiation, not a nice-to-have. Bubble Tea v2 queries DECRQM mode 2026 and can use `CSI ? 2026 h/l` around frames. If shux reports mode 2026 support, it must freeze the presented pane grid/cursor while the app writes the frame and expose the working grid only on reset; just accepting the escape sequences would still allow partial-frame screenshots/attach renders.

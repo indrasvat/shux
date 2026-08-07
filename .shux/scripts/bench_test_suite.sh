@@ -62,8 +62,14 @@ if [[ ",${ARMS}," == *",after,"* ]]; then
     echo "       Run: make setup-nextest" >&2
     exit 2
   fi
-  names+=("after: parallel (cargo nextest run --workspace)")
-  cmds+=(".shux/scripts/no_leak_guard.sh cargo nextest run --workspace --no-fail-fast")
+  # Deliberately `make test`, not a hand-written nextest line. The two are not
+  # the same command: `make test` passes `-j $(NEXTEST_JOBS)` (4x cores), and a
+  # bare `cargo nextest run` uses nextest's default of one thread per core.
+  # That is the difference between ~22s and ~70s here — a benchmark that
+  # measured the bare command would understate the very change it exists to
+  # prove, by a factor of three.
+  names+=("after: parallel (make test)")
+  cmds+=("make test")
 fi
 
 if [[ "${#cmds[@]}" -eq 0 ]]; then

@@ -84,6 +84,42 @@ fn kill_plugin_group(pid: Option<u32>) {
     }
 }
 
+/// Is any process still alive in this group?
+///
+/// `killpg(pgid, 0)` delivers nothing and reports whether the group exists —
+/// the standard liveness probe, and the one `shux::lens_scratch` already uses.
+fn plugin_group_alive(pid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+        match pid.filter(|p| *p > 0) {
+            Some(pid) => killpg(Pid::from_raw(pid as i32), None).is_ok(),
+            None => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Wait up to `budget` for a plugin's process group to empty out on its own.
+///
+/// Polls rather than calling `Child::wait`, deliberately: `wait` reaps, a
+/// reaped pid can be recycled, and the caller is about to signal this pgid.
+/// Returns as soon as the group is empty, or when the budget runs out.
+async fn wait_for_group_exit(pid: Option<u32>, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        if !plugin_group_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Kill a plugin's whole process group, then reap its leader.
 async fn kill_plugin_tree(child: &mut Child) {
     kill_plugin_group(child.id());
@@ -362,11 +398,31 @@ impl PluginManager {
             "id": "init",
         });
         let init_line = format!("{init_req}\n");
-        stdin.write_all(init_line.as_bytes()).await?;
-        stdin.flush().await?;
+        // `?` here would drop `child`, and dropping it reaches only the leader
+        // via `kill_on_drop` — the plugin's own children would survive, which is
+        // the whole defect this file's `kill_plugin_group` exists to close. Both
+        // writes fail with EPIPE if the plugin dies before reading `plugin.init`,
+        // so this is a live path, not a theoretical one.
+        if let Err(e) = stdin.write_all(init_line.as_bytes()).await {
+            kill_plugin_tree(&mut child).await;
+            return Err(e.into());
+        }
+        if let Err(e) = stdin.flush().await {
+            kill_plugin_tree(&mut child).await;
+            return Err(e.into());
+        }
 
         let manifest = match tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.next_line()).await {
-            Ok(Ok(Some(line))) => parse_manifest(&line)?,
+            // Same trap, and this one has a test: `install_rejects_garbage_manifest`
+            // drives a plugin that prints nonsense. `parse_manifest` errors, and a
+            // bare `?` would have leaked everything that plugin had forked.
+            Ok(Ok(Some(line))) => match parse_manifest(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    kill_plugin_tree(&mut child).await;
+                    return Err(e);
+                }
+            },
             Ok(Ok(None)) => {
                 kill_plugin_tree(&mut child).await;
                 return Err(PluginError::HandshakeFailed("plugin closed stdout".into()));
@@ -988,8 +1044,19 @@ async fn run_plugin_io(
                 }
                 let _ = stdin.flush().await;
                 debug!(plugin = %name, "kill signal received; draining grace");
-                let _ = tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await;
-                let _ = child.start_kill();
+                // Grace WITHOUT reaping. `child.wait()` would be the obvious way
+                // to wait out the 2s, and it is the wrong one: `wait` calls
+                // `waitpid`, and a reaped pid goes straight back into the
+                // kernel's free pool. The group kill in the tail below would
+                // then be aimed at a number that may already belong to somebody
+                // else — and since every plugin (and every job-control shell)
+                // makes itself a group leader, "somebody else" can be a live
+                // group we have no business signalling.
+                //
+                // An UNREAPED child pins its pid, so probing the group with
+                // signal 0 keeps the pgid ours for the whole window. Same probe
+                // `shux::lens_scratch` uses for the same reason.
+                wait_for_group_exit(plugin_pgid, SHUTDOWN_GRACE).await;
                 break;
             }
 
@@ -1058,10 +1125,13 @@ async fn run_plugin_io(
 
     // Every exit from the loop above lands here — the graceful shutdown, a
     // closed stdout, an I/O error. Whatever brought us here, anything the
-    // plugin started is now unowned, so the group goes with it. `child` is
-    // still in scope, which is what makes this pid safe to signal.
+    // plugin started is now unowned, so the group goes with it.
+    //
+    // No path above reaps the child, so its pid is still pinned and this pgid
+    // still means what it meant at spawn. Reaping happens after, never before.
     kill_plugin_group(plugin_pgid);
     let _ = child.start_kill();
+    let _ = child.wait().await;
 
     info!(plugin = %name, "plugin io task exited");
 }

@@ -138,12 +138,12 @@ test-fallback: ## Legacy serial runner (no nextest). Kept for hosts where nextes
 	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh --workspace -- --test-threads=1
 
 .PHONY: install-tools
-install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, fuzz, lefthook)
+install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, hyperfine, lefthook)
 	@echo "$(COLOR_BLUE)▶ Installing dev tools...$(COLOR_RESET)"
-	cargo install cargo-nextest --locked
+	@bash scripts/ensure-nextest.sh
 	cargo install cargo-llvm-cov --locked
 	cargo install cargo-deny --locked
-	cargo install cargo-fuzz --locked
+	@bash scripts/ensure-hyperfine.sh
 	cargo install lefthook --locked || npm i -g lefthook
 	@echo "$(COLOR_GREEN)✓ Dev tools installed$(COLOR_RESET)"
 
@@ -352,16 +352,23 @@ test-doc: ## Run doc tests
 	@echo "$(COLOR_GREEN)✓ Doc tests passed$(COLOR_RESET)"
 
 .PHONY: test-coverage
-test-coverage: ## Run tests with coverage report
+test-coverage: nextest-ready ## Run tests with coverage report
 	@echo "$(COLOR_BLUE)▶ Running tests with coverage...$(COLOR_RESET)"
 	@mkdir -p $(COVERAGE_DIR)
-	@cargo llvm-cov --workspace --lcov --output-path $(COVERAGE_DIR)/lcov.info -- --test-threads=1
+	@.shux/scripts/no_leak_guard.sh cargo llvm-cov nextest --workspace --lcov --output-path $(COVERAGE_DIR)/lcov.info
 	@echo "$(COLOR_GREEN)✓ Coverage report: $(COVERAGE_DIR)/lcov.info$(COLOR_RESET)"
 
 .PHONY: bench
-bench: ## Run benchmarks
-	@echo "$(COLOR_BLUE)▶ Running benchmarks...$(COLOR_RESET)"
-	@cargo bench --workspace
+bench: ## Show which benchmarks actually exist (there are no cargo #[bench] targets)
+	@echo "$(COLOR_YELLOW)No [[bench]] targets, no benches/ directory, no criterion dependency.$(COLOR_RESET)"
+	@echo ""
+	@echo "This target used to run 'cargo bench --workspace', which compiled the"
+	@echo "entire workspace in the bench profile and then ran zero benchmarks."
+	@echo ""
+	@echo "The real ones:"
+	@echo "  make bench-test-suite   hyperfine A/B of the test suite (issue #130)"
+	@echo "  make bench-lens-gate    lens capture/compare/render throughput"
+	@echo "  make bench-baseline     M0 binary-size + suite baseline"
 
 .PHONY: bench-baseline
 bench-baseline: ## Record M0 performance baseline
@@ -478,61 +485,61 @@ LENS_TESTS := --test lens_fixtures_smoke --test lens_glance --test lens_revision
 	--test lens_settle --test lens_diff --test lens_run --test lens_loop
 
 .PHONY: test-lens
-test-lens: ## Run the lens synthetic red suite (§12) serially under the leak guard
+test-lens: nextest-ready ## Run the lens synthetic red suite (§12) serially under the leak guard
 	$(call lens_run,Running lens red suite (§12),$(LENS_TESTS))
 
 .PHONY: test-lens-settle-hardening
-test-lens-settle-hardening: ## Run the task-083 pane.wait_settled hold-ms/stable-frames suite serially under the leak guard
+test-lens-settle-hardening: nextest-ready ## Run the task-083 pane.wait_settled hold-ms/stable-frames suite serially under the leak guard
 	$(call lens_run,Running lens settle-hardening suite (task 083),--test lens_settle_hardening)
 
 # --no-capture so the loud skip notice (§13) is visible when nidhi/vivecaka are absent (nextest
 # otherwise captures the stderr of passing/skipping tests).
 .PHONY: test-lens-t
-test-lens-t: ## Run the lens T-tier real-TUI suite (§13; loud-skips absent binaries)
+test-lens-t: nextest-ready ## Run the lens T-tier real-TUI suite (§13; loud-skips absent binaries)
 	$(call lens_run,Running lens T-tier suite (§13),--test lens_ttier,--no-capture)
 
 .PHONY: test-lens-diff-concurrency
-test-lens-diff-concurrency: ## Run the P4 diff concurrent-reader integration test (§7.4 council D2)
+test-lens-diff-concurrency: nextest-ready ## Run the P4 diff concurrent-reader integration test (§7.4 council D2)
 	$(call lens_run,Running lens P4 diff concurrency test (§7.4),--test diff_concurrent_readers)
 
 .PHONY: test-lens-scratch-reap
-test-lens-scratch-reap: ## Run the P5 scratch reap signal-order test (LENS-R-042, codex B3)
+test-lens-scratch-reap: nextest-ready ## Run the P5 scratch reap signal-order test (LENS-R-042, codex B3)
 	$(call lens_run,Running lens P5 scratch reap-order test (§8),--test scratch_reap_order)
 
 .PHONY: test-lens-gate
-test-lens-gate: ## Run the lens-gate GREEN dogfood suite (task 078; capture on real shux TUIs + cross-path PNG) serially under the leak guard
+test-lens-gate: nextest-ready ## Run the lens-gate GREEN dogfood suite (task 078; capture on real shux TUIs + cross-path PNG) serially under the leak guard
 	$(call lens_run,Running lens-gate dogfood suite (task 078),--test lens_gate_capture)
 
 .PHONY: test-lens-gate-contract
-test-lens-gate-contract: ## Run the frozen 078 lens-gate contract lane (GREEN since 081/082 built its cases)
+test-lens-gate-contract: nextest-ready ## Run the frozen 078 lens-gate contract lane (GREEN since 081/082 built its cases)
 	$(call lens_run,Running the frozen 078 lens-gate contract lane,--test lens_gate_contract)
 
 .PHONY: test-lens-gate-comparator
-test-lens-gate-comparator: ## Run the task-079 comparator suite (parity corpus + divergence fixtures + OSC-4 daemon isolation) serially under the leak guard
+test-lens-gate-comparator: nextest-ready ## Run the task-079 comparator suite (parity corpus + divergence fixtures + OSC-4 daemon isolation) serially under the leak guard
 	$(call lens_run,Running lens-gate comparator suite (task 079),--test lens_gate_parity --test lens_gate_divergence --test diff_palette_isolation)
 
 .PHONY: test-lens-gate-compare
-test-lens-gate-compare: ## Run the task-080 golden-compare suite (3 tiers + fingerprint + mask invariance + divergence pixel proofs; PURE, CI-run)
+test-lens-gate-compare: nextest-ready ## Run the task-080 golden-compare suite (3 tiers + fingerprint + mask invariance + divergence pixel proofs; PURE, CI-run)
 	$(call lens_run_pure,Running lens-gate golden-compare suite (task 080),--test lens_gate_compare)
 
 .PHONY: test-lens-gate-glance-cells
-test-lens-gate-glance-cells: ## Run the task-080 daemon-backed `pane.glance --cells` emission suite serially under the leak guard
+test-lens-gate-glance-cells: nextest-ready ## Run the task-080 daemon-backed `pane.glance --cells` emission suite serially under the leak guard
 	$(call lens_run,Running lens-gate glance --cells emission suite (task 080),--test lens_gate_glance_cells)
 
 .PHONY: bench-lens-gate
-bench-lens-gate: ## Record task-080 capture/compare/render throughput at 10/100/1000 frames (no daemon; prints numbers)
+bench-lens-gate: nextest-ready ## Record task-080 capture/compare/render throughput at 10/100/1000 frames (no daemon; prints numbers)
 	$(call lens_run_pure,Recording lens-gate throughput (task 080 §6),--test lens_gate_bench,--no-capture)
 
 .PHONY: test-lens-gate-run
-test-lens-gate-run: ## Run the task-081 scenario-runner suite (drives real fixture TUIs via `shux lens gate`) serially under the leak guard
+test-lens-gate-run: nextest-ready ## Run the task-081 scenario-runner suite (drives real fixture TUIs via `shux lens gate`) serially under the leak guard
 	$(call lens_run,Running lens-gate scenario-runner suite (task 081),--test lens_gate_run)
 
 .PHONY: test-lens-gate-verdict
-test-lens-gate-verdict: ## Run the task-082 verdict/report/xfail/bless/init suite (drives `shux lens gate` end-to-end) serially under the leak guard
+test-lens-gate-verdict: nextest-ready ## Run the task-082 verdict/report/xfail/bless/init suite (drives `shux lens gate` end-to-end) serially under the leak guard
 	$(call lens_run,Running lens-gate verdict suite (task 082),--test lens_gate_verdict)
 
 .PHONY: test-lens-gate-settle
-test-lens-gate-settle: ## Run the task-083 settle-hardening + cast gate suite (drives `shux lens gate` end-to-end) serially under the leak guard
+test-lens-gate-settle: nextest-ready ## Run the task-083 settle-hardening + cast gate suite (drives `shux lens gate` end-to-end) serially under the leak guard
 	$(call lens_run,Running lens-gate settle+cast suite (task 083),--test lens_gate_settle)
 
 .PHONY: test-gauntlet-seed
@@ -587,13 +594,13 @@ check: lint test check-test-groups test-shux-leak-guard test-agent-review-guard 
 	@echo ""
 
 .PHONY: ci
-ci: lint test-lib test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run CI pipeline (lint + test-lib + test-doc + process/QA guards)
+ci: lint test check-test-groups test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
 
 .PHONY: ci-strict
-ci-strict: ## Force latest stable toolchain, then run fmt+clippy+build+test (closes version-skew gap)
+ci-strict: nextest-ready ## Force latest stable toolchain, then run fmt+clippy+build+test (closes version-skew gap)
 	@command -v rustup >/dev/null 2>&1 || { echo "$(COLOR_RED)rustup is required for ci-strict (not on PATH)$(COLOR_RESET)" >&2; exit 1; }
 	@echo "$(COLOR_BLUE)▶ Updating stable toolchain to latest...$(COLOR_RESET)"
 	@rustup update stable
@@ -648,18 +655,14 @@ check-progress-active: ## Verify progress (active session variant, allows In Pro
 	@bash scripts/check-progress.sh --active-session
 
 .PHONY: fuzz
-fuzz: ## Show available fuzz targets
-	@echo "$(COLOR_YELLOW)Run individual fuzz targets with: cargo fuzz run <target>$(COLOR_RESET)"
+fuzz: ## (not wired up) — there is no fuzz/ crate in this repo yet
+	@echo "$(COLOR_YELLOW)There is no fuzz/ crate in this repository.$(COLOR_RESET)"
 	@echo ""
-	@echo "Available targets (after M3 task 056):"
-	@echo "  $(COLOR_GREEN)cargo fuzz run fuzz_vt_parser$(COLOR_RESET)"
-	@echo "  $(COLOR_GREEN)cargo fuzz run fuzz_json_rpc$(COLOR_RESET)"
-	@echo "  $(COLOR_GREEN)cargo fuzz run fuzz_config$(COLOR_RESET)"
-	@echo "  $(COLOR_GREEN)cargo fuzz run fuzz_layout$(COLOR_RESET)"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Tooling
-# ══════════════════════════════════════════════════════════════════════════════
+	@echo "This target used to print four ready-to-run 'cargo fuzz run ...' commands"
+	@echo "for targets that do not exist; every one of them failed with"
+	@echo "'fuzz directory not found'. Planned under M3 task 056, not yet built."
+	@echo ""
+	@echo "To start: cargo install cargo-fuzz && cargo fuzz init"
 
 .PHONY: setup
 setup: ## Run full dev environment setup
@@ -731,6 +734,6 @@ info: ## Show project info
 	@echo "  crates/shux-pty/     PTY manager (pty-process, async I/O)"
 	@echo "  crates/shux-vt/     Virtual terminal grid (vte, VecDeque)"
 	@echo "  crates/shux-rpc/     JSON-RPC server (UDS + TCP)"
-	@echo "  crates/shux-plugin/  Plugin host (wasmtime, WIT, process plugins)"
-	@echo "  crates/shux-ui/      TUI client (crossterm, ratatui)"
+	@echo "  crates/shux-plugin/  Plugin host (process plugins over stdio JSON-RPC)"
+	@echo "  crates/shux-ui/      TUI client (crossterm, hand-rolled chrome)"
 	@echo ""

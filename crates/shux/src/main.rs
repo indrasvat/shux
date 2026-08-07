@@ -9297,11 +9297,15 @@ mod tests {
         // handshake-timeout test spawns exactly `sleep 30` — so this test
         // could sit out its whole budget watching a different crate's
         // process, and conclude nothing about its own.
-        let sleep_tag = format!("29{:03}", std::process::id() % 1000);
+        // The marker goes in argv[0], NOT in the duration. Encoding uniqueness
+        // as `sleep 29456` would make every leaked marker process outlive the
+        // run by eight hours; the point of a unique needle is to stop reading
+        // other people's processes, not to create longer-lived ones.
+        let marker = format!("shuxlens-unconfirmed-{}", std::process::id());
         let run = dispatch_ok(
             &harness.router,
             "lens.run",
-            serde_json::json!({"argv": ["sleep", sleep_tag]}),
+            serde_json::json!({"argv": ["sh", "-c", format!("exec -a {marker} sleep 30")]}),
         )
         .await;
         let sid_str = run["session_id"].as_str().unwrap().to_string();
@@ -9333,9 +9337,7 @@ mod tests {
         // the leak guard stays clean; the surviving row simply ages out
         // with the harness tempdir, exactly like a crash-preserved row.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while count_procs_containing(&format!("sleep {sleep_tag}")) > 0
-            && std::time::Instant::now() < deadline
-        {
+        while count_procs_containing(&marker) > 0 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         harness.stop().await;

@@ -225,12 +225,23 @@ exec -a {own} sleep 45
 #[tokio::test]
 async fn install_rejects_garbage_manifest() {
     let tmp = tempfile::tempdir().unwrap();
-    let bad = r#"#!/usr/bin/env bash
+    // The plugin forks a grandchild before writing its garbage manifest.
+    //
+    // It used to be a leaf (`printf …; sleep 1`), which made the test blind to
+    // the thing most likely to go wrong on this path: a rejected manifest
+    // returns through `?`, and `?` drops the child, and dropping reaches only
+    // the leader. A leaf plugin has nothing to leak, so the assertion passed
+    // whether or not the subtree was being cleaned up.
+    let child = unique_marker("garbage-descendant");
+    let bad = format!(
+        r#"#!/usr/bin/env bash
 IFS= read -r _ || exit 1
+( exec -a {child} sleep 45 ) &
 printf 'not json at all\n'
 sleep 1
-"#;
-    let script = write_script(tmp.path(), "bad.sh", bad);
+"#
+    );
+    let script = write_script(tmp.path(), "bad.sh", &bad);
 
     let mgr = PluginManager::new(EventBus::new());
     let err = mgr
@@ -238,6 +249,12 @@ sleep 1
         .await
         .unwrap_err();
     assert!(matches!(err, shux_plugin::PluginError::HandshakeFailed(_)));
+
+    assert_eq!(
+        wait_for_no_procs(&child, Duration::from_secs(10)).await,
+        0,
+        "the rejected plugin's grandchild outlived the failed install"
+    );
 }
 
 #[tokio::test]
