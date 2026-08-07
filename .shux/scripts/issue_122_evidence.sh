@@ -59,6 +59,7 @@ runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-122-${label}.XXXXXX")"
 # to be readable at a glance, not to survey a desktop.
 cols="${EVID_COLS:-44}"
 rows="${EVID_ROWS:-12}"
+# The column-zero scene narrates its own steps, so it needs a couple more rows.
 
 sessions=()
 failures=0
@@ -270,10 +271,13 @@ finish
 echo "  scene: column-zero"
 start ev122-colzero "$(cat <<EOF
 printf '\033[1;1H${probe}'
-printf '\033[3;1Hprintf "X\\\\033[1;1H\\\\033[3b"'
-printf '\033[5;1HX'
-printf '\033[5;1H\033[3b'
-printf '\033[7;1Habove: one X, then "repeat it 3 times"'
+printf '\033[3;1HWhat the program asked for:'
+printf '\033[4;1H  1. print one X'
+printf '\033[5;1H  2. go back to the start of the line'
+printf '\033[6;1H  3. repeat that character 3 times'
+printf '\033[8;1HX'
+printf '\033[8;1H\033[3b'
+printf '\033[10;1HWhat it got:'
 EOF
 )"
 shoot "column-zero"

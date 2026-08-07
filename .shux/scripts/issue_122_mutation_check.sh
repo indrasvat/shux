@@ -82,7 +82,7 @@ s = s.replace(
                 return;
             };
             match self.grid.visible_row(self.cursor.row).get(col).cloned() {
-                Some(cell) => LastGraphic { ch: cell.ch, rest: None },
+                Some(cell) => LastGraphic { ch: cell.ch, rest: String::new() },
                 None => return,
             }
         };""")
@@ -93,25 +93,54 @@ s = s.replace("                *self.last_graphic = None;\n", "")
 EDIT
 
 mutate "combining marks stop extending the cluster" <<'EDIT'
-s = s.replace("""        self.set_active_grapheme_cell(row, col);
-        self.remember_graphic_cluster(row, col);
-    }
+old = """        if appended {
+            self.extend_remembered_graphic((row, col), ch);
+        }
+"""
+assert old in s, "anchor moved"
+s = s.replace(old, "")
+EDIT
 
-    fn try_append_to_active_grapheme""", """        self.set_active_grapheme_cell(row, col);
-    }
+mutate "a stray mark redefines the preceding character" <<'EDIT'
+old = """        if *self.active_grapheme_cell != Some(joined) {
+            return;
+        }
+"""
+assert old in s, "anchor moved"
+s = s.replace(old, "        let _ = joined;\n")
+EDIT
 
-    fn try_append_to_active_grapheme""")
+mutate "a joining scalar restarts the record instead of extending it" <<'EDIT'
+old = """        if self.try_append_to_active_grapheme(ch, width) {
+            return;
+        }
+        if self.try_append_regional_indicator_pair(ch) {
+            return;
+        }
+        self.remember_graphic_scalar(ch);"""
+assert old in s, "anchor moved"
+s = s.replace(old, """        self.remember_graphic_scalar(ch);
+        if self.try_append_to_active_grapheme(ch, width) {
+            return;
+        }
+        if self.try_append_regional_indicator_pair(ch) {
+            return;
+        }""")
 EDIT
 
 mutate "ZWJ joins stop extending the cluster" <<'EDIT'
-s = s.replace("""        self.remember_graphic_cluster(row, col);
-        let next_col = col + target_width;""", """        let next_col = col + target_width;""")
+old = """        self.extend_remembered_graphic((row, col), ch);
+        let next_col = col + target_width;"""
+assert old in s, "anchor moved"
+s = s.replace(old, "        let next_col = col + target_width;")
 EDIT
 
 mutate "flag pairs stop extending the cluster" <<'EDIT'
-s = s.replace("""        self.set_active_grapheme_cell(row, col);
-        self.remember_graphic_cluster(row, col);
-        self.cursor.col = (col + target_width)""", """        self.set_active_grapheme_cell(row, col);
+old = """        self.extend_remembered_graphic((row, col), ch);
+        self.set_active_grapheme_cell(row, col);
+        self.cursor.col = (col + target_width)"""
+assert old in s, "anchor moved"
+s = s.replace(old, """        self.set_active_grapheme_cell(row, col);
         self.cursor.col = (col + target_width)""")
 EDIT
 

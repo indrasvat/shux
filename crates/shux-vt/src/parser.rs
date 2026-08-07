@@ -167,22 +167,29 @@ pub struct DcsState {
 /// cluster keeps all of its scalars (`e` + U+0301, a flag pair, a ZWJ sequence);
 /// they are stored as PRINTED, after charset translation, so `ESC ( 0 q`
 /// followed by REP draws more horizontal line rather than more `q`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LastGraphic {
-    /// Base scalar, always present.
+    /// Base scalar — the character that occupied the columns.
     ch: char,
-    /// The rest of the cluster, when the character grew one.
-    rest: Option<String>,
+    /// The zero-width scalars that joined it, in arrival order. Empty for a
+    /// plain single-scalar character, which is the overwhelmingly common case.
+    ///
+    /// This buffer is REUSED rather than reallocated per character. Every
+    /// printed character updates the record, so this sits on the hot path for
+    /// all terminal output, not just for REP: building a fresh `String` per
+    /// cluster-growing scalar cost 10-24% of parsing throughput on
+    /// combining-mark and emoji text (adversarial review, issue #122).
+    rest: String,
 }
 
 impl LastGraphic {
     /// The scalars to replay, in the order they were printed.
     fn scalars(&self) -> impl Iterator<Item = char> + '_ {
-        std::iter::once(self.ch).chain(self.rest.iter().flat_map(|rest| rest.chars()))
+        std::iter::once(self.ch).chain(self.rest.chars())
     }
 
     fn scalar_count(&self) -> usize {
-        1 + self.rest.as_ref().map_or(0, |rest| rest.chars().count())
+        1 + self.rest.chars().count()
     }
 }
 
@@ -305,25 +312,42 @@ impl<'a> VtHandler<'a> {
         *self.active_grapheme_cell = Some((row, col));
     }
 
-    /// Remember a single-scalar character as the preceding one in the data
-    /// stream. See [`LastGraphic`].
+    /// Start a new remembered character. See [`LastGraphic`].
+    ///
+    /// Reuses the record's scalar buffer rather than allocating a new one: this
+    /// runs for every printed character.
     fn remember_graphic_scalar(&mut self, ch: char) {
-        *self.last_graphic = Some(LastGraphic { ch, rest: None });
+        match self.last_graphic.as_mut() {
+            Some(record) => {
+                record.ch = ch;
+                record.rest.clear();
+            }
+            None => {
+                *self.last_graphic = Some(LastGraphic {
+                    ch,
+                    rest: String::new(),
+                })
+            }
+        }
     }
 
-    /// Remember the grapheme cluster a cell now holds, after a combining mark,
-    /// a zero-width joiner or a regional indicator grew it. The cluster is the
-    /// unit REP repeats, so the record has to follow it as it grows rather than
-    /// stopping at the base scalar it started from.
-    fn remember_graphic_cluster(&mut self, row: usize, col: usize) {
-        let remembered = self.grid.visible_row(row).get(col).map(|cell| {
-            let rest = cell
-                .grapheme()
-                .and_then(|text| text.chars().next().map(|_| text.chars().skip(1).collect()));
-            LastGraphic { ch: cell.ch, rest }
-        });
-        if let Some(remembered) = remembered {
-            *self.last_graphic = Some(remembered);
+    /// Extend the remembered character with a zero-width scalar that joined it.
+    ///
+    /// `joined` is the cell the scalar actually landed in, and the record is only
+    /// extended when that is the ACTIVE grapheme cell — the cell the last printed
+    /// character went into. A mark that lands anywhere else has attached itself to
+    /// a cell on the SCREEN that the data stream moved on from: shux gives a
+    /// stray mark to whatever is left of the cursor, so after a cursor move it can
+    /// be a character several positions back. Letting that redefine the preceding
+    /// character is the screen-derived reasoning issue #122 exists to remove, and
+    /// it made `ABCZ` + a cursor move + a mark + `CSI 3 b` repeat the `A` and
+    /// overwrite `B`, `C` and `Z` (adversarial review).
+    fn extend_remembered_graphic(&mut self, joined: (usize, usize), ch: char) {
+        if *self.active_grapheme_cell != Some(joined) {
+            return;
+        }
+        if let Some(record) = self.last_graphic.as_mut() {
+            record.rest.push(ch);
         }
     }
 
@@ -549,19 +573,19 @@ impl<'a> VtHandler<'a> {
             self.append_zero_width_scalar(ch);
             return;
         }
-        // Recorded BEFORE the write, so the degenerate paths below -- a wide
-        // character with nowhere to put it on a one-column terminal -- still
-        // remember the character the data stream carried. A repeat of it then
-        // does the same harmless nothing another copy in the stream would have
-        // done. The join paths below overwrite this with the whole cluster once
-        // they have grown it (issue #122).
-        self.remember_graphic_scalar(ch);
+        // Both join paths EXTEND the remembered character rather than replacing
+        // it, because a scalar that joins a cluster is part of the same
+        // character. Everything past them starts a new one -- including the
+        // degenerate paths below, where a wide character has nowhere to go on a
+        // one-column terminal: the stream still carried it, so a repeat of it
+        // does the same harmless nothing another copy would have (issue #122).
         if self.try_append_to_active_grapheme(ch, width) {
             return;
         }
         if self.try_append_regional_indicator_pair(ch) {
             return;
         }
+        self.remember_graphic_scalar(ch);
         let cols = self.grid.cols();
         let rows = self.grid.rows();
 
@@ -675,14 +699,20 @@ impl<'a> VtHandler<'a> {
         if !will_write {
             return;
         }
-        {
+        let appended = {
             let row_ref = self.grid.visible_row_mut_marked(row);
-            if let Some(cell) = row_ref.cells_mut().get_mut(col) {
-                cell.append_grapheme_scalar(ch);
-            }
+            row_ref
+                .cells_mut()
+                .get_mut(col)
+                .is_some_and(|cell| cell.append_grapheme_scalar(ch))
+        };
+        // BEFORE `set_active_grapheme_cell` moves it: the record follows the
+        // character the stream is building, and this scalar only belongs to it
+        // if it landed where that character already is.
+        if appended {
+            self.extend_remembered_graphic((row, col), ch);
         }
         self.set_active_grapheme_cell(row, col);
-        self.remember_graphic_cluster(row, col);
     }
 
     fn try_append_to_active_grapheme(&mut self, ch: char, width: usize) -> bool {
@@ -725,7 +755,7 @@ impl<'a> VtHandler<'a> {
                 row_ref[col + 1] = Cell::wide_continuation();
             }
         }
-        self.remember_graphic_cluster(row, col);
+        self.extend_remembered_graphic((row, col), ch);
         let next_col = col + target_width;
         if next_col >= cols {
             self.cursor.col = cols.saturating_sub(1);
@@ -774,8 +804,8 @@ impl<'a> VtHandler<'a> {
                 row_ref[col + 1] = Cell::wide_continuation();
             }
         }
+        self.extend_remembered_graphic((row, col), ch);
         self.set_active_grapheme_cell(row, col);
-        self.remember_graphic_cluster(row, col);
         self.cursor.col = (col + target_width).min(cols.saturating_sub(1));
         self.cursor.auto_wrap_pending = col + target_width >= cols;
         true

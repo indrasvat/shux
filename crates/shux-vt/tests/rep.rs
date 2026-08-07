@@ -39,11 +39,17 @@
 //!     ends in a zero-width joiner, or a lone regional indicator, must not fuse
 //!     with the repeat before it.
 //!
-//! **Zero-width scalars.** A combining mark that lands on a cluster extends the
-//! remembered cluster (so `e` + U+0301 then REP repeats `é`). One that lands
-//! nowhere — no cluster to attach to — is dropped from the stream and leaves the
-//! remembered character alone. This mirrors xterm, which only repeats a
-//! character whose width is greater than zero.
+//! **Zero-width scalars are the one precondition on that oracle.** A combining
+//! mark extends the remembered character when it joins the character that was
+//! just printed — so `e` + U+0301 then REP repeats `é`. A mark that lands
+//! somewhere else does not. shux attaches a stray mark to whatever cell is left
+//! of the cursor, which after a cursor move is a cell the data stream moved on
+//! from long ago; letting that redefine "the preceding character" is how REP
+//! came to repeat a character four positions back and overwrite three cells that
+//! had nothing to do with it. So the rule is xterm's: **REP repeats the last
+//! character that occupied at least one column**, together with the marks that
+//! joined it. A mark that goes anywhere else is not repeatable, and for those
+//! streams REP is deliberately not the same as re-sending the bytes.
 
 use shux_vt::{Cell, Color, VirtualTerminal};
 
@@ -289,15 +295,62 @@ fn rep_after_a_dropped_combining_mark_is_a_no_op() {
     assert_eq!(cells(&t), before);
 }
 
+/// A combining mark with no cluster of its own attaches to whatever cell is left
+/// of the cursor. After a cursor move that is a cell the data stream left behind
+/// several characters ago — and letting it redefine the remembered character made
+/// REP repeat that stale cell and overwrite everything between. The mark joins a
+/// cell on the screen; it does not join the stream's current character.
+#[test]
+fn a_stray_combining_mark_does_not_change_what_rep_repeats() {
+    let mut t = vt(2, 10);
+    t.process("ABCZ\x1b[1;2H\u{0301}\x1b[3b".as_bytes());
+
+    let row = t.grid().visible_row(0);
+    assert_eq!(row[0].grapheme(), Some("A\u{0301}"), "the mark landed on A");
+    assert_eq!(
+        (row[1].ch, row[2].ch, row[3].ch),
+        ('Z', 'Z', 'Z'),
+        "REP repeated a character four back in the stream, not the last one"
+    );
+}
+
+/// Same rule, reached without any cursor move. With auto-wrap off, a wide
+/// character in the last column has nowhere to go and is dropped — which clears
+/// the active cell, so the variation selector behind it falls back to an earlier
+/// cell. The dropped character is still the last one the stream carried.
+#[test]
+fn a_mark_stranded_by_a_dropped_character_does_not_change_what_rep_repeats() {
+    let mut t = vt(1, 2);
+    t.process("\x1b[?7le\u{1F600}\u{FE0F}\x1b[1b".as_bytes());
+
+    let row = t.grid().visible_row(0);
+    assert_eq!(
+        row[0].grapheme(),
+        Some("e\u{FE0F}"),
+        "the selector landed on e"
+    );
+    assert_eq!(
+        row[1].ch, ' ',
+        "REP repeated the stranded cell instead of the dropped character"
+    );
+}
+
 /// RIS is a full reset: the terminal comes up as if it had just been switched
 /// on, and a freshly switched-on terminal has no preceding character.
 #[test]
 fn ris_forgets_the_preceding_character() {
     let mut t = vt(4, 10);
-    t.process(b"S\x1bc");
+    t.process(b"S\x1bc\x1b[3;7H");
     let before = cells(&t);
+    let writes = t.grid().mutations();
     t.process(b"\x1b[5b");
     assert_eq!(cells(&t), before, "RIS left a character behind for REP");
+    assert_eq!(
+        t.grid().mutations(),
+        writes,
+        "REP wrote blanks after a full reset"
+    );
+    assert_eq!((t.cursor().row, t.cursor().col), (2, 6), "the cursor moved");
 }
 
 /// A resize is not a reset. The stream continues across it.
@@ -318,9 +371,12 @@ fn fg_at(t: &VirtualTerminal, r: usize, c: usize) -> Color {
     t.grid().visible_row(r)[c].style.fg
 }
 
-/// The repeats are painted with the pen in effect at the `CSI b`. Reading the
-/// source cell off the screen also copied its colour, which is the wrong half
-/// of the cell to inherit.
+/// The repeats are painted with the pen in effect at the `CSI b`.
+///
+/// This has always been true and is NOT part of the fix — the old code cloned the
+/// source cell but took only its character, width and payload from it. It is
+/// pinned because the new record stores no style at all, and a future change that
+/// reintroduced one would break it silently.
 #[test]
 fn rep_paints_with_the_current_pen_not_the_originals() {
     let mut t = vt(2, 10);
