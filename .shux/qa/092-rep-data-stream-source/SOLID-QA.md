@@ -2,7 +2,7 @@ VERDICT: PASS
 
 # 091 — REP (`CSI Pn b`) sourced from the data stream (issue #122) — VT QA record
 
-**Task:** `docs/tasks/091-rep-data-stream-source.md`
+**Task:** `docs/tasks/092-rep-data-stream-source.md`
 **Gate:** `shux-vt-solid-qa`, run as an independent audit.
 **Branch:** `claude/shux-issue-122-33umu5`
 **Head under audit:** `8f5ebf81e2e7df4d6ec8466728dcca7362f3a358`
@@ -382,7 +382,7 @@ gate's.
 ## 10. The `Quality Gate:` marker — recommendation
 
 The task file carries **no** `**Quality Gate:** shux-vt-solid-qa` marker, so
-`make check-vt-qa` passes today **without checking task 091 at all**. That enforcement
+`make check-vt-qa` passes today **without checking task 092 at all**. That enforcement
 gap is filed as issue #123. Task 090 hit the same collision and re-scoped it explicitly:
 adding the marker makes `scripts/check-progress.sh` hard-require a committed
 `*-actual.png`, while the PR checklist says "no screenshots committed unless justified as
@@ -412,7 +412,7 @@ it.** The reasoning:
    requirement at all. That is the failure mode #123 describes.
 
 Concretely: add `**Quality Gate:** shux-vt-solid-qa` to the task header alongside
-`**QA record:** .shux/qa/091-rep-data-stream-source/SOLID-QA.md`, and commit this
+`**QA record:** .shux/qa/092-rep-data-stream-source/SOLID-QA.md`, and commit this
 directory. `check-progress.sh` then finds the report with `VERDICT: PASS` on line 1, the
 manifest with all six required keys, tracked `*-actual.png` screenshots, and pixel metric
 JSONs at exact 0/0 thresholds — all of which are present.
@@ -436,7 +436,7 @@ enforcement path against this directory — see §11.
 Not asserted from reading the script. Actually run, in both directions.
 
 **Today, without the marker.** `bash scripts/check-progress.sh` → exit 0, and
-`make check-vt-qa` → exit 0. Both pass *without looking at task 091 at all*, which is
+`make check-vt-qa` → exit 0. Both pass *without looking at task 092 at all*, which is
 issue #123 in one line.
 
 **With the marker, evidence staged.** The marker was added to the task file, this
@@ -457,11 +457,11 @@ a non-empty `screenshots` array containing `*-actual.png` entries; a non-empty
 
 ```
 === neg-test 1: verdict line changed to FAIL ===
-  - VT Task 091-rep-data-stream-source QA gate report must start exactly with 'VERDICT: PASS'
+  - VT Task 092-rep-data-stream-source QA gate report must start exactly with 'VERDICT: PASS'
 
 === neg-test 2: negative control listed under pixel_metrics ===
-  - VT Task 091-rep-data-stream-source pixel metric
-    .shux/qa/091-rep-data-stream-source/negative-control-base-rep-vs-literal-80x24.json
+  - VT Task 092-rep-data-stream-source pixel metric
+    .shux/qa/092-rep-data-stream-source/negative-control-base-rep-vs-literal-80x24.json
     did not pass (.status != "pass")
 ```
 

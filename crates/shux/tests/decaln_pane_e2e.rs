@@ -115,6 +115,13 @@ impl Env {
     }
 
     fn wait_for(&self, session: &str, pane: &str, needle: &str) {
+        // 60s, not 20s. This is a DEADLINE for reporting failure, not an
+        // assertion — the screen content is checked immediately after, so a
+        // broken DECALN still fails loudly and a longer budget cannot mask
+        // anything. It has to be generous because the coverage job runs the
+        // whole workspace instrumented (`cargo llvm-cov nextest --workspace`)
+        // AND in parallel, where this test took >20s while the same test on
+        // the same commit passed in ~3s under `Test (ubuntu)` and macOS.
         let out = self.run(&[
             "pane",
             "wait-for",
@@ -125,7 +132,7 @@ impl Env {
             "-t",
             needle,
             "--timeout-ms",
-            "20000",
+            "60000",
         ]);
         assert!(
             out.status.success(),

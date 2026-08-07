@@ -15,6 +15,25 @@ synchronized-output lazy freeze) — the fill has to satisfy both
 `.shux/qa/090-decaln-screen-alignment/` (new)
 **QA record:** `.shux/qa/090-decaln-screen-alignment/SOLID-QA.md` — `VERDICT: PASS`
 
+
+## Follow-up (2026-08-07, during task 092)
+
+`decaln_pane_e2e`'s `wait_for` deadline was raised from 20s to 60s. It timed
+out in the `Coverage (llvm-cov)` job on PR #128 while the SAME test on the SAME
+commit passed in `Test (ubuntu)` and `macOS (test + smoke)`, and runs in ~3s
+locally. The coverage job is the only one that runs the workspace instrumented
+(`cargo llvm-cov nextest --workspace`) and in parallel, which is several times
+slower than the serial uninstrumented suites everywhere else.
+
+The budget is a deadline for *reporting* failure, not an assertion: every
+content check runs immediately after it, so a broken DECALN still fails
+loudly and a longer wait cannot mask a defect. Hardening the test is also what
+`.config/nextest.toml` says to prefer over widening the retry override.
+
+Verified not attributable to #120's changes before touching this: 60 `pane
+capture` calls with a full uuid took 815ms on `e856793` and 838ms on the fix
+(~2.8%, within noise), and the failure is on a VT path that branch does not
+touch.
 ---
 
 ## Problem (issue #117)

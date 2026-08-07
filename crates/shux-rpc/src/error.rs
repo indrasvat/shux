@@ -234,6 +234,30 @@ impl RpcError {
         )
     }
 
+    /// Ambiguous id reference (issue #120): a short id prefix matched more
+    /// than one live entity.
+    ///
+    /// `InvalidParams`, not `NotFound` — the entity exists, several times
+    /// over; the *parameter* is what is wrong. `candidates` carries the full
+    /// ids so a caller can pick one without a second round trip, and `total`
+    /// says how many collided when the list is capped.
+    pub fn ambiguous_ref(resource: &str, id: &str, candidates: &[String], total: usize) -> Self {
+        Self::with_data(
+            ErrorCode::InvalidParams,
+            serde_json::json!({
+                "detail": format!(
+                    "{resource} id '{}' is ambiguous: {total} {resource}s share that prefix",
+                    id.escape_debug()
+                ),
+                "resource": resource,
+                "id": id,
+                "candidates": candidates,
+                "total": total,
+                "hint": "Pass more characters of the id, or the full uuid",
+            }),
+        )
+    }
+
     /// Not found error.
     pub fn not_found(resource: &str, id: &str) -> Self {
         Self::with_data(

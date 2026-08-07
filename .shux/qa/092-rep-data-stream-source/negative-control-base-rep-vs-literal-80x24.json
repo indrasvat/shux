@@ -1,9 +1,9 @@
 {
-  "actual": ".shux/qa/091-rep-data-stream-source/negative-control-base-80x24-actual.png",
+  "actual": ".shux/qa/092-rep-data-stream-source/negative-control-base-80x24-actual.png",
   "binary": "base@e856793",
   "changed_pixels": 4810,
-  "diff": ".shux/qa/091-rep-data-stream-source/negative-control-base-80x24-diff.png",
-  "expected": ".shux/qa/091-rep-data-stream-source/negative-control-base-80x24-expected.png",
+  "diff": ".shux/qa/092-rep-data-stream-source/negative-control-base-80x24-diff.png",
+  "expected": ".shux/qa/092-rep-data-stream-source/negative-control-base-80x24-expected.png",
   "expected_status": "fail",
   "max_mean_channel_delta": 0.0,
   "max_pixel_diff_ratio": 0.0,

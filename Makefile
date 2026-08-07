@@ -139,6 +139,23 @@ test-pane-io: ## Run pane I/O integration tests; optionally pass FILTER=<test-na
 	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test pane_io_integration -- $(FILTER) --test-threads=1
 	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
 
+.PHONY: test-id-refs-evidence
+test-id-refs-evidence: build ## Issue #120 A/B round trip against the real binary; pass BASE_BIN=<path> to also record the pre-fix arm
+	@echo "$(COLOR_BLUE)▶ issue-120 round trip (fixed binary)...$(COLOR_RESET)"
+	@SHUX_BIN=$(CURDIR)/target/debug/shux LABEL=after .shux/scripts/issue_120_evidence.sh
+	@if [ -n "$(BASE_BIN)" ]; then \
+	  echo "$(COLOR_BLUE)▶ issue-120 round trip (pre-fix binary)...$(COLOR_RESET)"; \
+	  SHUX_BIN=$(BASE_BIN) LABEL=before EXPECT_DEFECT=1 .shux/scripts/issue_120_evidence.sh; \
+	fi
+	@echo "$(COLOR_GREEN)✓ issue-120 evidence recorded under .shux/out/issue-120/$(COLOR_RESET)"
+
+.PHONY: test-id-refs
+test-id-refs: ## Run entity-id reference (short-id / prefix) tests end to end; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running entity-id reference tests...$(COLOR_RESET)"
+	@bash scripts/run-cargo-test.sh -p shux-core --lib -- idref $(FILTER) --test-threads=1
+	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test id_prefix_resolution -- $(FILTER) --test-threads=1
+	@echo "$(COLOR_GREEN)✓ Entity-id reference tests passed$(COLOR_RESET)"
+
 .PHONY: test-rpc
 test-rpc: ## Run shux-rpc crate tests (codec/router/server/attach); optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running shux-rpc tests...$(COLOR_RESET)"

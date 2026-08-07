@@ -22,7 +22,7 @@ The design claim this review round settled — that REP's source is the data str
 must be replayed through the ordinary print path — was independently cross-checked
 against Alacritty `1b2b36a6`, which has sourced REP from `ProcessorState::preceding_char`
 and replayed it through `handler.input()` since 2017. See the "Reference cross-check"
-section of `docs/tasks/091-rep-data-stream-source.md`.
+section of `docs/tasks/092-rep-data-stream-source.md`.
 
 **This is a substitution, not a waiver.** A reader who requires genuine council output
 for this task should treat this row of the evidence matrix as unmet.

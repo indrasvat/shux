@@ -1,11 +1,11 @@
-# 091 — REP (`CSI b`) repeated the cell left of the cursor instead of the preceding character in the data stream
+# 092 — REP (`CSI b`) repeated the cell left of the cursor instead of the preceding character in the data stream
 
 **Status:** Done
 **Priority:** High (conformance; silently drops output a real application asked for)
 **Milestone:** M3 polish
 **Depends On:** 090 (`e856793`, DECALN) — DECALN homes the cursor, which is how the
 column-0 case surfaced
-**Quality Gate:** shux-vt-solid-qa — `VERDICT: PASS`, `.shux/qa/091-rep-data-stream-source/SOLID-QA.md`
+**Quality Gate:** shux-vt-solid-qa — `VERDICT: PASS`, `.shux/qa/092-rep-data-stream-source/SOLID-QA.md`
 **Touches:** `crates/shux-vt/src/parser.rs`, `crates/shux-vt/src/lib.rs`,
 `crates/shux-vt/tests/rep.rs` (new), `crates/shux/tests/rep_pane_e2e.rs` (new),
 `.shux/scripts/issue_122_evidence.sh` (new)
