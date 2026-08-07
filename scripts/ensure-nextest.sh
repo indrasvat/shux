@@ -22,6 +22,14 @@ mkdir -p "${cargo_bin}"
 # `cargo-nextest` may be installed but not on PATH (common when CARGO_HOME is
 # relocated by CI). Check the destination before downloading anything.
 if [ -x "${cargo_bin}/cargo-nextest" ]; then
+  # Present but possibly invisible: a child script cannot put this directory on
+  # the parent make process's PATH, so callers that probe with `command -v`
+  # would report it missing right after we "succeeded". Say where it is.
+  case ":${PATH}:" in
+    *":${cargo_bin}:"*) ;;
+    *) echo "note: cargo-nextest is installed at ${cargo_bin}/cargo-nextest, which is not on PATH." >&2
+       echo "      Add it to PATH, or invoke it by absolute path." >&2 ;;
+  esac
   exit 0
 fi
 

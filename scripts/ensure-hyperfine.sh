@@ -17,6 +17,14 @@ fi
 cargo_bin="${CARGO_HOME:-${HOME}/.cargo}/bin"
 mkdir -p "${cargo_bin}"
 if [ -x "${cargo_bin}/hyperfine" ]; then
+  # Present but possibly invisible: a child script cannot put this directory on
+  # the parent make process's PATH, so callers that probe with `command -v`
+  # would report it missing right after we "succeeded". Say where it is.
+  case ":${PATH}:" in
+    *":${cargo_bin}:"*) ;;
+    *) echo "note: hyperfine is installed at ${cargo_bin}/hyperfine, which is not on PATH." >&2
+       echo "      Add it to PATH, or invoke it by absolute path." >&2 ;;
+  esac
   exit 0
 fi
 

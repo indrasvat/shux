@@ -760,56 +760,57 @@ async fn test_cli_api_raw_against_server() {
 /// redirect the test back out of it. This is what makes the suite safe to run
 /// beside anything else; it was never actually safe serially either, it just
 /// had less company.
-fn sandbox_root() -> &'static std::path::Path {
-    use std::sync::OnceLock;
-    // Held by value, and the guard below is what removes it. A `static
-    // TempDir` would never be dropped — Rust does not run destructors on
-    // statics — so every test PROCESS (and under nextest that is every test)
-    // would leave an empty directory behind for good.
-    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        let dir = tempfile::Builder::new()
-            // Unix socket paths cap out near 104 bytes, so the prefix stays
-            // short: a long one truncates the daemon socket and the failure
-            // reads as a hang rather than a name-too-long error.
-            .prefix("shux-cli")
-            .tempdir()
-            .expect("sandbox tempdir");
-        // `into_path` hands us ownership of a directory tempfile will no longer
-        // clean, so we clean it at process exit ourselves.
-        let path = dir.keep();
-        let cleanup = path.clone();
-        // Registering at first use rather than in a `main` we do not control.
-        // Best effort: if the process is SIGKILLed the tempdir survives, which
-        // is the same guarantee tempfile itself offers.
-        let _ = std::panic::catch_unwind(|| {
-            SANDBOX_CLEANUP
-                .set(SandboxCleanup(cleanup))
-                .map_err(|_| ())
-                .ok();
-        });
-        path
-    })
-    .as_path()
+/// A `Command` that owns the sandbox it points at.
+///
+/// The sandbox is a real `TempDir` held BY VALUE here, so it is removed when the
+/// command is done with. The obvious alternative — a `static OnceLock<TempDir>`
+/// shared by the whole test binary — does not work, and it fails in a way that
+/// reads as working: **Rust never runs destructors on statics**, so the
+/// `TempDir` is never dropped and every test process leaves a `shux-cli*`
+/// directory in `/tmp` for good. Wrapping the cleanup in a second static with a
+/// `Drop` impl does not help either; that static is never dropped for exactly
+/// the same reason. (Both were written here before this comment was.)
+///
+/// Every call site is a single `shux_bin().…().output()` expression, so the
+/// temporary lives to the end of the statement — the child has run and been
+/// waited on before the sandbox goes away.
+struct Sandboxed {
+    cmd: std::process::Command,
+    _root: tempfile::TempDir,
 }
 
-/// Removes the sandbox when the test binary's statics are torn down.
-struct SandboxCleanup(std::path::PathBuf);
-impl Drop for SandboxCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+impl std::ops::Deref for Sandboxed {
+    type Target = std::process::Command;
+    fn deref(&self) -> &Self::Target {
+        &self.cmd
     }
 }
-static SANDBOX_CLEANUP: std::sync::OnceLock<SandboxCleanup> = std::sync::OnceLock::new();
 
-fn shux_bin() -> std::process::Command {
-    let root = sandbox_root();
+impl std::ops::DerefMut for Sandboxed {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cmd
+    }
+}
+
+/// A sandbox directory, for tests that need to name a path inside one.
+fn sandbox_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        // Unix socket paths cap out near 104 bytes, so the prefix stays short:
+        // a long one truncates the daemon socket and the failure reads as a
+        // hang rather than a name-too-long error.
+        .prefix("shux-cli")
+        .tempdir()
+        .expect("sandbox tempdir")
+}
+
+fn shux_bin() -> Sandboxed {
+    let root = sandbox_dir();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_shux"));
-    cmd.env("XDG_RUNTIME_DIR", root)
-        .env("XDG_CONFIG_HOME", root)
-        .env("XDG_STATE_HOME", root)
+    cmd.env("XDG_RUNTIME_DIR", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .env("XDG_STATE_HOME", root.path())
         .env_remove("SHUX_SOCKET");
-    cmd
+    Sandboxed { cmd, _root: root }
 }
 
 #[test]
@@ -1052,16 +1053,10 @@ this is not valid toml
 
 #[test]
 fn test_cli_config_validate_missing_file() {
+    let dir = sandbox_dir();
+    let missing = dir.path().join("nonexistent-validate.toml");
     let output = shux_bin()
-        .args([
-            "config",
-            "validate",
-            "--config",
-            sandbox_root()
-                .join("nonexistent-validate.toml")
-                .to_str()
-                .unwrap(),
-        ])
+        .args(["config", "validate", "--config", missing.to_str().unwrap()])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1071,12 +1066,11 @@ fn test_cli_config_validate_missing_file() {
 
 #[test]
 fn test_cli_version_without_daemon() {
+    let dir = sandbox_dir();
+    let missing = dir.path().join("nonexistent.sock");
     let output = shux_bin()
         .arg("version")
-        .env(
-            "SHUX_SOCKET",
-            sandbox_root().join("nonexistent.sock").to_str().unwrap(),
-        )
+        .env("SHUX_SOCKET", missing.to_str().unwrap())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1087,12 +1081,11 @@ fn test_cli_version_without_daemon() {
 
 #[test]
 fn test_cli_version_json_without_daemon() {
+    let dir = sandbox_dir();
+    let missing = dir.path().join("nonexistent.sock");
     let output = shux_bin()
         .args(["--format", "json", "version"])
-        .env(
-            "SHUX_SOCKET",
-            sandbox_root().join("nonexistent.sock").to_str().unwrap(),
-        )
+        .env("SHUX_SOCKET", missing.to_str().unwrap())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

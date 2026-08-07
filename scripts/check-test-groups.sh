@@ -53,9 +53,20 @@ MAX_GROUP_PERCENT=${MAX_GROUP_PERCENT:-30}
 err_file="$(mktemp "${TMPDIR:-/tmp}/shux-test-groups.XXXXXX")"
 trap 'rm -f "${err_file}"' EXIT
 
+# `--color never` is load-bearing, not cosmetic. CI sets `CARGO_TERM_COLOR:
+# always` workflow-wide, which makes nextest wrap the group NAME in SGR codes —
+# `group: \e[1;4mdaemon-pty\e[0m (max threads = ...)`. The parse below anchors on
+# the literal name, so every group came back "not declared" and this guard failed
+# the build while reporting the one thing that was not wrong. It passed locally
+# and only ever failed in CI, which is the worst shape a guard can have.
+#
+# The `sed` is belt-and-braces for any other source of colour (a `NEXTEST_*`
+# override, a future default): a guard should not be re-breakable by an
+# environment variable.
 set +e
-raw="$(cargo nextest show-config test-groups --workspace 2>"${err_file}")"
-show_status=$?
+raw="$(cargo nextest --color never show-config test-groups --workspace 2>"${err_file}" \
+  | sed $'s/\033\[[0-9;]*m//g')"
+show_status=${PIPESTATUS[0]}
 set -e
 
 if [[ "${show_status}" -ne 0 ]]; then

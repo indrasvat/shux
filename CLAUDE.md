@@ -70,7 +70,9 @@ only that the code does what it does.
 Daemon-backed **shell** suites (`.shux/scripts/*_check.sh`, `make test-lens*`, the QA
 gates) run **serially** — never two at once. Daemon-backed **cargo tests** do not: they
 are scheduled by nextest under the `daemon-pty` group in `.config/nextest.toml`, capped
-at 8 concurrent, and each isolates its own `XDG_RUNTIME_DIR`. Do not add
+at 12 concurrent, and each isolates its own `XDG_RUNTIME_DIR`. That cap is measured, not
+chosen — see `docs/tasks/093-parallel-test-suite.md`; if you change it there, change it
+here, and `make check-test-groups` will tell you if the group's membership drifts. Do not add
 `--test-threads=1` or `-j 1` to a cargo test invocation to "be safe" — that was the
 house pattern until issue #130, it cost 461s a run, and it protected nothing that
 nextest's process-per-test model does not already protect. If a test genuinely needs a

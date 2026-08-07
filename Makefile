@@ -41,7 +41,13 @@ COVERAGE_DIR := coverage
 #
 # Override with `make test NEXTEST_JOBS=8` on a machine that is busy with
 # something else.
-NEXTEST_CPUS := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+# `scripts/cpu-budget.sh`, NOT `getconf _NPROCESSORS_ONLN`. getconf counts the
+# CPUs the MACHINE has; inside a container with a CPU quota that over-reports,
+# and multiplying an over-report by four is how you get hundreds of test
+# processes onto two usable CPUs — the exact starvation the scheduling here
+# exists to prevent. The helper takes the smallest of affinity, cgroup v2
+# `cpu.max` and cgroup v1 `cpu.cfs_quota_us`.
+NEXTEST_CPUS := $(shell bash scripts/cpu-budget.sh 2>/dev/null || echo 4)
 NEXTEST_JOBS ?= $(shell echo $$(( $(NEXTEST_CPUS) * 4 )))
 NEXTEST_RUN = cargo nextest run -j $(NEXTEST_JOBS)
 LEFTHOOK := $(shell command -v lefthook 2>/dev/null)
@@ -130,11 +136,11 @@ check-test-groups: nextest-ready ## Assert every nextest test-group still matche
 
 .PHONY: bench-test-suite
 bench-test-suite: nextest-ready setup-bench ## hyperfine A/B: legacy serial runner vs the parallel one
-	@bash .shux/scripts/bench_test_suite.sh
+	@PATH="$${CARGO_HOME:-$$HOME/.cargo}/bin:$$PATH" bash .shux/scripts/bench_test_suite.sh
 
 .PHONY: bench-edit-loop
 bench-edit-loop: nextest-ready ## Time the real loop: change code, run tests, repeat
-	@bash .shux/scripts/bench_edit_loop.sh
+	@PATH="$${CARGO_HOME:-$$HOME/.cargo}/bin:$$PATH" bash .shux/scripts/bench_edit_loop.sh
 
 .PHONY: test-fallback
 test-fallback: ## Legacy serial runner (no nextest). Kept for hosts where nextest cannot run.
