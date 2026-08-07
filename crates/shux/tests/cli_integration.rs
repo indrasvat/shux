@@ -746,8 +746,43 @@ async fn test_cli_api_raw_against_server() {
 // Smoke tests (no daemon needed) — use binary path from env
 // ══════════════════════════════════════════════════════════════
 
+/// The real binary, pointed at a sandbox instead of at the developer.
+///
+/// These are the "no daemon needed" smoke cases, but "needed" is not the same
+/// as "reachable": anything that gets past clap into dispatch will happily
+/// auto-start a daemon, and with an inherited environment that daemon lands in
+/// the *operator's* real `XDG_RUNTIME_DIR`, next to the sessions they are
+/// actually using — while also reading their real `~/.config/shux/config.toml`,
+/// so a local config could decide whether the assertion holds.
+///
+/// Every spawn therefore gets a per-binary sandbox for the three roots shux
+/// resolves state from, and `SHUX_SOCKET` is cleared so an exported one cannot
+/// redirect the test back out of it. This is what makes the suite safe to run
+/// beside anything else; it was never actually safe serially either, it just
+/// had less company.
+fn sandbox_root() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            // Unix socket paths cap out near 104 bytes, so the prefix stays
+            // short: a long one truncates the daemon socket and the failure
+            // reads as a hang rather than a name-too-long error.
+            .prefix("shux-cli")
+            .tempdir()
+            .expect("sandbox tempdir")
+    })
+    .path()
+}
+
 fn shux_bin() -> std::process::Command {
-    std::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+    let root = sandbox_root();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_shux"));
+    cmd.env("XDG_RUNTIME_DIR", root)
+        .env("XDG_CONFIG_HOME", root)
+        .env("XDG_STATE_HOME", root)
+        .env_remove("SHUX_SOCKET");
+    cmd
 }
 
 #[test]

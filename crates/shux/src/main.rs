@@ -9290,10 +9290,18 @@ mod tests {
     async fn production_unconfirmed_kill_preserves_registry_row() {
         use std::sync::atomic::Ordering;
         let harness = RpcHarness::new();
+        // A duration nobody else uses, for the same reason
+        // `production_lens_run_dropped_mid_core_leaves_no_orphan` does it:
+        // the wait at the end of this test greps the MACHINE-WIDE process
+        // table. `sleep 30` was the literal needle, and `shux-plugin`'s
+        // handshake-timeout test spawns exactly `sleep 30` — so this test
+        // could sit out its whole budget watching a different crate's
+        // process, and conclude nothing about its own.
+        let sleep_tag = format!("29{:03}", std::process::id() % 1000);
         let run = dispatch_ok(
             &harness.router,
             "lens.run",
-            serde_json::json!({"argv": ["sleep", "30"]}),
+            serde_json::json!({"argv": ["sleep", sleep_tag]}),
         )
         .await;
         let sid_str = run["session_id"].as_str().unwrap().to_string();
@@ -9325,7 +9333,9 @@ mod tests {
         // the leak guard stays clean; the surviving row simply ages out
         // with the harness tempdir, exactly like a crash-preserved row.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while count_procs_containing("sleep 30") > 0 && std::time::Instant::now() < deadline {
+        while count_procs_containing(&format!("sleep {sleep_tag}")) > 0
+            && std::time::Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         harness.stop().await;

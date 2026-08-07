@@ -49,6 +49,53 @@ pub const PROTOCOL_VERSION: &str = "1";
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// SIGKILL a plugin's entire process group.
+///
+/// `Child::kill` reaches exactly one process — the plugin's own. That is not
+/// what a plugin is. Plugins are shell scripts as often as they are binaries,
+/// and a script's children outlive it: killing the script left every process
+/// it had started running, reparented to init, with nothing anywhere
+/// recording that they existed. One failed handshake, one stray process.
+///
+/// `install` spawns each plugin with `process_group(0)`, so the group id
+/// equals the plugin's own pid and a single `killpg` reaches the whole tree
+/// however deeply nested.
+///
+/// **Only ever call this while the `Child` handle is still alive.** An
+/// unreaped child pins its pid against reuse; once it is reaped the kernel
+/// may recycle that pid, and `killpg` would then signal an unrelated group.
+///
+/// A pgid of 0 is refused outright — `killpg(0, sig)` signals the *caller's*
+/// own group, which here is the daemon. `shux::lens_scratch` guards the same
+/// footgun for the same reason.
+fn kill_plugin_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        if let Some(pid) = pid.filter(|p| *p > 0) {
+            // ESRCH just means the group is already gone: the end state we want.
+            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Kill a plugin's whole process group, then reap its leader.
+async fn kill_plugin_tree(child: &mut Child) {
+    kill_plugin_group(child.id());
+    let _ = child.kill().await;
+}
+
+/// Non-awaiting variant, for paths holding a lock or already shutting down.
+fn start_kill_plugin_tree(child: &mut Child) {
+    kill_plugin_group(child.id());
+    let _ = child.start_kill();
+}
+
 /// What a plugin reports about itself on handshake.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PluginManifest {
@@ -283,6 +330,11 @@ impl PluginManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Own process group, so one signal reaches the plugin AND everything
+        // it started. Plugins are shell scripts as often as they are binaries,
+        // and a script's children outlive it — see `kill_plugin_tree`.
+        #[cfg(unix)]
+        cmd.process_group(0);
         if let Some(cwd) = &source.cwd {
             cmd.current_dir(cwd);
         }
@@ -316,15 +368,15 @@ impl PluginManager {
         let manifest = match tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.next_line()).await {
             Ok(Ok(Some(line))) => parse_manifest(&line)?,
             Ok(Ok(None)) => {
-                let _ = child.kill().await;
+                kill_plugin_tree(&mut child).await;
                 return Err(PluginError::HandshakeFailed("plugin closed stdout".into()));
             }
             Ok(Err(e)) => {
-                let _ = child.kill().await;
+                kill_plugin_tree(&mut child).await;
                 return Err(PluginError::HandshakeFailed(format!("read: {e}")));
             }
             Err(_) => {
-                let _ = child.kill().await;
+                kill_plugin_tree(&mut child).await;
                 return Err(PluginError::HandshakeFailed(
                     "manifest not received within 5s".into(),
                 ));
@@ -332,7 +384,7 @@ impl PluginManager {
         };
 
         if manifest.name.is_empty() {
-            let _ = child.kill().await;
+            kill_plugin_tree(&mut child).await;
             return Err(PluginError::HandshakeFailed(
                 "plugin manifest missing 'name'".into(),
             ));
@@ -340,7 +392,7 @@ impl PluginManager {
         if let Some(expected) = &source.expected_name
             && manifest.name != *expected
         {
-            let _ = child.kill().await;
+            kill_plugin_tree(&mut child).await;
             return Err(PluginError::HandshakeFailed(format!(
                 "plugin manifest name mismatch: package expected {expected:?}, process reported {:?}",
                 manifest.name
@@ -349,7 +401,7 @@ impl PluginManager {
         if let Some(expected) = &source.expected_version
             && manifest.version != *expected
         {
-            let _ = child.kill().await;
+            kill_plugin_tree(&mut child).await;
             return Err(PluginError::HandshakeFailed(format!(
                 "plugin manifest version mismatch: package expected {expected:?}, process reported {:?}",
                 manifest.version
@@ -362,7 +414,7 @@ impl PluginManager {
         // matching subscribers filtering for the legitimate
         // `plugin.git-status.` prefix.
         if manifest.name.contains('.') || manifest.name.contains(char::is_whitespace) {
-            let _ = child.kill().await;
+            kill_plugin_tree(&mut child).await;
             return Err(PluginError::HandshakeFailed(format!(
                 "plugin name {:?} must not contain '.' or whitespace \
                  (used verbatim in the plugin.<name>.<type> event namespace)",
@@ -378,7 +430,7 @@ impl PluginManager {
         // non-blocking, so the lock window stays in microseconds.
         let mut inner = self.inner.lock().await;
         if inner.contains_key(&manifest.name) {
-            let _ = child.start_kill();
+            start_kill_plugin_tree(&mut child);
             return Err(PluginError::NameConflict(manifest.name.clone()));
         }
 
@@ -407,7 +459,7 @@ impl PluginManager {
         let mut grants = match Grants::load(&grants_path) {
             Ok(g) => g,
             Err(e) => {
-                let _ = child.start_kill();
+                start_kill_plugin_tree(&mut child);
                 return Err(PluginError::HandshakeFailed(format!(
                     "could not load grants at {}: {e}",
                     grants_path.display()
@@ -421,7 +473,7 @@ impl PluginManager {
                 grants.add_subscribe(filter);
             }
             if let Err(e) = grants.save(&grants_path) {
-                let _ = child.start_kill();
+                start_kill_plugin_tree(&mut child);
                 return Err(PluginError::HandshakeFailed(format!(
                     "could not initialise grants at {}: {e}",
                     grants_path.display()
@@ -437,7 +489,7 @@ impl PluginManager {
                 .cloned()
                 .collect();
             if !unauthorised.is_empty() {
-                let _ = child.start_kill();
+                start_kill_plugin_tree(&mut child);
                 return Err(PluginError::HandshakeFailed(format!(
                     "manifest.subscribes added unauthorised filters since last install: {unauthorised:?}. \
                      Run `shux plugin grant {} subscribe <filter>` for each, then retry.",
@@ -909,6 +961,14 @@ async fn run_plugin_io(
     // and get serialized onto stdin like any other outbound frame.
     let (resp_tx, mut resp_rx) = mpsc::channel::<String>(64);
 
+    // Remembered up front, because `child.id()` goes to `None` the moment the
+    // plugin is reaped — including by the graceful `child.wait()` below. A
+    // plugin that exits politely on `plugin.shutdown` can still have left
+    // something running behind it, and after the reap there is no longer any
+    // handle telling us which group to clean up. The `Child` stays alive for
+    // the whole function, which is what keeps this pid safe from reuse.
+    let plugin_pgid = child.id();
+
     loop {
         tokio::select! {
             biased;
@@ -995,6 +1055,13 @@ async fn run_plugin_io(
             }
         }
     }
+
+    // Every exit from the loop above lands here — the graceful shutdown, a
+    // closed stdout, an I/O error. Whatever brought us here, anything the
+    // plugin started is now unowned, so the group goes with it. `child` is
+    // still in scope, which is what makes this pid safe to signal.
+    kill_plugin_group(plugin_pgid);
+    let _ = child.start_kill();
 
     info!(plugin = %name, "plugin io task exited");
 }

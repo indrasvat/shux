@@ -122,6 +122,31 @@ fn fixture(h: &Harness, tag: &str) -> Fixed {
     h.wait_for(&pane_b, "BRAVO", 60_000)
         .expect("pane B never printed its marker");
 
+    // Content, THEN settle — the second half of the rule, which this fixture
+    // was only doing the first half of.
+    //
+    // `BRAVO` appearing does not mean pane B has stopped writing: it is an
+    // interactive shell, and the prompt it redraws afterwards lands whenever
+    // the scheduler gets round to it. Tests below glance the same pane twice
+    // and assert the two agree; on a loaded machine the shell's next write can
+    // slip between them, and the two captures differ by a line of prompt. The
+    // symptom reads as "the short id resolved to a different pane", which is a
+    // slander on the resolver — nothing about ids is wrong.
+    //
+    // Both panes settle: A parks in `sleep 300` after its probe, but the same
+    // prompt-after-output shape applies to it.
+    for pane in [&pane_a, &pane_b] {
+        let settled = h.rpc_ok(
+            "pane.wait_settled",
+            serde_json::json!({ "pane_id": pane, "quiet_ms": 250, "timeout_ms": 30_000 }),
+        );
+        assert_eq!(
+            settled["settled"],
+            serde_json::Value::Bool(true),
+            "pane {pane} never went quiet; captures taken from it cannot be compared"
+        );
+    }
+
     // A second window, so `-w 0` has something to be wrong about.
     let w2 = h.rpc_ok(
         "window.create",

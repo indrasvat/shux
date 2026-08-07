@@ -11,6 +11,44 @@ use std::time::Duration;
 use shux_core::bus::EventBus;
 use shux_plugin::{PluginManager, PluginSource};
 
+/// How many processes on this machine have `needle` in their argv.
+///
+/// `ps` is a machine-global view, so every caller MUST pass a needle that is
+/// unique to its own run. A shared needle (`"sleep 30"` was the original)
+/// silently reads other suites' processes: the assertion still passes, but it
+/// is no longer about the thing under test — and once the suite runs in
+/// parallel it is a coin flip.
+fn count_procs_containing(needle: &str) -> usize {
+    std::process::Command::new("ps")
+        .args(["-axo", "args="])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| l.contains(needle))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Wait (bounded) for every process matching `needle` to disappear.
+///
+/// Yields with `tokio::time::sleep`, never `std::thread::sleep`: these tests
+/// run on a current-thread runtime, and a blocking sleep would park the very
+/// executor that has to poll the plugin's I/O task before it can do the
+/// killing. Blocking here reports "the kill never happened" for every plugin,
+/// working or not.
+async fn wait_for_no_procs(needle: &str, budget: Duration) -> usize {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let n = count_procs_containing(needle);
+        if n == 0 || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, body).unwrap();
@@ -81,11 +119,18 @@ async fn install_times_out_on_silent_plugin() {
     let tmp = tempfile::tempdir().unwrap();
     // Plugin reads init but never writes a manifest — should time
     // out after HANDSHAKE_TIMEOUT (5s).
-    let silent = r#"#!/usr/bin/env bash
+    //
+    // The sleep carries a run-unique marker. It used to be a bare `sleep 30`,
+    // which is the exact string `shux`'s own daemon-lifecycle unit test scans
+    // the global process table for — two suites sharing one needle.
+    let marker = unique_marker("silent");
+    let silent = format!(
+        r#"#!/usr/bin/env bash
 IFS= read -r _ || exit 1
-sleep 30
-"#;
-    let script = write_script(tmp.path(), "silent.sh", silent);
+exec -a {marker} sleep 30
+"#
+    );
+    let script = write_script(tmp.path(), "silent.sh", &silent);
 
     let mgr = PluginManager::new(EventBus::new());
     let start = std::time::Instant::now();
@@ -99,6 +144,82 @@ sleep 30
     // Must hit within ~6s (5s budget + slack); must not return early.
     assert!(elapsed >= Duration::from_secs(4));
     assert!(elapsed < Duration::from_secs(7));
+
+    let survivors = wait_for_no_procs(&marker, Duration::from_secs(5)).await;
+    assert_eq!(
+        survivors, 0,
+        "the timed-out plugin's own process survived the kill"
+    );
+}
+
+/// A marker string unique to this process and this call site, safe to grep
+/// the global process table for.
+fn unique_marker(tag: &str) -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "shuxplug-{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Killing a plugin must kill everything the plugin started.
+///
+/// `Child::kill` signals the direct child and nothing else. Plugins are
+/// scripts as often as not, and a script's children outlive it: before this
+/// was fixed, a plugin that failed its handshake left its entire subtree
+/// running, reparented to init, with no record anywhere that it had existed.
+/// On a developer's machine that is a stray process per failed install; in a
+/// long-lived daemon it accumulates.
+///
+/// Seen failing first: without the process-group kill this leaves the
+/// `descendant` process alive for its full 45s and the assertion trips.
+#[tokio::test]
+async fn a_killed_plugin_takes_its_whole_process_tree_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let own = unique_marker("self");
+    let child = unique_marker("descendant");
+
+    // Handshakes correctly, then forks a grandchild and parks. Both the
+    // plugin and its grandchild carry distinct greppable argv markers.
+    let body = format!(
+        r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"forker","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+( exec -a {child} sleep 45 ) &
+exec -a {own} sleep 45
+"#
+    );
+    let script = write_script(tmp.path(), "forker.sh", &body);
+
+    let mgr = PluginManager::new(EventBus::new());
+    mgr.install(PluginSource::from_path(&script)).await.unwrap();
+
+    // Both must actually be running, or the test proves nothing.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while count_procs_containing(&child) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        count_procs_containing(&child),
+        1,
+        "the plugin never started its grandchild — the test would pass vacuously"
+    );
+
+    mgr.kill("forker").await.unwrap();
+
+    // `kill` grants a shutdown grace before the signal; allow for it.
+    assert_eq!(
+        wait_for_no_procs(&own, Duration::from_secs(10)).await,
+        0,
+        "the plugin process itself survived `kill`"
+    );
+    assert_eq!(
+        wait_for_no_procs(&child, Duration::from_secs(10)).await,
+        0,
+        "the plugin died but the process IT spawned was left running"
+    );
 }
 
 #[tokio::test]

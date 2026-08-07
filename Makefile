@@ -21,7 +21,29 @@ LIBGHOSTTY_SPIKE_BREW_ZIG015_BIN ?= /opt/homebrew/opt/zig@0.15/bin
 COVERAGE_DIR := coverage
 
 # Tools
-NEXTEST := $(shell command -v cargo-nextest 2>/dev/null)
+#
+# Every test target runs through nextest, so local runs and CI are the same
+# command at the same concurrency — the divergence issue #130 is about. nextest
+# runs each test in its own process, which is what makes the workspace safe to
+# run in parallel at all: process-global state (env vars, cwd, signal
+# disposition) stops being shared between tests. What stays genuinely shared —
+# the machine's process table, the kernel PTY pool — is bounded by the test
+# groups in .config/nextest.toml.
+#
+# `nextest-ready` installs the pre-built binary in seconds if it is missing, so
+# a fresh clone or a cold container gets the fast path rather than the fallback.
+# Test concurrency. The suite spends most of its time WAITING — on a daemon
+# handshake, on a PTY, on a pane going quiet — not computing, so one thread per
+# core (nextest's default) leaves most of the machine idle. Measured on a
+# 4-core box: 69.5s at one-per-core, 22.0s at four-per-core, same 1,933 passes.
+# The tests that genuinely cannot take that are held back by the groups in
+# .config/nextest.toml, not by lowering this.
+#
+# Override with `make test NEXTEST_JOBS=8` on a machine that is busy with
+# something else.
+NEXTEST_CPUS := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+NEXTEST_JOBS ?= $(shell echo $$(( $(NEXTEST_CPUS) * 4 )))
+NEXTEST_RUN = cargo nextest run -j $(NEXTEST_JOBS)
 LEFTHOOK := $(shell command -v lefthook 2>/dev/null)
 
 # Colors for output
@@ -90,6 +112,31 @@ install: release ## Install to ~/.local/bin
 	@install -m 755 target/release/$(BINARY_NAME) ~/.local/bin/$(BINARY_NAME)
 	@echo "$(COLOR_GREEN)✓ Installed to ~/.local/bin/$(BINARY_NAME)$(COLOR_RESET)"
 
+.PHONY: nextest-ready
+nextest-ready:
+	@bash scripts/ensure-nextest.sh
+
+.PHONY: setup-nextest
+setup-nextest: ## Install cargo-nextest (pre-built binary; seconds, not minutes)
+	@bash scripts/ensure-nextest.sh
+
+.PHONY: setup-bench
+setup-bench: ## Install hyperfine, the benchmark harness `make bench-test-suite` uses
+	@bash scripts/ensure-hyperfine.sh
+
+.PHONY: check-test-groups
+check-test-groups: nextest-ready ## Assert every nextest test-group still matches the tests it bounds
+	@bash scripts/check-test-groups.sh
+
+.PHONY: bench-test-suite
+bench-test-suite: nextest-ready setup-bench ## hyperfine A/B: legacy serial runner vs the parallel one
+	@bash .shux/scripts/bench_test_suite.sh
+
+.PHONY: test-fallback
+test-fallback: ## Legacy serial runner (no nextest). Kept for hosts where nextest cannot run.
+	@echo "$(COLOR_YELLOW)▶ Legacy serial runner — this is the slow path, and it is NOT what CI runs.$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh --workspace -- --test-threads=1
+
 .PHONY: install-tools
 install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, fuzz, lefthook)
 	@echo "$(COLOR_BLUE)▶ Installing dev tools...$(COLOR_RESET)"
@@ -105,38 +152,38 @@ install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, fuzz, lefth
 # ══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: test
-test: ## Run all tests with cargo test
+test: nextest-ready ## Run the whole workspace suite (same command CI runs)
 	@echo "$(COLOR_BLUE)▶ Running tests...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh --workspace -- --test-threads=1
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) --workspace
 	@echo "$(COLOR_GREEN)✓ Tests passed$(COLOR_RESET)"
 
 .PHONY: test-verbose
-test-verbose: ## Run tests with output visible
+test-verbose: nextest-ready ## Run tests with output visible
 	@echo "$(COLOR_BLUE)▶ Running tests (verbose)...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh --workspace -- --test-threads=1 --nocapture
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) --workspace --no-capture
 
 .PHONY: test-lib
-test-lib: ## Run library tests only
+test-lib: nextest-ready ## Run library tests only
 	@echo "$(COLOR_BLUE)▶ Running library tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh --workspace --lib -- --test-threads=1
+	@$(NEXTEST_RUN) --workspace --lib
 	@echo "$(COLOR_GREEN)✓ Library tests passed$(COLOR_RESET)"
 
 .PHONY: test-vt
-test-vt: ## Run focused virtual terminal tests; optionally pass FILTER=<test-name>
+test-vt: nextest-ready ## Run focused virtual terminal tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running virtual terminal tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux-vt --lib -- $(FILTER) --test-threads=1
+	@$(NEXTEST_RUN) -p shux-vt --lib $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Virtual terminal tests passed$(COLOR_RESET)"
 
 .PHONY: test-window-snapshot
-test-window-snapshot: ## Run the window-snapshot oversize cross-path integration test; optionally pass FILTER=<test-name>
+test-window-snapshot: nextest-ready ## Run the window-snapshot oversize cross-path integration test; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running window snapshot oversize integration tests...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test window_snapshot_oversize -- $(FILTER) --test-threads=1
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test window_snapshot_oversize $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Window snapshot oversize tests passed$(COLOR_RESET)"
 
 .PHONY: test-pane-io
-test-pane-io: ## Run pane I/O integration tests; optionally pass FILTER=<test-name>
+test-pane-io: nextest-ready ## Run pane I/O integration tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running pane I/O integration tests...$(COLOR_RESET)"
-	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test pane_io_integration -- $(FILTER) --test-threads=1
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_io_integration $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
 
 .PHONY: test-id-refs-evidence
@@ -150,29 +197,29 @@ test-id-refs-evidence: build ## Issue #120 A/B round trip against the real binar
 	@echo "$(COLOR_GREEN)✓ issue-120 evidence recorded under .shux/out/issue-120/$(COLOR_RESET)"
 
 .PHONY: test-id-refs
-test-id-refs: ## Run entity-id reference (short-id / prefix) tests end to end; optionally pass FILTER=<test-name>
+test-id-refs: nextest-ready ## Run entity-id reference (short-id / prefix) tests end to end; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running entity-id reference tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux-core --lib -- idref $(FILTER) --test-threads=1
-	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test id_prefix_resolution -- $(FILTER) --test-threads=1
+	@$(NEXTEST_RUN) -p shux-core --lib idref $(FILTER)
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test id_prefix_resolution $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Entity-id reference tests passed$(COLOR_RESET)"
 
 .PHONY: test-rpc
-test-rpc: ## Run shux-rpc crate tests (codec/router/server/attach); optionally pass FILTER=<test-name>
+test-rpc: nextest-ready ## Run shux-rpc crate tests (codec/router/server/attach); optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running shux-rpc tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux-rpc -- $(FILTER) --test-threads=1
+	@$(NEXTEST_RUN) -p shux-rpc $(FILTER)
 	@echo "$(COLOR_GREEN)✓ shux-rpc tests passed$(COLOR_RESET)"
 
 .PHONY: test-cli-unit
-test-cli-unit: ## Run shux CLI unit tests (bin target; mock-stream, no daemons); optionally pass FILTER=<test-name>
+test-cli-unit: nextest-ready ## Run shux CLI unit tests (bin target; mock-stream, no daemons); optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running shux CLI unit tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux --bin shux -- $(FILTER) --test-threads=1
+	@$(NEXTEST_RUN) -p shux --bin shux $(FILTER)
 	@echo "$(COLOR_GREEN)✓ shux CLI unit tests passed$(COLOR_RESET)"
 
 .PHONY: test-plugin-dx
-test-plugin-dx: ## Run focused plugin DX CLI/integration tests; optionally pass FILTER=<test-name>
+test-plugin-dx: nextest-ready ## Run focused plugin DX CLI/integration tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running plugin DX tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux --bin shux -- $(FILTER) --test-threads=1
-	@.shux/scripts/no_leak_guard.sh bash scripts/run-cargo-test.sh -p shux --test cli_integration -- $(FILTER) --test-threads=1
+	@$(NEXTEST_RUN) -p shux --bin shux $(FILTER)
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test cli_integration $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Plugin DX tests passed$(COLOR_RESET)"
 
 .PHONY: test-sightline
@@ -182,15 +229,15 @@ test-sightline: release ## Run focused Sightline plugin/package checks
 	@echo "$(COLOR_GREEN)✓ Sightline checks passed$(COLOR_RESET)"
 
 .PHONY: test-vt-corpus-unit
-test-vt-corpus-unit: ## Run VT corpus replay unit/integration tests
+test-vt-corpus-unit: nextest-ready ## Run VT corpus replay unit/integration tests
 	@echo "$(COLOR_BLUE)▶ Running VT corpus replay tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux-vt --test vt_corpus_replay -- --test-threads=1
+	@$(NEXTEST_RUN) -p shux-vt --test vt_corpus_replay
 	@echo "$(COLOR_GREEN)✓ VT corpus replay tests passed$(COLOR_RESET)"
 
 .PHONY: test-vt-wide-invariants
-test-vt-wide-invariants: ## Run wide-cell invariant property tests
+test-vt-wide-invariants: nextest-ready ## Run wide-cell invariant property tests
 	@echo "$(COLOR_BLUE)▶ Running VT wide-cell invariant tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux-vt --test wide_invariants -- --test-threads=1
+	@$(NEXTEST_RUN) -p shux-vt --test wide_invariants
 	@echo "$(COLOR_GREEN)✓ VT wide-cell invariant tests passed$(COLOR_RESET)"
 
 .PHONY: test-vt-corpus
@@ -272,9 +319,9 @@ record-vt-corpus: release ## Record installed rich TUIs into .shux/out/073-vt-co
 	@echo "$(COLOR_GREEN)✓ VT corpus rich-TUI recording pass completed$(COLOR_RESET)"
 
 .PHONY: test-ui
-test-ui: ## Run focused UI/rendering tests; optionally pass FILTER=<test-name>
+test-ui: nextest-ready ## Run focused UI/rendering tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running UI/rendering tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux-ui --lib -- $(FILTER) --test-threads=1
+	@$(NEXTEST_RUN) -p shux-ui --lib $(FILTER)
 	@echo "$(COLOR_GREEN)✓ UI/rendering tests passed$(COLOR_RESET)"
 
 .PHONY: test-attach-color
@@ -290,12 +337,12 @@ test-lossless-record: release ## Verify lossless pane recording with real PTY/TU
 	@echo "$(COLOR_GREEN)✓ Lossless pane record regression check passed$(COLOR_RESET)"
 
 .PHONY: test-copy-mode
-test-copy-mode: ## Run focused copy-mode and copy-overlay tests
+test-copy-mode: nextest-ready ## Run focused copy-mode and copy-overlay tests
 	@echo "$(COLOR_BLUE)▶ Running copy-mode tests...$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh -p shux-ui --lib copy_mode -- --test-threads=1
-	@bash scripts/run-cargo-test.sh -p shux-ui --lib compositor::tests::test_compositor_does_not_churn_cursor_when_idle -- --test-threads=1
-	@bash scripts/run-cargo-test.sh -p shux-ui --lib compositor::tests::test_compositor_moves_cursor_without_hide_show_when_only_cursor_changes -- --test-threads=1
-	@bash scripts/run-cargo-test.sh -p shux --bin shux attach::tests:: -- --test-threads=1
+	@$(NEXTEST_RUN) -p shux-ui --lib copy_mode
+	@$(NEXTEST_RUN) -p shux-ui --lib compositor::tests::test_compositor_does_not_churn_cursor_when_idle
+	@$(NEXTEST_RUN) -p shux-ui --lib compositor::tests::test_compositor_moves_cursor_without_hide_show_when_only_cursor_changes
+	@$(NEXTEST_RUN) -p shux --bin shux attach::tests::
 	@echo "$(COLOR_GREEN)✓ Copy-mode tests passed$(COLOR_RESET)"
 
 .PHONY: test-doc
@@ -534,7 +581,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint test test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
+check: lint test check-test-groups test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
@@ -559,7 +606,7 @@ ci-strict: ## Force latest stable toolchain, then run fmt+clippy+build+test (clo
 	@echo "$(COLOR_BLUE)▶ Build --all-targets (+stable)$(COLOR_RESET)"
 	@cargo +stable build --workspace --all-targets
 	@echo "$(COLOR_BLUE)▶ Library tests (+stable)$(COLOR_RESET)"
-	@bash scripts/run-cargo-test.sh --workspace --lib -- --test-threads=1
+	@$(NEXTEST_RUN) --workspace --lib
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ ci-strict passed against $$(rustc +stable --version)$(COLOR_RESET)"
 	@echo ""
