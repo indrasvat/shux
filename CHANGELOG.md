@@ -1,3 +1,10 @@
+## [0.46.11](https://github.com/indrasvat/shux/compare/v0.46.10...v0.46.11) (2026-08-07)
+
+
+### Performance Improvements
+
+* **test:** run the workspace suite in parallel — 461s → 29s ([#130](https://github.com/indrasvat/shux/issues/130)) ([#131](https://github.com/indrasvat/shux/issues/131)) ([b6f9523](https://github.com/indrasvat/shux/commit/b6f9523aa275ca3f12f58d44851f309a1e67db82))
+
 ## [0.46.10](https://github.com/indrasvat/shux/compare/v0.46.9...v0.46.10) (2026-08-07)
 
 
