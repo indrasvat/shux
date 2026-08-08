@@ -1549,6 +1549,22 @@ fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The human-readable half of an `RpcError`, for CLI-side reporting.
+///
+/// `RpcError`'s `Display` is the JSON-RPC code name (`invalid_params`); the
+/// sentence a person needs is in `data.detail`.
+fn rpc_error_detail(e: &shux_rpc::RpcError) -> String {
+    serde_json::to_value(e)
+        .ok()
+        .and_then(|v| {
+            v.get("data")
+                .and_then(|d| d.get("detail"))
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| e.to_string())
+}
+
 /// True when `pid` is alive AND is actually a shux daemon.
 ///
 /// The pidfile is untrusted input: it survives SIGKILL and reboots, and pids get reused, so
@@ -2245,19 +2261,9 @@ fn register_state_methods(
                 // that never spawned — reported as one line of `spawn_results`
                 // among many, with the session, window and dead pane kept
                 // (issue #125 follow-up). Rejected up front, before anything is
-                // committed.
-                for (i, op) in ops.iter().enumerate() {
-                    let (argv, field) = match op {
-                        shux_core::apply::Op::CreateSession {
-                            initial_command, ..
-                        }
-                        | shux_core::apply::Op::CreateWindow {
-                            initial_command, ..
-                        } => (initial_command, "initial_command"),
-                        shux_core::apply::Op::SplitPane { command, .. } => (command, "command"),
-                    };
-                    pane_command::validate_argv(argv, &format!("ops[{i}].{field}"))?;
-                }
+                // committed. Same function the CLI's `--dry-run` calls, so the
+                // two cannot give different answers.
+                pane_command::validate_ops(&ops)?;
 
                 // Run the staged transaction through the single-writer task.
                 let mut result = gh.apply_batch(ops).await.map_err(batch_error_to_rpc)?;
@@ -2896,6 +2902,19 @@ fn register_pane_methods(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
 
+                // Splitting focuses the new pane, and destroying a pane hands
+                // focus to whichever pane the layout tree yields first — NOT the
+                // one that had it. So a rollback has to put focus back itself,
+                // or a failed split silently moves the operator's cursor to an
+                // unrelated pane and every later `-p`-less verb targets it.
+                let prior_active_pane = {
+                    let snap = gh.snapshot();
+                    snap.panes
+                        .get(&pane_id)
+                        .and_then(|p| snap.windows.get(&p.window_id))
+                        .map(|w| w.active_pane)
+                };
+
                 // `_with_command` persists the argv on the new pane, so
                 // `pane list` and the `PaneCreated` event report what is
                 // really running instead of a blank.
@@ -2923,6 +2942,9 @@ fn register_pane_methods(
                 .await
                 {
                     let _ = gh.destroy_pane(new_pane_id, None).await;
+                    if let Some(prev) = prior_active_pane {
+                        let _ = gh.focus_pane(prev).await;
+                    }
                     return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
                 }
 
@@ -3844,6 +3866,17 @@ fn register_window_methods(
 
                     let command = pane_command::parse_pane_command(&params)?;
 
+                    // Creating a window focuses it, and destroying a window hands
+                    // focus to the session's FIRST window — not the one that had
+                    // it. A rollback therefore has to restore focus itself, or a
+                    // failed create silently relocates the session (see the
+                    // matching comment in `pane.split`).
+                    let prior_active_window = gh
+                        .snapshot()
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.active_window);
+
                     // `_with_command` persists the argv on the window's initial
                     // pane, so `pane list` and `PaneCreated` report what is really
                     // running instead of a blank (issue #125).
@@ -3887,6 +3920,9 @@ fn register_window_methods(
                     .await
                     {
                         let _ = gh.destroy_window(window_id, None).await;
+                        if let Some(prev) = prior_active_window {
+                            let _ = gh.focus_window(prev, None).await;
+                        }
                         return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
                     }
 
@@ -3981,6 +4017,11 @@ fn register_window_methods(
                         .unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                         });
+                    let prior_active_window = gh
+                        .snapshot()
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.active_window);
                     let window_id = gh
                         .create_window_with_command(session_id, name, cwd.clone(), command.clone())
                         .await
@@ -4010,6 +4051,9 @@ fn register_window_methods(
                     .await
                     {
                         let _ = gh.destroy_window(window_id, None).await;
+                        if let Some(prev) = prior_active_window {
+                            let _ = gh.focus_window(prev, None).await;
+                        }
                         return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
                     }
 
@@ -7157,6 +7201,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 watch,
             } => {
                 let ops = template::load_and_lower(&template)?;
+                pane_command::validate_ops(&ops)
+                    .map_err(|e| anyhow::anyhow!("{}", rpc_error_detail(&e)))?;
                 if dry_run {
                     println!("{}", style::json_safe(&serde_json::to_string_pretty(&ops)?));
                     Ok(())
@@ -7814,6 +7860,18 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             };
+
+            // Before printing OR sending: `--dry-run` exists to answer "will
+            // this apply succeed?", and the argv rule used to live only in the
+            // daemon, so dry-run said yes to templates the real run rejects.
+            if let Err(e) = pane_command::validate_ops(&ops) {
+                eprintln!(
+                    "{} {}",
+                    style::error("✗ template error:"),
+                    style::safe_diagnostic(&rpc_error_detail(&e))
+                );
+                std::process::exit(1);
+            }
 
             if dry_run {
                 // `--dry-run` prints the ops BEFORE the graph sanitizes

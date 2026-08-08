@@ -42,10 +42,23 @@ use shux_rpc::RpcError;
 /// Fallback when `$SHELL` is unset or blank. POSIX guarantees this path.
 const FALLBACK_SHELL: &str = "/bin/sh";
 
-/// Longest single argument the kernel will accept (`MAX_ARG_STRLEN` on Linux —
-/// `PAGE_SIZE * 32`). Past this, `execve` fails with `E2BIG` and the pane never
-/// spawns; caught here so the caller gets a parameter error naming the field.
-const MAX_ARG_BYTES: usize = 128 * 1024;
+/// Longest single argument `execve` will accept.
+///
+/// Linux's `MAX_ARG_STRLEN` is `PAGE_SIZE * 32` = 131072, and it counts the
+/// terminating NUL — so the largest string that actually fits is 131071. The
+/// first cut of this used 131072 and let exactly that length through to fail at
+/// `execve` with "Argument list too long", which is the outcome the check
+/// exists to prevent. Bisected against the real binary, not reasoned about.
+const MAX_ARG_BYTES: usize = 128 * 1024 - 1;
+
+/// Ceiling on the whole argv.
+///
+/// The per-argument cap does not bound the total: forty individually-legal
+/// 100 KiB arguments are 4 MiB and still `E2BIG`. The kernel's real limit is
+/// `ARG_MAX` (2 MiB typically) shared between argv AND the environment, and the
+/// environment's share is not ours to measure — so this sits well under it.
+/// A megabyte of argv is already four orders of magnitude past any real command.
+const MAX_ARGV_BYTES: usize = 1024 * 1024;
 
 /// The shell that interprets a string-form `command`.
 ///
@@ -103,6 +116,7 @@ pub(crate) fn parse_pane_command_with_shell(
                 reject_unexecutable(s, &format!("'command[{i}]'"))?;
                 argv.push(s.to_string());
             }
+            reject_oversize_argv(&argv, "'command'")?;
             // `[""]` and `["   "]` both exec a program name that cannot resolve:
             // the pane dies instantly with an error naming neither the pane nor
             // the cause. Blank is checked with `trim`, matching how the string
@@ -135,10 +149,34 @@ pub(crate) fn validate_argv(argv: &[String], what: &str) -> Result<(), RpcError>
     for (i, arg) in argv.iter().enumerate() {
         reject_unexecutable(arg, &format!("{what}[{i}]"))?;
     }
+    reject_oversize_argv(argv, what)?;
     if argv.first().is_some_and(|p| p.trim().is_empty()) {
         return Err(RpcError::invalid_params(&format!(
             "{what}[0] is blank — argv[0] must name a program to execute"
         )));
+    }
+    Ok(())
+}
+
+/// Validate every argv carried by a lowered `state.apply` batch.
+///
+/// Shared by the daemon's `state.apply` handler and by the CLI's `--dry-run`,
+/// which is the whole point: dry-run exists to answer "will this apply
+/// succeed?", and it answered yes to templates the real run rejects because the
+/// only copy of the rule lived server-side (issue #125 follow-up).
+pub(crate) fn validate_ops(ops: &[shux_core::apply::Op]) -> Result<(), RpcError> {
+    use shux_core::apply::Op;
+    for (i, op) in ops.iter().enumerate() {
+        let (argv, field) = match op {
+            Op::CreateSession {
+                initial_command, ..
+            }
+            | Op::CreateWindow {
+                initial_command, ..
+            } => (initial_command, "initial_command"),
+            Op::SplitPane { command, .. } => (command, "command"),
+        };
+        validate_argv(argv, &format!("ops[{i}].{field}"))?;
     }
     Ok(())
 }
@@ -155,6 +193,20 @@ fn reject_unexecutable(s: &str, what: &str) -> Result<(), RpcError> {
         return Err(RpcError::invalid_params(&format!(
             "{what} is {} bytes; a single argument cannot exceed {MAX_ARG_BYTES}",
             s.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an argv whose elements are each legal but whose total is not.
+fn reject_oversize_argv(argv: &[String], what: &str) -> Result<(), RpcError> {
+    // +1 per element for the NUL the kernel copies with each argument.
+    let total: usize = argv.iter().map(|a| a.len() + 1).sum();
+    if total > MAX_ARGV_BYTES {
+        return Err(RpcError::invalid_params(&format!(
+            "{what} is {total} bytes across {} arguments; the whole argv cannot \
+             exceed {MAX_ARGV_BYTES}",
+            argv.len()
         )));
     }
     Ok(())
@@ -301,9 +353,41 @@ mod tests {
         let msg = format!("{err:?}");
         assert!(msg.contains("command[1]"), "{msg}");
 
-        // Exactly at the limit is fine.
-        let ok = "x".repeat(MAX_ARG_BYTES);
-        assert!(parse(json!(["echo", ok])).is_ok());
+        // The boundary is the point. `MAX_ARG_STRLEN` counts the terminating
+        // NUL, so 131071 is the longest argument that can actually be exec'd and
+        // 131072 is not — the first cut of this had the cap one byte too high
+        // and asserted, greenly, that the byte length which fails at `execve`
+        // was fine. `crates/shux/tests/pane_command_e2e.rs` pins the same
+        // boundary against a real spawn.
+        assert_eq!(MAX_ARG_BYTES, 131071);
+        assert!(parse(json!(["echo", "x".repeat(MAX_ARG_BYTES)])).is_ok());
+        assert!(parse(json!(["echo", "x".repeat(MAX_ARG_BYTES + 1)])).is_err());
+    }
+
+    #[test]
+    fn an_argv_whose_total_is_too_long_is_rejected() {
+        // Every element legal on its own; the sum is not.
+        let arg = "x".repeat(100_000);
+        let argv: Vec<_> = std::iter::once("echo".to_string())
+            .chain(std::iter::repeat_n(arg, 40))
+            .collect();
+        let err = parse(serde_json::Value::Array(
+            argv.into_iter().map(serde_json::Value::String).collect(),
+        ))
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("whole argv"), "{msg}");
+
+        // A large-but-sane argv still passes.
+        let ok: Vec<_> = std::iter::once("echo".to_string())
+            .chain(std::iter::repeat_n("y".repeat(1000), 100))
+            .collect();
+        assert!(
+            parse(serde_json::Value::Array(
+                ok.into_iter().map(serde_json::Value::String).collect()
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -364,6 +448,12 @@ mod tests {
         let err = validate_argv(&["echo".into(), "a\u{0}b".into()], "c").unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("NUL") && msg.contains("c[1]"), "{msg}");
+
+        // The aggregate bound applies here too — `state.apply` can carry an argv
+        // as easily as an RPC parameter can.
+        let big: Vec<String> = std::iter::repeat_n("x".repeat(100_000), 20).collect();
+        let err = validate_argv(&big, "op").unwrap_err();
+        assert!(format!("{err:?}").contains("whole argv"), "{err:?}");
     }
 
     #[test]

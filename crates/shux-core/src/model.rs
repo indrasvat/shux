@@ -368,6 +368,13 @@ impl Pane {
 /// ["sh", "-c", "(cd x && make)"]      -> sh
 /// ["/usr/local/bin/my-c", "-c", "x"]  -> my-c   (not a shell; not unwrapped)
 /// ```
+///
+/// The shell test is on the **basename**, so a program that is genuinely not a
+/// shell but happens to be installed as `sh` or `bash` somewhere on `PATH` is
+/// unwrapped too, and its title then names the script's first word rather than
+/// the program that is running. Matching on absolute path instead would be
+/// worse: it would miss every real shell outside the handful of paths worth
+/// hard-coding.
 pub(crate) fn command_display_name(command: &[String]) -> Option<&str> {
     let program = basename(command.first()?);
     if is_shell(program)
@@ -428,9 +435,20 @@ fn script_leading_word(script: &str) -> Option<&str> {
         if is_shell_keyword(token) || token.chars().any(is_shell_syntax) {
             return None;
         }
+        // A leading `-` is a flag, and a flag is never the program. Without this
+        // `--cmd "-n is a valid sed script"` — the example in the flag's own
+        // help — titled the pane `-n`, and `A=1 -d 10` titled it `-d`.
+        if token.starts_with('-') {
+            return None;
+        }
         let name = basename(token);
-        // A bare number is a file descriptor (`2>&1 make`), never a program.
-        if name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) {
+        // A bare number is a file descriptor (`2>&1 make`), never a program, and
+        // a token with no letter or digit at all (`/`, `..`, `+++`) is not a
+        // program name either — `basename` hands back the whole token for those.
+        if name.is_empty()
+            || name.chars().all(|c| c.is_ascii_digit())
+            || !name.chars().any(|c| c.is_alphanumeric())
+        {
             return None;
         }
         return Some(name);
@@ -522,6 +540,11 @@ fn is_shell_syntax(c: char) -> bool {
 ///   formatting characters are dropped; the implicit bidi algorithm is
 ///   untouched, so ordinary RTL titles still render correctly.
 ///
+/// - **`U+200B` ZERO WIDTH SPACE, `U+2060` WORD JOINER, `U+FEFF`** — invisible
+///   and not `is_control()`. `ht<ZWSP>op` renders identically to `htop`, so two
+///   panes can carry titles a human cannot tell apart. Same spoofing shape as
+///   the bidi set above, without needing any reordering.
+///
 /// Deliberately **not** dropped: `U+200D` ZERO WIDTH JOINER, which is
 /// load-bearing inside emoji sequences — removing it would split a
 /// perfectly legitimate title into separate glyphs.
@@ -530,6 +553,7 @@ pub(crate) fn is_title_hostile(c: char) -> bool {
         || matches!(c, '\u{2028}' | '\u{2029}')
         || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}')
+        || matches!(c, '\u{200b}' | '\u{2060}' | '\u{feff}')
 }
 
 /// The longest title a pane will display. The border has limited room
@@ -811,6 +835,49 @@ mod tests {
     #[test]
     fn time_is_skipped_like_exec() {
         assert_eq!(title_of(&["sh", "-c", "time make -j4"]), "make");
+    }
+
+    /// A flag is never the program. `--cmd "-n is a valid sed script"` — the
+    /// example printed in the flag's own help — used to title the pane `-n`.
+    /// An invisible character makes two different titles look identical.
+    #[test]
+    fn test_sanitize_title_strips_invisible_spacers() {
+        for c in ['\u{200b}', '\u{2060}', '\u{feff}'] {
+            let title = title_of(&["sh", "-c", &format!("ht{c}op")]);
+            assert_eq!(title, "htop", "U+{:04X} survived", c as u32);
+        }
+        // The joiner is load-bearing inside emoji and must survive.
+        assert!(sanitize_title("a\u{200d}b").contains('\u{200d}'));
+    }
+
+    #[test]
+    fn a_flag_is_never_a_title() {
+        assert_eq!(
+            title_of(&["bash", "-c", "-n is a valid sed script"]),
+            "bash"
+        );
+        assert_eq!(title_of(&["bash", "-c", "--format json"]), "bash");
+        assert_eq!(title_of(&["bash", "-c", "-d"]), "bash");
+        // The space route past a leading assignment, which the `;` route caught
+        // but this one did not.
+        assert_eq!(title_of(&["bash", "-c", "A=1 -d 10"]), "bash");
+        assert_eq!(title_of(&["sh", "-c", "-- htop"]), "sh");
+    }
+
+    /// `basename` returns the whole token when there is no file name in it, so
+    /// a path-shaped non-program used to become the title verbatim.
+    #[test]
+    fn a_token_with_no_program_name_in_it_is_not_a_title() {
+        for script in ["/", "//", ".", "..", "+++ arg", "/usr/bin/ htop"] {
+            let title = title_of(&["sh", "-c", script]);
+            assert!(
+                title == "sh" || title.chars().any(|c| c.is_alphanumeric()),
+                "{script:?} produced title {title:?}"
+            );
+        }
+        assert_eq!(title_of(&["sh", "-c", "/"]), "sh");
+        assert_eq!(title_of(&["sh", "-c", ".."]), "sh");
+        assert_eq!(title_of(&["sh", "-c", "+++ arg"]), "sh");
     }
 
     #[test]

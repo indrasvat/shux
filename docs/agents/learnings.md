@@ -961,3 +961,49 @@ from one that has not started yet if you only look at the writer table. `exit_st
 is the discriminator. It was also spawning with `Vec::new()` and the daemon's cwd
 rather than the pane's own — so the race it closed, it closed with the wrong process
 in the wrong place.
+
+### Round two — the fixes needed fixing
+
+**Rollback is not just "undo the entity".** Creating a window focuses it and
+creating a pane focuses it, and the destroy paths hand focus to *whatever the
+container yields first* — the session's first window, the layout tree's first
+pane. So an error path that only destroys the entity silently relocates the
+operator: active window `three` → `1`, and every later `-w`-less verb then
+targets the wrong window. Capture the prior focus before the create and restore
+it after the destroy. The generic destroy paths are right for a deliberate kill
+and wrong for a rollback; the difference is the caller's, not theirs.
+
+**`MAX_ARG_STRLEN` counts the terminating NUL.** `PAGE_SIZE * 32` is 131072 and
+the longest argument that actually fits is 131071. The first cut capped at
+131072 — and wrote a unit test asserting that exactly-131072 was acceptable,
+which passed, because the unit test and the bug shared the same wrong constant.
+It took an agent bisecting through the real binary to find it. **A boundary
+constant needs a test that spawns**, not a test that compares the constant to
+itself; `crates/shux/tests/pane_command_e2e.rs` now pins both sides against a
+real `execve`.
+
+**A per-item cap does not bound the aggregate.** Forty individually-legal 100 KiB
+arguments are 4 MiB and still `E2BIG`, and the spawn-failure hint then blamed
+`argv[0]` and the cwd, neither of which was wrong.
+
+**A flag is not a program name.** The title extractor rejected shell syntax but
+not a leading `-`, so `--cmd "-n is a valid sed script"` — the example printed
+in the flag's own help — titled the pane `-n`. And `basename` returns the whole
+token when there is no file name in it, so `/`, `..` and `+++` became titles
+verbatim. Require at least one alphanumeric character and no leading dash.
+
+**`--dry-run` must run the same validation the real path runs.** The argv rule
+lived only in the daemon, so the flag whose entire purpose is "will this
+succeed?" answered yes to templates the real run rejects. One function, called
+from both.
+
+**A green tick over a failed spawn is the same bug as issue #125.**
+`state.apply` deliberately does not roll back a partial batch, which is
+defensible — but it printed `✓ Applied` and exited 0 when *every* pane failed,
+so `shux state apply t.toml && shux attach` walked straight into dead panes.
+Not rolling back is a policy; reporting success is a lie.
+
+**Invisible characters spoof titles without needing bidi.** `U+200B` is not
+`is_control()` and renders as nothing, so `ht<ZWSP>op` and `htop` are
+indistinguishable on a border. Same class as the Trojan Source set already
+handled; `U+200D` ZWJ still has to survive because emoji need it.

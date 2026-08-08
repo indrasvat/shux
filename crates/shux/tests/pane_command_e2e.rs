@@ -976,3 +976,285 @@ fn a_cmd_starting_with_a_hyphen_is_taken_as_the_command_not_a_flag() {
         panes[0].1
     );
 }
+
+// ── round-two follow-ups ────────────────────────────────────────────────
+//
+// Found by adversarial agents driving the real binary against the first cut of
+// the rollback and validation work above. Each was reproduced before it was
+// believed.
+
+/// Creating a window focuses it; destroying one hands focus to the session's
+/// FIRST window. So the rollback moved the operator's session somewhere else
+/// entirely — every later `-w`-less verb then targeted the wrong window.
+#[test]
+fn a_failed_window_create_leaves_focus_where_it_was() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "focus", "-d"]);
+    env.sessions.push("focus".to_string());
+    env.ok(&["window", "create", "-s", "focus", "-n", "two"]);
+    env.ok(&["window", "create", "-s", "focus", "-n", "three"]);
+
+    fn active(e: &Env) -> String {
+        e.json(&["window", "list", "-s", "focus"])
+            .as_array()
+            .expect("windows")
+            .iter()
+            .find(|w| w["is_active"] == true)
+            .and_then(|w| w["title"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+    let before = active(&env);
+    assert_eq!(before, "three", "setup: newest window should be active");
+
+    let out = env.run(&[
+        "window",
+        "create",
+        "-s",
+        "focus",
+        "-n",
+        "ghost",
+        "--",
+        "no-such-binary-xyz",
+    ]);
+    assert!(!out.status.success(), "spawn failure should be an error");
+
+    assert_eq!(
+        active(&env),
+        before,
+        "a failed window create relocated the session's active window"
+    );
+}
+
+/// Same shape one level down: splitting focuses the new pane, and destroying a
+/// pane hands focus to whatever the layout tree yields first.
+#[test]
+fn a_failed_split_leaves_focus_where_it_was() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "pfocus", "-d"]);
+    env.sessions.push("pfocus".to_string());
+    let first = env.first_pane("pfocus");
+    env.ok(&[
+        "pane",
+        "split",
+        "-s",
+        "pfocus",
+        "-p",
+        &first,
+        "--cmd",
+        &format!("{}; exec sleep 900", probe()),
+    ]);
+
+    fn active(e: &Env) -> String {
+        e.json(&["pane", "list", "-s", "pfocus"])
+            .as_array()
+            .expect("panes")
+            .iter()
+            .find(|p| p["is_focused"] == true)
+            .and_then(|p| p["id"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+    let before = active(&env);
+    assert!(!before.is_empty(), "setup: some pane must be active");
+
+    let out = env.run(&[
+        "pane",
+        "split",
+        "-s",
+        "pfocus",
+        "-p",
+        &before,
+        "--",
+        "no-such-binary-xyz",
+    ]);
+    assert!(!out.status.success());
+
+    assert_eq!(active(&env), before, "a failed split moved the active pane");
+}
+
+/// `MAX_ARG_STRLEN` counts the terminating NUL, so 131071 is the longest
+/// argument that can be exec'd and 131072 is not. The first cut capped at
+/// 131072 — and its unit test asserted, greenly, that the length which fails at
+/// `execve` was acceptable. This pins the boundary against a real spawn.
+#[test]
+fn the_argument_length_limit_matches_what_execve_accepts() {
+    let mut env = Env::new();
+    fn write(work: &std::path::Path, name: &str, len: usize) -> String {
+        let path = work.join(name);
+        std::fs::write(
+            &path,
+            serde_json::json!({"name": name, "command": ["/bin/echo", "x".repeat(len)]})
+                .to_string(),
+        )
+        .unwrap();
+        format!("@{}", path.display())
+    }
+    let work = env.work();
+    // One under the cap: accepted AND actually spawns.
+    let out = env.run(&[
+        "rpc",
+        "call",
+        "session.create",
+        "--params",
+        &write(&work, "under", 131_071),
+        "--format",
+        "json",
+    ]);
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "131071 bytes must be accepted and spawnable:\n{joined}"
+    );
+    env.sessions.push("under".to_string());
+
+    // One over: refused by the parser, never reaching execve.
+    let out = env.run(&[
+        "rpc",
+        "call",
+        "session.create",
+        "--params",
+        &write(&work, "over", 131_072),
+        "--format",
+        "json",
+    ]);
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "131072 bytes must be refused:\n{joined}"
+    );
+    assert!(
+        joined.contains("cannot exceed"),
+        "refusal must name the limit, not fail at execve:\n{joined}"
+    );
+    assert!(
+        !joined.contains("Argument list too long"),
+        "the parser let it through to execve:\n{joined}"
+    );
+}
+
+/// The per-argument cap does not bound the total: forty individually-legal
+/// 100 KiB arguments are 4 MiB and still `E2BIG`.
+#[test]
+fn an_argv_whose_total_is_too_long_is_refused_before_execve() {
+    let env = Env::new();
+    let argv: Vec<String> = std::iter::once("/bin/echo".to_string())
+        .chain(std::iter::repeat_n("x".repeat(100_000), 40))
+        .collect();
+    let path = env.work().join("total.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({"name": "total", "command": argv}).to_string(),
+    )
+    .unwrap();
+    let out = env.run(&[
+        "rpc",
+        "call",
+        "session.create",
+        "--params",
+        &format!("@{}", path.display()),
+        "--format",
+        "json",
+    ]);
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{joined}");
+    assert!(joined.contains("whole argv"), "{joined}");
+    assert!(!joined.contains("Argument list too long"), "{joined}");
+}
+
+/// `--dry-run` exists to answer "will this apply succeed?". The argv rule lived
+/// only in the daemon, so it answered yes to templates the real run rejects.
+#[test]
+fn state_apply_dry_run_rejects_what_the_real_run_rejects() {
+    let env = Env::new();
+    let path = env.work().join("bad.toml");
+    std::fs::write(
+        &path,
+        "[session]\nname = \"dry\"\n\n[[windows]]\ntitle = \"w\"\n\n\
+         [[windows.panes]]\ncommand = [\"\"]\n",
+    )
+    .unwrap();
+    let p = path.to_str().unwrap();
+
+    for args in [
+        &["state", "apply", p, "--dry-run"][..],
+        &["state", "apply", p][..],
+    ] {
+        let out = env.run(args);
+        let joined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "{args:?} accepted a blank argv:\n{joined}"
+        );
+        assert!(joined.contains("initial_command"), "{args:?}: {joined}");
+    }
+}
+
+/// A batch whose panes never started is not a success. `state.apply`
+/// deliberately does not roll back, but reporting a green tick and exit 0 let
+/// `shux state apply t.toml && shux attach` walk into a session of dead panes.
+#[test]
+fn state_apply_reports_failure_when_a_pane_does_not_spawn() {
+    let mut env = Env::new();
+    let path = env.work().join("ghost.toml");
+    std::fs::write(
+        &path,
+        "[session]\nname = \"ghost\"\n\n[[windows]]\ntitle = \"w\"\n\n\
+         [[windows.panes]]\ncommand = [\"no-such-binary-xyz\"]\n",
+    )
+    .unwrap();
+    let out = env.run(&["state", "apply", path.to_str().unwrap()]);
+    env.sessions.push("ghost".to_string());
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "apply reported success for a batch whose only pane never spawned:\n{joined}"
+    );
+    assert!(
+        !joined.contains("✓ Applied"),
+        "a green tick over a dead pane:\n{joined}"
+    );
+}
+
+/// A flag is never the program. `--cmd "-n is a valid sed script"` is the
+/// example printed in the flag's own help, and it used to title the pane `-n`.
+#[test]
+fn a_flag_shaped_command_does_not_become_the_pane_title() {
+    let mut env = Env::new();
+    for (name, script) in [
+        ("flaga", "-n is a valid sed script"),
+        ("flagb", "--format json"),
+        ("flagc", "A=1 -d 10"),
+    ] {
+        env.ok(&["session", "create", name, "-d", "--cmd", script]);
+        env.sessions.push(name.to_string());
+        let title = env.json(&["pane", "list", "-s", name])[0]["title"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !title.starts_with('-'),
+            "{script:?} produced the flag {title:?} as a pane title"
+        );
+    }
+}

@@ -571,10 +571,8 @@ pub enum SessionCommand {
         /// For exec-style passthrough with no shell at all, use trailing
         /// `--` instead.
         ///
-        /// `allow_hyphen_values` so a command that starts with a flag-shaped
-        /// word (`--cmd "-n is a valid sed script"`) is taken as the value.
-        /// Without it clap suggests `-- -n`, which is the *argv* form — a
-        /// different execution model, silently.
+        /// A command that itself starts with a dash (`--cmd "-n is a valid
+        /// sed script"`) is taken as the command, not as a flag.
         #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
         cmd: Option<String>,
 
@@ -982,7 +980,7 @@ pub enum WindowCommand {
         /// For exec-style passthrough use trailing `--` instead:
         /// `shux window create -s X -n W -- vim foo.rs`.
         ///
-        /// `allow_hyphen_values` — see `shux session create --help`.
+        /// A command starting with a dash is taken as the command, not a flag.
         #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
         cmd: Option<String>,
 
@@ -1188,7 +1186,7 @@ pub enum PaneCommand {
         /// falling back to `/bin/sh`) — pipes, `;`, `&&`, quoting, globs and
         /// redirection all work. Omitted opens your login+interactive shell.
         ///
-        /// `allow_hyphen_values` — see `shux session create --help`.
+        /// A command starting with a dash is taken as the command, not a flag.
         #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
         cmd: Option<String>,
 
@@ -6189,9 +6187,14 @@ pub async fn handle_apply(
     let spawned_ok = spawns.iter().filter(|s| s["spawned"] == true).count();
     let spawned_fail = spawns.len() - spawned_ok;
 
-    println!(
-        "{} ({} ops, {} panes spawned{}, last event seq {})",
-        style::success(&format!("✓ Applied {cid}")),
+    // A batch that committed but whose panes never started is not a success.
+    // `state.apply` deliberately does NOT roll back (codex P0 #1: killing
+    // already-spawned siblings has its own side effects, so partial outcomes are
+    // reported rather than undone) — but reporting them under a green tick and
+    // exit code 0 let `shux state apply t.toml && shux attach` walk straight
+    // into a session of dead panes (issue #125 follow-up).
+    let headline = format!(
+        "Applied {cid} ({} ops, {} panes spawned{}, last event seq {})",
         outputs,
         spawned_ok,
         if spawned_fail > 0 {
@@ -6201,6 +6204,11 @@ pub async fn handle_apply(
         },
         last_seq
     );
+    if spawned_fail > 0 {
+        println!("{}", style::warning(&format!("! {headline}")));
+    } else {
+        println!("{}", style::success(&format!("✓ {headline}")));
+    }
     for s in &spawns {
         let pid = s["pane_id"].as_str().unwrap_or("?");
         let pid_short: String = pid.chars().take(8).collect();
@@ -6215,6 +6223,13 @@ pub async fn handle_apply(
                 err
             );
         }
+    }
+
+    if spawned_fail > 0 && !watch {
+        return Err(anyhow::anyhow!(
+            "{spawned_fail} of {} pane(s) failed to spawn",
+            spawns.len()
+        ));
     }
 
     if watch {
