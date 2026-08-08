@@ -1,3 +1,10 @@
+## [0.46.12](https://github.com/indrasvat/shux/compare/v0.46.11...v0.46.12) (2026-08-08)
+
+
+### Bug Fixes
+
+* **cli:** `--cmd` is a shell command, not a whitespace split ([#125](https://github.com/indrasvat/shux/issues/125)) ([#139](https://github.com/indrasvat/shux/issues/139)) ([e7fe0fa](https://github.com/indrasvat/shux/commit/e7fe0fa32369bd19a859b0f0f1d760bdfdf904a5))
+
 ## [0.46.11](https://github.com/indrasvat/shux/compare/v0.46.10...v0.46.11) (2026-08-07)
 
 
