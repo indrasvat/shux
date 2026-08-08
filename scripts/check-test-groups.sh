@@ -39,7 +39,7 @@ fi
 REQUIRED_GROUPS=(
   process-table:5
   daemon-pty:247
-  wall-clock:1
+  wall-clock:2
 )
 
 # Largest share of the suite any single throttled group may hold, in percent.

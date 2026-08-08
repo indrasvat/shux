@@ -172,9 +172,19 @@ test-group = 'daemon-pty'
 # core and 30.8x at four, against a 12x threshold, purely from contention.
 # `threads-required = "num-test-threads"` reserves the whole run's budget, so
 # it is the only thing on the machine while it measures.
+#
+# `pane_record_duration_stops_on_daemon_side` joined after it failed the macOS
+# job on PR #143 (1 of 2074). Its assertion is a deadline: the recorder is given
+# `duration_ms: 25`, the test sleeps 75ms and requires the write on the far side
+# to have been refused. That is a wall-clock measurement by this group's own
+# definition, but it was in no group and no retry override, so it raced ~2,000
+# concurrent tests for a 50ms margin on a hypervisor that delivers latency in
+# bursts. It costs ~0.4s of serialized run time, which is the correct price for
+# a deadline test.
 [[profile.default.overrides]]
 filter = '''
   binary_id(=shux-vt::scroll_region_bounds) & test(=region_scroll_cost_is_linear_in_pane_height)
+  + binary_id(=shux::bin/shux) & test(=tests::pane_record_duration_stops_on_daemon_side)
 '''
 test-group = 'wall-clock'
 threads-required = "num-test-threads"
