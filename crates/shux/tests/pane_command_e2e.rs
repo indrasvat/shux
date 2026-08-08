@@ -1656,6 +1656,82 @@ fn the_focus_rescue_skips_a_corpse_left_by_an_earlier_apply() {
     );
 }
 
+/// The other half of "alive", and the half the test above cannot see because
+/// its live pane runs `exec sleep 900` forever.
+///
+/// A pane that has **exited** is still perfectly usable: shux keeps its grid
+/// and scrollback on purpose, so `pane capture` and `pane snapshot` answer for
+/// a short-lived command long after it finished. Only the PTY write side is
+/// torn down. Keying the rescue on the write side therefore skipped exactly
+/// the sibling a build template leaves behind — `["/bin/echo", "…"]` beside a
+/// typo'd editor — and focus stayed on the corpse.
+#[test]
+fn the_focus_rescue_accepts_a_sibling_that_has_already_finished() {
+    let mut env = Env::new();
+    let colour = env.work().join("finished-colour.txt");
+    std::fs::write(
+        &colour,
+        "\u{1b}[38;2;120;220;180mTRUECOLOR\u{1b}[0m \u{1b}[38;5;208mINDEXED\u{1b}[0m \u{1b}[34mBASIC\u{1b}[0m\n",
+    )
+    .unwrap();
+    let path = env.work().join("finished.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[session]\nname = \"finished\"\n\n[[windows]]\ntitle = \"build\"\n\n\
+             [[windows.panes]]\ncommand = [\"/bin/cat\", \"{}\"]\n\n\
+             [[windows.panes]]\ndirection = \"vertical\"\n\
+             command = [\"no-such-editor-zz\", \"src/main.rs\"]\n",
+            colour.display()
+        ),
+    )
+    .unwrap();
+    // One pane finishes, one never starts. The apply reports the failure and
+    // still commits — that part is deliberate.
+    let _ = env.run(&["state", "apply", path.to_str().unwrap()]);
+    env.sessions.push("finished".to_string());
+
+    let panes = env.json(&["pane", "list", "-s", "finished"]);
+    let finished = panes
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|p| p["exit_status"].is_number())
+        .expect("the `cat` pane should have exited")["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let focused = panes
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|p| p["is_focused"] == true)
+        .expect("some pane focused")["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        focused, finished,
+        "focus stayed on the pane that never started instead of the finished sibling: {panes}"
+    );
+
+    // The whole point of the rescue: a `-p`-less verb has to answer, and it has
+    // to answer with the finished command's output — colour included.
+    let out = env.run(&["pane", "capture", "-s", "finished"]);
+    assert!(
+        out.status.success(),
+        "the focused pane does not answer:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    for needle in ["TRUECOLOR", "INDEXED", "BASIC"] {
+        assert!(
+            text.contains(needle),
+            "the finished pane's retained output is missing {needle}:\n{text}"
+        );
+    }
+}
+
 /// Round three's ignorable-codepoint rule stripped the variation selectors,
 /// which are mandatory in the very emoji sequences the ZWJ exception exists to
 /// protect: `❤️‍🔥` came back as `❤` and `1️⃣` as a bare `1`.

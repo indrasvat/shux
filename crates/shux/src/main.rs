@@ -2359,14 +2359,23 @@ fn register_state_methods(
                     .map(|r| r.pane_id)
                     .collect();
                 if !dead.is_empty() {
-                    // "Alive" means it has a live PTY, not "absent from THIS
-                    // batch's failures". A corpse left by an earlier apply is
-                    // not a sibling worth focusing, and the first cut of this
-                    // rescue happily handed focus to one — reproducing the exact
-                    // symptom it was written to prevent.
-                    let live: std::collections::HashSet<_> = {
+                    // "Usable" means it has a VT, not "absent from THIS batch's
+                    // failures" and not "has a live PTY".
+                    //
+                    // A corpse left by an earlier apply never spawned, so it has
+                    // no VT — the first cut of this rescue focused one anyway,
+                    // reproducing the exact symptom it was written to prevent.
+                    //
+                    // But a pane that *exited* is not a corpse. Its writer is
+                    // gone by design while its grid and scrollback stay (see
+                    // `reap_pane`), which is what lets `pane capture` answer for
+                    // a short-lived command long after it finished. Keying on
+                    // `writers` therefore skipped the most ordinary sibling of
+                    // all — the build step that already succeeded — and left
+                    // focus on the pane that never started.
+                    let usable: std::collections::HashSet<_> = {
                         let state = io.lock().await;
-                        state.writers.keys().copied().collect()
+                        state.vts.keys().copied().collect()
                     };
                     let snap = gh.snapshot();
                     let mut rescue = Vec::new();
@@ -2384,14 +2393,14 @@ fn register_state_methods(
                         // map gave a different answer run to run, so a script
                         // that applied a template and then used the focused pane
                         // targeted a different one each time.
-                        if let Some(alive) = window
+                        if let Some(answering) = window
                             .layout
                             .tree
                             .pane_ids()
                             .into_iter()
-                            .find(|id| live.contains(id))
+                            .find(|id| usable.contains(id))
                         {
-                            rescue.push(alive);
+                            rescue.push(answering);
                         }
                     }
                     drop(snap);
