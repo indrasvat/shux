@@ -1,3 +1,10 @@
+## [0.46.13](https://github.com/indrasvat/shux/compare/v0.46.12...v0.46.13) (2026-08-08)
+
+
+### Bug Fixes
+
+* **cli:** name every pane and quote its argv in `pane list` ([#143](https://github.com/indrasvat/shux/issues/143)) ([3613a21](https://github.com/indrasvat/shux/commit/3613a2177d4139a3f96b7fc3e6e1e1f16e36147a))
+
 ## [0.46.12](https://github.com/indrasvat/shux/compare/v0.46.11...v0.46.12) (2026-08-08)
 
 
