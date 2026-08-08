@@ -196,10 +196,16 @@ pub(crate) fn validate_ops(ops: &[shux_core::apply::Op]) -> Result<(), RpcError>
         {
             return Err(RpcError::invalid_params(&format!("ops[{i}].title: {e}")));
         }
+        // `Some("")` is not a title — it is the absence of one. `title` is a
+        // required TOML field, so a template with nothing to say writes `""`,
+        // and `stage_create_session` substitutes the default `"1"` for it.
+        // Validating it here would reject templates the real apply accepts,
+        // which is the same dry-run/apply divergence in the other direction.
         if let Op::CreateSession {
             initial_window_title: Some(title),
             ..
         } = op
+            && !title.is_empty()
             && let Err(e) = shux_core::graph::SessionGraph::check_window_title(title)
         {
             return Err(RpcError::invalid_params(&format!(
@@ -489,5 +495,58 @@ mod tests {
         assert_eq!(parse_pane_command(&params).unwrap(), vec!["vim"]);
         let params = json!({"name": "x"});
         assert_eq!(parse_pane_command(&params).unwrap(), Vec::<String>::new());
+    }
+
+    // ── validate_ops must agree with the graph, in both directions ──────
+
+    fn create_session_titled(title: Option<&str>) -> shux_core::apply::Op {
+        shux_core::apply::Op::CreateSession {
+            name: Some("s".into()),
+            cwd: std::path::PathBuf::from("/tmp"),
+            initial_command: Vec::new(),
+            initial_window_title: title.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn blank_initial_window_title_is_unspecified_not_invalid() {
+        // `title` is a required TOML field, so a template with nothing to say
+        // writes `""`. `stage_create_session` substitutes `"1"` for it, and
+        // `state apply` has always accepted that — so the pre-flight check
+        // must not be stricter than the apply it is predicting.
+        validate_ops(&[create_session_titled(Some(""))]).expect("`\"\"` means unspecified");
+        validate_ops(&[create_session_titled(None)]).expect("`None` means unspecified");
+    }
+
+    #[test]
+    fn a_title_that_sanitizes_to_nothing_is_still_rejected() {
+        // The attack case is different from the blank case: content went in,
+        // nothing came out. That must not reach the graph.
+        let err = validate_ops(&[create_session_titled(Some("\u{200b}\u{200b}"))]).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("ops[0].initial_window_title"),
+            "{err:?}"
+        );
+
+        let long = "w".repeat(500);
+        let err = validate_ops(&[create_session_titled(Some(&long))]).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("ops[0].initial_window_title"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn create_window_still_rejects_a_blank_title() {
+        // `CreateWindow` has no "unspecified" spelling — `stage_create_window`
+        // validates unconditionally, so this pre-flight check must too.
+        let op = shux_core::apply::Op::CreateWindow {
+            session: shux_core::apply::SessionRef::BackRef { op_index: 0 },
+            title: String::new(),
+            cwd: None,
+            initial_command: Vec::new(),
+        };
+        let err = validate_ops(&[op]).unwrap_err();
+        assert!(format!("{err:?}").contains("ops[0].title"), "{err:?}");
     }
 }

@@ -1472,6 +1472,47 @@ fn state_apply_dry_run_rejects_an_impossible_window_title() {
     }
 }
 
+/// The mirror image, and a regression this task introduced: `title` is a
+/// required TOML field, so a template with nothing to say for its first window
+/// writes `""`. The apply has always read that as "unspecified" and named the
+/// window `1`. Pre-flight validation must not be stricter than the apply it is
+/// predicting, or every such template stops working.
+#[test]
+fn a_template_may_leave_its_first_window_title_blank() {
+    let mut env = Env::new();
+    let path = env.work().join("blank-title.toml");
+    std::fs::write(
+        &path,
+        "[session]\nname = \"blanktitle\"\n\n[[windows]]\ntitle = \"\"\n\n\
+         [[windows.panes]]\ncommand = [\"/bin/sh\", \"-c\", \"exec sleep 900\"]\n",
+    )
+    .unwrap();
+
+    let dry = env.run(&["state", "apply", path.to_str().unwrap(), "--dry-run"]);
+    assert!(
+        dry.status.success(),
+        "--dry-run rejected a blank first-window title:\n{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+
+    let out = env.run(&["state", "apply", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "apply rejected a blank first-window title:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    env.sessions.push("blanktitle".to_string());
+
+    let windows = env.json(&["window", "list", "-s", "blanktitle"]);
+    assert_eq!(
+        windows[0]["title"].as_str(),
+        Some("1"),
+        "a blank title should fall back to the default `1`: {windows}"
+    );
+}
+
 /// A program with an unusual but real name keeps it. Round two's
 /// "no alphanumeric character" rule threw `/usr/local/bin/+++` away.
 #[test]

@@ -154,6 +154,7 @@ introduced.
 | 37 | `state.apply` spawn failures | the new cause-specific diagnosis reached the five rollback RPCs and not `state.apply` — the one path where an oversized argv can actually land |
 | 38 | the spawn-failure hint | a **directory** as `argv[0]` reports `EACCES`, so it got "not executable by this user", which no `chmod` can fix |
 | 39 | title extraction | `:` is the shell's null command and a common idiom (`: placeholder`), not a program |
+| 40 | `validate_ops` (round three's own fix) | the new pre-flight window-title check was **stricter than the apply it predicts**: `title` is a required TOML field, so a template with nothing to say for its first window writes `""`, which `stage_create_session` has always read as "unspecified" and named `1`. The check rejected it, breaking every such template through both `state apply` and `session restore`. Blank is now passed through; a title that had content and sanitized away to nothing is still rejected. Reported by the Codex reviewer on PR #139, reproduced, and pinned by a unit test and a real-template e2e test both seen failing first |
 
 **Known residuals, measured and documented rather than papered over.**
 
@@ -198,6 +199,7 @@ introduced.
 | E2E — follow-ups | `window.ensure` on an existing window; blank argv[0]; oversize argument; a program that cannot be executed on all five verbs, with no phantom left behind; `state.apply` argv validation; `pane split --cmd` and trailing argv; a hyphen-leading `--cmd`; a blank `$SHELL` still opening a working default pane |
 | E2E — round two | focus survives a failed `window.create` and a failed `pane.split`; the argument-length boundary pinned against a **real spawn** on both sides (131071 spawns, 131072 refused before `execve`); an argv whose total is too long; `--dry-run` and the real run agreeing; `state apply` reporting failure; a flag-shaped `--cmd` never becoming a title. All seven observed failing against `dcb4a1e` and passing here |
 | E2E — round three | a concurrent focus surviving a rollback (16 trials, decisive: 12/16 reverted on the previous commit, 0 here); zoom surviving a failed split; `state.apply` not focusing a dead pane; `--format json` reporting failure; `--dry-run` rejecting an impossible window title; an oversized argv diagnosed rather than capped by a guess; a real program with an unusual name keeping it |
+| E2E — round four | a template whose first window title is `""` applies cleanly through `--dry-run` and the real run, and the window is named `1` — the pre-flight check agreeing with the apply in the *permissive* direction as well as the strict one |
 | Shell — `.shux/scripts/issue_125_evidence.sh` | eight scenes, both binaries, through the shipped binary, under the leak guard. Colour is asserted on the **pen** via `pane glance --cells`, not on the word: the pre-fix screen prints the literal text `INDEXED` inside printf's own error message, so a `grep` would have called that a colour probe. `EXPECT_DEFECT=1` inverts the verdict, so the baseline arm fails if the defect has already gone away |
 
 ## Acceptance Criteria
