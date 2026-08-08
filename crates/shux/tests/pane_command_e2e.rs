@@ -1768,6 +1768,20 @@ fn a_command_that_sanitizes_to_nothing_still_gets_a_title() {
         .unwrap_or_default()
         .to_string();
     assert!(!title.is_empty(), "pane was left with no title at all");
+
+    // The cwd is the fallback, so it has to hold up too. `--cwd /` is an
+    // ordinary invocation and `Path::file_name` is `None` for it, which left
+    // the border and the status bar blank in exactly the same way.
+    env.ok(&["session", "create", "rootcwd", "-d", "--cwd", "/"]);
+    env.sessions.push("rootcwd".to_string());
+    let title = env.json(&["pane", "list", "-s", "rootcwd"])[0]["title"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !title.is_empty(),
+        "a pane opened at the filesystem root was left with no title"
+    );
 }
 
 /// `state.apply` is the one path where an oversized argv can land, and it was

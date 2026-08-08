@@ -342,14 +342,35 @@ impl Pane {
                 }
             }
             if let Some(name) = self.cwd.file_name().and_then(|s| s.to_str()) {
-                self.title = sanitize_title_clamped(name);
+                let sanitized = sanitize_title_clamped(name);
+                if !sanitized.is_empty() {
+                    self.title = sanitized;
+                    return;
+                }
             }
+            // The cwd can fail to yield a name for two ordinary reasons, and
+            // both left the pane with a blank border and a blank status bar —
+            // the outcome the command fallback above was added to prevent.
+            //
+            // `Path::file_name` is `None` for a root path, so plain
+            // `shux session create s --cwd /` produced no title at all. And a
+            // directory whose own name sanitizes away leaves nothing either.
+            // The whole path is the honest answer for the first case; for the
+            // second there is no name to show, so say what the thing is.
+            let whole = sanitize_title_clamped(&self.cwd.to_string_lossy());
+            self.title = if whole.is_empty() {
+                FALLBACK_PANE_TITLE.to_string()
+            } else {
+                whole
+            };
         }
         // Auto disabled and no manual override → keep whatever we had.
-        // If title is empty (fresh pane with no command and no cwd
-        // basename), leave it empty rather than dropping garbage in.
     }
 }
+
+/// Shown when neither the command nor the cwd yields a printable name.
+/// A pane always has a title — "no title" is a rendering bug, not a state.
+const FALLBACK_PANE_TITLE: &str = "pane";
 
 /// The program name to show for a pane running `command`.
 ///
@@ -971,6 +992,39 @@ mod tests {
                 "{invisible:?} left a blank title"
             );
         }
+    }
+
+    /// …and when the cwd cannot supply one either, something still has to.
+    ///
+    /// Both of these are ordinary invocations, not adversarial input:
+    /// `Path::file_name` is `None` for a root path, and a directory can be
+    /// named with characters the sanitizer removes. Each used to leave the
+    /// pane with a blank border and a blank status bar.
+    #[test]
+    fn a_pane_always_has_a_title() {
+        let root = Pane::new(WindowId::new(), "/");
+        assert_eq!(root.effective_title(), "/", "a root cwd left no title");
+
+        let root_cmd =
+            Pane::with_command(WindowId::new(), "/", vec!["\u{00ad}".to_string()]);
+        assert_eq!(
+            root_cmd.effective_title(),
+            "/",
+            "a blank command name over a root cwd left no title"
+        );
+
+        // Nothing printable anywhere: not the command, not the directory's
+        // name, not the whole path.
+        let nameless = Pane::with_command(
+            WindowId::new(),
+            "\u{00ad}",
+            vec!["\u{00ad}".to_string()],
+        );
+        assert_eq!(
+            nameless.effective_title(),
+            "pane",
+            "a pane with nothing printable anywhere left no title"
+        );
     }
 
     #[test]
