@@ -1336,10 +1336,99 @@ async fn run_pane_pty_task(
     let _ = done_tx.send(());
 }
 
+/// The daemon's live user config, published for the pane-spawn path.
+///
+/// [`spawn_pane_pty_with_recorder`] is the single funnel every pane spawn goes
+/// through, but none of its ~10 RPC/attach call sites carries a `ConfigHandle`
+/// (of the five method registrars, only `register_pane_io_methods` is handed
+/// one). Publishing the daemon's handle once at startup wires `[shell]` into
+/// that funnel without threading an eleventh argument through all of them.
+/// `ConfigHandle::current()` reads the live `ArcSwap`, so edits to `[shell]`
+/// are picked up by the next pane spawn — same hot-reload story as the rest of
+/// the file, no daemon restart.
+///
+/// Unset in any process that is not the daemon (the CLI client, unit and
+/// integration tests that call `spawn_pane_pty` directly). Those read
+/// `ShellConfig::default()`, which is byte-for-byte the pre-issue-#132
+/// behaviour.
+static DAEMON_CONFIG: std::sync::OnceLock<shux_core::config::ConfigHandle> =
+    std::sync::OnceLock::new();
+
+/// Publish the daemon's config handle. Called once, from daemon startup.
+pub(crate) fn publish_daemon_config(handle: shux_core::config::ConfigHandle) {
+    let _ = DAEMON_CONFIG.set(handle);
+}
+
+/// The live `[shell]` section, or defaults outside the daemon.
+pub(crate) fn daemon_shell_config() -> shux_core::config::ShellConfig {
+    DAEMON_CONFIG
+        .get()
+        .map(|h| h.current().shell.clone())
+        .unwrap_or_default()
+}
+
+/// The configured shell argv, or `None` when `[shell].command` does not name a
+/// program.
+///
+/// One place decides what "configured" means, so the pane shell and the shell
+/// that interprets a `--cmd` string cannot disagree about it.
+pub(crate) fn configured_shell_argv(shell: &shux_core::config::ShellConfig) -> Option<Vec<String>> {
+    let program = shell.command.first()?;
+    if program.trim().is_empty() {
+        return None;
+    }
+    Some(shell.command.clone())
+}
+
+/// Fold the user's `[shell]` config into one pane's spawn plan (issue #132).
+///
+/// Returns the argv to exec — empty keeps `PtyConfig::default_shell`'s
+/// `$SHELL -l -i` — and the env to inject.
+///
+/// - `shell.command` is the *default* shell override, so it applies only when
+///   the caller asked for no command. An explicit `shux new -- vim a.rs` still
+///   runs `vim`, never the configured shell.
+/// - A **blank** `command[0]` means "not configured". `command = [""]` and
+///   `command = ["   "]` parse and validate — the schema is `Vec<String>` and
+///   nothing there knows what a program name is — and treating them as an
+///   override execs a blank program, so the default pane dies while `--cmd`
+///   still works because `interpreting_shell` filters the same blank and falls
+///   back to `$SHELL`. That is exactly the drift this change exists to remove.
+///   Blank-means-unset is already the house rule: `default_shell_argv` treats a
+///   blank `$SHELL` as unset, and `parse_pane_command` treats a blank `command`
+///   string as "no command given".
+/// - `shell.env` is layered *under* `extra_env`: `PtyHandle::spawn` applies
+///   `config.env` in order and last write wins, so a caller that names a
+///   variable explicitly (`lens.run`'s deterministic plan) beats the config.
+/// - `env_clear` callers get no `shell.env` at all. That flag exists to give
+///   the scratch gate runner a hermetic environment containing *only* its own
+///   plan; letting user config leak in would defeat the point.
+pub(crate) fn resolve_pane_spawn(
+    command: Vec<String>,
+    shell: &shux_core::config::ShellConfig,
+    extra_env: Vec<(String, String)>,
+    env_clear: bool,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let argv = if command.is_empty() {
+        configured_shell_argv(shell).unwrap_or_default()
+    } else {
+        command
+    };
+
+    let mut env = Vec::with_capacity(shell.env.len() + extra_env.len());
+    if !env_clear {
+        env.extend(shell.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    env.extend(extra_env);
+
+    (argv, env)
+}
+
 /// Spawn a PTY process and VT instance for a pane.
 ///
 /// When `command` is empty, spawns the user's default login+interactive
-/// shell (via `PtyConfig::default_shell`). When non-empty, runs that
+/// shell — `[shell].command` from the config file when set, otherwise
+/// `PtyConfig::default_shell`'s `$SHELL -l -i`. When non-empty, runs that
 /// argv directly — this is what `shux new -s X -- vim foo.rs` lands on,
 /// so the pane runs `vim foo.rs` instead of a shell. The pane lifetime
 /// becomes the lifetime of that command (when it exits, the pane EOFs).
@@ -1386,13 +1475,14 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     graph: shux_core::graph::GraphHandle,
     cast_recorder: Option<PaneRecorder>,
 ) -> Result<(), shux_pty::PtyError> {
-    let mut config = if command.is_empty() {
+    let (argv, env) = resolve_pane_spawn(command, &daemon_shell_config(), extra_env, env_clear);
+    let mut config = if argv.is_empty() {
         shux_pty::handle::PtyConfig::default_shell(cwd)
     } else {
-        shux_pty::handle::PtyConfig::with_command(command, cwd)
+        shux_pty::handle::PtyConfig::with_command(argv, cwd)
     };
     config.size = size;
-    config.env = extra_env;
+    config.env = env;
     config.env_clear = env_clear;
     let handle = shux_pty::handle::PtyHandle::spawn(&config)?;
     let pid = handle.pid();
@@ -1558,7 +1648,7 @@ fn run_daemon() -> anyhow::Result<()> {
 /// no ceiling this process could impose would know that number (issue #125
 /// follow-up).
 pub(crate) fn spawn_failure(e: &shux_pty::PtyError) -> shux_rpc::RpcError {
-    shux_rpc::RpcError::spawn_failed_with_hint(&e.to_string(), spawn_failure_hint(e))
+    shux_rpc::RpcError::spawn_failed_with_hint(&e.to_string(), &spawn_failure_hint(e))
 }
 
 /// The same diagnosis as one flat string, for `state.apply`'s per-pane results —
@@ -1567,18 +1657,37 @@ pub(crate) fn spawn_failure_message(e: &shux_pty::PtyError) -> String {
     format!("{e} — {}", spawn_failure_hint(e))
 }
 
-fn spawn_failure_hint(e: &shux_pty::PtyError) -> &'static str {
-    let detail = e.to_string();
+fn spawn_failure_hint(e: &shux_pty::PtyError) -> String {
+    spawn_failure_hint_for(&e.to_string(), &daemon_shell_config())
+}
+
+/// [`spawn_failure_hint`] with the config injected, so the diagnosis can be
+/// tested without a process-global `OnceLock` that no test can reset.
+fn spawn_failure_hint_for(detail: &str, shell: &shux_core::config::ShellConfig) -> String {
     if detail.contains("Argument list too long") {
         "the command's arguments and environment together exceed the kernel's \
          ARG_MAX; shorten the command or the environment"
+            .to_string()
     } else if detail.contains("Is a directory") || detail.contains("Permission denied") {
         // A directory as argv[0] reports EACCES on Linux, and no amount of
         // chmod fixes that — so the two share a hint that covers both.
         "argv[0] is not an executable file this user can run (a directory, or \
          a file without the execute bit)"
+            .to_string()
     } else {
-        "check argv[0] resolves via PATH and cwd exists"
+        // Since issue #132 argv[0] can come from a file the user edited days
+        // ago instead of the command line they just typed, and "check argv[0]"
+        // does not say where to look. Naming the configured program is a fact,
+        // not a diagnosis — it does not claim THIS pane used it, only that a
+        // pane with no command of its own would.
+        match configured_shell_argv(shell).map(|argv| argv[0].clone()) {
+            Some(program) => format!(
+                "check argv[0] resolves via PATH and cwd exists — note \
+                 [shell].command in your shux config runs `{program}` for any \
+                 pane with no command of its own"
+            ),
+            None => "check argv[0] resolves via PATH and cwd exists".to_string(),
+        }
     }
 }
 
@@ -1810,6 +1919,9 @@ async fn run_rpc_server(
     // task so edits to the file are picked up live.
     let config_path = shux_core::config::default_config_path();
     let config_handle = shux_core::config::ConfigHandle::load_or_default(&config_path);
+    // Publish before the RPC server accepts connections, so the very first
+    // pane spawn already sees `[shell]` (issue #132).
+    publish_daemon_config(config_handle.clone());
     let cfg_watcher_handle = config_handle.clone();
     let cfg_watcher_path = config_path.clone();
     let cfg_watcher_cancel = cancel.clone();
@@ -8112,6 +8224,175 @@ mod tests {
             !verdict,
             "a process whose argv merely contains `shux` and `__daemon` is not the daemon"
         );
+    }
+
+    // ── `[shell]` → pane spawn plan (issue #132) ──────────────────────
+    //
+    // The end-to-end proof lives in `tests/shell_config_e2e.rs`, which reads
+    // real pane screens. These pin the branch table itself, including the two
+    // precedence rules that are invisible on a screen.
+
+    fn shell_cfg(command: &[&str], env: &[(&str, &str)]) -> shux_core::config::ShellConfig {
+        shux_core::config::ShellConfig {
+            command: command.iter().map(|s| s.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn owned(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn configured_shell_command_becomes_a_default_panes_argv() {
+        let (argv, _) = resolve_pane_spawn(
+            Vec::new(),
+            &shell_cfg(&["/bin/dash", "-l"], &[]),
+            Vec::new(),
+            false,
+        );
+        assert_eq!(argv, owned(&["/bin/dash", "-l"]));
+    }
+
+    #[test]
+    fn an_empty_configured_command_keeps_the_dollar_shell_default() {
+        // Empty argv is the signal `PtyConfig::default_shell` reads as
+        // "$SHELL -l -i". Anything else here would hardcode a shell.
+        let (argv, _) = resolve_pane_spawn(Vec::new(), &shell_cfg(&[], &[]), Vec::new(), false);
+        assert!(argv.is_empty(), "{argv:?}");
+    }
+
+    #[test]
+    fn a_blank_configured_program_is_not_a_configured_shell() {
+        // `[""]` and `["   "]` parse and validate — the schema is `Vec<String>`
+        // and nothing there knows what a program name is. Treating them as an
+        // override execs a blank program: the default pane dies while `--cmd`
+        // keeps working off `$SHELL`, which is the drift this change removes.
+        for blank in [vec![""], vec!["   "], vec!["\t"], vec!["", "-l"]] {
+            let cfg = shell_cfg(&blank, &[]);
+            assert!(configured_shell_argv(&cfg).is_none(), "{blank:?}");
+            let (argv, _) = resolve_pane_spawn(Vec::new(), &cfg, Vec::new(), false);
+            assert!(argv.is_empty(), "{blank:?} should fall back to $SHELL");
+        }
+    }
+
+    #[test]
+    fn a_blank_argument_after_a_real_program_is_kept() {
+        // Only argv[0] names the program. An empty ARGUMENT is legitimate and
+        // must survive — the blank rule is about the program, not the argv.
+        let cfg = shell_cfg(&["/bin/sh", "", "-l"], &[]);
+        assert_eq!(
+            configured_shell_argv(&cfg),
+            Some(owned(&["/bin/sh", "", "-l"]))
+        );
+    }
+
+    #[test]
+    fn a_blank_configured_program_gets_no_config_note_in_the_hint() {
+        // It is not the configured shell, so naming it would be a lie.
+        let hint = spawn_failure_hint_for(
+            "failed to spawn child process: No such file or directory (os error 2)",
+            &shell_cfg(&["   "], &[]),
+        );
+        assert_eq!(hint, "check argv[0] resolves via PATH and cwd exists");
+    }
+
+    #[test]
+    fn an_explicit_command_is_never_replaced_by_the_configured_shell() {
+        let (argv, _) = resolve_pane_spawn(
+            owned(&["nvim", "a.rs"]),
+            &shell_cfg(&["/bin/dash", "-l"], &[]),
+            Vec::new(),
+            false,
+        );
+        assert_eq!(argv, owned(&["nvim", "a.rs"]));
+    }
+
+    #[test]
+    fn configured_env_is_injected_into_every_pane() {
+        let (_, env) = resolve_pane_spawn(
+            Vec::new(),
+            &shell_cfg(&[], &[("LC_ALL", "en_US.UTF-8")]),
+            Vec::new(),
+            false,
+        );
+        assert_eq!(env, vec![("LC_ALL".to_string(), "en_US.UTF-8".to_string())]);
+    }
+
+    #[test]
+    fn a_callers_explicit_env_wins_over_the_configured_env() {
+        // `PtyHandle::spawn` applies `config.env` in order and the last write
+        // wins, so the caller's entry must come SECOND, not merely be present.
+        let (_, env) = resolve_pane_spawn(
+            Vec::new(),
+            &shell_cfg(&[], &[("LC_ALL", "from-config")]),
+            vec![("LC_ALL".to_string(), "from-caller".to_string())],
+            false,
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("LC_ALL".to_string(), "from-config".to_string()),
+                ("LC_ALL".to_string(), "from-caller".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_clear_callers_get_no_configured_env_at_all() {
+        // `env_clear` exists to give the scratch gate runner an environment
+        // containing ONLY its own plan. User config leaking in would defeat it.
+        let (_, env) = resolve_pane_spawn(
+            Vec::new(),
+            &shell_cfg(&[], &[("LC_ALL", "from-config")]),
+            vec![("PATH".to_string(), "/usr/bin".to_string())],
+            true,
+        );
+        assert_eq!(env, vec![("PATH".to_string(), "/usr/bin".to_string())]);
+    }
+
+    #[test]
+    fn a_failed_spawn_names_the_configured_shell_as_a_place_to_look() {
+        // argv[0] can now come from a file the user edited days ago. "check
+        // argv[0]" alone does not say where to look.
+        let hint = spawn_failure_hint_for(
+            "failed to spawn child process: No such file or directory (os error 2)",
+            &shell_cfg(&["/usr/bin/zsh-typo", "-l"], &[]),
+        );
+        assert!(hint.contains("[shell].command"), "{hint}");
+        assert!(hint.contains("/usr/bin/zsh-typo"), "{hint}");
+    }
+
+    #[test]
+    fn a_failed_spawn_says_nothing_about_config_when_there_is_none() {
+        let hint = spawn_failure_hint_for(
+            "failed to spawn child process: No such file or directory (os error 2)",
+            &shell_cfg(&[], &[]),
+        );
+        assert_eq!(hint, "check argv[0] resolves via PATH and cwd exists");
+    }
+
+    #[test]
+    fn the_argv_too_long_diagnosis_does_not_get_a_config_note() {
+        // That failure is about total size, not about which program was named.
+        let hint = spawn_failure_hint_for(
+            "failed to spawn child process: Argument list too long (os error 7)",
+            &shell_cfg(&["/bin/zsh"], &[]),
+        );
+        assert!(hint.contains("ARG_MAX"), "{hint}");
+        assert!(!hint.contains("[shell].command"), "{hint}");
+    }
+
+    #[test]
+    fn a_process_without_a_published_config_sees_plain_defaults() {
+        // Every non-daemon process (the CLI client, these tests) reads this.
+        // It must be the pre-issue-#132 behaviour, byte for byte.
+        let shell = daemon_shell_config();
+        assert!(shell.command.is_empty());
+        assert!(shell.env.is_empty());
     }
 
     use shux_core::config::{Config, ConfigHandle, SegmentDef, StatusBarConfig};

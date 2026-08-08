@@ -302,7 +302,14 @@ async fn handle_attach_connection(
             if let Some(pane) = snap.panes.get(&session.active_pane_id)
                 && pane_awaits_first_spawn(pane)
             {
-                crate::spawn_pane_pty(
+                // Deliberately NOT rolled back, unlike the split and
+                // new-window paths: this pane already existed before the
+                // attach — destroying it because its PTY would not start
+                // would throw away a pane the user is trying to get back to.
+                // But it is not swallowed either. A failure here is why the
+                // pane renders empty forever, and with `[shell].command`
+                // (issue #132) the usual cause is a config typo that says so.
+                if let Err(e) = crate::spawn_pane_pty(
                     session.active_pane_id,
                     pane.cwd.clone(),
                     pane.command.clone(),
@@ -314,7 +321,13 @@ async fn handle_attach_connection(
                     graph.clone(),
                 )
                 .await
-                .ok();
+                {
+                    warn!(
+                        pane = %session.active_pane_id,
+                        error = %crate::spawn_failure_message(&e),
+                        "attach: pane has no PTY and could not be started"
+                    );
+                }
             }
         }
     }
@@ -898,7 +911,7 @@ async fn run_attach_loop(
                         // persists, subsequent ones short-circuit.
                         onboarding.mark_prefix_discovered().await;
 
-                        if let Err(e) = handle_action(
+                        let action_result = handle_action(
                             kind,
                             args.clone(),
                             &graph,
@@ -907,8 +920,8 @@ async fn run_attach_loop(
                             &client_size,
                             &cancel,
                         )
-                        .await
-                        {
+                        .await;
+                        if let Err(e) = &action_result {
                             warn!(?kind, error = %e, "attach: action failed");
                         }
 
@@ -916,7 +929,14 @@ async fn run_attach_loop(
                         // bar's center zone. Resolves the "did my keystroke
                         // do anything?" UX gap for actions whose effect
                         // isn't immediately obvious (kill, zoom, copy).
-                        if let Some(label) = action_feedback_label(kind) {
+                        //
+                        // Gated on success: an action that rolled back must
+                        // not flash its own name as if it had happened. That
+                        // is the "did my keystroke do anything?" question
+                        // answered wrongly, which is worse than not answering.
+                        if action_result.is_ok()
+                            && let Some(label) = action_feedback_label(kind)
+                        {
                             let mut s = render_session.lock().await;
                             s.last_action = Some((label.into(), std::time::Instant::now()));
                         }
@@ -2609,12 +2629,26 @@ async fn split(
         }
     };
 
+    // Splitting focuses the new pane, so an undo has to put focus back itself
+    // or a failed split silently relocates the operator's cursor.
+    let prior_active_pane = graph
+        .snapshot()
+        .windows
+        .get(&attached.active_window_id)
+        .map(|w| w.active_pane);
+
     let new_pane = graph
         .split_pane(attached.active_pane_id, direction, 0.5)
         .await
         .map_err(|e| anyhow::anyhow!("split failed: {e}"))?;
 
-    crate::spawn_pane_pty(
+    // A PTY that never started is not a pane. Discarding this error left a
+    // phantom in the graph — focused, drawn, and answering "pane VT not found"
+    // to every later verb — while the keystroke looked like it worked. The RPC
+    // `pane.split` has rolled this back since issue #125; the attach path
+    // never did, and `[shell].command` (issue #132) makes a default-pane spawn
+    // newly able to fail, so the latent case became a reachable one.
+    if let Err(e) = crate::spawn_pane_pty(
         new_pane,
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")),
         Vec::new(),
@@ -2626,7 +2660,32 @@ async fn split(
         graph.clone(),
     )
     .await
-    .ok();
+    {
+        // Compare-and-restore, not restore: an operator who moved focus while
+        // the PTY was starting keeps their choice (the lost-update lesson from
+        // #125's own rollback).
+        let focus_is_still_ours = graph
+            .snapshot()
+            .windows
+            .get(&attached.active_window_id)
+            .map(|w| w.active_pane)
+            == Some(new_pane);
+
+        let _ = graph.destroy_pane(new_pane, None).await;
+
+        if focus_is_still_ours
+            && let Some(prev) = prior_active_pane
+            && graph
+                .snapshot()
+                .windows
+                .get(&attached.active_window_id)
+                .map(|w| w.active_pane)
+                != Some(prev)
+        {
+            let _ = graph.focus_pane(prev).await;
+        }
+        return Err(anyhow::anyhow!("{}", crate::spawn_failure_message(&e)));
+    }
     Ok(())
 }
 
@@ -2838,7 +2897,11 @@ async fn new_window(
         .get(&window_id)
         .ok_or_else(|| anyhow::anyhow!("window vanished after create"))?;
     let pane_id = win.active_pane;
-    crate::spawn_pane_pty(
+    // A window whose only pane never started is not a window. Discarding this
+    // left one in the graph and then focused it, so the attach UI switched to
+    // a window that could never render — same contract the `window.create` RPC
+    // has enforced since issue #125.
+    if let Err(e) = crate::spawn_pane_pty(
         pane_id,
         cwd,
         Vec::new(),
@@ -2850,7 +2913,10 @@ async fn new_window(
         graph.clone(),
     )
     .await
-    .ok();
+    {
+        let _ = graph.destroy_window(window_id, None).await;
+        return Err(anyhow::anyhow!("{}", crate::spawn_failure_message(&e)));
+    }
 
     // Focus the new window.
     let _ = graph.focus_window(window_id, None).await;

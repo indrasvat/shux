@@ -1153,3 +1153,63 @@ orders are provably identical (every character the guard rewrites already fails
 the quoting allowlist; 200,000 random argvs, zero differences). Counting it as a
 survivor would have meant writing a test that cannot fail. Check whether a
 mutant is equivalent before treating a survivor as a coverage gap.
+
+- **2026-08-08 (fix/#132):**
+
+**A diagnostic dropped at the last hop reads as covered.** `RpcError::spawn_failed`
+has always attached `data.hint`, and `rpc_display`'s default arm returned
+`data.detail` alone — so every spawn failure shux has ever printed built a hint,
+serialized it, shipped it to the client, and threw it away one layer from the
+terminal. Nothing was red, and the code looked like it handled the case. When
+adding a hint, follow it all the way to stdout; the producer existing is not
+evidence anyone sees it.
+
+**A config that does not parse is indistinguishable from no config, and that
+makes a defaults test pass for the wrong reason.** `ConfigHandle::load_or_default`
+falls back to `Config::default()` with a `tracing::warn` on a parse error. A test
+fixture with a typo therefore reproduces exactly the pre-fix behaviour: the tests
+asserting the override fail with a confusing message, and the test asserting the
+default PASSES vacuously. Any harness that writes a config file should assert the
+file through `shux config validate` before starting the daemon. Hit for real here:
+the colour probe's `\033` is not a legal TOML escape, so the fixtures need
+multi-line literal (`'''`) strings.
+
+**Wiring one config field is a plumbing question, not a logic question.** Nothing
+read `[shell]` because every pane spawn funnels through one function whose ~10
+call sites carry no `ConfigHandle` — only one of five method registrars is handed
+one. The choice is an eleventh argument threaded through all of them, or
+publishing the daemon's handle once into a `OnceLock`. The latter keeps hot-reload
+(the handle is an `ArcSwap`) and leaves every non-daemon process on defaults, but
+it is process-global state: keep the *decision* in a pure function that takes the
+config, so the branch table is testable without a global no test can reset.
+
+**`env_clear` callers must not inherit user config.** The scratch gate runner sets
+`env_clear` precisely to get an environment containing only its own deterministic
+plan. Injecting `[shell].env` into it would be "consistent" and would defeat the
+flag's entire purpose.
+
+**A schema of `Vec<String>` does not know what a program name is.** `[shell]
+command = ["   "]` parsed, validated, and exec'd a blank program. Any config
+field that ends up as argv[0] needs a semantic check, and the check has to live
+in ONE predicate shared by every consumer — the pane shell and the `--cmd`
+interpreter disagreed about blankness precisely because each filtered for
+itself. This is the third time in this repo that `[""]` and `["   "]` diverged
+(#125 hit it in the RPC parser).
+
+**A contract enforced on every RPC is not enforced in the TUI.** #125 made a
+failed spawn roll back on all five spawning RPCs. The two attach actions that
+also spawn — `split` and `new_window` — kept `.await.ok()` and were never
+revisited, because with a default pane that could not fail the branch was
+unreachable. Making a previously-infallible path fallible turns every
+unreviewed `.ok()` downstream of it into a live defect: enumerate the callers,
+not just the function you changed.
+
+**A negative assertion needs a control arm.** "No phantom pane after the failing
+split" is satisfied just as well by keystrokes that never reached the client.
+The test splits once with a WORKING shell first and asserts that succeeded, so
+the negative half is only reached from a state known to be drivable.
+
+**Do not wait on a needle the shell echoes.** Waiting for the session name to
+appear on the host pane matched the shell's echo of the `session attach` command
+line, before the client existed. Wait on something only the running app draws —
+here `1 pane` from the attached status bar.

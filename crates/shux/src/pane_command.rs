@@ -72,10 +72,23 @@ const MAX_ARGV_BYTES: usize = 256 * 1024;
 
 /// The shell that interprets a string-form `command`.
 ///
-/// Read from the **daemon's** environment, which is where every other shell
-/// decision in shux is made — `PtyConfig::resolve_command` reads the same variable
-/// for the default pane shell, so the two cannot drift.
+/// Whatever a pane opened by hand runs, a `--cmd` string is interpreted by —
+/// otherwise the same line means bash syntax in one place and fish syntax in
+/// the other. So the resolution order mirrors the default pane shell exactly:
+/// `[shell].command`'s program when the user configured one (issue #132),
+/// otherwise the **daemon's** `$SHELL`, otherwise `/bin/sh`.
+///
+/// Only the program is taken from `[shell].command`, never its flags: those
+/// are login/interactive flags for a shell you sit in (`-l -i`), and this
+/// invocation is `-c` — see the module header on why one-shot commands do not
+/// read startup files.
 pub(crate) fn interpreting_shell() -> String {
+    if let Some(argv) = crate::configured_shell_argv(&crate::daemon_shell_config()) {
+        // `configured_shell_argv` already rejected a blank program, so the
+        // first element is a real name. Same predicate the pane shell uses —
+        // the two cannot disagree about whether a shell is configured.
+        return argv[0].clone();
+    }
     std::env::var("SHELL")
         .ok()
         .filter(|s| !s.trim().is_empty())

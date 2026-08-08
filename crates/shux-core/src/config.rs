@@ -136,10 +136,19 @@ fn default_prefix() -> String {
 pub struct ShellConfig {
     /// Override the default shell argv. When empty, the daemon uses
     /// `$SHELL -l -i`.
+    ///
+    /// This is the *default* — it governs panes that asked for no command of
+    /// their own. An explicit argv (`shux new -- vim a.rs`) still runs that.
+    /// The program (`command[0]`) is also the shell that interprets a
+    /// string-form `command` RPC parameter / `--cmd` line, so a pane opened by
+    /// hand and a `--cmd` line cannot end up speaking different shell dialects.
     #[serde(default)]
     pub command: Vec<String>,
     /// Extra env vars to inject into every spawned pane (in addition to
     /// the daemon's TERM_PROGRAM/SHUX/COLORTERM defaults).
+    ///
+    /// Layered *under* the caller's own environment plan: a pane spawned with
+    /// an explicit value for the same variable keeps its value.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
 }

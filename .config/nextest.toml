@@ -151,6 +151,7 @@ filter = '''
   + binary_id(=shux::pane_list_columns)
   + binary_id(=shux::rep_pane_e2e)
   + binary_id(=shux::settle_waiter_drop)
+  + binary_id(=shux::shell_config_e2e)
   + binary_id(=shux::statusbar_starship_symlink)
   + binary_id(=shux::window_snapshot_oversize)
   + binary_id(=shux::window_title_escape_injection)
