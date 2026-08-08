@@ -1047,3 +1047,42 @@ program. `Path::file_name()` returning `None` is the honest test for `/`, `//`,
 **Fixing the human output path is half a fix.** `state apply` stopped calling a
 batch of dead panes a success — in text mode. `--format json`, the mode scripts
 and agents actually use, returned before the check and still exited 0.
+
+### Round four — removing a cap removed a protection nobody had named
+
+**A bound can be wrong as a prediction and right as a policy.** Round three
+deleted the aggregate argv cap because it could not predict `execve` — true, and
+the right call for *pre-flight rejection*. But the cap had been incidentally
+bounding something else: what the graph stores and what `pane.list` echoes.
+`state.apply` keeps a pane whose spawn failed, so a few multi-megabyte argvs
+pushed the response past the 16 MB frame limit and every read of that session
+died with `early eof`. The cap is back with an honest justification — shux's own
+storage bound — and the kernel's limit stays the kernel's business.
+
+**"Not in this batch's failures" is not "alive".** The focus rescue asked the
+wrong question and handed focus to a corpse left by an earlier apply, which is
+precisely what it was written to prevent. The daemon already knows the truth:
+`io_state.writers` holds exactly the panes with a live PTY.
+
+**`HashMap::values().find(...)` is a coin toss.** The same template focused a
+different pane on each run, so a script that applied and then used the focused
+pane targeted something different every time. Iterate the layout tree, which has
+an order that means something.
+
+**An exception list has to cover the whole reason it exists.** ZWJ was exempted
+from the invisible-character sweep because dropping it splits family emoji. The
+variation selectors are mandatory in the same RGI sequences and were not
+exempted, so `❤️‍🔥` became `❤` and `1️⃣` became `1` — the rule broke exactly what
+the exception was protecting.
+
+**Widening two rules at once opened a gap between them.** Round three widened
+what counts as a program name *and* what the sanitizer strips; a command whose
+name sanitizes to nothing then produced an empty title, because the fallback to
+the cwd only ran when no name was found at all — not when the name evaporated.
+
+**A test built from the wrong ingredients passes on the broken build.** The
+first corpse test put its corpses in separate sessions, so they were never
+siblings and the rescue never saw them. Only `state.apply`'s `split_pane` op
+leaves a corpse in an existing window — `pane.split` the RPC rolls one back.
+Three green runs against the known-broken binary is the signal to rebuild the
+fixture, not to trust the test.

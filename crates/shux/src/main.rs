@@ -1558,16 +1558,28 @@ fn run_daemon() -> anyhow::Result<()> {
 /// no ceiling this process could impose would know that number (issue #125
 /// follow-up).
 pub(crate) fn spawn_failure(e: &shux_pty::PtyError) -> shux_rpc::RpcError {
+    shux_rpc::RpcError::spawn_failed_with_hint(&e.to_string(), spawn_failure_hint(e))
+}
+
+/// The same diagnosis as one flat string, for `state.apply`'s per-pane results —
+/// `SpawnResult` has room for a message and not for a structured hint.
+pub(crate) fn spawn_failure_message(e: &shux_pty::PtyError) -> String {
+    format!("{e} — {}", spawn_failure_hint(e))
+}
+
+fn spawn_failure_hint(e: &shux_pty::PtyError) -> &'static str {
     let detail = e.to_string();
-    let hint = if detail.contains("Argument list too long") {
+    if detail.contains("Argument list too long") {
         "the command's arguments and environment together exceed the kernel's \
          ARG_MAX; shorten the command or the environment"
-    } else if detail.contains("Permission denied") {
-        "argv[0] exists but is not executable by this user"
+    } else if detail.contains("Is a directory") || detail.contains("Permission denied") {
+        // A directory as argv[0] reports EACCES on Linux, and no amount of
+        // chmod fixes that — so the two share a hint that covers both.
+        "argv[0] is not an executable file this user can run (a directory, or \
+         a file without the execute bit)"
     } else {
         "check argv[0] resolves via PATH and cwd exists"
-    };
-    shux_rpc::RpcError::spawn_failed_with_hint(&detail, hint)
+    }
 }
 
 /// The human-readable half of an `RpcError`, for CLI-side reporting.
@@ -2325,7 +2337,12 @@ fn register_state_methods(
                                 op_index: output.op_index,
                                 pane_id,
                                 spawned: false,
-                                error: Some(e.to_string()),
+                                // Same diagnosis the five rollback RPCs give.
+                                // `SpawnResult` carries one string, so the hint
+                                // rides along in it rather than being dropped —
+                                // this is the one path where an oversized argv
+                                // can actually land.
+                                error: Some(spawn_failure_message(&e)),
                             }),
                         }
                     }
@@ -2342,6 +2359,15 @@ fn register_state_methods(
                     .map(|r| r.pane_id)
                     .collect();
                 if !dead.is_empty() {
+                    // "Alive" means it has a live PTY, not "absent from THIS
+                    // batch's failures". A corpse left by an earlier apply is
+                    // not a sibling worth focusing, and the first cut of this
+                    // rescue happily handed focus to one — reproducing the exact
+                    // symptom it was written to prevent.
+                    let live: std::collections::HashSet<_> = {
+                        let state = io.lock().await;
+                        state.writers.keys().copied().collect()
+                    };
                     let snap = gh.snapshot();
                     let mut rescue = Vec::new();
                     for pane_id in &dead {
@@ -2354,13 +2380,16 @@ fn register_state_methods(
                         if window.active_pane != *pane_id {
                             continue;
                         }
-                        // Prefer a sibling that spawned; a still-dead sibling is
-                        // no better than the one we are leaving.
-                        if let Some(alive) = snap
-                            .panes
-                            .values()
-                            .find(|p| p.window_id == window_id && !dead.contains(&p.id))
-                            .map(|p| p.id)
+                        // Layout order, not `HashMap` order: iterating the pane
+                        // map gave a different answer run to run, so a script
+                        // that applied a template and then used the focused pane
+                        // targeted a different one each time.
+                        if let Some(alive) = window
+                            .layout
+                            .tree
+                            .pane_ids()
+                            .into_iter()
+                            .find(|id| live.contains(id))
                         {
                             rescue.push(alive);
                         }

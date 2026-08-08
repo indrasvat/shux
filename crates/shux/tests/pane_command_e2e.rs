@@ -1472,47 +1472,6 @@ fn state_apply_dry_run_rejects_an_impossible_window_title() {
     }
 }
 
-/// The aggregate argv cap was wrong in both directions — the kernel shares
-/// `ARG_MAX` with the environment, which this process cannot measure. A large
-/// argv is now the kernel's call, and an `E2BIG` says what actually went wrong
-/// instead of blaming argv[0] and the cwd.
-#[test]
-fn an_oversized_argv_is_diagnosed_rather_than_capped_by_a_guess() {
-    let env = Env::new();
-    let argv: Vec<String> = std::iter::once("/bin/echo".to_string())
-        .chain(std::iter::repeat_n("x".repeat(100_000), 60))
-        .collect();
-    let path = env.work().join("big.json");
-    std::fs::write(
-        &path,
-        serde_json::json!({"name": "big", "command": argv}).to_string(),
-    )
-    .unwrap();
-    let out = env.run(&[
-        "rpc",
-        "call",
-        "session.create",
-        "--params",
-        &format!("@{}", path.display()),
-        "--format",
-        "json",
-    ]);
-    let joined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!out.status.success(), "{joined}");
-    assert!(
-        joined.contains("ARG_MAX"),
-        "the failure must name the real cause, not argv[0]:\n{joined}"
-    );
-    assert!(
-        !joined.contains("resolves via PATH"),
-        "still blaming argv[0] for a size problem:\n{joined}"
-    );
-}
-
 /// A program with an unusual but real name keeps it. Round two's
 /// "no alphanumeric character" rule threw `/usr/local/bin/+++` away.
 #[test]
@@ -1539,4 +1498,185 @@ fn a_real_program_with_an_unusual_name_keeps_its_title() {
         .unwrap_or_default()
         .to_string();
     assert_eq!(title, "+++", "a real program lost its name");
+}
+
+// ── round-four follow-ups ───────────────────────────────────────────────
+
+/// Removing the aggregate cap in round three left `state.apply` — the one
+/// spawn path that KEEPS a failed pane — storing a multi-megabyte argv in the
+/// graph and echoing it in full from `pane list`. A few of those pushed the
+/// response past the frame limit and every read of that session died with
+/// "early eof", recoverable only by killing it.
+#[test]
+fn an_argv_larger_than_shux_will_carry_never_reaches_the_graph() {
+    let mut env = Env::new();
+    let arg = "x".repeat(100_000);
+    let args: Vec<String> = std::iter::repeat_n(arg, 30).collect();
+    let quoted: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+    let path = env.work().join("big.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[session]\nname = \"bigargv\"\n\n[[windows]]\ntitle = \"w\"\n\n\
+             [[windows.panes]]\ncommand = [\"/bin/sh\", \"-c\", \"exec sleep 900\"]\n\n\
+             [[windows.panes]]\ndirection = \"vertical\"\ncommand = [\"/bin/echo\", {}]\n",
+            quoted.join(", ")
+        ),
+    )
+    .unwrap();
+
+    // Rejected before anything commits — and by `--dry-run` identically.
+    for args in [
+        &["state", "apply", path.to_str().unwrap(), "--dry-run"][..],
+        &["state", "apply", path.to_str().unwrap()][..],
+    ] {
+        let out = env.run(args);
+        let joined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{args:?} accepted it:\n{joined}");
+        assert!(joined.contains("stores and reports"), "{args:?}: {joined}");
+    }
+    assert!(
+        env.json(&["session", "list"])["sessions"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(true),
+        "a rejected apply still committed the session"
+    );
+    env.sessions.push("bigargv".to_string());
+}
+
+/// The rescue asked "is this pane absent from THIS batch's failures?", so a
+/// corpse left by an earlier apply counted as a healthy sibling and focus
+/// landed on it — reproducing exactly what the rescue was written to prevent.
+///
+/// `state.apply` is the only way to accumulate corpses: `pane.split` the RPC
+/// rolls one back, but a `split_pane` OP does not. The window is stacked with
+/// several on purpose — the old code chose by `HashMap` iteration order, so one
+/// corpse among two panes was a coin flip.
+#[test]
+fn the_focus_rescue_skips_a_corpse_left_by_an_earlier_apply() {
+    let mut env = Env::new();
+    let colour = env.work().join("colour.txt");
+    std::fs::write(
+        &colour,
+        "\u{1b}[38;2;120;220;180mTRUECOLOR\u{1b}[0m \u{1b}[38;5;208mINDEXED\u{1b}[0m \u{1b}[34mBASIC\u{1b}[0m\n",
+    )
+    .unwrap();
+    env.ok(&[
+        "session",
+        "create",
+        "corpse",
+        "-d",
+        "--cmd",
+        &format!("cat {}; exec sleep 900", colour.display()),
+    ]);
+    env.sessions.push("corpse".to_string());
+    let live = env.first_pane("corpse");
+
+    // Six failing `split_pane` ops, each leaving a corpse beside the live pane.
+    for i in 0..6 {
+        let ops = serde_json::json!({"ops": [{
+            "op": "split_pane",
+            "target": live,
+            "direction": "vertical",
+            "ratio": 0.5,
+            "command": [format!("no-such-binary-{i}")],
+        }]})
+        .to_string();
+        let _ = env.rpc("state.apply", &ops);
+    }
+
+    let panes = env.json(&["pane", "list", "-s", "corpse"]);
+    assert!(
+        panes.as_array().map(Vec::len).unwrap_or(0) >= 6,
+        "setup: the corpses should have accumulated"
+    );
+    let focused = panes
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|p| p["is_focused"] == true)
+        .expect("some pane focused");
+    assert_eq!(
+        focused["id"].as_str().unwrap_or_default(),
+        live,
+        "focus is not on the one pane with a live PTY"
+    );
+    // …which is the point: the `-p`-less verbs have to work.
+    let out = env.run(&["pane", "capture", "-s", "corpse"]);
+    assert!(
+        out.status.success(),
+        "the focused pane does not answer:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Round three's ignorable-codepoint rule stripped the variation selectors,
+/// which are mandatory in the very emoji sequences the ZWJ exception exists to
+/// protect: `❤️‍🔥` came back as `❤` and `1️⃣` as a bare `1`.
+#[test]
+fn emoji_sequences_survive_the_title_sanitizer() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "emoji", "-d"]);
+    env.sessions.push("emoji".to_string());
+    for (title, why) in [
+        ("\u{2764}\u{fe0f}\u{200d}\u{1f525} hot", "heart on fire"),
+        ("\u{1f3f3}\u{fe0f}\u{200d}\u{1f308} pride", "rainbow flag"),
+        ("1\u{fe0f}\u{20e3} first", "keycap one"),
+        ("\u{26a0}\u{fe0f} prod", "warning sign"),
+    ] {
+        let out = env.json(&["window", "create", "-s", "emoji", "-n", title]);
+        assert_eq!(
+            out["title"].as_str().unwrap_or_default(),
+            title,
+            "{why} was altered by the sanitizer"
+        );
+    }
+}
+
+/// A command whose name sanitizes to nothing produced a pane with a blank
+/// border and a blank status bar — round three widened both what counts as a
+/// program name and what the sanitizer removes.
+#[test]
+fn a_command_that_sanitizes_to_nothing_still_gets_a_title() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "blankname", "-d", "--cmd", "\u{00ad}"]);
+    env.sessions.push("blankname".to_string());
+    let title = env.json(&["pane", "list", "-s", "blankname"])[0]["title"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!title.is_empty(), "pane was left with no title at all");
+}
+
+/// `state.apply` is the one path where an oversized argv can land, and it was
+/// the one path whose failure said nothing useful.
+#[test]
+fn state_apply_spawn_failures_carry_the_same_diagnosis_as_the_rpcs() {
+    let mut env = Env::new();
+    let path = env.work().join("dir.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[session]\nname = \"diag\"\n\n[[windows]]\ntitle = \"w\"\n\n\
+             [[windows.panes]]\ncommand = [\"{}\"]\n",
+            env.work().display()
+        ),
+    )
+    .unwrap();
+    let out = env.run(&["state", "apply", path.to_str().unwrap()]);
+    env.sessions.push("diag".to_string());
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        joined.contains("not an executable file"),
+        "a directory as argv[0] got no useful diagnosis:\n{joined}"
+    );
 }

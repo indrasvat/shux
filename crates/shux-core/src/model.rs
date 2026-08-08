@@ -330,10 +330,16 @@ impl Pane {
             // validated as an existing path. They go through the same
             // sanitizer, or `sanitize_title` is not "the single title
             // rule" it claims to be (issue #104).
+            // A name that sanitizes to NOTHING is not a title. Round three
+            // widened both what counts as a program name and what the sanitizer
+            // removes, so `--cmd "<soft hyphen>"` produced a pane with a blank
+            // border and a blank status bar. Fall through to the cwd instead.
             if let Some(name) = command_display_name(&self.command) {
-                let name = name.to_string();
-                self.title = sanitize_title_clamped(&name);
-                return;
+                let sanitized = sanitize_title_clamped(name);
+                if !sanitized.is_empty() {
+                    self.title = sanitized;
+                    return;
+                }
             }
             if let Some(name) = self.cwd.file_name().and_then(|s| s.to_str()) {
                 self.title = sanitize_title_clamped(name);
@@ -485,6 +491,7 @@ fn is_shell_keyword(token: &str) -> bool {
             | "select"
             | "function"
             | "coproc"
+            | ":"
             | "{"
             | "}"
             | "[["
@@ -573,12 +580,21 @@ pub(crate) fn is_title_hostile(c: char) -> bool {
 /// rather than as the handful people think of first, because the property is
 /// what matters and the handful is never complete.
 ///
-/// **`U+200D` ZERO WIDTH JOINER is kept**, alone. It is load-bearing inside
-/// emoji sequences: dropping it splits a legitimate `👨‍👩‍👧` into three people.
-/// That costs one spoofable character, knowingly.
+/// **Three are kept**, for the same reason: they compose sequences a person
+/// legitimately types, and dropping them changes what the title *says*.
+///
+/// - `U+200D` ZERO WIDTH JOINER — `👨‍👩‍👧` becomes three separate people.
+/// - `U+FE0F` VARIATION SELECTOR-16 (emoji presentation) and `U+FE0E` (text
+///   presentation). VS16 is mandatory in RGI keycap and several RGI ZWJ
+///   sequences: stripping it turned `❤️‍🔥` into `❤`, `1️⃣` into a bare `1`, and
+///   `⚠️` into `⚠`. The first cut of this list included them, which broke the
+///   very sequences the ZWJ exception exists to protect.
+///
+/// That is three spoofable characters, knowingly, against a rule that would
+/// otherwise corrupt ordinary titles.
 fn is_default_ignorable(c: char) -> bool {
-    if c == '\u{200d}' {
-        return false; // ZWJ — see above.
+    if matches!(c, '\u{200d}' | '\u{fe0e}' | '\u{fe0f}') {
+        return false; // composing selectors — see above.
     }
     matches!(c,
         '\u{00ad}'                        // SOFT HYPHEN
@@ -590,7 +606,7 @@ fn is_default_ignorable(c: char) -> bool {
         | '\u{202a}'..='\u{202e}'         // bidi embedding / override
         | '\u{2060}'..='\u{206f}'         // word joiner, invisible operators, deprecated format
         | '\u{3164}'                      // HANGUL FILLER
-        | '\u{fe00}'..='\u{fe0f}'         // VARIATION SELECTOR 1..16
+        | '\u{fe00}'..='\u{fe0f}'         // VARIATION SELECTOR 1..16 (VS15/16 exempt above)
         | '\u{feff}'                      // ZERO WIDTH NO-BREAK SPACE / BOM
         | '\u{ffa0}'                      // HALFWIDTH HANGUL FILLER
         | '\u{fff0}'..='\u{fff8}'         // unassigned, reserved as ignorable
@@ -904,8 +920,6 @@ mod tests {
             '\u{2064}',
             '\u{3164}',
             '\u{fe00}',
-            '\u{fe0e}',
-            '\u{fe0f}',
             '\u{feff}',
             '\u{ffa0}',
             '\u{e0041}',
@@ -924,6 +938,39 @@ mod tests {
         }
         // The joiner is load-bearing inside emoji and is the one exception.
         assert!(sanitize_title("a\u{200d}b").contains('\u{200d}'));
+    }
+
+    /// Sequences a person legitimately types must survive intact. The first
+    /// cut of the ignorable-codepoint rule stripped the variation selectors,
+    /// which are mandatory in the very emoji the ZWJ exception protects.
+    #[test]
+    fn test_sanitize_title_keeps_composing_selectors() {
+        for (input, why) in [
+            ("\u{2764}\u{fe0f}\u{200d}\u{1f525}", "heart on fire"),
+            ("\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}", "rainbow flag"),
+            ("1\u{fe0f}\u{20e3}", "keycap one"),
+            ("\u{26a0}\u{fe0f}", "warning sign"),
+            ("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", "family"),
+        ] {
+            assert_eq!(sanitize_title(input), input, "{why} was altered");
+        }
+    }
+
+    /// A name that sanitizes to nothing is not a title — the cwd is.
+    #[test]
+    fn a_command_whose_name_sanitizes_to_nothing_falls_through_to_the_cwd() {
+        for invisible in ["\u{00ad}", "\u{2060}", "\u{3164}"] {
+            let pane = Pane::with_command(
+                WindowId::new(),
+                "/home/test/proj",
+                vec![invisible.to_string()],
+            );
+            assert_eq!(
+                pane.effective_title(),
+                "proj",
+                "{invisible:?} left a blank title"
+            );
+        }
     }
 
     #[test]

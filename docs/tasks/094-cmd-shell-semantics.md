@@ -142,6 +142,19 @@ introduced.
 | 30 | title sanitizer (round two's own fix) | an allowlist of three code points where the property is what matters: fifteen more invisible characters survived, and a program in a pane can set its own title via OSC 0 without any operator help. Now the `Default_Ignorable_Code_Point` set, minus ZWJ |
 | 31 | `state apply --dry-run` | still said yes to window titles the apply rejects — round two shared only the argv rule. The pure title rule is shared now; conflicts with live state cannot be decided without the daemon, and the flag's help says so |
 
+### Round four — what round three's fixes broke or missed
+
+| # | Surface | Before |
+|---|---|---|
+| 32 | removing the aggregate argv cap (round three's own fix) | **`state.apply` could wedge a session.** It is the one spawn path that keeps a failed pane, so a multi-megabyte argv stayed in the graph and was echoed in full by `pane.list` — a few of them pushed the response past the 16 MB frame limit and every read died with `early eof`, recoverable only by killing the session. The cap is back, framed as what it actually is: a bound on what shux stores and echoes, not a prediction about `execve` |
+| 33 | the `state.apply` focus rescue (round three's own fix) | asked "is this pane absent from THIS batch's failures?", so a corpse left by an *earlier* apply counted as a healthy sibling — focus landed on it, reproducing the exact symptom the rescue was written to prevent. It now asks whether the pane has a live PTY |
+| 34 | the same rescue | chose by `HashMap` iteration order, so the same template focused a different pane run to run. Layout order now |
+| 35 | the ignorable-codepoint set (round three's own fix) | included the variation selectors, which are **mandatory** in the very sequences the ZWJ exception exists to protect: `❤️‍🔥` came back as `❤`, `1️⃣` as a bare `1`, `⚠️` as `⚠`. VS15 and VS16 join ZWJ as exceptions |
+| 36 | title fallback (round three's own fix) | a command whose name sanitizes to nothing produced an **empty** title — blank border, blank status bar. Round three widened both what counts as a program name and what the sanitizer removes; the cwd fallback is reached again |
+| 37 | `state.apply` spawn failures | the new cause-specific diagnosis reached the five rollback RPCs and not `state.apply` — the one path where an oversized argv can actually land |
+| 38 | the spawn-failure hint | a **directory** as `argv[0]` reports `EACCES`, so it got "not executable by this user", which no `chmod` can fix |
+| 39 | title extraction | `:` is the shell's null command and a common idiom (`: placeholder`), not a program |
+
 **Known residuals, measured and documented rather than papered over.**
 
 - Between the split and the spawn failure the new pane *is* the window's active
@@ -159,7 +172,16 @@ introduced.
 - `state.apply` still does not roll back a partial batch (codex P0 #1: killing
   already-spawned siblings has its own side effects, so partial outcomes are
   reported rather than undone). What changed is that the report is no longer a
-  green tick and exit 0 — in either output format.
+  green tick and exit 0 — in either output format — and that focus lands on a
+  pane with a live PTY.
+- A split that clears zoom emits no `pane.zoomed{zoomed:false}`, so the
+  rollback's restore reads as a second `true` with no transition between. The
+  state is correct; the event stream omits a transition it has always omitted.
+  Filed as its own issue rather than changing what every successful split
+  publishes.
+- Three invisible characters are deliberately kept — ZWJ, VS15, VS16 — because
+  removing them corrupts ordinary emoji titles. Two titles differing only in
+  those are still indistinguishable.
 
 ## Testing Matrix
 

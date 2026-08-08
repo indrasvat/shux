@@ -51,21 +51,24 @@ const FALLBACK_SHELL: &str = "/bin/sh";
 /// exists to prevent. Bisected against the real binary, not reasoned about.
 const MAX_ARG_BYTES: usize = 128 * 1024 - 1;
 
-// There is deliberately NO aggregate argv cap here.
-//
-// The obvious one — a fixed ceiling on the sum — was tried and is wrong in both
-// directions, measured against the real kernel. Too loose: `ARG_MAX` is shared
-// between argv AND the environment, so a daemon with a 1.2 MB environment still
-// got `E2BIG` from a 1 MB argv that passed the check. Too strict: with an
-// ordinary environment the same box exec'd 1.5 MB of argv happily, and the cap
-// refused it — a false rejection of a command that works, and `--dry-run`
-// inherited it.
-//
-// No number available in this process is the kernel's number. What the check
-// was actually for is that an oversized argv used to fail with a diagnosis
-// blaming `argv[0]` and the cwd; that is fixed where it belongs, in the
-// spawn-failure message (`spawn_failure_hint` in `main.rs`). The per-argument
-// cap stays because `MAX_ARG_STRLEN` really is a fixed constant we can know.
+/// Ceiling on the whole argv — **shux's own limit, not a guess at the kernel's.**
+///
+/// The distinction matters, because a cap that claims to predict `execve` is
+/// wrong in both directions and was removed for exactly that reason: `ARG_MAX`
+/// is shared with the environment, so a 1.2 MB environment still produced
+/// `E2BIG` under a 1 MB argv that passed; and an ordinary environment exec'd
+/// 1.5 MB that the same cap refused. Whether `execve` will accept an argv is
+/// the kernel's call, and it is diagnosed at spawn (`spawn_failure` in
+/// `main.rs` names `ARG_MAX` when that is what happened).
+///
+/// This bounds something shux genuinely owns: an argv is **persisted on the
+/// pane, cloned into every graph snapshot, and echoed in full by `pane.list`
+/// and in `PaneCreated`**. `state.apply` keeps a pane whose spawn failed, so a
+/// few multi-megabyte argvs pushed `pane.list` past the 16 MB frame limit and
+/// every read of that session died with `early eof` — recoverable only by
+/// killing it. 256 KiB is two orders of magnitude past any real command line
+/// and two below the frame limit.
+const MAX_ARGV_BYTES: usize = 256 * 1024;
 
 /// The shell that interprets a string-form `command`.
 ///
@@ -123,6 +126,7 @@ pub(crate) fn parse_pane_command_with_shell(
                 reject_unexecutable(s, &format!("'command[{i}]'"))?;
                 argv.push(s.to_string());
             }
+            reject_oversize_argv(&argv, "'command'")?;
             // `[""]` and `["   "]` both exec a program name that cannot resolve:
             // the pane dies instantly with an error naming neither the pane nor
             // the cause. Blank is checked with `trim`, matching how the string
@@ -155,6 +159,7 @@ pub(crate) fn validate_argv(argv: &[String], what: &str) -> Result<(), RpcError>
     for (i, arg) in argv.iter().enumerate() {
         reject_unexecutable(arg, &format!("{what}[{i}]"))?;
     }
+    reject_oversize_argv(argv, what)?;
     if argv.first().is_some_and(|p| p.trim().is_empty()) {
         return Err(RpcError::invalid_params(&format!(
             "{what}[0] is blank — argv[0] must name a program to execute"
@@ -217,6 +222,21 @@ fn reject_unexecutable(s: &str, what: &str) -> Result<(), RpcError> {
         return Err(RpcError::invalid_params(&format!(
             "{what} is {} bytes; a single argument cannot exceed {MAX_ARG_BYTES}",
             s.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an argv larger than shux will carry. See [`MAX_ARGV_BYTES`] — this is
+/// a bound on what the graph stores and echoes, not a prediction about `execve`.
+fn reject_oversize_argv(argv: &[String], what: &str) -> Result<(), RpcError> {
+    // +1 per element for the NUL that travels with each argument.
+    let total: usize = argv.iter().map(|a| a.len() + 1).sum();
+    if total > MAX_ARGV_BYTES {
+        return Err(RpcError::invalid_params(&format!(
+            "{what} is {total} bytes across {} arguments; shux stores and reports \
+             a pane's command in full, so the whole argv cannot exceed {MAX_ARGV_BYTES}",
+            argv.len()
         )));
     }
     Ok(())
@@ -374,18 +394,30 @@ mod tests {
         assert!(parse(json!(["echo", "x".repeat(MAX_ARG_BYTES + 1)])).is_err());
     }
 
-    /// A large argv is NOT rejected here. No number available in this process
-    /// is the kernel's `ARG_MAX` — it is shared with the environment — so a
-    /// fixed ceiling refuses commands that really work. An argv too big for the
-    /// kernel fails at spawn, with a message that says so.
+    /// The aggregate bound is about what shux stores and echoes, so the message
+    /// says that rather than claiming to know what `execve` would have done.
     #[test]
-    fn a_large_argv_is_left_for_the_kernel_to_judge() {
+    fn an_argv_larger_than_shux_will_carry_is_rejected() {
         let argv: Vec<_> = std::iter::once("echo".to_string())
             .chain(std::iter::repeat_n("x".repeat(100_000), 40))
             .collect();
+        let err = parse(serde_json::Value::Array(
+            argv.into_iter().map(serde_json::Value::String).collect(),
+        ))
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("stores and reports"), "{msg}");
+
+        // An ordinary command line — even a generous one — is nowhere near it.
+        let ok: Vec<_> = std::iter::once("grep".to_string())
+            .chain(std::iter::repeat_n(
+                "some/path/to/a/file.rs".to_string(),
+                2000,
+            ))
+            .collect();
         assert!(
             parse(serde_json::Value::Array(
-                argv.into_iter().map(serde_json::Value::String).collect()
+                ok.into_iter().map(serde_json::Value::String).collect()
             ))
             .is_ok()
         );
