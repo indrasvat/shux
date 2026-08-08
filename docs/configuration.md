@@ -33,8 +33,11 @@ prefix = "ctrl-space"      # any "<mod>-<key>" combo crossterm understands
 
 [shell]
 # By default: $SHELL -l -i. Override with explicit argv (rare).
+# Applies to panes opened with no command of their own; `shux new -- vim a.rs`
+# still runs vim. The program here is also what interprets a `--cmd` string.
 command = []
-# Extra env vars injected into every spawned pane.
+# Extra env vars injected into every spawned pane. A pane that names the same
+# variable explicitly (lens.run) wins.
 env = {}
 
 # Status-bar customization — see below

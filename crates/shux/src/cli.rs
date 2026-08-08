@@ -2122,12 +2122,24 @@ fn rpc_display_raw(code: i64, message: &str, data: Option<&serde_json::Value>) -
                 format!("{resource} name_conflict")
             }
         }
-        // invalid_params / internal — use `detail` when present
+        // invalid_params / internal / spawn_failed — use `detail` when present,
+        // and `hint` alongside it.
+        //
+        // The hint used to be dropped here. `RpcError::spawn_failed` has always
+        // attached "check argv[0] resolves via PATH and cwd exists", and no
+        // user has ever seen it: a failed `session create` printed the bare OS
+        // error ("No such file or directory (os error 2)") and nothing about
+        // what to look at. A diagnostic that is built, serialized, and then
+        // discarded one layer from the terminal is worse than none — it reads
+        // as covered. Found dogfooding a typo'd `[shell].command` (issue #132).
         _ => {
-            if let Some(detail) = data.and_then(|d| d.get("detail")).and_then(|v| v.as_str()) {
-                return detail.to_string();
+            let detail = data.and_then(|d| d.get("detail")).and_then(|v| v.as_str());
+            let hint = data.and_then(|d| d.get("hint")).and_then(|v| v.as_str());
+            match (detail, hint) {
+                (Some(d), Some(h)) => format!("{d} — {h}"),
+                (Some(d), None) => d.to_string(),
+                (None, _) => format!("RPC error {code}: {message}"),
             }
-            format!("RPC error {code}: {message}")
         }
     }
 }
@@ -2380,6 +2392,17 @@ nerd_fonts = true
 [keys]
 # Prefix key (e.g. "ctrl-space", "ctrl-b", "alt-w")
 prefix = "ctrl-space"
+
+[shell]
+# Override the argv a pane runs when no command was given. Empty (the
+# default) means `$SHELL -l -i`. `shux new -- vim a.rs` still runs vim;
+# this only decides what "just a shell" means. The program named here is
+# also what interprets a `--cmd` string.
+#   command = ["/bin/zsh", "-l", "-i"]
+#
+# Extra env for every spawned pane. A pane that sets the same variable
+# explicitly keeps its own value.
+#   env = { LC_ALL = "en_US.UTF-8" }
 
 [keybindings]
 # Optional attach key overrides. Keys use the same notation as prefix:
@@ -8382,6 +8405,31 @@ mod tests {
             "-32003 is auth_required, not name_conflict: {rendered}"
         );
         assert!(rendered.contains("auth_required"), "{rendered}");
+    }
+
+    /// `data.hint` is the actionable half of a spawn failure and was dropped
+    /// on the floor here: `RpcError::spawn_failed` has always attached one, and
+    /// `session create` has always printed the bare OS error without it.
+    #[test]
+    fn a_hint_is_printed_alongside_the_detail() {
+        let data = serde_json::json!({
+            "detail": "failed to spawn child process: No such file or directory (os error 2)",
+            "hint": "check argv[0] resolves via PATH and cwd exists",
+        });
+        let rendered = rpc_display(-32014, "spawn_failed", Some(&data));
+        assert!(rendered.contains("No such file or directory"), "{rendered}");
+        assert!(rendered.contains("check argv[0]"), "{rendered}");
+    }
+
+    /// A `detail` with no `hint` must render exactly as before — the vast
+    /// majority of invalid_params errors carry only the detail.
+    #[test]
+    fn a_detail_without_a_hint_renders_unchanged() {
+        let data = serde_json::json!({ "detail": "hold_ms 5 out of range" });
+        assert_eq!(
+            rpc_display(-32602, "invalid_params", Some(&data)),
+            "hold_ms 5 out of range"
+        );
     }
 
     /// Every RPC error the CLI prints funnels through `rpc_display`, and most

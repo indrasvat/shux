@@ -1153,3 +1153,37 @@ orders are provably identical (every character the guard rewrites already fails
 the quoting allowlist; 200,000 random argvs, zero differences). Counting it as a
 survivor would have meant writing a test that cannot fail. Check whether a
 mutant is equivalent before treating a survivor as a coverage gap.
+
+- **2026-08-08 (fix/#132):**
+
+**A diagnostic dropped at the last hop reads as covered.** `RpcError::spawn_failed`
+has always attached `data.hint`, and `rpc_display`'s default arm returned
+`data.detail` alone — so every spawn failure shux has ever printed built a hint,
+serialized it, shipped it to the client, and threw it away one layer from the
+terminal. Nothing was red, and the code looked like it handled the case. When
+adding a hint, follow it all the way to stdout; the producer existing is not
+evidence anyone sees it.
+
+**A config that does not parse is indistinguishable from no config, and that
+makes a defaults test pass for the wrong reason.** `ConfigHandle::load_or_default`
+falls back to `Config::default()` with a `tracing::warn` on a parse error. A test
+fixture with a typo therefore reproduces exactly the pre-fix behaviour: the tests
+asserting the override fail with a confusing message, and the test asserting the
+default PASSES vacuously. Any harness that writes a config file should assert the
+file through `shux config validate` before starting the daemon. Hit for real here:
+the colour probe's `\033` is not a legal TOML escape, so the fixtures need
+multi-line literal (`'''`) strings.
+
+**Wiring one config field is a plumbing question, not a logic question.** Nothing
+read `[shell]` because every pane spawn funnels through one function whose ~10
+call sites carry no `ConfigHandle` — only one of five method registrars is handed
+one. The choice is an eleventh argument threaded through all of them, or
+publishing the daemon's handle once into a `OnceLock`. The latter keeps hot-reload
+(the handle is an `ArcSwap`) and leaves every non-daemon process on defaults, but
+it is process-global state: keep the *decision* in a pure function that takes the
+config, so the branch table is testable without a global no test can reset.
+
+**`env_clear` callers must not inherit user config.** The scratch gate runner sets
+`env_clear` precisely to get an environment containing only its own deterministic
+plan. Injecting `[shell].env` into it would be "consistent" and would defeat the
+flag's entire purpose.
