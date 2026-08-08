@@ -396,16 +396,29 @@ fn short_pane_id_from_pane_list_is_accepted_by_every_pane_command() {
             .spawn()
             .expect("spawn pane watch");
 
-        // Give the watcher a moment to subscribe — the data plane keeps no
-        // history, so anything emitted before it attaches is simply gone.
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        h.rpc_ok(
-            "pane.send_keys",
-            serde_json::json!({ "pane_id": f.pane_b, "text": "printf 'WATCHED\n'
+        // The data plane keeps no history, so anything the pane emits before
+        // the watcher attaches is simply gone — and there is no readiness
+        // signal to wait on from out here.
+        //
+        // A fixed sleep is therefore a race, not a synchronisation: it holds
+        // only while subscribing is faster than the number picked. This used to
+        // be one 600 ms sleep and one send, which lost that race on a loaded
+        // macOS runner and asserted that `pane watch` was broken. Re-send
+        // instead, until the output comes back or the deadline expires. The
+        // assertion is unchanged — `pane watch` still has to deliver the pane's
+        // output — but it no longer doubles as a bet on scheduler latency.
+        let send = || {
+            h.rpc_ok(
+                "pane.send_keys",
+                serde_json::json!({ "pane_id": f.pane_b, "text": "printf 'WATCHED\n'
 " }),
-        );
+            );
+        };
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        send();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut next_send = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut seen = String::new();
         while std::time::Instant::now() < deadline {
             seen = std::fs::read_to_string(&log).unwrap_or_default();
@@ -415,6 +428,10 @@ fn short_pane_id_from_pane_list_is_accepted_by_every_pane_command() {
             // A watcher that died is a failure, not something to wait out.
             if let Some(st) = child.try_wait().expect("try_wait") {
                 panic!("`pane watch` exited early ({st}) — output so far: {seen:?}");
+            }
+            if std::time::Instant::now() >= next_send {
+                send();
+                next_send = std::time::Instant::now() + std::time::Duration::from_secs(2);
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
