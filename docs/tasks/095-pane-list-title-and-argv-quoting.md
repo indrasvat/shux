@@ -212,7 +212,7 @@ boundaries.
 | Unit — `style.rs` | plain arm's four columns, order and content; one argument with a space vs several; an empty argument; the text arm's title and command; a fitted cell is exactly its allocated width (VS16, ZWJ, RI, CJK, combining marks, at every width 0–39); the box never exceeds the terminal at **every** width from the derived minimum to 200 × unicode/ASCII × focused/zoomed; frame never ragged; truncation never splits a wide character; never ends on a zero-width character; a control character cannot forge a plain column; a zoomed unfocused pane is marked; `session list` / `window list` byte-identical; all three `col_widths` callers agree |
 | Unit — `pane_command.rs` | every control character rejected by index and code point; every printable shape accepted including `""` |
 | E2E — `tests/pane_list_columns.rs` | real daemon, real PTYs: the human formats name every pane; one space-bearing argument is not printed as several **and the printed line re-splits into the argv it came from through a real shell**; a shell-wrapped `--cmd` pane; text/plain/json agree on id, title, cwd and program; the listed pane still renders all three colour classes (asserted on the **pen** via `glance --cells`); `args` rejects a null by index; a metacharacter argument arrives whole **and the call completes** (not `timed_out`); an empty argument survives; a control byte is refused and the pane still works afterwards |
-| Mutation — `.shux/scripts/issue_135_mutation_check.sh` | 21 mutations, each the pre-fix behaviour or a plausible wrong fix, each killed by a **named** test. A mutation whose edit matched nothing is a failure, not a kill |
+| Mutation — `.shux/scripts/issue_135_mutation_check.sh` | 21 mutations, each the pre-fix behaviour or a plausible wrong fix, each killed by a **named** test. A mutation whose edit matched nothing is a failure, not a kill. The battery first proves all three suites green unmutated and refuses to score against a red baseline, and each mutation's anchor must itself appear in the failure set — review of PR #143 caught the first of those missing and the second unenforced despite being claimed |
 | Shell — `.shux/scripts/issue_135_evidence.sh` | six scenes, both binaries, through the shipped binary, under an isolated runtime with a cleanup trap. The list is run **inside a real pane** because `--format text` downgrades to plain the moment stdout is a pipe — a screenshot taken through a pipe would be of the wrong code path. `EXPECT_DEFECT=1` inverts the verdict so the baseline arm fails if the defect has already gone away |
 | Dogfood | vim, top and less in real panes, listed at 110 columns through a real TTY: titles read `vim`/`top`/`less`, the `--cmd` pane's script is one quoted argument, all three TUIs still rendering |
 
@@ -234,7 +234,11 @@ boundaries.
 
 - [x] RED test observed failing for every defect above before the fix, including
       both regressions this task introduced.
-- [x] 21/21 mutations killed by named tests.
+- [x] 21/21 mutations killed by named tests, with the battery's own guards shown
+      failing first: a wrong anchor is reported `ANCHOR MISSED` and exits 1, and a
+      deliberately reddened baseline exits 2 rather than scoring anything. The
+      first of those doubles as a reproduction of the reviewed defect — a real but
+      unrelated failure that the previous parser credited as the kill.
 - [x] `make check` green (2,075 tests).
 - [x] Before/after evidence on both binaries, every scene asserted, baseline arm
       verdict-inverted.
