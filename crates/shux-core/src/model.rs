@@ -1005,8 +1005,7 @@ mod tests {
         let root = Pane::new(WindowId::new(), "/");
         assert_eq!(root.effective_title(), "/", "a root cwd left no title");
 
-        let root_cmd =
-            Pane::with_command(WindowId::new(), "/", vec!["\u{00ad}".to_string()]);
+        let root_cmd = Pane::with_command(WindowId::new(), "/", vec!["\u{00ad}".to_string()]);
         assert_eq!(
             root_cmd.effective_title(),
             "/",
@@ -1015,11 +1014,8 @@ mod tests {
 
         // Nothing printable anywhere: not the command, not the directory's
         // name, not the whole path.
-        let nameless = Pane::with_command(
-            WindowId::new(),
-            "\u{00ad}",
-            vec!["\u{00ad}".to_string()],
-        );
+        let nameless =
+            Pane::with_command(WindowId::new(), "\u{00ad}", vec!["\u{00ad}".to_string()]);
         assert_eq!(
             nameless.effective_title(),
             "pane",
