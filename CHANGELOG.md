@@ -1,3 +1,10 @@
+## [0.46.14](https://github.com/indrasvat/shux/compare/v0.46.13...v0.46.14) (2026-08-08)
+
+
+### Bug Fixes
+
+* **config:** read `[shell]` instead of parsing and discarding it ([#132](https://github.com/indrasvat/shux/issues/132)) ([#145](https://github.com/indrasvat/shux/issues/145)) ([99f7853](https://github.com/indrasvat/shux/commit/99f78539ba33ecc8210636b662ed5cd83b3e9851))
+
 ## [0.46.13](https://github.com/indrasvat/shux/compare/v0.46.12...v0.46.13) (2026-08-08)
 
 
