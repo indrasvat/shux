@@ -184,7 +184,22 @@ introduced.
   publishes.
 - Three invisible characters are deliberately kept — ZWJ, VS15, VS16 — because
   removing them corrupts ordinary emoji titles. Two titles differing only in
-  those are still indistinguishable.
+  those still resolve to different windows. Measured rather than assumed: four
+  byte-distinct titles all reading `prod deploy` produced four window ids, and
+  in shux's own rasterizer ZWJ is the *least* effective of the three — it draws
+  a visible extra gap (428 of 2196 differing pixels against the plain title),
+  while VS16 shifts one border cell (12 of 2196) and VS15 nothing. So this task
+  added two characters that hide better than the one already accepted. Kept
+  anyway: `❤️‍🔥` and `1️⃣` are worth more than a spoofing margin that a
+  35-character title already affords by other means.
+- `pane.list` echoes every pane's argv in full, so a session with enough panes
+  can outgrow the 16 MB RPC frame limit and answer `early eof`. The 256 KiB
+  per-argv bound added here raised the threshold from roughly 6 panes to 66
+  (bisected twice) but cannot remove it — any fixed per-argv cap times an
+  unbounded pane count exceeds any fixed frame limit. Closing it means
+  paginating or eliding `pane.list`, which trades against the truthfulness
+  property this task's tests assert. Filed as #140 with the reproduction rather
+  than decided here.
 
 ## Testing Matrix
 
