@@ -721,13 +721,28 @@ fn ensure_does_not_alias_long_names() {
 
 /// `cwd` and `command` are caller-supplied and legitimately arbitrary, so
 /// they are never sanitized on the way in. `pane list` prints both.
+///
+/// The hostile bytes ride in a real, spawnable pane: a directory that genuinely
+/// exists with an OSC payload in its name, and an argv element the shell will
+/// accept. Since issue #125 a pane whose program or cwd does not resolve is a
+/// spawn error rather than a phantom, so a session built from unspawnable parts
+/// would never reach the egress path this test is about.
 #[test]
 fn pane_list_never_prints_a_raw_cwd_or_command() {
     let env = Env::new();
     // JSON's own \u escapes decode to real control bytes before shux sees
     // them — the same trap TOML sets. A raw byte in the request is refused.
-    let params = r#"{"name":"pl","cwd":"/tmp/\u001b]0;PWNED-CWD\u0007","command":["sh\u001b]0;PWNED-CMD\u0007","-c","sleep 30"]}"#;
-    let out = env.run(&["rpc", "call", "session.create", "--params", params]);
+    let hostile_dir = env.work().join("pwned\u{1b}]0;PWNED-CWD\u{7}dir");
+    std::fs::create_dir_all(&hostile_dir).expect("hostile cwd");
+    let params = serde_json::json!({
+        "name": "pl",
+        "cwd": hostile_dir.to_str().unwrap(),
+        // argv[3] becomes `$0` for the script: carried verbatim into
+        // `Pane.command`, printed by `pane list`, and inert to the shell.
+        "command": ["sh", "-c", "sleep 30", "\u{1b}]0;PWNED-CMD\u{7}"],
+    })
+    .to_string();
+    let out = env.run(&["rpc", "call", "session.create", "--params", &params]);
     assert!(out.status.success(), "{}", combined(&out));
 
     for args in [

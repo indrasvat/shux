@@ -334,12 +334,18 @@ impl RpcError {
     /// caller's scratch allocation is guaranteed rolled back (no session,
     /// pane, or PTY survives).
     pub fn spawn_failed(detail: &str) -> Self {
+        Self::spawn_failed_with_hint(detail, "check argv[0] resolves via PATH and cwd exists")
+    }
+
+    /// [`Self::spawn_failed`] with the hint chosen by the caller.
+    ///
+    /// The default hint names the overwhelmingly common cause, and is actively
+    /// misleading for the others: an argv too large for `ARG_MAX` fails with
+    /// `E2BIG` while `argv[0]` resolves fine and the cwd exists.
+    pub fn spawn_failed_with_hint(detail: &str, hint: &str) -> Self {
         Self::with_data(
             ErrorCode::SpawnFailed,
-            serde_json::json!({
-                "detail": detail,
-                "hint": "check argv[0] resolves via PATH and cwd exists",
-            }),
+            serde_json::json!({ "detail": detail, "hint": hint }),
         )
     }
 }

@@ -56,6 +56,31 @@ mod tests {
     }
 
     #[test]
+    fn default_shell_argv_treats_a_blank_shell_as_unset() {
+        assert_eq!(
+            default_shell_argv(Some("/usr/bin/zsh")),
+            vec!["/usr/bin/zsh", "-l", "-i"]
+        );
+        // The three ways `$SHELL` fails to name a shell all land on /bin/sh.
+        for blank in [None, Some(""), Some("   "), Some("\t")] {
+            assert_eq!(
+                default_shell_argv(blank),
+                vec!["/bin/sh", "-l", "-i"],
+                "{blank:?} should fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_command_is_never_replaced_by_the_shell() {
+        let cfg = PtyConfig::with_command(
+            vec!["nvim".to_string(), "a.rs".to_string()],
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(cfg.resolve_command(), vec!["nvim", "a.rs"]);
+    }
+
+    #[test]
     fn resolve_pane_term_prefers_tmux_when_available() {
         let root =
             std::env::temp_dir().join(format!("shux-pty-term-prefers-tmux-{}", std::process::id()));
@@ -173,18 +198,32 @@ impl PtyConfig {
 
     fn resolve_command(&self) -> Vec<String> {
         if self.command.is_empty() {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            // Spawn as both login AND interactive. `-l` alone gets bash to
-            // read `~/.bash_profile` but leaves `$-` without `i`, so any
-            // interactive-only branch (the standard `[[ $- == *i* ]] &&
-            // source ~/.bashrc` bridge, starship init, prompt frameworks)
-            // gets skipped. `-l -i` runs both login and interactive
-            // initialization paths — same flags iTerm2 uses by default.
-            vec![shell, "-l".to_string(), "-i".to_string()]
+            default_shell_argv(std::env::var("SHELL").ok().as_deref())
         } else {
             self.command.clone()
         }
     }
+}
+
+/// The argv for a pane with no explicit command.
+///
+/// Spawned as both login AND interactive. `-l` alone gets bash to read
+/// `~/.bash_profile` but leaves `$-` without `i`, so any interactive-only
+/// branch (the standard `[[ $- == *i* ]] && source ~/.bashrc` bridge, starship
+/// init, prompt frameworks) gets skipped. `-l -i` runs both login and
+/// interactive initialization paths — the same flags iTerm2 uses by default.
+///
+/// A **blank** `$SHELL` is treated as unset. `env::var` returns `Ok("")` for a
+/// set-but-empty variable, so an `unwrap_or_else` fallback never fires and the
+/// pane execs the empty program name: it dies instantly with an error naming
+/// neither the pane nor the cause. This is the same rule the `command` RPC
+/// parameter resolves its shell by, so the two cannot disagree about which
+/// shell a pane gets (issue #125 follow-up).
+fn default_shell_argv(shell_env: Option<&str>) -> Vec<String> {
+    let shell = shell_env
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("/bin/sh");
+    vec![shell.to_string(), "-l".to_string(), "-i".to_string()]
 }
 
 /// A handle to a running PTY child process.

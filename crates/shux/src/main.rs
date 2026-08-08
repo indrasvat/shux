@@ -17,6 +17,7 @@ mod features;
 mod gate;
 mod lens_scratch;
 mod onboarding;
+mod pane_command;
 mod session_meta;
 mod session_persist;
 mod statusbar_build;
@@ -1548,6 +1549,55 @@ fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Turn a PTY spawn failure into an error whose hint matches the actual cause.
+///
+/// `spawn_failed`'s default hint — check `argv[0]` and the cwd — is right for
+/// "No such file or directory" and wrong for everything else. `E2BIG` in
+/// particular fires when `argv[0]` resolves perfectly and the cwd exists; the
+/// command and the environment together are simply larger than `ARG_MAX`, and
+/// no ceiling this process could impose would know that number (issue #125
+/// follow-up).
+pub(crate) fn spawn_failure(e: &shux_pty::PtyError) -> shux_rpc::RpcError {
+    shux_rpc::RpcError::spawn_failed_with_hint(&e.to_string(), spawn_failure_hint(e))
+}
+
+/// The same diagnosis as one flat string, for `state.apply`'s per-pane results —
+/// `SpawnResult` has room for a message and not for a structured hint.
+pub(crate) fn spawn_failure_message(e: &shux_pty::PtyError) -> String {
+    format!("{e} — {}", spawn_failure_hint(e))
+}
+
+fn spawn_failure_hint(e: &shux_pty::PtyError) -> &'static str {
+    let detail = e.to_string();
+    if detail.contains("Argument list too long") {
+        "the command's arguments and environment together exceed the kernel's \
+         ARG_MAX; shorten the command or the environment"
+    } else if detail.contains("Is a directory") || detail.contains("Permission denied") {
+        // A directory as argv[0] reports EACCES on Linux, and no amount of
+        // chmod fixes that — so the two share a hint that covers both.
+        "argv[0] is not an executable file this user can run (a directory, or \
+         a file without the execute bit)"
+    } else {
+        "check argv[0] resolves via PATH and cwd exists"
+    }
+}
+
+/// The human-readable half of an `RpcError`, for CLI-side reporting.
+///
+/// `RpcError`'s `Display` is the JSON-RPC code name (`invalid_params`); the
+/// sentence a person needs is in `data.detail`.
+fn rpc_error_detail(e: &shux_rpc::RpcError) -> String {
+    serde_json::to_value(e)
+        .ok()
+        .and_then(|v| {
+            v.get("data")
+                .and_then(|d| d.get("detail"))
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| e.to_string())
+}
+
 /// True when `pid` is alive AND is actually a shux daemon.
 ///
 /// The pidfile is untrusted input: it survives SIGKILL and reboots, and pids get reused, so
@@ -2238,6 +2288,16 @@ fn register_state_methods(
                         shux_rpc::RpcError::invalid_params(&format!("ops parse error: {e}"))
                     })?;
 
+                // serde proves each command is a `Vec<String>`; it does not
+                // prove the strings can reach `execve`. `[""]` and a NUL-bearing
+                // argument used to commit the whole batch and then leave a pane
+                // that never spawned — reported as one line of `spawn_results`
+                // among many, with the session, window and dead pane kept
+                // (issue #125 follow-up). Rejected up front, before anything is
+                // committed. Same function the CLI's `--dry-run` calls, so the
+                // two cannot give different answers.
+                pane_command::validate_ops(&ops)?;
+
                 // Run the staged transaction through the single-writer task.
                 let mut result = gh.apply_batch(ops).await.map_err(batch_error_to_rpc)?;
 
@@ -2277,11 +2337,78 @@ fn register_state_methods(
                                 op_index: output.op_index,
                                 pane_id,
                                 spawned: false,
-                                error: Some(e.to_string()),
+                                // Same diagnosis the five rollback RPCs give.
+                                // `SpawnResult` carries one string, so the hint
+                                // rides along in it rather than being dropped —
+                                // this is the one path where an oversized argv
+                                // can actually land.
+                                error: Some(spawn_failure_message(&e)),
                             }),
                         }
                     }
                 }
+                // `state.apply` deliberately keeps a pane whose PTY never
+                // started (codex P0 #1: no rollback), and the batch focuses the
+                // last pane it created regardless. So a batch with one bad op
+                // left the window focused on a corpse, and every `-p`-less verb
+                // in that window answered "pane VT not found". Hand focus to a
+                // pane that actually started (issue #125 follow-up).
+                let dead: std::collections::HashSet<_> = spawn_results
+                    .iter()
+                    .filter(|r| !r.spawned)
+                    .map(|r| r.pane_id)
+                    .collect();
+                if !dead.is_empty() {
+                    // "Usable" means it has a VT, not "absent from THIS batch's
+                    // failures" and not "has a live PTY".
+                    //
+                    // A corpse left by an earlier apply never spawned, so it has
+                    // no VT — the first cut of this rescue focused one anyway,
+                    // reproducing the exact symptom it was written to prevent.
+                    //
+                    // But a pane that *exited* is not a corpse. Its writer is
+                    // gone by design while its grid and scrollback stay (see
+                    // `reap_pane`), which is what lets `pane capture` answer for
+                    // a short-lived command long after it finished. Keying on
+                    // `writers` therefore skipped the most ordinary sibling of
+                    // all — the build step that already succeeded — and left
+                    // focus on the pane that never started.
+                    let usable: std::collections::HashSet<_> = {
+                        let state = io.lock().await;
+                        state.vts.keys().copied().collect()
+                    };
+                    let snap = gh.snapshot();
+                    let mut rescue = Vec::new();
+                    for pane_id in &dead {
+                        let Some(window_id) = snap.panes.get(pane_id).map(|p| p.window_id) else {
+                            continue;
+                        };
+                        let Some(window) = snap.windows.get(&window_id) else {
+                            continue;
+                        };
+                        if window.active_pane != *pane_id {
+                            continue;
+                        }
+                        // Layout order, not `HashMap` order: iterating the pane
+                        // map gave a different answer run to run, so a script
+                        // that applied a template and then used the focused pane
+                        // targeted a different one each time.
+                        if let Some(answering) = window
+                            .layout
+                            .tree
+                            .pane_ids()
+                            .into_iter()
+                            .find(|id| usable.contains(id))
+                        {
+                            rescue.push(answering);
+                        }
+                    }
+                    drop(snap);
+                    for pane in rescue {
+                        let _ = gh.focus_pane(pane).await;
+                    }
+                }
+
                 result.spawn_results = spawn_results;
 
                 serde_json::to_value(&result).map_err(|e| {
@@ -2863,20 +2990,10 @@ fn register_pane_methods(
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.5) as f32;
 
-                let new_pane_id = gh
-                    .split_pane(pane_id, direction, ratio)
-                    .await
-                    .map_err(graph_error_to_rpc)?;
-
-                let command: Vec<String> = params
-                    .get("command")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| s.as_str().map(|x| x.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // Parse BEFORE splitting. A malformed `command` used to be
+                // noticed after the graph had already grown a pane, leaving a
+                // half-made split behind on an error path (issue #125).
+                let command = pane_command::parse_pane_command(&params)?;
                 let cwd = params
                     .get("cwd")
                     .and_then(|v| v.as_str())
@@ -2884,7 +3001,38 @@ fn register_pane_methods(
                     .unwrap_or_else(|| {
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
-                let _ = spawn_pane_pty(
+
+                // Splitting focuses the new pane, and destroying a pane hands
+                // focus to whichever pane the layout tree yields first — NOT the
+                // one that had it. So a rollback has to put focus back itself,
+                // or a failed split silently moves the operator's cursor to an
+                // unrelated pane and every later `-p`-less verb targets it.
+                let (prior_active_pane, prior_zoom) = {
+                    let snap = gh.snapshot();
+                    let w = snap
+                        .panes
+                        .get(&pane_id)
+                        .and_then(|p| snap.windows.get(&p.window_id));
+                    (
+                        w.map(|w| w.active_pane),
+                        w.and_then(|w| w.layout.zoom.as_ref().map(|z| z.zoomed_pane)),
+                    )
+                };
+
+                // `_with_command` persists the argv on the new pane, so
+                // `pane list` and the `PaneCreated` event report what is
+                // really running instead of a blank.
+                let new_pane_id = gh
+                    .split_pane_with_command(pane_id, direction, ratio, command.clone())
+                    .await
+                    .map_err(graph_error_to_rpc)?;
+
+                // A PTY that never started is not a pane. Discarding this
+                // error left a phantom in the graph — `pane list` showed it
+                // with `exit_status: null`, every later verb answered "pane VT
+                // not found", and the RPC had already returned success
+                // (issue #125 follow-up).
+                if let Err(e) = spawn_pane_pty(
                     new_pane_id,
                     cwd,
                     command,
@@ -2895,7 +3043,52 @@ fn register_pane_methods(
                     ct,
                     gh.clone(),
                 )
-                .await;
+                .await
+                {
+                    // Restore focus ONLY if it is still on the pane being undone.
+                    // Capturing before and writing after is a lost update: an
+                    // operator who moved focus while the PTY was starting had
+                    // their choice silently reverted, and measurably more often
+                    // than before the restore existed. Their choice wins.
+                    // One snapshot, read three times: `gh.snapshot()` hands back
+                    // a temporary, so chaining lookups across two calls borrows
+                    // from something already dropped.
+                    let active_pane_of = |snap: &shux_core::graph::SessionGraphSnapshot,
+                                          pane: shux_core::model::PaneId| {
+                        snap.panes
+                            .get(&pane)
+                            .and_then(|p| snap.windows.get(&p.window_id))
+                            .map(|w| w.active_pane)
+                    };
+                    let focus_is_still_ours =
+                        active_pane_of(&gh.snapshot(), new_pane_id) == Some(new_pane_id);
+
+                    let _ = gh.destroy_pane(new_pane_id, None).await;
+
+                    if focus_is_still_ours
+                        && let Some(prev) = prior_active_pane
+                        // `destroy_pane` may already have landed on `prev`;
+                        // focusing again fires a transition out of nowhere.
+                        && active_pane_of(&gh.snapshot(), prev) != Some(prev)
+                    {
+                        let _ = gh.focus_pane(prev).await;
+                    }
+                    // A successful split legitimately clears zoom; an undone one
+                    // must not leave the window un-zoomed.
+                    if let Some(z) = prior_zoom {
+                        let snap = gh.snapshot();
+                        let zoomed_now = snap
+                            .panes
+                            .get(&z)
+                            .and_then(|p| snap.windows.get(&p.window_id))
+                            .is_some_and(|w| w.layout.is_zoomed());
+                        drop(snap);
+                        if !zoomed_now {
+                            let _ = gh.zoom_pane(z, None).await;
+                        }
+                    }
+                    return Err(spawn_failure(&e));
+                }
 
                 let snap = gh.snapshot();
                 let new_pane = snap
@@ -3813,18 +4006,24 @@ fn register_window_methods(
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                         });
 
-                    let command: Vec<String> = params
-                        .get("command")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|s| s.as_str().map(|x| x.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let command = pane_command::parse_pane_command(&params)?;
 
+                    // Creating a window focuses it, and destroying a window hands
+                    // focus to the session's FIRST window — not the one that had
+                    // it. A rollback therefore has to restore focus itself, or a
+                    // failed create silently relocates the session (see the
+                    // matching comment in `pane.split`).
+                    let prior_active_window = gh
+                        .snapshot()
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.active_window);
+
+                    // `_with_command` persists the argv on the window's initial
+                    // pane, so `pane list` and `PaneCreated` report what is really
+                    // running instead of a blank (issue #125).
                     let window_id = gh
-                        .create_window(session_id, title, cwd.clone())
+                        .create_window_with_command(session_id, title, cwd.clone(), command.clone())
                         .await
                         .map_err(graph_error_to_rpc)?;
 
@@ -3845,8 +4044,11 @@ fn register_window_methods(
                     let is_active = session.active_window == window_id;
                     let pane_id = window.active_pane.to_string();
 
-                    // Spawn PTY for the new pane
-                    let _ = spawn_pane_pty(
+                    // Spawn PTY for the new pane. A window whose only pane
+                    // never started is not a window — surface the failure and
+                    // undo the create rather than returning success on a
+                    // phantom (issue #125 follow-up).
+                    if let Err(e) = spawn_pane_pty(
                         window.active_pane,
                         cwd,
                         command,
@@ -3857,7 +4059,32 @@ fn register_window_methods(
                         ct,
                         gh.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        // Same compare-and-restore as `pane.split`: only put
+                        // focus back if it is still on the window being undone.
+                        let focus_is_still_ours = gh
+                            .snapshot()
+                            .sessions
+                            .get(&session_id)
+                            .map(|s| s.active_window)
+                            == Some(window_id);
+
+                        let _ = gh.destroy_window(window_id, None).await;
+
+                        if focus_is_still_ours
+                            && let Some(prev) = prior_active_window
+                            && gh
+                                .snapshot()
+                                .sessions
+                                .get(&session_id)
+                                .map(|s| s.active_window)
+                                != Some(prev)
+                        {
+                            let _ = gh.focus_window(prev, None).await;
+                        }
+                        return Err(spawn_failure(&e));
+                    }
 
                     let mut result = window_to_json(window, index, is_active, &snap);
                     // Include pane_id at top level for convenience
@@ -3918,6 +4145,14 @@ fn register_window_methods(
                         })?
                         .to_string();
 
+                    // Validate BEFORE the already-exists shortcut. Parsing after
+                    // it made `window.ensure` the one spawning RPC that accepted
+                    // `{"command": 42}` without complaint whenever the window
+                    // happened to exist — the same input it rejects when the
+                    // window does not (issue #125 follow-up). `session.ensure`
+                    // has always parsed first; this matches it.
+                    let command = pane_command::parse_pane_command(&params)?;
+
                     // Check if window with this name already exists
                     let snap = gh.snapshot();
                     if let Some(w) = snap.find_window_by_name(&session_id, &name) {
@@ -3942,17 +4177,13 @@ fn register_window_methods(
                         .unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                         });
-                    let command: Vec<String> = params
-                        .get("command")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|s| s.as_str().map(|x| x.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let prior_active_window = gh
+                        .snapshot()
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.active_window);
                     let window_id = gh
-                        .create_window(session_id, name, cwd.clone())
+                        .create_window_with_command(session_id, name, cwd.clone(), command.clone())
                         .await
                         .map_err(graph_error_to_rpc)?;
 
@@ -3962,8 +4193,11 @@ fn register_window_methods(
                         .get(&window_id)
                         .ok_or_else(|| shux_rpc::RpcError::internal("window not in snapshot"))?;
 
-                    // Spawn PTY for the new pane
-                    let _ = spawn_pane_pty(
+                    // Spawn PTY for the new pane. A window whose only pane
+                    // never started is not a window — surface the failure and
+                    // undo the create rather than returning success on a
+                    // phantom (issue #125 follow-up).
+                    if let Err(e) = spawn_pane_pty(
                         window.active_pane,
                         cwd,
                         command,
@@ -3974,7 +4208,32 @@ fn register_window_methods(
                         ct,
                         gh.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        // Same compare-and-restore as `pane.split`: only put
+                        // focus back if it is still on the window being undone.
+                        let focus_is_still_ours = gh
+                            .snapshot()
+                            .sessions
+                            .get(&session_id)
+                            .map(|s| s.active_window)
+                            == Some(window_id);
+
+                        let _ = gh.destroy_window(window_id, None).await;
+
+                        if focus_is_still_ours
+                            && let Some(prev) = prior_active_window
+                            && gh
+                                .snapshot()
+                                .sessions
+                                .get(&session_id)
+                                .map(|s| s.active_window)
+                                != Some(prev)
+                        {
+                            let _ = gh.focus_window(prev, None).await;
+                        }
+                        return Err(spawn_failure(&e));
+                    }
 
                     let session = snap
                         .sessions
@@ -4240,20 +4499,9 @@ fn register_session_methods(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
 
-                    // Optional pane command. Accepts:
-                    //   {"command": ["vim", "foo.rs"]}     — preferred (passthrough)
-                    //   {"command": "top"}                 — convenience: split on whitespace
-                    //   omitted / null                     — spawn the user's default shell
-                    let command: Vec<String> = match params.get("command") {
-                        Some(serde_json::Value::Array(arr)) => arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect(),
-                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
-                            s.split_whitespace().map(|s| s.to_string()).collect()
-                        }
-                        _ => Vec::new(),
-                    };
+                    // Optional pane command — see `pane_command` for the
+                    // contract every spawning RPC shares (issue #125).
+                    let command = pane_command::parse_pane_command(&params)?;
                     let pane_title = parse_initial_pane_title(&params)?;
 
                     // Auto-generate name if not provided (None).
@@ -4316,12 +4564,15 @@ fn register_session_methods(
                             });
 
                             let snap = gh.snapshot();
-                            // Spawn PTY for the initial pane
+                            // Spawn PTY for the initial pane. A session whose
+                            // only pane never started is not a session — the
+                            // CLI printed "✓ Created session" over a phantom
+                            // that answered "pane VT not found" to everything
+                            // afterwards (issue #125 follow-up).
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 if let Some(wid) = s.windows.first()
                                     && let Some(w) = snap.windows.get(wid)
-                                {
-                                    let _ = spawn_pane_pty(
+                                    && let Err(e) = spawn_pane_pty(
                                         w.active_pane,
                                         cwd,
                                         command.clone(),
@@ -4332,7 +4583,11 @@ fn register_session_methods(
                                         ct,
                                         gh.clone(),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    let _ = gh.destroy_session(session_id, None).await;
+                                    meta.remove(session_id).await;
+                                    return Err(spawn_failure(&e));
                                 }
                                 Ok(session_to_json(s, &snap))
                             } else {
@@ -4460,17 +4715,8 @@ fn register_session_methods(
                         .unwrap_or("default")
                         .to_string();
 
-                    // Optional pane command (same shape as session.create).
-                    let command: Vec<String> = match params.get("command") {
-                        Some(serde_json::Value::Array(arr)) => arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect(),
-                        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
-                            s.split_whitespace().map(|s| s.to_string()).collect()
-                        }
-                        _ => Vec::new(),
-                    };
+                    // Optional pane command (same contract as session.create).
+                    let command = pane_command::parse_pane_command(&params)?;
                     let pane_title = parse_initial_pane_title(&params)?;
 
                     // Check if session already exists
@@ -4513,12 +4759,13 @@ fn register_session_methods(
                             });
 
                             let snap = gh.snapshot();
-                            // Spawn PTY for the initial pane
+                            // Spawn PTY for the initial pane. Same contract as
+                            // session.create: a failed spawn is an error, not a
+                            // session (issue #125 follow-up).
                             if let Some(s) = snap.sessions.get(&session_id) {
                                 if let Some(wid) = s.windows.first()
                                     && let Some(w) = snap.windows.get(wid)
-                                {
-                                    let _ = spawn_pane_pty(
+                                    && let Err(e) = spawn_pane_pty(
                                         w.active_pane,
                                         cwd,
                                         command.clone(),
@@ -4529,7 +4776,11 @@ fn register_session_methods(
                                         ct,
                                         gh.clone(),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    let _ = gh.destroy_session(session_id, None).await;
+                                    meta.remove(session_id).await;
+                                    return Err(spawn_failure(&e));
                                 }
                                 let mut json = session_to_json(s, &snap);
                                 json["created"] = serde_json::Value::Bool(true);
@@ -7128,6 +7379,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 watch,
             } => {
                 let ops = template::load_and_lower(&template)?;
+                pane_command::validate_ops(&ops)
+                    .map_err(|e| anyhow::anyhow!("{}", rpc_error_detail(&e)))?;
                 if dry_run {
                     println!("{}", style::json_safe(&serde_json::to_string_pretty(&ops)?));
                     Ok(())
@@ -7258,6 +7511,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     pane,
                     direction,
                     ratio,
+                    cmd,
+                    argv,
                 } => {
                     cli::handle_pane_split(
                         &mut stream,
@@ -7266,6 +7521,8 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                         pane.as_deref(),
                         direction.as_deref(),
                         ratio,
+                        cmd,
+                        argv,
                         args.format,
                     )
                     .await
@@ -7781,6 +8038,18 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             };
+
+            // Before printing OR sending: `--dry-run` exists to answer "will
+            // this apply succeed?", and the argv rule used to live only in the
+            // daemon, so dry-run said yes to templates the real run rejects.
+            if let Err(e) = pane_command::validate_ops(&ops) {
+                eprintln!(
+                    "{} {}",
+                    style::error("✗ template error:"),
+                    style::safe_diagnostic(&rpc_error_detail(&e))
+                );
+                std::process::exit(1);
+            }
 
             if dry_run {
                 // `--dry-run` prints the ops BEFORE the graph sanitizes

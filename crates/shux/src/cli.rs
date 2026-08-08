@@ -503,7 +503,10 @@ pub enum StateCommand {
         /// Path to the TOML template (e.g. `./agent-conductor.toml`).
         template: std::path::PathBuf,
 
-        /// Validate + print the lowered ops without sending the apply.
+        /// Check the template and print the lowered ops without applying.
+        /// Catches everything decidable without the daemon (shape, argv,
+        /// window titles); conflicts with live state — a session name already
+        /// in use — can only surface on the real apply.
         #[arg(long)]
         dry_run: bool,
 
@@ -563,11 +566,22 @@ pub enum SessionCommand {
         #[arg(long, value_name = "TITLE")]
         title: Option<String>,
 
-        /// Shell command to run in the initial pane (single string).
-        #[arg(long)]
+        /// Shell command for the initial pane, run by the daemon's shell
+        /// (its `$SHELL -c`, falling back to `/bin/sh` — the daemon outlives
+        /// your terminal, so its environment is the one that applies) — so
+        /// pipes, `;`, `&&`, quoting, globs and redirection all work:
+        /// `--cmd "cargo watch -x test 2>&1 | tee build.log"`.
+        /// Omitted or empty opens your login+interactive shell.
+        /// For exec-style passthrough with no shell at all, use trailing
+        /// `--` instead.
+        ///
+        /// A command that itself starts with a dash (`--cmd "-n is a valid
+        /// sed script"`) is taken as the command, not as a flag.
+        #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
         cmd: Option<String>,
 
-        /// Trailing argv after `--` — exec'd directly (no shell wrapper).
+        /// Trailing argv after `--` — exec'd directly (no shell wrapper, no
+        /// splitting, no expansion). Takes precedence over `--cmd`.
         #[arg(last = true, num_args = 0..)]
         argv: Vec<String>,
     },
@@ -963,11 +977,15 @@ pub enum WindowCommand {
         #[arg(long)]
         cwd: Option<std::path::PathBuf>,
 
-        /// Shell command to run in the new window's initial pane.
+        /// Shell command for the new window's initial pane, run by the
+        /// daemon's shell (its `$SHELL -c`, falling back to `/bin/sh`) —
+        /// pipes, `;`, `&&`, quoting, globs and redirection all work.
         /// Empty / omitted spawns the user's login+interactive shell.
         /// For exec-style passthrough use trailing `--` instead:
         /// `shux window create -s X -n W -- vim foo.rs`.
-        #[arg(long)]
+        ///
+        /// A command starting with a dash is taken as the command, not a flag.
+        #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
         cmd: Option<String>,
 
         /// Create-if-missing semantics (maps to window.ensure)
@@ -1167,6 +1185,20 @@ pub enum PaneCommand {
         /// Split ratio (0.0-1.0, default 0.5)
         #[arg(short, long)]
         ratio: Option<f64>,
+
+        /// Shell command for the new pane, run by the daemon's shell (its
+        /// `$SHELL -c`, falling back to `/bin/sh`) — pipes, `;`, `&&`,
+        /// quoting, globs and redirection all work. Omitted opens the default
+        /// login+interactive shell.
+        ///
+        /// A command starting with a dash is taken as the command, not a flag.
+        #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
+        cmd: Option<String>,
+
+        /// Trailing argv after `--` — exec'd directly (no shell wrapper, no
+        /// splitting, no expansion). Takes precedence over `--cmd`.
+        #[arg(last = true, num_args = 0..)]
+        argv: Vec<String>,
     },
 
     /// Focus a specific pane by id (full UUID or short form)
@@ -3484,23 +3516,19 @@ pub async fn handle_window_new(
     }
     // Trailing argv (after `--`) wins over --cmd, matching the
     // `shux session create` behavior so muscle memory carries over.
-    let command_vec: Vec<String> = if !argv.is_empty() {
-        argv
-    } else if let Some(c) = cmd {
-        vec!["sh".into(), "-c".into(), c]
-    } else {
-        Vec::new()
-    };
-    if !command_vec.is_empty() {
+    //
+    // `--cmd` goes out as a JSON *string* and the daemon turns it into
+    // `$SHELL -c <string>`. It used to be wrapped as `["sh","-c",c]` right
+    // here, which made this verb the only one whose CLI did something its RPC
+    // did not, and pinned every user to `/bin/sh` rather than their own shell
+    // (issue #125).
+    if !argv.is_empty() {
         params.insert(
             "command".to_string(),
-            serde_json::Value::Array(
-                command_vec
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
+            serde_json::Value::Array(argv.into_iter().map(serde_json::Value::String).collect()),
         );
+    } else if let Some(c) = cmd {
+        params.insert("command".to_string(), serde_json::Value::String(c));
     }
 
     let result = rpc_call(stream, method, serde_json::Value::Object(params)).await?;
@@ -3920,6 +3948,7 @@ pub async fn handle_pane_list(
 }
 
 /// Handle the `shux pane split` command.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pane_split(
     stream: &mut tokio::net::UnixStream,
     session_name: &str,
@@ -3927,6 +3956,8 @@ pub async fn handle_pane_split(
     pane_spec: Option<&str>,
     direction: Option<&str>,
     ratio: Option<f64>,
+    cmd: Option<String>,
+    argv: Vec<String>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let (session_id, window_id) = resolve_pane_window_id(stream, session_name, window_spec).await?;
@@ -3944,6 +3975,16 @@ pub async fn handle_pane_split(
     }
     if let Some(r) = ratio {
         params["ratio"] = serde_json::json!(r);
+    }
+    // Same two forms and the same precedence as `session create` /
+    // `window create`: trailing argv is exec'd, `--cmd` is a shell command.
+    // `pane.split` has always accepted `command`; only the CLI had no way to
+    // say it (issue #125 follow-up).
+    if !argv.is_empty() {
+        params["command"] =
+            serde_json::Value::Array(argv.into_iter().map(serde_json::Value::String).collect());
+    } else if let Some(c) = cmd {
+        params["command"] = serde_json::Value::String(c);
     }
 
     let result = rpc_call(stream, "pane.split", params).await?;
@@ -6120,11 +6161,27 @@ pub async fn handle_apply(
         }
     };
 
+    let spawn_failures = |v: &serde_json::Value| -> usize {
+        v.get("spawn_results")
+            .and_then(|s| s.as_array())
+            .map(|a| a.iter().filter(|s| s["spawned"] != true).count())
+            .unwrap_or(0)
+    };
+
     if matches!(format, OutputFormat::Json) {
         println!(
             "{}",
             crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
         );
+        // The human path already refuses to call a batch of dead panes a
+        // success; returning early here left `--format json` — the format
+        // scripts and agents use — exiting 0 over exactly the same batch, so
+        // `shux --format json state apply t.toml && shux attach` still chained
+        // into it (issue #125 follow-up).
+        let failed = spawn_failures(&result);
+        if failed > 0 {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -6151,9 +6208,14 @@ pub async fn handle_apply(
     let spawned_ok = spawns.iter().filter(|s| s["spawned"] == true).count();
     let spawned_fail = spawns.len() - spawned_ok;
 
-    println!(
-        "{} ({} ops, {} panes spawned{}, last event seq {})",
-        style::success(&format!("✓ Applied {cid}")),
+    // A batch that committed but whose panes never started is not a success.
+    // `state.apply` deliberately does NOT roll back (codex P0 #1: killing
+    // already-spawned siblings has its own side effects, so partial outcomes are
+    // reported rather than undone) — but reporting them under a green tick and
+    // exit code 0 let `shux state apply t.toml && shux attach` walk straight
+    // into a session of dead panes (issue #125 follow-up).
+    let headline = format!(
+        "Applied {cid} ({} ops, {} panes spawned{}, last event seq {})",
         outputs,
         spawned_ok,
         if spawned_fail > 0 {
@@ -6163,6 +6225,11 @@ pub async fn handle_apply(
         },
         last_seq
     );
+    if spawned_fail > 0 {
+        println!("{}", style::warning(&format!("! {headline}")));
+    } else {
+        println!("{}", style::success(&format!("✓ {headline}")));
+    }
     for s in &spawns {
         let pid = s["pane_id"].as_str().unwrap_or("?");
         let pid_short: String = pid.chars().take(8).collect();
@@ -6177,6 +6244,13 @@ pub async fn handle_apply(
                 err
             );
         }
+    }
+
+    if spawned_fail > 0 && !watch {
+        return Err(anyhow::anyhow!(
+            "{spawned_fail} of {} pane(s) failed to spawn",
+            spawns.len()
+        ));
     }
 
     if watch {
@@ -6543,6 +6617,55 @@ mod tests {
             Some("aww-shux")
         );
         assert_eq!(params.get("command"), Some(&serde_json::json!(["pwd"])));
+    }
+
+    // ── issue #125: what `--cmd` and trailing argv put on the wire ────
+    //
+    // The CLI does not transform either one. `--cmd` travels as a JSON string
+    // (the daemon runs it through `$SHELL -c`), trailing argv travels as an
+    // array (exec'd directly). Anything else here would be a CLI-only
+    // behaviour the RPC does not have.
+
+    #[test]
+    fn cmd_is_sent_as_a_string_never_pre_split() {
+        let params = build_session_create_params(
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            Some("printf 'X\n'; sleep 300".to_string()),
+            Vec::new(),
+        );
+        assert_eq!(
+            params.get("command"),
+            Some(&serde_json::json!("printf 'X\n'; sleep 300"))
+        );
+    }
+
+    #[test]
+    fn trailing_argv_is_sent_as_an_array_and_beats_cmd() {
+        let params = build_session_create_params(
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            Some("echo from-cmd".to_string()),
+            vec!["nvim".to_string(), "a b.rs".to_string()],
+        );
+        assert_eq!(
+            params.get("command"),
+            Some(&serde_json::json!(["nvim", "a b.rs"]))
+        );
+    }
+
+    #[test]
+    fn no_cmd_and_no_argv_sends_no_command_at_all() {
+        let params = build_session_create_params(
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            None,
+            Vec::new(),
+        );
+        assert!(params.get("command").is_none());
     }
 
     #[test]
@@ -7465,6 +7588,8 @@ mod tests {
             Some(pane),
             Some("horizontal"),
             Some(0.4),
+            Some("echo split".to_string()),
+            Vec::new(),
             OutputFormat::Json,
         )
         .await
@@ -7552,9 +7677,13 @@ mod tests {
             .iter()
             .find(|r| r["method"] == "window.create")
             .unwrap();
+        // `--cmd` goes out as a STRING; the daemon is what turns it into
+        // `$SHELL -c <string>`. It used to be wrapped into `["sh","-c",…]`
+        // client-side, which made this the one verb whose CLI transformed a
+        // parameter its RPC did not (issue #125).
         assert_eq!(
             window_create["params"]["command"],
-            serde_json::json!(["sh", "-c", "echo hi"])
+            serde_json::json!("echo hi")
         );
         let pane_split = requests
             .iter()
@@ -7562,6 +7691,11 @@ mod tests {
             .unwrap();
         assert_eq!(pane_split["params"]["direction"], "horizontal");
         assert_eq!(pane_split["params"]["ratio"], 0.4);
+        // `--cmd` reaches `pane.split` as a string, same as the other verbs.
+        assert_eq!(
+            pane_split["params"]["command"],
+            serde_json::json!("echo split")
+        );
         let pane_title = requests
             .iter()
             .find(|r| r["method"] == "pane.set_title")

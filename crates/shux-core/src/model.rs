@@ -323,30 +323,231 @@ impl Pane {
                 self.title = o.clone();
                 return;
             }
-            // Auto from command (first arg basename) or cwd basename.
+            // Auto from the command's program name, or the cwd basename.
             //
             // These are as untrusted as the OSC and manual sources: a
             // template picks the argv and the cwd, and neither is
             // validated as an existing path. They go through the same
             // sanitizer, or `sanitize_title` is not "the single title
             // rule" it claims to be (issue #104).
-            if let Some(cmd) = self.command.first() {
-                self.title = sanitize_title_clamped(
-                    std::path::Path::new(cmd)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(cmd),
-                );
-                return;
+            // A name that sanitizes to NOTHING is not a title. Round three
+            // widened both what counts as a program name and what the sanitizer
+            // removes, so `--cmd "<soft hyphen>"` produced a pane with a blank
+            // border and a blank status bar. Fall through to the cwd instead.
+            if let Some(name) = command_display_name(&self.command) {
+                let sanitized = sanitize_title_clamped(name);
+                if !sanitized.is_empty() {
+                    self.title = sanitized;
+                    return;
+                }
             }
             if let Some(name) = self.cwd.file_name().and_then(|s| s.to_str()) {
-                self.title = sanitize_title_clamped(name);
+                let sanitized = sanitize_title_clamped(name);
+                if !sanitized.is_empty() {
+                    self.title = sanitized;
+                    return;
+                }
             }
+            // The cwd can fail to yield a name for two ordinary reasons, and
+            // both left the pane with a blank border and a blank status bar —
+            // the outcome the command fallback above was added to prevent.
+            //
+            // `Path::file_name` is `None` for a root path, so plain
+            // `shux session create s --cwd /` produced no title at all. And a
+            // directory whose own name sanitizes away leaves nothing either.
+            // The whole path is the honest answer for the first case; for the
+            // second there is no name to show, so say what the thing is.
+            let whole = sanitize_title_clamped(&self.cwd.to_string_lossy());
+            self.title = if whole.is_empty() {
+                FALLBACK_PANE_TITLE.to_string()
+            } else {
+                whole
+            };
         }
         // Auto disabled and no manual override → keep whatever we had.
-        // If title is empty (fresh pane with no command and no cwd
-        // basename), leave it empty rather than dropping garbage in.
     }
+}
+
+/// Shown when neither the command nor the cwd yields a printable name.
+/// A pane always has a title — "no title" is a rendering bug, not a state.
+const FALLBACK_PANE_TITLE: &str = "pane";
+
+/// The program name to show for a pane running `command`.
+///
+/// The obvious answer — the basename of `command[0]` — is the right one for an
+/// argv like `["nvim", "src/main.rs"]`. It is the wrong one whenever the argv is
+/// a **shell wrapper**, which is now the normal shape for a pane started from a
+/// shell command string (`shux session create --cmd "npm run dev"` runs
+/// `$SHELL -c "npm run dev"`, issue #125) and has always been the shape of the
+/// documented escape hatch `-- sh -c "npm run dev"`. Titling those panes `bash`
+/// and `sh` tells the operator nothing: every one of them looks the same.
+///
+/// So a wrapper is unwrapped and the title comes from the first real word of the
+/// script — skipping an `exec` prefix and any leading `NAME=value` assignments,
+/// the two things that routinely sit in front of the actual program. When the
+/// script does not begin with a plain command word (a subshell, a redirection, a
+/// `for` loop) there is no honest short answer and the shell's own name is used.
+///
+/// ```text
+/// ["nvim", "a.rs"]                    -> nvim
+/// ["/bin/bash", "-lc", "npm run dev"] -> npm
+/// ["sh", "-c", "exec TERM=x top"]     -> top
+/// ["sh", "-c", "(cd x && make)"]      -> sh
+/// ["/usr/local/bin/my-c", "-c", "x"]  -> my-c   (not a shell; not unwrapped)
+/// ```
+///
+/// The shell test is on the **basename**, so a program that is genuinely not a
+/// shell but happens to be installed as `sh` or `bash` somewhere on `PATH` is
+/// unwrapped too, and its title then names the script's first word rather than
+/// the program that is running. Matching on absolute path instead would be
+/// worse: it would miss every real shell outside the handful of paths worth
+/// hard-coding.
+pub(crate) fn command_display_name(command: &[String]) -> Option<&str> {
+    let raw = command.first()?;
+    let program = program_name(raw);
+    if let Some(program) = program
+        && is_shell(program)
+        && command.len() >= 3
+        && is_shell_command_flag(&command[1])
+        && let Some(word) = script_leading_word(&command[2])
+    {
+        return Some(word);
+    }
+    // argv[0] gets the same plausibility test as a script's first word: a token
+    // that names no program is not a title, and the cwd basename below is a
+    // better answer than `/` or `..`.
+    program
+}
+
+/// The file name inside `path`, or `None` when there is not one — `/`, `//`,
+/// `.` and `..` all resolve to nothing a pane can be named after.
+fn program_name(path: &str) -> Option<&str> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// Shells whose `-c` takes a script as one argument. Deliberately a fixed list:
+/// guessing from the argument shape would unwrap `openssl -c ...` too.
+fn is_shell(program: &str) -> bool {
+    matches!(
+        program,
+        "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "ksh93" | "mksh" | "fish" | "busybox"
+    )
+}
+
+/// `-c` and the login/interactive variants shells accept as one cluster:
+/// `-c`, `-lc`, `-ic`, `-lic`, `-cl`, … Anything else (including `--command`,
+/// which is a different, non-shell convention) is not a wrapper.
+fn is_shell_command_flag(flag: &str) -> bool {
+    let Some(letters) = flag.strip_prefix('-') else {
+        return false;
+    };
+    !letters.is_empty()
+        && letters.contains('c')
+        && letters.chars().all(|c| matches!(c, 'c' | 'l' | 'i'))
+}
+
+/// The first word of a shell script that names the program it runs, or `None`
+/// when the script does not start with one.
+///
+/// Only the script's **first simple command** is considered — everything up to
+/// the first shell operator. Reading past one is how `A=1;htop -d 10` produced
+/// the title `-d`: the leading token is a complete assignment, and the scanner
+/// walked on into a *flag* belonging to a command it never established.
+fn script_leading_word(script: &str) -> Option<&str> {
+    let segment = script.split(is_shell_operator).next()?;
+    for token in segment.split_whitespace() {
+        // `exec top` and `time make` run `top` and `make`.
+        if token == "exec" || token == "time" || is_env_assignment(token) {
+            continue;
+        }
+        // `for`, `if`, `while` … introduce a compound command. There is no
+        // single program to name, and naming the loop variable would be worse
+        // than saying nothing.
+        if is_shell_keyword(token) || token.chars().any(is_shell_syntax) {
+            return None;
+        }
+        // A leading `-` is a flag, and a flag is never the program. Without this
+        // `--cmd "-n is a valid sed script"` — the example in the flag's own
+        // help — titled the pane `-n`, and `A=1 -d 10` titled it `-d`.
+        if token.starts_with('-') {
+            return None;
+        }
+        // `/`, `//`, `.` and `..` have no file name in them at all; `Path`
+        // says so, and that is the right test. Judging by the glyphs instead —
+        // "no alphanumeric character" — also rejected `/usr/local/bin/+++`,
+        // which is a real program with an unusual name.
+        let name = program_name(token)?;
+        // A bare number is a file descriptor (`2>&1 make`), never a program.
+        if name.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        return Some(name);
+    }
+    None
+}
+
+/// Characters that end a simple command. Splitting on these first is what keeps
+/// `ls|wc` readable as `ls` while `(cd x && make)` correctly yields nothing.
+fn is_shell_operator(c: char) -> bool {
+    matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`' | '\n')
+}
+
+/// Reserved words that open a compound command.
+fn is_shell_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "in"
+            | "select"
+            | "function"
+            | "coproc"
+            | ":"
+            | "{"
+            | "}"
+            | "[["
+            | "]]"
+    )
+}
+
+/// `NAME=value` in the leading position — a per-command environment override,
+/// not the program.
+///
+/// The **value** is checked too. `A=1;htop` reaches here only if the operator
+/// split above missed it, and a value carrying `$`, a quote or a glob is not a
+/// plain assignment this code can reason about.
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, value)) = token.split_once('=') else {
+        return false;
+    };
+    let name_ok = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    // '=' is itself in `is_shell_syntax`; `A=b=c` is a legal assignment.
+    name_ok && !value.chars().any(|c| c != '=' && is_shell_syntax(c))
+}
+
+/// Characters that mean a token is shell syntax rather than a program name.
+/// The command *operators* are not here — [`is_shell_operator`] has already
+/// removed them by the time a token is examined.
+fn is_shell_syntax(c: char) -> bool {
+    matches!(
+        c,
+        '$' | '\\' | '"' | '\'' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '#' | '!' | '='
+    )
 }
 
 /// Characters that must never survive into a stored title.
@@ -371,6 +572,16 @@ impl Pane {
 ///   formatting characters are dropped; the implicit bidi algorithm is
 ///   untouched, so ordinary RTL titles still render correctly.
 ///
+/// - **Default-ignorable code points** — invisible, not `is_control()`, and far
+///   more numerous than the handful anyone names first. `ht<ZWSP>op` renders
+///   identically to `htop`, so two panes carry titles a human cannot tell
+///   apart; so do soft hyphen, the combining grapheme joiner, the invisible
+///   operators, the Hangul fillers, the variation selectors and the tag block.
+///   The first cut of this listed three of them and let fifteen more through —
+///   an allowlist where the property is what matters. See [`is_default_ignorable`].
+///   It is not only an operator's problem: a program running in a pane sets its
+///   own title with OSC 0, so it can mint an indistinguishable one unaided.
+///
 /// Deliberately **not** dropped: `U+200D` ZERO WIDTH JOINER, which is
 /// load-bearing inside emoji sequences — removing it would split a
 /// perfectly legitimate title into separate glyphs.
@@ -379,6 +590,51 @@ pub(crate) fn is_title_hostile(c: char) -> bool {
         || matches!(c, '\u{2028}' | '\u{2029}')
         || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}')
+        || is_default_ignorable(c)
+}
+
+/// Unicode's `Default_Ignorable_Code_Point` set, minus the one exception below.
+///
+/// These render as nothing. Two titles differing only in these characters are
+/// the same title to every human who looks at them, which is the whole of the
+/// spoof — no reordering required, unlike the bidi set. Enumerated as ranges
+/// rather than as the handful people think of first, because the property is
+/// what matters and the handful is never complete.
+///
+/// **Three are kept**, for the same reason: they compose sequences a person
+/// legitimately types, and dropping them changes what the title *says*.
+///
+/// - `U+200D` ZERO WIDTH JOINER — `👨‍👩‍👧` becomes three separate people.
+/// - `U+FE0F` VARIATION SELECTOR-16 (emoji presentation) and `U+FE0E` (text
+///   presentation). VS16 is mandatory in RGI keycap and several RGI ZWJ
+///   sequences: stripping it turned `❤️‍🔥` into `❤`, `1️⃣` into a bare `1`, and
+///   `⚠️` into `⚠`. The first cut of this list included them, which broke the
+///   very sequences the ZWJ exception exists to protect.
+///
+/// That is three spoofable characters, knowingly, against a rule that would
+/// otherwise corrupt ordinary titles.
+fn is_default_ignorable(c: char) -> bool {
+    if matches!(c, '\u{200d}' | '\u{fe0e}' | '\u{fe0f}') {
+        return false; // composing selectors — see above.
+    }
+    matches!(c,
+        '\u{00ad}'                        // SOFT HYPHEN
+        | '\u{034f}'                      // COMBINING GRAPHEME JOINER
+        | '\u{115f}'..='\u{1160}'         // HANGUL CHOSEONG/JUNGSEONG FILLER
+        | '\u{17b4}'..='\u{17b5}'         // KHMER INHERENT VOWELS
+        | '\u{180b}'..='\u{180f}'         // MONGOLIAN FVS + VOWEL SEPARATOR
+        | '\u{200b}'..='\u{200f}'         // ZWSP, ZWNJ, (ZWJ), LRM, RLM
+        | '\u{202a}'..='\u{202e}'         // bidi embedding / override
+        | '\u{2060}'..='\u{206f}'         // word joiner, invisible operators, deprecated format
+        | '\u{3164}'                      // HANGUL FILLER
+        | '\u{fe00}'..='\u{fe0f}'         // VARIATION SELECTOR 1..16 (VS15/16 exempt above)
+        | '\u{feff}'                      // ZERO WIDTH NO-BREAK SPACE / BOM
+        | '\u{ffa0}'                      // HALFWIDTH HANGUL FILLER
+        | '\u{fff0}'..='\u{fff8}'         // unassigned, reserved as ignorable
+        | '\u{1bca0}'..='\u{1bca3}'       // SHORTHAND FORMAT CONTROLS
+        | '\u{1d173}'..='\u{1d17a}'       // MUSICAL SYMBOL beams/slurs (format)
+        | '\u{e0000}'..='\u{e0fff}'       // TAGS + VARIATION SELECTORS SUPPLEMENT
+    )
 }
 
 /// The longest title a pane will display. The border has limited room
@@ -560,6 +816,274 @@ mod tests {
         let wid = WindowId::new();
         let pane = Pane::with_command(wid, "/home/test", vec!["/usr/bin/htop".into()]);
         assert_eq!(pane.effective_title(), "htop");
+    }
+
+    // ── issue #125: a shell wrapper must not become the title ─────────
+    //
+    // `--cmd "npm run dev"` runs `$SHELL -c "npm run dev"`. Titling the pane
+    // after the shell would make every `--cmd` pane in a session look
+    // identical.
+
+    #[track_caller]
+    fn title_of(argv: &[&str]) -> String {
+        let pane = Pane::with_command(
+            WindowId::new(),
+            "/home/test/proj",
+            argv.iter().map(|s| s.to_string()).collect(),
+        );
+        pane.effective_title().to_string()
+    }
+
+    #[test]
+    fn shell_wrapper_titles_after_the_program_the_script_runs() {
+        assert_eq!(title_of(&["/bin/bash", "-c", "npm run dev"]), "npm");
+        assert_eq!(title_of(&["sh", "-c", "top"]), "top");
+        assert_eq!(title_of(&["/usr/bin/zsh", "-lc", "cargo watch"]), "cargo");
+        assert_eq!(title_of(&["dash", "-ic", "htop"]), "htop");
+        assert_eq!(title_of(&["fish", "-lic", "btop"]), "btop");
+    }
+
+    #[test]
+    fn shell_wrapper_skips_exec_and_environment_prefixes() {
+        assert_eq!(title_of(&["sh", "-c", "exec top"]), "top");
+        assert_eq!(title_of(&["sh", "-c", "RUST_LOG=debug cargo run"]), "cargo");
+        assert_eq!(
+            title_of(&["sh", "-c", "exec FOO=1 BAR=2 btop -p 1"]),
+            "btop"
+        );
+    }
+
+    #[test]
+    fn shell_wrapper_takes_the_basename_of_an_absolute_program() {
+        assert_eq!(
+            title_of(&["sh", "-c", "/usr/local/bin/lazygit -p ."]),
+            "lazygit"
+        );
+    }
+
+    #[test]
+    fn shell_wrapper_falls_back_to_the_shell_when_the_script_is_not_a_plain_command() {
+        // A subshell, a redirection, a variable: no honest short name.
+        assert_eq!(title_of(&["sh", "-c", "(cd x && make)"]), "sh");
+        assert_eq!(title_of(&["bash", "-c", "> log 2>&1 make"]), "bash");
+        assert_eq!(title_of(&["sh", "-c", "$EDITOR notes"]), "sh");
+        assert_eq!(title_of(&["sh", "-c", "   "]), "sh");
+        assert_eq!(title_of(&["sh", "-c", ""]), "sh");
+        // Only assignments, no command.
+        assert_eq!(title_of(&["sh", "-c", "FOO=1"]), "sh");
+        // A leading file descriptor is not a program.
+        assert_eq!(title_of(&["sh", "-c", "2>&1 make"]), "sh");
+    }
+
+    /// A compound command has no single program to name. Naming the loop
+    /// variable or the branch keyword would be worse than saying nothing.
+    #[test]
+    fn shell_keywords_are_not_titles() {
+        assert_eq!(
+            title_of(&["sh", "-c", "for i in 1 2; do echo $i; done"]),
+            "sh"
+        );
+        assert_eq!(title_of(&["sh", "-c", "if true; then htop; fi"]), "sh");
+        assert_eq!(
+            title_of(&["bash", "-c", "while true; do htop; done"]),
+            "bash"
+        );
+        assert_eq!(title_of(&["sh", "-c", "until false; do :; done"]), "sh");
+        assert_eq!(title_of(&["sh", "-c", "case $x in a) :; esac"]), "sh");
+        assert_eq!(title_of(&["bash", "-c", "{ htop; }"]), "bash");
+    }
+
+    /// Only the FIRST simple command is read. Walking past a complete leading
+    /// assignment is how `A=1;htop -d 10` came out titled `-d` — a flag
+    /// belonging to a command the scanner never established.
+    #[test]
+    fn only_the_first_simple_command_is_considered() {
+        assert_eq!(title_of(&["bash", "-c", "A=1;htop -d 10"]), "bash");
+        assert_eq!(title_of(&["bash", "-c", "A=1;htop"]), "bash");
+        assert_eq!(title_of(&["bash", "-c", "cd /x && make"]), "cd");
+        assert_eq!(title_of(&["bash", "-c", "make; htop"]), "make");
+    }
+
+    /// Spacing around an operator must not change the answer.
+    #[test]
+    fn an_operator_without_surrounding_spaces_still_ends_the_command() {
+        assert_eq!(title_of(&["bash", "-c", "ls|wc"]), "ls");
+        assert_eq!(title_of(&["bash", "-c", "ls | wc"]), "ls");
+        assert_eq!(title_of(&["bash", "-c", "make&&test"]), "make");
+        assert_eq!(title_of(&["bash", "-c", "npm run dev>log"]), "npm");
+    }
+
+    #[test]
+    fn time_is_skipped_like_exec() {
+        assert_eq!(title_of(&["sh", "-c", "time make -j4"]), "make");
+    }
+
+    /// A flag is never the program. `--cmd "-n is a valid sed script"` — the
+    /// example printed in the flag's own help — used to title the pane `-n`.
+    /// An invisible character makes two different titles look identical. The
+    /// first cut named three of them; these are the ones it let through.
+    #[test]
+    fn test_sanitize_title_strips_invisible_spacers() {
+        let ignorable = [
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{17b4}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200e}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{3164}',
+            '\u{fe00}',
+            '\u{feff}',
+            '\u{ffa0}',
+            '\u{e0041}',
+        ];
+        for c in ignorable {
+            assert_eq!(
+                sanitize_title(&format!("ht{c}op")),
+                "htop",
+                "U+{:04X} survived the sanitizer",
+                c as u32
+            );
+            // …and through the title pipeline a running program can drive.
+            let mut pane = Pane::new(WindowId::new(), "/home/test/proj");
+            pane.set_osc_title(format!("ht{c}op"));
+            assert_eq!(pane.effective_title(), "htop", "U+{:04X} via OSC", c as u32);
+        }
+        // The joiner is load-bearing inside emoji and is the one exception.
+        assert!(sanitize_title("a\u{200d}b").contains('\u{200d}'));
+    }
+
+    /// Sequences a person legitimately types must survive intact. The first
+    /// cut of the ignorable-codepoint rule stripped the variation selectors,
+    /// which are mandatory in the very emoji the ZWJ exception protects.
+    #[test]
+    fn test_sanitize_title_keeps_composing_selectors() {
+        for (input, why) in [
+            ("\u{2764}\u{fe0f}\u{200d}\u{1f525}", "heart on fire"),
+            ("\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}", "rainbow flag"),
+            ("1\u{fe0f}\u{20e3}", "keycap one"),
+            ("\u{26a0}\u{fe0f}", "warning sign"),
+            ("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", "family"),
+        ] {
+            assert_eq!(sanitize_title(input), input, "{why} was altered");
+        }
+    }
+
+    /// A name that sanitizes to nothing is not a title — the cwd is.
+    #[test]
+    fn a_command_whose_name_sanitizes_to_nothing_falls_through_to_the_cwd() {
+        for invisible in ["\u{00ad}", "\u{2060}", "\u{3164}"] {
+            let pane = Pane::with_command(
+                WindowId::new(),
+                "/home/test/proj",
+                vec![invisible.to_string()],
+            );
+            assert_eq!(
+                pane.effective_title(),
+                "proj",
+                "{invisible:?} left a blank title"
+            );
+        }
+    }
+
+    /// …and when the cwd cannot supply one either, something still has to.
+    ///
+    /// Both of these are ordinary invocations, not adversarial input:
+    /// `Path::file_name` is `None` for a root path, and a directory can be
+    /// named with characters the sanitizer removes. Each used to leave the
+    /// pane with a blank border and a blank status bar.
+    #[test]
+    fn a_pane_always_has_a_title() {
+        let root = Pane::new(WindowId::new(), "/");
+        assert_eq!(root.effective_title(), "/", "a root cwd left no title");
+
+        let root_cmd = Pane::with_command(WindowId::new(), "/", vec!["\u{00ad}".to_string()]);
+        assert_eq!(
+            root_cmd.effective_title(),
+            "/",
+            "a blank command name over a root cwd left no title"
+        );
+
+        // Nothing printable anywhere: not the command, not the directory's
+        // name, not the whole path.
+        let nameless =
+            Pane::with_command(WindowId::new(), "\u{00ad}", vec!["\u{00ad}".to_string()]);
+        assert_eq!(
+            nameless.effective_title(),
+            "pane",
+            "a pane with nothing printable anywhere left no title"
+        );
+    }
+
+    #[test]
+    fn a_flag_is_never_a_title() {
+        assert_eq!(
+            title_of(&["bash", "-c", "-n is a valid sed script"]),
+            "bash"
+        );
+        assert_eq!(title_of(&["bash", "-c", "--format json"]), "bash");
+        assert_eq!(title_of(&["bash", "-c", "-d"]), "bash");
+        // The space route past a leading assignment, which the `;` route caught
+        // but this one did not.
+        assert_eq!(title_of(&["bash", "-c", "A=1 -d 10"]), "bash");
+        assert_eq!(title_of(&["sh", "-c", "-- htop"]), "sh");
+    }
+
+    /// `basename` returns the whole token when there is no file name in it, so
+    /// a path-shaped non-program used to become the title verbatim.
+    /// `/`, `//`, `.` and `..` contain no file name, so there is nothing to
+    /// name the pane after.
+    #[test]
+    fn a_token_with_no_program_name_in_it_is_not_a_title() {
+        assert_eq!(title_of(&["sh", "-c", "/"]), "sh");
+        assert_eq!(title_of(&["sh", "-c", "//"]), "sh");
+        assert_eq!(title_of(&["sh", "-c", "."]), "sh");
+        assert_eq!(title_of(&["sh", "-c", ".."]), "sh");
+        // …but a real program with an unusual name keeps it. Judging by the
+        // glyphs ("no alphanumeric character") threw this away too.
+        assert_eq!(title_of(&["sh", "-c", "/usr/local/bin/+++ arg"]), "+++");
+        assert_eq!(title_of(&["/usr/local/bin/+++"]), "+++");
+        assert_eq!(title_of(&["sh", "-c", "+++ arg"]), "+++");
+    }
+
+    /// argv[0] is judged the same way a script's first word is; when it names
+    /// no program the cwd basename is a better title than `/` or `..`.
+    #[test]
+    fn an_argv_that_names_no_program_falls_through_to_the_cwd() {
+        assert_eq!(title_of(&["/"]), "proj");
+        assert_eq!(title_of(&[".."]), "proj");
+    }
+
+    #[test]
+    fn a_program_that_merely_takes_dash_c_is_not_unwrapped() {
+        // `is_shell` is a fixed list precisely so this does not happen.
+        assert_eq!(title_of(&["openssl", "-c", "req"]), "openssl");
+        assert_eq!(title_of(&["/opt/tool/shush", "-c", "start"]), "shush");
+    }
+
+    #[test]
+    fn a_shell_without_a_dash_c_script_titles_after_the_shell() {
+        assert_eq!(title_of(&["bash", "-l", "-i"]), "bash");
+        assert_eq!(title_of(&["sh"]), "sh");
+        assert_eq!(title_of(&["sh", "-c"]), "sh"); // truncated wrapper
+        assert_eq!(title_of(&["bash", "--command", "top"]), "bash");
+        assert_eq!(title_of(&["bash", "-x", "top"]), "bash");
+    }
+
+    #[test]
+    fn an_unwrapped_script_word_is_still_sanitized() {
+        // The script is as untrusted as any other title source (issue #104).
+        let title = title_of(&["sh", "-c", "ev\u{1b}]0;spoof\u{7}il --now"]);
+        assert!(!title.contains('\u{1b}'), "{title:?}");
+        assert!(!title.contains('\u{7}'), "{title:?}");
     }
 
     #[test]

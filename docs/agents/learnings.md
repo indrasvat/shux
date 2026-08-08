@@ -902,3 +902,187 @@ palette, restore the deliberate table/summary divergence).
   `Permission denied` — the recorder ran as an unprivileged user against a
   root-owned socket. It would have shipped as "proof of the bug" and every failure
   in it would have been the wrong failure.
+
+## 2026-08-07 — issue #125, `--cmd` shell semantics
+
+**A test's colour probe can pass on text and fail on colour.** The pre-fix screen for
+`--cmd "printf '<probe>'; …"` reads
+`'TRUECOLORprintf: warning: ignoring excess arguments, starting with '\033[38;5;208mINDEXED\033[0m'`
+— printf quotes the arguments it refused back at the screen, so the literal words
+`INDEXED` and `BASIC` appear as **uncoloured text inside an error message**. A
+`grep INDEXED` on `pane capture` calls that a passing colour probe. `pane glance
+--cells` gives style runs; asserting "a run reading INDEXED carries 256-colour 208"
+is the assertion that cannot be satisfied by a mangled screen. Beware also that a
+run is `[col, text]` when it carries the default pen and `[col, text, style]` when
+it does not — an unconditional three-way unpack raises on exactly the uncoloured
+rows the check exists to reject.
+
+**A before/after evidence harness cannot always resize the pre-fix pane.** The
+defect here killed the pane's PTY immediately, so `pane set-size` failed outright
+and took the harness down before it could shoot anything. Both arms now shoot at
+the daemon's default 80x24, which removes the failure and makes the two sides
+pixel-comparable for free.
+
+**`env::var` returns `Ok("")` for a set-but-empty variable.** `std::env::var("SHELL")
+.unwrap_or_else(|_| "/bin/sh")` therefore never fires its fallback for `SHELL=""`
+and the pane execs the empty program name. Two places in this repo resolved `$SHELL`
+and only one of them filtered blank, so one daemon gave a working `--cmd` pane and a
+dead default pane. Filter blank, always.
+
+**Deriving a display name from a shell script needs the first *simple command*, not
+the first token.** The first cut skipped `NAME=value` prefixes token by token, so
+`A=1;htop -d 10` — one token that is a complete assignment — was skipped and the
+scanner landed on `-d`, a flag belonging to a command it had never established.
+Splitting on shell operators first (`| & ; < > ( ) \``) bounds the search to one
+command, and it also makes `ls|wc` read as `ls` rather than falling back to the
+shell's name.
+
+**`pkill -f <pattern>` matched the checking shell itself and killed this session.**
+The pattern `/tmp/vhs/shux __daemon` appeared in the invoking bash's own argv, so
+`pkill -f` reaped the caller. Identify processes by pidfile; the repo rule exists
+because this really happens.
+
+**VHS: overwriting the binary between takes fails with ETXTBSY** when the previous
+take's daemon is still executing it, and `cp && … && clear` swallows the failure —
+the second take silently records the FIRST binary. Put each build in its own
+directory and switch `PATH`, so nothing is ever overwritten, and verify by md5 that
+the take used the binary you meant.
+
+**A spawn failure that returns success is worse than a crash.** `let _ =
+spawn_pane_pty(...)` at five call sites turned "your program does not exist" into a
+session that reported `✓ Created`, listed a pane with `exit_status: null`, and
+failed every subsequent verb with "pane VT not found". `state.apply` already had the
+right instinct (per-pane `spawn_results`); the single-pane verbs now roll back and
+return `SPAWN_FAILED`.
+
+**Attach was resurrecting dead panes.** The spawn-if-no-writer branch exists to close
+a race with a freshly created session, but a pane that *exited* is indistinguishable
+from one that has not started yet if you only look at the writer table. `exit_status`
+is the discriminator. It was also spawning with `Vec::new()` and the daemon's cwd
+rather than the pane's own — so the race it closed, it closed with the wrong process
+in the wrong place.
+
+### Round two — the fixes needed fixing
+
+**Rollback is not just "undo the entity".** Creating a window focuses it and
+creating a pane focuses it, and the destroy paths hand focus to *whatever the
+container yields first* — the session's first window, the layout tree's first
+pane. So an error path that only destroys the entity silently relocates the
+operator: active window `three` → `1`, and every later `-w`-less verb then
+targets the wrong window. Capture the prior focus before the create and restore
+it after the destroy. The generic destroy paths are right for a deliberate kill
+and wrong for a rollback; the difference is the caller's, not theirs.
+
+**`MAX_ARG_STRLEN` counts the terminating NUL.** `PAGE_SIZE * 32` is 131072 and
+the longest argument that actually fits is 131071. The first cut capped at
+131072 — and wrote a unit test asserting that exactly-131072 was acceptable,
+which passed, because the unit test and the bug shared the same wrong constant.
+It took an agent bisecting through the real binary to find it. **A boundary
+constant needs a test that spawns**, not a test that compares the constant to
+itself; `crates/shux/tests/pane_command_e2e.rs` now pins both sides against a
+real `execve`.
+
+**A per-item cap does not bound the aggregate.** Forty individually-legal 100 KiB
+arguments are 4 MiB and still `E2BIG`, and the spawn-failure hint then blamed
+`argv[0]` and the cwd, neither of which was wrong.
+
+**A flag is not a program name.** The title extractor rejected shell syntax but
+not a leading `-`, so `--cmd "-n is a valid sed script"` — the example printed
+in the flag's own help — titled the pane `-n`. And `basename` returns the whole
+token when there is no file name in it, so `/`, `..` and `+++` became titles
+verbatim. Require at least one alphanumeric character and no leading dash.
+
+**`--dry-run` must run the same validation the real path runs.** The argv rule
+lived only in the daemon, so the flag whose entire purpose is "will this
+succeed?" answered yes to templates the real run rejects. One function, called
+from both.
+
+**A green tick over a failed spawn is the same bug as issue #125.**
+`state.apply` deliberately does not roll back a partial batch, which is
+defensible — but it printed `✓ Applied` and exited 0 when *every* pane failed,
+so `shux state apply t.toml && shux attach` walked straight into dead panes.
+Not rolling back is a policy; reporting success is a lie.
+
+**Invisible characters spoof titles without needing bidi.** `U+200B` is not
+`is_control()` and renders as nothing, so `ht<ZWSP>op` and `htop` are
+indistinguishable on a border. Same class as the Trojan Source set already
+handled; `U+200D` ZWJ still has to survive because emoji need it.
+
+### Round three — the fixes for the fixes needed fixing
+
+**"Capture before, restore after" is a lost update.** Round two's focus restore
+read the active window before the create and wrote it back after the rollback —
+so an operator who moved focus while the PTY was starting had their choice
+silently reverted, measured at 14/30 with two concurrent clients, *worse than
+the 12–15 % baseline the restore was added to improve*. The fix is
+compare-and-restore: put focus back only if it is still on the entity being
+undone (1/30). Any restore-a-captured-value pattern needs that guard.
+
+**A statistical race test with a sleep in it discriminates nothing.** The first
+attempt slept 20 ms between starting the doomed create and issuing the focus,
+which let the create finish first — the reverting build passed it. Both clients
+have to be in flight at once. Verify a race test against the build that has the
+bug, or it is decoration: 12/16 reverted on the old build, 0 on the new one,
+only after the sleep came out.
+
+**A cap you cannot compute is worse than no cap.** `MAX_ARGV_BYTES` was wrong in
+both directions, proven by measurement: `ARG_MAX` is shared between argv and the
+environment, so a 1.2 MB environment still produced `E2BIG` under a 1 MB argv
+that passed the check, while an ordinary environment exec'd 1.5 MB that the
+check refused. No number available in the process is the kernel's number. What
+the cap was really for — an oversized argv failing with a diagnosis that blamed
+`argv[0]` and the cwd — belongs in the error message, not in a guess.
+
+**An allowlist where the property is what matters will always be incomplete.**
+Round two stripped the three invisible characters a reviewer happened to name;
+fifteen more survived, and a program in a pane can set its own title via OSC 0
+without any operator cooperation. Enumerate the Unicode property
+(`Default_Ignorable_Code_Point`), not the examples.
+
+**Judge a program name by the path, not by its glyphs.** "Reject a token with no
+alphanumeric character" also rejects `/usr/local/bin/+++`, which is a real
+program. `Path::file_name()` returning `None` is the honest test for `/`, `//`,
+`.` and `..`.
+
+**Fixing the human output path is half a fix.** `state apply` stopped calling a
+batch of dead panes a success — in text mode. `--format json`, the mode scripts
+and agents actually use, returned before the check and still exited 0.
+
+### Round four — removing a cap removed a protection nobody had named
+
+**A bound can be wrong as a prediction and right as a policy.** Round three
+deleted the aggregate argv cap because it could not predict `execve` — true, and
+the right call for *pre-flight rejection*. But the cap had been incidentally
+bounding something else: what the graph stores and what `pane.list` echoes.
+`state.apply` keeps a pane whose spawn failed, so a few multi-megabyte argvs
+pushed the response past the 16 MB frame limit and every read of that session
+died with `early eof`. The cap is back with an honest justification — shux's own
+storage bound — and the kernel's limit stays the kernel's business.
+
+**"Not in this batch's failures" is not "alive".** The focus rescue asked the
+wrong question and handed focus to a corpse left by an earlier apply, which is
+precisely what it was written to prevent. The daemon already knows the truth:
+`io_state.writers` holds exactly the panes with a live PTY.
+
+**`HashMap::values().find(...)` is a coin toss.** The same template focused a
+different pane on each run, so a script that applied and then used the focused
+pane targeted something different every time. Iterate the layout tree, which has
+an order that means something.
+
+**An exception list has to cover the whole reason it exists.** ZWJ was exempted
+from the invisible-character sweep because dropping it splits family emoji. The
+variation selectors are mandatory in the same RGI sequences and were not
+exempted, so `❤️‍🔥` became `❤` and `1️⃣` became `1` — the rule broke exactly what
+the exception was protecting.
+
+**Widening two rules at once opened a gap between them.** Round three widened
+what counts as a program name *and* what the sanitizer strips; a command whose
+name sanitizes to nothing then produced an empty title, because the fallback to
+the cwd only ran when no name was found at all — not when the name evaporated.
+
+**A test built from the wrong ingredients passes on the broken build.** The
+first corpse test put its corpses in separate sessions, so they were never
+siblings and the rescue never saw them. Only `state.apply`'s `split_pane` op
+leaves a corpse in an existing window — `pane.split` the RPC rolls one back.
+Three green runs against the known-broken binary is the signal to rebuild the
+fixture, not to trust the test.

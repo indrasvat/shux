@@ -199,6 +199,23 @@ pub async fn run_attach_server(
     Ok(())
 }
 
+/// Has this pane's PTY simply not started yet, as opposed to started and
+/// finished?
+///
+/// Attach spawns a PTY for the active pane when none is registered, to close a
+/// race: a freshly created session can be attached to before its spawn task
+/// has run. A pane whose command **exited** looks identical from the writer
+/// table, and used to be swept up by the same branch — so a pane that ran
+/// `make` and finished came back, on attach, as a fresh login shell in the
+/// daemon's working directory. The default `RestartPolicy` is `Never` and
+/// attaching is not a restart request (issue #125 follow-up).
+///
+/// `exit_status` is the discriminator: `None` until the child is reaped, `Some`
+/// forever after.
+fn pane_awaits_first_spawn(pane: &shux_core::model::Pane) -> bool {
+    pane.exit_status.is_none()
+}
+
 /// Handle one attach connection: handshake, then run the streaming loop.
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach_connection(
@@ -266,25 +283,39 @@ async fn handle_attach_connection(
     // Spawn a PTY for the initial pane if it doesn't exist yet (newly
     // created sessions can race with the attach if the client hits us
     // before the spawn task finishes).
+    //
+    // Two things this must NOT do, both of which it used to (issue #125
+    // follow-up). It must not resurrect a pane that genuinely **exited** —
+    // the default `RestartPolicy` is `Never`, and attaching is not a restart
+    // request; a pane whose command ran and finished came back as a login
+    // shell, silently replacing the program the operator asked for. And when
+    // it does spawn, it must use the pane's OWN command and cwd rather than
+    // an empty argv and the daemon's working directory, or the race it exists
+    // to close is closed with the wrong process in the wrong place.
     {
         let writer_present = {
             let state = io_state.lock().await;
             state.writers.contains_key(&session.active_pane_id)
         };
         if !writer_present {
-            crate::spawn_pane_pty(
-                session.active_pane_id,
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")),
-                Vec::new(),
-                shux_pty::handle::PtySize::default(),
-                Vec::new(),
-                false,
-                io_state.clone(),
-                cancel.clone(),
-                graph.clone(),
-            )
-            .await
-            .ok();
+            let snap = graph.snapshot();
+            if let Some(pane) = snap.panes.get(&session.active_pane_id)
+                && pane_awaits_first_spawn(pane)
+            {
+                crate::spawn_pane_pty(
+                    session.active_pane_id,
+                    pane.cwd.clone(),
+                    pane.command.clone(),
+                    shux_pty::handle::PtySize::default(),
+                    Vec::new(),
+                    false,
+                    io_state.clone(),
+                    cancel.clone(),
+                    graph.clone(),
+                )
+                .await
+                .ok();
+            }
         }
     }
     // Resize every pane in the active window to its real layout rect, not
@@ -2915,6 +2946,27 @@ async fn resize_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Attach must close the spawn race without resurrecting a pane that
+    /// genuinely finished (issue #125 follow-up).
+    #[test]
+    fn attach_spawns_only_a_pane_that_never_ran() {
+        use shux_core::model::{Pane, WindowId};
+
+        let mut pane = Pane::with_command(WindowId::new(), "/work", vec!["make".into()]);
+        assert!(
+            pane_awaits_first_spawn(&pane),
+            "a pane that has not started yet must be spawned"
+        );
+
+        for status in [0, 1, 127, -1] {
+            pane.exit_status = Some(status);
+            assert!(
+                !pane_awaits_first_spawn(&pane),
+                "a pane that exited ({status}) must not be respawned as a shell"
+            );
+        }
+    }
 
     #[test]
     fn wheel_routing_follows_pane_mode_state() {
