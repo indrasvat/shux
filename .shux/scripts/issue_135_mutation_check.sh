@@ -90,17 +90,17 @@ MUTATIONS=(
   "only_the_three_signal_bytes_rejected|pane_command::tests::a_control_character_in_run_args_is_rejected|${PC}|s.replace(\"(*c as u32) < 0x20 || *c == '\\\\u{7f}'\", \"matches!(*c, '\\\\u{3}' | '\\\\u{15}' | '\\\\u{1a}')\")"
 )
 
-# Run the suite that owns `file` and echo its log. `--color never` is pinned at
-# the call site: CI exports CARGO_TERM_COLOR=always, and the parser below anchors
-# on plain text. A non-zero exit is EXPECTED here (failing tests are the signal),
+# Run the suite that owns `file` and echo its log, through a make target rather
+# than raw cargo (CLAUDE.md). `--color never` is pinned inside that target: CI
+# exports CARGO_TERM_COLOR=always, and the parser below anchors on plain text. A non-zero exit is EXPECTED here (failing tests are the signal),
 # so it is swallowed deliberately — but `has_run` below then proves cargo
 # actually got as far as running tests, so a build or harness failure can never
 # masquerade as a result.
 run_suite() {
   case "$1" in
-    "${PTY}") cargo test --color never -p shux-pty --lib 2>&1 || true ;;
-    "${PC}") cargo test --color never -p shux --bin shux -- pane_command::tests 2>&1 || true ;;
-    *) cargo test --color never -p shux --bin shux -- style::tests 2>&1 || true ;;
+    "${PTY}") make -s test-mutation-suite CRATE=shux-pty TARGET=--lib FILTER= 2>&1 || true ;;
+    "${PC}") make -s test-mutation-suite CRATE=shux TARGET="--bin shux" FILTER=pane_command::tests 2>&1 || true ;;
+    *) make -s test-mutation-suite CRATE=shux TARGET="--bin shux" FILTER=style::tests 2>&1 || true ;;
   esac
 }
 

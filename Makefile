@@ -229,6 +229,15 @@ test-cli-unit: nextest-ready ## Run shux CLI unit tests (bin target; mock-stream
 	@$(NEXTEST_RUN) -p shux --bin shux $(FILTER)
 	@echo "$(COLOR_GREEN)✓ shux CLI unit tests passed$(COLOR_RESET)"
 
+.PHONY: test-mutation-suite
+test-mutation-suite: ## One suite for the mutation batteries, in libtest format. CRATE=<pkg> TARGET=<--lib|--bin shux> FILTER=<path::to::tests>
+	@# Deliberately `cargo test`, not nextest: the batteries parse libtest's
+	@# indented `failures:` block, which nextest does not emit. `--color never`
+	@# is pinned HERE so no caller can forget it — CI exports
+	@# CARGO_TERM_COLOR=always and cargo only colours through a TTY, so the
+	@# coloured path is the one local runs never see (`make check-ci-parity`).
+	@cargo test --color never -p $(CRATE) $(TARGET) -- $(FILTER)
+
 .PHONY: test-plugin-dx
 test-plugin-dx: nextest-ready ## Run focused plugin DX CLI/integration tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running plugin DX tests...$(COLOR_RESET)"

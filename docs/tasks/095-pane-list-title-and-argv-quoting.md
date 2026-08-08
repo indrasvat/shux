@@ -242,6 +242,35 @@ boundaries.
 - [x] `make check` green (2,075 tests).
 - [x] Before/after evidence on both binaries, every scene asserted, baseline arm
       verdict-inverted.
+### Known defect at completion — #144 (P0, sequenced not deferred)
+
+The `shux-tui-qa` gate returned FAIL on a defect the whole unit suite is
+structurally blind to. `style.rs::display_width` measures `⚠️` (U+26A0 U+FE0F)
+as **2** columns — `UnicodeWidthStr`, which is what xterm, iTerm2 and wezterm
+render — while shux-vt allocates it **1** cell from the base scalar
+(`parser.rs:569`, `capture.rs:1181`). A pane titled `⚠️ build` therefore pads one
+space short and its row's right border lands at column 98 where every other row
+lands at 99.
+
+Probed against a real pane via `pane glance --cells`: VS16 (`⚠️`, `❤️`) and
+interior-ZWJ (`A<ZWJ>Z`) get 1 cell; ZWJ sequences, flags, plain emoji and CJK
+get 2. shux-vt is the side that disagrees with the ecosystem, so the fix is
+filed as **#144** under the `shux-vt-solid-qa` gate. Teaching `style.rs` to
+match shux-vt was rejected: it would square the frame inside a shux pane and
+break it in every other terminal, baking the disagreement into the CLI.
+
+Why the suite could not see it: `a_fitted_cell_is_exactly_as_wide_as_it_was_asked_to_be`
+and `the_box_never_renders_wider_than_the_terminal` both measure with the same
+`display_width` they are validating, so they are self-referential with respect
+to the real cell allocator — and the mutation `truncation_sums_per_character_widths`
+is killed by that same self-referential assertion. The lesson generalises: a
+width test that does not read the rendered grid tests only its own arithmetic.
+
+`the_box_frame_is_square_on_the_rendered_grid` now asserts on the border columns
+shux-vt actually painted, and is `#[ignore]`d pending #144. It was shown to fail
+with an emoji title (`right borders landed at [65, 65, 64, 65]`) and pass with an
+ASCII one, so it detects the defect rather than merely staying red.
+
 - [x] Visual proof published, six scenes side by side:
       <https://claude.ai/code/artifact/a12e9911-2c71-4ab4-996f-410eb64c4595>.
       This session is headless and has neither the `browsing-as-you` skill nor a

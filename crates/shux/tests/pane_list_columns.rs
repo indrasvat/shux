@@ -393,11 +393,43 @@ fn the_listed_pane_still_renders_every_colour_class() {
     for needle in ["TRUECOLOR", "INDEXED", "BASIC"] {
         assert!(text.contains(needle), "colour probe missing {needle}");
     }
-    // Assert on the PEN, not the word: the words themselves are ordinary text.
-    for (word, colour) in [("INDEXED", "208"), ("BASIC", "4")] {
+
+    // Assert on the PEN, structurally. A substring search cannot do this job:
+    // `"4"` occurs in the row and column indices of any non-empty frame, so the
+    // BASIC half of this test passed on a monochrome screen until the shux-tui-qa
+    // gate for task 095 pointed it out. Walk the runs and collect the actual
+    // foreground pens instead.
+    let mut indexed: Vec<u64> = Vec::new();
+    let mut truecolour = false;
+    let mut visit = |style: &serde_json::Value| {
+        let Some(fg) = style.get("fg") else { return };
+        if let Some(idx) = fg.get("idx").and_then(|v| v.as_u64()) {
+            indexed.push(idx);
+        }
+        if fg.get("rgb").is_some() {
+            truecolour = true;
+        }
+    };
+    for row in cells["result"]["cells"]["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        for run in row["runs"].as_array().into_iter().flatten() {
+            // A run is [col, content] or [col, content, style].
+            if let Some(style) = run.as_array().and_then(|r| r.get(2)) {
+                visit(style);
+            }
+        }
+    }
+    assert!(
+        truecolour,
+        "no run carries an rgb pen; the screen is monochrome:\n{text}"
+    );
+    for (word, idx) in [("INDEXED", 208u64), ("BASIC", 4u64)] {
         assert!(
-            text.contains(colour),
-            "no run carrying colour {colour} for {word}; the screen is monochrome:\n{text}"
+            indexed.contains(&idx),
+            "no run carries indexed pen {idx} for {word}; pens seen: {indexed:?}\n{text}"
         );
     }
 }
@@ -553,4 +585,82 @@ fn a_control_byte_in_args_is_refused_and_leaves_the_pane_usable() {
         "the pane was wedged by a rejected call: {out}"
     );
     env.wait_for(&s, "1", "[STILL-ALIVE]");
+}
+
+/// The box frame must be square on the RENDERED GRID, whatever the title holds.
+///
+/// This asserts on `pane glance --cells` — the columns shux-vt actually painted
+/// — and never on `style.rs::display_width`. That distinction is the whole
+/// point of the test. The width tests in `style.rs` measure with the same
+/// function they are validating, so they are self-referential with respect to
+/// the real cell allocator and cannot see a disagreement between the two; the
+/// `shux-tui-qa` gate for task 095 found exactly such a disagreement that the
+/// entire unit suite was blind to.
+///
+/// Ignored until #144 lands. shux-vt gives an emoji-presentation sequence
+/// (`⚠️` = U+26A0 U+FE0F) ONE cell while `UnicodeWidthStr` — and xterm, iTerm2
+/// and wezterm — give it two, so a title carrying one shifts its row a column
+/// left and the right border lands short. The fix belongs in shux-vt's cell
+/// allocation, not in this listing's padding: matching `style.rs` to shux-vt
+/// would square the frame inside a shux pane and break it in every other
+/// terminal. Un-ignore when #144 is fixed.
+#[test]
+#[ignore = "blocked on #144: shux-vt allocates 1 cell for VS16 emoji, real terminals allocate 2"]
+fn the_box_frame_is_square_on_the_rendered_grid() {
+    let mut env = Env::new();
+    let s = "t135f";
+    // `shell_session` returns the live shell's PANE id — it lists itself below.
+    let target = env.shell_session(s);
+
+    // Title it with an emoji-presentation sequence. The header and border rows
+    // are the control: they are pure ASCII, so a row that disagrees with them
+    // disagrees because of its title.
+    env.ok(&["pane", "title", "-s", s, "-p", &target, "-t", "⚠️ build"]);
+
+    env.ok(&[
+        "pane", "set-size", "-s", s, "-p", &target, "--cols", "100", "--rows", "20",
+    ]);
+    env.type_line(
+        s,
+        "1",
+        &format!("clear; {} --format text pane list -s {s}", env.bin_str()),
+    );
+    env.wait_for(s, "1", "TITLE");
+
+    let cells = env.json(&["pane", "glance", &target, "--cells"]);
+    let rows = cells["result"]["cells"]["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    // Right-border column of every framed row, read off the grid.
+    let mut borders: Vec<u64> = Vec::new();
+    for row in &rows {
+        let mut last: Option<u64> = None;
+        for run in row["runs"].as_array().into_iter().flatten() {
+            let (Some(col), Some(content)) = (
+                run.get(0).and_then(|v| v.as_u64()),
+                run.get(1).and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            if let Some(off) = content.rfind('│') {
+                last = Some(col + content[..off].chars().count() as u64);
+            }
+        }
+        if let Some(c) = last {
+            borders.push(c);
+        }
+    }
+
+    assert!(
+        borders.len() >= 3,
+        "expected a framed listing, got borders {borders:?}"
+    );
+    let first = borders[0];
+    assert!(
+        borders.iter().all(|c| *c == first),
+        "the frame is ragged: right borders landed at {borders:?} — every framed \
+         row must end in the same column regardless of what its title contains"
+    );
 }
