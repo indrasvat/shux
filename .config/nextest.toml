@@ -148,6 +148,7 @@ filter = '''
   + binary_id(=shux::m0_integration)
   + binary_id(=shux::pane_command_e2e)
   + binary_id(=shux::pane_io_integration)
+  + binary_id(=shux::pane_list_columns)
   + binary_id(=shux::rep_pane_e2e)
   + binary_id(=shux::settle_waiter_drop)
   + binary_id(=shux::statusbar_starship_symlink)

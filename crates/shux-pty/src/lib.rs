@@ -9,6 +9,6 @@ pub mod handle;
 pub mod manager;
 
 pub use capture::strip_ansi;
-pub use command::{CommandEngine, CommandResult};
+pub use command::{CommandEngine, CommandResult, shell_escape_args, shell_quote_arg};
 pub use handle::{PtyConfig, PtyError, PtyHandle, PtySize};
 pub use manager::{PaneId, PtyEvent, PtyManager};

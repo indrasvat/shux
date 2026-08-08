@@ -1086,3 +1086,70 @@ siblings and the rescue never saw them. Only `state.apply`'s `split_pane` op
 leaves a corpse in an existing window — `pane.split` the RPC rolls one back.
 Three green runs against the known-broken binary is the signal to rebuild the
 fixture, not to trust the test.
+
+## 2026-08-08 — task 095 (issue #135): `pane list` title + argv quoting
+
+**`UnicodeWidthStr::width` is a property of the STRING, not the sum of its
+characters.** `☀️` (U+2600 U+FE0F) is 1 if you add up its characters and **2** as
+a string; a ZWJ family is 6 added up and **2** as a string. A truncator that
+accumulated per-character widths therefore returned cells wider than the width
+it was asked for, `pad_right` then added no padding, the row under-reported its
+own visible length, and the box printed lines up to 240 columns wide in an
+80-column terminal — at 100 of the 177 widths swept. Everything else in
+`style.rs` measures whole strings, so anything new there must too. Measure the
+accumulated string; never sum.
+
+**A guard whose numbers restate an arithmetic done elsewhere will drift.** The
+minimum boxable width was written down as 24, derived by hand from "an id and a
+`◀ focus` marker are 18 columns". A *zoomed* pane's marker is `◀ focus
+[zoomed]` — 16 columns, not 7 — so the stated guarantee was wrong by seven and
+the test that asserted it used only unzoomed panes, which is why it was green.
+Derive the constant from `pane_marker(true, true)` and put the zoomed case in
+the sweep.
+
+**Making quoting correct can turn a transient failure into a permanent one.**
+`pane.run_command` types its line into the pane's *terminal*, so the tty line
+discipline reads it before any shell does. The old denylist left a `0x03`
+unquoted, and the line discipline's truncation happened to leave valid shell
+behind — one failed call, then recovery. Correct quoting puts the byte *inside*
+the single quotes, so the truncation now leaves an unterminated quote: bash
+drops to `>` and swallows every later command sent to that pane, forever.
+**Validate for the sink you actually have.** `reject_unexecutable` was written
+for `execve`, where NUL is the impossible byte; this sink is a tty, where NUL is
+the harmless one and the signal bytes are fatal.
+
+**An `expect ... no <pattern>` check passes vacuously when the file is missing.**
+The first run of the evidence harness passed `titles` where the helper wanted
+`titles.txt`, so `grep` errored, `hit=0`, and every "must NOT contain" assertion
+reported ok — against a file that did not exist. A missing artifact has to be a
+harness failure, not a satisfied negative.
+
+**A baseline arm can hide the defect it exists to show.** The injection scene
+used `A;touch FILE` — which contains a space, which the *old* denylist quoted.
+The pre-fix arm dutifully reported no injection. A probe must not rely on any
+character the code under test happened to handle; the space-free `A;>FILE`
+reproduces.
+
+**A control that asserts something only the fixed build can show is not a
+control.** `expect_always ... "/bin/sh"` read the rendered box — which pre-fix
+has no COMMAND column — so it failed on the baseline arm for the very reason the
+task exists. Controls must read a path both binaries share; here that is the
+RPC's own JSON, which this task did not change.
+
+**`-w 1` is the second window.** `window list` shows the default window at index
+0 with the name `1`, and index resolution runs before name resolution — so the
+evidence harness photographed the viewer window and looked plausible doing it.
+Use ids in automation. Filed as #142.
+
+**Idempotence and injectivity can be mutually exclusive.** `safe_label` maps a
+control character to the text `\u{a}`, which is ambiguous with a literal
+`\u{a}` — two different argvs print identically. Escaping the backslash fixes
+that and breaks `test_safe_label_is_idempotent`, which `print_success` depends
+on. Filed as #141 rather than traded away in passing.
+
+**Equivalent mutants are not survivors.** Swapping the egress guard and the
+quoting looked like a real mutation and no test killed it — because the two
+orders are provably identical (every character the guard rewrites already fails
+the quoting allowlist; 200,000 random argvs, zero differences). Counting it as a
+survivor would have meant writing a test that cannot fail. Check whether a
+mutant is equivalent before treating a survivor as a coverage gap.
