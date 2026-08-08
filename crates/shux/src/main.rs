@@ -1549,6 +1549,27 @@ fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Turn a PTY spawn failure into an error whose hint matches the actual cause.
+///
+/// `spawn_failed`'s default hint — check `argv[0]` and the cwd — is right for
+/// "No such file or directory" and wrong for everything else. `E2BIG` in
+/// particular fires when `argv[0]` resolves perfectly and the cwd exists; the
+/// command and the environment together are simply larger than `ARG_MAX`, and
+/// no ceiling this process could impose would know that number (issue #125
+/// follow-up).
+pub(crate) fn spawn_failure(e: &shux_pty::PtyError) -> shux_rpc::RpcError {
+    let detail = e.to_string();
+    let hint = if detail.contains("Argument list too long") {
+        "the command's arguments and environment together exceed the kernel's \
+         ARG_MAX; shorten the command or the environment"
+    } else if detail.contains("Permission denied") {
+        "argv[0] exists but is not executable by this user"
+    } else {
+        "check argv[0] resolves via PATH and cwd exists"
+    };
+    shux_rpc::RpcError::spawn_failed_with_hint(&detail, hint)
+}
+
 /// The human-readable half of an `RpcError`, for CLI-side reporting.
 ///
 /// `RpcError`'s `Display` is the JSON-RPC code name (`invalid_params`); the
@@ -2309,6 +2330,47 @@ fn register_state_methods(
                         }
                     }
                 }
+                // `state.apply` deliberately keeps a pane whose PTY never
+                // started (codex P0 #1: no rollback), and the batch focuses the
+                // last pane it created regardless. So a batch with one bad op
+                // left the window focused on a corpse, and every `-p`-less verb
+                // in that window answered "pane VT not found". Hand focus to a
+                // pane that actually started (issue #125 follow-up).
+                let dead: std::collections::HashSet<_> = spawn_results
+                    .iter()
+                    .filter(|r| !r.spawned)
+                    .map(|r| r.pane_id)
+                    .collect();
+                if !dead.is_empty() {
+                    let snap = gh.snapshot();
+                    let mut rescue = Vec::new();
+                    for pane_id in &dead {
+                        let Some(window_id) = snap.panes.get(pane_id).map(|p| p.window_id) else {
+                            continue;
+                        };
+                        let Some(window) = snap.windows.get(&window_id) else {
+                            continue;
+                        };
+                        if window.active_pane != *pane_id {
+                            continue;
+                        }
+                        // Prefer a sibling that spawned; a still-dead sibling is
+                        // no better than the one we are leaving.
+                        if let Some(alive) = snap
+                            .panes
+                            .values()
+                            .find(|p| p.window_id == window_id && !dead.contains(&p.id))
+                            .map(|p| p.id)
+                        {
+                            rescue.push(alive);
+                        }
+                    }
+                    drop(snap);
+                    for pane in rescue {
+                        let _ = gh.focus_pane(pane).await;
+                    }
+                }
+
                 result.spawn_results = spawn_results;
 
                 serde_json::to_value(&result).map_err(|e| {
@@ -2907,12 +2969,16 @@ fn register_pane_methods(
                 // one that had it. So a rollback has to put focus back itself,
                 // or a failed split silently moves the operator's cursor to an
                 // unrelated pane and every later `-p`-less verb targets it.
-                let prior_active_pane = {
+                let (prior_active_pane, prior_zoom) = {
                     let snap = gh.snapshot();
-                    snap.panes
+                    let w = snap
+                        .panes
                         .get(&pane_id)
-                        .and_then(|p| snap.windows.get(&p.window_id))
-                        .map(|w| w.active_pane)
+                        .and_then(|p| snap.windows.get(&p.window_id));
+                    (
+                        w.map(|w| w.active_pane),
+                        w.and_then(|w| w.layout.zoom.as_ref().map(|z| z.zoomed_pane)),
+                    )
                 };
 
                 // `_with_command` persists the argv on the new pane, so
@@ -2941,11 +3007,49 @@ fn register_pane_methods(
                 )
                 .await
                 {
+                    // Restore focus ONLY if it is still on the pane being undone.
+                    // Capturing before and writing after is a lost update: an
+                    // operator who moved focus while the PTY was starting had
+                    // their choice silently reverted, and measurably more often
+                    // than before the restore existed. Their choice wins.
+                    // One snapshot, read three times: `gh.snapshot()` hands back
+                    // a temporary, so chaining lookups across two calls borrows
+                    // from something already dropped.
+                    let active_pane_of = |snap: &shux_core::graph::SessionGraphSnapshot,
+                                          pane: shux_core::model::PaneId| {
+                        snap.panes
+                            .get(&pane)
+                            .and_then(|p| snap.windows.get(&p.window_id))
+                            .map(|w| w.active_pane)
+                    };
+                    let focus_is_still_ours =
+                        active_pane_of(&gh.snapshot(), new_pane_id) == Some(new_pane_id);
+
                     let _ = gh.destroy_pane(new_pane_id, None).await;
-                    if let Some(prev) = prior_active_pane {
+
+                    if focus_is_still_ours
+                        && let Some(prev) = prior_active_pane
+                        // `destroy_pane` may already have landed on `prev`;
+                        // focusing again fires a transition out of nowhere.
+                        && active_pane_of(&gh.snapshot(), prev) != Some(prev)
+                    {
                         let _ = gh.focus_pane(prev).await;
                     }
-                    return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
+                    // A successful split legitimately clears zoom; an undone one
+                    // must not leave the window un-zoomed.
+                    if let Some(z) = prior_zoom {
+                        let snap = gh.snapshot();
+                        let zoomed_now = snap
+                            .panes
+                            .get(&z)
+                            .and_then(|p| snap.windows.get(&p.window_id))
+                            .is_some_and(|w| w.layout.is_zoomed());
+                        drop(snap);
+                        if !zoomed_now {
+                            let _ = gh.zoom_pane(z, None).await;
+                        }
+                    }
+                    return Err(spawn_failure(&e));
                 }
 
                 let snap = gh.snapshot();
@@ -3919,11 +4023,29 @@ fn register_window_methods(
                     )
                     .await
                     {
+                        // Same compare-and-restore as `pane.split`: only put
+                        // focus back if it is still on the window being undone.
+                        let focus_is_still_ours = gh
+                            .snapshot()
+                            .sessions
+                            .get(&session_id)
+                            .map(|s| s.active_window)
+                            == Some(window_id);
+
                         let _ = gh.destroy_window(window_id, None).await;
-                        if let Some(prev) = prior_active_window {
+
+                        if focus_is_still_ours
+                            && let Some(prev) = prior_active_window
+                            && gh
+                                .snapshot()
+                                .sessions
+                                .get(&session_id)
+                                .map(|s| s.active_window)
+                                != Some(prev)
+                        {
                             let _ = gh.focus_window(prev, None).await;
                         }
-                        return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
+                        return Err(spawn_failure(&e));
                     }
 
                     let mut result = window_to_json(window, index, is_active, &snap);
@@ -4050,11 +4172,29 @@ fn register_window_methods(
                     )
                     .await
                     {
+                        // Same compare-and-restore as `pane.split`: only put
+                        // focus back if it is still on the window being undone.
+                        let focus_is_still_ours = gh
+                            .snapshot()
+                            .sessions
+                            .get(&session_id)
+                            .map(|s| s.active_window)
+                            == Some(window_id);
+
                         let _ = gh.destroy_window(window_id, None).await;
-                        if let Some(prev) = prior_active_window {
+
+                        if focus_is_still_ours
+                            && let Some(prev) = prior_active_window
+                            && gh
+                                .snapshot()
+                                .sessions
+                                .get(&session_id)
+                                .map(|s| s.active_window)
+                                != Some(prev)
+                        {
                             let _ = gh.focus_window(prev, None).await;
                         }
-                        return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
+                        return Err(spawn_failure(&e));
                     }
 
                     let session = snap
@@ -4409,7 +4549,7 @@ fn register_session_methods(
                                 {
                                     let _ = gh.destroy_session(session_id, None).await;
                                     meta.remove(session_id).await;
-                                    return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
+                                    return Err(spawn_failure(&e));
                                 }
                                 Ok(session_to_json(s, &snap))
                             } else {
@@ -4602,7 +4742,7 @@ fn register_session_methods(
                                 {
                                     let _ = gh.destroy_session(session_id, None).await;
                                     meta.remove(session_id).await;
-                                    return Err(shux_rpc::RpcError::spawn_failed(&e.to_string()));
+                                    return Err(spawn_failure(&e));
                                 }
                                 let mut json = session_to_json(s, &snap);
                                 json["created"] = serde_json::Value::Bool(true);

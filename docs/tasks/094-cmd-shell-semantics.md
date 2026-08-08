@@ -129,19 +129,37 @@ introduced.
 | 22 | `state apply` | printed `✓ Applied` and exited 0 when every pane in the batch failed to spawn, so `shux state apply t.toml && shux attach` walked into a session of dead panes |
 | 23 | title sanitizer | `U+200B` and friends survived, so `ht<ZWSP>op` renders identically to `htop` — the same spoofing shape as the bidi set, without needing any reordering |
 
-**Known residual, deliberately not fixed here.** Between the split and the spawn
-failure the new pane *is* the window's active pane, so a concurrent caller
-resolving "the active pane" in that window can still be handed an id that is
-about to be destroyed, and gets `pane not found`. Closing it means not focusing
-the new pane until the spawn succeeds, which adds two focus events to every
-successful split. Before this task the same caller got a *phantom* pane that
-resolved and was dead, so this is strictly an improvement: a loud error instead
-of a silent wrong pane.
+### Round three — what round two's fixes broke or missed
 
-**Also unchanged, by design.** `state.apply` still does not roll back a partial
-batch (codex P0 #1: killing already-spawned siblings has its own side effects,
-so partial outcomes are reported rather than undone). What changed is that the
-report is no longer a green tick and exit 0.
+| # | Surface | Before |
+|---|---|---|
+| 24 | focus restore (round two's own fix) | **a lost update.** Capturing focus before the create and writing it back after silently reverted a `window focus` the operator made meanwhile — measured at 14/30 with two concurrent clients, worse than the 12–15 % the restore was added to fix. Now compare-and-restore: focus goes back only if it is still on the entity being undone (1/30) |
+| 25 | rollback of a failed `pane.split` | left the window **un-zoomed**. A successful split legitimately clears zoom; an undone one must not |
+| 26 | `state.apply` | focused the pane that never started. `state.apply` deliberately keeps it, so every `-p`-less verb in that window answered "pane VT not found" against a corpse. Focus now goes to a pane that did start |
+| 27 | `state apply --format json` | round two fixed the human path only, and returned before the check — so the format scripts and agents use still exited 0 over a batch of dead panes |
+| 28 | `MAX_ARGV_BYTES` (round two's own fix) | **wrong in both directions.** `ARG_MAX` is shared with the environment: a 1.2 MB environment still gave `E2BIG` under a 1 MB argv that passed; and an ordinary environment exec'd 1.5 MB of argv that the cap refused. No number in this process is the kernel's number, so the cap is gone and the *diagnosis* is fixed instead — `E2BIG` now says so rather than blaming `argv[0]` and the cwd |
+| 29 | title rules (round two's own fix) | "no alphanumeric character" was applied after `basename`, so `/usr/local/bin/+++` — a real program — lost its name. The test is whether the path contains a file name at all, which `/`, `//`, `.` and `..` do not |
+| 30 | title sanitizer (round two's own fix) | an allowlist of three code points where the property is what matters: fifteen more invisible characters survived, and a program in a pane can set its own title via OSC 0 without any operator help. Now the `Default_Ignorable_Code_Point` set, minus ZWJ |
+| 31 | `state apply --dry-run` | still said yes to window titles the apply rejects — round two shared only the argv rule. The pure title rule is shared now; conflicts with live state cannot be decided without the daemon, and the flag's help says so |
+
+**Known residuals, measured and documented rather than papered over.**
+
+- Between the split and the spawn failure the new pane *is* the window's active
+  pane, so a concurrent caller resolving "the active pane" can be handed an id
+  about to be destroyed: **30 % over 60 trials, against 33 % before this task.**
+  Closing it means not focusing the new pane until the spawn succeeds, which
+  changes the event stream every successful split emits. Before this task the
+  same caller got a *phantom* pane that resolved and was dead — a loud error is
+  the improvement.
+- A rolled-back create still bumps entity versions, so another client's
+  optimistic-concurrency token is invalidated by an operation that changed
+  nothing (3 bumps before this task, 3 now — the extra one round two added is
+  gone with the conditional restore). Making a rollback version-neutral needs
+  transactional staging in the graph, which is a larger change than this task.
+- `state.apply` still does not roll back a partial batch (codex P0 #1: killing
+  already-spawned siblings has its own side effects, so partial outcomes are
+  reported rather than undone). What changed is that the report is no longer a
+  green tick and exit 0 — in either output format.
 
 ## Testing Matrix
 
@@ -157,6 +175,7 @@ report is no longer a green tick and exit 0.
 | Unit — `handle.rs` | blank/whitespace/unset `$SHELL` all fall back; an explicit command is never replaced |
 | E2E — follow-ups | `window.ensure` on an existing window; blank argv[0]; oversize argument; a program that cannot be executed on all five verbs, with no phantom left behind; `state.apply` argv validation; `pane split --cmd` and trailing argv; a hyphen-leading `--cmd`; a blank `$SHELL` still opening a working default pane |
 | E2E — round two | focus survives a failed `window.create` and a failed `pane.split`; the argument-length boundary pinned against a **real spawn** on both sides (131071 spawns, 131072 refused before `execve`); an argv whose total is too long; `--dry-run` and the real run agreeing; `state apply` reporting failure; a flag-shaped `--cmd` never becoming a title. All seven observed failing against `dcb4a1e` and passing here |
+| E2E — round three | a concurrent focus surviving a rollback (16 trials, decisive: 12/16 reverted on the previous commit, 0 here); zoom surviving a failed split; `state.apply` not focusing a dead pane; `--format json` reporting failure; `--dry-run` rejecting an impossible window title; an oversized argv diagnosed rather than capped by a guess; a real program with an unusual name keeping it |
 | Shell — `.shux/scripts/issue_125_evidence.sh` | eight scenes, both binaries, through the shipped binary, under the leak guard. Colour is asserted on the **pen** via `pane glance --cells`, not on the word: the pre-fix screen prints the literal text `INDEXED` inside printf's own error message, so a `grep` would have called that a colour probe. `EXPECT_DEFECT=1` inverts the verdict, so the baseline arm fails if the defect has already gone away |
 
 ## Acceptance Criteria

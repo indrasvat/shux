@@ -1141,39 +1141,6 @@ fn the_argument_length_limit_matches_what_execve_accepts() {
     );
 }
 
-/// The per-argument cap does not bound the total: forty individually-legal
-/// 100 KiB arguments are 4 MiB and still `E2BIG`.
-#[test]
-fn an_argv_whose_total_is_too_long_is_refused_before_execve() {
-    let env = Env::new();
-    let argv: Vec<String> = std::iter::once("/bin/echo".to_string())
-        .chain(std::iter::repeat_n("x".repeat(100_000), 40))
-        .collect();
-    let path = env.work().join("total.json");
-    std::fs::write(
-        &path,
-        serde_json::json!({"name": "total", "command": argv}).to_string(),
-    )
-    .unwrap();
-    let out = env.run(&[
-        "rpc",
-        "call",
-        "session.create",
-        "--params",
-        &format!("@{}", path.display()),
-        "--format",
-        "json",
-    ]);
-    let joined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!out.status.success(), "{joined}");
-    assert!(joined.contains("whole argv"), "{joined}");
-    assert!(!joined.contains("Argument list too long"), "{joined}");
-}
-
 /// `--dry-run` exists to answer "will this apply succeed?". The argv rule lived
 /// only in the daemon, so it answered yes to templates the real run rejects.
 #[test]
@@ -1257,4 +1224,319 @@ fn a_flag_shaped_command_does_not_become_the_pane_title() {
             "{script:?} produced the flag {title:?} as a pane title"
         );
     }
+}
+
+// ── round-three follow-ups ──────────────────────────────────────────────
+
+/// Round two captured focus before the create and wrote it back after — a lost
+/// update. A `window focus` issued while the PTY was starting returned success
+/// and was then silently reverted. Focus is now only put back if it is still on
+/// the entity being undone, so a choice made meanwhile wins.
+///
+/// Driven as a real race: the failing create runs concurrently with the focus.
+/// The margin is wide by construction — the reverting build loses focus on
+/// roughly half of these — so the threshold is not measuring jitter.
+#[test]
+fn a_concurrent_focus_survives_a_rollback() {
+    const TRIALS: usize = 16;
+    let mut env = Env::new();
+    env.ok(&["session", "create", "race", "-d"]);
+    env.sessions.push("race".to_string());
+    env.ok(&["window", "create", "-s", "race", "-n", "wa"]);
+    env.ok(&["window", "create", "-s", "race", "-n", "wb"]);
+
+    fn active(e: &Env) -> String {
+        e.json(&["window", "list", "-s", "race"])
+            .as_array()
+            .expect("windows")
+            .iter()
+            .find(|w| w["is_active"] == true)
+            .and_then(|w| w["title"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    let mut kept = 0;
+    for i in 0..TRIALS {
+        env.ok(&["window", "focus", "-s", "race", "-w", "wa"]);
+        let ghost = format!("ghost{i}");
+        // Start the doomed create, then move focus while its PTY is starting.
+        let mut child = env
+            .shux()
+            .args([
+                "window",
+                "create",
+                "-s",
+                "race",
+                "-n",
+                &ghost,
+                "--",
+                "no-such-binary-xyz",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn create");
+        // No delay: both clients must be in flight at once. A sleep here lets
+        // the create finish first, and the test then discriminates nothing —
+        // the reverting build passes it.
+        let focused = env
+            .run(&["window", "focus", "-s", "race", "-w", "wb"])
+            .status
+            .success();
+        let _ = child.wait();
+        if focused && active(&env) == "wb" {
+            kept += 1;
+        }
+    }
+    assert!(
+        kept >= TRIALS - 3,
+        "a rollback reverted a concurrent focus in {} of {TRIALS} trials",
+        TRIALS - kept
+    );
+}
+
+/// The settled form of the same property, deterministic: a focus that has
+/// already landed before the create is never dragged back.
+#[test]
+fn a_rollback_does_not_clobber_a_focus_change_made_meanwhile() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "settled", "-d"]);
+    env.sessions.push("settled".to_string());
+    env.ok(&["window", "create", "-s", "settled", "-n", "wa"]);
+    env.ok(&["window", "create", "-s", "settled", "-n", "wb"]);
+
+    fn active(e: &Env) -> String {
+        e.json(&["window", "list", "-s", "settled"])
+            .as_array()
+            .expect("windows")
+            .iter()
+            .find(|w| w["is_active"] == true)
+            .and_then(|w| w["title"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+    env.ok(&["window", "focus", "-s", "settled", "-w", "wb"]);
+    let out = env.run(&[
+        "window",
+        "create",
+        "-s",
+        "settled",
+        "-n",
+        "ghost",
+        "--",
+        "no-such-binary-xyz",
+    ]);
+    assert!(!out.status.success());
+    assert_eq!(active(&env), "wb");
+}
+
+/// A successful split legitimately clears zoom. An undone one must not.
+#[test]
+fn a_failed_split_leaves_the_window_zoomed() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "zoomed", "-d"]);
+    env.sessions.push("zoomed".to_string());
+    let first = env.first_pane("zoomed");
+    env.ok(&[
+        "pane",
+        "split",
+        "-s",
+        "zoomed",
+        "-p",
+        &first,
+        "--cmd",
+        &format!("{}; exec sleep 900", probe()),
+    ]);
+    env.ok(&["pane", "zoom", "-s", "zoomed", "-p", &first]);
+
+    let zoomed = |e: &Env| -> bool {
+        e.json(&["pane", "list", "-s", "zoomed"])
+            .as_array()
+            .expect("panes")
+            .iter()
+            .any(|p| p["is_zoomed"] == true)
+    };
+    assert!(zoomed(&env), "setup: the window should be zoomed");
+
+    let out = env.run(&[
+        "pane",
+        "split",
+        "-s",
+        "zoomed",
+        "-p",
+        &first,
+        "--",
+        "no-such-binary-xyz",
+    ]);
+    assert!(!out.status.success());
+    assert!(zoomed(&env), "a failed split un-zoomed the window");
+}
+
+/// `state.apply` deliberately keeps a pane whose PTY never started — and it
+/// focused it, so every `-p`-less verb in that window answered "pane VT not
+/// found" against a corpse.
+#[test]
+fn state_apply_does_not_leave_focus_on_a_pane_that_never_started() {
+    let mut env = Env::new();
+    // The colour probe lives in a file: TOML basic strings have no `\0`
+    // escape, so a `printf '\033[...'` written inline is a parse error.
+    let colour = env.work().join("colour.txt");
+    std::fs::write(
+        &colour,
+        "\u{1b}[38;2;120;220;180mTRUECOLOR\u{1b}[0m \u{1b}[38;5;208mINDEXED\u{1b}[0m \u{1b}[34mBASIC\u{1b}[0m\n",
+    )
+    .unwrap();
+    let path = env.work().join("mixed.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[session]\nname = \"mixed\"\n\n[[windows]]\ntitle = \"w\"\n\n\
+             [[windows.panes]]\ncommand = [\"/bin/sh\", \"-c\", \"cat {}; exec sleep 900\"]\n\n\
+             [[windows.panes]]\ndirection = \"vertical\"\ncommand = [\"no-such-binary-xyz\"]\n",
+            colour.display()
+        ),
+    )
+    .unwrap();
+    // The apply reports failure (one pane did not spawn) but still commits.
+    let _ = env.run(&["state", "apply", path.to_str().unwrap()]);
+    env.sessions.push("mixed".to_string());
+
+    let panes = env.json(&["pane", "list", "-s", "mixed"]);
+    let focused = panes
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|p| p["is_focused"] == true)
+        .expect("some pane must be focused");
+    let cmd = focused["command"]
+        .as_array()
+        .map(|a| a[0].as_str().unwrap_or_default().to_string())
+        .unwrap_or_default();
+    assert_ne!(
+        cmd, "no-such-binary-xyz",
+        "focus was left on the pane that never started"
+    );
+
+    // …and the `-p`-less verbs work, which is the point.
+    let out = env.run(&["pane", "capture", "-s", "mixed"]);
+    assert!(
+        out.status.success(),
+        "capture on the focused pane failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The human path refused to call a batch of dead panes a success; the JSON
+/// path — the one scripts and agents use — still exited 0 over the same batch.
+#[test]
+fn state_apply_reports_failure_in_json_format_too() {
+    let mut env = Env::new();
+    let path = env.work().join("json.toml");
+    std::fs::write(
+        &path,
+        "[session]\nname = \"jsonfail\"\n\n[[windows]]\ntitle = \"w\"\n\n\
+         [[windows.panes]]\ncommand = [\"no-such-binary-xyz\"]\n",
+    )
+    .unwrap();
+    let out = env.run(&["--format", "json", "state", "apply", path.to_str().unwrap()]);
+    env.sessions.push("jsonfail".to_string());
+    assert!(
+        !out.status.success(),
+        "--format json exited 0 over a batch whose only pane never spawned:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `--dry-run` must reject what the apply rejects for reasons it can decide
+/// without the daemon — a window title is one of them.
+#[test]
+fn state_apply_dry_run_rejects_an_impossible_window_title() {
+    let env = Env::new();
+    let path = env.work().join("title.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[session]\nname = \"longtitle\"\n\n[[windows]]\ntitle = \"{}\"\n\n\
+             [[windows.panes]]\ncommand = [\"/bin/sh\"]\n",
+            "t".repeat(300)
+        ),
+    )
+    .unwrap();
+    for args in [
+        &["state", "apply", path.to_str().unwrap(), "--dry-run"][..],
+        &["state", "apply", path.to_str().unwrap()][..],
+    ] {
+        let out = env.run(args);
+        assert!(!out.status.success(), "{args:?} accepted a 300-char title");
+    }
+}
+
+/// The aggregate argv cap was wrong in both directions — the kernel shares
+/// `ARG_MAX` with the environment, which this process cannot measure. A large
+/// argv is now the kernel's call, and an `E2BIG` says what actually went wrong
+/// instead of blaming argv[0] and the cwd.
+#[test]
+fn an_oversized_argv_is_diagnosed_rather_than_capped_by_a_guess() {
+    let env = Env::new();
+    let argv: Vec<String> = std::iter::once("/bin/echo".to_string())
+        .chain(std::iter::repeat_n("x".repeat(100_000), 60))
+        .collect();
+    let path = env.work().join("big.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({"name": "big", "command": argv}).to_string(),
+    )
+    .unwrap();
+    let out = env.run(&[
+        "rpc",
+        "call",
+        "session.create",
+        "--params",
+        &format!("@{}", path.display()),
+        "--format",
+        "json",
+    ]);
+    let joined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{joined}");
+    assert!(
+        joined.contains("ARG_MAX"),
+        "the failure must name the real cause, not argv[0]:\n{joined}"
+    );
+    assert!(
+        !joined.contains("resolves via PATH"),
+        "still blaming argv[0] for a size problem:\n{joined}"
+    );
+}
+
+/// A program with an unusual but real name keeps it. Round two's
+/// "no alphanumeric character" rule threw `/usr/local/bin/+++` away.
+#[test]
+fn a_real_program_with_an_unusual_name_keeps_its_title() {
+    let mut env = Env::new();
+    let bin = env.work().join("+++");
+    std::fs::write(&bin, "#!/bin/sh\nexec sleep 900\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    env.ok(&[
+        "session",
+        "create",
+        "plus",
+        "-d",
+        "--cmd",
+        bin.to_str().unwrap(),
+    ]);
+    env.sessions.push("plus".to_string());
+    let title = env.json(&["pane", "list", "-s", "plus"])[0]["title"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(title, "+++", "a real program lost its name");
 }

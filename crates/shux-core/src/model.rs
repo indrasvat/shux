@@ -376,22 +376,27 @@ impl Pane {
 /// worse: it would miss every real shell outside the handful of paths worth
 /// hard-coding.
 pub(crate) fn command_display_name(command: &[String]) -> Option<&str> {
-    let program = basename(command.first()?);
-    if is_shell(program)
+    let raw = command.first()?;
+    let program = program_name(raw);
+    if let Some(program) = program
+        && is_shell(program)
         && command.len() >= 3
         && is_shell_command_flag(&command[1])
         && let Some(word) = script_leading_word(&command[2])
     {
         return Some(word);
     }
-    Some(program)
+    // argv[0] gets the same plausibility test as a script's first word: a token
+    // that names no program is not a title, and the cwd basename below is a
+    // better answer than `/` or `..`.
+    program
 }
 
-fn basename(path: &str) -> &str {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(path)
+/// The file name inside `path`, or `None` when there is not one — `/`, `//`,
+/// `.` and `..` all resolve to nothing a pane can be named after.
+fn program_name(path: &str) -> Option<&str> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Shells whose `-c` takes a script as one argument. Deliberately a fixed list:
@@ -441,14 +446,13 @@ fn script_leading_word(script: &str) -> Option<&str> {
         if token.starts_with('-') {
             return None;
         }
-        let name = basename(token);
-        // A bare number is a file descriptor (`2>&1 make`), never a program, and
-        // a token with no letter or digit at all (`/`, `..`, `+++`) is not a
-        // program name either — `basename` hands back the whole token for those.
-        if name.is_empty()
-            || name.chars().all(|c| c.is_ascii_digit())
-            || !name.chars().any(|c| c.is_alphanumeric())
-        {
+        // `/`, `//`, `.` and `..` have no file name in them at all; `Path`
+        // says so, and that is the right test. Judging by the glyphs instead —
+        // "no alphanumeric character" — also rejected `/usr/local/bin/+++`,
+        // which is a real program with an unusual name.
+        let name = program_name(token)?;
+        // A bare number is a file descriptor (`2>&1 make`), never a program.
+        if name.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
         return Some(name);
@@ -540,10 +544,15 @@ fn is_shell_syntax(c: char) -> bool {
 ///   formatting characters are dropped; the implicit bidi algorithm is
 ///   untouched, so ordinary RTL titles still render correctly.
 ///
-/// - **`U+200B` ZERO WIDTH SPACE, `U+2060` WORD JOINER, `U+FEFF`** — invisible
-///   and not `is_control()`. `ht<ZWSP>op` renders identically to `htop`, so two
-///   panes can carry titles a human cannot tell apart. Same spoofing shape as
-///   the bidi set above, without needing any reordering.
+/// - **Default-ignorable code points** — invisible, not `is_control()`, and far
+///   more numerous than the handful anyone names first. `ht<ZWSP>op` renders
+///   identically to `htop`, so two panes carry titles a human cannot tell
+///   apart; so do soft hyphen, the combining grapheme joiner, the invisible
+///   operators, the Hangul fillers, the variation selectors and the tag block.
+///   The first cut of this listed three of them and let fifteen more through —
+///   an allowlist where the property is what matters. See [`is_default_ignorable`].
+///   It is not only an operator's problem: a program running in a pane sets its
+///   own title with OSC 0, so it can mint an indistinguishable one unaided.
 ///
 /// Deliberately **not** dropped: `U+200D` ZERO WIDTH JOINER, which is
 /// load-bearing inside emoji sequences — removing it would split a
@@ -553,7 +562,42 @@ pub(crate) fn is_title_hostile(c: char) -> bool {
         || matches!(c, '\u{2028}' | '\u{2029}')
         || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}')
-        || matches!(c, '\u{200b}' | '\u{2060}' | '\u{feff}')
+        || is_default_ignorable(c)
+}
+
+/// Unicode's `Default_Ignorable_Code_Point` set, minus the one exception below.
+///
+/// These render as nothing. Two titles differing only in these characters are
+/// the same title to every human who looks at them, which is the whole of the
+/// spoof — no reordering required, unlike the bidi set. Enumerated as ranges
+/// rather than as the handful people think of first, because the property is
+/// what matters and the handful is never complete.
+///
+/// **`U+200D` ZERO WIDTH JOINER is kept**, alone. It is load-bearing inside
+/// emoji sequences: dropping it splits a legitimate `👨‍👩‍👧` into three people.
+/// That costs one spoofable character, knowingly.
+fn is_default_ignorable(c: char) -> bool {
+    if c == '\u{200d}' {
+        return false; // ZWJ — see above.
+    }
+    matches!(c,
+        '\u{00ad}'                        // SOFT HYPHEN
+        | '\u{034f}'                      // COMBINING GRAPHEME JOINER
+        | '\u{115f}'..='\u{1160}'         // HANGUL CHOSEONG/JUNGSEONG FILLER
+        | '\u{17b4}'..='\u{17b5}'         // KHMER INHERENT VOWELS
+        | '\u{180b}'..='\u{180f}'         // MONGOLIAN FVS + VOWEL SEPARATOR
+        | '\u{200b}'..='\u{200f}'         // ZWSP, ZWNJ, (ZWJ), LRM, RLM
+        | '\u{202a}'..='\u{202e}'         // bidi embedding / override
+        | '\u{2060}'..='\u{206f}'         // word joiner, invisible operators, deprecated format
+        | '\u{3164}'                      // HANGUL FILLER
+        | '\u{fe00}'..='\u{fe0f}'         // VARIATION SELECTOR 1..16
+        | '\u{feff}'                      // ZERO WIDTH NO-BREAK SPACE / BOM
+        | '\u{ffa0}'                      // HALFWIDTH HANGUL FILLER
+        | '\u{fff0}'..='\u{fff8}'         // unassigned, reserved as ignorable
+        | '\u{1bca0}'..='\u{1bca3}'       // SHORTHAND FORMAT CONTROLS
+        | '\u{1d173}'..='\u{1d17a}'       // MUSICAL SYMBOL beams/slurs (format)
+        | '\u{e0000}'..='\u{e0fff}'       // TAGS + VARIATION SELECTORS SUPPLEMENT
+    )
 }
 
 /// The longest title a pane will display. The border has limited room
@@ -839,14 +883,46 @@ mod tests {
 
     /// A flag is never the program. `--cmd "-n is a valid sed script"` — the
     /// example printed in the flag's own help — used to title the pane `-n`.
-    /// An invisible character makes two different titles look identical.
+    /// An invisible character makes two different titles look identical. The
+    /// first cut named three of them; these are the ones it let through.
     #[test]
     fn test_sanitize_title_strips_invisible_spacers() {
-        for c in ['\u{200b}', '\u{2060}', '\u{feff}'] {
-            let title = title_of(&["sh", "-c", &format!("ht{c}op")]);
-            assert_eq!(title, "htop", "U+{:04X} survived", c as u32);
+        let ignorable = [
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{17b4}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200e}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{3164}',
+            '\u{fe00}',
+            '\u{fe0e}',
+            '\u{fe0f}',
+            '\u{feff}',
+            '\u{ffa0}',
+            '\u{e0041}',
+        ];
+        for c in ignorable {
+            assert_eq!(
+                sanitize_title(&format!("ht{c}op")),
+                "htop",
+                "U+{:04X} survived the sanitizer",
+                c as u32
+            );
+            // …and through the title pipeline a running program can drive.
+            let mut pane = Pane::new(WindowId::new(), "/home/test/proj");
+            pane.set_osc_title(format!("ht{c}op"));
+            assert_eq!(pane.effective_title(), "htop", "U+{:04X} via OSC", c as u32);
         }
-        // The joiner is load-bearing inside emoji and must survive.
+        // The joiner is load-bearing inside emoji and is the one exception.
         assert!(sanitize_title("a\u{200d}b").contains('\u{200d}'));
     }
 
@@ -866,18 +942,27 @@ mod tests {
 
     /// `basename` returns the whole token when there is no file name in it, so
     /// a path-shaped non-program used to become the title verbatim.
+    /// `/`, `//`, `.` and `..` contain no file name, so there is nothing to
+    /// name the pane after.
     #[test]
     fn a_token_with_no_program_name_in_it_is_not_a_title() {
-        for script in ["/", "//", ".", "..", "+++ arg", "/usr/bin/ htop"] {
-            let title = title_of(&["sh", "-c", script]);
-            assert!(
-                title == "sh" || title.chars().any(|c| c.is_alphanumeric()),
-                "{script:?} produced title {title:?}"
-            );
-        }
         assert_eq!(title_of(&["sh", "-c", "/"]), "sh");
+        assert_eq!(title_of(&["sh", "-c", "//"]), "sh");
+        assert_eq!(title_of(&["sh", "-c", "."]), "sh");
         assert_eq!(title_of(&["sh", "-c", ".."]), "sh");
-        assert_eq!(title_of(&["sh", "-c", "+++ arg"]), "sh");
+        // …but a real program with an unusual name keeps it. Judging by the
+        // glyphs ("no alphanumeric character") threw this away too.
+        assert_eq!(title_of(&["sh", "-c", "/usr/local/bin/+++ arg"]), "+++");
+        assert_eq!(title_of(&["/usr/local/bin/+++"]), "+++");
+        assert_eq!(title_of(&["sh", "-c", "+++ arg"]), "+++");
+    }
+
+    /// argv[0] is judged the same way a script's first word is; when it names
+    /// no program the cwd basename is a better title than `/` or `..`.
+    #[test]
+    fn an_argv_that_names_no_program_falls_through_to_the_cwd() {
+        assert_eq!(title_of(&["/"]), "proj");
+        assert_eq!(title_of(&[".."]), "proj");
     }
 
     #[test]

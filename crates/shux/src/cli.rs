@@ -503,7 +503,10 @@ pub enum StateCommand {
         /// Path to the TOML template (e.g. `./agent-conductor.toml`).
         template: std::path::PathBuf,
 
-        /// Validate + print the lowered ops without sending the apply.
+        /// Check the template and print the lowered ops without applying.
+        /// Catches everything decidable without the daemon (shape, argv,
+        /// window titles); conflicts with live state — a session name already
+        /// in use — can only surface on the real apply.
         #[arg(long)]
         dry_run: bool,
 
@@ -563,9 +566,10 @@ pub enum SessionCommand {
         #[arg(long, value_name = "TITLE")]
         title: Option<String>,
 
-        /// Shell command for the initial pane, run by your shell
-        /// (`$SHELL -c`, falling back to `/bin/sh`) — so pipes, `;`, `&&`,
-        /// quoting, globs and redirection all work:
+        /// Shell command for the initial pane, run by the daemon's shell
+        /// (its `$SHELL -c`, falling back to `/bin/sh` — the daemon outlives
+        /// your terminal, so its environment is the one that applies) — so
+        /// pipes, `;`, `&&`, quoting, globs and redirection all work:
         /// `--cmd "cargo watch -x test 2>&1 | tee build.log"`.
         /// Omitted or empty opens your login+interactive shell.
         /// For exec-style passthrough with no shell at all, use trailing
@@ -973,9 +977,9 @@ pub enum WindowCommand {
         #[arg(long)]
         cwd: Option<std::path::PathBuf>,
 
-        /// Shell command for the new window's initial pane, run by your
-        /// shell (`$SHELL -c`, falling back to `/bin/sh`) — pipes, `;`,
-        /// `&&`, quoting, globs and redirection all work.
+        /// Shell command for the new window's initial pane, run by the
+        /// daemon's shell (its `$SHELL -c`, falling back to `/bin/sh`) —
+        /// pipes, `;`, `&&`, quoting, globs and redirection all work.
         /// Empty / omitted spawns the user's login+interactive shell.
         /// For exec-style passthrough use trailing `--` instead:
         /// `shux window create -s X -n W -- vim foo.rs`.
@@ -1182,9 +1186,10 @@ pub enum PaneCommand {
         #[arg(short, long)]
         ratio: Option<f64>,
 
-        /// Shell command for the new pane, run by your shell (`$SHELL -c`,
-        /// falling back to `/bin/sh`) — pipes, `;`, `&&`, quoting, globs and
-        /// redirection all work. Omitted opens your login+interactive shell.
+        /// Shell command for the new pane, run by the daemon's shell (its
+        /// `$SHELL -c`, falling back to `/bin/sh`) — pipes, `;`, `&&`,
+        /// quoting, globs and redirection all work. Omitted opens the default
+        /// login+interactive shell.
         ///
         /// A command starting with a dash is taken as the command, not a flag.
         #[arg(long, value_name = "SHELL_COMMAND", allow_hyphen_values = true)]
@@ -6156,11 +6161,27 @@ pub async fn handle_apply(
         }
     };
 
+    let spawn_failures = |v: &serde_json::Value| -> usize {
+        v.get("spawn_results")
+            .and_then(|s| s.as_array())
+            .map(|a| a.iter().filter(|s| s["spawned"] != true).count())
+            .unwrap_or(0)
+    };
+
     if matches!(format, OutputFormat::Json) {
         println!(
             "{}",
             crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
         );
+        // The human path already refuses to call a batch of dead panes a
+        // success; returning early here left `--format json` — the format
+        // scripts and agents use — exiting 0 over exactly the same batch, so
+        // `shux --format json state apply t.toml && shux attach` still chained
+        // into it (issue #125 follow-up).
+        let failed = spawn_failures(&result);
+        if failed > 0 {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 

@@ -1007,3 +1007,43 @@ Not rolling back is a policy; reporting success is a lie.
 `is_control()` and renders as nothing, so `ht<ZWSP>op` and `htop` are
 indistinguishable on a border. Same class as the Trojan Source set already
 handled; `U+200D` ZWJ still has to survive because emoji need it.
+
+### Round three — the fixes for the fixes needed fixing
+
+**"Capture before, restore after" is a lost update.** Round two's focus restore
+read the active window before the create and wrote it back after the rollback —
+so an operator who moved focus while the PTY was starting had their choice
+silently reverted, measured at 14/30 with two concurrent clients, *worse than
+the 12–15 % baseline the restore was added to improve*. The fix is
+compare-and-restore: put focus back only if it is still on the entity being
+undone (1/30). Any restore-a-captured-value pattern needs that guard.
+
+**A statistical race test with a sleep in it discriminates nothing.** The first
+attempt slept 20 ms between starting the doomed create and issuing the focus,
+which let the create finish first — the reverting build passed it. Both clients
+have to be in flight at once. Verify a race test against the build that has the
+bug, or it is decoration: 12/16 reverted on the old build, 0 on the new one,
+only after the sleep came out.
+
+**A cap you cannot compute is worse than no cap.** `MAX_ARGV_BYTES` was wrong in
+both directions, proven by measurement: `ARG_MAX` is shared between argv and the
+environment, so a 1.2 MB environment still produced `E2BIG` under a 1 MB argv
+that passed the check, while an ordinary environment exec'd 1.5 MB that the
+check refused. No number available in the process is the kernel's number. What
+the cap was really for — an oversized argv failing with a diagnosis that blamed
+`argv[0]` and the cwd — belongs in the error message, not in a guess.
+
+**An allowlist where the property is what matters will always be incomplete.**
+Round two stripped the three invisible characters a reviewer happened to name;
+fifteen more survived, and a program in a pane can set its own title via OSC 0
+without any operator cooperation. Enumerate the Unicode property
+(`Default_Ignorable_Code_Point`), not the examples.
+
+**Judge a program name by the path, not by its glyphs.** "Reject a token with no
+alphanumeric character" also rejects `/usr/local/bin/+++`, which is a real
+program. `Path::file_name()` returning `None` is the honest test for `/`, `//`,
+`.` and `..`.
+
+**Fixing the human output path is half a fix.** `state apply` stopped calling a
+batch of dead panes a success — in text mode. `--format json`, the mode scripts
+and agents actually use, returned before the check and still exited 0.

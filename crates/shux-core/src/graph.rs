@@ -622,6 +622,16 @@ impl SessionGraph {
     /// `rename_window`, and the staged `state.apply` paths — so the value
     /// that lands in the graph is also the value used for conflict
     /// detection and published in the lifecycle event.
+    /// [`Self::validate_window_title`], callable without a graph.
+    ///
+    /// The rule is pure — sanitize, reject empty, reject over-long — but it
+    /// lived only behind a graph mutation, so `state apply --dry-run` (whose
+    /// entire job is "will this apply succeed?") said yes to templates the real
+    /// apply rejects (issue #125 follow-up).
+    pub fn check_window_title(raw: &str) -> Result<String, GraphError> {
+        Self::validate_window_title(raw)
+    }
+
     pub(crate) fn validate_window_title(raw: &str) -> Result<String, GraphError> {
         let cleaned = crate::model::sanitize_title(raw);
         if cleaned.is_empty() {
