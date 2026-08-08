@@ -1468,7 +1468,21 @@ pub enum PaneCommand {
         #[arg(short, long)]
         pane: Option<String>,
 
-        /// Command to run
+        /// Shell command to run, typed into the pane's live shell.
+        ///
+        /// This is shell TEXT, not an argv: it is written to the pane's
+        /// standard input exactly as given, so `;`, `|`, `&&`, `$(…)`,
+        /// redirection and globs are all active — the same contract as
+        /// `session create --cmd`. Quote anything you mean literally.
+        ///
+        /// The pane must have something reading its input. A pane whose
+        /// program replaced the shell (`--cmd '… exec top'`) will show the
+        /// line on screen and never run it.
+        ///
+        /// The `pane.run_command` RPC additionally takes an `args` array,
+        /// whose elements ARE arguments — shux quotes each one, so a value
+        /// containing spaces or metacharacters stays a single argument. There
+        /// is no CLI flag for it; use `shux rpc call` when you need it.
         #[arg(short, long)]
         command: String,
 
@@ -3905,19 +3919,31 @@ pub async fn handle_pane_list(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            // The pane's title — what its border draws, and
+                            // the only handle an operator has on it. It was
+                            // read here for `--format json` and nowhere else,
+                            // so neither human format ever named a pane
+                            // (issue #135).
+                            let title = p
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             // `pane.list` returns `command` as a JSON
                             // ARRAY; reading it with `as_str()` made this
-                            // column permanently blank. Join the argv the
-                            // way a shell would show it (issue #104
-                            // adversarial review).
+                            // column permanently blank (issue #104
+                            // adversarial review). The argv is handed on
+                            // whole — the renderer quotes it, so both human
+                            // formats show the same argument boundaries
+                            // (issue #135).
                             let command = p
                                 .get("command")
                                 .and_then(|v| v.as_array())
                                 .map(|a| {
                                     a.iter()
                                         .filter_map(|x| x.as_str())
+                                        .map(String::from)
                                         .collect::<Vec<_>>()
-                                        .join(" ")
                                 })
                                 .unwrap_or_default();
                             let is_focused = p
@@ -3930,6 +3956,7 @@ pub async fn handle_pane_list(
                                 .unwrap_or(false);
                             style::PaneInfo {
                                 id,
+                                title,
                                 cwd,
                                 command,
                                 is_focused,

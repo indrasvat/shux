@@ -147,6 +147,50 @@ pub(crate) fn parse_pane_command_with_shell(
     }
 }
 
+/// Parse `pane.run_command`'s `args` — an argument list, not an argv.
+///
+/// `args` is a different shape from `command`: it never carries the program
+/// name (that is the sibling `command` string, which is a shell line), so
+/// `args[0]` is an ordinary argument and `""` is a legal one. Everything else
+/// is the same contract, and it was being read with `filter_map(as_str)` — the
+/// exact silent-drop issue #125 removed from the five spawning RPCs, still live
+/// on the sixth: `["a", null, "b"]` ran `a b` and reported success.
+///
+/// It also validates for a **different sink**. Every other command in this
+/// module ends at `execve`, and [`reject_unexecutable`] is written for that:
+/// the one byte `execve` cannot carry is NUL. `args` never reaches `execve` —
+/// `CommandEngine::start_command` quotes it into a line and **types that line
+/// into the pane's terminal**, where the tty line discipline reads it first and
+/// NUL is the byte it harmlessly discards. See [`reject_untypeable`].
+pub(crate) fn parse_run_args(params: &serde_json::Value) -> Result<Vec<String>, RpcError> {
+    use serde_json::Value;
+
+    match params.get("args") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut args = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let Some(s) = item.as_str() else {
+                    return Err(RpcError::invalid_params(&format!(
+                        "'args[{i}]' is {}, but every element of an argument list must be a \
+                         string — put shell text in 'command' instead",
+                        describe(item)
+                    )));
+                };
+                reject_unexecutable(s, &format!("'args[{i}]'"))?;
+                reject_untypeable(s, &format!("'args[{i}]'"))?;
+                args.push(s.to_string());
+            }
+            reject_oversize_argv(&args, "'args'")?;
+            Ok(args)
+        }
+        Some(other) => Err(RpcError::invalid_params(&format!(
+            "'args' is {}, but must be an array of strings",
+            describe(other)
+        ))),
+    }
+}
+
 /// Validate an argv that did NOT come through [`parse_pane_command`].
 ///
 /// `state.apply` takes its ops as typed structs, so serde already guarantees
@@ -212,6 +256,43 @@ pub(crate) fn validate_ops(ops: &[shux_core::apply::Op]) -> Result<(), RpcError>
                 "ops[{i}].initial_window_title: {e}"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Reject a string that cannot survive being **typed into a terminal**.
+///
+/// `pane.run_command` does not exec anything. It shell-quotes its `args`, joins
+/// them into a line with the completion marker on the end, and writes that line
+/// to the pane's PTY — so the first thing to read it is the tty line
+/// discipline, not a shell. In canonical mode that layer *consumes* control
+/// bytes on sight: `0x03` is INTR, `0x15` kills the line, `0x1a` is SUSP,
+/// `0x7f` erases, `0x04` is EOF, and `\n`/`\r` submit the line early. Which
+/// byte does what is `termios`-configurable, so the set cannot be enumerated
+/// with any confidence — the whole class goes.
+///
+/// This is not theoretical tidiness. Quoting an argument correctly (which the
+/// allowlist in `shux_pty::shell_quote_arg` now does) puts the control byte
+/// **inside single quotes**, so when the line discipline eats it the line is
+/// truncated mid-quote and the shell drops to its continuation prompt and stays
+/// there — swallowing every later command sent to that pane. One `0x03` in one
+/// argument wedged the pane permanently. The looser quoting this task replaced
+/// happened to leave the truncated remainder syntactically valid, so the same
+/// input merely failed once; making the quoting correct turned a transient
+/// error into a permanent one, and the missing validation is what made that
+/// possible.
+///
+/// Rejecting is right rather than sanitizing: an argument that cannot be
+/// delivered verbatim is one the caller must be told about, not one to deliver
+/// approximately (issue #125's rule for this whole family).
+fn reject_untypeable(s: &str, what: &str) -> Result<(), RpcError> {
+    if let Some(c) = s.chars().find(|c| (*c as u32) < 0x20 || *c == '\u{7f}') {
+        return Err(RpcError::invalid_params(&format!(
+            "{what} contains the control character U+{:04X}, which cannot be typed into a \
+             terminal — the tty line discipline acts on it before any shell sees it. Put shell \
+             text in 'command' instead.",
+            c as u32
+        )));
     }
     Ok(())
 }
@@ -439,6 +520,48 @@ mod tests {
     fn a_nul_in_a_shell_string_is_rejected() {
         let err = parse(json!("echo \u{0}hi")).unwrap_err();
         assert!(format!("{err:?}").contains("NUL"));
+    }
+
+    /// `pane.run_command`'s `args` are TYPED INTO A TERMINAL, not exec'd. The
+    /// line discipline acts on control bytes before any shell reads them, and
+    /// because a correctly quoted argument puts the byte inside single quotes,
+    /// the truncated line leaves the shell at its continuation prompt — where
+    /// it swallows every later command sent to that pane. Reproduced against
+    /// the real binary: one `0x03` wedged the pane permanently.
+    #[test]
+    fn a_control_character_in_run_args_is_rejected() {
+        for (c, name) in [
+            ('\u{3}', "INTR"),
+            ('\u{15}', "KILL"),
+            ('\u{1a}', "SUSP"),
+            ('\u{7f}', "DEL"),
+            ('\u{4}', "EOF"),
+            ('\n', "newline"),
+            ('\r', "CR"),
+            ('\t', "TAB"),
+            ('\u{1b}', "ESC"),
+        ] {
+            let params = serde_json::json!({ "args": ["ok", format!("a{c}b")] });
+            let err =
+                parse_run_args(&params).expect_err(&format!("{name} ({c:?}) must be rejected"));
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("args[1]") && msg.contains(&format!("U+{:04X}", c as u32)),
+                "{name}: error must name the element and the byte, got {msg}"
+            );
+        }
+    }
+
+    /// The ordinary shapes must still pass — including the empty string, which
+    /// is a legal ARGUMENT even though it is not a legal argv[0].
+    #[test]
+    fn run_args_accepts_every_printable_shape() {
+        let params = serde_json::json!({
+            "args": ["", "a b", "a;id", "--flag=value", "=eq", "café", "中文", "it's"]
+        });
+        let args = parse_run_args(&params).expect("printable args are fine");
+        assert_eq!(args.len(), 8);
+        assert_eq!(args[0], "");
     }
 
     #[test]

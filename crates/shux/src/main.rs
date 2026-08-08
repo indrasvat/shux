@@ -5506,15 +5506,7 @@ fn register_pane_io_methods(
                                 shux_rpc::RpcError::invalid_params("missing 'command' parameter")
                             })?;
 
-                    let args: Vec<String> = params
-                        .get("args")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let args: Vec<String> = pane_command::parse_run_args(&params)?;
 
                     let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
                     let timeout = Duration::from_secs(timeout_secs);

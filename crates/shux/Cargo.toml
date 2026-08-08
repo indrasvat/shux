@@ -52,6 +52,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+base64 = "0.22"
 
 # ── lens red suite (§12/§13) — SEPARATE TEST LANE ──────────────────────────
 # `test = false` keeps these daemon-backed integration tests out of the default

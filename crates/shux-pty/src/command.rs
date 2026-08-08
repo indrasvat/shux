@@ -269,23 +269,73 @@ impl CommandEngine {
     }
 }
 
-/// Shell-escape an argument list for safe PTY injection.
+/// POSIX-shell-quote one argument so a shell re-reading the line recovers
+/// **exactly** this string, as **one** word.
+///
+/// The rule is an allowlist, not a denylist. A denylist of metacharacters is
+/// always one character short of the shell it is guarding — this function used
+/// to name seven (space, `"`, `'`, `$`, `\`, `` ` ``, `!`) and let `;`, `|`,
+/// `&`, `>`, `<`, `(`, `)`, `*`, `?`, `~`, `#`, a newline and a tab through
+/// untouched. That mattered: [`CommandEngine::start_command`] writes the result
+/// into a **live shell** on the pane's PTY, so an argument of `a;id` ran `id`.
+///
+/// Two consumers share this one implementation, deliberately:
+///
+/// * `pane.run` builds the line it injects, where a wrong answer executes.
+/// * `pane list` renders a pane's argv for a human, where a wrong answer makes
+///   `["sh", "-c", "a b"]` and `["sh", "-c", "a", "b"]` look identical
+///   (issue #135).
+///
+/// They want the same thing — a faithful, unambiguous rendering of an argv —
+/// and two implementations of that would be free to disagree about which
+/// characters are safe.
+///
+/// The allowlist is ASCII-only. Every byte of a non-ASCII scalar is `>= 0x80`,
+/// fails the test, and gets quoted: no shell treats those bytes as
+/// metacharacters, so quoting them is unnecessary but never wrong, and it keeps
+/// the rule free of Unicode edge cases.
+///
+/// `=` is allowed *inside* a word because `--flag=value` is ordinary, and an
+/// assignment is only an assignment in a command's *first* word, which nothing
+/// here ever is. A **leading** `=` is a different matter: zsh's `EQUALS` option
+/// is on by default, so a bare `=ls` is rewritten to `/usr/bin/ls`, and a bare
+/// `=nosuchprog` is a fatal error that aborts the whole line — taking the
+/// completion marker [`CommandEngine::start_command`] appends with it, so the
+/// caller waits out its full timeout instead of getting an answer. A leading
+/// `=` is therefore always quoted.
+///
+/// `~` is deliberately NOT on the allowlist and must stay off it: bash expands
+/// a tilde after an unquoted `=` or `:`, so allowing it would make `a=~` and
+/// `PATH=/x:~` expand mid-word.
+pub fn shell_quote_arg(arg: &str) -> String {
+    // The empty string is the case a denylist never catches: it contains
+    // nothing, so nothing triggers, and the argument DISAPPEARS from the line.
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.starts_with('=') {
+        return format!("'{}'", arg.replace('\'', "'\\''"));
+    }
+    let unquoted_is_literal = arg.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'_' | b'-' | b'.' | b'/' | b',' | b':' | b'=' | b'+' | b'@' | b'%'
+            )
+    });
+    if unquoted_is_literal {
+        return arg.to_string();
+    }
+    // Single quotes suspend every expansion a shell has, so the only character
+    // that needs handling inside them is the closing quote itself.
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Shell-quote an argument list into one space-separated line. See
+/// [`shell_quote_arg`].
 pub fn shell_escape_args(args: &[String]) -> String {
     args.iter()
-        .map(|a| {
-            if a.contains(' ')
-                || a.contains('"')
-                || a.contains('\'')
-                || a.contains('$')
-                || a.contains('\\')
-                || a.contains('`')
-                || a.contains('!')
-            {
-                format!("'{}'", a.replace('\'', "'\\''"))
-            } else {
-                a.clone()
-            }
-        })
+        .map(|a| shell_quote_arg(a))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -448,6 +498,233 @@ mod tests {
         assert_eq!(
             shell_escape_args(&["a".to_string(), "b c".to_string(), "d".to_string()]),
             "a 'b c' d"
+        );
+    }
+
+    /// The defect this function was carrying: it quoted on a DENYLIST of seven
+    /// characters, so every other shell metacharacter reached the live shell
+    /// `CommandEngine::start_command` writes into. Each of these is a second
+    /// command, a redirect, a glob or a word break that the caller did not ask
+    /// for.
+    #[test]
+    fn a_metacharacter_argument_is_one_word_not_a_second_command() {
+        for hostile in [
+            "a;id",     // command separator
+            "a|id",     // pipeline
+            "a&id",     // background + separator
+            "a>out",    // redirect
+            "a<in",     // redirect
+            "$(id)",    // command substitution (denylist caught `$`, but only that)
+            "a(b)",     // subshell
+            "a*",       // glob
+            "a?",       // glob
+            "[ab]",     // glob
+            "{a,b}",    // brace expansion
+            "~root",    // tilde expansion
+            "#comment", // the rest of the line disappears
+            "a\nid",    // a newline IS a command separator
+            "a\tb",     // field splitting
+            "a b",      // the one the denylist did catch
+        ] {
+            let quoted = shell_quote_arg(hostile);
+            assert_eq!(
+                sh_word_split(&quoted),
+                vec![hostile.to_string()],
+                "`{hostile:?}` quoted as `{quoted}` did not come back as one literal word"
+            );
+        }
+    }
+
+    /// The empty string is the case a denylist structurally cannot catch: it
+    /// contains none of the listed characters, so it was emitted as nothing and
+    /// the argument vanished from the line.
+    #[test]
+    fn an_empty_argument_survives_instead_of_vanishing() {
+        assert_eq!(shell_quote_arg(""), "''");
+        assert_eq!(
+            shell_escape_args(&["a".to_string(), String::new(), "b".to_string()]),
+            "a '' b"
+        );
+        assert_eq!(
+            sh_word_split(&shell_escape_args(&[
+                "a".to_string(),
+                String::new(),
+                "b".to_string()
+            ])),
+            vec!["a".to_string(), String::new(), "b".to_string()],
+        );
+    }
+
+    /// Ordinary arguments must stay readable — quoting everything would be safe
+    /// and useless as a display format (issue #135 renders argv with this).
+    #[test]
+    fn ordinary_arguments_are_left_bare() {
+        for plain in [
+            "ls",
+            "-la",
+            "--color=always",
+            "/usr/bin/env",
+            "a.rs",
+            "1,2",
+            "host:port",
+            "user@host",
+            "50%",
+            "a+b",
+            "snake_case",
+        ] {
+            assert_eq!(
+                shell_quote_arg(plain),
+                plain,
+                "{plain} should not be quoted"
+            );
+        }
+    }
+
+    /// Whatever the argument is, a shell re-reading the quoted form must hand
+    /// back that exact string as one word. Round-tripped through a real
+    /// `/bin/sh`, not through this crate's idea of one.
+    #[test]
+    fn every_shape_round_trips_through_a_real_shell() {
+        for arg in [
+            "it's",
+            "it's a 'quoted' thing",
+            "back\\slash",
+            "double\"quote",
+            "back`tick`",
+            "bang!",
+            "new\nline",
+            "trailing ",
+            " leading",
+            "",
+            "café",            // non-ASCII: quoted, and must survive it
+            "変数",            // ditto, multi-byte
+            "a'\\''b",         // already looks like an escape
+            "'",               // a lone quote
+            "''",              // and a pair
+            &"x".repeat(4096), // long
+        ] {
+            let quoted = shell_quote_arg(arg);
+            assert_eq!(
+                sh_word_split(&quoted),
+                vec![arg.to_string()],
+                "`{arg:?}` quoted as `{quoted}` did not round-trip"
+            );
+        }
+    }
+
+    /// Ask the shell itself to split the line, so the assertion is about the
+    /// shell's rules rather than a second implementation of them. Words come
+    /// back NUL-separated because every other separator is a legal argument.
+    fn word_split_with(shell: &str, line: &str) -> Vec<String> {
+        let script = format!("for a in {line}; do printf '%s\\0' \"$a\"; done");
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap_or_else(|e| panic!("run {shell}: {e}"));
+        assert!(
+            out.status.success(),
+            "{shell} rejected `{script}`:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{shell} wrote to stderr for `{script}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut words: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .map(String::from)
+            .collect();
+        // Trailing empty element after the final NUL, not a word.
+        words.pop();
+        words
+    }
+
+    fn sh_word_split(line: &str) -> Vec<String> {
+        word_split_with("/bin/sh", line)
+    }
+
+    /// `/bin/sh` is one shell. A pane runs whatever `$SHELL` is, so the rule
+    /// has to hold in the shells people actually set — and it is zsh that
+    /// disagrees with the other two.
+    #[test]
+    fn the_quoting_holds_in_every_installed_shell() {
+        let cases = [
+            "=ls",         // zsh EQUALS: rewritten to /usr/bin/ls
+            "=nosuchprog", // zsh EQUALS: FATAL, aborts the line
+            "a=b",         // an interior `=` must stay unquoted and literal
+            "--flag=value",
+            "a;id",
+            "{a,b}", // bash/zsh brace expansion — one word, not two
+            "a b",
+            "",
+            "~root",
+            "x=~",       // bash expands a tilde after an unquoted `=`
+            "PATH=/x:~", // ...and after a `:`
+            "!!",        // history expansion
+            "a\nb",
+            "café",
+        ];
+        let mut ran = 0;
+        for shell in ["/bin/sh", "/usr/bin/bash", "/usr/bin/zsh"] {
+            if !std::path::Path::new(shell).exists() {
+                eprintln!("SKIP: {shell} is not installed");
+                continue;
+            }
+            ran += 1;
+            for arg in cases {
+                let quoted = shell_quote_arg(arg);
+                assert_eq!(
+                    word_split_with(shell, &quoted),
+                    vec![arg.to_string()],
+                    "{shell}: `{arg:?}` quoted as `{quoted}` did not come back as itself"
+                );
+            }
+        }
+        assert!(ran > 0, "no shell to test against");
+    }
+
+    /// `start_command` skips the quoting entirely when there are no arguments,
+    /// so the no-argument path needs its own pin.
+    #[test]
+    fn a_command_with_no_arguments_is_unchanged() {
+        let mut engine = CommandEngine::new();
+        let (_, line) =
+            engine.start_command(Uuid::new_v4(), "echo hi", &[], Duration::from_secs(5), None);
+        assert!(
+            line.starts_with("echo hi; __shux_ec=$?;"),
+            "the command string is a shell line and must be passed through: {line:?}"
+        );
+    }
+
+    /// The line `start_command` actually injects. The argument is hostile; the
+    /// shell must run `printf` once with it, and must NOT run `id`.
+    #[test]
+    fn the_injected_command_line_cannot_be_broken_out_of() {
+        let mut engine = CommandEngine::new();
+        // No space anywhere in the argument: the pre-fix denylist saw nothing
+        // to quote and `id` became a command of its own.
+        let (_, pty_line) = engine.start_command(
+            Uuid::new_v4(),
+            "echo",
+            &["a;id".to_string()],
+            Duration::from_secs(5),
+            None,
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&pty_line)
+            .output()
+            .expect("run /bin/sh");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.starts_with("a;id\n"),
+            "the argument was not delivered whole; got {stdout:?} from line {pty_line:?}"
+        );
+        assert!(
+            !stdout.contains("uid="),
+            "`id` ran — the argument escaped its word: {stdout:?}"
         );
     }
 

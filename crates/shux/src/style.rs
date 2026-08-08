@@ -384,11 +384,77 @@ pub struct Column {
     pub min_width: usize,
 }
 
+/// Fit `s` into exactly `width` display columns, truncating with `marker`
+/// when it is too long.
+///
+/// Truncation walks display width, not bytes or `char`s, so a wide (CJK)
+/// character is never cut in half. It also refuses to end on a zero-width
+/// character: a trailing ZWJ or variation selector would be a dangling half of
+/// a grapheme cluster, and issue #104 deliberately keeps those code points in
+/// titles, so they reach here.
+///
+/// **Width is measured on the accumulated string, never summed per character.**
+/// `UnicodeWidthStr::width` is a property of the whole string: `☀️`
+/// (U+2600 U+FE0F) is 1 if you add up its characters and **2** as a string, and
+/// a ZWJ family is 6 added up and **2** as a string. Summing gave back cells
+/// whose real width was not the width they were asked for — `pad_right` then
+/// added no padding, the row under-reported its own length, and the box printed
+/// lines up to twice the terminal's width with a ragged frame. Everything else
+/// in this module (`display_width`, `pad_right`, `col_widths`) measures whole
+/// strings, so this must too or the two disagree by construction.
+fn fit_width(s: &str, width: usize, marker: &str) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    let marker_width = display_width(marker);
+    if width <= marker_width {
+        // Not even room for the marker — take what fits of it and stop.
+        return take_width(marker, width);
+    }
+    let mut out = take_width(s, width - marker_width);
+    while out
+        .chars()
+        .next_back()
+        .is_some_and(|c| display_width(&out) == display_width(&out[..out.len() - c.len_utf8()]))
+    {
+        out.pop();
+    }
+    out.push_str(marker);
+    out
+}
+
+/// The longest prefix of `s` that is at most `width` display columns wide,
+/// measured the way [`display_width`] measures.
+fn take_width(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        let mut candidate = out.clone();
+        candidate.push(c);
+        if display_width(&candidate) > width {
+            break;
+        }
+        out = candidate;
+    }
+    out
+}
+
 /// A mini column-alignment engine for tabular output.
 pub struct ColumnLayout {
     columns: Vec<Column>,
     rows: Vec<Vec<String>>,
     gap: usize,
+    /// Total display columns the table may occupy, and which columns give up
+    /// width to get there. `None` — the historical behaviour — means the table
+    /// is as wide as its widest cell.
+    budget: Option<usize>,
+    flex: Vec<usize>,
+    ellipsis: &'static str,
+    /// `col_widths` is asked for by `render_header`, every `render_row` and
+    /// `total_width`. It is a pure function of the columns, the rows and the
+    /// budget, so caching it is only a cost question — but the three callers
+    /// MUST agree, or the row's reported visible length and the box's inner
+    /// width drift apart and every border misaligns.
+    resolved: std::cell::OnceCell<Vec<usize>>,
 }
 
 impl ColumnLayout {
@@ -396,30 +462,122 @@ impl ColumnLayout {
         Self {
             columns,
             rows: Vec::new(),
-            gap: 3, // spaces between columns
+            gap: GAP,
+            budget: None,
+            flex: Vec::new(),
+            ellipsis: "\u{2026}",
+            resolved: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Cap the table at `max_total` display columns, shrinking the columns
+    /// whose indices are in `flex` (and truncating their cells) until it fits.
+    ///
+    /// Opt-in per listing: without it nothing about the layout changes, which
+    /// is why `session list` and `window list` render byte-identically to
+    /// before.
+    pub fn budget(mut self, max_total: usize, flex: &[usize], unicode: bool) -> Self {
+        self.budget = Some(max_total);
+        self.flex = flex.to_vec();
+        self.ellipsis = if unicode { "\u{2026}" } else { ".." };
+        self.resolved = std::cell::OnceCell::new();
+        self
     }
 
     pub fn add_row(&mut self, cells: Vec<String>) {
         self.rows.push(cells);
+        self.resolved = std::cell::OnceCell::new();
     }
 
-    /// Calculate the max display width for each column.
-    fn col_widths(&self) -> Vec<usize> {
-        self.columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                let header_width = display_width(&col.header);
-                let max_cell = self
-                    .rows
-                    .iter()
-                    .map(|row| row.get(i).map(|c| display_width(c)).unwrap_or(0))
-                    .max()
-                    .unwrap_or(0);
-                header_width.max(max_cell).max(col.min_width)
-            })
-            .collect()
+    /// Calculate the display width for each column.
+    fn col_widths(&self) -> &[usize] {
+        self.resolved.get_or_init(|| {
+            let mut widths: Vec<usize> = self
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    let header_width = display_width(&col.header);
+                    let max_cell = self
+                        .rows
+                        .iter()
+                        .map(|row| row.get(i).map(|c| display_width(c)).unwrap_or(0))
+                        .max()
+                        .unwrap_or(0);
+                    header_width.max(max_cell).max(col.min_width)
+                })
+                .collect();
+
+            let Some(budget) = self.budget else {
+                return widths;
+            };
+            if widths.is_empty() {
+                return widths;
+            }
+            let gaps = (widths.len() - 1) * self.gap;
+            let flex: Vec<usize> = self
+                .flex
+                .iter()
+                .copied()
+                .filter(|i| *i < widths.len())
+                .collect();
+            if flex.is_empty() {
+                return widths;
+            }
+            // Everything that will not shrink, plus the gaps, is a floor the
+            // budget cannot go under. What is left is shared out among the flex
+            // columns **max-min fair**: take them in order of what they ask
+            // for, smallest first, and give each either its whole ask or an
+            // equal share of what is left, whichever is smaller. So a six-cell
+            // TITLE is never clipped to make room for a forty-cell COMMAND that
+            // is going to be truncated regardless — a proportional split does
+            // exactly that, and it is the difference between a readable title
+            // and `prin…`. No flex column drops below its declared `min_width`;
+            // under that a column is an ellipsis with nothing before it.
+            let fixed: usize = widths
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !flex.contains(i))
+                .map(|(_, w)| *w)
+                .sum();
+            let wanted: usize = flex.iter().map(|i| widths[*i]).sum();
+            let available = budget.saturating_sub(fixed + gaps);
+            if wanted <= available {
+                return widths;
+            }
+            let mut order = flex.clone();
+            order.sort_by_key(|i| widths[*i]);
+            let mut remaining = available;
+            let mut left = order.len();
+            // What the columns after this one still need at their floors. An
+            // early column rounding its share UP past this is how a fair split
+            // overruns the budget by exactly the amount the last column's floor
+            // then reclaims.
+            let mut later_floors: usize = order.iter().map(|i| self.columns[*i].min_width).sum();
+            for i in order {
+                let floor = self.columns[i].min_width;
+                later_floors -= floor;
+                let share = (remaining / left).min(remaining.saturating_sub(later_floors));
+                let give = widths[i].min(share.max(floor));
+                widths[i] = give;
+                remaining = remaining.saturating_sub(give);
+                left -= 1;
+            }
+            widths
+        })
+    }
+
+    /// Fit a cell to its column, truncating when the budget shrank it.
+    fn fit_cell(&self, col_idx: usize, cell: &str, width: usize) -> String {
+        let sized = if self.budget.is_some() && self.flex.contains(&col_idx) {
+            fit_width(cell, width, self.ellipsis)
+        } else {
+            cell.to_string()
+        };
+        match self.columns[col_idx].align {
+            Align::Left => pad_right(&sized, width),
+            Align::Right => pad_left(&sized, width),
+        }
     }
 
     /// Render the header line (dim/muted).
@@ -427,12 +585,7 @@ impl ColumnLayout {
         let widths = self.col_widths();
         let mut parts = Vec::new();
         for (i, col) in self.columns.iter().enumerate() {
-            let w = widths[i];
-            let cell = match col.align {
-                Align::Left => pad_right(&col.header, w),
-                Align::Right => pad_left(&col.header, w),
-            };
-            parts.push(cell);
+            parts.push(self.fit_cell(i, &col.header, widths[i]));
         }
         let line = parts.join(&" ".repeat(self.gap));
         let visible_len = self.total_width();
@@ -451,16 +604,10 @@ impl ColumnLayout {
         let row = &self.rows[row_idx];
         let mut parts_colored = Vec::new();
 
-        for (i, col) in self.columns.iter().enumerate() {
+        for (i, width) in widths.iter().enumerate() {
             let raw = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            let w = widths[i];
-            let padded = match col.align {
-                Align::Left => pad_right(raw, w),
-                Align::Right => pad_left(raw, w),
-            };
-
-            let colored = color_fn(i, &padded);
-            parts_colored.push(colored);
+            let padded = self.fit_cell(i, raw, *width);
+            parts_colored.push(color_fn(i, &padded));
         }
 
         let gap_str = " ".repeat(self.gap);
@@ -763,6 +910,48 @@ pub fn render_pane_list(
     panes: &[PaneInfo],
 ) {
     let mut out = io::stdout().lock();
+    render_pane_list_into(&mut out, ctx, session_name, window_name, panes);
+}
+
+/// Which pane field a text-arm column shows. The set varies with the
+/// terminal's width, so the row builder cannot assume fixed indices.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneField {
+    Id,
+    Title,
+    Cwd,
+    Command,
+}
+
+/// Spaces `ColumnLayout` puts between columns. Named here because the text arm
+/// has to do the same arithmetic to decide which columns fit.
+const GAP: usize = 3;
+
+/// Zoom is reported whether or not the pane also has focus.
+///
+/// `pane.zoom` takes a pane id, so zoomed-without-focus is an ordinary state a
+/// caller can reach — and it is the state an operator most needs told about,
+/// because a zoomed pane is why the others are not on screen. The marker used
+/// to gate `[zoomed]` behind focus, so `--format json` said `is_zoomed: true`
+/// and both human formats said nothing at all.
+fn pane_marker(is_focused: bool, is_zoomed: bool) -> String {
+    match (is_focused, is_zoomed) {
+        (true, true) => "\u{25C0} focus [zoomed]".to_string(),
+        (true, false) => "\u{25C0} focus".to_string(),
+        (false, true) => "[zoomed]".to_string(),
+        (false, false) => String::new(),
+    }
+}
+
+/// The body of [`render_pane_list`], against any sink, so the output can be
+/// asserted on rather than only smoke-tested.
+fn render_pane_list_into(
+    out: &mut impl Write,
+    ctx: &TerminalContext,
+    session_name: &str,
+    window_name: &str,
+    panes: &[PaneInfo],
+) {
     // Egress guard (issue #104) — see `safe_label`.
     let session_name = &safe_label(session_name);
     let window_name = &safe_label(window_name);
@@ -770,16 +959,29 @@ pub fn render_pane_list(
     match ctx.format {
         OutputFormat::Plain => {
             for p in panes {
-                // `cwd` and `command` are caller-supplied and are NOT
+                // `cwd`, `command` and `title` are caller-supplied and are NOT
                 // sanitized on the way in — a path or an argv is
                 // legitimately arbitrary text, so the guard has to be here
                 // (issue #104).
+                //
+                // Quoting runs before the guard, and the order does not matter:
+                // every character `safe_label` rewrites is a control or
+                // separator character, none of which is on the quoting
+                // allowlist, so an argument the guard would touch is quoted
+                // under either order. Checked rather than assumed — 200,000
+                // random argvs over a hostile alphabet, zero differences. This
+                // order is simply the one that walks the line once.
+                //
+                // `title` is appended LAST so the three fields scripts already
+                // parse keep their positions — the same rule issue #120 followed
+                // when `window list` grew an id column.
                 let _ = writeln!(
                     out,
-                    "{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}",
                     short_id(&p.id),
                     safe_label(&p.cwd),
-                    safe_label(&p.command),
+                    safe_label(&render_argv(&p.command)),
+                    safe_label(&p.title),
                 );
             }
         }
@@ -789,49 +991,113 @@ pub fn render_pane_list(
                 let title = format!(
                     "Panes \u{2500}\u{2500} window: {window_name} \u{2500}\u{2500} session: {session_name}"
                 );
-                render_empty_state(&mut out, ctx, &title, "(no panes)", "");
+                render_empty_state(out, ctx, &title, "(no panes)", "");
                 return;
             }
 
-            let mut layout = ColumnLayout::new(vec![
-                Column {
-                    header: "ID".to_string(),
+            // Task 060 §C specified ID / CWD / CMD here and only ID ever
+            // shipped; issue #135 adds the title the border draws.
+            //
+            // Which of them appear depends on the terminal. A column that
+            // cannot reach a width where it says anything is dropped, not
+            // rendered as a bare ellipsis — task 060's own "narrow terminal →
+            // shrink the box" fallback, which `TerminalContext::width` was
+            // captured for and which nothing ever implemented. Priority order
+            // is ID (the handle you act with), then TITLE (the handle you
+            // recognise), then COMMAND (the subject of issue #135), then CWD.
+            let budget = inner_budget(ctx);
+            let marker_width = panes
+                .iter()
+                .map(|p| display_width(&pane_marker(p.is_focused, p.is_zoomed)))
+                .max()
+                .unwrap_or(0);
+            let mut columns = vec![Column {
+                header: "ID".to_string(),
+                align: Align::Left,
+                min_width: 8,
+            }];
+            let mut fields = vec![PaneField::Id];
+            // ID + the marker and their gap are the floor; each further column
+            // has to fit beside them.
+            let mut committed = 8 + GAP + marker_width;
+            for (field, header, min_width) in [
+                (PaneField::Title, "TITLE", 5),
+                (PaneField::Command, "COMMAND", 7),
+                (PaneField::Cwd, "CWD", 3),
+            ] {
+                if committed + GAP + min_width > budget {
+                    continue;
+                }
+                committed += GAP + min_width;
+                columns.push(Column {
+                    header: header.to_string(),
                     align: Align::Left,
-                    min_width: 8,
-                },
-                Column {
-                    header: String::new(),
-                    align: Align::Left,
-                    min_width: 0,
-                }, // focus/zoom marker
-            ]);
+                    min_width,
+                });
+                fields.push(field);
+            }
+            // CWD is appended last above but reads better between TITLE and
+            // COMMAND, which is also the order task 060 drew.
+            if let (Some(cwd_at), Some(cmd_at)) = (
+                fields.iter().position(|f| *f == PaneField::Cwd),
+                fields.iter().position(|f| *f == PaneField::Command),
+            ) && cwd_at > cmd_at
+            {
+                columns.swap(cwd_at, cmd_at);
+                fields.swap(cwd_at, cmd_at);
+            }
+            let marker_col = columns.len();
+            columns.push(Column {
+                header: String::new(),
+                align: Align::Left,
+                min_width: 0,
+            });
+            // Everything but the id and the marker carries arbitrary user text
+            // and therefore flexes.
+            let flex: Vec<usize> = (1..marker_col).collect();
+            let mut layout = ColumnLayout::new(columns).budget(budget, &flex, ctx.unicode);
 
             for p in panes {
-                let marker = if p.is_focused && p.is_zoomed {
-                    "\u{25C0} focus [zoomed]".to_string()
-                } else if p.is_focused {
-                    "\u{25C0} focus".to_string()
-                } else {
-                    String::new()
-                };
-                layout.add_row(vec![short_id(&p.id).to_string(), marker]);
+                let mut row: Vec<String> = fields
+                    .iter()
+                    .map(|f| match f {
+                        PaneField::Id => short_id(&p.id).to_string(),
+                        PaneField::Title => safe_label(&p.title),
+                        PaneField::Cwd => safe_label(&p.cwd),
+                        PaneField::Command => safe_label(&render_argv(&p.command)),
+                    })
+                    .collect();
+                row.push(pane_marker(p.is_focused, p.is_zoomed));
+                layout.add_row(row);
             }
 
             let content_width = layout.total_width();
-            let header_text = format!(
+            // The frame is not bounded by its columns alone: a long window or
+            // session name overflows through the header, and the footer quotes
+            // both again. So the box takes its width from the table, widening
+            // for the header or footer only as far as the budget allows, and
+            // then those two are trimmed to the width that was settled on.
+            //
+            // The trims are NOT the same number. `BoxRenderer` draws the header
+            // as `╭─ {title} …╮` and the footer as `╰… {footer} ╯`, which cost
+            // one column apart — and both fall back to a one-glyph pad when
+            // they do not fit, quietly making the line a column wider than
+            // every other. That is what an off-by-one here looks like: a frame
+            // with one longer edge.
+            let ellipsis = if ctx.unicode { "\u{2026}" } else { ".." };
+            let header_raw = format!(
                 "Panes \u{2500}\u{2500} window: {window_name} \u{2500}\u{2500} session: {session_name}"
             );
-            let footer_ctx = format!("{window_name}:{session_name}");
-
-            let footer_text = format!(
-                "{} pane{} \u{2500}\u{2500} {footer_ctx}",
+            let footer_raw = format!(
+                "{} pane{} \u{2500}\u{2500} {window_name}:{session_name}",
                 panes.len(),
                 if panes.len() == 1 { "" } else { "s" },
             );
-
             let box_width = content_width
-                .max(display_width(&header_text) + 4)
-                .max(display_width(&footer_text) + 4);
+                .max((display_width(&header_raw) + 4).min(budget))
+                .max((display_width(&footer_raw) + 4).min(budget));
+            let header_text = fit_width(&header_raw, box_width.saturating_sub(2), ellipsis);
+            let footer_text = fit_width(&footer_raw, box_width.saturating_sub(1), ellipsis);
 
             let bx = BoxRenderer::new(ctx, box_width)
                 .title(header_text)
@@ -851,7 +1117,7 @@ pub fn render_pane_list(
                 let (colored, visible_len) = layout.render_row(i, &|col_idx, cell| {
                     match col_idx {
                         0 => styled_if(cell, colors, None, false, true), // ID: muted
-                        1 if is_focused && is_zoomed => {
+                        c if c == marker_col && is_focused && is_zoomed => {
                             // Split the marker: "◀ focus" in cyan, "[zoomed]" in yellow
                             let trimmed = cell.trim_end();
                             if let Some(pos) = trimmed.find("[zoomed]") {
@@ -868,7 +1134,14 @@ pub fn render_pane_list(
                                 styled_if(cell, colors, Some(Color::Cyan), true, false)
                             }
                         }
-                        1 if is_focused => styled_if(cell, colors, Some(Color::Cyan), true, false),
+                        c if c == marker_col && is_focused => {
+                            styled_if(cell, colors, Some(Color::Cyan), true, false)
+                        }
+                        // Zoomed without focus — same yellow the zoom half of
+                        // the combined marker carries.
+                        c if c == marker_col && is_zoomed => {
+                            styled_if(cell, colors, Some(Color::Yellow), true, false)
+                        }
                         _ => cell.to_string(),
                     }
                 });
@@ -879,6 +1152,35 @@ pub fn render_pane_list(
             let _ = writeln!(out, "{}", bx.footer_line());
         }
     }
+}
+
+/// Display columns a box's *inner* area may occupy on this terminal.
+///
+/// A rendered row is `│ ` + inner + ` │`, so the frame costs four columns.
+/// `TerminalContext::width` has been captured since task 060 and read by
+/// nothing; this is its first consumer, and task 060's own "narrow terminal →
+/// shrink the box" fallback.
+/// The narrowest terminal whose `pane list` box can be honoured.
+///
+/// Below it the frame overflows — as it always has — rather than printing a row
+/// that names no pane: the id is what every other verb takes as an argument,
+/// and the focus marker is the only thing that says which pane is current, so
+/// neither is droppable. Everything else is.
+///
+/// DERIVED, not written down. The first cut hardcoded 24 from "an id and a
+/// `◀ focus` marker with a gap between them are 18 columns", which forgot that
+/// a *zoomed* pane's marker is `◀ focus [zoomed]` — 16 columns, not 7 — so the
+/// stated guarantee was wrong by seven for every zoomed pane. A constant that
+/// restates an arithmetic the code does elsewhere is a constant that will drift
+/// again.
+#[cfg(test)]
+fn min_boxable_width() -> usize {
+    // │ + space + ID + gap + widest marker + space + │
+    2 + 8 + GAP + display_width(&pane_marker(true, true)) + 2
+}
+
+fn inner_budget(ctx: &TerminalContext) -> usize {
+    (ctx.width as usize).saturating_sub(4)
 }
 
 /// Render an empty state inside a box frame.
@@ -944,10 +1246,38 @@ pub struct WindowInfo {
 /// Pane info for list rendering.
 pub struct PaneInfo {
     pub id: String,
+    /// The pane's displayed title — the text drawn in its border and the thing
+    /// an operator identifies a pane by. It reached `--format json` and neither
+    /// human format (issue #135).
+    pub title: String,
     pub cwd: String,
-    pub command: String,
+    /// The argv, NOT a pre-joined string. Joining it in the caller is how the
+    /// text and plain arms would be free to render the same pane differently;
+    /// [`render_pane_list`] joins it once, for both.
+    pub command: Vec<String>,
     pub is_focused: bool,
     pub is_zoomed: bool,
+}
+
+/// Render a pane's argv the way a shell would have to be given it.
+///
+/// A bare `join(" ")` made `["sh", "-c", "printf 'hi'; sleep 1"]` and a
+/// five-element argv print identically, which is exactly the case that matters
+/// since #125 made shell-wrapped argv the normal shape of a `--cmd` pane
+/// (issue #135). This is the same function that builds the line `pane.run`
+/// injects, so there is one quoting dialect rather than two free to disagree.
+///
+/// **What this guarantees is argument BOUNDARIES, not a byte-exact round trip.**
+/// The caller runs the output through [`safe_label`] afterwards, and it must:
+/// an argv is arbitrary text and the plain arm is tab-separated, so a raw TAB
+/// would forge a column and a raw ESC would reach the operator's terminal. The
+/// guard rewrites those bytes into visible `\u{9}`-style escapes *inside* the
+/// quotes, so feeding the printed line back to a shell yields the escape text,
+/// not the original byte. Measured: boundaries survived 2,637 out of 2,637
+/// end-to-end cases; content did not, in 73% of cases containing a control
+/// character. `--format json` remains the byte-exact contract, and says so.
+fn render_argv(argv: &[String]) -> String {
+    shux_pty::shell_escape_args(argv)
 }
 
 // ── Version & Confirmation Printers ────────────────────────────
@@ -1838,15 +2168,17 @@ mod tests {
         let panes = vec![
             PaneInfo {
                 id: "abcdef0123456789".to_string(),
+                title: "shell".to_string(),
                 cwd: "/tmp".to_string(),
-                command: "bash".to_string(),
+                command: vec!["bash".to_string()],
                 is_focused: true,
                 is_zoomed: true,
             },
             PaneInfo {
                 id: "fedcba9876543210".to_string(),
+                title: "tail".to_string(),
                 cwd: "/var/log".to_string(),
-                command: "tail -f app.log".to_string(),
+                command: ["tail", "-f", "app.log"].map(String::from).to_vec(),
                 is_focused: false,
                 is_zoomed: false,
             },
@@ -1923,5 +2255,454 @@ mod tests {
         );
         print_run_command(&serde_json::json!({"state": "weird"}), false);
         print_run_command(&serde_json::json!({}), false);
+    }
+
+    // ── issue #135: the human pane list named no pane and lost argv shape ──
+
+    fn pane_ctx(format: OutputFormat, width: u16, unicode: bool) -> TerminalContext {
+        TerminalContext {
+            is_tty: format == OutputFormat::Text,
+            colors: false,
+            unicode,
+            width,
+            format,
+        }
+    }
+
+    fn pane(id: &str, title: &str, cwd: &str, argv: &[&str], focused: bool) -> PaneInfo {
+        PaneInfo {
+            id: id.to_string(),
+            title: title.to_string(),
+            cwd: cwd.to_string(),
+            command: argv.iter().map(|s| s.to_string()).collect(),
+            is_focused: focused,
+            is_zoomed: false,
+        }
+    }
+
+    fn zoomed_pane(id: &str, title: &str, cwd: &str, argv: &[&str]) -> PaneInfo {
+        PaneInfo {
+            is_zoomed: true,
+            ..pane(id, title, cwd, argv, true)
+        }
+    }
+
+    fn render_panes(
+        ctx: &TerminalContext,
+        session: &str,
+        window: &str,
+        panes: &[PaneInfo],
+    ) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        render_pane_list_into(&mut buf, ctx, session, window, panes);
+        String::from_utf8(buf).expect("utf8")
+    }
+
+    /// The plain arm gained a title column, and it goes LAST so the three
+    /// fields scripts already parse keep their positions (the rule issue #120
+    /// followed for `window list`).
+    #[test]
+    fn the_plain_pane_list_carries_the_title_in_a_fourth_column() {
+        let out = render_panes(
+            &pane_ctx(OutputFormat::Plain, 100, false),
+            "dev",
+            "editor",
+            &[pane(
+                "abcdef0123456789",
+                "nvim",
+                "/home/u/p",
+                &["nvim", "main.rs"],
+                true,
+            )],
+        );
+        assert_eq!(out, "abcdef01\t/home/u/p\tnvim main.rs\tnvim\n");
+        let fields: Vec<&str> = out.trim_end().split('\t').collect();
+        assert_eq!(fields.len(), 4, "field count is the script-facing contract");
+        assert_eq!(fields[0], "abcdef01");
+        assert_eq!(fields[1], "/home/u/p");
+        assert_eq!(fields[3], "nvim");
+    }
+
+    /// The issue itself: a quoted argument and several arguments rendered
+    /// identically, so the output could not say which one it was.
+    #[test]
+    fn one_argument_with_a_space_is_distinguishable_from_two() {
+        let ctx = pane_ctx(OutputFormat::Plain, 100, false);
+        let one = render_panes(
+            &ctx,
+            "d",
+            "w",
+            &[pane("aaaaaaaa11", "sh", "/", &["sh", "-c", "a b"], false)],
+        );
+        let two = render_panes(
+            &ctx,
+            "d",
+            "w",
+            &[pane(
+                "aaaaaaaa11",
+                "sh",
+                "/",
+                &["sh", "-c", "a", "b"],
+                false,
+            )],
+        );
+        assert_ne!(one, two, "argv shape is not recoverable from the output");
+        assert!(one.contains("sh -c 'a b'"), "{one}");
+        assert!(two.contains("sh -c a b"), "{two}");
+    }
+
+    /// An empty argument used to disappear entirely, so `["sh","-c",""]`
+    /// printed as a two-element argv.
+    #[test]
+    fn an_empty_argument_is_visible_in_the_pane_list() {
+        let out = render_panes(
+            &pane_ctx(OutputFormat::Plain, 100, false),
+            "d",
+            "w",
+            &[pane("aaaaaaaa11", "sh", "/", &["sh", "-c", ""], false)],
+        );
+        assert!(out.contains("sh -c ''"), "{out}");
+    }
+
+    /// The text arm shipped as an ID column and a focus marker — no title, no
+    /// command, no cwd, though task 060 §C specified CWD and CMD and the CLI
+    /// had been computing both and throwing them away.
+    #[test]
+    fn the_text_pane_list_names_every_pane_and_says_what_it_runs() {
+        let out = render_panes(
+            &pane_ctx(OutputFormat::Text, 100, true),
+            "dev",
+            "editor",
+            &[
+                pane(
+                    "aaaaaaaa11",
+                    "nvim",
+                    "/home/u/p",
+                    &["nvim", "main.rs"],
+                    true,
+                ),
+                pane(
+                    "bbbbbbbb22",
+                    "make",
+                    "/home/u/p",
+                    &["make", "-j", "8"],
+                    false,
+                ),
+            ],
+        );
+        for needle in [
+            "TITLE",
+            "CWD",
+            "COMMAND",
+            "nvim",
+            "make",
+            "main.rs",
+            "-j 8",
+            "/home/u/p",
+            "aaaaaaaa",
+            "bbbbbbbb",
+        ] {
+            assert!(
+                out.contains(needle),
+                "text list is missing {needle:?}:\n{out}"
+            );
+        }
+    }
+
+    /// `TerminalContext::width` had been captured since task 060 and read by
+    /// nothing, so a wide column was free to push the frame off the screen —
+    /// and the frame is not bounded by its columns alone: the header quotes the
+    /// window and session names and the footer quotes them again.
+    #[test]
+    fn the_box_never_renders_wider_than_the_terminal() {
+        let long_cmd: Vec<&str> = vec![
+            "/usr/bin/bash",
+            "-c",
+            "for i in $(seq 1 100); do printf 'a very long line indeed %s\\n' \"$i\"; done; exec sleep 900",
+        ];
+        let panes = [
+            pane(
+                "aaaaaaaa11",
+                "a-rather-long-pane-title-that-keeps-going",
+                "/home/user/very/deep/project/tree/that/keeps/going/further",
+                &long_cmd,
+                true,
+            ),
+            pane("bbbbbbbb22", "sh", "/", &["sh"], false),
+        ];
+        // A ZOOMED pane, whose marker is `◀ focus [zoomed]` — nine columns
+        // wider than `◀ focus`, and the case the first cut of the minimum
+        // width forgot.
+        let zoomed = [
+            zoomed_pane("cccccccc33", "vim", "/home/user", &["vim", "a b.rs"]),
+            pane("dddddddd44", "sh", "/", &["sh"], false),
+        ];
+        for width in (min_boxable_width() as u16)..=200 {
+            for unicode in [true, false] {
+                let ctx = pane_ctx(OutputFormat::Text, width, unicode);
+                for set in [&panes[..], &zoomed[..]] {
+                    let out = render_panes(
+                        &ctx,
+                        "a-session-name-long-enough-to-overflow-on-its-own",
+                        "a-window-name-that-is-also-far-too-long-to-fit",
+                        set,
+                    );
+                    let budget = inner_budget(&ctx) + 4;
+                    for line in out.lines() {
+                        assert!(
+                            display_width(line) <= budget,
+                            "width={width} unicode={unicode}: line is {} wide, budget {budget}:\n{line}\n--- full ---\n{out}",
+                            display_width(line)
+                        );
+                    }
+                    // Every line of one box must be the SAME width, or the frame
+                    // is not a frame.
+                    let widths: std::collections::BTreeSet<usize> =
+                        out.lines().map(display_width).collect();
+                    assert_eq!(
+                        widths.len(),
+                        1,
+                        "width={width} unicode={unicode}: ragged frame {widths:?}:\n{out}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An empty list takes a different code path — `render_empty_state`,
+    /// which no listing budgets. Pinned as a KNOWN residual rather than left
+    /// unstated: it is shared by `session list` and `window list`, so bounding
+    /// it belongs with bounding those.
+    #[test]
+    fn the_empty_pane_list_is_rendered_and_its_overflow_is_documented() {
+        let ctx = pane_ctx(OutputFormat::Text, 40, true);
+        let out = render_panes(&ctx, "dev", "editor", &[]);
+        assert!(out.contains("(no panes)"), "{out}");
+        let wide = render_panes(
+            &ctx,
+            "a-session-name-long-enough-to-overflow-on-its-own",
+            "a-window-name-that-is-also-far-too-long-to-fit",
+            &[],
+        );
+        assert!(
+            wide.lines().any(|l| display_width(l) > 40),
+            "render_empty_state started honouring the terminal width — good; \
+             fold it into the budget and delete this pin"
+        );
+    }
+
+    /// `fit_width` and `display_width` must measure the SAME way.
+    ///
+    /// `UnicodeWidthStr::width` is a property of the whole string, not the sum
+    /// of its characters' widths, and for several ordinary sequences the two
+    /// disagree badly: `☀️` (U+2600 U+FE0F) is 1 per character and **2** as a
+    /// string, and a ZWJ family is 6 per character and **2** as a string. A
+    /// truncator that adds up characters therefore hands back a cell whose real
+    /// width is not the width it was asked for — `pad_right` then adds no
+    /// padding, the row's reported visible length under-counts, and the box
+    /// emits a line WIDER than the terminal.
+    #[test]
+    fn a_fitted_cell_is_exactly_as_wide_as_it_was_asked_to_be() {
+        let samples = [
+            "\u{2600}\u{fe0f}".repeat(30), // emoji presentation selector
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}".repeat(10), // ZWJ family
+            "\u{1f1fa}\u{1f1f8}".repeat(10), // regional-indicator flags
+            "\u{4e2d}\u{6587}".repeat(10), // CJK
+            "e\u{301}".repeat(20),         // combining marks
+            "plain ascii text that is quite long".to_string(),
+            "\u{fe0f}".repeat(5), // a lone selector
+        ];
+        for s in &samples {
+            for width in 0..40usize {
+                let fitted = fit_width(s, width, "\u{2026}");
+                assert!(
+                    display_width(&fitted) <= width,
+                    "{s:?} fitted to {width} came back {} wide: {fitted:?}",
+                    display_width(&fitted)
+                );
+                // And it must not claim there is more when there is not.
+                if display_width(s) <= width {
+                    assert_eq!(
+                        fitted, *s,
+                        "{s:?} was truncated at width {width} for nothing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Truncation walks display width. A CJK character is two columns wide and
+    /// cutting one in half corrupts the row and the frame with it.
+    #[test]
+    fn truncation_never_splits_a_wide_character() {
+        for width in 24u16..=48 {
+            let ctx = pane_ctx(OutputFormat::Text, width, true);
+            let out = render_panes(
+                &ctx,
+                "d",
+                "w",
+                &[
+                    pane(
+                        "aaaaaaaa11",
+                        "編集",
+                        "/一二三四五六七八九十/一二三四五六七八九十",
+                        &["編集", "一二三四五六七八九十.rs"],
+                        true,
+                    ),
+                    // The sequences where per-character and whole-string width
+                    // disagree — the ones that made the frame ragged.
+                    pane(
+                        "bbbbbbbb22",
+                        &"\u{2600}\u{fe0f}".repeat(30),
+                        &format!(
+                            "/{}",
+                            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}".repeat(10)
+                        ),
+                        &[
+                            "\u{1f1fa}\u{1f1f8}".repeat(10).as_str(),
+                            "e\u{301}".repeat(20).as_str(),
+                        ],
+                        false,
+                    ),
+                ],
+            );
+            let widths: std::collections::BTreeSet<usize> =
+                out.lines().map(display_width).collect();
+            assert_eq!(
+                widths.len(),
+                1,
+                "width={width}: ragged frame {widths:?}:\n{out}"
+            );
+        }
+    }
+
+    /// Cutting a grapheme cluster after its ZWJ or variation selector leaves a
+    /// dangling half. There is no segmenter in this workspace, so the rule is
+    /// "never end on a zero-width character".
+    #[test]
+    fn truncation_never_ends_on_a_zero_width_character() {
+        for s in ["ab\u{200d}cd", "ab\u{fe0f}cd", "e\u{301}f\u{301}g"] {
+            for w in 1..=6 {
+                let cut = fit_width(s, w, "\u{2026}");
+                let before_marker = cut.strip_suffix('\u{2026}').unwrap_or(&cut);
+                assert!(
+                    !before_marker
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| UnicodeWidthStr::width(c.to_string().as_str()) == 0),
+                    "{s:?} at width {w} was cut to {cut:?}, ending on a zero-width char"
+                );
+                assert!(
+                    display_width(&cut) <= w,
+                    "{s:?} at width {w} produced {cut:?}, {} wide",
+                    display_width(&cut)
+                );
+            }
+        }
+    }
+
+    /// The plain arm is tab-separated, so a TAB in a pane's own text would
+    /// forge a column. The issue #104 egress guard escapes control characters —
+    /// this pins that it still covers the new column, and that quoting runs
+    /// BEFORE the guard so the escape is not itself quoted.
+    #[test]
+    fn a_control_character_cannot_forge_a_plain_column() {
+        let out = render_panes(
+            &pane_ctx(OutputFormat::Plain, 100, false),
+            "d",
+            "w",
+            &[pane(
+                "aaaaaaaa11",
+                "ti\ttle\u{1b}]0;X\u{7}",
+                "/cw\td",
+                &["sh", "-c", "a\tb"],
+                false,
+            )],
+        );
+        assert_eq!(
+            out.matches('\t').count(),
+            3,
+            "a payload tab became a column separator:\n{out:?}"
+        );
+        assert!(
+            !out.chars()
+                .any(|c| c.is_control() && c != '\t' && c != '\n'),
+            "raw control byte reached the terminal: {out:?}"
+        );
+    }
+
+    /// `pane.zoom` takes a pane id, so a pane can be zoomed without being
+    /// focused — and that is the state the operator most needs told about,
+    /// since a zoomed pane is why the others are off screen. Both human formats
+    /// used to say nothing while `--format json` said `is_zoomed: true`.
+    #[test]
+    fn a_zoomed_pane_is_marked_even_when_it_does_not_have_focus() {
+        let unfocused_zoom = PaneInfo {
+            is_focused: false,
+            is_zoomed: true,
+            ..pane("aaaaaaaa11", "vim", "/home/u", &["vim"], false)
+        };
+        let out = render_panes(
+            &pane_ctx(OutputFormat::Text, 100, true),
+            "dev",
+            "editor",
+            &[unfocused_zoom, pane("bbbbbbbb22", "sh", "/", &["sh"], true)],
+        );
+        assert!(out.contains("[zoomed]"), "zoom is invisible:\n{out}");
+        assert!(out.contains("\u{25c0} focus"), "focus marker lost:\n{out}");
+    }
+
+    /// `session list` and `window list` share `ColumnLayout` and `BoxRenderer`.
+    /// The budget is opt-in precisely so they are untouched; this pins it.
+    #[test]
+    fn the_other_listings_are_byte_identical_to_before() {
+        let mut layout = ColumnLayout::new(vec![
+            Column {
+                header: "A".to_string(),
+                align: Align::Left,
+                min_width: 2,
+            },
+            Column {
+                header: "BB".to_string(),
+                align: Align::Right,
+                min_width: 1,
+            },
+        ]);
+        layout.add_row(vec!["a-very-long-cell-indeed".to_string(), "9".to_string()]);
+        assert_eq!(layout.total_width(), 23 + 3 + 2);
+        let (header, len) = layout.render_header(false);
+        assert_eq!(header, "A                         BB");
+        assert_eq!(len, 28);
+        let (row, len) = layout.render_row(0, &|_, c| c.to_string());
+        assert_eq!(row, "a-very-long-cell-indeed    9");
+        assert_eq!(len, 28);
+    }
+
+    /// The three consumers of `col_widths` must agree, or the row's reported
+    /// visible length and the box's inner width drift and every border
+    /// misaligns.
+    #[test]
+    fn a_budgeted_layout_reports_one_width_to_all_three_callers() {
+        let mut layout = ColumnLayout::new(vec![
+            Column {
+                header: "ID".to_string(),
+                align: Align::Left,
+                min_width: 8,
+            },
+            Column {
+                header: "CMD".to_string(),
+                align: Align::Left,
+                min_width: 3,
+            },
+        ])
+        .budget(30, &[1], true);
+        layout.add_row(vec!["abcdefgh".to_string(), "x".repeat(200)]);
+        let total = layout.total_width();
+        let (_, header_len) = layout.render_header(false);
+        let (row, row_len) = layout.render_row(0, &|_, c| c.to_string());
+        assert_eq!(total, header_len);
+        assert_eq!(total, row_len);
+        assert_eq!(display_width(&row), total);
+        assert!(total <= 30, "budget ignored: {total}");
     }
 }

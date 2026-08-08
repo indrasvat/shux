@@ -38,8 +38,8 @@ fi
 #   <group>:<expected test count>
 REQUIRED_GROUPS=(
   process-table:5
-  daemon-pty:238
-  wall-clock:1
+  daemon-pty:247
+  wall-clock:2
 )
 
 # Largest share of the suite any single throttled group may hold, in percent.
