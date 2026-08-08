@@ -94,6 +94,26 @@ impl Env {
         env
     }
 
+    /// Replace `config.toml` under a RUNNING daemon and wait out the
+    /// hot-reload watcher's debounce. Validated for the same reason as the
+    /// initial write.
+    #[track_caller]
+    fn rewrite_config(&self, config_toml: &str) {
+        std::fs::write(
+            self.root.path().join("config/shux/config.toml"),
+            config_toml,
+        )
+        .expect("rewrite config.toml");
+        let out = self.run(&["config", "validate"]);
+        assert!(
+            out.status.success(),
+            "rewritten fixture config.toml is invalid:\n{}\n--- config.toml ---\n{config_toml}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // `run_hot_reload` debounces 150ms; give the watcher room past that.
+        thread::sleep(Duration::from_millis(1_500));
+    }
+
     fn shux(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
         cmd.env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
@@ -150,6 +170,57 @@ impl Env {
 
     fn capture(&self, session: &str, pane: &str) -> String {
         self.ok(&["pane", "capture", "-s", session, "-p", pane])
+    }
+
+    /// `session create <name> -d -- <argv>` — an EXPLICIT argv, so the pane is
+    /// unaffected by `[shell].command` and survives a config flip.
+    #[track_caller]
+    fn session_with_argv(&mut self, name: &str, argv: &[&str]) -> String {
+        let mut args = vec!["session", "create", name, "-d", "--"];
+        args.extend_from_slice(argv);
+        self.ok(&args);
+        self.sessions.push(name.to_string());
+        self.first_pane(name)
+    }
+
+    fn send_keys(&self, session: &str, text: &str) {
+        let _ = self.run(&["pane", "send-keys", "-s", session, "-t", text]);
+    }
+
+    /// Every (window, pane) in `session`, with whether the pane has a live PTY.
+    ///
+    /// `pane list -s X` alone reads only the ACTIVE window — which a new-window
+    /// action moves — so a phantom left in the window you started in would not
+    /// even appear. Walk every window.
+    fn panes_with_liveness(&self, session: &str) -> Vec<(String, bool)> {
+        let windows: Vec<String> = serde_json::from_str::<serde_json::Value>(
+            &self.ok(&["--format", "json", "window", "list", "-s", session]),
+        )
+        .expect("window list json")
+        .as_array()
+        .expect("window array")
+        .iter()
+        .map(|w| w["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+
+        let mut out = Vec::new();
+        for wid in windows {
+            let v: serde_json::Value = serde_json::from_str(&self.ok(&[
+                "--format", "json", "pane", "list", "-s", session, "-w", &wid,
+            ]))
+            .expect("pane list json");
+            for p in v.as_array().expect("pane array") {
+                let pid = p["id"].as_str().unwrap_or_default().to_string();
+                // A pane with no PTY cannot be captured — that is exactly what
+                // "phantom" means to every verb a user reaches for next.
+                let live = self
+                    .run(&["pane", "capture", "-s", session, "-p", &pid])
+                    .status
+                    .success();
+                out.push((pid, live));
+            }
+        }
+        out
     }
 
     #[track_caller]
@@ -349,4 +420,117 @@ fn an_empty_shell_command_leaves_the_default_shell_alone() {
         &format!("printf 'ENV=[%s]\\n' \"$SHUX_ISSUE_132\"; {}", probe()),
     ]);
     env.expect_screen("defaults", &pane, "ENV=[from-config]", &["ENV=[]"]);
+}
+
+// ── blank configured program (Codex P2 on PR #145) ──────────────────────
+
+/// `command = ["   "]` parses and validates — the schema is `Vec<String>` and
+/// nothing there knows what a program name is. Treated as an override it execs
+/// a blank program, so the default pane dies while `--cmd` keeps working,
+/// because `interpreting_shell` filters the same blank and falls back to
+/// `$SHELL`. Blank means unset, on both paths.
+#[test]
+fn a_blank_configured_shell_is_treated_as_unset_on_both_paths() {
+    let mut env = Env::new("[shell]\ncommand = [\"   \"]\n", "/bin/sh");
+
+    // The default-pane path: a pane, not a spawn failure.
+    let pane = env.session("blankdefault");
+    env.ok(&[
+        "pane",
+        "run",
+        "-s",
+        "blankdefault",
+        "-p",
+        &pane,
+        "--command",
+        &format!("printf 'DEFAULT_PANE_ALIVE\\n'; {}", probe()),
+    ]);
+    env.expect_screen("blankdefault", &pane, "DEFAULT_PANE_ALIVE", &[]);
+
+    // The `--cmd` path: same shell, so the same answer.
+    let cmd_pane = env.session_with_cmd(
+        "blankcmd",
+        &format!("{}; printf 'CMD_PANE_ALIVE\\n'", probe()),
+    );
+    env.expect_screen("blankcmd", &cmd_pane, "CMD_PANE_ALIVE", &[]);
+}
+
+// ── attach rollback (Codex P1 on PR #145) ───────────────────────────────
+
+/// Prefix is rebound to ctrl-a because the default ctrl-space is NUL, and NUL
+/// is the one byte `pane send-keys` will not carry into a pane.
+const ATTACH_KEYS: &str = "[keys]\nprefix = \"ctrl-a\"\n\n";
+
+/// Drive the real attach client from inside a shux pane, split and create a
+/// window while `[shell].command` names a program that does not exist, and
+/// prove the graph is left with no phantom.
+///
+/// Before the fix both attach paths mutated the graph and then dropped the
+/// spawn error with `.ok()`: the split left a focused third pane that answered
+/// "pane VT not found" to every later verb, and `prefix c` created a whole
+/// window whose only pane could never render — with the attach UI switching to
+/// it as if it had worked. The `pane.split` and `window.create` RPCs have
+/// rolled this back since #125; the attach paths never did, and
+/// `[shell].command` turns that latent case into a reachable one.
+#[test]
+fn a_failed_attach_split_or_new_window_leaves_no_phantom() {
+    let mut env = Env::new(&format!("{ATTACH_KEYS}[shell]\ncommand = []\n"), "/bin/sh");
+
+    // A host pane running a real SHELL — the attach client has to be typed
+    // into something that reads its input. The target session's own pane gets
+    // an EXPLICIT argv so the config flip below cannot kill it.
+    let host_pane = env.session("host");
+    env.session_with_argv("target", &["sleep", "900"]);
+
+    let bin = env.bin.display().to_string();
+    let root = env.root.path().display().to_string();
+    env.send_keys(
+        "host",
+        &format!(
+            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
+             {bin} session attach target\n"
+        ),
+    );
+    // Wait for something only the ATTACHED UI draws. The session name is no
+    // good as a needle — the shell echoes the command line that contains it,
+    // so it is on screen before the client has started (a not-yet-started app
+    // is quiet, and matching its own echo is how you race one).
+    env.wait_for("host", &host_pane, "1 pane");
+
+    // CONTROL: with a working shell the same keystrokes really do split. This
+    // is what makes the negative assertion below mean anything — without it,
+    // "no phantom" is equally satisfied by keys that never arrived.
+    env.send_keys("host", "\x01v");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while env.panes_with_liveness("target").len() < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    let control = env.panes_with_liveness("target");
+    assert_eq!(
+        control.len(),
+        2,
+        "control split never happened, so this test cannot detect a phantom: {control:?}"
+    );
+    assert!(control.iter().all(|(_, live)| *live), "{control:?}");
+
+    // Now make every default-pane spawn fail, and repeat.
+    env.rewrite_config(&format!(
+        "{ATTACH_KEYS}[shell]\ncommand = [\"/usr/bin/shux-issue-132-typo\"]\n"
+    ));
+
+    env.send_keys("host", "\x01v");
+    thread::sleep(Duration::from_secs(3));
+    env.send_keys("host", "\x01c");
+    thread::sleep(Duration::from_secs(3));
+
+    let after = env.panes_with_liveness("target");
+    assert!(
+        after.iter().all(|(_, live)| *live),
+        "a failed spawn left a pane with no PTY in the graph: {after:?}"
+    );
+    assert_eq!(
+        after.len(),
+        2,
+        "the rolled-back split and window should leave the graph as the control did: {after:?}"
+    );
 }

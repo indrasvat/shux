@@ -1187,3 +1187,29 @@ config, so the branch table is testable without a global no test can reset.
 `env_clear` precisely to get an environment containing only its own deterministic
 plan. Injecting `[shell].env` into it would be "consistent" and would defeat the
 flag's entire purpose.
+
+**A schema of `Vec<String>` does not know what a program name is.** `[shell]
+command = ["   "]` parsed, validated, and exec'd a blank program. Any config
+field that ends up as argv[0] needs a semantic check, and the check has to live
+in ONE predicate shared by every consumer — the pane shell and the `--cmd`
+interpreter disagreed about blankness precisely because each filtered for
+itself. This is the third time in this repo that `[""]` and `["   "]` diverged
+(#125 hit it in the RPC parser).
+
+**A contract enforced on every RPC is not enforced in the TUI.** #125 made a
+failed spawn roll back on all five spawning RPCs. The two attach actions that
+also spawn — `split` and `new_window` — kept `.await.ok()` and were never
+revisited, because with a default pane that could not fail the branch was
+unreachable. Making a previously-infallible path fallible turns every
+unreviewed `.ok()` downstream of it into a live defect: enumerate the callers,
+not just the function you changed.
+
+**A negative assertion needs a control arm.** "No phantom pane after the failing
+split" is satisfied just as well by keystrokes that never reached the client.
+The test splits once with a WORKING shell first and asserts that succeeded, so
+the negative half is only reached from a state known to be drivable.
+
+**Do not wait on a needle the shell echoes.** Waiting for the session name to
+appear on the host pane matched the shell's echo of the `session attach` command
+line, before the client existed. Wait on something only the running app draws —
+here `1 pane` from the attached status bar.

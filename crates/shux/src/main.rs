@@ -1367,6 +1367,19 @@ pub(crate) fn daemon_shell_config() -> shux_core::config::ShellConfig {
         .unwrap_or_default()
 }
 
+/// The configured shell argv, or `None` when `[shell].command` does not name a
+/// program.
+///
+/// One place decides what "configured" means, so the pane shell and the shell
+/// that interprets a `--cmd` string cannot disagree about it.
+pub(crate) fn configured_shell_argv(shell: &shux_core::config::ShellConfig) -> Option<Vec<String>> {
+    let program = shell.command.first()?;
+    if program.trim().is_empty() {
+        return None;
+    }
+    Some(shell.command.clone())
+}
+
 /// Fold the user's `[shell]` config into one pane's spawn plan (issue #132).
 ///
 /// Returns the argv to exec — empty keeps `PtyConfig::default_shell`'s
@@ -1375,6 +1388,15 @@ pub(crate) fn daemon_shell_config() -> shux_core::config::ShellConfig {
 /// - `shell.command` is the *default* shell override, so it applies only when
 ///   the caller asked for no command. An explicit `shux new -- vim a.rs` still
 ///   runs `vim`, never the configured shell.
+/// - A **blank** `command[0]` means "not configured". `command = [""]` and
+///   `command = ["   "]` parse and validate — the schema is `Vec<String>` and
+///   nothing there knows what a program name is — and treating them as an
+///   override execs a blank program, so the default pane dies while `--cmd`
+///   still works because `interpreting_shell` filters the same blank and falls
+///   back to `$SHELL`. That is exactly the drift this change exists to remove.
+///   Blank-means-unset is already the house rule: `default_shell_argv` treats a
+///   blank `$SHELL` as unset, and `parse_pane_command` treats a blank `command`
+///   string as "no command given".
 /// - `shell.env` is layered *under* `extra_env`: `PtyHandle::spawn` applies
 ///   `config.env` in order and last write wins, so a caller that names a
 ///   variable explicitly (`lens.run`'s deterministic plan) beats the config.
@@ -1388,7 +1410,7 @@ pub(crate) fn resolve_pane_spawn(
     env_clear: bool,
 ) -> (Vec<String>, Vec<(String, String)>) {
     let argv = if command.is_empty() {
-        shell.command.clone()
+        configured_shell_argv(shell).unwrap_or_default()
     } else {
         command
     };
@@ -1658,7 +1680,7 @@ fn spawn_failure_hint_for(detail: &str, shell: &shux_core::config::ShellConfig) 
         // does not say where to look. Naming the configured program is a fact,
         // not a diagnosis — it does not claim THIS pane used it, only that a
         // pane with no command of its own would.
-        match shell.command.first() {
+        match configured_shell_argv(shell).map(|argv| argv[0].clone()) {
             Some(program) => format!(
                 "check argv[0] resolves via PATH and cwd exists — note \
                  [shell].command in your shux config runs `{program}` for any \
@@ -8241,6 +8263,41 @@ mod tests {
         // "$SHELL -l -i". Anything else here would hardcode a shell.
         let (argv, _) = resolve_pane_spawn(Vec::new(), &shell_cfg(&[], &[]), Vec::new(), false);
         assert!(argv.is_empty(), "{argv:?}");
+    }
+
+    #[test]
+    fn a_blank_configured_program_is_not_a_configured_shell() {
+        // `[""]` and `["   "]` parse and validate — the schema is `Vec<String>`
+        // and nothing there knows what a program name is. Treating them as an
+        // override execs a blank program: the default pane dies while `--cmd`
+        // keeps working off `$SHELL`, which is the drift this change removes.
+        for blank in [vec![""], vec!["   "], vec!["\t"], vec!["", "-l"]] {
+            let cfg = shell_cfg(&blank, &[]);
+            assert!(configured_shell_argv(&cfg).is_none(), "{blank:?}");
+            let (argv, _) = resolve_pane_spawn(Vec::new(), &cfg, Vec::new(), false);
+            assert!(argv.is_empty(), "{blank:?} should fall back to $SHELL");
+        }
+    }
+
+    #[test]
+    fn a_blank_argument_after_a_real_program_is_kept() {
+        // Only argv[0] names the program. An empty ARGUMENT is legitimate and
+        // must survive — the blank rule is about the program, not the argv.
+        let cfg = shell_cfg(&["/bin/sh", "", "-l"], &[]);
+        assert_eq!(
+            configured_shell_argv(&cfg),
+            Some(owned(&["/bin/sh", "", "-l"]))
+        );
+    }
+
+    #[test]
+    fn a_blank_configured_program_gets_no_config_note_in_the_hint() {
+        // It is not the configured shell, so naming it would be a lie.
+        let hint = spawn_failure_hint_for(
+            "failed to spawn child process: No such file or directory (os error 2)",
+            &shell_cfg(&["   "], &[]),
+        );
+        assert_eq!(hint, "check argv[0] resolves via PATH and cwd exists");
     }
 
     #[test]
