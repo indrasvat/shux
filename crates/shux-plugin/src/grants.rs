@@ -93,11 +93,11 @@ impl Scope {
 pub enum GrantsError {
     #[error("grants path is a symlink (refusing): {0}")]
     Symlink(PathBuf),
-    #[error("io error: {0}")]
+    #[error("io error")]
     Io(#[from] std::io::Error),
-    #[error("parse error: {0}")]
+    #[error("parse error")]
     Parse(#[from] toml::de::Error),
-    #[error("serialize error: {0}")]
+    #[error("serialize error")]
     Serialize(#[from] toml::ser::Error),
 }
 

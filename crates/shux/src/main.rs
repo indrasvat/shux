@@ -1549,8 +1549,9 @@ fn main() {
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     let result = if matches!(args.command, Some(Command::__daemon)) {
-        // Internal daemon subcommand — called by auto-start
-        run_daemon()
+        // Internal daemon subcommand — called by auto-start. `--socket` is a
+        // global arg, so the re-exec'd daemon sees whatever the client saw.
+        run_daemon(args.socket.clone())
     } else {
         // Normal CLI client mode
         run_client(args)
@@ -1584,7 +1585,15 @@ fn report_fatal(e: &anyhow::Error) -> ! {
         // anyhow's Debug is exactly what Termination used to print — chain
         // plus captured backtrace. Opted into, it is useful; unconditional,
         // it was the defect.
-        eprintln!("\n{e:?}");
+        //
+        // Sanitized, and NOT optionally. The chain carries error text built
+        // from untrusted input — a TOML parse diagnostic quotes the offending
+        // source line verbatim, so a template containing a raw ESC replays it
+        // straight at the operator's terminal (issue #104's whole class).
+        // `safe_diagnostic` keeps `\n`/`\t`, which are this block's structure,
+        // and escapes everything else. Asking for a backtrace is not consent
+        // to be attacked by one.
+        eprintln!("\n{}", style::safe_diagnostic(&format!("{e:?}")));
     }
 
     // `exit` runs no destructors, so anything buffered on the data channel
@@ -1602,7 +1611,7 @@ fn report_fatal(e: &anyhow::Error) -> ! {
 /// 4. Start signal handlers
 /// 5. Bind UDS
 /// 6. Run daemon state loop
-fn run_daemon() -> anyhow::Result<()> {
+fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
     // Step 1: Daemonize BEFORE tokio
     if !daemon::daemonize()? {
         // We are the parent — exit cleanly
@@ -1649,8 +1658,20 @@ fn run_daemon() -> anyhow::Result<()> {
             );
         }
 
-        // Set up SessionGraph + graph loop
-        let sock_path = daemon::socket_path()?;
+        // Set up SessionGraph + graph loop.
+        //
+        // The path the CLIENT resolved, not a second independent guess. The
+        // client honours `--socket` / `SHUX_SOCKET` and the daemon did not, so
+        // pointing `SHUX_SOCKET` at an unreachable path made the client probe
+        // one socket while the daemon it had just auto-started served another.
+        // They never met: the client retried, gave up, and left a fully
+        // working daemon behind with nothing referencing it — and every
+        // subsequent invocation did it again, each new daemon overwriting the
+        // pidfile so `daemon stop` could only ever reap the last one.
+        let sock_path = match socket_override {
+            Some(p) => p,
+            None => daemon::socket_path()?,
+        };
         let cancel = tokens.root.clone();
         let io_state =
             run_rpc_server(sock_path, cancel.clone(), lens_audit, unresolved_scratch).await?;
@@ -2207,11 +2228,21 @@ async fn run_rpc_server(
         auth_token: None,
     };
 
-    let server = shux_rpc::Server::new(config, router, cancel);
+    let server = shux_rpc::Server::new(config, router, cancel.clone());
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
             tracing::error!(error = %e, "RPC server error");
+            // And then SHUT DOWN. A daemon whose RPC server failed to bind
+            // serves nobody, but it used to keep running anyway: the failure
+            // was logged inside a detached task, onto a subscriber whose
+            // output is /dev/null, while the state loop carried on. The client
+            // meanwhile retried its ten times, gave up, and left the thing
+            // running — once per invocation, each new daemon overwriting the
+            // pidfile so `daemon stop` could only ever reap the last of them.
+            // Cancelling the root token unwinds the state loop, which is how
+            // every other fatal daemon condition already exits.
+            cancel.cancel();
         }
     });
 
@@ -3131,10 +3162,18 @@ fn register_pane_methods(
                     }
                 };
 
-                let ratio = params
+                // Validated BEFORE the cast, and before the graph grows a pane.
+                // `rpc call pane.split` is a shipped surface — every subcommand
+                // mirrors an RPC method 1:1 — so a guard that lives only in the
+                // clap value parser leaves the documented range reachable by
+                // anyone who types the method name instead of the verb.
+                let ratio_f64 = params
                     .get("ratio")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(0.5) as f32;
+                    .unwrap_or(0.5);
+                pane_command::check_ratio(ratio_f64)
+                    .map_err(|e| shux_rpc::RpcError::invalid_params(&format!("ratio: {e}")))?;
+                let ratio = ratio_f64 as f32;
 
                 // Parse BEFORE splitting. A malformed `command` used to be
                 // noticed after the graph had already grown a pane, leaving a
@@ -7516,9 +7555,12 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 dry_run,
                 watch,
             } => {
-                let ops = template::load_and_lower(&template)?;
+                // Identical wording and identical funnel to `state apply` —
+                // see the comment there (issue #137).
+                let ops = template::load_and_lower(&template)
+                    .map_err(|e| anyhow::Error::from(e).context("template error"))?;
                 pane_command::validate_ops(&ops)
-                    .map_err(|e| anyhow::anyhow!("{}", rpc_error_detail(&e)))?;
+                    .map_err(|e| anyhow::anyhow!("template error: {}", rpc_error_detail(&e)))?;
                 if dry_run {
                     // Same payload, same shape as `state apply --dry-run`:
                     // both lower through `template::load_and_lower` and both
@@ -8172,32 +8214,23 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
             // Lower the TOML template to apply ops first (no daemon needed
             // for parse / validate). If --dry-run, print the lowered ops as
             // pretty JSON and exit.
-            let ops = match template::load_and_lower(&template) {
-                Ok(ops) => ops,
-                Err(e) => {
-                    // The TOML diagnostic quotes the offending source
-                    // line verbatim; this runs before the daemon exists,
-                    // so ingress sanitizing cannot reach it (issue #104).
-                    eprintln!(
-                        "{} {}",
-                        style::error("✗ template error:"),
-                        style::safe_diagnostic(&e.to_string())
-                    );
-                    std::process::exit(1);
-                }
-            };
+            // Both template verbs report a bad template the same way, through
+            // the same funnel: `report_fatal` renders the anyhow chain once
+            // and `style::print_error` sanitizes it, which matters because the
+            // TOML diagnostic quotes the offending source line verbatim and
+            // this runs before the daemon exists, so ingress sanitizing cannot
+            // reach it (issue #104). Previously `state apply` prefixed
+            // `template error:` here while `session restore` propagated the
+            // bare error, so the same broken template read differently
+            // depending on which verb you typed (issue #137).
+            let ops = template::load_and_lower(&template)
+                .map_err(|e| anyhow::Error::from(e).context("template error"))?;
 
             // Before printing OR sending: `--dry-run` exists to answer "will
             // this apply succeed?", and the argv rule used to live only in the
             // daemon, so dry-run said yes to templates the real run rejects.
-            if let Err(e) = pane_command::validate_ops(&ops) {
-                eprintln!(
-                    "{} {}",
-                    style::error("✗ template error:"),
-                    style::safe_diagnostic(&rpc_error_detail(&e))
-                );
-                std::process::exit(1);
-            }
+            pane_command::validate_ops(&ops)
+                .map_err(|e| anyhow::anyhow!("template error: {}", rpc_error_detail(&e)))?;
 
             if dry_run {
                 // `--dry-run` prints the ops BEFORE the graph sanitizes

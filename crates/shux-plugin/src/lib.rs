@@ -221,7 +221,7 @@ pub enum PluginError {
     NameConflict(String),
     #[error("plugin handshake failed: {0}")]
     HandshakeFailed(String),
-    #[error("io error: {0}")]
+    #[error("io error")]
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Proto(String),

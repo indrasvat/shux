@@ -17,7 +17,7 @@ pub enum ExportError {
     WindowNotFound(String),
     #[error("pane not found while exporting session: {0}")]
     PaneNotFound(String),
-    #[error("template serialization failed: {0}")]
+    #[error("template serialization failed")]
     Serialize(#[from] toml::ser::Error),
 }
 

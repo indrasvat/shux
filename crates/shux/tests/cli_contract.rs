@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::Duration;
 
 /// Keeps a pane alive past the assertion.
 const PARK: &str = "exec sleep 900";
@@ -327,5 +328,291 @@ command = ["/bin/sleep", "900"]
     assert!(
         apply.get("ops").and_then(|v| v.as_array()).is_some(),
         "the shared shape is the wire shape, {{\"ops\": [...]}}: {apply}"
+    );
+}
+
+#[test]
+fn both_dry_run_verbs_report_a_bad_template_the_same_way() {
+    let env = Env::new();
+    let missing = env.work().join("nope.toml").to_string_lossy().to_string();
+
+    let apply = env.fails(&["state", "apply", &missing, "--dry-run"]);
+    let restore = env.fails(&["session", "restore", &missing, "--dry-run"]);
+    assert_eq!(
+        apply.trim(),
+        restore.trim(),
+        "the same broken template must read the same through both verbs:\n\
+         state apply     -> {apply}\n\
+         session restore -> {restore}"
+    );
+
+    // A malformed template, not just a missing one — that is the TOML
+    // diagnostic path, which quotes the source line.
+    let bad = env.write_template("bad.toml", "this is not = = toml [[[\n");
+    let b = bad.to_string_lossy().to_string();
+    let apply_b = env.fails(&["state", "apply", &b, "--dry-run"]);
+    let restore_b = env.fails(&["session", "restore", &b, "--dry-run"]);
+    assert_eq!(
+        apply_b.trim(),
+        restore_b.trim(),
+        "TOML errors must match too"
+    );
+}
+
+/// An unbindable `--socket` must not leave a daemon behind.
+///
+/// The client honoured `--socket`/`SHUX_SOCKET` and the daemon did not, and a
+/// bind failure inside the RPC server's detached task was only ever logged —
+/// onto a subscriber whose output is /dev/null. So an auto-start against a
+/// path the daemon could not bind produced a live daemon serving nobody, the
+/// client retried its ten times, gave up, and orphaned it. Once per
+/// invocation, each new daemon overwriting the pidfile so `daemon stop` could
+/// only ever reap the last. Straight through the repo's zero-leaked-daemons
+/// rule, from an ordinary typo.
+///
+/// The needle is this test's own `XDG_RUNTIME_DIR`, a fresh tempdir per `Env`.
+/// Matching on the binary path alone is a machine-wide view that also counts
+/// the daemons every other test in this file is running concurrently — the
+/// mistake CLAUDE.md warns about for `ps`, and it read as a product failure
+/// the first time round.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unbindable_socket_leaves_no_daemon_behind() {
+    let env = Env::new();
+    let exe = std::fs::canonicalize(&env.bin).expect("canonicalize bin");
+    let needle = format!(
+        "XDG_RUNTIME_DIR={}",
+        env.root.path().join("runtime").display()
+    );
+
+    let count = || -> usize {
+        std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                // Ours, by runtime dir ...
+                std::fs::read(e.path().join("environ"))
+                    .is_ok_and(|b| b.split(|c| *c == 0).any(|v| v == needle.as_bytes()))
+                    // ... and actually this binary.
+                    && std::fs::read_link(e.path().join("exe"))
+                        .ok()
+                        .and_then(|p| std::fs::canonicalize(p).ok())
+                        .is_some_and(|p| p == exe)
+            })
+            .count()
+    };
+
+    // A regular file where a directory would have to be: `mkdir` fails with
+    // ENOTDIR, so the bind cannot succeed. Stays inside the test's own tempdir.
+    let blocker = env.root.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").expect("write blocker");
+    let bogus = blocker.join("x.sock");
+
+    let before = count();
+    for _ in 0..2 {
+        let out = env
+            .shux()
+            .args(["--socket", bogus.to_str().unwrap(), "session", "list"])
+            .output()
+            .expect("spawn shux");
+        assert!(
+            !out.status.success(),
+            "an unbindable socket must fail, not succeed"
+        );
+    }
+
+    // Let any daemon that got as far as daemonizing finish; counting too early
+    // would pass for the wrong reason.
+    std::thread::sleep(Duration::from_millis(2000));
+    let after = count();
+    assert_eq!(
+        after,
+        before,
+        "{} daemon(s) leaked after two unbindable-socket invocations",
+        after.saturating_sub(before)
+    );
+}
+
+/// The other half of the same fix: `--socket` now genuinely selects the socket
+/// the daemon serves, instead of the client asking for one path while the
+/// daemon bound another.
+#[test]
+fn an_explicit_socket_path_is_actually_served() {
+    let env = Env::new();
+    let custom = env.root.path().join("custom").join("shux.sock");
+    let sock = custom.to_str().unwrap().to_string();
+
+    let out = env
+        .shux()
+        .args(["--socket", &sock, "session", "list"])
+        .output()
+        .expect("spawn shux");
+    assert!(
+        out.status.success(),
+        "a creatable --socket path must work:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        custom.exists(),
+        "the daemon bound {sock:?}, so it must exist"
+    );
+
+    let _ = env
+        .shux()
+        .args(["--socket", &sock, "daemon", "stop"])
+        .output();
+}
+
+/// The backtrace opt-in is an egress path like any other.
+///
+/// The rest of this file strips `RUST_BACKTRACE` to test default behaviour,
+/// which is exactly how the opt-in branch escaped scrutiny: it prints the
+/// anyhow chain, and that chain carries a TOML diagnostic quoting the
+/// offending source line verbatim. A template containing a raw ESC therefore
+/// replayed it at the operator's terminal for anyone who had the variable set.
+#[test]
+fn the_backtrace_opt_in_is_still_inert_against_a_hostile_template() {
+    let env = Env::new();
+    let path = env.work().join("hostile.toml");
+    // A RAW ESC byte — TOML forbids it in a basic string, which is why this
+    // is a parse error and why the diagnostic quotes it back.
+    std::fs::write(
+        &path,
+        b"[session]\nname = \"h\"\ntitle = \"\x1b]0;PWNED\x07\"\n".as_slice(),
+    )
+    .expect("write");
+
+    let out = env
+        .shux()
+        .args(["state", "apply", path.to_str().unwrap()])
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .expect("spawn shux");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(!out.status.success());
+    // `\n` and `\t` are structure; nothing else may reach the terminal raw.
+    let raw: Vec<u32> = combined
+        .chars()
+        .filter(|c| (c.is_control() && *c != '\n' && *c != '\t') || *c == '\u{7f}')
+        .map(|c| c as u32)
+        .collect();
+    assert!(
+        raw.is_empty(),
+        "opted-in backtrace leaked {} raw control byte(s) {:?}:\n{}",
+        raw.len(),
+        raw,
+        combined.escape_debug()
+    );
+    assert!(
+        combined.contains("\\u{1b}"),
+        "the payload should still be VISIBLE, escaped:\n{}",
+        combined.escape_debug()
+    );
+}
+
+/// `#[error("… {0}")]` on a `#[from]` field makes Display interpolate the very
+/// source `{:#}` then walks, so the OS error landed on screen twice inside one
+/// message: `… (os error 2): No such file or directory (os error 2)`.
+#[test]
+fn a_template_error_names_its_cause_exactly_once() {
+    let env = Env::new();
+    let missing = env.work().join("nope.toml").to_string_lossy().to_string();
+
+    for verb in [
+        vec!["state", "apply", &missing, "--dry-run"],
+        vec!["session", "restore", &missing, "--dry-run"],
+    ] {
+        let stderr = env.fails(&verb);
+        let hits = stderr.matches("os error 2").count();
+        assert_eq!(
+            hits, 1,
+            "{verb:?} named the cause {hits}x in one message:\n---\n{stderr}\n---"
+        );
+        // Naming the layer without the cause would be the opposite regression.
+        assert!(
+            stderr.contains("No such file or directory"),
+            "{verb:?} lost the cause entirely:\n---\n{stderr}\n---"
+        );
+    }
+}
+
+/// The clap value parser judged an `f64` while `Op::SplitPane::ratio` is `f32`,
+/// so anything in `(1 - 2^-25, 1.0)` passed the guard and then became exactly
+/// `1.0f32` — the same unusable sliver the range exists to refuse.
+#[test]
+fn split_rejects_ratios_that_only_collapse_after_the_f32_cast() {
+    let mut env = Env::new();
+    let s = env.session("ratio-f32");
+    let before = env.pane_count(&s);
+
+    // NOT included: `9e-46`, which casts to the smallest f32 subnormal and so
+    // is genuinely inside the open interval. It still draws a sliver, but so
+    // does `0.001` on a 120-column window — the practical floor depends on the
+    // target pane's width in cells, not on the type, and this guard has no
+    // access to that. The contract enforced here is the documented interval.
+    for bad in [
+        "0.99999999",
+        "0.9999999999999999",
+        "0.999999999999",
+        "1e-300",
+    ] {
+        let arg = format!("--ratio={bad}");
+        let stderr = env.fails(&["pane", "split", "-s", &s, &arg, "--cmd", PARK]);
+        assert!(
+            stderr.contains("0.0") && stderr.contains("1.0"),
+            "--ratio {bad} collapses to 0.0/1.0 in f32 and must be refused:\n---\n{stderr}\n---"
+        );
+    }
+    assert_eq!(
+        env.pane_count(&s),
+        before,
+        "a ratio that collapses on the cast still created a pane"
+    );
+}
+
+/// `rpc call` is a shipped surface — every subcommand mirrors an RPC method
+/// 1:1 — so a guard living only in the clap value parser left the documented
+/// range fully reachable by anyone typing the method name.
+#[test]
+fn the_split_rpc_rejects_an_out_of_range_ratio() {
+    let mut env = Env::new();
+    let s = env.session("ratio-rpc");
+    let before = env.pane_count(&s);
+    let pane = env.json(&["pane", "list", "-s", &s])[0]["id"]
+        .as_str()
+        .expect("pane id")
+        .to_string();
+
+    for bad in ["5.0", "1.0", "0.0", "-3.0", "1e9", "0.99999999"] {
+        let params = format!(r#"{{"pane_id":"{pane}","ratio":{bad},"command":"{PARK}"}}"#);
+        let out = env.run(&["rpc", "call", "pane.split", "--params", &params]);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("out of range"),
+            "pane.split accepted ratio {bad} over RPC:\n---\n{combined}\n---"
+        );
+    }
+    assert_eq!(
+        env.pane_count(&s),
+        before,
+        "an RPC split with a bad ratio still created a pane"
+    );
+
+    // Control: a good ratio still splits through the same RPC path.
+    let params = format!(r#"{{"pane_id":"{pane}","ratio":0.5,"command":"{PARK}"}}"#);
+    env.ok(&["rpc", "call", "pane.split", "--params", &params]);
+    assert_eq!(
+        env.pane_count(&s),
+        before + 1,
+        "a valid RPC split must work"
     );
 }

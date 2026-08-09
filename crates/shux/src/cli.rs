@@ -1144,13 +1144,10 @@ fn parse_ratio(s: &str) -> Result<f64, String> {
         .trim()
         .parse()
         .map_err(|_| format!("invalid ratio {s:?} (expected a number above 0.0 and below 1.0)"))?;
-    // Catches NaN and both infinities as well as ordinary out-of-range values:
-    // NaN fails every comparison, so it has to be excluded by `is_finite`.
-    if !v.is_finite() || v <= 0.0 || v >= 1.0 {
-        return Err(format!(
-            "ratio {s} is out of range: must be above 0.0 and below 1.0"
-        ));
-    }
+    // One predicate for every entry point — CLI flag, template and RPC — and
+    // it judges the `f32` the daemon will actually store, so a value that
+    // only collapses on the cast cannot pass here and fail there.
+    crate::pane_command::check_ratio(v).map_err(|e| format!("ratio {e}"))?;
     Ok(v)
 }
 
@@ -2172,9 +2169,9 @@ fn rpc_display_raw(code: i64, message: &str, data: Option<&serde_json::Value>) -
 /// Errors that can occur during RPC communication.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcClientError {
-    #[error("IO error: {0}")]
+    #[error("IO error")]
     Io(#[from] std::io::Error),
-    #[error("JSON error: {0}")]
+    #[error("JSON error")]
     Json(#[from] serde_json::Error),
     #[error("response frame too large: {0} bytes (max 16 MB)")]
     FrameTooLarge(usize),
