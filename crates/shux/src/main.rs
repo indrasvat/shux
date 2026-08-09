@@ -1537,7 +1537,7 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     // Inject the colorised agent reference at runtime so it honours
     // NO_COLOR + the IsTerminal piped-stdout check. clap's derive macro
     // only accepts a `&'static str` literal there, so we set it here.
@@ -1548,13 +1548,50 @@ fn main() -> anyhow::Result<()> {
     let matches = cmd.get_matches();
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    // Internal daemon subcommand — called by auto-start
-    if matches!(args.command, Some(Command::__daemon)) {
-        return run_daemon();
+    let result = if matches!(args.command, Some(Command::__daemon)) {
+        // Internal daemon subcommand — called by auto-start
+        run_daemon()
+    } else {
+        // Normal CLI client mode
+        run_client(args)
+    };
+
+    if let Err(e) = result {
+        report_fatal(&e);
+    }
+}
+
+/// Render a fatal error once, then exit non-zero.
+///
+/// `main` used to return `anyhow::Result<()>`, so every error `run_client` had
+/// already rendered through `style::print_error` got rendered a SECOND time by
+/// std's `Termination` impl — `Error: …` followed by thirty frames of
+/// backtrace naming our own dependency paths, for conditions as ordinary as a
+/// typo'd session name. That is issue #133, and it made every "not found" read
+/// like a crash.
+///
+/// Exiting here means the `Termination` path is never reached, so the message
+/// an operator sees is the one we chose to write. The backtrace stays
+/// reachable behind the standard opt-in, for whoever is actually debugging.
+fn report_fatal(e: &anyhow::Error) -> ! {
+    use std::io::Write as _;
+
+    // `{:#}` walks the anyhow chain onto one line; `print_error` owns the
+    // marker, the colour and the NO_COLOR check.
+    style::print_error(&format!("{e:#}"));
+
+    if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| !v.is_empty() && v != "0") {
+        // anyhow's Debug is exactly what Termination used to print — chain
+        // plus captured backtrace. Opted into, it is useful; unconditional,
+        // it was the defect.
+        eprintln!("\n{e:?}");
     }
 
-    // Normal CLI client mode
-    run_client(args)
+    // `exit` runs no destructors, so anything buffered on the data channel
+    // has to be flushed by hand or a partial `--format json` payload is lost.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(1);
 }
 
 /// Daemon entry point.
@@ -1844,13 +1881,10 @@ fn run_client(args: Cli) -> anyhow::Result<()> {
         .init();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let result = rt.block_on(async { dispatch(args).await });
-    if let Err(ref e) = result {
-        // Format error: strip "RPC error" prefix if present, avoid "error: Error:" duplication
-        let msg = format!("{e:#}");
-        style::print_error(&msg);
-    }
-    result
+    // Rendering belongs to `report_fatal`, which is the single place an error
+    // reaches the operator. Printing here as well as returning the `Err` is
+    // what produced the double-print in issue #133.
+    rt.block_on(async { dispatch(args).await })
 }
 
 /// Start the RPC server with a SessionGraph backing session methods.
