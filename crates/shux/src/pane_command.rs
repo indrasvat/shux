@@ -245,6 +245,20 @@ pub(crate) fn validate_ops(ops: &[shux_core::apply::Op]) -> Result<(), RpcError>
         };
         validate_argv(argv, &format!("ops[{i}].{field}"))?;
 
+        // Same reasoning as the titles below: the ratio's range lived only in
+        // the CLI flag's help text, and the layout engine clamps rather than
+        // refuses — so `ratio = 5.0` in a template applied successfully and
+        // produced an unusable sliver pane (issue #136). Validating it here
+        // covers `state.apply`, `session restore` and both `--dry-run`s at
+        // once, since they all funnel through this function.
+        if let Op::SplitPane { ratio, .. } = op
+            && (!ratio.is_finite() || *ratio <= 0.0 || *ratio >= 1.0)
+        {
+            return Err(RpcError::invalid_params(&format!(
+                "ops[{i}].ratio: {ratio} is out of range: must be above 0.0 and below 1.0"
+            )));
+        }
+
         // Window titles are a pure rule too, and lived only behind a graph
         // mutation — so a 300-character title, or one that sanitizes to
         // nothing, passed `--dry-run` and failed the apply.

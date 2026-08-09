@@ -1129,6 +1129,31 @@ fn parse_duration_ms(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("duration {s:?} overflows"))
 }
 
+/// Parse a split ratio, enforcing the range the flag has always documented.
+///
+/// The layout engine clamps an out-of-range ratio instead of refusing it, so
+/// `--ratio 5.0` used to exit 0 and hand back a ~3-column sliver too narrow to
+/// draw its own border title — a pane that exists but is unusable and
+/// unlabelled (issue #136). The range is open at both ends: `0.0` and `1.0`
+/// each ask for a zero-width pane.
+///
+/// A parse error surfaces as a clap usage error → CLI exit 2, matching how an
+/// out-of-range direction is already refused.
+fn parse_ratio(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid ratio {s:?} (expected a number above 0.0 and below 1.0)"))?;
+    // Catches NaN and both infinities as well as ordinary out-of-range values:
+    // NaN fails every comparison, so it has to be excluded by `is_finite`.
+    if !v.is_finite() || v <= 0.0 || v >= 1.0 {
+        return Err(format!(
+            "ratio {s} is out of range: must be above 0.0 and below 1.0"
+        ));
+    }
+    Ok(v)
+}
+
 /// Parse a `pane glance --mask ROW,COL,WIDTH` redaction rect (task 080). All three are
 /// `u16`; `WIDTH == 0` is rejected (a zero-width mask redacts nothing — likely a typo).
 fn parse_mask_rect(s: &str) -> Result<(u16, u16, u16), String> {
@@ -1182,8 +1207,8 @@ pub enum PaneCommand {
         #[arg(short, long)]
         direction: Option<String>,
 
-        /// Split ratio (0.0-1.0, default 0.5)
-        #[arg(short, long)]
+        /// Split ratio — above 0.0 and below 1.0 (default 0.5)
+        #[arg(short, long, value_parser = parse_ratio)]
         ratio: Option<f64>,
 
         /// Shell command for the new pane, run by the daemon's shell (its

@@ -198,3 +198,89 @@ fn several_distinct_error_paths_all_print_once() {
         );
     }
 }
+
+// ── #136: `pane split --ratio 5.0` accepted silently ────────────────────────
+
+#[test]
+fn split_rejects_a_ratio_outside_the_documented_range() {
+    let mut env = Env::new();
+    let s = env.session("ratio-oob");
+    let before = env.pane_count(&s);
+
+    // `--ratio=V`, not `--ratio V`: clap treats a bare leading-dash token as a
+    // flag and rejects it before any value parser runs, so the space form
+    // would never reach the range check for negatives.
+    for bad in ["5.0", "-1.0", "0.0", "1.0", "nan", "inf"] {
+        let arg = format!("--ratio={bad}");
+        let stderr = env.fails(&["pane", "split", "-s", &s, &arg]);
+        assert!(
+            stderr.contains("0.0") && stderr.contains("1.0"),
+            "--ratio {bad} must be refused with the range named:\n---\n{stderr}\n---"
+        );
+        assert_eq!(
+            env.pane_count(&s),
+            before,
+            "--ratio {bad} was refused but still created a pane"
+        );
+    }
+
+    // The space form still has to fail, even though clap answers it first.
+    for bad in ["5.0", "0.0"] {
+        env.fails(&["pane", "split", "-s", &s, "--ratio", bad]);
+    }
+    assert_eq!(env.pane_count(&s), before, "no pane survived a bad ratio");
+}
+
+#[test]
+fn split_still_accepts_ratios_inside_the_range() {
+    let mut env = Env::new();
+    let s = env.session("ratio-ok");
+    let before = env.pane_count(&s);
+
+    for good in ["0.25", "0.5", "0.75"] {
+        env.ok(&["pane", "split", "-s", &s, "--ratio", good, "--cmd", PARK]);
+    }
+    assert_eq!(
+        env.pane_count(&s),
+        before + 3,
+        "valid ratios must keep working"
+    );
+}
+
+#[test]
+fn a_template_with_an_out_of_range_ratio_is_refused() {
+    let mut env = Env::new();
+    let tpl = env.write_template(
+        "bad-ratio.toml",
+        r#"
+[session]
+name = "tpl-bad-ratio"
+
+[[windows]]
+title = "w"
+
+[[windows.panes]]
+command = ["/bin/sleep", "900"]
+
+[[windows.panes]]
+direction = "vertical"
+ratio = 5.0
+command = ["/bin/sleep", "900"]
+"#,
+    );
+    let p = tpl.to_string_lossy().to_string();
+
+    // Both the preview and the real apply must refuse it.
+    let dry = env.fails(&["state", "apply", &p, "--dry-run"]);
+    assert!(
+        dry.contains("ratio"),
+        "--dry-run must refuse an out-of-range ratio:\n---\n{dry}\n---"
+    );
+
+    let applied = env.fails(&["state", "apply", &p]);
+    assert!(
+        applied.contains("ratio"),
+        "apply must refuse an out-of-range ratio:\n---\n{applied}\n---"
+    );
+    env.sessions.push("tpl-bad-ratio".to_string());
+}
