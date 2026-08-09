@@ -1,3 +1,10 @@
+## [0.46.15](https://github.com/indrasvat/shux/compare/v0.46.14...v0.46.15) (2026-08-09)
+
+
+### Bug Fixes
+
+* **cli:** print errors once, reject bad split ratios, unify --dry-run output ([#146](https://github.com/indrasvat/shux/issues/146)) ([d108324](https://github.com/indrasvat/shux/commit/d10832443bc9537d9f7b46743868a199f2e7024e))
+
 ## [0.46.14](https://github.com/indrasvat/shux/compare/v0.46.13...v0.46.14) (2026-08-08)
 
 
