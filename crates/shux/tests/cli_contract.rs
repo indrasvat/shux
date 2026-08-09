@@ -1,10 +1,12 @@
-//! End-to-end CLI contract tests.
+//! End-to-end CLI contract tests for issues #133, #136 and #137.
 //!
-//! These are defects in what the *shipped binary* prints or accepts, so every
-//! case here drives `CARGO_BIN_EXE_shux` against a real daemon in an isolated
-//! `XDG_RUNTIME_DIR`. A unit test on the formatting helpers would have passed
-//! throughout: #133 lives in the gap between `style::print_error` and `main`'s
-//! `Termination` impl.
+//! All three are defects in what the *shipped binary* prints or accepts, so
+//! every case here drives `CARGO_BIN_EXE_shux` against a real daemon in an
+//! isolated `XDG_RUNTIME_DIR`. A unit test on the formatting helpers would
+//! have passed throughout: #133 lives in the gap between `style::print_error`
+//! and `main`'s `Termination` impl, #136 in the gap between clap's declared
+//! range and the layout engine's clamp, #137 in two verbs that print the same
+//! payload through different `println!`s.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -283,4 +285,47 @@ command = ["/bin/sleep", "900"]
         "apply must refuse an out-of-range ratio:\n---\n{applied}\n---"
     );
     env.sessions.push("tpl-bad-ratio".to_string());
+}
+
+// ── #137: the two dry-run verbs print different JSON shapes ─────────────────
+
+#[test]
+fn both_dry_run_verbs_print_the_same_shape() {
+    let env = Env::new();
+    let tpl = env.write_template(
+        "ok.toml",
+        r#"
+[session]
+name = "tpl-shape"
+
+[[windows]]
+title = "w"
+
+[[windows.panes]]
+command = ["/bin/sleep", "900"]
+
+[[windows.panes]]
+direction = "vertical"
+ratio = 0.4
+command = ["/bin/sleep", "900"]
+"#,
+    );
+    let p = tpl.to_string_lossy().to_string();
+
+    let apply: serde_json::Value =
+        serde_json::from_str(&env.ok(&["state", "apply", &p, "--dry-run"])).expect("apply json");
+    let restore: serde_json::Value =
+        serde_json::from_str(&env.ok(&["session", "restore", &p, "--dry-run"]))
+            .expect("restore json");
+
+    assert_eq!(
+        apply, restore,
+        "the same template through two verbs must preview identically:\n\
+         state apply  -> {apply}\n\
+         session restore -> {restore}"
+    );
+    assert!(
+        apply.get("ops").and_then(|v| v.as_array()).is_some(),
+        "the shared shape is the wire shape, {{\"ops\": [...]}}: {apply}"
+    );
 }

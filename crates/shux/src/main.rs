@@ -7520,7 +7520,17 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 pane_command::validate_ops(&ops)
                     .map_err(|e| anyhow::anyhow!("{}", rpc_error_detail(&e)))?;
                 if dry_run {
-                    println!("{}", style::json_safe(&serde_json::to_string_pretty(&ops)?));
+                    // Same payload, same shape as `state apply --dry-run`:
+                    // both lower through `template::load_and_lower` and both
+                    // preview what goes on the wire to `state.apply`, so a
+                    // consumer should not have to know which verb produced it
+                    // (issue #137).
+                    println!(
+                        "{}",
+                        style::json_safe(&serde_json::to_string_pretty(
+                            &serde_json::json!({"ops": ops})
+                        )?)
+                    );
                     Ok(())
                 } else {
                     let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
