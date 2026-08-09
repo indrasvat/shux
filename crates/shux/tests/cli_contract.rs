@@ -10,7 +10,6 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::Duration;
 
 /// Keeps a pane alive past the assertion.
 const PARK: &str = "exec sleep 900";
@@ -423,7 +422,7 @@ fn an_unbindable_socket_leaves_no_daemon_behind() {
 
     // Let any daemon that got as far as daemonizing finish; counting too early
     // would pass for the wrong reason.
-    std::thread::sleep(Duration::from_millis(2000));
+    std::thread::sleep(std::time::Duration::from_millis(2000));
     let after = count();
     assert_eq!(
         after,

@@ -41,9 +41,9 @@ pub struct AuditEntry<'a> {
 pub enum AuditError {
     #[error("audit path contains a symlink (refusing): {0}")]
     Symlink(PathBuf),
-    #[error("io error")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("serialize error")]
+    #[error("serialize error: {0}")]
     Serialize(#[from] serde_json::Error),
 }
 

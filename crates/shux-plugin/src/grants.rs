@@ -93,11 +93,11 @@ impl Scope {
 pub enum GrantsError {
     #[error("grants path is a symlink (refusing): {0}")]
     Symlink(PathBuf),
-    #[error("io error")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("parse error")]
+    #[error("parse error: {0}")]
     Parse(#[from] toml::de::Error),
-    #[error("serialize error")]
+    #[error("serialize error: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
 
@@ -290,5 +290,27 @@ mod tests {
 
         let err = Grants::load(&link).unwrap_err();
         assert!(matches!(err, GrantsError::Symlink(_)));
+    }
+
+    /// `GrantsError`'s Display MUST carry its source's detail.
+    ///
+    /// These errors are flattened into a String by `PluginManager` —
+    /// `HandshakeFailed(format!("load grants {path}: {e}"))` — with a plain
+    /// `{}`, not anyhow's chain-walking `{:#}`. So dropping the `{0}` here (as
+    /// a sweep for double-printed causes elsewhere in the workspace briefly
+    /// did) silently deletes the TOML line and column from what an operator
+    /// sees when a plugin's grants.toml is malformed, and nothing else in the
+    /// suite would notice.
+    #[test]
+    fn a_parse_error_keeps_its_toml_detail_when_flattened() {
+        let bad: Result<Grants, _> = toml::from_str::<Grants>("this is = = not toml [[[");
+        let err = GrantsError::Parse(bad.unwrap_err());
+        let flattened = format!("{err}");
+        assert!(
+            flattened.contains("TOML")
+                || flattened.contains("line")
+                || flattened.contains("expected"),
+            "Display lost the parse detail, leaving only a category: {flattened:?}"
+        );
     }
 }
