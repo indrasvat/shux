@@ -34,11 +34,11 @@ const MAX_BACKOFF: Duration = Duration::from_millis(2000);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("daemon error: {0}")]
+    #[error("daemon error")]
     Daemon(#[from] DaemonError),
     #[error("failed to connect to daemon after {0} retries")]
     ConnectionFailed(u32),
-    #[error("I/O error: {0}")]
+    #[error("I/O error")]
     Io(#[from] io::Error),
 }
 
@@ -174,7 +174,7 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
     }
 
     // Spawn the daemon process
-    start_daemon_process()?;
+    start_daemon_process(socket_path)?;
 
     // Retry with exponential backoff
     let mut backoff = INITIAL_BACKOFF;
@@ -214,11 +214,20 @@ pub async fn ensure_daemon_running() -> Result<UnixStream, ClientError> {
 /// We use re-exec rather than in-process fork+daemonize because the client
 /// may already have a tokio runtime running. The `__daemon` subcommand
 /// calls `daemonize()` before creating any runtime.
-fn start_daemon_process() -> Result<(), ClientError> {
+fn start_daemon_process(socket_path: &Path) -> Result<(), ClientError> {
     let exe = std::env::current_exe().map_err(ClientError::Io)?;
 
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__daemon");
+
+    // Tell the daemon which socket to serve, explicitly. `--socket` is a
+    // client-side flag and the re-exec carried neither it nor a guarantee that
+    // `SHUX_SOCKET` was set, so the daemon fell back to the default path while
+    // the client went on probing the one it was asked for. The two never met:
+    // the client retried, gave up, and left a perfectly healthy daemon behind
+    // with nothing referencing it — once per invocation, each overwriting the
+    // pidfile so `daemon stop` could only reap the last.
+    cmd.arg("--socket").arg(socket_path);
 
     // Detach: don't inherit stdin/stdout/stderr
     cmd.stdin(std::process::Stdio::null());

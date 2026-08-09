@@ -137,6 +137,7 @@ test-group = 'process-table'
 [[profile.default.overrides]]
 filter = '''
     binary_id(=shux::checkpoint_invalidation_gating)
+  + binary_id(=shux::cli_contract)
   + binary_id(=shux::cli_integration)
   + binary_id(=shux::daemon_lifecycle_integration)
   + binary_id(=shux::decaln_pane_e2e)

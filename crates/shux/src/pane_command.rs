@@ -231,6 +231,30 @@ pub(crate) fn validate_argv(argv: &[String], what: &str) -> Result<(), RpcError>
 /// which is the whole point: dry-run exists to answer "will this apply
 /// succeed?", and it answered yes to templates the real run rejects because the
 /// only copy of the rule lived server-side (issue #125 follow-up).
+/// Reject a split ratio outside the open interval the flag documents.
+///
+/// Checked against the value that actually SHIPS, not the one the caller
+/// typed. `Op::SplitPane::ratio` is `f32` and every path narrows to it
+/// eventually, so an `f64` check is not enough: every `f64` in
+/// `(1 - 2^-25, 1.0)` becomes exactly `1.0f32`, and every `f64` below roughly
+/// `7e-46` becomes `0.0f32`. Both are the zero-width panes this range exists
+/// to refuse, and both passed an `f64` guard and then collapsed on the cast —
+/// so `--ratio 0.99999999` produced the same unusable sliver as
+/// `--ratio 5.0`, while the template path (which deserializes straight into
+/// `f32`) refused the identical literal. Same number, same destination,
+/// opposite verdicts depending on the verb.
+///
+/// Returns the message tail; callers prepend whatever names the field.
+pub(crate) fn check_ratio(ratio: f64) -> Result<(), String> {
+    let shipped = ratio as f32;
+    if !shipped.is_finite() || shipped <= 0.0 || shipped >= 1.0 {
+        return Err(format!(
+            "{ratio} is out of range: must be above 0.0 and below 1.0"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_ops(ops: &[shux_core::apply::Op]) -> Result<(), RpcError> {
     use shux_core::apply::Op;
     for (i, op) in ops.iter().enumerate() {
@@ -244,6 +268,18 @@ pub(crate) fn validate_ops(ops: &[shux_core::apply::Op]) -> Result<(), RpcError>
             Op::SplitPane { command, .. } => (command, "command"),
         };
         validate_argv(argv, &format!("ops[{i}].{field}"))?;
+
+        // Same reasoning as the titles below: the ratio's range lived only in
+        // the CLI flag's help text, and the layout engine clamps rather than
+        // refuses — so `ratio = 5.0` in a template applied successfully and
+        // produced an unusable sliver pane (issue #136). Validating it here
+        // covers `state.apply`, `session restore` and both `--dry-run`s at
+        // once, since they all funnel through this function.
+        if let Op::SplitPane { ratio, .. } = op
+            && let Err(e) = check_ratio(*ratio as f64)
+        {
+            return Err(RpcError::invalid_params(&format!("ops[{i}].ratio: {e}")));
+        }
 
         // Window titles are a pure rule too, and lived only behind a graph
         // mutation — so a 300-character title, or one that sanitizes to

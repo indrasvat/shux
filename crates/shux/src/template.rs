@@ -100,9 +100,9 @@ fn default_ratio() -> f32 {
 /// Errors raised while parsing or lowering a template to apply ops.
 #[derive(Debug, thiserror::Error)]
 pub enum TemplateError {
-    #[error("template file read error: {0}")]
+    #[error("template file read error")]
     Io(#[from] std::io::Error),
-    #[error("template TOML parse error: {0}")]
+    #[error("template TOML parse error")]
     Toml(#[from] toml::de::Error),
     #[error("template must define at least one window")]
     NoWindows,
