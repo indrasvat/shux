@@ -74,7 +74,15 @@ import sys
 import tomllib
 from itertools import combinations
 
-MAX_GROUP_PERCENT = int(os.environ.get("MAX_GROUP_PERCENT", "30"))
+_raw_percent = os.environ.get("MAX_GROUP_PERCENT", "30")
+try:
+    MAX_GROUP_PERCENT = int(_raw_percent)
+except ValueError:
+    print(f"error: MAX_GROUP_PERCENT={_raw_percent!r} is not an integer", file=sys.stderr)
+    sys.exit(2)
+if not 0 < MAX_GROUP_PERCENT <= 100:
+    print(f"error: MAX_GROUP_PERCENT={MAX_GROUP_PERCENT} must be in 1..100", file=sys.stderr)
+    sys.exit(2)
 
 RED, GREEN, BLUE, OFF = "\033[31m", "\033[32m", "\033[34m", "\033[0m"
 
@@ -129,92 +137,138 @@ def matched_tests(filterset):
     }
 
 
-def _scan(text):
-    """Yield (index, char, depth, in_quote) with quoting and nesting resolved.
+def _word_bounded(text, index, length):
+    """True when text[index:index+length] is not glued to an identifier."""
+    before = text[index - 1] if index else " "
+    after = text[index + length] if index + length < len(text) else " "
+    return not (before.isalnum() or before == "_") and not (
+        after.isalnum() or after == "_"
+    )
 
-    A `/` only opens a regex when it directly follows `(`. Otherwise it is an
-    ordinary character in an exact match, and treating it as a delimiter
-    silently swallows the rest of the expression — `binary_id(=shux::bin/shux)`
-    is exactly that case, and it once made this whole check a no-op.
+
+def union_operands(text):
+    """Spans of every union operand in `text`, at EVERY nesting depth.
+
+    ONE pass over the original string, tracking depth, quotes, `/regex/` and
+    backslash escapes together, recording absolute spans. The previous version
+    recursed into parenthesised substrings and re-scanned them, which broke three
+    ways at once:
+
+      * `|` and the `or` keyword are unions in nextest exactly like `+`, and were
+        not recognised at all — so an expression joined with `|` had NO operands
+        checked, and a dead arm in one was invisible;
+      * a `\/` inside a regex ended the quote early, leaving a stray `)` to
+        desynchronise depth and disable the scan for the rest of the string;
+      * a substring handed to the recursion lost its opening `(`, so a leading
+        `/` was no longer "directly after `(`" and a regex quantifier like `.+`
+        was split as if it were a union — rejecting a perfectly valid config.
+
+    Spans are into the ORIGINAL text, so the caller can neutralise an operand in
+    place without any coordinate translation.
     """
-    depth, quote, previous = 0, None, ""
-    for index, char in enumerate(text):
+    frames = [{"start": 0, "seps": []}]
+    found = []
+
+    def close(frame, stop):
+        if not frame["seps"]:
+            return
+        cuts = [frame["start"]]
+        for sep_start, sep_end in frame["seps"]:
+            cuts.append(sep_start)
+            cuts.append(sep_end)
+        cuts.append(stop)
+        for lo, hi in zip(cuts[::2], cuts[1::2]):
+            span = text[lo:hi]
+            lead = len(span) - len(span.lstrip())
+            trail = len(span) - len(span.rstrip())
+            if span.strip():
+                found.append((lo + lead, hi - trail))
+
+    quote = None
+    escaped = False
+    previous = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
         if quote:
-            yield index, char, depth, True
-            if char == quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
                 quote = None
-            previous = char
+            index += 1
             continue
         if char in "'\"" or (char == "/" and previous == "("):
             quote = char
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-        yield index, char, depth, False
+            previous = char
+            index += 1
+            continue
+        if char == "(":
+            frames.append({"start": index + 1, "seps": []})
+            previous = char
+            index += 1
+            continue
+        if char == ")":
+            if len(frames) > 1:
+                close(frames.pop(), index)
+            previous = char
+            index += 1
+            continue
+        width = 0
+        if char in "+|":
+            width = 1
+        elif text.startswith("or", index) and _word_bounded(text, index, 2):
+            width = 2
+        if width:
+            frames[-1]["seps"].append((index, index + width))
+            previous = "+"
+            index += width
+            continue
         if not char.isspace():
             previous = char
+        index += 1
 
-
-def _top_level_operands(text):
-    """Spans of the `+`-separated operands at depth 0 of `text`."""
-    spans, start = [], 0
-    for index, char, depth, quoted in _scan(text):
-        if not quoted and char == "+" and depth == 0:
-            spans.append((start, index))
-            start = index + 1
-    spans.append((start, len(text)))
-    return spans
-
-
-def _paren_interiors(text):
-    """Spans of the interior of each outermost parenthesised group in `text`."""
-    groups, opened = [], None
-    for index, char, depth, quoted in _scan(text):
-        if quoted:
-            continue
-        if char == "(" and depth == 1:
-            opened = index + 1
-        elif char == ")" and depth == 0 and opened is not None:
-            groups.append((opened, index))
-            opened = None
-    return groups
-
-
-def union_operands(text, base=0):
-    """Spans of every union operand in `text`, at EVERY nesting depth.
-
-    Splitting only at depth 0 misses the unions this config already has:
-    `binary_id(X) & (test(a) + test(b))`. Rename `test(a)` and the outer operand
-    — and the group — stay non-empty, so the guard passes while a
-    process-counting test escapes its single-threaded group. Nesting is where
-    the interesting unions live, so the walk has to be recursive.
-    """
-    found = []
-    operands = _top_level_operands(text)
-    if len(operands) > 1:
-        found.extend((base + s, base + e) for s, e in operands)
-    for start, end in operands:
-        for open_at, close_at in _paren_interiors(text[start:end]):
-            found.extend(
-                union_operands(
-                    text[start + open_at : start + close_at], base + start + open_at
-                )
-            )
+    close(frames[0], len(text))
     return found
 
 
 print(f"{BLUE}▶ nextest test-group membership{OFF}")
 
-with open(".config/nextest.toml", "rb") as fh:
-    config = tomllib.load(fh)
+try:
+    with open(".config/nextest.toml", "rb") as fh:
+        config = tomllib.load(fh)
+except (OSError, tomllib.TOMLDecodeError) as exc:
+    err(f".config/nextest.toml could not be read: {exc}")
+    sys.exit(1)
 
 declared = set(config.get("test-groups", {}))
-overrides = [
-    override
-    for override in config.get("profile", {}).get("default", {}).get("overrides", [])
-    if "test-group" in override
-]
+
+# EVERY profile that assigns groups, not just `default`. Per-profile overrides
+# take precedence over the default profile's, so a `[[profile.ci.overrides]]`
+# can move tests out of a group in the exact profile CI selects while the
+# default profile — and therefore this guard — still looks healthy. Nothing in
+# this repo currently selects a non-default profile, which makes this latent
+# rather than live; it is checked so it cannot go live unnoticed.
+overrides = []
+for profile_name, profile in sorted(config.get("profile", {}).items()):
+    for override in profile.get("overrides", []):
+        if "test-group" not in override:
+            continue
+        # A `platform` key makes membership conditional on the HOST. `-E` knows
+        # nothing about it, so the guard would compute a full group while
+        # nextest bounds nobody here — reproduced: guard 293, reality 0.
+        if "platform" in override:
+            err(
+                f"profile '{profile_name}' has a platform-conditional grouped"
+                f" override (platform = {override['platform']!r}). This guard"
+                " evaluates filtersets with `-E`, which ignores `platform`, so it"
+                " cannot tell whether the group bounds anything on this host."
+                " Drop `platform`, or split the group so membership is"
+                " unconditional."
+            )
+            continue
+        overrides.append((profile_name, override))
 
 if not declared:
     err("no test groups are declared in .config/nextest.toml — nothing is bounded")
@@ -223,10 +277,13 @@ if not overrides:
     err("no override assigns any test group — every group is inert")
     sys.exit(1)
 
-for override in overrides:
+for profile_name, override in overrides:
     if override["test-group"] not in declared:
-        err(f"override assigns undeclared group '{override['test-group']}'")
-assigned = {override["test-group"] for override in overrides}
+        err(
+            f"profile '{profile_name}' assigns undeclared group"
+            f" '{override['test-group']}'"
+        )
+assigned = {override["test-group"] for _, override in overrides}
 for group in sorted(declared - assigned):
     err(f"group '{group}' is declared but no override assigns it — it bounds nothing")
 
@@ -235,8 +292,15 @@ if total is None:
     sys.exit(1)
 
 selections = []
-for override in overrides:
-    tests = matched_tests(override["filter"])
+for profile_name, override in overrides:
+    # nextest accepts a grouped override with NO filter — it then matches
+    # everything. `override["filter"]` died on it with a bare KeyError before the
+    # ceiling could report the whole suite being throttled.
+    expression = override.get("filter", "all()")
+    if not isinstance(expression, str):
+        err(f"profile '{profile_name}' has a non-string filter: {expression!r}")
+        continue
+    tests = matched_tests(expression)
     if tests is None:
         continue
     group = override["test-group"]
@@ -252,7 +316,6 @@ for override in overrides:
     # context, which is what makes nested unions checkable at all: for
     # `A & (B + C)`, dropping B leaves `A & (none() + C)` = `A & C`, and if that
     # still matches everything the original did, B was dead weight.
-    expression = override["filter"]
     for start, end in union_operands(expression):
         neutralised = f"{expression[:start]} none() {expression[end:]}"
         without = matched_tests(neutralised)
@@ -286,6 +349,41 @@ for (group_a, _, tests_a), (group_b, _, tests_b) in combinations(selections, 2):
             " `& !binary_id(=<id>)`.",
             file=sys.stderr,
         )
+
+# ── Everything that needs a bound must have one ─────────────────────────────
+#
+# The three checks above all ask "are the arms you wrote alive and disjoint?".
+# None of them notices an arm being NARROWED. Adding `& !binary_id(=…)` to the
+# daemon-pty filterset dropped four suites — 76 tests, three of them the ones
+# this config's own comments cite as measured failures under oversubscription —
+# into no group at all, and the guard called every group healthy. That is the
+# coverage the pinned per-group counts used to provide, and dropping them lost
+# it.
+#
+# Restored WITHOUT a shared ledger: the requirement is derived from the packages
+# themselves. Every integration test in the packages whose integration tests
+# boot a daemon or allocate a PTY must be claimed by SOME group. Narrowing a
+# filterset now leaves tests uncovered and fails here. A deliberate un-grouping
+# is still possible — it just has to say so by editing this predicate, which is
+# code-derived and per-branch, not a count every PR has to bump.
+MUST_BE_BOUNDED = "(package(shux) & kind(test)) + (package(shux-pty) & kind(test))"
+
+needs_bound = matched_tests(MUST_BE_BOUNDED)
+if needs_bound is not None:
+    claimed = set().union(*(tests for _, _, tests in selections)) if selections else set()
+    unbounded = needs_bound - claimed
+    if unbounded:
+        err(
+            f"{len(unbounded)} daemon-backed test(s) belong to NO group, so they run"
+            " unbounded. A filterset was narrowed (or a suite was added) without a"
+            " group to hold it:"
+        )
+        for name in sorted(unbounded)[:8]:
+            print(f"      {name}", file=sys.stderr)
+        if len(unbounded) > 8:
+            print(f"      … and {len(unbounded) - 8} more", file=sys.stderr)
+    else:
+        ok(f"coverage: all {len(needs_bound)} daemon-backed test(s) are bounded")
 
 # ── No group may swallow the suite ──────────────────────────────────────────
 ceiling = len(total) * MAX_GROUP_PERCENT // 100
