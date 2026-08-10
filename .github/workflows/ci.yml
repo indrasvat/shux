@@ -56,8 +56,11 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq
-      - name: Run VT corpus pixel regression
-        run: .shux/scripts/no_leak_guard.sh make test-vt-corpus
+      # Order matters: `make test-vt-corpus` REGENERATES
+      # `.shux/qa/073-shux-vt-corpus-regression-harness/` in this same worktree.
+      # If it ran first, CI's own harness output could land in the diff the guard
+      # reads and help satisfy the contract it is meant to enforce. Judge first,
+      # then regenerate.
       - name: Check VT QA evidence contract
         env:
           # On a PR, compare against the branch it targets. On a push to main
@@ -65,6 +68,8 @@ jobs:
           # evidence was already demanded of the PR that introduced the change.
           VT_QA_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: make check-vt-qa
+      - name: Run VT corpus pixel regression
+        run: .shux/scripts/no_leak_guard.sh make test-vt-corpus
 
   check:
     name: Check

@@ -29,8 +29,10 @@ commit-msg:
 #                         a license issue slipped through to CI; pushes now
 #                         block on cargo-deny rejections).
 #   - `make check-vt-qa` → matches the CI "VT QA evidence" job. It reads the
-#                         diff, so a push that touches no VT rendering path
-#                         costs nothing (issue #123).
+#                         committed range plus the index — never the unstaged
+#                         worktree — so it judges what is actually being pushed,
+#                         the same thing CI sees. A push that touches no VT
+#                         rendering path costs nothing (issue #123).
 pre-push:
   commands:
     vt-qa:

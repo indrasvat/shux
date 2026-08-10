@@ -61,7 +61,7 @@ screenshots, multi-level cleanup). Screenshots go to
 For PR review, attach the useful screenshots to GitHub PR comments instead of
 committing them. Use the `browsing-as-you` skill when an authenticated GitHub UI
 upload is needed. Only commit screenshots when they are durable regression
-goldens, fixtures, or product assets with explicit task and review
+goldens, fixtures, or product assets with explicit issue/PR and review
 justification.
 
 ## Conventional commits
@@ -75,12 +75,16 @@ docs(scope):     documentation only
 chore(scope):    tooling, deps, CI
 ```
 
-Reference task numbers when applicable (`feat(017): ...`).
+Reference the issue the change closes (`Closes #123`). Task numbers are
+historical; `docs/tasks/` is a frozen archive.
 
 ## Branch hygiene
 
 - Default branch is `main`. Branch protection blocks force-push and
-  deletion; CI checks (`Check`, `Deny`, both `Test`s) must pass before merge.
+  deletion; CI checks (`Check`, `Deny`, both `Test`s, `VT QA evidence`) must
+  pass before merge. `VT QA evidence` enforces the contract in
+  `.shux/qa/README.md`; if it is not in branch protection's required set, that
+  contract is advisory on GitHub and enforced only by a local hook.
 - Feature work happens on `feat/<slug>` / `fix/<slug>` / etc.
 - Squash-merge into `main`. Tag releases on `main` only.
 
@@ -88,8 +92,11 @@ Reference task numbers when applicable (`feat(017): ...`).
 
 `make hooks` installs lefthook. Two stages:
 
-- **pre-commit**: `make lint` (clippy + fmt-check).
-- **pre-push**: `make ci` (lint + test + test-doc) and `make check-vt-qa`.
+- **pre-commit**: `make fmt-check` and `make clippy`, both `glob: "*.rs"` — a
+  docs-only or Makefile-only commit runs neither.
+- **commit-msg**: `make check-lens-frozen` (needs the message for its trailer).
+- **pre-push**, in order: `make check-vt-qa`, `make test`, `make test-doc`,
+  `make deny`.
 
 Failures block the commit/push. The VT QA check reads the diff: it demands a
 `.shux/qa/<scope>/` report only when the change touches VT rendering, and costs

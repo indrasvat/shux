@@ -180,8 +180,8 @@ test-group = 'daemon-pty'
 # a deadline test.
 [[profile.default.overrides]]
 filter = '''
-  binary_id(=shux-vt::scroll_region_bounds) & test(=region_scroll_cost_is_linear_in_pane_height)
-  + binary_id(=shux::bin/shux) & test(=tests::pane_record_duration_stops_on_daemon_side)
+  (all() & !package(shux) & !package(shux-pty) & !binary_id(=shux-vt::scroll_region_bounds))
+  + binary_id(=shux-vt::scroll_region_bounds) & test(=region_scroll_cost_is_linear_in_pane_height)
 '''
 test-group = 'wall-clock'
 threads-required = "num-test-threads"
