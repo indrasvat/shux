@@ -147,6 +147,35 @@ impl Env {
         );
     }
 
+    /// Poll `pane list` until some pane reports a numeric `exit_status`.
+    ///
+    /// A finished pane is not finished the instant `state apply` returns: the
+    /// child has to exit AND the daemon has to reap it and record the status.
+    /// Reading the list once and asserting the status is already there is a
+    /// race — it held on Linux and lost on a macOS runner, where the hypervisor
+    /// delivers latency in bursts (see `.config/nextest.toml`). Waiting for the
+    /// condition costs nothing when it is already true.
+    #[track_caller]
+    fn wait_for_an_exited_pane(&self, session: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let panes = self.json(&["pane", "list", "-s", session]);
+            if panes
+                .as_array()
+                .expect("panes")
+                .iter()
+                .any(|p| p["exit_status"].is_number())
+            {
+                return panes;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no pane reported an exit_status within 20s; panes were:\n{panes:#}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     fn capture(&self, session: &str, pane: &str) -> String {
         self.ok(&["pane", "capture", "-s", session, "-p", pane])
     }
@@ -1691,7 +1720,7 @@ fn the_focus_rescue_accepts_a_sibling_that_has_already_finished() {
     let _ = env.run(&["state", "apply", path.to_str().unwrap()]);
     env.sessions.push("finished".to_string());
 
-    let panes = env.json(&["pane", "list", "-s", "finished"]);
+    let panes = env.wait_for_an_exited_pane("finished");
     let finished = panes
         .as_array()
         .expect("panes")
