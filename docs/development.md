@@ -26,7 +26,7 @@ Requires Rust 1.93+ (stable). Pinned via `rust-toolchain.toml`.
 | `make fmt` | Format all code |
 | `make fmt-check` | Check formatting (no changes) |
 | `make deny` | License/advisory audit |
-| `make check-progress` | Verify PROGRESS.md is current |
+| `make check-vt-qa` | Require QA evidence from diffs that touch VT rendering |
 | `make install` | Install to `~/.local/bin/shux` |
 | `make hooks` | Install lefthook git hooks |
 | `make doc` | Build documentation |
@@ -88,11 +88,12 @@ Reference task numbers when applicable (`feat(017): ...`).
 
 `make hooks` installs lefthook. Two stages:
 
-- **pre-commit**: `make lint` (clippy + fmt-check) and `make check-progress`.
-- **pre-push**: `make ci` (lint + test + test-doc).
+- **pre-commit**: `make lint` (clippy + fmt-check).
+- **pre-push**: `make ci` (lint + test + test-doc) and `make check-vt-qa`.
 
-Failures block the commit/push. The progress check ensures
-`docs/PROGRESS.md` is updated when source changes.
+Failures block the commit/push. The VT QA check reads the diff: it demands a
+`.shux/qa/<scope>/` report only when the change touches VT rendering, and costs
+nothing otherwise.
 
 ## Toolchain skew (gotcha)
 
@@ -109,21 +110,15 @@ rustup install stable
 cargo +stable clippy --workspace --all-targets -- -D warnings
 ```
 
-## Session protocol
+## Where work is tracked
 
-Each task in `docs/tasks/` has a `Status:` field:
+GitHub issues and pull requests. `docs/tasks/NNN-*.md` is a frozen archive of
+how the project got here — useful to read, closed to new entries.
 
-```
-**Status:** Pending | In Progress | Done
-```
-
-When starting a task: set status to `In Progress` in both the task file AND
-`docs/PROGRESS.md`. When finishing: flip to `Done`, add a session-log entry
-in `docs/PROGRESS.md`, and update `CLAUDE.md` Learnings if anything was
-discovered.
-
-The `make check-progress` target enforces this; pre-push hook blocks
-inconsistent state.
+There is deliberately no progress table, session log, or learnings file. Every
+open branch had to append to the same tail of the same file, so any two
+concurrent changes conflicted on it. What used to go there goes in the commit
+message and the PR description instead.
 
 ## Logging
 

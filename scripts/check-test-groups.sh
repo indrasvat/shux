@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fail if any nextest test-group is empty.
+# Assert every nextest test-group actually bounds the tests it claims to.
 #
 # A test group is the only thing standing between a machine-global resource and
 # a suite that now runs fully parallel. It is also completely silent when it is
@@ -9,8 +9,27 @@
 # like the identifier nextest itself prints, and matches zero tests — got
 # written in the first place.
 #
-# So the membership is asserted, not assumed. Each declared group must contain
-# at least one test, and (optionally) exactly the number of tests we expect.
+# So membership is asserted, not assumed. Three invariants, all derived from the
+# config and the suite rather than from a number someone remembered to update:
+#
+#   1. every declared group is used, and every used group is declared
+#   2. every top-level ARM of every filterset matches at least one test
+#   3. no test is claimed by two groups
+#
+# (2) is per-ARM and not merely per-filterset, because `A + B` where A has gone
+# dead still matches everything B matches: the group looks healthy and half its
+# intended membership runs unbounded. A pinned count caught that only by
+# accident of the number moving.
+#
+# (3) is the one that used to be enforced by pinning exact per-group counts. The
+# real invariant behind that number was never the count: a test belongs to at
+# most one group and the FIRST matching override wins, so an earlier, looser
+# group silently swallows binaries a later, tighter one names — and both groups
+# still look healthy. It happened here, with `pty-pool` and `daemon-backed`
+# sharing four binaries. Asserting non-overlap says that directly, and unlike a
+# pinned count it does not have to be edited by every PR that adds a test, which
+# made it a guaranteed merge conflict whenever two branches added tests at once
+# (issue #123).
 #
 #   scripts/check-test-groups.sh
 set -euo pipefail
@@ -23,139 +42,241 @@ if ! command -v cargo-nextest >/dev/null 2>&1; then
   exit 2
 fi
 
-# Groups that must exist, with the EXACT number of tests each must hold.
-#
-# An exact count, not just "non-empty". A test belongs to at most one group and
-# the first matching override wins, so a group listed earlier silently swallows
-# binaries a later one names — and both groups still look healthy. That is not
-# hypothetical: `pty-pool` and `daemon-backed` shipped as two groups sharing
-# four binaries, the earlier one took all of them, and the later one's tuning
-# comments described a membership it did not have. Nothing was red.
-#
-# Update these when you deliberately add or remove tests. The number moving on
-# its own is the signal.
-#
-#   <group>:<expected test count>
-REQUIRED_GROUPS=(
-  process-table:5
-  daemon-pty:270
-  wall-clock:2
-)
+# `tomllib` reads the group config from the same file nextest does, so the guard
+# and the runtime cannot disagree about what is declared. It is stdlib from 3.11.
+if ! python3 -c 'import tomllib' 2>/dev/null; then
+  echo "error: python3 with tomllib (3.11+) is required to read .config/nextest.toml" >&2
+  exit 2
+fi
 
 # Largest share of the suite any single throttled group may hold, in percent.
-MAX_GROUP_PERCENT=${MAX_GROUP_PERCENT:-30}
-
-# Deliberately NOT `raw=$(... )` under `set -e`: that aborts the script with
-# nextest's own exit code and no explanation, which is the one failure mode a
-# guard must never have. Capture, then report.
-# A per-run file, not a fixed literal. Two concurrent `make check` runs sharing
-# one path clobber and then delete each other's diagnostic — in the guard.
-err_file="$(mktemp "${TMPDIR:-/tmp}/shux-test-groups.XXXXXX")"
-trap 'rm -f "${err_file}"' EXIT
-
-# `--color never` is load-bearing, not cosmetic. CI sets `CARGO_TERM_COLOR:
-# always` workflow-wide, which makes nextest wrap the group NAME in SGR codes —
-# `group: \e[1;4mdaemon-pty\e[0m (max threads = ...)`. The parse below anchors on
-# the literal name, so every group came back "not declared" and this guard failed
-# the build while reporting the one thing that was not wrong. It passed locally
-# and only ever failed in CI, which is the worst shape a guard can have.
 #
-# The `sed` is belt-and-braces for any other source of colour (a `NEXTEST_*`
-# override, a future default): a guard should not be re-breakable by an
-# environment variable.
-set +e
-raw="$(cargo nextest --color never show-config test-groups --workspace 2>"${err_file}" \
-  | sed $'s/\033\[[0-9;]*m//g')"
-show_status=${PIPESTATUS[0]}
-set -e
+# A fraction, not `== total`: an overbroad filterset almost never captures
+# literally everything — `+ all()` in one of two groups here captured 1928 of
+# 1934, which an `== total` check waves straight through while the suite crawls.
+# These groups ration genuinely scarce machine-global resources; if a third of
+# the suite needs rationing, the premise is wrong and that deserves a human.
+export MAX_GROUP_PERCENT="${MAX_GROUP_PERCENT:-30}"
 
-if [[ "${show_status}" -ne 0 ]]; then
-  echo "✗ 'cargo nextest show-config test-groups' failed (exit ${show_status})." >&2
-  echo "  .config/nextest.toml is almost certainly invalid — nextest said:" >&2
-  sed 's/^/    /' ${err_file} >&2 || true
-  rm -f ${err_file}
-  exit 1
-fi
-rm -f ${err_file}
+# `--color never` is pinned at the call site below even though this guard now
+# reads `--message-format json`, which carries no SGR codes. CI sets
+# `CARGO_TERM_COLOR: always` workflow-wide, and the previous version of this
+# script parsed nextest's *human* output anchored on a literal group name: every
+# group came back "not declared" and the guard failed the build while reporting
+# the one thing that was not wrong. It passed locally every time, which is the
+# worst shape a guard can have. `make check-ci-parity` runs this under CI's
+# environment so that never regresses silently.
+exec python3 - "$@" <<'PY'
+import json
+import os
+import subprocess
+import sys
+import tomllib
+from itertools import combinations
 
-if [[ -z "${raw}" ]]; then
-  echo "✗ 'cargo nextest show-config test-groups' produced no output — no groups" >&2
-  echo "  are configured at all, so nothing is bounded." >&2
-  exit 1
-fi
+MAX_GROUP_PERCENT = int(os.environ.get("MAX_GROUP_PERCENT", "30"))
 
-status=0
+RED, GREEN, BLUE, OFF = "\033[31m", "\033[32m", "\033[34m", "\033[0m"
 
-total="$(cargo nextest list --workspace --message-format json 2>/dev/null |
-  python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(len(v["testcases"]) for v in d["rust-suites"].values()))')"
+status = 0
 
-for entry in "${REQUIRED_GROUPS[@]}"; do
-  group="${entry%%:*}"
-  expected="${entry##*:}"
-  # Slice the block between this group's header and the next one, counting the
-  # test lines (indented deeper than the binary-id headers, which end in ':').
-  # Declared-ness and membership come from the SAME pass: two independent
-  # parses of the same text can disagree, and when they do the guard reports
-  # the wrong failure — which is how "not declared" ended up being printed for
-  # a group that was declared perfectly well.
-  read -r declared count <<<"$(
-    printf '%s\n' "${raw}" | awk -v g="group: ${group} " '
-      index($0, g) == 1 { inblock = 1; seen = 1; next }
-      /^group: / { inblock = 0 }
-      inblock && /^ {10,}[^ ]/ && $0 !~ /:$/ { n++ }
-      END { print (seen ? "yes" : "no"), n + 0 }
-    '
-  )"
 
-  if [[ "${declared}" != "yes" ]]; then
-    echo "✗ test-group '${group}' is not declared in .config/nextest.toml" >&2
-    status=1
-    continue
-  fi
+def err(msg):
+    global status
+    print(f"  {RED}✗{OFF} {msg}", file=sys.stderr)
+    status = 1
 
-  if [[ "${count}" -eq 0 ]]; then
-    echo "✗ test-group '${group}' matched ZERO tests — its filterset is dead," >&2
-    echo "  so every test it was meant to bound is now running unbounded." >&2
-    status=1
-    continue
-  fi
 
-  # A group that swallows the workspace is the opposite failure and just as
-  # silent: the suite still passes, it merely takes six minutes again.
-  #
-  # The ceiling is a FRACTION, not `== total`. An overbroad filterset almost
-  # never captures literally everything — `+ all()` in one of two groups here
-  # captures 1928 of 1934, which an `== total` check waves straight through
-  # while the suite crawls. These groups exist to ration genuinely scarce
-  # machine-global resources; if a third of the suite needs rationing, the
-  # premise is wrong and that deserves a human, not a silent pass.
-  ceiling=$(( total * MAX_GROUP_PERCENT / 100 ))
-  if [[ "${count}" -gt "${ceiling}" ]]; then
-    echo "✗ test-group '${group}' holds ${count} of ${total} tests (>${MAX_GROUP_PERCENT}%)." >&2
-    echo "  A filterset this broad throttles most of the suite. Check for a" >&2
-    echo "  stray 'all()', or a 'test(=<binary-id>::<name>)' filter — that form" >&2
-    echo "  matches every test rather than the one it names." >&2
-    status=1
-    continue
-  fi
+def ok(msg):
+    print(f"  {GREEN}✓{OFF} {msg}")
 
-  if [[ "${count}" -ne "${expected}" ]]; then
-    echo "✗ test-group '${group}' holds ${count} tests; expected ${expected}." >&2
-    echo "  Either a test moved in or out of the group, or an EARLIER group in" >&2
-    echo "  .config/nextest.toml is now capturing binaries this one names —" >&2
-    echo "  first match wins, so overlap is silent. Run:" >&2
-    echo "      cargo nextest show-config test-groups --workspace" >&2
-    echo "  If the change is intentional, update REQUIRED_GROUPS in $0." >&2
-    status=1
-    continue
-  fi
 
-  echo "✓ test-group '${group}': ${count} test(s) of ${total} (expected ${expected})"
-done
+def matched_tests(filterset):
+    """The tests a filterset selects, evaluated on its own.
 
-if [[ "${status}" -ne 0 ]]; then
-  echo >&2
-  echo "See .config/nextest.toml for what each group protects." >&2
-fi
+    Deliberately NOT `show-config test-groups`, which reports groups already
+    resolved by first-match-wins — the very step that hides overlap. Each
+    override is evaluated independently so a collision is visible.
+    """
+    proc = subprocess.run(
+        [
+            "cargo", "nextest", "list", "--workspace",
+            "--color", "never", "--message-format", "json",
+            "-E", filterset,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        # nextest validates the WHOLE config before it evaluates `-E`, so a bad
+        # filterset in any override fails every call here, including `all()`.
+        # Print nextest's own diagnostic: it names the offending override.
+        err(f"`cargo nextest list -E` failed (exit {proc.returncode}) evaluating:")
+        print(f"      {filterset.strip()}", file=sys.stderr)
+        for line in proc.stderr.strip().splitlines()[-8:]:
+            print(f"      {line}", file=sys.stderr)
+        return None
+    suites = json.loads(proc.stdout)["rust-suites"]
+    return {
+        f"{binary_id}::{name}"
+        for binary_id, suite in suites.items()
+        for name, case in suite["testcases"].items()
+        # `filter-match` is load-bearing: `list --message-format json` reports
+        # EVERY test in the workspace and marks which ones the filterset
+        # selected. Counting the testcases themselves returns the whole suite
+        # for every filterset, so every group looks enormous and identical.
+        if case.get("filter-match", {}).get("status") == "matches"
+    }
 
-exit "${status}"
+
+def union_arms(filterset):
+    """Split a filterset into its top-level `+` arms.
+
+    Union is the only operator that can hide a dead sub-expression: `A + B`
+    stays non-empty when A matches nothing. `&` and `!` cannot — an empty
+    operand empties the whole expression, which check (2) already catches.
+
+    Depth-aware, and skips `+` inside parens, quoted strings and `/regex/`
+    literals. A `/` only opens a regex when it directly follows `(` — otherwise
+    it is an ordinary character in an exact match, and treating it as a
+    delimiter silently swallows the rest of the expression. `binary_id(=shux::
+    bin/shux)` is exactly that case, and it made this whole check a no-op.
+
+    Anything it cannot parse confidently degrades to a single arm, which is the
+    old whole-filterset behaviour: weaker, never wrong.
+    """
+    arms, current, depth = [], [], 0
+    quote = None
+    previous = ""
+    for char in filterset:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            previous = char
+            continue
+        if char in "'\"" or (char == "/" and previous == "("):
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "+" and depth == 0:
+            arms.append("".join(current))
+            current = []
+            previous = char
+            continue
+        current.append(char)
+        if not char.isspace():
+            previous = char
+    arms.append("".join(current))
+    if quote or depth != 0:
+        return [filterset]
+    return [arm for arm in (a.strip() for a in arms) if arm]
+
+
+print(f"{BLUE}▶ nextest test-group membership{OFF}")
+
+with open(".config/nextest.toml", "rb") as fh:
+    config = tomllib.load(fh)
+
+declared = set(config.get("test-groups", {}))
+overrides = [
+    override
+    for override in config.get("profile", {}).get("default", {}).get("overrides", [])
+    if "test-group" in override
+]
+
+if not declared:
+    err("no test groups are declared in .config/nextest.toml — nothing is bounded")
+    sys.exit(1)
+if not overrides:
+    err("no override assigns any test group — every group is inert")
+    sys.exit(1)
+
+for override in overrides:
+    if override["test-group"] not in declared:
+        err(f"override assigns undeclared group '{override['test-group']}'")
+assigned = {override["test-group"] for override in overrides}
+for group in sorted(declared - assigned):
+    err(f"group '{group}' is declared but no override assigns it — it bounds nothing")
+
+total = matched_tests("all()")
+if total is None:
+    sys.exit(1)
+
+selections = []
+for override in overrides:
+    tests = matched_tests(override["filter"])
+    if tests is None:
+        continue
+    group = override["test-group"]
+    if not tests:
+        err(
+            f"group '{group}' has an override matching ZERO tests — its filterset is"
+            " dead, so every test it was meant to bound now runs unbounded"
+        )
+        continue
+
+    arms = union_arms(override["filter"])
+    if len(arms) > 1:
+        for arm in arms:
+            matched = matched_tests(arm)
+            if matched is not None and not matched:
+                err(
+                    f"group '{group}' has a union arm matching ZERO tests, so the"
+                    " tests it names run unbounded while the group still looks"
+                    f" healthy:\n      {arm}"
+                )
+
+    selections.append((group, override["filter"], tests))
+
+# ── No test may be claimed by two groups ────────────────────────────────────
+overlapping = set()
+for (group_a, _, tests_a), (group_b, _, tests_b) in combinations(selections, 2):
+    if group_a == group_b:
+        continue
+    shared = tests_a & tests_b
+    if shared:
+        overlapping.update((group_a, group_b))
+        err(
+            f"groups '{group_a}' and '{group_b}' both claim {len(shared)} test(s)."
+            " First match wins, so the later group silently bounds nothing for them:"
+        )
+        for name in sorted(shared)[:5]:
+            print(f"      {name}", file=sys.stderr)
+        if len(shared) > 5:
+            print(f"      … and {len(shared) - 5} more", file=sys.stderr)
+        print(
+            "      Exclude them from the looser filterset, e.g."
+            " `& !binary_id(=<id>)`.",
+            file=sys.stderr,
+        )
+
+# ── No group may swallow the suite ──────────────────────────────────────────
+ceiling = len(total) * MAX_GROUP_PERCENT // 100
+by_group = {}
+for group, _, tests in selections:
+    by_group.setdefault(group, set()).update(tests)
+
+for group in sorted(by_group):
+    count = len(by_group[group])
+    if count > ceiling:
+        err(
+            f"group '{group}' holds {count} of {len(total)} tests"
+            f" (>{MAX_GROUP_PERCENT}%). A filterset this broad throttles"
+            " most of the suite — check for a stray `all()`, or a"
+            " `test(=<binary-id>::<name>)` filter, which matches every test rather"
+            " than the one it names."
+        )
+    elif group in overlapping:
+        err(f"group '{group}': {count} test(s) of {len(total)}, but overlapping (above)")
+    else:
+        ok(f"group '{group}': {count} test(s) of {len(total)}, exclusively claimed")
+
+if status:
+    print(file=sys.stderr)
+    print("See .config/nextest.toml for what each group protects.", file=sys.stderr)
+
+sys.exit(status)
+PY

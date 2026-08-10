@@ -652,13 +652,9 @@ deny-soft: ## Run license/advisory audit (non-blocking)
 	@echo "$(COLOR_BLUE)▶ Running cargo-deny (advisory)...$(COLOR_RESET)"
 	@cargo deny check 2>/dev/null || true
 
-.PHONY: check-progress
-check-progress: ## Verify PROGRESS.md and task Status fields are updated
-	@bash scripts/check-progress.sh
-
 .PHONY: check-vt-qa
-check-vt-qa: ## Verify completed VT tasks have tracked SOLID QA evidence
-	@bash scripts/check-progress.sh
+check-vt-qa: ## Require SOLID QA evidence from any diff that touches VT rendering
+	@bash scripts/check-vt-qa.sh
 	@bash scripts/check-vt-fixtures.sh
 
 .PHONY: check-tui-qa
@@ -672,10 +668,6 @@ check-gate-docs: ## Verify the lens-gate skill reference matches the shipped CLI
 .PHONY: check-skill-docs
 check-skill-docs: ## Verify agent-facing skill gotchas match shipped CLI shapes
 	@bash scripts/check-skill-docs.sh
-
-.PHONY: check-progress-active
-check-progress-active: ## Verify progress (active session variant, allows In Progress)
-	@bash scripts/check-progress.sh --active-session
 
 .PHONY: fuzz
 fuzz: ## (not wired up) — there is no fuzz/ crate in this repo yet

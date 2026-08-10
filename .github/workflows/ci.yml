@@ -46,6 +46,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The evidence contract is gated on what the diff touches, so the
+          # guard needs the base branch present to diff against. A shallow
+          # clone has no merge base and the guard fails loud rather than open.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
@@ -54,6 +59,11 @@ jobs:
       - name: Run VT corpus pixel regression
         run: .shux/scripts/no_leak_guard.sh make test-vt-corpus
       - name: Check VT QA evidence contract
+        env:
+          # On a PR, compare against the branch it targets. On a push to main
+          # the merge base is HEAD itself, so nothing is owed — correct: the
+          # evidence was already demanded of the PR that introduced the change.
+          VT_QA_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: make check-vt-qa
 
   check:

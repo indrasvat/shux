@@ -28,12 +28,13 @@ commit-msg:
 #   - `make deny`       → matches CI Deny job (strict — was `deny-soft` until
 #                         a license issue slipped through to CI; pushes now
 #                         block on cargo-deny rejections).
-#   - `make check-progress` is local-only (CI doesn't gate on PROGRESS.md
-#     updates but the team policy does).
+#   - `make check-vt-qa` → matches the CI "VT QA evidence" job. It reads the
+#                         diff, so a push that touches no VT rendering path
+#                         costs nothing (issue #123).
 pre-push:
   commands:
-    progress-check:
-      run: make check-progress
+    vt-qa:
+      run: make check-vt-qa
     test:
       run: make test
     test-doc:
