@@ -173,7 +173,9 @@ Every feature/fix PR.
 
 1. **Council on the design, before coding.** `dootsabha council --json`; iterate until
    converged. Config from `~/.config/dootsabha/config.yaml`; no CLI agent/chair/model
-   overrides.
+   overrides. **`dootsabha` unavailable → the council step is not skipped.** Spawn
+   context-appropriate parallel adversarial agents on disjoint surfaces instead and say
+   in the PR that you did. See *Tooling fallbacks*.
 2. **Build with tests** — unit + integration for every new path.
 3. **Verify every render path touched** — live attach, `pane`/`window`/`session.snapshot`,
    `events.watch`, web preview. Enumerate the matrix at design time.
@@ -182,7 +184,8 @@ Every feature/fix PR.
 5. **Adversarial review** (`adversarial-review` skill) once green, before the convergence
    council. 2–4 parallel agents on **disjoint** surfaces that drive the real system.
    Reproduce each finding; fix with a regression test.
-6. **Council on the implementation diff, before pushing.**
+6. **Council on the implementation diff, before pushing.** Same fallback as step 1 if
+   `dootsabha` is unavailable.
 7. **Capture evidence for every relevant (render path × config state) cell**, named
    `v<N>_<render-path>_<width>_<config-state>.png`. Render path is mandatory in the name
    or two cells collide silently. One default-state screenshot is not the matrix — drift
@@ -203,7 +206,9 @@ Every feature/fix PR.
 11. **Start `gh-ghent` when the PR is created.** Load `gh-ghent`;
     `gh ghent status --pr N --await-review --solo --logs --format json --no-tui` right
     after `gh pr create`, and after every fix push. Background, never foreground. Don't
-    report a PR done with unread review comments.
+    report a PR done with unread review comments. **`gh-ghent` or `gh` unavailable →
+    monitor by another route, starting the moment the PR exists.** See *Tooling
+    fallbacks*.
 12. **Post-merge `curl|sh` smoke.** After merge + semantic-release tags, install via
     `curl -fsSL https://shux.pages.dev/install.sh | sh` and smoke the *published* binary.
 
@@ -228,6 +233,22 @@ Paste into every feature PR:
 ```
 
 Unfillable cell → explicit callout. **Empty cells without explanation are gaps.**
+
+## Tooling fallbacks
+
+A missing tool never downgrades the step it serves. Substitute, and name the substitution
+in the PR.
+
+| Missing | Do this instead |
+|---|---|
+| `dootsabha` | Spawn context-appropriate **parallel adversarial agents on disjoint surfaces** that drive the real system. Reproduce every finding before believing it; fix with a test seen failing first. |
+| `gh-ghent` / `gh` | Monitor the PR from the moment it is created by whatever route exists — `subscribe_pr_activity`, the GitHub MCP tools, scheduled self check-ins. **Reply to and resolve every bot review thread**, exactly as `gh-ghent` would. Webhooks do not reliably deliver CI success, so poll on a timer as well. |
+| `browsing-as-you` | Publish a Claude Artifact and link it (already step 8). |
+
+**An agent that rewrites tracked files runs in its own git worktree.** Never point one at
+the shared checkout: a `git add -A` during its run commits its scratch. That is not
+hypothetical — an adversarial agent's attack payload reached `origin` on PR #147 that
+way, and only `make check-test-groups` caught it.
 
 ## Git protocol
 
