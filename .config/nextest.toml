@@ -25,6 +25,13 @@
 
 # Default: no retries — make new flakes loud.
 retries = 0
+# Repeat every failure at the END of the run, not only inline where it happened.
+# GitHub's log API returns the TAIL of a job log, so an inline failure at test
+# 216 of 2113 is unreachable — three attempts to read one macOS assertion came
+# back truncated, and the fix that followed was guesswork. The `ci` profile below
+# already does this; the default one is what `make test` uses, which is what both
+# CI test jobs actually run.
+failure-output = "immediate-final"
 # Allow tests to fail fast so a real regression doesn't get hidden by
 # minutes of subsequent successes.
 fail-fast = false
