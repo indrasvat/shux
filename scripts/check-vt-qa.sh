@@ -38,12 +38,27 @@ cd "$REPO_ROOT"
 # Paths that own what ends up on screen. A change inside any of these can move a
 # cell or a pixel, which is exactly what the VT gate audits.
 #
+# The `shux-ui` entries are the composition half of the snapshot pipeline, not
+# the attach UI: `window.snapshot` renders through `shux_ui::compose` before it
+# reaches `shux_raster`, so `composed.rs` and everything it pulls in to build
+# that grid — borders, cell buffer, viewport offsets, crossterm→VT conversion —
+# changes snapshot pixels directly. They were missing from the first version of
+# this list and a `composed.rs`-only diff sailed through with "no evidence
+# required". Input, keys, copy mode, help overlay and status-bar CONTENT stay
+# out: those are the TUI gate's surface per the table in CLAUDE.md.
+#
 # Add a path here when a new surface starts producing cells or pixels. Over-
 # triggering costs one audit; under-triggering is how the old gate got to 1-in-11.
 VT_PATHS=(
     'crates/shux-vt/'
     'crates/shux-raster/'
     'crates/shux-pty/src/capture.rs'
+    'crates/shux-ui/src/composed.rs'
+    'crates/shux-ui/src/compositor.rs'
+    'crates/shux-ui/src/borders.rs'
+    'crates/shux-ui/src/buffer.rs'
+    'crates/shux-ui/src/viewport.rs'
+    'crates/shux-ui/src/vt_convert.rs'
 )
 
 errors=()
@@ -110,16 +125,28 @@ if [[ ${#touched_vt[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# ── Requirement: a .shux/qa/<scope>/ in the same diff ───────────────────────
+# ── Requirement: a verdict issued for THIS diff ─────────────────────────────
+#
+# A scope counts only when the diff touches BOTH its report and its manifest.
+# Selecting a scope from any changed file underneath it was a hole wide enough
+# to drive the whole gate through: appending one newline to
+# `.shux/qa/067-shux-vt-resize-reflow/SOLID-QA.md` let an unrelated shux-vt
+# change inherit task 067's months-old metrics and councils, and the guard said
+# PASS. The verdict has to be issued for the change in front of it.
 scopes=()
+add_scope_if_complete() {
+    local scope="$1"
+    [[ " ${scopes[*]-} " != *" $scope "* ]] || return 0
+    grep -qxF ".shux/qa/$scope/SOLID-QA.md" <<<"$changed" || return 0
+    grep -qxF ".shux/qa/$scope/evidence-manifest.json" <<<"$changed" || return 0
+    scopes+=("$scope")
+}
 while IFS= read -r file; do
     [[ "$file" == .shux/qa/*/* ]] || continue
     scope="${file#.shux/qa/}"
     scope="${scope%%/*}"
     [[ -n "$scope" ]] || continue
-    if [[ " ${scopes[*]-} " != *" $scope "* ]]; then
-        scopes+=("$scope")
-    fi
+    add_scope_if_complete "$scope"
 done <<<"$changed"
 
 if [[ ${#scopes[@]} -eq 0 ]]; then
@@ -130,11 +157,13 @@ if [[ ${#scopes[@]} -eq 0 ]]; then
         printf '    - %s\n' "${touched_vt[@]}"
         echo ""
         echo "  but adds or updates no .shux/qa/<scope>/ evidence. Run the"
-        echo "  shux-vt-solid-qa gate and commit its report:"
+        echo "  shux-vt-solid-qa gate and commit BOTH of its files:"
         echo ""
         echo "    .shux/qa/<scope>/SOLID-QA.md            first line exactly 'VERDICT: PASS'"
         echo "    .shux/qa/<scope>/evidence-manifest.json see .shux/qa/README.md"
         echo ""
+        echo "  Both must be in this diff: a scope is not selected by touching some"
+        echo "  other file underneath it, or an old audit would satisfy a new change."
         echo "  <scope> is free-form — name it after the change, not after a task."
     } >&2
     exit 2
@@ -148,6 +177,17 @@ fi
 # Resolves a manifest-relative artifact path into RESOLVED and reports problems.
 # Deliberately a global rather than stdout: `add_error` inside a command
 # substitution runs in a subshell and its findings are silently discarded.
+# Non-whitespace content this branch ADDS to a file, or empty if it adds none.
+#
+# Deliberately a command substitution and not `… | grep -q`: `grep -q` exits the
+# moment it matches, the upstream `sed` takes SIGPIPE, and under `set -o pipefail`
+# the pipeline reports 141 — a FAILURE — precisely when the content was found.
+# That inverted this check on any report long enough for grep to short-circuit,
+# which is every real one. Caught by the positive control, not by review.
+added_content() {
+    git diff "$base" -- "$1" | sed -n 's/^+\([^+]\)/\1/p' | tr -d '[:space:]'
+}
+
 RESOLVED=""
 resolve_artifact() {
     local scope="$1" qa_dir="$2" manifest_path="$3" label="$4" rel
@@ -189,6 +229,12 @@ check_scope() {
         add_error "$scope: $qa_file is not tracked"
     elif [[ "$(head -n 1 "$qa_file")" != "VERDICT: PASS" ]]; then
         add_error "$scope: $qa_file must start exactly with 'VERDICT: PASS'"
+    elif [[ -z "$(added_content "$qa_file")" ]]; then
+        # Requiring the file to appear in the diff is not enough on its own —
+        # `echo "" >> SOLID-QA.md` appears in the diff. The report has to say
+        # something new about this change. This raises the floor; it is not
+        # fraud-proof, and is not trying to be.
+        add_error "$scope: $qa_file is in the diff but gains no new content — the verdict must be written for this change, not inherited"
     fi
 
     if [[ ! -f "$manifest" ]]; then

@@ -129,28 +129,18 @@ def matched_tests(filterset):
     }
 
 
-def union_arms(filterset):
-    """Split a filterset into its top-level `+` arms.
+def _scan(text):
+    """Yield (index, char, depth, in_quote) with quoting and nesting resolved.
 
-    Union is the only operator that can hide a dead sub-expression: `A + B`
-    stays non-empty when A matches nothing. `&` and `!` cannot — an empty
-    operand empties the whole expression, which check (2) already catches.
-
-    Depth-aware, and skips `+` inside parens, quoted strings and `/regex/`
-    literals. A `/` only opens a regex when it directly follows `(` — otherwise
-    it is an ordinary character in an exact match, and treating it as a
-    delimiter silently swallows the rest of the expression. `binary_id(=shux::
-    bin/shux)` is exactly that case, and it made this whole check a no-op.
-
-    Anything it cannot parse confidently degrades to a single arm, which is the
-    old whole-filterset behaviour: weaker, never wrong.
+    A `/` only opens a regex when it directly follows `(`. Otherwise it is an
+    ordinary character in an exact match, and treating it as a delimiter
+    silently swallows the rest of the expression — `binary_id(=shux::bin/shux)`
+    is exactly that case, and it once made this whole check a no-op.
     """
-    arms, current, depth = [], [], 0
-    quote = None
-    previous = ""
-    for char in filterset:
+    depth, quote, previous = 0, None, ""
+    for index, char in enumerate(text):
         if quote:
-            current.append(char)
+            yield index, char, depth, True
             if char == quote:
                 quote = None
             previous = char
@@ -161,18 +151,57 @@ def union_arms(filterset):
             depth += 1
         elif char == ")":
             depth -= 1
-        elif char == "+" and depth == 0:
-            arms.append("".join(current))
-            current = []
-            previous = char
-            continue
-        current.append(char)
+        yield index, char, depth, False
         if not char.isspace():
             previous = char
-    arms.append("".join(current))
-    if quote or depth != 0:
-        return [filterset]
-    return [arm for arm in (a.strip() for a in arms) if arm]
+
+
+def _top_level_operands(text):
+    """Spans of the `+`-separated operands at depth 0 of `text`."""
+    spans, start = [], 0
+    for index, char, depth, quoted in _scan(text):
+        if not quoted and char == "+" and depth == 0:
+            spans.append((start, index))
+            start = index + 1
+    spans.append((start, len(text)))
+    return spans
+
+
+def _paren_interiors(text):
+    """Spans of the interior of each outermost parenthesised group in `text`."""
+    groups, opened = [], None
+    for index, char, depth, quoted in _scan(text):
+        if quoted:
+            continue
+        if char == "(" and depth == 1:
+            opened = index + 1
+        elif char == ")" and depth == 0 and opened is not None:
+            groups.append((opened, index))
+            opened = None
+    return groups
+
+
+def union_operands(text, base=0):
+    """Spans of every union operand in `text`, at EVERY nesting depth.
+
+    Splitting only at depth 0 misses the unions this config already has:
+    `binary_id(X) & (test(a) + test(b))`. Rename `test(a)` and the outer operand
+    — and the group — stay non-empty, so the guard passes while a
+    process-counting test escapes its single-threaded group. Nesting is where
+    the interesting unions live, so the walk has to be recursive.
+    """
+    found = []
+    operands = _top_level_operands(text)
+    if len(operands) > 1:
+        found.extend((base + s, base + e) for s, e in operands)
+    for start, end in operands:
+        for open_at, close_at in _paren_interiors(text[start:end]):
+            found.extend(
+                union_operands(
+                    text[start + open_at : start + close_at], base + start + open_at
+                )
+            )
+    return found
 
 
 print(f"{BLUE}▶ nextest test-group membership{OFF}")
@@ -218,18 +247,23 @@ for override in overrides:
         )
         continue
 
-    arms = union_arms(override["filter"])
-    if len(arms) > 1:
-        for arm in arms:
-            matched = matched_tests(arm)
-            if matched is not None and not matched:
-                err(
-                    f"group '{group}' has a union arm matching ZERO tests, so the"
-                    " tests it names run unbounded while the group still looks"
-                    f" healthy:\n      {arm}"
-                )
+    # Each union operand must CONTRIBUTE. Neutralising one with `none()` and
+    # re-evaluating the whole expression tests it in its real surrounding
+    # context, which is what makes nested unions checkable at all: for
+    # `A & (B + C)`, dropping B leaves `A & (none() + C)` = `A & C`, and if that
+    # still matches everything the original did, B was dead weight.
+    expression = override["filter"]
+    for start, end in union_operands(expression):
+        neutralised = f"{expression[:start]} none() {expression[end:]}"
+        without = matched_tests(neutralised)
+        if without is not None and without == tests:
+            err(
+                f"group '{group}' has a union operand that matches nothing the rest"
+                " of the filterset does not already match, so the tests it names are"
+                f" not actually bounded by it:\n      {expression[start:end].strip()}"
+            )
 
-    selections.append((group, override["filter"], tests))
+    selections.append((group, expression, tests))
 
 # ── No test may be claimed by two groups ────────────────────────────────────
 overlapping = set()

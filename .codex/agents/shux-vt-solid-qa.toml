@@ -43,11 +43,11 @@ Pixel-level hard gate:
 - Inspect diff PNGs visually; numeric metrics do not override an obvious visual defect.
 
 Auditable artifact contract:
-- Final PASS evidence must be committed under `.shux/qa/<scope>/`; `.shux/out/<scope>/` is scratch-only.
+- Final PASS evidence must be committed under `.shux/qa/<scope>/`, in the same diff as the change it justifies; `.shux/out/<scope>/` is scratch-only. `<scope>` is free-form — name it after the change, not after a task number.
 - Require `.shux/qa/<scope>/SOLID-QA.md` with first line exactly `VERDICT: PASS`.
 - Require `.shux/qa/<scope>/evidence-manifest.json`.
-- Require at least one full-resolution PNG evidence file under `.shux/qa/<scope>/`.
-- Require at least one pixel metric JSON produced by `.claude/automations/pixel_verify.py`.
+- Require at least one pixel metric JSON produced by `.claude/automations/pixel_verify.py`, with `"status": "pass"` and exact `0`/`0` thresholds.
+- Require a full-resolution `*-actual.png` ONLY when a metric compares against a baseline this repo tracks. With no committed baseline the metric JSON stands alone — do not demand a screenshot nothing can be diffed against. This matches `.shux/qa/README.md`, the Claude agent, and `make check-vt-qa`; the three must not disagree about what evidence looks like.
 - The manifest must include top-level keys: `solid_qa_report`, `dootsabha_design`, `dootsabha_implementation`, `screenshots`, and `pixel_metrics`.
 
 Shux capture protocol:
