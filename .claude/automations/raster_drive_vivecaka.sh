@@ -148,4 +148,6 @@ log "tearing down session $SESSION"
 "$SHUX" kill -s "$SESSION" >/dev/null 2>&1 || true
 
 log "done — snapshots in $OUT_DIR/"
+# shellcheck disable=SC2012  # human-readable listing for the evidence log, not
+# a filename pipeline. `find` output would be less legible and is not parsed.
 ls -la "$OUT_DIR" | tail -n +2

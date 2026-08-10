@@ -62,7 +62,7 @@ shux_cmd window snapshot -s "$SESSION" --cols 120 --rows 32 -o "$PNG" >/dev/null
 head -c 8 "$PNG" | od -A n -t x1 | tr -d ' \n' | grep -q '89504e470d0a1a0a'
 
 shux_cmd session save -s "$SESSION" -o "$SAVED" >/dev/null
-grep -q 'name = "'$SESSION'"' "$SAVED"
+grep -q "name = \"$SESSION\"" "$SAVED"
 grep -q 'direction = "vertical"' "$SAVED"
 
 shux_cmd session restore "$SAVED" --dry-run > "$RESTORE_JSON"

@@ -25,8 +25,13 @@ if [ "${status}" -ne 124 ] && [ "${status}" -ne 1 ]; then
 fi
 
 sleep 1
+# shellcheck disable=SC2009  # pgrep is FORBIDDEN here — see CLAUDE.md "Process
+# hygiene": `pgrep -f`/`pkill -f` match on a substring of the whole argv, so the
+# checking process matches its own command line and reports a phantom leak. This
+# grep is scoped to a per-run unique `${marker}`, which is the house pattern.
 if ps -axo pid=,args= | grep "${marker}" | grep -v grep >/dev/null 2>&1; then
   echo "agent review guard self-test: marked child survived cleanup" >&2
+  # shellcheck disable=SC2009  # same reason as above
   ps -axo pid=,ppid=,pgid=,stat=,args= | grep "${marker}" | grep -v grep >&2 || true
   exit 1
 fi

@@ -62,6 +62,8 @@ mk_session () {
 echo "==> [ 1/12] session.create → rename → kill round-trip"
 # ──────────────────────────────────────────────────────────────
 sid_a=$(mk_session "${PFX}-life" "sleep 9000")
+# shellcheck disable=SC2015  # both sides of the && are TESTS, not actions, so
+# `|| fail` fires on exactly the cases meant to fail. Not the A&&B||C trap.
 [ -n "$sid_a" ] && [ "$sid_a" != "null" ] || fail "session.create returned no id"
 
 # CLI `rename` (uses dual-resolution: name → uuid). Asserts the CLI

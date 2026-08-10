@@ -80,6 +80,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The guards, leak checks and evidence harnesses are all shell. A defect
+      # there does not fail loudly the way a test does — it makes a guard quietly
+      # stop guarding, which is the failure mode this repo can least afford.
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends shellcheck
+      - name: Shellcheck every tracked script
+        run: make shellcheck
 
   frozen-guard:
     name: Lens frozen-path guard

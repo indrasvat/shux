@@ -86,7 +86,7 @@ help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*##"} /^(test|bench)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Code Quality:$(COLOR_RESET)"
-	@awk 'BEGIN {FS = ":.*##"} /^(clippy|lint|fmt|check|ci|deny|fuzz)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"} /^(clippy|lint|fmt|check|ci|deny|fuzz|shellcheck)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Tooling:$(COLOR_RESET)"
 	@awk 'BEGIN {FS = ":.*##"} /^(setup|hooks|doc|clean|version|info)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -611,13 +611,13 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint test check-test-groups check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
+check: lint shellcheck test check-test-groups check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
 
 .PHONY: ci
-ci: lint test check-test-groups check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck test check-test-groups check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
@@ -656,6 +656,10 @@ deny-soft: ## Run license/advisory audit (non-blocking)
 check-vt-qa: ## Require SOLID QA evidence from any diff that touches VT rendering
 	@bash scripts/check-vt-qa.sh
 	@bash scripts/check-vt-fixtures.sh
+
+.PHONY: shellcheck
+shellcheck: ## shellcheck every tracked shell script (the layer the guards live in)
+	@bash scripts/check-shell.sh
 
 .PHONY: check-tui-qa
 check-tui-qa: ## Verify tracked general TUI QA evidence manifests

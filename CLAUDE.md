@@ -25,6 +25,7 @@ make check              # lint + test (pre-commit)
 make deny               # license + advisory audit
 make check-vt-qa        # VT-touching diffs carry tracked QA evidence
 make check-test-groups  # nextest groups still bound what they claim
+make shellcheck         # every tracked shell script (the guards live in shell)
 make install / hooks    # install binary / lefthook hooks
 ```
 
@@ -105,7 +106,13 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   the worst shape a guard can have — `make check-ci-parity` runs the parsers under CI's
   environment so that failure lands on your machine instead.
 - **Never mask failures in a measurement harness.** `|| true` turns an instant error into
-  a fast success. Abort loudly.
+  a fast success. Abort loudly. A guard whose tool is missing must say so and exit
+  non-zero — never report success for work it did not do.
+- **`make shellcheck` is a gate, and suppressions carry a reason.** The guards are shell,
+  so a defect there stops a guard guarding instead of failing a test. Some patterns here
+  are deliberate and shellcheck cannot know it — `ps | grep` over `pgrep` (SC2009) is
+  *required* by the process-hygiene rule above. Suppress with
+  `# shellcheck disable=SCxxxx  # why`, never bare.
 - **A not-yet-started app is quiet.** `wait-settled` alone races slow starters and
   captures blanks. Require content, then settle.
 - **Screenshot-diffing animated TUIs measures capture timing, not rendering.** For

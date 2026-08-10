@@ -54,6 +54,10 @@ echo "==> unit coverage: scrollback copy-mode navigation/search/render"
 "$MAKE_BIN" test-copy-mode
 
 echo "==> dogfood: spawn scrollback-heavy pane"
+# shellcheck disable=SC2016  # single quotes are REQUIRED: `$i`, `$TERM`, `$COLORTERM`
+# and `$NO_COLOR` must expand in the INNER `bash -lc` running inside the pane, not
+# in this shell. Expanding them here would bake the harness's own environment into
+# the colour probe and the check would assert nothing.
 shux_cmd --format json session create "$SESSION" -d --title copy-mode-check -- \
     bash -lc 'for i in $(seq -w 0 500); do printf "copy-line-%s  searchable payload %s\n" "$i" "$i"; done; printf "\033[38;2;116;199;236mcolor-probe\033[0m TERM=%s COLORTERM=%s NO_COLOR=%s\n" "$TERM" "${COLORTERM-unset}" "${NO_COLOR-unset}"; sleep 9000' \
     >/dev/null

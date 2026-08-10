@@ -13,6 +13,7 @@ fi
 timeout_seconds="${SHUX_EXEC_PREFLIGHT_TIMEOUT_SECONDS:-8}"
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/shux-exec-check.XXXXXX")"
 
+# shellcheck disable=SC2317  # reached via `trap cleanup EXIT`, not by fallthrough.
 cleanup() {
   rm -rf "${tmpdir}"
 }

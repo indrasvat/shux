@@ -40,6 +40,9 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 skill_dir="$(cd "${script_dir}/.." && pwd -P)"
+# shellcheck disable=SC2015  # inside a command substitution: a failed `cd`
+# should yield an EMPTY repo_root, which is what `|| true` produces. The local
+# package is optional and its absence is handled below.
 repo_root="$(cd "${skill_dir}/../.." 2>/dev/null && pwd -P || true)"
 local_pkg="${repo_root}/plugins/sightline"
 cache_root="${SHUX_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/shux/plugins}"
