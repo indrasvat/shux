@@ -24,6 +24,11 @@ if ! command -v lefthook &>/dev/null; then
 fi
 echo "lefthook $(lefthook version 2>/dev/null || echo 'installed')"
 
+# Installing the binary is not installing the hooks — `lefthook install` writes
+# .git/hooks. Without this the documented setup left a checkout with no hooks
+# and no warning.
+bash "$(dirname "${BASH_SOURCE[0]}")/ensure-hooks.sh"
+
 # Install git hooks
 echo "Installing git hooks..."
 lefthook install

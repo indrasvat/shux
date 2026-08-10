@@ -611,7 +611,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: lint shellcheck test check-test-groups check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
+check: hooks-check lint shellcheck test check-test-groups check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
@@ -691,9 +691,11 @@ setup: ## Run full dev environment setup
 
 .PHONY: hooks
 hooks: ## Install lefthook git hooks
-	@echo "$(COLOR_BLUE)▶ Installing git hooks...$(COLOR_RESET)"
-	@lefthook install
-	@echo "$(COLOR_GREEN)✓ Git hooks installed$(COLOR_RESET)"
+	@bash scripts/ensure-hooks.sh
+
+.PHONY: hooks-check
+hooks-check: ## Fail if this checkout has no git hooks installed
+	@bash scripts/ensure-hooks.sh --check
 
 .PHONY: hooks-run
 hooks-run: ## Run pre-commit hook manually
