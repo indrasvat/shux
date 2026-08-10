@@ -38,6 +38,14 @@ dist/
 .claude/RESUME.md
 .claude/scheduled_tasks.lock
 .claude/agent-memory/
+# Throwaway git worktrees for isolated agents. Each is a full nested checkout
+# (~1200 files) and must never be committed. Isolation is also the fix for a
+# real incident on this branch: an adversarial agent was asked to mutate
+# `.config/nextest.toml` in place inside the SHARED checkout, and a `git add -A`
+# caught its attack payload mid-mutation and pushed it. An agent that rewrites
+# tracked files gets its own worktree; this line keeps that worktree out of the
+# index.
+.claude/worktrees/
 .codemap/
 
 .DS_Store
