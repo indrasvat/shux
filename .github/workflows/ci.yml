@@ -46,15 +46,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The evidence contract is gated on what the diff touches, so the
+          # guard needs the base branch present to diff against. A shallow
+          # clone has no merge base and the guard fails loud rather than open.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq
+      # Order matters: `make test-vt-corpus` REGENERATES
+      # `.shux/qa/073-shux-vt-corpus-regression-harness/` in this same worktree.
+      # If it ran first, CI's own harness output could land in the diff the guard
+      # reads and help satisfy the contract it is meant to enforce. Judge first,
+      # then regenerate.
+      - name: Check VT QA evidence contract
+        env:
+          # On a PR, compare against the branch it targets. On a push to main
+          # the merge base is HEAD itself, so nothing is owed — correct: the
+          # evidence was already demanded of the PR that introduced the change.
+          VT_QA_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+        run: make check-vt-qa
       - name: Run VT corpus pixel regression
         run: .shux/scripts/no_leak_guard.sh make test-vt-corpus
-      - name: Check VT QA evidence contract
-        run: make check-vt-qa
 
   check:
     name: Check
@@ -70,6 +85,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The guards, leak checks and evidence harnesses are all shell. A defect
+      # there does not fail loudly the way a test does — it makes a guard quietly
+      # stop guarding, which is the failure mode this repo can least afford.
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends shellcheck
+      - name: Shellcheck every tracked script
+        run: make shellcheck
 
   frozen-guard:
     name: Lens frozen-path guard

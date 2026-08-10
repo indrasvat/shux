@@ -44,6 +44,8 @@ case "${work_real}/" in
   "${root_real}"/*) ;;
   *) die "refusing to run: ${work_real} is outside the gauntlet scratch root ${root_real}" ;;
 esac
+# shellcheck disable=SC2015  # both sides are TESTS; `|| die` is meant to fire
+# when either is false. This guard refuses to run outside the scratch root.
 [ -f "${WORK}/board.py" ] && [ -d "${WORK}/goldens" ] \
   || die "refusing to run: ${work_real} does not look like a seeded gauntlet copy"
 

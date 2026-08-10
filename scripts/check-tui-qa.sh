@@ -14,7 +14,10 @@ add_error() {
 
 rel_path() {
     local path="$1"
-    printf '%s\n' "${path#$REPO_ROOT/}"
+    # Quoted: unquoted, `$REPO_ROOT` is a GLOB PATTERN here, so a checkout under
+    # a path containing `[`, `*` or `?` silently fails to strip and every path
+    # in this guard's output becomes absolute and wrong.
+    printf '%s\n' "${path#"$REPO_ROOT"/}"
 }
 
 is_tracked_or_staged() {

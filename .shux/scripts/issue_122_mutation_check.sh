@@ -13,7 +13,11 @@
 set -uo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-cd "${repo_root}"
+# `|| exit` is load-bearing here, not boilerplate: this script has `set -uo
+# pipefail` but deliberately NOT `-e`, and it rewrites a TRACKED source file in
+# place. A failed `cd` would leave it mutating whatever directory it happened to
+# start in. Never mask a failure in a measurement harness.
+cd "${repo_root}" || exit 1
 
 PARSER=crates/shux-vt/src/parser.rs
 

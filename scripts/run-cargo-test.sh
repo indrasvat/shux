@@ -77,6 +77,8 @@ run_with_timeout() {
 
   (
     active_sleep_pid=""
+    # shellcheck disable=SC2317  # invoked via `trap cleanup_watchdog EXIT INT TERM`
+    # below, which shellcheck does not follow.
     cleanup_watchdog() {
       if [[ -n "${active_sleep_pid}" ]]; then
         kill "${active_sleep_pid}" 2>/dev/null || true

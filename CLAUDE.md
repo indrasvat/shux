@@ -7,9 +7,7 @@ shux: terminal multiplexer in Rust. Tiny core, plugin system, typed API, pixel-p
 | | |
 |---|---|
 | Requirements | `docs/PRD.md` |
-| Progress tracker | `docs/PROGRESS.md` — keep current |
-| Tasks | `docs/tasks/NNN-*.md` |
-| Session learnings | `docs/agents/learnings.md` — append every session |
+| Task archive | `docs/tasks/NNN-*.md` — historical record; don't add new ones |
 | API + crate notes | `docs/agents/api-notes.md` |
 | Releases | `docs/agents/releases.md` |
 | Visual testing | `docs/agents/visual-testing.md` |
@@ -25,8 +23,9 @@ make test               # nextest across workspace
 make lint               # clippy -D warnings + fmt-check
 make check              # lint + test (pre-commit)
 make deny               # license + advisory audit
-make check-progress     # PROGRESS.md + task Status current
-make check-vt-qa        # completed VT tasks have tracked QA evidence
+make check-vt-qa        # VT-touching diffs carry tracked QA evidence
+make check-test-groups  # nextest groups still bound what they claim
+make shellcheck         # every tracked shell script (the guards live in shell)
 make install / hooks    # install binary / lefthook hooks
 ```
 
@@ -53,9 +52,9 @@ crates/shux-ui/     TUI client (crossterm, hand-rolled chrome, compositor)
 defer, hand off, or ask the user whether to fix. "Pre-existing" / "out of scope" /
 "already Done" / "only a P2" → be careful, not skip. Needs sequencing? Say so while
 already doing it. Applies hardest to defects in verification machinery.
-Fix it on whichever task's surface owns it, then **re-run that task's gate and frozen
-suite and record the fix in its task file** — a fix on a Done task leaves its committed
-QA evidence stale and its scope undocumented otherwise.
+Then **re-run the gates the fix falls under** (`make check`, plus `make check-vt-qa` if
+it touched VT rendering) and say what you fixed in the commit and the PR — that is where
+the record lives now.
 
 **Reproduce before believing — including your own findings.** Every report is a
 hypothesis: review agent, QA gate, dogfood, council, or you. A/B against a worktree of
@@ -72,12 +71,13 @@ gates) run **serially** — never two at once. Daemon-backed **cargo tests** do 
 are scheduled by nextest under the `daemon-pty` group in `.config/nextest.toml`, capped
 at 12 concurrent, and each isolates its own `XDG_RUNTIME_DIR`. That cap is measured, not
 chosen — see `docs/tasks/093-parallel-test-suite.md`; if you change it there, change it
-here, and `make check-test-groups` will tell you if the group's membership drifts. Do not add
-`--test-threads=1` or `-j 1` to a cargo test invocation to "be safe" — that was the
-house pattern until issue #130, it cost 461s a run, and it protected nothing that
+here. Group membership is matched by pattern, so a new suite joins automatically;
+`make check-test-groups` fails if a group goes empty or two groups claim the same test.
+Do not add `--test-threads=1` or `-j 1` to a cargo test invocation to "be safe" — that
+was the house pattern until issue #130, it cost 461s a run, and it protected nothing that
 nextest's process-per-test model does not already protect. If a test genuinely needs a
-machine-global resource, put it in a group and give it an expected member count in
-`scripts/check-test-groups.sh`.
+machine-global resource, put it in a group in `.config/nextest.toml` — prefer a pattern
+over naming the binary, and exclude it from any looser group that would claim it first.
 
 Identify processes by **pidfile**; never `pgrep -f`/`pkill -f` on a substring (your own
 argv matches it → phantom leaks). Never `pkill -f shux`. A test that counts processes
@@ -106,7 +106,13 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   the worst shape a guard can have — `make check-ci-parity` runs the parsers under CI's
   environment so that failure lands on your machine instead.
 - **Never mask failures in a measurement harness.** `|| true` turns an instant error into
-  a fast success. Abort loudly.
+  a fast success. Abort loudly. A guard whose tool is missing must say so and exit
+  non-zero — never report success for work it did not do.
+- **`make shellcheck` is a gate, and suppressions carry a reason.** The guards are shell,
+  so a defect there stops a guard guarding instead of failing a test. Some patterns here
+  are deliberate and shellcheck cannot know it — `ps | grep` over `pgrep` (SC2009) is
+  *required* by the process-hygiene rule above. Suppress with
+  `# shellcheck disable=SCxxxx  # why`, never bare.
 - **A not-yet-started app is quiet.** `wait-settled` alone races slow starters and
   captures blanks. Require content, then settle.
 - **Screenshot-diffing animated TUIs measures capture timing, not rendering.** For
@@ -132,8 +138,8 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
 
 ## Gates
 
-Hard gates. `VERDICT: PASS` required; `FAIL`/`BLOCKED` must be fixed or explicitly
-re-scoped in the task file first.
+Hard gates. `VERDICT: PASS` required; `FAIL`/`BLOCKED` must be fixed, or explicitly
+re-scoped in the PR description before it ships.
 
 | Gate | Applies to |
 |---|---|
@@ -142,19 +148,24 @@ re-scoped in the task file first.
 
 Defined in `.claude/agents/<name>.md` and `.codex/agents/<name>.toml`.
 
-Both MUST: enforce the task's exact Testing Matrix / Acceptance Criteria / DoD; use real
-coloured workloads and real TUIs; inspect full-resolution screenshots and pixel-verify
-where a baseline exists (`.claude/automations/pixel_verify.py` via `uv run --script`);
-prove zero leaked daemons. **Missing evidence is failure, not residual risk.**
+Both MUST: enforce the Testing Matrix / Acceptance Criteria / DoD the PR states for
+itself; use real coloured workloads and real TUIs; inspect full-resolution screenshots and
+pixel-verify where a baseline exists (`.claude/automations/pixel_verify.py` via
+`uv run --script`); prove zero leaked daemons. **Missing evidence is failure, not residual
+risk.**
 
-VT gate PASS report commits to `.shux/qa/<task>/SOLID-QA.md`, first line exactly
-`VERDICT: PASS`.
+VT gate PASS report commits to `.shux/qa/<scope>/SOLID-QA.md`, first line exactly
+`VERDICT: PASS`. `<scope>` is free-form — name it after the change. `make check-vt-qa`
+demands it from any diff touching `crates/shux-vt/`, `crates/shux-raster/` or
+`crates/shux-pty/src/capture.rs`, and demands nothing from any diff that doesn't.
 
 **Evidence storage.** `.shux/out/<scope>/` is gitignored scratch. Review via PR comments,
-not committed binaries. Commit a PNG only as a true baseline/golden with task
-documentation + DootSabha approval; then also commit `evidence-manifest.json` and
-pixel-metric JSON. Baselines come from committed `.shux/goldens/` or `.shux/fixtures/`
-replay output — never mint your own expected PNG and call it proof.
+not committed binaries. Commit a PNG only as a true baseline/golden, documented in the PR
++ DootSabha approval; then also commit `evidence-manifest.json` and pixel-metric JSON.
+With no committed baseline to compare against, the pixel-metric JSON stands alone — don't
+commit a screenshot that nothing can be diffed against. Baselines come from committed
+`.shux/goldens/` or `.shux/fixtures/` replay output — never mint your own expected PNG and
+call it proof.
 
 ## Feature protocol
 
@@ -162,7 +173,9 @@ Every feature/fix PR.
 
 1. **Council on the design, before coding.** `dootsabha council --json`; iterate until
    converged. Config from `~/.config/dootsabha/config.yaml`; no CLI agent/chair/model
-   overrides.
+   overrides. **`dootsabha` unavailable → the council step is not skipped.** Spawn
+   context-appropriate parallel adversarial agents on disjoint surfaces instead and say
+   in the PR that you did. See *Tooling fallbacks*.
 2. **Build with tests** — unit + integration for every new path.
 3. **Verify every render path touched** — live attach, `pane`/`window`/`session.snapshot`,
    `events.watch`, web preview. Enumerate the matrix at design time.
@@ -171,7 +184,8 @@ Every feature/fix PR.
 5. **Adversarial review** (`adversarial-review` skill) once green, before the convergence
    council. 2–4 parallel agents on **disjoint** surfaces that drive the real system.
    Reproduce each finding; fix with a regression test.
-6. **Council on the implementation diff, before pushing.**
+6. **Council on the implementation diff, before pushing.** Same fallback as step 1 if
+   `dootsabha` is unavailable.
 7. **Capture evidence for every relevant (render path × config state) cell**, named
    `v<N>_<render-path>_<width>_<config-state>.png`. Render path is mandatory in the name
    or two cells collide silently. One default-state screenshot is not the matrix — drift
@@ -192,7 +206,9 @@ Every feature/fix PR.
 11. **Start `gh-ghent` when the PR is created.** Load `gh-ghent`;
     `gh ghent status --pr N --await-review --solo --logs --format json --no-tui` right
     after `gh pr create`, and after every fix push. Background, never foreground. Don't
-    report a PR done with unread review comments.
+    report a PR done with unread review comments. **`gh-ghent` or `gh` unavailable →
+    monitor by another route, starting the moment the PR exists.** See *Tooling
+    fallbacks*.
 12. **Post-merge `curl|sh` smoke.** After merge + semantic-release tags, install via
     `curl -fsSL https://shux.pages.dev/install.sh | sh` and smoke the *published* binary.
 
@@ -218,19 +234,37 @@ Paste into every feature PR:
 
 Unfillable cell → explicit callout. **Empty cells without explanation are gaps.**
 
-## Git & session protocol
+## Tooling fallbacks
+
+A missing tool never downgrades the step it serves. Substitute, and name the substitution
+in the PR.
+
+| Missing | Do this instead |
+|---|---|
+| `dootsabha` | Spawn context-appropriate **parallel adversarial agents on disjoint surfaces** that drive the real system. Reproduce every finding before believing it; fix with a test seen failing first. |
+| `gh-ghent` / `gh` | Monitor the PR from the moment it is created by whatever route exists — `subscribe_pr_activity`, the GitHub MCP tools, scheduled self check-ins. **Reply to and resolve every bot review thread**, exactly as `gh-ghent` would. Webhooks do not reliably deliver CI success, so poll on a timer as well. |
+| `browsing-as-you` | Publish a Claude Artifact and link it (already step 8). |
+
+**An agent that rewrites tracked files runs in its own git worktree.** Never point one at
+the shared checkout: a `git add -A` during its run commits its scratch. That is not
+hypothetical — an adversarial agent's attack payload reached `origin` on PR #147 that
+way, and only `make check-test-groups` caught it.
+
+## Git protocol
 
 - Branches: `feat/`, `fix/`, `refactor/`, `docs/`, `chore/`. **Branch before the first
   edit — never commit to `main`.**
-- Conventional commits. One feature/fix per PR; reference the task number.
-- Hooks: pre-commit fmt+clippy; pre-push full suite + `check-progress`.
+- Conventional commits. One feature/fix per PR; reference the issue it closes.
+- Hooks: pre-commit fmt+clippy; pre-push full suite + `check-vt-qa`.
 
-**Starting a task:** `Status: In Progress` in the task file AND the `docs/PROGRESS.md`
-table.
+**No shared ledger.** There is no progress table, no session log, and no learnings file
+to append to. They were a guaranteed merge conflict the moment two branches were open at
+once, which is most of the time. Everything worth keeping goes in the commit message and
+the PR description — the two places that are already per-branch.
 
-**Completing a task / ending a session:** mark **Done** in both, add a `docs/PROGRESS.md`
-session-log entry, append to `docs/agents/learnings.md` if anything was discovered,
-commit, push. `scripts/check-progress.sh` blocks the push otherwise.
+**A guard may read anything, but must never require you to write to a file someone else
+is also writing to.** Before adding one, check it derives its answer from the code or the
+diff. `docs/tasks/NNN-*.md` are a frozen archive: read them for history, don't add more.
 
 ## Key decisions
 

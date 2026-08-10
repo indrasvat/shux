@@ -132,6 +132,40 @@ fn a_failing_command_prints_its_error_exactly_once() {
     );
 }
 
+/// `session attach` REFUSES when stdin or stdout is not a terminal, rather than
+/// entering crossterm raw mode.
+///
+/// This is an anti-hang contract, and it needs no daemon: the guard fires before
+/// anything is spawned. crossterm's `enable_raw_mode()` opens `/dev/tty`
+/// DIRECTLY, so it resolves through the process's controlling terminal and
+/// ignores stdin/stdout — piping a child's stdio does not stop it. With a
+/// controlling terminal present (a git pre-push hook, `script`, any real shell)
+/// `session attach` took the tty and sat in its interactive loop forever;
+/// `timeout 8 script -qec 'shux session attach x'` exited 124. Without one it
+/// died on `enter raw mode: No such device or address` having already written
+/// escape sequences and a 35-frame backtrace.
+///
+/// The bare-`shux` path has had this guard since a council + bot review of
+/// PR #24, for exactly this hang. The subcommand was missed.
+#[test]
+fn session_attach_refuses_without_a_terminal_instead_of_hanging() {
+    let env = Env::new();
+    let stderr = env.fails(&["session", "attach", "anything"]);
+
+    assert!(
+        stderr.to_lowercase().contains("terminal"),
+        "refusing to attach must say WHY, so a script author can act on it:\n---\n{stderr}\n---"
+    );
+    assert!(
+        !stderr.contains("enter raw mode"),
+        "the guard must fire BEFORE raw mode is attempted:\n---\n{stderr}\n---"
+    );
+    assert!(
+        !stderr.contains("Stack backtrace"),
+        "an expected refusal is not a crash:\n---\n{stderr}\n---"
+    );
+}
+
 #[test]
 fn a_failing_command_prints_no_backtrace_by_default() {
     let env = Env::new();

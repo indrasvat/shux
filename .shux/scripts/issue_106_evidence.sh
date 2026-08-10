@@ -200,7 +200,7 @@ print(json.dumps({
     "elapsed_ms": round((time.monotonic() - start) * 1000, 1),
 }, indent=2))
 PY2
-cat "${out_dir}/dos-rpc-outcome.json" | sed 's/^/    /'
+sed 's/^/    /' "${out_dir}/dos-rpc-outcome.json"
 sleep 4
 
 # Latency of an ordinary RPC against the victim pane, while the attacker runs.

@@ -1,7 +1,6 @@
 # Roadmap
 
-Live status: see [`PROGRESS.md`](PROGRESS.md) for the per-task table and
-session log.
+Live status: see the [open issues and pull requests](https://github.com/indrasvat/shux/issues).
 
 ## Milestones
 

@@ -147,6 +147,35 @@ impl Env {
         );
     }
 
+    /// Poll `pane list` until the pane running `command_needle` reports a
+    /// numeric `exit_status`, then return the list as of that moment.
+    ///
+    /// Keyed on the COMMAND, not on "any pane with an exit status". A scenario
+    /// with one pane that finishes and one that never starts has TWO panes that
+    /// stop, and which records first is platform-dependent — a failed spawn can
+    /// report immediately while a real process still has to run and be reaped.
+    /// "First pane with an exit status" therefore picks a different pane on
+    /// different machines, and the caller compares focus against the wrong one.
+    #[track_caller]
+    fn wait_for_exited_pane(&self, session: &str, command_needle: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let panes = self.json(&["pane", "list", "-s", session]);
+            let ready = panes.as_array().expect("panes").iter().any(|p| {
+                p["exit_status"].is_number() && p["command"].to_string().contains(command_needle)
+            });
+            if ready {
+                return panes;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane running {command_needle:?} never reported an exit_status \
+                 within 20s; panes were:\n{panes:#}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     fn capture(&self, session: &str, pane: &str) -> String {
         self.ok(&["pane", "capture", "-s", session, "-p", pane])
     }
@@ -1691,12 +1720,12 @@ fn the_focus_rescue_accepts_a_sibling_that_has_already_finished() {
     let _ = env.run(&["state", "apply", path.to_str().unwrap()]);
     env.sessions.push("finished".to_string());
 
-    let panes = env.json(&["pane", "list", "-s", "finished"]);
+    let panes = env.wait_for_exited_pane("finished", "/bin/cat");
     let finished = panes
         .as_array()
         .expect("panes")
         .iter()
-        .find(|p| p["exit_status"].is_number())
+        .find(|p| p["exit_status"].is_number() && p["command"].to_string().contains("/bin/cat"))
         .expect("the `cat` pane should have exited")["id"]
         .as_str()
         .unwrap_or_default()

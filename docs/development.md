@@ -26,7 +26,7 @@ Requires Rust 1.93+ (stable). Pinned via `rust-toolchain.toml`.
 | `make fmt` | Format all code |
 | `make fmt-check` | Check formatting (no changes) |
 | `make deny` | License/advisory audit |
-| `make check-progress` | Verify PROGRESS.md is current |
+| `make check-vt-qa` | Require QA evidence from diffs that touch VT rendering |
 | `make install` | Install to `~/.local/bin/shux` |
 | `make hooks` | Install lefthook git hooks |
 | `make doc` | Build documentation |
@@ -61,7 +61,7 @@ screenshots, multi-level cleanup). Screenshots go to
 For PR review, attach the useful screenshots to GitHub PR comments instead of
 committing them. Use the `browsing-as-you` skill when an authenticated GitHub UI
 upload is needed. Only commit screenshots when they are durable regression
-goldens, fixtures, or product assets with explicit task and review
+goldens, fixtures, or product assets with explicit issue/PR and review
 justification.
 
 ## Conventional commits
@@ -75,12 +75,16 @@ docs(scope):     documentation only
 chore(scope):    tooling, deps, CI
 ```
 
-Reference task numbers when applicable (`feat(017): ...`).
+Reference the issue the change closes (`Closes #123`). Task numbers are
+historical; `docs/tasks/` is a frozen archive.
 
 ## Branch hygiene
 
 - Default branch is `main`. Branch protection blocks force-push and
-  deletion; CI checks (`Check`, `Deny`, both `Test`s) must pass before merge.
+  deletion; CI checks (`Check`, `Deny`, both `Test`s, `VT QA evidence`) must
+  pass before merge. `VT QA evidence` enforces the contract in
+  `.shux/qa/README.md`; if it is not in branch protection's required set, that
+  contract is advisory on GitHub and enforced only by a local hook.
 - Feature work happens on `feat/<slug>` / `fix/<slug>` / etc.
 - Squash-merge into `main`. Tag releases on `main` only.
 
@@ -88,11 +92,15 @@ Reference task numbers when applicable (`feat(017): ...`).
 
 `make hooks` installs lefthook. Two stages:
 
-- **pre-commit**: `make lint` (clippy + fmt-check) and `make check-progress`.
-- **pre-push**: `make ci` (lint + test + test-doc).
+- **pre-commit**: `make fmt-check` and `make clippy`, both `glob: "*.rs"` — a
+  docs-only or Makefile-only commit runs neither.
+- **commit-msg**: `make check-lens-frozen` (needs the message for its trailer).
+- **pre-push**, in order: `make check-vt-qa`, `make test`, `make test-doc`,
+  `make deny`.
 
-Failures block the commit/push. The progress check ensures
-`docs/PROGRESS.md` is updated when source changes.
+Failures block the commit/push. The VT QA check reads the diff: it demands a
+`.shux/qa/<scope>/` report only when the change touches VT rendering, and costs
+nothing otherwise.
 
 ## Toolchain skew (gotcha)
 
@@ -109,21 +117,15 @@ rustup install stable
 cargo +stable clippy --workspace --all-targets -- -D warnings
 ```
 
-## Session protocol
+## Where work is tracked
 
-Each task in `docs/tasks/` has a `Status:` field:
+GitHub issues and pull requests. `docs/tasks/NNN-*.md` is a frozen archive of
+how the project got here — useful to read, closed to new entries.
 
-```
-**Status:** Pending | In Progress | Done
-```
-
-When starting a task: set status to `In Progress` in both the task file AND
-`docs/PROGRESS.md`. When finishing: flip to `Done`, add a session-log entry
-in `docs/PROGRESS.md`, and update `CLAUDE.md` Learnings if anything was
-discovered.
-
-The `make check-progress` target enforces this; pre-push hook blocks
-inconsistent state.
+There is deliberately no progress table, session log, or learnings file. Every
+open branch had to append to the same tail of the same file, so any two
+concurrent changes conflicted on it. What used to go there goes in the commit
+message and the PR description instead.
 
 ## Logging
 

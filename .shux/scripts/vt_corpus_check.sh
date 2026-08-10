@@ -19,6 +19,9 @@ need cargo
 need jq
 need uv
 
+# shellcheck disable=SC2016  # this is a jq PROGRAM, not a shell string: `$root` is
+# a jq variable bound with --arg below. Expanding it in the shell would substitute
+# an empty string and the path scrubbing would silently stop working.
 scrub_paths_filter='
 def scrub:
   if type == "object" then
@@ -63,6 +66,9 @@ failed=0
 screenshots=()
 pixel_metrics=()
 
+# shellcheck disable=SC2034  # `diff` is the record's last TSV field and must be
+# consumed by the read, or `expected` absorbs it. The diff path this script
+# actually uses is `qa_diff`, computed below.
 while IFS=$'\t' read -r layer name actual expected diff; do
   case_id="${layer}-${name}"
   qa_actual="${qa}/${case_id}-actual.png"

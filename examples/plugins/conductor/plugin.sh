@@ -53,7 +53,11 @@ CAPTURE_LINES="${SHUX_CONDUCTOR_CAPTURE_LINES:-40}"
 # v0.2 settle-snapshot archive
 SNAPSHOTS="${SHUX_CONDUCTOR_SNAPSHOTS:-1}"
 SNAPSHOT_DIR="${SHUX_CONDUCTOR_SNAPSHOT_DIR:-.shux/conductor/snapshots}"
+# shellcheck disable=SC2034  # advisory only, and documented as such in
+# README.md: the daemon renders the VT's actual dimensions. Kept so the
+# documented env vars have a visible home when that changes.
 SNAPSHOT_COLS="${SHUX_CONDUCTOR_SNAPSHOT_COLS:-100}"
+# shellcheck disable=SC2034  # advisory, same as SNAPSHOT_COLS above
 SNAPSHOT_ROWS="${SHUX_CONDUCTOR_SNAPSHOT_ROWS:-32}"
 # v0.3 OS notifications
 NOTIFY="${SHUX_CONDUCTOR_NOTIFY:-system}"   # system | stdout | off

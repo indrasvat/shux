@@ -52,4 +52,5 @@ fi
 
 echo "→ $OUT"
 file "$OUT"
+# shellcheck disable=SC2012  # single known file, printing a human-readable size.
 ls -lh "$OUT" | awk '{print "   size:", $5}'

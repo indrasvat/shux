@@ -1,13 +1,29 @@
 {
+  "_comment": [
+    "Repo-level Claude Code hooks. Both entries run `make check-vt-qa`, which derives",
+    "BOTH its trigger and its requirement from the diff: it demands a .shux/qa/<scope>/",
+    "report only when the change touches VT rendering, and nothing otherwise. ~1s.",
+    "",
+    "This file previously held a Stop hook running `check-progress-active`, which",
+    "required every session to append to docs/PROGRESS.md \u2014 a shared tail that made two",
+    "concurrent branches conflict before they touched code. Issue #123 deleted that, and",
+    "with it the only end-of-session enforcement an agent could not simply forget.",
+    "",
+    "These replace it under the rule that issue established: a guard may READ anything,",
+    "but must never require you to WRITE to a file someone else is also writing to.",
+    "Nothing here writes, and nothing here is shared.",
+    "",
+    "SessionStart runs scripts/ensure-hooks.sh so a fresh checkout \u2014 cloud or local \u2014 has its git hooks before the first commit. An agent cannot forget to run `make hooks` if it never has to. The CI guard lives in that script, once, because these sessions can run inside GitHub Actions."
+  ],
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "make -C \"$CLAUDE_PROJECT_DIR\" check-progress-active",
-            "timeout": 10,
-            "statusMessage": "Checking progress tracking..."
+            "command": "make -C \"$CLAUDE_PROJECT_DIR\" check-vt-qa",
+            "timeout": 30,
+            "statusMessage": "Checking VT QA evidence for this diff..."
           }
         ]
       }
@@ -18,20 +34,21 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE '^git\\s+push'; then make -C \"$CLAUDE_PROJECT_DIR\" check-progress; fi",
-            "timeout": 10,
-            "statusMessage": "Verifying progress before push..."
+            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE '^[[:space:]]*git[[:space:]]+push'; then make -C \"$CLAUDE_PROJECT_DIR\" check-vt-qa; fi",
+            "timeout": 30,
+            "statusMessage": "Verifying VT QA evidence before push..."
           }
         ]
-      },
+      }
+    ],
+    "SessionStart": [
       {
-        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE 'git\\s+commit'; then echo 'GATE: Verify PROGRESS.md and task Status are updated before committing.' >&2; fi; exit 0",
-            "timeout": 5,
-            "statusMessage": "Commit gate check..."
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/ensure-hooks.sh\"",
+            "timeout": 30,
+            "statusMessage": "Ensuring git hooks are installed..."
           }
         ]
       }

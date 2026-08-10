@@ -7520,6 +7520,28 @@ async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     .await
             }
             cli::SessionCommand::Attach { name_pos, session } => {
+                // Refuse before touching the terminal. `run_attach` drives
+                // crossterm raw mode, and crossterm opens `/dev/tty` DIRECTLY —
+                // it resolves through the process's controlling terminal and
+                // ignores stdin/stdout. So piping a child's stdio does not stop
+                // it: with a controlling terminal present it grabbed the tty and
+                // sat in the interactive loop forever, and without one it died
+                // on `enter raw mode: No such device or address` after already
+                // emitting escape sequences and a 35-frame backtrace.
+                //
+                // The bare-`shux` path at the `None` arm above has had this
+                // guard since a council + bot review of PR #24, for exactly this
+                // hang. The subcommand was missed. Same test, same reason.
+                use std::io::IsTerminal;
+                if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+                    anyhow::bail!(
+                        "`session attach` needs a terminal: it takes over the screen \
+                         and reads keys, so it cannot run with stdin or stdout \
+                         redirected. Run it from a terminal, or use \
+                         `shux pane capture`/`shux pane snapshot` to read a session \
+                         non-interactively."
+                    );
+                }
                 let _ = client::ensure_daemon_running_at(&socket_path).await?;
                 let session_name = name_pos
                     .or(session)

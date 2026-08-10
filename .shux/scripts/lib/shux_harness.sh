@@ -139,8 +139,7 @@ shux_harness_stop_daemon() {
   fi
 
   kill -TERM "${pid}" >/dev/null 2>&1 || true
-  local i
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     if ! kill -0 "${pid}" >/dev/null 2>&1; then
       break
     fi
@@ -151,7 +150,7 @@ shux_harness_stop_daemon() {
     kill -KILL "${pid}" >/dev/null 2>&1 || true
   fi
 
-  for i in $(seq 1 20); do
+  for _ in $(seq 1 20); do
     if ! kill -0 "${pid}" >/dev/null 2>&1; then
       return 0
     fi
