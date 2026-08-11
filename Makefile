@@ -138,6 +138,10 @@ check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's enviro
 check-test-groups: nextest-ready ## Assert every nextest test-group still matches the tests it bounds
 	@bash scripts/check-test-groups.sh
 
+.PHONY: check-test-inventory
+check-test-inventory: nextest-ready ## Assert no test stopped being compiled since BASE_REF (default origin/main)
+	@bash scripts/check-test-inventory.sh
+
 .PHONY: bench-test-suite
 bench-test-suite: nextest-ready setup-bench ## hyperfine A/B: legacy serial runner vs the parallel one
 	@PATH="$${CARGO_HOME:-$$HOME/.cargo}/bin:$$PATH" bash .shux/scripts/bench_test_suite.sh

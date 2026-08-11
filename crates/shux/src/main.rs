@@ -18,6 +18,7 @@ mod gate;
 mod lens_scratch;
 mod onboarding;
 mod pane_command;
+mod rpc;
 mod session_meta;
 mod session_persist;
 mod statusbar_build;
@@ -2133,56 +2134,19 @@ async fn run_rpc_server(
     let plugins = shux_plugin::PluginManager::new(event_bus.clone());
 
     // Build router: system builtins + session + window + pane + pane I/O + lens.run + events + state + plugin methods
-    let router = register_plugin_methods(
-        register_state_methods(
-            register_events_methods(
-                lens_scratch::register_lens_run_method(
-                    register_pane_io_methods(
-                        register_pane_methods(
-                            register_window_methods(
-                                register_session_methods(
-                                    shux_rpc::server::register_builtin_methods(
-                                        shux_rpc::Router::builder(),
-                                    ),
-                                    graph_handle.clone(),
-                                    io_state.clone(),
-                                    cancel.clone(),
-                                    session_meta_cache.clone(),
-                                    scratch_registry.clone(),
-                                ),
-                                graph_handle.clone(),
-                                io_state.clone(),
-                                cancel.clone(),
-                            ),
-                            graph_handle.clone(),
-                            io_state.clone(),
-                            cancel.clone(),
-                        ),
-                        graph_handle.clone(),
-                        io_state.clone(),
-                        cancel.clone(),
-                        config_handle.clone(),
-                        session_meta_cache.clone(),
-                        onboarding.clone(),
-                        segment_cache.clone(),
-                        lens_audit.clone(),
-                    ),
-                    graph_handle.clone(),
-                    io_state.clone(),
-                    cancel.clone(),
-                    event_bus.clone(),
-                    scratch_registry.clone(),
-                ),
-                event_bus,
-                graph_handle.clone(),
-            ),
-            graph_handle.clone(),
-            io_state,
-            cancel.clone(),
-        ),
+    let router = rpc::build_router(
+        graph_handle.clone(),
+        io_state,
+        cancel.clone(),
+        session_meta_cache.clone(),
+        scratch_registry.clone(),
+        config_handle.clone(),
+        onboarding.clone(),
+        segment_cache.clone(),
+        lens_audit.clone(),
+        event_bus,
         plugins.clone(),
-    )
-    .build();
+    );
 
     // Startup assertion: every registered RPC method must declare a
     // sensitivity policy. Catches "added a new method, forgot to
@@ -2440,7 +2404,7 @@ fn event_to_json(event: &shux_core::event::Event) -> serde_json::Value {
 /// graph (codex P0 #1: rolling back PTY-spawned commands would mean
 /// killing already-launched subprocesses, which has its own side effects;
 /// honest reporting beats dishonest atomicity).
-fn register_state_methods(
+pub(crate) fn register_state_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
@@ -2631,7 +2595,7 @@ fn plugin_error_to_rpc(e: shux_plugin::PluginError) -> shux_rpc::RpcError {
 ///   returns the resolved `PluginInfo`.
 /// - `plugin.list` — snapshot of every running plugin.
 /// - `plugin.kill` — graceful shutdown + child cleanup.
-fn register_plugin_methods(
+pub(crate) fn register_plugin_methods(
     builder: shux_rpc::RouterBuilder,
     plugins: shux_plugin::PluginManager,
 ) -> shux_rpc::RouterBuilder {
@@ -2814,7 +2778,7 @@ fn register_plugin_methods(
 }
 
 /// `events.history` is a simple bus.history_filtered() wrapper.
-fn register_events_methods(
+pub(crate) fn register_events_methods(
     builder: shux_rpc::RouterBuilder,
     bus: shux_core::bus::EventBus,
     // `pane.output.watch` takes a `pane_id`, and every id parameter has to
@@ -3096,7 +3060,7 @@ fn register_events_methods(
 }
 
 /// Register pane operation methods on the router builder.
-fn register_pane_methods(
+pub(crate) fn register_pane_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
@@ -4129,7 +4093,7 @@ fn resolve_grid_default_colors(grid: &mut shux_vt::Grid, defaults: shux_vt::Term
 }
 
 /// Register window CRUD methods on the router builder.
-fn register_window_methods(
+pub(crate) fn register_window_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
@@ -4602,7 +4566,7 @@ fn register_window_methods(
 /// These methods use a `GraphHandle` to interact with the SessionGraph.
 /// They are registered here (in the binary crate) because shux-rpc
 /// intentionally does not depend on shux-core.
-fn register_session_methods(
+pub(crate) fn register_session_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
@@ -5485,7 +5449,7 @@ async fn wait_settled_frame_stability(
 
 /// Register pane I/O methods (send_keys, run_command, command_status, command_cancel, capture).
 #[allow(clippy::too_many_arguments)]
-fn register_pane_io_methods(
+pub(crate) fn register_pane_io_methods(
     builder: shux_rpc::RouterBuilder,
     graph: shux_core::graph::GraphHandle,
     io_state: Arc<Mutex<PaneIoState>>,
