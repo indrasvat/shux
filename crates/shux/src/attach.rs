@@ -309,7 +309,7 @@ async fn handle_attach_connection(
                 // But it is not swallowed either. A failure here is why the
                 // pane renders empty forever, and with `[shell].command`
                 // (issue #132) the usual cause is a config typo that says so.
-                if let Err(e) = crate::spawn_pane_pty(
+                if let Err(e) = crate::pane_spawn::spawn_pane_pty(
                     session.active_pane_id,
                     pane.cwd.clone(),
                     pane.command.clone(),
@@ -324,7 +324,7 @@ async fn handle_attach_connection(
                 {
                     warn!(
                         pane = %session.active_pane_id,
-                        error = %crate::spawn_failure_message(&e),
+                        error = %crate::pane_spawn::spawn_failure_message(&e),
                         "attach: pane has no PTY and could not be started"
                     );
                 }
@@ -2650,7 +2650,7 @@ async fn split(
     // `pane.split` has rolled this back since issue #125; the attach path
     // never did, and `[shell].command` (issue #132) makes a default-pane spawn
     // newly able to fail, so the latent case became a reachable one.
-    if let Err(e) = crate::spawn_pane_pty(
+    if let Err(e) = crate::pane_spawn::spawn_pane_pty(
         new_pane,
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")),
         Vec::new(),
@@ -2686,7 +2686,10 @@ async fn split(
         {
             let _ = graph.focus_pane(prev).await;
         }
-        return Err(anyhow::anyhow!("{}", crate::spawn_failure_message(&e)));
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::pane_spawn::spawn_failure_message(&e)
+        ));
     }
     Ok(())
 }
@@ -2903,7 +2906,7 @@ async fn new_window(
     // left one in the graph and then focused it, so the attach UI switched to
     // a window that could never render — same contract the `window.create` RPC
     // has enforced since issue #125.
-    if let Err(e) = crate::spawn_pane_pty(
+    if let Err(e) = crate::pane_spawn::spawn_pane_pty(
         pane_id,
         cwd,
         Vec::new(),
@@ -2917,7 +2920,10 @@ async fn new_window(
     .await
     {
         let _ = graph.destroy_window(window_id, None).await;
-        return Err(anyhow::anyhow!("{}", crate::spawn_failure_message(&e)));
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::pane_spawn::spawn_failure_message(&e)
+        ));
     }
 
     // Focus the new window.

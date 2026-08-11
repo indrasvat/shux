@@ -1846,7 +1846,7 @@ async fn spawn_scratch_core(
         }
         None => None,
     };
-    let spawn_result = crate::spawn_pane_pty_with_recorder(
+    let spawn_result = crate::pane_spawn::spawn_pane_pty_with_recorder(
         pane_id,
         cwd,
         p.argv.clone(),
