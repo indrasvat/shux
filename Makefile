@@ -261,6 +261,12 @@ test-vt-corpus-unit: nextest-ready ## Run VT corpus replay unit/integration test
 	@$(NEXTEST_RUN) -p shux-vt --test vt_corpus_replay
 	@echo "$(COLOR_GREEN)✓ VT corpus replay tests passed$(COLOR_RESET)"
 
+.PHONY: test-vt-cow-aliasing
+test-vt-cow-aliasing: nextest-ready ## Run copy-on-write / sync-freeze aliasing tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running VT copy-on-write aliasing tests...$(COLOR_RESET)"
+	@$(NEXTEST_RUN) -p shux-vt --test cow_aliasing_adversarial $(FILTER)
+	@echo "$(COLOR_GREEN)✓ VT copy-on-write aliasing tests passed$(COLOR_RESET)"
+
 .PHONY: test-vt-wide-invariants
 test-vt-wide-invariants: nextest-ready ## Run wide-cell invariant property tests
 	@echo "$(COLOR_BLUE)▶ Running VT wide-cell invariant tests...$(COLOR_RESET)"
