@@ -9,7 +9,7 @@
 //!   * the live side really did change (so a test that froze nothing, or
 //!     hammered nothing, cannot pass vacuously).
 
-use shux_vt::{Cell, Grid, GridConfig, Row, VirtualTerminal};
+use shux_vt::{Cell, Grid, GridConfig, Row, SYNC_UPDATE_TIMEOUT_MS, VirtualTerminal};
 
 /// Every observable byte of a grid: dimensions, and for every line
 /// (scrollback + visible) its wrap flag and every cell.
@@ -139,6 +139,64 @@ fn assert_frozen(vt: &VirtualTerminal, at_freeze: &Fingerprint, what: &str) {
         "presented frame moved during a sync window ({what}): {}",
         first_divergence(at_freeze, &now)
     );
+}
+
+/// A freeze assertion for a window held across a LONG loop of `process()`
+/// calls, where the deadline is in play (issue #154).
+///
+/// `SYNC_UPDATE_TIMEOUT_MS` bounds every window and `process()` enforces it on
+/// every batch by design, so a loop cannot assume the window it armed is still
+/// open: a runner descheduled for a deadline's worth of wall clock between two
+/// chunks gets the window released, the frame legitimately moves, and a bare
+/// `assert_frozen` fails for a reason that is not a freeze bug.
+///
+/// So the invariant asserted here is the one the freeze actually promises —
+/// the frame does not move *while the window is open*. An expiry is not
+/// tolerated, it is COUNTED and re-armed: an expiry costs a full deadline of
+/// wall clock, so the elapsed time is a hard ceiling on how many are
+/// legitimate, and a freeze that releases windows it should be holding blows
+/// through that ceiling however slow the machine is.
+struct SyncWatch {
+    expiries: u64,
+    started: std::time::Instant,
+}
+
+impl SyncWatch {
+    fn new() -> Self {
+        Self {
+            expiries: 0,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Assert the freeze after a `process()` call, and return the fingerprint
+    /// to compare against next time: the same one while the window is still
+    /// open, a fresh baseline from a re-armed window when the deadline closed
+    /// it.
+    fn check(&mut self, vt: &mut VirtualTerminal, frozen: Fingerprint, what: &str) -> Fingerprint {
+        if vt.sync_output_active() {
+            assert_frozen(vt, &frozen, what);
+            frozen
+        } else {
+            self.expiries += 1;
+            arm_sync(vt)
+        }
+    }
+
+    /// Windows are armed one at a time, so N expiries cannot have happened in
+    /// less than N deadlines of wall clock. Anything above that ceiling is the
+    /// freeze releasing windows, not the machine being slow.
+    fn assert_expiries_fit_the_clock(&self, what: &str) {
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let budget = elapsed_ms / SYNC_UPDATE_TIMEOUT_MS + 1;
+        assert!(
+            self.expiries <= budget,
+            "{what}: {} sync windows expired in {elapsed_ms} ms, but each expiry costs a \
+             full {SYNC_UPDATE_TIMEOUT_MS} ms deadline (budget {budget}) — the windows are \
+             being released, not held",
+            self.expiries
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -729,16 +787,32 @@ fn frozen_frame_is_chunk_independent() {
     let script: &[u8] =
         b"\x1b[2;6r\x1b[3;1H\x1b[38;2;10;20;30mA\x1b[3S\x1b[2L\x1b[4@\x1b[2P\x1b#8\x1b[?1049h\x1b[?1049l\x1b[2J";
     let mut results = Vec::new();
+    let mut watch = SyncWatch::new();
     for chunk in [1usize, 2, 3, 5, 8, 13, script.len()] {
         let mut vt = seeded_vt(8, 24);
-        let frozen = arm_sync(&mut vt);
+        let armed = arm_sync(&mut vt);
+        let mut frozen = armed.clone();
+        let expiries_before = watch.expiries;
         for part in script.chunks(chunk) {
             vt.process(part);
-            assert_frozen(&vt, &frozen, &format!("chunk size {chunk}"));
+            frozen = watch.check(&mut vt, frozen, &format!("chunk size {chunk}"));
         }
         vt.process(b"\x1b[?2026l");
-        results.push((chunk, frozen, fingerprint(vt.grid())));
+        // A run whose window the deadline released mid-script was re-armed with
+        // `?2026h` bytes the other runs never saw, so its live frame is no
+        // longer comparable with theirs. Chunk-independence is a claim about
+        // the script, not about the runner's scheduling.
+        if watch.expiries == expiries_before {
+            results.push((chunk, armed, fingerprint(vt.grid())));
+        }
     }
+    watch.assert_expiries_fit_the_clock("frozen_frame_is_chunk_independent");
+    assert!(
+        results.len() > 1,
+        "only {} of 7 chunk sizes ran without the sync deadline expiring, so nothing was \
+         compared across chunk boundaries",
+        results.len()
+    );
     let (_, f0, l0) = &results[0];
     for (chunk, f, l) in &results[1..] {
         assert_eq!(f, f0, "frozen frame differs at chunk size {chunk}");
@@ -822,11 +896,12 @@ impl Rng {
 #[test]
 fn fuzzed_scripts_cannot_move_the_frozen_frame() {
     let mut changed_live = 0usize;
+    let mut watch = SyncWatch::new();
     for seed in 1u64..=400 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut vt = seeded_vt(8, 22);
         let before = fingerprint(vt.grid());
-        let frozen = arm_sync(&mut vt);
+        let mut frozen = arm_sync(&mut vt);
 
         let mut script = String::new();
         for _ in 0..40 {
@@ -847,7 +922,7 @@ fn fuzzed_scripts_cannot_move_the_frozen_frame() {
                 end += 1;
             }
             vt.process(&bytes[i..end]);
-            assert_frozen(&vt, &frozen, &format!("fuzz seed {seed}, offset {i}"));
+            frozen = watch.check(&mut vt, frozen, &format!("fuzz seed {seed}, offset {i}"));
             i = end;
         }
         vt.process(b"\x1b[?2026l");
@@ -855,6 +930,7 @@ fn fuzzed_scripts_cannot_move_the_frozen_frame() {
             changed_live += 1;
         }
     }
+    watch.assert_expiries_fit_the_clock("fuzzed_scripts_cannot_move_the_frozen_frame");
     // Proof the fuzz is not vacuous: nearly every script must actually have
     // written something to the live grid.
     assert!(

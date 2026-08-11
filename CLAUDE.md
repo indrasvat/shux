@@ -158,6 +158,11 @@ VT gate PASS report commits to `.shux/qa/<scope>/SOLID-QA.md`, first line exactl
 `VERDICT: PASS`. `<scope>` is free-form — name it after the change. `make check-vt-qa`
 demands it from any diff touching `crates/shux-vt/`, `crates/shux-raster/` or
 `crates/shux-pty/src/capture.rs`, and demands nothing from any diff that doesn't.
+The one exemption is the `tests/` and `benches/` trees under those crates: they
+ship no cells and no pixels, so the only audit they could carry would be about
+code the diff never touched. A diff touching `src/` **and** `tests/` still owes
+evidence. `scripts/check-vt-qa-selftest.sh` runs the real guard against a
+reintroduced defect and against empty input, and `make check-vt-qa` runs it first.
 
 **Evidence storage.** `.shux/out/<scope>/` is gitignored scratch. Review via PR comments,
 not committed binaries. Commit a PNG only as a true baseline/golden, documented in the PR

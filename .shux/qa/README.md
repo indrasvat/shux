@@ -3,7 +3,9 @@
 Any diff that touches VT rendering — `crates/shux-vt/`, `crates/shux-raster/`, or
 `crates/shux-pty/src/capture.rs` — must carry the auditable subset of its QA
 evidence here, in the same diff. `make check-vt-qa` enforces both halves from the
-diff itself; a diff touching none of those paths is asked for nothing.
+diff itself; a diff touching none of those paths is asked for nothing. The
+`tests/` and `benches/` trees under those crates are exempt — they ship no cells
+and no pixels — but a diff that touches `src/` as well still owes evidence.
 
 ```text
 .shux/qa/<scope>/
