@@ -11,6 +11,19 @@ use tokio::sync::Mutex;
 
 use crate::pane_io::PaneIoState;
 
+pub(crate) mod convert;
+pub(crate) mod events;
+pub(crate) mod pane;
+pub(crate) mod pane_io;
+pub(crate) mod params;
+pub(crate) mod plugin;
+pub(crate) mod session;
+pub(crate) mod state;
+pub(crate) mod window;
+
+#[cfg(test)]
+pub(crate) mod test_harness;
+
 /// Chain every registration function into the daemon's router.
 ///
 /// The order is the registration order and is preserved verbatim: builtins
@@ -31,14 +44,14 @@ pub(crate) fn build_router(
     event_bus: shux_core::bus::EventBus,
     plugins: shux_plugin::PluginManager,
 ) -> shux_rpc::Router {
-    crate::register_plugin_methods(
-        crate::register_state_methods(
-            crate::register_events_methods(
+    crate::rpc::plugin::register_plugin_methods(
+        crate::rpc::state::register_state_methods(
+            crate::rpc::events::register_events_methods(
                 crate::lens_scratch::register_lens_run_method(
-                    crate::register_pane_io_methods(
-                        crate::register_pane_methods(
-                            crate::register_window_methods(
-                                crate::register_session_methods(
+                    crate::rpc::pane_io::register_pane_io_methods(
+                        crate::rpc::pane::register_pane_methods(
+                            crate::rpc::window::register_window_methods(
+                                crate::rpc::session::register_session_methods(
                                     shux_rpc::server::register_builtin_methods(
                                         shux_rpc::Router::builder(),
                                     ),

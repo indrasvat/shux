@@ -124,8 +124,8 @@ wall-clock = { max-threads = 1 }
 # reason. Scope by binary first, then by name.
 filter = '''
     (binary_id(=shux::bin/shux) & (
-        test(=tests::production_unconfirmed_kill_preserves_registry_row)
-      + test(=tests::production_lens_run_dropped_mid_core_leaves_no_orphan)
+        test(=lens_scratch::production_route_tests::production_unconfirmed_kill_preserves_registry_row)
+      + test(=lens_scratch::production_route_tests::production_lens_run_dropped_mid_core_leaves_no_orphan)
     ))
   + binary_id(=shux::scratch_reap_order)
   + (binary_id(=shux-plugin::plugin_lifecycle) & (
@@ -188,7 +188,7 @@ test-group = 'daemon-pty'
 [[profile.default.overrides]]
 filter = '''
   binary_id(=shux-vt::scroll_region_bounds) & test(=region_scroll_cost_is_linear_in_pane_height)
-  + binary_id(=shux::bin/shux) & test(=tests::pane_record_duration_stops_on_daemon_side)
+  + binary_id(=shux::bin/shux) & test(=rpc::pane_io::tests::pane_record_duration_stops_on_daemon_side)
 '''
 test-group = 'wall-clock'
 threads-required = "num-test-threads"
