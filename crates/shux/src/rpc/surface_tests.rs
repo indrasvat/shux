@@ -14,7 +14,7 @@ use std::sync::Arc;
 use shux_rpc::{Policy, Sensitivity};
 use tokio::sync::Mutex;
 
-use crate::PaneIoState;
+use crate::pane_io::PaneIoState;
 
 /// `method → policy`, one line each, sorted by method.
 ///
