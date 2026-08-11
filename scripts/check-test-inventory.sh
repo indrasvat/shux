@@ -24,6 +24,13 @@
 # tests, but a guard landing alongside its own invariant test would otherwise
 # have to fail itself.
 #
+# Wired into `make ci` and the CI `Test (ubuntu)` job on pull requests only.
+# NOT into `make check`: the first run against a given base pays a full
+# workspace build in the worktree, and the pre-commit gate is the wrong place
+# for that. On a push to main the merge-base is the head, so there is nothing
+# to compare and the run would be pure cost — hence the pull-request condition
+# in `.github/workflows/ci.yml`.
+#
 #   scripts/check-test-inventory.sh [BASE_REF]     # default: origin/main
 set -euo pipefail
 

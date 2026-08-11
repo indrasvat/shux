@@ -621,7 +621,7 @@ check: hooks-check lint shellcheck test check-test-groups check-ci-parity test-s
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck test check-test-groups check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
