@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::PaneIoState;
+use crate::pane_io::PaneIoState;
 
 /// Chain every registration function into the daemon's router.
 ///

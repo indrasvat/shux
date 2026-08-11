@@ -44,7 +44,7 @@ use shux_rpc::attach::{
 use shux_rpc::create_codec;
 use shux_ui::{BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor};
 
-use crate::PaneIoState;
+use crate::pane_io::PaneIoState;
 use crate::statusbar_runner::{SegmentCache, populate_bar};
 
 /// Client-screen dimensions (cols, rows) tracked per attached client.
@@ -546,7 +546,7 @@ async fn apply_resize_to_window(
     // a channel send while still holding the PaneIoState mutex. Attach
     // fan-out is fire-and-forget (ack=None); the synchronous path is
     // `pane.set_size` RPC which constructs its own oneshot.
-    let mut to_send: Vec<(mpsc::Sender<crate::ResizeRequest>, PtySize)> = Vec::new();
+    let mut to_send: Vec<(mpsc::Sender<crate::pane_io::ResizeRequest>, PtySize)> = Vec::new();
 
     if win.layout.is_zoomed() {
         // Zoomed: every pane in the tree reports the full content area
@@ -588,7 +588,9 @@ async fn apply_resize_to_window(
     }
 
     for (tx, size) in to_send {
-        let _ = tx.send(crate::ResizeRequest { size, ack: None }).await;
+        let _ = tx
+            .send(crate::pane_io::ResizeRequest { size, ack: None })
+            .await;
     }
 }
 
@@ -3381,7 +3383,7 @@ mod tests {
         pane_id: PaneId,
     ) -> (
         mpsc::Receiver<Vec<u8>>,
-        mpsc::Receiver<crate::ResizeRequest>,
+        mpsc::Receiver<crate::pane_io::ResizeRequest>,
         CancellationToken,
     ) {
         let (writer_tx, writer_rx) = mpsc::channel(8);

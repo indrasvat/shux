@@ -51,7 +51,7 @@ use shux_core::event::EventData;
 use shux_core::graph::GraphHandle;
 use shux_core::model::{PaneId, SessionId};
 
-use crate::PaneIoState;
+use crate::pane_io::PaneIoState;
 
 // ── bounds (LENS-R-040) ───────────────────────────────────────────────────
 
@@ -1833,15 +1833,17 @@ async fn spawn_scratch_core(
     // so the child's first bytes are captured. A failed open rolls back the allocation (the cast
     // is the caller's declared deliverable — silently dropping it would ship a lie).
     let cast_recorder = match p.cast {
-        Some(cast_path) => match crate::open_cast_recorder(cast_path, p.cols, p.rows).await {
-            Ok(rec) => Some(rec),
-            Err(e) => {
-                let _ = graph.destroy_session(session_id, None).await;
-                return Err(shux_rpc::RpcError::internal(&format!(
-                    "cast recorder open failed: {e}"
-                )));
+        Some(cast_path) => {
+            match crate::pane_record::open_cast_recorder(cast_path, p.cols, p.rows).await {
+                Ok(rec) => Some(rec),
+                Err(e) => {
+                    let _ = graph.destroy_session(session_id, None).await;
+                    return Err(shux_rpc::RpcError::internal(&format!(
+                        "cast recorder open failed: {e}"
+                    )));
+                }
             }
-        },
+        }
         None => None,
     };
     let spawn_result = crate::spawn_pane_pty_with_recorder(
