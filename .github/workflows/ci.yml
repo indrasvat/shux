@@ -120,6 +120,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `check-test-inventory` builds the merge-base in a worktree, so it
+          # needs the history to find one. A shallow clone would make it fail
+          # closed, which is correct but useless.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -133,6 +138,13 @@ jobs:
         run: make test-doc
       - name: Test-group membership
         run: make check-test-groups
+      # Pull requests only, and deliberately so: the guard asks "did anything
+      # that ran at the merge-base stop running here", and on a push to main
+      # the merge-base IS the head, so it would compare a build against itself
+      # and pay a second workspace compile to learn nothing.
+      - name: Test inventory (no test silently stopped being compiled)
+        if: github.event_name == 'pull_request'
+        run: make check-test-inventory
       # Belt and braces: this job already runs with CARGO_TERM_COLOR=always, so
       # the step above is the real colour test. This one fails with an
       # explanation instead of a bare parse mismatch, and keeps the local and CI

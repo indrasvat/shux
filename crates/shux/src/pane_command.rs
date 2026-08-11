@@ -83,7 +83,9 @@ const MAX_ARGV_BYTES: usize = 256 * 1024;
 /// invocation is `-c` — see the module header on why one-shot commands do not
 /// read startup files.
 pub(crate) fn interpreting_shell() -> String {
-    if let Some(argv) = crate::configured_shell_argv(&crate::daemon_shell_config()) {
+    if let Some(argv) =
+        crate::pane_spawn::configured_shell_argv(&crate::pane_spawn::daemon_shell_config())
+    {
         // `configured_shell_argv` already rejected a blank program, so the
         // first element is a real name. Same predicate the pane shell uses —
         // the two cannot disagree about whether a shell is configured.
