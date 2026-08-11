@@ -17,10 +17,44 @@ GUARD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-vt-qa.sh"
     exit 1
 }
 
+# ── Never touch the caller's repository ─────────────────────────────────────
+#
+# Git exports repository-local variables to its hooks, and `GIT_DIR` /
+# `GIT_INDEX_FILE` win over `git -C <dir>`: `-C` changes the working directory,
+# not the repository git resolves to. Run from the pre-push hook (which is
+# exactly where `make check-vt-qa` runs), every command below would have
+# operated on the CALLER's git directory instead of the throwaway one — the
+# `git add -A` and `git commit` here replaced the branch tree with this
+# `README.md`, and the per-case `git reset` wiped the caller's index. Measured
+# against a sacrificial clone: 1223 tracked files became 2, and the self-test
+# still reported all eight cases green, because the guard it invoked was
+# reading the repository it had just destroyed.
+#
+# `githooks(5)` says to clear these before invoking git in a foreign
+# repository. Clearing them is also correct for the guard runs below: it must
+# resolve `$work`, never the caller.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE \
+    GIT_PREFIX GIT_QUARANTINE_PATH
+
 work="$(mktemp -d "${TMPDIR:-/tmp}/shux-vt-qa-selftest.XXXXXX")"
 trap 'rm -rf "${work}"' EXIT
 
 git -C "$work" init -q
+
+# Belt and braces: assert the isolation rather than trusting the unset above to
+# stay complete. A future git that exports one more variable, or an edit that
+# drops one from the list, has to fail LOUDLY here — the failure mode this
+# guards is a silent destructive commit on the caller's branch, which the
+# self-test cannot notice from the inside.
+resolved="$(git -C "$work" rev-parse --absolute-git-dir)"
+if [[ "$resolved" != "$work"/* ]]; then
+    echo "✗ refusing to run: git in the throwaway dir resolves to $resolved" >&2
+    echo "  (expected something under $work — a repository-local GIT_* variable" >&2
+    echo "  leaked in from the caller and would make this script write there)" >&2
+    exit 1
+fi
+
 git -C "$work" config user.email selftest@example.invalid
 git -C "$work" config user.name selftest
 echo base >"$work/README.md"
