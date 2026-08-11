@@ -1,3 +1,10 @@
+## [0.46.16](https://github.com/indrasvat/shux/compare/v0.46.15...v0.46.16) (2026-08-11)
+
+
+### Bug Fixes
+
+* assert the sync freeze only while the window is open ([#155](https://github.com/indrasvat/shux/issues/155)) ([10de4a0](https://github.com/indrasvat/shux/commit/10de4a0508bf0d863cb3580f61899e859bc2e901))
+
 ## [0.46.15](https://github.com/indrasvat/shux/compare/v0.46.14...v0.46.15) (2026-08-09)
 
 
