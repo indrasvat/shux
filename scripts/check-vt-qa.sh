@@ -155,6 +155,23 @@ changed_contains() {
     return 1
 }
 
+# Trees under a gated crate that ship no cells and no pixels: the test and
+# benchmark binaries. They are compiled by `cargo test`/`cargo bench` and by
+# nothing a user runs, so a diff confined to them cannot move a pixel and has
+# no pixel metric to offer — the audit it would be asked for could only be
+# about code the diff does not touch, which is the "artifact that proves
+# nothing" CLAUDE.md rules out.
+#
+# This is the ONLY exemption, and it is a suffix-tree rule rather than a path
+# list so it cannot rot: a new crate joining VT_PATHS gets the same treatment
+# without a second edit. It does not weaken the trigger — a diff that touches
+# `src/` AND `tests/` still owes evidence, because the `src/` file is still in
+# `touched_vt`. Asserted by scripts/check-vt-qa-selftest.sh.
+is_non_shipping() {
+    local file="$1"
+    [[ "$file" == */tests/* || "$file" == */benches/* ]]
+}
+
 # ── Trigger ─────────────────────────────────────────────────────────────────
 #
 # A file entry also matches its module-directory form: `composed.rs` and
@@ -162,6 +179,7 @@ changed_contains() {
 # refactor would otherwise drop a surface off this gate permanently.
 touched_vt=()
 for file in ${changed_files[@]+"${changed_files[@]}"}; do
+    is_non_shipping "$file" && continue
     for prefix in "${VT_PATHS[@]}"; do
         if [[ "$file" == "$prefix" || "$file" == "$prefix"* || "$file" == "${prefix%.rs}/"* ]]; then
             touched_vt+=("$file")

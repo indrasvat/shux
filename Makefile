@@ -664,6 +664,7 @@ deny-soft: ## Run license/advisory audit (non-blocking)
 
 .PHONY: check-vt-qa
 check-vt-qa: ## Require SOLID QA evidence from any diff that touches VT rendering
+	@bash scripts/check-vt-qa-selftest.sh
 	@bash scripts/check-vt-qa.sh
 	@bash scripts/check-vt-fixtures.sh
 
