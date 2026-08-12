@@ -263,14 +263,16 @@ jobs:
         run: |
           make test
           make test-doc
-      # `--workspace --bin shux`, NOT `-p shux`: feature unification differs
-      # between the two, so `-p shux` shares nothing with the `--workspace` test
-      # build that just ran and recompiles 10 crates (~20s here, measured). The
-      # workspace-scoped form reuses those artifacts exactly — 0 crates, 0s.
-      # See E2E smoke (ubuntu) note: smoke/integration are correctness tests;
-      # release-mode validation lives in release.yml.
+      # Left as `-p shux` deliberately. `--workspace --bin shux` looked like a
+      # free win — locally it reused the test build's artifacts and compiled 0
+      # crates against 10 — but on a clean CI job it still compiled all 8 in
+      # 20.16s (run 31572953492). The local result was an artifact of a target
+      # dir that already held dev-profile units; a fresh job has none. It buys
+      # nothing here and would change feature unification, so it stays.
+      # See E2E smoke (ubuntu) note: smoke/integration are correctness
+      # tests; release-mode validation lives in release.yml.
       - name: Build shux (debug, for smoke)
-        run: cargo build --workspace --bin shux
+        run: cargo build -p shux
       - name: End-to-end smoke (happy path)
         run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/smoke.sh
       - name: Integration regressions (12 deterministic scenarios)
