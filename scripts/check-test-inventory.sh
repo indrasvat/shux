@@ -85,8 +85,23 @@ list_tests() {
 # against it without rebuilding it. Shares `list_tests` with the comparison path
 # below deliberately — a second copy of `normalize` would drift, and the drift
 # would read as "every test was removed".
+# Baselines are named by the `crates/` TREE hash, not the commit sha. The test
+# list is a function of the source, and two commits with identical sources have
+# identical lists — so this is both more accurate and the thing that makes the
+# cache actually hit. semantic-release lands `chore(release): X.Y.Z [skip ci]`
+# on main, touching only CHANGELOG.md / Cargo.toml / Cargo.lock and running no
+# CI. Main's HEAD is therefore usually a commit that published no baseline, and
+# the PRs that fork from it would miss on every lookup keyed by sha. The tree
+# hash is unchanged across every release commit in this repo's history.
+#
+# It fails in the safe direction too: drop a workspace member from the root
+# Cargo.toml without touching crates/ and the tree still matches, so the cached
+# list still names the tests that stopped compiling — and the guard reports them
+# removed, which is exactly right.
+crates_tree() { git rev-parse "${1}^{commit}:crates"; }
+
 if [[ "${WRITE_BASELINE}" -eq 1 ]]; then
-  HEAD_SHA="$(git rev-parse HEAD)"
+  HEAD_SHA="$(crates_tree HEAD)"
   OUT="${CACHE_DIR}/${HEAD_SHA}.txt"
   list_tests >"${OUT}.tmp"
   if [[ ! -s "${OUT}.tmp" ]]; then
@@ -95,7 +110,7 @@ if [[ "${WRITE_BASELINE}" -eq 1 ]]; then
     exit 2
   fi
   mv "${OUT}.tmp" "${OUT}"
-  echo "✓ published baseline for ${HEAD_SHA:0:12}: $(wc -l <"${OUT}" | tr -d ' ') tests"
+  echo "✓ published baseline for crates tree ${HEAD_SHA:0:12}: $(wc -l <"${OUT}" | tr -d ' ') tests"
   exit 0
 fi
 
@@ -109,7 +124,8 @@ fi
 if MERGE_BASE="$(git merge-base HEAD "${BASE_SHA}" 2>/dev/null)"; then
   BASE_SHA="${MERGE_BASE}"
 fi
-BASE_LIST="${CACHE_DIR}/${BASE_SHA}.txt"
+BASE_TREE="$(crates_tree "${BASE_SHA}")"
+BASE_LIST="${CACHE_DIR}/${BASE_TREE}.txt"
 
 if [[ ! -s "${BASE_LIST}" ]]; then
   echo "▶ listing tests at base ${BASE_SHA:0:12} (cached afterwards)..."

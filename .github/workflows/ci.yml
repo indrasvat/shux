@@ -142,10 +142,16 @@ jobs:
           BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: |
           if [ -n "$BASE_REF" ]; then
-            echo "sha=$(git merge-base HEAD "$BASE_REF")" >> "$GITHUB_OUTPUT"
+            base="$(git merge-base HEAD "$BASE_REF")"
           else
-            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            base=HEAD
           fi
+          # The `crates/` TREE, not the commit — see check-test-inventory.sh.
+          # semantic-release lands `chore(release) [skip ci]` on main, which
+          # runs no CI and so publishes no baseline; keyed by sha, every PR
+          # forking from main's HEAD would miss. The tree is identical across
+          # every release commit in this repo's history.
+          echo "sha=$(git rev-parse "$base^{commit}:crates")" >> "$GITHUB_OUTPUT"
           echo "disc=$(rustc --version | tr -d ' /')-$(sha256sum scripts/check-test-inventory.sh | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       - name: Restore test-inventory baseline
