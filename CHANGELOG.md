@@ -1,3 +1,10 @@
+## [0.46.17](https://github.com/indrasvat/shux/compare/v0.46.16...v0.46.17) (2026-08-12)
+
+
+### Bug Fixes
+
+* **ci:** two local gates were broken on macOS ([#158](https://github.com/indrasvat/shux/issues/158)) ([a9b6b07](https://github.com/indrasvat/shux/commit/a9b6b07db5b11d07545b6213eb991e46ed7cbde1))
+
 ## [0.46.16](https://github.com/indrasvat/shux/compare/v0.46.15...v0.46.16) (2026-08-11)
 
 
