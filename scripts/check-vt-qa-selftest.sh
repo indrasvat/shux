@@ -38,6 +38,12 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
     GIT_PREFIX GIT_QUARANTINE_PATH
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/shux-vt-qa-selftest.XXXXXX")"
+# Canonicalise before comparing paths below: `rev-parse --absolute-git-dir`
+# reports the PHYSICAL path, while on macOS $TMPDIR is a symlink (/var →
+# /private/var) and carries a trailing slash. Comparing the two forms literally
+# never matches, so the assertion refused every run on macOS — taking
+# `make check-vt-qa`, and with it every local push, down with it.
+work="$(cd "${work}" && pwd -P)"
 trap 'rm -rf "${work}"' EXIT
 
 git -C "$work" init -q
