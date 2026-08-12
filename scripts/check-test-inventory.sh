@@ -31,11 +31,24 @@
 # to compare and the run would be pure cost — hence the pull-request condition
 # in `.github/workflows/ci.yml`.
 #
+# The baseline is cached per commit sha, so a run that already has the file for
+# its merge-base does no build at all. `--write-baseline` populates that file for
+# the CURRENT checkout from an already-warm target dir, which is what lets CI on
+# main publish its own list for PRs to compare against instead of every PR paying
+# a from-cold rebuild of the merge-base (issue #157).
+#
 #   scripts/check-test-inventory.sh [BASE_REF]     # default: origin/main
+#   scripts/check-test-inventory.sh --write-baseline
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+
+WRITE_BASELINE=0
+if [[ "${1:-}" == "--write-baseline" ]]; then
+  WRITE_BASELINE=1
+  shift
+fi
 
 BASE_REF="${1:-${BASE_REF:-origin/main}}"
 
@@ -44,20 +57,8 @@ if ! command -v cargo-nextest >/dev/null 2>&1; then
   exit 2
 fi
 
-if ! BASE_SHA="$(git rev-parse --verify "${BASE_REF}^{commit}" 2>/dev/null)"; then
-  echo "error: cannot resolve base ref '${BASE_REF}'. Fetch it first: git fetch origin main" >&2
-  exit 2
-fi
-# Compare against the commit this branch actually forked from, not the tip of
-# main — otherwise every test another branch merged in the meantime reads as a
-# test this branch added.
-if MERGE_BASE="$(git merge-base HEAD "${BASE_SHA}" 2>/dev/null)"; then
-  BASE_SHA="${MERGE_BASE}"
-fi
-
 CACHE_DIR="${REPO_ROOT}/.shux/out/test-inventory"
 mkdir -p "${CACHE_DIR}"
-BASE_LIST="${CACHE_DIR}/${BASE_SHA}.txt"
 
 # `<binary-id>\t<leaf test name>\t<occurrence>`, sorted, one line per test.
 # `cargo nextest list` prints `<binary-id> <module::path::test_name>`;
@@ -79,6 +80,36 @@ list_tests() {
   # not swallowed into an empty list.
   cargo nextest list --workspace --color never | normalize
 }
+
+# `--write-baseline`: publish THIS commit's list so later runs can compare
+# against it without rebuilding it. Shares `list_tests` with the comparison path
+# below deliberately — a second copy of `normalize` would drift, and the drift
+# would read as "every test was removed".
+if [[ "${WRITE_BASELINE}" -eq 1 ]]; then
+  HEAD_SHA="$(git rev-parse HEAD)"
+  OUT="${CACHE_DIR}/${HEAD_SHA}.txt"
+  list_tests >"${OUT}.tmp"
+  if [[ ! -s "${OUT}.tmp" ]]; then
+    rm -f "${OUT}.tmp"
+    echo "error: listed zero tests at HEAD — refusing to publish an empty baseline" >&2
+    exit 2
+  fi
+  mv "${OUT}.tmp" "${OUT}"
+  echo "✓ published baseline for ${HEAD_SHA:0:12}: $(wc -l <"${OUT}" | tr -d ' ') tests"
+  exit 0
+fi
+
+if ! BASE_SHA="$(git rev-parse --verify "${BASE_REF}^{commit}" 2>/dev/null)"; then
+  echo "error: cannot resolve base ref '${BASE_REF}'. Fetch it first: git fetch origin main" >&2
+  exit 2
+fi
+# Compare against the commit this branch actually forked from, not the tip of
+# main — otherwise every test another branch merged in the meantime reads as a
+# test this branch added.
+if MERGE_BASE="$(git merge-base HEAD "${BASE_SHA}" 2>/dev/null)"; then
+  BASE_SHA="${MERGE_BASE}"
+fi
+BASE_LIST="${CACHE_DIR}/${BASE_SHA}.txt"
 
 if [[ ! -s "${BASE_LIST}" ]]; then
   echo "▶ listing tests at base ${BASE_SHA:0:12} (cached afterwards)..."
