@@ -208,12 +208,16 @@ Every feature/fix PR.
     genuine lifecycle. Judge consumer-facing output: `--help` truthfulness, artifact
     exists and reads legibly (OPEN it), errors point at the cause. Reproduce findings
     before believing.
-11. **Start `gh-ghent` when the PR is created.** Load `gh-ghent`;
-    `gh ghent status --pr N --await-review --solo --logs --format json --no-tui` right
-    after `gh pr create`, and after every fix push. Background, never foreground. Don't
-    report a PR done with unread review comments. **`gh-ghent` or `gh` unavailable →
-    monitor by another route, starting the moment the PR exists.** See *Tooling
-    fallbacks*.
+11. **The moment a PR exists, load the `gh-ghent` skill and follow it.** Load it — do
+    not run the command from memory. The skill owns the invocation, the cadence, the
+    decision order and the reply/resolve semantics; recalling it instead of loading it
+    is how half the contract silently gets dropped. It is a loop that runs until the PR
+    is done, not a kickoff — re-enter it after every push. **Reading its output IS the
+    step**: a finished background task is an unread message, not an answer, and a
+    hand-rolled `gh pr checks` poll sees CI while staying blind to review threads.
+    Don't report a PR done with unread review comments. **`gh-ghent` or `gh`
+    unavailable → monitor by another route, starting the moment the PR exists.** See
+    *Tooling fallbacks*.
 12. **Post-merge `curl|sh` smoke.** After merge + semantic-release tags, install via
     `curl -fsSL https://shux.pages.dev/install.sh | sh` and smoke the *published* binary.
 
@@ -233,7 +237,7 @@ Paste into every feature PR:
 - [ ] `make check` (lint + tests)
 - [ ] real-target dogfood — consumer-facing output judged; findings reproduced
 - [ ] visual proof for every (render path × config state) cell, attached as a PR comment (or Claude Artifact link); non-visual change → exemption stated
-- [ ] `gh ghent status --await-review` from PR creation; all threads answered
+- [ ] `gh-ghent` skill loaded at PR creation, re-entered after every push, output read; every thread answered **and** resolved
 - [ ] no screenshots committed unless justified as durable baselines
 ```
 

@@ -128,6 +128,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+
+      # The merge-base test list, published by main's own CI run (step at the
+      # end of this job). Exact key, no `restore-keys`: a prefix fallback could
+      # hand this guard a list from the WRONG commit, and a guard comparing
+      # against the wrong baseline passes while a test is missing. A miss is
+      # safe — the script rebuilds the merge-base exactly as before, just
+      # slower. The key carries everything the list's CONTENT depends on, so a
+      # toolchain or script change can never match a stale blob.
+      - name: Resolve merge-base
+        id: mergebase
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            base="$(git merge-base HEAD "$BASE_REF")"
+          else
+            base=HEAD
+          fi
+          # The `crates/` TREE, not the commit — see check-test-inventory.sh.
+          # semantic-release lands `chore(release) [skip ci]` on main, which
+          # runs no CI and so publishes no baseline; keyed by sha, every PR
+          # forking from main's HEAD would miss. The tree is identical across
+          # every release commit in this repo's history.
+          echo "sha=$(git rev-parse "$base^{commit}:crates")" >> "$GITHUB_OUTPUT"
+          echo "disc=$(rustc --version | tr -d ' /')-$(sha256sum scripts/check-test-inventory.sh | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore test-inventory baseline
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: .shux/out/test-inventory
+          key: test-inventory-v1-${{ steps.mergebase.outputs.disc }}-${{ steps.mergebase.outputs.sha }}
+
       # Same command `make test` runs — same runner, same concurrency, same
       # leak accounting. Issue #130: without the guard here the local/CI
       # asymmetry only moves, from "different runner" to "only one side counts
@@ -145,6 +178,22 @@ jobs:
       - name: Test inventory (no test silently stopped being compiled)
         if: github.event_name == 'pull_request'
         run: make check-test-inventory
+
+      # On main, publish this commit's list so the PRs that fork from it never
+      # rebuild it. The target dir is already warm from `make test` above, so
+      # this is a listing (~2s), not a build. Before this, every PR paid a
+      # from-cold rebuild of the merge-base — 211s on the critical path, which
+      # is what took PR CI from ~7m20s to ~11m30s (issue #157).
+      - name: Publish test-inventory baseline
+        if: github.event_name == 'push'
+        run: bash scripts/check-test-inventory.sh --write-baseline
+
+      - name: Save test-inventory baseline
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: .shux/out/test-inventory
+          key: test-inventory-v1-${{ steps.mergebase.outputs.disc }}-${{ steps.mergebase.outputs.sha }}
       # Belt and braces: this job already runs with CARGO_TERM_COLOR=always, so
       # the step above is the real colour test. This one fails with an
       # explanation instead of a bare parse mismatch, and keeps the local and CI
@@ -220,6 +269,12 @@ jobs:
         run: |
           make test
           make test-doc
+      # Left as `-p shux` deliberately. `--workspace --bin shux` looked like a
+      # free win — locally it reused the test build's artifacts and compiled 0
+      # crates against 10 — but on a clean CI job it still compiled all 8 in
+      # 20.16s (run 31572953492). The local result was an artifact of a target
+      # dir that already held dev-profile units; a fresh job has none. It buys
+      # nothing here and would change feature unification, so it stays.
       # See E2E smoke (ubuntu) note: smoke/integration are correctness
       # tests; release-mode validation lives in release.yml.
       - name: Build shux (debug, for smoke)
@@ -229,10 +284,16 @@ jobs:
       - name: Integration regressions (12 deterministic scenarios)
         run: SHUX="$PWD/target/debug/shux" .shux/scripts/no_leak_guard.sh bash .shux/scripts/integration.sh
 
+  # No `needs:` on purpose. Coverage re-runs the whole suite itself under
+  # instrumentation and consumes nothing from `test-ubuntu` — no artifact, no
+  # target dir, its own rust-cache key. Gating it on that job bought one thing,
+  # not spending a runner when tests already failed, and charged the full
+  # coverage duration to the end of EVERY green run: 227s of pure serialization
+  # in run 31503355437, which started coverage 3s after Test finished. Standard
+  # runners are free on a public repo; wall clock is not (issue #157).
   coverage:
     name: Coverage (llvm-cov)
     if: github.event_name != 'schedule'
-    needs: test-ubuntu
     runs-on: ubuntu-latest
     permissions:
       contents: read
