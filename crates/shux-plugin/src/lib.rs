@@ -46,7 +46,19 @@ use crate::grants::Grants;
 use crate::permissions::{CheckCtx, Decision, TargetOwners, Targets};
 
 pub const PROTOCOL_VERSION: &str = "1";
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a freshly spawned plugin gets to emit its manifest line.
+///
+/// This bounds ONE failure mode and only one: a plugin that is alive, holding
+/// stdout open, and saying nothing. A plugin that dies is caught by EOF on the
+/// next read, immediately and regardless of this value — so a generous budget
+/// here costs nothing in detection speed for the case that actually matters.
+///
+/// It was 5s, which is enormous for writing one line and still not enough on a
+/// busy machine: the process has to be *scheduled* first. Under CI load 4 of 5
+/// runs failed with "manifest not received within 5s" while nothing was wrong
+/// (issue #160). Wall-clock budgets on a shared machine measure the scheduler,
+/// not the plugin.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// SIGKILL a plugin's entire process group.
@@ -273,6 +285,10 @@ pub struct PluginManager {
     /// non-daemon embeddings — denials still audit to the per-plugin log
     /// regardless.
     denial_hook: Arc<tokio::sync::OnceCell<DenialHook>>,
+    /// Handshake budget, defaulting to [`HANDSHAKE_TIMEOUT`]. Overridable so
+    /// the test that asserts the timeout FIRES does not have to sit out the
+    /// production budget to do it.
+    handshake_timeout: Duration,
 }
 
 impl PluginManager {
@@ -292,7 +308,16 @@ impl PluginManager {
             state_root: Arc::new(state_root),
             graph: Arc::new(tokio::sync::OnceCell::new()),
             denial_hook: Arc::new(tokio::sync::OnceCell::new()),
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Override the handshake budget. See [`HANDSHAKE_TIMEOUT`] for why the
+    /// default is generous.
+    #[must_use]
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// Root for grant + audit files (`<state_root>/by-id/<uuid>/`).
@@ -412,7 +437,8 @@ impl PluginManager {
             return Err(e.into());
         }
 
-        let manifest = match tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.next_line()).await {
+        let manifest = match tokio::time::timeout(self.handshake_timeout, reader.next_line()).await
+        {
             // Same trap, and this one has a test: `install_rejects_garbage_manifest`
             // drives a plugin that prints nonsense. `parse_manifest` errors, and a
             // bare `?` would have leaked everything that plugin had forked.
@@ -433,9 +459,10 @@ impl PluginManager {
             }
             Err(_) => {
                 kill_plugin_tree(&mut child).await;
-                return Err(PluginError::HandshakeFailed(
-                    "manifest not received within 5s".into(),
-                ));
+                return Err(PluginError::HandshakeFailed(format!(
+                    "manifest not received within {:?}",
+                    self.handshake_timeout
+                )));
             }
         };
 
