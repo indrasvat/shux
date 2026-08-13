@@ -138,6 +138,36 @@ async fn kill_plugin_tree(child: &mut Child) {
     let _ = child.kill().await;
 }
 
+/// Kills the plugin's process group if dropped while armed.
+///
+/// Every `return` inside `install` already reaps the tree, but a return is not
+/// the only way out: `install` is awaited inside an RPC handler, so a client
+/// that disconnects mid-handshake DROPS the future. Drop runs only tokio's
+/// `kill_on_drop`, which signals the leader and leaves anything it forked
+/// behind. This closes that path, and it matters more the longer the handshake
+/// budget is (issue #160).
+struct PluginGroupGuard {
+    pid: Option<u32>,
+}
+
+impl PluginGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+    /// The plugin is now owned by someone who will reap it.
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for PluginGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            kill_plugin_group(Some(pid));
+        }
+    }
+}
+
 /// Non-awaiting variant, for paths holding a lock or already shutting down.
 fn start_kill_plugin_tree(child: &mut Child) {
     kill_plugin_group(child.id());
@@ -407,6 +437,10 @@ impl PluginManager {
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let pid = child.id();
+        // Armed for the whole handshake. Every early return below reaps the
+        // tree itself and leaves this a no-op; the case it exists for is the
+        // future being DROPPED, which no `return` can cover.
+        let mut cancel_guard = PluginGroupGuard::new(pid);
 
         // Stage 1: handshake. Send plugin.init, read one line from
         // stdout, expect a JSON-RPC response with the manifest.
@@ -673,6 +707,9 @@ impl PluginManager {
 
         inner.insert(manifest.name.clone(), running);
         drop(inner);
+        // Registered: the manager owns the tree now and `kill`/`shutdown` reap
+        // it. Anything before this point is still the guard's responsibility.
+        cancel_guard.disarm();
         info!(plugin = %manifest.name, "plugin installed");
         Ok(info)
     }

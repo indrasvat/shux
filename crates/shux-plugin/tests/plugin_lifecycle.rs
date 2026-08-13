@@ -959,3 +959,42 @@ exit 3
          (took {elapsed:?}); error was: {err}"
     );
 }
+
+/// Cancelling an install must take the plugin's whole process group with it.
+///
+/// Raised by review on #160. `install` is awaited inside an RPC handler, so a
+/// client that disconnects mid-handshake drops the future. Drop only runs
+/// tokio's `kill_on_drop`, which signals the plugin LEADER — descendants it
+/// forked survive, exactly the leak `kill_plugin_tree` exists to prevent on
+/// every other exit path. Widening the handshake budget widens that window, so
+/// the guard has to be cancellation-safe, not timeout-safe.
+#[tokio::test]
+async fn cancelling_an_install_still_reaps_the_plugin_process_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = unique_marker("cancelled-install");
+    // Forks a marked grandchild, then never hands back a manifest. The
+    // grandchild is what `kill_on_drop` alone cannot reach.
+    let forker = format!(
+        r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+exec -a {marker} sleep 120 &
+sleep 120
+"#
+    );
+    let script = write_script(tmp.path(), "forker.sh", &forker);
+
+    let mgr = PluginManager::new(EventBus::new());
+    // Drop the install future mid-handshake, the way a disconnecting client does.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(700),
+        mgr.install(PluginSource::from_path(&script)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the install should not have completed");
+
+    let survivors = wait_for_no_procs(&marker, Duration::from_secs(5)).await;
+    assert_eq!(
+        survivors, 0,
+        "a cancelled install leaked the plugin's forked child"
+    );
+}
