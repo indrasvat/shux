@@ -1,12 +1,19 @@
-VERDICT: FAIL
+VERDICT: PASS
 
 # SOLID VT QA — `optlevel-render-budget`
 
-One P1. The load-bearing question — *is rendering output byte-identical between
+The load-bearing question — *is rendering output byte-identical between
 `[profile.test] opt-level = 0` and `= 1`?* — is **established, with 35 exact
-(0/0) pixel metrics and byte-identical text captures**. The FAIL is not about
-that. It is about the diff delivering its own stated purpose to two of the three
-sites it applies to.
+(0/0) pixel metrics and byte-identical text captures** across the committed VT
+corpus, five recorded rich-TUI PTY streams, and three viewport breakpoints
+driven through a real daemon.
+
+**This report was issued FAIL first.** Round 1 found one P1: the diff re-scoped
+two of the three wall-clock render assertions and left the third asserting the
+PRD 8 ms release budget on the build it had just made unoptimised. That is now
+fixed and re-verified (§11). The verdict below is round 2. The round-1 findings
+are kept in §7 rather than rewritten, because a gate that erases what it caught
+is a gate nobody can audit.
 
 ## 1. Change under audit
 
@@ -47,7 +54,7 @@ The five items the change asked this gate to establish.
 | 2 | Real coloured workloads + real TUIs; truecolor + indexed + basic probes | **PASS** | §5 screenshot matrix; 5 real-TUI raw replays; 16-colour fg/bg, 256-indexed fg/bg, truecolor fg/bg all probed |
 | 3 | Pixel-verify against committed baselines | **PASS** | all 19 corpus renders byte-identical to `.shux/goldens/073-vt-corpus/` at both opt levels |
 | 4 | Zero leaked daemons; isolated short `XDG_RUNTIME_DIR` | **PASS** (with a pre-existing caveat) | §8; audit daemons under `/tmp/qopt/r0`, `/tmp/qopt/r1`, both stopped |
-| 5 | Judge the 100 ms ceiling | **Answered — 100 ms stands** | §6; and see finding F1, which is the reason for the FAIL |
+| 5 | Judge the 100 ms ceiling | **Answered — 100 ms stands** | §6; F1 (§7) was the round-1 FAIL and is now fixed — see §11 |
 
 ## 3. Testing matrix
 
@@ -199,9 +206,9 @@ cargo bench targets exist. That is fine as a direction; it is not fine as a
 justification for deleting the only 8 ms signal while leaving a third assertion
 still claiming to be that signal.
 
-## 7. Findings
+## 7. Findings (as recorded in round 1)
 
-### F1 — P1 — the diff re-scopes 2 of 3 wall-clock render assertions
+### F1 — P1 — **FIXED, re-verified in §11** — the diff re-scoped 2 of 3 wall-clock render assertions
 
 `crates/shux-ui/tests/compositor_tests.rs:57-58`, untouched by this diff, in one
 of the two files this diff edits:
@@ -243,7 +250,7 @@ remedy is to bring the third site in line with the two the diff already changed:
 raise it to the same ceiling and replace the comment with the same explanation.
 Two lines. Then re-run this gate and it flips to PASS.
 
-### F2 — P2 — a shipped doc comment still advertises the 8 ms budget
+### F2 — P3 (downgraded from P2 in round 2) — a shipped doc comment mentions the 8 ms budget
 
 `crates/shux-ui/src/compositor.rs:22-23`:
 
@@ -252,8 +259,11 @@ Two lines. Then re-run this gate and it flips to PASS.
 /// against the PRD section 14.1 budget (p50 <= 8ms).
 ```
 
-Non-blocking on its own; worth folding into the F1 fix so the file tells one
-story. Flagged by the implementation council.
+Still present at the round-2 state, deliberately. **Downgraded to P3 and
+explicitly not blocking**, on re-reading: this describes what the struct is
+*for*, and `RenderStats` genuinely is the instrument you would monitor that
+budget with. It does not claim any test enforces it, which was the actual defect
+in F1. Leave it or reword it; either is defensible.
 
 ### F3 — P2 — `make test` exits 2 on the leak guard — **pre-existing, not this diff**
 
@@ -334,3 +344,78 @@ today, but nothing in the tree enforces it and a `push:`-triggered 90-minute
   and four pre-existing `target/debug/shux __daemon` processes on temp sockets
   that were not started by this audit. F3's leak-guard finding is A/B'd against
   that noise; nothing else in this report depends on process counts.
+
+## 11. Round 2 — F1 re-verification
+
+Scope of this round, deliberately narrow: **F1 only.** A test-threshold and
+comment edit cannot move a pixel, so §4's byte-identity work and the 35 metrics
+are not invalidated by it and were not redone. What changed is confined to two
+`assert!` bounds and three comments, which the diff below shows in full.
+
+### The fix, read rather than taken on trust
+
+`git diff` against the round-1 state, `crates/` only — two files, `+6 -4`, no
+executable statement outside a test:
+
+- `crates/shux-ui/tests/compositor_tests.rs:54-59` — `assert!(stats.total_time_us
+  < 8000)` → `< 100_000`, and the comment "Render time should comfortably beat
+  the PRD 8ms budget" → "Catastrophic-regression guard, not the PRD's 8ms budget
+  — see the note on `test_performance_80x24_under_budget`". This is exactly the
+  remedy F1 asked for: the third site now says what the other two say.
+- `crates/shux-ui/src/compositor.rs:1281-1289` (inside `#[cfg(test)] mod tests`,
+  which opens at line 726) — the comment no longer promises "the real budget
+  belongs to a release-profile bench". It now states that nothing asserts the
+  8 ms budget any more and that doing so needs a bench which does not exist yet.
+  Correct: `make bench` reports no cargo bench targets, so the old wording
+  pointed at nothing. It also records the measured ~4.2x opt0/opt1 ratio from §6.
+
+### Consistency, checked mechanically
+
+```
+$ grep -rn "total_time_us <" crates/ --include=*.rs
+crates/shux-ui/tests/compositor_tests.rs:59:    assert!(stats.total_time_us < 100_000);
+crates/shux-ui/tests/compositor_tests.rs:307:        stats.total_time_us < 100_000,
+crates/shux-ui/src/compositor.rs:1302:            stats.total_time_us < 100_000,
+```
+
+Three sites, three identical ceilings, three comments telling the same story. No
+fourth site appeared.
+
+### Green at both opt levels
+
+| Run | Result |
+|---|---|
+| `make test-ui` (lib, opt-level 0) | 227 run / **227 passed** / 0 skipped |
+| `cargo nextest run -p shux-ui`, `CARGO_PROFILE_TEST_OPT_LEVEL=0` | 235 run / **235 passed** / 0 skipped |
+| `cargo nextest run -p shux-ui`, `CARGO_PROFILE_TEST_OPT_LEVEL=1` | 235 run / **235 passed** / 0 skipped |
+| the three wall-clock tests alone, opt0, **×5 reps** | 3/3 passed every rep |
+
+Identical counts at both opt levels, so nothing stopped being compiled. The five
+reps are there because a wall-clock assertion that passes once has demonstrated
+very little; §6's measured worst case at opt0 on this machine is 868 us against
+a 100 000 us bound, ~115x headroom locally and ~9.65x against the worst CI
+observation.
+
+### What this PASS is pinned to
+
+The fix arrived **uncommitted** in the shared checkout. `scripts/check-vt-qa.sh`
+deliberately reads the committed range plus the index and ignores the unstaged
+worktree, so this verdict is pinned to exact content, not to "whatever is in the
+tree later":
+
+```
+473452f7d62886deddb1c63b335743d96bd18acb9d1f55f1655ded46ce494c83  crates/shux-ui/src/compositor.rs
+cb032b038a87fe977f2dee2930b10fdabd9b46f91ec6642ac3dd869c9f90a9e7  crates/shux-ui/tests/compositor_tests.rs
+```
+
+Commit those two blobs unchanged and the verdict holds. Edit either before
+committing and it does not — re-run the gate.
+
+### Outstanding after round 2
+
+Nothing blocking. F2 is downgraded to P3 and explained above. F3 (`make test`
+exits 2 on an orphaned `sleep 900`) still stands and still reproduces at
+opt-level 1, so it remains **pre-existing and out of this change's scope** —
+but it is real, it is red on this machine today, and it wants an owner. F5 (the
+temporary probe workflow) must actually be deleted before merge; nothing in the
+tree enforces that.

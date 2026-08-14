@@ -1,7 +1,7 @@
 {
   "gate": "shux-vt-solid-qa",
   "scope": "optlevel-render-budget",
-  "verdict": "FAIL",
+  "verdict": "PASS",
   "generated_at_utc": "2026-08-14T07:32:25.954602+00:00",
   "branch": "perf/optlevel-probe",
   "head_commit_at_audit": "25a27714e5c1cd278e9e4aaeeba8a38c5e25dac7",
@@ -71,15 +71,17 @@
     {
       "id": "F1",
       "severity": "P1",
-      "blocking": true,
+      "blocking": false,
       "title": "crates/shux-ui/tests/compositor_tests.rs:58 still asserts total_time_us < 8000 against the PRD 8ms budget on the now-unoptimised test build",
-      "remedy": "raise the third site to the same ceiling and give it the same comment; do NOT drop opt-level = 0 \u2014 byte-identity is proven"
+      "remedy": "raise the third site to the same ceiling and give it the same comment; do NOT drop opt-level = 0 \u2014 byte-identity is proven",
+      "status": "fixed and re-verified in round 2"
     },
     {
       "id": "F2",
-      "severity": "P2",
+      "severity": "P3",
       "blocking": false,
-      "title": "crates/shux-ui/src/compositor.rs:22-23 RenderStats doc still advertises the PRD p50 <= 8ms budget"
+      "title": "crates/shux-ui/src/compositor.rs:22-23 RenderStats doc still advertises the PRD p50 <= 8ms budget",
+      "note": "downgraded in round 2: the doc describes what RenderStats is FOR and claims no test enforces the budget; not blocking"
     },
     {
       "id": "F3",
@@ -112,5 +114,39 @@
     "audit_sessions_killed": true,
     "council_worktree_removed": true,
     "shared_checkout_head_moved": false
-  }
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "verdict": "FAIL",
+      "blocking_finding": "F1",
+      "audited_commit": "25a2771"
+    },
+    {
+      "round": 2,
+      "verdict": "PASS",
+      "scope": "F1 re-verification only",
+      "audited_state": "uncommitted working tree on perf/optlevel-probe, pinned by blob sha256 below",
+      "why_byte_identity_not_redone": "the round-2 delta is two assert! bounds and three comments (+6 -4, no executable statement outside a test); it cannot move a cell or a pixel, so the 35 metrics from round 1 still describe the rendering under audit"
+    }
+  ],
+  "round2_pinned_blobs": {
+    "crates/shux-ui/src/compositor.rs": "473452f7d62886deddb1c63b335743d96bd18acb9d1f55f1655ded46ce494c83",
+    "crates/shux-ui/tests/compositor_tests.rs": "cb032b038a87fe977f2dee2930b10fdabd9b46f91ec6642ac3dd869c9f90a9e7"
+  },
+  "round2_verification": {
+    "wall_clock_sites": [
+      "crates/shux-ui/tests/compositor_tests.rs:59 -> 100_000",
+      "crates/shux-ui/tests/compositor_tests.rs:307 -> 100_000",
+      "crates/shux-ui/src/compositor.rs:1302 -> 100_000"
+    ],
+    "make test-ui (opt0)": "227 run / 227 passed / 0 skipped",
+    "cargo nextest run -p shux-ui (opt0)": "235 run / 235 passed / 0 skipped",
+    "cargo nextest run -p shux-ui (opt1)": "235 run / 235 passed / 0 skipped",
+    "three wall-clock tests, opt0, 5 reps": "3/3 passed every rep"
+  },
+  "outstanding_after_round2": [
+    "F3 (P2, pre-existing, reproduces at opt-level 1): make test exits 2 via no_leak_guard.sh on an orphaned `sleep 900` pane child \u2014 needs an owner, out of this change's scope",
+    "F5 (P3): .github/workflows/optlevel-probe.yml must actually be deleted before merge; nothing in the tree enforces it"
+  ]
 }
