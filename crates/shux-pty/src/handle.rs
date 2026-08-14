@@ -11,6 +11,20 @@ use nix::pty::{Winsize, openpty};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info};
 
+/// How often a read that is holding the slave fd open checks whether the child
+/// has exited — one `waitpid(WNOHANG)` plus one `FIONREAD` per tick.
+///
+/// Tight while the pane is young and slack afterwards, because the two costs
+/// pull in opposite directions and land on different panes. The tick bounds
+/// how long after a child's exit the pane reaches EOF, and the panes that care
+/// are the short-lived ones an agent runs and immediately captures — they are
+/// gone inside the first seconds. A shell someone has had open all afternoon
+/// cares about idle wakeups instead, and cannot tell 20ms from 200ms when it
+/// finally exits.
+const SLAVE_RELEASE_POLL_EAGER: std::time::Duration = std::time::Duration::from_millis(20);
+const SLAVE_RELEASE_POLL_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+const SLAVE_RELEASE_EAGER_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
 const PANE_TERM_CANDIDATES: &[&str] = &["tmux-256color", "screen-256color", "xterm-256color"];
 const DEFAULT_TERMINFO_DIRS: &[&str] = &[
     "/etc/terminfo",
@@ -132,13 +146,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    // ── the drain loop at child exit (issue #162) ─────────────────────
+    //
+    // The sequences a pane's last read actually sees. These run the same code
+    // on every host, which is the point: the macOS-only arm is what lost a
+    // finished pane's output, and no Linux runner could reach it.
+
+    /// `read` returning a scripted sequence, one call at a time.
+    fn scripted(
+        steps: Vec<nix::Result<&'static [u8]>>,
+    ) -> impl FnMut(&mut [u8]) -> nix::Result<usize> {
+        let mut steps = steps.into_iter();
+        move |dst: &mut [u8]| match steps.next() {
+            Some(Ok(bytes)) => {
+                let n = bytes.len().min(dst.len());
+                dst[..n].copy_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(nix::errno::Errno::EAGAIN),
+        }
+    }
+
+    #[test]
+    fn eio_is_pty_eof_on_every_unix() {
+        // Not just Linux: a macOS pane exit lands here too.
+        assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
+        assert!(!is_pty_eof_errno(nix::errno::Errno::EAGAIN));
+    }
+
+    /// Kept under its original name so `check-test-inventory` sees no test
+    /// disappear. It asserted a platform gate that no longer exists; what
+    /// survives of it is the half that was always true, and the general
+    /// contract now lives in `eio_is_pty_eof_on_every_unix`.
     #[test]
     fn linux_eio_is_treated_as_pty_eof() {
-        #[cfg(target_os = "linux")]
         assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
+    }
 
-        #[cfg(not(target_os = "linux"))]
-        assert!(!is_pty_eof_errno(nix::errno::Errno::EIO));
+    #[test]
+    fn the_last_bytes_before_eof_survive() {
+        let mut buf = [0u8; 64];
+        let n = drain_with(
+            &mut buf,
+            scripted(vec![Ok(b"TRUECOLOR\n"), Err(nix::errno::Errno::EIO)]),
+        )
+        .expect("EOF after a short read is not an error");
+        assert_eq!(&buf[..n], b"TRUECOLOR\n");
+    }
+
+    #[test]
+    fn a_read_error_never_eats_the_bytes_already_read() {
+        // Any failing errno, not just the EOF one: the caller gets the data
+        // now and the error on the next call.
+        for errno in [nix::errno::Errno::ENXIO, nix::errno::Errno::EBADF] {
+            let mut buf = [0u8; 64];
+            let n = drain_with(&mut buf, scripted(vec![Ok(b"TRUECOLOR\n"), Err(errno)]))
+                .unwrap_or_else(|e| panic!("{errno:?} after a short read dropped the bytes: {e}"));
+            assert_eq!(&buf[..n], b"TRUECOLOR\n");
+        }
+    }
+
+    #[test]
+    fn an_error_with_nothing_buffered_is_still_an_error() {
+        let mut buf = [0u8; 64];
+        let err = drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::ENXIO)]))
+            .expect_err("a bare read failure must surface");
+        assert_eq!(err.raw_os_error(), Some(nix::errno::Errno::ENXIO as i32));
+
+        // …and EOF with nothing buffered is a clean zero, not an error.
+        assert_eq!(
+            drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::EIO)])).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_full_buffer_stops_the_drain() {
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            drain_with(&mut buf, scripted(vec![Ok(b"ab"), Ok(b"cd"), Ok(b"ef")])).unwrap(),
+            4
+        );
+        assert_eq!(&buf, b"abcd");
+    }
+
+    #[test]
+    fn nothing_readable_yet_is_would_block() {
+        let mut buf = [0u8; 64];
+        let err = drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::EAGAIN)]))
+            .expect_err("an empty nonblocking read must not look like EOF");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     }
 }
 
@@ -229,8 +327,20 @@ fn default_shell_argv(shell_env: Option<&str>) -> Vec<String> {
 /// A handle to a running PTY child process.
 pub struct PtyHandle {
     pty: AsyncFd<OwnedFd>,
+    /// The parent's own slave fd, held open for as long as the child lives.
+    ///
+    /// A tty discards whatever is still queued when its **last** slave fd
+    /// closes, so a child that writes once and exits can have its final bytes
+    /// destroyed before the reader has run at all — the pane then reports its
+    /// exit status against an empty grid (issue #162). Holding one open means
+    /// the child's exit is not the last close. The pane task drops it via
+    /// [`PtyHandle::release_slave`] once the child is reaped *and* the master
+    /// has nothing queued, which is what lets the read reach EOF.
+    slave: Option<OwnedFd>,
     child: Child,
     pid: u32,
+    /// When the child was spawned — only used to slacken the exit poll above.
+    spawned_at: std::time::Instant,
     initial_cwd: PathBuf,
     size: PtySize,
 }
@@ -296,15 +406,30 @@ fn resolve_pane_term() -> &'static str {
     resolve_pane_term_from_roots(&terminfo_roots())
 }
 
+/// `EIO` on a PTY master read is the master's EOF: the last slave fd closed,
+/// i.e. the child and everything holding its terminal are gone.
+///
+/// Every unix reports it that way, not just Linux. Gating it to Linux left
+/// macOS taking the read-*error* path on every pane exit, which — with the
+/// pre-#162 drain below — threw away the bytes the same call had already read.
+/// A pane that printed and exited then reported its exit status with an empty
+/// grid, so an agent's `PaneExited` → `pane.capture` loop captured nothing.
 fn is_pty_eof_errno(errno: nix::errno::Errno) -> bool {
+    errno == nix::errno::Errno::EIO
+}
+
+/// `si_pid`, which libc exposes as a plain field on BSD/macOS and behind an
+/// accessor on Linux. Zero means `waitid` found nothing waitable.
+fn siginfo_pid(info: &nix::libc::siginfo_t) -> nix::libc::pid_t {
     #[cfg(target_os = "linux")]
     {
-        errno == nix::errno::Errno::EIO
+        // SAFETY: reading the pid of a siginfo `waitid` just filled in (or of
+        // the zeroed struct it left untouched) is always valid.
+        unsafe { info.si_pid() }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = errno;
-        false
+        info.si_pid
     }
 }
 
@@ -312,9 +437,23 @@ fn drain_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> 
     // SAFETY: the fd is owned by self.pty and remains valid for the duration
     // of this synchronous nonblocking read.
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    drain_with(buf, |dst| nix::unistd::read(fd, dst))
+}
+
+/// The drain loop, over an injectable read so the exit-time errno sequences
+/// can be tested on any host (issue #162).
+///
+/// Bytes already in `buf` are never dropped: an error that arrives after a
+/// short read is reported on the *next* call, once the caller has the data.
+/// Read failures are sticky — the fd stays broken — so nothing is lost by
+/// deferring one, while a discarded read is gone for good.
+fn drain_with<F>(buf: &mut [u8], mut read: F) -> std::io::Result<usize>
+where
+    F: FnMut(&mut [u8]) -> nix::Result<usize>,
+{
     let mut total = 0usize;
     loop {
-        match nix::unistd::read(fd, &mut buf[total..]) {
+        match read(&mut buf[total..]) {
             Ok(0) => return Ok(total),
             Ok(n) => {
                 total += n;
@@ -330,7 +469,12 @@ fn drain_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> 
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) if is_pty_eof_errno(e) => return Ok(total),
-            Err(e) => return Err(std::io::Error::from(e)),
+            Err(e) => {
+                if total > 0 {
+                    return Ok(total);
+                }
+                return Err(std::io::Error::from(e));
+            }
         }
     }
 }
@@ -449,8 +593,11 @@ impl PtyHandle {
 
         Ok(Self {
             pty,
+            // Kept, not dropped: see the field's docs (issue #162).
+            slave: Some(pty_pair.slave),
             child,
             pid,
+            spawned_at: std::time::Instant::now(),
             initial_cwd: config.cwd.clone(),
             size: config.size,
         })
@@ -469,11 +616,44 @@ impl PtyHandle {
     }
 
     /// Read bytes from the PTY (child's stdout/stderr).
+    ///
+    /// `Ok(0)` is EOF, as it always was. Reaching it now includes dropping the
+    /// slave fd this handle holds on the child's behalf (issue #162) — done
+    /// here, inside the read, so every caller keeps the plain read-until-EOF
+    /// contract and none has to know about the fd at all.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, PtyError> {
         if buf.is_empty() {
             return Ok(0);
         }
         loop {
+            if self.slave.is_some() {
+                // While we hold a slave open the master cannot report EOF, so
+                // the wait for readability is raced against a poll for the
+                // child's exit. Biased: queued output is always drained first,
+                // and the release only happens with the queue empty, because
+                // on BSD/macOS that close discards whatever is still in it.
+                let poll = self.slave_release_poll();
+                let exit_tick = tokio::select! {
+                    biased;
+
+                    guard = self.pty.readable_mut() => {
+                        let mut guard = guard.map_err(PtyError::Read)?;
+                        match guard.try_io(|inner| drain_read(inner.get_ref().as_raw_fd(), buf)) {
+                            Ok(result) => return result.map_err(PtyError::Read),
+                            Err(_would_block) => false,
+                        }
+                    }
+                    _ = tokio::time::sleep(poll) => true,
+                };
+                if exit_tick
+                    && self.child_exited_unreaped()
+                    && self.pending_input_bytes().unwrap_or(0) == 0
+                {
+                    self.release_slave();
+                }
+                continue;
+            }
+
             let mut guard = self.pty.readable_mut().await.map_err(PtyError::Read)?;
             match guard.try_io(|inner| drain_read(inner.get_ref().as_raw_fd(), buf)) {
                 Ok(result) => return result.map_err(PtyError::Read),
@@ -551,6 +731,79 @@ impl PtyHandle {
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, PtyError> {
         self.child.try_wait().map_err(PtyError::Child)
+    }
+
+    /// Bytes the master can read right now.
+    ///
+    /// Used to decide when releasing the retained slave fd is safe: at zero
+    /// there is nothing left for the close to discard.
+    fn pending_input_bytes(&self) -> Result<usize, PtyError> {
+        let mut n: nix::libc::c_int = 0;
+        // SAFETY: `self.pty` owns the fd for the duration of the call, and
+        // FIONREAD writes a single c_int through the pointer we pass.
+        let rc = unsafe {
+            nix::libc::ioctl(
+                self.pty.get_ref().as_raw_fd(),
+                nix::libc::FIONREAD,
+                &mut n as *mut nix::libc::c_int,
+            )
+        };
+        if rc == -1 {
+            return Err(PtyError::Read(std::io::Error::last_os_error()));
+        }
+        Ok(n.max(0) as usize)
+    }
+
+    /// Has the child exited? Answered **without reaping it**.
+    ///
+    /// `Child::try_wait` would reap, and reaping frees the pid — which is also
+    /// this pane's process *group* id, since the child is a session leader.
+    /// A pane whose child exits while a descendant keeps the tty open is still
+    /// a live group that teardown has to be able to signal, and a freed pgid is
+    /// one an unrelated process can be handed. `WNOWAIT` leaves the zombie in
+    /// place, so the group stays allocated and the real reap stays exactly
+    /// where it always was: `wait()`, after the read loop ends.
+    fn child_exited_unreaped(&self) -> bool {
+        // libc directly, because nix's `waitid` wrapper is not compiled for
+        // Apple targets — and macOS is the platform this whole fix exists for.
+        // POSIX idiom: zero the struct first, since a `WNOHANG` call that finds
+        // nothing waitable returns 0 and leaves `si_pid` untouched.
+        let mut info: nix::libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, correctly-typed `siginfo_t` for the whole
+        // call, and it is the only thing `waitid` writes through the pointer.
+        let rc = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                self.pid as nix::libc::id_t,
+                &mut info,
+                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+            )
+        };
+        if rc == -1 {
+            // ECHILD: not ours to wait on any more, so it is certainly gone.
+            let e = std::io::Error::last_os_error();
+            debug!(pid = self.pid, error = %e, "PTY child waitid failed");
+            return true;
+        }
+        siginfo_pid(&info) != 0
+    }
+
+    /// The current exit-poll interval — see the constants.
+    fn slave_release_poll(&self) -> std::time::Duration {
+        if self.spawned_at.elapsed() < SLAVE_RELEASE_EAGER_FOR {
+            SLAVE_RELEASE_POLL_EAGER
+        } else {
+            SLAVE_RELEASE_POLL_IDLE
+        }
+    }
+
+    /// Drop the parent's slave fd, so a master read can reach EOF.
+    ///
+    /// Only safe once the child is reaped and [`Self::pending_input_bytes`] is
+    /// zero: on BSD/macOS this close is what discards anything still queued.
+    /// Idempotent.
+    fn release_slave(&mut self) {
+        self.slave.take();
     }
 
     /// Ask the whole PTY process group to terminate.

@@ -176,6 +176,30 @@ impl Env {
         }
     }
 
+    /// Same wait, scoped to one window — so a rep in a loop cannot be satisfied
+    /// by an earlier rep's corpse.
+    #[track_caller]
+    fn wait_for_exited_pane_in_window(&self, session: &str, window: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let panes = self.json(&["pane", "list", "-s", session, "-w", window]);
+            if panes
+                .as_array()
+                .expect("panes")
+                .iter()
+                .any(|p| p["exit_status"].is_number())
+            {
+                return panes;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane in window {window:?} never reported an exit_status \
+                 within 20s; panes were:\n{panes:#}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn capture(&self, session: &str, pane: &str) -> String {
         self.ok(&["pane", "capture", "-s", session, "-p", pane])
     }
@@ -1756,9 +1780,129 @@ fn the_focus_rescue_accepts_a_sibling_that_has_already_finished() {
     for needle in ["TRUECOLOR", "INDEXED", "BASIC"] {
         assert!(
             text.contains(needle),
-            "the finished pane's retained output is missing {needle}:\n{text}"
+            "the finished pane's retained output is missing {needle}:\n{text}\n\
+             — by explicit pane id instead:\n{}\n— panes: {panes}",
+            // Same grid, addressed directly: this separates "the focused pane
+            // is the wrong pane" from "the grid is empty", which read the same
+            // in the message above (issue #162).
+            env.ok(&["pane", "capture", "-s", "finished", "-p", &finished])
         );
     }
+}
+
+/// Issue #162: `PaneExited` is the "done" signal every agent gates on, so the
+/// exit status must never be visible before the pane's own output is.
+///
+/// The bytes were lost in the drain loop, which threw away everything it had
+/// already read when the read that followed failed — and on macOS the PTY
+/// master's EOF (`EIO`) *was* that failing read. The pane then reported
+/// `exit_status` with an empty grid. Note the deliberate absence of `PARK`:
+/// this command exits, which is the case under test.
+#[test]
+fn an_exited_pane_answers_capture_with_what_it_printed() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "exited", "-d", "--", "sleep", "900"]);
+    env.sessions.push("exited".to_string());
+
+    // A burst first, the colour probe last, so the assertion reads the final
+    // chunk — the one that shares its read with the child's exit.
+    env.ok(&[
+        "window",
+        "create",
+        "-s",
+        "exited",
+        "-n",
+        "burst",
+        "--cmd",
+        &format!("seq 1 500; printf '{COLOUR_PROBE}\\n'"),
+    ]);
+
+    let panes = env.wait_for_exited_pane("exited", "seq 1 500");
+    let pane = panes
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|p| p["exit_status"].is_number())
+        .expect("the burst pane should have exited")["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // No settle, no content wait: the exit status is the only signal, exactly
+    // as `events.watch` → `PaneExited` → `pane.capture` gives an agent.
+    let text = env.ok(&["pane", "capture", "-s", "exited", "-p", &pane]);
+    for needle in ["TRUECOLOR", "INDEXED", "BASIC"] {
+        assert!(
+            text.contains(needle),
+            "the exited pane reported its status with {needle} missing from its screen:\n{text}"
+        );
+    }
+}
+
+/// The same contract for the smallest possible command: one write, then exit.
+///
+/// `an_exited_pane_answers_capture_with_what_it_printed` bursts 500 lines
+/// first, which keeps the reader awake and draining. `/bin/cat` on a 60-byte
+/// file — the shape in issue #162 — can be reaped before the reader has run at
+/// all, so it exercises a different half of the same guarantee. Captured by
+/// explicit pane id, so a focus-resolution bug cannot be mistaken for a lost
+/// grid.
+#[test]
+fn a_pane_that_prints_once_and_exits_keeps_its_screen() {
+    let mut env = Env::new();
+    let colour = env.work().join("once.txt");
+    std::fs::write(
+        &colour,
+        "\u{1b}[38;2;120;220;180mTRUECOLOR\u{1b}[0m \u{1b}[38;5;208mINDEXED\u{1b}[0m \u{1b}[34mBASIC\u{1b}[0m\n",
+    )
+    .unwrap();
+    env.ok(&["session", "create", "once", "-d", "--", "sleep", "900"]);
+    env.sessions.push("once".to_string());
+
+    // Repeated, because this is a race and one green pane proves nothing: the
+    // defect ran at roughly 1 in 5 on a loaded macOS runner, so a single
+    // attempt passes most of the time with the bug fully present.
+    const REPS: usize = 20;
+    let mut empty = Vec::new();
+    for rep in 0..REPS {
+        let win = format!("cat{rep}");
+        env.ok(&[
+            "window",
+            "create",
+            "-s",
+            "once",
+            "-n",
+            &win,
+            "--",
+            "/bin/cat",
+            colour.to_str().unwrap(),
+        ]);
+        let panes = env.wait_for_exited_pane_in_window("once", &win);
+        let pane = panes
+            .as_array()
+            .expect("panes")
+            .iter()
+            .find(|p| p["exit_status"].is_number())
+            .expect("the cat pane should have exited")["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let text = env.ok(&["pane", "capture", "-s", "once", "-p", &pane]);
+        if !["TRUECOLOR", "INDEXED", "BASIC"]
+            .iter()
+            .all(|n| text.contains(n))
+        {
+            empty.push(format!("rep {rep}: [{}]", text.replace('\n', "")));
+        }
+    }
+    assert!(
+        empty.is_empty(),
+        "{}/{REPS} panes that printed once reported an exit status with the \
+         output missing:\n{}",
+        empty.len(),
+        empty.join("\n")
+    );
 }
 
 /// Round three's ignorable-codepoint rule stripped the variation selectors,

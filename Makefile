@@ -134,6 +134,14 @@ setup-bench: ## Install hyperfine, the benchmark harness `make bench-test-suite`
 check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's environment (colour on)
 	@bash scripts/check-ci-parity.sh
 
+.PHONY: check-darwin
+check-darwin: ## Type-check the workspace for macOS — catches cfg-gated APIs a Linux build never sees
+	@echo "$(COLOR_BLUE)▶ Cross-checking aarch64-apple-darwin...$(COLOR_RESET)"
+	@rustup target list --installed | grep -qx aarch64-apple-darwin \
+	  || rustup target add aarch64-apple-darwin
+	@cargo check --workspace --all-targets --target aarch64-apple-darwin --color never
+	@echo "$(COLOR_GREEN)✓ macOS type-check passed$(COLOR_RESET)"
+
 .PHONY: check-test-groups
 check-test-groups: nextest-ready ## Assert every nextest test-group still matches the tests it bounds
 	@bash scripts/check-test-groups.sh
@@ -203,6 +211,22 @@ test-pane-io: nextest-ready ## Run pane I/O integration tests; optionally pass F
 	@echo "$(COLOR_BLUE)▶ Running pane I/O integration tests...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_io_integration $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
+
+.PHONY: test-pane-command
+test-pane-command: nextest-ready ## Run pane command / exited-pane e2e tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running pane command e2e tests...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_command_e2e $(FILTER)
+	@echo "$(COLOR_GREEN)✓ Pane command e2e tests passed$(COLOR_RESET)"
+
+.PHONY: test-exit-capture-evidence
+test-exit-capture-evidence: build ## Issue #162 exit-then-capture A/B; pass BASE_BIN=<macOS-arm binary> to also record the pre-fix arm
+	@echo "$(COLOR_BLUE)▶ issue-162 exit-then-capture (fixed binary)...$(COLOR_RESET)"
+	@SHUX_BIN=$(CURDIR)/target/debug/shux LABEL=after .shux/scripts/issue_162_evidence.sh
+	@if [ -n "$(BASE_BIN)" ]; then \
+	  echo "$(COLOR_BLUE)▶ issue-162 exit-then-capture (pre-fix binary)...$(COLOR_RESET)"; \
+	  SHUX_BIN=$(BASE_BIN) LABEL=before EXPECT_DEFECT=1 .shux/scripts/issue_162_evidence.sh; \
+	fi
+	@echo "$(COLOR_GREEN)✓ issue-162 evidence recorded under .shux/out/issue-162/$(COLOR_RESET)"
 
 .PHONY: test-id-refs-evidence
 test-id-refs-evidence: build ## Issue #120 A/B round trip against the real binary; pass BASE_BIN=<path> to also record the pre-fix arm
