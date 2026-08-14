@@ -176,6 +176,30 @@ impl Env {
         }
     }
 
+    /// Same wait, scoped to one window — so a rep in a loop cannot be satisfied
+    /// by an earlier rep's corpse.
+    #[track_caller]
+    fn wait_for_exited_pane_in_window(&self, session: &str, window: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let panes = self.json(&["pane", "list", "-s", session, "-w", window]);
+            if panes
+                .as_array()
+                .expect("panes")
+                .iter()
+                .any(|p| p["exit_status"].is_number())
+            {
+                return panes;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane in window {window:?} never reported an exit_status \
+                 within 20s; panes were:\n{panes:#}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn capture(&self, session: &str, pane: &str) -> String {
         self.ok(&["pane", "capture", "-s", session, "-p", pane])
     }
@@ -1835,37 +1859,50 @@ fn a_pane_that_prints_once_and_exits_keeps_its_screen() {
     env.ok(&["session", "create", "once", "-d", "--", "sleep", "900"]);
     env.sessions.push("once".to_string());
 
-    // No shell in the way: `/bin/cat` writes once and is gone.
-    env.ok(&[
-        "window",
-        "create",
-        "-s",
-        "once",
-        "-n",
-        "cat",
-        "--",
-        "/bin/cat",
-        colour.to_str().unwrap(),
-    ]);
+    // Repeated, because this is a race and one green pane proves nothing: the
+    // defect ran at roughly 1 in 5 on a loaded macOS runner, so a single
+    // attempt passes most of the time with the bug fully present.
+    const REPS: usize = 20;
+    let mut empty = Vec::new();
+    for rep in 0..REPS {
+        let win = format!("cat{rep}");
+        env.ok(&[
+            "window",
+            "create",
+            "-s",
+            "once",
+            "-n",
+            &win,
+            "--",
+            "/bin/cat",
+            colour.to_str().unwrap(),
+        ]);
+        let panes = env.wait_for_exited_pane_in_window("once", &win);
+        let pane = panes
+            .as_array()
+            .expect("panes")
+            .iter()
+            .find(|p| p["exit_status"].is_number())
+            .expect("the cat pane should have exited")["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
-    let panes = env.wait_for_exited_pane("once", "/bin/cat");
-    let pane = panes
-        .as_array()
-        .expect("panes")
-        .iter()
-        .find(|p| p["exit_status"].is_number() && p["command"].to_string().contains("/bin/cat"))
-        .expect("the cat pane should have exited")["id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-
-    let text = env.ok(&["pane", "capture", "-s", "once", "-p", &pane]);
-    for needle in ["TRUECOLOR", "INDEXED", "BASIC"] {
-        assert!(
-            text.contains(needle),
-            "a pane that printed once reported its exit status with {needle} missing:\n{text}"
-        );
+        let text = env.ok(&["pane", "capture", "-s", "once", "-p", &pane]);
+        if !["TRUECOLOR", "INDEXED", "BASIC"]
+            .iter()
+            .all(|n| text.contains(n))
+        {
+            empty.push(format!("rep {rep}: [{}]", text.replace('\n', "")));
+        }
     }
+    assert!(
+        empty.is_empty(),
+        "{}/{REPS} panes that printed once reported an exit status with the \
+         output missing:\n{}",
+        empty.len(),
+        empty.join("\n")
+    );
 }
 
 /// Round three's ignorable-codepoint rule stripped the variation selectors,

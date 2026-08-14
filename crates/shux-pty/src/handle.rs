@@ -11,6 +11,20 @@ use nix::pty::{Winsize, openpty};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info};
 
+/// How often a read that is holding the slave fd open checks whether the child
+/// has exited — one `waitpid(WNOHANG)` plus one `FIONREAD` per tick.
+///
+/// Tight while the pane is young and slack afterwards, because the two costs
+/// pull in opposite directions and land on different panes. The tick bounds
+/// how long after a child's exit the pane reaches EOF, and the panes that care
+/// are the short-lived ones an agent runs and immediately captures — they are
+/// gone inside the first seconds. A shell someone has had open all afternoon
+/// cares about idle wakeups instead, and cannot tell 20ms from 200ms when it
+/// finally exits.
+const SLAVE_RELEASE_POLL_EAGER: std::time::Duration = std::time::Duration::from_millis(20);
+const SLAVE_RELEASE_POLL_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+const SLAVE_RELEASE_EAGER_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
 const PANE_TERM_CANDIDATES: &[&str] = &["tmux-256color", "screen-256color", "xterm-256color"];
 const DEFAULT_TERMINFO_DIRS: &[&str] = &[
     "/etc/terminfo",
@@ -313,8 +327,20 @@ fn default_shell_argv(shell_env: Option<&str>) -> Vec<String> {
 /// A handle to a running PTY child process.
 pub struct PtyHandle {
     pty: AsyncFd<OwnedFd>,
+    /// The parent's own slave fd, held open for as long as the child lives.
+    ///
+    /// A tty discards whatever is still queued when its **last** slave fd
+    /// closes, so a child that writes once and exits can have its final bytes
+    /// destroyed before the reader has run at all — the pane then reports its
+    /// exit status against an empty grid (issue #162). Holding one open means
+    /// the child's exit is not the last close. The pane task drops it via
+    /// [`PtyHandle::release_slave`] once the child is reaped *and* the master
+    /// has nothing queued, which is what lets the read reach EOF.
+    slave: Option<OwnedFd>,
     child: Child,
     pid: u32,
+    /// When the child was spawned — only used to slacken the exit poll above.
+    spawned_at: std::time::Instant,
     initial_cwd: PathBuf,
     size: PtySize,
 }
@@ -552,8 +578,11 @@ impl PtyHandle {
 
         Ok(Self {
             pty,
+            // Kept, not dropped: see the field's docs (issue #162).
+            slave: Some(pty_pair.slave),
             child,
             pid,
+            spawned_at: std::time::Instant::now(),
             initial_cwd: config.cwd.clone(),
             size: config.size,
         })
@@ -572,11 +601,50 @@ impl PtyHandle {
     }
 
     /// Read bytes from the PTY (child's stdout/stderr).
+    ///
+    /// `Ok(0)` is EOF, as it always was. Reaching it now includes dropping the
+    /// slave fd this handle holds on the child's behalf (issue #162) — done
+    /// here, inside the read, so every caller keeps the plain read-until-EOF
+    /// contract and none has to know about the fd at all.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, PtyError> {
         if buf.is_empty() {
             return Ok(0);
         }
         loop {
+            if self.slave.is_some() {
+                // While we hold a slave open the master cannot report EOF, so
+                // the wait for readability is raced against a poll for the
+                // child's exit. Biased: queued output is always drained first,
+                // and the release only happens with the queue empty, because
+                // on BSD/macOS that close discards whatever is still in it.
+                let poll = self.slave_release_poll();
+                let exit_tick = tokio::select! {
+                    biased;
+
+                    guard = self.pty.readable_mut() => {
+                        let mut guard = guard.map_err(PtyError::Read)?;
+                        match guard.try_io(|inner| drain_read(inner.get_ref().as_raw_fd(), buf)) {
+                            Ok(result) => return result.map_err(PtyError::Read),
+                            Err(_would_block) => false,
+                        }
+                    }
+                    _ = tokio::time::sleep(poll) => true,
+                };
+                if exit_tick {
+                    let reaped = match self.try_wait() {
+                        Ok(status) => status.is_some(),
+                        Err(e) => {
+                            debug!(pid = self.pid, error = %e, "PTY child try_wait failed");
+                            true
+                        }
+                    };
+                    if reaped && self.pending_input_bytes().unwrap_or(0) == 0 {
+                        self.release_slave();
+                    }
+                }
+                continue;
+            }
+
             let mut guard = self.pty.readable_mut().await.map_err(PtyError::Read)?;
             match guard.try_io(|inner| drain_read(inner.get_ref().as_raw_fd(), buf)) {
                 Ok(result) => return result.map_err(PtyError::Read),
@@ -654,6 +722,45 @@ impl PtyHandle {
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, PtyError> {
         self.child.try_wait().map_err(PtyError::Child)
+    }
+
+    /// Bytes the master can read right now.
+    ///
+    /// Used to decide when releasing the retained slave fd is safe: at zero
+    /// there is nothing left for the close to discard.
+    fn pending_input_bytes(&self) -> Result<usize, PtyError> {
+        let mut n: nix::libc::c_int = 0;
+        // SAFETY: `self.pty` owns the fd for the duration of the call, and
+        // FIONREAD writes a single c_int through the pointer we pass.
+        let rc = unsafe {
+            nix::libc::ioctl(
+                self.pty.get_ref().as_raw_fd(),
+                nix::libc::FIONREAD,
+                &mut n as *mut nix::libc::c_int,
+            )
+        };
+        if rc == -1 {
+            return Err(PtyError::Read(std::io::Error::last_os_error()));
+        }
+        Ok(n.max(0) as usize)
+    }
+
+    /// The current exit-poll interval — see the constants.
+    fn slave_release_poll(&self) -> std::time::Duration {
+        if self.spawned_at.elapsed() < SLAVE_RELEASE_EAGER_FOR {
+            SLAVE_RELEASE_POLL_EAGER
+        } else {
+            SLAVE_RELEASE_POLL_IDLE
+        }
+    }
+
+    /// Drop the parent's slave fd, so a master read can reach EOF.
+    ///
+    /// Only safe once the child is reaped and [`Self::pending_input_bytes`] is
+    /// zero: on BSD/macOS this close is what discards anything still queued.
+    /// Idempotent.
+    fn release_slave(&mut self) {
+        self.slave.take();
     }
 
     /// Ask the whole PTY process group to terminate.
