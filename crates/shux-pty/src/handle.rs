@@ -630,17 +630,11 @@ impl PtyHandle {
                     }
                     _ = tokio::time::sleep(poll) => true,
                 };
-                if exit_tick {
-                    let reaped = match self.try_wait() {
-                        Ok(status) => status.is_some(),
-                        Err(e) => {
-                            debug!(pid = self.pid, error = %e, "PTY child try_wait failed");
-                            true
-                        }
-                    };
-                    if reaped && self.pending_input_bytes().unwrap_or(0) == 0 {
-                        self.release_slave();
-                    }
+                if exit_tick
+                    && self.child_exited_unreaped()
+                    && self.pending_input_bytes().unwrap_or(0) == 0
+                {
+                    self.release_slave();
                 }
                 continue;
             }
@@ -743,6 +737,31 @@ impl PtyHandle {
             return Err(PtyError::Read(std::io::Error::last_os_error()));
         }
         Ok(n.max(0) as usize)
+    }
+
+    /// Has the child exited? Answered **without reaping it**.
+    ///
+    /// `Child::try_wait` would reap, and reaping frees the pid — which is also
+    /// this pane's process *group* id, since the child is a session leader.
+    /// A pane whose child exits while a descendant keeps the tty open is still
+    /// a live group that teardown has to be able to signal, and a freed pgid is
+    /// one an unrelated process can be handed. `WNOWAIT` leaves the zombie in
+    /// place, so the group stays allocated and the real reap stays exactly
+    /// where it always was: `wait()`, after the read loop ends.
+    fn child_exited_unreaped(&self) -> bool {
+        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+        match waitid(
+            Id::Pid(nix::unistd::Pid::from_raw(self.pid as i32)),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+        ) {
+            Ok(WaitStatus::StillAlive) => false,
+            Ok(_) => true,
+            // ECHILD: something already reaped it, so it is certainly gone.
+            Err(e) => {
+                debug!(pid = self.pid, error = %e, "PTY child waitid failed");
+                true
+            }
+        }
     }
 
     /// The current exit-poll interval — see the constants.

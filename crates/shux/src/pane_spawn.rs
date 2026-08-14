@@ -352,12 +352,7 @@ async fn run_pane_pty_task(
     // an explicit kill before waiting will return. Bound both stages
     // with timeouts so a wedged child can't stall pane teardown.
     let exit_code = if task_exit == PtyTaskExit::RequestedTeardown {
-        // Never signal a child this task has already reaped: the loop's
-        // release poll (issue #162) calls `try_wait`, and the pid — a process
-        // GROUP id here — is free for reuse the moment it succeeds.
-        if !matches!(handle.try_wait(), Ok(Some(_))) {
-            let _ = handle.terminate();
-        }
+        let _ = handle.terminate();
         match tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait()).await {
             Ok(Ok(status)) => status.code(),
             Ok(Err(e)) => {

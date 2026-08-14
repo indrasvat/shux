@@ -278,3 +278,46 @@ async fn test_pty_event_output() {
     assert!(got_output, "Did not receive output event");
     assert!(got_exit, "Did not receive exit event");
 }
+
+/// The read loop must not reap the pane's child (#163 review).
+///
+/// It watches for the child's exit so it can drop the slave fd it holds
+/// (issue #162), and `Child::try_wait` would answer that question by reaping —
+/// which frees the pid. That pid is also the pane's process GROUP id, and a
+/// pane whose child exits while a descendant keeps the tty open is still a
+/// live group that teardown has to signal. Reaping early hands that pgid back
+/// to the OS while the group is still running.
+///
+/// A zombie answers `kill(pid, 0)`; a reaped pid does not.
+#[tokio::test]
+async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    // The leader exits immediately; the descendant holds the slave open, so
+    // there is no EOF and the loop keeps running with the child gone.
+    let config = PtyConfig::with_command(
+        vec!["sh".into(), "-c".into(), "sleep 30 & exit 7".into()],
+        test_cwd(),
+    );
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    let pid = Pid::from_raw(handle.pid() as i32);
+
+    // Long enough for several exit polls; the read cannot return, because the
+    // descendant is holding the tty open and writing nothing.
+    let mut buf = [0u8; 1024];
+    let _ = tokio::time::timeout(Duration::from_millis(400), handle.read(&mut buf)).await;
+
+    let still_waitable = nix::sys::signal::kill(pid, None).is_ok();
+
+    // Clean up the whole group before asserting, so a failure cannot leak the
+    // `sleep` into the rest of the run.
+    let _ = killpg(pid, Signal::SIGKILL);
+    let _ = handle.wait().await;
+
+    assert!(
+        still_waitable,
+        "the read loop reaped the child, so teardown lost its handle on a \
+         process group that is still alive"
+    );
+}
