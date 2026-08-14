@@ -46,7 +46,19 @@ use crate::grants::Grants;
 use crate::permissions::{CheckCtx, Decision, TargetOwners, Targets};
 
 pub const PROTOCOL_VERSION: &str = "1";
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a freshly spawned plugin gets to emit its manifest line.
+///
+/// This bounds ONE failure mode and only one: a plugin that is alive, holding
+/// stdout open, and saying nothing. A plugin that dies is caught by EOF on the
+/// next read, immediately and regardless of this value — so a generous budget
+/// here costs nothing in detection speed for the case that actually matters.
+///
+/// It was 5s, which is enormous for writing one line and still not enough on a
+/// busy machine: the process has to be *scheduled* first. Under CI load 4 of 5
+/// runs failed with "manifest not received within 5s" while nothing was wrong
+/// (issue #160). Wall-clock budgets on a shared machine measure the scheduler,
+/// not the plugin.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// SIGKILL a plugin's entire process group.
@@ -124,6 +136,36 @@ async fn wait_for_group_exit(pid: Option<u32>, budget: Duration) {
 async fn kill_plugin_tree(child: &mut Child) {
     kill_plugin_group(child.id());
     let _ = child.kill().await;
+}
+
+/// Kills the plugin's process group if dropped while armed.
+///
+/// Every `return` inside `install` already reaps the tree, but a return is not
+/// the only way out: `install` is awaited inside an RPC handler, so a client
+/// that disconnects mid-handshake DROPS the future. Drop runs only tokio's
+/// `kill_on_drop`, which signals the leader and leaves anything it forked
+/// behind. This closes that path, and it matters more the longer the handshake
+/// budget is (issue #160).
+struct PluginGroupGuard {
+    pid: Option<u32>,
+}
+
+impl PluginGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+    /// The plugin is now owned by someone who will reap it.
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for PluginGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            kill_plugin_group(Some(pid));
+        }
+    }
 }
 
 /// Non-awaiting variant, for paths holding a lock or already shutting down.
@@ -273,6 +315,10 @@ pub struct PluginManager {
     /// non-daemon embeddings — denials still audit to the per-plugin log
     /// regardless.
     denial_hook: Arc<tokio::sync::OnceCell<DenialHook>>,
+    /// Handshake budget, defaulting to [`HANDSHAKE_TIMEOUT`]. Overridable so
+    /// the test that asserts the timeout FIRES does not have to sit out the
+    /// production budget to do it.
+    handshake_timeout: Duration,
 }
 
 impl PluginManager {
@@ -292,7 +338,16 @@ impl PluginManager {
             state_root: Arc::new(state_root),
             graph: Arc::new(tokio::sync::OnceCell::new()),
             denial_hook: Arc::new(tokio::sync::OnceCell::new()),
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Override the handshake budget. See [`HANDSHAKE_TIMEOUT`] for why the
+    /// default is generous.
+    #[must_use]
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// Root for grant + audit files (`<state_root>/by-id/<uuid>/`).
@@ -382,6 +437,10 @@ impl PluginManager {
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let pid = child.id();
+        // Armed for the whole handshake. Every early return below reaps the
+        // tree itself and leaves this a no-op; the case it exists for is the
+        // future being DROPPED, which no `return` can cover.
+        let mut cancel_guard = PluginGroupGuard::new(pid);
 
         // Stage 1: handshake. Send plugin.init, read one line from
         // stdout, expect a JSON-RPC response with the manifest.
@@ -412,7 +471,8 @@ impl PluginManager {
             return Err(e.into());
         }
 
-        let manifest = match tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.next_line()).await {
+        let manifest = match tokio::time::timeout(self.handshake_timeout, reader.next_line()).await
+        {
             // Same trap, and this one has a test: `install_rejects_garbage_manifest`
             // drives a plugin that prints nonsense. `parse_manifest` errors, and a
             // bare `?` would have leaked everything that plugin had forked.
@@ -433,9 +493,10 @@ impl PluginManager {
             }
             Err(_) => {
                 kill_plugin_tree(&mut child).await;
-                return Err(PluginError::HandshakeFailed(
-                    "manifest not received within 5s".into(),
-                ));
+                return Err(PluginError::HandshakeFailed(format!(
+                    "manifest not received within {:?}",
+                    self.handshake_timeout
+                )));
             }
         };
 
@@ -646,6 +707,9 @@ impl PluginManager {
 
         inner.insert(manifest.name.clone(), running);
         drop(inner);
+        // Registered: the manager owns the tree now and `kill`/`shutdown` reap
+        // it. Anything before this point is still the guard's responsibility.
+        cancel_guard.disarm();
         info!(plugin = %manifest.name, "plugin installed");
         Ok(info)
     }

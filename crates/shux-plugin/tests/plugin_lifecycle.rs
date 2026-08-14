@@ -132,7 +132,11 @@ exec -a {marker} sleep 30
     );
     let script = write_script(tmp.path(), "silent.sh", &silent);
 
-    let mgr = PluginManager::new(EventBus::new());
+    // An explicit short budget: this test is about the timeout FIRING, not
+    // about its production value, and inheriting the real one would make it
+    // sit out 30s to learn nothing extra (issue #160).
+    let budget = Duration::from_secs(2);
+    let mgr = PluginManager::new(EventBus::new()).with_handshake_timeout(budget);
     let start = std::time::Instant::now();
     let err = mgr
         .install(PluginSource::from_path(&script))
@@ -141,9 +145,12 @@ exec -a {marker} sleep 30
     let elapsed = start.elapsed();
 
     assert!(matches!(err, shux_plugin::PluginError::HandshakeFailed(_)));
-    // Must hit within ~6s (5s budget + slack); must not return early.
-    assert!(elapsed >= Duration::from_secs(4));
-    assert!(elapsed < Duration::from_secs(7));
+    // Must hit at the budget, and must not return early.
+    assert!(elapsed >= budget, "returned early: {elapsed:?}");
+    assert!(
+        elapsed < budget + Duration::from_secs(3),
+        "overshot: {elapsed:?}"
+    );
 
     let survivors = wait_for_no_procs(&marker, Duration::from_secs(5)).await;
     assert_eq!(
@@ -890,4 +897,104 @@ done
     );
 
     mgr.kill("badnames").await.unwrap();
+}
+
+/// A plugin that is ALIVE but has not been scheduled yet must still install.
+///
+/// This is issue #160. `HANDSHAKE_TIMEOUT` was a 5s wall-clock budget for a
+/// freshly spawned process to emit one line, and on a loaded machine that is
+/// not enough: 4 of 5 CI reps went red with
+/// `HandshakeFailed("manifest not received within 5s")` once the uncapped
+/// test pool got more expensive. Nothing was broken — the machine was busy.
+///
+/// A sleep reproduces starvation exactly as the manager sees it: child alive,
+/// stdout open, no line yet. Deterministic, no contention harness needed.
+#[tokio::test]
+async fn install_survives_a_plugin_that_is_slow_to_hand_shake() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slow = r#"#!/usr/bin/env bash
+set -u
+IFS= read -r _ || exit 1
+sleep 8
+printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"slowpoke","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"plugin.shutdown"'*) exit 0 ;;
+  esac
+done
+"#;
+    let script = write_script(tmp.path(), "slow.sh", slow);
+
+    let mgr = PluginManager::new(EventBus::new());
+    let info = mgr
+        .install(PluginSource::from_path(&script))
+        .await
+        .expect("a plugin that is merely slow must not be mistaken for a broken one");
+    assert_eq!(info.name, "slowpoke");
+    mgr.kill("slowpoke").await.unwrap();
+}
+
+/// The other half of #160: raising the budget must NOT slow down detection of
+/// a plugin that actually died. That case never depended on the timeout —
+/// stdout closes and the read returns EOF — so it must still fail promptly.
+#[tokio::test]
+async fn install_still_fails_fast_when_the_plugin_exits_without_a_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dies = r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+exit 3
+"#;
+    let script = write_script(tmp.path(), "dies.sh", dies);
+
+    let mgr = PluginManager::new(EventBus::new());
+    let start = std::time::Instant::now();
+    let err = mgr
+        .install(PluginSource::from_path(&script))
+        .await
+        .expect_err("a plugin that exits without a manifest must fail");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a dead plugin must be detected by EOF, not by waiting out the handshake budget \
+         (took {elapsed:?}); error was: {err}"
+    );
+}
+
+/// Cancelling an install must take the plugin's whole process group with it.
+///
+/// Raised by review on #160. `install` is awaited inside an RPC handler, so a
+/// client that disconnects mid-handshake drops the future. Drop only runs
+/// tokio's `kill_on_drop`, which signals the plugin LEADER — descendants it
+/// forked survive, exactly the leak `kill_plugin_tree` exists to prevent on
+/// every other exit path. Widening the handshake budget widens that window, so
+/// the guard has to be cancellation-safe, not timeout-safe.
+#[tokio::test]
+async fn cancelling_an_install_still_reaps_the_plugin_process_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = unique_marker("cancelled-install");
+    // Forks a marked grandchild, then never hands back a manifest. The
+    // grandchild is what `kill_on_drop` alone cannot reach.
+    let forker = format!(
+        r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+exec -a {marker} sleep 120 &
+sleep 120
+"#
+    );
+    let script = write_script(tmp.path(), "forker.sh", &forker);
+
+    let mgr = PluginManager::new(EventBus::new());
+    // Drop the install future mid-handshake, the way a disconnecting client does.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(700),
+        mgr.install(PluginSource::from_path(&script)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the install should not have completed");
+
+    let survivors = wait_for_no_procs(&marker, Duration::from_secs(5)).await;
+    assert_eq!(
+        survivors, 0,
+        "a cancelled install leaked the plugin's forked child"
+    );
 }
