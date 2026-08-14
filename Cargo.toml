@@ -85,5 +85,7 @@ debug = "line-tables-only"
 opt-level = 2
 debug = false
 
+# 0, not 1: CI always compiles cold (rust-cache prunes workspace crates), so the
+# optimiser costs more than it buys back — measured -63s/job. See #157.
 [profile.test]
-opt-level = 1
+opt-level = 0
