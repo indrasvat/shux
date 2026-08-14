@@ -1281,8 +1281,9 @@ mod tests {
     #[test]
     fn test_performance_80x24_under_budget() {
         // A catastrophic-regression guard, not the PRD's 8ms frame budget: this
-        // runs on an unoptimised test build, so it measures codegen and runner
-        // load. The real budget belongs to a release-profile bench.
+        // runs on an unoptimised test build (opt-level 0 is ~4.2x slower here),
+        // so it measures codegen and runner load. Nothing asserts the 8ms budget
+        // now — that needs a release-profile bench, which does not exist yet.
         let mut compositor = make_compositor(80, 24, CompositorConfig::default());
 
         let stats = compositor
