@@ -1,3 +1,15 @@
+## [0.46.18](https://github.com/indrasvat/shux/compare/v0.46.17...v0.46.18) (2026-08-14)
+
+
+### Bug Fixes
+
+* **plugin:** a busy machine is not a broken plugin ([#161](https://github.com/indrasvat/shux/issues/161)) ([d308a0c](https://github.com/indrasvat/shux/commit/d308a0c451369b8457469def21f8c49f66cf7f8f))
+
+
+### Performance Improvements
+
+* **ci:** cut PR CI wall clock ([#159](https://github.com/indrasvat/shux/issues/159)) ([9b7a972](https://github.com/indrasvat/shux/commit/9b7a972d0e68ffc73125469506301cd2d2cfcffe)), closes [#153](https://github.com/indrasvat/shux/issues/153) [#ghent](https://github.com/indrasvat/shux/issues/ghent)
+
 ## [0.46.17](https://github.com/indrasvat/shux/compare/v0.46.16...v0.46.17) (2026-08-12)
 
 
