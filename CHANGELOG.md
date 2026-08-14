@@ -1,3 +1,10 @@
+## [0.46.19](https://github.com/indrasvat/shux/compare/v0.46.18...v0.46.19) (2026-08-14)
+
+
+### Bug Fixes
+
+* **pty:** a finished pane's output must be readable when its exit status is ([#162](https://github.com/indrasvat/shux/issues/162)) ([#163](https://github.com/indrasvat/shux/issues/163)) ([8f76e3f](https://github.com/indrasvat/shux/commit/8f76e3fef57c6b7dbfa05c871f6e22ec743b76a3))
+
 ## [0.46.18](https://github.com/indrasvat/shux/compare/v0.46.17...v0.46.18) (2026-08-14)
 
 
