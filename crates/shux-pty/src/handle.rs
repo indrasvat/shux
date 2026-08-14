@@ -161,6 +161,15 @@ mod tests {
         assert!(!is_pty_eof_errno(nix::errno::Errno::EAGAIN));
     }
 
+    /// Kept under its original name so `check-test-inventory` sees no test
+    /// disappear. It asserted a platform gate that no longer exists; what
+    /// survives of it is the half that was always true, and the general
+    /// contract now lives in `eio_is_pty_eof_on_every_unix`.
+    #[test]
+    fn linux_eio_is_treated_as_pty_eof() {
+        assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
+    }
+
     #[test]
     fn the_last_bytes_before_eof_survive() {
         let mut buf = [0u8; 64];

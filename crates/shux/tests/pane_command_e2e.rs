@@ -1756,7 +1756,12 @@ fn the_focus_rescue_accepts_a_sibling_that_has_already_finished() {
     for needle in ["TRUECOLOR", "INDEXED", "BASIC"] {
         assert!(
             text.contains(needle),
-            "the finished pane's retained output is missing {needle}:\n{text}"
+            "the finished pane's retained output is missing {needle}:\n{text}\n\
+             — by explicit pane id instead:\n{}\n— panes: {panes}",
+            // Same grid, addressed directly: this separates "the focused pane
+            // is the wrong pane" from "the grid is empty", which read the same
+            // in the message above (issue #162).
+            env.ok(&["pane", "capture", "-s", "finished", "-p", &finished])
         );
     }
 }
@@ -1806,6 +1811,59 @@ fn an_exited_pane_answers_capture_with_what_it_printed() {
         assert!(
             text.contains(needle),
             "the exited pane reported its status with {needle} missing from its screen:\n{text}"
+        );
+    }
+}
+
+/// The same contract for the smallest possible command: one write, then exit.
+///
+/// `an_exited_pane_answers_capture_with_what_it_printed` bursts 500 lines
+/// first, which keeps the reader awake and draining. `/bin/cat` on a 60-byte
+/// file — the shape in issue #162 — can be reaped before the reader has run at
+/// all, so it exercises a different half of the same guarantee. Captured by
+/// explicit pane id, so a focus-resolution bug cannot be mistaken for a lost
+/// grid.
+#[test]
+fn a_pane_that_prints_once_and_exits_keeps_its_screen() {
+    let mut env = Env::new();
+    let colour = env.work().join("once.txt");
+    std::fs::write(
+        &colour,
+        "\u{1b}[38;2;120;220;180mTRUECOLOR\u{1b}[0m \u{1b}[38;5;208mINDEXED\u{1b}[0m \u{1b}[34mBASIC\u{1b}[0m\n",
+    )
+    .unwrap();
+    env.ok(&["session", "create", "once", "-d", "--", "sleep", "900"]);
+    env.sessions.push("once".to_string());
+
+    // No shell in the way: `/bin/cat` writes once and is gone.
+    env.ok(&[
+        "window",
+        "create",
+        "-s",
+        "once",
+        "-n",
+        "cat",
+        "--",
+        "/bin/cat",
+        colour.to_str().unwrap(),
+    ]);
+
+    let panes = env.wait_for_exited_pane("once", "/bin/cat");
+    let pane = panes
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|p| p["exit_status"].is_number() && p["command"].to_string().contains("/bin/cat"))
+        .expect("the cat pane should have exited")["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let text = env.ok(&["pane", "capture", "-s", "once", "-p", &pane]);
+    for needle in ["TRUECOLOR", "INDEXED", "BASIC"] {
+        assert!(
+            text.contains(needle),
+            "a pane that printed once reported its exit status with {needle} missing:\n{text}"
         );
     }
 }
