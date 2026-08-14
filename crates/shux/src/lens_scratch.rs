@@ -570,7 +570,7 @@ struct ScratchState {
 /// extension): `{session_id, pgid, start_time, created_at,
 /// max_runtime_deadline}`.
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct RegistryRow {
+pub struct RegistryRow {
     session_id: String,
     pgid: u32,
     #[serde(default)]

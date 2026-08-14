@@ -10,7 +10,7 @@ use crate::daemon_boot::handle_daemon_command;
 use crate::{cli, client, daemon, features, gate, pane_command, style, template};
 
 /// Client entry point — parse CLI args, ensure daemon is running, dispatch.
-pub(crate) fn run_client(args: Cli) -> anyhow::Result<()> {
+pub fn run_client(args: Cli) -> anyhow::Result<()> {
     // Set up logging
     let filter = if args.verbose {
         EnvFilter::new("debug")

@@ -17,8 +17,9 @@
 # Comparison is on `<binary-id> <leaf test name>`, as a multiset. The module
 # path is deliberately dropped: relocating `tests::foo` to `pane_io::tests::foo`
 # is the whole point of a split, and pinning the full path would fail on every
-# move it is supposed to protect. The leaf name plus the binary is what says
-# "this test still runs".
+# move it is supposed to protect. The `::bin/<name>` target suffix is dropped
+# for the same reason (see `normalize`). The leaf name plus the package — and,
+# for integration tests, the file — is what says "this test still runs".
 #
 # Removals fail. Additions are reported and allowed — a refactor should not add
 # tests, but a guard landing alongside its own invariant test would otherwise
@@ -66,12 +67,42 @@ mkdir -p "${CACHE_DIR}"
 # move is allowed to change. The occurrence index keeps two same-named tests in
 # one binary distinguishable, so losing one of them still reads as a removal
 # while the lines stay sorted (which `comm` requires).
+#
+# The `::bin/<name>` suffix is dropped for the same reason the module path is.
+# A package's unit tests are compiled into whichever target owns its module
+# tree, and giving `crates/shux` a library target moved all 506 of them from
+# `shux::bin/shux` to `shux` without changing one line of test code. Keeping the
+# target in the key made that read as 506 removals plus 506 additions — a guard
+# firing on the refactor it exists to protect. Integration-test binaries
+# (`shux::m0_integration`) keep their own ids: those are separate files, and a
+# test vanishing from one is a real loss.
+#
+# This does mean a unit test moving between the bin and lib target of one
+# package is invisible here. That is the intent — it still runs, which is the
+# only question this guard asks. Deleting it outright still drops the leaf name
+# from the package's multiset, and still fails.
 normalize() {
   sed -e 's/[[:space:]]*$//' -e '/^$/d' \
-    | awk '{ id = $1; $1 = ""; sub(/^ /, ""); leaf = $0; sub(/^.*::/, "", leaf); print id "\t" leaf }' \
+    | awk '{ id = $1; $1 = ""; sub(/^ /, ""); leaf = $0; sub(/^.*::/, "", leaf);
+             sub(/::bin\/[^\/]+$/, "", id); print id "\t" leaf }' \
     | sort \
     | awk '{ print $0 "\t" (++seen[$0]) }'
 }
+
+# Baselines are cached by content, so they must also be keyed by the code that
+# produced them. `normalize` just changed shape; a baseline written by the old
+# one and compared by the new one reports every renamed target as removed. CI
+# already folds this script's hash into its cache key for exactly that reason —
+# the local cache needs the same discriminator or a local run silently compares
+# two incompatible formats and blames the working tree.
+# `sha256sum` is GNU coreutils and absent on macOS; `shasum -a 256` ships with
+# perl on both. Same fallback order as scripts/build-release.sh, and both print
+# `<hex>  <path>`, so the leading 12 characters agree either way.
+if command -v sha256sum >/dev/null 2>&1; then
+  SCRIPT_DISC="$(sha256sum "${BASH_SOURCE[0]}" | cut -c1-12)"
+else
+  SCRIPT_DISC="$(shasum -a 256 "${BASH_SOURCE[0]}" | cut -c1-12)"
+fi
 
 list_tests() {
   # `--color never` at the call site: CI exports CARGO_TERM_COLOR=always, and a
@@ -102,7 +133,7 @@ crates_tree() { git rev-parse "${1}^{commit}:crates"; }
 
 if [[ "${WRITE_BASELINE}" -eq 1 ]]; then
   HEAD_SHA="$(crates_tree HEAD)"
-  OUT="${CACHE_DIR}/${HEAD_SHA}.txt"
+  OUT="${CACHE_DIR}/${HEAD_SHA}-${SCRIPT_DISC}.txt"
   list_tests >"${OUT}.tmp"
   if [[ ! -s "${OUT}.tmp" ]]; then
     rm -f "${OUT}.tmp"
@@ -125,7 +156,7 @@ if MERGE_BASE="$(git merge-base HEAD "${BASE_SHA}" 2>/dev/null)"; then
   BASE_SHA="${MERGE_BASE}"
 fi
 BASE_TREE="$(crates_tree "${BASE_SHA}")"
-BASE_LIST="${CACHE_DIR}/${BASE_TREE}.txt"
+BASE_LIST="${CACHE_DIR}/${BASE_TREE}-${SCRIPT_DISC}.txt"
 
 if [[ ! -s "${BASE_LIST}" ]]; then
   echo "▶ listing tests at base ${BASE_SHA:0:12} (cached afterwards)..."

@@ -25,7 +25,7 @@ use crate::{
 /// 4. Start signal handlers
 /// 5. Bind UDS
 /// 6. Run daemon state loop
-pub(crate) fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
     // Step 1: Daemonize BEFORE tokio
     if !daemon::daemonize()? {
         // We are the parent — exit cleanly

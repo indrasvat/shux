@@ -645,13 +645,13 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: hooks-check lint shellcheck test check-test-groups check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen ## Run lint + test + process/QA guards (what pre-commit runs)
+check: hooks-check lint shellcheck test check-test-groups check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
 
 .PHONY: ci
-ci: lint shellcheck test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
+ci: lint shellcheck test check-test-groups check-test-inventory check-ci-parity test-doc test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-no-bin-mods ## Run the CI pipeline locally (lint + full test + doc tests + process/QA guards)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ CI pipeline passed!$(COLOR_RESET)"
 	@echo ""
@@ -703,6 +703,10 @@ check-tui-qa: ## Verify tracked general TUI QA evidence manifests
 .PHONY: check-gate-docs
 check-gate-docs: ## Verify the lens-gate skill reference matches the shipped CLI + THIRD-PARTY-NOTICES
 	@bash scripts/check-gate-docs.sh
+
+.PHONY: check-no-bin-mods
+check-no-bin-mods: ## Assert crates/shux/src/main.rs declares no modules (lib/bin double-compile)
+	@bash scripts/check-no-bin-mods.sh
 
 .PHONY: check-skill-docs
 check-skill-docs: ## Verify agent-facing skill gotchas match shipped CLI shapes
