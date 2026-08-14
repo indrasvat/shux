@@ -10,10 +10,12 @@
 
 use std::path::Path;
 
-use shux_raster::{Rasterizer, TierVerdict, evaluate_tier, os_arch, pixel_baseline_path};
-use shux_vt::{
-    Fingerprint, FrameEnvelope, GateStatus, StyleDelta, Tier, capture_sha256, style_deltas,
-};
+use crate::gate::pixel::{TierVerdict, evaluate_tier, os_arch, pixel_baseline_path};
+use shux_raster::Rasterizer;
+
+use crate::gate::cell_compare::{Fingerprint, Tier, capture_sha256};
+use crate::gate::vocab::{GateStatus, StyleDelta, style_deltas};
+use shux_vt::FrameEnvelope;
 
 use super::signal::RunnerSignal;
 
@@ -116,9 +118,13 @@ pub fn compare_frame(
         // Enforce the baseline CONTENT PIN (080 impl-review BLOCKER): a swapped-but-valid
         // PNG must be refused; `capture_sha256` only pins the cell JSON.
         let pin_ok = match tier {
-            Tier::Exact => sidecar.png_sha256.as_deref() == Some(&shux_raster::png_sha256(&bytes)),
-            Tier::Pixel => match shux_raster::decode_png(&bytes) {
-                Ok(img) => sidecar.rgba_sha256.as_deref() == Some(&shux_raster::rgba_sha256(&img)),
+            Tier::Exact => {
+                sidecar.png_sha256.as_deref() == Some(&crate::gate::pixel::png_sha256(&bytes))
+            }
+            Tier::Pixel => match crate::gate::pixel::decode_png(&bytes) {
+                Ok(img) => {
+                    sidecar.rgba_sha256.as_deref() == Some(&crate::gate::pixel::rgba_sha256(&img))
+                }
                 Err(_) => false,
             },
             Tier::Cell => true,
@@ -177,10 +183,10 @@ pub fn compare_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shux_vt::{
-        FINGERPRINT_SCHEMA, MaskSet, RENDERER_FORMAT_VERSION, SCHEMA_VERSION, TolParams,
-        VirtualTerminal, mask_hash, unicode_width_version,
+    use crate::gate::cell_compare::{
+        FINGERPRINT_SCHEMA, RENDERER_FORMAT_VERSION, TolParams, mask_hash, unicode_width_version,
     };
+    use shux_vt::{MaskSet, SCHEMA_VERSION, VirtualTerminal};
 
     fn rasterizer() -> Rasterizer {
         Rasterizer::new(16.0).expect("bundled rasterizer")
@@ -197,7 +203,7 @@ mod tests {
             fp_schema: FINGERPRINT_SCHEMA,
             schema: SCHEMA_VERSION,
             renderer_format_version: RENDERER_FORMAT_VERSION,
-            raster_font_fingerprint: shux_raster::builtin_font_fingerprint(16.0),
+            raster_font_fingerprint: crate::gate::pixel::builtin_font_fingerprint(16.0),
             unicode_width_ver: unicode_width_version(),
             tol: tier,
             tol_params: TolParams::default(),
@@ -225,12 +231,12 @@ mod tests {
 
     fn bless_pixel(dir: &Path, name: &str, golden: &FrameEnvelope, tier: Tier, r: &Rasterizer) {
         std::fs::write(cell_json_path(dir, name), golden.to_canonical_json()).unwrap();
-        let img = shux_raster::render_envelope(r, golden);
-        let png = shux_raster::encode_png(&img).unwrap();
+        let img = crate::gate::pixel::render_envelope(r, golden);
+        let png = crate::gate::pixel::encode_png(&img).unwrap();
         let mut fp = current_fp(tier);
         fp.capture_sha256 = capture_sha256(golden);
-        fp.rgba_sha256 = Some(shux_raster::rgba_sha256(&img));
-        fp.png_sha256 = Some(shux_raster::png_sha256(&png));
+        fp.rgba_sha256 = Some(crate::gate::pixel::rgba_sha256(&img));
+        fp.png_sha256 = Some(crate::gate::pixel::png_sha256(&png));
         std::fs::write(
             fp_path(dir, name),
             serde_json::to_string_pretty(&fp).unwrap(),
@@ -328,7 +334,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = rasterizer();
         let other =
-            shux_raster::render_envelope_png(&r, &env(b"\x1b[31mTAMPERED\x1b[0m", 2, 10)).unwrap();
+            crate::gate::pixel::render_envelope_png(&r, &env(b"\x1b[31mTAMPERED\x1b[0m", 2, 10))
+                .unwrap();
         for tier in [Tier::Pixel, Tier::Exact] {
             let golden = env(b"\x1b[34mORIGINAL\x1b[0m", 2, 10);
             bless_pixel(dir.path(), "pin", &golden, tier, &r);

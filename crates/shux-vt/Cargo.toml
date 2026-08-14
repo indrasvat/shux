@@ -12,10 +12,11 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Lens-gate golden content hashing (task 080): capture_sha256 / mask_hash. The gate
-# vocabulary already lives here (gate.rs), so the cell-tier compare + fingerprint
-# struct that the frozen contract tests import stay in the lowest shared crate.
-sha2 = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+# Only the differential tests hash a frame, and only to get an exact identity to
+# compare two terminals on. The gate's `capture_sha256` used to live here and made
+# this a library dependency; it is the gate's now (#151), and the library itself
+# hashes nothing — `frame_stability_hash` uses a `DefaultHasher`.
+sha2 = { workspace = true }

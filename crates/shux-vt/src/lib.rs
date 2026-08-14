@@ -10,8 +10,6 @@ mod cell;
 mod charset;
 mod cursor;
 mod diff;
-mod gate;
-mod gate_compare;
 mod grid;
 mod parser;
 mod screen;
@@ -31,15 +29,6 @@ pub use charset::{CharsetSlot, TerminalCharset, TerminalCharsets};
 pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use diff::{
     CellGridView, CellRef, CursorState, FrameDiff, FrameView, GridFrame, LensRowSpan, diff_frames,
-};
-pub use gate::{
-    DiffRegion, DiffReport, FrameReport, GATE_REPORT_SCHEMA, GateStatus, ScenarioReport,
-    StyleDelta, XfailMeta, style_deltas,
-};
-pub use gate_compare::{
-    CellVerdict, FINGERPRINT_SCHEMA, Fingerprint, RENDERER_FORMAT_VERSION, Tier, TolParams,
-    capture_sha256, compare_cell, has_indexed_colors, mask_hash, palette_unportable, sha256_hex,
-    unicode_width_version,
 };
 pub use grid::{DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};

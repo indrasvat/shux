@@ -59,7 +59,7 @@ pub async fn run_init(
             "{}",
             style::warning("lens gate init is refused in CI: goldens are never self-minted here")
         );
-        return Ok(shux_vt::GateStatus::UpdateRefused.exit_code() as i32);
+        return Ok(crate::gate::vocab::GateStatus::UpdateRefused.exit_code() as i32);
     }
     // The scenario name is a filesystem component — validate via the same parser guard by
     // building a minimal scenario and letting `parse` reject a hostile name.

@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use shux_raster::Rasterizer;
-use shux_vt::{
-    FINGERPRINT_SCHEMA, Fingerprint, FrameEnvelope, MaskSet, RENDERER_FORMAT_VERSION,
-    SCHEMA_VERSION, Tier, TolParams, capture_sha256, mask_hash, unicode_width_version,
+use crate::gate::cell_compare::{
+    FINGERPRINT_SCHEMA, Fingerprint, RENDERER_FORMAT_VERSION, Tier, TolParams, capture_sha256,
+    mask_hash, unicode_width_version,
 };
+use shux_raster::Rasterizer;
+use shux_vt::{FrameEnvelope, MaskSet, SCHEMA_VERSION};
+
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, Notify};
 
@@ -192,12 +194,12 @@ fn current_fp(tier: Tier, masks: &MaskSet, scenario_hash: &str, cmd_env_hash: &s
         fp_schema: FINGERPRINT_SCHEMA,
         schema: SCHEMA_VERSION,
         renderer_format_version: RENDERER_FORMAT_VERSION,
-        raster_font_fingerprint: shux_raster::builtin_font_fingerprint(FONT_SIZE),
+        raster_font_fingerprint: crate::gate::pixel::builtin_font_fingerprint(FONT_SIZE),
         unicode_width_ver: unicode_width_version(),
         tol: tier,
         tol_params: TolParams::default(),
         mask_hash: mask_hash(masks),
-        platform: (tier != Tier::Cell).then(shux_raster::os_arch),
+        platform: (tier != Tier::Cell).then(crate::gate::pixel::os_arch),
         shux_version: env!("CARGO_PKG_VERSION").to_string(),
         capture_sha256: String::new(),
         rgba_sha256: None,
@@ -366,7 +368,7 @@ fn finish(
         scenario_name: scenario.name.clone(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        font_chain_sha256: Some(shux_raster::builtin_font_fingerprint(FONT_SIZE)),
+        font_chain_sha256: Some(crate::gate::pixel::builtin_font_fingerprint(FONT_SIZE)),
         font_size_px: FONT_SIZE as u16,
         started_at_ms,
         duration_ms: start.elapsed().as_millis() as u64,
@@ -1063,7 +1065,7 @@ async fn drive_step(
                             step_index: idx,
                             needle: text.clone(),
                             excerpt: bounded_excerpt(captured, 120),
-                            text_sha256: shux_vt::sha256_hex(captured.as_bytes()),
+                            text_sha256: crate::gate::cell_compare::sha256_hex(captured.as_bytes()),
                         });
                     }
                     StepFlow::Continue
@@ -1228,7 +1230,7 @@ async fn capture_and_compare(
     ce_hash: &str,
     rasterizer: &Rasterizer,
     golden_dir: &Path,
-    xfail: Option<shux_vt::XfailMeta>,
+    xfail: Option<crate::gate::vocab::XfailMeta>,
 ) -> CaptureResult {
     let params = serde_json::json!({
         "pane_id": pane_id,

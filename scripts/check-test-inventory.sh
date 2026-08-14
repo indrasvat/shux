@@ -23,7 +23,10 @@
 #
 # Removals fail. Additions are reported and allowed — a refactor should not add
 # tests, but a guard landing alongside its own invariant test would otherwise
-# have to fail itself.
+# have to fail itself. A removal matched by an addition of the same leaf name
+# elsewhere is a cross-crate MOVE: still compiled, still running, but requires a
+# `TEST-MOVE:` trailer so it is visible as a deliberate act. See the block above
+# the check itself. A name that vanishes from the whole workspace always fails.
 #
 # Wired into `make ci` and the CI `Test (ubuntu)` job on pull requests only.
 # NOT into `make check`: the first run against a given base pays a full
@@ -207,14 +210,64 @@ if [[ -n "${added}" ]]; then
   echo "${added}" | cut -f1,2 | sed 's/^/    + /'
 fi
 
-if [[ -n "${removed}" ]]; then
-  echo ""
-  echo "error: these tests no longer run:" >&2
-  echo "${removed}" | cut -f1,2 | sed 's/^/    - /' >&2
+# A removal whose leaf name reappears somewhere else in the workspace is a MOVE:
+# the test did not stop being compiled, it changed crates. That is a real and
+# occasionally necessary thing to do — #151 moved 50 of them out of `shux-vt` and
+# `shux-raster` — and it is also indistinguishable, from here, from deleting a
+# test in one crate and coincidentally adding a same-named one in another.
+#
+# So it is neither failed nor waved through: it needs a `TEST-MOVE:` trailer with
+# a reason, the same mechanism `check-lens-frozen.sh` uses for a deliberate change
+# to a frozen path, and read with git's own trailer parser rather than a body grep
+# (which would match the string inside quoted text). The trailer permits MOVES only.
+# A leaf name that vanishes from the whole workspace fails with or without it.
+removed_leaves="$(printf '%s' "${removed}" | sed -e '/^$/d' | cut -f2 | sort)"
+added_leaves="$(printf '%s' "${added}" | sed -e '/^$/d' | cut -f2 | sort)"
+# Multiset difference: two removals of `foo` against one addition of `foo` leaves
+# one genuinely vanished, which is what `comm` on sorted duplicates reports.
+vanished="$(comm -23 <(printf '%s\n' "${removed_leaves}" | sed '/^$/d') \
+                     <(printf '%s\n' "${added_leaves}" | sed '/^$/d') || true)"
+
+if [[ -n "${vanished}" ]]; then
+  echo "" >&2
+  echo "error: these tests no longer run anywhere in the workspace:" >&2
+  printf '%s\n' "${vanished}" | sed 's/^/    - /' >&2
   echo "" >&2
   echo "A test that disappears from the listing is a defect in the move, not a" >&2
   echo "tidy-up: an undeclared module compiles clean and covers nothing." >&2
   exit 1
+fi
+
+if [[ -n "${removed}" ]]; then
+  # Every removal is matched by an addition elsewhere. Demand the trailer.
+  moved_ok=0
+  if git rev-parse --verify --quiet "${BASE_SHA}" >/dev/null; then
+    for sha in $(git rev-list "${BASE_SHA}..HEAD"); do
+      if git log -1 --format='%B' "${sha}" \
+        | git interpret-trailers --parse 2>/dev/null \
+        | grep -qE '^TEST-MOVE: [^[:space:]].*'; then
+        moved_ok=1
+        break
+      fi
+    done
+  fi
+
+  echo ""
+  echo "  moved to another crate (leaf name still runs):"
+  echo "${removed}" | cut -f1,2 | sed 's/^/    ~ /'
+
+  if [[ "${moved_ok}" -ne 1 ]]; then
+    echo "" >&2
+    echo "error: tests changed crate with no TEST-MOVE: trailer in ${BASE_SHA:0:12}..HEAD." >&2
+    echo "" >&2
+    echo "  Moving a test between crates is legitimate, and it is also exactly what a" >&2
+    echo "  silently-undeclared module looks like from here. Say which it is:" >&2
+    echo "" >&2
+    echo "      TEST-MOVE: gate vocabulary relocated from shux-vt to shux (#151)" >&2
+    echo "" >&2
+    exit 1
+  fi
+  echo "  ✓ TEST-MOVE: trailer present for the relocation"
 fi
 
 echo "✓ every test at ${BASE_SHA:0:12} still runs"

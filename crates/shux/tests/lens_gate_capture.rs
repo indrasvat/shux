@@ -14,10 +14,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use shux::gate::vocab::{GateStatus, ScenarioReport, XfailMeta};
 use shux_raster::{RasterOptions, Rasterizer};
-use shux_vt::{
-    CapColor, FrameEnvelope, GateStatus, MaskSet, Run, ScenarioReport, VirtualTerminal, XfailMeta,
-};
+use shux_vt::{CapColor, FrameEnvelope, MaskSet, Run, VirtualTerminal};
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR = <repo>/crates/shux

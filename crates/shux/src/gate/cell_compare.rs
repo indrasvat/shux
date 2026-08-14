@@ -1,13 +1,14 @@
 //! Lens-gate CELL-tier compare + golden fingerprint (task 080).
 //!
 //! The cell tier is the portable, authoritative comparison: two frames match iff
-//! [`diff_frames`](crate::diff_frames) reports no cell/geometry/cursor change AND the
-//! frame pair is portable (no indexed colour under an OSC-4 override — [`D8`]). It
-//! lives HERE, not in the binary, for the same reason the gate vocabulary
-//! ([`crate::gate`]) does: `shux` is a binary-only crate whose internals the frozen
-//! contract tests (`crates/shux/tests/lens_gate_*`) cannot import, and this is the
-//! lowest shared crate they and the eventual runner (081/082) both depend on
-//! (design-review D1).
+//! [`diff_frames`](shux_vt::diff_frames) reports no cell/geometry/cursor change AND the
+//! frame pair is portable (no indexed colour under an OSC-4 override — [`D8`]).
+//!
+//! **Placement note (#151).** This lived in `shux-vt` because [`vocab`](super::vocab)
+//! already did — the workaround reproducing itself, in the crate manifest's own words.
+//! Both moved here once #150 gave `crates/shux` a library target. `shux-vt` keeps
+//! `sha2`: [`settle`](shux_vt::frame_stability_hash) hashes frames independently of
+//! anything the gate does.
 //!
 //! The [`Fingerprint`] sidecar accompanies every golden and records the build/config
 //! under which it was blessed. A stale-trigger mismatch (font stack, Unicode-width
@@ -15,25 +16,24 @@
 //! [`GateStatus::StaleGolden`] verdict: the compare is REFUSED, never silently trusted
 //! (design-review D5/D6). `shux_version` is stored but is NOT a stale trigger (keying
 //! stale on the exact app version would churn every golden each release). The pixel/
-//! exact PNG tiers layer ON TOP of this (in `shux-raster`, design-review D2:
+//! exact PNG tiers layer ON TOP of this (in [`pixel`](super::pixel), design-review D2:
 //! conjunctive — a matching PNG never overrides a semantic cell fail).
 //!
 //! `080 asserts STATUSES only` — the `GateStatus -> exit_code` map is frozen in
-//! [`crate::gate`] and owned by task 082; nothing here asserts a process exit.
+//! [`vocab`](super::vocab) and owned by task 082; nothing here asserts a process exit.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::capture::{FrameEnvelope, MaskSet};
-use crate::cell::Color;
-use crate::diff::{CellGridView, FrameDiff, diff_frames};
-use crate::gate::GateStatus;
+use shux_vt::{CellGridView, Color, FrameDiff, FrameEnvelope, MaskSet, diff_frames};
+
+use super::vocab::GateStatus;
 
 /// Fingerprint sidecar format version. Distinct from the capture [`schema`] (078) — the
 /// sidecar shape can evolve independently of the frame wire format (council fp change).
 /// Bump only with a `GATE-TEST-CHANGE:` trailer.
 ///
-/// [`schema`]: crate::capture::SCHEMA_VERSION
+/// [`schema`]: shux_vt::SCHEMA_VERSION
 pub const FINGERPRINT_SCHEMA: u32 = 1;
 
 /// Render-format version — bump when a raster change alters golden pixels for the SAME
@@ -308,7 +308,7 @@ pub fn compare_cell(golden: &dyn CellGridView, live: &dyn CellGridView) -> CellV
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VirtualTerminal;
+    use shux_vt::VirtualTerminal;
 
     fn env(prog: &[u8], rows: usize, cols: usize) -> FrameEnvelope {
         let mut vt = VirtualTerminal::new(rows, cols);
@@ -520,7 +520,7 @@ mod tests {
     fn fp(font: &str, tol: Tier) -> Fingerprint {
         Fingerprint {
             fp_schema: FINGERPRINT_SCHEMA,
-            schema: crate::capture::SCHEMA_VERSION,
+            schema: shux_vt::SCHEMA_VERSION,
             renderer_format_version: RENDERER_FORMAT_VERSION,
             raster_font_fingerprint: font.to_string(),
             unicode_width_ver: unicode_width_version(),

@@ -6,8 +6,8 @@
 //! `GateStatus` decision — the signal→status map, xfail governance, and the worst-frame
 //! rollup. The exit code is `worst().exit_code()`; `report.json` is the source of truth.
 
+use crate::gate::vocab::{DiffRegion, DiffReport, FrameReport, GateStatus, ScenarioReport};
 use chrono::NaiveDate;
-use shux_vt::{DiffRegion, DiffReport, FrameReport, GateStatus, ScenarioReport};
 
 use super::outcome::{FrameKind, FrameOutcome, RunOutcome, TerminalOutcome};
 
@@ -289,7 +289,7 @@ fn parse_expiry(s: &str) -> Result<NaiveDate, String> {
 
 /// An xfail must name a reason, an owner, and a tracking issue (council #1: mandatory
 /// accountability). Blank fields are an authoring error, not a licence to differ.
-fn xfail_is_accountable(x: &shux_vt::XfailMeta) -> bool {
+fn xfail_is_accountable(x: &crate::gate::vocab::XfailMeta) -> bool {
     !x.reason.trim().is_empty() && !x.owner.trim().is_empty() && !x.issue.trim().is_empty()
 }
 
@@ -325,7 +325,7 @@ pub(crate) fn sanitize_note(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shux_raster::{PixelMetrics, TierVerdict};
+    use crate::gate::pixel::{PixelMetrics, TierVerdict};
 
     #[test]
     fn every_frame_reason_is_pure_ascii() {
@@ -394,7 +394,9 @@ mod tests {
         let out = sanitize_note("bless failed for AKIAIOSFODNN7EXAMPLE while writing golden");
         assert_eq!(out, "[redacted: note carried secret-shaped content]");
     }
-    use shux_vt::{CellVerdict, FrameDiff, LensRowSpan, Tier, XfailMeta};
+    use crate::gate::cell_compare::{CellVerdict, Tier};
+    use crate::gate::vocab::XfailMeta;
+    use shux_vt::{FrameDiff, LensRowSpan};
 
     fn today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 7, 18).unwrap()
@@ -428,12 +430,13 @@ mod tests {
         }
     }
 
-    fn dummy_fp() -> shux_vt::Fingerprint {
-        use shux_vt::{
-            FINGERPRINT_SCHEMA, MaskSet, RENDERER_FORMAT_VERSION, SCHEMA_VERSION, TolParams,
-            mask_hash, unicode_width_version,
+    fn dummy_fp() -> crate::gate::cell_compare::Fingerprint {
+        use crate::gate::cell_compare::{
+            FINGERPRINT_SCHEMA, RENDERER_FORMAT_VERSION, TolParams, mask_hash,
+            unicode_width_version,
         };
-        shux_vt::Fingerprint {
+        use shux_vt::{MaskSet, SCHEMA_VERSION};
+        crate::gate::cell_compare::Fingerprint {
             fp_schema: FINGERPRINT_SCHEMA,
             schema: SCHEMA_VERSION,
             renderer_format_version: RENDERER_FORMAT_VERSION,

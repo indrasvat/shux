@@ -13,10 +13,11 @@ mod lens_common;
 use std::path::Path;
 
 use lens_common::Harness;
-use shux_vt::{
-    FINGERPRINT_SCHEMA, Fingerprint, FrameEnvelope, MaskSet, RENDERER_FORMAT_VERSION,
-    SCHEMA_VERSION, Tier, TolParams, capture_sha256, mask_hash, unicode_width_version,
+use shux::gate::cell_compare::{
+    FINGERPRINT_SCHEMA, Fingerprint, RENDERER_FORMAT_VERSION, Tier, TolParams, capture_sha256,
+    mask_hash, unicode_width_version,
 };
+use shux_vt::{FrameEnvelope, MaskSet, SCHEMA_VERSION};
 
 /// A parsed gate run: the raw signal trace + the process exit code.
 struct GateRun {
@@ -126,7 +127,7 @@ fn bless_cell(golden_dir: &Path, name: &str, capture_json: &str) {
         fp_schema: FINGERPRINT_SCHEMA,
         schema: SCHEMA_VERSION,
         renderer_format_version: RENDERER_FORMAT_VERSION,
-        raster_font_fingerprint: shux_raster::builtin_font_fingerprint(16.0),
+        raster_font_fingerprint: shux::gate::pixel::builtin_font_fingerprint(16.0),
         unicode_width_ver: unicode_width_version(),
         tol: Tier::Cell,
         tol_params: TolParams::default(),
