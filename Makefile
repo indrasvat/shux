@@ -134,6 +134,14 @@ setup-bench: ## Install hyperfine, the benchmark harness `make bench-test-suite`
 check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's environment (colour on)
 	@bash scripts/check-ci-parity.sh
 
+.PHONY: check-darwin
+check-darwin: ## Type-check the workspace for macOS — catches cfg-gated APIs a Linux build never sees
+	@echo "$(COLOR_BLUE)▶ Cross-checking aarch64-apple-darwin...$(COLOR_RESET)"
+	@rustup target list --installed | grep -qx aarch64-apple-darwin \
+	  || rustup target add aarch64-apple-darwin
+	@cargo check --workspace --all-targets --target aarch64-apple-darwin --color never
+	@echo "$(COLOR_GREEN)✓ macOS type-check passed$(COLOR_RESET)"
+
 .PHONY: check-test-groups
 check-test-groups: nextest-ready ## Assert every nextest test-group still matches the tests it bounds
 	@bash scripts/check-test-groups.sh

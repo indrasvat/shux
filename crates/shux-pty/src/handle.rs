@@ -418,6 +418,21 @@ fn is_pty_eof_errno(errno: nix::errno::Errno) -> bool {
     errno == nix::errno::Errno::EIO
 }
 
+/// `si_pid`, which libc exposes as a plain field on BSD/macOS and behind an
+/// accessor on Linux. Zero means `waitid` found nothing waitable.
+fn siginfo_pid(info: &nix::libc::siginfo_t) -> nix::libc::pid_t {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: reading the pid of a siginfo `waitid` just filled in (or of
+        // the zeroed struct it left untouched) is always valid.
+        unsafe { info.si_pid() }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        info.si_pid
+    }
+}
+
 fn drain_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     // SAFETY: the fd is owned by self.pty and remains valid for the duration
     // of this synchronous nonblocking read.
@@ -749,19 +764,28 @@ impl PtyHandle {
     /// place, so the group stays allocated and the real reap stays exactly
     /// where it always was: `wait()`, after the read loop ends.
     fn child_exited_unreaped(&self) -> bool {
-        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
-        match waitid(
-            Id::Pid(nix::unistd::Pid::from_raw(self.pid as i32)),
-            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
-        ) {
-            Ok(WaitStatus::StillAlive) => false,
-            Ok(_) => true,
-            // ECHILD: something already reaped it, so it is certainly gone.
-            Err(e) => {
-                debug!(pid = self.pid, error = %e, "PTY child waitid failed");
-                true
-            }
+        // libc directly, because nix's `waitid` wrapper is not compiled for
+        // Apple targets — and macOS is the platform this whole fix exists for.
+        // POSIX idiom: zero the struct first, since a `WNOHANG` call that finds
+        // nothing waitable returns 0 and leaves `si_pid` untouched.
+        let mut info: nix::libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, correctly-typed `siginfo_t` for the whole
+        // call, and it is the only thing `waitid` writes through the pointer.
+        let rc = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                self.pid as nix::libc::id_t,
+                &mut info,
+                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+            )
+        };
+        if rc == -1 {
+            // ECHILD: not ours to wait on any more, so it is certainly gone.
+            let e = std::io::Error::last_os_error();
+            debug!(pid = self.pid, error = %e, "PTY child waitid failed");
+            return true;
         }
+        siginfo_pid(&info) != 0
     }
 
     /// The current exit-poll interval — see the constants.
