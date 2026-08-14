@@ -132,13 +132,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn linux_eio_is_treated_as_pty_eof() {
-        #[cfg(target_os = "linux")]
-        assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
+    // ── the drain loop at child exit (issue #162) ─────────────────────
+    //
+    // The sequences a pane's last read actually sees. These run the same code
+    // on every host, which is the point: the macOS-only arm is what lost a
+    // finished pane's output, and no Linux runner could reach it.
 
-        #[cfg(not(target_os = "linux"))]
-        assert!(!is_pty_eof_errno(nix::errno::Errno::EIO));
+    /// `read` returning a scripted sequence, one call at a time.
+    fn scripted(
+        steps: Vec<nix::Result<&'static [u8]>>,
+    ) -> impl FnMut(&mut [u8]) -> nix::Result<usize> {
+        let mut steps = steps.into_iter();
+        move |dst: &mut [u8]| match steps.next() {
+            Some(Ok(bytes)) => {
+                let n = bytes.len().min(dst.len());
+                dst[..n].copy_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(nix::errno::Errno::EAGAIN),
+        }
+    }
+
+    #[test]
+    fn eio_is_pty_eof_on_every_unix() {
+        // Not just Linux: a macOS pane exit lands here too.
+        assert!(is_pty_eof_errno(nix::errno::Errno::EIO));
+        assert!(!is_pty_eof_errno(nix::errno::Errno::EAGAIN));
+    }
+
+    #[test]
+    fn the_last_bytes_before_eof_survive() {
+        let mut buf = [0u8; 64];
+        let n = drain_with(
+            &mut buf,
+            scripted(vec![Ok(b"TRUECOLOR\n"), Err(nix::errno::Errno::EIO)]),
+        )
+        .expect("EOF after a short read is not an error");
+        assert_eq!(&buf[..n], b"TRUECOLOR\n");
+    }
+
+    #[test]
+    fn a_read_error_never_eats_the_bytes_already_read() {
+        // Any failing errno, not just the EOF one: the caller gets the data
+        // now and the error on the next call.
+        for errno in [nix::errno::Errno::ENXIO, nix::errno::Errno::EBADF] {
+            let mut buf = [0u8; 64];
+            let n = drain_with(&mut buf, scripted(vec![Ok(b"TRUECOLOR\n"), Err(errno)]))
+                .unwrap_or_else(|e| panic!("{errno:?} after a short read dropped the bytes: {e}"));
+            assert_eq!(&buf[..n], b"TRUECOLOR\n");
+        }
+    }
+
+    #[test]
+    fn an_error_with_nothing_buffered_is_still_an_error() {
+        let mut buf = [0u8; 64];
+        let err = drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::ENXIO)]))
+            .expect_err("a bare read failure must surface");
+        assert_eq!(err.raw_os_error(), Some(nix::errno::Errno::ENXIO as i32));
+
+        // …and EOF with nothing buffered is a clean zero, not an error.
+        assert_eq!(
+            drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::EIO)])).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_full_buffer_stops_the_drain() {
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            drain_with(&mut buf, scripted(vec![Ok(b"ab"), Ok(b"cd"), Ok(b"ef")])).unwrap(),
+            4
+        );
+        assert_eq!(&buf, b"abcd");
+    }
+
+    #[test]
+    fn nothing_readable_yet_is_would_block() {
+        let mut buf = [0u8; 64];
+        let err = drain_with(&mut buf, scripted(vec![Err(nix::errno::Errno::EAGAIN)]))
+            .expect_err("an empty nonblocking read must not look like EOF");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     }
 }
 
@@ -296,25 +371,39 @@ fn resolve_pane_term() -> &'static str {
     resolve_pane_term_from_roots(&terminfo_roots())
 }
 
+/// `EIO` on a PTY master read is the master's EOF: the last slave fd closed,
+/// i.e. the child and everything holding its terminal are gone.
+///
+/// Every unix reports it that way, not just Linux. Gating it to Linux left
+/// macOS taking the read-*error* path on every pane exit, which — with the
+/// pre-#162 drain below — threw away the bytes the same call had already read.
+/// A pane that printed and exited then reported its exit status with an empty
+/// grid, so an agent's `PaneExited` → `pane.capture` loop captured nothing.
 fn is_pty_eof_errno(errno: nix::errno::Errno) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        errno == nix::errno::Errno::EIO
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = errno;
-        false
-    }
+    errno == nix::errno::Errno::EIO
 }
 
 fn drain_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     // SAFETY: the fd is owned by self.pty and remains valid for the duration
     // of this synchronous nonblocking read.
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    drain_with(buf, |dst| nix::unistd::read(fd, dst))
+}
+
+/// The drain loop, over an injectable read so the exit-time errno sequences
+/// can be tested on any host (issue #162).
+///
+/// Bytes already in `buf` are never dropped: an error that arrives after a
+/// short read is reported on the *next* call, once the caller has the data.
+/// Read failures are sticky — the fd stays broken — so nothing is lost by
+/// deferring one, while a discarded read is gone for good.
+fn drain_with<F>(buf: &mut [u8], mut read: F) -> std::io::Result<usize>
+where
+    F: FnMut(&mut [u8]) -> nix::Result<usize>,
+{
     let mut total = 0usize;
     loop {
-        match nix::unistd::read(fd, &mut buf[total..]) {
+        match read(&mut buf[total..]) {
             Ok(0) => return Ok(total),
             Ok(n) => {
                 total += n;
@@ -330,7 +419,12 @@ fn drain_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> 
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) if is_pty_eof_errno(e) => return Ok(total),
-            Err(e) => return Err(std::io::Error::from(e)),
+            Err(e) => {
+                if total > 0 {
+                    return Ok(total);
+                }
+                return Err(std::io::Error::from(e));
+            }
         }
     }
 }

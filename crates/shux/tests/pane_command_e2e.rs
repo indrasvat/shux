@@ -1761,6 +1761,55 @@ fn the_focus_rescue_accepts_a_sibling_that_has_already_finished() {
     }
 }
 
+/// Issue #162: `PaneExited` is the "done" signal every agent gates on, so the
+/// exit status must never be visible before the pane's own output is.
+///
+/// The bytes were lost in the drain loop, which threw away everything it had
+/// already read when the read that followed failed — and on macOS the PTY
+/// master's EOF (`EIO`) *was* that failing read. The pane then reported
+/// `exit_status` with an empty grid. Note the deliberate absence of `PARK`:
+/// this command exits, which is the case under test.
+#[test]
+fn an_exited_pane_answers_capture_with_what_it_printed() {
+    let mut env = Env::new();
+    env.ok(&["session", "create", "exited", "-d", "--", "sleep", "900"]);
+    env.sessions.push("exited".to_string());
+
+    // A burst first, the colour probe last, so the assertion reads the final
+    // chunk — the one that shares its read with the child's exit.
+    env.ok(&[
+        "window",
+        "create",
+        "-s",
+        "exited",
+        "-n",
+        "burst",
+        "--cmd",
+        &format!("seq 1 500; printf '{COLOUR_PROBE}\\n'"),
+    ]);
+
+    let panes = env.wait_for_exited_pane("exited", "seq 1 500");
+    let pane = panes
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|p| p["exit_status"].is_number())
+        .expect("the burst pane should have exited")["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // No settle, no content wait: the exit status is the only signal, exactly
+    // as `events.watch` → `PaneExited` → `pane.capture` gives an agent.
+    let text = env.ok(&["pane", "capture", "-s", "exited", "-p", &pane]);
+    for needle in ["TRUECOLOR", "INDEXED", "BASIC"] {
+        assert!(
+            text.contains(needle),
+            "the exited pane reported its status with {needle} missing from its screen:\n{text}"
+        );
+    }
+}
+
 /// Round three's ignorable-codepoint rule stripped the variation selectors,
 /// which are mandatory in the very emoji sequences the ZWJ exception exists to
 /// protect: `❤️‍🔥` came back as `❤` and `1️⃣` as a bare `1`.
