@@ -1,0 +1,152 @@
+{
+  "gate": "shux-vt-solid-qa",
+  "scope": "optlevel-render-budget",
+  "verdict": "PASS",
+  "generated_at_utc": "2026-08-14T07:32:25.954602+00:00",
+  "branch": "perf/optlevel-probe",
+  "head_commit_at_audit": "25a27714e5c1cd278e9e4aaeeba8a38c5e25dac7",
+  "baseline_commit": "d308a0c451369b8457469def21f8c49f66cf7f8f",
+  "trigger": [
+    "crates/shux-ui/src/compositor.rs"
+  ],
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "dootsabha-design.md",
+  "dootsabha_implementation": "dootsabha-implementation.md",
+  "screenshots": [],
+  "screenshots_rationale": "No PNG is committed: every pixel metric compares the opt-level-0 arm against the opt-level-1 arm, and neither side is a repo-tracked baseline. Per .shux/qa/README.md the metric JSON stands alone in that case. Full-resolution PNGs, diffs and crops live in .shux/out/optlevel-render-budget/.",
+  "pixel_metrics": [
+    "pixel/pixel-corpus-rich-tui-btop-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-rich-tui-lazygit-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-rich-tui-nvim-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-rich-tui-vicaya-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-rich-tui-vivecaka-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-alternate-screen-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-dec-special-graphics-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-grapheme-storage-current-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-origin-response-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-origin-scroll-region-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-osc-default-colors-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-plain-crlf-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-resize-smoke-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-scroll-region-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-sync-output-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-tab-stops-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-tabs-current-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-wide-cjk-ansi-dec-edit-opt1-vs-opt0.json",
+    "pixel/pixel-corpus-synthetic-wide-cjk-opt1-vs-opt0.json",
+    "pixel/pixel-shuxpane-probe-120x40-pane-opt1-vs-opt0.json",
+    "pixel/pixel-shuxpane-probe-200x60-pane-opt1-vs-opt0.json",
+    "pixel/pixel-shuxpane-probe-80x24-pane-opt1-vs-opt0.json",
+    "pixel/pixel-shuxpane-tui-btop-pane-opt1-vs-opt0.json",
+    "pixel/pixel-shuxpane-tui-lazygit-pane-opt1-vs-opt0.json",
+    "pixel/pixel-shuxpane-tui-nvim-pane-opt1-vs-opt0.json",
+    "pixel/pixel-shuxpane-tui-vicaya-pane-opt1-vs-opt0.json",
+    "pixel/pixel-shuxpane-tui-vivecaka-pane-opt1-vs-opt0.json",
+    "pixel/pixel-shuxwin-probe-120x40-window-noclock-opt1-vs-opt0.json",
+    "pixel/pixel-shuxwin-probe-200x60-window-noclock-opt1-vs-opt0.json",
+    "pixel/pixel-shuxwin-probe-80x24-window-noclock-opt1-vs-opt0.json",
+    "pixel/pixel-shuxwin-tui-btop-window-noclock-opt1-vs-opt0.json",
+    "pixel/pixel-shuxwin-tui-lazygit-window-noclock-opt1-vs-opt0.json",
+    "pixel/pixel-shuxwin-tui-nvim-window-noclock-opt1-vs-opt0.json",
+    "pixel/pixel-shuxwin-tui-vicaya-window-noclock-opt1-vs-opt0.json",
+    "pixel/pixel-shuxwin-tui-vivecaka-window-noclock-opt1-vs-opt0.json"
+  ],
+  "pixel_metric_thresholds": {
+    "max_pixel_diff_ratio": 0,
+    "max_mean_channel_delta": 0
+  },
+  "arms": {
+    "opt0": "CARGO_PROFILE_TEST_OPT_LEVEL=0 (branch default), CARGO_TARGET_DIR=/tmp/qopt-t0",
+    "opt1": "CARGO_PROFILE_TEST_OPT_LEVEL=1 (main's value),  CARGO_TARGET_DIR=/tmp/qopt-t1"
+  },
+  "evidence_layers": {
+    "unit_and_integration": "make test x3 (opt0 x2, opt1 x1): 2120 run / 2120 passed / 2 skipped, identical at both opt levels",
+    "raw_replay": ".shux/fixtures/vt-corpus/{synthetic,rich-tui} replayed through cargo run --profile test -p shux-raster --example vt_corpus_harness at both opt levels; 19/19 PNG+TXT byte-identical between arms and to .shux/goldens/073-vt-corpus/",
+    "shux_automation": "shux built with cargo build --profile test at both opt levels; isolated daemons at /tmp/qopt/r0 and /tmp/qopt/r1; colour probe at 80x24/120x40/200x60 + 5 real-TUI raw replays at 120x36; pane.capture + pane.snapshot + window.snapshot",
+    "visual_inspection": "probe-80x24-pane-opt0.png, tui-btop-window-opt1.png and 6x status-bar crops opened as images",
+    "pixel_comparison": "35 metrics, all 0 changed pixels at exact 0/0 thresholds",
+    "self_determinism_control": "two consecutive pane.snapshot calls per breakpoint per arm are byte-identical"
+  },
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "P1",
+      "blocking": false,
+      "title": "crates/shux-ui/tests/compositor_tests.rs:58 still asserts total_time_us < 8000 against the PRD 8ms budget on the now-unoptimised test build",
+      "remedy": "raise the third site to the same ceiling and give it the same comment; do NOT drop opt-level = 0 \u2014 byte-identity is proven",
+      "status": "fixed and re-verified in round 2"
+    },
+    {
+      "id": "F2",
+      "severity": "P3",
+      "blocking": false,
+      "title": "crates/shux-ui/src/compositor.rs:22-23 RenderStats doc still advertises the PRD p50 <= 8ms budget",
+      "note": "downgraded in round 2: the doc describes what RenderStats is FOR and claims no test enforces the budget; not blocking"
+    },
+    {
+      "id": "F3",
+      "severity": "P2",
+      "blocking": false,
+      "attributable_to_diff": false,
+      "title": "make test exits 2 via no_leak_guard.sh on an orphaned `sleep 900` pane child; reproduces at opt-level 1, so pre-existing"
+    },
+    {
+      "id": "F4",
+      "severity": "P3",
+      "blocking": false,
+      "attributable_to_diff": false,
+      "title": "CJK tofu and spacing combining marks in pane.snapshot \u2014 documented renderer-v2 font gap, identical in both arms"
+    },
+    {
+      "id": "F5",
+      "severity": "P3",
+      "blocking": false,
+      "title": ".github/workflows/optlevel-probe.yml is still present at HEAD; the PR says it is deleted before merge"
+    }
+  ],
+  "threshold_judgement": {
+    "verdict": "100_000us stands; no change requested",
+    "basis": "9.65x the worst opt-level-0 CI observation (10365us). Locally measured opt0/opt1 ratio 4.0-4.2x over n=30. Council counter-proposals of 25_000-30_000us are rejected as 2.4-2.9x headroom, the same marginal shape that made the 8000us bound flaky.",
+    "optional": "125_000 makes the 10x rule exactly true"
+  },
+  "cleanup": {
+    "audit_daemons_stopped": true,
+    "audit_sessions_killed": true,
+    "council_worktree_removed": true,
+    "shared_checkout_head_moved": false
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "verdict": "FAIL",
+      "blocking_finding": "F1",
+      "audited_commit": "25a2771"
+    },
+    {
+      "round": 2,
+      "verdict": "PASS",
+      "scope": "F1 re-verification only",
+      "audited_state": "uncommitted working tree on perf/optlevel-probe, pinned by blob sha256 below",
+      "why_byte_identity_not_redone": "the round-2 delta is two assert! bounds and three comments (+6 -4, no executable statement outside a test); it cannot move a cell or a pixel, so the 35 metrics from round 1 still describe the rendering under audit"
+    }
+  ],
+  "round2_pinned_blobs": {
+    "crates/shux-ui/src/compositor.rs": "473452f7d62886deddb1c63b335743d96bd18acb9d1f55f1655ded46ce494c83",
+    "crates/shux-ui/tests/compositor_tests.rs": "cb032b038a87fe977f2dee2930b10fdabd9b46f91ec6642ac3dd869c9f90a9e7"
+  },
+  "round2_verification": {
+    "wall_clock_sites": [
+      "crates/shux-ui/tests/compositor_tests.rs:59 -> 100_000",
+      "crates/shux-ui/tests/compositor_tests.rs:307 -> 100_000",
+      "crates/shux-ui/src/compositor.rs:1302 -> 100_000"
+    ],
+    "make test-ui (opt0)": "227 run / 227 passed / 0 skipped",
+    "cargo nextest run -p shux-ui (opt0)": "235 run / 235 passed / 0 skipped",
+    "cargo nextest run -p shux-ui (opt1)": "235 run / 235 passed / 0 skipped",
+    "three wall-clock tests, opt0, 5 reps": "3/3 passed every rep"
+  },
+  "outstanding_after_round2": [
+    "F3 (P2, pre-existing, reproduces at opt-level 1): make test exits 2 via no_leak_guard.sh on an orphaned `sleep 900` pane child \u2014 needs an owner, out of this change's scope",
+    "F5 (P3): .github/workflows/optlevel-probe.yml must actually be deleted before merge; nothing in the tree enforces it"
+  ]
+}

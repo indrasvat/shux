@@ -584,7 +584,14 @@ test-lens-gate-glance-cells: nextest-ready ## Run the task-080 daemon-backed `pa
 	$(call lens_run,Running lens-gate glance --cells emission suite (task 080),--test lens_gate_glance_cells)
 
 .PHONY: bench-lens-gate
+# opt-level 2 explicitly: `[profile.test]` is 0 so ordinary tests compile fast,
+# but this target measures throughput and its numbers are compared against the
+# task-080 baseline. An unoptimised build would make them incomparable.
 bench-lens-gate: nextest-ready ## Record task-080 capture/compare/render throughput at 10/100/1000 frames (no daemon; prints numbers)
+	@CARGO_PROFILE_TEST_OPT_LEVEL=2 $(MAKE) --no-print-directory lens-gate-bench-run
+
+.PHONY: lens-gate-bench-run
+lens-gate-bench-run:
 	$(call lens_run_pure,Recording lens-gate throughput (task 080 §6),--test lens_gate_bench,--no-capture)
 
 .PHONY: test-lens-gate-run
