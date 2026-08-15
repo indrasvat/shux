@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assert `crates/shux/src/main.rs` declares no modules.
+# Assert the `shux` BINARY target declares no modules.
 #
 # `crates/shux` has both a `[lib]` and a `[[bin]]`. A module declared in BOTH
 # `lib.rs` and `main.rs` is compiled once per target, producing two unrelated
@@ -10,30 +10,126 @@
 #
 # It is also the cheapest possible thing to check — `main.rs` owns `fn main()`
 # and the module tree lives in `lib.rs`, so the correct number of `mod`
-# declarations in this file is zero, for ever. Hence a guard rather than a note.
+# declarations in that file is zero, for ever. Hence a guard rather than a note.
 #
-# Only `main.rs` is inspected. `lib.rs` is where modules belong, and every other
-# binary-less crate in the workspace is unaffected by this hazard.
+# ── What this is, and is not ────────────────────────────────────────────────
+# This is a LINT over one small file, not a Rust parser. It is deliberately
+# biased toward false POSITIVES: the file it inspects is expected to contain
+# zero module declarations, so a spurious hit costs one line of author time,
+# while a miss costs the confusing-type-error class this exists to prevent.
+#
+# The first version of this guard was regex-per-line and an adversarial review
+# walked straight through it: `pub(crate) mod foo;` evaded (the regex wanted
+# `pub` + whitespace), as did `pub(super)`, `pub(in crate::x)`, an attribute on
+# the same line (`#[cfg(test)] mod tests;`), a raw identifier (`mod r#gen;`),
+# an uppercase name, and a declaration wrapped across two lines. All of those
+# are caught now, which is why the scan below normalises before it matches
+# instead of trusting one line to hold one declaration.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-MAIN="crates/shux/src/main.rs"
+MANIFEST="crates/shux/Cargo.toml"
+[[ -f "${MANIFEST}" ]] || { echo "error: ${MANIFEST} does not exist" >&2; exit 2; }
 
-if [[ ! -f "${MAIN}" ]]; then
-  echo "error: ${MAIN} does not exist — this guard is checking nothing" >&2
+# Read the bin path from the manifest rather than hardcoding it. A guard that
+# names `src/main.rs` while `[[bin]] path` points somewhere else is checking a
+# file the binary does not build — it passes while the hazard sits in the real
+# entry point. Adversarial review reproduced exactly that.
+MAIN="$(awk '
+  /^\[\[bin\]\]/ { inbin = 1; next }
+  /^\[/          { inbin = 0 }
+  inbin && /^[[:space:]]*path[[:space:]]*=/ {
+    line = $0
+    sub(/^[^=]*=[[:space:]]*/, "", line)
+    gsub(/^"|"[[:space:]]*$/, "", line)
+    print "crates/shux/" line
+    exit
+  }
+' "${MANIFEST}")"
+
+if [[ -z "${MAIN}" ]]; then
+  echo "error: could not read [[bin]] path from ${MANIFEST} — this guard would check nothing" >&2
   exit 2
 fi
 
-# Declarations only. `mod foo;` and `pub mod foo;` at any indentation, but not
-# `mod tests { … }` (an inline block declares nothing that could collide across
-# targets) and not the word `mod` inside a comment or string.
+if [[ ! -f "${MAIN}" ]]; then
+  echo "error: ${MAIN} (from ${MANIFEST}) does not exist — this guard is checking nothing" >&2
+  exit 2
+fi
+
+# Strip what a `mod` keyword can legally hide inside, then look for declarations
+# across the whole file rather than line by line:
 #
-# `grep -c` exits 1 on no match, which is the passing case here, so the count is
-# captured with a `|| true` on the SUBSTITUTION and the emptiness handled below
-# — never `grep … || true` as a condition, which would always be true.
-hits="$(grep -nE '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+[a-z_][a-z0-9_]*[[:space:]]*;' "${MAIN}" || true)"
+#   - block comments, line comments, and string/char literals are blanked, so
+#     prose and raw strings cannot trip the match (`//! see `mod foo;`` is fine);
+#   - `mod NAME ;` is matched with the declaration's pieces allowed to be
+#     separated by any whitespace INCLUDING newlines;
+#   - visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in path)`) and any
+#     leading attributes are permitted before the keyword, because every one of
+#     them is still a declaration;
+#   - `mod NAME { … }` (an inline module) is NOT a hit: it declares no separate
+#     compilation unit and cannot collide across targets.
+#
+# The line number reported is the line the `mod` keyword sits on.
+hits="$(awk '
+  { lines[NR] = $0 }
+  END {
+    # Rebuild the file with comments and literals blanked, tracking line numbers.
+    inblock = 0
+    for (i = 1; i <= NR; i++) {
+      s = lines[i]; out = ""
+      j = 1
+      while (j <= length(s)) {
+        c = substr(s, j, 1); d = substr(s, j, 2)
+        if (inblock) {
+          if (d == "*/") { inblock = 0; j += 2 } else { j++ }
+          out = out " "
+          continue
+        }
+        if (d == "/*") { inblock = 1; j += 2; out = out "  "; continue }
+        if (d == "//") { while (j <= length(s)) { out = out " "; j++ } break }
+        if (c == "\"") {
+          out = out " "; j++
+          while (j <= length(s)) {
+            if (substr(s, j, 1) == "\\") { out = out "  "; j += 2; continue }
+            if (substr(s, j, 1) == "\"") { out = out " "; j++; break }
+            out = out " "; j++
+          }
+          continue
+        }
+        out = out c; j++
+      }
+      clean[i] = out
+      joined = joined out "\n"
+      # Record, for each character offset in `joined`, which line it came from.
+      for (k = 0; k <= length(out); k++) { lineof[offset + k] = i }
+      offset += length(out) + 1
+    }
+
+    # Collapse newlines to spaces for matching, keeping offsets aligned.
+    flat = joined
+    gsub(/\n/, " ", flat)
+
+    # `mod NAME ;` with arbitrary whitespace between the pieces. `r#` prefixes
+    # and any identifier case are allowed. A trailing `{` is an inline module
+    # and is deliberately not matched.
+    rest = flat; base = 0
+    while (match(rest, /(^|[^A-Za-z0-9_])mod[[:space:]]+(r#)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*;/)) {
+      start = base + RSTART
+      # Skip the leading non-identifier character the regex had to consume.
+      probe = substr(rest, RSTART, RLENGTH)
+      if (probe !~ /^mod/) start += 1
+      decl = substr(rest, RSTART, RLENGTH)
+      sub(/^[^A-Za-z0-9_]/, "", decl)
+      gsub(/[[:space:]]+/, " ", decl)
+      printf "%d:%s\n", lineof[start - 1], decl
+      base += RSTART + RLENGTH - 1
+      rest = substr(rest, RSTART + RLENGTH)
+    }
+  }
+' "${MAIN}")"
 
 if [[ -n "${hits}" ]]; then
   echo "✗ ${MAIN} declares modules:" >&2
@@ -43,7 +139,8 @@ if [[ -n "${hits}" ]]; then
   echo "  both targets compiles into each as a separate type with the same name;" >&2
   echo "  it builds, and every type error after it is unreadable." >&2
   echo "" >&2
-  echo "  Move the declaration to lib.rs and reach it from main.rs as \`shux::<name>\`." >&2
+  echo "  Move the declaration to lib.rs and reach it from the binary as" >&2
+  echo "  \`shux::<name>\`." >&2
   exit 1
 fi
 

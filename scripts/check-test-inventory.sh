@@ -135,6 +135,22 @@ list_tests() {
 crates_tree() { git rev-parse "${1}^{commit}:crates"; }
 
 if [[ "${WRITE_BASELINE}" -eq 1 ]]; then
+  # The list comes from the WORKING TREE but the cache key names the COMMITTED
+  # `crates/` tree, so publishing from a dirty checkout files a wrong answer
+  # under a right-looking key — and every later branch forking from that tree
+  # inherits it. An adversarial review did exactly this: deleted one test in the
+  # working tree only, published, restored, and the cached "baseline" was
+  # permanently short a test the tree actually contains, licensing its deletion
+  # for free. CI is clean by construction; `make ci` locally is not.
+  if ! git diff --quiet HEAD -- crates || \
+     [[ -n "$(git ls-files --others --exclude-standard -- crates)" ]]; then
+    echo "error: refusing to publish a baseline from a dirty crates/ tree." >&2
+    echo "  The list would describe the working tree while the cache key names" >&2
+    echo "  the committed tree, so the wrong answer gets filed under the right" >&2
+    echo "  key. Commit or stash first." >&2
+    git status --short -- crates | sed 's/^/    /' >&2
+    exit 2
+  fi
   HEAD_SHA="$(crates_tree HEAD)"
   OUT="${CACHE_DIR}/${HEAD_SHA}-${SCRIPT_DISC}.txt"
   list_tests >"${OUT}.tmp"
@@ -210,23 +226,52 @@ if [[ -n "${added}" ]]; then
   echo "${added}" | cut -f1,2 | sed 's/^/    + /'
 fi
 
-# A removal whose leaf name reappears somewhere else in the workspace is a MOVE:
-# the test did not stop being compiled, it changed crates. That is a real and
-# occasionally necessary thing to do — #151 moved 50 of them out of `shux-vt` and
-# `shux-raster` — and it is also indistinguishable, from here, from deleting a
-# test in one crate and coincidentally adding a same-named one in another.
+# A removal whose leaf name reappears in a DIFFERENT PACKAGE is a cross-crate
+# MOVE: the test did not stop being compiled, it changed crates. That is a real
+# and occasionally necessary thing to do — #151 moved 50 of them out of `shux-vt`
+# and `shux-raster` — and it is also indistinguishable, from here, from deleting
+# a test in one crate and coincidentally adding a same-named one in another.
 #
 # So it is neither failed nor waved through: it needs a `TEST-MOVE:` trailer with
 # a reason, the same mechanism `check-lens-frozen.sh` uses for a deliberate change
 # to a frozen path, and read with git's own trailer parser rather than a body grep
 # (which would match the string inside quoted text). The trailer permits MOVES only.
-# A leaf name that vanishes from the whole workspace fails with or without it.
-removed_leaves="$(printf '%s' "${removed}" | sed -e '/^$/d' | cut -f2 | sort)"
-added_leaves="$(printf '%s' "${added}" | sed -e '/^$/d' | cut -f2 | sort)"
-# Multiset difference: two removals of `foo` against one addition of `foo` leaves
-# one genuinely vanished, which is what `comm` on sorted duplicates reports.
-vanished="$(comm -23 <(printf '%s\n' "${removed_leaves}" | sed '/^$/d') \
-                     <(printf '%s\n' "${added_leaves}" | sed '/^$/d') || true)"
+# A leaf name that vanishes fails with or without it.
+#
+# DIFFERENT PACKAGE, not "anywhere", and that word is load-bearing. The first cut
+# of this matched the leaf name against every addition in the workspace, and an
+# adversarial review used it to delete 815 bytes of real assertions from
+# `crates/shux/tests/lens_gate_compare.rs` while adding an empty function of the
+# same name to `crates/shux/tests/lib_target.rs` — same package, different test
+# binary. The guard called it a move "to another crate", said the test still ran,
+# and exited 0. Both claims were false. Matching only across packages makes that
+# specific laundering impossible: an intra-package shuffle now has no addition to
+# pair with and falls through to the hard failure below.
+#
+# What remains, and is NOT claimed to be caught: deleting a test in crate A while
+# adding a same-named stub in crate B, with a trailer. Name-based matching cannot
+# see that, and this guard only ever sees names. It is bounded by being printed
+# in full and requiring a deliberate trailer, and by review of the diff.
+# `<package>\t<leaf>`, so a leaf reappearing under the SAME package cannot pair.
+removed_keys="$(printf '%s' "${removed}" | sed '/^$/d' \
+  | awk -F'\t' '{ pkg = $1; sub(/::.*/, "", pkg); print pkg "\t" $2 }' | sort)"
+added_keys="$(printf '%s' "${added}" | sed '/^$/d' \
+  | awk -F'\t' '{ pkg = $1; sub(/::.*/, "", pkg); print pkg "\t" $2 }' | sort)"
+
+# For each removed (package, leaf), a move requires the SAME leaf under a
+# DIFFERENT package. Multiset-aware: two removals of `foo` need two such
+# additions, else one of them is genuinely gone.
+vanished="$(awk -F'\t' '
+  NR == FNR { avail[$2 "\t" $1]++; leaf_total[$2]++; next }
+  {
+    pkg = $1; leaf = $2
+    same = avail[leaf "\t" pkg] + 0
+    elsewhere = leaf_total[leaf] - same
+    if (elsewhere > 0) { leaf_total[leaf]--; next }
+    print leaf "  (was in " pkg ")"
+  }
+' <(printf '%s\n' "${added_keys}" | sed '/^$/d') \
+  <(printf '%s\n' "${removed_keys}" | sed '/^$/d') || true)"
 
 if [[ -n "${vanished}" ]]; then
   echo "" >&2

@@ -12,8 +12,8 @@
 //! the `report.json` schema, the cell comparator, the pixel tier — was pushed
 //! two layers down into `shux-vt` and `shux-raster` purely so the frozen
 //! contract tests could import it. Both files said so in their own placement
-//! notes. This target removes the reason; [`gate::vocab`], [`gate::cells`] and
-//! [`gate::pixel`] are where that vocabulary lives now.
+//! notes. This target removes the reason; [`gate::vocab`], [`gate::cell_compare`]
+//! and [`gate::pixel`] are where that vocabulary lives now.
 //!
 //! **`main.rs` declares no modules.** A module declared in both a `lib.rs` and
 //! a `main.rs` is compiled into each target as two unrelated types with the

@@ -1,0 +1,16 @@
+{
+  "actual": "f7-resize-head.png",
+  "changed_pixels": 0,
+  "diff": "f7-resize-diff.png",
+  "expected": "f7-resize-base.png",
+  "max_mean_channel_delta": 0.0,
+  "max_pixel_diff_ratio": 0.0,
+  "mean_rgba_channel_delta": 0.0,
+  "pixel_diff_ratio": 0.0,
+  "size": [
+    1188,
+    817
+  ],
+  "status": "pass",
+  "total_pixels": 970596
+}
