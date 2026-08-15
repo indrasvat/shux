@@ -1,3 +1,10 @@
+## [0.46.20](https://github.com/indrasvat/shux/compare/v0.46.19...v0.46.20) (2026-08-15)
+
+
+### Performance Improvements
+
+* **test:** build test targets unoptimised ([#166](https://github.com/indrasvat/shux/issues/166)) ([817aafc](https://github.com/indrasvat/shux/commit/817aafca0cc09d9a5f88ddbd5fb79a2e63289df5))
+
 ## [0.46.19](https://github.com/indrasvat/shux/compare/v0.46.18...v0.46.19) (2026-08-14)
 
 
