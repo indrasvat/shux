@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOC="$ROOT/skills/shux/references/gate.md"
 SCENARIO_RS="$ROOT/crates/shux/src/gate/scenario.rs"
-STATUS_RS="$ROOT/crates/shux-vt/src/gate.rs"
+STATUS_RS="$ROOT/crates/shux/src/gate/vocab.rs"
 NOTICES="$ROOT/THIRD-PARTY-NOTICES"
 # Every skill doc that teaches the gate. The grammar checks below key off gate.md (it is
 # the reference), but the "wrong claim" checks must sweep ALL of them: task 085 fixed the

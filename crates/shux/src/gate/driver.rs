@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use shux_vt::{GateStatus, ScenarioReport};
+use crate::gate::vocab::{GateStatus, ScenarioReport};
 
 use super::runner::{TraceTarget, default_golden_dir};
 use super::scenario;
@@ -21,7 +21,7 @@ pub struct GateRunOptions {
     pub on_missing: crate::cli::OnMissing,
     pub update: Option<String>,
     pub reason: Option<String>,
-    pub tol: Option<shux_vt::TolParams>,
+    pub tol: Option<crate::gate::cell_compare::TolParams>,
     pub out: Option<PathBuf>,
     pub retries: Option<u32>,
     /// `--cast [PATH]` (task 083): `None` = off; `Some("")` = default `<out>/<scenario>.cast`;

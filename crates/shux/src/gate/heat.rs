@@ -12,11 +12,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::gate::pixel::{decode_png, encode_png, os_arch, pixel_baseline_path, render_envelope};
 use image::RgbaImage;
-use shux_raster::{
-    Rasterizer, decode_png, encode_png, os_arch, pixel_baseline_path, render_envelope,
-};
-use shux_vt::{FrameEnvelope, GateStatus, ScenarioReport, Tier};
+use shux_raster::Rasterizer;
+
+use crate::gate::cell_compare::Tier;
+use crate::gate::vocab::{GateStatus, ScenarioReport};
+use shux_vt::FrameEnvelope;
 
 use super::outcome::{FrameKind, RunOutcome};
 

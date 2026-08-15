@@ -1,13 +1,16 @@
 //! Lens-gate verdict / report contract (task 078).
 //!
-//! **Placement note.** These are lens-gate *vocabulary* types (the closed status
-//! set, the exit map, the xfail metadata shape, and the `report.json` schema).
-//! They live in `shux-vt` — not because they are virtual-terminal concepts, but
-//! because `shux` is a binary-only crate whose internals integration tests cannot
-//! import, and this is the lowest shared crate that both the eventual gate
-//! implementation (in the `shux` binary, tasks 081/082) and the frozen contract
-//! tests (`crates/shux/tests/lens_gate_*`) can depend on. They are colocated with
-//! [`crate::capture`] and the task-079 comparator as the "lens core" surface.
+//! The lens-gate *vocabulary*: the closed status set, the exit map, the xfail
+//! metadata shape, and the `report.json` schema.
+//!
+//! **Placement note (#151).** This module spent tasks 078–085 in `shux-vt`, and
+//! said so itself: *"not because they are virtual-terminal concepts, but because
+//! `shux` is a binary-only crate whose internals integration tests cannot
+//! import."* A CI exit-code table had no business living in the terminal
+//! emulator, and the arrangement had started to justify itself — `shux-vt`'s
+//! manifest cited this file as grounds for putting the cell comparator there
+//! too. #150 gave `crates/shux` a library target, which removed the reason;
+//! this is the destination. Nothing about the contract changed on the way.
 //!
 //! **078 freezes the SHAPES; 082 fills in the COMPUTATION.** The one behaviour
 //! frozen here is the total, pure [`GateStatus::exit_code`] mapping (§7.4). The
@@ -17,7 +20,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{CapColor, CapStyle, FrameEnvelope, RowRepr, Run, RunContent};
+use shux_vt::{CapColor, CapStyle, FrameEnvelope, RowRepr, Run, RunContent};
 
 /// `report.json` schema version. Bump only with a `GATE-TEST-CHANGE:` trailer.
 pub const GATE_REPORT_SCHEMA: u32 = 1;

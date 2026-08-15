@@ -103,10 +103,9 @@ pub trait CellGridView {
     /// Whether this frame is the ALTERNATE screen (task-080). Defaulted to `false` so the
     /// frozen [`diff_frames`] path and the live [`GridFrame`] (daemon `pane.diff_since`,
     /// which never diffs across an alt-switch) are byte-unchanged; only [`FrameView`]
-    /// overrides it, so the lens gate's [`compare_cell`](crate::compare_cell) can treat an
+    /// overrides it, so the lens gate's `compare_cell` can treat an
     /// alt/primary flip between a golden and a live capture as a difference.
-    ///
-    /// [`compare_cell`]: crate::compare_cell
+    /// (`compare_cell` is the gate's, in `crates/shux`; this crate does not depend on it.)
     fn alt_screen(&self) -> bool {
         false
     }

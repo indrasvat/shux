@@ -20,7 +20,7 @@
 mod lens_common;
 
 use lens_common::Harness;
-use shux_vt::{GateStatus, ScenarioReport};
+use shux::gate::vocab::{GateStatus, ScenarioReport};
 
 fn hello_scenario(h: &Harness) -> String {
     h.repo_root()

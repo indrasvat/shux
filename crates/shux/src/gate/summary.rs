@@ -6,7 +6,7 @@
 //!
 //! Pure: `render` returns the exact string the orchestrator prints (a test pins it).
 
-use shux_vt::{GateStatus, ScenarioReport};
+use crate::gate::vocab::{GateStatus, ScenarioReport};
 
 /// The status label as it appears in `report.json` (frozen snake_case), for the table.
 pub(crate) fn status_label(s: GateStatus) -> &'static str {
@@ -149,7 +149,7 @@ pub fn render(reports: &[ScenarioReport]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shux_vt::{DiffReport, FrameReport};
+    use crate::gate::vocab::{DiffReport, FrameReport};
 
     fn frame(
         name: &str,

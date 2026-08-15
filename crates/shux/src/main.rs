@@ -1,34 +1,16 @@
+//! Entry point, and nothing else.
+//!
+//! Every module lives in `lib.rs`. Declaring one here as well would compile it
+//! into both targets as two unrelated types with the same name — see the note
+//! on the crate docs in `lib.rs`. `scripts/check-no-bin-mods.sh` asserts this
+//! file stays free of `mod` declarations.
+
 use clap::{CommandFactory, FromArgMatches};
 
-mod attach;
-mod cli;
-mod client;
-mod config_validate;
-mod daemon;
-mod daemon_boot;
-mod dispatch;
-mod features;
-mod gate;
-mod lens_render;
-mod lens_scratch;
-mod onboarding;
-mod pane_command;
-mod pane_io;
-mod pane_record;
-mod pane_spawn;
-mod rpc;
-mod session_meta;
-mod session_persist;
-mod settle;
-mod snapshot;
-mod statusbar_build;
-mod statusbar_runner;
-mod style;
-mod template;
-
-use cli::{Cli, Command};
-use daemon_boot::run_daemon;
-use dispatch::run_client;
+use shux::cli::{self, Cli, Command};
+use shux::daemon_boot::run_daemon;
+use shux::dispatch::run_client;
+use shux::style;
 
 fn main() {
     // Inject the colorised agent reference at runtime so it honours

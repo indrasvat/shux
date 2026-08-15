@@ -14,15 +14,17 @@
 
 use std::path::{Path, PathBuf};
 
-use shux_raster::{
-    Rasterizer, encode_png, evaluate_tier, os_arch, pixel_baseline_path, render_envelope,
-    render_envelope_png,
+use shux::gate::pixel::{
+    encode_png, evaluate_tier, os_arch, pixel_baseline_path, render_envelope, render_envelope_png,
 };
-use shux_vt::{
-    FINGERPRINT_SCHEMA, Fingerprint, FrameEnvelope, GateStatus, MaskSet, RENDERER_FORMAT_VERSION,
-    SCHEMA_VERSION, Tier, TolParams, VirtualTerminal, capture_sha256, compare_cell, diff_frames,
-    mask_hash, unicode_width_version,
+use shux_raster::Rasterizer;
+
+use shux::gate::cell_compare::{
+    FINGERPRINT_SCHEMA, Fingerprint, RENDERER_FORMAT_VERSION, Tier, TolParams, capture_sha256,
+    compare_cell, mask_hash, unicode_width_version,
 };
+use shux::gate::vocab::GateStatus;
+use shux_vt::{FrameEnvelope, MaskSet, SCHEMA_VERSION, VirtualTerminal, diff_frames};
 
 const FONT_SIZE: f32 = 16.0;
 
@@ -31,7 +33,7 @@ fn rasterizer() -> Rasterizer {
 }
 
 fn font_fp() -> String {
-    shux_raster::builtin_font_fingerprint(FONT_SIZE)
+    shux::gate::pixel::builtin_font_fingerprint(FONT_SIZE)
 }
 
 fn env(prog: &[u8], rows: usize, cols: usize) -> FrameEnvelope {
@@ -109,8 +111,8 @@ fn bless_pixel(
     let png = encode_png(&img).unwrap();
     let mut fp = current_fp(tier, tol, &MaskSet::new(), Some(os_arch()));
     fp.capture_sha256 = capture_sha256(golden);
-    fp.rgba_sha256 = Some(shux_raster::rgba_sha256(&img));
-    fp.png_sha256 = Some(shux_raster::png_sha256(&png));
+    fp.rgba_sha256 = Some(shux::gate::pixel::rgba_sha256(&img));
+    fp.png_sha256 = Some(shux::gate::pixel::png_sha256(&png));
     std::fs::write(
         dir.join(format!("{name}.fingerprint.json")),
         serde_json::to_string_pretty(&fp).unwrap(),
@@ -131,7 +133,7 @@ fn gate_status(
     live: &FrameEnvelope,
     current: &Fingerprint,
     r: &Rasterizer,
-) -> (GateStatus, Option<shux_raster::TierVerdict>) {
+) -> (GateStatus, Option<shux::gate::pixel::TierVerdict>) {
     let json_path = dir.join(format!("{name}.capture.json"));
     let fp_path = dir.join(format!("{name}.fingerprint.json"));
     if !json_path.exists() || !fp_path.exists() {
@@ -157,9 +159,13 @@ fn gate_status(
         // bytes; pixel → `rgba_sha256` of the decoded RGBA, encoder-stable). A mismatch
         // or an undecodable baseline is `stale_golden`, never silently accepted.
         let pin_ok = match tier {
-            Tier::Exact => sidecar.png_sha256.as_deref() == Some(&shux_raster::png_sha256(&bytes)),
-            Tier::Pixel => match shux_raster::decode_png(&bytes) {
-                Ok(img) => sidecar.rgba_sha256.as_deref() == Some(&shux_raster::rgba_sha256(&img)),
+            Tier::Exact => {
+                sidecar.png_sha256.as_deref() == Some(&shux::gate::pixel::png_sha256(&bytes))
+            }
+            Tier::Pixel => match shux::gate::pixel::decode_png(&bytes) {
+                Ok(img) => {
+                    sidecar.rgba_sha256.as_deref() == Some(&shux::gate::pixel::rgba_sha256(&img))
+                }
                 Err(_) => false,
             },
             Tier::Cell => true,
@@ -460,12 +466,15 @@ fn mask_invariance_across_capture_hash_compare_and_pixels() {
     // both sides, so the RGBA is identical (no false pixel mismatch — D4/agy #3).
     let ra = render_envelope(&r, &a);
     let rb = render_envelope(&r, &b);
-    let m = shux_raster::compare_pixels(&ra, &rb, &TolParams::default());
+    let m = shux::gate::pixel::compare_pixels(&ra, &rb, &TolParams::default());
     assert_eq!(
         m.changed_pixels, 0,
         "masked pixels are identical across secrets"
     );
-    assert_eq!(shux_raster::rgba_sha256(&ra), shux_raster::rgba_sha256(&rb));
+    assert_eq!(
+        shux::gate::pixel::rgba_sha256(&ra),
+        shux::gate::pixel::rgba_sha256(&rb)
+    );
 }
 
 #[test]
@@ -489,8 +498,8 @@ fn mask_does_not_leak_secret_length_via_cursor() {
     );
     let r = rasterizer();
     assert_eq!(
-        shux_raster::rgba_sha256(&render_envelope(&r, &long)),
-        shux_raster::rgba_sha256(&render_envelope(&r, &short)),
+        shux::gate::pixel::rgba_sha256(&render_envelope(&r, &long)),
+        shux::gate::pixel::rgba_sha256(&render_envelope(&r, &short)),
         "secret length must not leak via cursor into rgba_sha256"
     );
     // No OVER-clamping: a cursor OUTSIDE every masked rect keeps its real column.
@@ -520,9 +529,9 @@ fn div_pair(name: &str) -> (FrameEnvelope, FrameEnvelope) {
 }
 
 /// changed pixels rendering a vs b through the SAME rasterizer.
-fn pixel_delta(a: &FrameEnvelope, b: &FrameEnvelope) -> shux_raster::PixelMetrics {
+fn pixel_delta(a: &FrameEnvelope, b: &FrameEnvelope) -> shux::gate::pixel::PixelMetrics {
     let r = rasterizer();
-    shux_raster::compare_pixels(
+    shux::gate::pixel::compare_pixels(
         &render_envelope(&r, a),
         &render_envelope(&r, b),
         &TolParams::default(),
@@ -653,7 +662,7 @@ fn divergence_glyph_fallback_is_pixel_only_under_a_different_font_stack() {
     // pixel tier: same cells, different font stack → the emoji glyph renders differently.
     let with_emoji = render_envelope(&full, &crab);
     let without = render_envelope(&no_emoji, &crab);
-    let m = shux_raster::compare_pixels(&with_emoji, &without, &TolParams::default());
+    let m = shux::gate::pixel::compare_pixels(&with_emoji, &without, &TolParams::default());
     assert!(
         m.changed_pixels > 0,
         "an emoji-only glyph renders differently without the emoji fallback (font-stack pixel divergence)"

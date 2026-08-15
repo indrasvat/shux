@@ -1585,7 +1585,7 @@ pub enum LensCommand {
         /// `MAX_CHANNEL_DELTA[,MAX_CHANGED_FRAC]` (bless-only; compare tol always comes
         /// from the blessed sidecar, never a runtime value).
         #[arg(long, value_name = "DELTA[,FRAC]", value_parser = parse_tol)]
-        tol: Option<shux_vt::TolParams>,
+        tol: Option<crate::gate::cell_compare::TolParams>,
 
         /// Directory for scratch evidence (heat PNGs). Default `.shux/out/<scenario>/`.
         #[arg(long, value_name = "DIR")]
@@ -1659,7 +1659,7 @@ pub enum GateSubcommand {
 }
 
 /// Parse a bless tolerance `MAX_CHANNEL_DELTA[,MAX_CHANGED_FRAC]` (e.g. `8` or `8,0.01`).
-pub fn parse_tol(s: &str) -> Result<shux_vt::TolParams, String> {
+pub fn parse_tol(s: &str) -> Result<crate::gate::cell_compare::TolParams, String> {
     let (delta, frac) = match s.split_once(',') {
         Some((d, f)) => (d.trim(), Some(f.trim())),
         None => (s.trim(), None),
@@ -1678,7 +1678,7 @@ pub fn parse_tol(s: &str) -> Result<shux_vt::TolParams, String> {
             "--tol frac {max_changed_frac} out of range 0.0..=1.0"
         ));
     }
-    Ok(shux_vt::TolParams {
+    Ok(crate::gate::cell_compare::TolParams {
         max_channel_delta,
         max_changed_frac,
     })

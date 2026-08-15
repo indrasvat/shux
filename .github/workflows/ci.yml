@@ -113,6 +113,11 @@ jobs:
       # user's run with exit 2. This compares the doc against the shipped surface.
       - name: Check lens-gate docs match the shipped CLI
         run: make check-gate-docs
+      # `crates/shux` has both a lib and a bin. A module declared in both targets
+      # builds fine and produces two same-named, incompatible types; the errors
+      # that follow name neither cause. Cheap to assert, so it is asserted.
+      - name: Check the shux binary declares no modules
+        run: make check-no-bin-mods
 
   test-ubuntu:
     name: Test (ubuntu)

@@ -17,8 +17,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::gate::cell_compare::sha256_hex;
 use serde::Serialize;
-use shux_vt::sha256_hex;
 
 use super::scenario::{Scenario, TerminalCfg};
 

@@ -14,7 +14,29 @@
 //! sequences that never reach this code.
 
 use proptest::prelude::*;
-use shux_vt::{FrameEnvelope, MaskSet, VirtualTerminal, capture_sha256};
+use sha2::{Digest, Sha256};
+use shux_vt::{FrameEnvelope, MaskSet, VirtualTerminal};
+
+/// Canonical-JSON SHA-256 of a captured frame.
+///
+/// This used to be `shux_vt::capture_sha256`, which was never a virtual-terminal
+/// concept — it was lens-gate vocabulary parked in this crate because a binary-only
+/// `shux` could not export anything its integration tests could import (#150/#151).
+/// It lives with the gate now. The digest is reproduced here rather than reached for
+/// across a crate boundary: this test needs a compact, exact identity for a frame, and
+/// nothing about that requirement belongs to the gate. `frame_stability_hash` is the
+/// crate's own frame identity but is a 64-bit transient, and a differential test should
+/// not trade collision resistance for brevity.
+fn frame_digest(env: &FrameEnvelope) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(env.to_canonical_json().as_bytes());
+    let mut out = String::with_capacity(64);
+    for b in hasher.finalize() {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
 
 /// One step of a generated program.
 #[derive(Debug, Clone)]
@@ -62,7 +84,7 @@ fn observe(vt: &mut VirtualTerminal) -> Observed {
         .map(|row| (0..row.len()).map(|c| row[c].ch).collect::<String>())
         .collect();
     Observed {
-        frame: capture_sha256(&env),
+        frame: frame_digest(&env),
         scrollback,
         scrollback_len: grid.scrollback_len(),
         total_lines: grid.total_lines(),

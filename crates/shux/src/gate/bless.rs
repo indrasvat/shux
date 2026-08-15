@@ -17,10 +17,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use shux_raster::{
-    Rasterizer, encode_png, os_arch, pixel_baseline_path, png_sha256, render_envelope, rgba_sha256,
+use crate::gate::pixel::{
+    encode_png, os_arch, pixel_baseline_path, png_sha256, render_envelope, rgba_sha256,
 };
-use shux_vt::{Fingerprint, FrameEnvelope, GateStatus, ScenarioReport, Tier};
+use shux_raster::Rasterizer;
+
+use crate::gate::cell_compare::{Fingerprint, Tier};
+use crate::gate::vocab::{GateStatus, ScenarioReport};
+use shux_vt::FrameEnvelope;
 
 use super::compare::{cell_json_path, fp_path};
 use super::driver::{GateRunOptions, is_ci};
@@ -720,11 +724,12 @@ fn kind_status(kind: super::outcome::FrameKind) -> GateStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::outcome::FrameKind;
-    use shux_vt::{
-        FINGERPRINT_SCHEMA, MaskSet, RENDERER_FORMAT_VERSION, SCHEMA_VERSION, TolParams,
-        VirtualTerminal, capture_sha256, mask_hash, unicode_width_version,
+    use crate::gate::cell_compare::{
+        FINGERPRINT_SCHEMA, RENDERER_FORMAT_VERSION, TolParams, capture_sha256, mask_hash,
+        unicode_width_version,
     };
+    use crate::gate::outcome::FrameKind;
+    use shux_vt::{MaskSet, SCHEMA_VERSION, VirtualTerminal};
 
     fn envelope(prog: &[u8]) -> FrameEnvelope {
         let mut vt = VirtualTerminal::new(3, 20);
@@ -737,7 +742,7 @@ mod tests {
             fp_schema: FINGERPRINT_SCHEMA,
             schema: SCHEMA_VERSION,
             renderer_format_version: RENDERER_FORMAT_VERSION,
-            raster_font_fingerprint: shux_raster::builtin_font_fingerprint(FONT_SIZE),
+            raster_font_fingerprint: crate::gate::pixel::builtin_font_fingerprint(FONT_SIZE),
             unicode_width_ver: unicode_width_version(),
             tol: Tier::Cell,
             tol_params: TolParams::default(),
@@ -877,8 +882,8 @@ mod tests {
     }
 
     /// An xfail waiver pinned to ONE diff via its fingerprint.
-    fn pinned_xfail() -> shux_vt::XfailMeta {
-        shux_vt::XfailMeta {
+    fn pinned_xfail() -> crate::gate::vocab::XfailMeta {
+        crate::gate::vocab::XfailMeta {
             reason: "known".into(),
             owner: "aria".into(),
             issue: "#1".into(),

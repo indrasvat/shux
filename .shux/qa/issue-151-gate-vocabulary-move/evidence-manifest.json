@@ -1,0 +1,92 @@
+{
+  "artifact_sha256_16": {
+    "SOLID-QA.md": "8d5c1af5aa367567",
+    "council-design.md": "f26d0ac42732b888",
+    "council-implementation.md": "735371912888118b",
+    "pixel-f1-80x24.json": "f5dcc24b0c5da871",
+    "pixel-f10alt-120x40.json": "6e5b476571fb63ec",
+    "pixel-f10ret-120x40.json": "be8134d0a25004f8",
+    "pixel-f3-80x24.json": "e853b77ab59b926c",
+    "pixel-f5-200x60.json": "98ec1e56a8e5ce98",
+    "pixel-f5-80x24.json": "65d15b36590db5ad",
+    "pixel-f7-resize.json": "77ff787fcfb2608c",
+    "pixel-f8-80x24.json": "58f301b2abeac234",
+    "pixel-probe-120x40.json": "a216ce6ec591e5c6",
+    "pixel-probe2-120x40.json": "c76c695fe059907f",
+    "pixel-replay-btop.json": "826c0e6891ca5a35",
+    "pixel-replay-lazygit.json": "c3cb557c4a0e399a",
+    "pixel-replay-nvim.json": "7e9c0e7b516e6087",
+    "pixel-replay-vicaya.json": "a40671eac715a84c",
+    "pixel-replay-vivecaka.json": "44a81258b3ddef4b",
+    "pixel-rz-post.json": "a508edbaaba37bb2",
+    "pixel-rz-pre.json": "43e94f7540e2d5c1",
+    "pixel-vim-120x40.json": "bb326daed8989c5d",
+    "pixel-vim-200x60.json": "60b4c755529b1acb"
+  },
+  "audited_binaries": {
+    "base": "/tmp/shux-base-target/debug/shux built from worktree at 6c18a16",
+    "head": "target/debug/shux built from claude/issue-151-refactor-9jvtkw"
+  },
+  "base_commit": "6c18a16",
+  "branch": "claude/issue-151-refactor-9jvtkw",
+  "claim_under_audit": "Pure move of lens-gate vocabulary out of shux-vt and shux-raster. Zero rendering change: every edit inside those crates' src/ is a deletion or a comment; the only non-comment insertions are four Cargo.toml dependency lines.",
+  "council_substitution": "dootsabha is not installed in this environment (command -v dootsabha -> not found). Per CLAUDE.md 'Tooling fallbacks', the council step ran as parallel adversarial agents on disjoint surfaces driving the real system. Recorded in council-design.md and council-implementation.md.",
+  "dootsabha_design": "council-design.md",
+  "dootsabha_implementation": "council-implementation.md",
+  "gate": "shux-vt-solid-qa",
+  "issues": [
+    150,
+    151
+  ],
+  "non_pixel_evidence": {
+    "dependencies": "four edges removed, none added",
+    "exit_codes": "four distinct verdicts and exit codes byte-identical (pass/0, missing_golden/1, scenario_error/2, child_error/5)",
+    "gate_suites": "lens_gate_run 23/23 and lens_gate_verdict 22/22, identical pass set base vs head",
+    "help_output": "byte-identical across all 85 subcommand blocks (114862 bytes each side)",
+    "moved_tests": "all 50 inline tests (20 vocab, 17 cell_compare, 13 pixel) compile, list, and keep their leaf names",
+    "process_hygiene": "zero leaked daemons or child processes; pidfile identification, isolated XDG_RUNTIME_DIR",
+    "public_surface": "shrank by exactly the gate re-export blocks (30 from shux-vt, 15 from shux-raster); nothing added",
+    "serde": "108 values round-tripped through probe binaries built against both sides, byte-identical",
+    "suite": "2132 tests pass; make check green"
+  },
+  "pixel_metrics": [
+    "pixel-f1-80x24.json",
+    "pixel-f10alt-120x40.json",
+    "pixel-f10ret-120x40.json",
+    "pixel-f3-80x24.json",
+    "pixel-f5-200x60.json",
+    "pixel-f5-80x24.json",
+    "pixel-f7-resize.json",
+    "pixel-f8-80x24.json",
+    "pixel-probe-120x40.json",
+    "pixel-probe2-120x40.json",
+    "pixel-replay-btop.json",
+    "pixel-replay-lazygit.json",
+    "pixel-replay-nvim.json",
+    "pixel-replay-vicaya.json",
+    "pixel-replay-vivecaka.json",
+    "pixel-rz-post.json",
+    "pixel-rz-pre.json",
+    "pixel-vim-120x40.json",
+    "pixel-vim-200x60.json"
+  ],
+  "pixel_metrics_summary": {
+    "all_status_pass": true,
+    "cases": 19,
+    "changed_pixels_total": 0,
+    "comparator_negative_control": "two genuinely different renders -> status fail, exit 1, 22.7% changed; missing input -> exit 2",
+    "method": "A/B of base-commit build vs HEAD build, .claude/automations/pixel_verify.py via uv run --script",
+    "thresholds": "exact (max_pixel_diff_ratio 0.0, max_mean_channel_delta 0.0)"
+  },
+  "pr": 164,
+  "residual_risk": [
+    "A same-named stub within one package still hides a deletion from check-test-inventory.sh (pre-existing).",
+    "112 tests live in test = false binaries, outside that guard's view.",
+    "One TEST-MOVE: trailer authorises every move in its commit range.",
+    "bash defers the WINCH trap while blocked in read, so f7_winsize.sh does not reprint under bash; unchanged by this branch."
+  ],
+  "scope": "issue-151-gate-vocabulary-move",
+  "screenshots": [],
+  "screenshots_note": "No committed baseline exists to diff against - the reference is a build of base commit 6c18a16, not a tracked file. Per .shux/qa/README.md the pixel-metric JSON stands alone and no screenshot is committed.",
+  "solid_qa_report": "SOLID-QA.md"
+}

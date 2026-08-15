@@ -17,12 +17,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 shux-vt = { path = "../shux-vt" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# Lens-gate pixel/exact tiers (task 080): PNG/RGBA compare + golden content pins +
-# font-chain fingerprint. This is the lowest crate that can render a golden AND that the
-# frozen contract tests can import (design-review D1).
+
+# The gate's pixel/exact tiers used to live here and made serde + sha2 library
+# dependencies of the rasterizer (#151 moved them to `crates/shux`). What is left
+# needs neither: the crate turns a `Grid<Cell>` into a PNG and serializes nothing.
+# The example harnesses still emit JSON reports, which is what dev-dependencies are for.
+[dev-dependencies]
+tempfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

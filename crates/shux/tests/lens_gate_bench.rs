@@ -8,8 +8,11 @@
 
 use std::time::Instant;
 
-use shux_raster::{Rasterizer, render_envelope};
-use shux_vt::{FrameEnvelope, MaskSet, TolParams, VirtualTerminal, compare_cell};
+use shux::gate::pixel::render_envelope;
+use shux_raster::Rasterizer;
+
+use shux::gate::cell_compare::{TolParams, compare_cell};
+use shux_vt::{FrameEnvelope, MaskSet, VirtualTerminal};
 
 /// A dense, coloured 24×80 frame whose row `seed` differs (so consecutive frames diff).
 fn frame(seed: usize) -> FrameEnvelope {

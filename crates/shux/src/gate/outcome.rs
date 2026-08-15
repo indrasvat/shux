@@ -8,8 +8,10 @@
 //! scenario-level terminal disposition. 082's `verdict` layer rolls this up into the
 //! frozen `report.json` schema — it never re-parses the trace text (handoff requirement).
 
-use shux_raster::TierVerdict;
-use shux_vt::{Fingerprint, StyleDelta, Tier, XfailMeta};
+use crate::gate::pixel::TierVerdict;
+
+use crate::gate::cell_compare::{Fingerprint, Tier};
+use crate::gate::vocab::{StyleDelta, XfailMeta};
 
 /// The compare disposition of one `expect_golden` frame (the four raw compare outcomes
 /// 081 can produce; 082 maps these + xfail to the frozen `GateStatus`).

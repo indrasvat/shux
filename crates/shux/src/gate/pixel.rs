@@ -1,9 +1,15 @@
 //! Lens-gate PIXEL / EXACT tiers + golden render + font fingerprint (task 080).
 //!
 //! This is the raster half of the compare (design-review D1): the cell tier +
-//! [`Fingerprint`](shux_vt::Fingerprint) live in `shux-vt` (importable by the frozen
-//! contract tests); rendering a golden, comparing PNGs, and fingerprinting the bundled
-//! font chain live HERE — the lowest crate that can render AND that those tests import.
+//! [`Fingerprint`](super::cell_compare::Fingerprint) are next door in
+//! [`cell_compare`](super::cell_compare); rendering a golden, comparing PNGs, and
+//! fingerprinting the bundled font chain live HERE.
+//!
+//! **Placement note (#151).** This was in `shux-raster` for the same reason the cell
+//! tier was in `shux-vt` — the frozen contract tests could not import a binary crate's
+//! internals. #150 removed that constraint; the rasterizer no longer ships a gate
+//! status set. It reaches back into `shux-raster` for the renderer only, through that
+//! crate's existing public API.
 //!
 //! Two load-bearing rulings:
 //!
@@ -22,15 +28,15 @@
 //!
 //! The RGBA compare productizes `.claude/automations/pixel_verify.py` (no shelling): a
 //! per-channel int16 abs-delta, a size mismatch is a hard fail, and `changed_frac` /
-//! `max_channel_delta` gate against a [`TolParams`](shux_vt::TolParams).
+//! `max_channel_delta` gate against a [`TolParams`](super::cell_compare::TolParams).
 
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
-use shux_vt::{
-    CellVerdict, CursorShape, FrameEnvelope, GateStatus, Tier, TolParams, compare_cell, sha256_hex,
-};
+use shux_raster::{DEFAULT_FALLBACK_FONT_SPECS, RasterOptions, Rasterizer, builtin_font_bytes};
+use shux_vt::{CursorShape, FrameEnvelope};
 
-use crate::{DEFAULT_FALLBACK_FONT_SPECS, RasterOptions, Rasterizer, builtin_font_bytes};
+use super::cell_compare::{CellVerdict, Tier, TolParams, compare_cell, sha256_hex};
+use super::vocab::GateStatus;
 
 /// Errors from a tier evaluation — a malformed golden or a render/decode failure. Kept
 /// distinct from a `GateStatus` so the caller (081) can classify (`scenario_error` /
@@ -352,7 +358,8 @@ pub fn content_pin(tier: Tier, img: &RgbaImage, png_bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shux_vt::{MaskSet, VirtualTerminal, capture_sha256};
+    use crate::gate::cell_compare::capture_sha256;
+    use shux_vt::{MaskSet, VirtualTerminal};
 
     fn env(prog: &[u8], rows: usize, cols: usize) -> FrameEnvelope {
         let mut vt = VirtualTerminal::new(rows, cols);

@@ -117,13 +117,18 @@ wall-clock = { max-threads = 1 }
 # Tests that count processes machine-wide to decide their verdict.
 [[profile.default.overrides]]
 # `test()` matches the test NAME, never the `binary-id name` pair nextest
-# prints — `test(=shux::bin/shux::tests::foo)` is not a stricter version of
+# prints — `test(=shux::tests::foo)` is not a stricter version of
 # `test(=tests::foo)`, it is a filter that matches nothing, and a group whose
 # filter matches nothing silently applies to nobody. Membership is asserted by
 # `make check-test-groups`, which fails on an empty group for exactly that
 # reason. Scope by binary first, then by name.
+#
+# The id is `shux`, not `shux::bin/shux`: this package's unit tests compile into
+# its LIBRARY target since #150. `check-test-groups` caught the stale id when the
+# target changed, which is the whole reason it asserts membership rather than
+# trusting the filter to have meant something.
 filter = '''
-    (binary_id(=shux::bin/shux) & (
+    (binary_id(=shux) & (
         test(=lens_scratch::production_route_tests::production_unconfirmed_kill_preserves_registry_row)
       + test(=lens_scratch::production_route_tests::production_lens_run_dropped_mid_core_leaves_no_orphan)
     ))
@@ -188,7 +193,7 @@ test-group = 'daemon-pty'
 [[profile.default.overrides]]
 filter = '''
   binary_id(=shux-vt::scroll_region_bounds) & test(=region_scroll_cost_is_linear_in_pane_height)
-  + binary_id(=shux::bin/shux) & test(=rpc::pane_io::tests::pane_record_duration_stops_on_daemon_side)
+  + binary_id(=shux) & test(=rpc::pane_io::tests::pane_record_duration_stops_on_daemon_side)
 '''
 test-group = 'wall-clock'
 threads-required = "num-test-threads"

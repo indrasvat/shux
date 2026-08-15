@@ -8,8 +8,11 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use shux_raster::{Rasterizer, encode_png, render_envelope};
-use shux_vt::{FrameEnvelope, GateStatus};
+use crate::gate::pixel::{encode_png, render_envelope};
+use shux_raster::Rasterizer;
+
+use crate::gate::vocab::GateStatus;
+use shux_vt::FrameEnvelope;
 
 use super::runner::{default_golden_dir, drive_scenario};
 use super::scenario;

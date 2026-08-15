@@ -18,8 +18,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::gate::cell_compare::Tier;
+use crate::gate::vocab::XfailMeta;
 use serde::{Deserialize, Serialize};
-use shux_vt::{Tier, XfailMeta};
 
 /// Default whole-scenario wall-clock budget when `deadline_ms` is omitted.
 pub const DEFAULT_DEADLINE_MS: u64 = 60_000;

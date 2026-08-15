@@ -17,7 +17,7 @@ use crate::FrameEnvelope;
 
 /// A cheap `u64` content hash of a captured frame for IN-PROCESS frame-stability tracking
 /// (`pane.wait_settled` hold-ms / stable-frames). It keys the SAME canonical, mask-applied form
-/// as [`crate::capture_sha256`], so daemon-side stability tracks exactly what the golden compare
+/// as the gate's `capture_sha256`, so daemon-side stability tracks exactly what the golden compare
 /// would see. It is NOT persisted and NOT a golden pin — only a transient wake-to-wake identity,
 /// so a process-local hasher is fine (no cross-version stability required).
 ///

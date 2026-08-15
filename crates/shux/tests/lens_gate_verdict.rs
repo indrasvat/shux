@@ -11,7 +11,7 @@ mod lens_common;
 use std::path::Path;
 
 use lens_common::Harness;
-use shux_vt::{GateStatus, ScenarioReport};
+use shux::gate::vocab::{GateStatus, ScenarioReport};
 
 /// A parsed gate invocation: raw streams + exit code.
 struct Gate {

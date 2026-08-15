@@ -9,9 +9,9 @@
 //! that does NOT depend on `worst()` as its own oracle — weakening the exit map
 //! (or the closed status set) fails CI and cannot land without a trailer.
 //!
-//! Pure assertions on `shux_vt::GateStatus` — no daemon, no subprocess.
+//! Pure assertions on `shux::gate::vocab::GateStatus` — no daemon, no subprocess.
 
-use shux_vt::GateStatus;
+use shux::gate::vocab::GateStatus;
 
 /// The frozen exit-code map (§7.4). Hard-coded VALUES, not derived — this is the
 /// independent oracle the RED contract lane's rollup test cannot be.
