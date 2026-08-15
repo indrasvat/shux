@@ -76,6 +76,9 @@ fi
 hits="$(awk '
   { lines[NR] = $0 }
   END {
+    # A literal single quote cannot appear inside this single-quoted awk program,
+    # so it is built from its character code and compared by variable throughout.
+    SQ = sprintf("%c", 39)
     # Rebuild the file with comments and literals blanked, tracking line numbers.
     inblock = 0
     for (i = 1; i <= NR; i++) {
@@ -90,6 +93,32 @@ hits="$(awk '
         }
         if (d == "/*") { inblock = 1; j += 2; out = out "  "; continue }
         if (d == "//") { while (j <= length(s)) { out = out " "; j++ } break }
+        # CHARACTER LITERALS FIRST. A char literal holding a double quote —
+        # `const Q: char = SQ "SQ ; mod attach;` — otherwise reads as the START of
+        # a string, blanks the rest of the line, and hides the declaration. That
+        # is the exact duplicate-module hazard this guard exists to catch, and a
+        # bot review found it here. A single quote also introduces a LIFETIME
+        # (`SQ a`), which has no closing quote, so a literal is consumed only when
+        # a closing quote is actually found; otherwise it is ordinary code.
+        if (c == SQ) {
+          k2 = 0
+          if (substr(s, j + 1, 1) == "\\") {
+            # Escaped: newline, backslash, quote, or a \u{...} escape.
+            for (m = j + 2; m <= length(s) && m <= j + 12; m++) {
+              if (substr(s, m, 1) == SQ) { k2 = m; break }
+            }
+          } else if (substr(s, j + 2, 1) == SQ && substr(s, j + 1, 1) != SQ) {
+            k2 = j + 2
+          }
+          if (k2 > 0) {
+            for (m = j; m <= k2; m++) { out = out " " }
+            j = k2 + 1
+            continue
+          }
+          # A lifetime, or a stray quote. Emit it and carry on.
+          out = out c; j++
+          continue
+        }
         if (c == "\"") {
           out = out " "; j++
           while (j <= length(s)) {
