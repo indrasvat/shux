@@ -49,7 +49,11 @@ COVERAGE_DIR := coverage
 # `cpu.max` and cgroup v1 `cpu.cfs_quota_us`.
 NEXTEST_CPUS := $(shell bash scripts/cpu-budget.sh 2>/dev/null || echo 4)
 NEXTEST_JOBS ?= $(shell echo $$(( $(NEXTEST_CPUS) * 4 )))
-NEXTEST_RUN = cargo nextest run -j $(NEXTEST_JOBS)
+# `--status-level fail`: print failures and the summary, not 2131 PASS lines.
+# The pass list was 90% of pre-push output and buried the one line that matters.
+# Override with `make test NEXTEST_STATUS=pass` when you want the roll call.
+NEXTEST_STATUS ?= fail
+NEXTEST_RUN = cargo nextest run -j $(NEXTEST_JOBS) --status-level $(NEXTEST_STATUS)
 LEFTHOOK := $(shell command -v lefthook 2>/dev/null)
 
 # Colors for output
