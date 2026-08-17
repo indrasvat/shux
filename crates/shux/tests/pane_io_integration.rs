@@ -1401,21 +1401,14 @@ async fn test_capture_works_after_pane_process_exits() {
     )
     .await;
 
-    // Give the shell time to: render the echo, exit cleanly, and let
-    // the PTY task drain. 2s is overkill but tests should be sturdy.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let result = rpc_call(
-        &mut stream,
-        "pane.capture",
-        serde_json::json!({"session_id": session_id}),
-    )
+    // Poll for the marker rather than sleeping a fixed 2s. The shell has to
+    // render the echo, exit, and let the PTY task drain, and a blind sleep only
+    // has to be wrong once on a loaded machine — this test was the intermittent
+    // red in `make test` on main.
+    let text = wait_for_capture_text(&mut stream, &session_id, PROBE_TIMEOUT, |t| {
+        t.contains("SHUX_LIVES_AFTER_EXIT")
+    })
     .await;
-
-    let text = result["text"].as_str().expect(
-        "pane.capture must keep returning text after the pane process exits — \
-         the VT should linger until the pane is explicitly destroyed",
-    );
     assert!(
         text.contains("SHUX_LIVES_AFTER_EXIT"),
         "captured text after exit should contain the marker, got: {text}"
