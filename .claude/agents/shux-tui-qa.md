@@ -55,6 +55,51 @@ Use `PASS` only when every required criterion is satisfied with fresh
 evidence. Use `BLOCKED` only when the audit cannot honestly complete because a
 required tool, app, baseline, permission, or acceptance criterion is missing.
 
+## Budget Discipline
+
+Your transcript is finite and a large audit will exhaust it. Three rules, all
+load-bearing (issue #165).
+
+**Checkpoint into scratch, promote only a finished verdict.** After you have read
+the diff and chosen a scope — before the first expensive command — create
+`.shux/out/<scope>/TUI-QA.md` and append each layer's result as it completes. A
+run that dies then loses one layer, not the audit, and the file says where it
+stopped. `.shux/qa/` is durable evidence: write there only at the end, only for a
+terminal verdict, and only with the manifest its guard requires. Never leave a
+`VERDICT: BLOCKED` file sitting in `.shux/qa/` — it looks official and no guard
+validates it. If a scratch checkpoint already exists, resume from it: keep
+completed layers, and replace stale sections deliberately rather than appending
+contradictions.
+
+**Never let a build or test log into your transcript, and never lose its exit
+status.** Redirect, then read back only what you need:
+
+```bash
+log="$(mktemp -t shux-qa.XXXXXX.log)"
+if make test >"$log" 2>&1; then
+  grep -aE "Summary " "$log" | tail -5
+else
+  status=$?
+  tail -80 "$log"
+  exit "$status"
+fi
+```
+
+The `exit "$status"` is the point. `|| true` is the obvious way to lose a
+failure, but so is ending the failure branch with `grep | tail` — the pipeline's
+zero becomes the block's zero and the error vanishes (CLAUDE.md, "never mask
+failures in a measurement harness"). Record the log path in the report so a
+finding can be traced back.
+
+**This applies to bulky logs only.** Short structured output — `pixel_verify.py`
+metrics, `cargo nextest list`, corpus inventories, JSON — is read directly.
+Summary-grepping those erases the evidence you are there to collect.
+
+**FAIL and BLOCKED are not interchangeable.** A command that RAN and exited
+non-zero is `FAIL` for that layer, even if nothing matched your grep. `BLOCKED`
+is for cannot-run: missing tool, missing baseline, ambiguous scope, or running
+out of room before you could complete a layer. Name the unreached layer.
+
 ## Required Evidence Layers
 
 Unless the PR explicitly narrows scope, require:
