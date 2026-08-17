@@ -1,3 +1,10 @@
+## [0.46.21](https://github.com/indrasvat/shux/compare/v0.46.20...v0.46.21) (2026-08-17)
+
+
+### Bug Fixes
+
+* unbreak and quiet the local gates ([#167](https://github.com/indrasvat/shux/issues/167)) ([cc13b9f](https://github.com/indrasvat/shux/commit/cc13b9f13b0230955e9c8d232189951e6b0cea43)), closes [#165](https://github.com/indrasvat/shux/issues/165)
+
 ## [0.46.20](https://github.com/indrasvat/shux/compare/v0.46.19...v0.46.20) (2026-08-15)
 
 
