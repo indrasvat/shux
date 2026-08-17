@@ -1388,6 +1388,17 @@ async fn test_capture_works_after_pane_process_exits() {
     let mut stream = UnixStream::connect(&socket_path).await.unwrap();
     let (session_id, _pane_id) = create_test_session(&mut stream).await;
 
+    // A file the shell touches as its LAST act before `exit`. The PTY echoes
+    // whatever `send_keys` types, so the marker TEXT shows up the moment the
+    // command is entered — polling the capture for it would let this test pass
+    // before the shell ever exits. The file only appears once the shell has
+    // actually run the line.
+    let exit_marker = std::env::temp_dir().join(format!(
+        "shux-exited-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let exit_marker_display = exit_marker.display().to_string();
+
     // Print a marker, then exit the shell. After this, the PTY task
     // sees EOF, reaps the child, and tears its loop down. The Pane
     // remains in the graph with exit_status=Some(0).
@@ -1396,26 +1407,26 @@ async fn test_capture_works_after_pane_process_exits() {
         "pane.send_keys",
         serde_json::json!({
             "session_id": session_id,
-            "text": "echo SHUX_LIVES_AFTER_EXIT && exit 0\n",
+            "text": format!("echo SHUX_LIVES_AFTER_EXIT; touch {exit_marker_display}; exit 0\n"),
         }),
     )
     .await;
 
-    // Give the shell time to: render the echo, exit cleanly, and let
-    // the PTY task drain. 2s is overkill but tests should be sturdy.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the shell to have actually run its line and exited, then give
+    // the PTY task a beat to see EOF and tear down. Only after that does
+    // capture prove the VT lingers past teardown — the regression this covers.
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    while !exit_marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "shell never reached its exit line within {PROBE_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = std::fs::remove_file(&exit_marker);
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let result = rpc_call(
-        &mut stream,
-        "pane.capture",
-        serde_json::json!({"session_id": session_id}),
-    )
-    .await;
-
-    let text = result["text"].as_str().expect(
-        "pane.capture must keep returning text after the pane process exits — \
-         the VT should linger until the pane is explicitly destroyed",
-    );
+    let text = capture_text(&mut stream, &session_id, 80).await;
     assert!(
         text.contains("SHUX_LIVES_AFTER_EXIT"),
         "captured text after exit should contain the marker, got: {text}"

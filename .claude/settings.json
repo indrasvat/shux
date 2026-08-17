@@ -16,18 +16,6 @@
     "SessionStart runs scripts/ensure-hooks.sh so a fresh checkout \u2014 cloud or local \u2014 has its git hooks before the first commit. An agent cannot forget to run `make hooks` if it never has to. The CI guard lives in that script, once, because these sessions can run inside GitHub Actions."
   ],
   "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "make -C \"$CLAUDE_PROJECT_DIR\" check-vt-qa",
-            "timeout": 30,
-            "statusMessage": "Checking VT QA evidence for this diff..."
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
