@@ -60,7 +60,7 @@ required tool, app, baseline, permission, or acceptance criterion is missing.
 Your transcript is finite and a large audit will exhaust it. Two rules, both
 load-bearing (issue #165):
 
-**Write findings as you earn them, not at the end.** Create the report file with
+**Write findings as you earn them, not at the end.** Create `.shux/qa/<scope>/TUI-QA.md` with
 `VERDICT: BLOCKED` as your FIRST action, then append each layer's result as it
 completes. A run that dies mid-audit loses one layer instead of everything. Flip
 the first line to `PASS` or `FAIL` only at the end.
@@ -69,9 +69,19 @@ the first line to `PASS` or `FAIL` only at the end.
 only what you need:
 
 ```bash
-cargo nextest run ... >/tmp/qa-run.log 2>&1 || true
-grep -aE "FAIL \[|Summary \[|panicked" /tmp/qa-run.log | tail -20
+if cargo nextest run ... >/tmp/qa-run.log 2>&1; then
+  grep -aE "Summary \[" /tmp/qa-run.log | tail -5
+else
+  grep -aE "FAIL \[|panicked|^error" /tmp/qa-run.log | tail -20
+  # the command failed: this layer is FAIL, never PASS.
+fi
 ```
+
+Keep the exit status. `|| true` turns a build error into a silent pass — the
+harness then reports a layer it never ran (CLAUDE.md, "never mask failures in a
+measurement harness"). A non-zero exit is a `FAIL` or `BLOCKED` for that layer
+even if no line matched your grep, because an unmatched failure is still a
+failure.
 
 If you run out of room regardless, return `VERDICT: BLOCKED` naming the layer you
 could not reach. A truncated audit reported honestly beats a verdict you did not

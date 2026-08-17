@@ -110,9 +110,19 @@ the first line to `PASS` or `FAIL` only at the end.
 only what you need:
 
 ```bash
-cargo nextest run ... >/tmp/qa-run.log 2>&1 || true
-grep -aE "FAIL \[|Summary \[|panicked" /tmp/qa-run.log | tail -20
+if cargo nextest run ... >/tmp/qa-run.log 2>&1; then
+  grep -aE "Summary \[" /tmp/qa-run.log | tail -5
+else
+  grep -aE "FAIL \[|panicked|^error" /tmp/qa-run.log | tail -20
+  # the command failed: this layer is FAIL, never PASS.
+fi
 ```
+
+Keep the exit status. `|| true` turns a build error into a silent pass — the
+harness then reports a layer it never ran (CLAUDE.md, "never mask failures in a
+measurement harness"). A non-zero exit is a `FAIL` or `BLOCKED` for that layer
+even if no line matched your grep, because an unmatched failure is still a
+failure.
 
 The same applies to `cargo nextest list`, corpus replays and pixel comparisons:
 pipe to a file, grep the summary. A single unfiltered `make test` is thousands of

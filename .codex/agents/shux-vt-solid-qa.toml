@@ -43,7 +43,7 @@ Pixel-level hard gate:
 
 Budget discipline (issue #165):
 - Your transcript is finite; a large audit will exhaust it. Write `SOLID-QA.md` with `VERDICT: BLOCKED` as your FIRST action and append each layer's result as it completes, so a death mid-audit loses one layer rather than everything. Flip the first line to PASS/FAIL only at the end.
-- Never pipe a build or test log into your transcript. Redirect to a file and grep back the summary: `cargo nextest run ... >/tmp/qa.log 2>&1 || true` then `grep -aE "FAIL |Summary |panicked" /tmp/qa.log | tail -20`.
+- Never pipe a build or test log into your transcript. Redirect to a file and grep back the summary: `if cargo nextest run ... >/tmp/qa.log 2>&1; then grep -aE "Summary " /tmp/qa.log | tail -5; else grep -aE "FAIL |panicked|^error" /tmp/qa.log | tail -20; fi`. KEEP the exit status — `|| true` turns a build error into a silent pass and the harness then reports a layer it never ran. A non-zero exit is FAIL/BLOCKED for that layer even if nothing matched the grep.
 - If room runs out regardless, return `VERDICT: BLOCKED` naming the layer you could not reach. A truncated audit reported honestly beats a verdict you did not earn.
 
 Auditable artifact contract:
