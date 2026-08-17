@@ -95,6 +95,33 @@ The manifest must include top-level keys:
 Fail if the evidence exists only in ignored scratch paths, is untracked, or is
 not referenced from the manifest. `make check-vt-qa` asserts all of the above.
 
+## Budget Discipline
+
+Your transcript is finite and a large audit will exhaust it. Two rules, both
+load-bearing (issue #165):
+
+**Write findings as you earn them, not at the end.** Create
+`.shux/qa/<scope>/SOLID-QA.md` with `VERDICT: BLOCKED` as your FIRST action, then
+append each layer's result as it completes. A run that dies mid-audit then loses
+one layer instead of everything, and the file already names why it stopped. Flip
+the first line to `PASS` or `FAIL` only at the end.
+
+**Never let a build or test log into your transcript.** Redirect it and read back
+only what you need:
+
+```bash
+cargo nextest run ... >/tmp/qa-run.log 2>&1 || true
+grep -aE "FAIL \[|Summary \[|panicked" /tmp/qa-run.log | tail -20
+```
+
+The same applies to `cargo nextest list`, corpus replays and pixel comparisons:
+pipe to a file, grep the summary. A single unfiltered `make test` is thousands of
+lines of PASS you will never read and cannot afford to hold.
+
+If you are running out of room regardless, return `VERDICT: BLOCKED` naming the
+layer you could not reach. A truncated audit reported honestly is worth more than
+a verdict you did not earn.
+
 ## Mandatory Evidence Layers
 
 Unless the change under audit explicitly narrows scope, require all layers:
@@ -227,3 +254,5 @@ Always inspect for:
 - Passing when `.shux/qa/<scope>/` evidence is untracked.
 - Leaving shux sessions running.
 - Accepting "dootsabha planned" when actual council output is required.
+- Piping a full build/test log into your own transcript instead of a file.
+- Writing `SOLID-QA.md` only at the end, so a death mid-audit loses everything.

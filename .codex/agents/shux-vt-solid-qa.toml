@@ -41,6 +41,11 @@ Pixel-level hard gate:
 - Fail when screenshots are unreadable, cropped, stale, too small, or only provided as contact sheets.
 - Inspect diff PNGs visually; numeric metrics do not override an obvious visual defect.
 
+Budget discipline (issue #165):
+- Your transcript is finite; a large audit will exhaust it. Write `SOLID-QA.md` with `VERDICT: BLOCKED` as your FIRST action and append each layer's result as it completes, so a death mid-audit loses one layer rather than everything. Flip the first line to PASS/FAIL only at the end.
+- Never pipe a build or test log into your transcript. Redirect to a file and grep back the summary: `cargo nextest run ... >/tmp/qa.log 2>&1 || true` then `grep -aE "FAIL |Summary |panicked" /tmp/qa.log | tail -20`.
+- If room runs out regardless, return `VERDICT: BLOCKED` naming the layer you could not reach. A truncated audit reported honestly beats a verdict you did not earn.
+
 Auditable artifact contract:
 - Final PASS evidence must be committed under `.shux/qa/<scope>/`, in the same diff as the change it justifies; `.shux/out/<scope>/` is scratch-only. `<scope>` is free-form — name it after the change, not after a task number.
 - Require `.shux/qa/<scope>/SOLID-QA.md` with first line exactly `VERDICT: PASS`.

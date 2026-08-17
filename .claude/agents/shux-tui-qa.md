@@ -55,6 +55,28 @@ Use `PASS` only when every required criterion is satisfied with fresh
 evidence. Use `BLOCKED` only when the audit cannot honestly complete because a
 required tool, app, baseline, permission, or acceptance criterion is missing.
 
+## Budget Discipline
+
+Your transcript is finite and a large audit will exhaust it. Two rules, both
+load-bearing (issue #165):
+
+**Write findings as you earn them, not at the end.** Create the report file with
+`VERDICT: BLOCKED` as your FIRST action, then append each layer's result as it
+completes. A run that dies mid-audit loses one layer instead of everything. Flip
+the first line to `PASS` or `FAIL` only at the end.
+
+**Never let a build or test log into your transcript.** Redirect and read back
+only what you need:
+
+```bash
+cargo nextest run ... >/tmp/qa-run.log 2>&1 || true
+grep -aE "FAIL \[|Summary \[|panicked" /tmp/qa-run.log | tail -20
+```
+
+If you run out of room regardless, return `VERDICT: BLOCKED` naming the layer you
+could not reach. A truncated audit reported honestly beats a verdict you did not
+earn.
+
 ## Required Evidence Layers
 
 Unless the PR explicitly narrows scope, require:

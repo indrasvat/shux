@@ -35,6 +35,11 @@ Required evidence layers unless the PR explicitly narrows scope:
 - cleanup proof showing no new shux daemons and no new orphan automation processes,
 - external council/reviewer evidence when the PR or CLAUDE.md requires it.
 
+Budget discipline (issue #165):
+- Your transcript is finite; a large audit will exhaust it. Write `SOLID-QA.md` with `VERDICT: BLOCKED` as your FIRST action and append each layer's result as it completes, so a death mid-audit loses one layer rather than everything. Flip the first line to PASS/FAIL only at the end.
+- Never pipe a build or test log into your transcript. Redirect to a file and grep back the summary: `cargo nextest run ... >/tmp/qa.log 2>&1 || true` then `grep -aE "FAIL |Summary |panicked" /tmp/qa.log | tail -20`.
+- If room runs out regardless, return `VERDICT: BLOCKED` naming the layer you could not reach. A truncated audit reported honestly beats a verdict you did not earn.
+
 Auditable artifact contract:
 - Routine general TUI QA evidence is scratch by default. Write reports, captures, PNG screenshots, pixel summaries, and transcripts under `.shux/out/<scope>/` or another gitignored working directory.
 - Attach review-worthy screenshots to the PR as comments; use `browsing-as-you` for authenticated GitHub uploads when needed. Do not commit routine screenshots.
