@@ -32,13 +32,14 @@ make install / hooks    # install binary / lefthook hooks
 ## Architecture
 
 ```
-crates/shux/        CLI entrypoint (clap, daemon auto-start)
+crates/shux/        CLI entrypoint (clap, daemon auto-start); internal lib so tests reach it
 crates/shux-core/   SessionGraph, LayoutEngine, EventBus, config, theme
 crates/shux-pty/    PTY manager (openpty, async I/O, lifecycle)
 crates/shux-vt/     VT grid (vte parser, VecDeque grid, scrollback)
 crates/shux-rpc/    JSON-RPC (UDS + TCP, length-prefixed framing)
 crates/shux-plugin/ Plugin host (process plugins over stdio JSON-RPC, permissions)
 crates/shux-ui/     TUI client (crossterm, hand-rolled chrome, compositor)
+crates/shux-raster/ Grid -> PNG rasterizer (headless snapshots, pixel goldens)
 ```
 
 - Client/server: single binary, daemon auto-starts on first use.
@@ -60,8 +61,14 @@ the record lives now.
 hypothesis: review agent, QA gate, dogfood, council, or you. A/B against a worktree of
 the base commit before attributing a regression.
 
-**Every fix ships with a test seen failing first.** A test never observed red asserts
-only that the code does what it does.
+**Every fix ships with a test seen failing first — failing for the RIGHT reason.** A
+test never observed red asserts only that the code does what it does. Run the
+UNCHANGED test against the unfixed tree and read the failure message — that is the
+only thing proving it catches THIS defect. Sabotaging the assertion proves only
+that the assertion is wired; it manufactures a red on any tree. Reach for that
+solely when there is no unfixed tree to run against, e.g. when the test itself was
+the defect. On #167 a capture test passed because the PTY echoed the marker before
+the shell had exited — stable, green, and testing nothing.
 
 **Process hygiene.** Zero leaked daemons or child processes. Use
 `.shux/scripts/no_leak_guard.sh` + isolated short `XDG_RUNTIME_DIR`.
@@ -106,8 +113,14 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   the worst shape a guard can have — `make check-ci-parity` runs the parsers under CI's
   environment so that failure lands on your machine instead.
 - **Never mask failures in a measurement harness.** `|| true` turns an instant error into
-  a fast success. Abort loudly. A guard whose tool is missing must say so and exit
-  non-zero — never report success for work it did not do.
+  a fast success. So does letting a branch END in a pipeline: without `pipefail`,
+  `if cmd; then :; else grep x log | tail; fi` exits 0 because the pipeline's status
+  becomes the block's. Guards here run `set -euo pipefail`, which covers that case —
+  but agent-written one-liners and subagent instructions often do not. Capture
+  `status=$?` on the FIRST line of the failure branch, before any diagnostic
+  command — put it after the `tail` and you have captured the `tail` — then
+  re-exit it. Abort loudly. A guard whose tool is missing must say so
+  and exit non-zero — never report success for work it did not do.
 - **`make shellcheck` is a gate, and suppressions carry a reason.** The guards are shell,
   so a defect there stops a guard guarding instead of failing a test. Some patterns here
   are deliberate and shellcheck cannot know it — `ps | grep` over `pgrep` (SC2009) is
@@ -189,8 +202,12 @@ Every feature/fix PR.
 5. **Adversarial review** (`adversarial-review` skill) once green, before the convergence
    council. 2–4 parallel agents on **disjoint** surfaces that drive the real system.
    Reproduce each finding; fix with a regression test.
-6. **Council on the implementation diff, before pushing.** Same fallback as step 1 if
-   `dootsabha` is unavailable.
+6. **Council on the implementation diff, before pushing.** `dootsabha council`, or the
+   step-1 fallback (parallel adversarial agents on disjoint surfaces) when it is
+   unavailable. Not optional, and **not scaled down for small diffs** — a 4-line
+   `Cargo.toml` change silently made a benchmark incomparable (#166) and a docs-only
+   diff shipped two P1s (#168). Size does not predict defects. Every PR merged in the
+   2026-08-15..17 run skipped this step; every one had a real defect found after push.
 7. **Capture evidence for every relevant (render path × config state) cell**, named
    `v<N>_<render-path>_<width>_<config-state>.png`. Render path is mandatory in the name
    or two cells collide silently. One default-state screenshot is not the matrix — drift
@@ -230,7 +247,7 @@ Paste into every feature PR:
 ## Verification matrix
 - [ ] dootsabha council on design — converged
 - [ ] adversarial review — parallel agents drove the real system; findings fixed + regression-tested
-- [ ] dootsabha council on implementation diff — clean
+- [ ] implementation diff reviewed before push — `dootsabha council`, or parallel adversarial agents on disjoint surfaces; findings addressed
 - [ ] every render path touched
 - [ ] config states: default · init · feature-maxed · malformed · hot-reload
 - [ ] cross-path consistency test
