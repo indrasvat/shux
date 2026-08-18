@@ -39,6 +39,7 @@ crates/shux-vt/     VT grid (vte parser, VecDeque grid, scrollback)
 crates/shux-rpc/    JSON-RPC (UDS + TCP, length-prefixed framing)
 crates/shux-plugin/ Plugin host (process plugins over stdio JSON-RPC, permissions)
 crates/shux-ui/     TUI client (crossterm, hand-rolled chrome, compositor)
+crates/shux-raster/ Grid -> PNG rasterizer (headless snapshots, pixel goldens)
 ```
 
 - Client/server: single binary, daemon auto-starts on first use.
@@ -110,10 +111,12 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   the worst shape a guard can have — `make check-ci-parity` runs the parsers under CI's
   environment so that failure lands on your machine instead.
 - **Never mask failures in a measurement harness.** `|| true` turns an instant error into
-  a fast success. So does any branch that ENDS in a pipeline — `if cmd; then :; else
-  grep x log | tail; fi` exits 0, because the pipeline's status becomes the block's.
-  Capture `status=$?` and re-exit it. Abort loudly. A guard whose tool is missing must
-  say so and exit non-zero — never report success for work it did not do.
+  a fast success. So does letting a branch END in a pipeline: without `pipefail`,
+  `if cmd; then :; else grep x log | tail; fi` exits 0 because the pipeline's status
+  becomes the block's. Guards here run `set -euo pipefail`, which covers that case —
+  but agent-written one-liners and subagent instructions often do not. Capture
+  `status=$?` and re-exit it. Abort loudly. A guard whose tool is missing must say so
+  and exit non-zero — never report success for work it did not do.
 - **`make shellcheck` is a gate, and suppressions carry a reason.** The guards are shell,
   so a defect there stops a guard guarding instead of failing a test. Some patterns here
   are deliberate and shellcheck cannot know it — `ps | grep` over `pgrep` (SC2009) is
@@ -195,12 +198,12 @@ Every feature/fix PR.
 5. **Adversarial review** (`adversarial-review` skill) once green, before the convergence
    council. 2–4 parallel agents on **disjoint** surfaces that drive the real system.
    Reproduce each finding; fix with a regression test.
-6. **Review the implementation diff before pushing.** `dootsabha council` when the change
-   warrants it; a single adversarial agent on a small diff is ~2 minutes and is the
-   FLOOR, not an exemption. Same fallback as step 1 if `dootsabha` is unavailable.
-   **Size does not predict defects.** Every PR merged on 2026-08-17 skipped this step and
-   every one had a real defect found after push — including a 4-line `Cargo.toml` change
-   and a docs-only diff carrying two P1s.
+6. **Council on the implementation diff, before pushing.** `dootsabha council`, or the
+   step-1 fallback (parallel adversarial agents on disjoint surfaces) when it is
+   unavailable. Not optional, and **not scaled down for small diffs** — a 4-line
+   `Cargo.toml` change silently made a benchmark incomparable (#166) and a docs-only
+   diff shipped two P1s (#168). Size does not predict defects. Every PR merged in the
+   2026-08-15..17 run skipped this step; every one had a real defect found after push.
 7. **Capture evidence for every relevant (render path × config state) cell**, named
    `v<N>_<render-path>_<width>_<config-state>.png`. Render path is mandatory in the name
    or two cells collide silently. One default-state screenshot is not the matrix — drift
