@@ -62,11 +62,13 @@ hypothesis: review agent, QA gate, dogfood, council, or you. A/B against a workt
 the base commit before attributing a regression.
 
 **Every fix ships with a test seen failing first — failing for the RIGHT reason.** A
-test never observed red asserts only that the code does what it does. Worse, one
-that goes red for an unrelated reason asserts nothing at all: sabotage it (assert
-on something the code never produces) and read the failure message. On #167 a
-capture test passed because the PTY echoed the marker before the shell had exited
-— stable, green, and testing nothing.
+test never observed red asserts only that the code does what it does. Run the
+UNCHANGED test against the unfixed tree and read the failure message — that is the
+only thing proving it catches THIS defect. Sabotaging the assertion proves only
+that the assertion is wired; it manufactures a red on any tree. Reach for that
+solely when there is no unfixed tree to run against, e.g. when the test itself was
+the defect. On #167 a capture test passed because the PTY echoed the marker before
+the shell had exited — stable, green, and testing nothing.
 
 **Process hygiene.** Zero leaked daemons or child processes. Use
 `.shux/scripts/no_leak_guard.sh` + isolated short `XDG_RUNTIME_DIR`.
@@ -115,7 +117,9 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   `if cmd; then :; else grep x log | tail; fi` exits 0 because the pipeline's status
   becomes the block's. Guards here run `set -euo pipefail`, which covers that case —
   but agent-written one-liners and subagent instructions often do not. Capture
-  `status=$?` and re-exit it. Abort loudly. A guard whose tool is missing must say so
+  `status=$?` on the FIRST line of the failure branch, before any diagnostic
+  command — put it after the `tail` and you have captured the `tail` — then
+  re-exit it. Abort loudly. A guard whose tool is missing must say so
   and exit non-zero — never report success for work it did not do.
 - **`make shellcheck` is a gate, and suppressions carry a reason.** The guards are shell,
   so a defect there stops a guard guarding instead of failing a test. Some patterns here
@@ -243,7 +247,7 @@ Paste into every feature PR:
 ## Verification matrix
 - [ ] dootsabha council on design — converged
 - [ ] adversarial review — parallel agents drove the real system; findings fixed + regression-tested
-- [ ] implementation diff reviewed before push (council, or adversarial agents) — findings addressed
+- [ ] implementation diff reviewed before push — `dootsabha council`, or parallel adversarial agents on disjoint surfaces; findings addressed
 - [ ] every render path touched
 - [ ] config states: default · init · feature-maxed · malformed · hot-reload
 - [ ] cross-path consistency test
