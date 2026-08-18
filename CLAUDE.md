@@ -32,7 +32,7 @@ make install / hooks    # install binary / lefthook hooks
 ## Architecture
 
 ```
-crates/shux/        CLI entrypoint (clap, daemon auto-start)
+crates/shux/        CLI entrypoint (clap, daemon auto-start); internal lib so tests reach it
 crates/shux-core/   SessionGraph, LayoutEngine, EventBus, config, theme
 crates/shux-pty/    PTY manager (openpty, async I/O, lifecycle)
 crates/shux-vt/     VT grid (vte parser, VecDeque grid, scrollback)
@@ -60,8 +60,12 @@ the record lives now.
 hypothesis: review agent, QA gate, dogfood, council, or you. A/B against a worktree of
 the base commit before attributing a regression.
 
-**Every fix ships with a test seen failing first.** A test never observed red asserts
-only that the code does what it does.
+**Every fix ships with a test seen failing first — failing for the RIGHT reason.** A
+test never observed red asserts only that the code does what it does. Worse, one
+that goes red for an unrelated reason asserts nothing at all: sabotage it (assert
+on something the code never produces) and read the failure message. On #167 a
+capture test passed because the PTY echoed the marker before the shell had exited
+— stable, green, and testing nothing.
 
 **Process hygiene.** Zero leaked daemons or child processes. Use
 `.shux/scripts/no_leak_guard.sh` + isolated short `XDG_RUNTIME_DIR`.
@@ -106,8 +110,10 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   the worst shape a guard can have — `make check-ci-parity` runs the parsers under CI's
   environment so that failure lands on your machine instead.
 - **Never mask failures in a measurement harness.** `|| true` turns an instant error into
-  a fast success. Abort loudly. A guard whose tool is missing must say so and exit
-  non-zero — never report success for work it did not do.
+  a fast success. So does any branch that ENDS in a pipeline — `if cmd; then :; else
+  grep x log | tail; fi` exits 0, because the pipeline's status becomes the block's.
+  Capture `status=$?` and re-exit it. Abort loudly. A guard whose tool is missing must
+  say so and exit non-zero — never report success for work it did not do.
 - **`make shellcheck` is a gate, and suppressions carry a reason.** The guards are shell,
   so a defect there stops a guard guarding instead of failing a test. Some patterns here
   are deliberate and shellcheck cannot know it — `ps | grep` over `pgrep` (SC2009) is
@@ -189,8 +195,12 @@ Every feature/fix PR.
 5. **Adversarial review** (`adversarial-review` skill) once green, before the convergence
    council. 2–4 parallel agents on **disjoint** surfaces that drive the real system.
    Reproduce each finding; fix with a regression test.
-6. **Council on the implementation diff, before pushing.** Same fallback as step 1 if
-   `dootsabha` is unavailable.
+6. **Review the implementation diff before pushing.** `dootsabha council` when the change
+   warrants it; a single adversarial agent on a small diff is ~2 minutes and is the
+   FLOOR, not an exemption. Same fallback as step 1 if `dootsabha` is unavailable.
+   **Size does not predict defects.** Every PR merged on 2026-08-17 skipped this step and
+   every one had a real defect found after push — including a 4-line `Cargo.toml` change
+   and a docs-only diff carrying two P1s.
 7. **Capture evidence for every relevant (render path × config state) cell**, named
    `v<N>_<render-path>_<width>_<config-state>.png`. Render path is mandatory in the name
    or two cells collide silently. One default-state screenshot is not the matrix — drift
@@ -230,7 +240,7 @@ Paste into every feature PR:
 ## Verification matrix
 - [ ] dootsabha council on design — converged
 - [ ] adversarial review — parallel agents drove the real system; findings fixed + regression-tested
-- [ ] dootsabha council on implementation diff — clean
+- [ ] implementation diff reviewed before push (council, or adversarial agents) — findings addressed
 - [ ] every render path touched
 - [ ] config states: default · init · feature-maxed · malformed · hot-reload
 - [ ] cross-path consistency test
