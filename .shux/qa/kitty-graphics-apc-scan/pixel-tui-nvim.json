@@ -1,18 +1,18 @@
 {
- "actual": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/ev2-code/tui-nvim.png",
+ "actual": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/ev3-code/tui-nvim.png",
  "changed_pixels": 0,
  "diff": null,
- "expected": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/ev2-base/tui-nvim.png",
+ "expected": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/ev3-base/tui-nvim.png",
  "max_mean_channel_delta": 0.0,
  "max_pixel_diff_ratio": 0.0,
  "mean_rgba_channel_delta": 0.0,
  "pixel_diff_ratio": 0.0,
  "provenance": {
-  "actual_commit": "b0cd0b98df784bcf54dc66702030065affe976f6",
-  "determinism": "see echo-determinism.sh and its committed logs in this directory.",
+  "actual_commit": "4333728bf768052b57d93cc70b45d21c8126841b",
+  "determinism": "see echo-determinism.sh and echo-determinism-{on,off}.txt in this directory.",
   "expected_commit": "f071c89b99ca5604252756c529d29c5ae0e5736b",
   "harness": "ab-render.sh",
-  "note": "actual = the last commit that changed product code on this branch; expected = a build of the base commit. The evidence commit that carries this file touches no crates/, so this SHA is the code these pixels came from."
+  "note": "actual = the last commit on this branch that changes product code; expected = a build of the base commit. The evidence commit carrying this file touches no crates/, Makefile or scripts/, so this SHA is exactly the code these pixels came from."
  },
  "size": [
   1080,

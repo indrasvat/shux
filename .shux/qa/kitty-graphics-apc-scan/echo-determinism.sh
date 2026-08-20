@@ -28,6 +28,7 @@ cols="$(jq -r '.cols' "${repo_root}/.shux/fixtures/vt-corpus/rich-tui/manifest.j
 rows="$(jq -r '.rows' "${repo_root}/.shux/fixtures/vt-corpus/rich-tui/manifest.json")"
 out="$(mktemp -d "${TMPDIR:-/tmp}/shux-echodet.XXXXXX")"
 trap 'rm -rf "${out}"' EXIT
+leaked=0
 
 for i in $(seq 1 "${runs}"); do
     runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-echodet-rt.XXXXXX")"
@@ -66,16 +67,24 @@ for i in $(seq 1 "${runs}"); do
 
     # Reap by THIS run's unique runtime dir, never a shared needle like `shux`:
     # a shared one reads other suites' processes, and matching our own argv
-    # invents phantom leaks.
+    # invents phantom leaks. Reaping is REPORTED, not silent -- a harness that
+    # quietly cleans up a leak is indistinguishable from one that never leaked.
     for proc in /proc/[0-9]*; do
         pid="${proc#/proc/}"
         [ "$(readlink "${proc}/exe" 2>/dev/null || true)" = "${bin}" ] || continue
         if tr '\0' ' ' <"${proc}/cmdline" 2>/dev/null | grep -qF -- "${runtime}/"; then
+            printf 'echo-determinism: LEAKED daemon pid %s on run %s\n' "${pid}" "${i}" >&2
             kill -TERM "${pid}" 2>/dev/null || true
+            leaked=$((leaked + 1))
         fi
     done
     rm -rf "${runtime}"
 done
+
+if [ "${leaked}" -gt 0 ]; then
+    printf 'echo-determinism: %d daemon(s) leaked and were reaped; failing the run\n' "${leaked}" >&2
+    exit 1
+fi
 
 distinct="$(sha256sum "${out}"/*.png | awk '{print $1}' | sort -u | wc -l)"
 printf 'echo=%s runs=%s distinct=%s\n' "${echo_mode}" "${runs}" "${distinct}"
