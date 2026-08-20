@@ -233,6 +233,11 @@ pub struct VtHandler<'a> {
     pub(crate) charsets: &'a mut TerminalCharsets,
     pub(crate) tab_stops: &'a mut TabStops,
     pub(crate) responses: &'a mut Vec<Vec<u8>>,
+    /// Set when a sequence handled inside vte resets the terminal, so the
+    /// caller can drop graphics state it owns outside the parser (the APC
+    /// scanner's in-flight sequence, stored images, placements). RIS runs
+    /// downstream of the scanner, so it cannot reach that state directly.
+    pub(crate) graphics_reset: &'a mut bool,
     /// Sticky flag set when a valid OSC 4 palette override is applied. shux-vt
     /// discards the override (Class-B limitation), so an indexed-colour capture
     /// taken afterwards is non-portable — the lens gate reads this to emit the
@@ -1757,6 +1762,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 // character, so a REP straight after one repeats nothing
                 // (issue #122).
                 *self.last_graphic = None;
+                // RIS clears images too: the graphics protocol requires that
+                // "when resetting the terminal, all images that are visible on
+                // the screen must be cleared".
+                *self.graphics_reset = true;
                 self.reset_charsets();
                 self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
@@ -2444,6 +2453,7 @@ mod tests {
 
         fn process(&mut self, bytes: &[u8]) {
             let mut palette_overridden = false;
+            let mut graphics_reset = false;
             let mut handler = VtHandler {
                 grid: Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
                 cursor: Presented::new(&mut self.cursor, &mut self.frozen_cursor, &self.sync_armed),
@@ -2466,6 +2476,7 @@ mod tests {
                 charsets: &mut self.charsets,
                 tab_stops: &mut self.tab_stops,
                 responses: &mut self.responses,
+                graphics_reset: &mut graphics_reset,
                 palette_overridden: &mut palette_overridden,
                 alt_spare: &mut self.alt_spare,
                 reuse_retired_grids: true,

@@ -10,6 +10,7 @@ mod cell;
 mod charset;
 mod cursor;
 mod diff;
+mod graphics;
 mod grid;
 mod parser;
 mod screen;
@@ -98,6 +99,10 @@ pub struct VirtualTerminal {
     parser: VtParser,
     /// In-progress DCS payload, preserved across partial PTY chunks.
     dcs_state: Option<DcsState>,
+    /// Locates kitty-graphics APC sequences, whose bytes vte consumes without
+    /// ever calling back. Carries state across PTY reads: 48% of
+    /// terminal-browser's APCs straddle an 8192-byte read boundary.
+    apc_scanner: graphics::apc::ApcScanner,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
     /// open. Shared by reference with every [`sync::Presented`] wrapper handed
     /// to the parser, which is why it is a cell rather than a plain `bool`;
@@ -235,6 +240,7 @@ impl VirtualTerminal {
             default_colors: TerminalDefaultColors::default(),
             parser: VtParser::new_with_size(),
             dcs_state: None,
+            apc_scanner: graphics::apc::ApcScanner::default(),
             sync_armed: std::sync::atomic::AtomicBool::new(false),
             frozen_grid: None,
             frozen_cursor: None,
@@ -409,6 +415,69 @@ impl VirtualTerminal {
         let _ = self.process_with_responses(bytes);
     }
 
+    /// Feed one slice of the batch to vte.
+    ///
+    /// Split out of [`Self::process_with_responses`] so that batch can be cut at
+    /// APC boundaries and still hand vte every byte. The handler borrows a pile
+    /// of disjoint fields; building it per slice is what lets graphics work run
+    /// in between.
+    fn advance_slice(&mut self, bytes: &[u8], responses: &mut Vec<Vec<u8>>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut graphics_reset = false;
+        let mut handler = VtHandler {
+            grid: sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
+            cursor: sync::Presented::new(
+                &mut self.cursor,
+                &mut self.frozen_cursor,
+                &self.sync_armed,
+            ),
+            modes: &mut self.modes,
+            scroll_region: &mut self.scroll_region,
+            title: sync::Presented::new(&mut self.title, &mut self.frozen_title, &self.sync_armed),
+            default_colors: sync::Presented::new(
+                &mut self.default_colors,
+                &mut self.frozen_colors,
+                &self.sync_armed,
+            ),
+            alt_grid: &mut self.alt_grid,
+            alt_cursor: &mut self.alt_cursor,
+            dcs_state: &mut self.dcs_state,
+            sync_armed: &self.sync_armed,
+            frozen_alt: &mut self.frozen_alt,
+            eager_sync_freeze: self.eager_sync_freeze,
+            active_grapheme_cell: &mut self.active_grapheme_cell,
+            last_graphic: &mut self.last_graphic,
+            charsets: &mut self.charsets,
+            tab_stops: &mut self.tab_stops,
+            responses,
+            graphics_reset: &mut graphics_reset,
+            palette_overridden: &mut self.palette_overridden,
+            alt_spare: &mut self.alt_spare,
+            reuse_retired_grids: self.reuse_retired_grids,
+        };
+        self.parser.advance(&mut handler, bytes);
+        if graphics_reset {
+            // A reset handled inside vte (RIS today) clears graphics state the
+            // parser cannot reach: the scanner's in-flight sequence lives
+            // upstream of it.
+            self.apc_scanner.reset();
+        }
+    }
+
+    /// Act on one kitty graphics command.
+    ///
+    /// `body` is the APC payload between `ESC _` and the terminator. Anything
+    /// that is not a `G`-introduced graphics command is discarded, exactly as
+    /// vte already discards every APC today.
+    fn dispatch_graphics(&mut self, body: &[u8], responses: &mut Vec<Vec<u8>>) {
+        let Some(command) = body.strip_prefix(b"G") else {
+            return;
+        };
+        let _ = (command, responses);
+    }
+
     /// Process raw PTY output bytes and return terminal reply bytes.
     ///
     /// This is the request/response half of terminal emulation. Apps running
@@ -446,41 +515,34 @@ impl VirtualTerminal {
         let before_alt = self.modes.alternate_screen;
         let before_colors = self.default_colors();
 
-        // We need to create a VtHandler that borrows our fields mutably.
-        // The vte Parser is taken out temporarily so we can pass both
-        // the parser and the handler without conflicting borrows.
         let mut responses = Vec::new();
-        let mut handler = VtHandler {
-            grid: sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
-            cursor: sync::Presented::new(
-                &mut self.cursor,
-                &mut self.frozen_cursor,
-                &self.sync_armed,
-            ),
-            modes: &mut self.modes,
-            scroll_region: &mut self.scroll_region,
-            title: sync::Presented::new(&mut self.title, &mut self.frozen_title, &self.sync_armed),
-            default_colors: sync::Presented::new(
-                &mut self.default_colors,
-                &mut self.frozen_colors,
-                &self.sync_armed,
-            ),
-            alt_grid: &mut self.alt_grid,
-            alt_cursor: &mut self.alt_cursor,
-            dcs_state: &mut self.dcs_state,
-            sync_armed: &self.sync_armed,
-            frozen_alt: &mut self.frozen_alt,
-            eager_sync_freeze: self.eager_sync_freeze,
-            active_grapheme_cell: &mut self.active_grapheme_cell,
-            last_graphic: &mut self.last_graphic,
-            charsets: &mut self.charsets,
-            tab_stops: &mut self.tab_stops,
-            responses: &mut responses,
-            palette_overridden: &mut self.palette_overridden,
-            alt_spare: &mut self.alt_spare,
-            reuse_retired_grids: self.reuse_retired_grids,
-        };
-        self.parser.advance(&mut handler, bytes);
+
+        // Kitty graphics arrive as APC sequences, which vte consumes without
+        // ever calling back (vte-0.15 `src/lib.rs:182`). We therefore locate
+        // them ourselves -- but we do NOT remove them from the stream. vte is
+        // handed every byte unchanged and we merely cut its `advance` calls at
+        // the APC boundaries, so the text path stays bit-identical to the
+        // pre-graphics build BY CONSTRUCTION. Stripping instead would change
+        // vte's state and can lose text or synthesize escape sequences that
+        // were never sent; see the module docs on [`graphics::apc`].
+        //
+        // Cutting at the boundary also puts each graphics command at its true
+        // position in the stream, which two things depend on: a placement
+        // anchors at the cursor as it stands right there, and replies queue in
+        // request order (terminal-browser sends its graphics query and `CSI c`
+        // back-to-back inside one read and matches the answers up in order).
+        let cuts = self.apc_scanner.scan(bytes);
+        if cuts.is_empty() {
+            self.advance_slice(bytes, &mut responses);
+        } else {
+            let mut at = 0;
+            for cut in cuts {
+                self.advance_slice(&bytes[at..cut.end], &mut responses);
+                self.dispatch_graphics(&cut.body, &mut responses);
+                at = cut.end;
+            }
+            self.advance_slice(&bytes[at..], &mut responses);
+        }
 
         let after_alt = self.modes.alternate_screen;
         let after_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
