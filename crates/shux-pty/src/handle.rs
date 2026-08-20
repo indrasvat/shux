@@ -240,6 +240,70 @@ mod tests {
     }
 }
 
+/// Environment variables by which a terminal emulator advertises *itself*, and
+/// which therefore must never survive into a pane child.
+///
+/// shux is the terminal a pane talks to. A variable naming the emulator shux
+/// itself happens to be running under points every consumer at the wrong
+/// terminal, and the resulting failures are silent rather than loud (see the
+/// scrub site in [`PtyHandle::spawn`]).
+///
+/// Grouped by emulator/multiplexer. `TERM_PROGRAM`/`TERM_PROGRAM_VERSION` are
+/// absent deliberately: they are *overwritten* with shux's own values rather
+/// than removed, which is the same pattern tmux follows.
+pub const OUTER_TERMINAL_IDENTITY_VARS: &[&str] = &[
+    // kitty
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_LISTEN_ON",
+    "KITTY_PUBLIC_KEY",
+    "KITTY_INSTALLATION_DIR",
+    // tmux / screen
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "WINDOW",
+    // ghostty
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "GHOSTTY_SHELL_INTEGRATION_NO_SUDO",
+    // wezterm
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "WEZTERM_EXECUTABLE",
+    "WEZTERM_EXECUTABLE_DIR",
+    "WEZTERM_CONFIG_FILE",
+    // cmux
+    "CMUX_SURFACE_ID",
+    "CMUX_WORKSPACE_ID",
+    "CMUX_BUNDLED_CLI_PATH",
+    // herdr
+    "HERDR_PANE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_BIN_PATH",
+    "HERDR_CONFIG_PATH",
+    // tty7
+    "TTY7_PANE",
+    // VS Code
+    "VSCODE_INJECTION",
+    "VSCODE_SHELL_INTEGRATION",
+    // iTerm2
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    // alacritty
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "ALACRITTY_LOG",
+    // misc emulators that gate features on their own marker
+    "KONSOLE_VERSION",
+    "KONSOLE_DBUS_SESSION",
+    "VTE_VERSION",
+    "TERMINOLOGY",
+    "CONTOUR_PROFILE",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
+];
+
 /// Configuration for spawning a PTY child process.
 #[derive(Debug, Clone)]
 pub struct PtyConfig {
@@ -561,6 +625,29 @@ impl PtyHandle {
             // uses (it sets TERM_PROGRAM=tmux).
             .env("TERM_PROGRAM", "shux")
             .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+
+        // `TERM_PROGRAM` above is not the only variable that names a terminal.
+        // Every emulator worth integrating with exports a handle to ITSELF, and
+        // tools discover the terminal they are talking to by sniffing for them.
+        // Inside a pane those handles are lies: shux is the terminal now.
+        //
+        // Left in place, they do not degrade gracefully — they silently address
+        // the wrong terminal. terminal-browser is the worked example: seeing
+        // `KITTY_WINDOW_ID` it concludes the terminal is kitty, treats an
+        // unanswered graphics probe as "supported" (a recognised terminal is
+        // assumed capable), and streams images into a pane that discards them —
+        // no message, no non-zero exit, just a blank pane. Its `--split` would
+        // cut a pane in the outer kitty rather than in shux. Scrubbed, the same
+        // command correctly reports that this terminal cannot show images.
+        //
+        // Deny-listed rather than allow-listed on purpose: `env_clear` is off by
+        // default (a pane inherits the user's environment, which is the point),
+        // so the only workable shape is to name the identities we know lie. A
+        // pane that genuinely needs one back can set it via `PtyConfig::env`,
+        // which is applied below and therefore wins.
+        for key in OUTER_TERMINAL_IDENTITY_VARS {
+            cmd.env_remove(key);
+        }
 
         for (key, value) in &config.env {
             cmd.env(key, value);

@@ -321,3 +321,80 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
          process group that is still alive"
     );
 }
+
+/// A pane child must not inherit the *outer* terminal's identity.
+///
+/// shux is the terminal its children talk to, so a pane that still advertises
+/// `KITTY_WINDOW_ID` (or `TMUX`, `GHOSTTY_RESOURCES_DIR`, …) makes every tool
+/// that sniffs those variables address the wrong terminal. The failure is
+/// silent and total: terminal-browser detects the *outer* emulator, concludes
+/// graphics are supported without probing, and streams images into a pane shux
+/// discards — no message, no non-zero exit, just a blank pane. Its `--split`
+/// would likewise cut a pane in the outer terminal.
+///
+/// shux already scrubs `TERM_PROGRAM` for exactly this reason (see
+/// `handle.rs`); these belong with it.
+#[tokio::test]
+async fn pane_child_does_not_inherit_outer_terminal_identity() {
+    const LEAKY: &[&str] = &[
+        "KITTY_WINDOW_ID",
+        "KITTY_PID",
+        "KITTY_LISTEN_ON",
+        "KITTY_PUBLIC_KEY",
+        "TMUX",
+        "TMUX_PANE",
+        "GHOSTTY_RESOURCES_DIR",
+        "GHOSTTY_BIN_DIR",
+        "WEZTERM_PANE",
+        "WEZTERM_UNIX_SOCKET",
+        "WEZTERM_EXECUTABLE",
+        "CMUX_SURFACE_ID",
+        "CMUX_WORKSPACE_ID",
+        "CMUX_BUNDLED_CLI_PATH",
+        "HERDR_PANE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_BIN_PATH",
+        "HERDR_CONFIG_PATH",
+        "TTY7_PANE",
+        "VSCODE_INJECTION",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "ITERM_SESSION_ID",
+        "ALACRITTY_WINDOW_ID",
+        "ALACRITTY_SOCKET",
+        "KONSOLE_VERSION",
+        "VTE_VERSION",
+        "TERMINOLOGY",
+        "CONTOUR_PROFILE",
+    ];
+
+    // SAFETY: single-threaded setup before the child is spawned; the values are
+    // removed again below. Mirrors what a real outer emulator would export.
+    for key in LEAKY {
+        unsafe { std::env::set_var(key, "leaked-outer-terminal") };
+    }
+
+    let mut config = PtyConfig::with_command(
+        vec!["sh".into(), "-c".into(), "env; echo ENV_DONE".into()],
+        test_cwd(),
+    );
+    config.env.clear();
+
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    for key in LEAKY {
+        unsafe { std::env::remove_var(key) };
+    }
+
+    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
+    let leaked: Vec<&str> = LEAKY
+        .iter()
+        .copied()
+        .filter(|key| output.contains(&format!("{key}=leaked-outer-terminal")))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "pane child inherited the outer terminal's identity: {leaked:?}"
+    );
+}
