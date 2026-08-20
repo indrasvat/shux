@@ -370,3 +370,105 @@ async fn attach_detach_does_not_orphan_or_kill_pane_child() {
     h.rpc("session.kill", serde_json::json!({ "name": "life-attach" }));
     assert_pid_gone(pid, "session.kill after detach should reap pane child");
 }
+
+/// `daemon stop` must stop the daemon it started, whatever the binary is called.
+///
+/// The identity check that keeps `daemon stop` from signalling a bystander used
+/// to require the executable's basename to be literally `shux`. Any other name —
+/// an A/B pair like `shux-BEFORE`/`shux-AFTER`, a versioned or distro-renamed
+/// install — made shux fail to recognise its OWN daemon. Two things then went
+/// wrong at once: it printed "no daemon running" and exited 0, so a cleanup trap
+/// believed the daemon was gone, and it deleted the pidfile, orphaning a live
+/// daemon that nothing could find afterwards. Every A/B harness leaked one
+/// daemon per run.
+#[test]
+fn daemon_stop_reaps_a_daemon_started_by_a_renamed_binary() {
+    let runtime = tempfile::tempdir().expect("temp runtime dir");
+    let bin_dir = tempfile::tempdir().expect("temp bin dir");
+    let renamed = bin_dir.path().join("shux-under-a-different-name");
+    std::fs::copy(env!("CARGO_BIN_EXE_shux"), &renamed).expect("copy shux binary");
+    let mut perms = std::fs::metadata(&renamed).expect("stat").permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&renamed, perms).expect("chmod");
+
+    let run = |args: &[&str]| -> Output {
+        Command::new(&renamed)
+            .args(args)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("SHUX_SOCKET")
+            .env("NO_COLOR", "1")
+            .env("SHELL", "/bin/sh")
+            .output()
+            .expect("run renamed shux")
+    };
+
+    // Auto-starts the daemon.
+    let created = run(&[
+        "--format",
+        "json",
+        "session",
+        "create",
+        "renamed-daemon-test",
+        "-d",
+        "--",
+        "sh",
+        "-c",
+        "sleep 120",
+    ]);
+    assert!(
+        created.status.success(),
+        "session create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let pid_path = runtime.path().join("shux").join("shux.pid");
+    let pid: i32 = std::fs::read_to_string(&pid_path)
+        .expect("pidfile")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert!(
+        kill(Pid::from_raw(pid), None).is_ok(),
+        "daemon {pid} should be alive before stop"
+    );
+
+    // Every failure path below must still reap this daemon, including the
+    // assertions that fire before the stop is even attempted. A test for a leak
+    // bug that leaks on failure is its own bug -- an earlier draft did exactly
+    // that, and left a daemon behind each time it was run against the unfixed
+    // code.
+    struct Reaper(i32);
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            if kill(Pid::from_raw(self.0), None).is_ok() {
+                let _ = kill(Pid::from_raw(self.0), Signal::SIGKILL);
+            }
+        }
+    }
+    let _reaper = Reaper(pid);
+
+    let _ = run(&["session", "kill", "renamed-daemon-test"]);
+    let stopped = run(&["daemon", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "daemon stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if kill(Pid::from_raw(pid), None).is_err() {
+            return; // reaped
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!(
+        "daemon {pid} survived `daemon stop`, which reported: {}",
+        String::from_utf8_lossy(&stopped.stdout).trim()
+    );
+}

@@ -131,6 +131,26 @@ pub(crate) fn is_live_shux_daemon(pid: u32) -> bool {
     // line merely CONTAINS both words — say `watch-for shux __daemon` — would otherwise be
     // accepted as the daemon and signalled. A shux daemon is `<path>/shux __daemon`.
     let args = String::from_utf8_lossy(&out.stdout);
+    let args = args.trim_end();
+
+    // A daemon THIS executable started is ours whatever the file happens to be
+    // called. Requiring the basename to be literally `shux` silently disowned
+    // every daemon spawned by a differently-named build — an A/B pair like
+    // `shux-BEFORE`/`shux-AFTER`, a versioned or distro-renamed install — and
+    // `daemon stop` then reported "no daemon running" and leaked it. Matching on
+    // the whole argv prefix rather than a whitespace-split field also survives
+    // an executable path containing spaces, which the split below cannot.
+    if let Ok(self_exe) = std::env::current_exe()
+        && let Some(self_exe) = self_exe.to_str()
+        && args
+            .strip_prefix(self_exe)
+            .and_then(|rest| rest.strip_prefix(" __daemon"))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    {
+        return true;
+    }
+
+    // An installed `shux` is ours too, even from a different build than this one.
     let mut argv = args.split_whitespace();
     let exe_is_shux = argv
         .next()
@@ -182,7 +202,34 @@ pub(crate) fn handle_daemon_command(
         }
         cli::DaemonCommand::Stop => {
             let Some(p) = pid.filter(|_| alive) else {
-                // Idempotent: safe to call from a cleanup trap that may run twice.
+                // A pidfile naming a LIVE process we could not identify is not the
+                // same thing as no daemon at all, and must not be reported as one:
+                // saying "no daemon running" and exiting 0 is a success claim for
+                // work that did not happen, and the caller's cleanup trap believes
+                // it. Deleting the pidfile here made it worse — it orphaned a live
+                // daemon permanently, since nothing could find it afterwards.
+                if let Some(p) = pid.filter(|p| *p > 1)
+                    && nix::sys::signal::kill(nix::unistd::Pid::from_raw(p as i32), None).is_ok()
+                {
+                    if let cli::OutputFormat::Json = format {
+                        println!(
+                            "{{\"stopped\": false, \"reason\": \"unidentified_process\", \"pid\": {p}}}"
+                        );
+                    } else {
+                        println!(
+                            "{} {}",
+                            style::error(format!(
+                                "pid {p} is alive but is not recognisably a shux daemon"
+                            )),
+                            style::muted("leaving it and its pidfile alone")
+                        );
+                    }
+                    anyhow::bail!(
+                        "refusing to claim a daemon was stopped: pid {p} is alive but unidentified"
+                    );
+                }
+                // Genuinely nothing running. Idempotent: safe to call from a
+                // cleanup trap that may run twice, and the stale pidfile goes.
                 if let cli::OutputFormat::Json = format {
                     println!("{{\"stopped\": false, \"reason\": \"not_running\"}}");
                 } else {
