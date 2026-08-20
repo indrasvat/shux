@@ -15,7 +15,16 @@
 #      and still reported success. `set -euo pipefail` plus no `|| true` on any
 #      measurement step is the whole fix.
 #
-#   2. THE PANE IS SIZED BEFORE THE FIRST BYTE IS REPLAYED. A pane starts at the
+#   2. PANE ECHO IS OFF. Terminal replies to a fixture's own device queries
+#      (DA1, DECRQM, DSR, OSC 11) are written back to the PTY master, and a pane
+#      with ECHO on paints them into the frame at a position that races the
+#      replay. Measured on nvim.raw, one binary, echo on: 10 runs -> 2 distinct
+#      images (9 + 1). Echo off: 12 runs -> 1. An earlier revision removed this
+#      after a 3-run sample suggested the resize race below was the only cause;
+#      3 runs cannot see a 1-in-10 flake. Both bugs are real and independent --
+#      fixing the race did NOT make echo-on deterministic.
+#
+#   3. THE PANE IS SIZED BEFORE THE FIRST BYTE IS REPLAYED. A pane starts at the
 #      daemon default (80x24). Spawning the replay and *then* resizing means an
 #      arbitrary prefix of the stream is parsed at the wrong width and reflowed,
 #      so the snapshot shows 80-column wrapping inside a 120-column frame. The
@@ -85,15 +94,23 @@ trap cleanup EXIT
 
 # Colour probe. Truecolor + indexed + basic are mandatory in any daemon-backed
 # capture test, so a monochrome or NO_COLOR regression cannot pass unnoticed.
-# `printf '\xNN'` is NOT portable -- dash's builtin printf leaves it literal --
-# so the combining mark and every other non-ASCII case is written as real UTF-8
-# bytes in this heredoc rather than as an escape.
+# Two traps here, both previously fallen into. `printf '\xNN'` is not portable --
+# dash's builtin printf leaves it literal -- so escapes are written as real UTF-8
+# bytes below, EXCEPT the combining mark, which must stay a decomposed `e` +
+# U+0301 to exercise combining-mark storage at all; a precomposed `é` is a single
+# scalar and tests nothing. It is emitted via printf's own `\xNN` under `sh -c`
+# from bash, which does expand it.
+#
+# Note on the `wide:` arm: the bundled raster font has no CJK, so `世界` renders
+# as tofu. That is base-identical and out of scope here, but it means this arm
+# proves wide-cell ACCOUNTING, not glyph rendering -- do not read it as the
+# latter.
 cat >"${runtime}/colour.sh" <<'SH'
 printf '\033[2J\033[H'
 printf '\033[38;2;255;96;0mTRUECOLOR-fg\033[0m \033[48;2;0;96;255mTRUECOLOR-bg\033[0m\n'
 printf '\033[38;5;208mINDEXED-208\033[0m \033[48;5;27mINDEXED-27\033[0m\n'
 printf '\033[31mBASIC-red\033[0m \033[42mBASIC-green-bg\033[0m \033[1mBOLD\033[0m \033[3mITALIC\033[0m \033[4mUNDER\033[0m\n'
-printf 'box: ┌─┐│└┘  arrows: ⟠⟐⟁⟡  combining: é  wide: 世界  zwj: 👩‍💻\n'
+printf 'box: ┌─┐│└┘  arrows: ⟠⟐⟁⟡  combining: e\xcc\x81  wide: 世界  zwj: 👩‍💻\n'
 printf 'dec-graphics: \033(0lqqqk\033(B ascii-safe\n'
 SH
 
@@ -124,7 +141,7 @@ render() {
     local pane json
 
     json="$(sx --format json session create "${sess}" -d --title "${label}" -- \
-        sh -c "while [ ! -f '${trigger}' ]; do sleep 0.02; done; ${body}; : >'${done}'; sleep 600")"
+        sh -c "stty -echo 2>/dev/null; while [ ! -f '${trigger}' ]; do sleep 0.02; done; ${body}; : >'${done}'; sleep 600")"
     echo "${sess}" >>"${runtime}/sessions"
     pane="$(jq -r '.pane_id' <<<"${json}")"
 
@@ -153,8 +170,8 @@ render() {
     sx session kill "${sess}" >/dev/null
 }
 
-render colour-80x24 80 24 "sh '${runtime}/colour.sh'"
-render colour-120x40 120 40 "sh '${runtime}/colour.sh'"
+render colour-80x24 80 24 "bash '${runtime}/colour.sh'"
+render colour-120x40 120 40 "bash '${runtime}/colour.sh'"
 render apc-80x24 80 24 "sh '${runtime}/apc.sh'"
 render apc-120x40 120 40 "sh '${runtime}/apc.sh'"
 

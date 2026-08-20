@@ -99,44 +99,83 @@ impl ApcScanner {
         self.scan_slow(chunk)
     }
 
+    /// The two "scanning for a byte" states skip ahead with `memchr` rather than
+    /// stepping one byte at a time.
+    ///
+    /// This is not only about speed in the APC case. A pane that emits a lone
+    /// `ESC _` and never terminates it -- a truncated writer, or `cat` on a
+    /// binary that happens to contain those two bytes -- leaves the scanner in
+    /// `Apc` forever. `scan`'s `memmem` fast path is gated on `Ground`, so every
+    /// subsequent read for the life of that pane would take the slow path. With
+    /// a byte-at-a-time loop that is a permanent ~8x scan-cost penalty bought
+    /// with two bytes; with `memchr` the parked state costs one SIMD pass.
     fn scan_slow(&mut self, chunk: &[u8]) -> Vec<ApcCut> {
         let mut cuts = Vec::new();
-        for (i, &b) in chunk.iter().enumerate() {
+        let mut i = 0;
+        while i < chunk.len() {
             match self.state {
                 ScanState::Ground => {
-                    if b == 0x1b {
-                        self.state = ScanState::GroundEsc;
+                    // Only ESC can leave Ground; everything before it is text.
+                    match memchr::memchr(0x1b, &chunk[i..]) {
+                        Some(off) => {
+                            self.state = ScanState::GroundEsc;
+                            i += off + 1;
+                        }
+                        None => break,
                     }
                 }
-                ScanState::GroundEsc => match b {
-                    b'_' => self.begin(),
-                    // `ESC ESC` leaves us still looking at an escape.
-                    0x1b => {}
-                    _ => self.state = ScanState::Ground,
-                },
-                ScanState::Apc => match b {
-                    0x1b => self.state = ScanState::ApcEsc,
-                    // CAN / SUB abort a string sequence outright.
-                    0x18 | 0x1a => self.abort(),
-                    _ => self.push(b),
-                },
-                ScanState::ApcEsc => match b {
-                    // ST: the only well-formed terminator.
-                    b'\\' => {
-                        if !self.overflowed {
-                            cuts.push(ApcCut {
-                                end: i + 1,
-                                body: std::mem::take(&mut self.body),
-                            });
+                ScanState::Apc => {
+                    // Only ESC, CAN or SUB can leave an APC body; everything
+                    // before them is payload.
+                    match memchr::memchr3(0x1b, 0x18, 0x1a, &chunk[i..]) {
+                        Some(off) => {
+                            self.push_span(&chunk[i..i + off]);
+                            let b = chunk[i + off];
+                            i += off + 1;
+                            if b == 0x1b {
+                                self.state = ScanState::ApcEsc;
+                            } else {
+                                // CAN / SUB abort a string sequence outright.
+                                self.abort();
+                            }
                         }
-                        self.abort();
+                        None => {
+                            self.push_span(&chunk[i..]);
+                            break;
+                        }
                     }
-                    // `ESC _` starts a fresh APC; the unterminated one is junk.
-                    b'_' => self.begin(),
-                    0x1b => {}
-                    // Any other ESC-introduced sequence ends this APC malformed.
-                    _ => self.abort(),
-                },
+                }
+                ScanState::GroundEsc => {
+                    let b = chunk[i];
+                    i += 1;
+                    match b {
+                        b'_' => self.begin(),
+                        // `ESC ESC` leaves us still looking at an escape.
+                        0x1b => {}
+                        _ => self.state = ScanState::Ground,
+                    }
+                }
+                ScanState::ApcEsc => {
+                    let b = chunk[i];
+                    i += 1;
+                    match b {
+                        // ST: the only well-formed terminator.
+                        b'\\' => {
+                            if !self.overflowed {
+                                cuts.push(ApcCut {
+                                    end: i,
+                                    body: std::mem::take(&mut self.body),
+                                });
+                            }
+                            self.abort();
+                        }
+                        // `ESC _` starts a fresh APC; the unterminated one is junk.
+                        b'_' => self.begin(),
+                        0x1b => {}
+                        // Any other ESC-introduced sequence ends this APC malformed.
+                        _ => self.abort(),
+                    }
+                }
             }
         }
         cuts
@@ -154,15 +193,20 @@ impl ApcScanner {
         self.overflowed = false;
     }
 
-    fn push(&mut self, b: u8) {
-        if self.body.len() >= MAX_APC_BODY_BYTES {
+    /// Append a run of payload bytes, dropping the whole body once it exceeds
+    /// the cap. Dropped rather than truncated: a partial image is not worth
+    /// decoding, and the scanner keeps running so the stream resynchronises at
+    /// the real terminator.
+    fn push_span(&mut self, span: &[u8]) {
+        if self.overflowed {
+            return;
+        }
+        if self.body.len() + span.len() > MAX_APC_BODY_BYTES {
             self.overflowed = true;
             self.body.clear();
             return;
         }
-        if !self.overflowed {
-            self.body.push(b);
-        }
+        self.body.extend_from_slice(span);
     }
 
     /// Drop any in-flight sequence. Used by `RIS`, which resets the terminal

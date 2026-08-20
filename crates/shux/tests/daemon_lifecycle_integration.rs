@@ -425,31 +425,34 @@ fn daemon_stop_reaps_a_daemon_started_by_a_renamed_binary() {
         String::from_utf8_lossy(&created.stderr)
     );
 
+    // Installed BEFORE the pidfile is read, so that a malformed or missing
+    // pidfile -- which panics -- still reaps. A test for a leak bug that leaks
+    // when it fails is its own bug; an earlier draft asserted first and reaped
+    // last, and left a daemon behind every time it ran against the unfixed code.
+    // `Reaper` holds an Option because the pid is not known until after the read.
+    struct Reaper(Option<i32>);
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0
+                && kill(Pid::from_raw(pid), None).is_ok()
+            {
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+        }
+    }
+    let mut reaper = Reaper(None);
+
     let pid_path = runtime.path().join("shux").join("shux.pid");
-    let pid: i32 = std::fs::read_to_string(&pid_path)
-        .expect("pidfile")
-        .trim()
-        .parse()
-        .expect("pid");
+    let pid_text = std::fs::read_to_string(&pid_path).expect("pidfile");
+    // Adopt the pid the instant it is known, before anything can panic on it.
+    reaper.0 = pid_text.trim().parse().ok();
+    let pid: i32 = reaper
+        .0
+        .unwrap_or_else(|| panic!("unparseable pid {pid_text:?}"));
     assert!(
         kill(Pid::from_raw(pid), None).is_ok(),
         "daemon {pid} should be alive before stop"
     );
-
-    // Every failure path below must still reap this daemon, including the
-    // assertions that fire before the stop is even attempted. A test for a leak
-    // bug that leaks on failure is its own bug -- an earlier draft did exactly
-    // that, and left a daemon behind each time it was run against the unfixed
-    // code.
-    struct Reaper(i32);
-    impl Drop for Reaper {
-        fn drop(&mut self) {
-            if kill(Pid::from_raw(self.0), None).is_ok() {
-                let _ = kill(Pid::from_raw(self.0), Signal::SIGKILL);
-            }
-        }
-    }
-    let _reaper = Reaper(pid);
 
     let _ = run(&["session", "kill", "renamed-daemon-test"]);
     let stopped = run(&["daemon", "stop"]);

@@ -1,7 +1,7 @@
 {
   "scope": "kitty-graphics-apc-scan",
   "base_commit": "f071c89b99ca5604252756c529d29c5ae0e5736b",
-  "head_commit": "61d3bee2a9e5b040a7ebf416366efa00d3446602",
+  "head_commit": "58320d33158c6d992a5d8f8eeb911179ecdfe4d5",
   "summary": "Locate kitty-graphics APC sequences without altering the byte stream; stop leaking the outer terminal's identity into panes; stop disowning a daemon whose binary is not named `shux`. The load-bearing claim is that the text/render path is bit-identical to the base commit: vte receives every byte unchanged and only its `advance` calls are cut at APC boundaries. No graphics command is acted on and no graphics query is answered yet.",
   "solid_qa_report": "SOLID-QA.md",
   "dootsabha_design": "adversarial-review-apc.md",
@@ -26,8 +26,12 @@
     "The pane was sized AFTER the replay started, so a prefix of every stream was parsed at the 80x24 default and reflowed -- btop rendered with 80-column wrapping inside a 120-column frame and vivecaka captured essentially blank. The replay now blocks on a trigger file created only after `pane set-size` returns.",
     "Rich TUIs were replayed at 120x40 while rich-tui/manifest.json declares the recording as 120x36, so the comparison measured reflow. Geometry is now read from the manifest.",
     "Completion was signalled by printing MARKER_DONE into the pane, which overprinted the frame being measured (visible on nvim). It is now signalled out of band via a file.",
-    "The combining-mark probe was written as printf '\\xcc\\x81', which dash does not expand, so it rendered literally and tested nothing. Non-ASCII cases are now real UTF-8 bytes.",
-    "An earlier revision added `stty -echo` and justified it as fixing nvim/lazygit nondeterminism. That diagnosis was WRONG -- the nondeterminism was the resize race above. With the race fixed, echo-on is deterministic, so `stty -echo` has been removed rather than kept for a reason that does not hold.",
-    "The harness leaked one daemon per run and could not tell, because `daemon stop` reported success while leaving it alive. Root cause fixed in shux itself; the harness additionally asserts zero leaked daemons, identified by this run's own unique socket path."
+    "The combining-mark probe was written as printf '\\xNN' under dash, which does not expand it, so it rendered literally. Fixing the escaping alone was not enough: the replacement used a PRECOMPOSED U+00E9, a single scalar that exercises no combining-mark storage. It is now a decomposed `e` + U+0301.",
+    "An intermediate revision REMOVED `stty -echo`, claiming the resize race above had been its only cause. That was wrong, and is recorded here because the wrong version was committed. Both bugs are real and independent. Device-query replies (DA1, DECRQM, DSR, OSC 11 -- nvim.raw carries 10, lazygit.raw 5) are echoed into the frame at a position that races the replay. Measured on the nvim arm with one binary: echo ON 35 runs -> 3 distinct images; echo OFF 37 runs -> 1. The earlier removal rested on a 3-run sample, which cannot see a 1-in-10 flake.",
+    "The harness leaked one daemon per run and could not tell, because `daemon stop` reported success while leaving it alive. Root cause fixed in shux itself; the harness additionally asserts zero leaked daemons, identified by this run's own unique socket path. That assertion still fires on a base-commit build, which is the cleanest demonstration of the fix."
+  ],
+  "known_limitations": [
+    "The `wide: \u4e16\u754c` probe renders as tofu in every arm: the bundled raster font has no CJK. Base-identical and outside this diff, but it means that arm proves wide-cell ACCOUNTING, not glyph rendering.",
+    "8-bit C1 APC (0x9F) is deliberately unsupported; see the module docs on graphics::apc."
   ]
 }
