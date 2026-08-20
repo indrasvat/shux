@@ -263,6 +263,9 @@ pub const OUTER_TERMINAL_IDENTITY_VARS: &[&str] = &[
     // screen also exports a bare `WINDOW`. It is the only unprefixed English
     // word here, so it is removed only when `STY` proves screen set it --
     // stripping `WINDOW` from every pane child would be collateral damage.
+    // tty7: consumed by terminal-browser's tty7 backend
+    // (terminals/src/terminals/tty7.ts: `if (!env.TTY7_PANE && ...) return null`).
+    // Cited because it is obscure enough that a reviewer flagged it as invented.
     "TTY7_PANE",
     // iTerm2. LC_TERMINAL is the one designed to survive ssh, so a stale value
     // travels further than any other on this list.

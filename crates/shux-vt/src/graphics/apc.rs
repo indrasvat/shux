@@ -253,6 +253,29 @@ mod tests {
     }
 
     #[test]
+    fn every_cut_ends_exactly_one_byte_past_the_st() {
+        // The proptest that compares a sliced terminal against an unsliced one
+        // is only ~0.17% likely to notice an off-by-one here, so it is pinned
+        // directly instead. `end` is what the caller feeds vte before acting on
+        // the command; one byte short leaves vte mid-ST, one byte long steals a
+        // byte of the following text.
+        let stream: &[u8] = b"xx\x1b_Ga=q,i=7;QQ\x1b\\yyyy";
+        let mut scanner = ApcScanner::default();
+        let cuts = scanner.scan(stream);
+        assert_eq!(cuts.len(), 1);
+        let end = cuts[0].end;
+        assert_eq!(
+            &stream[end - 2..end],
+            b"\x1b\\",
+            "a cut must land immediately after the ST it terminated on"
+        );
+        assert_eq!(
+            stream[end], b'y',
+            "the next byte is untouched following text"
+        );
+    }
+
+    #[test]
     fn survives_every_chunk_boundary() {
         let stream: &[u8] = b"xx\x1b_Ga=q,i=1;AAAA\x1b\\yy\x1b_Gm=0;BB\x1b\\zz";
         let whole = bodies(&[stream]);
