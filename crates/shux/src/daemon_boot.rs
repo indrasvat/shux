@@ -133,20 +133,16 @@ pub(crate) fn is_live_shux_daemon(pid: u32) -> bool {
     let args = String::from_utf8_lossy(&out.stdout);
     let args = args.trim_end();
 
-    // Note two things this relies on. `ps -o args=` is not truncated on Linux for
-    // argv of this length (measured), but BSD/macOS `ps` can truncate without
-    // `-ww`; the pre-existing basename branch below has the same exposure, so
-    // this is not a new risk, but it is a real one. And the comparison works
-    // because the daemon is spawned with `current_exe()` (see `start_daemon_process`
-    // in client.rs), so argv[0] is the resolved path this same call produces.
+    // A daemon THIS executable started is ours whatever the file is called.
+    // Requiring the basename to be literally `shux` disowned every daemon from a
+    // differently-named build (an A/B pair, a renamed install): `daemon stop`
+    // reported "no daemon running" and leaked it. Works because the daemon is
+    // spawned with `current_exe()` (`start_daemon_process` in client.rs).
+    // Matching the whole argv prefix, not a whitespace-split field, also
+    // survives an executable path containing spaces.
     //
-    // A daemon THIS executable started is ours whatever the file happens to be
-    // called. Requiring the basename to be literally `shux` silently disowned
-    // every daemon spawned by a differently-named build — an A/B pair like
-    // `shux-BEFORE`/`shux-AFTER`, a versioned or distro-renamed install — and
-    // `daemon stop` then reported "no daemon running" and leaked it. Matching on
-    // the whole argv prefix rather than a whitespace-split field also survives
-    // an executable path containing spaces, which the split below cannot.
+    // Caveat: BSD/macOS `ps` can truncate argv without `-ww`. The basename
+    // branch below has the same exposure, so this is not a new risk.
     if let Ok(self_exe) = std::env::current_exe()
         && let Some(self_exe) = self_exe.to_str()
         && args
@@ -209,20 +205,12 @@ pub(crate) fn handle_daemon_command(
         }
         cli::DaemonCommand::Stop => {
             let Some(p) = pid.filter(|_| alive) else {
-                // A pidfile whose pid is alive but is NOT one of our daemons means
-                // the pidfile is stale in the ordinary way: our daemon died and the
-                // OS handed its number to somebody else. "No daemon running" is the
-                // right answer, clearing the stale file is the right action, and
-                // exit 0 keeps the documented contract that this verb is idempotent
-                // and safe in a `set -e` cleanup trap (skills/shux/references/gate.md,
-                // skills/shux/examples/headless-tui-test.md).
-                //
-                // It is still worth saying out loud. The bug this branch fixed was a
-                // daemon of OURS being misread as a bystander, and the only visible
-                // symptom was this same "no daemon running" on a machine that had one.
-                // A warning naming the pid means the next occurrence is diagnosable
-                // instead of silent -- but it goes to stderr, so a trap that pipes
-                // stdout is unaffected and the exit code stays 0.
+                // Alive but not ours means an ordinarily stale pidfile: our daemon
+                // died and the OS reused its number. Exit 0 keeps the documented
+                // idempotence contract (skills/shux/references/gate.md,
+                // skills/shux/examples/headless-tui-test.md). The warning goes to
+                // stderr so a trap piping stdout is unaffected -- worth saying out
+                // loud, because the bug this branch fixed had exactly this symptom.
                 if let Some(p) = pid.filter(|p| *p > 1)
                     && nix::sys::signal::kill(nix::unistd::Pid::from_raw(p as i32), None).is_ok()
                 {

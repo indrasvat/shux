@@ -1,59 +1,34 @@
-//! APC (Application Program Command) extraction for the kitty graphics protocol.
+//! APC extraction for the kitty graphics protocol.
 //!
-//! # Why this exists
+//! `vte` 0.15 has no APC callback -- `State::SosPmApcString` dispatches only
+//! through `anywhere` -- so kitty's `ESC _ G <control> ; <payload> ESC \` is
+//! invisible to a `Perform` impl.
 //!
-//! `vte` 0.15 has no APC callback: `State::SosPmApcString` consumes the bytes
-//! and dispatches only through `anywhere`, so a `Perform` implementation never
-//! sees them (vte-0.15 `src/lib.rs:182`). Kitty graphics commands arrive as
-//! `ESC _ G <control> ; <payload> ESC \`, which means shux cannot see a single
-//! byte of them through the parser alone.
+//! This scanner reports only *where* an APC sits; it never removes bytes.
+//! Stripping is not fixably correct: vte leaves a string state on `ESC <any>`,
+//! `CAN` and `SUB`, not just `ESC \`, so a stripping splitter both loses output
+//! (`ESC _ G broken` then `ESC [ 31 m RED` swallows everything) and invents it
+//! (`ESC [ 3 ESC _ G x ESC \ HELLO` synthesizes `CSI 3 H`). The caller instead
+//! feeds vte every byte and cuts only its `advance` calls, making the text path
+//! bit-identical to the pre-graphics build by construction.
 //!
-//! # Why this scanner does NOT remove bytes
-//!
-//! The obvious design -- strip the APC out of the stream and hand the rest to
-//! vte -- is wrong, and not fixably so. Deleting bytes from a stream feeding a
-//! state machine changes that machine's state. vte leaves a string state on
-//! `ESC <any>`, `CAN` (0x18) and `SUB` (0x1A), not only on `ESC \`, so a
-//! stripping splitter diverges from a correct terminal in ways that lose or
-//! invent user-visible output. Measured against stock vte:
-//!
-//! | input | stock vte | strip-first |
-//! |---|---|---|
-//! | `ESC [ 3 ESC _ G x ESC \ HELLO` | CSI aborted, prints `HELLO` | **invents `CSI 3 H`** |
-//! | `ESC _ G broken` then `ESC [ 31 m RED` | full coloured output | **everything swallowed** |
-//! | `ESC ] 0 ; t ESC _ G a=q ; ESC \ HI` | title set, prints `HI` | title AND text lost |
-//!
-//! So this scanner only reports *where* an APC sits. The caller feeds vte every
-//! byte unchanged and merely cuts its `advance` calls at those boundaries, which
-//! makes the text path bit-identical to the pre-graphics build **by
-//! construction** rather than by test. A scanner false positive therefore costs
-//! at most one spurious image -- never a lost glyph, never a synthesized CSI.
-//!
-//! Deliberately out of scope: 8-bit C1 forms (`0x9F` APC / `0x9C` ST). vte only
-//! speaks 7-bit codes, and `0x9F` is a legal UTF-8 continuation byte -- six of
-//! them sit inside `.shux/fixtures/vt-corpus/rich-tui/vivecaka.raw` as parts of
-//! `U+27A0`/`U+27D0`/`U+27C1`/`U+27E1`. A byte-level scan for `0x9F` would eat
-//! those glyphs.
+//! Out of scope: 8-bit C1 forms. `0x9F` is a legal UTF-8 continuation byte --
+//! six sit inside `vt-corpus/rich-tui/vivecaka.raw` -- so scanning for it would
+//! eat glyphs.
 
-/// Cap on a single APC body held in flight.
-///
-/// The kitty protocol requires clients to chunk direct transmissions at 4096
-/// base64 bytes per escape code, so this is ample headroom (terminal-browser's
-/// largest observed APC is 4152 bytes) while keeping a hostile pane's in-flight
-/// buffer bounded. An overrun is dropped, not truncated-and-decoded: a partial
-/// image is not worth rendering, and the scanner keeps running so the stream
-/// resynchronises at the real terminator.
+/// Cap on a single APC body held in flight. Kitty chunks direct transmissions
+/// at 4096 base64 bytes, so this is ample headroom while bounding a hostile
+/// pane. An overrun drops the body and keeps scanning to resynchronise.
 pub(crate) const MAX_APC_BODY_BYTES: usize = 64 * 1024;
 
 /// One completed APC found in the current chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApcCut {
-    /// Offset in the current chunk one past the APC's terminator. The caller
-    /// feeds vte everything up to here before acting on `body`, so the cursor
-    /// and mode state the command observes are the ones the sequence really saw.
+    /// One past the terminator. vte is fed everything up to here first, so the
+    /// command observes the cursor and mode state the sequence really saw.
     pub(crate) end: usize,
-    /// Body between `ESC _` and the terminator. For a kitty graphics command
-    /// this is `G<control>;<payload>`. May have started in an earlier chunk.
+    /// Body between `ESC _` and the terminator; `G<control>;<payload>` for
+    /// kitty. May have started in an earlier chunk.
     pub(crate) body: Vec<u8>,
 }
 
@@ -62,8 +37,7 @@ enum ScanState {
     /// Outside any APC.
     #[default]
     Ground,
-    /// Outside an APC, previous byte was ESC. Carried across chunk boundaries:
-    /// 48% of terminal-browser's APCs straddle an 8192-byte PTY read.
+    /// Outside an APC, previous byte was ESC. Carried across chunk boundaries.
     GroundEsc,
     /// Inside an APC body.
     Apc,
@@ -76,26 +50,17 @@ enum ScanState {
 pub(crate) struct ApcScanner {
     state: ScanState,
     body: Vec<u8>,
-    /// Set when `body` hit [`MAX_APC_BODY_BYTES`]; the sequence is still tracked
-    /// to its terminator so scanning resynchronises, but no cut is emitted.
+    /// Set when `body` hit [`MAX_APC_BODY_BYTES`]. Still tracked to its
+    /// terminator so scanning resynchronises, but no cut is emitted.
     overflowed: bool,
 }
 
 impl ApcScanner {
     /// Report every APC that *completes* within `chunk`, in stream order.
     ///
-    /// Escape-free input short-circuits on one SIMD pass.
-    ///
-    /// The guard is `no ESC at all`, not `no literal "ESC _"`. The tighter
-    /// probe looks equivalent and is not: vte stays in the Escape state across
-    /// C0 bytes, DEL and 8-bit bytes, so `ESC LF _` opens an APC while
-    /// containing no `ESC _` pair. Searching for the pair skipped those
-    /// sequences entirely and then read their bodies as ground text.
-    ///
-    /// The cost of the wider guard is small because the slow path is itself
-    /// `memchr`-driven: escape-heavy TUI output pays roughly 1.5x a `memmem`
-    /// probe rather than the ~8x a byte-at-a-time loop would cost, and plain
-    /// text -- build logs, `cat` -- still short-circuits.
+    /// The fast path guards on `no ESC at all`, not on `no literal "ESC _"`:
+    /// vte stays in Escape across C0 bytes, DEL and 8-bit bytes, so `ESC LF _`
+    /// opens an APC while containing no `ESC _` pair.
     pub(crate) fn scan(&mut self, chunk: &[u8]) -> Vec<ApcCut> {
         if self.state == ScanState::Ground && memchr::memchr(0x1b, chunk).is_none() {
             // No ESC means the state machine cannot leave Ground, so no APC can
@@ -105,16 +70,10 @@ impl ApcScanner {
         self.scan_slow(chunk)
     }
 
-    /// The two "scanning for a byte" states skip ahead with `memchr` rather than
-    /// stepping one byte at a time.
-    ///
-    /// This is not only about speed in the APC case. A pane that emits a lone
-    /// `ESC _` and never terminates it -- a truncated writer, or `cat` on a
-    /// binary that happens to contain those two bytes -- leaves the scanner in
-    /// `Apc` forever. `scan`'s `memmem` fast path is gated on `Ground`, so every
-    /// subsequent read for the life of that pane would take the slow path. With
-    /// a byte-at-a-time loop that is a permanent ~8x scan-cost penalty bought
-    /// with two bytes; with `memchr` the parked state costs one SIMD pass.
+    /// Both scanning states skip ahead with `memchr`. A pane that emits a lone
+    /// unterminated `ESC _` parks the scanner in `Apc` for its whole life, and
+    /// the fast path is gated on `Ground` -- so the parked cost must stay one
+    /// SIMD pass rather than a byte-at-a-time walk.
     fn scan_slow(&mut self, chunk: &[u8]) -> Vec<ApcCut> {
         let mut cuts = Vec::new();
         let mut i = 0;
@@ -156,12 +115,9 @@ impl ApcScanner {
                     i += 1;
                     match b {
                         b'_' => self.begin(),
-                        // vte stays in Escape for all of these -- it executes C0
-                        // bytes and ignores DEL and 8-bit bytes without leaving
-                        // the state (vte-0.15 src/lib.rs:340-390) -- so a `_`
-                        // after one of them still opens an APC. Only CAN (0x18)
-                        // and SUB (0x1A) really return to Ground, and they fall
-                        // through to the default arm below.
+                        // vte stays in Escape across these (vte-0.15
+                        // src/lib.rs:340-390), so a later `_` still opens an
+                        // APC. Only CAN/SUB return to Ground, via the arm below.
                         0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => {}
                         _ => self.state = ScanState::Ground,
                     }
@@ -205,10 +161,8 @@ impl ApcScanner {
         self.overflowed = false;
     }
 
-    /// Append a run of payload bytes, dropping the whole body once it exceeds
-    /// the cap. Dropped rather than truncated: a partial image is not worth
-    /// decoding, and the scanner keeps running so the stream resynchronises at
-    /// the real terminator.
+    /// Append payload, dropping the whole body past the cap rather than
+    /// truncating -- a partial image is not worth decoding.
     fn push_span(&mut self, span: &[u8]) {
         if self.overflowed {
             return;
@@ -254,11 +208,9 @@ mod tests {
 
     #[test]
     fn every_cut_ends_exactly_one_byte_past_the_st() {
-        // The proptest that compares a sliced terminal against an unsliced one
-        // is only ~0.17% likely to notice an off-by-one here, so it is pinned
-        // directly instead. `end` is what the caller feeds vte before acting on
-        // the command; one byte short leaves vte mid-ST, one byte long steals a
-        // byte of the following text.
+        // Pinned directly: the sliced-vs-unsliced proptest is only ~0.17%
+        // likely to catch an off-by-one. One byte short leaves vte mid-ST, one
+        // byte long steals a byte of the following text.
         let stream: &[u8] = b"xx\x1b_Ga=q,i=7;QQ\x1b\\yyyy";
         let mut scanner = ApcScanner::default();
         let cuts = scanner.scan(stream);
@@ -293,12 +245,10 @@ mod tests {
         assert_eq!(bodies(&chunks), vec![b"Ga=T;QQ".to_vec()]);
     }
 
-    // NOTE on the shape of the next three tests: each puts a *well-formed
-    // terminator later in the stream*. Asserting "nothing was emitted" on a
-    // stream that simply never terminates passes for both the correct and the
-    // broken scanner, so it proves nothing. With a trailing `ESC \\`, a scanner
-    // that wrongly treats the abort byte as payload emits a body here, and
-    // these go red -- verified by mutation.
+    // The next three tests each put a well-formed terminator LATER in the
+    // stream. "Nothing emitted" on a never-terminating stream passes on both
+    // the correct and the broken scanner; with a trailing `ESC \\` a scanner
+    // that treats the abort byte as payload goes red. Verified by mutation.
 
     #[test]
     fn can_aborts_the_sequence() {

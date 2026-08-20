@@ -240,35 +240,24 @@ mod tests {
     }
 }
 
-/// Environment variables by which a terminal emulator advertises *itself*, and
-/// which therefore must never survive into a pane child.
+/// Variables by which a terminal emulator advertises *itself*, which must never
+/// survive into a pane child: shux is the terminal a pane talks to, so they
+/// point consumers at the wrong one (see [`PtyHandle::spawn`]).
 ///
-/// shux is the terminal a pane talks to. A variable naming the emulator shux
-/// itself happens to be running under points every consumer at the wrong
-/// terminal, and the resulting failures are silent rather than loud (see the
-/// scrub site in [`PtyHandle::spawn`]).
-///
-/// Exact names only; the vendor-prefixed families are handled by
-/// [`OUTER_TERMINAL_IDENTITY_PREFIXES`] instead, because a name list cannot keep
-/// up with an emulator that adds a variable.
-///
-/// `TERM_PROGRAM`/`TERM_PROGRAM_VERSION` are absent deliberately: they are
-/// *overwritten* with shux's own values rather than removed, the same pattern
-/// tmux follows.
+/// Exact names only; vendor families live in
+/// [`OUTER_TERMINAL_IDENTITY_PREFIXES`]. `TERM_PROGRAM`/`TERM_PROGRAM_VERSION`
+/// are absent deliberately -- they are overwritten with shux's own values, as
+/// tmux does.
 pub const OUTER_TERMINAL_IDENTITY_VARS: &[&str] = &[
     // multiplexers
     "TMUX",
     "TMUX_PANE",
     "STY",
-    // screen also exports a bare `WINDOW`. It is the only unprefixed English
-    // word here, so it is removed only when `STY` proves screen set it --
-    // stripping `WINDOW` from every pane child would be collateral damage.
-    // tty7: consumed by terminal-browser's tty7 backend
-    // (terminals/src/terminals/tty7.ts: `if (!env.TTY7_PANE && ...) return null`).
-    // Cited because it is obscure enough that a reviewer flagged it as invented.
+    // screen's bare `WINDOW` is handled at the scrub site: it needs `STY` to
+    // prove screen set it. Consumed by terminal-browser's tty7 backend
+    // (terminals/src/terminals/tty7.ts).
     "TTY7_PANE",
-    // iTerm2. LC_TERMINAL is the one designed to survive ssh, so a stale value
-    // travels further than any other on this list.
+    // iTerm2. LC_TERMINAL survives ssh, so a stale value travels furthest.
     "ITERM_SESSION_ID",
     "ITERM_PROFILE",
     "LC_TERMINAL",
@@ -286,12 +275,8 @@ pub const OUTER_TERMINAL_IDENTITY_VARS: &[&str] = &[
     "VSCODE_SHELL_INTEGRATION",
 ];
 
-/// Vendor prefixes whose whole family names the outer terminal.
-///
-/// Prefixes rather than names because the failure mode of a name list is
-/// silent: an emulator adds `FOO_SOMETHING_NEW`, it leaks, and nothing says so.
-/// Every prefix here is vendor-namespaced, so a false positive would have to be
-/// someone else's variable squatting an emulator's namespace.
+/// Vendor prefixes whose whole family names the outer terminal. Prefixes, not
+/// names, because a name list fails silently when an emulator adds a variable.
 pub const OUTER_TERMINAL_IDENTITY_PREFIXES: &[&str] = &[
     "KITTY_",
     "GHOSTTY_",
@@ -628,25 +613,16 @@ impl PtyHandle {
             .env("TERM_PROGRAM", "shux")
             .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
-        // `TERM_PROGRAM` above is not the only variable that names a terminal.
-        // Every emulator worth integrating with exports a handle to ITSELF, and
-        // tools discover the terminal they are talking to by sniffing for them.
-        // Inside a pane those handles are lies: shux is the terminal now.
+        // Every emulator exports a handle to ITSELF, and tools sniff for those
+        // to discover their terminal. Inside a pane they are lies, and they fail
+        // silently: seeing `KITTY_WINDOW_ID`, terminal-browser concludes the
+        // terminal is kitty, treats an unanswered graphics probe as "supported",
+        // and streams images into a pane that discards them -- no message, no
+        // non-zero exit, just a blank pane.
         //
-        // Left in place, they do not degrade gracefully — they silently address
-        // the wrong terminal. terminal-browser is the worked example: seeing
-        // `KITTY_WINDOW_ID` it concludes the terminal is kitty, treats an
-        // unanswered graphics probe as "supported" (a recognised terminal is
-        // assumed capable), and streams images into a pane that discards them —
-        // no message, no non-zero exit, just a blank pane. Its `--split` would
-        // cut a pane in the outer kitty rather than in shux. Scrubbed, the same
-        // command correctly reports that this terminal cannot show images.
-        //
-        // Deny-listed rather than allow-listed on purpose: `env_clear` is off by
-        // default (a pane inherits the user's environment, which is the point),
-        // so the only workable shape is to name the identities we know lie. A
-        // pane that genuinely needs one back can set it via `PtyConfig::env`,
-        // which is applied below and therefore wins.
+        // Deny-listed, not allow-listed: `env_clear` is off by default because a
+        // pane should inherit the user's environment. A pane that needs one back
+        // sets it via `PtyConfig::env`, applied below, which wins.
         for key in OUTER_TERMINAL_IDENTITY_VARS {
             cmd.env_remove(key);
         }
@@ -654,9 +630,8 @@ impl PtyHandle {
         if std::env::var_os("STY").is_some() {
             cmd.env_remove("WINDOW");
         }
-        // Prefix families are matched against the environment this process will
-        // hand down, so a variable an emulator added after this list was written
-        // is still removed.
+        // Matched against the environment this process hands down, so a
+        // variable added after this list was written is still removed.
         for (key, _) in std::env::vars_os() {
             let Some(key) = key.to_str() else { continue };
             if OUTER_TERMINAL_IDENTITY_PREFIXES

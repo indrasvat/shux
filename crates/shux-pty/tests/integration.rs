@@ -322,27 +322,17 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
     );
 }
 
-/// A pane child must not inherit the *outer* terminal's identity.
-///
-/// shux is the terminal its children talk to, so a pane that still advertises
-/// `KITTY_WINDOW_ID` (or `TMUX`, `GHOSTTY_RESOURCES_DIR`, ...) makes every tool
-/// that sniffs those variables address the wrong terminal. The failure is
-/// silent and total: terminal-browser detects the *outer* emulator, concludes
-/// graphics are supported without probing, and streams images into a pane shux
-/// discards -- no message, no non-zero exit, just a blank pane. Its `--split`
-/// would likewise cut a pane in the outer terminal.
-///
-/// The list is read from `OUTER_TERMINAL_IDENTITY_VARS` rather than restated
-/// here. A second hand-maintained copy is a copy that drifts: it would leave a
-/// newly-added variable covered by nothing, which is exactly the coverage this
-/// test exists to provide.
+/// A pane child must not inherit the *outer* terminal's identity: a pane still
+/// advertising `KITTY_WINDOW_ID` makes every tool that sniffs it address the
+/// wrong terminal, silently. See `OUTER_TERMINAL_IDENTITY_VARS`, which this
+/// reads rather than restates -- a second copy would drift and leave a
+/// newly-added variable covered by nothing.
 #[tokio::test]
 async fn pane_child_does_not_inherit_outer_terminal_identity() {
     const SENTINEL: &str = "leaked-outer-terminal";
 
     // Every exact name, plus a synthesised member of each prefix family --
-    // including one nobody has written down yet, which is the whole point of
-    // matching prefixes rather than names.
+    // including one nobody has written down, which is the point of prefixes.
     let mut expected: Vec<String> = shux_pty::OUTER_TERMINAL_IDENTITY_VARS
         .iter()
         .map(|k| (*k).to_string())
@@ -354,9 +344,8 @@ async fn pane_child_does_not_inherit_outer_terminal_identity() {
     // screen's bare WINDOW is scrubbed only when STY proves screen set it.
     expected.push("WINDOW".to_string());
 
-    // SAFETY: single-threaded setup before the child is spawned, and removed
-    // again below. nextest runs each test in its own process, so no other test
-    // observes these. Mirrors what a real outer emulator would export.
+    // SAFETY: single-threaded setup before the child spawns, removed below.
+    // nextest gives each test its own process, so nothing else observes these.
     for key in &expected {
         unsafe { std::env::set_var(key, SENTINEL) };
     }

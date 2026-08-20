@@ -1,23 +1,19 @@
 //! The APC scanner must be observationally neutral.
 //!
-//! `VirtualTerminal::process_with_responses` cuts its `advance` calls at APC
-//! boundaries so a graphics command can be acted on at its true position in the
-//! stream. That slicing is only sound if it is invisible: vte receives every
-//! byte either way, so the grid, cursor, title and reply stream must not depend
-//! on where the cuts fall or on how the PTY happened to chunk the read.
+//! `process_with_responses` cuts its `advance` calls at APC boundaries so a
+//! graphics command lands at its true stream position. That is only sound if it
+//! is invisible: grid, cursor, title and replies must not depend on where the
+//! cuts fall or how the PTY chunked the read.
 //!
-//! Nothing else in the suite pins this. The property is currently upheld
-//! structurally -- `dispatch_graphics` has no body yet -- which is exactly why
-//! it needs a test now rather than later: the first line added there that
-//! touches the grid, the cursor or `responses` would break the invariant
-//! silently, and every other test would stay green.
+//! The property currently holds structurally -- `dispatch_graphics` has no body
+//! -- which is why it needs pinning now: the first line added there that touches
+//! the grid, cursor or `responses` would break it while every other test stayed
+//! green.
 //!
-//! The alphabet below is deliberately hostile. It is weighted toward the bytes
-//! that make a naive splitter diverge from vte: `ESC`, `CAN` (0x18), `SUB`
-//! (0x1A), the string introducers `_ X ^ P ]`, and the `\` of a String
-//! Terminator. Plain-text-only inputs would exercise only the `memmem` fast
-//! path -- as, in fact, all five committed rich-TUI corpus fixtures do, since
-//! not one of them contains a single `ESC _`, CAN or SUB byte.
+//! The alphabet is weighted toward bytes that make a naive splitter diverge:
+//! `ESC`, `CAN`, `SUB`, the string introducers `_ X ^ P ]`, and ST's `\`. All
+//! five committed rich-TUI fixtures contain none of them, so they exercise only
+//! the fast path.
 
 use proptest::prelude::*;
 use shux_vt::VirtualTerminal;
@@ -55,12 +51,9 @@ fn drive_with(chunks: &[&[u8]], slicing: bool) -> Observable {
 
 /// Bytes chosen to land on the seams: string introducers, aborts, terminators.
 ///
-/// The multibyte arms are load-bearing, not decoration. The only split-sensitive
-/// machinery inside `vte::Parser::advance` is its partial-UTF-8 buffer and the
-/// 3-byte lookahead that fills it, so a cut that disturbed those is precisely
-/// the bug this file exists to catch. An ASCII-only alphabet cannot reach that
-/// code at all -- an earlier version of this generator was ASCII-only and called
-/// itself "hostile".
+/// The multibyte arms are load-bearing: the only split-sensitive machinery in
+/// `vte::Parser::advance` is its partial-UTF-8 buffer and the 3-byte lookahead
+/// filling it, which an ASCII-only alphabet cannot reach at all.
 fn hostile_byte() -> impl Strategy<Value = u8> {
     prop_oneof![
         6 => prop::num::u8::ANY.prop_map(|b| 0x20 + (b % 0x5f)), // printable ASCII
@@ -91,15 +84,10 @@ fn hostile_byte() -> impl Strategy<Value = u8> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
-    /// Cutting `advance` at APC boundaries must change nothing.
-    ///
-    /// Both terminals get the SAME bytes in the SAME chunks; only one of them
-    /// slices. That is what isolates this code: comparing two *chunkings*
-    /// instead would measure vte, which is chunk-sensitive in ways that predate
-    /// this branch (see `c1_controls_are_chunk_sensitive_in_vte`) -- an earlier
-    /// version of this test did exactly that and failed on base-commit
-    /// behaviour, which is a property shux does not have and this code never
-    /// claimed.
+    /// Cutting `advance` at APC boundaries must change nothing. Both terminals
+    /// get the SAME bytes in the SAME chunks; only one slices. Comparing two
+    /// *chunkings* instead would measure vte, which is chunk-sensitive already
+    /// (see `c1_controls_are_chunk_sensitive_in_vte`).
     #[test]
     fn slicing_at_apc_boundaries_is_invisible(
         stream in prop::collection::vec(hostile_byte(), 0..400),
@@ -124,11 +112,9 @@ proptest! {
     }
 }
 
-/// An APC's payload is not screen content, however printable it looks.
-///
-/// A `dispatch_graphics` that ever wrote its command through to the grid would
-/// paint control data over the user's text; so would a mis-cut that let vte
-/// resume in `Ground` partway through a body.
+/// An APC's payload is not screen content, however printable it looks. A
+/// mis-cut letting vte resume in `Ground` mid-body would paint control data
+/// over the user's text.
 #[test]
 fn apc_payload_never_reaches_the_grid() {
     let observed = drive(&[
@@ -148,12 +134,10 @@ fn apc_payload_never_reaches_the_grid() {
     );
 }
 
-/// No graphics command is answered yet, and that is deliberate.
-///
-/// Replying `OK` to a query before shux can actually draw would turn an honest
-/// "this terminal cannot show images" into a silent blank screen: a client that
-/// believes the terminal is capable stops probing and starts transmitting.
-/// The query answer must land in the same change as the renderer.
+/// No graphics command is answered yet, deliberately. Replying `OK` before shux
+/// can draw turns an honest "cannot show images" into a silent blank screen: the
+/// client stops probing and starts transmitting. The answer ships with the
+/// renderer.
 #[test]
 fn graphics_queries_are_not_answered_yet() {
     let observed = drive(&[b"\x1b_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\\x1b[c"]);
@@ -164,10 +148,9 @@ fn graphics_queries_are_not_answered_yet() {
     );
 }
 
-/// The scanner must not disturb an unterminated string sequence around it.
-///
-/// vte leaves a string state on `ESC`-anything; a splitter that consumed that
-/// ESC would park vte inside the OSC forever and mute the pane.
+/// The scanner must not disturb an unterminated string sequence around it: vte
+/// leaves a string state on `ESC`-anything, and a splitter consuming that ESC
+/// would park vte inside the OSC forever and mute the pane.
 #[test]
 fn text_after_an_apc_interrupted_osc_still_renders() {
     let observed = drive(&[b"\x1b]0;title\x1b_Ga=q;\x1b\\AFTER-OSC"]);
@@ -178,14 +161,8 @@ fn text_after_an_apc_interrupted_osc_still_renders() {
     );
 }
 
-/// A `RIS` earlier in the same read must not swallow an APC that starts after it.
-///
-/// The scanner consumes a whole PTY read before vte sees any of it, so by the
-/// time `ESC c` executes mid-chunk the scanner's state already reflects the END
-/// of that chunk. Resetting it there could only ever discard state belonging to
-/// bytes *after* the reset -- never anything before it, because an APC cannot
-/// span a `RIS`: the ESC that introduces `ESC c` terminates the string sequence
-/// first. So the reset was pure loss, and this pins it.
+/// The screen-visible half of the RIS case; the unit test of the same name in
+/// `lib.rs` covers delivery, and carries the reasoning.
 #[test]
 fn a_ris_does_not_swallow_an_apc_that_starts_after_it() {
     let mut vt = VirtualTerminal::new(24, 80);
@@ -218,10 +195,9 @@ fn a_ris_does_not_swallow_an_apc_that_starts_after_it() {
 /// The class is exactly U+0080..=U+009F: NBSP, e-acute, CJK, astral emoji, bare
 /// continuation bytes and truncated sequences were all measured chunk-invariant.
 ///
-/// Pinned rather than fixed here. Fixing it means changing how shux drives vte's
-/// UTF-8 decoding, on the hottest path in the multiplexer, which does not belong
-/// in a change about APC sequences -- but it must not be lost, and if a vte
-/// upgrade ever changes this, this test is what will say so.
+/// Pinned, not fixed: the fix means changing how shux drives vte's UTF-8
+/// decoding on the hottest path, which does not belong in a change about APC
+/// sequences. If a vte upgrade changes this, this test says so.
 #[test]
 fn c1_controls_are_chunk_sensitive_in_vte() {
     let stream: &[u8] = b"\x20\xc2\x80\x20";

@@ -100,15 +100,11 @@ pub struct VirtualTerminal {
     /// In-progress DCS payload, preserved across partial PTY chunks.
     dcs_state: Option<DcsState>,
     /// Locates kitty-graphics APC sequences, whose bytes vte consumes without
-    /// ever calling back. Carries state across PTY reads: 48% of
-    /// terminal-browser's APCs straddle an 8192-byte read boundary.
+    /// calling back. Carries state across PTY reads.
     apc_scanner: graphics::apc::ApcScanner,
     /// Every graphics command that reached [`Self::dispatch_graphics`].
-    ///
-    /// Test-only, and needed because that function has no body yet: until it
-    /// does, whether a command was delivered at all is invisible from outside
-    /// the crate, and a test written against the public API would pass equally
-    /// on a build that dropped every one.
+    /// Test-only: that function has no body yet, so delivery is otherwise
+    /// invisible and a public-API test would pass on a build that dropped all.
     #[cfg(test)]
     pub(crate) dispatched_graphics: Vec<Vec<u8>>,
     /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
@@ -282,15 +278,10 @@ impl VirtualTerminal {
     /// Turn APC cut-slicing off, so `process_with_responses` feeds vte one
     /// unbroken call exactly as it did before graphics existed.
     ///
-    /// Slicing is required to be UNOBSERVABLE, and the only oracle with teeth is
-    /// a terminal that does not slice. Chunking-invariance is NOT that oracle:
-    /// vte is itself chunk-sensitive in at least two ways that predate this code
-    /// (see `c1_controls_are_chunk_sensitive_in_vte`), so a property comparing
-    /// two chunkings measures vte, not slicing. Driving the same bytes with the
-    /// same chunking through a sliced and an unsliced terminal cancels that out
-    /// and leaves exactly the difference this code could cause.
-    ///
-    /// This exists for that oracle. Production never calls it.
+    /// The only oracle with teeth is a terminal that does not slice.
+    /// Chunking-invariance is not one: vte is itself chunk-sensitive (see
+    /// `c1_controls_are_chunk_sensitive_in_vte`), so comparing two chunkings
+    /// measures vte. Production never calls this.
     #[doc(hidden)]
     pub fn set_apc_cut_slicing(&mut self, enabled: bool) {
         self.apc_cut_slicing = enabled;
@@ -447,10 +438,8 @@ impl VirtualTerminal {
 
     /// Feed one slice of the batch to vte.
     ///
-    /// Split out of [`Self::process_with_responses`] so that batch can be cut at
-    /// APC boundaries and still hand vte every byte. The handler borrows a pile
-    /// of disjoint fields; building it per slice is what lets graphics work run
-    /// in between.
+    /// Split out of [`Self::process_with_responses`] so a batch can be cut at
+    /// APC boundaries while vte still receives every byte.
     fn advance_slice(&mut self, bytes: &[u8], responses: &mut Vec<Vec<u8>>) {
         if bytes.is_empty() {
             return;
@@ -488,21 +477,13 @@ impl VirtualTerminal {
         self.parser.advance(&mut handler, bytes);
     }
 
-    // A note for whoever wires RIS to the image store: clear the store there,
-    // but never the APC scanner. The scanner consumes a whole read before vte
-    // sees any of it, so by the time RIS executes mid-chunk the scanner's state
-    // already reflects the END of that chunk -- resetting it could only discard
-    // state belonging to bytes AFTER the reset. And it can never need to discard
-    // anything from before, because an APC cannot span a RIS: the ESC that
-    // introduces `ESC c` terminates the string sequence first. An earlier
-    // revision did reset it, and silently swallowed the first graphics command
-    // to arrive in the same read as a reset.
+    // Wiring RIS to the image store: clear the store, never the scanner.
+    // See `a_ris_does_not_swallow_an_apc_that_starts_after_it_in_the_same_read`.
 
     /// Act on one kitty graphics command.
     ///
-    /// `body` is the APC payload between `ESC _` and the terminator. Anything
-    /// that is not a `G`-introduced graphics command is discarded, exactly as
-    /// vte already discards every APC today.
+    /// `body` is the payload between `ESC _` and the terminator. Non-`G` APCs
+    /// are discarded, exactly as vte discards every APC today.
     fn dispatch_graphics(&mut self, body: &[u8], responses: &mut Vec<Vec<u8>>) {
         let Some(command) = body.strip_prefix(b"G") else {
             return;
@@ -551,20 +532,12 @@ impl VirtualTerminal {
 
         let mut responses = Vec::new();
 
-        // Kitty graphics arrive as APC sequences, which vte consumes without
-        // ever calling back (vte-0.15 `src/lib.rs:182`). We therefore locate
-        // them ourselves -- but we do NOT remove them from the stream. vte is
-        // handed every byte unchanged and we merely cut its `advance` calls at
-        // the APC boundaries, so the text path stays bit-identical to the
-        // pre-graphics build BY CONSTRUCTION. Stripping instead would change
-        // vte's state and can lose text or synthesize escape sequences that
-        // were never sent; see the module docs on [`graphics::apc`].
-        //
-        // Cutting at the boundary also puts each graphics command at its true
-        // position in the stream, which two things depend on: a placement
-        // anchors at the cursor as it stands right there, and replies queue in
-        // request order (terminal-browser sends its graphics query and `CSI c`
-        // back-to-back inside one read and matches the answers up in order).
+        // Locate APCs but never remove them: vte gets every byte and only its
+        // `advance` calls are cut, so the text path stays bit-identical by
+        // construction. See the [`graphics::apc`] module docs for why stripping
+        // cannot be made correct. Cutting at the boundary also places each
+        // command at its true stream position -- a placement anchors at the
+        // cursor as it stands there, and replies queue in request order.
         let cuts = if self.apc_cut_slicing {
             self.apc_scanner.scan(bytes)
         } else {
@@ -1106,15 +1079,11 @@ mod tests {
         assert_eq!(vt.cursor().col, 9); // 0-indexed
     }
 
-    /// A `RIS` earlier in the same read must not swallow an APC that starts
-    /// after it.
-    ///
-    /// The scanner consumes a whole PTY read before vte sees any of it, so by
-    /// the time `ESC c` executes mid-chunk the scanner's state already reflects
-    /// the END of that chunk. Resetting it there can only ever discard state
-    /// belonging to bytes AFTER the reset -- never anything before it, because
-    /// an APC cannot span a `RIS`: the ESC introducing `ESC c` terminates the
-    /// string sequence first. The reset was therefore pure loss.
+    /// A `RIS` earlier in the same read must not swallow an APC starting after
+    /// it. The scanner consumes a whole read before vte sees any of it, so a
+    /// reset at `ESC c` could only discard state for bytes AFTER the reset --
+    /// an APC cannot span a `RIS`, since the introducing ESC terminates the
+    /// string sequence first.
     #[test]
     fn a_ris_does_not_swallow_an_apc_that_starts_after_it_in_the_same_read() {
         let mut vt = VirtualTerminal::new(24, 80);
