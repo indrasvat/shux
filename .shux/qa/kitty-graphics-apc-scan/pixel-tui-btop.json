@@ -1,0 +1,22 @@
+{
+ "actual": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/ev-head/tui-btop.png",
+ "changed_pixels": 0,
+ "diff": null,
+ "expected": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/ev-base/tui-btop.png",
+ "max_mean_channel_delta": 0.0,
+ "max_pixel_diff_ratio": 0.0,
+ "mean_rgba_channel_delta": 0.0,
+ "pixel_diff_ratio": 0.0,
+ "provenance": {
+  "actual_commit": "61d3bee2a9e5b040a7ebf416366efa00d3446602",
+  "expected_commit": "f071c89b99ca5604252756c529d29c5ae0e5736b",
+  "harness": "ab-render.sh",
+  "note": "actual = this branch's HEAD; expected = a build of the base commit. Both rendered through real shux panes by the same harness."
+ },
+ "size": [
+  1080,
+  684
+ ],
+ "status": "pass",
+ "total_pixels": 738720
+}

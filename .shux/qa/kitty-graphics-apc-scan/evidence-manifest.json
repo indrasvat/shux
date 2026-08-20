@@ -1,0 +1,33 @@
+{
+  "scope": "kitty-graphics-apc-scan",
+  "base_commit": "f071c89b99ca5604252756c529d29c5ae0e5736b",
+  "head_commit": "61d3bee2a9e5b040a7ebf416366efa00d3446602",
+  "summary": "Locate kitty-graphics APC sequences without altering the byte stream; stop leaking the outer terminal's identity into panes; stop disowning a daemon whose binary is not named `shux`. The load-bearing claim is that the text/render path is bit-identical to the base commit: vte receives every byte unchanged and only its `advance` calls are cut at APC boundaries. No graphics command is acted on and no graphics query is answered yet.",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "adversarial-review-apc.md",
+  "dootsabha_implementation": "adversarial-review-protocol.md",
+  "dootsabha_substitution": "dootsabha unavailable in this environment. Per CLAUDE.md's Tooling fallbacks table, substituted with two parallel cold-context adversarial agents on disjoint surfaces (APC handling; protocol semantics + diagnosis). Both returned blocking findings that changed the design before any code was written.",
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-apc-120x40.json",
+    "pixel-apc-80x24.json",
+    "pixel-colour-120x40.json",
+    "pixel-colour-80x24.json",
+    "pixel-tui-btop.json",
+    "pixel-tui-lazygit.json",
+    "pixel-tui-nvim.json",
+    "pixel-tui-vicaya.json",
+    "pixel-tui-vivecaka.json"
+  ],
+  "harness": "ab-render.sh",
+  "method": "Rendered 9 workloads through real shux panes on a build of the base commit and on this branch's HEAD, then compared with .claude/automations/pixel_verify.py at exact thresholds (0/0). Each metric carries the two commit SHAs under `provenance`. Workloads: truecolor+indexed+basic colour probes at 80x24 and 120x40; an APC-bearing stream (well-formed kitty graphics, an ESC-aborted APC, an unterminated APC) at both sizes; and replays of all five committed rich-TUI corpus fixtures at the corpus-native 120x36.",
+  "harness_corrections": [
+    "wait-settled was invoked with wrong flags and the error swallowed by `|| true`, so the harness had never settled anything while reporting success. Flags fixed; the call is now unguarded so a settle failure aborts the run.",
+    "The pane was sized AFTER the replay started, so a prefix of every stream was parsed at the 80x24 default and reflowed -- btop rendered with 80-column wrapping inside a 120-column frame and vivecaka captured essentially blank. The replay now blocks on a trigger file created only after `pane set-size` returns.",
+    "Rich TUIs were replayed at 120x40 while rich-tui/manifest.json declares the recording as 120x36, so the comparison measured reflow. Geometry is now read from the manifest.",
+    "Completion was signalled by printing MARKER_DONE into the pane, which overprinted the frame being measured (visible on nvim). It is now signalled out of band via a file.",
+    "The combining-mark probe was written as printf '\\xcc\\x81', which dash does not expand, so it rendered literally and tested nothing. Non-ASCII cases are now real UTF-8 bytes.",
+    "An earlier revision added `stty -echo` and justified it as fixing nvim/lazygit nondeterminism. That diagnosis was WRONG -- the nondeterminism was the resize race above. With the race fixed, echo-on is deterministic, so `stty -echo` has been removed rather than kept for a reason that does not hold.",
+    "The harness leaked one daemon per run and could not tell, because `daemon stop` reported success while leaving it alive. Root cause fixed in shux itself; the harness additionally asserts zero leaked daemons, identified by this run's own unique socket path."
+  ]
+}
