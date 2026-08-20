@@ -84,16 +84,22 @@ pub(crate) struct ApcScanner {
 impl ApcScanner {
     /// Report every APC that *completes* within `chunk`, in stream order.
     ///
-    /// Never allocates and never scans byte-by-byte for the overwhelmingly
-    /// common case of a pane that emits no APC at all: a single SIMD
-    /// `memmem` probe answers that in ~0.04 ms/MB.
+    /// Escape-free input short-circuits on one SIMD pass.
+    ///
+    /// The guard is `no ESC at all`, not `no literal "ESC _"`. The tighter
+    /// probe looks equivalent and is not: vte stays in the Escape state across
+    /// C0 bytes, DEL and 8-bit bytes, so `ESC LF _` opens an APC while
+    /// containing no `ESC _` pair. Searching for the pair skipped those
+    /// sequences entirely and then read their bodies as ground text.
+    ///
+    /// The cost of the wider guard is small because the slow path is itself
+    /// `memchr`-driven: escape-heavy TUI output pays roughly 1.5x a `memmem`
+    /// probe rather than the ~8x a byte-at-a-time loop would cost, and plain
+    /// text -- build logs, `cat` -- still short-circuits.
     pub(crate) fn scan(&mut self, chunk: &[u8]) -> Vec<ApcCut> {
-        if self.state == ScanState::Ground && memchr::memmem::find(chunk, b"\x1b_").is_none() {
-            // No APC can start here. The only state worth carrying is a
-            // trailing ESC, whose `_` may arrive in the next read.
-            if chunk.last() == Some(&0x1b) {
-                self.state = ScanState::GroundEsc;
-            }
+        if self.state == ScanState::Ground && memchr::memchr(0x1b, chunk).is_none() {
+            // No ESC means the state machine cannot leave Ground, so no APC can
+            // begin and there is nothing to carry to the next read.
             return Vec::new();
         }
         self.scan_slow(chunk)
@@ -150,8 +156,13 @@ impl ApcScanner {
                     i += 1;
                     match b {
                         b'_' => self.begin(),
-                        // `ESC ESC` leaves us still looking at an escape.
-                        0x1b => {}
+                        // vte stays in Escape for all of these -- it executes C0
+                        // bytes and ignores DEL and 8-bit bytes without leaving
+                        // the state (vte-0.15 src/lib.rs:340-390) -- so a `_`
+                        // after one of them still opens an APC. Only CAN (0x18)
+                        // and SUB (0x1A) really return to Ground, and they fall
+                        // through to the default arm below.
+                        0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => {}
                         _ => self.state = ScanState::Ground,
                     }
                 }
@@ -171,7 +182,8 @@ impl ApcScanner {
                         }
                         // `ESC _` starts a fresh APC; the unterminated one is junk.
                         b'_' => self.begin(),
-                        0x1b => {}
+                        // Same "vte is still in Escape" set as GroundEsc above.
+                        0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => {}
                         // Any other ESC-introduced sequence ends this APC malformed.
                         _ => self.abort(),
                     }
@@ -287,6 +299,46 @@ mod tests {
     #[test]
     fn unterminated_apc_emits_nothing() {
         assert!(bodies(&[b"\x1b_Gbroken-forever"]).is_empty());
+    }
+
+    #[test]
+    fn a_c0_byte_after_esc_does_not_cancel_the_escape() {
+        // vte's `advance_esc` EXECUTES C0 bytes (and ignores DEL and 8-bit
+        // bytes) while STAYING in the Escape state, so `ESC LF _` still opens an
+        // APC (vte-0.15 src/lib.rs:340-390). A scanner that dropped to Ground on
+        // the C0 would miss the sequence entirely and then read the body as
+        // ground text.
+        for interruption in [
+            &b"\x00"[..], // NUL
+            &b"\x07"[..], // BEL
+            &b"\x0a"[..], // LF
+            &b"\x1f"[..], // US
+            &b"\x7f"[..], // DEL
+            &b"\xff"[..], // 8-bit
+        ] {
+            let mut stream = Vec::from(&b"\x1b"[..]);
+            stream.extend_from_slice(interruption);
+            stream.extend_from_slice(b"_Ga=T;P\x1b\\");
+            assert_eq!(
+                bodies(&[&stream]),
+                vec![b"Ga=T;P".to_vec()],
+                "ESC {interruption:?} _ should still open an APC"
+            );
+        }
+    }
+
+    #[test]
+    fn can_and_sub_after_esc_do_cancel_it() {
+        // The two that really do return vte to Ground.
+        for cancel in [&b"\x18"[..], &b"\x1a"[..]] {
+            let mut stream = Vec::from(&b"\x1b"[..]);
+            stream.extend_from_slice(cancel);
+            stream.extend_from_slice(b"_Ga=T;P\x1b\\");
+            assert!(
+                bodies(&[&stream]).is_empty(),
+                "ESC {cancel:?} returns to Ground, so `_` opens nothing"
+            );
+        }
     }
 
     #[test]

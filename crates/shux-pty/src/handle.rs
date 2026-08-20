@@ -248,60 +248,59 @@ mod tests {
 /// terminal, and the resulting failures are silent rather than loud (see the
 /// scrub site in [`PtyHandle::spawn`]).
 ///
-/// Grouped by emulator/multiplexer. `TERM_PROGRAM`/`TERM_PROGRAM_VERSION` are
-/// absent deliberately: they are *overwritten* with shux's own values rather
-/// than removed, which is the same pattern tmux follows.
+/// Exact names only; the vendor-prefixed families are handled by
+/// [`OUTER_TERMINAL_IDENTITY_PREFIXES`] instead, because a name list cannot keep
+/// up with an emulator that adds a variable.
+///
+/// `TERM_PROGRAM`/`TERM_PROGRAM_VERSION` are absent deliberately: they are
+/// *overwritten* with shux's own values rather than removed, the same pattern
+/// tmux follows.
 pub const OUTER_TERMINAL_IDENTITY_VARS: &[&str] = &[
-    // kitty
-    "KITTY_WINDOW_ID",
-    "KITTY_PID",
-    "KITTY_LISTEN_ON",
-    "KITTY_PUBLIC_KEY",
-    "KITTY_INSTALLATION_DIR",
-    // tmux / screen
+    // multiplexers
     "TMUX",
     "TMUX_PANE",
     "STY",
-    "WINDOW",
-    // ghostty
-    "GHOSTTY_RESOURCES_DIR",
-    "GHOSTTY_BIN_DIR",
-    "GHOSTTY_SHELL_INTEGRATION_NO_SUDO",
-    // wezterm
-    "WEZTERM_PANE",
-    "WEZTERM_UNIX_SOCKET",
-    "WEZTERM_EXECUTABLE",
-    "WEZTERM_EXECUTABLE_DIR",
-    "WEZTERM_CONFIG_FILE",
-    // cmux
-    "CMUX_SURFACE_ID",
-    "CMUX_WORKSPACE_ID",
-    "CMUX_BUNDLED_CLI_PATH",
-    // herdr
-    "HERDR_PANE_ID",
-    "HERDR_TAB_ID",
-    "HERDR_BIN_PATH",
-    "HERDR_CONFIG_PATH",
-    // tty7
+    // screen also exports a bare `WINDOW`. It is the only unprefixed English
+    // word here, so it is removed only when `STY` proves screen set it --
+    // stripping `WINDOW` from every pane child would be collateral damage.
     "TTY7_PANE",
-    // VS Code
-    "VSCODE_INJECTION",
-    "VSCODE_SHELL_INTEGRATION",
-    // iTerm2
+    // iTerm2. LC_TERMINAL is the one designed to survive ssh, so a stale value
+    // travels further than any other on this list.
     "ITERM_SESSION_ID",
     "ITERM_PROFILE",
-    // alacritty
-    "ALACRITTY_WINDOW_ID",
-    "ALACRITTY_SOCKET",
-    "ALACRITTY_LOG",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "TERM_SESSION_ID",
     // misc emulators that gate features on their own marker
-    "KONSOLE_VERSION",
-    "KONSOLE_DBUS_SESSION",
     "VTE_VERSION",
     "TERMINOLOGY",
     "CONTOUR_PROFILE",
-    "WT_SESSION",
-    "WT_PROFILE_ID",
+    "TILIX_ID",
+    "TERMINATOR_UUID",
+    "TERMINATOR_DBUS_NAME",
+    "TERMINATOR_DBUS_PATH",
+    "VSCODE_INJECTION",
+    "VSCODE_SHELL_INTEGRATION",
+];
+
+/// Vendor prefixes whose whole family names the outer terminal.
+///
+/// Prefixes rather than names because the failure mode of a name list is
+/// silent: an emulator adds `FOO_SOMETHING_NEW`, it leaks, and nothing says so.
+/// Every prefix here is vendor-namespaced, so a false positive would have to be
+/// someone else's variable squatting an emulator's namespace.
+pub const OUTER_TERMINAL_IDENTITY_PREFIXES: &[&str] = &[
+    "KITTY_",
+    "GHOSTTY_",
+    "WEZTERM_",
+    "ALACRITTY_",
+    "KONSOLE_",
+    "WT_",    // Windows Terminal
+    "ZELLIJ", // ZELLIJ, ZELLIJ_SESSION_NAME, ZELLIJ_PANE_ID
+    "CMUX_",
+    "HERDR_",
+    "WARP_",
+    "SUPACODE_",
 ];
 
 /// Configuration for spawning a PTY child process.
@@ -647,6 +646,22 @@ impl PtyHandle {
         // which is applied below and therefore wins.
         for key in OUTER_TERMINAL_IDENTITY_VARS {
             cmd.env_remove(key);
+        }
+        // screen's bare `WINDOW` is only screen's when `STY` is also set.
+        if std::env::var_os("STY").is_some() {
+            cmd.env_remove("WINDOW");
+        }
+        // Prefix families are matched against the environment this process will
+        // hand down, so a variable an emulator added after this list was written
+        // is still removed.
+        for (key, _) in std::env::vars_os() {
+            let Some(key) = key.to_str() else { continue };
+            if OUTER_TERMINAL_IDENTITY_PREFIXES
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+            {
+                cmd.env_remove(key);
+            }
         }
 
         for (key, value) in &config.env {

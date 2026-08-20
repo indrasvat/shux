@@ -201,7 +201,11 @@ test-lib: nextest-ready ## Run library tests only
 .PHONY: test-vt
 test-vt: nextest-ready ## Run focused virtual terminal tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running virtual terminal tests...$(COLOR_RESET)"
-	@$(NEXTEST_RUN) -p shux-vt --lib $(FILTER)
+# The whole package, not just --lib. shux-vt's integration tests carry the
+# differential oracles (APC slicing neutrality, DECALN, corpus replay), and
+# --lib silently skipped every one of them -- so the focused target people
+# actually reach for was blind to exactly the tests that matter most here.
+	@$(NEXTEST_RUN) -p shux-vt $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Virtual terminal tests passed$(COLOR_RESET)"
 
 .PHONY: test-window-snapshot

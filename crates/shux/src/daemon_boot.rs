@@ -133,6 +133,13 @@ pub(crate) fn is_live_shux_daemon(pid: u32) -> bool {
     let args = String::from_utf8_lossy(&out.stdout);
     let args = args.trim_end();
 
+    // Note two things this relies on. `ps -o args=` is not truncated on Linux for
+    // argv of this length (measured), but BSD/macOS `ps` can truncate without
+    // `-ww`; the pre-existing basename branch below has the same exposure, so
+    // this is not a new risk, but it is a real one. And the comparison works
+    // because the daemon is spawned with `current_exe()` (see `start_daemon_process`
+    // in client.rs), so argv[0] is the resolved path this same call produces.
+    //
     // A daemon THIS executable started is ours whatever the file happens to be
     // called. Requiring the basename to be literally `shux` silently disowned
     // every daemon spawned by a differently-named build — an A/B pair like
@@ -202,34 +209,33 @@ pub(crate) fn handle_daemon_command(
         }
         cli::DaemonCommand::Stop => {
             let Some(p) = pid.filter(|_| alive) else {
-                // A pidfile naming a LIVE process we could not identify is not the
-                // same thing as no daemon at all, and must not be reported as one:
-                // saying "no daemon running" and exiting 0 is a success claim for
-                // work that did not happen, and the caller's cleanup trap believes
-                // it. Deleting the pidfile here made it worse — it orphaned a live
-                // daemon permanently, since nothing could find it afterwards.
+                // A pidfile whose pid is alive but is NOT one of our daemons means
+                // the pidfile is stale in the ordinary way: our daemon died and the
+                // OS handed its number to somebody else. "No daemon running" is the
+                // right answer, clearing the stale file is the right action, and
+                // exit 0 keeps the documented contract that this verb is idempotent
+                // and safe in a `set -e` cleanup trap (skills/shux/references/gate.md,
+                // skills/shux/examples/headless-tui-test.md).
+                //
+                // It is still worth saying out loud. The bug this branch fixed was a
+                // daemon of OURS being misread as a bystander, and the only visible
+                // symptom was this same "no daemon running" on a machine that had one.
+                // A warning naming the pid means the next occurrence is diagnosable
+                // instead of silent -- but it goes to stderr, so a trap that pipes
+                // stdout is unaffected and the exit code stays 0.
                 if let Some(p) = pid.filter(|p| *p > 1)
                     && nix::sys::signal::kill(nix::unistd::Pid::from_raw(p as i32), None).is_ok()
                 {
-                    if let cli::OutputFormat::Json = format {
-                        println!(
-                            "{{\"stopped\": false, \"reason\": \"unidentified_process\", \"pid\": {p}}}"
-                        );
-                    } else {
-                        println!(
-                            "{} {}",
-                            style::error(format!(
-                                "pid {p} is alive but is not recognisably a shux daemon"
-                            )),
-                            style::muted("leaving it and its pidfile alone")
-                        );
-                    }
-                    anyhow::bail!(
-                        "refusing to claim a daemon was stopped: pid {p} is alive but unidentified"
+                    eprintln!(
+                        "{}",
+                        style::warning(format!(
+                            "stale pidfile named pid {p}, which is alive but is not one of \
+                             our daemons; treating the pidfile as stale"
+                        ))
                     );
                 }
-                // Genuinely nothing running. Idempotent: safe to call from a
-                // cleanup trap that may run twice, and the stale pidfile goes.
+                // Idempotent: safe to call from a cleanup trap that may run twice,
+                // and the stale pidfile goes.
                 if let cli::OutputFormat::Json = format {
                     println!("{{\"stopped\": false, \"reason\": \"not_running\"}}");
                 } else {

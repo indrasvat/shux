@@ -111,6 +111,8 @@ pub struct VirtualTerminal {
     /// on a build that dropped every one.
     #[cfg(test)]
     pub(crate) dispatched_graphics: Vec<Vec<u8>>,
+    /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
+    apc_cut_slicing: bool,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
     /// open. Shared by reference with every [`sync::Presented`] wrapper handed
     /// to the parser, which is why it is a cell rather than a plain `bool`;
@@ -251,6 +253,7 @@ impl VirtualTerminal {
             apc_scanner: graphics::apc::ApcScanner::default(),
             #[cfg(test)]
             dispatched_graphics: Vec::new(),
+            apc_cut_slicing: true,
             sync_armed: std::sync::atomic::AtomicBool::new(false),
             frozen_grid: None,
             frozen_cursor: None,
@@ -274,6 +277,23 @@ impl VirtualTerminal {
             palette_overridden: false,
             reuse_retired_grids: true,
         }
+    }
+
+    /// Turn APC cut-slicing off, so `process_with_responses` feeds vte one
+    /// unbroken call exactly as it did before graphics existed.
+    ///
+    /// Slicing is required to be UNOBSERVABLE, and the only oracle with teeth is
+    /// a terminal that does not slice. Chunking-invariance is NOT that oracle:
+    /// vte is itself chunk-sensitive in at least two ways that predate this code
+    /// (see `c1_controls_are_chunk_sensitive_in_vte`), so a property comparing
+    /// two chunkings measures vte, not slicing. Driving the same bytes with the
+    /// same chunking through a sliced and an unsliced terminal cancels that out
+    /// and leaves exactly the difference this code could cause.
+    ///
+    /// This exists for that oracle. Production never calls it.
+    #[doc(hidden)]
+    pub fn set_apc_cut_slicing(&mut self, enabled: bool) {
+        self.apc_cut_slicing = enabled;
     }
 
     /// Turn retired-buffer recycling (issue #106) off or on.
@@ -545,7 +565,11 @@ impl VirtualTerminal {
         // anchors at the cursor as it stands right there, and replies queue in
         // request order (terminal-browser sends its graphics query and `CSI c`
         // back-to-back inside one read and matches the answers up in order).
-        let cuts = self.apc_scanner.scan(bytes);
+        let cuts = if self.apc_cut_slicing {
+            self.apc_scanner.scan(bytes)
+        } else {
+            Vec::new()
+        };
         if cuts.is_empty() {
             self.advance_slice(bytes, &mut responses);
         } else {

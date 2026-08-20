@@ -340,10 +340,24 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
 async fn pane_child_does_not_inherit_outer_terminal_identity() {
     const SENTINEL: &str = "leaked-outer-terminal";
 
+    // Every exact name, plus a synthesised member of each prefix family --
+    // including one nobody has written down yet, which is the whole point of
+    // matching prefixes rather than names.
+    let mut expected: Vec<String> = shux_pty::OUTER_TERMINAL_IDENTITY_VARS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+    for prefix in shux_pty::OUTER_TERMINAL_IDENTITY_PREFIXES {
+        expected.push(format!("{prefix}WINDOW_ID"));
+        expected.push(format!("{prefix}SOMETHING_INVENTED_LATER"));
+    }
+    // screen's bare WINDOW is scrubbed only when STY proves screen set it.
+    expected.push("WINDOW".to_string());
+
     // SAFETY: single-threaded setup before the child is spawned, and removed
     // again below. nextest runs each test in its own process, so no other test
     // observes these. Mirrors what a real outer emulator would export.
-    for key in shux_pty::OUTER_TERMINAL_IDENTITY_VARS {
+    for key in &expected {
         unsafe { std::env::set_var(key, SENTINEL) };
     }
     // Not an emulator handle: proves this is a deny-list and not `env_clear`,
@@ -359,16 +373,15 @@ async fn pane_child_does_not_inherit_outer_terminal_identity() {
     let mut handle = PtyHandle::spawn(&config).unwrap();
     let output = read_pty_to_exit(&mut handle).await;
 
-    for key in shux_pty::OUTER_TERMINAL_IDENTITY_VARS {
+    for key in &expected {
         unsafe { std::env::remove_var(key) };
     }
     unsafe { std::env::remove_var("SHUX_TEST_UNRELATED_VAR") };
 
     assert!(output.contains("ENV_DONE"), "child did not run: {output}");
 
-    let leaked: Vec<&str> = shux_pty::OUTER_TERMINAL_IDENTITY_VARS
+    let leaked: Vec<&String> = expected
         .iter()
-        .copied()
         .filter(|key| output.contains(&format!("{key}={SENTINEL}")))
         .collect();
     assert!(

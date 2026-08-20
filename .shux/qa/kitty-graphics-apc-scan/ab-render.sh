@@ -39,7 +39,11 @@
 # Usage: ab-render.sh <shux-binary> <output-dir>
 set -euo pipefail
 
-shux_bin="$1"
+# Resolved, because the leak scan below compares against `readlink /proc/N/exe`,
+# which is always absolute with symlinks followed. Invoked as `./shux` or through
+# a symlink, an unresolved path matches zero processes and the guard passes for
+# work it did not do.
+shux_bin="$(readlink -f "$1")"
 outdir="$2"
 repo_root="$(git rev-parse --show-toplevel)"
 mkdir -p "$outdir"
@@ -142,7 +146,7 @@ render() {
     local pane json
 
     json="$(sx --format json session create "${sess}" -d --title "${label}" -- \
-        sh -c "stty -echo 2>/dev/null; while [ ! -f '${trigger}' ]; do sleep 0.02; done; ${body}; : >'${done}'; sleep 600")"
+        sh -c "stty -echo || { echo 'ab-render: stty -echo failed' >&2; exit 97; }; while [ ! -f '${trigger}' ]; do sleep 0.02; done; ${body}; : >'${done}'; sleep 600")"
     echo "${sess}" >>"${runtime}/sessions"
     pane="$(jq -r '.pane_id' <<<"${json}")"
 

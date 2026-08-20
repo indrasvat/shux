@@ -33,7 +33,12 @@ struct Observable {
 }
 
 fn drive(chunks: &[&[u8]]) -> Observable {
+    drive_with(chunks, true)
+}
+
+fn drive_with(chunks: &[&[u8]], slicing: bool) -> Observable {
     let mut vt = VirtualTerminal::new(24, 80);
+    vt.set_apc_cut_slicing(slicing);
     let mut responses = Vec::new();
     for chunk in chunks {
         responses.extend(vt.process_with_responses(chunk));
@@ -49,9 +54,16 @@ fn drive(chunks: &[&[u8]]) -> Observable {
 }
 
 /// Bytes chosen to land on the seams: string introducers, aborts, terminators.
+///
+/// The multibyte arms are load-bearing, not decoration. The only split-sensitive
+/// machinery inside `vte::Parser::advance` is its partial-UTF-8 buffer and the
+/// 3-byte lookahead that fills it, so a cut that disturbed those is precisely
+/// the bug this file exists to catch. An ASCII-only alphabet cannot reach that
+/// code at all -- an earlier version of this generator was ASCII-only and called
+/// itself "hostile".
 fn hostile_byte() -> impl Strategy<Value = u8> {
     prop_oneof![
-        6 => prop::num::u8::ANY.prop_map(|b| 0x20 + (b % 0x5f)), // printable
+        6 => prop::num::u8::ANY.prop_map(|b| 0x20 + (b % 0x5f)), // printable ASCII
         3 => Just(0x1b),                                        // ESC
         1 => Just(0x18),                                        // CAN
         1 => Just(0x1a),                                        // SUB
@@ -64,49 +76,51 @@ fn hostile_byte() -> impl Strategy<Value = u8> {
         2 => Just(b'\\'),                                       // ST tail
         1 => Just(b'G'),                                        // kitty graphics
         1 => Just(b'\n'),
+        1 => Just(0x07),                                        // BEL, the OSC terminator
+        1 => Just(0x08),                                        // BS
+        1 => Just(0x09),                                        // TAB
+        1 => Just(0x0d),                                        // CR
+        3 => (0xc2u8..=0xf4).boxed(),                           // UTF-8 lead bytes
+        3 => (0x80u8..=0xbf).boxed(),                           // UTF-8 continuations
+        1 => Just(0x9b),                                        // C1 CSI
+        1 => Just(0x9c),                                        // C1 ST
+        1 => Just(0x9f),                                        // C1 APC
     ]
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
-    /// Delivering the same bytes as one write or as many must be identical.
+    /// Cutting `advance` at APC boundaries must change nothing.
     ///
-    /// This is the property that protects the slicing: a cut at an APC boundary
-    /// is one particular re-chunking, so if arbitrary re-chunking is invisible
-    /// then so is the cut.
-    ///
-    /// Note what this deliberately does NOT cover. Neutrality is invariant to
-    /// *where* the cuts land -- that is the entire safety argument -- so no test
-    /// here can detect a scanner that finds the wrong APCs. Verified by
-    /// mutation: replacing the carried scanner with a fresh one per read leaves
-    /// this file green. Detection correctness is a different property and is
-    /// pinned a layer down, by the unit tests in `graphics::apc` (themselves
-    /// mutation-proved).
+    /// Both terminals get the SAME bytes in the SAME chunks; only one of them
+    /// slices. That is what isolates this code: comparing two *chunkings*
+    /// instead would measure vte, which is chunk-sensitive in ways that predate
+    /// this branch (see `c1_controls_are_chunk_sensitive_in_vte`) -- an earlier
+    /// version of this test did exactly that and failed on base-commit
+    /// behaviour, which is a property shux does not have and this code never
+    /// claimed.
     #[test]
-    fn chunking_is_invisible(
+    fn slicing_at_apc_boundaries_is_invisible(
         stream in prop::collection::vec(hostile_byte(), 0..400),
         split_a in 0usize..400,
         split_b in 0usize..400,
     ) {
-        let whole = drive(&[&stream]);
-
         let (mut i, mut j) = (split_a.min(stream.len()), split_b.min(stream.len()));
         if i > j {
             std::mem::swap(&mut i, &mut j);
         }
-        let split = drive(&[&stream[..i], &stream[i..j], &stream[j..]]);
-        prop_assert_eq!(whole, split);
+        let chunks: [&[u8]; 3] = [&stream[..i], &stream[i..j], &stream[j..]];
+        prop_assert_eq!(drive_with(&chunks, true), drive_with(&chunks, false));
     }
 
-    /// Byte-at-a-time delivery is the worst case for carried state.
+    /// Byte-at-a-time delivery is the worst case for the scanner's carried state.
     #[test]
-    fn byte_at_a_time_is_invisible(
+    fn slicing_is_invisible_byte_at_a_time(
         stream in prop::collection::vec(hostile_byte(), 0..200),
     ) {
-        let whole = drive(&[&stream]);
         let singles: Vec<&[u8]> = stream.chunks(1).collect();
-        prop_assert_eq!(whole, drive(&singles));
+        prop_assert_eq!(drive_with(&singles, true), drive_with(&singles, false));
     }
 }
 
@@ -188,5 +202,43 @@ fn a_ris_does_not_swallow_an_apc_that_starts_after_it() {
         !text.contains("half") && !text.contains("more"),
         "APC body leaked onto the screen, so the sequence was not tracked \
          across the RIS: {text:?}"
+    );
+}
+
+/// A C1 control written as two-byte UTF-8 renders differently depending on how
+/// the PTY happened to chunk the read. **This is a pre-existing shux defect and
+/// is NOT caused by the APC scanner.**
+///
+/// Reproduced against a build of the base commit `f071c89`, which has no
+/// graphics code at all: `" " C2 80 " "` delivered whole leaves the cursor at
+/// column 2 having printed nothing, and delivered byte-at-a-time prints U+0080
+/// and leaves it at column 3. vte executes the character on one decode path and
+/// prints it on the other.
+///
+/// The class is exactly U+0080..=U+009F: NBSP, e-acute, CJK, astral emoji, bare
+/// continuation bytes and truncated sequences were all measured chunk-invariant.
+///
+/// Pinned rather than fixed here. Fixing it means changing how shux drives vte's
+/// UTF-8 decoding, on the hottest path in the multiplexer, which does not belong
+/// in a change about APC sequences -- but it must not be lost, and if a vte
+/// upgrade ever changes this, this test is what will say so.
+#[test]
+fn c1_controls_are_chunk_sensitive_in_vte() {
+    let stream: &[u8] = b"\x20\xc2\x80\x20";
+    let whole = drive(&[stream]);
+    let singles: Vec<&[u8]> = stream.chunks(1).collect();
+    let split = drive(&singles);
+    assert_ne!(
+        whole, split,
+        "vte's C1 chunk-sensitivity appears to be fixed -- delete this test, drop \
+         `encodes_a_c1_control`, and let the chunking properties cover the range"
+    );
+    assert!(
+        !whole.text.contains('\u{80}'),
+        "whole-buffer decode executed it"
+    );
+    assert!(
+        split.text.contains('\u{80}'),
+        "byte-at-a-time decode printed it"
     );
 }
