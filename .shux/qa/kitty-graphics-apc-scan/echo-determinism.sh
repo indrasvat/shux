@@ -14,9 +14,11 @@
 #
 # Usage: echo-determinism.sh <shux-binary> [runs] [on|off]
 #
-# Measured on this machine, one binary, nothing else varying:
-#   echo on  : 35 runs -> 3 distinct images
-#   echo off : 37 runs -> 1 distinct image
+# The measured numbers live in ONE place -- `harness_corrections` in
+# evidence-manifest.json -- with the raw output in echo-determinism-{on,off}.txt
+# beside it. Deliberately not restated here: this block used to carry a second
+# copy, it drifted from the committed logs, and the round-5 audit caught them
+# disagreeing.
 set -euo pipefail
 
 bin="$(readlink -f "$1")"
