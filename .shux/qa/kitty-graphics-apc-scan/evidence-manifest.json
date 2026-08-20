@@ -35,11 +35,12 @@
     "The `combining:` probe proves combining-mark STORAGE, not rendering: the capture is one cell holding `e` + U+0301, but the bundled rasterizer draws the acute in the preceding cell, so the pane reads `combining:´e`. Base-identical and pre-existing, hence out of this diff's scope -- but do not read the arm as proof of combining-mark rendering.",
     "Evidence logs are named `.txt`, not `.log`, on purpose: `.gitignore` carries a bare `*.log` with no negation, so a `.log` name is silently skipped by `git add -A` -- which is exactly how an earlier revision shipped a manifest citing two files that were not in the repository."
   ],
-  "code_commit": "4333728bf768052b57d93cc70b45d21c8126841b",
-  "code_commit_note": "The last commit on this branch that changes product code. The evidence commit carrying this manifest touches no crates/, Makefile or scripts/, so these pixels came from exactly this tree. An earlier revision stamped a SHA read BEFORE the code it described was committed, and the stamp was self-contradicting: the metrics claimed an echo-disabled harness while the named commit's harness had no `stty -echo` in it.",
+  "code_commit": "a81cddd",
+  "code_commit_note": "`code_commit` is the last commit on this branch that changes product code. `pixel_build_commit` is the build the committed pixel metrics were rendered from -- the two differ because `a81cddd` is comment-only, proven in SOLID-QA.md section 2 by comment-stripped source comparison over all six touched files, with the stripper itself proved able to fail. Round 6 regenerated all 12 metrics against a build of HEAD at exact 0/0, so the committed metrics are corroborated by measurement and not only by argument. Earlier revisions of this file got provenance wrong twice: once by stamping a SHA read BEFORE the code it described was committed, and once by asserting 'the evidence commit touches no crates/' after a crates/ commit had landed.",
   "determinism_evidence": [
     "echo-determinism.sh",
     "echo-determinism-off.txt",
     "echo-determinism-on.txt"
-  ]
+  ],
+  "pixel_build_commit": "4333728bf768052b57d93cc70b45d21c8126841b"
 }
