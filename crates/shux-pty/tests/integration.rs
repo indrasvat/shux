@@ -325,54 +325,30 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
 /// A pane child must not inherit the *outer* terminal's identity.
 ///
 /// shux is the terminal its children talk to, so a pane that still advertises
-/// `KITTY_WINDOW_ID` (or `TMUX`, `GHOSTTY_RESOURCES_DIR`, …) makes every tool
+/// `KITTY_WINDOW_ID` (or `TMUX`, `GHOSTTY_RESOURCES_DIR`, ...) makes every tool
 /// that sniffs those variables address the wrong terminal. The failure is
 /// silent and total: terminal-browser detects the *outer* emulator, concludes
 /// graphics are supported without probing, and streams images into a pane shux
-/// discards — no message, no non-zero exit, just a blank pane. Its `--split`
+/// discards -- no message, no non-zero exit, just a blank pane. Its `--split`
 /// would likewise cut a pane in the outer terminal.
 ///
-/// shux already scrubs `TERM_PROGRAM` for exactly this reason (see
-/// `handle.rs`); these belong with it.
+/// The list is read from `OUTER_TERMINAL_IDENTITY_VARS` rather than restated
+/// here. A second hand-maintained copy is a copy that drifts: it would leave a
+/// newly-added variable covered by nothing, which is exactly the coverage this
+/// test exists to provide.
 #[tokio::test]
 async fn pane_child_does_not_inherit_outer_terminal_identity() {
-    const LEAKY: &[&str] = &[
-        "KITTY_WINDOW_ID",
-        "KITTY_PID",
-        "KITTY_LISTEN_ON",
-        "KITTY_PUBLIC_KEY",
-        "TMUX",
-        "TMUX_PANE",
-        "GHOSTTY_RESOURCES_DIR",
-        "GHOSTTY_BIN_DIR",
-        "WEZTERM_PANE",
-        "WEZTERM_UNIX_SOCKET",
-        "WEZTERM_EXECUTABLE",
-        "CMUX_SURFACE_ID",
-        "CMUX_WORKSPACE_ID",
-        "CMUX_BUNDLED_CLI_PATH",
-        "HERDR_PANE_ID",
-        "HERDR_TAB_ID",
-        "HERDR_BIN_PATH",
-        "HERDR_CONFIG_PATH",
-        "TTY7_PANE",
-        "VSCODE_INJECTION",
-        "TERM_PROGRAM",
-        "TERM_PROGRAM_VERSION",
-        "ITERM_SESSION_ID",
-        "ALACRITTY_WINDOW_ID",
-        "ALACRITTY_SOCKET",
-        "KONSOLE_VERSION",
-        "VTE_VERSION",
-        "TERMINOLOGY",
-        "CONTOUR_PROFILE",
-    ];
+    const SENTINEL: &str = "leaked-outer-terminal";
 
-    // SAFETY: single-threaded setup before the child is spawned; the values are
-    // removed again below. Mirrors what a real outer emulator would export.
-    for key in LEAKY {
-        unsafe { std::env::set_var(key, "leaked-outer-terminal") };
+    // SAFETY: single-threaded setup before the child is spawned, and removed
+    // again below. nextest runs each test in its own process, so no other test
+    // observes these. Mirrors what a real outer emulator would export.
+    for key in shux_pty::OUTER_TERMINAL_IDENTITY_VARS {
+        unsafe { std::env::set_var(key, SENTINEL) };
     }
+    // Not an emulator handle: proves this is a deny-list and not `env_clear`,
+    // which would take the user's whole environment with it.
+    unsafe { std::env::set_var("SHUX_TEST_UNRELATED_VAR", SENTINEL) };
 
     let mut config = PtyConfig::with_command(
         vec!["sh".into(), "-c".into(), "env; echo ENV_DONE".into()],
@@ -383,18 +359,30 @@ async fn pane_child_does_not_inherit_outer_terminal_identity() {
     let mut handle = PtyHandle::spawn(&config).unwrap();
     let output = read_pty_to_exit(&mut handle).await;
 
-    for key in LEAKY {
+    for key in shux_pty::OUTER_TERMINAL_IDENTITY_VARS {
         unsafe { std::env::remove_var(key) };
     }
+    unsafe { std::env::remove_var("SHUX_TEST_UNRELATED_VAR") };
 
     assert!(output.contains("ENV_DONE"), "child did not run: {output}");
-    let leaked: Vec<&str> = LEAKY
+
+    let leaked: Vec<&str> = shux_pty::OUTER_TERMINAL_IDENTITY_VARS
         .iter()
         .copied()
-        .filter(|key| output.contains(&format!("{key}=leaked-outer-terminal")))
+        .filter(|key| output.contains(&format!("{key}={SENTINEL}")))
         .collect();
     assert!(
         leaked.is_empty(),
         "pane child inherited the outer terminal's identity: {leaked:?}"
+    );
+    assert!(
+        output.contains(&format!("SHUX_TEST_UNRELATED_VAR={SENTINEL}")),
+        "the scrub is a deny-list, not env_clear -- an unrelated variable must survive"
+    );
+    // TERM_PROGRAM is overwritten rather than removed (tmux does the same), so
+    // it must be present AND must name shux.
+    assert!(
+        output.contains("TERM_PROGRAM=shux"),
+        "TERM_PROGRAM should be claimed by shux, not merely removed: {output}"
     );
 }
