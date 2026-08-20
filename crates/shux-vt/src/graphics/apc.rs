@@ -208,14 +208,6 @@ impl ApcScanner {
         }
         self.body.extend_from_slice(span);
     }
-
-    /// Drop any in-flight sequence. Used by `RIS`, which resets the terminal
-    /// from inside vte -- downstream of this scanner, so it needs telling.
-    pub(crate) fn reset(&mut self) {
-        self.state = ScanState::Ground;
-        self.body.clear();
-        self.overflowed = false;
-    }
 }
 
 #[cfg(test)]
@@ -329,14 +321,5 @@ mod tests {
     #[test]
     fn ignores_streams_with_no_apc() {
         assert!(bodies(&[b"\x1b[31mRED\x1b[0m\r\n$ \x1b]0;title\x07"]).is_empty());
-    }
-
-    #[test]
-    fn reset_drops_an_in_flight_sequence() {
-        let mut s = ApcScanner::default();
-        assert!(s.scan(b"\x1b_Gpartial").is_empty());
-        s.reset();
-        // Without the reset the trailing ST would complete the stale body.
-        assert!(s.scan(b"\x1b\\").is_empty());
     }
 }

@@ -425,11 +425,17 @@ fn daemon_stop_reaps_a_daemon_started_by_a_renamed_binary() {
         String::from_utf8_lossy(&created.stderr)
     );
 
-    // Installed BEFORE the pidfile is read, so that a malformed or missing
-    // pidfile -- which panics -- still reaps. A test for a leak bug that leaks
-    // when it fails is its own bug; an earlier draft asserted first and reaped
-    // last, and left a daemon behind every time it ran against the unfixed code.
-    // `Reaper` holds an Option because the pid is not known until after the read.
+    // A test for a leak bug that leaks when it fails is its own bug: an earlier
+    // draft asserted first and reaped last, and left a daemon behind every time
+    // it ran against the unfixed code. The guard is installed before the pidfile
+    // is read and adopts the pid the moment it parses, so every path from there
+    // on reaps -- including the `daemon stop` failure and daemon-survived paths,
+    // which are the ones that actually fire.
+    //
+    // What it does NOT cover, deliberately: a missing or unparseable pidfile
+    // still panics with `self.0 == None`. There is no pid to reap in that case,
+    // so there is nothing the guard could do; the daemon, if any, is
+    // unreachable by pid either way.
     struct Reaper(Option<i32>);
     impl Drop for Reaper {
         fn drop(&mut self) {

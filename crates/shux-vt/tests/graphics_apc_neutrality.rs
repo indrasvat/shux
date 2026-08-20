@@ -163,3 +163,30 @@ fn text_after_an_apc_interrupted_osc_still_renders() {
         observed.text
     );
 }
+
+/// A `RIS` earlier in the same read must not swallow an APC that starts after it.
+///
+/// The scanner consumes a whole PTY read before vte sees any of it, so by the
+/// time `ESC c` executes mid-chunk the scanner's state already reflects the END
+/// of that chunk. Resetting it there could only ever discard state belonging to
+/// bytes *after* the reset -- never anything before it, because an APC cannot
+/// span a `RIS`: the ESC that introduces `ESC c` terminates the string sequence
+/// first. So the reset was pure loss, and this pins it.
+#[test]
+fn a_ris_does_not_swallow_an_apc_that_starts_after_it() {
+    let mut vt = VirtualTerminal::new(24, 80);
+    // RIS, then the first half of a graphics command, in one read.
+    vt.process_with_responses(b"\x1bc\x1b_Ghalf");
+    // The rest of it, in the next read.
+    vt.process_with_responses(b"more\x1b\\visible");
+    let text = vt.capture_text(None);
+    assert!(
+        text.contains("visible"),
+        "text after the APC was lost: {text:?}"
+    );
+    assert!(
+        !text.contains("half") && !text.contains("more"),
+        "APC body leaked onto the screen, so the sequence was not tracked \
+         across the RIS: {text:?}"
+    );
+}

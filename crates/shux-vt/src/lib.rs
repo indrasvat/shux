@@ -103,6 +103,14 @@ pub struct VirtualTerminal {
     /// ever calling back. Carries state across PTY reads: 48% of
     /// terminal-browser's APCs straddle an 8192-byte read boundary.
     apc_scanner: graphics::apc::ApcScanner,
+    /// Every graphics command that reached [`Self::dispatch_graphics`].
+    ///
+    /// Test-only, and needed because that function has no body yet: until it
+    /// does, whether a command was delivered at all is invisible from outside
+    /// the crate, and a test written against the public API would pass equally
+    /// on a build that dropped every one.
+    #[cfg(test)]
+    pub(crate) dispatched_graphics: Vec<Vec<u8>>,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
     /// open. Shared by reference with every [`sync::Presented`] wrapper handed
     /// to the parser, which is why it is a cell rather than a plain `bool`;
@@ -241,6 +249,8 @@ impl VirtualTerminal {
             parser: VtParser::new_with_size(),
             dcs_state: None,
             apc_scanner: graphics::apc::ApcScanner::default(),
+            #[cfg(test)]
+            dispatched_graphics: Vec::new(),
             sync_armed: std::sync::atomic::AtomicBool::new(false),
             frozen_grid: None,
             frozen_cursor: None,
@@ -425,7 +435,6 @@ impl VirtualTerminal {
         if bytes.is_empty() {
             return;
         }
-        let mut graphics_reset = false;
         let mut handler = VtHandler {
             grid: sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
             cursor: sync::Presented::new(
@@ -452,19 +461,22 @@ impl VirtualTerminal {
             charsets: &mut self.charsets,
             tab_stops: &mut self.tab_stops,
             responses,
-            graphics_reset: &mut graphics_reset,
             palette_overridden: &mut self.palette_overridden,
             alt_spare: &mut self.alt_spare,
             reuse_retired_grids: self.reuse_retired_grids,
         };
         self.parser.advance(&mut handler, bytes);
-        if graphics_reset {
-            // A reset handled inside vte (RIS today) clears graphics state the
-            // parser cannot reach: the scanner's in-flight sequence lives
-            // upstream of it.
-            self.apc_scanner.reset();
-        }
     }
+
+    // A note for whoever wires RIS to the image store: clear the store there,
+    // but never the APC scanner. The scanner consumes a whole read before vte
+    // sees any of it, so by the time RIS executes mid-chunk the scanner's state
+    // already reflects the END of that chunk -- resetting it could only discard
+    // state belonging to bytes AFTER the reset. And it can never need to discard
+    // anything from before, because an APC cannot span a RIS: the ESC that
+    // introduces `ESC c` terminates the string sequence first. An earlier
+    // revision did reset it, and silently swallowed the first graphics command
+    // to arrive in the same read as a reset.
 
     /// Act on one kitty graphics command.
     ///
@@ -475,6 +487,8 @@ impl VirtualTerminal {
         let Some(command) = body.strip_prefix(b"G") else {
             return;
         };
+        #[cfg(test)]
+        self.dispatched_graphics.push(command.to_vec());
         let _ = (command, responses);
     }
 
@@ -1066,6 +1080,29 @@ mod tests {
         vt.process(b"\x1b[5;10H");
         assert_eq!(vt.cursor().row, 4); // 0-indexed
         assert_eq!(vt.cursor().col, 9); // 0-indexed
+    }
+
+    /// A `RIS` earlier in the same read must not swallow an APC that starts
+    /// after it.
+    ///
+    /// The scanner consumes a whole PTY read before vte sees any of it, so by
+    /// the time `ESC c` executes mid-chunk the scanner's state already reflects
+    /// the END of that chunk. Resetting it there can only ever discard state
+    /// belonging to bytes AFTER the reset -- never anything before it, because
+    /// an APC cannot span a `RIS`: the ESC introducing `ESC c` terminates the
+    /// string sequence first. The reset was therefore pure loss.
+    #[test]
+    fn a_ris_does_not_swallow_an_apc_that_starts_after_it_in_the_same_read() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        // RIS, then the opening half of a graphics command, in ONE read.
+        vt.process_with_responses(b"\x1bc\x1b_Ghalf");
+        // Its continuation and terminator arrive in the next read.
+        vt.process_with_responses(b"more\x1b\\");
+        assert_eq!(
+            vt.dispatched_graphics,
+            vec![b"halfmore".to_vec()],
+            "the APC opened after the RIS was dropped"
+        );
     }
 
     #[test]

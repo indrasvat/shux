@@ -18,11 +18,12 @@
 #   2. PANE ECHO IS OFF. Terminal replies to a fixture's own device queries
 #      (DA1, DECRQM, DSR, OSC 11) are written back to the PTY master, and a pane
 #      with ECHO on paints them into the frame at a position that races the
-#      replay. Measured on nvim.raw, one binary, echo on: 10 runs -> 2 distinct
-#      images (9 + 1). Echo off: 12 runs -> 1. An earlier revision removed this
-#      after a 3-run sample suggested the resize race below was the only cause;
-#      3 runs cannot see a 1-in-10 flake. Both bugs are real and independent --
-#      fixing the race did NOT make echo-on deterministic.
+#      replay. An earlier revision removed this after a 3-run sample suggested
+#      the resize race below was the only cause; 3 runs cannot see a 1-in-10
+#      flake. Both bugs are real and independent -- fixing the race did NOT make
+#      echo-on deterministic. The measurement is recorded in ONE place, the
+#      `harness_corrections` entry in evidence-manifest.json, so the two cannot
+#      drift apart; do not restate the run counts here.
 #
 #   3. THE PANE IS SIZED BEFORE THE FIRST BYTE IS REPLAYED. A pane starts at the
 #      daemon default (80x24). Spawning the replay and *then* resizing means an
