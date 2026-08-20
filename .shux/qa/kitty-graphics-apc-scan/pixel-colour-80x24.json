@@ -1,18 +1,18 @@
 {
- "actual": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/fin-head/colour-80x24.png",
+ "actual": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/ev2-code/colour-80x24.png",
  "changed_pixels": 0,
  "diff": null,
- "expected": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/fin-base/colour-80x24.png",
+ "expected": "/tmp/claude-0/-home-user-shux/38f40ee1-c158-5fed-882a-67b918187943/scratchpad/ev2-base/colour-80x24.png",
  "max_mean_channel_delta": 0.0,
  "max_pixel_diff_ratio": 0.0,
  "mean_rgba_channel_delta": 0.0,
  "pixel_diff_ratio": 0.0,
  "provenance": {
-  "actual_commit": "58320d33158c6d992a5d8f8eeb911179ecdfe4d5",
-  "determinism": "nvim/lazygit replay device queries whose echoed replies race the frame; the harness disables pane echo. Measured on the nvim arm: echo off 37 runs -> 1 distinct image, echo on 35 runs -> 3.",
+  "actual_commit": "b0cd0b98df784bcf54dc66702030065affe976f6",
+  "determinism": "see echo-determinism.sh and its committed logs in this directory.",
   "expected_commit": "f071c89b99ca5604252756c529d29c5ae0e5736b",
   "harness": "ab-render.sh",
-  "note": "actual = this branch's HEAD; expected = a build of the base commit, both rendered by the same harness through real shux panes."
+  "note": "actual = the last commit that changed product code on this branch; expected = a build of the base commit. The evidence commit that carries this file touches no crates/, so this SHA is the code these pixels came from."
  },
  "size": [
   720,

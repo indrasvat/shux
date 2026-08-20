@@ -1,12 +1,11 @@
 {
   "scope": "kitty-graphics-apc-scan",
   "base_commit": "f071c89b99ca5604252756c529d29c5ae0e5736b",
-  "head_commit": "58320d33158c6d992a5d8f8eeb911179ecdfe4d5",
   "summary": "Locate kitty-graphics APC sequences without altering the byte stream; stop leaking the outer terminal's identity into panes; stop disowning a daemon whose binary is not named `shux`. The load-bearing claim is that the text/render path is bit-identical to the base commit: vte receives every byte unchanged and only its `advance` calls are cut at APC boundaries. No graphics command is acted on and no graphics query is answered yet.",
   "solid_qa_report": "SOLID-QA.md",
   "dootsabha_design": "adversarial-review-apc.md",
-  "dootsabha_implementation": "adversarial-review-protocol.md",
-  "dootsabha_substitution": "dootsabha unavailable in this environment. Per CLAUDE.md's Tooling fallbacks table, substituted with two parallel cold-context adversarial agents on disjoint surfaces (APC handling; protocol semantics + diagnosis). Both returned blocking findings that changed the design before any code was written.",
+  "dootsabha_implementation": "adversarial-review-implementation.md",
+  "dootsabha_substitution": "dootsabha unavailable in this environment. Per CLAUDE.md's Tooling fallbacks table, replaced by cold-context adversarial agents on disjoint surfaces: two at DESIGN stage (APC handling; protocol semantics + diagnosis), recorded in adversarial-review-apc.md and adversarial-review-protocol.md, and one over the IMPLEMENTATION DIFF, recorded in adversarial-review-implementation.md. An earlier revision pointed `dootsabha_implementation` at the second DESIGN review, which satisfied step 1 twice and step 6 not at all.",
   "screenshots": [],
   "pixel_metrics": [
     "pixel-apc-120x40.json",
@@ -34,5 +33,12 @@
     "The `wide: \u4e16\u754c` probe renders as tofu in every arm: the bundled raster font has no CJK. Base-identical and outside this diff, but it means that arm proves wide-cell ACCOUNTING, not glyph rendering.",
     "8-bit C1 APC (0x9F) is deliberately unsupported; see the module docs on graphics::apc.",
     "The `combining:` probe proves combining-mark STORAGE, not rendering: the capture is one cell holding `e` + U+0301, but the bundled rasterizer draws the acute in the preceding cell, so the pane reads `combining:\u00b4e`. Base-identical and pre-existing, hence out of this diff's scope -- but do not read the arm as proof of combining-mark rendering."
+  ],
+  "code_commit": "b0cd0b98df784bcf54dc66702030065affe976f6",
+  "code_commit_note": "The last commit on this branch that changes product code. The evidence commit carrying this manifest touches no crates/, Makefile or scripts/, so these pixels came from exactly this tree. An earlier revision stamped a SHA read BEFORE the code it described was committed, and the stamp was self-contradicting: the metrics claimed an echo-disabled harness while the named commit's harness had no `stty -echo` in it.",
+  "determinism_evidence": [
+    "echo-determinism.sh",
+    "echo-determinism-off.log",
+    "echo-determinism-on.log"
   ]
 }
