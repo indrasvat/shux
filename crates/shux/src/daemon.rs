@@ -207,8 +207,8 @@ pub fn remove_pid_file_for(socket: &Path) -> Result<(), DaemonError> {
 }
 
 /// Remove the socket file (called before binding and on shutdown).
-pub fn remove_socket_file() -> Result<(), DaemonError> {
-    let path = socket_path()?;
+pub fn remove_socket_file_for(socket: &Path) -> Result<(), DaemonError> {
+    let path = socket.to_path_buf();
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -575,7 +575,7 @@ mod tests {
         unsafe { set_xdg_runtime_dir(tmpdir.path()) };
 
         ensure_runtime_dir().unwrap();
-        remove_socket_file().unwrap();
+        remove_socket_file_for(&socket_path().unwrap()).unwrap();
 
         unsafe { restore_xdg_runtime_dir(original) };
     }

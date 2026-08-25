@@ -116,7 +116,7 @@ fn kill_stale_daemon(socket: &Path) -> bool {
         debug!(pid, "Failed to send SIGTERM (process may already be gone)");
         // Clean up stale files even if kill failed
         let _ = daemon::remove_pid_file_for(socket);
-        let _ = daemon::remove_socket_file();
+        let _ = daemon::remove_socket_file_for(socket);
         true
     }
 }
@@ -130,7 +130,7 @@ async fn wait_for_daemon_exit(socket_path: &Path) {
         }
     }
     // Force cleanup if daemon didn't exit
-    let _ = daemon::remove_socket_file();
+    let _ = daemon::remove_socket_file_for(socket_path);
     let _ = daemon::remove_pid_file_for(socket_path);
 }
 

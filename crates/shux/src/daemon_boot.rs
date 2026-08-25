@@ -58,7 +58,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 
         // Ensure runtime dir and clean up stale socket
         let runtime_dir = daemon::ensure_runtime_dir()?;
-        daemon::remove_socket_file()?;
+        daemon::remove_socket_file_for(&sock_path)?;
 
         // Daemon-level lens audit log (LENS-R-052): ONE instance for the
         // whole daemon — the chain head is cached in memory, so a second
@@ -110,7 +110,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 
         // Cleanup
         daemon::remove_pid_file_for(&sock_path)?;
-        daemon::remove_socket_file()?;
+        daemon::remove_socket_file_for(&sock_path)?;
         tracing::info!("Daemon shut down cleanly");
 
         Ok::<(), anyhow::Error>(())
@@ -243,7 +243,18 @@ fn argv_is_daemon_for(argv: &[String], socket: &Path) -> bool {
 /// group, and pid 1 is init.
 pub(crate) fn our_live_daemon(socket: &Path) -> Option<u32> {
     let pid = daemon::read_pid_file_for(socket).ok().flatten()?;
-    (pid > 1 && is_live_shux_daemon(pid, socket)).then_some(pid)
+    verify_our_daemon(pid, socket).then_some(pid)
+}
+
+/// Whether `pid`, already read from a pidfile, is our live daemon for `socket`.
+///
+/// Callers that need BOTH the recorded pid and the verdict must read the pidfile
+/// once and pass the result here, never call [`our_live_daemon`] alongside their
+/// own read: two reads can straddle a concurrent restart, and then the pid that
+/// was validated is not the pid that gets signalled. That is the arbitrary-
+/// process signalling hole this whole change exists to close, reopened as a race.
+pub(crate) fn verify_our_daemon(pid: u32, socket: &Path) -> bool {
+    pid > 1 && is_live_shux_daemon(pid, socket)
 }
 
 /// `shux daemon stop|status` — the missing half of the daemon lifecycle (085 F5).
@@ -260,8 +271,10 @@ pub(crate) fn handle_daemon_command(
     format: cli::OutputFormat,
     socket: &Path,
 ) -> anyhow::Result<()> {
+    // ONE read. `ours` is derived from this exact value, so the pid signalled
+    // below is the pid that was validated -- see `verify_our_daemon`.
     let pid = daemon::read_pid_file_for(socket).ok().flatten();
-    let ours = our_live_daemon(socket);
+    let ours = pid.filter(|p| verify_our_daemon(*p, socket));
     // A pidfile can outlive its process (SIGKILL, a reboot) and the OS reuses pids, so the
     // number in it may name a COMPLETELY UNRELATED process by the time we read it. Probe
     // with signal 0, then confirm the process really is a shux daemon before believing the
@@ -289,7 +302,7 @@ pub(crate) fn handle_daemon_command(
             Ok(())
         }
         cli::DaemonCommand::Stop => {
-            let Some(p) = pid.filter(|_| alive) else {
+            let Some(p) = ours else {
                 // Alive but not ours means an ordinarily stale pidfile: our daemon
                 // died and the OS reused its number. Exit 0 keeps the documented
                 // idempotence contract (skills/shux/references/gate.md,
@@ -332,7 +345,7 @@ pub(crate) fn handle_daemon_command(
             }
             if gone {
                 let _ = daemon::remove_pid_file_for(socket);
-                let _ = daemon::remove_socket_file();
+                let _ = daemon::remove_socket_file_for(socket);
             }
             match (format, gone) {
                 (cli::OutputFormat::Json, _) => {
@@ -721,11 +734,41 @@ mod tests {
 
         // 085 QA P3: a bystander whose command line merely CONTAINS both words must be
         // rejected. A substring check accepted this and killed it.
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", r#"exec -a "watch-for shux __daemon" /bin/sleep 5"#])
+        //
+        // argv0 is spoofed with `CommandExt::arg0`, NOT `sh -c 'exec -a ...'`.
+        // That shell form is a bashism: `/bin/sh` is dash on Debian and Ubuntu,
+        // whose `exec` has no `-a`, so the shell errored out and the "bystander"
+        // was already dead by the time the assertion ran. The check then passed
+        // because there was no process, not because its argv was rejected --
+        // green on every tree, proving nothing. `arg0` is a direct execve and
+        // needs no shell at all.
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0("watch-for shux __daemon")
+            .arg("5")
             .spawn()
             .expect("spawn crafted-argv bystander");
-        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        // Wait for the exec, not for a duration: before it lands argv is still
+        // this test's own, and the negative below would again pass for the
+        // wrong reason.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let argv = super::process_argv(child.id()).unwrap_or_default();
+            if argv.first().is_some_and(|a| a.contains("watch-for")) {
+                assert_eq!(
+                    argv.get(1).map(String::as_str),
+                    Some("5"),
+                    "the bystander must be a real live process with a spoofed argv0"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bystander never exec'd; argv still {argv:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let verdict = super::is_live_shux_daemon(child.id(), sock);
         let _ = child.kill();
         let _ = child.wait();

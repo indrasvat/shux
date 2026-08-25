@@ -513,6 +513,36 @@ fn copy_bin(dir: &Path, name: &str) -> PathBuf {
     dst
 }
 
+/// Poll until `dir` holds `n` pidfiles naming live processes.
+///
+/// A fixed sleep is not good enough here: daemon startup under the coverage job's
+/// instrumentation, or on a loaded macOS runner, routinely outruns any constant
+/// small enough to keep the suite quick. This mirrors `wait_for_pid_file`.
+fn wait_for_pid_files(dir: &Path, n: usize) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let found: Vec<u32> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pid"))
+            .filter_map(|e| try_read_pid(&e.path()))
+            .filter(|pid| pid_exists(*pid))
+            .collect();
+        if found.len() >= n {
+            return found;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "{} held {} live pidfile(s), expected {n}",
+                dir.display(),
+                found.len()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn run_bin(bin: &Path, runtime: &Path, socket: Option<&Path>, args: &[&str]) -> Output {
     let mut cmd = Command::new(bin);
     cmd.args(args)
@@ -583,7 +613,27 @@ fn daemon_stop_spares_a_daemon_serving_another_socket() {
 
     let stopped = run_bin(&bin, ours.path(), None, &["daemon", "stop"]);
     assert!(stopped.status.success(), "daemon stop must stay idempotent");
-    std::thread::sleep(Duration::from_millis(800));
+
+    // Two POSITIVE assertions instead of sleeping and hoping. Waiting a fixed
+    // interval to see whether something died is a guess -- too short and it
+    // passes on a daemon that was about to die, too long and the suite crawls.
+    //
+    // 1. Our invocation must say it refused. `daemon stop` has already exited,
+    //    so if it were going to signal, it signalled before this returned.
+    let out = String::from_utf8_lossy(&stopped.stdout);
+    assert!(
+        out.contains("no daemon running"),
+        "expected a refusal, got: {out}"
+    );
+    // 2. Their daemon must still SERVE, which is stronger than still existing:
+    //    a SIGTERMed daemon stops answering. A successful round-trip is a
+    //    positive, immediate fact -- no waiting involved.
+    let their_reply = run_bin(&bin, theirs.path(), None, &["session", "list"]);
+    assert!(
+        their_reply.status.success(),
+        "a daemon serving another socket stopped answering after our `daemon stop`: {}",
+        String::from_utf8_lossy(&their_reply.stderr)
+    );
     assert!(
         pid_exists(their_pid),
         "`daemon stop` killed a daemon serving another socket (pid {their_pid})"
@@ -604,7 +654,6 @@ fn two_sockets_in_one_runtime_dir_do_not_share_a_pidfile() {
     let two = runtime.path().join("two.sock");
     let mut reaper = Reaper(Vec::new());
 
-    let mut pids = Vec::new();
     for sock in [&one, &two] {
         assert!(
             run_bin(&bin, runtime.path(), Some(sock), &["session", "list"])
@@ -612,16 +661,10 @@ fn two_sockets_in_one_runtime_dir_do_not_share_a_pidfile() {
                 .success(),
             "session list on {sock:?} failed"
         );
-        // Whichever pidfile this socket owns, it must not be the other's.
-        std::thread::sleep(Duration::from_millis(600));
-        let found: Vec<u32> = std::fs::read_dir(runtime.path().join("shux"))
-            .expect("runtime dir")
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "pid"))
-            .filter_map(|e| try_read_pid(&e.path()))
-            .collect();
-        pids = found;
     }
+    // Two daemons must own two pidfiles. Sharing one is the defect: the second
+    // overwrote the first's entry and the first became unreachable.
+    let pids = wait_for_pid_files(&runtime.path().join("shux"), 2);
     assert_eq!(
         pids.len(),
         2,
