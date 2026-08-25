@@ -98,7 +98,9 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> 
 /// SIGKILL and reboots and pids get reused, so that is "SIGTERM an arbitrary
 /// process" on a routine command.
 fn kill_stale_daemon(socket: &Path) -> bool {
-    let Some(pid) = crate::daemon_boot::our_live_daemon(socket) else {
+    let Some(crate::daemon_boot::LiveDaemon { pid, pidfile }) =
+        crate::daemon_boot::our_live_daemon(socket)
+    else {
         let _ = daemon::remove_pid_file_for(socket);
         return false;
     };
@@ -115,7 +117,7 @@ fn kill_stale_daemon(socket: &Path) -> bool {
     } else {
         debug!(pid, "Failed to send SIGTERM (process may already be gone)");
         // Clean up stale files even if kill failed
-        let _ = daemon::remove_pid_file_for(socket);
+        let _ = std::fs::remove_file(&pidfile);
         let _ = daemon::remove_socket_file_for(socket);
         true
     }

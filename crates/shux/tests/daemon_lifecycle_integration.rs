@@ -685,3 +685,84 @@ fn two_sockets_in_one_runtime_dir_do_not_share_a_pidfile() {
         );
     }
 }
+
+/// Upgrading must not orphan a daemon started by the previous version.
+///
+/// Every shux before the socket-keyed pidfile wrote `$RUNTIME_DIR/shux.pid`
+/// whatever socket it served. A client that looked only at the new hashed name
+/// could not see such a daemon: it reported "no daemon running", left it alive
+/// and unreachable, and rebound its socket underneath it -- this PR's own bug,
+/// reintroduced at every upgrade. Simulated by moving the pidfile to where the
+/// old version would have written it, which is exactly the state upgrading
+/// leaves behind.
+#[test]
+fn a_daemon_from_before_the_socket_keyed_pidfile_is_still_stoppable() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let sock = runtime.path().join("custom.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, runtime.path(), Some(&sock), &["session", "list"])
+            .status
+            .success()
+    );
+    let pids = wait_for_pid_files(&runtime.path().join("shux"), 1);
+    let pid = pids[0];
+    reaper.0.push(pid as i32);
+
+    // Rewrite history: put the pid where the PREVIOUS version would have.
+    let hashed = std::fs::read_dir(runtime.path().join("shux"))
+        .expect("runtime dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "pid"))
+        .expect("a pidfile");
+    let legacy = runtime.path().join("shux").join("shux.pid");
+    std::fs::rename(&hashed, &legacy).expect("move pidfile to the legacy path");
+
+    let stopped = run_bin(&bin, runtime.path(), Some(&sock), &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        "a daemon recorded at the pre-upgrade pidfile path was orphaned: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+}
+
+/// Reading the legacy pidfile must not let one daemon claim another.
+///
+/// The migration above consults `$RUNTIME_DIR/shux.pid` when the socket-keyed
+/// file is absent. That file may belong to the DEFAULT daemon, so the identity
+/// check is what keeps the migration safe: a custom-socket client must not stop
+/// the default daemon just because its pid is the one recorded there.
+#[test]
+fn the_legacy_pidfile_is_not_claimed_by_a_daemon_serving_another_socket() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let mut reaper = Reaper(Vec::new());
+
+    // A DEFAULT-socket daemon, whose pidfile is the legacy path by definition.
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    let pid = wait_for_pid_file(&runtime.path().join("shux").join("shux.pid"));
+    reaper.0.push(pid as i32);
+
+    let other = runtime.path().join("other.sock");
+    let stopped = run_bin(&bin, runtime.path(), Some(&other), &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop must stay idempotent");
+    assert!(
+        String::from_utf8_lossy(&stopped.stdout).contains("no daemon running"),
+        "expected a refusal for a socket no daemon serves"
+    );
+    // Still serving is stronger than still existing.
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success(),
+        "the default daemon was stopped by a client asking about another socket"
+    );
+}

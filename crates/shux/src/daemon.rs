@@ -86,6 +86,34 @@ pub fn pid_file_path() -> Result<PathBuf, DaemonError> {
     pid_file_path_for(&socket_path()?)
 }
 
+/// Pidfile paths to consult for `socket`, most specific first.
+///
+/// The second entry is the pre-upgrade location. Every shux before this change
+/// wrote `$RUNTIME_DIR/shux.pid` whatever socket it served, so a client that
+/// looked only at the socket-keyed name could not see a daemon started by the
+/// version it is replacing -- it would report "no daemon running", leave that
+/// daemon alive and unreachable, and rebind its socket underneath it. That is
+/// the exact failure this change exists to remove, so not migrating would have
+/// reintroduced it at every upgrade.
+///
+/// Consulting the legacy file is safe because the caller identity-checks what it
+/// finds: a legacy pidfile naming the DEFAULT daemon does not validate for a
+/// custom socket, because that process's argv says which socket it serves.
+pub fn pid_file_candidates(socket: &Path) -> Result<Vec<PathBuf>, DaemonError> {
+    let primary = pid_file_path_for(socket)?;
+    let legacy = runtime_dir()?.join("shux.pid");
+    Ok(if primary == legacy {
+        vec![primary]
+    } else {
+        vec![primary, legacy]
+    })
+}
+
+/// Read a pid from an explicit pidfile path.
+pub fn read_pid_at(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// Full path to the Unix domain socket: `$RUNTIME_DIR/shux.sock`
 pub fn socket_path() -> Result<PathBuf, DaemonError> {
     Ok(runtime_dir()?.join("shux.sock"))

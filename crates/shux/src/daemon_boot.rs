@@ -119,15 +119,25 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The exact argument vector of `pid`, or `None` if it cannot be read.
+/// A process's argv, exactly where the platform can give it exactly.
+#[derive(Debug)]
+enum ProcessArgv {
+    /// NUL-separated and complete: argument boundaries are real.
+    Exact(Vec<String>),
+    /// `ps` output, space-joined. Boundaries are NOT recoverable, so a socket
+    /// path containing a space cannot be tokenised back out -- which is why the
+    /// socket test below matches the expected rendering rather than splitting.
+    Joined(String),
+}
+
+/// The argv of `pid`, or `None` if it cannot be read.
 ///
-/// `/proc` is preferred wherever it exists: it is NUL-separated, so an argument
-/// containing a space survives intact, and it cannot be truncated. `ps` is the
-/// fallback for macOS, which CI and the release workflow both build for. `-ww`
-/// is not optional there -- without it BSD `ps` truncates argv, and a truncated
-/// argv silently fails the socket check below, which would resurrect exactly the
-/// "no daemon running" leak this function exists to prevent.
-fn process_argv(pid: u32) -> Option<Vec<String>> {
+/// `/proc` is preferred wherever it exists: NUL-separated, complete, and immune
+/// to truncation. `ps` is the fallback for macOS, which CI and the release
+/// workflow both build for. `-ww` is not optional there -- without it BSD `ps`
+/// truncates argv, and a truncated argv fails the socket check below, which
+/// would resurrect the "no daemon running" leak this function exists to prevent.
+fn process_argv(pid: u32) -> Option<ProcessArgv> {
     #[cfg(target_os = "linux")]
     if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
         let argv: Vec<String> = raw
@@ -136,21 +146,39 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect();
         if !argv.is_empty() {
-            return Some(argv);
+            return Some(ProcessArgv::Exact(argv));
         }
     }
     let out = std::process::Command::new("ps")
         .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
         .output()
         .ok()?;
-    let joined = String::from_utf8_lossy(&out.stdout);
-    let joined = joined.trim_end();
-    if joined.is_empty() {
-        return None;
+    let joined = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    (!joined.is_empty()).then_some(ProcessArgv::Joined(joined))
+}
+
+/// Whether a space-joined argv serves exactly `socket`.
+///
+/// Splitting on whitespace and reading the token after `--socket` loses a socket
+/// path containing a space: the daemon would then fail to recognise ITSELF, and
+/// `daemon stop` would delete its pidfile while leaving it running. Since the
+/// socket being looked for is already known, the expected rendering is matched
+/// instead, which needs no boundaries. The match must end at a space or at the
+/// end of the string so `/a/x.sock` does not also match `/a/x.sock2`.
+fn joined_serves_socket(joined: &str, socket: &Path) -> bool {
+    let socket = socket.to_string_lossy();
+    for needle in [format!(" --socket {socket}"), format!(" --socket={socket}")] {
+        if let Some(rest) = joined.split_once(&needle).map(|(_, rest)| rest)
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            return true;
+        }
     }
-    // Space-joined and therefore lossy for arguments containing spaces. Only
-    // reachable off Linux.
-    Some(joined.split_whitespace().map(str::to_owned).collect())
+    // No `--socket` at all: a hand-started `shux __daemon` serves the default.
+    if !joined.contains("--socket") {
+        return daemon::socket_path().is_ok_and(|d| d.to_string_lossy() == socket);
+    }
+    false
 }
 
 /// The socket a daemon process is serving, read from its own argv.
@@ -207,11 +235,14 @@ pub(crate) fn is_live_shux_daemon(pid: u32, socket: &Path) -> bool {
     if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
         return false;
     }
-    let Some(argv) = process_argv(pid) else {
+    match process_argv(pid) {
+        Some(ProcessArgv::Exact(argv)) => argv_is_daemon_for(&argv, socket),
+        Some(ProcessArgv::Joined(joined)) => {
+            joined.contains(" __daemon") && joined_serves_socket(&joined, socket)
+        }
         // Without a way to confirm identity, refuse to claim it is ours.
-        return false;
-    };
-    argv_is_daemon_for(&argv, socket)
+        None => false,
+    }
 }
 
 /// Whether `argv` is a shux daemon serving `socket`.
@@ -241,9 +272,25 @@ fn argv_is_daemon_for(argv: &[String], socket: &Path) -> bool {
 ///
 /// pid 0 and 1 are rejected outright: `kill(0, ..)` signals the whole process
 /// group, and pid 1 is init.
-pub(crate) fn our_live_daemon(socket: &Path) -> Option<u32> {
-    let pid = daemon::read_pid_file_for(socket).ok().flatten()?;
-    verify_our_daemon(pid, socket).then_some(pid)
+/// Our live daemon for `socket`, and the pidfile that named it.
+///
+/// The pidfile path travels with the pid because they must not be looked up
+/// separately: the file removed after a successful stop has to be the file the
+/// pid came from, which on an upgrade is the legacy one.
+pub(crate) struct LiveDaemon {
+    pub(crate) pid: u32,
+    pub(crate) pidfile: PathBuf,
+}
+
+pub(crate) fn our_live_daemon(socket: &Path) -> Option<LiveDaemon> {
+    for pidfile in daemon::pid_file_candidates(socket).ok()? {
+        if let Some(pid) = daemon::read_pid_at(&pidfile)
+            && verify_our_daemon(pid, socket)
+        {
+            return Some(LiveDaemon { pid, pidfile });
+        }
+    }
+    None
 }
 
 /// Whether `pid`, already read from a pidfile, is our live daemon for `socket`.
@@ -271,10 +318,14 @@ pub(crate) fn handle_daemon_command(
     format: cli::OutputFormat,
     socket: &Path,
 ) -> anyhow::Result<()> {
-    // ONE read. `ours` is derived from this exact value, so the pid signalled
-    // below is the pid that was validated -- see `verify_our_daemon`.
-    let pid = daemon::read_pid_file_for(socket).ok().flatten();
-    let ours = pid.filter(|p| verify_our_daemon(*p, socket));
+    // `ours` carries both the validated pid and the file it came from, so the
+    // pid signalled below is the pid that was validated and the file removed is
+    // the file that named it -- see `verify_our_daemon` and `LiveDaemon`.
+    let ours = our_live_daemon(socket);
+    let pid = ours
+        .as_ref()
+        .map(|d| d.pid)
+        .or_else(|| daemon::read_pid_file_for(socket).ok().flatten());
     // A pidfile can outlive its process (SIGKILL, a reboot) and the OS reuses pids, so the
     // number in it may name a COMPLETELY UNRELATED process by the time we read it. Probe
     // with signal 0, then confirm the process really is a shux daemon before believing the
@@ -302,7 +353,7 @@ pub(crate) fn handle_daemon_command(
             Ok(())
         }
         cli::DaemonCommand::Stop => {
-            let Some(p) = ours else {
+            let Some(LiveDaemon { pid: p, pidfile }) = ours else {
                 // Alive but not ours means an ordinarily stale pidfile: our daemon
                 // died and the OS reused its number. Exit 0 keeps the documented
                 // idempotence contract (skills/shux/references/gate.md,
@@ -344,7 +395,7 @@ pub(crate) fn handle_daemon_command(
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             if gone {
-                let _ = daemon::remove_pid_file_for(socket);
+                let _ = std::fs::remove_file(&pidfile);
                 let _ = daemon::remove_socket_file_for(socket);
             }
             match (format, gone) {
@@ -754,13 +805,16 @@ mod tests {
         // wrong reason.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let argv = super::process_argv(child.id()).unwrap_or_default();
-            if argv.first().is_some_and(|a| a.contains("watch-for")) {
-                assert_eq!(
-                    argv.get(1).map(String::as_str),
-                    Some("5"),
-                    "the bystander must be a real live process with a spoofed argv0"
-                );
+            let argv = super::process_argv(child.id());
+            let exec_landed = match &argv {
+                Some(super::ProcessArgv::Exact(v)) => {
+                    v.first().is_some_and(|a| a.contains("watch-for"))
+                        && v.get(1).map(String::as_str) == Some("5")
+                }
+                Some(super::ProcessArgv::Joined(j)) => j.contains("watch-for"),
+                None => false,
+            };
+            if exec_landed {
                 break;
             }
             assert!(
@@ -838,6 +892,44 @@ mod tests {
         assert!(!super::argv_is_daemon_for(
             &argv,
             Path::new("/run/mine/x.sock")
+        ));
+    }
+
+    /// A space-joined argv (the macOS `ps` path) must still resolve the socket.
+    ///
+    /// Splitting on whitespace loses a socket path containing a space, and the
+    /// daemon then fails to recognise ITSELF: `daemon stop` deletes its pidfile
+    /// and leaves it running -- this bug, on the platform that cannot use
+    /// `/proc`.
+    #[test]
+    fn a_joined_argv_resolves_a_socket_containing_spaces() {
+        let spacey = "/tmp/my sockets/shux.sock";
+        let joined = format!("/opt/shux __daemon --socket {spacey}");
+        assert!(super::joined_serves_socket(&joined, Path::new(spacey)));
+        assert!(!super::joined_serves_socket(
+            &joined,
+            Path::new("/tmp/my sockets/other.sock")
+        ));
+
+        // A prefix must not match: `/a/x.sock` is not `/a/x.sock2`.
+        let joined = "/opt/shux __daemon --socket /a/x.sock2".to_string();
+        assert!(!super::joined_serves_socket(
+            &joined,
+            Path::new("/a/x.sock")
+        ));
+        assert!(super::joined_serves_socket(
+            &joined,
+            Path::new("/a/x.sock2")
+        ));
+
+        // The `--socket=` form, and a trailing argument after the socket.
+        assert!(super::joined_serves_socket(
+            "/opt/shux __daemon --socket=/a/x.sock",
+            Path::new("/a/x.sock")
+        ));
+        assert!(super::joined_serves_socket(
+            "/opt/shux __daemon --socket /a/x.sock --verbose",
+            Path::new("/a/x.sock")
         ));
     }
 
