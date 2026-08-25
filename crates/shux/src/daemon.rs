@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -45,9 +45,45 @@ pub fn runtime_dir() -> Result<PathBuf, DaemonError> {
     Ok(dir)
 }
 
-/// Full path to the PID file: `$RUNTIME_DIR/shux.pid`
+/// Full path to the PID file for the daemon serving `socket`.
+///
+/// Keyed to the socket, not to the runtime dir alone, because the socket is
+/// independently overridable by `--socket` / `SHUX_SOCKET` while the runtime dir
+/// is not. Two daemons in one runtime dir on different sockets used to share
+/// `$RUNTIME_DIR/shux.pid`: the second overwrote the first's entry and the first
+/// became unreachable -- `daemon stop` could never name it again, so it ran
+/// until the machine went down.
+///
+/// The default socket keeps exactly `$RUNTIME_DIR/shux.pid`, so the path
+/// documented on `--socket` stays true. Any other socket gets a sibling file in
+/// the SAME runtime dir, named by a hash of its path.
+///
+/// The pidfile deliberately stays inside the runtime dir rather than sitting
+/// beside the socket. `ensure_runtime_dir` proves that directory is ours and
+/// 0700; an arbitrary `--socket` path has had no such check, and a pidfile in a
+/// world-writable directory is a pid an attacker can choose.
+///
+/// The hash is a hand-rolled FNV-1a rather than `DefaultHasher`, whose output is
+/// explicitly not stable across releases. A daemon writes this file and a client
+/// of a DIFFERENT version reads it -- that is precisely the version-mismatch
+/// restart path -- so an unstable hash would orphan the daemon it is meant to
+/// find.
+pub fn pid_file_path_for(socket: &Path) -> Result<PathBuf, DaemonError> {
+    let dir = runtime_dir()?;
+    if socket_path().is_ok_and(|default| default == socket) {
+        return Ok(dir.join("shux.pid"));
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in socket.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(dir.join(format!("shux-{hash:016x}.pid")))
+}
+
+/// The PID file for the default socket.
 pub fn pid_file_path() -> Result<PathBuf, DaemonError> {
-    Ok(runtime_dir()?.join("shux.pid"))
+    pid_file_path_for(&socket_path()?)
 }
 
 /// Full path to the Unix domain socket: `$RUNTIME_DIR/shux.sock`
@@ -129,9 +165,9 @@ pub fn ensure_runtime_dir() -> Result<PathBuf, DaemonError> {
 /// a real 0700 directory, refusing to write through a symlink at the pidfile
 /// path is cheap defense-in-depth against an arbitrary-file clobber. A stale
 /// regular pidfile from a previous run is still overwritten (create + truncate).
-pub fn write_pid_file() -> Result<(), DaemonError> {
+pub fn write_pid_file(socket: &Path) -> Result<(), DaemonError> {
     use std::io::Write;
-    let path = pid_file_path()?;
+    let path = pid_file_path_for(socket)?;
     let pid = std::process::id();
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -148,8 +184,8 @@ pub fn write_pid_file() -> Result<(), DaemonError> {
 
 /// Read the PID from the PID file, if it exists.
 #[allow(dead_code)] // Used in tests; will be used for stale PID detection in future tasks
-pub fn read_pid_file() -> Result<Option<u32>, DaemonError> {
-    let path = pid_file_path()?;
+pub fn read_pid_file_for(socket: &Path) -> Result<Option<u32>, DaemonError> {
+    let path = pid_file_path_for(socket)?;
     match fs::read_to_string(&path) {
         Ok(contents) => {
             let pid = contents.trim().parse::<u32>().ok();
@@ -161,8 +197,8 @@ pub fn read_pid_file() -> Result<Option<u32>, DaemonError> {
 }
 
 /// Remove the PID file (called on shutdown).
-pub fn remove_pid_file() -> Result<(), DaemonError> {
-    let path = pid_file_path()?;
+pub fn remove_pid_file_for(socket: &Path) -> Result<(), DaemonError> {
+    let path = pid_file_path_for(socket)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -194,7 +230,7 @@ pub fn remove_socket_file() -> Result<(), DaemonError> {
 /// 5. Write PID file
 ///
 /// Returns `Ok(true)` in the daemon process, `Ok(false)` in the original parent.
-pub fn daemonize() -> Result<bool, DaemonError> {
+pub fn daemonize(socket: &Path) -> Result<bool, DaemonError> {
     use nix::unistd::{ForkResult, fork, setsid};
 
     // SAFETY: This is called before any tokio runtime is created, so the process
@@ -224,7 +260,7 @@ pub fn daemonize() -> Result<bool, DaemonError> {
 
     // Ensure runtime dir exists and write PID file
     ensure_runtime_dir()?;
-    write_pid_file()?;
+    write_pid_file(socket)?;
 
     Ok(true)
 }
@@ -421,7 +457,7 @@ mod tests {
         let original = std::env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: guarded by ENV_LOCK, restored before releasing it.
         unsafe { set_xdg_runtime_dir(&xdg) };
-        let result = write_pid_file();
+        let result = write_pid_file(&socket_path().unwrap());
         unsafe { restore_xdg_runtime_dir(original) };
 
         assert!(
@@ -459,14 +495,60 @@ mod tests {
         unsafe { set_xdg_runtime_dir(tmpdir.path()) };
 
         ensure_runtime_dir().unwrap();
-        write_pid_file().unwrap();
+        let sock = socket_path().unwrap();
+        write_pid_file(&sock).unwrap();
 
-        let pid = read_pid_file().unwrap();
+        let pid = read_pid_file_for(&sock).unwrap();
         assert_eq!(pid, Some(std::process::id()));
 
-        remove_pid_file().unwrap();
-        let pid = read_pid_file().unwrap();
+        remove_pid_file_for(&sock).unwrap();
+        let pid = read_pid_file_for(&sock).unwrap();
         assert!(pid.is_none());
+
+        unsafe { restore_xdg_runtime_dir(original) };
+    }
+
+    /// Two daemons in one runtime dir on different sockets must not share a pidfile.
+    ///
+    /// They did: the second overwrote the first's entry, and `daemon stop` could
+    /// never name the first again -- it ran until the machine went down. The
+    /// default socket must keep the documented `$RUNTIME_DIR/shux.pid` path.
+    #[test]
+    fn a_pidfile_belongs_to_one_socket() {
+        let _guard = env_lock().lock().unwrap();
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let original = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: Guarded by ENV_LOCK and restored before releasing it.
+        unsafe { set_xdg_runtime_dir(tmpdir.path()) };
+
+        let default_sock = socket_path().unwrap();
+        assert_eq!(
+            pid_file_path_for(&default_sock).unwrap(),
+            pid_file_path().unwrap(),
+            "the default socket must keep the documented pidfile path"
+        );
+        assert_eq!(
+            pid_file_path().unwrap().file_name().unwrap(),
+            "shux.pid",
+            "`--socket` documents $XDG_RUNTIME_DIR/shux/shux.pid; keep it true"
+        );
+
+        let one = pid_file_path_for(Path::new("/run/x/one.sock")).unwrap();
+        let two = pid_file_path_for(Path::new("/run/x/two.sock")).unwrap();
+        assert_ne!(one, two, "distinct sockets must get distinct pidfiles");
+        assert_ne!(one, pid_file_path().unwrap());
+        for p in [&one, &two] {
+            assert_eq!(
+                p.parent().unwrap(),
+                runtime_dir().unwrap(),
+                "a pidfile must stay inside the ownership-checked 0700 runtime dir"
+            );
+        }
+        assert_eq!(
+            one,
+            pid_file_path_for(Path::new("/run/x/one.sock")).unwrap(),
+            "the hash must be stable -- a client of another version reads this"
+        );
 
         unsafe { restore_xdg_runtime_dir(original) };
     }
@@ -480,7 +562,7 @@ mod tests {
         unsafe { set_xdg_runtime_dir(tmpdir.path()) };
 
         ensure_runtime_dir().unwrap();
-        remove_pid_file().unwrap();
+        remove_pid_file_for(&socket_path().unwrap()).unwrap();
 
         unsafe { restore_xdg_runtime_dir(original) };
     }

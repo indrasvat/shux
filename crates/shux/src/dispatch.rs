@@ -877,7 +877,9 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
             cli::handle_api(&mut stream, &method, &resolved, args.format).await
         }
 
-        Some(Command::Daemon { command }) => handle_daemon_command(command, args.format),
+        Some(Command::Daemon { command }) => {
+            handle_daemon_command(command, args.format, &socket_path)
+        }
 
         Some(Command::Version) => {
             // Quick probe — don't auto-start daemon just for version
