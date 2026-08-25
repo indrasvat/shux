@@ -120,9 +120,15 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// A process's argv, exactly where the platform can give it exactly.
+///
+/// Exactly one variant is constructed per platform -- `Exact` on Linux, `Joined`
+/// everywhere else -- so on any given target the other is genuinely dead. CI
+/// builds both Linux and macOS with `-Dwarnings`, where that is a hard error, so
+/// the allow is on the type rather than fighting it variant by variant.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum ProcessArgv {
-    /// NUL-separated and complete: argument boundaries are real.
+    /// NUL-separated and complete: argument boundaries are real. Linux only.
     Exact(Vec<String>),
     /// `ps` output, space-joined. Boundaries are NOT recoverable, so a socket
     /// path containing a space cannot be tokenised back out -- which is why the
@@ -131,24 +137,29 @@ enum ProcessArgv {
 }
 
 /// The argv of `pid`, or `None` if it cannot be read.
-///
-/// `/proc` is preferred wherever it exists: NUL-separated, complete, and immune
-/// to truncation. `ps` is the fallback for macOS, which CI and the release
-/// workflow both build for. `-ww` is not optional there -- without it BSD `ps`
-/// truncates argv, and a truncated argv fails the socket check below, which
-/// would resurrect the "no daemon running" leak this function exists to prevent.
+/// On Linux `/proc` is AUTHORITATIVE, including when it comes back empty.
+/// `/proc/<pid>/cmdline` is momentarily empty while a process is mid-exec (and
+/// for a zombie). An earlier revision treated that as "unavailable" and fell
+/// through to `ps`, so the lossy space-joined path answered instead -- a silent
+/// downgrade on the one platform that never needs it, and one that only appeared
+/// in CI, where the exec window is wide enough to hit. `None` makes the caller
+/// poll again rather than accept worse data.
+#[cfg(target_os = "linux")]
 fn process_argv(pid: u32) -> Option<ProcessArgv> {
-    #[cfg(target_os = "linux")]
-    if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-        let argv: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|arg| !arg.is_empty())
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect();
-        if !argv.is_empty() {
-            return Some(ProcessArgv::Exact(argv));
-        }
-    }
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    (!argv.is_empty()).then_some(ProcessArgv::Exact(argv))
+}
+
+/// `-ww` is not optional: without it BSD `ps` truncates argv, and a truncated
+/// argv fails the socket check, which would resurrect the "no daemon running"
+/// leak this function exists to prevent.
+#[cfg(not(target_os = "linux"))]
+fn process_argv(pid: u32) -> Option<ProcessArgv> {
     let out = std::process::Command::new("ps")
         .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
         .output()
@@ -794,11 +805,23 @@ mod tests {
         // green on every tree, proving nothing. `arg0` is a direct execve and
         // needs no shell at all.
         use std::os::unix::process::CommandExt;
-        let mut child = std::process::Command::new("/bin/sleep")
+        let child = std::process::Command::new("/bin/sleep")
             .arg0("watch-for shux __daemon")
             .arg("5")
             .spawn()
             .expect("spawn crafted-argv bystander");
+        // Adopted BEFORE the poll below, which asserts and so can panic. An
+        // earlier revision killed the child only after the assertions and
+        // leaked it on every failure -- nextest reported `FAIL + LEAK`.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(child);
+        let child = &mut child.0;
 
         // Wait for the exec, not for a duration: before it lands argv is still
         // this test's own, and the negative below would again pass for the
