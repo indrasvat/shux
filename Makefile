@@ -5,23 +5,9 @@
 # Variables
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── CI parity ────────────────────────────────────────────────────────────────
-#
-# CI exports these for every job (.github/workflows/ci.yml). The Makefile did
-# not, so `make check` was strictly MORE PERMISSIVE than CI and a warning-level
-# defect could pass locally and fail on push. That is not hypothetical: a
-# cfg-gated `enum` variant, unconstructed on macOS, passed `make check` on Linux
-# and broke the macOS build with `-D dead-code`.
-#
-# `?=` so an explicit RUSTFLAGS in the environment still wins, and `export` so
-# every cargo invocation below inherits it. This is only coherent because the
-# house rule is "always `make <target>`, never raw cargo" (CLAUDE.md): within
-# that workflow the flag is uniform, so there is no fingerprint thrash between
-# a bare `cargo build` and a `make` target.
-#
-# CARGO_TERM_COLOR is deliberately NOT set here. CI's colour axis is covered by
-# `check-ci-parity`, which drives the cargo-output parsers with colour on --
-# they pin `--color never` at each call site, and that guard proves it.
+# CI exports this for every job; without it `make check` is more permissive than
+# CI and a warning-level defect passes locally then fails on push. `?=` so an
+# explicit value still wins.
 export RUSTFLAGS ?= -Dwarnings
 
 BINARY_NAME := shux
@@ -159,11 +145,8 @@ check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's enviro
 
 .PHONY: check-darwin
 check-darwin: ## Type-check the workspace for macOS — catches cfg-gated APIs a Linux build never sees
-	@# Runs under the exported -Dwarnings above, and that is the whole point: a
-	@# cfg-gated item that is dead on macOS is a WARNING, so without it this
-	@# target printed `variant is never constructed` and then reported success.
-	@# It sat in no aggregate target for that reason or another -- nothing ran
-	@# it, and CI does not call it either (CI has a real macOS job instead).
+	@# Needs the -Dwarnings above: dead cfg-gated items are warnings, so without
+	@# it this printed the defect and reported success.
 	@echo "$(COLOR_BLUE)▶ Cross-checking aarch64-apple-darwin...$(COLOR_RESET)"
 	@rustup target list --installed | grep -qx aarch64-apple-darwin \
 	  || rustup target add aarch64-apple-darwin
