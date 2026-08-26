@@ -12,10 +12,10 @@ READ-ONLY BOUNDARY. You may run only read-only git: `diff`, `log`, `show`, `grep
 
 METHOD:
 1. `git diff $(git merge-base origin/main HEAD)..HEAD` is the subject. Read the branch's commit messages (`git log --format=%B <base>..HEAD`) — or the PR body if one exists — for what the change is FOR, never for whether it is good. This step usually runs before any PR exists.
-2. MEASURE BEFORE JUDGING. Density of ADDED lines, per file. Note `color.ui=never`: without it a user with colour configured gets 0 and reads it as "no comments here".
+2. MEASURE BEFORE JUDGING. Density of ADDED lines, per file. Note `color.ui=never`: without it a user with colour configured gets 0 and reads it as "no comments here". Note `..HEAD`: without it you measure the implementer's live working tree, not the subject step 1 declared.
      base=$(git merge-base origin/main HEAD)
-     git --no-pager -c color.ui=never diff "$base" -- FILE | grep -c '^+[^+]'
-     git --no-pager -c color.ui=never diff "$base" -- FILE | grep -cE '^\\+\\s*(//|/\\*|\\*[\\s/])'
+     git --no-pager -c color.ui=never diff "$base"..HEAD -- FILE | grep -c '^+[^+]'
+     git --no-pager -c color.ui=never diff "$base"..HEAD -- FILE | grep -cE '^\\+\\s*(//|/\\*|\\*[\\s/])'
    The house norm is a DIFFERENT population — whole tracked files, not added lines — so compute it, never quote it:
      files=$(git ls-files 'crates/*.rs')
      cat $files | grep -c '[^[:space:]]'

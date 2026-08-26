@@ -38,13 +38,15 @@ may be in flight, and this job needs reading, not building.
    never for whether it is good. This step usually runs before any PR exists.
 2. **Measure before judging.** Opinions are arguable; numbers are not.
 
-   Density of ADDED lines, per file — note `color.ui=never`, without which a
-   user with colour configured gets `0` and reads it as "no comments here":
+   Density of ADDED lines, per file. `color.ui=never`, without which a user
+   with colour configured gets `0` and reads it as "no comments here";
+   `..HEAD`, without which you measure the implementer's live working tree
+   instead of the subject step 1 declared:
 
    ```sh
    base=$(git merge-base origin/main HEAD)
-   git --no-pager -c color.ui=never diff "$base" -- FILE | grep -c '^+[^+]'
-   git --no-pager -c color.ui=never diff "$base" -- FILE | grep -cE '^\+\s*(//|/\*|\*[\s/])'
+   git --no-pager -c color.ui=never diff "$base"..HEAD -- FILE | grep -c '^+[^+]'
+   git --no-pager -c color.ui=never diff "$base"..HEAD -- FILE | grep -cE '^\+\s*(//|/\*|\*[\s/])'
    ```
 
    The house norm is a **different population** — whole tracked files, not added
