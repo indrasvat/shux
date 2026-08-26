@@ -321,3 +321,237 @@ async fn the_read_loop_leaves_the_child_reapable_for_teardown() {
          process group that is still alive"
     );
 }
+
+/// A pane child must not inherit the *outer* terminal's identity: a pane still
+/// advertising `KITTY_WINDOW_ID` makes every tool that sniffs it address the
+/// wrong terminal, silently. See `OUTER_TERMINAL_IDENTITY_VARS`, which this
+/// reads rather than restates -- a second copy would drift and leave a
+/// newly-added variable covered by nothing.
+#[tokio::test]
+async fn pane_child_does_not_inherit_outer_terminal_identity() {
+    const SENTINEL: &str = "leaked-outer-terminal";
+
+    // Every exact name, plus a synthesised member of each prefix family --
+    // including one nobody has written down, which is the point of prefixes.
+    let mut expected: Vec<String> = shux_pty::OUTER_TERMINAL_IDENTITY_VARS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+    for prefix in shux_pty::OUTER_TERMINAL_IDENTITY_PREFIXES {
+        expected.push(format!("{prefix}WINDOW_ID"));
+        expected.push(format!("{prefix}SOMETHING_INVENTED_LATER"));
+        // Anchored exemption: `CONFIG` anywhere but the start is still identity.
+        expected.push(format!("{prefix}SESSION_CONFIGURED_ID"));
+    }
+    expected.push("WINDOW".to_string());
+
+    let pairs: Vec<(&str, &str)> = expected
+        .iter()
+        .map(|k| (k.as_str(), SENTINEL))
+        // Not an emulator handle: proves this is a deny-list and not
+        // `env_clear`, which would take the user's whole environment with it.
+        .chain(std::iter::once(("SHUX_TEST_UNRELATED_VAR", SENTINEL)))
+        .collect();
+    let _env = EnvGuard::set(&pairs);
+
+    let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
+
+    let leaked: Vec<&String> = expected
+        .iter()
+        .filter(|key| env_has(&output, key, SENTINEL))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "pane child inherited the outer terminal's identity: {leaked:?}"
+    );
+    assert!(
+        env_has(&output, "SHUX_TEST_UNRELATED_VAR", SENTINEL),
+        "the scrub is a deny-list, not env_clear -- an unrelated variable must survive"
+    );
+    // Backstop, not the guard: the ordering at the scrub site is what makes a
+    // collision unrepresentable. This fires only if someone reorders AND adds a
+    // colliding name. COLORTERM/CLICOLOR are pinned by
+    // `test_spawn_interactive_env_enables_color_by_default`.
+    for (key, value) in [("TERM_PROGRAM", "shux"), ("SHUX", "1")] {
+        assert!(
+            env_has(&output, key, value),
+            "the scrub took shux's own {key}, which it sets itself: {output}"
+        );
+    }
+}
+
+/// Restores every variable it set, including on panic. Without this a test that
+/// panics mid-way leaves ~40 sentinels behind for whatever shares its process.
+struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
+
+impl EnvGuard {
+    fn set(pairs: &[(&str, &str)]) -> Self {
+        let saved = pairs
+            .iter()
+            .map(|(k, v)| {
+                let prior = std::env::var_os(k);
+                // SAFETY: nextest runs each test in its own process, so no other
+                // thread here observes the environment. Restored on drop.
+                unsafe { std::env::set_var(k, v) };
+                ((*k).to_string(), prior)
+            })
+            .collect();
+        Self(saved)
+    }
+
+    fn unset(keys: &[&str]) -> Self {
+        let saved = keys
+            .iter()
+            .map(|k| {
+                let prior = std::env::var_os(k);
+                // SAFETY: as above.
+                unsafe { std::env::remove_var(k) };
+                ((*k).to_string(), prior)
+            })
+            .collect();
+        Self(saved)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, prior) in &self.0 {
+            // SAFETY: as above.
+            match prior {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
+/// Line-exact `KEY=VALUE` lookup. `contains` would report `TERM_SESSION_ID` as
+/// leaked whenever `ITERM_SESSION_ID` is, sending the reader at the wrong name.
+fn env_has(output: &str, key: &str, value: &str) -> bool {
+    let needle = format!("{key}={value}");
+    output
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == needle)
+}
+
+fn env_dump_config() -> PtyConfig {
+    PtyConfig::with_command(
+        vec!["sh".into(), "-c".into(), "env; echo ENV_DONE".into()],
+        test_cwd(),
+    )
+}
+
+/// screen's bare `WINDOW` is only screen's when `STY` proves it. Without this
+/// test an UNCONDITIONAL `WINDOW` scrub passes the suite, taking a variable
+/// that belongs to the user.
+#[tokio::test]
+async fn window_survives_when_sty_is_unset() {
+    let _sty = EnvGuard::unset(&["STY"]);
+    let _window = EnvGuard::set(&[("WINDOW", "not-screens-window")]);
+
+    let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
+    assert!(
+        env_has(&output, "WINDOW", "not-screens-window"),
+        "a non-screen WINDOW was scrubbed even though STY was unset: {output}"
+    );
+}
+
+/// The scrub's documented escape hatch. Nothing else covers env-over-SCRUB --
+/// the existing NO_COLOR test covers env-over-DEFAULTS, which is a different
+/// ordering.
+#[tokio::test]
+async fn config_env_restores_a_scrubbed_var() {
+    let _outer = EnvGuard::set(&[("KITTY_WINDOW_ID", "outer-value")]);
+
+    let mut config = env_dump_config();
+    config
+        .env
+        .push(("KITTY_WINDOW_ID".to_string(), "restored".to_string()));
+
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
+    assert!(
+        env_has(&output, "KITTY_WINDOW_ID", "restored"),
+        "PtyConfig::env could not restore a scrubbed variable: {output}"
+    );
+}
+
+/// See `is_user_config_in_vendor_namespace` for why this boundary exists.
+#[tokio::test]
+async fn user_config_survives_inside_a_scrubbed_vendor_namespace() {
+    const KEPT: &[(&str, &str)] = &[
+        ("ZELLIJ_CONFIG_DIR", "cfg-dir"),
+        ("ZELLIJ_CONFIG_FILE", "cfg-file"),
+        ("ZELLIJ_AUTO_ATTACH", "true"),
+        ("KITTY_CONFIG_DIRECTORY", "kitty-cfg"),
+        ("WEZTERM_CONFIG_FILE", "wez-cfg"),
+    ];
+    // One name, only so the "scrubbed vendor namespace" in the title is proven
+    // here rather than inferred. The other mutants are covered by KEPT above and
+    // by `pane_child_does_not_inherit_outer_terminal_identity`.
+    const SCRUBBED: &[(&str, &str)] = &[("ZELLIJ_SESSION_NAME", "outer-session")];
+
+    let _kept = EnvGuard::set(KEPT);
+    let _scrubbed = EnvGuard::set(SCRUBBED);
+
+    let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
+    for (key, value) in KEPT {
+        assert!(
+            env_has(&output, key, value),
+            "user config {key} was scrubbed with the vendor's identity: {output}"
+        );
+    }
+    for (key, value) in SCRUBBED {
+        assert!(
+            !env_has(&output, key, value),
+            "{key} is identity, not config, and must not survive: {output}"
+        );
+    }
+}
+
+/// `COLORFGBG` must survive. Removing it is worse than leaking it: vim gets no
+/// polarity signal under `TERM=tmux-256color` and falls back to
+/// `background=light` inside a dark pane. Measured, not assumed -- scrubbing it
+/// flipped real vim from `background=dark` to `background=light`.
+#[tokio::test]
+async fn colorfgbg_survives_because_removing_it_misleads_vim() {
+    let _env = EnvGuard::set(&[("COLORFGBG", "15;0")]);
+
+    let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
+    assert!(
+        env_has(&output, "COLORFGBG", "15;0"),
+        "COLORFGBG was scrubbed; vim will pick background=light in a dark pane: {output}"
+    );
+}
+
+/// ncurses prefers `COLUMNS`/`LINES` over the pty ioctl, so a stale pair from
+/// the outer terminal makes every `tput cols` script render at the wrong width.
+#[tokio::test]
+async fn outer_terminal_geometry_does_not_reach_the_child() {
+    let _env = EnvGuard::set(&[("COLUMNS", "203"), ("LINES", "51")]);
+
+    let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
+    for (key, value) in [("COLUMNS", "203"), ("LINES", "51")] {
+        assert!(
+            !env_has(&output, key, value),
+            "the outer terminal's {key} reached the pane; `tput cols` will lie: {output}"
+        );
+    }
+}

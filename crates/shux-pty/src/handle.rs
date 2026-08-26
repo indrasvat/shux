@@ -240,6 +240,92 @@ mod tests {
     }
 }
 
+/// Variables by which a terminal emulator or host advertises *itself*. shux is
+/// the terminal a pane talks to, so inside a pane these name the wrong one.
+///
+/// Exact names; vendor families live in [`OUTER_TERMINAL_IDENTITY_PREFIXES`].
+/// `TERM_PROGRAM`/`TERM_PROGRAM_VERSION` are absent deliberately: shux
+/// overwrites those instead (see the `.env` call that sets them).
+///
+/// `COLORFGBG` is absent for a different reason: removing it is WORSE than
+/// leaking it. vim does not issue OSC 11 under `TERM=tmux-256color`, so with
+/// `COLORFGBG` gone it has no polarity signal and falls back to
+/// `background=light` -- measured, in a dark pane. It needs the
+/// `TERM_PROGRAM` treatment (set from shux's own theme) rather than removal,
+/// and that needs the theme plumbed into this crate.
+pub const OUTER_TERMINAL_IDENTITY_VARS: &[&str] = &[
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "ZELLIJ",
+    // Set by terminal-browser's tty7 backend (zenbu-labs/terminal-browser) --
+    // the app whose blank pane prompted this scrub.
+    "TTY7_PANE",
+    // `NVIM` names the OUTER nvim's socket, so `nvim` in a pane opens the file
+    // in the outer editor.
+    "NVIM",
+    "NVIM_LISTEN_ADDRESS",
+    "INSIDE_EMACS",
+    // NOT locale categories despite the prefix: iTerm2 uses `LC_*` so ssh's
+    // `SendEnv LC_*` forwards them, and POSIX ignores unknown `LC_*` names.
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "TERM_SESSION_ID",
+    "VTE_VERSION",
+    "GNOME_TERMINAL_SCREEN",
+    "GNOME_TERMINAL_SERVICE",
+    "XTERM_VERSION",
+    "TERMINAL_EMULATOR",
+    "TERMINOLOGY",
+    "CONTOUR_PROFILE",
+    "TILIX_ID",
+    "TERMINATOR_UUID",
+    "TERMINATOR_DBUS_NAME",
+    "TERMINATOR_DBUS_PATH",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
+    // Describe geometry or a window the pane is not drawing into. ncurses
+    // prefers `COLUMNS`/`LINES` over the pty ioctl, so a stale pair makes every
+    // `tput cols` script render at the OUTER terminal's width -- measured 203
+    // in an 80-column pane. `COLORFGBG` is deliberately NOT here: see below.
+    "WINDOWID",
+    "COLUMNS",
+    "LINES",
+    // Drive VS Code's OSC 633 integration, which shux's VT swallows anyway. Do
+    // NOT make this a `VSCODE_` prefix: that eats `VSCODE_IPC_HOOK_CLI` (breaks
+    // `code file` from a pane) and the `VSCODE_GIT_ASKPASS_*` trio.
+    "VSCODE_INJECTION",
+    "VSCODE_SHELL_INTEGRATION",
+];
+
+/// Vendor prefixes whose whole family names the outer terminal -- prefixes, so
+/// a variable an emulator adds later is still caught. Every entry is a full
+/// vendor word ending in `_`; anything shorter claims more namespace than it
+/// can justify and belongs in [`OUTER_TERMINAL_IDENTITY_VARS`] instead.
+pub const OUTER_TERMINAL_IDENTITY_PREFIXES: &[&str] = &[
+    "KITTY_",
+    "GHOSTTY_",
+    "WEZTERM_",
+    "ALACRITTY_",
+    "KONSOLE_",
+    "ZELLIJ_",
+    "WARP_",
+];
+
+/// A vendor namespace holds the user's configuration too, and scrubbing that is
+/// the same silent misbehaviour: `ZELLIJ_CONFIG_DIR` stripped from a pane makes
+/// a nested zellij load defaults. A rule rather than a third list, so it covers
+/// vendor knobs nobody has written down yet.
+///
+/// `rest` is the key with its vendor prefix already stripped, and the match is
+/// anchored there: a free substring search also exempts
+/// `WEZTERM_SESSION_CONFIGURED_ID`, which is identity, not configuration.
+fn is_user_config_in_vendor_namespace(rest: &[u8]) -> bool {
+    rest.starts_with(b"CONFIG") || rest.starts_with(b"AUTO_")
+}
+
 /// Configuration for spawning a PTY child process.
 #[derive(Debug, Clone)]
 pub struct PtyConfig {
@@ -497,6 +583,10 @@ fn write_once(fd: std::os::fd::RawFd, buf: &[u8]) -> std::io::Result<usize> {
 
 impl PtyHandle {
     /// Spawn a new PTY child process.
+    ///
+    /// Reads the process environment to scrub outer-terminal identity (see
+    /// [`OUTER_TERMINAL_IDENTITY_VARS`]), so it must not run concurrently with
+    /// `std::env::set_var`.
     pub fn spawn(config: &PtyConfig) -> Result<Self, PtyError> {
         let winsize = Winsize {
             ws_row: config.size.rows,
@@ -523,6 +613,30 @@ impl PtyHandle {
         if config.env_clear {
             cmd.env_clear();
         }
+        // Ordering is load-bearing: BEFORE the `.env()` calls below, so a name
+        // that is both scrubbed and set by shux keeps shux's value, and before
+        // `config.env`, so a caller can put one back.
+        for key in OUTER_TERMINAL_IDENTITY_VARS {
+            cmd.env_remove(key);
+        }
+        // screen's bare `WINDOW` is only screen's when `STY` is also set.
+        if std::env::var_os("STY").is_some() {
+            cmd.env_remove("WINDOW");
+        }
+        // Bytes, not `to_str`: a key that is not valid UTF-8 would skip silently.
+        for (key, _) in std::env::vars_os() {
+            let bytes = key.as_encoded_bytes();
+            let Some(rest) = OUTER_TERMINAL_IDENTITY_PREFIXES
+                .iter()
+                .find_map(|prefix| bytes.strip_prefix(prefix.as_bytes()))
+            else {
+                continue;
+            };
+            if !is_user_config_in_vendor_namespace(rest) {
+                cmd.env_remove(&key);
+            }
+        }
+
         cmd.args(args)
             .current_dir(&config.cwd)
             .stdin(stdin)
