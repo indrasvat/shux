@@ -370,3 +370,267 @@ async fn attach_detach_does_not_orphan_or_kill_pane_child() {
     h.rpc("session.kill", serde_json::json!({ "name": "life-attach" }));
     assert_pid_gone(pid, "session.kill after detach should reap pane child");
 }
+
+// The pidfile is untrusted: it survives SIGKILL and reboots and pids get reused,
+// so each test below is about who a pid actually belongs to. Each was seen RED.
+
+/// Reaps an adopted pid on drop, so a test for a leak never leaks when it fails.
+struct Reaper(Vec<i32>);
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            if kill(Pid::from_raw(*pid), None).is_ok() {
+                let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+            }
+        }
+    }
+}
+
+fn copy_bin(dir: &Path, name: &str) -> PathBuf {
+    let dst = dir.join(name);
+    std::fs::copy(env!("CARGO_BIN_EXE_shux"), &dst).expect("copy shux binary");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&dst).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&dst, perms).expect("chmod");
+    dst
+}
+
+/// Poll until `dir` holds `n` pidfiles naming live processes.
+///
+/// A fixed sleep is not good enough here: daemon startup under the coverage job's
+/// instrumentation, or on a loaded macOS runner, routinely outruns any constant
+/// small enough to keep the suite quick. This mirrors `wait_for_pid_file`.
+fn wait_for_pid_files(dir: &Path, n: usize) -> Vec<(PathBuf, u32)> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let found: Vec<(PathBuf, u32)> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "pid"))
+            .filter_map(|p| try_read_pid(&p).map(|pid| (p, pid)))
+            .filter(|(_, pid)| pid_exists(*pid))
+            .collect();
+        if found.len() >= n {
+            return found;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "{} held {} live pidfile(s), expected {n}",
+                dir.display(),
+                found.len()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_bin(bin: &Path, runtime: &Path, socket: Option<&Path>, args: &[&str]) -> Output {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("NO_COLOR", "1")
+        .env("SHELL", "/bin/sh");
+    match socket {
+        Some(s) => cmd.env("SHUX_SOCKET", s),
+        None => cmd.env_remove("SHUX_SOCKET"),
+    };
+    cmd.output().expect("run shux")
+}
+
+/// One build must stop a daemon another build started.
+///
+/// Identity used to be the executable: first "basename is `shux`", then "path
+/// equals `current_exe()`". Both disowned this case -- `daemon stop` printed
+/// "no daemon running", exited 0, deleted the pidfile and left the daemon alive.
+/// A daemon is ours because of the socket it serves, not what the file is named.
+#[test]
+fn one_build_stops_a_daemon_another_build_started() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bins = tempfile::tempdir().expect("temp bins");
+    let starter = copy_bin(bins.path(), "shux-AAA");
+    let stopper = copy_bin(bins.path(), "shux-BBB");
+    let mut reaper = Reaper(Vec::new());
+
+    let created = run_bin(&starter, runtime.path(), None, &["session", "list"]);
+    assert!(created.status.success(), "session list failed");
+
+    let pid = wait_for_pid_file(&runtime.path().join("shux").join("shux.pid"));
+    reaper.0.push(pid as i32);
+
+    let stopped = run_bin(&stopper, runtime.path(), None, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        "daemon {pid} started by shux-AAA survived `shux-BBB daemon stop`: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+}
+
+/// `daemon stop` must never signal a daemon serving a different socket.
+///
+/// Identity ignored which daemon it had found, so any shux daemon at that pid
+/// qualified. On a recycled pid that is another checkout's daemon, killed by a
+/// routine cleanup trap. Here the wrong pid is planted directly, which is what a
+/// pid collision looks like from the code's point of view.
+#[test]
+fn daemon_stop_spares_a_daemon_serving_another_socket() {
+    let theirs = tempfile::tempdir().expect("their runtime");
+    let ours = tempfile::tempdir().expect("our runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, theirs.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    let their_pid = wait_for_pid_file(&theirs.path().join("shux").join("shux.pid"));
+    reaper.0.push(their_pid as i32);
+
+    // Our runtime dir's pidfile names THEIR daemon.
+    let our_pidfile = ours.path().join("shux").join("shux.pid");
+    std::fs::create_dir_all(our_pidfile.parent().unwrap()).expect("mkdir");
+    std::fs::write(&our_pidfile, their_pid.to_string()).expect("plant pidfile");
+
+    let stopped = run_bin(&bin, ours.path(), None, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop must stay idempotent");
+
+    // Two positive assertions rather than sleeping to see whether something
+    // died: `daemon stop` has already exited, so it signalled or it did not.
+    let out = String::from_utf8_lossy(&stopped.stdout);
+    assert!(
+        out.contains("no daemon running"),
+        "expected a refusal, got: {out}"
+    );
+    // Still SERVING is stronger than still existing.
+    let their_reply = run_bin(&bin, theirs.path(), None, &["session", "list"]);
+    assert!(
+        their_reply.status.success(),
+        "a daemon serving another socket stopped answering after our `daemon stop`: {}",
+        String::from_utf8_lossy(&their_reply.stderr)
+    );
+}
+
+/// Two daemons in one runtime dir on different sockets must both be stoppable.
+///
+/// The pidfile was `$RUNTIME_DIR/shux.pid` while the socket is independently
+/// overridable, so the second daemon overwrote the first's entry and the first
+/// became unreachable: `daemon stop` could never name it again and it ran until
+/// the machine went down.
+#[test]
+fn two_sockets_in_one_runtime_dir_do_not_share_a_pidfile() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let one = runtime.path().join("one.sock");
+    let two = runtime.path().join("two.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    for sock in [&one, &two] {
+        assert!(
+            run_bin(&bin, runtime.path(), Some(sock), &["session", "list"])
+                .status
+                .success(),
+            "session list on {sock:?} failed"
+        );
+    }
+    // Two daemons must own two pidfiles. Sharing one is the defect: the second
+    // overwrote the first's entry and the first became unreachable.
+    let pids: Vec<u32> = wait_for_pid_files(&runtime.path().join("shux"), 2)
+        .into_iter()
+        .map(|(_, pid)| pid)
+        .collect();
+    for pid in &pids {
+        reaper.0.push(*pid as i32);
+    }
+
+    for sock in [&one, &two] {
+        let out = run_bin(&bin, runtime.path(), Some(sock), &["daemon", "stop"]);
+        assert!(out.status.success(), "daemon stop on {sock:?} failed");
+    }
+    for pid in &pids {
+        assert!(
+            wait_for_pid_gone(*pid, Duration::from_secs(5)),
+            "daemon {pid} was orphaned -- its pidfile was overwritten by the other socket"
+        );
+    }
+}
+
+/// Upgrading must not orphan a daemon started by the previous version.
+///
+/// Every shux before the socket-keyed pidfile wrote `$RUNTIME_DIR/shux.pid`
+/// whatever socket it served. A client that looked only at the new hashed name
+/// could not see such a daemon: it reported "no daemon running", left it alive
+/// and unreachable, and rebound its socket underneath it -- this PR's own bug,
+/// reintroduced at every upgrade. Simulated by moving the pidfile to where the
+/// old version would have written it, which is exactly the state upgrading
+/// leaves behind.
+#[test]
+fn a_daemon_from_before_the_socket_keyed_pidfile_is_still_stoppable() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let sock = runtime.path().join("custom.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, runtime.path(), Some(&sock), &["session", "list"])
+            .status
+            .success()
+    );
+    let (hashed, pid) = wait_for_pid_files(&runtime.path().join("shux"), 1)
+        .into_iter()
+        .next()
+        .expect("a pidfile");
+    reaper.0.push(pid as i32);
+
+    // Rewrite history: put the pid where the PREVIOUS version would have.
+    let legacy = runtime.path().join("shux").join("shux.pid");
+    std::fs::rename(&hashed, &legacy).expect("move pidfile to the legacy path");
+
+    let stopped = run_bin(&bin, runtime.path(), Some(&sock), &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        "a daemon recorded at the pre-upgrade pidfile path was orphaned: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+}
+
+/// Reading the legacy pidfile must not let one daemon claim another.
+///
+/// The migration above consults `$RUNTIME_DIR/shux.pid` when the socket-keyed
+/// file is absent. That file may belong to the DEFAULT daemon, so the identity
+/// check is what keeps the migration safe: a custom-socket client must not stop
+/// the default daemon just because its pid is the one recorded there.
+#[test]
+fn the_legacy_pidfile_is_not_claimed_by_a_daemon_serving_another_socket() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let mut reaper = Reaper(Vec::new());
+
+    // A DEFAULT-socket daemon, whose pidfile is the legacy path by definition.
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    let pid = wait_for_pid_file(&runtime.path().join("shux").join("shux.pid"));
+    reaper.0.push(pid as i32);
+
+    let other = runtime.path().join("other.sock");
+    let stopped = run_bin(&bin, runtime.path(), Some(&other), &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop must stay idempotent");
+    assert!(
+        String::from_utf8_lossy(&stopped.stdout).contains("no daemon running"),
+        "expected a refusal for a socket no daemon serves"
+    );
+    // Still serving is stronger than still existing.
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success(),
+        "the default daemon was stopped by a client asking about another socket"
+    );
+}

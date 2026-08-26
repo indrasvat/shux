@@ -5,7 +5,7 @@
 //! the pane I/O state, the attach listener and the router together and hands
 //! back the handle daemon shutdown drains.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,8 +26,15 @@ use crate::{
 /// 5. Bind UDS
 /// 6. Run daemon state loop
 pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
+    // Resolve the socket BEFORE forking: the pidfile is keyed to it, and
+    // `daemonize` is what writes the pidfile.
+    let sock_path = match socket_override {
+        Some(p) => p,
+        None => daemon::socket_path()?,
+    };
+
     // Step 1: Daemonize BEFORE tokio
-    if !daemon::daemonize()? {
+    if !daemon::daemonize(&sock_path)? {
         // We are the parent — exit cleanly
         return Ok(());
     }
@@ -51,7 +58,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 
         // Ensure runtime dir and clean up stale socket
         let runtime_dir = daemon::ensure_runtime_dir()?;
-        daemon::remove_socket_file()?;
+        daemon::remove_socket_file_for(&sock_path)?;
 
         // Daemon-level lens audit log (LENS-R-052): ONE instance for the
         // whole daemon — the chain head is cached in memory, so a second
@@ -82,13 +89,14 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         // working daemon behind with nothing referencing it — and every
         // subsequent invocation did it again, each new daemon overwriting the
         // pidfile so `daemon stop` could only ever reap the last one.
-        let sock_path = match socket_override {
-            Some(p) => p,
-            None => daemon::socket_path()?,
-        };
         let cancel = tokens.root.clone();
-        let io_state =
-            run_rpc_server(sock_path, cancel.clone(), lens_audit, unresolved_scratch).await?;
+        let io_state = run_rpc_server(
+            sock_path.clone(),
+            cancel.clone(),
+            lens_audit,
+            unresolved_scratch,
+        )
+        .await?;
 
         // Run the daemon state loop (blocks until shutdown)
         shux_core::daemon::run_daemon_state_loop(cmd_rx, tokens.clone(), config_reload_notify)
@@ -101,8 +109,8 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         shutdown_all_pane_io(io_state).await;
 
         // Cleanup
-        daemon::remove_pid_file()?;
-        daemon::remove_socket_file()?;
+        daemon::remove_pid_file_for(&sock_path)?;
+        daemon::remove_socket_file_for(&sock_path)?;
         tracing::info!("Daemon shut down cleanly");
 
         Ok::<(), anyhow::Error>(())
@@ -111,33 +119,139 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// True when `pid` is alive AND is actually a shux daemon.
+/// A process's argv. Exactly one variant is built per platform, so the other is
+/// genuinely dead there -- hence the type-level allow under `-Dwarnings`.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum ProcessArgv {
+    /// From `/proc`: boundaries are real. Linux only.
+    Exact(Vec<String>),
+    /// From `ps`: space-joined, boundaries unrecoverable.
+    Joined(String),
+}
+
+/// The argv of `pid`, or `None` if it cannot be read.
+/// `/proc` is authoritative here, empty included: `cmdline` reads back empty
+/// mid-exec and for zombies, and `None` makes the caller poll again rather than
+/// fall through to the lossy `ps` path.
+#[cfg(target_os = "linux")]
+fn process_argv(pid: u32) -> Option<ProcessArgv> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    (!argv.is_empty()).then_some(ProcessArgv::Exact(argv))
+}
+
+/// `-ww` is not optional: BSD `ps` truncates argv without it.
+#[cfg(not(target_os = "linux"))]
+fn process_argv(pid: u32) -> Option<ProcessArgv> {
+    let out = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .ok()?;
+    let joined = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    (!joined.is_empty()).then_some(ProcessArgv::Joined(joined))
+}
+
+/// Whether a space-joined argv serves exactly `socket`.
 ///
-/// The pidfile is untrusted input: it survives SIGKILL and reboots, and pids get reused, so
-/// a bare `kill(pid)` on its contents can hit a bystander. Verified by reading the process's
-/// own argv — a shux daemon runs as `<path>/shux __daemon`.
-pub(crate) fn is_live_shux_daemon(pid: u32) -> bool {
+/// Splitting on whitespace would lose a socket path containing a space, so the
+/// expected rendering is matched instead. The match must end at a space or
+/// end-of-string, or `/a/x.sock` would also match `/a/x.sock2`.
+fn joined_serves_socket(joined: &str, socket: &Path) -> bool {
+    let socket = socket.to_string_lossy();
+    let needle = format!(" --socket {socket}");
+    joined
+        .split_once(&needle)
+        .is_some_and(|(_, rest)| rest.is_empty() || rest.starts_with(' '))
+}
+
+/// The socket a daemon process is serving, read from its own argv.
+///
+/// An argv without `--socket` names no socket and is nobody's daemon. Inferring
+/// "the default" there was a hole: the 085 bystander `watch-for shux __daemon`
+/// has no `--socket`, so it was claimed as the default daemon and signalled.
+fn served_socket(argv: &[String]) -> Option<PathBuf> {
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--socket" {
+            return it.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+/// Whether two socket paths name the same endpoint.
+fn same_socket(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// True when `pid` is alive AND is a shux daemon serving `socket`.
+///
+/// The pidfile is untrusted: it survives SIGKILL and reboots and pids get reused, so identity
+/// comes from the process's own argv. Deliberately NOT the executable name -- requiring the
+/// basename `shux` disowned every renamed build and orphaned its daemon. The served socket is
+/// what makes a daemon *ours* rather than merely *a shux daemon*.
+fn is_live_shux_daemon(pid: u32, socket: &Path) -> bool {
     if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
         return false;
     }
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "args="])
-        .output()
-    else {
+    match process_argv(pid) {
+        Some(ProcessArgv::Exact(argv)) => argv_is_daemon_for(&argv, socket),
+        Some(ProcessArgv::Joined(joined)) => {
+            joined.contains(" __daemon") && joined_serves_socket(&joined, socket)
+        }
         // Without a way to confirm identity, refuse to claim it is ours.
+        None => false,
+    }
+}
+
+/// Whether `argv` is a shux daemon serving `socket`. Split out so it can be
+/// tested against hand-built argv.
+fn argv_is_daemon_for(argv: &[String], socket: &Path) -> bool {
+    // Exact argv position, not a substring match (085 QA P3): a bystander whose command line
+    // merely CONTAINS both words -- say `watch-for shux __daemon` -- must not be accepted.
+    if argv.get(1).map(String::as_str) != Some("__daemon") {
         return false;
-    };
-    // Exact argv positions, not a substring match (085 QA P3): a bystander whose command
-    // line merely CONTAINS both words — say `watch-for shux __daemon` — would otherwise be
-    // accepted as the daemon and signalled. A shux daemon is `<path>/shux __daemon`.
-    let args = String::from_utf8_lossy(&out.stdout);
-    let mut argv = args.split_whitespace();
-    let exe_is_shux = argv
-        .next()
-        .and_then(|p| p.rsplit('/').next())
-        .is_some_and(|base| base == "shux");
-    let first_arg_is_daemon = argv.next() == Some("__daemon");
-    exe_is_shux && first_arg_is_daemon
+    }
+    served_socket(argv).is_some_and(|served| same_socket(&served, socket))
+}
+
+/// Our live daemon for `socket`, and the pidfile that named it.
+///
+/// The pidfile path travels with the pid because they must not be looked up
+/// separately: the file removed after a successful stop has to be the file the
+/// pid came from, which on an upgrade is the legacy one.
+pub(crate) struct LiveDaemon {
+    pub(crate) pid: u32,
+    pub(crate) pidfile: PathBuf,
+}
+
+/// The only sanctioned way to turn a pidfile into a pid you may signal.
+///
+/// Both signalling paths go through here so the check cannot be forgotten:
+/// `daemon stop`, and the version-mismatch restart in `client::kill_stale_daemon`
+/// -- which had none and SIGTERMed whatever the pidfile held. pid 0 and 1 are
+/// rejected: `kill(0, ..)` signals the process group and pid 1 is init.
+pub(crate) fn our_live_daemon(socket: &Path) -> Option<LiveDaemon> {
+    for pidfile in daemon::pid_file_candidates(socket).ok()? {
+        if let Some(pid) = daemon::read_pid_at(&pidfile)
+            && pid > 1
+            && is_live_shux_daemon(pid, socket)
+        {
+            return Some(LiveDaemon { pid, pidfile });
+        }
+    }
+    None
 }
 
 /// `shux daemon stop|status` — the missing half of the daemon lifecycle (085 F5).
@@ -152,20 +266,16 @@ pub(crate) fn is_live_shux_daemon(pid: u32) -> bool {
 pub(crate) fn handle_daemon_command(
     command: cli::DaemonCommand,
     format: cli::OutputFormat,
+    socket: &Path,
 ) -> anyhow::Result<()> {
-    let pid = daemon::read_pid_file().ok().flatten();
-    // A pidfile can outlive its process (SIGKILL, a reboot) and the OS reuses pids, so the
-    // number in it may name a COMPLETELY UNRELATED process by the time we read it. Probe
-    // with signal 0, then confirm the process really is a shux daemon before believing the
-    // file — otherwise `daemon stop` becomes "SIGTERM an arbitrary pid", which is the exact
-    // failure this verb exists to avoid. pid 0 and 1 are rejected outright: `kill(0, …)`
-    // signals the whole process group and pid 1 is init.
-    let alive = pid.is_some_and(|p| p > 1 && is_live_shux_daemon(p));
+    // Carries the validated pid AND the file it came from, so the pid signalled
+    // is the pid that was validated and the file removed is the one that named it.
+    let ours = our_live_daemon(socket);
 
     match command {
         cli::DaemonCommand::Status => {
-            match (pid, alive) {
-                (Some(p), true) => match format {
+            match ours.as_ref().map(|d| d.pid) {
+                Some(p) => match format {
                     cli::OutputFormat::Json => println!("{{\"running\": true, \"pid\": {p}}}"),
                     _ => println!(
                         "{} {}",
@@ -173,7 +283,7 @@ pub(crate) fn handle_daemon_command(
                         style::muted(format!("pid {p}"))
                     ),
                 },
-                _ => match format {
+                None => match format {
                     cli::OutputFormat::Json => println!("{{\"running\": false, \"pid\": null}}"),
                     _ => println!("{}", style::warning("daemon not running")),
                 },
@@ -181,14 +291,15 @@ pub(crate) fn handle_daemon_command(
             Ok(())
         }
         cli::DaemonCommand::Stop => {
-            let Some(p) = pid.filter(|_| alive) else {
-                // Idempotent: safe to call from a cleanup trap that may run twice.
+            let Some(LiveDaemon { pid: p, pidfile }) = ours else {
+                // Idempotent, and exit 0: a cleanup trap may run this twice
+                // (skills/shux/references/gate.md).
                 if let cli::OutputFormat::Json = format {
                     println!("{{\"stopped\": false, \"reason\": \"not_running\"}}");
                 } else {
                     println!("{}", style::muted("no daemon running"));
                 }
-                let _ = daemon::remove_pid_file();
+                let _ = daemon::remove_pid_file_for(socket);
                 return Ok(());
             };
             // SIGTERM → the daemon's signal handler runs a graceful shutdown.
@@ -205,8 +316,8 @@ pub(crate) fn handle_daemon_command(
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             if gone {
-                let _ = daemon::remove_pid_file();
-                let _ = daemon::remove_socket_file();
+                let _ = std::fs::remove_file(&pidfile);
+                let _ = daemon::remove_socket_file_for(socket);
             }
             match (format, gone) {
                 (cli::OutputFormat::Json, _) => {
@@ -584,28 +695,191 @@ mod tests {
     /// killed an innocent `sleep`. The identity check is what makes the verb safe.
     #[test]
     fn a_live_non_daemon_pid_is_not_mistaken_for_the_daemon() {
+        let sock = Path::new("/nonexistent/shux.sock");
         // This test process is alive and is emphatically not a shux daemon.
         assert!(
-            !super::is_live_shux_daemon(std::process::id()),
+            !super::is_live_shux_daemon(std::process::id(), sock),
             "a live process that is not `shux __daemon` must never be treated as the daemon"
         );
         // pid 1 is init; signalling it would be catastrophic and it is never our daemon.
-        assert!(!super::is_live_shux_daemon(1));
+        assert!(!super::is_live_shux_daemon(1, sock));
 
         // 085 QA P3: a bystander whose command line merely CONTAINS both words must be
         // rejected. A substring check accepted this and killed it.
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", r#"exec -a "watch-for shux __daemon" /bin/sleep 5"#])
+        //
+        // argv0 is spoofed with `CommandExt::arg0`, NOT `sh -c 'exec -a ...'`.
+        // That shell form is a bashism: `/bin/sh` is dash on Debian and Ubuntu,
+        // whose `exec` has no `-a`, so the shell errored out and the "bystander"
+        // was already dead by the time the assertion ran. The check then passed
+        // because there was no process, not because its argv was rejected --
+        // green on every tree, proving nothing. `arg0` is a direct execve and
+        // needs no shell at all.
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("/bin/sleep")
+            .arg0("watch-for shux __daemon")
+            .arg("5")
             .spawn()
             .expect("spawn crafted-argv bystander");
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let verdict = super::is_live_shux_daemon(child.id());
+        // Adopted BEFORE the poll below, which asserts and so can panic. An
+        // earlier revision killed the child only after the assertions and
+        // leaked it on every failure -- nextest reported `FAIL + LEAK`.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(child);
+        let child = &mut child.0;
+
+        // Wait for the exec, not for a duration: before it lands argv is still
+        // this test's own, and the negative below would again pass for the
+        // wrong reason.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let argv = super::process_argv(child.id());
+            let exec_landed = match &argv {
+                Some(super::ProcessArgv::Exact(v)) => {
+                    v.first().is_some_and(|a| a.contains("watch-for"))
+                }
+                Some(super::ProcessArgv::Joined(j)) => j.contains("watch-for"),
+                None => false,
+            };
+            if exec_landed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bystander never exec'd; argv still {argv:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let verdict = super::is_live_shux_daemon(child.id(), sock);
         let _ = child.kill();
         let _ = child.wait();
         assert!(
             !verdict,
             "a process whose argv merely contains `shux` and `__daemon` is not the daemon"
         );
+    }
+
+    /// A daemon is claimed only for the socket it actually serves.
+    ///
+    /// Without this, any shux daemon at the pidfile's pid qualified -- so on a
+    /// recycled pid, `daemon stop` could signal another checkout's daemon.
+    #[test]
+    fn a_daemon_serving_another_socket_is_not_ours() {
+        let argv: Vec<String> = [
+            "/opt/shux/bin/shux",
+            "__daemon",
+            "--socket",
+            "/run/other/x.sock",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(
+            !super::argv_is_daemon_for(&argv, Path::new("/run/mine/x.sock")),
+            "a daemon serving another socket must never be ours"
+        );
+        assert!(
+            super::argv_is_daemon_for(&argv, Path::new("/run/other/x.sock")),
+            "the same argv IS the daemon for the socket it serves -- without this the \
+             test would pass on a predicate that rejects everything"
+        );
+    }
+
+    /// Identity does not depend on what the executable is called.
+    ///
+    /// The bug this replaced required the basename to be `shux`, which disowned
+    /// every daemon from a renamed build and leaked it.
+    #[test]
+    fn the_executable_name_does_not_decide_identity() {
+        for exe in ["/tmp/shux-AAA", "/opt/shux-0.46.21", "/x/y/shux"] {
+            let argv: Vec<String> = [exe, "__daemon", "--socket", "/run/mine/x.sock"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert!(
+                super::argv_is_daemon_for(&argv, Path::new("/run/mine/x.sock")),
+                "{exe} serving our socket is our daemon whatever it is called"
+            );
+        }
+    }
+
+    /// `__daemon` must sit at argv[1], not merely appear somewhere.
+    #[test]
+    fn daemon_must_be_the_first_argument() {
+        let argv: Vec<String> = [
+            "watch-for",
+            "shux",
+            "__daemon",
+            "--socket",
+            "/run/mine/x.sock",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(!super::argv_is_daemon_for(
+            &argv,
+            Path::new("/run/mine/x.sock")
+        ));
+    }
+
+    /// A space-joined argv (the macOS `ps` path) must still resolve the socket.
+    ///
+    /// Splitting on whitespace loses a socket path containing a space, and the
+    /// daemon then fails to recognise ITSELF: `daemon stop` deletes its pidfile
+    /// and leaves it running -- this bug, on the platform that cannot use
+    /// `/proc`.
+    #[test]
+    fn a_joined_argv_resolves_a_socket_containing_spaces() {
+        let spacey = "/tmp/my sockets/shux.sock";
+        let joined = format!("/opt/shux __daemon --socket {spacey}");
+        assert!(super::joined_serves_socket(&joined, Path::new(spacey)));
+        assert!(!super::joined_serves_socket(
+            &joined,
+            Path::new("/tmp/my sockets/other.sock")
+        ));
+
+        // A prefix must not match: `/a/x.sock` is not `/a/x.sock2`.
+        let joined = "/opt/shux __daemon --socket /a/x.sock2".to_string();
+        assert!(!super::joined_serves_socket(
+            &joined,
+            Path::new("/a/x.sock")
+        ));
+        assert!(super::joined_serves_socket(
+            &joined,
+            Path::new("/a/x.sock2")
+        ));
+
+        // A trailing argument after the socket.
+        assert!(super::joined_serves_socket(
+            "/opt/shux __daemon --socket /a/x.sock --verbose",
+            Path::new("/a/x.sock")
+        ));
+    }
+
+    /// An argv with no `--socket` is nobody's daemon, on either platform.
+    ///
+    /// Inferring "the default socket" there re-opened the 085 P3 defect on the
+    /// macOS path: `watch-for shux __daemon` contains ` __daemon` and has no
+    /// `--socket`, so it was claimed as the default daemon and would have been
+    /// signalled. Verified failing before the fix.
+    #[test]
+    fn an_argv_without_socket_is_nobodys_daemon() {
+        let default = super::daemon::socket_path().unwrap();
+        assert!(!super::joined_serves_socket(
+            "watch-for shux __daemon 5",
+            &default
+        ));
+        assert!(!super::joined_serves_socket("/opt/shux __daemon", &default));
+        let argv: Vec<String> = ["/opt/shux", "__daemon"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(super::served_socket(&argv), None);
     }
 
     #[tokio::test]

@@ -90,11 +90,16 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> 
     Some(DaemonVersion { version, git_sha })
 }
 
-/// Kill the running daemon by sending SIGTERM to the PID from the PID file.
-fn kill_stale_daemon() -> bool {
-    let pid = match daemon::read_pid_file() {
-        Ok(Some(pid)) => pid,
-        _ => return false,
+/// Kill the daemon serving `socket` by SIGTERM, if the pidfile names one of ours.
+///
+/// Fires on a version mismatch -- an ordinary `session list` against an older
+/// daemon -- and used to SIGTERM whatever the pidfile held, unverified.
+fn kill_stale_daemon(socket: &Path) -> bool {
+    let Some(crate::daemon_boot::LiveDaemon { pid, pidfile }) =
+        crate::daemon_boot::our_live_daemon(socket)
+    else {
+        let _ = daemon::remove_pid_file_for(socket);
+        return false;
     };
 
     // Safety: sending SIGTERM to a known process
@@ -109,8 +114,8 @@ fn kill_stale_daemon() -> bool {
     } else {
         debug!(pid, "Failed to send SIGTERM (process may already be gone)");
         // Clean up stale files even if kill failed
-        let _ = daemon::remove_pid_file();
-        let _ = daemon::remove_socket_file();
+        let _ = std::fs::remove_file(&pidfile);
+        let _ = daemon::remove_socket_file_for(socket);
         true
     }
 }
@@ -124,8 +129,8 @@ async fn wait_for_daemon_exit(socket_path: &Path) {
         }
     }
     // Force cleanup if daemon didn't exit
-    let _ = daemon::remove_socket_file();
-    let _ = daemon::remove_pid_file();
+    let _ = daemon::remove_socket_file_for(socket_path);
+    let _ = daemon::remove_pid_file_for(socket_path);
 }
 
 /// Ensure the daemon is running at the given socket path and return a connected socket.
@@ -164,7 +169,7 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
 
             // Version mismatch or check failed: kill and restart
             drop(stream);
-            kill_stale_daemon();
+            kill_stale_daemon(socket_path);
             wait_for_daemon_exit(socket_path).await;
         }
         Err(e) if is_connection_refused_or_not_found(&e) => {
