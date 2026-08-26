@@ -1,3 +1,10 @@
+## [0.46.23](https://github.com/indrasvat/shux/compare/v0.46.22...v0.46.23) (2026-08-26)
+
+
+### Bug Fixes
+
+* **daemon:** identify a daemon by the socket it serves, not its filename ([#170](https://github.com/indrasvat/shux/issues/170)) ([b78f2ca](https://github.com/indrasvat/shux/commit/b78f2ca2d3d2db318903b4881a6a7d707870933c))
+
 ## [0.46.22](https://github.com/indrasvat/shux/compare/v0.46.21...v0.46.22) (2026-08-26)
 
 
