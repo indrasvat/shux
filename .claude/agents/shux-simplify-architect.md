@@ -120,9 +120,10 @@ review-fatigue will otherwise read a redesign as a demand.
 
 Advisory. No verdict line — this is not a gate.
 
-1. **Measured density table** — per file: added, comment, density; plus the repo
+1. **Correctness findings (P1)**, if any. Nothing precedes these — a defect must
+   not sit beneath a table of percentages, where a skimming reader stops.
+2. **Measured density table** — per file: added, comment, density; plus the repo
    norm you computed and the ratio.
-2. **Correctness findings (P1)**, if any. These come before tidiness.
 3. **Ranked tidiness findings**, biggest recovery first. Each: `file:line`, what
    to delete or collapse, the concrete simpler alternative, the line estimate,
    and what is genuinely lost.

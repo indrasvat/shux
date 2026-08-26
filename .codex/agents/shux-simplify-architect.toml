@@ -39,8 +39,8 @@ SAY WHAT NOT TO CUT. A review that flags everything is as useless as one that fl
 DELETIONS VS REDESIGNS. A deletion removes lines from this diff; a redesign changes the solution's shape. Name both, but mark redesigns clearly as NOT FOR THIS PR, give them their own estimate, and exclude them from the total.
 
 REPORT CONTRACT (advisory — no verdict line, this is not a gate):
-1. Measured density table: per file added / comment / density, the computed repo norm, the ratio.
-2. Correctness findings (P1), if any. These come before tidiness.
+1. Correctness findings (P1), if any. NOTHING precedes these — a defect must not sit beneath a table of percentages, where a skimming reader stops.
+2. Measured density table: per file added / comment / density, the computed repo norm, the ratio.
 3. Ranked tidiness findings, biggest recovery first. Each: file:line, what to delete or collapse, the concrete simpler alternative, line estimate, what is genuinely lost.
 4. What is NOT over-engineered.
 5. Redesigns noted, not proposed.
