@@ -462,6 +462,22 @@ async fn window_survives_when_sty_is_unset() {
     );
 }
 
+/// An EMPTY `STY` is not screen either -- screen always writes a session id --
+/// so `is_some()` alone takes a `WINDOW` that belongs to the user.
+#[tokio::test]
+async fn window_survives_when_sty_is_set_but_empty() {
+    let _env = EnvGuard::set(&[("STY", ""), ("WINDOW", "not-screens-window")]);
+
+    let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
+    let output = read_pty_to_exit(&mut handle).await;
+
+    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
+    assert!(
+        env_has(&output, "WINDOW", "not-screens-window"),
+        "an empty STY does not prove screen set WINDOW, but it was scrubbed: {output}"
+    );
+}
+
 /// The scrub's documented escape hatch. Nothing else covers env-over-SCRUB --
 /// the existing NO_COLOR test covers env-over-DEFAULTS, which is a different
 /// ordering.

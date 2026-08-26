@@ -619,8 +619,10 @@ impl PtyHandle {
         for key in OUTER_TERMINAL_IDENTITY_VARS {
             cmd.env_remove(key);
         }
-        // screen's bare `WINDOW` is only screen's when `STY` is also set.
-        if std::env::var_os("STY").is_some() {
+        // screen's bare `WINDOW` is only screen's when `STY` is also set, and
+        // set to something: screen always writes a session id, so an empty
+        // `STY` proves nothing and the user's own `WINDOW` must survive it.
+        if std::env::var_os("STY").is_some_and(|sty| !sty.is_empty()) {
             cmd.env_remove("WINDOW");
         }
         // Bytes, not `to_str`: a key that is not valid UTF-8 would skip silently.
