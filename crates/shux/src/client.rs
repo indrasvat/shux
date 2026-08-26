@@ -92,11 +92,8 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> 
 
 /// Kill the daemon serving `socket` by SIGTERM, if the pidfile names one of ours.
 ///
-/// The identity check is the whole point. This fires on a version mismatch --
-/// an ordinary `shux session list` against an older daemon -- and it used to
-/// SIGTERM whatever number the pidfile held, unverified. A pidfile survives
-/// SIGKILL and reboots and pids get reused, so that is "SIGTERM an arbitrary
-/// process" on a routine command.
+/// Fires on a version mismatch -- an ordinary `session list` against an older
+/// daemon -- and used to SIGTERM whatever the pidfile held, unverified.
 fn kill_stale_daemon(socket: &Path) -> bool {
     let Some(crate::daemon_boot::LiveDaemon { pid, pidfile }) =
         crate::daemon_boot::our_live_daemon(socket)

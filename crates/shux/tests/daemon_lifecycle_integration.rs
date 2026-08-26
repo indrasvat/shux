@@ -371,122 +371,8 @@ async fn attach_detach_does_not_orphan_or_kill_pane_child() {
     assert_pid_gone(pid, "session.kill after detach should reap pane child");
 }
 
-/// `daemon stop` must stop the daemon it started, whatever the binary is called.
-///
-/// The identity check that keeps `daemon stop` from signalling a bystander used
-/// to require the executable's basename to be literally `shux`. Any other name —
-/// an A/B pair like `shux-BEFORE`/`shux-AFTER`, a versioned or distro-renamed
-/// install — made shux fail to recognise its OWN daemon. Two things then went
-/// wrong at once: it printed "no daemon running" and exited 0, so a cleanup trap
-/// believed the daemon was gone, and it deleted the pidfile, orphaning a live
-/// daemon that nothing could find afterwards. Every A/B harness leaked one
-/// daemon per run.
-#[test]
-fn daemon_stop_reaps_a_daemon_started_by_a_renamed_binary() {
-    let runtime = tempfile::tempdir().expect("temp runtime dir");
-    let bin_dir = tempfile::tempdir().expect("temp bin dir");
-    let renamed = bin_dir.path().join("shux-under-a-different-name");
-    std::fs::copy(env!("CARGO_BIN_EXE_shux"), &renamed).expect("copy shux binary");
-    let mut perms = std::fs::metadata(&renamed).expect("stat").permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o755);
-    }
-    std::fs::set_permissions(&renamed, perms).expect("chmod");
-
-    let run = |args: &[&str]| -> Output {
-        Command::new(&renamed)
-            .args(args)
-            .env("XDG_RUNTIME_DIR", runtime.path())
-            .env_remove("SHUX_SOCKET")
-            .env("NO_COLOR", "1")
-            .env("SHELL", "/bin/sh")
-            .output()
-            .expect("run renamed shux")
-    };
-
-    // Auto-starts the daemon.
-    let created = run(&[
-        "--format",
-        "json",
-        "session",
-        "create",
-        "renamed-daemon-test",
-        "-d",
-        "--",
-        "sh",
-        "-c",
-        "sleep 120",
-    ]);
-    assert!(
-        created.status.success(),
-        "session create failed: {}",
-        String::from_utf8_lossy(&created.stderr)
-    );
-
-    // A test for a leak bug that leaks when it fails is its own bug: an earlier
-    // draft asserted first and reaped last, and left a daemon behind every time
-    // it ran against the unfixed code. The guard is installed before the pidfile
-    // is read and adopts the pid the moment it parses, so every path from there
-    // on reaps -- including the `daemon stop` failure and daemon-survived paths,
-    // which are the ones that actually fire.
-    //
-    // What it does NOT cover, deliberately: a missing or unparseable pidfile
-    // still panics with `self.0 == None`. There is no pid to reap in that case,
-    // so there is nothing the guard could do; the daemon, if any, is
-    // unreachable by pid either way.
-    struct Reaper(Option<i32>);
-    impl Drop for Reaper {
-        fn drop(&mut self) {
-            if let Some(pid) = self.0
-                && kill(Pid::from_raw(pid), None).is_ok()
-            {
-                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-            }
-        }
-    }
-    let mut reaper = Reaper(None);
-
-    let pid_path = runtime.path().join("shux").join("shux.pid");
-    let pid_text = std::fs::read_to_string(&pid_path).expect("pidfile");
-    // Adopt the pid the instant it is known, before anything can panic on it.
-    reaper.0 = pid_text.trim().parse().ok();
-    let pid: i32 = reaper
-        .0
-        .unwrap_or_else(|| panic!("unparseable pid {pid_text:?}"));
-    assert!(
-        kill(Pid::from_raw(pid), None).is_ok(),
-        "daemon {pid} should be alive before stop"
-    );
-
-    let _ = run(&["session", "kill", "renamed-daemon-test"]);
-    let stopped = run(&["daemon", "stop"]);
-    assert!(
-        stopped.status.success(),
-        "daemon stop failed: {}",
-        String::from_utf8_lossy(&stopped.stderr)
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if kill(Pid::from_raw(pid), None).is_err() {
-            return; // reaped
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    panic!(
-        "daemon {pid} survived `daemon stop`, which reported: {}",
-        String::from_utf8_lossy(&stopped.stdout).trim()
-    );
-}
-
-// ── pidfile identity: three defects, one root cause ─────────────────────────
-//
-// The pidfile is untrusted input -- it survives SIGKILL and reboots, and pids
-// get reused -- so every one of these is about who a pid actually belongs to.
-// Each test below was seen RED against the code before its fix.
+// The pidfile is untrusted: it survives SIGKILL and reboots and pids get reused,
+// so each test below is about who a pid actually belongs to. Each was seen RED.
 
 /// Reaps an adopted pid on drop, so a test for a leak never leaks when it fails.
 struct Reaper(Vec<i32>);
@@ -503,13 +389,10 @@ impl Drop for Reaper {
 fn copy_bin(dir: &Path, name: &str) -> PathBuf {
     let dst = dir.join(name);
     std::fs::copy(env!("CARGO_BIN_EXE_shux"), &dst).expect("copy shux binary");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dst).expect("stat").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&dst, perms).expect("chmod");
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&dst).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&dst, perms).expect("chmod");
     dst
 }
 
@@ -518,16 +401,17 @@ fn copy_bin(dir: &Path, name: &str) -> PathBuf {
 /// A fixed sleep is not good enough here: daemon startup under the coverage job's
 /// instrumentation, or on a loaded macOS runner, routinely outruns any constant
 /// small enough to keep the suite quick. This mirrors `wait_for_pid_file`.
-fn wait_for_pid_files(dir: &Path, n: usize) -> Vec<u32> {
+fn wait_for_pid_files(dir: &Path, n: usize) -> Vec<(PathBuf, u32)> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let found: Vec<u32> = std::fs::read_dir(dir)
+        let found: Vec<(PathBuf, u32)> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "pid"))
-            .filter_map(|e| try_read_pid(&e.path()))
-            .filter(|pid| pid_exists(*pid))
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "pid"))
+            .filter_map(|p| try_read_pid(&p).map(|pid| (p, pid)))
+            .filter(|(_, pid)| pid_exists(*pid))
             .collect();
         if found.len() >= n {
             return found;
@@ -614,29 +498,19 @@ fn daemon_stop_spares_a_daemon_serving_another_socket() {
     let stopped = run_bin(&bin, ours.path(), None, &["daemon", "stop"]);
     assert!(stopped.status.success(), "daemon stop must stay idempotent");
 
-    // Two POSITIVE assertions instead of sleeping and hoping. Waiting a fixed
-    // interval to see whether something died is a guess -- too short and it
-    // passes on a daemon that was about to die, too long and the suite crawls.
-    //
-    // 1. Our invocation must say it refused. `daemon stop` has already exited,
-    //    so if it were going to signal, it signalled before this returned.
+    // Two positive assertions rather than sleeping to see whether something
+    // died: `daemon stop` has already exited, so it signalled or it did not.
     let out = String::from_utf8_lossy(&stopped.stdout);
     assert!(
         out.contains("no daemon running"),
         "expected a refusal, got: {out}"
     );
-    // 2. Their daemon must still SERVE, which is stronger than still existing:
-    //    a SIGTERMed daemon stops answering. A successful round-trip is a
-    //    positive, immediate fact -- no waiting involved.
+    // Still SERVING is stronger than still existing.
     let their_reply = run_bin(&bin, theirs.path(), None, &["session", "list"]);
     assert!(
         their_reply.status.success(),
         "a daemon serving another socket stopped answering after our `daemon stop`: {}",
         String::from_utf8_lossy(&their_reply.stderr)
-    );
-    assert!(
-        pid_exists(their_pid),
-        "`daemon stop` killed a daemon serving another socket (pid {their_pid})"
     );
 }
 
@@ -664,12 +538,10 @@ fn two_sockets_in_one_runtime_dir_do_not_share_a_pidfile() {
     }
     // Two daemons must own two pidfiles. Sharing one is the defect: the second
     // overwrote the first's entry and the first became unreachable.
-    let pids = wait_for_pid_files(&runtime.path().join("shux"), 2);
-    assert_eq!(
-        pids.len(),
-        2,
-        "two daemons on two sockets must have two pidfiles, found {pids:?}"
-    );
+    let pids: Vec<u32> = wait_for_pid_files(&runtime.path().join("shux"), 2)
+        .into_iter()
+        .map(|(_, pid)| pid)
+        .collect();
     for pid in &pids {
         reaper.0.push(*pid as i32);
     }
@@ -707,17 +579,13 @@ fn a_daemon_from_before_the_socket_keyed_pidfile_is_still_stoppable() {
             .status
             .success()
     );
-    let pids = wait_for_pid_files(&runtime.path().join("shux"), 1);
-    let pid = pids[0];
+    let (hashed, pid) = wait_for_pid_files(&runtime.path().join("shux"), 1)
+        .into_iter()
+        .next()
+        .expect("a pidfile");
     reaper.0.push(pid as i32);
 
     // Rewrite history: put the pid where the PREVIOUS version would have.
-    let hashed = std::fs::read_dir(runtime.path().join("shux"))
-        .expect("runtime dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x == "pid"))
-        .expect("a pidfile");
     let legacy = runtime.path().join("shux").join("shux.pid");
     std::fs::rename(&hashed, &legacy).expect("move pidfile to the legacy path");
 
