@@ -159,9 +159,12 @@ re-scoped in the PR description before it ships.
 | `shux-vt-solid-qa` | `shux-vt`, `shux-raster`, PTY output, pane sizing/resize, capture, snapshot pixels, Unicode width, default colours, cursor, alt screen, scroll regions, terminal responses |
 | `shux-tui-qa` | attach UI, keyboard/mouse, copy mode, palette, help, status bar, themes, pane/window/session UX, plugin UX, CLI flows, **agent workflows**, templates, recordings, **rich-TUI compatibility** — when the VT gate doesn't apply |
 
+`shux-simplify-architect` is advisory, not a gate — no `VERDICT`, nothing to pass.
+See step 6.
+
 Defined in `.claude/agents/<name>.md` and `.codex/agents/<name>.toml`.
 
-Both MUST: enforce the Testing Matrix / Acceptance Criteria / DoD the PR states for
+Both gates MUST: enforce the Testing Matrix / Acceptance Criteria / DoD the PR states for
 itself; use real coloured workloads and real TUIs; inspect full-resolution screenshots and
 pixel-verify where a baseline exists (`.claude/automations/pixel_verify.py` via
 `uv run --script`); prove zero leaked daemons. **Missing evidence is failure, not residual
@@ -202,17 +205,27 @@ Every feature/fix PR.
 5. **Adversarial review** (`adversarial-review` skill) once green, before the convergence
    council. 2–4 parallel agents on **disjoint** surfaces that drive the real system.
    Reproduce each finding; fix with a regression test.
-6. **Council on the implementation diff, before pushing.** `dootsabha council`, or the
+6. **Simplification review** (`shux-simplify-architect`) alongside step 5, on any diff
+   over ~200 added lines in `crates/*.rs`
+   (`git diff --numstat <base>..HEAD -- 'crates/*.rs' | awk '{a+=$1} END {print a}'`).
+   Cold context, read-only, biased toward deletion; advisory, no verdict. Tidiness
+   findings are addressed or explicitly declined in the PR; correctness findings fall
+   under *Correctness is never a scope question* and cannot be declined. On #170 it
+   found a shipping security defect that two bot reviews and a QA gate had passed.
+
+   **5, 6 and 7 run before the first push, before the PR exists.** A finding that
+   lands after the push arrives as churn on an open PR.
+7. **Council on the implementation diff, before pushing.** `dootsabha council`, or the
    step-1 fallback (parallel adversarial agents on disjoint surfaces) when it is
    unavailable. Not optional, and **not scaled down for small diffs** — a 4-line
    `Cargo.toml` change silently made a benchmark incomparable (#166) and a docs-only
    diff shipped two P1s (#168). Size does not predict defects. Every PR merged in the
    2026-08-15..17 run skipped this step; every one had a real defect found after push.
-7. **Capture evidence for every relevant (render path × config state) cell**, named
+8. **Capture evidence for every relevant (render path × config state) cell**, named
    `v<N>_<render-path>_<width>_<config-state>.png`. Render path is mandatory in the name
    or two cells collide silently. One default-state screenshot is not the matrix — drift
    hides in the feature-maxed and malformed cells.
-8. **Visual proof in a PR comment — MANDATORY for any user-visible change.**
+9. **Visual proof in a PR comment — MANDATORY for any user-visible change.**
    Non-visual changes (CI config, docs, resource limits, protocol validation) are
    exempt; say so in one line in the PR rather than attaching an artifact that proves
    nothing. Load `browsing-as-you`;
@@ -220,12 +233,12 @@ Every feature/fix PR.
    `gh api repos/O/R/issues/N/comments`. **Skill unavailable (cloud/headless) or
    attachment fails → publish a Claude Artifact, link it in the comment.** Prose-only
    evidence is not done.
-9. **Cross-path consistency test** — assert identical logical output across render paths.
-10. **Real-target dogfood** for user-facing surfaces. Real binary, real installed TUI/CLI,
+10. **Cross-path consistency test** — assert identical logical output across render paths.
+11. **Real-target dogfood** for user-facing surfaces. Real binary, real installed TUI/CLI,
     genuine lifecycle. Judge consumer-facing output: `--help` truthfulness, artifact
     exists and reads legibly (OPEN it), errors point at the cause. Reproduce findings
     before believing.
-11. **The moment a PR exists, load the `gh-ghent` skill and follow it.** Load it — do
+12. **The moment a PR exists, load the `gh-ghent` skill and follow it.** Load it — do
     not run the command from memory. The skill owns the invocation, the cadence, the
     decision order and the reply/resolve semantics; recalling it instead of loading it
     is how half the contract silently gets dropped. It is a loop that runs until the PR
@@ -235,7 +248,7 @@ Every feature/fix PR.
     Don't report a PR done with unread review comments. **`gh-ghent` or `gh`
     unavailable → monitor by another route, starting the moment the PR exists.** See
     *Tooling fallbacks*.
-12. **Post-merge `curl|sh` smoke.** After merge + semantic-release tags, install via
+13. **Post-merge `curl|sh` smoke.** After merge + semantic-release tags, install via
     `curl -fsSL https://shux.pages.dev/install.sh | sh` and smoke the *published* binary.
 
 **PR description: problem, change, measured result, risks.** Detail goes in commits,
@@ -247,6 +260,7 @@ Paste into every feature PR:
 ## Verification matrix
 - [ ] dootsabha council on design — converged
 - [ ] adversarial review — parallel agents drove the real system; findings fixed + regression-tested
+- [ ] simplification review (`shux-simplify-architect`) — diff >~200 added lines; findings addressed, or tidiness ones declined with reason
 - [ ] implementation diff reviewed before push — `dootsabha council`, or parallel adversarial agents on disjoint surfaces; findings addressed
 - [ ] every render path touched
 - [ ] config states: default · init · feature-maxed · malformed · hot-reload
@@ -269,7 +283,7 @@ in the PR.
 |---|---|
 | `dootsabha` | Spawn context-appropriate **parallel adversarial agents on disjoint surfaces** that drive the real system. Reproduce every finding before believing it; fix with a test seen failing first. |
 | `gh-ghent` / `gh` | Monitor the PR from the moment it is created by whatever route exists — `subscribe_pr_activity`, the GitHub MCP tools, scheduled self check-ins. **Reply to and resolve every bot review thread**, exactly as `gh-ghent` would. Webhooks do not reliably deliver CI success, so poll on a timer as well. |
-| `browsing-as-you` | Publish a Claude Artifact and link it (already step 8). |
+| `browsing-as-you` | Publish a Claude Artifact and link it (already step 9). |
 
 **An agent that rewrites tracked files runs in its own git worktree.** Never point one at
 the shared checkout: a `git add -A` during its run commits its scratch. That is not
