@@ -1,3 +1,10 @@
+## [0.46.24](https://github.com/indrasvat/shux/compare/v0.46.23...v0.46.24) (2026-08-26)
+
+
+### Bug Fixes
+
+* **pty:** scrub the outer terminal's identity from pane children ([#173](https://github.com/indrasvat/shux/issues/173)) ([f160085](https://github.com/indrasvat/shux/commit/f1600857ca3c5ba5a34c37cf50d54c30e9078818)), closes [#172](https://github.com/indrasvat/shux/issues/172)
+
 ## [0.46.23](https://github.com/indrasvat/shux/compare/v0.46.22...v0.46.23) (2026-08-26)
 
 
