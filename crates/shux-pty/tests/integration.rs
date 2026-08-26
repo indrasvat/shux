@@ -340,8 +340,12 @@ async fn pane_child_does_not_inherit_outer_terminal_identity() {
     for prefix in shux_pty::OUTER_TERMINAL_IDENTITY_PREFIXES {
         expected.push(format!("{prefix}WINDOW_ID"));
         expected.push(format!("{prefix}SOMETHING_INVENTED_LATER"));
-        // Anchored exemption: `CONFIG` anywhere but the start is still identity.
+        // Anchored exemption: the word must be a whole segment. `CONFIG` after
+        // the start is identity, and so is `CONFIG` that merely starts the
+        // segment -- only anchoring one of the two words let this one through.
         expected.push(format!("{prefix}SESSION_CONFIGURED_ID"));
+        expected.push(format!("{prefix}CONFIGURED_ID"));
+        expected.push(format!("{prefix}AUTOMATION_ID"));
     }
     expected.push("WINDOW".to_string());
 
@@ -372,9 +376,7 @@ async fn pane_child_does_not_inherit_outer_terminal_identity() {
         "the scrub is a deny-list, not env_clear -- an unrelated variable must survive"
     );
     // Backstop, not the guard: the ordering at the scrub site is what makes a
-    // collision unrepresentable. This fires only if someone reorders AND adds a
-    // colliding name. COLORTERM/CLICOLOR are pinned by
-    // `test_spawn_interactive_env_enables_color_by_default`.
+    // collision unrepresentable. This fires only on a reorder AND a collision.
     for (key, value) in [("TERM_PROGRAM", "shux"), ("SHUX", "1")] {
         assert!(
             env_has(&output, key, value),
@@ -383,8 +385,8 @@ async fn pane_child_does_not_inherit_outer_terminal_identity() {
     }
 }
 
-/// Restores every variable it set, including on panic. Without this a test that
-/// panics mid-way leaves ~40 sentinels behind for whatever shares its process.
+/// Restores every variable it set, including on panic -- so a test that fails
+/// mid-way cannot leave sentinels for anything later in its own process.
 struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
 
 impl EnvGuard {
@@ -393,8 +395,10 @@ impl EnvGuard {
             .iter()
             .map(|(k, v)| {
                 let prior = std::env::var_os(k);
-                // SAFETY: nextest runs each test in its own process, so no other
-                // thread here observes the environment. Restored on drop.
+                // SAFETY: nextest gives each test its own process, and the
+                // read this races is `PtyHandle::spawn` on this same thread.
+                // Restored on drop, so a later test in-process sees the prior
+                // value even if this one panics.
                 unsafe { std::env::set_var(k, v) };
                 ((*k).to_string(), prior)
             })
@@ -455,7 +459,6 @@ async fn window_survives_when_sty_is_unset() {
     let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
     let output = read_pty_to_exit(&mut handle).await;
 
-    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
     assert!(
         env_has(&output, "WINDOW", "not-screens-window"),
         "a non-screen WINDOW was scrubbed even though STY was unset: {output}"
@@ -471,7 +474,6 @@ async fn window_survives_when_sty_is_set_but_empty() {
     let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
     let output = read_pty_to_exit(&mut handle).await;
 
-    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
     assert!(
         env_has(&output, "WINDOW", "not-screens-window"),
         "an empty STY does not prove screen set WINDOW, but it was scrubbed: {output}"
@@ -506,13 +508,15 @@ async fn user_config_survives_inside_a_scrubbed_vendor_namespace() {
     const KEPT: &[(&str, &str)] = &[
         ("ZELLIJ_CONFIG_DIR", "cfg-dir"),
         ("ZELLIJ_CONFIG_FILE", "cfg-file"),
+        // Bare words: the segment IS the whole remainder. Anchoring to
+        // `CONFIG_`/`AUTO_` instead would scrub these.
+        ("ZELLIJ_CONFIG", "cfg"),
+        ("ZELLIJ_AUTO", "auto"),
         ("ZELLIJ_AUTO_ATTACH", "true"),
         ("KITTY_CONFIG_DIRECTORY", "kitty-cfg"),
         ("WEZTERM_CONFIG_FILE", "wez-cfg"),
     ];
-    // One name, only so the "scrubbed vendor namespace" in the title is proven
-    // here rather than inferred. The other mutants are covered by KEPT above and
-    // by `pane_child_does_not_inherit_outer_terminal_identity`.
+    // Proves the namespace really is scrubbed, so KEPT below means something.
     const SCRUBBED: &[(&str, &str)] = &[("ZELLIJ_SESSION_NAME", "outer-session")];
 
     let _kept = EnvGuard::set(KEPT);
@@ -536,10 +540,8 @@ async fn user_config_survives_inside_a_scrubbed_vendor_namespace() {
     }
 }
 
-/// `COLORFGBG` must survive. Removing it is worse than leaking it: vim gets no
-/// polarity signal under `TERM=tmux-256color` and falls back to
-/// `background=light` inside a dark pane. Measured, not assumed -- scrubbing it
-/// flipped real vim from `background=dark` to `background=light`.
+/// See `OUTER_TERMINAL_IDENTITY_VARS` for why removing this is worse than
+/// leaking it.
 #[tokio::test]
 async fn colorfgbg_survives_because_removing_it_misleads_vim() {
     let _env = EnvGuard::set(&[("COLORFGBG", "15;0")]);
@@ -547,7 +549,6 @@ async fn colorfgbg_survives_because_removing_it_misleads_vim() {
     let mut handle = PtyHandle::spawn(&env_dump_config()).unwrap();
     let output = read_pty_to_exit(&mut handle).await;
 
-    assert!(output.contains("ENV_DONE"), "child did not run: {output}");
     assert!(
         env_has(&output, "COLORFGBG", "15;0"),
         "COLORFGBG was scrubbed; vim will pick background=light in a dark pane: {output}"

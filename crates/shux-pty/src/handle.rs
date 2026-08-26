@@ -289,7 +289,7 @@ pub const OUTER_TERMINAL_IDENTITY_VARS: &[&str] = &[
     // Describe geometry or a window the pane is not drawing into. ncurses
     // prefers `COLUMNS`/`LINES` over the pty ioctl, so a stale pair makes every
     // `tput cols` script render at the OUTER terminal's width -- measured 203
-    // in an 80-column pane. `COLORFGBG` is deliberately NOT here: see below.
+    // in an 80-column pane. `COLORFGBG` is deliberately NOT here -- see this const's own doc.
     "WINDOWID",
     "COLUMNS",
     "LINES",
@@ -319,11 +319,20 @@ pub const OUTER_TERMINAL_IDENTITY_PREFIXES: &[&str] = &[
 /// a nested zellij load defaults. A rule rather than a third list, so it covers
 /// vendor knobs nobody has written down yet.
 ///
-/// `rest` is the key with its vendor prefix already stripped, and the match is
-/// anchored there: a free substring search also exempts
-/// `WEZTERM_SESSION_CONFIGURED_ID`, which is identity, not configuration.
+/// `rest` is the key with its vendor prefix already stripped, and the word must
+/// be a whole segment of it -- `KITTY_CONFIG_DIR` and a bare `KITTY_CONFIG` are
+/// the user's, `KITTY_CONFIGURED_ID` is identity that merely starts the same
+/// way. Anchoring only one of the two words is how that last one got exempted.
 fn is_user_config_in_vendor_namespace(rest: &[u8]) -> bool {
-    rest.starts_with(b"CONFIG") || rest.starts_with(b"AUTO_")
+    [b"CONFIG".as_slice(), b"AUTO".as_slice()]
+        .iter()
+        .any(|word| leads_with_segment(rest, word))
+}
+
+/// `word` is `rest`'s first `_`-delimited segment, or all of it.
+fn leads_with_segment(rest: &[u8], word: &[u8]) -> bool {
+    rest.strip_prefix(word)
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with(b"_"))
 }
 
 /// Configuration for spawning a PTY child process.
