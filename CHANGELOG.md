@@ -1,3 +1,10 @@
+## [0.46.22](https://github.com/indrasvat/shux/compare/v0.46.21...v0.46.22) (2026-08-26)
+
+
+### Bug Fixes
+
+* **build:** make local checks match CI, and run the guard that was orphaned ([#171](https://github.com/indrasvat/shux/issues/171)) ([efdb670](https://github.com/indrasvat/shux/commit/efdb670875e1437068b871c2de82a1f3a82bde4d)), closes [#170](https://github.com/indrasvat/shux/issues/170)
+
 ## [0.46.21](https://github.com/indrasvat/shux/compare/v0.46.20...v0.46.21) (2026-08-17)
 
 
