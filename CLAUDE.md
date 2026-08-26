@@ -159,6 +159,9 @@ re-scoped in the PR description before it ships.
 | `shux-vt-solid-qa` | `shux-vt`, `shux-raster`, PTY output, pane sizing/resize, capture, snapshot pixels, Unicode width, default colours, cursor, alt screen, scroll regions, terminal responses |
 | `shux-tui-qa` | attach UI, keyboard/mouse, copy mode, palette, help, status bar, themes, pane/window/session UX, plugin UX, CLI flows, **agent workflows**, templates, recordings, **rich-TUI compatibility** — when the VT gate doesn't apply |
 
+`shux-simplify-architect` is advisory, not a gate — no `VERDICT`, nothing to pass.
+See step 5a.
+
 Defined in `.claude/agents/<name>.md` and `.codex/agents/<name>.toml`.
 
 Both MUST: enforce the Testing Matrix / Acceptance Criteria / DoD the PR states for
@@ -202,6 +205,14 @@ Every feature/fix PR.
 5. **Adversarial review** (`adversarial-review` skill) once green, before the convergence
    council. 2–4 parallel agents on **disjoint** surfaces that drive the real system.
    Reproduce each finding; fix with a regression test.
+5a. **Simplification review** (`shux-simplify-architect`) alongside step 5, on any diff
+   over ~200 added lines. Cold context, read-only, biased toward deletion; advisory,
+   no verdict. Findings are addressed or explicitly declined in the PR. On #170 it
+   found a shipping security defect and ~350 removable lines that two bot reviews and
+   a QA gate had already passed.
+
+   **5, 5a and 6 run before the first push, before the PR exists.** A finding that
+   lands after the push arrives as churn on an open PR.
 6. **Council on the implementation diff, before pushing.** `dootsabha council`, or the
    step-1 fallback (parallel adversarial agents on disjoint surfaces) when it is
    unavailable. Not optional, and **not scaled down for small diffs** — a 4-line
