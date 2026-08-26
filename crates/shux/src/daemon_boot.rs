@@ -163,14 +163,10 @@ fn process_argv(pid: u32) -> Option<ProcessArgv> {
 /// end-of-string, or `/a/x.sock` would also match `/a/x.sock2`.
 fn joined_serves_socket(joined: &str, socket: &Path) -> bool {
     let socket = socket.to_string_lossy();
-    for needle in [format!(" --socket {socket}")] {
-        if let Some(rest) = joined.split_once(&needle).map(|(_, rest)| rest)
-            && (rest.is_empty() || rest.starts_with(' '))
-        {
-            return true;
-        }
-    }
-    false
+    let needle = format!(" --socket {socket}");
+    joined
+        .split_once(&needle)
+        .is_some_and(|(_, rest)| rest.is_empty() || rest.starts_with(' '))
 }
 
 /// The socket a daemon process is serving, read from its own argv.
