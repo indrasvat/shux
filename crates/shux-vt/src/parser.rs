@@ -211,6 +211,8 @@ pub struct VtHandler<'a> {
     pub(crate) default_colors: Presented<'a, TerminalDefaultColors>,
     pub(crate) alt_grid: &'a mut Option<Grid>,
     pub(crate) alt_cursor: &'a mut Option<Cursor>,
+    /// SPIKE FIX: terminal-scoped image epoch, bumped by the screen swap.
+    pub(crate) spike_image_epoch: &'a mut u64,
     pub(crate) dcs_state: &'a mut Option<DcsState>,
     /// Whether synchronized output is currently holding the presentation
     /// open. Shared with every [`Presented`] above, which is how a `?2026h`
@@ -257,6 +259,7 @@ impl<'a> VtHandler<'a> {
             stashed_cursor: self.alt_cursor,
             spare: self.alt_spare,
             reuse: self.reuse_retired_grids,
+            image_epoch: self.spike_image_epoch,
         }
     }
 
@@ -1757,11 +1760,17 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 // character, so a REP straight after one repeats nothing
                 // (issue #122).
                 *self.last_graphic = None;
-                // When the image/placement store lands, RIS must clear it here:
-                // the graphics protocol requires that "when resetting the
-                // terminal, all images that are visible on the screen must be
-                // cleared". It must NOT clear the APC scanner -- see the note in
-                // `VirtualTerminal::advance_slice` for why that is always wrong.
+                // SPIKE FIX: the store has landed, so do what this comment
+                // said would be needed. The graphics protocol requires that
+                // "when resetting the terminal, all images that are visible on
+                // the screen must be cleared". It must NOT clear the APC
+                // scanner -- see the note in `VirtualTerminal::advance_slice`
+                // for why that is always wrong.
+                if !self.grid.spike_images.is_empty() {
+                    self.grid.spike_images.clear();
+                    self.grid.spike_image_gen = self.grid.spike_image_gen.saturating_add(1);
+                    *self.spike_image_epoch = self.spike_image_epoch.saturating_add(1);
+                }
                 self.reset_charsets();
                 self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
@@ -2449,6 +2458,7 @@ mod tests {
 
         fn process(&mut self, bytes: &[u8]) {
             let mut palette_overridden = false;
+            let mut spike_image_epoch = 0u64;
             let mut handler = VtHandler {
                 grid: Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
                 cursor: Presented::new(&mut self.cursor, &mut self.frozen_cursor, &self.sync_armed),
@@ -2462,6 +2472,7 @@ mod tests {
                 ),
                 alt_grid: &mut self.alt_grid,
                 alt_cursor: &mut self.alt_cursor,
+                spike_image_epoch: &mut spike_image_epoch,
                 dcs_state: &mut self.dcs_state,
                 sync_armed: &self.sync_armed,
                 frozen_alt: &mut self.frozen_alt,

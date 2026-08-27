@@ -380,6 +380,41 @@ impl Rasterizer {
             self.draw_cursor(&mut img, grid, cr, cc, opts);
         }
 
+        // SPIKE: composite placed images over the text cells, clipped to the
+        // pane. This is the step Zellij has no equivalent for -- it renders to
+        // a terminal, not to a PNG.
+        for pic in &grid.spike_images {
+            let ox = pic.col as u32 * self.cell_w;
+            let oy = pic.row as u32 * self.cell_h;
+            for py in 0..pic.height {
+                let dy = oy + py;
+                if dy >= h {
+                    break;
+                }
+                for px in 0..pic.width {
+                    let dx = ox + px;
+                    if dx >= w {
+                        break;
+                    }
+                    let i = ((py * pic.width + px) * 4) as usize;
+                    let Some(src) = pic.rgba.get(i..i + 4) else {
+                        continue;
+                    };
+                    let a = src[3] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let dst = img.get_pixel_mut(dx, dy);
+                    for ch in 0..3 {
+                        dst[ch] = ((src[ch] as u32 * a
+                            + dst[ch] as u32 * (255 - a))
+                            / 255) as u8;
+                    }
+                    dst[3] = 255;
+                }
+            }
+        }
+
         img
     }
 

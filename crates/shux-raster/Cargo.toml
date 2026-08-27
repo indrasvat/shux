@@ -12,6 +12,7 @@ license = "MIT AND OFL-1.1"
 description = "Pure-Rust cell-grid rasterizer — turns a shux-vt Grid<Cell> into a PNG without a terminal emulator."
 
 [dependencies]
+base64 = "0.22"
 fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 shux-vt = { path = "../shux-vt" }

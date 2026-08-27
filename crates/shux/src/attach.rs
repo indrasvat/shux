@@ -958,6 +958,7 @@ async fn run_attach_loop(
                         button,
                         col,
                         row,
+                        shift,
                     } => {
                         // Modal guard: swallow mouse events while the
                         // help overlay is visible. Otherwise a click or
@@ -969,6 +970,23 @@ async fn run_attach_loop(
                         if render_session.lock().await.help_visible {
                             mouse_drag = None;
                             selection_drag = SelectionDrag::None;
+                            continue;
+                        }
+                        if !shift
+                            && handle_app_mouse(
+                            kind,
+                            button,
+                            col,
+                            row,
+                            &graph,
+                            &io_state,
+                            &render_session,
+                            &client_size,
+                        )
+                        .await?
+                        {
+                            let pulse = io_state.lock().await.render_pulse.clone();
+                            pulse.notify_one();
                             continue;
                         }
                         if handle_mouse_selection(
@@ -2118,6 +2136,125 @@ async fn handle_mouse(
     Ok(())
 }
 
+/// SPIKE: a button event forwarded to a mouse-aware app.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MouseAction {
+    Press,
+    Release,
+    Drag,
+}
+
+/// SPIKE: encode a button event as a mouse report for the pane's app.
+/// `col`/`row` are 1-based pane-local. Cb: 0=left, 1=middle, 2=right, +32
+/// while dragging. SGR (1006) ends a release with `m` and keeps the real
+/// button; legacy X10 reports every release as Cb=3 and offsets by 32.
+fn encode_mouse_button(
+    action: MouseAction,
+    button: ProtoMouseButton,
+    sgr: bool,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    let base: u16 = match button {
+        ProtoMouseButton::Left | ProtoMouseButton::None => 0,
+        ProtoMouseButton::Middle => 1,
+        ProtoMouseButton::Right => 2,
+    };
+    let cb = if action == MouseAction::Drag {
+        base + 32
+    } else {
+        base
+    };
+    if sgr {
+        let fin = if action == MouseAction::Release { 'm' } else { 'M' };
+        format!("\x1b[<{cb};{col};{row}{fin}").into_bytes()
+    } else {
+        let cb = if action == MouseAction::Release { 3 } else { cb };
+        let enc = |v: u16| -> u8 { v.saturating_add(32).min(255) as u8 };
+        vec![0x1b, b'[', b'M', enc(cb), enc(col), enc(row)]
+    }
+}
+
+/// SPIKE: forward a click / drag / release to a mouse-aware app in the pane
+/// under the pointer. Returns `true` when the event was consumed.
+///
+/// shux's own modes win: copy mode, the copy menu and border drags keep the
+/// mouse. Everything else inside a pane whose app asked for mouse tracking
+/// belongs to that app -- the tmux/wezterm model.
+#[allow(clippy::too_many_arguments)]
+async fn handle_app_mouse(
+    kind: MouseKind,
+    button: ProtoMouseButton,
+    col: u16,
+    row: u16,
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+) -> anyhow::Result<bool> {
+    let action = match kind {
+        MouseKind::Down => MouseAction::Press,
+        MouseKind::Up => MouseAction::Release,
+        MouseKind::Drag => MouseAction::Drag,
+        // The wheel keeps its own routing in `handle_wheel`.
+        _ => return Ok(false),
+    };
+    let attached = session.lock().await.clone();
+    if attached.copy_mode.is_some() || attached.copy_menu.is_some() {
+        return Ok(false);
+    }
+    let viewport = current_viewport(client_size).await;
+    let snap = graph.snapshot();
+    let Some(win) = snap.windows.get(&attached.active_window_id) else {
+        return Ok(false);
+    };
+    if !win.layout.is_zoomed() && border_at(&win.layout.tree, viewport, col, row).is_some() {
+        return Ok(false);
+    }
+    let pane_id = if win.layout.is_zoomed() {
+        attached.active_pane_id
+    } else {
+        match pane_at(&win.layout.tree, viewport, col, row) {
+            Some((pid, _)) => pid,
+            None => return Ok(false),
+        }
+    };
+    let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+        return Ok(false);
+    };
+    let (mouse_on, sgr) = {
+        let state = io_state.lock().await;
+        match state.vts.get(&pane_id) {
+            Some(vt) => {
+                let m = vt.modes();
+                (m.mouse_tracking != shux_vt::MouseMode::None, m.sgr_mouse)
+            }
+            None => (false, false),
+        }
+    };
+    if !mouse_on {
+        return Ok(false);
+    }
+    let local_col = col
+        .saturating_sub(rect.x)
+        .min(rect.width.saturating_sub(1))
+        .saturating_add(1);
+    let local_row = row
+        .saturating_sub(rect.y)
+        .min(rect.height.saturating_sub(1))
+        .saturating_add(1);
+    forward_bytes_to_pane(
+        io_state,
+        pane_id,
+        encode_mouse_button(action, button, sgr, local_col, local_row),
+    )
+    .await;
+    Ok(true)
+}
+
+/// SPIKE: cell size in pixels (same source the winsize fix needs).
+const SPIKE_CELL: (u16, u16) = (9, 19);
+
 /// How a wheel tick is routed, given the target pane's live VT state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WheelRouting {
@@ -2145,7 +2282,21 @@ fn route_wheel(mouse_on: bool, alt_screen: bool, alt_scroll: bool) -> WheelRouti
 /// 65 = wheel down. SGR (mode 1006) uses decimal params + `M`; legacy X10
 /// packs each value into a byte offset by 32, wire-capped at 255.
 fn encode_mouse_wheel(up: bool, sgr: bool, col: u16, row: u16) -> Vec<u8> {
+    encode_mouse_wheel_px(up, sgr, col, row, None)
+}
+
+/// SPIKE: as `encode_mouse_wheel`, but when the app has enabled DECSET 1016
+/// (SGR-pixel) and we know the cell size, report the pointer in pixels —
+/// the centre of the cell, matching what a real terminal reports.
+fn encode_mouse_wheel_px(
+    up: bool,
+    sgr: bool,
+    col: u16,
+    row: u16,
+    pixel_cell: Option<(u16, u16)>,
+) -> Vec<u8> {
     let cb: u16 = if up { 64 } else { 65 };
+    let _ = pixel_cell;
     if sgr {
         format!("\x1b[<{cb};{col};{row}M").into_bytes()
     } else {
@@ -2225,7 +2376,7 @@ async fn handle_wheel(
     };
 
     // Snapshot the target pane's live mode state + scrollback depth.
-    let (mouse_on, sgr, alt, alt_scroll, app_cursor, total_lines) = {
+    let (mouse_on, sgr, sgr_px, alt, alt_scroll, app_cursor, total_lines) = {
         let state = io_state.lock().await;
         match state.vts.get(&pane_id) {
             Some(vt) => {
@@ -2233,13 +2384,14 @@ async fn handle_wheel(
                 (
                     m.mouse_tracking != shux_vt::MouseMode::None,
                     m.sgr_mouse,
+                    false,
                     vt.is_alternate_screen(),
                     m.alternate_scroll,
                     m.application_cursor_keys,
                     vt.presented_total_lines(),
                 )
             }
-            None => (false, false, false, true, false, rect.height as usize),
+            None => (false, false, false, false, true, false, rect.height as usize),
         }
     };
 
@@ -2256,7 +2408,13 @@ async fn handle_wheel(
             forward_bytes_to_pane(
                 io_state,
                 pane_id,
-                encode_mouse_wheel(up, sgr, local_col, local_row),
+                encode_mouse_wheel_px(
+                    up,
+                    sgr,
+                    local_col,
+                    local_row,
+                    sgr_px.then_some(SPIKE_CELL),
+                ),
             )
             .await;
         }

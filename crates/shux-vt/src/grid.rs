@@ -462,6 +462,12 @@ impl Default for GridConfig {
 /// The VecDeque allows O(1) push_front (for scrollback) and O(1) push_back (for new lines).
 #[derive(Debug)]
 pub struct Grid {
+    /// SPIKE: decoded images placed in this grid.
+    pub spike_images: Vec<crate::graphics::spike_kitty::SpikeImage>,
+    /// SPIKE: bumped whenever `spike_images` changes. Images are not cells,
+    /// so `mutations()` cannot see them and an image-only update would never
+    /// mark the frame dirty — the attach client would keep a stale picture.
+    pub spike_image_gen: u64,
     /// All lines: scrollback + visible area.
     raw: VecDeque<Row>,
     /// Number of visible rows (terminal height).
@@ -492,6 +498,8 @@ pub struct Grid {
 impl Clone for Grid {
     fn clone(&self) -> Self {
         Grid {
+            spike_images: self.spike_images.clone(),
+            spike_image_gen: 0,
             raw: self.raw.clone(),
             rows: self.rows,
             cols: self.cols,
@@ -550,6 +558,9 @@ impl Grid {
             raw.push_back(row.clone());
         }
         Grid {
+            // SPIKE: the whole point -- without this the snapshot has no image.
+            spike_images: self.spike_images.clone(),
+            spike_image_gen: 0,
             raw,
             rows: self.rows,
             cols: self.cols,
@@ -572,6 +583,8 @@ impl Grid {
             raw.push_back(Row::new(cols));
         }
         Grid {
+            spike_images: Vec::new(),
+            spike_image_gen: 0,
             raw,
             rows,
             cols,
@@ -605,6 +618,10 @@ impl Grid {
     /// the test suite rather than by a user.
     pub(crate) fn is_blank_canvas(&self, rows: usize, cols: usize, config: &GridConfig) -> bool {
         self.mutations == 0
+            // SPIKE FIX: the write tally counts CELL writes, and an image is
+            // not a cell. Without this a buffer holding a picture passes as a
+            // blank canvas and is recycled with the picture still on it.
+            && self.spike_images.is_empty()
             && self.rows == rows
             && self.cols == cols
             && self.raw.len() == rows
@@ -642,6 +659,13 @@ impl Grid {
         self.dirty.reset(rows, config.track_dirty);
         self.config = config;
         self.mutations = 0;
+        // SPIKE FIX: images are not cells, so blanking the cells left them
+        // behind -- a retired alternate-screen buffer came back on the next
+        // entry still holding the previous session's picture.
+        if !self.spike_images.is_empty() {
+            self.spike_images.clear();
+            self.spike_image_gen = self.spike_image_gen.saturating_add(1);
+        }
     }
 
     /// Monotonic count of cell/scroll/clear write operations on this grid
@@ -710,6 +734,14 @@ impl Grid {
     }
 
     /// Access a visible row (0 = top of visible area).
+    /// SPIKE FIX: absolute line number of a visible row. `evicted` counts lines
+    /// gone from the front for good; `scrollback_len()` counts lines above the
+    /// viewport still held. Their sum is the viewport's top line, and it GROWS
+    /// as content scrolls — which is what makes an anchored image move.
+    pub fn abs_line_of_visible_row(&self, row: usize) -> u64 {
+        self.evicted + self.scrollback_len() as u64 + row as u64
+    }
+
     pub fn visible_row(&self, row: usize) -> &Row {
         let idx = self.scrollback_len() + row;
         &self.raw[idx]
@@ -727,6 +759,43 @@ impl Grid {
             raw.push_back(self.visible_row(r).clone());
         }
         Grid {
+            // SPIKE FIX: resolve absolute anchors against THIS viewport and drop
+            // whatever is now off-screen. Doing it here is deliberate:
+            // clone_visible re-bases rows to zero, so an absolute address carried
+            // into the clone would be wrong by exactly scrollback_len — the trap
+            // described in §5 of the plan.
+            spike_image_gen: self.spike_image_gen,
+            spike_images: {
+                let top = self.abs_line_of_visible_row(0);
+                if let Ok(path) = std::env::var("SHUX_SPIKE_VIEW_LOG") {
+                    use std::io::Write as _;
+                    if let Ok(mut f) =
+                        std::fs::OpenOptions::new().create(true).append(true).open(path)
+                    {
+                        let _ = writeln!(
+                            f,
+                            "clone_visible top={} rows={} store={:?}",
+                            top,
+                            self.rows,
+                            self.spike_images
+                                .iter()
+                                .map(|p| (p.image_id, p.width, p.height, p.anchor))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+                self.spike_images
+                    .iter()
+                    .filter_map(|p| {
+                        let row = p.anchor.checked_sub(top)? as usize;
+                        (row < self.rows).then(|| {
+                            let mut q = p.clone();
+                            q.row = row;
+                            q
+                        })
+                    })
+                    .collect()
+            },
             raw,
             rows: self.rows,
             cols: self.cols,

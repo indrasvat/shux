@@ -47,6 +47,10 @@ pub(crate) struct ScreenSwap<'a> {
     /// differential tests run a second terminal with it `false` so the
     /// recycling path can be compared against the allocate-every-time one.
     pub reuse: bool,
+    /// SPIKE FIX: the terminal's image epoch. A swap changes which pictures
+    /// are presented without touching either grid's own generation, so the
+    /// swap has to say so itself.
+    pub image_epoch: &'a mut u64,
 }
 
 impl ScreenSwap<'_> {
@@ -89,6 +93,7 @@ impl ScreenSwap<'_> {
         };
         alt.mark_all_dirty();
 
+        *self.image_epoch = self.image_epoch.saturating_add(1);
         *self.stashed_grid = Some(std::mem::replace(self.grid, alt));
         if save_cursor {
             let parked = std::mem::take(self.cursor);
@@ -120,6 +125,7 @@ impl ScreenSwap<'_> {
     /// parked a cursor to put back.
     pub(crate) fn leave(&mut self, restore_cursor: bool) {
         if let Some(primary) = self.stashed_grid.take() {
+            *self.image_epoch = self.image_epoch.saturating_add(1);
             let retired = std::mem::replace(self.grid, primary);
             self.grid.mark_all_dirty();
             if self.reuse {

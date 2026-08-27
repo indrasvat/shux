@@ -85,6 +85,20 @@ pub fn compose(
     for (pid, rect) in &pane_rects {
         if let Some((src_grid, src_cursor)) = inputs.panes.get(pid) {
             compose_pane(&mut grid, *rect, src_grid, src_cursor);
+            // SPIKE FIX: the multi-pane compositor builds a FRESH Grid and
+            // copies cells. Images are not cells, so without this a split
+            // window renders every pane's text and none of its pictures —
+            // observed, not theorised. Offset by the pane's origin and clip.
+            for img in &src_grid.spike_images {
+                let row = img.row + rect.y as usize;
+                let col = img.col + rect.x as usize;
+                if row < (rect.y + rect.height) as usize {
+                    let mut q = img.clone();
+                    q.row = row;
+                    q.col = col;
+                    grid.spike_images.push(q);
+                }
+            }
         } else {
             compose_placeholder(&mut grid, *rect, "(no output)");
         }

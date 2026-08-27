@@ -1278,6 +1278,7 @@ dependencies = [
 name = "shux-raster"
 version = "0.46.21"
 dependencies = [
+ "base64",
  "fontdue",
  "image",
  "serde",
@@ -1315,9 +1316,11 @@ dependencies = [
  "bytes",
  "crossterm",
  "futures",
+ "image",
  "serde",
  "serde_json",
  "shux-core",
+ "shux-raster",
  "shux-rpc",
  "shux-vt",
  "tempfile",
@@ -1333,6 +1336,8 @@ dependencies = [
 name = "shux-vt"
 version = "0.46.21"
 dependencies = [
+ "base64",
+ "flate2",
  "memchr",
  "proptest",
  "serde",

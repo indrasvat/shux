@@ -1,0 +1,27 @@
+<!doctype html><html><head><meta charset="utf-8"><title>tick</title>
+<style>
+ html,body{margin:0;height:100%;background:#0b0f14;color:#e6edf3;
+   font-family:ui-monospace,"DejaVu Sans Mono",monospace;overflow:hidden}
+ .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2vh}
+ #n{font-size:22vh;font-weight:700;line-height:1;letter-spacing:-0.02em;color:#5ee08a;
+    font-variant-numeric:tabular-nums}
+ #lbl{font-size:3.2vh;color:#8ab4f8;letter-spacing:.18em;text-transform:uppercase}
+ #geo{font-size:2.6vh;color:#9aa0aa}
+ .bar{height:3vh;width:86vw;background:#1b252a;border-radius:2px;overflow:hidden}
+ .fill{height:100%;background:#5ee08a;width:0}
+</style></head><body><div class="wrap">
+ <div id="lbl">frame counter — inside the image</div>
+ <div id="n">0000</div>
+ <div class="bar"><div class="fill" id="f"></div></div>
+ <div id="geo"></div>
+</div>
+<script>
+let i=0;
+function paint(){
+  i++;
+  document.getElementById('n').textContent=String(i).padStart(4,'0');
+  document.getElementById('f').style.width=((i*7)%100)+'%';
+  document.getElementById('geo').textContent='canvas '+window.innerWidth+' x '+window.innerHeight+' css px';
+}
+paint(); setInterval(paint,1000);
+</script></body></html>

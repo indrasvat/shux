@@ -117,6 +117,61 @@ struct CursorTarget {
 ///
 /// In this task (009) we support single-pane rendering only. Task 017
 /// extends this to multi-pane with borders and layout-aware composition.
+/// SPIKE: cell height in pixels (matches the winsize shux reports to panes).
+const SPIKE_CELL_H: u16 = 19;
+
+fn spike_wire(msg: &str) {
+    if let Ok(path) = std::env::var("SHUX_SPIKE_WIRE_LOG") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+/// SPIKE: cell width in pixels, matching the winsize shux reports to panes.
+const SPIKE_CELL_W: u16 = 9;
+
+/// SPIKE: crop an image to the pixels that actually fit inside its pane.
+///
+/// The rasterizer clips while compositing, but the emit path hands the whole
+/// bitmap to the host terminal, which draws all of it -- straight over the
+/// pane border, the status bar and any neighbouring pane. Zellij transmits a
+/// sub-rectangle for exactly this reason (`source_px_*` on its image chunks).
+fn spike_clip_to_pane(
+    img: &shux_vt::graphics::spike_kitty::SpikeImage,
+    row: u16,
+    col: u16,
+    rect: Rect,
+) -> Option<shux_vt::graphics::spike_kitty::SpikeImage> {
+    let avail_w = u32::from(rect.x.saturating_add(rect.width).saturating_sub(col))
+        * u32::from(SPIKE_CELL_W);
+    let avail_h = u32::from(rect.y.saturating_add(rect.height).saturating_sub(row))
+        * u32::from(SPIKE_CELL_H);
+    let w = img.width.min(avail_w);
+    let h = img.height.min(avail_h);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if w == img.width && h == img.height {
+        return Some(img.clone());
+    }
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        let start = ((y * img.width) * 4) as usize;
+        let end = start + (w * 4) as usize;
+        match img.rgba.get(start..end) {
+            Some(rowpx) => rgba.extend_from_slice(rowpx),
+            None => return None,
+        }
+    }
+    let mut out = img.clone();
+    out.width = w;
+    out.height = h;
+    out.rgba = rgba;
+    Some(out)
+}
+
+
 pub struct RenderCompositor<W: Write> {
     buffer: FrameBuffer,
     backend: RenderBackend<W>,
@@ -133,6 +188,26 @@ pub struct RenderCompositor<W: Write> {
     /// position so cursor-only movement can still emit just `MoveTo`.
     terminal_cursor_visual: Option<CursorVisual>,
     cursor_state_known: bool,
+    /// SPIKE: signature of the images last re-transmitted to the outer
+    /// terminal, so an unchanged frame costs nothing.
+    spike_last_images: Vec<(u16, u16, u32, u32, u32)>,
+    /// SPIKE FIX: per-pane image epoch behind those images. Geometry alone
+    /// cannot tell two repaints apart -- terminal-browser re-transmits i=1 at
+    /// the SAME s=/v= on every frame, so a content-blind signature pins the
+    /// first frame after a resize forever.
+    ///
+    /// Kept per pane and keyed BY pane: a single summed counter cannot tell
+    /// "pane A repainted" from "pane A repainted while pane B's epoch went
+    /// backwards", and an unkeyed list cannot tell two panes apart at all.
+    spike_last_epochs: Vec<(PaneId, u64)>,
+    /// SPIKE: per-placement key, so only changed pictures are re-sent.
+    spike_last_keys: Vec<(u16, u16, u32, u32, u32, PaneId, u64, (u16, u16))>,
+    /// SPIKE: bitmaps already sent to the host, keyed by content identity.
+    spike_transmitted: std::collections::HashMap<(PaneId, u32, u64), u32>,
+    spike_next_host_image: u32,
+    /// SPIKE: host image id currently placed in each slot, so a slot that
+    /// switches to a different bitmap can retire the old one.
+    spike_last_host: Vec<u32>,
 }
 
 impl<W: Write> RenderCompositor<W> {
@@ -146,6 +221,12 @@ impl<W: Write> RenderCompositor<W> {
             terminal_cursor: None,
             terminal_cursor_visual: None,
             cursor_state_known: false,
+            spike_last_images: Vec::new(),
+            spike_last_epochs: Vec::new(),
+            spike_last_keys: Vec::new(),
+            spike_transmitted: std::collections::HashMap::new(),
+            spike_next_host_image: 1_000_000,
+            spike_last_host: Vec::new(),
         }
     }
 
@@ -411,6 +492,146 @@ impl<W: Write> RenderCompositor<W> {
     /// Render a full multi-pane frame. Replaces the single-pane path of
     /// `render_frame` for any window with more than one pane (or one pane
     /// inside a layout). Honors zoom state and the configured border style.
+    /// SPIKE: cell height in pixels, matching the pty winsize shux reports.
+    const _SPIKE_CELL_H_DOC: () = ();
+
+    /// SPIKE: re-transmit pane images to the OUTER terminal.
+    ///
+    /// The compositor writes cells. Images are not cells, so an attached
+    /// client renders every pane's text and none of its pictures. This
+    /// forwards each visible image as a kitty graphics command positioned
+    /// at its pane-relative anchor, offset into screen coordinates.
+    ///
+    /// Only re-emits when the visible image set changes -- re-transmitting
+    /// megabytes every frame would make the attach unusable.
+    fn spike_emit_images(
+        &mut self,
+        placed: &[(
+            u16,
+            u16,
+            shux_vt::graphics::spike_kitty::SpikeImage,
+            PaneId,
+            u64,
+            (u16, u16),
+        )],
+        repainted_rows: &std::collections::HashSet<u16>,
+        epochs: &[(PaneId, u64)],
+    ) -> io::Result<()> {
+        use base64::Engine as _;
+        let sig: Vec<(u16, u16, u32, u32, u32)> = placed
+            .iter()
+            .map(|(r, c, i, _, _, _)| (*r, *c, i.image_id, i.width, i.height))
+            .collect();
+        if let Ok(path) = std::env::var("SHUX_SPIKE_EMIT_LOG") {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "emit_called placed={:?} last={:?}", sig, self.spike_last_images);
+            }
+        }
+        // Zellij's rule (`changed_kitty_chunks_in_viewport`): a placement is
+        // re-emitted whenever the cells underneath it are repainted, because
+        // the cell layer paints straight over the picture. Its full-redraw
+        // variant just passes the whole viewport as one changed rect.
+        //
+        // Without this, a resize wipes the image with cells and an unchanged
+        // signature refuses to put it back -- which looked like "images do not
+        // re-fit on resize" when the daemon had the right image all along.
+        let overpainted = placed.iter().any(|(row, _, img, _, _, _)| {
+            let span = img.height.div_ceil(u32::from(SPIKE_CELL_H)).max(1) as u16;
+            (*row..row.saturating_add(span)).any(|r| repainted_rows.contains(&r))
+        });
+        // Per-image keys. Delete-all-then-replace-all meant ANY change
+        // anywhere re-sent every picture in the window -- one pane's 1-pixel
+        // repaint re-transmitting another pane's 400 KB image, every frame.
+        // Key each placement on its own identity + its pane's epoch, and touch
+        // only the ones that actually changed.
+        // PaneId is part of the key. Without it, pane A being replaced by
+        // pane B at the same rect -- same app, same image id, same geometry,
+        // same epoch -- compares equal, and B inherits A's picture.
+        let keys: Vec<(u16, u16, u32, u32, u32, PaneId, u64, (u16, u16))> = placed
+            .iter()
+            .map(|(r, c, i, pid, ep, d)| {
+                (*r, *c, i.image_id, i.width, i.height, *pid, *ep, *d)
+            })
+            .collect();
+        // DOUBLE-BUFFERED host image ids.
+        //
+        // kitty deletes an existing image the instant you re-transmit its id
+        // ("the existing image and all its placements are deleted, the new data
+        // replaces the old"). Re-sending a ~3.6 MB bitmap under the SAME id
+        // therefore empties the pane for the whole ~900-chunk transfer -- a
+        // visible flicker on every repaint, measured as the image being absent
+        // on 5 of 25 sampled frames in real kitty.
+        //
+        // So each slot alternates between two ids. The new bitmap is
+        // transmitted and placed under the id the slot is NOT currently using;
+        // the old image stays on screen for the entire transfer and is deleted
+        // only once its replacement is up.
+        let mut resend: Vec<usize> = (0..placed.len())
+            .filter(|&i| self.spike_last_keys.get(i) != keys.get(i) || overpainted)
+            .collect();
+        let gone: Vec<u32> = (placed.len()..self.spike_last_host.len())
+            .filter_map(|i| self.spike_last_host.get(i).copied())
+            .collect();
+        self.spike_last_images = sig;
+        self.spike_last_epochs = epochs.to_vec();
+        self.spike_last_keys = keys;
+        if resend.is_empty() && gone.is_empty() {
+            return Ok(());
+        }
+        resend.sort_unstable();
+
+        let mut next_host = self.spike_last_host.clone();
+        next_host.resize(placed.len(), 0);
+        for &idx in &resend {
+            let (row, col, img, _, _, dest) = &placed[idx];
+            let slot_a: u32 = 1_000_000 + (idx as u32) * 2;
+            let slot_b: u32 = slot_a + 1;
+            let old = self.spike_last_host.get(idx).copied().unwrap_or(0);
+            let new_id = if old == slot_a { slot_b } else { slot_a };
+            {
+                let out = self.backend.inner_mut();
+                write!(out, "\x1b[{};{}H", row + 1, col + 1)?;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&img.rgba);
+                let bytes = b64.as_bytes();
+                let total = bytes.len().div_ceil(4096).max(1);
+                for (ci, chunk) in bytes.chunks(4096).enumerate() {
+                    let more = u8::from(ci + 1 < total);
+                    let payload = std::str::from_utf8(chunk).unwrap_or("");
+                    if ci == 0 {
+                        // c=/r= give the destination box in CELLS, so the host's
+                        // own cell pixel size stops mattering.
+                        write!(
+                            out,
+                            "\x1b_Ga=T,f=32,t=d,s={},v={},i={},c={},r={},q=2,m={};{}\x1b\\",
+                            img.width, img.height, new_id, dest.0, dest.1, more, payload
+                        )?;
+                    } else {
+                        if more == 0 {
+                            write!(out, "\x1b[{};{}H", row + 1, col + 1)?;
+                        }
+                        write!(out, "\x1b_Gq=2,m={};{}\x1b\\", more, payload)?;
+                    }
+                }
+                // The replacement is up; only now retire the previous one.
+                if old != 0 {
+                    write!(out, "\x1b_Ga=d,q=2,d=I,i={old}\x1b\\")?;
+                }
+            }
+            next_host[idx] = new_id;
+        }
+        {
+            let out = self.backend.inner_mut();
+            for old in &gone {
+                write!(out, "\x1b_Ga=d,q=2,d=I,i={old}\x1b\\")?;
+            }
+        }
+        self.spike_last_host = next_host;
+        let out = self.backend.inner_mut();
+        out.flush()?;
+        Ok(())
+    }
+
     pub fn render_multi_pane(&mut self, frame: MultiPaneFrame<'_>) -> io::Result<RenderStats> {
         let frame_start = Instant::now();
         let compose_start = Instant::now();
@@ -460,6 +681,48 @@ impl<W: Write> RenderCompositor<W> {
                 // Missing VT: render an "(no output)" placeholder so the
                 // pane is visible.
                 self.compose_placeholder(*rect, "(no output)");
+            }
+        }
+
+        // 2b. SPIKE: collect this frame's visible images in screen coords.
+        let mut spike_placed = Vec::new();
+        let mut spike_epochs: Vec<(PaneId, u64)> = Vec::new();
+        for (pid, rect) in &pane_rects {
+            if let Some(vt) = frame.vts.get(pid) {
+                let before = spike_placed.len();
+                for img in &vt.grid().clone_visible().spike_images {
+                    let row = img.row as u16 + rect.y;
+                    let col = img.col as u16 + rect.x;
+                    if row < rect.y + rect.height && col < rect.x + rect.width {
+                        if let Some(clipped) = spike_clip_to_pane(img, row, col, *rect) {
+                            // Destination box in CELLS. The host terminal's cell
+                            // pixel size is its own business -- ours is 9x19 and
+                            // kitty's is not -- so hand it a cell rectangle and
+                            // let it scale, instead of assuming pixels match.
+                            let cols = (clipped.width.div_ceil(u32::from(SPIKE_CELL_W)).max(1)
+                                as u16)
+                                .min(rect.x + rect.width - col);
+                            let rows = (clipped.height.div_ceil(u32::from(SPIKE_CELL_H)).max(1)
+                                as u16)
+                                .min(rect.y + rect.height - row);
+                            spike_placed.push((
+                                row,
+                                col,
+                                clipped,
+                                *pid,
+                                vt.spike_image_epoch(),
+                                (cols, rows),
+                            ));
+                        }
+                    }
+                }
+                // Only panes that actually placed something get an epoch: a
+                // pane with no pictures must not make an idle client chatter,
+                // and a pane that LOSES its last picture already shows up in
+                // the placement signature.
+                if spike_placed.len() > before {
+                    spike_epochs.push((*pid, vt.spike_image_epoch()));
+                }
             }
         }
 
@@ -625,6 +888,10 @@ impl<W: Write> RenderCompositor<W> {
                 None
             };
         self.render_dirty_and_cursor(&dirty, target_cursor)?;
+        // SPIKE: pictures go out after the cells, so text never overdraws them.
+        let repainted_rows: std::collections::HashSet<u16> =
+            dirty.iter().map(|c| c.row).collect();
+        self.spike_emit_images(&spike_placed, &repainted_rows, &spike_epochs)?;
 
         let render_time = render_start.elapsed();
         self.buffer.swap();

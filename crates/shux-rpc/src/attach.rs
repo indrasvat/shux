@@ -95,6 +95,11 @@ pub enum AttachClientFrame {
         button: MouseButton,
         col: u16,
         row: u16,
+        /// SPIKE: Shift held. Shift takes the mouse back from a
+        /// mouse-aware app so shux's own selection still works.
+        /// Defaults false so older clients stay wire-compatible.
+        #[serde(default)]
+        shift: bool,
     },
     /// Client wants to detach.
     Detach,

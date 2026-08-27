@@ -8,6 +8,11 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::pty::{Winsize, openpty};
+
+/// SPIKE: shux-raster's cell box at the default 14.0 font. Hardcoded here only
+/// because the PTY layer has no handle on the rasterizer; a real fix plumbs it.
+const SPIKE_CELL_W: u16 = 9;
+const SPIKE_CELL_H: u16 = 19;
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info};
 
@@ -549,11 +554,14 @@ fn write_once(fd: std::os::fd::RawFd, buf: &[u8]) -> std::io::Result<usize> {
 impl PtyHandle {
     /// Spawn a new PTY child process.
     pub fn spawn(config: &PtyConfig) -> Result<Self, PtyError> {
+        // SPIKE FIX: shux reported 0x0 pixels, so a pane app cannot learn the
+        // cell size and must guess. terminal-browser guesses 16x32; shux renders
+        // 9x19, so every mouse coordinate it computes lands in the wrong place.
         let winsize = Winsize {
             ws_row: config.size.rows,
             ws_col: config.size.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: config.size.cols * SPIKE_CELL_W,
+            ws_ypixel: config.size.rows * SPIKE_CELL_H,
         };
         let pty_pair = openpty(Some(&winsize), None).map_err(nix_to_io)?;
         set_nonblocking(&pty_pair.master).map_err(PtyError::Open)?;
@@ -775,8 +783,8 @@ impl PtyHandle {
         let winsize = Winsize {
             ws_row: new_size.rows,
             ws_col: new_size.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: new_size.cols * SPIKE_CELL_W,
+            ws_ypixel: new_size.rows * SPIKE_CELL_H,
         };
         let rc = unsafe {
             nix::libc::ioctl(

@@ -10,7 +10,7 @@ mod cell;
 mod charset;
 mod cursor;
 mod diff;
-mod graphics;
+pub mod graphics;
 mod grid;
 mod parser;
 mod screen;
@@ -109,6 +109,20 @@ pub struct VirtualTerminal {
     pub(crate) dispatched_graphics: Vec<Vec<u8>>,
     /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
     apc_cut_slicing: bool,
+    /// SPIKE: kitty image chunk assembler.
+    spike_asm: graphics::spike_kitty::SpikeAssembler,
+    /// SPIKE: bitmaps the host has been given, by image id. Separate from
+    /// `grid.spike_images`, which holds PLACEMENTS -- a transmit stores, a
+    /// place makes it visible.
+    spike_store: std::collections::HashMap<u32, graphics::spike_kitty::SpikeImage>,
+    /// SPIKE FIX: TERMINAL-scoped image epoch. `Grid::spike_image_gen` cannot
+    /// do this job: it belongs to a grid, and the two paths that hand out a
+    /// DIFFERENT grid -- the synchronized-output freeze (`clone_presented_
+    /// viewport` resets it to 0) and the alternate-screen swap (`mem::replace`)
+    /// -- both make it non-monotonic, so two different pictures can be read at
+    /// the same generation. This one is owned by the terminal and bumped by
+    /// every store change AND every screen swap.
+    spike_image_epoch: u64,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
     /// open. Shared by reference with every [`sync::Presented`] wrapper handed
     /// to the parser, which is why it is a cell rather than a plain `bool`;
@@ -250,6 +264,9 @@ impl VirtualTerminal {
             #[cfg(test)]
             dispatched_graphics: Vec::new(),
             apc_cut_slicing: true,
+            spike_asm: graphics::spike_kitty::SpikeAssembler::default(),
+            spike_store: std::collections::HashMap::new(),
+            spike_image_epoch: 0,
             sync_armed: std::sync::atomic::AtomicBool::new(false),
             frozen_grid: None,
             frozen_cursor: None,
@@ -461,6 +478,7 @@ impl VirtualTerminal {
             ),
             alt_grid: &mut self.alt_grid,
             alt_cursor: &mut self.alt_cursor,
+            spike_image_epoch: &mut self.spike_image_epoch,
             dcs_state: &mut self.dcs_state,
             sync_armed: &self.sync_armed,
             frozen_alt: &mut self.frozen_alt,
@@ -488,9 +506,137 @@ impl VirtualTerminal {
         let Some(command) = body.strip_prefix(b"G") else {
             return;
         };
+        let gen_before = self.grid.spike_image_gen;
+        let epoch_guard = |vt: &mut Self| {
+            if vt.grid.spike_image_gen != gen_before {
+                vt.spike_image_epoch = vt.spike_image_epoch.saturating_add(1);
+            }
+        };
         #[cfg(test)]
         self.dispatched_graphics.push(command.to_vec());
-        let _ = (command, responses);
+        // SPIKE: answer the capability query. terminal-browser REFUSES to start
+        // unless it sees `Gi=<id>;OK` -- this is a hard requirement, not an
+        // optimisation. Found by running the real app against the spike.
+        {
+            let (control, _) = match command.iter().position(|b| *b == b';') {
+                Some(i) => (&command[..i], &command[i + 1..]),
+                None => (command, &b""[..]),
+            };
+            let mut is_query = false;
+            let mut id: Option<&[u8]> = None;
+            let mut medium: &[u8] = b"d";
+            for part in control.split(|b| *b == b',') {
+                let mut it = part.splitn(2, |b| *b == b'=');
+                if let (Some(k), Some(v)) = (it.next(), it.next()) {
+                    match k {
+                        b"a" if v == b"q" => is_query = true,
+                        b"i" => id = Some(v),
+                        b"t" => medium = v,
+                        _ => {}
+                    }
+                }
+            }
+            if is_query && let Some(id) = id {
+                // SPIKE: OK only for direct transmission. Answering OK to the
+                // file/shm probes makes the app ship pixels by a route we do
+                // not implement, and the pane stays blank -- observed, not
+                // theorised. This is why D11 says refuse them explicitly.
+                let ok = medium == b"d";
+                let mut reply = Vec::new();
+                reply.extend_from_slice(b"\x1b_Gi=");
+                reply.extend_from_slice(id);
+                reply.extend_from_slice(if ok { b";OK\x1b\\" } else { b";EBADF\x1b\\" });
+                responses.push(reply);
+            }
+            if let Ok(path) = std::env::var("SHUX_SPIKE_TRACE") {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let head: Vec<u8> = control.iter().copied().take(90).collect();
+                    let _ = writeln!(f, "{}", String::from_utf8_lossy(&head));
+                }
+            }
+        }
+        // SPIKE: a=d deletion. terminal-browser sends `a=d,d=A` (delete ALL)
+        // on shrink, so this is on the target's real path.
+        {
+            let (control, _) = match command.iter().position(|b| *b == b';') {
+                Some(i) => (&command[..i], &command[i + 1..]),
+                None => (command, &b""[..]),
+            };
+            let mut is_delete = false;
+            let mut is_place = false;
+            let mut what: &[u8] = b"a";
+            let mut id: Option<u32> = None;
+            for part in control.split(|b| *b == b',') {
+                let mut it = part.splitn(2, |b| *b == b'=');
+                if let (Some(k), Some(v)) = (it.next(), it.next()) {
+                    match k {
+                        b"a" if v == b"d" => is_delete = true,
+                        b"a" if v == b"p" => is_place = true,
+                        b"d" => what = v,
+                        b"i" => id = std::str::from_utf8(v).ok().and_then(|t| t.parse().ok()),
+                        _ => {}
+                    }
+                }
+            }
+            // `a=p` -- place an already-transmitted bitmap. Zellij transmits
+            // once (`a=t`) and then only re-places; without this the place is
+            // dropped and the picture never appears.
+            if !is_delete && is_place {
+                if let Some(id) = id {
+                    if let Some(src) = self.spike_store.get(&id).cloned() {
+                        let mut img = src;
+                        img.anchor = self.grid.abs_line_of_visible_row(self.cursor.row);
+                        img.row = self.cursor.row;
+                        img.col = self.cursor.col;
+                        self.grid.spike_images.retain(|p| p.image_id != img.image_id);
+                        self.grid.spike_images.push(img);
+                        self.grid.spike_image_gen += 1;
+                    }
+                }
+            }
+            if is_delete {
+                match what {
+                    b"A" | b"a" => {
+                        self.grid.spike_images.clear();
+                        self.grid.spike_image_gen += 1;
+                    }
+                    b"I" | b"i" => {
+                        if let Some(id) = id {
+                            self.grid.spike_images.retain(|p| p.image_id != id);
+                            self.grid.spike_image_gen += 1;
+                        }
+                    }
+                    _ => {
+                        self.grid.spike_images.clear();
+                        self.grid.spike_image_gen += 1;
+                    }
+                }
+            }
+        }
+        // SPIKE: decode and place at the cursor as it stands right now.
+        let anchor = self.grid.abs_line_of_visible_row(self.cursor.row);
+        let col = self.cursor.col;
+        if let Some(img) = self.spike_asm.feed(command, anchor, col) {
+            // SPIKE FIX: kitty's spec — "when re-transmitting image data for a
+            // specific id, the existing image and all its placements must be
+            // deleted. The new data replaces the old." terminal-browser sends
+            // i=1 for EVERY repaint, so this one line is what turns unbounded
+            // growth into a constant one-frame cost.
+            if let Ok(path) = std::env::var("SHUX_SPIKE_RECV_LOG") {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "{} recv id={} {}x{} bytes={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), img.image_id, img.width, img.height, img.rgba.len());
+                }
+            }
+            self.spike_store.insert(img.image_id, img.clone());
+            if img.place_now {
+                self.grid.spike_images.retain(|p| p.image_id != img.image_id);
+                self.grid.spike_images.push(img);
+                self.grid.spike_image_gen += 1;
+            }
+        }
+        epoch_guard(self);
     }
 
     /// Process raw PTY output bytes and return terminal reply bytes.
@@ -526,6 +672,11 @@ impl VirtualTerminal {
         }
 
         let before_writes = self.grid.mutations();
+        // SPIKE FIX: images are not cells, so `mutations()` cannot see them.
+        // Without this an image-only update never bumps ContentRevision, the
+        // attach client never re-renders, and it keeps showing a stale picture
+        // long after the daemon holds the right one — observed, not theorised.
+        let before_images = self.grid.spike_image_gen;
         let before_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
         let before_alt = self.modes.alternate_screen;
         let before_colors = self.default_colors();
@@ -569,7 +720,9 @@ impl VirtualTerminal {
         let presented_colors_changed = self.default_colors() != before_colors;
         let other_class_a = after_alt != before_alt
             || after_cursor != before_cursor
-            || (before_alt == after_alt && self.grid.mutations() != before_writes);
+            || (before_alt == after_alt
+                && (self.grid.mutations() != before_writes
+                    || self.grid.spike_image_gen != before_images));
         // §4.2 (adjudicated, PR #87 bot P1): while synchronized output
         // (CSI ?2026h) freezes the presentation, Class-A events must NOT bump
         // immediately — the counter tracks the PRESENTED frame, matching
@@ -638,6 +791,12 @@ impl VirtualTerminal {
     /// seeded at pane creation. Basis for `pane.wait_settled` (P3).
     pub fn last_mutation_ns(&self) -> u64 {
         self.last_mutation_ns
+    }
+
+    /// SPIKE FIX: monotonic epoch of the images this terminal PRESENTS.
+    /// Bumped by every store mutation and by every screen swap.
+    pub fn spike_image_epoch(&self) -> u64 {
+        self.spike_image_epoch
     }
 
     /// Access the current (active) grid.
@@ -902,6 +1061,7 @@ impl VirtualTerminal {
             stashed_cursor: &mut self.alt_cursor,
             spare: &mut self.alt_spare,
             reuse: self.reuse_retired_grids,
+            image_epoch: &mut self.spike_image_epoch,
         }
     }
 

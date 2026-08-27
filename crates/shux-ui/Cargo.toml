@@ -25,3 +25,5 @@ futures = "0.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+shux-raster = { path = "../shux-raster" }
+image = { version = "0.25", default-features = false, features = ["png"] }

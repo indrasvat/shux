@@ -267,6 +267,7 @@ where
                             button,
                             col: m.column,
                             row: m.row,
+                            shift: m.modifiers.contains(KeyModifiers::SHIFT),
                         };
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();
