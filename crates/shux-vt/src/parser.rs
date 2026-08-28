@@ -1777,6 +1777,11 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 // character, so a REP straight after one repeats nothing
                 // (issue #122).
                 *self.last_graphic = None;
+                // When the image/placement store lands, RIS must clear it here:
+                // the graphics protocol requires that "when resetting the
+                // terminal, all images that are visible on the screen must be
+                // cleared". It must NOT clear the APC scanner -- see the note in
+                // `VirtualTerminal::advance_slice` for why that is always wrong.
                 self.reset_charsets();
                 self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
