@@ -32,6 +32,20 @@ def main() -> int:
     ap.add_argument("images", nargs="+", type=Path)
     ap.add_argument("--min-colors", type=int, default=8)
     ap.add_argument("--min-ink-ratio", type=float, default=0.01)
+    ap.add_argument(
+        "--min-chroma-ratio",
+        type=float,
+        default=None,
+        help=(
+            "fraction of pixels that must carry actual colour, i.e. where "
+            "max(R,G,B) - min(R,G,B) exceeds --chroma-threshold. Counting "
+            "DISTINCT COLOURS does not discriminate colour from greyscale: "
+            "antialiasing alone produces hundreds of distinct greys, so a "
+            "screen with every colour stripped still scores in the hundreds. "
+            "Only chroma separates them."
+        ),
+    )
+    ap.add_argument("--chroma-threshold", type=int, default=16)
     args = ap.parse_args()
 
     failed = False
@@ -51,12 +65,23 @@ def main() -> int:
         # that happens to be -- a light theme is not blank just because its
         # dominant colour is white.
         ink_ratio = 1.0 - (counts.max() / len(arr))
+        chroma_ratio = None
+        if args.min_chroma_ratio is not None:
+            hi = arr.max(axis=1).astype(np.int16)
+            lo = arr.min(axis=1).astype(np.int16)
+            chroma_ratio = float((hi - lo > args.chroma_threshold).mean())
+
         ok = n_colors >= args.min_colors and ink_ratio >= args.min_ink_ratio
+        if chroma_ratio is not None and chroma_ratio < args.min_chroma_ratio:
+            ok = False
         status = "ok  " if ok else "FAIL"
-        print(
+        detail = (
             f"    {status} {path.name}: {n_colors} distinct colours, "
             f"{ink_ratio:.3%} non-background"
         )
+        if chroma_ratio is not None:
+            detail += f", {chroma_ratio:.3%} chromatic"
+        print(detail)
         if not ok:
             failed = True
 

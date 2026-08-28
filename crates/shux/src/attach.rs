@@ -2523,8 +2523,22 @@ async fn handle_app_mouse(
         // The app owns the mouse but did not subscribe to this event. Consume
         // it: a stray shux selection appearing under a running TUI is not a
         // better answer than nothing happening.
+        //
+        // One exception, and it is the whole reason this arm is not a bare
+        // swallow: a RELEASE that ends a gesture the app is still listening
+        // for. If the app turned tracking off it stopped listening and
+        // manufacturing a report it never subscribed to would be inventing
+        // input — but if it merely switched to a coordinate mode shux cannot
+        // encode (1005/1015/1016), it IS still waiting for the button to come
+        // up, and dropping the release leaves it button-held or mid-drag for
+        // the rest of the pane's life. A release at a coordinate the app reads
+        // oddly is recoverable; a stuck button is not.
         AppMouseRoute::Swallow => {
-            end_gesture_if_released(gesture, action, button);
+            if action == ButtonAction::Release && mode != shux_vt::MouseMode::None {
+                release_app_gesture(io_state, gesture).await;
+            } else {
+                end_gesture_if_released(gesture, action, button);
+            }
             return Ok(AppMouse::Consumed { redraw: false });
         }
         AppMouseRoute::Forward(pane_id) => pane_id,
@@ -6371,6 +6385,50 @@ mod tests {
             "the wheel should have fallen back to shux's scrollback"
         );
         fixture.stop();
+    }
+
+    /// An app that switches to a coordinate mode shux cannot encode, mid-drag,
+    /// still gets its release.
+    ///
+    /// Greptile P1 on #176. The press was forwarded, then the app sets 1016 —
+    /// it is still tracking, still waiting for the button to come up, and shux
+    /// can no longer encode a coordinate it will read correctly. Swallowing the
+    /// release there leaves it button-held or mid-drag for the rest of the
+    /// pane's life. A release at a coordinate the app reads oddly is
+    /// recoverable; a stuck button is not.
+    ///
+    /// Contrast `an_app_that_drops_tracking_mid_gesture_stops_receiving_reports`:
+    /// an app that turned tracking OFF stopped listening, and manufacturing a
+    /// report it never subscribed to would be inventing input.
+    #[tokio::test]
+    async fn an_app_that_switches_to_an_unencodable_mode_mid_gesture_still_gets_its_release() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+
+        // The app asks for SGR-pixel coordinates mid-gesture.
+        {
+            let mut st = h.fixture.io_state.lock().await;
+            st.vts
+                .get_mut(&h.fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[?1016h");
+        }
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 10, 5).await;
+
+        assert_eq!(
+            recv_text(&mut wr).await,
+            "\x1b[<0;10;5m",
+            "the app is still tracking and still waiting for this release"
+        );
+        assert_eq!(h.gesture, SelectionDrag::None, "the gesture must end");
+        h.fixture.stop();
     }
 
     // --- Task 086: mouse wheel behavioral regression tests ---

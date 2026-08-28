@@ -31,23 +31,41 @@ RPC="crates/shux-rpc/src/attach.rs"
 OVERLAY="crates/shux-ui/src/help_overlay.rs"
 SNAPSHOT="crates/shux/src/snapshot.rs"
 
-# This battery REWRITES TRACKED FILES in place, which CLAUDE.md says belongs in
-# its own worktree. An EXIT trap is the only thing putting them back, and a trap
-# does not survive SIGKILL -- a mutated `attach.rs` left in the tree is a
-# deliberately-broken guard sitting one `git add -A` away from `origin`.
+# This battery REWRITES TRACKED FILES, so per CLAUDE.md it runs in its OWN git
+# worktree — never in the shared checkout.
 #
-# Two cheap defences, since the trap cannot be made reliable: refuse to start on
-# a dirty tree (or a crashed earlier run gets baked into this run's backup and
-# silently "restored" as the mutated version), and assert on the way out that
-# the tree really is clean again.
-if ! git diff --quiet -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" "${SNAPSHOT}"; then
-  echo "Refusing to run: these files already have uncommitted changes." >&2
-  git diff --stat -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" "${SNAPSHOT}" >&2
-  echo >&2
-  echo "This battery mutates them in place. Commit or stash first, or run it" >&2
-  echo "in its own worktree (CLAUDE.md: an agent that rewrites tracked files" >&2
-  echo "runs in its own git worktree)." >&2
-  exit 2
+# A clean-start check plus an EXIT trap is not enough and the script used to say
+# so itself: a trap does not survive SIGKILL, OOM or a cancelled CI run, and a
+# mutated `attach.rs` left behind is a deliberately-broken guard sitting one
+# `git add -A` away from `origin`. Orphaned backup dirs on the machine this was
+# developed on showed the trap had already failed to fire twice. A disposable
+# worktree removes the whole class: the worst a hard kill can leave is a stale
+# directory under /tmp that nothing will ever commit.
+#
+# Re-execs itself inside the worktree. `SHUX_174_MUTATION_WORKTREE` marks the
+# inner run so it does not recurse.
+if [[ -z "${SHUX_174_MUTATION_WORKTREE:-}" ]]; then
+  if ! git diff --quiet HEAD; then
+    echo "Refusing to run: the working tree has uncommitted changes." >&2
+    git status --porcelain >&2
+    echo >&2
+    echo "This battery mutates a WORKTREE of HEAD, so uncommitted work would" >&2
+    echo "not be measured at all -- the run would silently test something" >&2
+    echo "other than what you have in front of you. Commit or stash first." >&2
+    exit 2
+  fi
+  WT="$(mktemp -d "${TMPDIR:-/tmp}/shux-174-mutation-wt-XXXXXX")"
+  rm -rf "${WT}"
+  git worktree add --detach --quiet "${WT}" HEAD
+  # Share the build cache: a cold rebuild of the workspace per run would make
+  # this battery too slow to actually run, which is its own kind of defect.
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+  export SHUX_174_MUTATION_WORKTREE=1
+  status=0
+  ( cd "${WT}" && bash .shux/scripts/issue_174_mutation_check.sh "$@" ) || status=$?
+  git worktree remove --force "${WT}" 2>/dev/null || rm -rf "${WT}"
+  git worktree prune
+  exit "${status}"
 fi
 
 BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shux-174-mutation-XXXXXX")"

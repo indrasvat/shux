@@ -20,6 +20,14 @@
 #     and they take the alternate screen, so a pane that garbles under a click
 #     or under non-zero `ws_xpixel` shows up as a missing needle or as residue.
 #
+# The colour assertion is made on the TUI's OWN screen, not on a probe line.
+# Printing `TRUECOLOR/INDEXED/BASIC` before launch proves nothing here: every
+# one of these apps takes the alternate screen, so the probe is on the discarded
+# primary and the capture never sees it. A regression that stripped every colour
+# while leaving text and cursor placement intact would have passed. Instead the
+# snapshot PNG is sampled for distinct colours, which is a property of the
+# picture the app actually drew.
+#
 # Clicks are written to the master side of a real pty running `shux session
 # attach`, so crossterm parses them exactly as it would parse a real click.
 # Nothing here stubs the client.
@@ -74,7 +82,19 @@ trap cleanup EXIT
 # settle is a quieting delay on top of an assertion that already passed, and
 # every check after it reads captured content rather than an exit code. A settle
 # that times out costs a slightly earlier screenshot, not a false pass.
-sx() { env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" "$@"; }
+# An explicit, isolated config: the click target below is computed from the
+# DEFAULT rounded one-cell outline, so a developer whose own config says
+# `border_style = "none"` would get a one-cell cursor mismatch and a false
+# failure even though forwarding is correct. Nothing about this check should
+# depend on the host's appearance settings.
+config_home="${runtime}/config"
+mkdir -p "${config_home}/shux"
+printf '[appearance]\nborder_style = "rounded"\n' >"${config_home}/shux/config.toml"
+
+sx() {
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${config_home}" \
+    "${shux_bin}" "$@"
+}
 
 mkdir -p "${out_dir}"
 echo "==> rich TUIs under a real click: $(${shux_bin} version 2>/dev/null | head -1)"
@@ -131,8 +151,8 @@ drive() {
   local session="$1" log="$2"; shift 2
   local args=() s
   for s in "$@"; do args+=(--step "${s}"); done
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" TERM=xterm-256color \
-      COLORTERM=truecolor LANG=C.utf8 LC_ALL=C.utf8 \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${config_home}" \
+      TERM=xterm-256color COLORTERM=truecolor LANG=C.utf8 LC_ALL=C.utf8 \
     python3 "${driver}" --cols "${cols}" --rows "${rows}" --log "${log}" \
       --timeout 90 "${args[@]}" -- "${shux_bin}" session attach -s "${session}"
 }
@@ -142,6 +162,30 @@ capture() {
   sx pane wait-settled "${pane}" --quiet 250 --timeout 8000 >/dev/null 2>&1 || true
   sx pane capture -s "${session}" -p "${pane}" --lines "${rows}" >"${out_dir}/${name}.txt"
   sx pane snapshot -s "${session}" -p "${pane}" -o "${out_dir}/${name}.png" >/dev/null
+}
+
+# Assert the TUI's own screen is in colour.
+#
+# The measure is CHROMA, not a distinct-colour count. Counting colours does not
+# discriminate: I tried it first, and a greyscale copy of the real htop screen
+# still scored 221 distinct colours because antialiasing alone produces hundreds
+# of greys. It would have passed a screen with every colour stripped -- the
+# exact regression this is here to catch. Chroma separates them cleanly:
+# measured 14.9% on the real screen, 0.000% on the greyscale copy.
+#
+# 2% is well under every app here and unreachable by a monochrome frame.
+assert_colourful() {
+  local name="$1"
+  local out
+  if out="$(uv run --script "${repo_root}/.shux/scripts/lib/png_not_blank.py" \
+      "${out_dir}/${name}.png" --min-colors 24 --min-ink-ratio 0.02 \
+      --min-chroma-ratio 0.02 2>&1)"; then
+    return 0
+  fi
+  printf '    %-9s FAIL — screen is not in colour; a monochrome regression would pass here\n' \
+    "${name}"
+  printf '%s\n' "${out}"
+  return 1
 }
 
 # ── vim / nvim: ground truth on where the click landed ─────────────────────
@@ -157,7 +201,11 @@ check_editor() {
     return 0
   fi
   start "${name}" "abcdefghij" \
-    "${bin}" -u NONE -c "'set mouse=a noswapfile nonumber nowrap laststatus=0'" "${buffer}"
+    "${bin}" -u NONE \
+    -c "'set mouse=a noswapfile nonumber nowrap laststatus=2 hlsearch ruler'" \
+    -c "'silent! /abcdefghij'" \
+    -c "'nohlsearch | set hlsearch'" \
+    "${buffer}"
   local session="${started_session}" pane="${started_pane}"
 
   drive "${session}" "${out_dir}/${name}-attach.log" \
@@ -181,6 +229,10 @@ check_editor() {
     printf '    %-9s FAIL — buffer is not on the final screen\n' "${name}"
     failures=$((failures + 1))
   else
+    if ! assert_colourful "${name}"; then
+      failures=$((failures + 1))
+      return 0
+    fi
     printf '    %-9s ok   click landed exactly on (%s, %s); %s bytes png\n' \
       "${name}" "${target_col}" "${target_row}" "$(wc -c <"${out_dir}/${name}.png")"
     passes=$((passes + 1))
@@ -218,6 +270,10 @@ check_tui() {
     printf '    %-9s FAIL — raw mouse reports are visible on the screen\n' "${name}"
     failures=$((failures + 1))
   else
+    if ! assert_colourful "${name}"; then
+      failures=$((failures + 1))
+      return 0
+    fi
     printf '    %-9s ok   still rendering under clicks; %s bytes png\n' \
       "${name}" "$(wc -c <"${out_dir}/${name}.png")"
     passes=$((passes + 1))
