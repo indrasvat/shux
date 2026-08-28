@@ -101,3 +101,24 @@ orphan_candidate_pids() {
       if pid_cwd_in_repo "${pid}"; then printf '%s\n' "${pid}"; fi
     done
 }
+
+# One-line `ps` description of a pid, or nothing when it has already exited.
+describe_pid() {
+  local pid="$1"
+  ps -p "${pid}" -o pid=,ppid=,stat=,args= 2>/dev/null || true
+}
+
+# TERM, then KILL what survives. Callers must have attributed every pid first —
+# this helper does no scoping of its own.
+terminate_pids() {
+  local pid
+  for pid in "$@"; do
+    kill -TERM "${pid}" >/dev/null 2>&1 || true
+  done
+  sleep 1
+  for pid in "$@"; do
+    if kill -0 "${pid}" >/dev/null 2>&1; then
+      kill -KILL "${pid}" >/dev/null 2>&1 || true
+    fi
+  done
+}

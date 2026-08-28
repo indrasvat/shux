@@ -34,28 +34,24 @@ pid_in_list() {
   return 1
 }
 
-describe_pid() {
-  local pid="$1"
-  ps -p "${pid}" -o pid=,ppid=,stat=,args= 2>/dev/null || true
-}
-
-kill_new_pids() {
-  local pid
-  for pid in "$@"; do
-    kill -TERM "${pid}" >/dev/null 2>&1 || true
-  done
-  sleep 1
-  for pid in "$@"; do
-    if kill -0 "${pid}" >/dev/null 2>&1; then
-      kill -KILL "${pid}" >/dev/null 2>&1 || true
-    fi
-  done
-}
-
 # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 baseline_shux=($(shux_pids))
 # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 baseline_orphans=($(orphan_candidate_pids))
+
+# Pre-existing daemons stay exempt — a guard must never blame a command for, or kill,
+# a process it did not start, and a concurrent session in this checkout is entitled to
+# its daemon. But exempt was also SILENT, so a daemon orphaned by an interrupted run
+# was invisible to every later invocation and accumulated forever: four of them sat in
+# `ps` through a full green `make check` (issue #179). Say they are there.
+if [ "${#baseline_shux[@]}" -gt 0 ]; then
+  echo "⚠ shux leak guard: ${#baseline_shux[@]} shux daemon(s) from this checkout were already" >&2
+  echo "  running before this command, so they are EXEMPT from the check below:" >&2
+  for pid in "${baseline_shux[@]}"; do
+    describe_pid "${pid}" >&2
+  done
+  echo "  If no session of yours is using them, \`make reap\` stops them." >&2
+fi
 
 set +e
 "$@"
@@ -79,7 +75,7 @@ if [ "${#new_shux_pids[@]}" -gt 0 ]; then
   for pid in "${new_shux_pids[@]}"; do
     describe_pid "${pid}" >&2
   done
-  kill_new_pids "${new_shux_pids[@]}"
+  terminate_pids "${new_shux_pids[@]}"
 fi
 
 # Re-scan after daemon cleanup: killing a daemon must not strand pane commands.
@@ -100,7 +96,7 @@ if [ "${#new_orphan_pids[@]}" -gt 0 ]; then
   for pid in "${new_orphan_pids[@]}"; do
     describe_pid "${pid}" >&2
   done
-  kill_new_pids "${new_orphan_pids[@]}"
+  terminate_pids "${new_orphan_pids[@]}"
 fi
 
 if [ "${#new_shux_pids[@]}" -gt 0 ] || [ "${#new_orphan_pids[@]}" -gt 0 ]; then

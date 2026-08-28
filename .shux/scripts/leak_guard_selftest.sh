@@ -190,5 +190,81 @@ if [ "${xvfb_guard_status}" -eq 0 ]; then
   exit 1
 fi
 
+# A daemon orphaned by an interrupted run is BASELINE for every later guard invocation:
+# exempt by construction, and once silently so — four of them sat in `ps` through a full
+# green `make check` (issue #179). The guard must name them, and `make reap` must be able
+# to select them.
+#
+# The daemon here is started OUTSIDE the guard, so it is baseline exactly as an orphan is.
+# The reaper is exercised with `--dry-run`: a self-test must never be able to kill a
+# process it did not create, and a real reap is machine-wide within this checkout.
+baseline_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-baseline.XXXXXX")"
+stop_baseline_daemon() {
+  local pid
+  pid="$(cat "${baseline_runtime}/shux/shux.pid" 2>/dev/null || true)"
+  case "${pid}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${pid}" -gt 1 ] || return 0
+  terminate_pids "${pid}"
+}
+
+env -u SHUX_SOCKET XDG_RUNTIME_DIR="${baseline_runtime}" "${shux_bin}" --format json \
+  session create leak-guard-baseline-$$ -d -- sh -lc 'sleep 60' >/dev/null
+baseline_pid="$(cat "${baseline_runtime}/shux/shux.pid")"
+trap 'stop_baseline_daemon; assert_leaked_daemon_reaped "${selftest_runtime}"; assert_no_new_orphan_automation_processes "${orphan_baseline}"; rm -f "${orphan_baseline}"' EXIT
+
+baseline_warning="$(mktemp "${TMPDIR:-/tmp}/shux-leak-guard-warning.XXXXXX")"
+.shux/scripts/no_leak_guard.sh true 2>"${baseline_warning}"
+
+if ! grep -q "EXEMPT" "${baseline_warning}" || ! grep -q "${baseline_pid}" "${baseline_warning}"; then
+  echo "no_leak_guard stayed silent about an already-running daemon (${baseline_pid})" >&2
+  cat "${baseline_warning}" >&2
+  rm -f "${baseline_warning}"
+  exit 1
+fi
+rm -f "${baseline_warning}"
+
+# Capture, then match. Piping into `grep -q` under `pipefail` reports the writer's
+# SIGPIPE (141) as the pipeline's status, which reads as "the reaper failed" no matter
+# what it printed — this assertion failed that way before it ever ran for real.
+reap_listing="$(.shux/scripts/reap_daemons.sh --dry-run)"
+case "${reap_listing}" in
+  *"${baseline_pid}"*) ;;
+  *)
+    echo "reap_daemons.sh did not select the already-running daemon ${baseline_pid}" >&2
+    echo "${reap_listing}" >&2
+    exit 1
+    ;;
+esac
+
+# Assert with the guard's own instrument, not `kill -0`: an orphan reparented to a
+# non-reaping init stays a zombie for a while, and `kill -0` cannot tell that from a
+# running daemon. `shux_daemon_pids` can — a zombie's argv is `[shux] <defunct>`, which
+# matches neither `__daemon` nor this checkout's path.
+stop_baseline_daemon
+case "$(shux_daemon_pids)" in
+  *"${baseline_pid}"*)
+    echo "leak guard self-test could not stop its own baseline daemon ${baseline_pid}" >&2
+    describe_pid "${baseline_pid}" >&2
+    exit 1
+    ;;
+esac
+
+# The other half of the contract: with nothing of ours running, the guard says nothing.
+# Only assertable on an empty process table — a concurrent session in this checkout is
+# entitled to its daemon, and warning about that one is the feature working.
+if [ -z "$(shux_daemon_pids)" ]; then
+  quiet_warning="$(mktemp "${TMPDIR:-/tmp}/shux-leak-guard-quiet.XXXXXX")"
+  .shux/scripts/no_leak_guard.sh true 2>"${quiet_warning}"
+  if grep -q "EXEMPT" "${quiet_warning}"; then
+    echo "no_leak_guard warned about exempt daemons when none were running" >&2
+    cat "${quiet_warning}" >&2
+    rm -f "${quiet_warning}"
+    exit 1
+  fi
+  rm -f "${quiet_warning}"
+else
+  echo "note: other daemons from this checkout are running; skipping the quiet-baseline case" >&2
+fi
+
 assert_no_new_orphan_automation_processes "${orphan_baseline}"
 echo "shux leak guard self-test passed"
