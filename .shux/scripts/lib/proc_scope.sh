@@ -10,7 +10,18 @@
 #
 # Callers must set REPO_ROOT before sourcing, or it is derived from this file.
 
-: "${REPO_ROOT:="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"}"
+# `pwd -P`, not `pwd`: the daemon's argv comes from `current_exe()`, which is always the
+# PHYSICAL path, so a logical REPO_ROOT taken through a symlink can never prefix-match it.
+# Reached through a symlinked checkout — routine on macOS, where `/tmp` is `/private/tmp`
+# — every daemon of this very checkout went unseen.
+: "${REPO_ROOT:="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"}"
+
+# `ps` is the one external tool these helpers cannot do without. A guard whose tool is
+# missing must say so and exit non-zero, never report clean for work it did not do.
+if ! command -v ps >/dev/null 2>&1; then
+  echo "⚠ leak guard: \`ps\` is not on PATH, so no process can be attributed." >&2
+  exit 3
+fi
 
 # A process's working directory, or empty when it cannot be determined.
 #
@@ -58,20 +69,29 @@ pid_cwd_in_repo() {
 #
 # Only a daemon can leak — a CLIENT invocation is transient and exits on its own, so it
 # is never anyone's leak — and only one running this checkout's binary is our business.
+#
+# `__daemon` is matched in the SUBCOMMAND slot, not anywhere in the argv. As a substring
+# it also matched live clients (`shux events watch --filter __daemon`), which
+# `reap_daemons.sh` would then TERM+KILL. Everything before ` __daemon` must be this
+# checkout's binary; a client that merely mentions the word leaves its own subcommands
+# in there and stops matching.
+#
+# `ps`, not `pgrep`: `pgrep -x shux 2>/dev/null || true` cannot tell "no daemons" from
+# "no pgrep on this host", and answered "clean" to both.
+#
+# A zombie is excluded for free — its argv reads `[shux] <defunct>` — which is right:
+# it holds no socket, no PTY and no runtime dir.
 shux_daemon_pids() {
-  local pid args
-  for pid in $(pgrep -x shux 2>/dev/null || true); do
-    # `ps -o args=` pads with leading whitespace; strip it or the prefix match never fires.
-    args="$(ps -p "${pid}" -o args= 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
-    case "${args}" in
-      *"__daemon"*) ;;
-      *) continue ;;
-    esac
-    case "${args}" in
-      "${REPO_ROOT}"/*) printf '%s\n' "${pid}" ;;
-      *) ;;
-    esac
-  done
+  ps -axo pid=,args= |
+    while read -r pid args; do
+      case "${args}" in
+        *" __daemon"*) ;;
+        *) continue ;;
+      esac
+      case "${args%% __daemon*}" in
+        "${REPO_ROOT}"/*/shux | "${REPO_ROOT}"/shux) printf '%s\n' "${pid}" ;;
+      esac
+    done
 }
 
 # Orphaned automation processes (PPID 1) that belong to this repository.
@@ -100,4 +120,58 @@ orphan_candidate_pids() {
     while read -r pid; do
       if pid_cwd_in_repo "${pid}"; then printf '%s\n' "${pid}"; fi
     done
+}
+
+# One-line `ps` description of a pid, or nothing when it has already exited.
+describe_pid() {
+  local pid="$1"
+  ps -p "${pid}" -o pid=,ppid=,stat=,args= 2>/dev/null || true
+}
+
+# True when a pid is no longer a running process. A zombie counts as gone: it is waiting
+# to be reaped and owns nothing. `kill -0` alone cannot tell the two apart, and under an
+# init that does not reap promptly it calls a dead daemon alive.
+pid_is_gone() {
+  local pid="$1" state
+  kill -0 "${pid}" >/dev/null 2>&1 || return 0
+  state="$(ps -p "${pid}" -o stat= 2>/dev/null | tr -d '[:space:]')"
+  case "${state}" in '' | Z*) return 0 ;; *) return 1 ;; esac
+}
+
+# Whether a pid appears in a list of pids.
+pid_in_list() {
+  local needle="$1"
+  local pid
+  shift
+  for pid in "$@"; do
+    if [ "${pid}" = "${needle}" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# TERM, then KILL what survives. Callers must have attributed every pid first —
+# this helper does no scoping of its own.
+terminate_pids() {
+  local pid waited
+  for pid in "$@"; do
+    kill -TERM "${pid}" >/dev/null 2>&1 || true
+  done
+  sleep 1
+  for pid in "$@"; do
+    if kill -0 "${pid}" >/dev/null 2>&1; then
+      kill -KILL "${pid}" >/dev/null 2>&1 || true
+    fi
+  done
+  # KILL is asynchronous. Return before the kernel has torn the process down and a
+  # survivor scan on the caller's next line still sees it, with its full argv — a
+  # successful kill reported as "survived TERM+KILL".
+  waited=0
+  while [ "${waited}" -lt 50 ]; do
+    for pid in "$@"; do
+      pid_is_gone "${pid}" || { waited=$((waited + 1)); sleep 0.1; continue 2; }
+    done
+    return 0
+  done
 }

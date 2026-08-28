@@ -27,6 +27,7 @@ make check-vt-qa        # VT-touching diffs carry tracked QA evidence
 make check-test-groups  # nextest groups still bound what they claim
 make shellcheck         # every tracked shell script (the guards live in shell)
 make test-gui-terminal  # what a REAL GUI terminal (kitty/Xvfb) draws from shux's output
+make reap               # stop daemons this checkout leaked when a run was interrupted
 make install / hooks    # install binary / lefthook hooks
 ```
 

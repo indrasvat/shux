@@ -98,7 +98,7 @@ help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*##"} /^(clippy|lint|fmt|check|ci|deny|fuzz|shellcheck)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Tooling:$(COLOR_RESET)"
-	@awk 'BEGIN {FS = ":.*##"} /^(setup|hooks|doc|clean|version|info)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"} /^(setup|hooks|doc|clean|version|info|reap)[a-zA-Z_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "$(COLOR_BOLD)Spikes:$(COLOR_RESET)"
 	@awk 'BEGIN {FS = ":.*##"} /^spike[a-zA-Z0-9_-]*:.*?##/ { printf "  $(COLOR_GREEN)%-20s$(COLOR_RESET) %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -386,6 +386,10 @@ test-vt-dirty-regions: release ## Drive dirty-region tracking evidence, performa
 	@echo "$(COLOR_BLUE)▶ Running VT dirty-region automation...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh .shux/scripts/dirty_region_check.sh
 	@echo "$(COLOR_GREEN)✓ VT dirty-region automation passed$(COLOR_RESET)"
+
+.PHONY: reap
+reap: ## Stop shux daemons from this checkout left behind by an interrupted run
+	@.shux/scripts/reap_daemons.sh
 
 .PHONY: test-shux-leak-guard
 test-shux-leak-guard: release ## Verify shux automation leak guard catches and kills orphan daemons
