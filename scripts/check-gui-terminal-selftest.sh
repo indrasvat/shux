@@ -14,8 +14,8 @@
 #      kitty would also produce. With it the rig must go green, which is what
 #      proves the red came from the missing box and not from the injection.
 #   2. Empty input — no frames, a missing frame, a black screen, a truncated
-#      capture, a frame that lost a colour class, and a phase whose promised
-#      image never arrived.
+#      capture, a frame that lost a colour class, an overflow in a colour the rig
+#      does not paint, and a phase whose promised image never arrived.
 #   3. A missing tool — no kitty, no ImageMagick, no shux binary, no working
 #      comparator: say so and exit non-zero, never report success for work not
 #      done.
@@ -209,34 +209,59 @@ open(sys.argv[1], "wb").write(
     expect 1 "a truncated capture is a failure" "unreadable" \
         "${verdict}" --geometry "${work}/truncated.json"
 
-    # A frame that lost a colour class. The mutation is on the PICTURE, not on
-    # the geometry file: repointing `probe_rgb` at a colour nothing paints would
+    # Two mutations of a real capture. Both are on the PICTURE, not on the
+    # geometry file: repointing a colour at something nothing paints would
     # manufacture a red on any tree, which proves the assertion is wired and
-    # nothing else. Repainting the pixels the indexed probe drew is what a shux
-    # that had stopped emitting indexed colour would actually produce.
-    cat >"${work}/strip_colour.py" <<'STRIPPER'
+    # nothing else.
+    cat >"${work}/mutate_frame.py" <<'MUTATOR'
 # /// script
 # requires-python = ">=3.14"
 # dependencies = ["pillow", "numpy"]
 # ///
+"""Damage a real captured frame in one specific way, and rewrite its geometry."""
 import json, sys
 from pathlib import Path
 import numpy as np
 from PIL import Image
 
-run = json.loads(Path(sys.argv[1]).read_text())
+mode, src_json, out_png, out_json = sys.argv[1:5]
+run = json.loads(Path(src_json).read_text())
 phase = run["phases"][0]
 arr = np.asarray(Image.open(phase["frames"][0]).convert("RGB")).astype(int)
-target = np.array(run["probe_rgb"][1])
-arr[np.abs(arr - target).max(axis=2) <= 60] = [200, 200, 200]
-Image.fromarray(arr.astype(np.uint8)).save(sys.argv[2])
-run["phases"] = [dict(phase, frames=[sys.argv[2]])]
-Path(sys.argv[3]).write_text(json.dumps(run))
-STRIPPER
-    uv run --script "${work}/strip_colour.py" "${contained_out}/run.json" \
+
+if mode == "strip-indexed":
+    # What a shux that had stopped emitting indexed colour would produce.
+    target = np.array(run["probe_rgb"][1])
+    arr[np.abs(arr - target).max(axis=2) <= 60] = [200, 200, 200]
+elif mode == "grey-overflow":
+    # #175's actual shape: a real image is a photographic ramp, not a flat
+    # colour. Painted over the pane's bottom border and the status bar.
+    h, w = arr.shape[:2]
+    top, left, tall, wide = h - 130, w - 420, 120, 300
+    ramp = np.linspace(20, 210, wide)[None, :, None] * np.ones((tall, 1, 3))
+    ramp += np.random.default_rng(175).integers(-8, 9, (tall, wide, 3))
+    arr[top : top + tall, left : left + wide] = np.clip(ramp, 0, 255)
+else:
+    raise SystemExit(f"unknown mode {mode}")
+
+Image.fromarray(arr.astype(np.uint8)).save(out_png)
+run["phases"] = [dict(phase, frames=[out_png])]
+Path(out_json).write_text(json.dumps(run))
+MUTATOR
+
+    uv run --script "${work}/mutate_frame.py" strip-indexed "${contained_out}/run.json" \
         "${work}/no_indexed.png" "${work}/no_indexed.json"
     expect 1 "a frame that lost indexed colour is a failure" "probe" \
         "${verdict}" --geometry "${work}/no_indexed.json"
+
+    # The defect class the rig exists for, in the shape it actually takes. An
+    # earlier comparator accepted any blend of any two chrome colours anywhere
+    # outside the pane — and black and white are both chrome, so the segment
+    # between them admitted the whole greyscale axis. This exact frame PASSED.
+    uv run --script "${work}/mutate_frame.py" grey-overflow "${contained_out}/run.json" \
+        "${work}/grey.png" "${work}/grey.json"
+    expect 1 "a greyscale image over the border and status bar is a failure" \
+        "containment:foreign" "${verdict}" --geometry "${work}/grey.json"
 
     # An injected phase judged against a frame from BEFORE the injection: the
     # image the phase promises is simply not there. Without this case nothing

@@ -702,10 +702,12 @@ json.dump({
     "status_rgb": [int(c) for c in sys.argv[4].split(",")],
     "content_rgb": [int(c) for c in sys.argv[5].split(",")],
     "image_rgb": [int(c) for c in sys.argv[6].split(",")],
-    # Everything shux is allowed to paint outside the pane: the border, the
-    # status bar background, its foreground (every status colour is pinned to
-    # white by the config above) and the desktop behind the window.
-    "chrome_rgb": [[0, 0, 0], [255, 0, 0], [0, 0, 255], [255, 255, 255]],
+    # The other half of each palette that bounds what may legitimately appear
+    # outside the pane: white, because every status colour is pinned to it by the
+    # config above, and black, the kitty default background — which is both the
+    # terminal behind the border ring and the desktop behind the window.
+    "status_fg_rgb": [255, 255, 255],
+    "background_rgb": [0, 0, 0],
     # The truecolor / indexed / basic probes AS KITTY RENDERS THEM: the
     # truecolor triple verbatim, indexed 208 and SGR 34 from the default palette
     # of kitty 0.32.2. Measured off a real frame at 103, 92 and 50 px. A kitty

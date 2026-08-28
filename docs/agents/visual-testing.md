@@ -45,18 +45,35 @@ theme paints the status accent in the same sapphire as the border.
 |---|---|
 | `chrome` | the pane border is not a rectangle, or the status bar is not below it |
 | `clipped` | the window ran off the screen, so the capture is missing the region an overflow lands in |
-| `grid` | the size shux told the pane does not match the grid the emulator is drawing, to under one cell of slack in the window |
+| `grid` | the size shux told the pane does not match the grid the emulator is drawing |
 | `containment:foreign` | something that is not shux's chrome — **any colour** — was painted outside the pane |
 | `containment:image` | a known payload was painted outside the pane, under its own name so the self-test can require *that* failure |
+| `fiducial` | a landmark colour appeared *inside* the pane, so the geometry measured from it cannot be trusted |
 | `content:image` / `content:block` | a promised payload is absent, or the workload's block is half-drawn |
 | `probe` | the truecolor, indexed or basic colour probe did not render — a colour class is not reaching the emulator |
 | `crosspath` | the payload block sits at different cells in kitty than in shux's own `pane capture` |
 
-`containment:foreign` is the one that generalises: a real emitted image is not one
-flat colour, so counting a hand-picked payload colour only ever catches the
-payload the rig paints for itself. Measured on real captures, a correct frame has
-**exactly zero** foreign pixels outside the pane — at every tolerance from 8 to 40
-— and an overflowing frame has 4686. It is an exact assertion, not a budget.
+`containment:foreign` is the one that generalises, and getting it right took two
+attempts. A real emitted image is a photographic ramp, not a flat colour, so
+counting the payload colour the rig paints for itself catches almost nothing. The
+first general version accepted any blend of any two chrome colours anywhere
+outside the pane — and black and white are both chrome, so the segment between
+them admitted the entire greyscale axis, about 10% of the RGB cube. Measured: a
+grey block, a white block, a red block and a photographic greyscale ramp painted
+straight over the border and the status bar all scored zero and **passed**.
+
+What ships instead is a palette per *region*: the status bar may contain only its
+own two colours, and everything else outside the pane — the border ring, the
+desktop behind the window — only the border colour on the terminal's background.
+Nothing bridges the two. Correct frames score exactly zero foreign pixels in both
+regions; every one of those overflows now fails.
+
+`grid` needed the same care. Deriving the cell size from the border rules divided
+by the pane size, and then checking the pane size with it, puts the number under
+test on both sides: measured that way, lying about `pane.rows` by 1, 2 or 3 and
+about `pane.cols` by 1 all passed. The cell is now measured from the payload
+block's pixel extent, which neither number can influence, and every ±1 lie about
+either is caught.
 
 ### Proving it can fail
 
@@ -70,6 +87,12 @@ The reintroduced defect is an A/B on one thing: the same payload emitted with an
 without a destination box in **cells** (`c=`/`r=`), which was the fix. Without it
 kitty draws at natural pixel size and it spills; the rig must go red naming
 `containment:image` specifically, so a crashed kitty cannot satisfy the case.
+
+Two arms damage a real capture rather than the geometry file, because repointing
+a colour at something nothing paints would manufacture a red on any tree: one
+strips the indexed-colour probe out of the picture, one paints a photographic
+greyscale ramp over the border and status bar. The second is the frame that used
+to pass.
 
 ### What it is not
 

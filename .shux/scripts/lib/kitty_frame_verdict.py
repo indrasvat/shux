@@ -76,6 +76,12 @@ BLOCK_COVERAGE = 0.5
 # colour class without failing on a different font's thinner glyphs.
 PROBE_FLOOR_PX = 10
 
+# How far the border outline's measured span may sit from the cell count shux
+# reports before the two are calling it a different grid. A quarter cell: the
+# block-derived cell is exact on a background run, so anything approaching half a
+# cell is a real disagreement rather than measurement noise.
+GRID_SLACK_CELLS = 0.25
+
 
 @dataclass
 class Phase:
@@ -98,9 +104,10 @@ class GeometryFile:
     status_rgb: tuple[int, int, int]
     content_rgb: tuple[int, int, int]
     image_rgb: tuple[int, int, int]
-    # Every colour shux is allowed to paint OUTSIDE the pane: the border, the
-    # status bar's background and foreground, and the desktop behind the window.
-    chrome_rgb: list[tuple[int, int, int]]
+    # The status bar's foreground, and the terminal's background — the other
+    # halves of the two palettes that bound what may appear outside the pane.
+    status_fg_rgb: tuple[int, int, int]
+    background_rgb: tuple[int, int, int]
     # The truecolor / indexed / basic probes as kitty renders them, which is what
     # makes a lost colour class visible rather than merely printed.
     probe_rgb: list[tuple[int, int, int]]
@@ -109,31 +116,102 @@ class GeometryFile:
     phases: list[Phase] = field(default_factory=list)
 
 
+class BadGeometry(Exception):
+    """The geometry file is unusable — a broken input, not a failed assertion."""
+
+
+def _rgb(raw: object, what: str) -> tuple[int, int, int]:
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        raise BadGeometry(f"{what} must be three numbers, got {raw!r}")
+    try:
+        values = tuple(int(c) for c in raw)
+    except (TypeError, ValueError):
+        raise BadGeometry(f"{what} must be three integers, got {raw!r}") from None
+    if any(c < 0 or c > 255 for c in values):
+        raise BadGeometry(f"{what} must be three 0-255 values, got {raw!r}")
+    return values
+
+
+def _positive(raw: object, what: str, floor: int = 1) -> int:
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise BadGeometry(f"{what} must be an integer, got {raw!r}") from None
+    if value < floor:
+        raise BadGeometry(f"{what} must be at least {floor}, got {value}")
+    return value
+
+
+def _key(raw: dict, key: str, what: str) -> object:
+    if not isinstance(raw, dict) or key not in raw:
+        raise BadGeometry(f"{what} is missing '{key}'")
+    return raw[key]
+
+
 def load_geometry(path: Path) -> GeometryFile:
-    raw = json.loads(path.read_text())
-    phases = [
-        Phase(
-            name=p["name"],
-            window_w=int(p["window"]["w"]),
-            window_h=int(p["window"]["h"]),
-            pane_cols=int(p["pane"]["cols"]),
-            pane_rows=int(p["pane"]["rows"]),
-            status_rows=int(p.get("status_rows", 1)),
-            block=p["block"],
-            frames=[Path(f) for f in p["frames"]],
-            require_image=bool(p.get("require_image", False)),
+    """Read `run.json`, and reject anything it cannot honestly judge.
+
+    Every failure here raises rather than tracebacking, because the two outcomes
+    have to be distinguishable to whoever is reading: exit 1 means shux painted
+    outside the box, exit 2 means this file could not be read. Measured before
+    this existed: ten shapes of malformed geometry — a missing key, a two-element
+    colour, a non-numeric `cols`, a negative `rows`, `frames` as a string —
+    tracebacked out at exit 1, and the rig printed each one as a rendering
+    defect. It fired for real when the comparator gained a key before the rig
+    wrote it.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BadGeometry(f"{exc}") from None
+    if not isinstance(raw, dict):
+        raise BadGeometry("the top level must be an object")
+
+    phases = []
+    raw_phases = _key(raw, "phases", "the geometry file")
+    if not isinstance(raw_phases, list):
+        raise BadGeometry(f"'phases' must be a list, got {type(raw_phases).__name__}")
+    for i, phase in enumerate(raw_phases):
+        where = f"phase {i}"
+        if not isinstance(phase, dict):
+            raise BadGeometry(f"{where} must be an object")
+        window = _key(phase, "window", where)
+        pane = _key(phase, "pane", where)
+        block = _key(phase, "block", where)
+        frames = _key(phase, "frames", where)
+        if not isinstance(frames, list):
+            raise BadGeometry(f"{where}: 'frames' must be a list, got {frames!r}")
+        rect = {k: _positive(_key(block, k, f"{where} block"), f"{where} block.{k}", 0)
+                for k in ("row0", "row1", "col0", "col1")}
+        if rect["row1"] < rect["row0"] or rect["col1"] < rect["col0"]:
+            raise BadGeometry(f"{where}: block rect is inside out: {rect}")
+        phases.append(
+            Phase(
+                name=str(_key(phase, "name", where)),
+                window_w=_positive(_key(window, "w", f"{where} window"), f"{where} window.w"),
+                window_h=_positive(_key(window, "h", f"{where} window"), f"{where} window.h"),
+                pane_cols=_positive(_key(pane, "cols", f"{where} pane"), f"{where} pane.cols"),
+                pane_rows=_positive(_key(pane, "rows", f"{where} pane"), f"{where} pane.rows"),
+                status_rows=_positive(phase.get("status_rows", 1), f"{where} status_rows", 0),
+                block=rect,
+                frames=[Path(str(f)) for f in frames],
+                require_image=bool(phase.get("require_image", False)),
+            )
         )
-        for p in raw["phases"]
-    ]
+
     return GeometryFile(
-        border_rgb=tuple(raw["border_rgb"]),
-        status_rgb=tuple(raw["status_rgb"]),
-        content_rgb=tuple(raw["content_rgb"]),
-        image_rgb=tuple(raw["image_rgb"]),
-        chrome_rgb=[tuple(c) for c in raw["chrome_rgb"]],
-        probe_rgb=[tuple(c) for c in raw["probe_rgb"]],
-        scenario=raw.get("scenario", "plain"),
-        tolerance=int(raw.get("tolerance", DEFAULT_TOLERANCE)),
+        border_rgb=_rgb(_key(raw, "border_rgb", "the geometry file"), "border_rgb"),
+        status_rgb=_rgb(_key(raw, "status_rgb", "the geometry file"), "status_rgb"),
+        content_rgb=_rgb(_key(raw, "content_rgb", "the geometry file"), "content_rgb"),
+        image_rgb=_rgb(_key(raw, "image_rgb", "the geometry file"), "image_rgb"),
+        status_fg_rgb=_rgb(_key(raw, "status_fg_rgb", "the geometry file"), "status_fg_rgb"),
+        background_rgb=_rgb(_key(raw, "background_rgb", "the geometry file"), "background_rgb"),
+        probe_rgb=[
+            _rgb(c, f"probe_rgb[{i}]")
+            for i, c in enumerate(_key(raw, "probe_rgb", "the geometry file"))  # type: ignore[arg-type]
+        ],
+        scenario=str(raw.get("scenario", "plain")),
+        tolerance=_positive(raw.get("tolerance", DEFAULT_TOLERANCE), "tolerance", 0),
         phases=phases,
     )
 
@@ -202,6 +280,7 @@ class FrameVerdict:
         self.path = path
         self.reasons: list[str] = []
         self.notes: list[str] = []
+        self.status_band: tuple[int, int, int, int] | None = None
 
     def fail(self, reason: str, detail: str) -> None:
         if reason not in self.reasons:
@@ -226,7 +305,7 @@ class FrameVerdict:
         rect = self.check_chrome(arr)
         if rect is None:
             return False
-        cell = self.check_grid(rect)
+        cell = self.check_grid(arr, rect)
         self.check_payloads(arr, rect, cell)
         return not self.reasons
 
@@ -273,26 +352,74 @@ class FrameVerdict:
                     f"status bar starts at y={int(ys.min())}, at or above the "
                     f"pane border's bottom rule y={y1}",
                 )
-            self.notes.append(f"status band: rows {int(ys.min())}..{int(ys.max())}")
+            xs = np.nonzero(status.any(axis=0))[0]
+            self.status_band = (int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max()))
+            self.notes.append(
+                f"status band: rows {ys.min()}..{ys.max()}, cols {xs.min()}..{xs.max()}"
+            )
         return x0, y0, x1, y1
 
     # ── 3. the grid shux believes in vs the grid kitty is drawing ────────────
-    def check_grid(self, rect: tuple[int, int, int, int]) -> tuple[float, float] | None:
+    def check_grid(
+        self, arr: np.ndarray, rect: tuple[int, int, int, int]
+    ) -> tuple[float, float] | None:
+        """Does the size shux TOLD the pane match the grid kitty is drawing?
+
+        The cell is measured from the payload BLOCK, not from the border rules
+        divided by the pane size. Deriving it from `pane_cols` and then checking
+        `pane_cols` with it puts the number under test on both sides, and the
+        test very nearly cancels: measured that way, lying about `pane.rows` by
+        1, 2 or 3 and about `pane.cols` by 1 all PASSED, and `grid` did not fire
+        until rows were off by 4 or columns by 12. The block's pixel extent is
+        independent of both, because it is a background run that fills whole
+        cells — so dividing it by the block's own cell rect gives a cell size
+        that `pane_cols` cannot influence, and `pane_cols` becomes falsifiable.
+        """
         x0, y0, x1, y1 = rect
         ph = self.phase
-        # The rules run down the CENTRE of the border cells, so the distance
-        # between opposite rules is one cell short of the outline's full extent.
-        cell_w = (x1 - x0) / (ph.pane_cols + 1)
-        cell_h = (y1 - y0) / (ph.pane_rows + 1)
+        b = self.phase.block
+        block_cols = int(b["col1"]) - int(b["col0"]) + 1
+        block_rows = int(b["row1"]) - int(b["row0"]) + 1
+        block = mask_for(arr, self.geom.content_rgb, self.geom.tolerance)
+        if not block.any() or block_cols < 1 or block_rows < 1:
+            self.fail(
+                "grid",
+                "cannot measure a cell: the payload block is not in the frame, so "
+                "there is nothing to derive the emulator's grid from",
+            )
+            return None
+        ys, xs = np.nonzero(block)
+        cell_w = (int(xs.max()) + 1 - int(xs.min())) / block_cols
+        cell_h = (int(ys.max()) + 1 - int(ys.min())) / block_rows
         self.notes.append(
-            f"cell: {cell_w:.2f}x{cell_h:.2f} px from {ph.pane_cols}x{ph.pane_rows} pane cells"
+            f"cell: {cell_w:.2f}x{cell_h:.2f} px, measured from the "
+            f"{block_cols}x{block_rows}-cell payload block"
         )
         if cell_w < 3 or cell_h < 3:
             self.fail("grid", f"implausible cell size {cell_w:.2f}x{cell_h:.2f}")
             return None
+
+        # The rules run down the CENTRE of the border cells, so the distance
+        # between opposite rules is one cell short of the outline's full extent.
+        span_cols = (x1 - x0) / cell_w
+        span_rows = (y1 - y0) / cell_h
+        self.notes.append(
+            f"outline spans {span_cols:.2f}x{span_rows:.2f} cells against shux's "
+            f"{ph.pane_cols + 1}x{ph.pane_rows + 1}"
+        )
+        if abs(span_cols - (ph.pane_cols + 1)) > GRID_SLACK_CELLS or abs(
+            span_rows - (ph.pane_rows + 1)
+        ) > GRID_SLACK_CELLS:
+            self.fail(
+                "grid",
+                f"the border outline spans {span_cols:.2f}x{span_rows:.2f} cells, but "
+                f"shux says the pane is {ph.pane_cols}x{ph.pane_rows} — which would make "
+                f"it {ph.pane_cols + 1}x{ph.pane_rows + 1}",
+            )
+            return None
+
         # The whole grid — pane, its outline, the status bar — must tile the
-        # emulator's window with less than one cell spare. One column more or
-        # fewer than fits, and this goes over a cell.
+        # emulator's window with less than one cell spare.
         spare_w = ph.window_w - (ph.pane_cols + 2) * cell_w
         spare_h = ph.window_h - (ph.pane_rows + 2 + ph.status_rows) * cell_h
         self.notes.append(
@@ -326,16 +453,17 @@ class FrameVerdict:
         # block's exact left edge, so rounding the wrong way would count a column
         # of legitimate content as an overflow. The defect this must catch is a
         # cell wide at minimum (10 px here) and was 160-252 px in the field.
-        ix0 = x0 + cell_w / 2 - EDGE_MARGIN_PX
-        ix1 = x1 - cell_w / 2 + EDGE_MARGIN_PX
-        iy0 = y0 + cell_h / 2 - EDGE_MARGIN_PX
-        iy1 = y1 - cell_h / 2 + EDGE_MARGIN_PX
+        # `round`, not `int`: truncation goes toward zero and so takes a
+        # different side on each edge. Measured, that made the blind band 3 px on
+        # the left, 2 on the right, 4 on the top and 1 on the bottom — none of
+        # them the constant this names.
+        ix0 = round(x0 + cell_w / 2) - EDGE_MARGIN_PX
+        ix1 = round(x1 - cell_w / 2) + EDGE_MARGIN_PX
+        iy0 = round(y0 + cell_h / 2) - EDGE_MARGIN_PX
+        iy1 = round(y1 - cell_h / 2) + EDGE_MARGIN_PX
 
         inside = np.zeros(arr.shape[:2], dtype=bool)
-        inside[
-            max(int(iy0), 0) : int(iy1) + 1,
-            max(int(ix0), 0) : int(ix1) + 1,
-        ] = True
+        inside[max(iy0, 0) : iy1 + 1, max(ix0, 0) : ix1 + 1] = True
 
         self.check_foreign(arr, inside, (ix0, iy0, ix1, iy1))
 
@@ -362,7 +490,19 @@ class FrameVerdict:
         if self.phase.require_image and total == 0:
             self.fail("content:image", "no image pixels anywhere in the frame")
 
+        # The strict box: the same interior with the margin taken off the other
+        # side. The two questions want opposite slack — "is this payload outside"
+        # must not count a legitimate edge cell, while "is a landmark loose
+        # inside" must not count the border's own ink, whose antialiasing reaches
+        # 2 px into the lenient box.
+        strict = np.zeros(arr.shape[:2], dtype=bool)
+        strict[
+            max(iy0 + 2 * EDGE_MARGIN_PX, 0) : iy1 - 2 * EDGE_MARGIN_PX + 1,
+            max(ix0 + 2 * EDGE_MARGIN_PX, 0) : ix1 - 2 * EDGE_MARGIN_PX + 1,
+        ] = True
+
         self.check_block_area(arr, cell)
+        self.check_fiducials(arr, strict)
         self.check_probes(arr, inside)
         self.check_crosspath(arr, rect, cell)
 
@@ -376,42 +516,83 @@ class FrameVerdict:
 
         Counting one hand-picked payload colour only ever catches the payload
         this rig paints for itself; a real emitted image, thumbnail or sixel is
-        not one flat colour and would score zero. This is the general form: every
-        pixel outside the pane's interior must be one of shux's own chrome
-        colours or a blend of two of them (glyph antialiasing, the rounded
-        corners). Measured on real captures, a correct frame scores EXACTLY zero
-        foreign pixels — at every tolerance from 8 to 40 — while the overflow
-        frame scores 4686. It is an exact assertion, not a budget.
+        not one flat colour and would score zero.
+
+        The general form has to be careful about WHERE, not just what. An earlier
+        version accepted any blend of any two chrome colours anywhere outside the
+        pane, and black and white are both chrome — so the black-to-white segment
+        admitted the entire greyscale axis, 10% of the RGB cube. Measured on real
+        frames: a grey block, a white block, a red block and a photographic
+        greyscale ramp painted straight over the border and the status bar all
+        scored zero foreign pixels and PASSED. That is the #175 shape exactly.
+
+        So each region gets only the palette that region can legitimately
+        contain: the status bar is its own two colours, and everything else
+        outside the pane — the border ring, the desktop behind the window — is
+        the border colour on the terminal's background. Nothing bridges them.
         """
-        palette = [np.array(c, dtype=float) for c in self.geom.chrome_rgb]
-        out = arr[~inside].astype(float)
-        if out.size == 0:
-            return
-        best = np.full(len(out), np.inf)
-        for i, a in enumerate(palette):
-            for b in palette[i:]:
-                ab = b - a
-                denom = float(ab @ ab)
-                if denom == 0.0:
-                    dist = np.linalg.norm(out - a, axis=1)
-                else:
-                    t = np.clip(((out - a) @ ab) / denom, 0.0, 1.0)[:, None]
-                    dist = np.linalg.norm(out - (a + t * ab), axis=1)
-                best = np.minimum(best, dist)
-        foreign = int((best > FOREIGN_TOLERANCE).sum())
-        self.notes.append(f"outside the pane: {foreign} px that are not shux's chrome")
-        if foreign > 0:
-            ys, xs = np.nonzero(~inside)
-            bad = best > FOREIGN_TOLERANCE
-            ix0, iy0, ix1, iy1 = interior
-            self.fail(
-                "containment:foreign",
-                f"{foreign} pixel(s) outside the pane interior "
-                f"({int(ix0)},{int(iy0)})-({int(ix1)},{int(iy1)}) are not any of "
-                f"shux's chrome colours {self.geom.chrome_rgb} — bbox "
-                f"({int(xs[bad].min())},{int(ys[bad].min())})-"
-                f"({int(xs[bad].max())},{int(ys[bad].max())})",
+        outside = ~inside
+
+        # The status bar's own rectangle, taken from the bar's own pixels rather
+        # than derived from the border rules. The bar is a solid background run
+        # across the full terminal width, so its bounding box is exact — while
+        # deriving the width from the outline overshoots into the desktop beyond
+        # the window, and black there is not a colour the status palette allows.
+        # Measured: that overshoot failed every correct frame on 38 desktop
+        # pixels. The frame region excludes the same rectangle grown by the
+        # margin, so the boundary itself is judged by neither palette rather than
+        # by the wrong one; at 2 px it cannot hide an overflow, which is a cell.
+        status_region = np.zeros(arr.shape[:2], dtype=bool)
+        status_guard = np.zeros(arr.shape[:2], dtype=bool)
+        if self.status_band is not None:
+            top, bottom, left, right = self.status_band
+            status_region[top : bottom + 1, left : right + 1] = True
+            status_guard[
+                max(top - EDGE_MARGIN_PX, 0) : bottom + EDGE_MARGIN_PX + 1,
+                max(left - EDGE_MARGIN_PX, 0) : right + EDGE_MARGIN_PX + 1,
+            ] = True
+        status_region &= outside
+
+        regions = (
+            (
+                "status bar",
+                status_region,
+                (self.geom.status_rgb, self.geom.status_fg_rgb),
+            ),
+            (
+                "border and desktop",
+                outside & ~status_guard,
+                (self.geom.background_rgb, self.geom.border_rgb),
+            ),
+        )
+
+        ix0, iy0, ix1, iy1 = interior
+        for label, region, palette in regions:
+            pixels = arr[region].astype(float)
+            if pixels.size == 0:
+                continue
+            a = np.array(palette[0], dtype=float)
+            b = np.array(palette[1], dtype=float)
+            ab = b - a
+            denom = float(ab @ ab) or 1.0
+            t = np.clip(((pixels - a) @ ab) / denom, 0.0, 1.0)[:, None]
+            dist = np.linalg.norm(pixels - (a + t * ab), axis=1)
+            bad = dist > FOREIGN_TOLERANCE
+            foreign = int(bad.sum())
+            self.notes.append(
+                f"{label}: {foreign} of {len(pixels)} px are not "
+                f"{palette[0]}..{palette[1]}"
             )
+            if foreign > 0:
+                ys, xs = np.nonzero(region)
+                self.fail(
+                    "containment:foreign",
+                    f"{foreign} pixel(s) over the {label} are neither "
+                    f"{palette[0]} nor {palette[1]} nor a blend of them — bbox "
+                    f"({int(xs[bad].min())},{int(ys[bad].min())})-"
+                    f"({int(xs[bad].max())},{int(ys[bad].max())}), pane interior "
+                    f"({int(ix0)},{int(iy0)})-({int(ix1)},{int(iy1)})",
+                )
 
     def check_block_area(self, arr: np.ndarray, cell: tuple[float, float]) -> None:
         """The payload block must cover the area its cell rect implies.
@@ -433,6 +614,30 @@ class FrameVerdict:
                 f"the payload block covers {got} px, under the {want:.0f} px floor "
                 f"its {cells}-cell rect implies — it is half-drawn or torn",
             )
+
+    def check_fiducials(self, arr: np.ndarray, strict: np.ndarray) -> None:
+        """No chrome fiducial may appear INSIDE the pane.
+
+        The fiducials are only landmarks while nothing else paints them, and
+        every geometry assertion here is measured from them. It is also the only
+        thing that sees an overflow painted in the BORDER's own colour: over the
+        border ring that is legitimate chrome by construction, so a red block
+        reaching into the pane is caught here or nowhere. Measured — with this
+        check absent, a 110x114 px block of #ff0000 covering the pane interior,
+        the border and the status bar below it passed every other assertion.
+        """
+        for label, rgb in (("border", self.geom.border_rgb), ("status", self.geom.status_rgb)):
+            hits = int((mask_for(arr, rgb, self.geom.tolerance) & strict).sum())
+            if hits > 0:
+                ys, xs = np.nonzero(mask_for(arr, rgb, self.geom.tolerance) & strict)
+                self.fail(
+                    "fiducial",
+                    f"{hits} pixel(s) of the {label} fiducial {rgb} are inside the "
+                    f"pane — bbox ({int(xs.min())},{int(ys.min())})-"
+                    f"({int(xs.max())},{int(ys.max())}). Either something is painting "
+                    f"a landmark colour, or an overflow arrived in it; the geometry "
+                    f"measured from that landmark cannot be trusted either way",
+                )
 
     def check_probes(self, arr: np.ndarray, inside: np.ndarray) -> None:
         """The truecolor, indexed and basic probes must all be in the picture.
@@ -510,11 +715,19 @@ def probe(path: Path, rgb: tuple[int, int, int], tol: int) -> int:
     rect = find_rect(mask_for(arr, rgb, tol))
     if rect is None:
         return 1
+    y0, y1, x0, x1 = rect
+    h, w = arr.shape[:2]
+    # The same two rejections `check_chrome` makes. Without them the rig waits on
+    # a rectangle its own assertions would throw out — a degenerate one, or one
+    # flush with the frame edge, which is the clipped-window case exactly.
+    if x1 <= x0 or y1 <= y0:
+        return 1
+    if x0 <= 0 or y0 <= 0 or x1 >= w - 1 or y1 >= h - 1:
+        return 1
     # Print the rectangle, so the caller can wait for it to STOP MOVING as well
     # as to appear. Measured across a resize, one capture caught the old box with
     # its origin shifted a pixel — mid-flight geometry that satisfies "the chrome
     # is up" and would be measured as a grid mismatch a moment before it settles.
-    y0, y1, x0, x1 = rect
     print(f"{x0} {y0} {x1} {y1}")
     return 0
 
@@ -540,9 +753,10 @@ def main() -> int:
         if args.border_rgb is None:
             print("✗ --probe requires --border-rgb", file=sys.stderr)
             return 2
-        rgb = tuple(int(c) for c in args.border_rgb.split(","))
-        if len(rgb) != 3:
-            print(f"✗ --border-rgb: expected R,G,B, got {args.border_rgb!r}", file=sys.stderr)
+        try:
+            rgb = _rgb(args.border_rgb.split(","), "--border-rgb")
+        except BadGeometry as exc:
+            print(f"✗ {exc}", file=sys.stderr)
             return 2
         return probe(args.probe, rgb, args.tolerance)
 
@@ -552,7 +766,11 @@ def main() -> int:
     if not args.geometry.exists():
         print(f"✗ geometry file {args.geometry} does not exist", file=sys.stderr)
         return 2
-    geom = load_geometry(args.geometry)
+    try:
+        geom = load_geometry(args.geometry)
+    except BadGeometry as exc:
+        print(f"✗ geometry file {args.geometry}: {exc}", file=sys.stderr)
+        return 2
 
     total_frames = 0
     failed_frames = 0
