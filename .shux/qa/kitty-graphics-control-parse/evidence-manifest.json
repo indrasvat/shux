@@ -1,6 +1,7 @@
 {
   "scope": "kitty-graphics-control-parse",
   "base": "7d1b716",
+  "audited_head": "51ae4c9",
   "solid_qa_report": "SOLID-QA.md",
   "dootsabha_design": "council-substitution.md",
   "dootsabha_implementation": "council-substitution.md",
