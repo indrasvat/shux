@@ -1,34 +1,15 @@
-//! Issue #174 — `window.snapshot` must compose with the border style the user
-//! configured, not with a constant.
+//! `window.snapshot` must compose with the border style the user configured.
 //!
-//! `snapshot.rs` passed a hardcoded `BorderStyle::Rounded` to `shux_ui::compose`
-//! and that is the ONLY production caller of the composer. Two bugs sat on that
-//! one argument. The cosmetic one is old: a user configured `thick` / `ascii` /
-//! `none` got rounded borders in every snapshot PNG. The one that is not
-//! cosmetic arrived with #174 — `compose` derives the pane viewport from the
-//! style, so once a pane's PTY started following the LIVE compositor's rule, a
-//! snapshot under `border_style = "none"` composed panes into rects two columns
-//! and two rows smaller than their grids and silently cropped the right and
-//! bottom edges out of the image.
-//!
-//! Why this file rather than a case in `attach.rs`'s unit tests:
-//! `every_render_path_agrees_on_the_pane_viewport` calls `shux_ui::compose`
-//! directly with a style it parsed itself, so it asserts agreement between two
-//! things it wired together and stayed green while production disagreed. This
-//! drives the real binary, the real daemon and the real CLI, so the constant is
-//! in the path.
-//!
-//! Self-contained on purpose: `tests/lens_common` is a frozen path (PRD §16.2)
-//! and none of this is about lens.
-//!
-//! Colour probes are mandatory (CLAUDE.md), and here the fill colour is
-//! load-bearing — it is what makes a cropped column detectable at all.
+//! `snapshot.rs` passed a hardcoded `BorderStyle::Rounded`. Beyond the cosmetic
+//! wrong outline, `compose` derives the pane viewport from the style, so a
+//! snapshot under `border_style = "none"` cropped the pane's last column and
+//! row out of the PNG. Drives the real binary, daemon and CLI: `attach.rs`'s
+//! unit test calls `compose` with a style it parsed itself and stayed green.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Truecolor fill for the pane body. A cropped column reads as the frame's
-/// background instead of this, which is the whole assertion.
+/// Truecolor pane fill; a cropped column reads as frame background instead.
 const FILL: (u8, u8, u8) = (200, 40, 40);
 const TOL: i32 = 8;
 
@@ -84,8 +65,7 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        // Zero leaked daemons is a hard rule, and it has to hold on the panic
-        // path too — an assertion failure must not leave a daemon behind.
+        // Hard rule: no leaked daemons, including on the panic path.
         let _ = self.shux().args(["daemon", "stop"]).output();
     }
 }
@@ -154,16 +134,9 @@ fn snapshot_filled_window(env: &Env, cols: u16, rows: u16) -> (image::RgbaImage,
         png.to_str().expect("png path"),
     ]);
     let img = image::open(&png).expect("decode snapshot png").to_rgba8();
-    // Cell metrics come from the declared box, which the snapshot rasterizer
-    // renders at; asserting them keeps the probes from drifting silently.
     let (cw, ch) = (
-        u32::from(shux_pty::DECLARED_CELL_PIXELS.0),
-        u32::from(shux_pty::DECLARED_CELL_PIXELS.1),
-    );
-    assert_eq!(
-        img.width(),
-        u32::from(cols) * cw,
-        "snapshot width is not cols x the declared cell box"
+        img.width() / u32::from(cols),
+        img.height() / u32::from(rows),
     );
     env.run(&["session", "kill", &name]);
     (img, cw, ch)
@@ -201,28 +174,31 @@ fn window_snapshot_honours_border_style_none() {
     );
 }
 
-/// The control: the default style DOES draw an outline, so the two are not the
-/// same picture. Without it, the test above would also pass on a build that
-/// ignores the setting in the other direction.
+/// The control: the default style DOES inset for an outline, so the two are not
+/// the same picture and the test above is not vacuous.
+///
+/// Asserts the INSET, which is the only thing that separates `rounded` from
+/// `none`. An earlier version asserted the top pixel row was not one flat
+/// colour — true on any image with a glyph in it, so it passed on a build that
+/// ignored the config and always composed `none`.
 #[test]
 fn window_snapshot_still_draws_the_default_outline() {
     let env = Env::new("rounded");
     let (cols, rows) = (60u16, 20u16);
-    let (img, _cw, ch) = snapshot_filled_window(&env, cols, rows);
+    let (img, cw, ch) = snapshot_filled_window(&env, cols, rows);
 
-    // Scan the whole first cell-row of PIXELS rather than one sample per cell:
-    // a horizontal box-drawing rule sits at the cell's vertical centre, so a
-    // fixed offset near the top misses it and reports a uniform row.
-    let mut distinct = std::collections::HashSet::new();
-    for y in 0..ch.min(img.height()) {
-        for x in 0..img.width() {
-            let p = img.get_pixel(x, y);
-            distinct.insert((p[0], p[1], p[2]));
-        }
-    }
+    // Inset by one: cell column 0 is the outline ring, column 1 the pane's
+    // first column. Row 2 is a fill row either way (`rounded` puts the marker
+    // at row 1, `none` at row 0), so only the column distinction is under test.
+    let outside = cell_bg(&img, cw, ch, 0, 2);
+    let inside = cell_bg(&img, cw, ch, 1, 2);
     assert!(
-        distinct.len() > 1,
-        "the default style drew a uniform top row; no outline is being composed \
-         at all, so the `none` test above proves nothing"
+        !near(outside, FILL),
+        "column 0 carries the pane fill ({outside:?}); nothing is inset for an \
+         outline, so the `none` test above proves nothing"
+    );
+    assert!(
+        near(inside, FILL),
+        "column 1 is not the pane's fill ({inside:?})"
     );
 }

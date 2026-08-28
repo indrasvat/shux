@@ -345,16 +345,9 @@ fn display_width(s: &str) -> usize {
 mod tests {
     use super::*;
 
-    /// The overlay's minimum height is a user-visible contract, and nothing
-    /// pinned it. Adding two rows to the Mouse section moved it from 37 to 39
-    /// without a single test noticing: everyone on a 37- or 38-row terminal
-    /// silently lost the cheat sheet and got a one-line hint telling them to
-    /// press the key they had just pressed.
-    ///
-    /// 37 is not a magic number to be updated when it breaks -- it is the
-    /// height this overlay has always needed. If this fails, a section grew:
-    /// shrink it back rather than raising the constant, or the fallback band
-    /// widens again for the people with the smallest terminals.
+    /// 37 rows is the overlay's minimum and nothing pinned it: a section that
+    /// grows silently drops everyone on a 37-38 row terminal to the one-line
+    /// fallback hint. If this fails, shrink the section, don't raise the bound.
     #[test]
     fn the_overlay_still_fits_the_smallest_terminal_it_always_has() {
         const MIN_ROWS: u16 = 37;
@@ -363,8 +356,7 @@ mod tests {
             render_help_overlay_into(&mut buf, 120, rows, &Theme::DEFAULT);
             String::from_utf8_lossy(&buf).into_owned()
         };
-        // A row from the last section proves the WHOLE table rendered, not just
-        // the top of the box.
+        // A row from the LAST section -- proves the whole table rendered.
         assert!(
             render(MIN_ROWS).contains("Scroll wheel"),
             "the full cheat sheet no longer fits in {MIN_ROWS} rows; a section grew"

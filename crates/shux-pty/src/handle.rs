@@ -59,8 +59,8 @@ pub enum PtyError {
 }
 
 #[cfg(test)]
-mod winsize_tests {
-    use super::{DECLARED_CELL_PIXELS, PtySize, winsize_for};
+mod tests {
+    use super::*;
 
     #[test]
     fn declares_pixels_as_cells_times_the_cell_box() {
@@ -72,19 +72,15 @@ mod winsize_tests {
         );
     }
 
-    /// Overflow must land on the honest sentinel, not a saturated number. Apps
-    /// derive the cell size back as `ws_xpixel / ws_col`, so `u16::MAX` across
-    /// 7282 columns reads as a believable 8px cell -- a lie where `0` already
-    /// means "not declared". Both axes go to zero together: a half-declared
-    /// winsize is a third thing nobody has a rule for.
+    /// Overflow declares the honest `0` sentinel on both axes, never a
+    /// saturated number an app would divide into a believable cell size.
     #[test]
     fn overflow_declares_nothing_on_both_axes() {
         let ws = winsize_for(PtySize::new(7282, 30));
         assert_eq!((ws.ws_col, ws.ws_row), (7282, 30), "cells stay truthful");
         assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
 
-        // Only the vertical axis overflows; the horizontal one must not be
-        // reported on its own.
+        // Vertical-only overflow must not leave the horizontal axis declared.
         let ws = winsize_for(PtySize::new(100, 3450));
         assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
 
@@ -98,11 +94,6 @@ mod winsize_tests {
         let ws = winsize_for(PtySize::new(0, 0));
         assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     fn create_terminfo_entry(root: &Path, term: &str) {
         let first = term.as_bytes()[0];
@@ -377,38 +368,22 @@ fn leads_with_segment(rest: &[u8], word: &[u8]) -> bool {
         .is_some_and(|tail| tail.is_empty() || tail.starts_with(b"_"))
 }
 
-/// The cell box, in pixels, shux declares to the children it spawns.
+/// The cell box, in pixels, declared to pane children via `ws_xpixel`/`ws_ypixel`.
 ///
-/// **A declaration, not a measurement.** There is no single physical cell size
-/// in shux: `pane.snapshot` rasterizes at font 14.0 (a 9x19 box), the lens gate
-/// rasterizes at 16.0 (10x22), and under `shux session attach` the pane is drawn
-/// by the *user's* terminal at whatever box that terminal uses -- often neither.
-/// So this is not "how big a cell is"; it is the number shux promises an app and
-/// the number that app multiplies by. Choosing the default snapshot rasterizer's
-/// box makes the promise true on the one path shux renders itself.
-///
-/// Deliberately config-independent. `appearance.font` changes snapshot cell
-/// metrics (see `shux-core`'s config docs) and hot-reloads; if this tracked it,
-/// panes spawned before and after a reload would declare different geometry in
-/// the same session with nothing reporting it. One value, one owner.
-///
-/// Pinned to the default snapshot rasterizer's box by a test in the `shux`
-/// crate -- the only crate depending on both this one and `shux-raster`, which
-/// this one must not depend on.
+/// A promise, not a measurement -- snapshots render 9x19, the lens gate 10x22,
+/// live attach whatever the user's terminal uses. Deliberately not derived from
+/// `appearance.font`, which hot-reloads: panes either side of a reload would
+/// declare different geometry. Pinned to the snapshot rasterizer by
+/// `declared_pty_cell_box_matches_the_default_snapshot_rasterizer` (crate `shux`).
 pub const DECLARED_CELL_PIXELS: (u16, u16) = (9, 19);
 
 /// Build the `winsize` a PTY is opened or resized with.
 ///
-/// Overflow yields `0/0` on BOTH axes rather than a saturated value -- the
-/// value zero already means "this terminal will not tell me", which is what
-/// every pane read before this existed. `winsize`
-/// fields are `u16`, so at 9x19 a pane wider than 7281 cells or taller than
-/// 3449 would saturate -- and apps derive the cell size back out as
-/// `ws_xpixel / ws_col`, so a saturated 65535 across 7282 columns computes a
-/// cell width of 8 and is believed. A silent lie is worse than the honest
-/// "unknown" zero already means. shux's own paths cap panes at 1000x1000
-/// (`pane.set_size`), so this branch is unreachable through the CLI or RPC;
-/// `spawn`/`resize` are `pub` and validate nothing, which is why it exists.
+/// Overflow declares `0/0` on BOTH axes, never a saturated value: apps recover
+/// the cell size as `ws_xpixel / ws_col`, so a clamped 65535 reads as a
+/// believable-but-wrong cell, where `0` already means "not declared". Reachable
+/// only through `spawn`/`resize`, which are `pub` and validate nothing -- the
+/// CLI and RPC cap panes at 1000x1000.
 fn winsize_for(size: PtySize) -> Winsize {
     let (cell_w, cell_h) = DECLARED_CELL_PIXELS;
     let (xpixel, ypixel) = match (size.cols.checked_mul(cell_w), size.rows.checked_mul(cell_h)) {
@@ -685,10 +660,6 @@ impl PtyHandle {
     /// [`OUTER_TERMINAL_IDENTITY_VARS`]), so it must not run concurrently with
     /// `std::env::set_var`.
     pub fn spawn(config: &PtyConfig) -> Result<Self, PtyError> {
-        // Pixel geometry is declared here AND in `resize` -- an app reads
-        // `TIOCGWINSZ` once at startup and again on every SIGWINCH, and a pane
-        // that is told 9x19 at spawn and 0x0 on the first resize is worse off
-        // than one told nothing at all.
         let winsize = winsize_for(config.size);
         let pty_pair = openpty(Some(&winsize), None).map_err(nix_to_io)?;
         set_nonblocking(&pty_pair.master).map_err(PtyError::Open)?;

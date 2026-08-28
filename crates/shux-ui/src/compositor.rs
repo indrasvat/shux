@@ -22,24 +22,18 @@ use crate::statusbar::StatusBar;
 
 /// Whether the 1-cell outline ring is actually drawn for `content`.
 ///
-/// Borders need a 3x3 content area: one cell of inset on each side of anything
-/// smaller would leave a pane with no columns, so the outline is suppressed
-/// rather than overdrawing the pane's only cell. Zooming bypasses borders
-/// entirely so the pane really fills the window (matching tmux).
+/// Suppressed below a 3x3 content area, where the inset would leave a pane with
+/// no cells, and when zoomed, so the pane fills the window (matching tmux).
 pub(crate) fn borders_visible(content: Rect, style: BorderStyle, zoomed: bool) -> bool {
     !zoomed && style != BorderStyle::None && content.width >= 3 && content.height >= 3
 }
 
-/// The rect pane layout is computed against, inset for the outline ring when
-/// one is drawn.
+/// The rect pane layout is computed against, inset by the outline ring when one
+/// is drawn.
 ///
-/// **Shared on purpose.** The daemon's attach loop hit-tests mouse events
-/// against this same rect to decide which pane was clicked and where inside it.
-/// It used to inset unconditionally while the compositor inset only when
-/// borders were on, so with `appearance.border_style = "none"` every hit-test
-/// was one cell off in both axes and the last column and row were unreachable.
-/// That style hot-reloads, so the skew appeared mid-session. Two copies of this
-/// rule is one copy too many.
+/// Shared with the daemon's attach loop, which hit-tests mouse events against
+/// this same rect: two copies of this rule skew clicks by a cell under
+/// `border_style = "none"`, and that style hot-reloads.
 pub fn pane_viewport(content: Rect, style: BorderStyle, zoomed: bool) -> Rect {
     if borders_visible(content, style, zoomed) {
         Rect::new(
@@ -451,15 +445,7 @@ impl<W: Write> RenderCompositor<W> {
         let content = self.content_rect();
         self.buffer.clear_current();
 
-        // The outer 1-cell ring is reserved for the border outline when
-        // borders are enabled. Pane content lives strictly inside this
-        // ring so the outline never overdraws the first/last column or
-        // first/last row of any pane.
         let zoomed = frame.zoom.is_some();
-        // Borders need at least a 3x3 content area (1 cell of inset on
-        // each side leaves a 1-cell pane). Below that, suppress borders
-        // entirely — drawing the outline would overwrite the pane's
-        // only column/row.
         let borders_on = borders_visible(content, self.config.border_style, zoomed);
         let pane_viewport = pane_viewport(content, self.config.border_style, zoomed);
 

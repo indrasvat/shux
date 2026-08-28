@@ -95,11 +95,9 @@ pub enum AttachClientFrame {
         button: MouseButton,
         col: u16,
         row: u16,
-        /// Shift held. Reserved for shux: it is the escape that keeps shux's
-        /// own text selection reachable inside a pane whose app has taken the
-        /// mouse, so it is never encoded into a forwarded report. Most host
-        /// terminals claim Shift+mouse for their own selection and emit no
-        /// event at all, so this arrives only where the host forwards it.
+        /// Shift held. Reserved for shux -- the escape that keeps shux's own
+        /// selection reachable inside a pane that has taken the mouse, so it is
+        /// never encoded into a forwarded report.
         #[serde(default)]
         shift: bool,
         /// Alt/Meta held -- forwarded to the app as Cb bit 8.
@@ -208,16 +206,10 @@ pub struct ActionArgs {
 mod tests {
     use super::*;
 
-    /// Issue #174 added `shift`/`alt`/`ctrl` to the mouse frame. The daemon
-    /// outlives the client across upgrades, so both skew directions have to
-    /// survive: an old client's frame must still deserialize (the fields
-    /// default), and a new client's frame must not break an old daemon (the
-    /// extra keys are ignored — `deny_unknown_fields` appears nowhere in this
-    /// crate, and this test is what keeps it that way).
-    ///
-    /// `shift: false` is the safe default: an old client loses the escape that
-    /// hands a click back to shux, rather than shux swallowing clicks the app
-    /// should have received.
+    /// The daemon outlives the client across upgrades, so an older client's
+    /// mouse frame -- without `shift`/`alt`/`ctrl` -- must still deserialize.
+    /// `false` is the safe default: the client loses the escape that hands a
+    /// click back to shux, rather than shux swallowing clicks the app wants.
     #[test]
     fn a_mouse_frame_without_modifiers_still_deserializes() {
         let old_wire = r#"{"type":"mouse","kind":"down","button":"left","col":3,"row":4}"#;
@@ -241,9 +233,9 @@ mod tests {
         }
     }
 
-    /// The other direction: a new client's extra keys must be ignored rather
-    /// than rejected, or every mouse event from a newer client would fail to
-    /// parse and mouse input would die silently on an older daemon.
+    /// The other direction: unknown keys must be ignored, not rejected, or a
+    /// newer client's frames would fail to parse wholesale. No
+    /// `deny_unknown_fields` anywhere in this crate; this test keeps it that way.
     #[test]
     fn a_mouse_frame_with_unknown_fields_is_still_accepted() {
         let future_wire = r#"{"type":"mouse","kind":"drag","button":"right","col":9,"row":2,

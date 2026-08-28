@@ -573,31 +573,19 @@ async fn outer_terminal_geometry_does_not_reach_the_child() {
     }
 }
 
-/// Issue #174 A: a pane child must be TOLD its pixel geometry, at spawn AND on
-/// every resize.
+/// A pane child must be TOLD its pixel geometry, at spawn AND on every resize.
 ///
-/// Asserts what the CHILD reads out of `TIOCGWINSZ`, not what the handle
-/// remembers -- `test_resize` above only ever checked `handle.size()`, so both
-/// call sites could have gone on writing zeros with every test green. The
-/// reader runs against its own tty, which is the same fd `vim`, `htop` and
-/// terminal-browser read.
-///
-/// Run against the tree before the fix, both lines report `0 0`.
+/// Asserts what the CHILD reads from `TIOCGWINSZ`, not what the handle
+/// remembers: `test_resize` only checks `handle.size()`, so both call sites
+/// could go on writing zeros with every test green.
 #[tokio::test]
 async fn winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize() {
-    // Not a skip. This is the ONLY test that asserts a child actually reads
-    // non-zero pixels out of `TIOCGWINSZ` -- the whole of the winsize contract.
-    // Skipping it on a machine without python3 would report success for work it
-    // did not do, and leave `make test` green with the feature unverified.
     let python = which_python().expect(
-        "python3 (or python) is required: this test reads TIOCGWINSZ from inside \
-         the child, and there is no other check that the declared pixel geometry \
-         reaches a pane at all",
+        "python3 or python is required: nothing else asserts a child reads \
+         non-zero pixels out of TIOCGWINSZ",
     );
-    // Prints the four winsize fields, then polls until the cell geometry
-    // actually changes and prints again. Polling rather than sleeping: a fixed
-    // sleep races the parent's ioctl and would read the OLD size, manufacturing
-    // a failure that means nothing.
+    // Prints winsize, then polls until the cell geometry changes and prints
+    // again. Polling, not sleeping: a fixed sleep races the parent's ioctl.
     let program = r#"
 import fcntl, struct, sys, termios, time
 def ws():
@@ -621,10 +609,8 @@ print("RESIZED %d %d %d %d" % (c2, r2, x2, y2), flush=True)
     let (cell_w, cell_h) = shux_pty::DECLARED_CELL_PIXELS;
 
     let mut handle = PtyHandle::spawn(&config).unwrap();
-    // Resize only AFTER the child has reported the spawn geometry. Resizing
-    // first would let the child's very first read return the NEW size, so it
-    // would never observe a change, and the test would time out rather than
-    // measure anything.
+    // Resize only after the child has reported SPAWN: resize first and its
+    // first read already sees the new size, so it never observes a change.
     let mut output = read_pty_until(&mut handle, "SPAWN").await;
     handle.resize(PtySize::new(120, 40)).unwrap();
     output.push_str(&read_pty_until(&mut handle, "RESIZED").await);

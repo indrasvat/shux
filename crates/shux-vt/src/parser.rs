@@ -36,23 +36,16 @@ pub struct TerminalModes {
     pub sgr_mouse: bool,
     /// UTF-8 mouse coordinate encoding (Mode 1005).
     ///
-    /// Tracked but NOT emitted, and that is the whole point: a coordinate mode
-    /// shux does not encode must still be visible to the code that decides
-    /// whether to forward a mouse report, so it can stand down instead of
-    /// sending bytes the app will decode as something else. Under 1005 the two
-    /// encodings agree byte-for-byte up to column 95 and diverge silently after
-    /// it, which is the worst possible shape for a defect: correct on an
-    /// 80-column test pane, corrupt on a wide one.
+    /// Tracked but never emitted: the forwarder must see it to stand down. 1005
+    /// and X10 agree byte-for-byte up to column 95 and diverge silently after,
+    /// so a defect here is correct on an 80-column pane and corrupt on a wide one.
     pub utf8_mouse: bool,
-    /// urxvt mouse coordinate encoding (Mode 1015). Tracked, not emitted --
-    /// see [`TerminalModes::utf8_mouse`]. An app in 1015 ignores the X10-framed
-    /// reports shux writes, so forwarding under it looks like a dead mouse.
+    /// urxvt mouse coordinates (Mode 1015). Tracked, not emitted -- an app in
+    /// 1015 ignores shux's X10-framed reports, so the mouse looks dead.
     pub urxvt_mouse: bool,
-    /// SGR-pixel mouse coordinate encoding (Mode 1016). Tracked, not emitted --
-    /// see [`TerminalModes::utf8_mouse`]. Apps set 1016 *in addition to* 1006,
-    /// so `sgr_mouse` alone cannot tell the two apart, and an app in 1016 reads
-    /// forwarded CELL coordinates as PIXELS: every click collapses into the
-    /// top-left corner of the pane.
+    /// SGR-pixel mouse coordinates (Mode 1016). Tracked, not emitted -- set *in
+    /// addition to* 1006, so `sgr_mouse` cannot tell them apart, and an app in
+    /// 1016 reads forwarded CELL coordinates as PIXELS (every click hits 0,0).
     pub pixel_mouse: bool,
     /// Alternate-scroll mode (Mode 1007): while on the alternate screen and the
     /// app has NOT requested mouse tracking, the terminal translates wheel
@@ -1073,15 +1066,11 @@ impl<'a> VtHandler<'a> {
             }
             // Focus in/out events.
             1004 => self.modes.focus_events = enable,
-            // UTF-8 mouse coordinates. Tracked, never emitted, so a forwarder
-            // can stand down; the DECRQM answer stays "not recognized", which
-            // remains true. Same for 1015 and 1016 below.
+            // 1005/1015/1016: tracked so a forwarder can stand down; never emitted.
             1005 => self.modes.utf8_mouse = enable,
             // SGR mouse coordinate encoding.
             1006 => self.modes.sgr_mouse = enable,
-            // urxvt mouse coordinates.
             1015 => self.modes.urxvt_mouse = enable,
-            // SGR-pixel mouse coordinates.
             1016 => self.modes.pixel_mouse = enable,
             // Alternate-scroll: wheel -> arrow keys on the alternate screen.
             1007 => self.modes.alternate_scroll = enable,
@@ -2414,15 +2403,9 @@ fn parse_rgb_component(component: &str) -> Result<u8, ()> {
 #[cfg(test)]
 mod tests {
 
-    /// Issue #174 tracks modes 1005, 1015 and 1016 so a mouse forwarder can
-    /// stand down under a coordinate encoding shux does not emit. Tracking must
-    /// NOT turn the DECRQM answer into a lie.
-    ///
-    /// `0` means "not recognized", and that stays true: shux never emits any of
-    /// these. Answering `1` ("set") would tell a well-behaved app that queries
-    /// first that it may use an encoding shux cannot produce, which is how you
-    /// turn a working mouse into a dead one. Nothing else pins this — the flags
-    /// are set and the report value is computed in two different places.
+    /// Tracking 1005/1015/1016 must not make DECRQM claim them: `0` ("not
+    /// recognized") stays true because shux never emits these encodings, and an
+    /// app that queries first would otherwise pick one shux cannot produce.
     #[test]
     fn tracking_a_coordinate_mode_does_not_make_decrqm_claim_it() {
         let flatten =

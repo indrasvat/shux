@@ -517,17 +517,11 @@ async fn resolve_or_create_session(
     })
 }
 
-/// Compute per-pane rects given the client size and dispatch each PTY its
-/// real winsize. Multi-pane TUIs read `TIOCGWINSZ` and lay themselves out from
-/// it, so a pane whose PTY thinks it is a different size than the rect it is
-/// drawn in renders into the wrong shape.
-///
-/// Goes through [`shux_ui::pane_viewport`], the compositor's own rule. This
-/// used to inset for the outline unconditionally, so under
-/// `appearance.border_style = "none"` every pane's VT grid came out two columns
-/// and two rows smaller than the rect the compositor drew it into: the last
-/// columns of each pane held nothing, and a mouse click on them named a cell
-/// the app did not have.
+/// Compute per-pane rects given the client size and dispatch each PTY its real
+/// winsize. Multi-pane TUIs read `TIOCGWINSZ` and lay themselves out from it, so
+/// a pane whose PTY believes a different size than the rect it is drawn in
+/// renders into the wrong shape. Uses [`shux_ui::pane_viewport`], the
+/// compositor's own rule, so the two cannot diverge.
 async fn apply_resize_to_window(
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
@@ -719,17 +713,16 @@ async fn run_attach_loop(
     // the layout split ratio.
     let mut mouse_drag: Option<DragState> = None;
     let mut selection_drag = SelectionDrag::None;
-    // `appearance.border_style` decides the pane viewport, so a live edit moves
-    // every pane's rect. The compositor picks that up on its next frame and the
-    // hit-test reads it per event, but a pane's PTY only learns its size when
-    // something re-fans the winsize -- attach, a client resize, or a
-    // layout-changing action. Without this the two drift apart until one of
-    // those happens: the app is drawn at one size and told another, and a click
-    // on its last column names a cell it does not have. Tracked here rather
-    // than read per iteration so the fan-out fires on the EDGE, not every wake.
-    let mut last_border_style = config.current().appearance.border_style.clone();
+    // `appearance.border_style` moves every pane's rect, and a pane's PTY only
+    // learns its size on attach, a client resize, or a layout-changing action.
+    // Fire the fan-out on the EDGE of a style change so the two cannot drift.
+    //
+    // Arm before reading the style: `Notified` captures the `notify_waiters`
+    // count when constructed, so a reload landing between these two statements
+    // is only seen if the listener is the older of the pair.
     let cfg_changed = config.change_notify();
     let mut cfg_listener = Box::pin(cfg_changed.notified());
+    let mut last_border_style = config.current().appearance.border_style.clone();
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -1014,10 +1007,6 @@ async fn run_attach_loop(
                             selection_drag = SelectionDrag::None;
                             continue;
                         }
-                        // Inside a pane whose app asked for the mouse, the
-                        // mouse is the app's — ahead of shux's own selection,
-                        // behind shux's modes. `handle_wheel` still owns every
-                        // scroll tick.
                         match handle_app_mouse(
                             kind,
                             button,
@@ -1681,13 +1670,9 @@ struct DragState {
     last_row: u16,
 }
 
-/// Who owns the in-flight mouse gesture.
-///
-/// Decided once, at button-down, and honoured until the last button comes up.
-/// Two independent latches -- one for shux's selection, one for the pane app --
-/// could both be live at once, and then a mode change mid-drag split the
-/// gesture between them: shux kept a selection highlight that no mouse action
-/// could clear, and the app got a release with no matching press.
+/// Who owns the in-flight mouse gesture. Decided once, at button-down, and
+/// honoured until the last button comes up: a single latch, so a mode change
+/// mid-drag cannot split a gesture between shux and the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionDrag {
     None,
@@ -2239,20 +2224,11 @@ enum ButtonAction {
     Drag,
 }
 
-/// Which xterm modes report `action`.
-///
-/// A real terminal reports only what the app asked for: in mode 1000 it sends
-/// press and release and nothing else, so forwarding a drag there tells the app
-/// about an event it has no handler for. `MouseMode::None` reports nothing —
-/// that pane keeps shux's own mouse handling.
-///
-/// Motion with no button (mode 1003's extra) is absent because shux never
-/// receives it: the host mouse profile deliberately enables 1000+1002 and not
-/// 1003 (`shux_ui::terminal`, pinned by a test there), so crossterm produces no
-/// `Moved` events to forward. An `AnyEvent` pane therefore gets press, release
-/// and drag but never hover. Making that work means enabling 1003 on the host,
-/// which costs the host terminal's own selection — a separate trade, not this
-/// change.
+/// Which xterm modes report `action`. Mode 1000 (`Normal`) subscribes to press
+/// and release only; forwarding a drag there reports an event the app never
+/// asked for. `MouseMode::None` reports nothing, so such a pane keeps shux's own
+/// mouse handling. Hover (1003's extra) is absent because the host profile does
+/// not enable 1003, so crossterm never produces one.
 fn mode_reports(mode: shux_vt::MouseMode, action: ButtonAction) -> bool {
     use shux_vt::MouseMode;
     match mode {
@@ -2262,15 +2238,11 @@ fn mode_reports(mode: shux_vt::MouseMode, action: ButtonAction) -> bool {
     }
 }
 
-/// Whether shux can encode a coordinate the app in this pane will read back as
-/// the cell the user actually clicked.
-///
-/// shux emits X10 or SGR (1006). An app that also asked for 1005, 1015 or 1016
-/// decodes those bytes as something else — 1016 in particular reads cells as
-/// pixels and collapses every click into the pane's top-left corner. Forwarding
-/// under any of them is not "mostly working"; it is clicking the wrong thing.
-/// Standing down leaves the pane exactly where it was before this feature
-/// existed, which is the honest floor.
+/// Whether shux can encode a coordinate this pane's app will read back as the
+/// cell the user clicked. shux emits X10 or SGR (1006); an app that also asked
+/// for 1005, 1015 or 1016 decodes those bytes as something else — 1016 reads
+/// cells as pixels and collapses every click into the top-left corner. A pane
+/// that fails this keeps shux's own mouse handling.
 fn coords_are_encodable(modes: &shux_vt::TerminalModes) -> bool {
     !modes.utf8_mouse && !modes.urxvt_mouse && !modes.pixel_mouse
 }
@@ -2290,10 +2262,6 @@ enum AppMouseRoute {
 }
 
 /// Route a button event, given facts the caller has already resolved.
-///
-/// Pure so the precedence can be tested exhaustively instead of inferred from
-/// the order of early returns in the handler — the same reason `route_wheel`
-/// exists next to `handle_wheel`.
 ///
 /// Order matters and is the tmux/wezterm model with one addition at the top:
 ///
@@ -2316,10 +2284,6 @@ fn route_app_mouse(
     encodable: bool,
     action: ButtonAction,
 ) -> AppMouseRoute {
-    // 1. An in-flight gesture is not re-decided. This is what makes a press and
-    //    its release reach the same place even if the app toggles its mouse
-    //    mode, the user presses or releases Shift, or the pointer leaves the
-    //    pane mid-drag.
     if let SelectionDrag::App { pane_id, .. } = gesture {
         return if mode_reports(mode, action) && encodable {
             AppMouseRoute::Forward(pane_id)
@@ -2330,13 +2294,11 @@ fn route_app_mouse(
     if gesture != SelectionDrag::None || border_drag_active || copy_active {
         return AppMouseRoute::Shux;
     }
-    // Only a press opens a gesture. A drag or release with no gesture in flight
-    // belongs to whatever shux started, or to nothing.
+    // Only a press opens a gesture; a stray drag or release is shux's.
     if action != ButtonAction::Press {
         return AppMouseRoute::Shux;
     }
-    // Shift is the user taking the mouse back. See `AttachClientFrame::Mouse`
-    // for how rarely most host terminals let this through.
+    // Shift is the user taking the mouse back.
     if shift {
         return AppMouseRoute::Shux;
     }
@@ -2384,13 +2346,10 @@ fn button_bit(button: ProtoMouseButton) -> u8 {
     }
 }
 
-/// Tell the app every held button came up, then end the gesture.
-///
-/// Called wherever a forwarded gesture is abandoned rather than completed — the
-/// help overlay opening, the client detaching, the session ending, the pane's
-/// rect disappearing under a zoom or a window switch. Without it the app is
-/// left believing a button is still down: in mode 1002 it reports nothing
-/// further until the next click, and most TUIs sit visibly mid-drag.
+/// Tell the app every held button came up, then end the gesture. Called wherever
+/// a forwarded gesture is abandoned rather than completed — help overlay,
+/// detach, session end, the pane's rect vanishing under a zoom or window switch
+/// — so the app is never left believing a button is down.
 async fn release_app_gesture(io_state: &Arc<Mutex<PaneIoState>>, gesture: &mut SelectionDrag) {
     let SelectionDrag::App {
         pane_id,
@@ -2520,19 +2479,11 @@ async fn handle_app_mouse(
     );
     let pane_id = match route {
         AppMouseRoute::Shux => return Ok(AppMouse::NotHandled),
-        // The app owns the mouse but did not subscribe to this event. Consume
-        // it: a stray shux selection appearing under a running TUI is not a
-        // better answer than nothing happening.
-        //
-        // One exception, and it is the whole reason this arm is not a bare
-        // swallow: a RELEASE that ends a gesture the app is still listening
-        // for. If the app turned tracking off it stopped listening and
-        // manufacturing a report it never subscribed to would be inventing
-        // input — but if it merely switched to a coordinate mode shux cannot
-        // encode (1005/1015/1016), it IS still waiting for the button to come
-        // up, and dropping the release leaves it button-held or mid-drag for
-        // the rest of the pane's life. A release at a coordinate the app reads
-        // oddly is recoverable; a stuck button is not.
+        // The app owns the mouse but did not subscribe to this event; consume
+        // it rather than letting shux act underneath a running TUI. An app that
+        // is STILL tracking (it only switched to a coordinate mode shux cannot
+        // encode) is still waiting for the button: send the release anyway,
+        // because a stuck button does not recover and a mis-placed release does.
         AppMouseRoute::Swallow => {
             if action == ButtonAction::Release && mode != shux_vt::MouseMode::None {
                 release_app_gesture(io_state, gesture).await;
@@ -2570,6 +2521,10 @@ async fn handle_app_mouse(
         .saturating_add(1);
 
     let Some(cb) = button_cb(action, button, alt, ctrl) else {
+        // No truthful report exists for a buttonless press or release, but a
+        // release must still clear the latch or the app sits button-held for
+        // the rest of the pane's life.
+        end_gesture_if_released(gesture, action, button);
         return Ok(AppMouse::NotHandled);
     };
     let Some(bytes) = encode_mouse_report(
@@ -2685,40 +2640,24 @@ fn route_wheel(mouse_on: bool, alt_screen: bool, alt_scroll: bool) -> WheelRouti
     }
 }
 
-/// The largest coordinate the legacy byte-packed encodings can carry.
-///
-/// X10 offsets each value by 32 and packs it into one byte, so 223 is the last
-/// value that fits. xterm reports `0` past it; shux sends nothing at all --
-/// see [`encode_mouse_report`].
+/// Last cell the X10 byte-packed form can name: each value is offset by 32 and
+/// packed into one byte, so 223 + 32 = 255.
 const X10_MOUSE_LIMIT: u16 = 223;
 
-/// Encode one mouse report for a pane's application.
-///
-/// The single encoder for every mouse event shux forwards: wheel ticks, button
-/// presses, drags and releases. It was two, and the duplicate meant a fix to
-/// the coordinate encoding had two homes and only ever found one.
+/// Encode one mouse report for a pane's application: wheel, press, drag, release.
 ///
 /// `cb` is the xterm button code before any encoding-specific rewrite: 0/1/2
-/// for left/middle/right, `+32` for motion, 3+32 for motion with no button
-/// held, 64/65 for wheel up/down, plus the modifier bits (shift 4, alt 8,
-/// ctrl 16). `col`/`row` are **1-based pane-local** cells.
+/// left/middle/right, `+32` motion, 3+32 motion with no button held, 64/65
+/// wheel up/down, plus modifier bits (shift 4, alt 8, ctrl 16). `col`/`row` are
+/// **1-based pane-local** cells.
 ///
-/// SGR (mode 1006) ends a release with `m` and keeps the real button, so the
-/// app learns which button came up. Legacy X10 has no way to say that: every
-/// release is `Cb = 3`, and the modifier bits ride along on it.
+/// SGR (1006) ends a release with `m` and keeps the real button; legacy X10
+/// cannot, so every X10 release is `Cb = 3` with the modifier bits kept.
 ///
-/// Returns `None` when the report cannot be encoded truthfully, and callers
-/// forward nothing:
-///
-/// - a legacy coordinate past [`X10_MOUSE_LIMIT`]. The old code clamped to 255,
-///   which is not a refusal — it is a perfectly valid report for a cell the
-///   user did not click, so the app acts at column 223. For a wheel tick that
-///   is a mis-aimed scroll; for a click it is the wrong button pressed in
-///   vim or lazygit, silently.
-/// - a 1-based coordinate of `0`, which is not a cell.
+/// `None` — do not forward — for a legacy coordinate past [`X10_MOUSE_LIMIT`]
+/// or a 1-based coordinate of `0`. Clamping instead would name a cell the user
+/// did not click.
 fn encode_mouse_report(cb: u16, release: bool, sgr: bool, col: u16, row: u16) -> Option<Vec<u8>> {
-    // No `debug_assert!` here: it would panic in exactly the builds the tests
-    // run, making the graceful branch below dead code everywhere it is checked.
     if col == 0 || row == 0 {
         return None;
     }
@@ -2822,15 +2761,9 @@ async fn handle_wheel(
         return Ok(true);
     };
 
-    // Snapshot the target pane's live mode state + scrollback depth.
-    //
-    // `coords_are_encodable` gates the wheel for the same reason it gates
-    // buttons: an app that also asked for 1005/1015/1016 decodes the bytes shux
-    // writes as something else, and under 1016 in particular it reads cell
-    // coordinates as pixels. Forwarding there is not "mostly working" — it is
-    // scrolling the wrong place. A pane that fails it is treated as not
-    // mouse-aware, so the wheel falls back to shux's own scrollback, which is
-    // what the user got before any of this existed.
+    // Snapshot the target pane's live mode state + scrollback depth. A pane shux
+    // cannot encode for is treated as not mouse-aware, so the wheel falls back
+    // to shux's own scrollback. See `coords_are_encodable`.
     let (mouse_on, sgr, alt, alt_scroll, app_cursor, total_lines) = {
         let state = io_state.lock().await;
         match state.vts.get(&pane_id) {
@@ -2995,14 +2928,9 @@ async fn pane_rect_for(
     pane_rect_in(graph, attached, content, viewport, pane_id)
 }
 
-/// `pane_rect_for` with the geometry already resolved.
-///
-/// Split out so a caller that has already computed the viewport for this event
-/// uses that one rather than reading the live config a second time. The two
-/// reads are microseconds apart, but a config reload landing between them would
-/// hit-test one event against two different geometries — and the whole point of
-/// deriving the viewport instead of caching it is that there is one answer per
-/// event.
+/// `pane_rect_for` with the geometry already resolved, so a caller that has
+/// already computed the viewport for this event hit-tests against that one
+/// rather than re-reading the live config and getting a second answer.
 fn pane_rect_in(
     graph: &GraphHandle,
     attached: &AttachedSession,
@@ -3098,31 +3026,14 @@ async fn current_content_rect(client_size: &ClientSize) -> Rect {
     Rect::new(0, 0, cols, rows.saturating_sub(STATUS_BAR_ROWS))
 }
 
-/// Compute the actual pane viewport (inset for outline + status bar) at
-/// the current client size. Used by spatial actions (focus_dir, smart
-/// split) and by every mouse hit-test, so the geometry they reason about
-/// matches what the user sees — not a hardcoded 120x40 fiction.
+/// The pane viewport at the current client size: the content area inset for the
+/// outline (when one is drawn) and the status bar. Used by spatial actions
+/// (focus_dir, smart split) and by every mouse hit-test, so their geometry
+/// matches what the compositor drew. Read live rather than cached — a config
+/// read is an ArcSwap load, and a cache here went stale in both directions.
 ///
-/// Delegates to [`shux_ui::pane_viewport`], the same function the compositor
-/// lays panes out with. It used to inset for the outline unconditionally while
-/// the compositor inset only when the outline was drawn, which put every
-/// hit-test one cell off under `appearance.border_style = "none"`.
-///
-/// The style is read from the live config on every call rather than cached on
-/// [`AttachedSession`]. A cache here was wrong twice over: it went stale for the
-/// common case (a user whose config says `none` and never edits it — the render
-/// loop only republished ON CHANGE, so the value never left its default), and
-/// seeding it separately from the render loop's own change detection left a
-/// window where a reload between the two reads stranded it forever. A config
-/// read is an ArcSwap load.
-///
-/// `zoomed: false` is not an oversight, but the reason is narrower than "every
-/// caller checks first". Six of the seven callers do take a zoomed branch before
-/// asking. The seventh, `handle_action`'s `SplitSmart`, reaches
-/// `compute_rects(viewport)` while zoomed — and is unaffected, because the only
-/// thing it asks of the rect is `width >= height`, and the inset subtracts 2
-/// from both. Stated this way rather than as a claim a reader can falsify with
-/// one grep.
+/// `zoomed: false`: `SplitSmart` is the one caller that reaches here while
+/// zoomed, and it only compares `width >= height`, which the inset preserves.
 async fn current_viewport(client_size: &ClientSize, config: &ConfigHandle) -> Rect {
     let border_style = BorderStyle::parse(&config.current().appearance.border_style);
     shux_ui::pane_viewport(current_content_rect(client_size).await, border_style, false)
@@ -3730,13 +3641,8 @@ mod tests {
         );
     }
 
-    /// Name retained deliberately, "and_caps" included: `check-test-inventory`
-    /// treats a test's name as the identity of its coverage, and a name that
-    /// vanishes from the workspace is a hard failure with no rename escape —
-    /// correctly, since a renamed test and a deleted one look identical from
-    /// outside. What the test asserts AT the cap is what issue #174 inverted:
-    /// 223 still encodes, 224 is now refused rather than clamped to byte 255.
-    /// The refusal itself is pinned separately by
+    /// Name frozen by `check-test-inventory`, which treats a test name as the
+    /// identity of its coverage. The cap itself is pinned by
     /// `encode_mouse_report_refuses_legacy_coordinates_it_cannot_carry`.
     #[test]
     fn encode_mouse_wheel_x10_offsets_by_32_and_caps() {
@@ -3751,22 +3657,11 @@ mod tests {
             encode_mouse_wheel(false, false, 1, 1),
             Some(vec![0x1b, b'[', b'M', 97, 33, 33])
         );
-        // At the cap: 223 is the last cell the byte-packed form can name
-        // (223+32 = 255), and 224 is refused rather than clamped.
-        assert_eq!(
-            encode_mouse_wheel(true, false, 223, 1).map(|b| b[4]),
-            Some(255)
-        );
-        assert_eq!(encode_mouse_wheel(true, false, 224, 1), None);
     }
 
-    /// Issue #174. This test previously asserted the opposite -- that a
-    /// coordinate past the legacy limit is clamped to the 255 wire ceiling.
-    /// Clamping is not a refusal: byte 255 is a perfectly valid report for
-    /// column 223, so the app acts on a cell the user never touched. For a
-    /// wheel tick that is a mis-aimed scroll; once clicks travel the same
-    /// encoder it is the wrong button pressed, silently. Refusing to encode
-    /// leaves the app where it was.
+    /// A coordinate the legacy form cannot carry is refused, not clamped: byte
+    /// 255 is a valid report for column 223, so a clamp makes the app act on a
+    /// cell the user never touched.
     #[test]
     fn encode_mouse_report_refuses_legacy_coordinates_it_cannot_carry() {
         // 223 is the last cell the byte-packed form can name: 223+32 = 255.
@@ -5118,13 +5013,8 @@ mod tests {
     }
 
     // --- Issue #174: button events reach a mouse-aware app ---------------
-    //
-    // These drive the real `handle_app_mouse` and the real
-    // `route_app_mouse` against a live graph + pane VT. Every one of them was
-    // run against the tree before the fix: the encoder and routing tests fail
-    // to compile there (the functions do not exist), and the behavioural ones
-    // were re-checked against a neutered `handle_app_mouse` that returns
-    // `NotHandled` unconditionally, which is what the old code did.
+    // These drive the real `handle_app_mouse` and `route_app_mouse` against a
+    // live graph + pane VT.
 
     /// Byte-exact reports, checked against what crossterm's own decoder reads
     /// back. The classic defects here are silent: swapping middle and right
@@ -5580,6 +5470,40 @@ mod tests {
         h.send(MouseKind::Up, ProtoMouseButton::Left, 12, 5).await;
         assert_eq!(recv_text(&mut wr).await, "\x1b[<0;12;5m");
         assert_eq!(h.gesture, SelectionDrag::None, "gesture must have ended");
+        h.fixture.stop();
+    }
+
+    /// An `Up` the client cannot attribute to a button must still end the gesture.
+    ///
+    /// `button_cb` refuses `None` on a press or release — correctly, since
+    /// turning it into a left click would forward a click the user never made.
+    /// But that early return is the one path out of `handle_app_mouse` that
+    /// skips both gesture helpers, so the latch never clears. `Mouse` is an
+    /// untrusted wire frame, so this shape is reachable even though shux's own
+    /// client never sends it.
+    #[tokio::test]
+    async fn an_unattributable_release_still_ends_the_app_gesture() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+        assert!(matches!(h.gesture, SelectionDrag::App { .. }));
+
+        // Nothing is forwarded — there is no truthful report for a buttonless
+        // release — but the gesture must not outlive it.
+        h.send(MouseKind::Up, ProtoMouseButton::None, 10, 5).await;
+        assert_no_bytes(&mut wr, "a buttonless release is not encodable").await;
+        assert_eq!(
+            h.gesture,
+            SelectionDrag::None,
+            "the app is left believing the button is still down"
+        );
         h.fixture.stop();
     }
 
@@ -6091,15 +6015,9 @@ mod tests {
     }
 
     /// The hit-test viewport must be the one the compositor laid the panes out
-    /// with. It used to inset for the outline unconditionally while the
-    /// compositor inset only when the outline was drawn, so under
-    /// `appearance.border_style = "none"` every click was one cell off in both
-    /// axes and the last column and row could not be clicked at all.
-    ///
-    /// Driven from a real config FILE, not from a `BorderStyle` handed in: the
-    /// defect that shipped was in the plumbing from config to hit-test, not in
-    /// the inset arithmetic, and a test that passes the style in by hand cannot
-    /// see it.
+    /// with. Driven from a real config FILE, not from a `BorderStyle` handed in:
+    /// the defect was in the plumbing from config to hit-test, not in the inset
+    /// arithmetic, and a test passing the style in by hand cannot see it.
     #[tokio::test]
     async fn the_pane_hit_test_agrees_with_the_compositor_under_every_border_style() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6140,21 +6058,11 @@ mod tests {
         );
     }
 
-    /// Cross-path consistency: the places that decide where a pane's rect is
-    /// must agree, for every border style.
-    ///
-    /// They were three independent copies of the same arithmetic and two were
-    /// wrong: mouse hit-testing (`current_viewport`) and the PTY resize fan-out
-    /// (`apply_resize_to_window`) both inset for the outline unconditionally,
-    /// while the compositor and the snapshot composer inset only when the
-    /// outline is drawn. Under `border_style = "none"` that made every click
-    /// land a cell off AND gave each pane a VT grid two columns narrower than
-    /// the rect it was drawn into, so a click on the last column named a cell
-    /// the app did not have.
-    ///
-    /// Asserted through the real APIs on each path -- where `compose` actually
-    /// lands a pane's first cell, what the resize fan-out actually sends -- not
-    /// by re-deriving the arithmetic and comparing it to itself.
+    /// Cross-path consistency: hit-test, compositor, snapshot composer and the
+    /// PTY resize fan-out must all place a pane's rect identically, for every
+    /// border style. Asserted through each path's real API — where `compose`
+    /// lands a pane's first cell, what the fan-out actually sends — not by
+    /// re-deriving the arithmetic and comparing it to itself.
     #[tokio::test]
     async fn every_render_path_agrees_on_the_pane_viewport() {
         use std::collections::HashMap;
@@ -6271,14 +6179,9 @@ mod tests {
         fixture.stop();
     }
 
-    /// A live `border_style` edit moves every pane's rect, so the PTYs have to
-    /// be re-told their size or they are drawn at one geometry and believe
-    /// another — and a click on the last column then names a cell the app does
-    /// not have, which is the whole defect class this PR exists to close.
-    ///
-    /// Drives the real `ConfigHandle::replace` and the real fan-out. Seen
-    /// failing against the tree before the `change_notify` branch existed: the
-    /// resize channel stays silent and the receiver times out.
+    /// A live `border_style` edit moves every pane's rect, so the PTYs must be
+    /// re-told their size or they are drawn at one geometry and believe another.
+    /// Drives the real `ConfigHandle::replace` and the real fan-out.
     #[tokio::test]
     async fn a_border_style_reload_re_fans_every_pane_winsize() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6346,14 +6249,8 @@ mod tests {
         fixture.stop();
     }
 
-    /// The wheel stands down under a coordinate mode shux cannot encode, just
-    /// as the button path does.
-    ///
-    /// This was asymmetric: `handle_app_mouse` refused, `handle_wheel` did not,
-    /// so an app in `1002h 1006h 1016h` got no clicks but did get wheel reports
-    /// whose cell coordinates it read as pixels. Half a guard is not a guard.
-    /// Falling back to shux's own scrollback is the honest floor — it is what
-    /// the pane did before any forwarding existed.
+    /// The wheel stands down under a coordinate mode shux cannot encode, just as
+    /// the button path does, and falls back to shux's own scrollback.
     #[tokio::test]
     async fn the_wheel_stands_down_under_a_coordinate_mode_shux_cannot_encode() {
         let fixture = attach_fixture().await;
@@ -6387,19 +6284,10 @@ mod tests {
         fixture.stop();
     }
 
-    /// An app that switches to a coordinate mode shux cannot encode, mid-drag,
-    /// still gets its release.
-    ///
-    /// Greptile P1 on #176. The press was forwarded, then the app sets 1016 —
-    /// it is still tracking, still waiting for the button to come up, and shux
-    /// can no longer encode a coordinate it will read correctly. Swallowing the
-    /// release there leaves it button-held or mid-drag for the rest of the
-    /// pane's life. A release at a coordinate the app reads oddly is
-    /// recoverable; a stuck button is not.
-    ///
-    /// Contrast `an_app_that_drops_tracking_mid_gesture_stops_receiving_reports`:
-    /// an app that turned tracking OFF stopped listening, and manufacturing a
-    /// report it never subscribed to would be inventing input.
+    /// An app that switches to an unencodable coordinate mode mid-drag is still
+    /// tracking and still waiting for the button: send the release anyway.
+    /// Contrast `an_app_that_drops_tracking_mid_gesture_stops_receiving_reports`
+    /// — an app that turned tracking OFF never subscribed to it.
     #[tokio::test]
     async fn an_app_that_switches_to_an_unencodable_mode_mid_gesture_still_gets_its_release() {
         let mut h = AppMouseHarness::new().await;

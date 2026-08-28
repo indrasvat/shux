@@ -252,16 +252,9 @@ pub(crate) async fn snapshot_window(
     .await;
     const STATUS_BAR_ROWS: u16 = 1;
 
-    // The user's outline style, not a hardcoded `Rounded`.
-    //
-    // Two bugs in one line. The old one was cosmetic and long-standing: a user
-    // configured `thick` / `ascii` / `double` got rounded borders in every
-    // snapshot PNG. The new one is not cosmetic -- `compose` derives the pane
-    // viewport from this style, so once a pane's PTY started following the LIVE
-    // compositor's rule (issue #174), a snapshot taken under
-    // `border_style = "none"` composed panes into rects two columns and two
-    // rows smaller than their grids and silently cropped the right and bottom
-    // edges out of the image. Read before `spawn_blocking` takes the closure.
+    // Compose with the user's outline style: `compose` derives the pane viewport
+    // from it, so a hardcoded style crops panes under `border_style = "none"`.
+    // Read here, before `spawn_blocking` takes the closure.
     let border_style = shux_ui::BorderStyle::parse(&config.current().appearance.border_style);
 
     let (img, png_buf) = tokio::task::spawn_blocking(move || {
@@ -485,24 +478,10 @@ pub(crate) fn snapshot_font_key(cfg: &shux_core::config::Config) -> SnapshotFont
 mod tests {
     use super::*;
 
-    /// Issue #174: `shux-pty` declares a cell box to every pane child in
-    /// `ws_xpixel`/`ws_ypixel`, and cannot depend on `shux-raster` to derive
-    /// it. This crate depends on both, so this is where the two can be held to
-    /// the same number.
-    ///
-    /// Built through `build_snapshot_rasterizer`, NOT `Rasterizer::new(14.0)`:
-    /// restating the font size here would make the test agree with itself while
-    /// the production path moved. As written it fails if the default snapshot
-    /// font size changes, if the bundled font changes, or if the declared box
-    /// is edited alone.
-    ///
-    /// If it fails: the promise shux makes to pane children no longer matches
-    /// what shux renders. Update `DECLARED_CELL_PIXELS` and re-bless the pixel
-    /// goldens -- do not delete this test.
-    ///
-    /// Scope, deliberately not asserted: the lens gate rasterizes at 16.0 and
-    /// `appearance.font` can change the box at runtime. The declaration tracks
-    /// neither; see `DECLARED_CELL_PIXELS`' own docs for why.
+    /// `shux-pty` declares a cell box to pane children but cannot depend on
+    /// `shux-raster`; this crate depends on both, so this is where they are held
+    /// to one number. Built through `build_snapshot_rasterizer`, not a restated
+    /// `14.0`, so it also fails if the default font or font size moves.
     #[test]
     fn declared_pty_cell_box_matches_the_default_snapshot_rasterizer() {
         let rasterizer = build_snapshot_rasterizer(&Config::default())

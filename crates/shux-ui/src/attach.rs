@@ -262,11 +262,9 @@ where
                             // ScrollLeft / ScrollRight: ignore for now.
                             _ => continue,
                         };
-                        // Modifiers travel with the event. crossterm parses
-                        // them for both the SGR and legacy encodings; dropping
-                        // them here is what made ctrl-click and alt-click
-                        // arrive at a pane app as plain clicks -- in nvim that
-                        // silently turns jump-to-tag into a cursor move.
+                        // Modifiers travel with the event: dropping them made
+                        // ctrl-click and alt-click arrive at the app as plain
+                        // clicks (in nvim, jump-to-tag became a cursor move).
                         let frame = AttachClientFrame::Mouse {
                             kind,
                             button,
