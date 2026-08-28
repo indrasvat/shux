@@ -3716,8 +3716,16 @@ mod tests {
         );
     }
 
+    /// Name retained deliberately, "and_caps" included: `check-test-inventory`
+    /// treats a test's name as the identity of its coverage, and a name that
+    /// vanishes from the workspace is a hard failure with no rename escape —
+    /// correctly, since a renamed test and a deleted one look identical from
+    /// outside. What the test asserts AT the cap is what issue #174 inverted:
+    /// 223 still encodes, 224 is now refused rather than clamped to byte 255.
+    /// The refusal itself is pinned separately by
+    /// `encode_mouse_report_refuses_legacy_coordinates_it_cannot_carry`.
     #[test]
-    fn encode_mouse_wheel_x10_offsets_by_32() {
+    fn encode_mouse_wheel_x10_offsets_by_32_and_caps() {
         // X10: ESC [ M  Cb  Cx  Cy, each byte = value + 32.
         // up at (1,1): Cb=64+32=96, Cx=Cy=1+32=33.
         assert_eq!(
@@ -3729,6 +3737,13 @@ mod tests {
             encode_mouse_wheel(false, false, 1, 1),
             Some(vec![0x1b, b'[', b'M', 97, 33, 33])
         );
+        // At the cap: 223 is the last cell the byte-packed form can name
+        // (223+32 = 255), and 224 is refused rather than clamped.
+        assert_eq!(
+            encode_mouse_wheel(true, false, 223, 1).map(|b| b[4]),
+            Some(255)
+        );
+        assert_eq!(encode_mouse_wheel(true, false, 224, 1), None);
     }
 
     /// Issue #174. This test previously asserted the opposite -- that a
