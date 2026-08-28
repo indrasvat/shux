@@ -207,10 +207,14 @@ Everything else in this report was measured at `51ae4c9` in this pass.
 - **shux cannot audit its own emit path here.** This change emits nothing to an
   outer terminal, so that limit is not exercised — but it becomes live for work
   item 6 (attach re-transmit), where `make test-gui-terminal` is the only witness.
-- **Live `lazygit`, `vicaya` and `vivecaka` are not installed** in this
-  environment. Only their committed raw replay fixtures were exercised, which is
-  what CLAUDE.md requires unless recordings are being refreshed. Refreshing those
-  recordings will need a host that has them.
+- **Live `vicaya` and `vivecaka` are not installed** in this environment and
+  could not be obtained. Only their committed raw replay fixtures were
+  exercised. This is an UNFILLABLE CELL, not a satisfied requirement: CLAUDE.md
+  says "real workloads over fixtures ... colour-probed `printf`/`cat` is the
+  letter, not the spirit", and a replay is a recording, not the application.
+  Closing it needs a host that has them.
+  (`lazygit` was in this bullet when the audit was issued; it has since been
+  installed and driven live — see the addendum.)
 
 ## Cleanup
 
@@ -219,3 +223,48 @@ processes after every daemon-backed run. The A/B harness additionally proves thi
 per-run against its own unique socket path. The audit's private git worktree was
 removed and pruned. The mutation matrix restored all three mutated files;
 `git status --porcelain` is empty and `git diff HEAD` is empty at `51ae4c9`.
+
+
+---
+
+## Addendum — live `lazygit`, added after the audit
+
+Written by the change author, not the auditor, in response to a P1 on
+[#181](https://github.com/indrasvat/shux/pull/181) from `chatgpt-codex-connector`.
+It is recorded here rather than silently folded into the audit above.
+
+**The finding was correct on both counts.** The report claimed 11 pixel pairs
+including 200x60 while `evidence-manifest.json` listed nine and no `*-200x60`
+metric was tracked — the files existed only in gitignored scratch. And the
+residual-risk bullet above asserted that replay fixtures were what CLAUDE.md
+requires, which inverts the rule.
+
+**What changed.** All 15 metric files the audit's own tables cite are now
+tracked and named in the manifest, including both 200x60 pairs, the
+hostile-splice arms and the real-`icat` arms. `make check-vt-qa` goes red if any
+manifest entry is untracked — it did, which is how the gap was closed rather
+than argued away.
+
+**Live `lazygit` 0.44.1**, installed from the upstream release and driven in a
+real 120x40 shux pane against this branch's binary and against `origin/main`:
+
+```
+lazygit live: 40 lines, panels and box-drawing intact, 1080x760 colours=1558   (branch)
+lazygit live: 40 lines, panels and box-drawing intact, 1080x760 colours=1557   (origin/main)
+```
+
+The capture is committed as `lazygit-live-capture.txt`. Panels (`Status`,
+`Files - Worktrees - Submodules`, `Diff`, `Local branches`, `Commits`, `Stash`),
+box-drawing glyphs, truecolor, underlined hyperlinks and the commit list all
+render correctly. The barrier is content — the `Commits` panel title, which
+lazygit draws only after reading the repo — then `wait-settled`; a bare settle
+would race its startup and capture a blank.
+
+**Not a byte-identity check, deliberately.** lazygit's welcome modal rotates its
+text and the Status panel carries live repo state, so two runs differ for
+reasons unrelated to this change (hence 1558 vs 1557 colours). Byte-identity is
+proved by the deterministic replay fixture, which is 0/0; this arm proves the
+REAL application renders correctly, which is the half a replay cannot show.
+
+**`vicaya` and `vivecaka` remain unfillable here** and are called out as such
+above rather than counted as passes.
