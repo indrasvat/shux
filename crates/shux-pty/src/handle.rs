@@ -62,6 +62,39 @@ pub enum PtyError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn declares_pixels_as_cells_times_the_cell_box() {
+        let ws = winsize_for(PtySize::new(100, 30));
+        assert_eq!((ws.ws_col, ws.ws_row), (100, 30));
+        assert_eq!(
+            (ws.ws_xpixel, ws.ws_ypixel),
+            (100 * DECLARED_CELL_PIXELS.0, 30 * DECLARED_CELL_PIXELS.1)
+        );
+    }
+
+    /// Overflow declares the honest `0` sentinel on both axes, never a
+    /// saturated number an app would divide into a believable cell size.
+    #[test]
+    fn overflow_declares_nothing_on_both_axes() {
+        let ws = winsize_for(PtySize::new(7282, 30));
+        assert_eq!((ws.ws_col, ws.ws_row), (7282, 30), "cells stay truthful");
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
+
+        // Vertical-only overflow must not leave the horizontal axis declared.
+        let ws = winsize_for(PtySize::new(100, 3450));
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
+
+        // One cell under the limit still declares.
+        let ws = winsize_for(PtySize::new(7281, 3449));
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (65529, 65531));
+    }
+
+    #[test]
+    fn a_zero_sized_pty_is_not_an_error() {
+        let ws = winsize_for(PtySize::new(0, 0));
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
+    }
+
     fn create_terminfo_entry(root: &Path, term: &str) {
         let first = term.as_bytes()[0];
         let dir = root.join(format!("{first:x}"));
@@ -335,6 +368,36 @@ fn leads_with_segment(rest: &[u8], word: &[u8]) -> bool {
         .is_some_and(|tail| tail.is_empty() || tail.starts_with(b"_"))
 }
 
+/// The cell box, in pixels, declared to pane children via `ws_xpixel`/`ws_ypixel`.
+///
+/// A promise, not a measurement -- snapshots render 9x19, the lens gate 10x22,
+/// live attach whatever the user's terminal uses. Deliberately not derived from
+/// `appearance.font`, which hot-reloads: panes either side of a reload would
+/// declare different geometry. Pinned to the snapshot rasterizer by
+/// `declared_pty_cell_box_matches_the_default_snapshot_rasterizer` (crate `shux`).
+pub const DECLARED_CELL_PIXELS: (u16, u16) = (9, 19);
+
+/// Build the `winsize` a PTY is opened or resized with.
+///
+/// Overflow declares `0/0` on BOTH axes, never a saturated value: apps recover
+/// the cell size as `ws_xpixel / ws_col`, so a clamped 65535 reads as a
+/// believable-but-wrong cell, where `0` already means "not declared". Reachable
+/// only through `spawn`/`resize`, which are `pub` and validate nothing -- the
+/// CLI and RPC cap panes at 1000x1000.
+fn winsize_for(size: PtySize) -> Winsize {
+    let (cell_w, cell_h) = DECLARED_CELL_PIXELS;
+    let (xpixel, ypixel) = match (size.cols.checked_mul(cell_w), size.rows.checked_mul(cell_h)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => (0, 0),
+    };
+    Winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: xpixel,
+        ws_ypixel: ypixel,
+    }
+}
+
 /// Configuration for spawning a PTY child process.
 #[derive(Debug, Clone)]
 pub struct PtyConfig {
@@ -597,12 +660,7 @@ impl PtyHandle {
     /// [`OUTER_TERMINAL_IDENTITY_VARS`]), so it must not run concurrently with
     /// `std::env::set_var`.
     pub fn spawn(config: &PtyConfig) -> Result<Self, PtyError> {
-        let winsize = Winsize {
-            ws_row: config.size.rows,
-            ws_col: config.size.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
+        let winsize = winsize_for(config.size);
         let pty_pair = openpty(Some(&winsize), None).map_err(nix_to_io)?;
         set_nonblocking(&pty_pair.master).map_err(PtyError::Open)?;
 
@@ -817,12 +875,7 @@ impl PtyHandle {
 
     /// Resize the PTY (sends TIOCSWINSZ/SIGWINCH to child).
     pub fn resize(&mut self, new_size: PtySize) -> Result<(), PtyError> {
-        let winsize = Winsize {
-            ws_row: new_size.rows,
-            ws_col: new_size.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
+        let winsize = winsize_for(new_size);
         let rc = unsafe {
             nix::libc::ioctl(
                 self.pty.get_ref().as_raw_fd(),

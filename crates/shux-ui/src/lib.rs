@@ -28,7 +28,9 @@ pub use borders::{BorderChars, BorderColors, BorderSegment, BorderStyle, compute
 pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
 pub use client::{ClientConfig, ExitReason};
 pub use composed::{ComposeInputs, ComposedFrame, compose};
-pub use compositor::{CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats};
+pub use compositor::{
+    CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats, pane_viewport,
+};
 pub use copy_mode::{
     CopyKey, CopyModeState, handle_key as copy_mode_key,
     handle_key_with_vt as copy_mode_key_with_vt, osc52_copy, render_copy_overlay_into,

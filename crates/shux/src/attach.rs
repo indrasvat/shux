@@ -335,7 +335,7 @@ async fn handle_attach_connection(
     // the full client size. Multi-pane TUIs (vim, htop, less) read TIOCGWINSZ
     // and will lay themselves out wrong if every pane PTY pretends to be
     // the whole screen.
-    apply_resize_to_window(&graph, &io_state, &session, hello.cols, hello.rows).await;
+    apply_resize_to_window(&graph, &io_state, &session, &config, hello.cols, hello.rows).await;
 
     // Step 3: Send AttachReady::Ok.
     let ready = AttachReady::Ok {
@@ -517,14 +517,16 @@ async fn resolve_or_create_session(
     })
 }
 
-/// Compute per-pane rects given the client size and dispatch each PTY its
-/// real winsize. The compositor's pane viewport is inset by 1 cell on each
-/// side for the border outline, and the bottom row is reserved for the
-/// status bar — apply the same arithmetic here.
+/// Compute per-pane rects given the client size and dispatch each PTY its real
+/// winsize. Multi-pane TUIs read `TIOCGWINSZ` and lay themselves out from it, so
+/// a pane whose PTY believes a different size than the rect it is drawn in
+/// renders into the wrong shape. Uses [`shux_ui::pane_viewport`], the
+/// compositor's own rule, so the two cannot diverge.
 async fn apply_resize_to_window(
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &AttachedSession,
+    config: &ConfigHandle,
     cols: u16,
     rows: u16,
 ) {
@@ -536,11 +538,11 @@ async fn apply_resize_to_window(
     };
     let content_h = rows.saturating_sub(STATUS_BAR_ROWS);
     let content = Rect::new(0, 0, cols, content_h);
-    let viewport = if cols >= 3 && content_h >= 3 {
-        Rect::new(content.x + 1, content.y + 1, cols - 2, content_h - 2)
-    } else {
-        content
-    };
+    let viewport = shux_ui::pane_viewport(
+        content,
+        BorderStyle::parse(&config.current().appearance.border_style),
+        false,
+    );
 
     // Drain the resizer senders out from under the lock so we never await
     // a channel send while still holding the PaneIoState mutex. Attach
@@ -711,9 +713,34 @@ async fn run_attach_loop(
     // the layout split ratio.
     let mut mouse_drag: Option<DragState> = None;
     let mut selection_drag = SelectionDrag::None;
+    // `appearance.border_style` moves every pane's rect, and a pane's PTY only
+    // learns its size on attach, a client resize, or a layout-changing action.
+    // Fire the fan-out on the EDGE of a style change so the two cannot drift.
+    //
+    // Arm before reading the style: `Notified` captures the `notify_waiters`
+    // count when constructed, so a reload landing between these two statements
+    // is only seen if the listener is the older of the pair.
+    let cfg_changed = config.change_notify();
+    let mut cfg_listener = Box::pin(cfg_changed.notified());
+    let mut last_border_style = config.current().appearance.border_style.clone();
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            () = &mut cfg_listener => {
+                cfg_listener = Box::pin(cfg_changed.notified());
+                let live = config.current().appearance.border_style.clone();
+                if live != last_border_style {
+                    last_border_style = live;
+                    let attached = render_session.lock().await.clone();
+                    let (cols, rows) = *client_size.lock().await;
+                    apply_resize_to_window(
+                        &graph, &io_state, &attached, &config, cols, rows,
+                    )
+                    .await;
+                    let pulse = io_state.lock().await.render_pulse.clone();
+                    pulse.notify_one();
+                }
+            }
             frame = stream.next() => {
                 let buf = match frame {
                     Some(Ok(b)) => b,
@@ -797,6 +824,7 @@ async fn run_attach_loop(
                                     active_pane,
                                     &attached_clone,
                                     &client_size,
+                                    &config,
                                 )
                                 .await;
                                 let action = {
@@ -903,7 +931,7 @@ async fn run_attach_loop(
                             *cs = (cols, rows);
                         }
                         let attached = render_session.lock().await.clone();
-                        apply_resize_to_window(&graph, &io_state, &attached, cols, rows).await;
+                        apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.notify_one();
                     }
@@ -920,6 +948,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &cancel,
                         )
                         .await;
@@ -948,7 +977,7 @@ async fn run_attach_loop(
                         if action_changes_layout(kind) {
                             let attached = render_session.lock().await.clone();
                             let (cols, rows) = *client_size.lock().await;
-                            apply_resize_to_window(&graph, &io_state, &attached, cols, rows).await;
+                            apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
                         }
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.notify_one();
@@ -958,6 +987,9 @@ async fn run_attach_loop(
                         button,
                         col,
                         row,
+                        shift,
+                        alt,
+                        ctrl,
                     } => {
                         // Modal guard: swallow mouse events while the
                         // help overlay is visible. Otherwise a click or
@@ -968,8 +1000,39 @@ async fn run_attach_loop(
                         // doesn't keep ratcheting.
                         if render_session.lock().await.help_visible {
                             mouse_drag = None;
+                            // An app mid-drag behind the overlay has to be
+                            // told the button came up, or it stays stuck
+                            // dragging for the rest of its life.
+                            release_app_gesture(&io_state, &mut selection_drag).await;
                             selection_drag = SelectionDrag::None;
                             continue;
+                        }
+                        match handle_app_mouse(
+                            kind,
+                            button,
+                            col,
+                            row,
+                            shift,
+                            alt,
+                            ctrl,
+                            &graph,
+                            &io_state,
+                            &render_session,
+                            &client_size,
+                            &config,
+                            &mouse_drag,
+                            &mut selection_drag,
+                        )
+                        .await?
+                        {
+                            AppMouse::Consumed { redraw } => {
+                                if redraw {
+                                    let pulse = io_state.lock().await.render_pulse.clone();
+                                    pulse.notify_one();
+                                }
+                                continue;
+                            }
+                            AppMouse::NotHandled => {}
                         }
                         if handle_mouse_selection(
                             kind,
@@ -980,6 +1043,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &out_tx,
                             &mut selection_drag,
                         )
@@ -998,6 +1062,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &out_tx,
                             &mut selection_drag,
                         )
@@ -1017,6 +1082,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                         )
                         .await?
                         {
@@ -1033,6 +1099,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &mut mouse_drag,
                         )
                         .await
@@ -1091,6 +1158,12 @@ async fn run_attach_loop(
             break;
         }
     }
+
+    // A gesture forwarded to a pane app outlives the attach: the PTY does not
+    // go away when the client does. Detaching mid-drag without this leaves the
+    // app believing a button is still held, and it stays that way for the rest
+    // of the pane's life — visible next time anyone attaches.
+    release_app_gesture(&io_state, &mut selection_drag).await;
 
     drop(out_tx); // closes the writer cleanly
     let _ = writer.await;
@@ -1238,7 +1311,7 @@ async fn run_render_loop(
         };
         let copy_overlay = if let Some(ref cm) = attached.copy_mode {
             let content = current_content_rect(&client_size).await;
-            let viewport = current_viewport(&client_size).await;
+            let viewport = current_viewport(&client_size, &config).await;
             let rect = if win.layout.is_zoomed() {
                 Some(content)
             } else {
@@ -1256,7 +1329,7 @@ async fn run_render_loop(
                 theme: live_theme,
             })
         } else if let Some(selection) = attached.mouse_selection.as_ref() {
-            pane_rect_for(&graph, &attached, &client_size, selection.pane_id)
+            pane_rect_for(&graph, &attached, &client_size, &config, selection.pane_id)
                 .await
                 .map(|rect| CopyOverlayStamp {
                     kind: CopyOverlayKind::MouseSelection,
@@ -1597,11 +1670,28 @@ struct DragState {
     last_row: u16,
 }
 
+/// Who owns the in-flight mouse gesture. Decided once, at button-down, and
+/// honoured until the last button comes up: a single latch, so a mode change
+/// mid-drag cannot split a gesture between shux and the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionDrag {
     None,
     CopyMode,
-    MouseSelection { pane_id: PaneId },
+    MouseSelection {
+        pane_id: PaneId,
+    },
+    /// Forwarded to a mouse-aware app in `pane_id`.
+    ///
+    /// `buttons` is a bitmask of the buttons currently held, not a count: on a
+    /// host without SGR mouse reporting every release decodes as
+    /// `Up(MouseButton::Left)`, so a latch keyed to one button would never
+    /// clear. `last` is the pane-local cell of the most recent forwarded
+    /// report, used to synthesize a release if the gesture is abandoned.
+    App {
+        pane_id: PaneId,
+        buttons: u8,
+        last: (u16, u16),
+    },
 }
 
 /// Look up which pane contains the cell at `(col, row)`. Returns the
@@ -1677,6 +1767,7 @@ async fn handle_mouse_selection(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     out_tx: &mpsc::Sender<AttachServerFrame>,
     drag: &mut SelectionDrag,
 ) -> anyhow::Result<bool> {
@@ -1699,7 +1790,8 @@ async fn handle_mouse_selection(
                         .filter(|selection| selection.pane_id == menu.pane_id);
                     if let Some(selection) = selection {
                         if let Some(rect) =
-                            pane_rect_for(graph, &attached, client_size, selection.pane_id).await
+                            pane_rect_for(graph, &attached, client_size, config, selection.pane_id)
+                                .await
                         {
                             let copied = yank_selection(
                                 selection.pane_id,
@@ -1737,7 +1829,7 @@ async fn handle_mouse_selection(
 
     match (kind, button) {
         (MouseKind::Down, ProtoMouseButton::Left) => {
-            let viewport = current_viewport(client_size).await;
+            let viewport = current_viewport(client_size, config).await;
             let snap = graph.snapshot();
             let Some(win) = snap.windows.get(&attached.active_window_id) else {
                 return Ok(false);
@@ -1777,7 +1869,8 @@ async fn handle_mouse_selection(
             let SelectionDrag::MouseSelection { pane_id } = *drag else {
                 return Ok(false);
             };
-            let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+            let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await
+            else {
                 *drag = SelectionDrag::None;
                 return Ok(true);
             };
@@ -1796,7 +1889,8 @@ async fn handle_mouse_selection(
             let SelectionDrag::MouseSelection { pane_id } = *drag else {
                 return Ok(false);
             };
-            let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+            let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await
+            else {
                 *drag = SelectionDrag::None;
                 return Ok(true);
             };
@@ -1841,7 +1935,8 @@ async fn handle_mouse_selection(
             let Some(selection) = attached.mouse_selection.as_ref() else {
                 return Ok(false);
             };
-            let Some(rect) = pane_rect_for(graph, &attached, client_size, selection.pane_id).await
+            let Some(rect) =
+                pane_rect_for(graph, &attached, client_size, config, selection.pane_id).await
             else {
                 session.lock().await.mouse_selection = None;
                 return Ok(true);
@@ -1883,6 +1978,7 @@ async fn handle_copy_mode_mouse(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     out_tx: &mpsc::Sender<AttachServerFrame>,
     dragging: &mut SelectionDrag,
 ) -> anyhow::Result<bool> {
@@ -1894,7 +1990,7 @@ async fn handle_copy_mode_mouse(
         return Ok(false);
     }
 
-    let Some(rect) = focused_pane_rect(graph, &attached, client_size).await else {
+    let Some(rect) = focused_pane_rect(graph, &attached, client_size, config).await else {
         *dragging = SelectionDrag::None;
         return Ok(true);
     };
@@ -1910,7 +2006,7 @@ async fn handle_copy_mode_mouse(
             // mode keeps the wheel so a stray scroll over another pane never
             // discards an in-progress selection/search (copy mode is
             // session-global — only one is active at a time).
-            let viewport = current_viewport(client_size).await;
+            let viewport = current_viewport(client_size, config).await;
             let cursor_pane = pane_under_pointer(graph, &attached, viewport, col, row);
             let transient = attached
                 .copy_mode
@@ -2044,10 +2140,11 @@ async fn handle_mouse(
     _io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     drag: &mut Option<DragState>,
 ) -> anyhow::Result<()> {
-    let viewport = current_viewport(client_size).await;
     let attached = session.lock().await.clone();
+    let viewport = current_viewport(client_size, config).await;
     let snap = graph.snapshot();
     let win = match snap.windows.get(&attached.active_window_id) {
         Some(w) => w,
@@ -2118,6 +2215,409 @@ async fn handle_mouse(
     Ok(())
 }
 
+/// A button event, as an app's mouse report understands it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ButtonAction {
+    Press,
+    Release,
+    /// Motion with a button held.
+    Drag,
+}
+
+/// Which xterm modes report `action`. Mode 1000 (`Normal`) subscribes to press
+/// and release only; forwarding a drag there reports an event the app never
+/// asked for. `MouseMode::None` reports nothing, so such a pane keeps shux's own
+/// mouse handling. Hover (1003's extra) is absent because the host profile does
+/// not enable 1003, so crossterm never produces one.
+fn mode_reports(mode: shux_vt::MouseMode, action: ButtonAction) -> bool {
+    use shux_vt::MouseMode;
+    match mode {
+        MouseMode::None => false,
+        MouseMode::Normal => action != ButtonAction::Drag,
+        MouseMode::ButtonEvent | MouseMode::AnyEvent => true,
+    }
+}
+
+/// Whether shux can encode a coordinate this pane's app will read back as the
+/// cell the user clicked. shux emits X10 or SGR (1006); an app that also asked
+/// for 1005, 1015 or 1016 decodes those bytes as something else — 1016 reads
+/// cells as pixels and collapses every click into the top-left corner. A pane
+/// that fails this keeps shux's own mouse handling.
+fn coords_are_encodable(modes: &shux_vt::TerminalModes) -> bool {
+    !modes.utf8_mouse && !modes.urxvt_mouse && !modes.pixel_mouse
+}
+
+/// Where a button event goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMouseRoute {
+    /// shux keeps it: selection, copy mode, border drag, or a pane whose app
+    /// never asked for the mouse.
+    Shux,
+    /// Forward an encoded report to this pane.
+    Forward(PaneId),
+    /// The app owns the mouse but does not report this event. Consume it
+    /// silently rather than letting shux start a selection the user did not
+    /// ask for underneath a running app.
+    Swallow,
+}
+
+/// Route a button event, given facts the caller has already resolved.
+///
+/// Order matters and is the tmux/wezterm model with one addition at the top:
+///
+/// 1. a gesture already in flight keeps its owner, whatever the pointer is over
+///    now and whatever the app's mode has become since
+/// 2. copy mode / the copy menu / an existing selection are shux's modes
+/// 3. a border drag in flight is shux's
+/// 4. no pane under the pointer (border cell, outline, status bar) is shux's
+/// 5. a pane whose app never asked for the mouse is shux's
+/// 6. an app that cannot decode what shux would send keeps nothing — shux does
+/// 7. everything else belongs to the app
+#[allow(clippy::too_many_arguments)]
+fn route_app_mouse(
+    gesture: SelectionDrag,
+    border_drag_active: bool,
+    copy_active: bool,
+    shift: bool,
+    pane_hit: Option<PaneId>,
+    mode: shux_vt::MouseMode,
+    encodable: bool,
+    action: ButtonAction,
+) -> AppMouseRoute {
+    if let SelectionDrag::App { pane_id, .. } = gesture {
+        return if mode_reports(mode, action) && encodable {
+            AppMouseRoute::Forward(pane_id)
+        } else {
+            AppMouseRoute::Swallow
+        };
+    }
+    if gesture != SelectionDrag::None || border_drag_active || copy_active {
+        return AppMouseRoute::Shux;
+    }
+    // Only a press opens a gesture; a stray drag or release is shux's.
+    if action != ButtonAction::Press {
+        return AppMouseRoute::Shux;
+    }
+    // Shift is the user taking the mouse back.
+    if shift {
+        return AppMouseRoute::Shux;
+    }
+    let Some(pane_id) = pane_hit else {
+        return AppMouseRoute::Shux;
+    };
+    // `mode_reports` is false for every action under `MouseMode::None`, so a
+    // pane whose app never asked for the mouse falls out here too.
+    if !encodable || !mode_reports(mode, action) {
+        return AppMouseRoute::Shux;
+    }
+    AppMouseRoute::Forward(pane_id)
+}
+
+/// The xterm button code for a button event, before encoding.
+///
+/// `None` is not a button. It reaches here on motion, which xterm reports as
+/// `3` (no button) with the motion bit set; on a press or release it is
+/// meaningless and must not be turned into a left click, which is what a
+/// `_ => 0` arm would do.
+fn button_cb(action: ButtonAction, button: ProtoMouseButton, alt: bool, ctrl: bool) -> Option<u16> {
+    let base: u16 = match button {
+        ProtoMouseButton::Left => 0,
+        ProtoMouseButton::Middle => 1,
+        ProtoMouseButton::Right => 2,
+        ProtoMouseButton::None => match action {
+            ButtonAction::Drag => 3,
+            ButtonAction::Press | ButtonAction::Release => return None,
+        },
+    };
+    let motion = if action == ButtonAction::Drag { 32 } else { 0 };
+    // Shift is deliberately absent: it is reserved for shux, so an event
+    // carrying it never reaches an app to begin with.
+    let mods = if alt { 8 } else { 0 } | if ctrl { 16 } else { 0 };
+    Some(base + motion + mods)
+}
+
+/// The bit `button` occupies in [`SelectionDrag::App`]'s held-button mask.
+fn button_bit(button: ProtoMouseButton) -> u8 {
+    match button {
+        ProtoMouseButton::Left => 1,
+        ProtoMouseButton::Middle => 2,
+        ProtoMouseButton::Right => 4,
+        ProtoMouseButton::None => 0,
+    }
+}
+
+/// Tell the app every held button came up, then end the gesture. Called wherever
+/// a forwarded gesture is abandoned rather than completed — help overlay,
+/// detach, session end, the pane's rect vanishing under a zoom or window switch
+/// — so the app is never left believing a button is down.
+async fn release_app_gesture(io_state: &Arc<Mutex<PaneIoState>>, gesture: &mut SelectionDrag) {
+    let SelectionDrag::App {
+        pane_id,
+        buttons,
+        last,
+    } = *gesture
+    else {
+        return;
+    };
+    *gesture = SelectionDrag::None;
+    let sgr = {
+        let state = io_state.lock().await;
+        state
+            .vts
+            .get(&pane_id)
+            .is_some_and(|vt| vt.modes().sgr_mouse)
+    };
+    for (bit, button) in [
+        (1u8, ProtoMouseButton::Left),
+        (2, ProtoMouseButton::Middle),
+        (4, ProtoMouseButton::Right),
+    ] {
+        if buttons & bit == 0 {
+            continue;
+        }
+        let Some(cb) = button_cb(ButtonAction::Release, button, false, false) else {
+            continue;
+        };
+        if let Some(bytes) = encode_mouse_report(cb, true, sgr, last.0, last.1) {
+            forward_bytes_to_pane(io_state, pane_id, bytes).await;
+        }
+    }
+}
+
+/// What `handle_app_mouse` did with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMouse {
+    /// Not ours — fall through to shux's own mouse handling.
+    NotHandled,
+    /// Consumed. `redraw` is true only when shux's own state changed, so a
+    /// drag under mode 1002 (which reports continuously) does not force a full
+    /// compositor frame per motion event.
+    Consumed { redraw: bool },
+}
+
+/// Forward a press / drag / release to a mouse-aware app in the pane under the
+/// pointer.
+///
+/// Sits ahead of shux's selection handling in the attach loop: inside a pane
+/// whose app asked for the mouse, the mouse is the app's. `handle_wheel` stays
+/// the sole authority on scroll ticks — this returns [`AppMouse::NotHandled`]
+/// for them so the scrollback, alt-scroll and forward tiers keep working.
+#[allow(clippy::too_many_arguments)]
+async fn handle_app_mouse(
+    kind: MouseKind,
+    button: ProtoMouseButton,
+    col: u16,
+    row: u16,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    graph: &GraphHandle,
+    io_state: &Arc<Mutex<PaneIoState>>,
+    session: &Arc<Mutex<AttachedSession>>,
+    client_size: &ClientSize,
+    config: &ConfigHandle,
+    border_drag: &Option<DragState>,
+    gesture: &mut SelectionDrag,
+) -> anyhow::Result<AppMouse> {
+    let action = match kind {
+        MouseKind::Down => ButtonAction::Press,
+        MouseKind::Up => ButtonAction::Release,
+        MouseKind::Drag => ButtonAction::Drag,
+        // The wheel keeps its own routing; `Move` never arrives, because the
+        // host profile does not enable any-motion tracking.
+        MouseKind::ScrollUp | MouseKind::ScrollDown | MouseKind::Move => {
+            return Ok(AppMouse::NotHandled);
+        }
+    };
+    let attached = session.lock().await.clone();
+    let copy_active = attached.copy_mode.is_some() || attached.copy_menu.is_some();
+    let viewport = current_viewport(client_size, config).await;
+
+    // Resolve the pane under the pointer. `pane_at`, deliberately not
+    // `pane_under_pointer`: that helper falls back to the active pane whenever
+    // the hit-test misses, which would forward clicks on borders, the outline
+    // and the status bar into whatever pane happens to be focused.
+    let (pane_hit, on_border) = {
+        let snap = graph.snapshot();
+        match snap.windows.get(&attached.active_window_id) {
+            None => (None, false),
+            Some(win) if win.layout.is_zoomed() => (Some(attached.active_pane_id), false),
+            Some(win) => (
+                pane_at(&win.layout.tree, viewport, col, row).map(|(pid, _)| pid),
+                border_at(&win.layout.tree, viewport, col, row).is_some(),
+            ),
+        }
+    };
+    let pane_hit = if on_border { None } else { pane_hit };
+
+    // Modes are read from the pane the gesture already owns when there is one,
+    // so an app that turns tracking off mid-drag still gets its release.
+    let mode_pane = match *gesture {
+        SelectionDrag::App { pane_id, .. } => Some(pane_id),
+        _ => pane_hit,
+    };
+    let (mode, sgr, encodable) = {
+        let state = io_state.lock().await;
+        match mode_pane.and_then(|pid| state.vts.get(&pid)) {
+            Some(vt) => {
+                let m = vt.modes();
+                (m.mouse_tracking, m.sgr_mouse, coords_are_encodable(m))
+            }
+            None => (shux_vt::MouseMode::None, false, true),
+        }
+    };
+
+    let route = route_app_mouse(
+        *gesture,
+        border_drag.is_some(),
+        copy_active,
+        shift,
+        pane_hit,
+        mode,
+        encodable,
+        action,
+    );
+    let pane_id = match route {
+        AppMouseRoute::Shux => return Ok(AppMouse::NotHandled),
+        // The app owns the mouse but did not subscribe to this event; consume
+        // it rather than letting shux act underneath a running TUI. An app that
+        // is STILL tracking (it only switched to a coordinate mode shux cannot
+        // encode) is still waiting for the button: send the release anyway,
+        // because a stuck button does not recover and a mis-placed release does.
+        AppMouseRoute::Swallow => {
+            if action == ButtonAction::Release && mode != shux_vt::MouseMode::None {
+                release_app_gesture(io_state, gesture).await;
+            } else {
+                end_gesture_if_released(gesture, action, button);
+            }
+            return Ok(AppMouse::Consumed { redraw: false });
+        }
+        AppMouseRoute::Forward(pane_id) => pane_id,
+    };
+
+    // The pane can lose its rect mid-gesture: a window switch or a zoom leaves
+    // it off-screen. Let the app know the button came up rather than letting
+    // the gesture evaporate with it still held.
+    let content = current_content_rect(client_size).await;
+    let Some(rect) = pane_rect_in(graph, &attached, content, viewport, pane_id) else {
+        release_app_gesture(io_state, gesture).await;
+        return Ok(AppMouse::NotHandled);
+    };
+    // While zoomed the pane's rect is the whole content area, so a click on the
+    // status bar would otherwise clamp into the pane's last row and be
+    // forwarded as a click the user never made.
+    let inside =
+        col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height;
+    if !inside && matches!(*gesture, SelectionDrag::None) {
+        return Ok(AppMouse::NotHandled);
+    }
+    let local_col = col
+        .saturating_sub(rect.x)
+        .min(rect.width.saturating_sub(1))
+        .saturating_add(1);
+    let local_row = row
+        .saturating_sub(rect.y)
+        .min(rect.height.saturating_sub(1))
+        .saturating_add(1);
+
+    let Some(cb) = button_cb(action, button, alt, ctrl) else {
+        // No truthful report exists for a buttonless press or release, but a
+        // release must still clear the latch or the app sits button-held for
+        // the rest of the pane's life.
+        end_gesture_if_released(gesture, action, button);
+        return Ok(AppMouse::NotHandled);
+    };
+    let Some(bytes) = encode_mouse_report(
+        cb,
+        action == ButtonAction::Release,
+        sgr,
+        local_col,
+        local_row,
+    ) else {
+        // Not encodable for this app's coordinate mode. Consume it: the pane is
+        // still the app's, and a stray shux selection under a running TUI is
+        // not a better answer than nothing happening.
+        end_gesture_if_released(gesture, action, button);
+        return Ok(AppMouse::Consumed { redraw: false });
+    };
+
+    let mut redraw = false;
+    if action == ButtonAction::Press {
+        // tmux's `MouseDown1Pane` is `select-pane` followed by `send-keys -M`:
+        // the click both focuses the pane and reaches the app. (The wheel's
+        // forward tier deliberately does NOT focus, which is why this cites
+        // tmux rather than `handle_wheel`.)
+        if pane_id != attached.active_pane_id {
+            let _ = graph.focus_pane(pane_id).await;
+            session.lock().await.active_pane_id = pane_id;
+            redraw = true;
+        }
+        // A selection left over from before the app took the mouse can no
+        // longer be cleared by clicking, so clear it here or it renders
+        // forever.
+        let mut s = session.lock().await;
+        if s.mouse_selection.is_some() || s.copy_menu.is_some() {
+            s.mouse_selection = None;
+            s.copy_menu = None;
+            redraw = true;
+        }
+    }
+
+    if !forward_bytes_to_pane(io_state, pane_id, bytes).await {
+        // Dropped on the floor. Opening a gesture now would hand the app a
+        // release with no press behind it.
+        return Ok(AppMouse::Consumed { redraw });
+    }
+
+    if action == ButtonAction::Press {
+        let held = match *gesture {
+            SelectionDrag::App { buttons, .. } => buttons,
+            _ => 0,
+        };
+        *gesture = SelectionDrag::App {
+            pane_id,
+            buttons: held | button_bit(button),
+            last: (local_col, local_row),
+        };
+    } else {
+        // Where the pointer was when the gesture is abandoned, so
+        // `release_app_gesture` can put the synthetic release there.
+        if let SelectionDrag::App { last, .. } = gesture {
+            *last = (local_col, local_row);
+        }
+        end_gesture_if_released(gesture, action, button);
+    }
+    Ok(AppMouse::Consumed { redraw })
+}
+
+/// Clear the released button from an app gesture, ending it once nothing is
+/// held.
+///
+/// A release whose button is not in the mask clears the whole mask: without SGR
+/// reporting the host cannot say which button came up, and a mask that can
+/// never empty is a gesture that never ends.
+fn end_gesture_if_released(
+    gesture: &mut SelectionDrag,
+    action: ButtonAction,
+    button: ProtoMouseButton,
+) {
+    if action != ButtonAction::Release {
+        return;
+    }
+    let SelectionDrag::App { buttons, .. } = gesture else {
+        return;
+    };
+    let bit = button_bit(button);
+    *buttons = if bit != 0 && *buttons & bit != 0 {
+        *buttons & !bit
+    } else {
+        0
+    };
+    if *buttons == 0 {
+        *gesture = SelectionDrag::None;
+    }
+}
+
 /// How a wheel tick is routed, given the target pane's live VT state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WheelRouting {
@@ -2140,18 +2640,44 @@ fn route_wheel(mouse_on: bool, alt_screen: bool, alt_scroll: bool) -> WheelRouti
     }
 }
 
-/// Encode a wheel tick as a mouse report for the pane's application.
-/// `col`/`row` are 1-based pane-local coordinates. Button 64 = wheel up,
-/// 65 = wheel down. SGR (mode 1006) uses decimal params + `M`; legacy X10
-/// packs each value into a byte offset by 32, wire-capped at 255.
-fn encode_mouse_wheel(up: bool, sgr: bool, col: u16, row: u16) -> Vec<u8> {
-    let cb: u16 = if up { 64 } else { 65 };
-    if sgr {
-        format!("\x1b[<{cb};{col};{row}M").into_bytes()
-    } else {
-        let enc = |v: u16| -> u8 { v.saturating_add(32).min(255) as u8 };
-        vec![0x1b, b'[', b'M', enc(cb), enc(col), enc(row)]
+/// Last cell the X10 byte-packed form can name: each value is offset by 32 and
+/// packed into one byte, so 223 + 32 = 255.
+const X10_MOUSE_LIMIT: u16 = 223;
+
+/// Encode one mouse report for a pane's application: wheel, press, drag, release.
+///
+/// `cb` is the xterm button code before any encoding-specific rewrite: 0/1/2
+/// left/middle/right, `+32` motion, 3+32 motion with no button held, 64/65
+/// wheel up/down, plus modifier bits (shift 4, alt 8, ctrl 16). `col`/`row` are
+/// **1-based pane-local** cells.
+///
+/// SGR (1006) ends a release with `m` and keeps the real button; legacy X10
+/// cannot, so every X10 release is `Cb = 3` with the modifier bits kept.
+///
+/// `None` — do not forward — for a legacy coordinate past [`X10_MOUSE_LIMIT`]
+/// or a 1-based coordinate of `0`. Clamping instead would name a cell the user
+/// did not click.
+fn encode_mouse_report(cb: u16, release: bool, sgr: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    if col == 0 || row == 0 {
+        return None;
     }
+    if sgr {
+        let fin = if release { 'm' } else { 'M' };
+        return Some(format!("\x1b[<{cb};{col};{row}{fin}").into_bytes());
+    }
+    if col > X10_MOUSE_LIMIT || row > X10_MOUSE_LIMIT || cb > X10_MOUSE_LIMIT {
+        return None;
+    }
+    // Legacy cannot name the released button; 3 is "some button came up".
+    // Modifier bits survive, which is what xterm does.
+    let cb = if release { 3 | (cb & !3) } else { cb };
+    let enc = |v: u16| -> u8 { (v + 32) as u8 };
+    Some(vec![0x1b, b'[', b'M', enc(cb), enc(col), enc(row)])
+}
+
+/// Encode a wheel tick. Button 64 = wheel up, 65 = wheel down.
+fn encode_mouse_wheel(up: bool, sgr: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    encode_mouse_report(if up { 64 } else { 65 }, false, sgr, col, row)
 }
 
 /// The arrow-key bytes one wheel tick maps to on the alternate screen when the
@@ -2168,25 +2694,35 @@ fn wheel_arrow_seq(up: bool, app_cursor: bool) -> &'static [u8] {
 
 /// Send bytes to a pane's PTY writer using the same non-blocking path as
 /// keystrokes (drop on backpressure rather than freeze the attach loop).
+///
+/// Returns whether the bytes were actually queued. Button forwarding needs to
+/// know: a press that was dropped must not open a gesture, or the release that
+/// follows reaches the app with no matching press and leaves it button-held.
 async fn forward_bytes_to_pane(
     io_state: &Arc<Mutex<PaneIoState>>,
     pane_id: PaneId,
     bytes: Vec<u8>,
-) {
+) -> bool {
     let writer = {
         let state = io_state.lock().await;
         state.writers.get(&pane_id).cloned()
     };
-    if let Some(tx) = writer
-        && let Err(e) = tx.try_send(bytes)
-    {
-        tracing::warn!(error = %e, "wheel forward dropped (pane backpressured)");
+    match writer {
+        None => false,
+        Some(tx) => match tx.try_send(bytes) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "mouse forward dropped (pane backpressured)");
+                false
+            }
+        },
     }
 }
 
 /// Handle a scroll-wheel event while copy mode is NOT active. Returns `Ok(true)`
 /// if the event was a wheel event (and thus consumed), `Ok(false)` otherwise so
 /// the caller falls through to the layout/focus mouse handler.
+#[allow(clippy::too_many_arguments)]
 async fn handle_wheel(
     kind: MouseKind,
     col: u16,
@@ -2195,6 +2731,7 @@ async fn handle_wheel(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
 ) -> anyhow::Result<bool> {
     let up = match kind {
         MouseKind::ScrollUp => true,
@@ -2202,7 +2739,7 @@ async fn handle_wheel(
         _ => return Ok(false),
     };
     let attached = session.lock().await.clone();
-    let viewport = current_viewport(client_size).await;
+    let viewport = current_viewport(client_size, config).await;
 
     // Resolve the pane under the cursor (fallback: the active pane).
     let pane_id = {
@@ -2220,18 +2757,20 @@ async fn handle_wheel(
             }
         }
     };
-    let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+    let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
         return Ok(true);
     };
 
-    // Snapshot the target pane's live mode state + scrollback depth.
+    // Snapshot the target pane's live mode state + scrollback depth. A pane shux
+    // cannot encode for is treated as not mouse-aware, so the wheel falls back
+    // to shux's own scrollback. See `coords_are_encodable`.
     let (mouse_on, sgr, alt, alt_scroll, app_cursor, total_lines) = {
         let state = io_state.lock().await;
         match state.vts.get(&pane_id) {
             Some(vt) => {
                 let m = vt.modes();
                 (
-                    m.mouse_tracking != shux_vt::MouseMode::None,
+                    m.mouse_tracking != shux_vt::MouseMode::None && coords_are_encodable(m),
                     m.sgr_mouse,
                     vt.is_alternate_screen(),
                     m.alternate_scroll,
@@ -2253,12 +2792,12 @@ async fn handle_wheel(
                 .saturating_sub(rect.y)
                 .min(rect.height.saturating_sub(1))
                 .saturating_add(1);
-            forward_bytes_to_pane(
-                io_state,
-                pane_id,
-                encode_mouse_wheel(up, sgr, local_col, local_row),
-            )
-            .await;
+            // `None` means the tick cannot be encoded truthfully for this
+            // app's coordinate mode; sending nothing beats sending a tick
+            // aimed at a cell the user never touched.
+            if let Some(bytes) = encode_mouse_wheel(up, sgr, local_col, local_row) {
+                forward_bytes_to_pane(io_state, pane_id, bytes).await;
+            }
         }
         WheelRouting::ArrowKeys => {
             let seq = wheel_arrow_seq(up, app_cursor);
@@ -2350,11 +2889,12 @@ async fn focused_pane_size(
     pane_id: PaneId,
     attached: &AttachedSession,
     client_size: &ClientSize,
+    config: &ConfigHandle,
 ) -> (u16, u16) {
     if pane_id != attached.active_pane_id {
         return (0, 0);
     }
-    focused_pane_rect(graph, attached, client_size)
+    focused_pane_rect(graph, attached, client_size, config)
         .await
         .map(|rect| (rect.width, rect.height))
         .unwrap_or((0, 0))
@@ -2364,18 +2904,40 @@ async fn focused_pane_rect(
     graph: &GraphHandle,
     attached: &AttachedSession,
     client_size: &ClientSize,
+    config: &ConfigHandle,
 ) -> Option<Rect> {
-    pane_rect_for(graph, attached, client_size, attached.active_pane_id).await
+    pane_rect_for(
+        graph,
+        attached,
+        client_size,
+        config,
+        attached.active_pane_id,
+    )
+    .await
 }
 
 async fn pane_rect_for(
     graph: &GraphHandle,
     attached: &AttachedSession,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     pane_id: PaneId,
 ) -> Option<Rect> {
     let content = current_content_rect(client_size).await;
-    let viewport = current_viewport(client_size).await;
+    let viewport = current_viewport(client_size, config).await;
+    pane_rect_in(graph, attached, content, viewport, pane_id)
+}
+
+/// `pane_rect_for` with the geometry already resolved, so a caller that has
+/// already computed the viewport for this event hit-tests against that one
+/// rather than re-reading the live config and getting a second answer.
+fn pane_rect_in(
+    graph: &GraphHandle,
+    attached: &AttachedSession,
+    content: Rect,
+    viewport: Rect,
+    pane_id: PaneId,
+) -> Option<Rect> {
     let snap = graph.snapshot();
     let win = snap.windows.get(&attached.active_window_id)?;
     if win.layout.is_zoomed() {
@@ -2464,21 +3026,21 @@ async fn current_content_rect(client_size: &ClientSize) -> Rect {
     Rect::new(0, 0, cols, rows.saturating_sub(STATUS_BAR_ROWS))
 }
 
-/// Compute the actual pane viewport (inset for outline + status bar) at
-/// the current client size. Used by spatial actions (focus_dir, smart
-/// split) so the geometry they reason about matches what the user sees
-/// — not a hardcoded 120x40 fiction.
-async fn current_viewport(client_size: &ClientSize) -> Rect {
-    let (cols, rows) = *client_size.lock().await;
-    let content_h = rows.saturating_sub(STATUS_BAR_ROWS);
-    if cols >= 3 && content_h >= 3 {
-        Rect::new(1, 1, cols - 2, content_h - 2)
-    } else {
-        Rect::new(0, 0, cols, content_h)
-    }
+/// The pane viewport at the current client size: the content area inset for the
+/// outline (when one is drawn) and the status bar. Used by spatial actions
+/// (focus_dir, smart split) and by every mouse hit-test, so their geometry
+/// matches what the compositor drew. Read live rather than cached — a config
+/// read is an ArcSwap load, and a cache here went stale in both directions.
+///
+/// `zoomed: false`: `SplitSmart` is the one caller that reaches here while
+/// zoomed, and it only compares `width >= height`, which the inset preserves.
+async fn current_viewport(client_size: &ClientSize, config: &ConfigHandle) -> Rect {
+    let border_style = BorderStyle::parse(&config.current().appearance.border_style);
+    shux_ui::pane_viewport(current_content_rect(client_size).await, border_style, false)
 }
 
 /// Dispatch an Action keybinding from the client.
+#[allow(clippy::too_many_arguments)]
 async fn handle_action(
     kind: ActionKind,
     args: shux_rpc::attach::ActionArgs,
@@ -2486,6 +3048,7 @@ async fn handle_action(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     use shux_core::layout::Direction;
@@ -2522,7 +3085,7 @@ async fn handle_action(
     }
 
     let attached = session.lock().await.clone();
-    let viewport = current_viewport(client_size).await;
+    let viewport = current_viewport(client_size, config).await;
 
     match kind {
         ActionKind::SplitSmart => split(graph, &attached, None, viewport, io_state, cancel).await,
@@ -3019,6 +3582,15 @@ async fn resize_pane(
 
 #[cfg(test)]
 mod tests {
+    /// A `ConfigHandle` on a path that does not exist, i.e. the defaults. The
+    /// mouse handlers take one because the pane viewport is derived from
+    /// `appearance.border_style` rather than cached.
+    fn test_config() -> ConfigHandle {
+        ConfigHandle::load_or_default(std::path::Path::new(
+            "/nonexistent/shux-attach-tests/config.toml",
+        ))
+    }
+
     use super::*;
 
     /// Attach must close the spawn race without resurrecting a pane that
@@ -3059,25 +3631,55 @@ mod tests {
     #[test]
     fn encode_mouse_wheel_sgr_is_byte_exact() {
         // Wheel up/down at pane-local (col=10, row=5), SGR encoding.
-        assert_eq!(encode_mouse_wheel(true, true, 10, 5), b"\x1b[<64;10;5M");
-        assert_eq!(encode_mouse_wheel(false, true, 10, 5), b"\x1b[<65;10;5M");
+        assert_eq!(
+            encode_mouse_wheel(true, true, 10, 5).as_deref(),
+            Some(&b"\x1b[<64;10;5M"[..])
+        );
+        assert_eq!(
+            encode_mouse_wheel(false, true, 10, 5).as_deref(),
+            Some(&b"\x1b[<65;10;5M"[..])
+        );
     }
 
+    /// Name frozen by `check-test-inventory`, which treats a test name as the
+    /// identity of its coverage. The cap itself is pinned by
+    /// `encode_mouse_report_refuses_legacy_coordinates_it_cannot_carry`.
     #[test]
     fn encode_mouse_wheel_x10_offsets_by_32_and_caps() {
         // X10: ESC [ M  Cb  Cx  Cy, each byte = value + 32.
         // up at (1,1): Cb=64+32=96, Cx=Cy=1+32=33.
         assert_eq!(
             encode_mouse_wheel(true, false, 1, 1),
-            vec![0x1b, b'[', b'M', 96, 33, 33]
+            Some(vec![0x1b, b'[', b'M', 96, 33, 33])
         );
         // down at (1,1): Cb=65+32=97.
         assert_eq!(
             encode_mouse_wheel(false, false, 1, 1),
-            vec![0x1b, b'[', b'M', 97, 33, 33]
+            Some(vec![0x1b, b'[', b'M', 97, 33, 33])
         );
-        // Large coord clamps to the 255 wire ceiling rather than wrapping.
-        assert_eq!(encode_mouse_wheel(true, false, 400, 1)[4], 255);
+    }
+
+    /// A coordinate the legacy form cannot carry is refused, not clamped: byte
+    /// 255 is a valid report for column 223, so a clamp makes the app act on a
+    /// cell the user never touched.
+    #[test]
+    fn encode_mouse_report_refuses_legacy_coordinates_it_cannot_carry() {
+        // 223 is the last cell the byte-packed form can name: 223+32 = 255.
+        assert_eq!(
+            encode_mouse_wheel(true, false, 223, 1).map(|b| b[4]),
+            Some(255)
+        );
+        assert_eq!(encode_mouse_wheel(true, false, 224, 1), None);
+        assert_eq!(encode_mouse_wheel(true, false, 400, 1), None);
+        assert_eq!(encode_mouse_wheel(true, false, 1, 224), None);
+        // SGR has no such ceiling -- it is decimal text.
+        assert_eq!(
+            encode_mouse_wheel(true, true, 400, 1).as_deref(),
+            Some(&b"\x1b[<64;400;1M"[..])
+        );
+        // 1-based coordinates: 0 is not a cell in either encoding.
+        assert_eq!(encode_mouse_report(0, false, true, 0, 5), None);
+        assert_eq!(encode_mouse_report(0, false, false, 5, 0), None);
     }
 
     #[test]
@@ -3183,7 +3785,10 @@ mod tests {
     #[tokio::test]
     async fn current_viewport_insets_for_borders_and_status_row() {
         let size = Arc::new(Mutex::new((120, 40)));
-        assert_eq!(current_viewport(&size).await, Rect::new(1, 1, 118, 37));
+        assert_eq!(
+            current_viewport(&size, &test_config()).await,
+            Rect::new(1, 1, 118, 37)
+        );
     }
 
     struct AttachFixture {
@@ -3457,6 +4062,7 @@ mod tests {
             &fixture.graph,
             &fixture.io_state,
             &fixture.attached,
+            &test_config(),
             100,
             30,
         )
@@ -3488,6 +4094,7 @@ mod tests {
             &fixture.graph,
             &fixture.io_state,
             &fixture.attached,
+            &test_config(),
             100,
             30,
         )
@@ -3548,6 +4155,7 @@ mod tests {
                     &fixture.graph,
                     &fixture.io_state,
                     &fixture.attached,
+                    &test_config(),
                     cols,
                     rows,
                 )
@@ -3596,6 +4204,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3609,6 +4218,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3622,6 +4232,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3633,6 +4244,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3646,6 +4258,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3658,6 +4271,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3671,6 +4285,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3692,6 +4307,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3703,6 +4319,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3718,6 +4335,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3733,6 +4351,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -3889,6 +4508,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -3911,6 +4531,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -3925,6 +4546,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -3945,6 +4567,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -3964,6 +4587,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -3998,6 +4622,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4014,6 +4639,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4031,6 +4657,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4046,6 +4673,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4060,6 +4688,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4079,7 +4708,7 @@ mod tests {
         let fixture = attach_fixture().await;
         let session = Arc::new(Mutex::new(fixture.attached.clone()));
         let client_size = Arc::new(Mutex::new((100, 30)));
-        let viewport = current_viewport(&client_size).await;
+        let viewport = current_viewport(&client_size, &test_config()).await;
         let (first_point, second_point, border_point) =
             find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
         let mut drag = None;
@@ -4093,6 +4722,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4109,6 +4739,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4125,6 +4756,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4139,6 +4771,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4160,6 +4793,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4378,6 +5012,1313 @@ mod tests {
             .expect("pane write channel closed")
     }
 
+    // --- Issue #174: button events reach a mouse-aware app ---------------
+    // These drive the real `handle_app_mouse` and `route_app_mouse` against a
+    // live graph + pane VT.
+
+    /// Byte-exact reports, checked against what crossterm's own decoder reads
+    /// back. The classic defects here are silent: swapping middle and right
+    /// puts a paste where a context menu belongs, and emitting `M` for a
+    /// release leaves the app button-held forever.
+    #[test]
+    fn encode_mouse_report_is_byte_exact_for_every_button_and_action() {
+        let sgr = |cb, release| encode_mouse_report(cb, release, true, 10, 5).unwrap();
+        let cb = |action, button| button_cb(action, button, false, false).unwrap();
+
+        // Press: left 0, middle 1, right 2.
+        assert_eq!(
+            sgr(cb(ButtonAction::Press, ProtoMouseButton::Left), false),
+            b"\x1b[<0;10;5M"
+        );
+        assert_eq!(
+            sgr(cb(ButtonAction::Press, ProtoMouseButton::Middle), false),
+            b"\x1b[<1;10;5M"
+        );
+        assert_eq!(
+            sgr(cb(ButtonAction::Press, ProtoMouseButton::Right), false),
+            b"\x1b[<2;10;5M"
+        );
+        // Release: lowercase `m`, and the REAL button survives.
+        assert_eq!(
+            sgr(cb(ButtonAction::Release, ProtoMouseButton::Left), true),
+            b"\x1b[<0;10;5m"
+        );
+        assert_eq!(
+            sgr(cb(ButtonAction::Release, ProtoMouseButton::Right), true),
+            b"\x1b[<2;10;5m"
+        );
+        // Drag: motion bit 32, still `M`.
+        assert_eq!(
+            sgr(cb(ButtonAction::Drag, ProtoMouseButton::Left), false),
+            b"\x1b[<32;10;5M"
+        );
+        assert_eq!(
+            sgr(cb(ButtonAction::Drag, ProtoMouseButton::Middle), false),
+            b"\x1b[<33;10;5M"
+        );
+        // Motion with no button held is 3+32, not a left click.
+        assert_eq!(
+            sgr(cb(ButtonAction::Drag, ProtoMouseButton::None), false),
+            b"\x1b[<35;10;5M"
+        );
+    }
+
+    /// `None` is not a button. Answering "left" for it is how a hover turns
+    /// into a click nobody made.
+    #[test]
+    fn button_cb_refuses_to_invent_a_button() {
+        assert_eq!(
+            button_cb(ButtonAction::Press, ProtoMouseButton::None, false, false),
+            None
+        );
+        assert_eq!(
+            button_cb(ButtonAction::Release, ProtoMouseButton::None, false, false),
+            None
+        );
+        assert_eq!(
+            button_cb(ButtonAction::Drag, ProtoMouseButton::None, false, false),
+            Some(35)
+        );
+    }
+
+    /// Modifier bits are 4/8/16, not 1/2/4. Shift is absent by design: it is
+    /// reserved for shux, so it never reaches an app to be encoded.
+    #[test]
+    fn button_cb_carries_alt_and_ctrl_but_never_shift() {
+        let left = ProtoMouseButton::Left;
+        assert_eq!(button_cb(ButtonAction::Press, left, false, true), Some(16));
+        assert_eq!(button_cb(ButtonAction::Press, left, true, false), Some(8));
+        assert_eq!(button_cb(ButtonAction::Press, left, true, true), Some(24));
+        // ctrl + alt while dragging: 0 + 32 + 8 + 16.
+        assert_eq!(button_cb(ButtonAction::Drag, left, true, true), Some(56));
+    }
+
+    /// Legacy X10 cannot name the released button, but the modifier bits ride
+    /// along on the `3` exactly as xterm does.
+    #[test]
+    fn x10_release_is_button_three_and_keeps_modifiers() {
+        let cb = button_cb(ButtonAction::Release, ProtoMouseButton::Right, false, true).unwrap();
+        assert_eq!(cb, 18, "right + ctrl");
+        assert_eq!(
+            encode_mouse_report(cb, true, false, 1, 1),
+            // 3 | (18 & !3) = 19, +32 = 51.
+            Some(vec![0x1b, b'[', b'M', 51, 33, 33])
+        );
+        // SGR keeps the real button instead.
+        assert_eq!(
+            encode_mouse_report(cb, true, true, 1, 1).as_deref(),
+            Some(&b"\x1b[<18;1;1m"[..])
+        );
+    }
+
+    /// A real terminal reports only what the app subscribed to.
+    #[test]
+    fn mode_reports_matches_what_each_xterm_mode_subscribes_to() {
+        use shux_vt::MouseMode;
+        for action in [
+            ButtonAction::Press,
+            ButtonAction::Release,
+            ButtonAction::Drag,
+        ] {
+            assert!(!mode_reports(MouseMode::None, action), "{action:?}");
+            assert!(mode_reports(MouseMode::ButtonEvent, action), "{action:?}");
+            assert!(mode_reports(MouseMode::AnyEvent, action), "{action:?}");
+        }
+        assert!(mode_reports(MouseMode::Normal, ButtonAction::Press));
+        assert!(mode_reports(MouseMode::Normal, ButtonAction::Release));
+        assert!(
+            !mode_reports(MouseMode::Normal, ButtonAction::Drag),
+            "mode 1000 never asked for motion"
+        );
+    }
+
+    /// The three coordinate modes shux does not emit must stop forwarding.
+    /// 1016 is the sharp one: apps set it alongside 1006, so `sgr_mouse` alone
+    /// cannot tell them apart, and the app reads cells as pixels.
+    #[test]
+    fn coordinate_modes_shux_cannot_encode_stop_forwarding() {
+        let probe = |setup: &[u8]| {
+            let mut vt = shux_vt::VirtualTerminal::new(10, 40);
+            vt.process(setup);
+            coords_are_encodable(vt.modes())
+        };
+        assert!(probe(b"\x1b[?1000h\x1b[?1006h"), "plain SGR is encodable");
+        assert!(!probe(b"\x1b[?1000h\x1b[?1006h\x1b[?1016h"), "1016 pixel");
+        assert!(!probe(b"\x1b[?1000h\x1b[?1005h"), "1005 utf-8");
+        assert!(!probe(b"\x1b[?1000h\x1b[?1015h"), "1015 urxvt");
+        // …and turning it back off restores forwarding.
+        assert!(probe(b"\x1b[?1000h\x1b[?1006h\x1b[?1016h\x1b[?1016l"));
+    }
+
+    /// The precedence table, exhaustively. Written as a pure function for
+    /// exactly this: inferring it from the order of early returns in the
+    /// handler is how the border-drag and copy-menu cases got missed.
+    #[test]
+    fn route_app_mouse_precedence() {
+        use shux_vt::MouseMode;
+        let pane = PaneId::new();
+        let other = PaneId::new();
+        let press = ButtonAction::Press;
+
+        let route = |gesture, border, copy, shift, hit, mode, enc, action| {
+            route_app_mouse(gesture, border, copy, shift, hit, mode, enc, action)
+        };
+
+        // Baseline: a mouse-aware pane under the pointer takes the press.
+        assert_eq!(
+            route(
+                SelectionDrag::None,
+                false,
+                false,
+                false,
+                Some(pane),
+                MouseMode::Normal,
+                true,
+                press
+            ),
+            AppMouseRoute::Forward(pane)
+        );
+        // An in-flight app gesture keeps the whole gesture, even over another
+        // pane and even once the app turned tracking off.
+        assert_eq!(
+            route(
+                SelectionDrag::App {
+                    pane_id: pane,
+                    buttons: 1,
+                    last: (1, 1)
+                },
+                false,
+                false,
+                true,
+                Some(other),
+                MouseMode::None,
+                true,
+                ButtonAction::Release
+            ),
+            AppMouseRoute::Swallow,
+            "a gesture the app can no longer decode is still not shux's"
+        );
+        assert_eq!(
+            route(
+                SelectionDrag::App {
+                    pane_id: pane,
+                    buttons: 1,
+                    last: (1, 1)
+                },
+                false,
+                false,
+                true,
+                None,
+                MouseMode::ButtonEvent,
+                true,
+                ButtonAction::Drag
+            ),
+            AppMouseRoute::Forward(pane),
+            "shift pressed mid-drag must not split the gesture"
+        );
+        // shux's own modes and gestures win.
+        for (label, gesture, border, copy) in [
+            (
+                "shux selection in flight",
+                SelectionDrag::MouseSelection { pane_id: pane },
+                false,
+                false,
+            ),
+            ("copy mode gesture", SelectionDrag::CopyMode, false, false),
+            ("border resize in flight", SelectionDrag::None, true, false),
+            ("copy mode or menu open", SelectionDrag::None, false, true),
+        ] {
+            assert_eq!(
+                route(
+                    gesture,
+                    border,
+                    copy,
+                    false,
+                    Some(pane),
+                    MouseMode::ButtonEvent,
+                    true,
+                    press
+                ),
+                AppMouseRoute::Shux,
+                "{label}"
+            );
+        }
+        // Shift is the escape hatch.
+        assert_eq!(
+            route(
+                SelectionDrag::None,
+                false,
+                false,
+                true,
+                Some(pane),
+                MouseMode::ButtonEvent,
+                true,
+                press
+            ),
+            AppMouseRoute::Shux
+        );
+        // No pane under the pointer: a border cell, the outline, the status bar.
+        assert_eq!(
+            route(
+                SelectionDrag::None,
+                false,
+                false,
+                false,
+                None,
+                MouseMode::ButtonEvent,
+                true,
+                press
+            ),
+            AppMouseRoute::Shux
+        );
+        // An app that never asked for the mouse.
+        assert_eq!(
+            route(
+                SelectionDrag::None,
+                false,
+                false,
+                false,
+                Some(pane),
+                MouseMode::None,
+                true,
+                press
+            ),
+            AppMouseRoute::Shux
+        );
+        // An app shux cannot encode for keeps shux's handling, not silence.
+        assert_eq!(
+            route(
+                SelectionDrag::None,
+                false,
+                false,
+                false,
+                Some(pane),
+                MouseMode::ButtonEvent,
+                false,
+                press
+            ),
+            AppMouseRoute::Shux
+        );
+        // Only a press opens a gesture: a stray drag or release with nothing in
+        // flight belongs to whatever shux started.
+        for action in [ButtonAction::Drag, ButtonAction::Release] {
+            assert_eq!(
+                route(
+                    SelectionDrag::None,
+                    false,
+                    false,
+                    false,
+                    Some(pane),
+                    MouseMode::ButtonEvent,
+                    true,
+                    action
+                ),
+                AppMouseRoute::Shux,
+                "{action:?}"
+            );
+        }
+    }
+
+    /// A press whose button mask can never empty is a gesture that never ends.
+    #[test]
+    fn app_gesture_ends_only_when_every_button_is_up() {
+        let pane = PaneId::new();
+        let mut g = SelectionDrag::App {
+            pane_id: pane,
+            buttons: 0b101, // left + right
+            last: (3, 4),
+        };
+        end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Right);
+        assert_eq!(
+            g,
+            SelectionDrag::App {
+                pane_id: pane,
+                buttons: 0b001,
+                last: (3, 4)
+            },
+            "releasing one of two buttons must not end the gesture"
+        );
+        end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Left);
+        assert_eq!(g, SelectionDrag::None);
+
+        // A host without SGR reporting decodes every release as Up(Left).
+        // A mask keyed strictly to the button would strand the gesture.
+        let mut g = SelectionDrag::App {
+            pane_id: pane,
+            buttons: 0b100, // right only
+            last: (3, 4),
+        };
+        end_gesture_if_released(&mut g, ButtonAction::Release, ProtoMouseButton::Left);
+        assert_eq!(
+            g,
+            SelectionDrag::None,
+            "an unattributable release must still end the gesture"
+        );
+
+        // A press or drag never ends one.
+        let mut g = SelectionDrag::App {
+            pane_id: pane,
+            buttons: 1,
+            last: (3, 4),
+        };
+        end_gesture_if_released(&mut g, ButtonAction::Drag, ProtoMouseButton::Left);
+        assert!(matches!(g, SelectionDrag::App { .. }));
+    }
+
+    // --- Issue #174: `handle_app_mouse` against a live graph + pane VT ------
+
+    /// Every argument `handle_app_mouse` takes but the event itself, so the
+    /// tests below read as the scenario rather than as a call.
+    struct AppMouseHarness {
+        fixture: AttachFixture,
+        session: Arc<Mutex<AttachedSession>>,
+        client_size: ClientSize,
+        border_drag: Option<DragState>,
+        gesture: SelectionDrag,
+    }
+
+    impl AppMouseHarness {
+        async fn new() -> Self {
+            let fixture = attach_fixture().await;
+            let session = Arc::new(Mutex::new(fixture.attached.clone()));
+            Self {
+                fixture,
+                session,
+                client_size: Arc::new(Mutex::new((100, 30))),
+                border_drag: None,
+                gesture: SelectionDrag::None,
+            }
+        }
+
+        async fn send(
+            &mut self,
+            kind: MouseKind,
+            button: ProtoMouseButton,
+            col: u16,
+            row: u16,
+        ) -> AppMouse {
+            self.send_mod(kind, button, col, row, false, false, false)
+                .await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn send_mod(
+            &mut self,
+            kind: MouseKind,
+            button: ProtoMouseButton,
+            col: u16,
+            row: u16,
+            shift: bool,
+            alt: bool,
+            ctrl: bool,
+        ) -> AppMouse {
+            handle_app_mouse(
+                kind,
+                button,
+                col,
+                row,
+                shift,
+                alt,
+                ctrl,
+                &self.fixture.graph,
+                &self.fixture.io_state,
+                &self.session,
+                &self.client_size,
+                &test_config(),
+                &self.border_drag,
+                &mut self.gesture,
+            )
+            .await
+            .expect("handle_app_mouse")
+        }
+    }
+
+    /// Nothing arrived on the pane's writer. Distinguished from "arrived late"
+    /// by draining with a real timeout rather than a `try_recv`.
+    async fn assert_no_bytes(rx: &mut mpsc::Receiver<Vec<u8>>, why: &str) {
+        match tokio::time::timeout(Duration::from_millis(150), rx.recv()).await {
+            Err(_) => {}
+            Ok(None) => {}
+            Ok(Some(bytes)) => panic!("{why}: app received {:?}", String::from_utf8_lossy(&bytes)),
+        }
+    }
+
+    async fn recv_text(rx: &mut mpsc::Receiver<Vec<u8>>) -> String {
+        String::from_utf8_lossy(&recv_bytes(rx).await).into_owned()
+    }
+
+    /// The headline defect: four clicks produced zero reports.
+    #[tokio::test]
+    async fn a_click_reaches_a_mouse_aware_app_at_pane_local_coordinates() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+
+        // The active pane's rect starts at (1,1) with the default outline, so
+        // screen (10,5) is pane-local cell (10,5) 1-based.
+        assert_eq!(
+            h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await,
+            AppMouse::Consumed { redraw: false }
+        );
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+        h.send(MouseKind::Drag, ProtoMouseButton::Left, 12, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<32;12;5M");
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 12, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;12;5m");
+        assert_eq!(h.gesture, SelectionDrag::None, "gesture must have ended");
+        h.fixture.stop();
+    }
+
+    /// An `Up` the client cannot attribute to a button must still end the gesture.
+    ///
+    /// `button_cb` refuses `None` on a press or release — correctly, since
+    /// turning it into a left click would forward a click the user never made.
+    /// But that early return is the one path out of `handle_app_mouse` that
+    /// skips both gesture helpers, so the latch never clears. `Mouse` is an
+    /// untrusted wire frame, so this shape is reachable even though shux's own
+    /// client never sends it.
+    #[tokio::test]
+    async fn an_unattributable_release_still_ends_the_app_gesture() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+        assert!(matches!(h.gesture, SelectionDrag::App { .. }));
+
+        // Nothing is forwarded — there is no truthful report for a buttonless
+        // release — but the gesture must not outlive it.
+        h.send(MouseKind::Up, ProtoMouseButton::None, 10, 5).await;
+        assert_no_bytes(&mut wr, "a buttonless release is not encodable").await;
+        assert_eq!(
+            h.gesture,
+            SelectionDrag::None,
+            "the app is left believing the button is still down"
+        );
+        h.fixture.stop();
+    }
+
+    /// Screen-global coordinates reaching the app is the defect this catches:
+    /// the click would land in the wrong place in every pane but the first.
+    #[tokio::test]
+    async fn a_click_in_a_second_pane_is_local_to_that_pane_and_focuses_it() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.second_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        let viewport = current_viewport(&h.client_size, &test_config()).await;
+        let rect = {
+            let snap = h.fixture.graph.snapshot();
+            let win = snap.windows.get(&h.fixture.first_window).expect("window");
+            win.layout
+                .compute_rects(viewport)
+                .into_iter()
+                .find(|(pid, _)| *pid == h.fixture.second_pane)
+                .expect("second pane rect")
+                .1
+        };
+        assert!(rect.x > 0, "the second pane must not start at the origin");
+
+        let outcome = h
+            .send(
+                MouseKind::Down,
+                ProtoMouseButton::Left,
+                rect.x + 3,
+                rect.y + 2,
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            AppMouse::Consumed { redraw: true },
+            "focusing a background pane is a visible change"
+        );
+        assert_eq!(
+            recv_text(&mut wr).await,
+            "\x1b[<0;4;3M",
+            "coordinates must be local to the clicked pane, not the screen"
+        );
+        // tmux's MouseDown1Pane selects the pane AND forwards the click.
+        assert_eq!(
+            h.fixture.graph.snapshot().windows[&h.fixture.first_window].active_pane,
+            h.fixture.second_pane
+        );
+        assert_eq!(h.session.lock().await.active_pane_id, h.fixture.second_pane);
+        h.fixture.stop();
+    }
+
+    /// Mode fidelity: 1000 subscribes to press and release only. The drag is
+    /// swallowed rather than falling through, so no stray shux selection
+    /// appears under a running app.
+    #[tokio::test]
+    async fn a_drag_is_withheld_from_a_mode_1000_app_and_not_given_to_shux() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1000h\x1b[?1006h",
+        )
+        .await;
+
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+        assert_eq!(
+            h.send(MouseKind::Drag, ProtoMouseButton::Left, 12, 5).await,
+            AppMouse::Consumed { redraw: false },
+            "the app owns the mouse; the drag is not shux's to reinterpret"
+        );
+        assert_no_bytes(&mut wr, "mode 1000 never subscribed to motion").await;
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 12, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;12;5m");
+        assert!(
+            h.session.lock().await.mouse_selection.is_none(),
+            "a swallowed drag must not start a shux selection"
+        );
+        h.fixture.stop();
+    }
+
+    /// The gesture is decided at press and honoured to the end. Without this,
+    /// an app enabling tracking mid-drag stranded a shux selection that no
+    /// mouse action could clear.
+    #[tokio::test]
+    async fn a_gesture_started_in_shux_is_not_stolen_when_the_app_takes_the_mouse() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, b"").await;
+
+        // Press lands on a plain pane: shux's.
+        assert_eq!(
+            h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await,
+            AppMouse::NotHandled
+        );
+        h.gesture = SelectionDrag::MouseSelection {
+            pane_id: h.fixture.first_pane,
+        };
+        // The app now turns tracking on mid-gesture (vim `:set mouse=a`).
+        {
+            let mut st = h.fixture.io_state.lock().await;
+            st.vts
+                .get_mut(&h.fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[?1002h\x1b[?1006h");
+        }
+        assert_eq!(
+            h.send(MouseKind::Drag, ProtoMouseButton::Left, 12, 5).await,
+            AppMouse::NotHandled
+        );
+        // The discriminating step. Drag and Up above are also refused by the
+        // press-only rule, so they cannot tell the gesture guard apart from its
+        // absence — a second PRESS while shux owns the gesture can, and it is a
+        // real gesture (middle-click while text-selecting).
+        assert_eq!(
+            h.send(MouseKind::Down, ProtoMouseButton::Middle, 12, 5)
+                .await,
+            AppMouse::NotHandled,
+            "a press during a shux selection must not open an app gesture"
+        );
+        assert_eq!(
+            h.send(MouseKind::Up, ProtoMouseButton::Left, 12, 5).await,
+            AppMouse::NotHandled
+        );
+        assert_no_bytes(&mut wr, "a gesture shux started stays shux's").await;
+        h.fixture.stop();
+    }
+
+    /// An app that turns tracking OFF mid-gesture stops receiving reports, and
+    /// the gesture still ends.
+    ///
+    /// No synthetic release here, deliberately: a real terminal stops reporting
+    /// the moment the app clears the mode, and manufacturing a release it never
+    /// subscribed to would be inventing input. The release IS synthesized where
+    /// the app never asked to stop — see
+    /// `abandoning_a_gesture_synthesizes_the_release_the_app_is_waiting_for`.
+    /// What matters here is that the gesture does not stay latched.
+    #[tokio::test]
+    async fn an_app_that_drops_tracking_mid_gesture_stops_receiving_reports() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+        {
+            let mut st = h.fixture.io_state.lock().await;
+            st.vts
+                .get_mut(&h.fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[?1002l");
+        }
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 10, 5).await;
+        assert_no_bytes(
+            &mut wr,
+            "tracking is off, so the release is swallowed, not forwarded",
+        )
+        .await;
+        assert_eq!(h.gesture, SelectionDrag::None, "the gesture must still end");
+        h.fixture.stop();
+    }
+
+    /// Abandoning a forwarded gesture tells the app the button came up. The
+    /// attach loop calls this when the help overlay opens and when the client
+    /// detaches; without it the app stays mid-drag for the pane's whole life.
+    #[tokio::test]
+    async fn abandoning_a_gesture_synthesizes_the_release_the_app_is_waiting_for() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+        h.send(MouseKind::Drag, ProtoMouseButton::Left, 14, 7).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<32;14;7M");
+
+        release_app_gesture(&h.fixture.io_state, &mut h.gesture).await;
+        assert_eq!(
+            recv_text(&mut wr).await,
+            "\x1b[<0;14;7m",
+            "the synthetic release must land where the drag left the pointer"
+        );
+        assert_eq!(h.gesture, SelectionDrag::None);
+        // Idempotent: nothing left to release.
+        release_app_gesture(&h.fixture.io_state, &mut h.gesture).await;
+        assert_no_bytes(&mut wr, "a finished gesture releases once").await;
+        h.fixture.stop();
+    }
+
+    /// Shift is the escape that keeps shux's selection reachable.
+    #[tokio::test]
+    async fn shift_hands_the_click_back_to_shux() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        assert_eq!(
+            h.send_mod(
+                MouseKind::Down,
+                ProtoMouseButton::Left,
+                10,
+                5,
+                true,
+                false,
+                false
+            )
+            .await,
+            AppMouse::NotHandled
+        );
+        assert_no_bytes(&mut wr, "shift reserves the mouse for shux").await;
+        h.fixture.stop();
+    }
+
+    /// Ctrl and alt are the app's; nvim's `<C-LeftMouse>` is jump-to-tag, and
+    /// arriving as a plain click turns that into a silent cursor move.
+    #[tokio::test]
+    async fn ctrl_and_alt_travel_with_the_click() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        h.send_mod(
+            MouseKind::Down,
+            ProtoMouseButton::Left,
+            10,
+            5,
+            false,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<16;10;5M");
+        h.fixture.stop();
+    }
+
+    /// The wheel keeps its own three-way routing (scrollback / arrows /
+    /// forward). Stealing it here would bypass the transient wheel-initiated
+    /// scrollback view entirely.
+    #[tokio::test]
+    async fn the_wheel_is_never_taken_from_handle_wheel() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        for kind in [MouseKind::ScrollUp, MouseKind::ScrollDown, MouseKind::Move] {
+            assert_eq!(
+                h.send(kind, ProtoMouseButton::None, 10, 5).await,
+                AppMouse::NotHandled,
+                "{kind:?}"
+            );
+        }
+        assert_no_bytes(&mut wr, "handle_app_mouse must not forward wheel ticks").await;
+
+        // …and it still is not ours mid-gesture, which is the case the
+        // press-only rule does not cover: a wheel tick during a drag would
+        // otherwise be re-decided as motion and forwarded twice.
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+        for kind in [MouseKind::ScrollUp, MouseKind::ScrollDown] {
+            assert_eq!(
+                h.send(kind, ProtoMouseButton::None, 10, 5).await,
+                AppMouse::NotHandled,
+                "{kind:?} during a gesture"
+            );
+        }
+        assert_no_bytes(&mut wr, "the wheel stays handle_wheel's, gesture or not").await;
+        h.fixture.stop();
+    }
+
+    /// A border drag already in flight is shux's for the whole gesture, even
+    /// once the pointer has moved off the border and over a mouse-aware pane.
+    /// Otherwise the resize stalls after one cell and the app gets a phantom
+    /// drag it never saw the press for.
+    #[tokio::test]
+    async fn a_border_resize_in_flight_is_not_hijacked_by_the_pane_it_drags_over() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        h.border_drag = Some(DragState {
+            target: h.fixture.first_pane,
+            direction: shux_core::layout::Direction::Vertical,
+            last_col: 40,
+            last_row: 5,
+        });
+        for (kind, col) in [
+            (MouseKind::Down, 40),
+            (MouseKind::Drag, 12),
+            (MouseKind::Up, 12),
+        ] {
+            assert_eq!(
+                h.send(kind, ProtoMouseButton::Left, col, 5).await,
+                AppMouse::NotHandled,
+                "{kind:?}"
+            );
+        }
+        assert_no_bytes(&mut wr, "a border resize keeps the whole gesture").await;
+        h.fixture.stop();
+    }
+
+    /// Copy mode and the copy menu are shux's modes. The menu is the sharp
+    /// case: it swallows every event until dismissed, so forwarding the click
+    /// meant to dismiss it left it stuck on screen with no way out but a key.
+    #[tokio::test]
+    async fn copy_mode_and_the_copy_menu_keep_the_mouse() {
+        for open_menu in [false, true] {
+            let mut h = AppMouseHarness::new().await;
+            let mut wr = seed_scrollback_pane(
+                &h.fixture.io_state,
+                h.fixture.first_pane,
+                b"\x1b[?1002h\x1b[?1006h",
+            )
+            .await;
+            {
+                let mut s = h.session.lock().await;
+                if open_menu {
+                    s.copy_menu = Some(CopyContextMenu {
+                        pane_id: h.fixture.first_pane,
+                        col: 10,
+                        row: 5,
+                    });
+                } else {
+                    s.copy_mode = Some(shux_ui::CopyModeState::new());
+                }
+            }
+            assert_eq!(
+                h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await,
+                AppMouse::NotHandled,
+                "open_menu={open_menu}"
+            );
+            assert_no_bytes(&mut wr, "shux's own modes outrank the app").await;
+            h.fixture.stop();
+        }
+    }
+
+    /// A selection left over from before the app took the mouse can no longer
+    /// be cleared by clicking, so the forward clears it — otherwise the
+    /// highlight renders until the user happens to press a key.
+    #[tokio::test]
+    async fn forwarding_a_press_clears_a_stale_shux_selection() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        {
+            let mut s = h.session.lock().await;
+            s.mouse_selection = Some(MouseSelection {
+                pane_id: h.fixture.first_pane,
+                state: shux_ui::CopyModeState::new(),
+            });
+        }
+        assert_eq!(
+            h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await,
+            AppMouse::Consumed { redraw: true },
+            "clearing the highlight is a visible change and must pulse a frame"
+        );
+        assert!(h.session.lock().await.mouse_selection.is_none());
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+        h.fixture.stop();
+    }
+
+    /// While zoomed the pane's rect is the whole content area, so without a
+    /// containment check a click on the status bar clamps into the pane's last
+    /// row and reaches the app as a click the user never made.
+    #[tokio::test]
+    async fn a_click_on_the_status_bar_never_reaches_a_zoomed_app() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        assert!(
+            h.fixture
+                .graph
+                .zoom_pane(h.fixture.first_pane, None)
+                .await
+                .expect("zoom"),
+            "pane must actually be zoomed"
+        );
+        let (_, rows) = *h.client_size.lock().await;
+
+        // Inside the zoomed pane: forwarded.
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;11;6M");
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;11;6m");
+
+        // The status bar row is outside the content rect.
+        assert_eq!(
+            h.send(MouseKind::Down, ProtoMouseButton::Left, 10, rows - 1)
+                .await,
+            AppMouse::NotHandled
+        );
+        assert_no_bytes(&mut wr, "the status bar is not part of the pane").await;
+        h.fixture.stop();
+    }
+
+    /// A press dropped by a backpressured pane must not open a gesture: the
+    /// release that follows would reach the app with no press behind it.
+    #[tokio::test]
+    async fn a_dropped_press_does_not_open_a_gesture() {
+        let mut h = AppMouseHarness::new().await;
+        // A writer with no receiver: `try_send` fails exactly as it does when a
+        // pane is backpressured.
+        let (writer_tx, writer_rx) = mpsc::channel(1);
+        drop(writer_rx);
+        {
+            let mut st = h.fixture.io_state.lock().await;
+            let mut vt = shux_vt::VirtualTerminal::new(28, 49);
+            vt.process(b"\x1b[?1002h\x1b[?1006h");
+            st.vts.insert(h.fixture.first_pane, vt);
+            st.writers.insert(h.fixture.first_pane, writer_tx);
+        }
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(
+            h.gesture,
+            SelectionDrag::None,
+            "a press the pane never received is not a gesture"
+        );
+        h.fixture.stop();
+    }
+
+    /// The three coordinate modes shux cannot encode stop forwarding outright
+    /// rather than sending bytes the app decodes as another cell. 1016 is the
+    /// one that matters: every click would collapse into the top-left corner.
+    #[tokio::test]
+    async fn an_app_in_a_coordinate_mode_shux_cannot_encode_gets_nothing() {
+        for mode in [b"\x1b[?1016h".as_slice(), b"\x1b[?1005h", b"\x1b[?1015h"] {
+            let mut h = AppMouseHarness::new().await;
+            let mut setup = b"\x1b[?1002h\x1b[?1006h".to_vec();
+            setup.extend_from_slice(mode);
+            let mut wr =
+                seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, &setup).await;
+            assert_eq!(
+                h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await,
+                AppMouse::NotHandled,
+                "{:?}",
+                String::from_utf8_lossy(mode)
+            );
+            assert_no_bytes(&mut wr, "cell coordinates would be misread").await;
+            h.fixture.stop();
+        }
+    }
+
+    /// A pane whose app never asked for the mouse keeps shux's own handling —
+    /// selection, click-to-focus, border drags all still work there.
+    #[tokio::test]
+    async fn a_pane_that_never_asked_for_the_mouse_is_untouched() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(&h.fixture.io_state, h.fixture.first_pane, b"").await;
+        for kind in [MouseKind::Down, MouseKind::Drag, MouseKind::Up] {
+            assert_eq!(
+                h.send(kind, ProtoMouseButton::Left, 10, 5).await,
+                AppMouse::NotHandled,
+                "{kind:?}"
+            );
+        }
+        assert_no_bytes(&mut wr, "no mouse tracking, no forwarding").await;
+        h.fixture.stop();
+    }
+
+    /// A drag or release with no gesture in flight belongs to whatever shux
+    /// started, or to nothing. Opening a gesture on one would hand the app a
+    /// motion report with no press behind it — and shux would then swallow the
+    /// release that belonged to its own selection.
+    #[tokio::test]
+    async fn a_drag_with_no_gesture_in_flight_is_not_the_apps() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        for kind in [MouseKind::Drag, MouseKind::Up] {
+            assert_eq!(
+                h.send(kind, ProtoMouseButton::Left, 10, 5).await,
+                AppMouse::NotHandled,
+                "{kind:?} with nothing in flight"
+            );
+        }
+        assert_no_bytes(&mut wr, "only a press opens a gesture").await;
+        h.fixture.stop();
+    }
+
+    /// The hit-test viewport must be the one the compositor laid the panes out
+    /// with. Driven from a real config FILE, not from a `BorderStyle` handed in:
+    /// the defect was in the plumbing from config to hit-test, not in the inset
+    /// arithmetic, and a test passing the style in by hand cannot see it.
+    #[tokio::test]
+    async fn the_pane_hit_test_agrees_with_the_compositor_under_every_border_style() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        let content = current_content_rect(&client_size).await;
+
+        for (name, style) in [
+            ("none", BorderStyle::None),
+            ("thin", BorderStyle::Thin),
+            ("thick", BorderStyle::Thick),
+            ("double", BorderStyle::Double),
+            ("rounded", BorderStyle::Rounded),
+            ("ascii", BorderStyle::Ascii),
+        ] {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&path, format!("[appearance]\nborder_style = \"{name}\"\n"))
+                .expect("write config");
+            let config = ConfigHandle::load_or_default(&path);
+            assert_eq!(
+                current_viewport(&client_size, &config).await,
+                shux_ui::pane_viewport(content, style, false),
+                "border_style = {name:?}: the hit-test and the compositor must agree"
+            );
+        }
+
+        // Concretely, and this is the pair that discriminates: with no outline
+        // the pane starts at the origin and the last column and row are
+        // reachable; with one it is inset by exactly a cell on every side.
+        let none = dir.path().join("none.toml");
+        assert_eq!(
+            current_viewport(&client_size, &ConfigHandle::load_or_default(&none)).await,
+            Rect::new(0, 0, 100, 29)
+        );
+        let rounded = dir.path().join("rounded.toml");
+        assert_eq!(
+            current_viewport(&client_size, &ConfigHandle::load_or_default(&rounded)).await,
+            Rect::new(1, 1, 98, 27)
+        );
+    }
+
+    /// Cross-path consistency: hit-test, compositor, snapshot composer and the
+    /// PTY resize fan-out must all place a pane's rect identically, for every
+    /// border style. Asserted through each path's real API — where `compose`
+    /// lands a pane's first cell, what the fan-out actually sends — not by
+    /// re-deriving the arithmetic and comparing it to itself.
+    #[tokio::test]
+    async fn every_render_path_agrees_on_the_pane_viewport() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = attach_fixture().await;
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        let content = current_content_rect(&client_size).await;
+
+        // Each pane's grid carries a distinct glyph in its own (0,0), so where
+        // that glyph lands in the composed frame IS the pane's origin.
+        let marks = [(fixture.first_pane, 'A'), (fixture.second_pane, 'B')];
+        let mut vts: HashMap<PaneId, shux_vt::VirtualTerminal> = HashMap::new();
+        for (pid, mark) in marks {
+            let mut vt = shux_vt::VirtualTerminal::new(30, 100);
+            vt.process(mark.to_string().repeat(200).as_bytes());
+            vts.insert(pid, vt);
+        }
+
+        for name in ["none", "rounded", "thick", "ascii"] {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&path, format!("[appearance]\nborder_style = \"{name}\"\n"))
+                .expect("write config");
+            let config = ConfigHandle::load_or_default(&path);
+            let style = BorderStyle::parse(name);
+            let expected = shux_ui::pane_viewport(content, style, false);
+
+            // 1. The live-attach hit-test.
+            assert_eq!(
+                current_viewport(&client_size, &config).await,
+                expected,
+                "{name}: hit-test viewport"
+            );
+
+            // 2. The snapshot / web-preview composer.
+            let snap = fixture.graph.snapshot();
+            let win = snap.windows.get(&fixture.first_window).expect("window");
+            let rects: HashMap<PaneId, Rect> = win
+                .layout
+                .tree
+                .compute_rects(expected)
+                .into_iter()
+                .collect();
+            let panes: HashMap<PaneId, (&shux_vt::Grid, &shux_vt::Cursor)> = vts
+                .iter()
+                .map(|(pid, vt)| (*pid, (vt.grid(), vt.cursor())))
+                .collect();
+            let composed = shux_ui::compose(
+                &shux_ui::ComposeInputs {
+                    layout: &win.layout.tree,
+                    zoom: None,
+                    focused: fixture.first_pane,
+                    panes: &panes,
+                    titles: None,
+                    status_bar: None,
+                },
+                100,
+                30,
+                style,
+                shux_ui::BorderColors::default(),
+                STATUS_BAR_ROWS,
+            );
+            for (pid, mark) in marks {
+                let rect = rects.get(&pid).expect("pane rect");
+                let cell = composed
+                    .grid
+                    .visible_row(rect.y as usize)
+                    .get(rect.x as usize)
+                    .expect("composed cell");
+                assert_eq!(
+                    cell.ch, mark,
+                    "{name}: pane {pid}'s first cell is not at the rect every \
+                     other path uses ({}, {})",
+                    rect.x, rect.y
+                );
+            }
+            drop(snap);
+
+            // 3. The PTY resize fan-out: each pane must be TOLD the size of the
+            //    rect it is DRAWN in, or a click on its last column names a
+            //    cell the app does not have.
+            let mut receivers = Vec::new();
+            {
+                let mut state = fixture.io_state.lock().await;
+                state.resizers.clear();
+                for (pid, _) in marks {
+                    let (tx, rx) = mpsc::channel(8);
+                    state.resizers.insert(pid, tx);
+                    receivers.push((pid, rx));
+                }
+            }
+            apply_resize_to_window(
+                &fixture.graph,
+                &fixture.io_state,
+                &fixture.attached,
+                &config,
+                100,
+                30,
+            )
+            .await;
+            for (pid, mut rx) in receivers {
+                let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("resize request")
+                    .expect("resize request");
+                let rect = rects.get(&pid).expect("pane rect");
+                assert_eq!(
+                    (req.size.cols, req.size.rows),
+                    (rect.width, rect.height),
+                    "{name}: pane {pid} was told a size that is not the rect it is drawn in"
+                );
+            }
+        }
+        fixture.stop();
+    }
+
+    /// A live `border_style` edit moves every pane's rect, so the PTYs must be
+    /// re-told their size or they are drawn at one geometry and believe another.
+    /// Drives the real `ConfigHandle::replace` and the real fan-out.
+    #[tokio::test]
+    async fn a_border_style_reload_re_fans_every_pane_winsize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[appearance]\nborder_style = \"rounded\"\n").expect("write");
+        let config = ConfigHandle::load_or_default(&path);
+
+        let fixture = attach_fixture().await;
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        let mut receivers = Vec::new();
+        {
+            let mut state = fixture.io_state.lock().await;
+            for pid in [fixture.first_pane, fixture.second_pane] {
+                let (tx, rx) = mpsc::channel(8);
+                state.resizers.insert(pid, tx);
+                receivers.push((pid, rx));
+            }
+        }
+
+        // Baseline: the outline is drawn, so the viewport is inset.
+        let (cols, rows) = *client_size.lock().await;
+        apply_resize_to_window(
+            &fixture.graph,
+            &fixture.io_state,
+            &fixture.attached,
+            &config,
+            cols,
+            rows,
+        )
+        .await;
+        let mut before = Vec::new();
+        for (pid, rx) in receivers.iter_mut() {
+            let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("baseline resize")
+                .expect("baseline resize");
+            before.push((*pid, req.size.cols, req.size.rows));
+        }
+
+        // The edit the user makes. `replace` is what the config watcher calls.
+        let mut reloaded = (*config.current()).clone();
+        reloaded.appearance.border_style = "none".to_string();
+        config.replace(reloaded);
+
+        apply_resize_to_window(
+            &fixture.graph,
+            &fixture.io_state,
+            &fixture.attached,
+            &config,
+            cols,
+            rows,
+        )
+        .await;
+        for ((pid, was_cols, was_rows), (_, rx)) in before.iter().zip(receivers.iter_mut()) {
+            let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("post-reload resize")
+                .expect("post-reload resize");
+            assert!(
+                req.size.cols > *was_cols || req.size.rows > *was_rows,
+                "pane {pid} kept {was_cols}x{was_rows} after the outline was \
+                 turned off; it is now drawn larger than it was told"
+            );
+        }
+        fixture.stop();
+    }
+
+    /// The wheel stands down under a coordinate mode shux cannot encode, just as
+    /// the button path does, and falls back to shux's own scrollback.
+    #[tokio::test]
+    async fn the_wheel_stands_down_under_a_coordinate_mode_shux_cannot_encode() {
+        let fixture = attach_fixture().await;
+        let mut wr = seed_scrollback_pane(
+            &fixture.io_state,
+            fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h\x1b[?1016h",
+        )
+        .await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+
+        handle_wheel(
+            MouseKind::ScrollUp,
+            3,
+            3,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &test_config(),
+        )
+        .await
+        .expect("wheel");
+
+        assert_no_bytes(&mut wr, "1016 makes the app read cells as pixels").await;
+        assert!(
+            session.lock().await.copy_mode.is_some(),
+            "the wheel should have fallen back to shux's scrollback"
+        );
+        fixture.stop();
+    }
+
+    /// An app that switches to an unencodable coordinate mode mid-drag is still
+    /// tracking and still waiting for the button: send the release anyway.
+    /// Contrast `an_app_that_drops_tracking_mid_gesture_stops_receiving_reports`
+    /// — an app that turned tracking OFF never subscribed to it.
+    #[tokio::test]
+    async fn an_app_that_switches_to_an_unencodable_mode_mid_gesture_still_gets_its_release() {
+        let mut h = AppMouseHarness::new().await;
+        let mut wr = seed_scrollback_pane(
+            &h.fixture.io_state,
+            h.fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h",
+        )
+        .await;
+        h.send(MouseKind::Down, ProtoMouseButton::Left, 10, 5).await;
+        assert_eq!(recv_text(&mut wr).await, "\x1b[<0;10;5M");
+
+        // The app asks for SGR-pixel coordinates mid-gesture.
+        {
+            let mut st = h.fixture.io_state.lock().await;
+            st.vts
+                .get_mut(&h.fixture.first_pane)
+                .expect("vt")
+                .process(b"\x1b[?1016h");
+        }
+        h.send(MouseKind::Up, ProtoMouseButton::Left, 10, 5).await;
+
+        assert_eq!(
+            recv_text(&mut wr).await,
+            "\x1b[<0;10;5m",
+            "the app is still tracking and still waiting for this release"
+        );
+        assert_eq!(h.gesture, SelectionDrag::None, "the gesture must end");
+        h.fixture.stop();
+    }
+
     // --- Task 086: mouse wheel behavioral regression tests ---
     // These drive the real `handle_wheel` against a live graph + pane VT. Each
     // asserts an outcome the pre-fix code could NOT produce (the old scroll arm
@@ -4400,6 +6341,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel up");
@@ -4440,6 +6382,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel");
@@ -4475,6 +6418,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel");
@@ -4512,6 +6456,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel up");
@@ -4533,6 +6478,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4571,6 +6517,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4586,6 +6533,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4617,7 +6565,7 @@ mod tests {
         let client_size = Arc::new(Mutex::new((100, 30)));
         let (out_tx, _out_rx) = mpsc::channel(8);
         let mut drag = SelectionDrag::None;
-        let viewport = current_viewport(&client_size).await;
+        let viewport = current_viewport(&client_size, &test_config()).await;
         let (first_point, second_point, _border) =
             find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
 
@@ -4630,6 +6578,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel up over pane A");
@@ -4652,6 +6601,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4676,6 +6626,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel up over pane B");
@@ -4706,7 +6657,7 @@ mod tests {
         let client_size = Arc::new(Mutex::new((100, 30)));
         let (out_tx, _out_rx) = mpsc::channel(8);
         let mut drag = SelectionDrag::None;
-        let viewport = current_viewport(&client_size).await;
+        let viewport = current_viewport(&client_size, &test_config()).await;
         let (_first_point, second_point, _border) =
             find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
 
@@ -4719,6 +6670,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )

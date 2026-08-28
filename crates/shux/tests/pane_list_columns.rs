@@ -21,6 +21,16 @@ use std::time::{Duration, Instant};
 /// daemon-backed capture (CLAUDE.md).
 const COLOUR_PROBE: &str = "\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\033[38;5;208mINDEXED\\033[0m \\033[34mBASIC\\033[0m";
 
+const DONE_MARKER: &str = "RENDER-DONE";
+
+/// Build the line to type so the shell prints [`DONE_MARKER`] once `line` has
+/// finished. The marker is SPLIT across a quote boundary so the echoed line
+/// cannot contain it; `the_completion_marker_cannot_be_satisfied_by_the_echoed_line`
+/// pins that.
+fn line_with_completion_marker(line: &str) -> String {
+    format!("{line}; printf 'RENDER''-DONE\\n'")
+}
+
 /// Keeps a pane's screen alive after the interesting part has run.
 const PARK: &str = "; exec sleep 900";
 
@@ -108,8 +118,7 @@ impl Env {
             .as_str()
             .expect("pane id")
             .to_string();
-        self.type_line(name, "1", &format!("printf '{COLOUR_PROBE}\\n'"));
-        self.wait_for(name, "1", "TRUECOLOR");
+        self.run_line_and_wait(name, "1", &format!("printf '{COLOUR_PROBE}\\n'"));
         pane
     }
 
@@ -148,6 +157,19 @@ impl Env {
             std::thread::sleep(Duration::from_millis(150));
         }
         panic!("{needle:?} never appeared in {session}:{window}:\n{last}");
+    }
+
+    /// Type `line` and wait until the command has FINISHED writing.
+    ///
+    /// Waiting on the command's own output races the render — `pane list
+    /// --format text` reaches the screen header-first and `wait_for` returns
+    /// that partial frame (seen in CI under llvm-cov). Waiting on a needle the
+    /// shell also ECHOES is worse: satisfied before the command runs at all
+    /// (#167). So wait on a marker the shell emits only after the command exits.
+    #[track_caller]
+    fn run_line_and_wait(&self, session: &str, window: &str, line: &str) -> String {
+        self.type_line(session, window, &line_with_completion_marker(line));
+        self.wait_for(session, window, DONE_MARKER)
     }
 
     fn bin_str(&self) -> String {
@@ -304,6 +326,30 @@ fn a_shell_wrapped_cmd_pane_prints_its_script_as_one_argument() {
     assert!(row[2].ends_with('\''), "unterminated quote: {:?}", row[2]);
 }
 
+/// The split marker must not survive into the line the shell ECHOES — that is
+/// the whole reason `run_line_and_wait` is safe, and #167 shipped a green test
+/// that returned on the echo. Pin both halves by execution, not by eye.
+#[test]
+fn the_completion_marker_cannot_be_satisfied_by_the_echoed_line() {
+    let typed = line_with_completion_marker("shux pane list -s s -w 0 --format text");
+    assert!(
+        !typed.contains(DONE_MARKER),
+        "the echoed line contains {DONE_MARKER:?} verbatim, so the wait would \
+         return on the echo instead of the output: {typed}"
+    );
+
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(line_with_completion_marker("true"))
+        .output()
+        .expect("spawn sh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        DONE_MARKER,
+        "the shell no longer reassembles the marker, so the wait would time out"
+    );
+}
+
 // ── cross-path consistency ──────────────────────────────────────────────
 
 /// The three formats must agree about the same panes. They are three renderers
@@ -345,8 +391,7 @@ fn text_plain_and_json_agree_about_every_pane() {
         "24",
     ]);
     let cmd = format!("{} pane list -s {s} -w 0 --format text", env.bin_str());
-    env.type_line(&s, "viewer", &cmd);
-    let screen = env.wait_for(&s, "viewer", "COMMAND");
+    let screen = env.run_line_and_wait(&s, "viewer", &cmd);
 
     for pane in panes {
         let short = &pane["id"].as_str().expect("id")[..8];
@@ -620,12 +665,11 @@ fn the_box_frame_is_square_on_the_rendered_grid() {
     env.ok(&[
         "pane", "set-size", "-s", s, "-p", &target, "--cols", "100", "--rows", "20",
     ]);
-    env.type_line(
+    env.run_line_and_wait(
         s,
         "1",
         &format!("clear; {} --format text pane list -s {s}", env.bin_str()),
     );
-    env.wait_for(s, "1", "TITLE");
 
     let cells = env.json(&["pane", "glance", &target, "--cells"]);
     let rows = cells["result"]["cells"]["rows"]

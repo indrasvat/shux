@@ -1,0 +1,1 @@
+{"actual": ".shux/out/issue-174/pixel/head.png", "changed_pixels": 0, "diff": ".shux/out/issue-174/pixel/render-parity-rounded-pane-diff.png", "expected": ".shux/out/issue-174/pixel/base.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [900, 570], "status": "pass", "total_pixels": 513000}

@@ -92,15 +92,15 @@ const SECTIONS: &[Section] = &[
         entries: &[
             Entry {
                 key: "Scroll wheel",
-                desc: "Scroll scrollback (or the focused app when it uses the mouse)",
+                desc: "Scrollback, or the app in the pane under the pointer",
             },
             Entry {
-                key: "Drag text",
-                desc: "Select visible text and copy on release",
+                key: "Click / drag",
+                desc: "The app's when the pane uses the mouse; else select",
             },
             Entry {
-                key: "Right-click selection",
-                desc: "Open Copy / Clear menu",
+                key: "Shift + drag",
+                desc: "Selects even then, host permitting; right-click: menu",
             },
         ],
     },
@@ -344,6 +344,29 @@ fn display_width(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 37 rows is the overlay's minimum and nothing pinned it: a section that
+    /// grows silently drops everyone on a 37-38 row terminal to the one-line
+    /// fallback hint. If this fails, shrink the section, don't raise the bound.
+    #[test]
+    fn the_overlay_still_fits_the_smallest_terminal_it_always_has() {
+        const MIN_ROWS: u16 = 37;
+        let render = |rows: u16| {
+            let mut buf = Vec::new();
+            render_help_overlay_into(&mut buf, 120, rows, &Theme::DEFAULT);
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        // A row from the LAST section -- proves the whole table rendered.
+        assert!(
+            render(MIN_ROWS).contains("Scroll wheel"),
+            "the full cheat sheet no longer fits in {MIN_ROWS} rows; a section grew"
+        );
+        assert!(
+            !render(MIN_ROWS - 1).contains("Scroll wheel"),
+            "the fallback boundary moved DOWN — this test is now measuring \
+             something other than the real minimum"
+        );
+    }
 
     #[test]
     fn renders_into_buffer_for_reasonable_size() {

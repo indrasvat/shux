@@ -34,6 +34,19 @@ pub struct TerminalModes {
     pub mouse_tracking: MouseMode,
     /// SGR mouse coordinate encoding (Mode 1006).
     pub sgr_mouse: bool,
+    /// UTF-8 mouse coordinate encoding (Mode 1005).
+    ///
+    /// Tracked but never emitted: the forwarder must see it to stand down. 1005
+    /// and X10 agree byte-for-byte up to column 95 and diverge silently after,
+    /// so a defect here is correct on an 80-column pane and corrupt on a wide one.
+    pub utf8_mouse: bool,
+    /// urxvt mouse coordinates (Mode 1015). Tracked, not emitted -- an app in
+    /// 1015 ignores shux's X10-framed reports, so the mouse looks dead.
+    pub urxvt_mouse: bool,
+    /// SGR-pixel mouse coordinates (Mode 1016). Tracked, not emitted -- set *in
+    /// addition to* 1006, so `sgr_mouse` cannot tell them apart, and an app in
+    /// 1016 reads forwarded CELL coordinates as PIXELS (every click hits 0,0).
+    pub pixel_mouse: bool,
     /// Alternate-scroll mode (Mode 1007): while on the alternate screen and the
     /// app has NOT requested mouse tracking, the terminal translates wheel
     /// events into arrow-key presses so pagers/editors scroll. Defaults on
@@ -61,6 +74,9 @@ impl Default for TerminalModes {
             focus_events: false,
             mouse_tracking: MouseMode::None,
             sgr_mouse: false,
+            utf8_mouse: false,
+            urxvt_mouse: false,
+            pixel_mouse: false,
             alternate_scroll: true,
             synchronized_output: false,
             alternate_screen: false,
@@ -1050,8 +1066,12 @@ impl<'a> VtHandler<'a> {
             }
             // Focus in/out events.
             1004 => self.modes.focus_events = enable,
+            // 1005/1015/1016: tracked so a forwarder can stand down; never emitted.
+            1005 => self.modes.utf8_mouse = enable,
             // SGR mouse coordinate encoding.
             1006 => self.modes.sgr_mouse = enable,
+            1015 => self.modes.urxvt_mouse = enable,
+            1016 => self.modes.pixel_mouse = enable,
             // Alternate-scroll: wheel -> arrow keys on the alternate screen.
             1007 => self.modes.alternate_scroll = enable,
             // Save cursor (1048).
@@ -2382,6 +2402,33 @@ fn parse_rgb_component(component: &str) -> Result<u8, ()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Tracking 1005/1015/1016 must not make DECRQM claim them: `0` ("not
+    /// recognized") stays true because shux never emits these encodings, and an
+    /// app that queries first would otherwise pick one shux cannot produce.
+    #[test]
+    fn tracking_a_coordinate_mode_does_not_make_decrqm_claim_it() {
+        let flatten =
+            |r: Vec<Vec<u8>>| -> String { String::from_utf8_lossy(&r.concat()).to_string() };
+        for mode in [1005u16, 1015, 1016] {
+            // The control: how shux answers about a mode it has genuinely never
+            // heard of. Anything else would be this test asserting a constant.
+            let unknown = {
+                let mut probe = crate::VirtualTerminal::new(10, 40);
+                flatten(probe.process_with_responses(b"\x1b[?9999$p"))
+                    .replace("9999", &mode.to_string())
+            };
+
+            let mut vt = crate::VirtualTerminal::new(10, 40);
+            vt.process(format!("\x1b[?{mode}h").as_bytes());
+            let got = flatten(vt.process_with_responses(format!("\x1b[?{mode}$p").as_bytes()));
+            assert_eq!(
+                got, unknown,
+                "mode {mode} is tracked, but DECRQM must still answer exactly as \
+                 it does for a mode shux has never heard of"
+            );
+        }
+    }
     use super::*;
     use crate::grid::GridConfig;
 

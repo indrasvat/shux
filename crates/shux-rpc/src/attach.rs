@@ -95,6 +95,17 @@ pub enum AttachClientFrame {
         button: MouseButton,
         col: u16,
         row: u16,
+        /// Shift held. Reserved for shux -- the escape that keeps shux's own
+        /// selection reachable inside a pane that has taken the mouse, so it is
+        /// never encoded into a forwarded report.
+        #[serde(default)]
+        shift: bool,
+        /// Alt/Meta held -- forwarded to the app as Cb bit 8.
+        #[serde(default)]
+        alt: bool,
+        /// Ctrl held -- forwarded to the app as Cb bit 16.
+        #[serde(default)]
+        ctrl: bool,
     },
     /// Client wants to detach.
     Detach,
@@ -194,6 +205,50 @@ pub struct ActionArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon outlives the client across upgrades, so an older client's
+    /// mouse frame -- without `shift`/`alt`/`ctrl` -- must still deserialize.
+    /// `false` is the safe default: the client loses the escape that hands a
+    /// click back to shux, rather than shux swallowing clicks the app wants.
+    #[test]
+    fn a_mouse_frame_without_modifiers_still_deserializes() {
+        let old_wire = r#"{"type":"mouse","kind":"down","button":"left","col":3,"row":4}"#;
+        let frame: AttachClientFrame =
+            serde_json::from_str(old_wire).expect("an older client's frame must still parse");
+        match frame {
+            AttachClientFrame::Mouse {
+                col,
+                row,
+                shift,
+                alt,
+                ctrl,
+                ..
+            } => {
+                assert_eq!((col, row), (3, 4));
+                assert!(!shift, "shift must default off, not swallow the click");
+                assert!(!alt);
+                assert!(!ctrl);
+            }
+            other => panic!("expected a mouse frame, got {other:?}"),
+        }
+    }
+
+    /// The other direction: unknown keys must be ignored, not rejected, or a
+    /// newer client's frames would fail to parse wholesale. No
+    /// `deny_unknown_fields` anywhere in this crate; this test keeps it that way.
+    #[test]
+    fn a_mouse_frame_with_unknown_fields_is_still_accepted() {
+        let future_wire = r#"{"type":"mouse","kind":"drag","button":"right","col":9,"row":2,
+            "shift":true,"alt":true,"ctrl":true,"super":true,"click_count":2}"#;
+        let frame: AttachClientFrame =
+            serde_json::from_str(future_wire).expect("unknown fields must be ignored");
+        match frame {
+            AttachClientFrame::Mouse {
+                shift, alt, ctrl, ..
+            } => assert_eq!((shift, alt, ctrl), (true, true, true)),
+            other => panic!("expected a mouse frame, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_hello_roundtrip() {

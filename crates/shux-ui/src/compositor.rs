@@ -20,6 +20,33 @@ use crate::buffer::{FrameBuffer, RenderAttrs, RenderCell};
 use crate::render::RenderBackend;
 use crate::statusbar::StatusBar;
 
+/// Whether the 1-cell outline ring is actually drawn for `content`.
+///
+/// Suppressed below a 3x3 content area, where the inset would leave a pane with
+/// no cells, and when zoomed, so the pane fills the window (matching tmux).
+pub(crate) fn borders_visible(content: Rect, style: BorderStyle, zoomed: bool) -> bool {
+    !zoomed && style != BorderStyle::None && content.width >= 3 && content.height >= 3
+}
+
+/// The rect pane layout is computed against, inset by the outline ring when one
+/// is drawn.
+///
+/// Shared with the daemon's attach loop, which hit-tests mouse events against
+/// this same rect: two copies of this rule skew clicks by a cell under
+/// `border_style = "none"`, and that style hot-reloads.
+pub fn pane_viewport(content: Rect, style: BorderStyle, zoomed: bool) -> Rect {
+    if borders_visible(content, style, zoomed) {
+        Rect::new(
+            content.x + 1,
+            content.y + 1,
+            content.width - 2,
+            content.height - 2,
+        )
+    } else {
+        content
+    }
+}
+
 /// Statistics from the last render pass, used for performance monitoring
 /// against the PRD section 14.1 budget (p50 <= 8ms).
 #[derive(Debug, Clone)]
@@ -418,29 +445,9 @@ impl<W: Write> RenderCompositor<W> {
         let content = self.content_rect();
         self.buffer.clear_current();
 
-        // The outer 1-cell ring is reserved for the border outline when
-        // borders are enabled. Pane content lives strictly inside this
-        // ring so the outline never overdraws the first/last column or
-        // first/last row of any pane.
         let zoomed = frame.zoom.is_some();
-        // Borders need at least a 3x3 content area (1 cell of inset on
-        // each side leaves a 1-cell pane). Below that, suppress borders
-        // entirely — drawing the outline would overwrite the pane's
-        // only column/row.
-        let borders_on = !zoomed
-            && self.config.border_style != BorderStyle::None
-            && content.width >= 3
-            && content.height >= 3;
-        let pane_viewport = if borders_on {
-            Rect::new(
-                content.x + 1,
-                content.y + 1,
-                content.width - 2,
-                content.height - 2,
-            )
-        } else {
-            content
-        };
+        let borders_on = borders_visible(content, self.config.border_style, zoomed);
+        let pane_viewport = pane_viewport(content, self.config.border_style, zoomed);
 
         // 1. Compute pane rects.
         // When zoomed: only the zoomed pane is shown filling the content

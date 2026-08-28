@@ -252,6 +252,11 @@ pub(crate) async fn snapshot_window(
     .await;
     const STATUS_BAR_ROWS: u16 = 1;
 
+    // Compose with the user's outline style: `compose` derives the pane viewport
+    // from it, so a hardcoded style crops panes under `border_style = "none"`.
+    // Read here, before `spawn_blocking` takes the closure.
+    let border_style = shux_ui::BorderStyle::parse(&config.current().appearance.border_style);
+
     let (img, png_buf) = tokio::task::spawn_blocking(move || {
         let panes: std::collections::HashMap<
             shux_core::model::PaneId,
@@ -279,7 +284,7 @@ pub(crate) async fn snapshot_window(
             &inputs,
             cols,
             rows,
-            shux_ui::BorderStyle::Rounded,
+            border_style,
             shux_ui::BorderColors::default(),
             STATUS_BAR_ROWS,
         );
@@ -472,6 +477,28 @@ pub(crate) fn snapshot_font_key(cfg: &shux_core::config::Config) -> SnapshotFont
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `shux-pty` declares a cell box to pane children but cannot depend on
+    /// `shux-raster`; this crate depends on both, so this is where they are held
+    /// to one number. Built through `build_snapshot_rasterizer`, not a restated
+    /// `14.0`, so it also fails if the default font or font size moves.
+    #[test]
+    fn declared_pty_cell_box_matches_the_default_snapshot_rasterizer() {
+        let rasterizer = build_snapshot_rasterizer(&Config::default())
+            .expect("default config must build a rasterizer");
+        let (w, h) = rasterizer.cell_size();
+        // `try_from`, not `as`: an `as` cast truncates 65545 to 9 and passes.
+        let measured = (
+            u16::try_from(w).expect("cell width fits u16"),
+            u16::try_from(h).expect("cell height fits u16"),
+        );
+        assert_eq!(
+            shux_pty::DECLARED_CELL_PIXELS,
+            measured,
+            "the cell box shux declares to pane children has drifted from the \
+             one the default snapshot rasterizer actually renders"
+        );
+    }
     use shux_core::config::{Config, ConfigHandle, SegmentDef, StatusBarConfig};
     use shux_core::graph::SessionGraphSnapshot;
     use shux_core::model::{Pane, Session, Window};
