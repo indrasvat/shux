@@ -256,21 +256,24 @@ fn nothing_is_answered() {
         b"\x1b_Ga=T,f=32,s=1,v=1,i=1;AAAA\x1b\\",
         b"\x1b_Ga=T,i=1,I=2;AAAA\x1b\\",
         b"\x1b_Ga=Z,i=1;AAAA\x1b\\",
-        // The support-detection idiom: a query and a device-attributes request
-        // in ONE read. An application that gets a graphics answer here concludes
-        // shux does graphics; it must get only the DA1 reply.
-        b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c",
     ] {
-        let replies = vt.process_with_responses(command);
-        let joined = String::from_utf8_lossy(&replies.concat()).into_owned();
         assert!(
-            !joined.contains("\x1b_G"),
-            "shux answered a graphics command it cannot honour: {command:?} -> {joined:?}"
+            vt.process_with_responses(command).is_empty(),
+            "shux answered a graphics command it cannot honour: {command:?}"
         );
     }
 
-    // Positive control: this driver DOES surface replies when one is owed.
-    assert!(!vt.process_with_responses(b"\x1b[c").is_empty());
+    // The support-detection idiom: a graphics query and a device-attributes
+    // request in ONE read. An application that gets any graphics answer here
+    // concludes shux does graphics; it must get the DA1 answer and nothing
+    // else. Asserted as an exact equality rather than "contains no APC",
+    // which would admit any other unexpected reply.
+    let combined = vt.process_with_responses(b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c");
+    assert_eq!(
+        combined.concat(),
+        b"\x1b[?62;1;2;6;9;15;22c".to_vec(),
+        "the DA1 answer must be the whole of it"
+    );
 }
 
 /// An APC must not disturb the pen, and this must be checked on a stream that

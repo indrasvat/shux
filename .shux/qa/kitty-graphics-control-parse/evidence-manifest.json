@@ -1,0 +1,19 @@
+{
+  "scope": "kitty-graphics-control-parse",
+  "base": "7d1b716",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-substitution.md",
+  "dootsabha_implementation": "council-substitution.md",
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-apc-120x40.json",
+    "pixel-apc-80x24.json",
+    "pixel-colour-120x40.json",
+    "pixel-colour-80x24.json",
+    "pixel-tui-btop.json",
+    "pixel-tui-lazygit.json",
+    "pixel-tui-nvim.json",
+    "pixel-tui-vicaya.json",
+    "pixel-tui-vivecaka.json"
+  ]
+}
