@@ -137,10 +137,15 @@ uv run --script "${repo_root}/.shux/scripts/lib/png_not_blank.py" \
 compare() {
   local what="$1" suffix="$2"
   local metric="${metric_out}/pixel-render-parity-${border_style}-${what}.json"
-  uv run --script "${repo_root}/.claude/automations/pixel_verify.py" \
-    "${out_dir}/head${suffix}.png" "${out_dir}/base${suffix}.png" \
-    --diff "${out_dir}/render-parity-${border_style}-${what}-diff.png" \
-    --max-pixel-diff-ratio 0 --max-mean-channel-delta 0 >"${metric}"
+  # Repo-RELATIVE paths, run from the repo root. The comparator records the
+  # paths it was handed, and this JSON is committed as durable evidence: an
+  # absolute path into a gitignored scratch dir on the machine that produced it
+  # points at nothing anyone reviewing the PR can open.
+  ( cd "${repo_root}" && uv run --script .claude/automations/pixel_verify.py \
+      ".shux/out/issue-174/pixel/head${suffix}.png" \
+      ".shux/out/issue-174/pixel/base${suffix}.png" \
+      --diff ".shux/out/issue-174/pixel/render-parity-${border_style}-${what}-diff.png" \
+      --max-pixel-diff-ratio 0 --max-mean-channel-delta 0 ) >"${metric}"
   printf '    %-7s ' "${what}"
   python3 - "${metric}" <<'PY'
 import json, sys
