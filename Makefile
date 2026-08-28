@@ -139,6 +139,10 @@ setup-nextest: ## Install cargo-nextest (pre-built binary; seconds, not minutes)
 setup-bench: ## Install hyperfine, the benchmark harness `make bench-test-suite` uses
 	@bash scripts/ensure-hyperfine.sh
 
+.PHONY: setup-deny
+setup-deny: ## Install cargo-deny (pre-built binary; seconds, not minutes)
+	@bash scripts/ensure-deny.sh
+
 .PHONY: check-ci-parity
 check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's environment (colour on)
 	@bash scripts/check-ci-parity.sh
@@ -179,7 +183,7 @@ install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, hyperfine, 
 	@echo "$(COLOR_BLUE)▶ Installing dev tools...$(COLOR_RESET)"
 	@bash scripts/ensure-nextest.sh
 	cargo install cargo-llvm-cov --locked
-	cargo install cargo-deny --locked
+	@bash scripts/ensure-deny.sh
 	@bash scripts/ensure-hyperfine.sh
 	cargo install lefthook --locked || npm i -g lefthook
 	@echo "$(COLOR_GREEN)✓ Dev tools installed$(COLOR_RESET)"
@@ -720,8 +724,12 @@ ci-strict: nextest-ready ## Force latest stable toolchain, then run fmt+clippy+b
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ ci-strict passed against $$(rustc +stable --version)$(COLOR_RESET)"
 	@echo ""
 
+.PHONY: deny-ready
+deny-ready:
+	@bash scripts/ensure-deny.sh
+
 .PHONY: deny
-deny: ## Run license/advisory audit (strict)
+deny: deny-ready ## Run license/advisory audit (strict)
 	@echo "$(COLOR_BLUE)▶ Running cargo-deny...$(COLOR_RESET)"
 	@cargo deny check
 	@echo "$(COLOR_GREEN)✓ Audit passed$(COLOR_RESET)"
