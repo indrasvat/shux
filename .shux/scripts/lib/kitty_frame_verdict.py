@@ -164,6 +164,9 @@ def load_geometry(path: Path) -> GeometryFile:
             for name, value in size.items():
                 if value < 1:
                     raise BadGeometry(f"{where}: {name} must be at least 1, got {value}")
+            status_rows = int(phase.get("status_rows", 1))
+            if status_rows < 0:
+                raise BadGeometry(f"{where}: status_rows cannot be negative, got {status_rows}")
             if block["row1"] < block["row0"] or block["col1"] < block["col0"]:
                 raise BadGeometry(f"{where}: block rect is inside out: {block}")
             if min(block.values()) < 0:
@@ -178,7 +181,7 @@ def load_geometry(path: Path) -> GeometryFile:
                     window_h=size["window.h"],
                     pane_cols=size["pane.cols"],
                     pane_rows=size["pane.rows"],
-                    status_rows=int(phase.get("status_rows", 1)),
+                    status_rows=status_rows,
                     block=block,
                     frames=[Path(str(f)) for f in frames],
                     require_image=bool(phase.get("require_image", False)),
@@ -191,6 +194,14 @@ def load_geometry(path: Path) -> GeometryFile:
         if len(probes) != 3:
             raise BadGeometry(f"probe_rgb must list three colours, got {len(probes)}")
 
+        # Floors, because a negative here is a broken input that still computes:
+        # measured, `status_rows: -1` came out as a `grid` failure and
+        # `tolerance: -5` as a `chrome` one — both exit 1, both blaming shux's
+        # rendering for a bad number in a file this rig wrote.
+        tolerance = int(raw.get("tolerance", DEFAULT_TOLERANCE))
+        if tolerance < 0:
+            raise BadGeometry(f"tolerance cannot be negative, got {tolerance}")
+
         return GeometryFile(
             border_rgb=_rgb(raw["border_rgb"], "border_rgb"),
             status_rgb=_rgb(raw["status_rgb"], "status_rgb"),
@@ -200,7 +211,7 @@ def load_geometry(path: Path) -> GeometryFile:
             background_rgb=_rgb(raw["background_rgb"], "background_rgb"),
             probe_rgb=probes,
             scenario=str(raw.get("scenario", "plain")),
-            tolerance=int(raw.get("tolerance", DEFAULT_TOLERANCE)),
+            tolerance=tolerance,
             phases=phases,
         )
     except BadGeometry:

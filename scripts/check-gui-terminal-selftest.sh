@@ -300,6 +300,15 @@ json.dump(run, open(sys.argv[2], "w"))
     expect 2 "dropping two colour probes is a broken input" "three colours" \
         "${verdict}" --geometry "${work}/one_probe.json"
 
+    python3 -c '
+import json, sys
+run = json.load(open(sys.argv[1]))
+run["phases"][0]["status_rows"] = -1
+json.dump(run, open(sys.argv[2], "w"))
+' "${contained_out}/run.json" "${work}/neg_status.json"
+    expect 2 "a negative row count is a broken input" "cannot be negative" \
+        "${verdict}" --geometry "${work}/neg_status.json"
+
     # An injected phase judged against a frame from BEFORE the injection: the
     # image the phase promises is simply not there. Without this case nothing
     # exercises `require_image`, and an injection that silently never happened

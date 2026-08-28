@@ -31,17 +31,13 @@ fi
 cargo_bin="${CARGO_HOME:-${HOME}/.cargo}/bin"
 mkdir -p "${cargo_bin}"
 
-if [ -x "${cargo_bin}/cargo-deny" ]; then
-  # Present but possibly invisible: a child script cannot put this directory on
-  # the parent make process's PATH, so callers that probe for it would report it
-  # missing right after we "succeeded". Say where it is.
-  case ":${PATH}:" in
-    *":${cargo_bin}:"*) ;;
-    *) echo "note: cargo-deny is installed at ${cargo_bin}/cargo-deny, which is not on PATH." >&2
-       echo "      Add it to PATH, or invoke it by absolute path." >&2 ;;
-  esac
-  exit 0
-fi
+# No "installed but not on PATH" branch, unlike the sibling scripts: this is a
+# cargo SUBCOMMAND, and cargo searches ${CARGO_HOME}/bin for `cargo-*` itself.
+# Measured — with that directory stripped from PATH, `command -v cargo-deny`
+# fails and `cargo deny --version` still prints 0.20.2. So the probe above is
+# already the question the caller asks, and a branch that exited 0 merely
+# because a file exists would be reporting success after that probe had failed:
+# a stale or wrong-architecture binary would sail straight through it.
 
 # Pinned, not `latest`: an unpinned audit tool means a push can start failing on
 # a morning when nothing in this repo changed. Bump it deliberately.
