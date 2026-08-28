@@ -149,4 +149,46 @@ if [ "${orphan_guard_status}" -eq 0 ]; then
 fi
 
 assert_no_new_orphan_automation_processes "${orphan_baseline}"
+
+# An orphaned X server or GUI terminal — the shapes the issue #175 rig owns.
+#
+# Before `Xvfb`/`kitty` were added to the orphan allowlist this was a silent
+# hole: measured, a leaked Xvfb with its cwd inside this repo and no controlling
+# tty matched neither branch of `orphan_candidate_pids`, so the guard reported
+# success while the server ran on, holding its display number for good.
+#
+# The leak is a COPY of `sleep` named `Xvfb`, not a real X server. `ps -o comm=`
+# reports the executable's basename, which is the whole of what the guard matches
+# on, so the copy exercises the real matching path — and this case then runs on a
+# machine with no X server installed, which is most of them.
+xvfb_shim_dir="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-xvfb.XXXXXX")"
+cp "$(command -v sleep)" "${xvfb_shim_dir}/Xvfb"
+
+set +e
+.shux/scripts/no_leak_guard.sh python3 - "${xvfb_shim_dir}/Xvfb" <<'XVFBLEAK'
+import subprocess
+import sys
+import time
+
+subprocess.Popen(
+    [sys.argv[1], "60"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+    close_fds=True,
+)
+time.sleep(0.25)
+sys.exit(0)
+XVFBLEAK
+xvfb_guard_status=$?
+set -e
+rm -rf "${xvfb_shim_dir}"
+
+if [ "${xvfb_guard_status}" -eq 0 ]; then
+  echo "no_leak_guard did not fail for an intentionally orphaned X server" >&2
+  exit 1
+fi
+
+assert_no_new_orphan_automation_processes "${orphan_baseline}"
 echo "shux leak guard self-test passed"

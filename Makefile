@@ -344,6 +344,21 @@ test-vt-grapheme: release ## Drive shux grapheme storage visual/pixel automation
 	@.shux/scripts/no_leak_guard.sh .shux/scripts/grapheme_check.sh
 	@echo "$(COLOR_GREEN)✓ VT grapheme storage automation passed$(COLOR_RESET)"
 
+# Deliberately NOT in `make check` or `make ci`: this needs an X server and a GUI
+# terminal, and it costs minutes. Image work and emit-path changes invoke it.
+# docs/agents/visual-testing.md says what it can and cannot see.
+.PHONY: test-gui-terminal-selftest
+test-gui-terminal-selftest: release ## Prove the GUI-terminal rig can FAIL (kitty + Xvfb; ~1 min)
+	@echo "$(COLOR_BLUE)▶ Proving the GUI-terminal rig can fail...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash scripts/check-gui-terminal-selftest.sh
+	@echo "$(COLOR_GREEN)✓ GUI-terminal rig self-test passed$(COLOR_RESET)"
+
+.PHONY: test-gui-terminal
+test-gui-terminal: test-gui-terminal-selftest ## Photograph shux in a real GUI terminal (kitty + Xvfb)
+	@echo "$(COLOR_BLUE)▶ Running the GUI-terminal rig...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_check.sh --scenario plain
+	@echo "$(COLOR_GREEN)✓ GUI-terminal rig passed$(COLOR_RESET)"
+
 .PHONY: test-vt-dec-special-graphics
 test-vt-dec-special-graphics: release ## Drive DEC special graphics visual/pixel automation
 	@echo "$(COLOR_BLUE)▶ Running VT DEC special graphics automation...$(COLOR_RESET)"

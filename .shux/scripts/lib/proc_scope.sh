@@ -80,13 +80,19 @@ shux_daemon_pids() {
 # never fired — that branch was dead and the guard was weaker than it read. Compare the
 # BASENAME, and require the working directory to be inside this repo so a concurrent
 # session in another checkout is never a candidate.
+#
+# `Xvfb`/`kitty` are here for the GUI-terminal rig (issue #175), the first automation in
+# this tree to own processes that are neither a shell nor a shux binary. They were
+# invisible: measured, an orphaned Xvfb with its cwd inside the repo and a tty of `?`
+# matched neither branch, so `no_leak_guard.sh` reported success while the X server ran
+# on — and each leaked server holds a display number for good.
 orphan_candidate_pids() {
   ps -axo pid=,ppid=,tty=,comm= |
     awk '
       $2 == 1 {
         n = split($4, parts, "/")
         base = parts[n]
-        if ($3 ~ /^(ttys|pts\/)/ || base ~ /^(sh|bash|zsh|fish|sleep|yes|python|python[0-9.]*|node|cargo|shux)$/) {
+        if ($3 ~ /^(ttys|pts\/)/ || base ~ /^(sh|bash|zsh|fish|sleep|yes|python|python[0-9.]*|node|cargo|shux|Xvfb|kitty)$/) {
           print $1
         }
       }
