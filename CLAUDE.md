@@ -26,6 +26,7 @@ make deny               # license + advisory audit
 make check-vt-qa        # VT-touching diffs carry tracked QA evidence
 make check-test-groups  # nextest groups still bound what they claim
 make shellcheck         # every tracked shell script (the guards live in shell)
+make test-gui-terminal  # what a REAL GUI terminal (kitty/Xvfb) draws from shux's output
 make install / hooks    # install binary / lefthook hooks
 ```
 
@@ -135,6 +136,13 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   before/after proof, replay recorded PTY bytes through both versions and compare grids.
 - **Open the artifact.** A valid PNG of the right size can be blank. Assert on content,
   never on "file exists".
+- **shux cannot audit its own emit path by rendering it itself.** `shux-raster` clips
+  while compositing, so anything shux EMITS to an outer terminal — image placement,
+  cursor positioning, synchronized-output framing, DA/DSR replies — is never drawn by
+  one in any shux-rendered check. An image that spilled 160-252 px past the pane border
+  and over the status bar passed every gate for exactly this reason. `make
+  test-gui-terminal` photographs kitty under Xvfb; `docs/agents/visual-testing.md` says
+  what it can and cannot see.
 - **Verify counts before reporting them.**
 - **A probe for a defect must not be subject to that defect.** On #174 the probe for
   an echo-satisfied wait used a needle its own echo satisfied, and reported a good

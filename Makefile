@@ -139,6 +139,10 @@ setup-nextest: ## Install cargo-nextest (pre-built binary; seconds, not minutes)
 setup-bench: ## Install hyperfine, the benchmark harness `make bench-test-suite` uses
 	@bash scripts/ensure-hyperfine.sh
 
+.PHONY: setup-deny
+setup-deny: ## Install cargo-deny (pre-built binary; seconds, not minutes)
+	@bash scripts/ensure-deny.sh
+
 .PHONY: check-ci-parity
 check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's environment (colour on)
 	@bash scripts/check-ci-parity.sh
@@ -179,7 +183,7 @@ install-tools: ## Install dev dependencies (nextest, llvm-cov, deny, hyperfine, 
 	@echo "$(COLOR_BLUE)▶ Installing dev tools...$(COLOR_RESET)"
 	@bash scripts/ensure-nextest.sh
 	cargo install cargo-llvm-cov --locked
-	cargo install cargo-deny --locked
+	@bash scripts/ensure-deny.sh
 	@bash scripts/ensure-hyperfine.sh
 	cargo install lefthook --locked || npm i -g lefthook
 	@echo "$(COLOR_GREEN)✓ Dev tools installed$(COLOR_RESET)"
@@ -343,6 +347,21 @@ test-vt-grapheme: release ## Drive shux grapheme storage visual/pixel automation
 	@echo "$(COLOR_BLUE)▶ Running VT grapheme storage automation...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh .shux/scripts/grapheme_check.sh
 	@echo "$(COLOR_GREEN)✓ VT grapheme storage automation passed$(COLOR_RESET)"
+
+# Deliberately NOT in `make check` or `make ci`: this needs an X server and a GUI
+# terminal, and it costs minutes. Image work and emit-path changes invoke it.
+# docs/agents/visual-testing.md says what it can and cannot see.
+.PHONY: test-gui-terminal-selftest
+test-gui-terminal-selftest: release ## Prove the GUI-terminal rig can FAIL (kitty + Xvfb; ~1 min)
+	@echo "$(COLOR_BLUE)▶ Proving the GUI-terminal rig can fail...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash scripts/check-gui-terminal-selftest.sh
+	@echo "$(COLOR_GREEN)✓ GUI-terminal rig self-test passed$(COLOR_RESET)"
+
+.PHONY: test-gui-terminal
+test-gui-terminal: test-gui-terminal-selftest ## Photograph shux in a real GUI terminal (kitty + Xvfb)
+	@echo "$(COLOR_BLUE)▶ Running the GUI-terminal rig...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_check.sh --scenario plain
+	@echo "$(COLOR_GREEN)✓ GUI-terminal rig passed$(COLOR_RESET)"
 
 .PHONY: test-vt-dec-special-graphics
 test-vt-dec-special-graphics: release ## Drive DEC special graphics visual/pixel automation
@@ -705,8 +724,12 @@ ci-strict: nextest-ready ## Force latest stable toolchain, then run fmt+clippy+b
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ ci-strict passed against $$(rustc +stable --version)$(COLOR_RESET)"
 	@echo ""
 
+.PHONY: deny-ready
+deny-ready:
+	@bash scripts/ensure-deny.sh
+
 .PHONY: deny
-deny: ## Run license/advisory audit (strict)
+deny: deny-ready ## Run license/advisory audit (strict)
 	@echo "$(COLOR_BLUE)▶ Running cargo-deny...$(COLOR_RESET)"
 	@cargo deny check
 	@echo "$(COLOR_GREEN)✓ Audit passed$(COLOR_RESET)"
