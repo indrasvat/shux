@@ -20,11 +20,15 @@
 //! removes the class outright, and costs nothing: terminal-browser probes
 //! `t=f`/`t=s` and falls back to inline transmit anyway.
 //!
-//! ## Why nothing is answered yet
+//! ## Why nothing is answered
 //!
-//! The design plan's D11 says to refuse the file transports *in a reply*. That
-//! is right only once shux can draw. The protocol makes any reply an
-//! advertisement of support:
+//! shux emits no graphics reply at all, and that is a deliberate match to
+//! kitty rather than a gap. kitty's `REPORT_ERROR` is log-only (`graphics.c:28`)
+//! and every parse failure in `parse-graphics-command.h` follows it with a bare
+//! `return`, so a malformed command produces no wire response there either.
+//!
+//! It is also the safe default while shux cannot draw. The protocol treats any
+//! response as an advertisement of support:
 //!
 //! > If you get back a response to the graphics query, the terminal emulator
 //! > supports the protocol, if you get back a response to the device attributes
@@ -32,12 +36,20 @@
 //! > -- `graphics-protocol.rst`, "Querying support and available transmission
 //! > mediums"
 //!
-//! An **error** response is still a response. A client that receives one
-//! concludes shux does graphics, stops using its text fallback, and transmits
-//! into a terminal with no renderer -- a blank pane where there used to be
-//! readable output. So [`error_reply`] is built and tested here, and deliberately
-//! not emitted: the replies switch on with the renderer, in one change, so
-//! support is advertised exactly when it is real.
+//! An **error** is still a response. A client that receives one concludes shux
+//! does graphics, abandons its text fallback, and transmits into a terminal
+//! with no renderer -- a blank pane where there used to be readable output.
+//! The replies, and the `q=` verbosity rules that gate them, belong with the
+//! renderer that makes them true.
+//!
+//! ## Where shux is deliberately laxer than kitty
+//!
+//! kitty discards a whole command when any key it knows carries a malformed
+//! value -- `o=`, `d=`, `f=`, `m=`, `S=`, `z=`, `p=`. shux reads five keys and
+//! acts on none of the rest, so validating them here would be knowledge with no
+//! consumer. The store that reads a payload must validate `m=` in particular:
+//! a garbage chunking key is a dropped command in kitty and would otherwise be
+//! a live transfer here.
 
 /// What the application asked the terminal to do.
 ///
@@ -101,115 +113,62 @@ impl Transport {
             _ => None,
         }
     }
-
-    /// The medium named in the refusal, so an operator reading a pane's traffic
-    /// can tell which probe was answered.
-    fn describe(self) -> &'static str {
-        match self {
-            Transport::Direct => "direct",
-            Transport::File => "file",
-            Transport::TempFile => "temporary file",
-            Transport::SharedMemory => "shared memory",
-        }
-    }
-}
-
-/// How much the application wants to hear back (`q=`).
-///
-/// Honouring this is not politeness. A reply the application did not ask for
-/// arrives on its stdin mid-parse; kitty's own relay clients set `q=2` so they
-/// can stop reading. Thresholds are `graphics.c:927` --
-/// `if (g->quiet) { if (is_ok_response || g->quiet > 1) return NULL; }` -- so
-/// anything at or above 2 is silent, not just the literal `2`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Verbosity {
-    /// `q=0`, the default -- report successes and errors.
-    #[default]
-    All,
-    /// `q=1` -- suppress success, still report errors.
-    ErrorsOnly,
-    /// `q>=2` -- say nothing at all.
-    Silent,
-}
-
-impl Verbosity {
-    fn parse(value: &[u8]) -> Option<Self> {
-        match number(value)? {
-            0 => Some(Verbosity::All),
-            1 => Some(Verbosity::ErrorsOnly),
-            _ => Some(Verbosity::Silent),
-        }
-    }
-
-    fn allows_error(self) -> bool {
-        self != Verbosity::Silent
-    }
 }
 
 /// A parsed control block. Payload bytes are deliberately not held here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Command {
     pub(crate) action: Action,
-    pub(crate) transport: Transport,
-    /// `i=` -- chosen by the APPLICATION, so it is unique only within one pane.
-    pub(crate) image_id: u32,
-    /// `I=` -- image NUMBER, an alternative addressing scheme. Distinct from
-    /// `i=`, echoed separately in a reply, and zero when unused.
-    pub(crate) image_number: u32,
-    pub(crate) verbosity: Verbosity,
 }
 
-/// Why a command was rejected.
+/// Why a command was refused. No reply is built from it -- see the module docs
+/// -- so it carries the reason and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Rejection {
-    pub(crate) image_id: u32,
-    pub(crate) image_number: u32,
-    pub(crate) reason: Reason,
-    /// Carried from the request: a refusal the application asked not to hear
-    /// about is still not sent.
-    pub(crate) verbosity: Verbosity,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Reason {
+pub(crate) enum Rejection {
     /// A transport shux will not implement.
     UnsupportedTransport(Transport),
     /// Animation, in any of its three actions.
     UnsupportedAnimation,
-    /// The control block named an action that is not in the protocol.
+    /// `i=` and `I=` together. `graphics-protocol.rst:839` makes this an error
+    /// the terminal must not act on, and kitty checks it before the action
+    /// switch and before any transport work (`graphics.c:2568`).
+    BothIdAndNumber,
+    /// The control block is not one this protocol can express.
     Malformed,
 }
 
-impl Rejection {
-    /// The kitty-protocol message half: a code, a colon, and prose.
-    fn message(&self) -> String {
-        match &self.reason {
-            Reason::UnsupportedTransport(transport) => format!(
-                "ENOTSUPPORTED:{} transport is refused; retransmit inline (t=d)",
-                transport.describe()
-            ),
-            Reason::UnsupportedAnimation => {
-                "ENOTSUPPORTED:animation is not implemented".to_string()
-            }
-            Reason::Malformed => "EINVAL:could not parse the graphics control block".to_string(),
-        }
-    }
-}
-
-/// Split `key=value` pairs out of a control block.
+/// Split the control block into `key=value` pairs.
 ///
-/// Unknown keys are skipped rather than rejected: the protocol grows, and a
-/// terminal that fails a whole command over one unrecognised key is worse for
-/// the application than one that ignores it. Keys are single characters in this
-/// protocol, so anything longer is skipped too.
-fn pairs(control: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
-    control.split(|b| *b == b',').filter_map(|part| {
-        let mut it = part.splitn(2, |b| *b == b'=');
-        match (it.next(), it.next()) {
-            (Some([key]), Some(value)) => Some((*key, value)),
-            _ => None,
-        }
-    })
+/// A token that is not exactly `<single byte>=<value>` fails the whole command.
+/// kitty's generated parser treats an unreadable key as fatal -- an invalid key
+/// character and a key not followed by `=` both `return`
+/// (`parse-graphics-command.h:91-101`) -- and skipping them instead made
+/// `a=T,` + a space + `t=f` parse as an ordinary direct transmission, so a
+/// single stray byte defeated the recognition the file-transport refusal is
+/// keyed on.
+///
+/// Unknown SINGLE-CHARACTER keys are still skipped, which IS laxer than kitty.
+/// That is deliberate: the protocol grows by adding keys, and failing a whole
+/// command over one shux has not learned about yet is worse for the application
+/// than ignoring it.
+fn pairs(control: &[u8]) -> Result<Vec<(u8, &[u8])>, Rejection> {
+    // An empty control block is the protocol's own default command, not a
+    // malformed one: `a` defaults to `t` and `t` to `d`.
+    if control.is_empty() {
+        return Ok(Vec::new());
+    }
+    control
+        .split(|b| *b == b',')
+        .map(|part| {
+            let mut it = part.splitn(2, |b| *b == b'=');
+            match (it.next(), it.next()) {
+                (Some([key]), Some(value)) => Ok((*key, value)),
+                // A trailing or doubled comma yields an empty token. kitty's
+                // AFTER_VALUE state rejects that too.
+                _ => Err(Rejection::Malformed),
+            }
+        })
+        .collect()
 }
 
 /// Read one unsigned protocol integer, matching kitty's generated parser
@@ -234,9 +193,9 @@ fn number(value: &[u8]) -> Option<u32> {
 
 /// Read one APC body's command half (everything after the leading `G`).
 pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
-    // The payload half is deliberately dropped: nothing in this change reads
-    // image bytes, and for a refused transport those bytes are a filesystem
-    // path. The store that consumes payloads brings its own bounds with it.
+    // The payload half is deliberately dropped: nothing here reads image bytes,
+    // and for a refused transport those bytes are a filesystem path. The store
+    // that consumes payloads brings its own bounds with it.
     let control = match command.iter().position(|b| *b == b';') {
         Some(i) => &command[..i],
         None => command,
@@ -246,10 +205,9 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
     let mut transport = Transport::Direct;
     let mut image_id = 0;
     let mut image_number = 0;
-    let mut verbosity = Verbosity::default();
     let mut malformed = false;
 
-    for (key, value) in pairs(control) {
+    for (key, value) in pairs(control)? {
         match key {
             b'a' => action = Some(Action::parse(value)),
             b't' => match Transport::parse(value) {
@@ -266,84 +224,38 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
                 Some(n) => image_number = n,
                 None => malformed = true,
             },
-            b'q' => match Verbosity::parse(value) {
-                Some(v) => verbosity = v,
-                None => malformed = true,
-            },
             _ => {}
         }
     }
 
-    let reject = |reason| {
-        Err(Rejection {
-            image_id,
-            image_number,
-            reason,
-            verbosity,
-        })
-    };
-
-    if malformed {
-        return reject(Reason::Malformed);
+    // Refuse the file-backed media FIRST, before any other verdict can claim
+    // the command. A rejection that does not name the transport leaves a caller
+    // unable to tell that the payload it holds is a path rather than image
+    // data, so this must not sit behind any check that could return a
+    // different reason.
+    if transport != Transport::Direct {
+        return Err(Rejection::UnsupportedTransport(transport));
     }
 
-    // Refuse the file-backed media before anything looks at the payload, which
-    // for those transports is a PATH. Ordering is load-bearing: behind any check
-    // that could return a different error, a future caller could read the path
-    // believing it had merely failed to parse.
-    if transport != Transport::Direct {
-        return reject(Reason::UnsupportedTransport(transport));
+    if malformed {
+        return Err(Rejection::Malformed);
+    }
+
+    if image_id != 0 && image_number != 0 {
+        return Err(Rejection::BothIdAndNumber);
     }
 
     // `a` defaults to `t` (control data reference). A continuation chunk carries
     // only `m=` and payload, and lands on that same default.
     match action {
-        Some(Some(Action::Animation)) => return reject(Reason::UnsupportedAnimation),
-        Some(None) => return reject(Reason::Malformed),
+        Some(Some(Action::Animation)) => return Err(Rejection::UnsupportedAnimation),
+        Some(None) => return Err(Rejection::Malformed),
         _ => {}
     }
-    let action = action.flatten().unwrap_or(Action::Transmit);
 
     Ok(Command {
-        action,
-        transport,
-        image_id,
-        image_number,
-        verbosity,
+        action: action.flatten().unwrap_or(Action::Transmit),
     })
-}
-
-/// Build the `APC G ... ST` reply for a rejection.
-///
-/// `None` means "send nothing", which the protocol requires in two distinct
-/// cases, both from `graphics.c:924-948`:
-///
-/// * the application asked for silence (`q>=2`); and
-/// * **the command carried neither `i=` nor `I=`** -- kitty's
-///   `if (g->id || g->image_number) { ...respond... } return NULL;`. A reply to
-///   an unaddressed command is unsolicited data on the application's stdin,
-///   which it has no reason to be reading.
-///
-/// Not wired to the wire yet -- see the module docs on why replying at all has
-/// to wait for the renderer.
-pub(crate) fn error_reply(rejection: &Rejection) -> Option<Vec<u8>> {
-    if !rejection.verbosity.allows_error() {
-        return None;
-    }
-    if rejection.image_id == 0 && rejection.image_number == 0 {
-        return None;
-    }
-    let mut keys = String::new();
-    if rejection.image_id != 0 {
-        keys.push_str(&format!("i={}", rejection.image_id));
-    }
-    if rejection.image_number != 0 {
-        if !keys.is_empty() {
-            keys.push(',');
-        }
-        keys.push_str(&format!("I={}", rejection.image_number));
-    }
-    Some(format!("\x1b_G{keys};{}\x1b\\", rejection.message()).into_bytes())
 }
 
 #[cfg(test)]
@@ -360,19 +272,20 @@ mod tests {
 
     #[test]
     fn reads_a_direct_transmit_and_place() {
-        let command = ok(b"a=T,f=32,s=10,v=20,i=7,t=d;PAYLOAD");
-        assert_eq!(command.action, Action::TransmitAndPlace);
-        assert_eq!(command.transport, Transport::Direct);
-        assert_eq!(command.image_id, 7);
+        assert_eq!(
+            ok(b"a=T,f=32,s=10,v=20,i=7,t=d;PAYLOAD").action,
+            Action::TransmitAndPlace
+        );
     }
 
     /// Both defaults come from the protocol's control data reference: `a`
     /// defaults to `t`, `t` defaults to `d`.
     #[test]
     fn the_protocol_defaults_are_transmit_and_direct() {
-        let command = ok(b"f=32,s=1,v=1;PAY");
-        assert_eq!(command.action, Action::Transmit);
-        assert_eq!(command.transport, Transport::Direct);
+        assert_eq!(ok(b"f=32,s=1,v=1;PAY").action, Action::Transmit);
+        // `t` defaulting to direct is observable only through what is NOT
+        // refused, now that `Command` no longer carries the transport.
+        assert!(parse(b"f=32,s=1,v=1;PAY").is_ok());
     }
 
     /// The security case. All three file-backed media are refused, and the
@@ -387,9 +300,55 @@ mod tests {
             (b"a=T,t=t,i=2;L3RtcC94", Transport::TempFile),
             (b"a=T,t=s,i=3;L3NobS94", Transport::SharedMemory),
         ] {
+            assert_eq!(refused(control), Rejection::UnsupportedTransport(transport));
+        }
+    }
+
+    /// The refusal must survive a command whose OTHER keys are bad, or the
+    /// rejection loses the one fact a caller needs: that the payload it holds
+    /// is a filesystem path rather than image data.
+    ///
+    /// A block too broken to tokenise is the exception, and it is covered in
+    /// `a_malformed_token_fails_the_command_rather_than_being_skipped`.
+    #[test]
+    fn a_file_transport_is_refused_as_such_even_when_the_block_is_also_malformed() {
+        for control in [
+            b"a=T,t=f,i=1,q=nope;L2V0Yy9wYXNzd2Q=".as_slice(),
+            b"a=T,t=f,i=1,I=99999999999;L2V0Yy9wYXNzd2Q=",
+            b"a=T,t=f,i=99999999999;L2V0Yy9wYXNzd2Q=",
+        ] {
             assert_eq!(
-                refused(control).reason,
-                Reason::UnsupportedTransport(transport)
+                refused(control),
+                Rejection::UnsupportedTransport(Transport::File),
+                "refusal lost the transport for {control:?}"
+            );
+        }
+    }
+
+    /// A stray byte must not turn a named file medium into an ordinary direct
+    /// transmission. kitty's parser treats the space as fatal to the command
+    /// (`parse-graphics-command.h:91`); skipping the token instead let
+    /// `a=T, t=f` through as `Direct`.
+    #[test]
+    fn a_malformed_token_fails_the_command_rather_than_being_skipped() {
+        for control in [
+            b"a=T, t=f,i=1;L2V0Yy9wYXNzd2Q=".as_slice(),
+            b"a=T,\tt=f,i=1;L2V0Yy9wYXNzd2Q=",
+            b"a=T,tt=f,i=1;L2V0Yy9wYXNzd2Q=",
+            b"a=T,junk,i=3;PAY",
+            b"a=T,,i=3;PAY",
+            // A structurally broken token beats the transport refusal, because
+            // the block cannot be read far enough to know a medium was named.
+            // Safe, and it matches kitty, which discards at the bad token
+            // without ever reaching `t=`. The security property is not "the
+            // refusal names the medium" but "the payload is never read as a
+            // path", and a malformed command is discarded whole.
+            b"a=T,t=f,junk,i=1;L2V0Yy9wYXNzd2Q=",
+        ] {
+            assert_eq!(
+                refused(control),
+                Rejection::Malformed,
+                "token shape accepted for {control:?}"
             );
         }
     }
@@ -399,74 +358,37 @@ mod tests {
     #[test]
     fn all_three_animation_actions_are_unsupported_not_malformed() {
         for control in [b"a=f,i=1;D".as_slice(), b"a=a,i=1;D", b"a=c,i=1;D"] {
-            assert_eq!(refused(control).reason, Reason::UnsupportedAnimation);
+            assert_eq!(refused(control), Rejection::UnsupportedAnimation);
         }
+    }
+
+    /// `graphics-protocol.rst:839` -- "Specifying both `i` and `I` keys in any
+    /// command is an error." kitty checks it at `graphics.c:2568`, before the
+    /// action switch and before any transport work.
+    #[test]
+    fn specifying_both_an_image_id_and_an_image_number_is_an_error() {
+        assert_eq!(refused(b"a=T,i=1,I=2;D"), Rejection::BothIdAndNumber);
+        // Either alone is fine, and zero means "unset" for both.
+        assert!(parse(b"a=T,i=1;D").is_ok());
+        assert!(parse(b"a=T,I=2;D").is_ok());
+        assert!(parse(b"a=T,i=0,I=2;D").is_ok());
+        assert!(parse(b"a=T,i=1,I=0;D").is_ok());
     }
 
     #[test]
     fn an_action_outside_the_protocol_is_malformed() {
-        assert_eq!(refused(b"a=Z,i=8;PAY").reason, Reason::Malformed);
-        assert_eq!(refused(b"a=,i=8;PAY").reason, Reason::Malformed);
+        assert_eq!(refused(b"a=Z,i=8;PAY"), Rejection::Malformed);
+        assert_eq!(refused(b"a=,i=8;PAY"), Rejection::Malformed);
     }
 
     #[test]
     fn an_unknown_transport_is_malformed() {
-        assert_eq!(refused(b"a=T,t=zz,i=8;PAY").reason, Reason::Malformed);
-    }
-
-    /// A refusal must be attributed, or an application juggling several
-    /// transmissions cannot tell which one failed.
-    #[test]
-    fn a_refusal_names_the_medium_and_the_request() {
-        let reply = error_reply(&refused(b"a=T,t=f,i=4242;cGF0aA==")).expect("must answer");
-        let reply = String::from_utf8(reply).unwrap();
-        assert!(reply.starts_with("\x1b_Gi=4242;"), "{reply:?}");
-        assert!(reply.ends_with("\x1b\\"), "unterminated: {reply:?}");
-        assert!(reply.contains("ENOTSUPPORTED"), "{reply:?}");
-        assert!(reply.contains("file transport"), "{reply:?}");
-    }
-
-    /// `graphics.c:940-941` prints `i=` then `,I=` -- a client addressing by
-    /// image number needs its number back or it cannot match the reply.
-    #[test]
-    fn a_reply_echoes_whichever_addressing_the_request_used() {
-        let by_number = error_reply(&refused(b"a=T,t=f,I=13;cA==")).unwrap();
-        assert!(
-            String::from_utf8(by_number)
-                .unwrap()
-                .starts_with("\x1b_GI=13;")
-        );
-
-        let by_both = error_reply(&refused(b"a=T,t=f,i=99,I=13;cA==")).unwrap();
-        assert!(
-            String::from_utf8(by_both)
-                .unwrap()
-                .starts_with("\x1b_Gi=99,I=13;")
-        );
-    }
-
-    /// `graphics.c:931` -- `if (g->id || g->image_number)`, else no response.
-    /// An unaddressed command gets silence, or the terminal is writing
-    /// unsolicited bytes onto an application's stdin.
-    #[test]
-    fn an_unaddressed_command_is_never_answered() {
-        assert_eq!(error_reply(&refused(b"a=T,t=f;cGF0aA==")), None);
-        assert_eq!(error_reply(&refused(b"a=T,t=f,i=0,I=0;cGF0aA==")), None);
-    }
-
-    /// `graphics.c:927` -- `if (is_ok_response || g->quiet > 1) return NULL`.
-    /// At or above 2, not merely equal to it.
-    #[test]
-    fn quiet_at_or_above_two_suppresses_even_a_refusal() {
-        assert_eq!(error_reply(&refused(b"a=T,t=f,i=1,q=2;cA==")), None);
-        assert_eq!(error_reply(&refused(b"a=T,t=f,i=1,q=7;cA==")), None);
-        assert!(error_reply(&refused(b"a=T,t=f,i=1,q=1;cA==")).is_some());
-        assert!(error_reply(&refused(b"a=T,t=f,i=1,q=0;cA==")).is_some());
+        assert_eq!(refused(b"a=T,t=zz,i=8;PAY"), Rejection::Malformed);
     }
 
     #[test]
-    fn unknown_keys_are_skipped_not_rejected() {
-        assert_eq!(ok(b"a=T,zz=9,X=1,i=3;PAY").image_id, 3);
+    fn unknown_single_character_keys_are_skipped_not_rejected() {
+        assert!(parse(b"a=T,W=1,X=9,i=3;PAY").is_ok());
     }
 
     /// Only the first chunk of a transmission carries `a=`; continuations
@@ -496,19 +418,18 @@ mod tests {
         // shux would act on a command kitty discards.
         assert_eq!(number(b"00000000001"), None, "eleven digits");
         assert_eq!(number(b"0000000001"), Some(1), "ten digits, zero-padded");
-        assert_eq!(refused(b"a=T,i=00000000001;PAY").reason, Reason::Malformed);
+        assert_eq!(refused(b"a=T,i=00000000001;PAY"), Rejection::Malformed);
 
         // A bad integer discards the whole command; it does not default the key.
-        assert_eq!(refused(b"a=T,i=99999999999;PAY").reason, Reason::Malformed);
-        assert_eq!(refused(b"a=T,q=nope;PAY").reason, Reason::Malformed);
+        assert_eq!(refused(b"a=T,i=99999999999;PAY"), Rejection::Malformed);
     }
 
     #[test]
     fn degenerate_control_blocks_do_not_panic() {
         assert_eq!(parse(b"").map(|c| c.action), Ok(Action::Transmit));
         assert_eq!(parse(b";").map(|c| c.action), Ok(Action::Transmit));
-        assert_eq!(parse(b",,,").map(|c| c.action), Ok(Action::Transmit));
-        assert_eq!(parse(b"=").map(|c| c.action), Ok(Action::Transmit));
-        assert_eq!(parse(b"a").map(|c| c.action), Ok(Action::Transmit));
+        assert_eq!(parse(b"a").map(|c| c.action), Err(Rejection::Malformed));
+        assert_eq!(parse(b"=").map(|c| c.action), Err(Rejection::Malformed));
+        assert_eq!(parse(b",,,").map(|c| c.action), Err(Rejection::Malformed));
     }
 }

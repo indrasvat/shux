@@ -109,8 +109,11 @@ pub struct VirtualTerminal {
     pub(crate) dispatched_graphics: Vec<Vec<u8>>,
     /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
     apc_cut_slicing: bool,
-    /// Graphics commands seen on this terminal, and what was done with them.
-    graphics: graphics::GraphicsState,
+    /// Graphics commands this terminal declined: an unimplemented transport,
+    /// animation, or a control block outside the protocol. The only externally
+    /// visible trace of the graphics path, and the witness that the scanner is
+    /// wired at all -- see `graphics_refusals`.
+    graphics_refusals: u64,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
     /// open. Shared by reference with every [`sync::Presented`] wrapper handed
     /// to the parser, which is why it is a cell rather than a plain `bool`;
@@ -252,7 +255,7 @@ impl VirtualTerminal {
             #[cfg(test)]
             dispatched_graphics: Vec::new(),
             apc_cut_slicing: true,
-            graphics: graphics::GraphicsState::default(),
+            graphics_refusals: 0,
             sync_armed: std::sync::atomic::AtomicBool::new(false),
             frozen_grid: None,
             frozen_cursor: None,
@@ -290,19 +293,16 @@ impl VirtualTerminal {
         self.apc_cut_slicing = enabled;
     }
 
-    /// Answer refused graphics commands on the wire.
+    /// How many graphics commands this terminal has declined.
     ///
-    /// Off everywhere in this change, and deliberately so. The protocol makes a
-    /// reply an advertisement of support -- "if you get back a response to the
-    /// graphics query, the terminal emulator supports the protocol" -- and an
-    /// error is a response. Switching this on before shux can draw would move
-    /// applications off their text fallback and onto a transmit path that
-    /// renders nothing, turning readable output into a blank pane. It exists so
-    /// the refusal path is exercised by tests rather than merely written, and it
-    /// is what the renderer flips.
+    /// shux answers nothing on the wire, so without this a refusal is
+    /// indistinguishable from a command that was never located -- which is
+    /// exactly the gap that let a whole neutrality suite pass against a scanner
+    /// gutted to find nothing. Read-only: there is no switch here that could
+    /// make shux advertise graphics support it cannot honour.
     #[doc(hidden)]
-    pub fn set_graphics_replies(&mut self, enabled: bool) {
-        self.graphics.replies_enabled = enabled;
+    pub fn graphics_refusals(&self) -> u64 {
+        self.graphics_refusals
     }
 
     /// Turn retired-buffer recycling (issue #106) off or on.
@@ -495,30 +495,29 @@ impl VirtualTerminal {
         self.parser.advance(&mut handler, bytes);
     }
 
-    // Wiring RIS to the image store: clear the store, never the scanner.
-    // See `a_ris_does_not_swallow_an_apc_that_starts_after_it_in_the_same_read`.
-
     /// Act on one kitty graphics command.
     ///
     /// `body` is the payload between `ESC _` and the terminator. Non-`G` APCs
     /// are discarded, exactly as vte discards every APC today.
-    fn dispatch_graphics(&mut self, body: &[u8], responses: &mut Vec<Vec<u8>>) {
+    /// Act on one kitty graphics command.
+    ///
+    /// Takes only the counter it updates, never `&mut self`. `advance_slice`
+    /// routes every write to the grid, cursor, title and default colours
+    /// through [`sync::Presented`], which snapshots live to frozen on the first
+    /// write inside a `CSI ?2026h` window; this runs BETWEEN slices, so a
+    /// `&mut self` here would reach those fields unwrapped and leak into a
+    /// frame that is supposed to be held still. Nothing needs that access
+    /// today, and the signature is what keeps it that way when the renderer
+    /// lands.
+    fn dispatch_graphics(refusals: &mut u64, body: &[u8], #[cfg(test)] seen: &mut Vec<Vec<u8>>) {
         let Some(command) = body.strip_prefix(b"G") else {
             return;
         };
         #[cfg(test)]
-        self.dispatched_graphics.push(command.to_vec());
+        seen.push(command.to_vec());
 
-        match graphics::kitty::parse(command) {
-            Ok(command) => self.graphics.record(command.action),
-            Err(rejection) => {
-                self.graphics.refused = self.graphics.refused.saturating_add(1);
-                if self.graphics.replies_enabled
-                    && let Some(reply) = graphics::kitty::error_reply(&rejection)
-                {
-                    responses.push(reply);
-                }
-            }
+        if graphics::kitty::parse(command).is_err() {
+            *refusals = refusals.saturating_add(1);
         }
     }
 
@@ -562,9 +561,10 @@ impl VirtualTerminal {
         let mut responses = Vec::new();
 
         // Locate APCs but never remove them: vte gets every byte and only its
-        // `advance` calls are cut, so the text path stays bit-identical by
-        // construction. See the [`graphics::apc`] module docs for why stripping
-        // cannot be made correct. Cutting at the boundary also places each
+        // `advance` calls are cut. See the [`graphics::apc`] module docs for why
+        // stripping cannot be made correct, and for why cutting is neutral --
+        // which is a property of where the cuts land, NOT of vte being
+        // chunk-insensitive, because it is not. Cutting at the boundary places each
         // command at its true stream position -- a placement anchors at the
         // cursor as it stands there, and replies queue in request order.
         let cuts = if self.apc_cut_slicing {
@@ -578,7 +578,14 @@ impl VirtualTerminal {
             let mut at = 0;
             for cut in cuts {
                 self.advance_slice(&bytes[at..cut.end], &mut responses);
-                self.dispatch_graphics(&cut.body, &mut responses);
+                #[cfg(test)]
+                Self::dispatch_graphics(
+                    &mut self.graphics_refusals,
+                    &cut.body,
+                    &mut self.dispatched_graphics,
+                );
+                #[cfg(not(test))]
+                Self::dispatch_graphics(&mut self.graphics_refusals, &cut.body);
                 at = cut.end;
             }
             self.advance_slice(&bytes[at..], &mut responses);

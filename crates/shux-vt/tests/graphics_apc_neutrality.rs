@@ -13,23 +13,30 @@
 //! The alphabet is weighted toward bytes that make a naive splitter diverge:
 //! `ESC`, `CAN`, `SUB`, the string introducers `_ X ^ P ]`, and ST's `\`.
 //!
-//! Those bytes are not exotic. Counted over the five committed rich-TUI
-//! fixtures: `btop` carries 1,902 `ESC`, `lazygit` 1,010 (and 10 `\`), `nvim`
-//! 760, `vicaya` 747 (and 19 `_`), `vivecaka` 87. The fast path needs
-//! `Ground` AND no `ESC` in the chunk, and btop emits one every ~20 bytes, so
-//! every real rich-TUI read takes `scan_slow`. The generated alphabet is
-//! therefore representative of the hot path, not a synthetic worst case.
+//! Real rich TUIs emit `ESC` constantly -- the committed `btop` capture carries
+//! one every ~20 bytes -- and the fast path needs `Ground` AND no `ESC` in the
+//! chunk, so every real read takes `scan_slow`. The alphabet is weighted to
+//! match the hot path, not to be a synthetic worst case.
 
 use proptest::prelude::*;
-use shux_vt::VirtualTerminal;
+use shux_vt::{FrameEnvelope, MaskSet, VirtualTerminal};
 
 /// Everything a pane can observe about a terminal after feeding it bytes.
+///
+/// `frame` is the load-bearing field: it carries each cell's foreground,
+/// background, flags and extended attributes. Comparing characters alone lets
+/// an attribute-only divergence through, which is what CLAUDE.md's colour-probe
+/// rule exists to stop. The rest are the other channels a future
+/// `dispatch_graphics` could disturb the presented frame through.
 #[derive(Debug, PartialEq, Eq)]
 struct Observable {
-    text: String,
-    cursor: (usize, usize, bool),
+    frame: String,
+    scrollback: String,
+    cursor: String,
     title: Option<String>,
     alt_screen: bool,
+    scroll_region: String,
+    content_revision: u64,
     responses: Vec<Vec<u8>>,
 }
 
@@ -44,12 +51,14 @@ fn drive_with(chunks: &[&[u8]], slicing: bool) -> Observable {
     for chunk in chunks {
         responses.extend(vt.process_with_responses(chunk));
     }
-    let cursor = vt.cursor();
     Observable {
-        text: vt.capture_text(None),
-        cursor: (cursor.row, cursor.col, cursor.visible),
+        frame: FrameEnvelope::from_terminal(&vt, &MaskSet::new()).to_canonical_json(),
+        scrollback: vt.capture_text(None),
+        cursor: format!("{:?}", vt.cursor()),
         title: vt.title().map(str::to_owned),
         alt_screen: vt.is_alternate_screen(),
+        scroll_region: format!("{:?}", vt.scroll_region()),
+        content_revision: vt.content_revision(),
         responses,
     }
 }
@@ -125,17 +134,17 @@ fn apc_payload_never_reaches_the_grid() {
     let observed = drive(&[
         b"visible-before\r\n\x1b_Ga=T,f=32,s=1,v=1,i=1,q=2;SECRETPAYLOAD\x1b\\visible-after",
     ]);
-    assert!(observed.text.contains("visible-before"));
-    assert!(observed.text.contains("visible-after"));
+    assert!(observed.scrollback.contains("visible-before"));
+    assert!(observed.scrollback.contains("visible-after"));
     assert!(
-        !observed.text.contains("SECRETPAYLOAD"),
+        !observed.scrollback.contains("SECRETPAYLOAD"),
         "APC payload leaked onto the screen: {:?}",
-        observed.text
+        observed.scrollback
     );
     assert!(
-        !observed.text.contains("a=T"),
+        !observed.scrollback.contains("a=T"),
         "APC control data leaked onto the screen: {:?}",
-        observed.text
+        observed.scrollback
     );
 }
 
@@ -160,9 +169,9 @@ fn graphics_queries_are_not_answered_yet() {
 fn text_after_an_apc_interrupted_osc_still_renders() {
     let observed = drive(&[b"\x1b]0;title\x1b_Ga=q;\x1b\\AFTER-OSC"]);
     assert!(
-        observed.text.contains("AFTER-OSC"),
+        observed.scrollback.contains("AFTER-OSC"),
         "text was swallowed: {:?}",
-        observed.text
+        observed.scrollback
     );
 }
 
@@ -215,11 +224,11 @@ fn c1_controls_are_chunk_sensitive_in_vte() {
          `encodes_a_c1_control`, and let the chunking properties cover the range"
     );
     assert!(
-        !whole.text.contains('\u{80}'),
+        !whole.scrollback.contains('\u{80}'),
         "whole-buffer decode executed it"
     );
     assert!(
-        split.text.contains('\u{80}'),
+        split.scrollback.contains('\u{80}'),
         "byte-at-a-time decode printed it"
     );
 }
@@ -232,39 +241,89 @@ fn c1_controls_are_chunk_sensitive_in_vte() {
 /// in an integration test can see `dispatched_graphics`, which is
 /// `#[cfg(test)]` and so belongs to the unit-test build, not this one.
 ///
-/// So: turn the refusals on and observe one on the wire. This is the only
-/// assertion in the file that fails if the scanner stops locating APCs, and it
-/// exercises the shipping library rather than a test-only field.
+/// The refusal counter is the one thing the shipping library exposes that only
+/// moves when an APC was actually located, parsed, and declined.
 #[test]
 fn a_located_command_reaches_the_parser_in_the_shipping_build() {
-    let mut vt = shux_vt::VirtualTerminal::new(24, 80);
-    vt.set_graphics_replies(true);
+    let mut vt = VirtualTerminal::new(24, 80);
+    assert_eq!(vt.graphics_refusals(), 0);
 
-    let responses = vt.process_with_responses(b"\x1b_Ga=T,t=f,i=77;L2V0Yy9wYXNzd2Q=\x1b\\");
-    let joined: Vec<u8> = responses.concat();
-    let reply = String::from_utf8_lossy(&joined);
-
-    assert!(
-        reply.contains("\x1b_Gi=77;") && reply.contains("ENOTSUPPORTED"),
-        "the file transport was not refused on the wire; got {reply:?}"
+    vt.process_with_responses(b"\x1b_Ga=T,t=f,i=77;L2V0Yy9wYXNzd2Q=\x1b\\");
+    assert_eq!(
+        vt.graphics_refusals(),
+        1,
+        "the file transport was not located, parsed and refused"
     );
+
+    // A well-formed direct transmission is not a refusal, so the counter is
+    // measuring the verdict rather than merely counting APCs.
+    vt.process_with_responses(b"\x1b_Ga=T,f=32,s=1,v=1,i=1;AAAA\x1b\\");
+    assert_eq!(vt.graphics_refusals(), 1);
 }
 
-/// ...and by default it stays off, so a pane sees exactly what it sees today.
+/// Nothing is answered, ever. With no reply path in the library this is
+/// structurally true rather than switch-dependent -- there is no longer a
+/// setting that could make shux advertise graphics support it cannot honour.
 ///
-/// This is the half that protects users: any reply at all tells an application
-/// that shux supports the graphics protocol, so it abandons its text fallback.
+/// It matters because the protocol treats ANY response as that advertisement:
+/// an application that gets one abandons its text fallback.
 #[test]
-fn nothing_is_answered_by_default() {
-    let mut vt = shux_vt::VirtualTerminal::new(24, 80);
+fn nothing_is_answered() {
+    let mut vt = VirtualTerminal::new(24, 80);
     for command in [
         b"\x1b_Ga=T,t=f,i=77;L2V0Yy9wYXNzd2Q=\x1b\\".as_slice(),
         b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\",
         b"\x1b_Ga=T,f=32,s=1,v=1,i=1;AAAA\x1b\\",
+        b"\x1b_Ga=T,i=1,I=2;AAAA\x1b\\",
+        b"\x1b_Ga=Z,i=1;AAAA\x1b\\",
     ] {
         assert!(
             vt.process_with_responses(command).is_empty(),
-            "shux answered a graphics command it cannot yet honour: {command:?}"
+            "shux answered a graphics command it cannot honour: {command:?}"
         );
     }
+
+    // Positive control: this driver DOES surface replies when one is owed.
+    assert!(!vt.process_with_responses(b"\x1b[c").is_empty());
+}
+
+/// An APC must not disturb the pen, and this must be checked on a stream that
+/// definitely contains one.
+///
+/// The generated properties above cannot be relied on for this: their alphabet
+/// opens APCs readily but terminates them rarely, so the dispatch seam is
+/// almost never reached in a generated case. Colour in `Observable` is
+/// necessary and not sufficient -- catching a pen change at the seam needs a
+/// deterministic stream that definitely carries a complete
+/// `ESC _ G ... ESC \` between two attributed spans.
+#[test]
+fn a_complete_apc_disturbs_neither_the_pen_nor_the_frame() {
+    // Underline on, text, a complete graphics command, then more text under
+    // the same attribute. Colour probes per CLAUDE.md: truecolor, indexed and
+    // basic all cross the seam.
+    let stream: &[u8] = b"\x1b[4m\x1b[38;2;10;200;30mUNDER\
+\x1b_Ga=T,f=32,s=1,v=1,i=1;AAAA\x1b\\AFTER\
+\x1b[38;5;93mINDEXED\x1b[31mBASIC";
+
+    let sliced = drive(&[stream]);
+    let unsliced = drive_with(&[stream], false);
+    assert_eq!(
+        sliced, unsliced,
+        "a complete APC changed the presented frame"
+    );
+
+    // The assertion above is only worth anything if the APC really was located
+    // and dispatched on the sliced side.
+    let mut vt = VirtualTerminal::new(24, 80);
+    vt.process_with_responses(b"\x1b_Ga=T,t=f,i=1;Lw==\x1b\\");
+    assert_eq!(vt.graphics_refusals(), 1, "the seam was never reached");
+
+    // ...and that the attributes it must preserve are actually in the frame we
+    // compare, rather than being invisible to it the way `capture_text` was.
+    assert!(
+        sliced.frame.contains("200"),
+        "the compared frame carries no truecolor component; it cannot see a \
+         pen change: {}",
+        &sliced.frame[..sliced.frame.len().min(200)]
+    );
 }
