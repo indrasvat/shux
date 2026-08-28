@@ -553,7 +553,13 @@ wait_for_stable_chrome() {
             fail "kitty exited while its chrome was settling: $(cat "${kitty_log}")"
         shot "${probe}"
         status=0
-        now="$("${verdict_py}" --probe "${probe}" --border-rgb "${BORDER_RGB}" 2>/dev/null)" || status=$?
+        now="$("${verdict_py}" --probe "${probe}" --border-rgb "${BORDER_RGB}" 2>"${runtime}/probe.err")" ||
+            status=$?
+        # Exit 2 is a usage error, not "not drawn yet". Retrying it spins out the
+        # whole budget and then reports that shux never drew its chrome.
+        if [ "${status}" -eq 2 ]; then
+            fail "the comparator rejected the probe arguments: $(cat "${runtime}/probe.err")"
+        fi
         if [ "${status}" -eq 0 ] && [ -n "${now}" ] && [ "${now}" = "${last}" ]; then
             return 0
         fi
@@ -562,7 +568,7 @@ wait_for_stable_chrome() {
     done
     if [ -z "${last}" ]; then
         cp -f "${probe}" "${out_dir}/no-chrome.png" 2>/dev/null || true
-        fail "shux's chrome never appeared in the emulator (last frame: ${out_dir}/no-chrome.png)"
+        fail "no border rectangle ever appeared in the emulator — either shux drew no chrome, or the window is larger than the screen and X clipped it (last frame: ${out_dir}/no-chrome.png)"
     fi
     fail "the border rectangle never stopped moving (last: ${last})"
 }
@@ -723,6 +729,15 @@ json.dump({
 echo "▶ verdict"
 verdict_status=0
 "${verdict_py}" --geometry "${geometry_json}" || verdict_status=$?
+# Exit 2 is the comparator saying it could not read the file, which is a broken
+# input and not a rendering defect. Collapsing the two here would throw away the
+# whole point of the distinction: the reader would be told shux painted outside
+# the box because a key was missing from a JSON file this script wrote.
+if [ "${verdict_status}" -eq 2 ]; then
+    echo "✗ gui_terminal_check: ${geometry_json} is not readable by the comparator." >&2
+    echo "  Nothing was judged; this is a rig defect, not a shux one." >&2
+    exit 2
+fi
 if [ "${verdict_status}" -ne 0 ]; then
     fail "gui_terminal_check: the emulator's frames failed the assertions (exit ${verdict_status})"
 fi

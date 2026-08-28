@@ -18,7 +18,8 @@
 #      does not paint, and a phase whose promised image never arrived.
 #   3. A missing tool — no kitty, no ImageMagick, no shux binary, no working
 #      comparator: say so and exit non-zero, never report success for work not
-#      done.
+#      done. A geometry file the comparator cannot read belongs here too, at
+#      exit 2: reporting it as exit 1 blames shux for a broken input.
 #
 # And one the issue does not name: the default `plain` scenario must PASS at all
 # four window sizes. Nothing else exercises `xdotool windowsize` or the wait for
@@ -235,9 +236,14 @@ if mode == "strip-indexed":
     arr[np.abs(arr - target).max(axis=2) <= 60] = [200, 200, 200]
 elif mode == "grey-overflow":
     # #175's actual shape: a real image is a photographic ramp, not a flat
-    # colour. Painted over the pane's bottom border and the status bar.
-    h, w = arr.shape[:2]
-    top, left, tall, wide = h - 130, w - 420, 120, 300
+    # colour. It has to land ON the pane's bottom border and the status bar, so
+    # it is positioned from the BAR's own pixels — offsetting from the frame's
+    # corner puts it on the desktop beyond the window, where it still goes red
+    # but exercises none of the status-bar palette.
+    bar = np.nonzero(
+        (np.abs(arr - np.array(run["status_rgb"])).max(axis=2) <= 8).any(axis=1)
+    )[0]
+    top, left, tall, wide = int(bar.min()) - 60, 40, 120, 300
     ramp = np.linspace(20, 210, wide)[None, :, None] * np.ones((tall, 1, 3))
     ramp += np.random.default_rng(175).integers(-8, 9, (tall, wide, 3))
     arr[top : top + tall, left : left + wide] = np.clip(ramp, 0, 255)
@@ -262,6 +268,37 @@ MUTATOR
         "${work}/grey.png" "${work}/grey.json"
     expect 1 "a greyscale image over the border and status bar is a failure" \
         "containment:foreign" "${verdict}" --geometry "${work}/grey.json"
+
+    # A geometry file the comparator cannot read is a BROKEN INPUT, exit 2, and
+    # must never be reported as a rendering defect. Both shapes below shipped as
+    # tracebacks at exit 1 until an arm existed to notice: a colour that parses
+    # but is the wrong length, and a probe list that is not a list at all.
+    python3 -c '
+import json, sys
+run = json.load(open(sys.argv[1]))
+run["border_rgb"] = [255, 0]
+json.dump(run, open(sys.argv[2], "w"))
+' "${contained_out}/run.json" "${work}/short_rgb.json"
+    expect 2 "a two-element colour is a broken input, not a failed assertion" \
+        "must be three numbers" "${verdict}" --geometry "${work}/short_rgb.json"
+
+    python3 -c '
+import json, sys
+run = json.load(open(sys.argv[1]))
+run["probe_rgb"] = 5
+json.dump(run, open(sys.argv[2], "w"))
+' "${contained_out}/run.json" "${work}/bad_probes.json"
+    expect 2 "an unreadable probe list is a broken input" "TypeError" \
+        "${verdict}" --geometry "${work}/bad_probes.json"
+
+    python3 -c '
+import json, sys
+run = json.load(open(sys.argv[1]))
+run["probe_rgb"] = run["probe_rgb"][:1]
+json.dump(run, open(sys.argv[2], "w"))
+' "${contained_out}/run.json" "${work}/one_probe.json"
+    expect 2 "dropping two colour probes is a broken input" "three colours" \
+        "${verdict}" --geometry "${work}/one_probe.json"
 
     # An injected phase judged against a frame from BEFORE the injection: the
     # image the phase promises is simply not there. Without this case nothing
