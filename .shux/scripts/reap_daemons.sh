@@ -27,9 +27,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 pids=($(shux_daemon_pids))
-# Taken before anything is signalled — see the stranded-children sweep below.
-# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
-baseline_orphans=($(orphan_candidate_pids))
+
+# Children of a pid, listed while it is still their parent.
+child_pids() {
+  ps -axo pid=,ppid= | awk -v parent="$1" '$2 == parent { print $1 }'
+}
 
 if [ "${#pids[@]}" -eq 0 ]; then
   echo "no shux daemons from ${REPO_ROOT} are running"
@@ -38,6 +40,16 @@ fi
 
 for pid in "${pids[@]}"; do
   describe_pid "${pid}"
+done
+
+# Recorded before anything is signalled: SIGKILL destroys the only evidence of who owned
+# these. Once the daemon is gone its panes read as PPID 1, with nothing connecting them
+# to it. See the sweep below.
+daemon_children=()
+for pid in "${pids[@]}"; do
+  for child in $(child_pids "${pid}"); do
+    daemon_children+=("${child}")
+  done
 done
 
 if [ "${dry_run}" -eq 1 ]; then
@@ -66,22 +78,20 @@ fi
 # A daemon too wedged to service SIGTERM is SIGKILLed, and SIGKILL runs none of its pane
 # teardown: its pane children are reparented to init, holding the PTYs the daemon held.
 # Reaping without this turns one leaked daemon into several leaked shells and calls it
-# success — manufacturing precisely what `no_leak_guard.sh` exists to catch. New since
-# the snapshot above, so they are attributable to the reap and to nothing else.
-# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
-after_orphans=($(orphan_candidate_pids))
-# A DAEMON that appeared meanwhile is not stranded by us: shux auto-starts one on first
-# use, so a concurrent command in this checkout mints a PPID-1 shux process with its cwd
-# in the repo — an orphan candidate by every test the sweep applies. Measured: without
-# this the sweep killed that daemon, which is the one thing these guards must never do.
-# shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
-live_daemons=($(shux_daemon_pids))
+# success — manufacturing precisely what `no_leak_guard.sh` exists to catch.
+#
+# Attribution is LINEAGE, not timing. "Appeared between two snapshots" is not ownership:
+# anything else in this checkout that orphans a process during the reap window looks
+# identical, and since shux auto-starts a daemon on first use, a concurrent command mints
+# one that passes every test a timing sweep applies — measured, an earlier version of
+# this killed exactly that. Each pid below was a child of a daemon we stopped, and is an
+# orphan now because we stopped it.
 stranded=()
 set +u
-for pid in "${after_orphans[@]}"; do
+for pid in "${daemon_children[@]:-}"; do
   [ -n "${pid}" ] || continue
-  pid_in_list "${pid}" "${baseline_orphans[@]:-}" && continue
-  pid_in_list "${pid}" "${live_daemons[@]:-}" && continue
+  pid_is_gone "${pid}" && continue
+  [ "$(ps -p "${pid}" -o ppid= 2>/dev/null | tr -d '[:space:]')" = "1" ] || continue
   stranded+=("${pid}")
 done
 set -u

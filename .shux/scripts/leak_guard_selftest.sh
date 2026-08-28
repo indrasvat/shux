@@ -350,6 +350,67 @@ if names_pid "${baseline_pid}" "$(shux_daemon_pids)"; then
 fi
 stop_foreign_daemon
 
+# The stranded-child sweep is the most destructive code in the reaper, so it is exercised
+# for REAL — but only once the daemons this test made are gone and no other daemon of this
+# checkout is running, so a real reap cannot reach a concurrent session's work.
+if [ -z "$(shux_daemon_pids)" ]; then
+  wedge_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-wedge.XXXXXX")"
+  bystander_needle="leak-guard-bystander-$$"
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${wedge_runtime}" "${shux_bin}" --format json \
+    session create leak-guard-wedge-$$ -d -- sh -lc 'sleep 400' >/dev/null
+  wedge_pid="$(cat "${wedge_runtime}/shux/shux.pid")"
+  wedge_children="$(ps -axo pid=,ppid= | awk -v p="${wedge_pid}" '$2 == p { print $1 }')"
+  if [ -z "${wedge_children}" ]; then
+    echo "leak guard self-test: wedged daemon ${wedge_pid} had no pane child to strand" >&2
+    kill -KILL "${wedge_pid}" >/dev/null 2>&1 || true
+    rm -rf "${wedge_runtime}"
+    exit 1
+  fi
+  # Too wedged to service SIGTERM, so the reaper must escalate to SIGKILL — the only path
+  # that strands pane children, because SIGKILL runs none of the daemon's teardown.
+  kill -STOP "${wedge_pid}"
+  # A process this checkout orphans DURING the reap window, owned by nobody the reap
+  # touched. Attribution by "appeared between two snapshots" killed it.
+  #
+  # It reports its own pid: `setsid` forks, so `$!` is a process that has already exited,
+  # and killing that one leaves the real bystander — and its `sleep` — running. Cleanup
+  # signals the whole session `setsid` made, so nothing outlives this block.
+  bystander_pidfile="$(mktemp "${TMPDIR:-/tmp}/shux-leak-guard-bystander.XXXXXX")"
+  # Detached in a subshell so bash does not report our own deliberate kill as a job.
+  (setsid sh -c "echo \$\$ >'${bystander_pidfile}'; sleep 300; : ${bystander_needle}" \
+    >/dev/null 2>&1 &)
+  sleep 0.5
+  bystander_pid="$(cat "${bystander_pidfile}")"
+  rm -f "${bystander_pidfile}"
+
+  set +e
+  .shux/scripts/reap_daemons.sh >/dev/null
+  wedge_reap_status=$?
+  set -e
+  bystander_alive=1
+  pid_is_gone "${bystander_pid}" && bystander_alive=0
+  kill -KILL -- "-${bystander_pid}" >/dev/null 2>&1 || true
+  rm -rf "${wedge_runtime}"
+
+  if [ "${wedge_reap_status}" -ne 0 ]; then
+    echo "reap_daemons.sh failed on a wedged daemon (status ${wedge_reap_status})" >&2
+    exit 1
+  fi
+  for pid in ${wedge_children}; do
+    pid_is_gone "${pid}" && continue
+    echo "reap_daemons.sh left the wedged daemon's pane child running (${pid})" >&2
+    describe_pid "${pid}" >&2
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+    exit 1
+  done
+  if [ "${bystander_alive}" -ne 1 ]; then
+    echo "reap_daemons.sh killed a process it did not strand (${bystander_pid})" >&2
+    exit 1
+  fi
+else
+  echo "note: other daemons from this checkout are running; skipping the reap sweep case" >&2
+fi
+
 # The other half of the contract: with nothing of ours running, the guard says nothing.
 # Only assertable on an empty process table — a concurrent session in this checkout is
 # entitled to its daemon, and warning about that one is the feature working.
