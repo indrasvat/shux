@@ -1073,15 +1073,15 @@ impl<'a> VtHandler<'a> {
             }
             // Focus in/out events.
             1004 => self.modes.focus_events = enable,
-            // UTF-8 mouse coordinate encoding. Recorded so a forwarder can
-            // refuse; `private_mode_report_value` still answers "not
-            // recognized" for it, which stays true -- shux never EMITS it.
+            // UTF-8 mouse coordinates. Tracked, never emitted, so a forwarder
+            // can stand down; the DECRQM answer stays "not recognized", which
+            // remains true. Same for 1015 and 1016 below.
             1005 => self.modes.utf8_mouse = enable,
             // SGR mouse coordinate encoding.
             1006 => self.modes.sgr_mouse = enable,
-            // urxvt mouse coordinate encoding. Recorded, not emitted (1005).
+            // urxvt mouse coordinates.
             1015 => self.modes.urxvt_mouse = enable,
-            // SGR-pixel mouse coordinate encoding. Recorded, not emitted (1005).
+            // SGR-pixel mouse coordinates.
             1016 => self.modes.pixel_mouse = enable,
             // Alternate-scroll: wheel -> arrow keys on the alternate screen.
             1007 => self.modes.alternate_scroll = enable,

@@ -29,7 +29,7 @@ pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
 pub use client::{ClientConfig, ExitReason};
 pub use composed::{ComposeInputs, ComposedFrame, compose};
 pub use compositor::{
-    CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats, borders_visible, pane_viewport,
+    CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats, pane_viewport,
 };
 pub use copy_mode::{
     CopyKey, CopyModeState, handle_key as copy_mode_key,

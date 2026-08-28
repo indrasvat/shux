@@ -585,10 +585,15 @@ async fn outer_terminal_geometry_does_not_reach_the_child() {
 /// Run against the tree before the fix, both lines report `0 0`.
 #[tokio::test]
 async fn winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize() {
-    let Some(python) = which_python() else {
-        eprintln!("skipping: no python3 on PATH");
-        return;
-    };
+    // Not a skip. This is the ONLY test that asserts a child actually reads
+    // non-zero pixels out of `TIOCGWINSZ` -- the whole of the winsize contract.
+    // Skipping it on a machine without python3 would report success for work it
+    // did not do, and leave `make test` green with the feature unverified.
+    let python = which_python().expect(
+        "python3 (or python) is required: this test reads TIOCGWINSZ from inside \
+         the child, and there is no other check that the declared pixel geometry \
+         reaches a pane at all",
+    );
     // Prints the four winsize fields, then polls until the cell geometry
     // actually changes and prints again. Polling rather than sleeping: a fixed
     // sleep races the parent's ioctl and would read the OLD size, manufacturing

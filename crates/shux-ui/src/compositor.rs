@@ -26,7 +26,7 @@ use crate::statusbar::StatusBar;
 /// smaller would leave a pane with no columns, so the outline is suppressed
 /// rather than overdrawing the pane's only cell. Zooming bypasses borders
 /// entirely so the pane really fills the window (matching tmux).
-pub fn borders_visible(content: Rect, style: BorderStyle, zoomed: bool) -> bool {
+pub(crate) fn borders_visible(content: Rect, style: BorderStyle, zoomed: bool) -> bool {
     !zoomed && style != BorderStyle::None && content.width >= 3 && content.height >= 3
 }
 

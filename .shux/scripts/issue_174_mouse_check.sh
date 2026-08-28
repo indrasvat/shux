@@ -25,6 +25,12 @@
 #      for motion. Getting this wrong is invisible until an app mishandles an
 #      event it never subscribed to.
 #   4. a pane whose app did NOT ask for the mouse receives nothing at all
+#   5. the coordinate is right under `appearance.border_style = "none"` too.
+#      The compositor drops the 1-cell outline inset when no outline is drawn,
+#      so the pane starts at the origin and the SAME wire coordinate must come
+#      out one cell further into the pane. The hit-test used to inset
+#      unconditionally, which put every click one cell off under that config
+#      and made the last column and row unreachable.
 #
 # Output: .shux/out/issue-174/mouse/. Gitignored scratch.
 
@@ -54,7 +60,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-sx() { env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" "$@"; }
+# The daemon reads its config from `$XDG_CONFIG_HOME/shux/config.toml`, so the
+# config state is part of the environment every invocation shares.
+config_home="${runtime}/config"
+mkdir -p "${config_home}/shux"
+
+sx() {
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${config_home}" \
+    "${shux_bin}" "$@"
+}
 
 mkdir -p "${out_dir}"
 echo "==> mouse button forwarding: $(${shux_bin} version 2>/dev/null | head -1)"
@@ -98,8 +112,8 @@ attach_and_send() {
   local args=()
   local s
   for s in "$@"; do args+=(--step "${s}"); done
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" TERM=xterm-256color \
-      COLORTERM=truecolor LANG=C.utf8 LC_ALL=C.utf8 \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${config_home}" \
+      TERM=xterm-256color COLORTERM=truecolor LANG=C.utf8 LC_ALL=C.utf8 \
     python3 "${driver}" --cols "${cols}" --rows "${rows}" --log "${log}" \
       --timeout 60 "${args[@]}" \
       -- "${shux_bin}" session attach -s "${session}"
@@ -187,7 +201,41 @@ sx pane capture -s mouse-off -p "${pane_off}" --lines "${rows}" >"${cap_off}"
 sx pane snapshot -s mouse-off -p "${pane_off}" -o "${out_dir}/mouse-off.png" >/dev/null
 expect "no-mouse app gets nothing" "${cap_off}" '^[[<' 0
 
-for c in "${cap_btn}" "${cap_norm}" "${cap_off}"; do
+# ── 5: the same click under `border_style = "none"` ────────────────────────
+#
+# A fresh daemon, because config is read once at daemon start. Sessions are
+# killed FIRST so the array cleanup drains stays accurate -- stopping the daemon
+# out from under live sessions and then clearing the array would leave the exit
+# trap unable to say what it had actually cleaned up.
+for s in "${sessions[@]:-}"; do
+  [ -n "${s}" ] && shux_harness_kill_session "${runtime}" "${shux_bin}" "${s}"
+done
+sessions=()
+shux_harness_stop_daemon "${runtime}"
+shux_harness_assert_no_daemon "${runtime}" || shux_harness_stop_daemon "${runtime}"
+cat >"${config_home}/shux/config.toml" <<'TOML'
+[appearance]
+border_style = "none"
+TOML
+
+start_pane mouse-noborder 1002
+pane_nb="${started_pane}"
+sx pane wait-for -s mouse-noborder -p "${pane_nb}" -t READY --timeout-ms 20000 >/dev/null
+attach_and_send mouse-noborder "${out_dir}/attach-mouse-noborder.log" \
+  'sleep:2.5' 'send:\x1b[<0;11;6M' 'sleep:0.3' 'send:\x1b[<0;11;6m' 'sleep:1.5'
+sx pane wait-settled "${pane_nb}" --quiet 250 --timeout 8000 >/dev/null 2>&1 || true
+cap_nb="${out_dir}/mouse-noborder.txt"
+sx pane capture -s mouse-noborder -p "${pane_nb}" --lines "${rows}" >"${cap_nb}"
+sx pane snapshot -s mouse-noborder -p "${pane_nb}" -o "${out_dir}/mouse-noborder.png" >/dev/null
+
+# Wire (11,6) is screen (10,5) 0-based. With no outline the pane rect starts at
+# (0,0), so the pane-local 1-based cell is (11,6) — one further in than the
+# (10,5) the default outline produces.
+expect "no-outline press"      "${cap_nb}" '^[[<0;11;6M' 1
+expect "no-outline release"    "${cap_nb}" '^[[<0;11;6m' 1
+expect "no-outline not skewed" "${cap_nb}" '^[[<0;10;5M' 0
+
+for c in "${cap_btn}" "${cap_norm}" "${cap_off}" "${cap_nb}"; do
   if ! grep -q 'TRUECOLOR' "${c}"; then
     printf '    %-34s FAIL — colour probe missing from %s\n' "colour probe" "$(basename "${c}")"
     failures=$((failures + 1))

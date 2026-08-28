@@ -27,22 +27,25 @@ cd "${REPO_ROOT}"
 
 ATTACH="crates/shux/src/attach.rs"
 HANDLE="crates/shux-pty/src/handle.rs"
+RPC="crates/shux-rpc/src/attach.rs"
 BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shux-174-mutation-XXXXXX")"
 cp "${ATTACH}" "${BACKUP_DIR}/attach.rs"
 cp "${HANDLE}" "${BACKUP_DIR}/handle.rs"
+cp "${RPC}" "${BACKUP_DIR}/rpc_attach.rs"
 
 restore() {
   cp "${BACKUP_DIR}/attach.rs" "${ATTACH}"
   cp "${BACKUP_DIR}/handle.rs" "${HANDLE}"
+  cp "${BACKUP_DIR}/rpc_attach.rs" "${RPC}"
 }
 trap 'restore; rm -rf "${BACKUP_DIR}"' EXIT
 
 # name | anchor test that must catch it | file | python expression over `s`
 MUTATIONS=(
   # ── Half A: the declared winsize ──────────────────────────────────────────
-  "spawn_declares_no_pixels|winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize|${HANDLE}|s.replace('let winsize = winsize_for(config.size, config.cell_pixels);', 'let winsize = winsize_for(config.size, (0, 0));')"
-  "resize_drops_the_pixels|winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize|${HANDLE}|s.replace('let winsize = winsize_for(new_size, self.cell_pixels);', 'let winsize = winsize_for(new_size, (0, 0));')"
-  "overflow_saturates_instead_of_declaring_nothing|handle::winsize_tests::overflow_declares_nothing_on_both_axes|${HANDLE}|s.replace('        (Some(x), Some(y)) => (x, y),\n        _ => (0, 0),', '        (Some(x), Some(y)) => (x, y),\n        _ => (size.cols.saturating_mul(cell.0), size.rows.saturating_mul(cell.1)),')"
+  "spawn_declares_no_pixels|winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize|${HANDLE}|s.replace('let winsize = winsize_for(config.size);', '''let winsize = Winsize { ws_row: config.size.rows, ws_col: config.size.cols, ws_xpixel: 0, ws_ypixel: 0 };''')"
+  "resize_drops_the_pixels|winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize|${HANDLE}|s.replace('let winsize = winsize_for(new_size);', '''let winsize = Winsize { ws_row: new_size.rows, ws_col: new_size.cols, ws_xpixel: 0, ws_ypixel: 0 };''')"
+  "overflow_saturates_instead_of_declaring_nothing|handle::winsize_tests::overflow_declares_nothing_on_both_axes|${HANDLE}|s.replace('        (Some(x), Some(y)) => (x, y),\n        _ => (0, 0),', '        (Some(x), Some(y)) => (x, y),\n        _ => (size.cols.saturating_mul(cell_w), size.rows.saturating_mul(cell_h)),')"
   "the_axes_can_disagree|handle::winsize_tests::overflow_declares_nothing_on_both_axes|${HANDLE}|s.replace('        (Some(x), Some(y)) => (x, y),\n        _ => (0, 0),', '        (x, y) => (x.unwrap_or(0), y.unwrap_or(u16::MAX)),')"
 
   # ── Half B: the encoder ───────────────────────────────────────────────────
@@ -62,7 +65,7 @@ MUTATIONS=(
   "shift_stops_reserving_the_mouse|attach::tests::shift_hands_the_click_back_to_shux|${ATTACH}|s.replace('    if shift {\n        return AppMouseRoute::Shux;\n    }', '')"
   "a_stray_drag_opens_a_gesture|attach::tests::a_drag_with_no_gesture_in_flight_is_not_the_apps|${ATTACH}|s.replace('    if action != ButtonAction::Press {\n        return AppMouseRoute::Shux;\n    }', '')"
   "the_wheel_is_stolen_from_handle_wheel|attach::tests::the_wheel_is_never_taken_from_handle_wheel|${ATTACH}|s.replace('        MouseKind::ScrollUp | MouseKind::ScrollDown | MouseKind::Move => {\n            return Ok(AppMouse::NotHandled);\n        }', '        MouseKind::ScrollUp | MouseKind::ScrollDown | MouseKind::Move => ButtonAction::Drag,')"
-  "the_pane_hit_test_falls_back_to_the_focused_pane|attach::tests::a_click_on_the_status_bar_never_reaches_a_zoomed_app|${ATTACH}|s.replace('    let inside = col >= rect.x\n        && col < rect.x + rect.width\n        && row >= rect.y\n        && row < rect.y + rect.height;', '    let inside = true;')"
+  "the_pane_hit_test_falls_back_to_the_focused_pane|attach::tests::a_click_on_the_status_bar_never_reaches_a_zoomed_app|${ATTACH}|s.replace('    let inside =\n        col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height;', '    let inside = true;')"
   "a_dropped_press_still_opens_a_gesture|attach::tests::a_dropped_press_does_not_open_a_gesture|${ATTACH}|s.replace('    if !forward_bytes_to_pane(io_state, pane_id, bytes).await {', '    if false {')"
   "an_abandoned_gesture_leaves_the_app_button_held|attach::tests::abandoning_a_gesture_synthesizes_the_release_the_app_is_waiting_for|${ATTACH}|s.replace('        if let Some(bytes) = encode_mouse_report(cb, true, sgr, last.0, last.1) {\n            forward_bytes_to_pane(io_state, pane_id, bytes).await;\n        }', '')"
   "a_multi_button_gesture_ends_on_the_first_release|attach::tests::app_gesture_ends_only_when_every_button_is_up|${ATTACH}|s.replace('    *buttons = if bit != 0 && *buttons & bit != 0 {\n        *buttons & !bit\n    } else {\n        0\n    };', '    *buttons = 0;')"
@@ -71,8 +74,15 @@ MUTATIONS=(
   "a_stale_selection_survives_a_forwarded_click|attach::tests::forwarding_a_press_clears_a_stale_shux_selection|${ATTACH}|s.replace('        if s.mouse_selection.is_some() || s.copy_menu.is_some() {\n            s.mouse_selection = None;\n            s.copy_menu = None;\n            redraw = true;\n        }', '')"
   "coordinates_stay_screen_global|attach::tests::a_click_in_a_second_pane_is_local_to_that_pane_and_focuses_it|${ATTACH}|s.replace('    let local_col = col\n        .saturating_sub(rect.x)', '    let local_col = col\n        .saturating_sub(0)')"
 
+  # ── The wire ──────────────────────────────────────────────────────────────
+  "an_older_clients_mouse_frame_stops_parsing|attach::tests::a_mouse_frame_without_modifiers_still_deserializes|${RPC}|s.replace('        #[serde(default)]\n        shift: bool,', '        shift: bool,')"
+
   # ── The pane viewport shared with the compositor ───────────────────────────
-  "the_hit_test_insets_even_without_an_outline|attach::tests::the_pane_hit_test_agrees_with_the_compositor_under_every_border_style|${ATTACH}|s.replace('    shux_ui::pane_viewport(\n        current_content_rect(client_size).await,\n        border_style,\n        false,\n    )', '''    let (cols, rows) = *client_size.lock().await;\n    let content_h = rows.saturating_sub(STATUS_BAR_ROWS);\n    if cols >= 3 && content_h >= 3 {\n        Rect::new(1, 1, cols - 2, content_h - 2)\n    } else {\n        Rect::new(0, 0, cols, content_h)\n    }''')"
+  "the_hit_test_insets_even_without_an_outline|attach::tests::the_pane_hit_test_agrees_with_the_compositor_under_every_border_style|${ATTACH}|s.replace('    shux_ui::pane_viewport(current_content_rect(client_size).await, border_style, false)', '''    let _ = border_style;\n    let (cols, rows) = *client_size.lock().await;\n    let content_h = rows.saturating_sub(STATUS_BAR_ROWS);\n    if cols >= 3 && content_h >= 3 {\n        Rect::new(1, 1, cols - 2, content_h - 2)\n    } else {\n        Rect::new(0, 0, cols, content_h)\n    }''')"
+  # The defect that actually shipped: not the arithmetic, but the plumbing --
+  # a cached style that the render loop only republished ON CHANGE, so a user
+  # configured `none` who never edited it kept the default forever.
+  "the_hit_test_ignores_the_configured_style|attach::tests::the_pane_hit_test_agrees_with_the_compositor_under_every_border_style|${ATTACH}|s.replace('    let border_style = BorderStyle::parse(&config.current().appearance.border_style);', '    let border_style = BorderStyle::default();')"
 )
 
 # `RUSTFLAGS=-Awarnings`, pinned for the WHOLE battery including the baseline.
@@ -85,6 +95,7 @@ run_suite() {
   export RUSTFLAGS=-Awarnings
   case "$1" in
     "${HANDLE}") make -s test-mutation-suite CRATE=shux-pty TARGET= FILTER= 2>&1 || true ;;
+    "${RPC}") make -s test-mutation-suite CRATE=shux-rpc TARGET=--lib FILTER=attach::tests 2>&1 || true ;;
     *) make -s test-mutation-suite CRATE=shux TARGET=--lib FILTER=attach::tests 2>&1 || true ;;
   esac
 }
@@ -97,7 +108,7 @@ has_run() { printf '%s\n' "$1" | grep -q '^test result:'; }
 
 declare -A BASELINE
 echo "Baseline (unmutated):"
-for f in "${HANDLE}" "${ATTACH}"; do
+for f in "${HANDLE}" "${RPC}" "${ATTACH}"; do
   log="$(run_suite "${f}")"
   if ! has_run "${log}"; then
     echo "  ${f}: cargo never ran the tests — build or harness failure, not a result." >&2

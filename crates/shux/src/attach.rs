@@ -405,16 +405,6 @@ struct AttachedSession {
     /// `welcome_toast_seen: true` via the OnboardingHandle so the next
     /// attach skips the toast.
     show_welcome_toast: bool,
-    /// The outline style the render loop most recently composed with.
-    ///
-    /// Mouse hit-testing has to agree with the frame the user is looking at:
-    /// the compositor insets the pane viewport by one cell only when the
-    /// outline is actually drawn, so with `appearance.border_style = "none"`
-    /// an unconditional inset puts every click one cell off and makes the last
-    /// column and row unreachable. The style hot-reloads, so it is carried here
-    /// rather than re-read per event -- the renderer writes it when it changes,
-    /// and every hit-test reads what was last drawn.
-    border_style: BorderStyle,
 }
 
 /// Find a session by name, or create it (with one window + one pane) if
@@ -451,10 +441,6 @@ async fn resolve_or_create_session(
             // time by reading the onboarding state file; this stays
             // true here so the render loop can flip it off after dwell.
             show_welcome_toast: true,
-            // Corrected by the render loop on its first frame, from the
-            // live config. Any hit-test before that first frame has no
-            // frame to disagree with.
-            border_style: BorderStyle::default(),
         })
     };
 
@@ -528,7 +514,6 @@ async fn resolve_or_create_session(
         copy_menu: None,
         last_action: None,
         show_welcome_toast: true,
-        border_style: BorderStyle::default(),
     })
 }
 
@@ -812,6 +797,7 @@ async fn run_attach_loop(
                                     active_pane,
                                     &attached_clone,
                                     &client_size,
+                                    &config,
                                 )
                                 .await;
                                 let action = {
@@ -935,6 +921,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &cancel,
                         )
                         .await;
@@ -1009,6 +996,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &mouse_drag,
                             &mut selection_drag,
                         )
@@ -1032,6 +1020,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &out_tx,
                             &mut selection_drag,
                         )
@@ -1050,6 +1039,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &out_tx,
                             &mut selection_drag,
                         )
@@ -1069,6 +1059,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                         )
                         .await?
                         {
@@ -1085,6 +1076,7 @@ async fn run_attach_loop(
                             &io_state,
                             &render_session,
                             &client_size,
+                            &config,
                             &mut mouse_drag,
                         )
                         .await
@@ -1258,11 +1250,7 @@ async fn run_render_loop(
         let live_cfg = config.current();
         if live_cfg.appearance.border_style != last_border_style {
             last_border_style = live_cfg.appearance.border_style.clone();
-            let parsed = BorderStyle::parse(&last_border_style);
-            compositor.set_border_style(parsed);
-            // Publish it: mouse hit-testing insets the pane viewport by the
-            // same rule, and must use the value THIS frame was composed with.
-            session.lock().await.border_style = parsed;
+            compositor.set_border_style(BorderStyle::parse(&last_border_style));
         }
         let live_theme = shux_core::theme::Theme::resolve(&live_cfg.theme);
         if live_theme != last_theme {
@@ -1300,7 +1288,7 @@ async fn run_render_loop(
         };
         let copy_overlay = if let Some(ref cm) = attached.copy_mode {
             let content = current_content_rect(&client_size).await;
-            let viewport = current_viewport(&client_size, attached.border_style).await;
+            let viewport = current_viewport(&client_size, &config).await;
             let rect = if win.layout.is_zoomed() {
                 Some(content)
             } else {
@@ -1318,7 +1306,7 @@ async fn run_render_loop(
                 theme: live_theme,
             })
         } else if let Some(selection) = attached.mouse_selection.as_ref() {
-            pane_rect_for(&graph, &attached, &client_size, selection.pane_id)
+            pane_rect_for(&graph, &attached, &client_size, &config, selection.pane_id)
                 .await
                 .map(|rect| CopyOverlayStamp {
                     kind: CopyOverlayKind::MouseSelection,
@@ -1760,6 +1748,7 @@ async fn handle_mouse_selection(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     out_tx: &mpsc::Sender<AttachServerFrame>,
     drag: &mut SelectionDrag,
 ) -> anyhow::Result<bool> {
@@ -1782,7 +1771,8 @@ async fn handle_mouse_selection(
                         .filter(|selection| selection.pane_id == menu.pane_id);
                     if let Some(selection) = selection {
                         if let Some(rect) =
-                            pane_rect_for(graph, &attached, client_size, selection.pane_id).await
+                            pane_rect_for(graph, &attached, client_size, config, selection.pane_id)
+                                .await
                         {
                             let copied = yank_selection(
                                 selection.pane_id,
@@ -1820,7 +1810,7 @@ async fn handle_mouse_selection(
 
     match (kind, button) {
         (MouseKind::Down, ProtoMouseButton::Left) => {
-            let viewport = current_viewport(client_size, attached.border_style).await;
+            let viewport = current_viewport(client_size, config).await;
             let snap = graph.snapshot();
             let Some(win) = snap.windows.get(&attached.active_window_id) else {
                 return Ok(false);
@@ -1860,7 +1850,8 @@ async fn handle_mouse_selection(
             let SelectionDrag::MouseSelection { pane_id } = *drag else {
                 return Ok(false);
             };
-            let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+            let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await
+            else {
                 *drag = SelectionDrag::None;
                 return Ok(true);
             };
@@ -1879,7 +1870,8 @@ async fn handle_mouse_selection(
             let SelectionDrag::MouseSelection { pane_id } = *drag else {
                 return Ok(false);
             };
-            let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+            let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await
+            else {
                 *drag = SelectionDrag::None;
                 return Ok(true);
             };
@@ -1924,7 +1916,8 @@ async fn handle_mouse_selection(
             let Some(selection) = attached.mouse_selection.as_ref() else {
                 return Ok(false);
             };
-            let Some(rect) = pane_rect_for(graph, &attached, client_size, selection.pane_id).await
+            let Some(rect) =
+                pane_rect_for(graph, &attached, client_size, config, selection.pane_id).await
             else {
                 session.lock().await.mouse_selection = None;
                 return Ok(true);
@@ -1966,6 +1959,7 @@ async fn handle_copy_mode_mouse(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     out_tx: &mpsc::Sender<AttachServerFrame>,
     dragging: &mut SelectionDrag,
 ) -> anyhow::Result<bool> {
@@ -1977,7 +1971,7 @@ async fn handle_copy_mode_mouse(
         return Ok(false);
     }
 
-    let Some(rect) = focused_pane_rect(graph, &attached, client_size).await else {
+    let Some(rect) = focused_pane_rect(graph, &attached, client_size, config).await else {
         *dragging = SelectionDrag::None;
         return Ok(true);
     };
@@ -1993,7 +1987,7 @@ async fn handle_copy_mode_mouse(
             // mode keeps the wheel so a stray scroll over another pane never
             // discards an in-progress selection/search (copy mode is
             // session-global — only one is active at a time).
-            let viewport = current_viewport(client_size, attached.border_style).await;
+            let viewport = current_viewport(client_size, config).await;
             let cursor_pane = pane_under_pointer(graph, &attached, viewport, col, row);
             let transient = attached
                 .copy_mode
@@ -2127,10 +2121,11 @@ async fn handle_mouse(
     _io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     drag: &mut Option<DragState>,
 ) -> anyhow::Result<()> {
     let attached = session.lock().await.clone();
-    let viewport = current_viewport(client_size, attached.border_style).await;
+    let viewport = current_viewport(client_size, config).await;
     let snap = graph.snapshot();
     let win = match snap.windows.get(&attached.active_window_id) {
         Some(w) => w,
@@ -2257,7 +2252,7 @@ enum AppMouseRoute {
     /// The app owns the mouse but does not report this event. Consume it
     /// silently rather than letting shux start a selection the user did not
     /// ask for underneath a running app.
-    Swallow(PaneId),
+    Swallow,
 }
 
 /// Route a button event, given facts the caller has already resolved.
@@ -2295,7 +2290,7 @@ fn route_app_mouse(
         return if mode_reports(mode, action) && encodable {
             AppMouseRoute::Forward(pane_id)
         } else {
-            AppMouseRoute::Swallow(pane_id)
+            AppMouseRoute::Swallow
         };
     }
     if gesture != SelectionDrag::None || border_drag_active || copy_active {
@@ -2314,9 +2309,8 @@ fn route_app_mouse(
     let Some(pane_id) = pane_hit else {
         return AppMouseRoute::Shux;
     };
-    if mode == shux_vt::MouseMode::None {
-        return AppMouseRoute::Shux;
-    }
+    // `mode_reports` is false for every action under `MouseMode::None`, so a
+    // pane whose app never asked for the mouse falls out here too.
     if !encodable || !mode_reports(mode, action) {
         return AppMouseRoute::Shux;
     }
@@ -2428,6 +2422,7 @@ async fn handle_app_mouse(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     border_drag: &Option<DragState>,
     gesture: &mut SelectionDrag,
 ) -> anyhow::Result<AppMouse> {
@@ -2443,7 +2438,7 @@ async fn handle_app_mouse(
     };
     let attached = session.lock().await.clone();
     let copy_active = attached.copy_mode.is_some() || attached.copy_menu.is_some();
-    let viewport = current_viewport(client_size, attached.border_style).await;
+    let viewport = current_viewport(client_size, config).await;
 
     // Resolve the pane under the pointer. `pane_at`, deliberately not
     // `pane_under_pointer`: that helper falls back to the active pane whenever
@@ -2491,9 +2486,11 @@ async fn handle_app_mouse(
     );
     let pane_id = match route {
         AppMouseRoute::Shux => return Ok(AppMouse::NotHandled),
-        AppMouseRoute::Swallow(pane_id) => {
+        // The app owns the mouse but did not subscribe to this event. Consume
+        // it: a stray shux selection appearing under a running TUI is not a
+        // better answer than nothing happening.
+        AppMouseRoute::Swallow => {
             end_gesture_if_released(gesture, action, button);
-            let _ = pane_id;
             return Ok(AppMouse::Consumed { redraw: false });
         }
         AppMouseRoute::Forward(pane_id) => pane_id,
@@ -2502,7 +2499,7 @@ async fn handle_app_mouse(
     // The pane can lose its rect mid-gesture: a window switch or a zoom leaves
     // it off-screen. Let the app know the button came up rather than letting
     // the gesture evaporate with it still held.
-    let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+    let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
         release_app_gesture(io_state, gesture).await;
         return Ok(AppMouse::NotHandled);
     };
@@ -2568,29 +2565,23 @@ async fn handle_app_mouse(
         return Ok(AppMouse::Consumed { redraw });
     }
 
-    match action {
-        ButtonAction::Press => {
-            let held = match *gesture {
-                SelectionDrag::App { buttons, .. } => buttons,
-                _ => 0,
-            };
-            *gesture = SelectionDrag::App {
-                pane_id,
-                buttons: held | button_bit(button),
-                last: (local_col, local_row),
-            };
+    if action == ButtonAction::Press {
+        let held = match *gesture {
+            SelectionDrag::App { buttons, .. } => buttons,
+            _ => 0,
+        };
+        *gesture = SelectionDrag::App {
+            pane_id,
+            buttons: held | button_bit(button),
+            last: (local_col, local_row),
+        };
+    } else {
+        // Where the pointer was when the gesture is abandoned, so
+        // `release_app_gesture` can put the synthetic release there.
+        if let SelectionDrag::App { last, .. } = gesture {
+            *last = (local_col, local_row);
         }
-        ButtonAction::Drag => {
-            if let SelectionDrag::App { last, .. } = gesture {
-                *last = (local_col, local_row);
-            }
-        }
-        ButtonAction::Release => {
-            if let SelectionDrag::App { last, .. } = gesture {
-                *last = (local_col, local_row);
-            }
-            end_gesture_if_released(gesture, action, button);
-        }
+        end_gesture_if_released(gesture, action, button);
     }
     Ok(AppMouse::Consumed { redraw })
 }
@@ -2743,6 +2734,7 @@ async fn forward_bytes_to_pane(
 /// Handle a scroll-wheel event while copy mode is NOT active. Returns `Ok(true)`
 /// if the event was a wheel event (and thus consumed), `Ok(false)` otherwise so
 /// the caller falls through to the layout/focus mouse handler.
+#[allow(clippy::too_many_arguments)]
 async fn handle_wheel(
     kind: MouseKind,
     col: u16,
@@ -2751,6 +2743,7 @@ async fn handle_wheel(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
 ) -> anyhow::Result<bool> {
     let up = match kind {
         MouseKind::ScrollUp => true,
@@ -2758,7 +2751,7 @@ async fn handle_wheel(
         _ => return Ok(false),
     };
     let attached = session.lock().await.clone();
-    let viewport = current_viewport(client_size, attached.border_style).await;
+    let viewport = current_viewport(client_size, config).await;
 
     // Resolve the pane under the cursor (fallback: the active pane).
     let pane_id = {
@@ -2776,7 +2769,7 @@ async fn handle_wheel(
             }
         }
     };
-    let Some(rect) = pane_rect_for(graph, &attached, client_size, pane_id).await else {
+    let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
         return Ok(true);
     };
 
@@ -2906,11 +2899,12 @@ async fn focused_pane_size(
     pane_id: PaneId,
     attached: &AttachedSession,
     client_size: &ClientSize,
+    config: &ConfigHandle,
 ) -> (u16, u16) {
     if pane_id != attached.active_pane_id {
         return (0, 0);
     }
-    focused_pane_rect(graph, attached, client_size)
+    focused_pane_rect(graph, attached, client_size, config)
         .await
         .map(|rect| (rect.width, rect.height))
         .unwrap_or((0, 0))
@@ -2920,18 +2914,27 @@ async fn focused_pane_rect(
     graph: &GraphHandle,
     attached: &AttachedSession,
     client_size: &ClientSize,
+    config: &ConfigHandle,
 ) -> Option<Rect> {
-    pane_rect_for(graph, attached, client_size, attached.active_pane_id).await
+    pane_rect_for(
+        graph,
+        attached,
+        client_size,
+        config,
+        attached.active_pane_id,
+    )
+    .await
 }
 
 async fn pane_rect_for(
     graph: &GraphHandle,
     attached: &AttachedSession,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     pane_id: PaneId,
 ) -> Option<Rect> {
     let content = current_content_rect(client_size).await;
-    let viewport = current_viewport(client_size, attached.border_style).await;
+    let viewport = current_viewport(client_size, config).await;
     let snap = graph.snapshot();
     let win = snap.windows.get(&attached.active_window_id)?;
     if win.layout.is_zoomed() {
@@ -3030,14 +3033,24 @@ async fn current_content_rect(client_size: &ClientSize) -> Rect {
 /// the compositor inset only when the outline was drawn, which put every
 /// hit-test one cell off under `appearance.border_style = "none"`.
 ///
+/// The style is read from the live config on every call rather than cached on
+/// [`AttachedSession`]. A cache here was wrong twice over: it went stale for the
+/// common case (a user whose config says `none` and never edits it — the render
+/// loop only republished ON CHANGE, so the value never left its default), and
+/// seeding it separately from the render loop's own change detection left a
+/// window where a reload between the two reads stranded it forever. A config
+/// read is an ArcSwap load.
+///
 /// `zoomed: false` is not an oversight: while zoomed there is one pane filling
 /// the content rect, and every caller here takes the zoomed branch before it
 /// asks for a viewport.
-async fn current_viewport(client_size: &ClientSize, border_style: BorderStyle) -> Rect {
+async fn current_viewport(client_size: &ClientSize, config: &ConfigHandle) -> Rect {
+    let border_style = BorderStyle::parse(&config.current().appearance.border_style);
     shux_ui::pane_viewport(current_content_rect(client_size).await, border_style, false)
 }
 
 /// Dispatch an Action keybinding from the client.
+#[allow(clippy::too_many_arguments)]
 async fn handle_action(
     kind: ActionKind,
     args: shux_rpc::attach::ActionArgs,
@@ -3045,6 +3058,7 @@ async fn handle_action(
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &Arc<Mutex<AttachedSession>>,
     client_size: &ClientSize,
+    config: &ConfigHandle,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     use shux_core::layout::Direction;
@@ -3081,7 +3095,7 @@ async fn handle_action(
     }
 
     let attached = session.lock().await.clone();
-    let viewport = current_viewport(client_size, attached.border_style).await;
+    let viewport = current_viewport(client_size, config).await;
 
     match kind {
         ActionKind::SplitSmart => split(graph, &attached, None, viewport, io_state, cancel).await,
@@ -3578,6 +3592,15 @@ async fn resize_pane(
 
 #[cfg(test)]
 mod tests {
+    /// A `ConfigHandle` on a path that does not exist, i.e. the defaults. The
+    /// mouse handlers take one because the pane viewport is derived from
+    /// `appearance.border_style` rather than cached.
+    fn test_config() -> ConfigHandle {
+        ConfigHandle::load_or_default(std::path::Path::new(
+            "/nonexistent/shux-attach-tests/config.toml",
+        ))
+    }
+
     use super::*;
 
     /// Attach must close the spawn race without resurrecting a pane that
@@ -3774,7 +3797,7 @@ mod tests {
     async fn current_viewport_insets_for_borders_and_status_row() {
         let size = Arc::new(Mutex::new((120, 40)));
         assert_eq!(
-            current_viewport(&size, BorderStyle::default()).await,
+            current_viewport(&size, &test_config()).await,
             Rect::new(1, 1, 118, 37)
         );
     }
@@ -3960,7 +3983,6 @@ mod tests {
             copy_menu: None,
             last_action: None,
             show_welcome_toast: true,
-            border_style: BorderStyle::default(),
         };
 
         AttachFixture {
@@ -4190,6 +4212,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4203,6 +4226,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4216,6 +4240,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4227,6 +4252,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4240,6 +4266,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4252,6 +4279,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4265,6 +4293,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4286,6 +4315,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4297,6 +4327,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4312,6 +4343,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4327,6 +4359,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &fixture.cancel,
         )
         .await
@@ -4483,6 +4516,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4505,6 +4539,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4519,6 +4554,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4539,6 +4575,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4558,6 +4595,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4592,6 +4630,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4608,6 +4647,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -4625,6 +4665,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4640,6 +4681,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4654,6 +4696,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -4673,7 +4716,7 @@ mod tests {
         let fixture = attach_fixture().await;
         let session = Arc::new(Mutex::new(fixture.attached.clone()));
         let client_size = Arc::new(Mutex::new((100, 30)));
-        let viewport = current_viewport(&client_size, BorderStyle::default()).await;
+        let viewport = current_viewport(&client_size, &test_config()).await;
         let (first_point, second_point, border_point) =
             find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
         let mut drag = None;
@@ -4687,6 +4730,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4703,6 +4747,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4719,6 +4764,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4733,6 +4779,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -4754,6 +4801,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &mut drag,
         )
         .await
@@ -5160,7 +5208,7 @@ mod tests {
                 true,
                 ButtonAction::Release
             ),
-            AppMouseRoute::Swallow(pane),
+            AppMouseRoute::Swallow,
             "a gesture the app can no longer decode is still not shux's"
         );
         assert_eq!(
@@ -5389,6 +5437,7 @@ mod tests {
                 &self.fixture.io_state,
                 &self.session,
                 &self.client_size,
+                &test_config(),
                 &self.border_drag,
                 &mut self.gesture,
             )
@@ -5448,11 +5497,10 @@ mod tests {
             b"\x1b[?1002h\x1b[?1006h",
         )
         .await;
-        let viewport = current_viewport(&h.client_size, BorderStyle::default()).await;
+        let viewport = current_viewport(&h.client_size, &test_config()).await;
         let rect = {
             let snap = h.fixture.graph.snapshot();
             let win = snap.windows.get(&h.fixture.first_window).expect("window");
-            pane_at(&win.layout.tree, viewport, 0, 0);
             win.layout
                 .compute_rects(viewport)
                 .into_iter()
@@ -5932,34 +5980,48 @@ mod tests {
     /// with. It used to inset for the outline unconditionally while the
     /// compositor inset only when the outline was drawn, so under
     /// `appearance.border_style = "none"` every click was one cell off in both
-    /// axes and the last column and row could not be clicked at all. The style
-    /// hot-reloads, so the skew appeared mid-session.
+    /// axes and the last column and row could not be clicked at all.
+    ///
+    /// Driven from a real config FILE, not from a `BorderStyle` handed in: the
+    /// defect that shipped was in the plumbing from config to hit-test, not in
+    /// the inset arithmetic, and a test that passes the style in by hand cannot
+    /// see it.
     #[tokio::test]
     async fn the_pane_hit_test_agrees_with_the_compositor_under_every_border_style() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
         let content = current_content_rect(&client_size).await;
-        for style in [
-            BorderStyle::None,
-            BorderStyle::Thin,
-            BorderStyle::Thick,
-            BorderStyle::Double,
-            BorderStyle::Rounded,
-            BorderStyle::Ascii,
+
+        for (name, style) in [
+            ("none", BorderStyle::None),
+            ("thin", BorderStyle::Thin),
+            ("thick", BorderStyle::Thick),
+            ("double", BorderStyle::Double),
+            ("rounded", BorderStyle::Rounded),
+            ("ascii", BorderStyle::Ascii),
         ] {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&path, format!("[appearance]\nborder_style = \"{name}\"\n"))
+                .expect("write config");
+            let config = ConfigHandle::load_or_default(&path);
             assert_eq!(
-                current_viewport(&client_size, style).await,
+                current_viewport(&client_size, &config).await,
                 shux_ui::pane_viewport(content, style, false),
-                "{style:?}: the hit-test and the compositor must agree"
+                "border_style = {name:?}: the hit-test and the compositor must agree"
             );
         }
-        // Concretely: with no outline the pane starts at the origin and the
-        // last column is reachable.
+
+        // Concretely, and this is the pair that discriminates: with no outline
+        // the pane starts at the origin and the last column and row are
+        // reachable; with one it is inset by exactly a cell on every side.
+        let none = dir.path().join("none.toml");
         assert_eq!(
-            current_viewport(&client_size, BorderStyle::None).await,
+            current_viewport(&client_size, &ConfigHandle::load_or_default(&none)).await,
             Rect::new(0, 0, 100, 29)
         );
+        let rounded = dir.path().join("rounded.toml");
         assert_eq!(
-            current_viewport(&client_size, BorderStyle::Rounded).await,
+            current_viewport(&client_size, &ConfigHandle::load_or_default(&rounded)).await,
             Rect::new(1, 1, 98, 27)
         );
     }
@@ -5986,6 +6048,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel up");
@@ -6026,6 +6089,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel");
@@ -6061,6 +6125,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel");
@@ -6098,6 +6163,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel up");
@@ -6119,6 +6185,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -6157,6 +6224,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -6172,6 +6240,7 @@ mod tests {
                 &fixture.io_state,
                 &session,
                 &client_size,
+                &test_config(),
                 &out_tx,
                 &mut drag,
             )
@@ -6203,7 +6272,7 @@ mod tests {
         let client_size = Arc::new(Mutex::new((100, 30)));
         let (out_tx, _out_rx) = mpsc::channel(8);
         let mut drag = SelectionDrag::None;
-        let viewport = current_viewport(&client_size, BorderStyle::default()).await;
+        let viewport = current_viewport(&client_size, &test_config()).await;
         let (first_point, second_point, _border) =
             find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
 
@@ -6216,6 +6285,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel up over pane A");
@@ -6238,6 +6308,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )
@@ -6262,6 +6333,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
         )
         .await
         .expect("wheel up over pane B");
@@ -6292,7 +6364,7 @@ mod tests {
         let client_size = Arc::new(Mutex::new((100, 30)));
         let (out_tx, _out_rx) = mpsc::channel(8);
         let mut drag = SelectionDrag::None;
-        let viewport = current_viewport(&client_size, BorderStyle::default()).await;
+        let viewport = current_viewport(&client_size, &test_config()).await;
         let (_first_point, second_point, _border) =
             find_pane_and_border_points(&fixture.graph, fixture.first_window, viewport);
 
@@ -6305,6 +6377,7 @@ mod tests {
             &fixture.io_state,
             &session,
             &client_size,
+            &test_config(),
             &out_tx,
             &mut drag,
         )

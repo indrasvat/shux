@@ -97,14 +97,9 @@ pub enum AttachClientFrame {
         row: u16,
         /// Shift held. Reserved for shux: it is the escape that keeps shux's
         /// own text selection reachable inside a pane whose app has taken the
-        /// mouse, so it is never encoded into a forwarded report.
-        ///
-        /// NOTE for anyone reading this as a feature promise: most host
-        /// terminals (xterm, VTE, kitty, WezTerm, iTerm2, Alacritty) treat
-        /// Shift+mouse as the *user's* override of application mouse reporting
-        /// and never emit an event at all, so on those hosts this arrives only
-        /// if the host chose to forward it. `Prefix [` copy mode is the
-        /// pane-accurate selection path that always works.
+        /// mouse, so it is never encoded into a forwarded report. Most host
+        /// terminals claim Shift+mouse for their own selection and emit no
+        /// event at all, so this arrives only where the host forwards it.
         #[serde(default)]
         shift: bool,
         /// Alt/Meta held -- forwarded to the app as Cb bit 8.
@@ -212,6 +207,56 @@ pub struct ActionArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #174 added `shift`/`alt`/`ctrl` to the mouse frame. The daemon
+    /// outlives the client across upgrades, so both skew directions have to
+    /// survive: an old client's frame must still deserialize (the fields
+    /// default), and a new client's frame must not break an old daemon (the
+    /// extra keys are ignored — `deny_unknown_fields` appears nowhere in this
+    /// crate, and this test is what keeps it that way).
+    ///
+    /// `shift: false` is the safe default: an old client loses the escape that
+    /// hands a click back to shux, rather than shux swallowing clicks the app
+    /// should have received.
+    #[test]
+    fn a_mouse_frame_without_modifiers_still_deserializes() {
+        let old_wire = r#"{"type":"mouse","kind":"down","button":"left","col":3,"row":4}"#;
+        let frame: AttachClientFrame =
+            serde_json::from_str(old_wire).expect("an older client's frame must still parse");
+        match frame {
+            AttachClientFrame::Mouse {
+                col,
+                row,
+                shift,
+                alt,
+                ctrl,
+                ..
+            } => {
+                assert_eq!((col, row), (3, 4));
+                assert!(!shift, "shift must default off, not swallow the click");
+                assert!(!alt);
+                assert!(!ctrl);
+            }
+            other => panic!("expected a mouse frame, got {other:?}"),
+        }
+    }
+
+    /// The other direction: a new client's extra keys must be ignored rather
+    /// than rejected, or every mouse event from a newer client would fail to
+    /// parse and mouse input would die silently on an older daemon.
+    #[test]
+    fn a_mouse_frame_with_unknown_fields_is_still_accepted() {
+        let future_wire = r#"{"type":"mouse","kind":"drag","button":"right","col":9,"row":2,
+            "shift":true,"alt":true,"ctrl":true,"super":true,"click_count":2}"#;
+        let frame: AttachClientFrame =
+            serde_json::from_str(future_wire).expect("unknown fields must be ignored");
+        match frame {
+            AttachClientFrame::Mouse {
+                shift, alt, ctrl, ..
+            } => assert_eq!((shift, alt, ctrl), (true, true, true)),
+            other => panic!("expected a mouse frame, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_hello_roundtrip() {

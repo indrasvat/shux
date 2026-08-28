@@ -64,21 +64,12 @@ mod winsize_tests {
 
     #[test]
     fn declares_pixels_as_cells_times_the_cell_box() {
-        let ws = winsize_for(PtySize::new(100, 30), DECLARED_CELL_PIXELS);
+        let ws = winsize_for(PtySize::new(100, 30));
         assert_eq!((ws.ws_col, ws.ws_row), (100, 30));
         assert_eq!(
             (ws.ws_xpixel, ws.ws_ypixel),
             (100 * DECLARED_CELL_PIXELS.0, 30 * DECLARED_CELL_PIXELS.1)
         );
-    }
-
-    /// `(0, 0)` is the documented opt-out, and it must reproduce the historical
-    /// behaviour exactly rather than being an error.
-    #[test]
-    fn a_zero_cell_box_declares_nothing() {
-        let ws = winsize_for(PtySize::new(100, 30), (0, 0));
-        assert_eq!((ws.ws_col, ws.ws_row), (100, 30));
-        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
     }
 
     /// Overflow must land on the honest sentinel, not a saturated number. Apps
@@ -88,23 +79,23 @@ mod winsize_tests {
     /// winsize is a third thing nobody has a rule for.
     #[test]
     fn overflow_declares_nothing_on_both_axes() {
-        let ws = winsize_for(PtySize::new(7282, 30), DECLARED_CELL_PIXELS);
+        let ws = winsize_for(PtySize::new(7282, 30));
         assert_eq!((ws.ws_col, ws.ws_row), (7282, 30), "cells stay truthful");
         assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
 
         // Only the vertical axis overflows; the horizontal one must not be
         // reported on its own.
-        let ws = winsize_for(PtySize::new(100, 3450), DECLARED_CELL_PIXELS);
+        let ws = winsize_for(PtySize::new(100, 3450));
         assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
 
         // One cell under the limit still declares.
-        let ws = winsize_for(PtySize::new(7281, 3449), DECLARED_CELL_PIXELS);
+        let ws = winsize_for(PtySize::new(7281, 3449));
         assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (65529, 65531));
     }
 
     #[test]
     fn a_zero_sized_pty_is_not_an_error() {
-        let ws = winsize_for(PtySize::new(0, 0), DECLARED_CELL_PIXELS);
+        let ws = winsize_for(PtySize::new(0, 0));
         assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
     }
 }
@@ -401,22 +392,16 @@ fn leads_with_segment(rest: &[u8], word: &[u8]) -> bool {
 /// panes spawned before and after a reload would declare different geometry in
 /// the same session with nothing reporting it. One value, one owner.
 ///
-/// Pinned to `Rasterizer::cell_size()` by a test in the `shux` crate -- the only
-/// crate that depends on both this one and `shux-raster`, which this one must
-/// not depend on. If that test fails, the bundled font or the default snapshot
-/// font size changed: update this constant AND re-bless the pixel goldens.
-///
-/// If shux ever answers XTWINOPS `CSI 14 t` / `CSI 16 t`, the answer must come
-/// from here, or shux reports two different cell sizes to one app.
+/// Pinned to the default snapshot rasterizer's box by a test in the `shux`
+/// crate -- the only crate depending on both this one and `shux-raster`, which
+/// this one must not depend on.
 pub const DECLARED_CELL_PIXELS: (u16, u16) = (9, 19);
 
 /// Build the `winsize` a PTY is opened or resized with.
 ///
-/// `cell` of `(0, 0)` means "undeclared" and reproduces the historical
-/// behaviour: zero pixels, which is what a child reads as "this terminal will
-/// not tell me".
-///
-/// Overflow yields `0/0` on BOTH axes rather than a saturated value. `winsize`
+/// Overflow yields `0/0` on BOTH axes rather than a saturated value -- the
+/// value zero already means "this terminal will not tell me", which is what
+/// every pane read before this existed. `winsize`
 /// fields are `u16`, so at 9x19 a pane wider than 7281 cells or taller than
 /// 3449 would saturate -- and apps derive the cell size back out as
 /// `ws_xpixel / ws_col`, so a saturated 65535 across 7282 columns computes a
@@ -424,8 +409,9 @@ pub const DECLARED_CELL_PIXELS: (u16, u16) = (9, 19);
 /// "unknown" zero already means. shux's own paths cap panes at 1000x1000
 /// (`pane.set_size`), so this branch is unreachable through the CLI or RPC;
 /// `spawn`/`resize` are `pub` and validate nothing, which is why it exists.
-fn winsize_for(size: PtySize, cell: (u16, u16)) -> Winsize {
-    let (xpixel, ypixel) = match (size.cols.checked_mul(cell.0), size.rows.checked_mul(cell.1)) {
+fn winsize_for(size: PtySize) -> Winsize {
+    let (cell_w, cell_h) = DECLARED_CELL_PIXELS;
+    let (xpixel, ypixel) = match (size.cols.checked_mul(cell_w), size.rows.checked_mul(cell_h)) {
         (Some(x), Some(y)) => (x, y),
         _ => (0, 0),
     };
@@ -449,10 +435,6 @@ pub struct PtyConfig {
     /// sees ONLY the deterministic plan. Default `false` = byte-identical prior
     /// behaviour (the scratch gate runner is the only caller that sets it).
     pub env_clear: bool,
-    /// Pixel size of one cell, declared to the child in `ws_xpixel`/`ws_ypixel`
-    /// at spawn and re-declared on every resize. Defaults to
-    /// [`DECLARED_CELL_PIXELS`]; `(0, 0)` opts out and leaves both fields zero.
-    pub cell_pixels: (u16, u16),
 }
 
 /// PTY dimensions in columns and rows.
@@ -482,7 +464,6 @@ impl PtyConfig {
             env: Vec::new(),
             size: PtySize::default(),
             env_clear: false,
-            cell_pixels: DECLARED_CELL_PIXELS,
         }
     }
 
@@ -493,7 +474,6 @@ impl PtyConfig {
             env: Vec::new(),
             size: PtySize::default(),
             env_clear: false,
-            cell_pixels: DECLARED_CELL_PIXELS,
         }
     }
 
@@ -546,10 +526,6 @@ pub struct PtyHandle {
     spawned_at: std::time::Instant,
     initial_cwd: PathBuf,
     size: PtySize,
-    /// Carried from the spawn config because `resize` rebuilds the whole
-    /// `winsize` from a `PtySize`, which knows only cells. Without it the
-    /// resize path would have to re-derive the cell box or zero it.
-    cell_pixels: (u16, u16),
 }
 
 fn nix_to_io(err: nix::Error) -> PtyError {
@@ -713,7 +689,7 @@ impl PtyHandle {
         // `TIOCGWINSZ` once at startup and again on every SIGWINCH, and a pane
         // that is told 9x19 at spawn and 0x0 on the first resize is worse off
         // than one told nothing at all.
-        let winsize = winsize_for(config.size, config.cell_pixels);
+        let winsize = winsize_for(config.size);
         let pty_pair = openpty(Some(&winsize), None).map_err(nix_to_io)?;
         set_nonblocking(&pty_pair.master).map_err(PtyError::Open)?;
 
@@ -836,7 +812,6 @@ impl PtyHandle {
             spawned_at: std::time::Instant::now(),
             initial_cwd: config.cwd.clone(),
             size: config.size,
-            cell_pixels: config.cell_pixels,
         })
     }
 
@@ -929,7 +904,7 @@ impl PtyHandle {
 
     /// Resize the PTY (sends TIOCSWINSZ/SIGWINCH to child).
     pub fn resize(&mut self, new_size: PtySize) -> Result<(), PtyError> {
-        let winsize = winsize_for(new_size, self.cell_pixels);
+        let winsize = winsize_for(new_size);
         let rc = unsafe {
             nix::libc::ioctl(
                 self.pty.get_ref().as_raw_fd(),
