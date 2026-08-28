@@ -1,3 +1,10 @@
+## [0.47.1](https://github.com/indrasvat/shux/compare/v0.47.0...v0.47.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **guards:** name the daemons the leak guard exempts, and add `make reap` ([#180](https://github.com/indrasvat/shux/issues/180)) ([7d1b716](https://github.com/indrasvat/shux/commit/7d1b71693d9495dd0f495272205c1d91f8c4882d)), closes [#179](https://github.com/indrasvat/shux/issues/179) [#179](https://github.com/indrasvat/shux/issues/179)
+
 # [0.47.0](https://github.com/indrasvat/shux/compare/v0.46.24...v0.47.0) (2026-08-28)
 
 
