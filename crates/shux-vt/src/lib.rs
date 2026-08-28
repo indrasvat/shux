@@ -102,18 +102,12 @@ pub struct VirtualTerminal {
     /// Locates kitty-graphics APC sequences, whose bytes vte consumes without
     /// calling back. Carries state across PTY reads.
     apc_scanner: graphics::apc::ApcScanner,
-    /// Every graphics command that reached [`Self::dispatch_graphics`].
-    /// Test-only: that function has no body yet, so delivery is otherwise
-    /// invisible and a public-API test would pass on a build that dropped all.
-    #[cfg(test)]
-    pub(crate) dispatched_graphics: Vec<Vec<u8>>,
     /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
     apc_cut_slicing: bool,
-    /// Graphics commands this terminal declined: an unimplemented transport,
-    /// animation, or a control block outside the protocol. The only externally
-    /// visible trace of the graphics path, and the witness that the scanner is
-    /// wired at all -- see `graphics_refusals`.
-    graphics_refusals: u64,
+    /// Everything the graphics path writes. Bundled so `dispatch_graphics` can
+    /// take one `&mut` argument and no `&mut self`, and so the test-only field
+    /// needs no `cfg` at the call site.
+    graphics: graphics::GraphicsSink,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
     /// open. Shared by reference with every [`sync::Presented`] wrapper handed
     /// to the parser, which is why it is a cell rather than a plain `bool`;
@@ -252,10 +246,8 @@ impl VirtualTerminal {
             parser: VtParser::new_with_size(),
             dcs_state: None,
             apc_scanner: graphics::apc::ApcScanner::default(),
-            #[cfg(test)]
-            dispatched_graphics: Vec::new(),
             apc_cut_slicing: true,
-            graphics_refusals: 0,
+            graphics: graphics::GraphicsSink::default(),
             sync_armed: std::sync::atomic::AtomicBool::new(false),
             frozen_grid: None,
             frozen_cursor: None,
@@ -296,13 +288,12 @@ impl VirtualTerminal {
     /// How many graphics commands this terminal has declined.
     ///
     /// shux answers nothing on the wire, so without this a refusal is
-    /// indistinguishable from a command that was never located -- which is
-    /// exactly the gap that let a whole neutrality suite pass against a scanner
-    /// gutted to find nothing. Read-only: there is no switch here that could
-    /// make shux advertise graphics support it cannot honour.
+    /// indistinguishable from a command that was never located -- the gap that
+    /// let a whole neutrality suite pass against a scanner gutted to find
+    /// nothing.
     #[doc(hidden)]
     pub fn graphics_refusals(&self) -> u64 {
-        self.graphics_refusals
+        self.graphics.refusals
     }
 
     /// Turn retired-buffer recycling (issue #106) off or on.
@@ -495,29 +486,22 @@ impl VirtualTerminal {
         self.parser.advance(&mut handler, bytes);
     }
 
-    /// Act on one kitty graphics command.
+    /// Act on one kitty graphics command. Non-`G` APCs are discarded, as vte
+    /// discards every APC today.
     ///
-    /// `body` is the payload between `ESC _` and the terminator. Non-`G` APCs
-    /// are discarded, exactly as vte discards every APC today.
-    /// Act on one kitty graphics command.
-    ///
-    /// Takes only the counter it updates, never `&mut self`. `advance_slice`
-    /// routes every write to the grid, cursor, title and default colours
-    /// through [`sync::Presented`], which snapshots live to frozen on the first
-    /// write inside a `CSI ?2026h` window; this runs BETWEEN slices, so a
-    /// `&mut self` here would reach those fields unwrapped and leak into a
-    /// frame that is supposed to be held still. Nothing needs that access
-    /// today, and the signature is what keeps it that way when the renderer
-    /// lands.
-    fn dispatch_graphics(refusals: &mut u64, body: &[u8], #[cfg(test)] seen: &mut Vec<Vec<u8>>) {
+    /// Takes no `&mut self`: `advance_slice` routes writes through
+    /// [`sync::Presented`], which freezes the presented frame on the first
+    /// write inside a `CSI ?2026h` window, and this runs BETWEEN slices, so
+    /// unwrapped access here would leak into a frame held still.
+    fn dispatch_graphics(sink: &mut graphics::GraphicsSink, body: &[u8]) {
         let Some(command) = body.strip_prefix(b"G") else {
             return;
         };
         #[cfg(test)]
-        seen.push(command.to_vec());
+        sink.dispatched.push(command.to_vec());
 
         if graphics::kitty::parse(command).is_err() {
-            *refusals = refusals.saturating_add(1);
+            sink.refusals = sink.refusals.saturating_add(1);
         }
     }
 
@@ -578,14 +562,7 @@ impl VirtualTerminal {
             let mut at = 0;
             for cut in cuts {
                 self.advance_slice(&bytes[at..cut.end], &mut responses);
-                #[cfg(test)]
-                Self::dispatch_graphics(
-                    &mut self.graphics_refusals,
-                    &cut.body,
-                    &mut self.dispatched_graphics,
-                );
-                #[cfg(not(test))]
-                Self::dispatch_graphics(&mut self.graphics_refusals, &cut.body);
+                Self::dispatch_graphics(&mut self.graphics, &cut.body);
                 at = cut.end;
             }
             self.advance_slice(&bytes[at..], &mut responses);
@@ -1128,7 +1105,7 @@ mod tests {
         // Its continuation and terminator arrive in the next read.
         vt.process_with_responses(b"more\x1b\\");
         assert_eq!(
-            vt.dispatched_graphics,
+            vt.graphics.dispatched,
             vec![b"halfmore".to_vec()],
             "the APC opened after the RIS was dropped"
         );
@@ -1150,7 +1127,7 @@ mod tests {
             vt.process_with_responses(bytes);
             let text = vt.capture_text(None);
             (
-                vt.dispatched_graphics.clone(),
+                vt.graphics.dispatched.clone(),
                 text.contains("AFTER"),
                 text.contains("PAYLOAD"),
             )

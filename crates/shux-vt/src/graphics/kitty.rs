@@ -5,9 +5,7 @@
 //! pixel path lands with the image store.
 //!
 //! Key/value shape adapted from Zellij's `kitty_graphics/parser.rs` (MIT), which
-//! the design plan names as the precedent. Every field, default and response
-//! rule below is taken from kitty's `docs/graphics-protocol.rst` and checked
-//! against `kitty/graphics.c`, not from memory.
+//! the design plan names as the precedent.
 //!
 //! ## Why the file transports are refused
 //!
@@ -17,39 +15,16 @@
 //! process in any pane sends `a=T,f=32,t=f;` + base64(`~/.ssh/id_rsa`), and the
 //! bytes become an image that is re-emitted to every attaching client and
 //! composited into `pane.snapshot` -- a file on disk. Refusing the medium
-//! removes the class outright, and costs nothing: terminal-browser probes
-//! `t=f`/`t=s` and falls back to inline transmit anyway.
-//!
-//! ## Why nothing is answered
-//!
-//! shux emits no graphics reply at all, and that is a deliberate match to
-//! kitty rather than a gap. kitty's `REPORT_ERROR` is log-only (`graphics.c:28`)
-//! and every parse failure in `parse-graphics-command.h` follows it with a bare
-//! `return`, so a malformed command produces no wire response there either.
-//!
-//! It is also the safe default while shux cannot draw. The protocol treats any
-//! response as an advertisement of support:
-//!
-//! > If you get back a response to the graphics query, the terminal emulator
-//! > supports the protocol, if you get back a response to the device attributes
-//! > query without a response to the graphics query, it does not.
-//! > -- `graphics-protocol.rst`, "Querying support and available transmission
-//! > mediums"
-//!
-//! An **error** is still a response. A client that receives one concludes shux
-//! does graphics, abandons its text fallback, and transmits into a terminal
-//! with no renderer -- a blank pane where there used to be readable output.
-//! The replies, and the `q=` verbosity rules that gate them, belong with the
-//! renderer that makes them true.
+//! removes the class outright.
 //!
 //! ## Where shux is deliberately laxer than kitty
 //!
 //! kitty discards a whole command when any key it knows carries a malformed
 //! value -- `o=`, `d=`, `f=`, `m=`, `S=`, `z=`, `p=`. shux reads five keys and
 //! acts on none of the rest, so validating them here would be knowledge with no
-//! consumer. The store that reads a payload must validate `m=` in particular:
-//! a garbage chunking key is a dropped command in kitty and would otherwise be
-//! a live transfer here.
+//! consumer. The store that reads a payload must validate `m=`: a garbage
+//! chunking key is a dropped command in kitty and would otherwise be a live
+//! transfer here.
 
 /// What the application asked the terminal to do.
 ///
@@ -139,18 +114,12 @@ pub(crate) enum Rejection {
 
 /// Split the control block into `key=value` pairs.
 ///
-/// A token that is not exactly `<single byte>=<value>` fails the whole command.
-/// kitty's generated parser treats an unreadable key as fatal -- an invalid key
-/// character and a key not followed by `=` both `return`
-/// (`parse-graphics-command.h:91-101`) -- and skipping them instead made
-/// `a=T,` + a space + `t=f` parse as an ordinary direct transmission, so a
-/// single stray byte defeated the recognition the file-transport refusal is
-/// keyed on.
+/// A token that is not `<byte>=<value>` fails the whole command: skipping it
+/// let `a=T,` + a space + `t=f` parse as an ordinary direct transmission,
+/// defeating the recognition the file-transport refusal is keyed on.
 ///
-/// Unknown SINGLE-CHARACTER keys are still skipped, which IS laxer than kitty.
-/// That is deliberate: the protocol grows by adding keys, and failing a whole
-/// command over one shux has not learned about yet is worse for the application
-/// than ignoring it.
+/// Unknown single-character keys are still skipped, deliberately laxer than
+/// kitty, because the protocol grows by adding keys.
 fn pairs(control: &[u8]) -> Result<Vec<(u8, &[u8])>, Rejection> {
     // An empty control block is the protocol's own default command, not a
     // malformed one: `a` defaults to `t` and `t` to `d`.
@@ -174,16 +143,12 @@ fn pairs(control: &[u8]) -> Result<Vec<(u8, &[u8])>, Rejection> {
 /// Read one unsigned protocol integer, matching kitty's generated parser
 /// (`parse-graphics-command.h`, `READ_UINT`) rather than Rust's defaults.
 ///
-/// kitty scans **at most ten digits** and then requires a `,` or `;`, so an
-/// eleventh digit is a malformed control block even when the value it spells is
-/// small: `i=00000000001` is an error there, not `1`. It then rejects anything
-/// above `u32::MAX` outright instead of wrapping.
+/// Ten digits then a separator, so `i=00000000001` is malformed even though it
+/// spells 1; above `u32::MAX` is rejected rather than wrapped.
 ///
-/// `None` therefore means THE COMMAND IS MALFORMED, not "the key was absent".
-/// kitty `return`s from its parser on a bad integer and discards the whole
-/// command; defaulting the key instead would act on a command kitty would have
-/// thrown away, which is how two terminals end up disagreeing about what a pane
-/// asked for.
+/// `None` means THE COMMAND IS MALFORMED, not "the key was absent" -- kitty
+/// discards the whole command on a bad integer, so defaulting the key would act
+/// on something kitty threw away.
 fn number(value: &[u8]) -> Option<u32> {
     if value.is_empty() || value.len() > 10 || !value.iter().all(u8::is_ascii_digit) {
         return None;
@@ -411,11 +376,6 @@ mod tests {
         assert_eq!(number(b"4294967295"), Some(u32::MAX));
         assert_eq!(number(b"4294967296"), None, "u32 overflow must not wrap");
 
-        // kitty reads ten digits and then demands a separator, so an eleventh
-        // makes the block malformed even when the value it spells is small.
-        // This is what makes the ten-digit cap load-bearing rather than a
-        // micro-optimisation: without it `00000000001` would parse as 1 and
-        // shux would act on a command kitty discards.
         assert_eq!(number(b"00000000001"), None, "eleven digits");
         assert_eq!(number(b"0000000001"), Some(1), "ten digits, zero-padded");
         assert_eq!(refused(b"a=T,i=00000000001;PAY"), Rejection::Malformed);

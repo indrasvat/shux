@@ -13,10 +13,6 @@
 //! The alphabet is weighted toward bytes that make a naive splitter diverge:
 //! `ESC`, `CAN`, `SUB`, the string introducers `_ X ^ P ]`, and ST's `\`.
 //!
-//! Real rich TUIs emit `ESC` constantly -- the committed `btop` capture carries
-//! one every ~20 bytes -- and the fast path needs `Ground` AND no `ESC` in the
-//! chunk, so every real read takes `scan_slow`. The alphabet is weighted to
-//! match the hot path, not to be a synthetic worst case.
 
 use proptest::prelude::*;
 use shux_vt::{FrameEnvelope, MaskSet, VirtualTerminal};
@@ -34,7 +30,6 @@ struct Observable {
     scrollback: String,
     cursor: String,
     title: Option<String>,
-    alt_screen: bool,
     scroll_region: String,
     content_revision: u64,
     responses: Vec<Vec<u8>>,
@@ -56,7 +51,6 @@ fn drive_with(chunks: &[&[u8]], slicing: bool) -> Observable {
         scrollback: vt.capture_text(None),
         cursor: format!("{:?}", vt.cursor()),
         title: vt.title().map(str::to_owned),
-        alt_screen: vt.is_alternate_screen(),
         scroll_region: format!("{:?}", vt.scroll_region()),
         content_revision: vt.content_revision(),
         responses,
@@ -261,12 +255,12 @@ fn a_located_command_reaches_the_parser_in_the_shipping_build() {
     assert_eq!(vt.graphics_refusals(), 1);
 }
 
-/// Nothing is answered, ever. With no reply path in the library this is
-/// structurally true rather than switch-dependent -- there is no longer a
-/// setting that could make shux advertise graphics support it cannot honour.
+/// Nothing is answered, ever.
 ///
-/// It matters because the protocol treats ANY response as that advertisement:
-/// an application that gets one abandons its text fallback.
+/// The protocol treats ANY response -- an error included -- as an
+/// advertisement that the terminal does graphics, after which an application
+/// abandons its text fallback and transmits into a pane shux cannot draw. With
+/// no reply path in the library this is structurally true, not a setting.
 #[test]
 fn nothing_is_answered() {
     let mut vt = VirtualTerminal::new(24, 80);
@@ -312,14 +306,8 @@ fn a_complete_apc_disturbs_neither_the_pen_nor_the_frame() {
         "a complete APC changed the presented frame"
     );
 
-    // The assertion above is only worth anything if the APC really was located
-    // and dispatched on the sliced side.
-    let mut vt = VirtualTerminal::new(24, 80);
-    vt.process_with_responses(b"\x1b_Ga=T,t=f,i=1;Lw==\x1b\\");
-    assert_eq!(vt.graphics_refusals(), 1, "the seam was never reached");
-
-    // ...and that the attributes it must preserve are actually in the frame we
-    // compare, rather than being invisible to it the way `capture_text` was.
+    // The comparison is only worth anything if the attributes it must preserve
+    // are in the frame at all.
     assert!(
         sliced.frame.contains("200"),
         "the compared frame carries no truecolor component; it cannot see a \

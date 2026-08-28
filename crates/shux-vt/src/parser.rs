@@ -1780,8 +1780,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 // When the image/placement store lands, RIS must clear it here:
                 // the graphics protocol requires that "when resetting the
                 // terminal, all images that are visible on the screen must be
-                // cleared". It must NOT clear the APC scanner -- see the note in
-                // `VirtualTerminal::advance_slice` for why that is always wrong.
+                // cleared". It must NOT clear the APC scanner: an APC cannot
+                // span a RIS, because the introducing ESC ends the string
+                // sequence first. See
+                // `a_ris_does_not_swallow_an_apc_that_starts_after_it_in_the_same_read`.
                 self.reset_charsets();
                 self.tab_stops.reset(self.grid.cols());
                 self.scroll_region.top = 0;
