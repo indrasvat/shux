@@ -81,9 +81,13 @@ fi
 
 if command -v cargo-binstall >/dev/null 2>&1; then
   echo "▶ Installing cargo-deny via cargo-binstall..."
-  cargo binstall --no-confirm cargo-deny
+  cargo binstall --no-confirm "cargo-deny@${version}"
   exit 0
 fi
 
-echo "▶ Installing cargo-deny from source (slow — no pre-built path available)..."
-cargo install cargo-deny --locked
+echo "▶ Installing cargo-deny ${version} from source (slow — no pre-built path available)..."
+# `--version`, not just `--locked`: `--locked` only preserves the lockfile of
+# whichever release is selected, so on its own this installs whatever the
+# registry currently publishes — an unpinned audit tool in the fallback of a
+# script whose whole point above is the pin.
+cargo install cargo-deny --version "${version}" --locked
