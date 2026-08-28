@@ -25,6 +25,8 @@ nerd_fonts = true
 # The list must be non-empty when set. If font is unset, bundled
 # JetBrains Mono still anchors cell metrics; this list only changes
 # glyph fallback coverage.
+# Setting `font` does NOT change the cell size shux declares to pane
+# processes in `ws_xpixel`/`ws_ypixel` — see "Pixel geometry" below.
 # font = "/path/to/primary.ttf"
 # font_fallbacks = ["builtin:nerd-font", "builtin:math", "builtin:symbols", "builtin:symbols-legacy", "builtin:emoji"]
 
@@ -149,6 +151,23 @@ fi
 
 The result: full starship outside shux, bare chevron inside, the rich info
 only in shux's status bar.
+
+## Pixel geometry declared to panes
+
+Every pane child is told a cell size in `ws_xpixel`/`ws_ypixel`, at spawn and on
+every resize, so an app that derives geometry from `TIOCGWINSZ` gets a number
+instead of a zero. It is one fixed value: the cell box the default snapshot
+rasterizer renders at, 9x19 pixels.
+
+It is a **declaration, not a measurement**, and deliberately does not track
+config. Setting `appearance.font` changes the box `pane snapshot` rasterizes at
+but not the one panes are told; under `shux session attach` the pane is drawn by
+your own terminal at whatever box it uses, which is a third number again. There
+is no single physical cell size in shux to report, so it reports a stable one.
+
+If you set a custom `font` and something inside a pane sizes itself from
+`ws_xpixel`, its idea of the pane's pixel size will not match a PNG snapshot of
+that pane. Nothing in shux depends on the two agreeing.
 
 ## Hot reload semantics
 
