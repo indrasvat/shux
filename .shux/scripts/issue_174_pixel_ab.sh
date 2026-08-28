@@ -25,6 +25,11 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 source "${repo_root}/.shux/scripts/lib/shux_harness.sh"
 
 shux_bin="${SHUX_BIN:-${repo_root}/target/debug/shux}"
+# `border_style = "none"` is not a nicety: the pane viewport rule differs
+# there, and a snapshot path frozen on `Rounded` while the live compositor
+# followed the config cropped every pane's last two columns and rows out of
+# the image. That shows up here as an A/B divergence and nowhere else.
+border_style="${BORDER_STYLE:-rounded}"
 base_bin="${BASE_BIN:?BASE_BIN must point at a binary built from the base commit}"
 out_dir="${repo_root}/.shux/out/issue-174/pixel"
 metric_out="${METRIC_OUT:-${out_dir}}"
@@ -47,48 +52,75 @@ printf 'RENDERED\n'
 EOF
 )
 
+# Runtime dirs are tracked in a global so the EXIT trap can tear down a daemon
+# whichever line `set -e` aborted on. Without this, a `wait-for` timeout left a
+# live daemon behind -- reproduced, and exactly what "zero leaked daemons" is
+# there to stop.
+runtimes=()
+cleanup() {
+  local rt
+  for rt in "${runtimes[@]:-}"; do
+    [ -n "${rt}" ] || continue
+    shux_harness_stop_daemon "${rt}"
+    shux_harness_assert_no_daemon "${rt}" || shux_harness_stop_daemon "${rt}"
+    rm -rf "${rt}"
+  done
+}
+trap cleanup EXIT
+
 # render <label> <binary> -> $out_dir/<label>.png + .txt
 render() {
   local label="$1" bin="$2"
   local runtime; runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-174-px-${label}.XXXXXX")"
-  local session="px174-${label}"
+  runtimes+=("${runtime}")
+  mkdir -p "${runtime}/config/shux"
+  printf '[appearance]\nborder_style = "%s"\n' "${border_style}" \
+    >"${runtime}/config/shux/config.toml"
+  # SAME name on both sides: it is drawn in the window title and the status
+  # bar, so `px174-base` vs `px174-head` made every window comparison differ on
+  # text that has nothing to do with the change. The two runs are sequential and
+  # in separate runtime dirs, so the name cannot collide.
+  local session="px174"
   local script="${runtime}/pane.sh"
   { printf '%s\n' "${payload}"; printf 'sleep 120\n'; } >"${script}"
 
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${bin}" session create "${session}" -d \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" session create "${session}" -d \
     --title "${session}" -- \
     env TERM=xterm-256color COLORTERM=truecolor LANG=C.utf8 LC_ALL=C.utf8 \
         HOME="${runtime}" sh "${script}" >/dev/null
   local pane
-  pane="$(env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${bin}" --format json pane list \
+  pane="$(env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" --format json pane list \
     -s "${session}" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')"
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${bin}" pane set-size -s "${session}" \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" pane set-size -s "${session}" \
     -p "${pane}" --cols "${cols}" --rows "${rows}" >/dev/null
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${bin}" pane wait-for -s "${session}" \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" pane wait-for -s "${session}" \
     -p "${pane}" -t RENDERED --timeout-ms 20000 >/dev/null
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${bin}" pane wait-settled "${pane}" \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" pane wait-settled "${pane}" \
     --quiet 250 --timeout 8000 >/dev/null 2>&1 || true
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${bin}" pane capture -s "${session}" \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" pane capture -s "${session}" \
     -p "${pane}" --lines "${rows}" >"${out_dir}/${label}.txt"
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${bin}" pane snapshot -s "${session}" \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" pane snapshot -s "${session}" \
     -p "${pane}" -o "${out_dir}/${label}.png" >/dev/null
+  # The WINDOW composer too -- it is the path that was frozen on `Rounded`.
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" \
+    window snapshot -s "${session}" -o "${out_dir}/${label}-window.png" >/dev/null
 
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${bin}" session kill "${session}" \
+  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" XDG_CONFIG_HOME="${runtime}/config" "${bin}" session kill "${session}" \
     >/dev/null 2>&1 || true
-  shux_harness_stop_daemon "${runtime}"
-  shux_harness_assert_no_daemon "${runtime}" || shux_harness_stop_daemon "${runtime}"
-  sleep 0.3
-  rm -rf "${runtime}"
+  # Teardown is the EXIT trap's job -- see `runtimes` above.
 }
 
-echo "==> pixel A/B: base $(${base_bin} version 2>/dev/null | head -1)"
+echo "==> pixel A/B (border_style=${border_style}): base $(${base_bin} version 2>/dev/null | head -1)"
 echo "               head $(${shux_bin} version 2>/dev/null | head -1)"
 
 render base "${base_bin}"
 render head "${shux_bin}"
 
-# Two blank screens also compare equal. Require content on BOTH before the
-# comparison is allowed to mean anything.
+# Two blank screens also compare equal, so BOTH sides must be shown to carry
+# content -- and the check has to look at the PNGs, not only the text. A
+# rasterizer regression that renders blank on both trees leaves the text
+# captures full of TRUECOLOR while the images say nothing, and the comparison
+# then reports a confident, meaningless 0.
 for label in base head; do
   for needle in TRUECOLOR INDEXED BASIC RENDERED; do
     if ! grep -q -- "${needle}" "${out_dir}/${label}.txt"; then
@@ -97,21 +129,48 @@ for label in base head; do
     fi
   done
 done
+uv run --script "${repo_root}/.shux/scripts/lib/png_not_blank.py" \
+  "${out_dir}/base.png" "${out_dir}/head.png" \
+  "${out_dir}/base-window.png" "${out_dir}/head-window.png" \
+  --min-colors 8 --min-ink-ratio 0.01
 
-metric="${metric_out}/pixel-render-parity.json"
-uv run --script "${repo_root}/.claude/automations/pixel_verify.py" \
-  "${out_dir}/head.png" "${out_dir}/base.png" \
-  --diff "${out_dir}/render-parity-diff.png" \
-  --max-pixel-diff-ratio 0 --max-mean-channel-delta 0 >"${metric}"
-
-python3 - "${metric}" <<'PY'
+compare() {
+  local what="$1" suffix="$2"
+  local metric="${metric_out}/pixel-render-parity-${border_style}-${what}.json"
+  uv run --script "${repo_root}/.claude/automations/pixel_verify.py" \
+    "${out_dir}/head${suffix}.png" "${out_dir}/base${suffix}.png" \
+    --diff "${out_dir}/render-parity-${border_style}-${what}-diff.png" \
+    --max-pixel-diff-ratio 0 --max-mean-channel-delta 0 >"${metric}"
+  printf '    %-7s ' "${what}"
+  python3 - "${metric}" <<'PY'
 import json, sys
 m = json.load(open(sys.argv[1]))
-print("    " + json.dumps({k: m[k] for k in ("status", "diff_pixels", "mean_channel_delta") if k in m}))
+keys = ("status", "changed_pixels", "total_pixels", "pixel_diff_ratio", "mean_rgba_channel_delta")
+missing = [k for k in keys if k not in m]
+if missing:
+    print(f"FAIL — comparator did not report {missing}; its output shape changed")
+    sys.exit(1)
+print(json.dumps({k: m[k] for k in keys}))
 if m.get("status") != "pass":
-    print("    FAIL — the rendered output changed; this change should move no pixel")
+    print("FAIL — the rendered output changed; this change should move no pixel")
     sys.exit(1)
 PY
+}
 
-echo "    metric: ${metric}"
-echo "==> PASS — byte-identical rendering across the change"
+# Both the pane rasterizer and the WINDOW composer. The window path is the one
+# that was frozen on `Rounded` while the live compositor followed the config.
+#
+# The parity claim holds under the DEFAULT style only, and that is the honest
+# scope: under `border_style = "none"` the window snapshot is SUPPOSED to
+# differ, because base ignored the setting and drew rounded borders anyway.
+# `issue_174_snapshot_style_check.sh` is where that direction is asserted.
+compare pane ""
+if [ "${border_style}" = "rounded" ]; then
+  compare window "-window"
+else
+  echo "    window  skipped — base ignores border_style here; see"
+  echo "            issue_174_snapshot_style_check.sh for that direction"
+fi
+
+echo "    metrics: ${metric_out}"
+echo "==> PASS — byte-identical rendering (border_style=${border_style})"

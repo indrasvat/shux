@@ -44,6 +44,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# `wait-settled ... || true` appears below, which is the pattern CLAUDE.md warns
+# turns an error into a fast success. It is safe HERE and only here: every one is
+# preceded by a `wait-for` that hard-fails if the content never arrived, so the
+# settle is a quieting delay on top of an assertion that already passed, and
+# every check after it reads captured content rather than an exit code. A settle
+# that times out costs a slightly earlier screenshot, not a false pass.
 sx() { env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" "$@"; }
 
 mkdir -p "${out_dir}"

@@ -137,8 +137,23 @@ def main():
     except OSError:
         pass
     if status is None:
-        sys.exit(0)
-    sys.exit(os.waitstatus_to_exitcode(status) if os.WIFEXITED(status) else 0)
+        # Never reaped. Not a clean exit, and callers run this bare under
+        # `set -e`, so it must not look like one.
+        sys.exit(125)
+    if os.WIFEXITED(status):
+        sys.exit(os.waitstatus_to_exitcode(status))
+    if os.WIFSIGNALED(status):
+        sig = os.WTERMSIG(status)
+        # SIGHUP is what this script itself sends to ask the client to detach,
+        # and SIGTERM is the same request by another route. Anything else means
+        # the child DIED -- a SIGSEGV or SIGABRT in `shux attach` must not be
+        # indistinguishable from a clean detach, because the harnesses invoke
+        # this bare and that exit code is the only place a crash surfaces.
+        if sig in (signal.SIGHUP, signal.SIGTERM):
+            sys.exit(0)
+        sys.stderr.write(f"child died on signal {sig} ({signal.Signals(sig).name})\n")
+        sys.exit(128 + sig)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

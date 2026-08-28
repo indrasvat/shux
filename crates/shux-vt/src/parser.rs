@@ -2413,6 +2413,39 @@ fn parse_rgb_component(component: &str) -> Result<u8, ()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #174 tracks modes 1005, 1015 and 1016 so a mouse forwarder can
+    /// stand down under a coordinate encoding shux does not emit. Tracking must
+    /// NOT turn the DECRQM answer into a lie.
+    ///
+    /// `0` means "not recognized", and that stays true: shux never emits any of
+    /// these. Answering `1` ("set") would tell a well-behaved app that queries
+    /// first that it may use an encoding shux cannot produce, which is how you
+    /// turn a working mouse into a dead one. Nothing else pins this — the flags
+    /// are set and the report value is computed in two different places.
+    #[test]
+    fn tracking_a_coordinate_mode_does_not_make_decrqm_claim_it() {
+        let flatten =
+            |r: Vec<Vec<u8>>| -> String { String::from_utf8_lossy(&r.concat()).to_string() };
+        for mode in [1005u16, 1015, 1016] {
+            // The control: how shux answers about a mode it has genuinely never
+            // heard of. Anything else would be this test asserting a constant.
+            let unknown = {
+                let mut probe = crate::VirtualTerminal::new(10, 40);
+                flatten(probe.process_with_responses(b"\x1b[?9999$p"))
+                    .replace("9999", &mode.to_string())
+            };
+
+            let mut vt = crate::VirtualTerminal::new(10, 40);
+            vt.process(format!("\x1b[?{mode}h").as_bytes());
+            let got = flatten(vt.process_with_responses(format!("\x1b[?{mode}$p").as_bytes()));
+            assert_eq!(
+                got, unknown,
+                "mode {mode} is tracked, but DECRQM must still answer exactly as \
+                 it does for a mode shux has never heard of"
+            );
+        }
+    }
     use super::*;
     use crate::grid::GridConfig;
 

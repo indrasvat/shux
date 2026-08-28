@@ -252,6 +252,18 @@ pub(crate) async fn snapshot_window(
     .await;
     const STATUS_BAR_ROWS: u16 = 1;
 
+    // The user's outline style, not a hardcoded `Rounded`.
+    //
+    // Two bugs in one line. The old one was cosmetic and long-standing: a user
+    // configured `thick` / `ascii` / `double` got rounded borders in every
+    // snapshot PNG. The new one is not cosmetic -- `compose` derives the pane
+    // viewport from this style, so once a pane's PTY started following the LIVE
+    // compositor's rule (issue #174), a snapshot taken under
+    // `border_style = "none"` composed panes into rects two columns and two
+    // rows smaller than their grids and silently cropped the right and bottom
+    // edges out of the image. Read before `spawn_blocking` takes the closure.
+    let border_style = shux_ui::BorderStyle::parse(&config.current().appearance.border_style);
+
     let (img, png_buf) = tokio::task::spawn_blocking(move || {
         let panes: std::collections::HashMap<
             shux_core::model::PaneId,
@@ -279,7 +291,7 @@ pub(crate) async fn snapshot_window(
             &inputs,
             cols,
             rows,
-            shux_ui::BorderStyle::Rounded,
+            border_style,
             shux_ui::BorderColors::default(),
             STATUS_BAR_ROWS,
         );

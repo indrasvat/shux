@@ -92,23 +92,15 @@ const SECTIONS: &[Section] = &[
         entries: &[
             Entry {
                 key: "Scroll wheel",
-                desc: "Scroll scrollback (or the focused app when it uses the mouse)",
+                desc: "Scrollback, or the app in the pane under the pointer",
             },
             Entry {
                 key: "Click / drag",
-                desc: "Goes to the app when the pane uses the mouse",
-            },
-            Entry {
-                key: "Drag text",
-                desc: "Otherwise: select and copy on release",
+                desc: "The app's when the pane uses the mouse; else select",
             },
             Entry {
                 key: "Shift + drag",
-                desc: "Take the mouse back (if your terminal allows)",
-            },
-            Entry {
-                key: "Right-click selection",
-                desc: "Open Copy / Clear menu",
+                desc: "Selects even then, host permitting; right-click: menu",
             },
         ],
     },
@@ -352,6 +344,37 @@ fn display_width(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overlay's minimum height is a user-visible contract, and nothing
+    /// pinned it. Adding two rows to the Mouse section moved it from 37 to 39
+    /// without a single test noticing: everyone on a 37- or 38-row terminal
+    /// silently lost the cheat sheet and got a one-line hint telling them to
+    /// press the key they had just pressed.
+    ///
+    /// 37 is not a magic number to be updated when it breaks -- it is the
+    /// height this overlay has always needed. If this fails, a section grew:
+    /// shrink it back rather than raising the constant, or the fallback band
+    /// widens again for the people with the smallest terminals.
+    #[test]
+    fn the_overlay_still_fits_the_smallest_terminal_it_always_has() {
+        const MIN_ROWS: u16 = 37;
+        let render = |rows: u16| {
+            let mut buf = Vec::new();
+            render_help_overlay_into(&mut buf, 120, rows, &Theme::DEFAULT);
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        // A row from the last section proves the WHOLE table rendered, not just
+        // the top of the box.
+        assert!(
+            render(MIN_ROWS).contains("Scroll wheel"),
+            "the full cheat sheet no longer fits in {MIN_ROWS} rows; a section grew"
+        );
+        assert!(
+            !render(MIN_ROWS - 1).contains("Scroll wheel"),
+            "the fallback boundary moved DOWN — this test is now measuring \
+             something other than the real minimum"
+        );
+    }
 
     #[test]
     fn renders_into_buffer_for_reasonable_size() {

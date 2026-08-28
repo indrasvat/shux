@@ -719,9 +719,35 @@ async fn run_attach_loop(
     // the layout split ratio.
     let mut mouse_drag: Option<DragState> = None;
     let mut selection_drag = SelectionDrag::None;
+    // `appearance.border_style` decides the pane viewport, so a live edit moves
+    // every pane's rect. The compositor picks that up on its next frame and the
+    // hit-test reads it per event, but a pane's PTY only learns its size when
+    // something re-fans the winsize -- attach, a client resize, or a
+    // layout-changing action. Without this the two drift apart until one of
+    // those happens: the app is drawn at one size and told another, and a click
+    // on its last column names a cell it does not have. Tracked here rather
+    // than read per iteration so the fan-out fires on the EDGE, not every wake.
+    let mut last_border_style = config.current().appearance.border_style.clone();
+    let cfg_changed = config.change_notify();
+    let mut cfg_listener = Box::pin(cfg_changed.notified());
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            () = &mut cfg_listener => {
+                cfg_listener = Box::pin(cfg_changed.notified());
+                let live = config.current().appearance.border_style.clone();
+                if live != last_border_style {
+                    last_border_style = live;
+                    let attached = render_session.lock().await.clone();
+                    let (cols, rows) = *client_size.lock().await;
+                    apply_resize_to_window(
+                        &graph, &io_state, &attached, &config, cols, rows,
+                    )
+                    .await;
+                    let pulse = io_state.lock().await.render_pulse.clone();
+                    pulse.notify_one();
+                }
+            }
             frame = stream.next() => {
                 let buf = match frame {
                     Some(Ok(b)) => b,
@@ -2507,7 +2533,8 @@ async fn handle_app_mouse(
     // The pane can lose its rect mid-gesture: a window switch or a zoom leaves
     // it off-screen. Let the app know the button came up rather than letting
     // the gesture evaporate with it still held.
-    let Some(rect) = pane_rect_for(graph, &attached, client_size, config, pane_id).await else {
+    let content = current_content_rect(client_size).await;
+    let Some(rect) = pane_rect_in(graph, &attached, content, viewport, pane_id) else {
         release_app_gesture(io_state, gesture).await;
         return Ok(AppMouse::NotHandled);
     };
@@ -2782,13 +2809,21 @@ async fn handle_wheel(
     };
 
     // Snapshot the target pane's live mode state + scrollback depth.
+    //
+    // `coords_are_encodable` gates the wheel for the same reason it gates
+    // buttons: an app that also asked for 1005/1015/1016 decodes the bytes shux
+    // writes as something else, and under 1016 in particular it reads cell
+    // coordinates as pixels. Forwarding there is not "mostly working" — it is
+    // scrolling the wrong place. A pane that fails it is treated as not
+    // mouse-aware, so the wheel falls back to shux's own scrollback, which is
+    // what the user got before any of this existed.
     let (mouse_on, sgr, alt, alt_scroll, app_cursor, total_lines) = {
         let state = io_state.lock().await;
         match state.vts.get(&pane_id) {
             Some(vt) => {
                 let m = vt.modes();
                 (
-                    m.mouse_tracking != shux_vt::MouseMode::None,
+                    m.mouse_tracking != shux_vt::MouseMode::None && coords_are_encodable(m),
                     m.sgr_mouse,
                     vt.is_alternate_screen(),
                     m.alternate_scroll,
@@ -2943,6 +2978,24 @@ async fn pane_rect_for(
 ) -> Option<Rect> {
     let content = current_content_rect(client_size).await;
     let viewport = current_viewport(client_size, config).await;
+    pane_rect_in(graph, attached, content, viewport, pane_id)
+}
+
+/// `pane_rect_for` with the geometry already resolved.
+///
+/// Split out so a caller that has already computed the viewport for this event
+/// uses that one rather than reading the live config a second time. The two
+/// reads are microseconds apart, but a config reload landing between them would
+/// hit-test one event against two different geometries — and the whole point of
+/// deriving the viewport instead of caching it is that there is one answer per
+/// event.
+fn pane_rect_in(
+    graph: &GraphHandle,
+    attached: &AttachedSession,
+    content: Rect,
+    viewport: Rect,
+    pane_id: PaneId,
+) -> Option<Rect> {
     let snap = graph.snapshot();
     let win = snap.windows.get(&attached.active_window_id)?;
     if win.layout.is_zoomed() {
@@ -3049,9 +3102,13 @@ async fn current_content_rect(client_size: &ClientSize) -> Rect {
 /// window where a reload between the two reads stranded it forever. A config
 /// read is an ArcSwap load.
 ///
-/// `zoomed: false` is not an oversight: while zoomed there is one pane filling
-/// the content rect, and every caller here takes the zoomed branch before it
-/// asks for a viewport.
+/// `zoomed: false` is not an oversight, but the reason is narrower than "every
+/// caller checks first". Six of the seven callers do take a zoomed branch before
+/// asking. The seventh, `handle_action`'s `SplitSmart`, reaches
+/// `compute_rects(viewport)` while zoomed — and is unaffected, because the only
+/// thing it asks of the rect is `width >= height`, and the inset subtracts 2
+/// from both. Stated this way rather than as a claim a reader can falsify with
+/// one grep.
 async fn current_viewport(client_size: &ClientSize, config: &ConfigHandle) -> Rect {
     let border_style = BorderStyle::parse(&config.current().appearance.border_style);
     shux_ui::pane_viewport(current_content_rect(client_size).await, border_style, false)
@@ -5606,6 +5663,16 @@ mod tests {
             h.send(MouseKind::Drag, ProtoMouseButton::Left, 12, 5).await,
             AppMouse::NotHandled
         );
+        // The discriminating step. Drag and Up above are also refused by the
+        // press-only rule, so they cannot tell the gesture guard apart from its
+        // absence — a second PRESS while shux owns the gesture can, and it is a
+        // real gesture (middle-click while text-selecting).
+        assert_eq!(
+            h.send(MouseKind::Down, ProtoMouseButton::Middle, 12, 5)
+                .await,
+            AppMouse::NotHandled,
+            "a press during a shux selection must not open an app gesture"
+        );
         assert_eq!(
             h.send(MouseKind::Up, ProtoMouseButton::Left, 12, 5).await,
             AppMouse::NotHandled
@@ -5614,10 +5681,17 @@ mod tests {
         h.fixture.stop();
     }
 
-    /// The mirror image: an app losing the mouse mid-gesture still gets its
-    /// release, so it does not sit button-held forever.
+    /// An app that turns tracking OFF mid-gesture stops receiving reports, and
+    /// the gesture still ends.
+    ///
+    /// No synthetic release here, deliberately: a real terminal stops reporting
+    /// the moment the app clears the mode, and manufacturing a release it never
+    /// subscribed to would be inventing input. The release IS synthesized where
+    /// the app never asked to stop — see
+    /// `abandoning_a_gesture_synthesizes_the_release_the_app_is_waiting_for`.
+    /// What matters here is that the gesture does not stay latched.
     #[tokio::test]
-    async fn an_app_that_drops_tracking_mid_gesture_still_gets_its_release() {
+    async fn an_app_that_drops_tracking_mid_gesture_stops_receiving_reports() {
         let mut h = AppMouseHarness::new().await;
         let mut wr = seed_scrollback_pane(
             &h.fixture.io_state,
@@ -6165,6 +6239,122 @@ mod tests {
                 );
             }
         }
+        fixture.stop();
+    }
+
+    /// A live `border_style` edit moves every pane's rect, so the PTYs have to
+    /// be re-told their size or they are drawn at one geometry and believe
+    /// another — and a click on the last column then names a cell the app does
+    /// not have, which is the whole defect class this PR exists to close.
+    ///
+    /// Drives the real `ConfigHandle::replace` and the real fan-out. Seen
+    /// failing against the tree before the `change_notify` branch existed: the
+    /// resize channel stays silent and the receiver times out.
+    #[tokio::test]
+    async fn a_border_style_reload_re_fans_every_pane_winsize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[appearance]\nborder_style = \"rounded\"\n").expect("write");
+        let config = ConfigHandle::load_or_default(&path);
+
+        let fixture = attach_fixture().await;
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        let mut receivers = Vec::new();
+        {
+            let mut state = fixture.io_state.lock().await;
+            for pid in [fixture.first_pane, fixture.second_pane] {
+                let (tx, rx) = mpsc::channel(8);
+                state.resizers.insert(pid, tx);
+                receivers.push((pid, rx));
+            }
+        }
+
+        // Baseline: the outline is drawn, so the viewport is inset.
+        let (cols, rows) = *client_size.lock().await;
+        apply_resize_to_window(
+            &fixture.graph,
+            &fixture.io_state,
+            &fixture.attached,
+            &config,
+            cols,
+            rows,
+        )
+        .await;
+        let mut before = Vec::new();
+        for (pid, rx) in receivers.iter_mut() {
+            let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("baseline resize")
+                .expect("baseline resize");
+            before.push((*pid, req.size.cols, req.size.rows));
+        }
+
+        // The edit the user makes. `replace` is what the config watcher calls.
+        let mut reloaded = (*config.current()).clone();
+        reloaded.appearance.border_style = "none".to_string();
+        config.replace(reloaded);
+
+        apply_resize_to_window(
+            &fixture.graph,
+            &fixture.io_state,
+            &fixture.attached,
+            &config,
+            cols,
+            rows,
+        )
+        .await;
+        for ((pid, was_cols, was_rows), (_, rx)) in before.iter().zip(receivers.iter_mut()) {
+            let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("post-reload resize")
+                .expect("post-reload resize");
+            assert!(
+                req.size.cols > *was_cols || req.size.rows > *was_rows,
+                "pane {pid} kept {was_cols}x{was_rows} after the outline was \
+                 turned off; it is now drawn larger than it was told"
+            );
+        }
+        fixture.stop();
+    }
+
+    /// The wheel stands down under a coordinate mode shux cannot encode, just
+    /// as the button path does.
+    ///
+    /// This was asymmetric: `handle_app_mouse` refused, `handle_wheel` did not,
+    /// so an app in `1002h 1006h 1016h` got no clicks but did get wheel reports
+    /// whose cell coordinates it read as pixels. Half a guard is not a guard.
+    /// Falling back to shux's own scrollback is the honest floor — it is what
+    /// the pane did before any forwarding existed.
+    #[tokio::test]
+    async fn the_wheel_stands_down_under_a_coordinate_mode_shux_cannot_encode() {
+        let fixture = attach_fixture().await;
+        let mut wr = seed_scrollback_pane(
+            &fixture.io_state,
+            fixture.first_pane,
+            b"\x1b[?1002h\x1b[?1006h\x1b[?1016h",
+        )
+        .await;
+        let session = Arc::new(Mutex::new(fixture.attached.clone()));
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+
+        handle_wheel(
+            MouseKind::ScrollUp,
+            3,
+            3,
+            &fixture.graph,
+            &fixture.io_state,
+            &session,
+            &client_size,
+            &test_config(),
+        )
+        .await
+        .expect("wheel");
+
+        assert_no_bytes(&mut wr, "1016 makes the app read cells as pixels").await;
+        assert!(
+            session.lock().await.copy_mode.is_some(),
+            "the wheel should have fallen back to shux's scrollback"
+        );
         fixture.stop();
     }
 

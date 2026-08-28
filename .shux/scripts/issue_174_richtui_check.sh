@@ -53,6 +53,8 @@ wire_row=$((target_row + 1))
 sessions=()
 failures=0
 passes=0
+# How many of the checks read the cursor back out of the app (vim/nvim).
+ground_truth=0
 skipped=()
 
 cleanup() {
@@ -66,6 +68,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# `wait-settled ... || true` appears below, which is the pattern CLAUDE.md warns
+# turns an error into a fast success. It is safe HERE and only here: every one is
+# preceded by a `wait-for` that hard-fails if the content never arrived, so the
+# settle is a quieting delay on top of an assertion that already passed, and
+# every check after it reads captured content rather than an exit code. A settle
+# that times out costs a slightly earlier screenshot, not a false pass.
 sx() { env -u SHUX_SOCKET XDG_RUNTIME_DIR="${runtime}" "${shux_bin}" "$@"; }
 
 mkdir -p "${out_dir}"
@@ -176,6 +184,7 @@ check_editor() {
     printf '    %-9s ok   click landed exactly on (%s, %s); %s bytes png\n' \
       "${name}" "${target_col}" "${target_row}" "$(wc -c <"${out_dir}/${name}.png")"
     passes=$((passes + 1))
+    ground_truth=$((ground_truth + 1))
   fi
   finish "${session}"
 }
@@ -226,12 +235,24 @@ echo "    artifacts: ${out_dir}"
 if [ "${#skipped[@]}" -ne 0 ]; then
   printf '    skipped: %s\n' "${skipped[*]}"
 fi
+# CLAUDE.md's list also names `vicaya` and `vivecaka`. Neither is packaged, so
+# neither is covered here; say so rather than let the list look complete.
+for absent in vicaya vivecaka; do
+  command -v "${absent}" >/dev/null 2>&1 \
+    || skipped+=("${absent} (not installed; named in CLAUDE.md's matrix)")
+done
+
 if [ "${failures}" -ne 0 ]; then
   echo "==> FAIL (${passes} ok, ${failures} failed)"
   exit 1
 fi
-if [ "${passes}" -eq 0 ]; then
-  echo "==> FAIL — nothing ran; a matrix that checked nothing is not a pass"
+# `passes > 0` is too weak a floor: htop/btop/lazygit assert only "still
+# renders", which holds with forwarding ripped out entirely. Only vim and nvim
+# read the cursor back and can say the click landed on the right cell, so at
+# least one of them must actually have run.
+if [ "${ground_truth}" -eq 0 ]; then
+  echo "==> FAIL — neither vim nor nvim ran; nothing here checked WHERE a click"
+  echo "           landed, only that the TUIs still draw. That is not the matrix."
   exit 1
 fi
-echo "==> PASS (${passes} ok)"
+echo "==> PASS (${passes} ok, ${ground_truth} with cursor ground truth)"

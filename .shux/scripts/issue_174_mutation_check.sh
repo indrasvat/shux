@@ -28,17 +28,51 @@ cd "${REPO_ROOT}"
 ATTACH="crates/shux/src/attach.rs"
 HANDLE="crates/shux-pty/src/handle.rs"
 RPC="crates/shux-rpc/src/attach.rs"
+OVERLAY="crates/shux-ui/src/help_overlay.rs"
+
+# This battery REWRITES TRACKED FILES in place, which CLAUDE.md says belongs in
+# its own worktree. An EXIT trap is the only thing putting them back, and a trap
+# does not survive SIGKILL -- a mutated `attach.rs` left in the tree is a
+# deliberately-broken guard sitting one `git add -A` away from `origin`.
+#
+# Two cheap defences, since the trap cannot be made reliable: refuse to start on
+# a dirty tree (or a crashed earlier run gets baked into this run's backup and
+# silently "restored" as the mutated version), and assert on the way out that
+# the tree really is clean again.
+if ! git diff --quiet -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}"; then
+  echo "Refusing to run: these files already have uncommitted changes." >&2
+  git diff --stat -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" >&2
+  echo >&2
+  echo "This battery mutates them in place. Commit or stash first, or run it" >&2
+  echo "in its own worktree (CLAUDE.md: an agent that rewrites tracked files" >&2
+  echo "runs in its own git worktree)." >&2
+  exit 2
+fi
+
 BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shux-174-mutation-XXXXXX")"
 cp "${ATTACH}" "${BACKUP_DIR}/attach.rs"
 cp "${HANDLE}" "${BACKUP_DIR}/handle.rs"
 cp "${RPC}" "${BACKUP_DIR}/rpc_attach.rs"
+cp "${OVERLAY}" "${BACKUP_DIR}/help_overlay.rs"
 
 restore() {
   cp "${BACKUP_DIR}/attach.rs" "${ATTACH}"
   cp "${BACKUP_DIR}/handle.rs" "${HANDLE}"
   cp "${BACKUP_DIR}/rpc_attach.rs" "${RPC}"
+  cp "${BACKUP_DIR}/help_overlay.rs" "${OVERLAY}"
 }
-trap 'restore; rm -rf "${BACKUP_DIR}"' EXIT
+finish() {
+  local status=$?
+  restore
+  rm -rf "${BACKUP_DIR}"
+  if ! git diff --quiet -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}"; then
+    echo "REFUSING TO EXIT CLEAN: restore did not put the tree back." >&2
+    git diff --stat -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" >&2
+    exit 90
+  fi
+  exit "${status}"
+}
+trap finish EXIT
 
 # name | anchor test that must catch it | file | python expression over `s`
 MUTATIONS=(
@@ -78,6 +112,17 @@ MUTATIONS=(
   "an_older_clients_mouse_frame_stops_parsing|attach::tests::a_mouse_frame_without_modifiers_still_deserializes|${RPC}|s.replace('        #[serde(default)]\n        shift: bool,', '        shift: bool,')"
 
   "the_resize_fan_out_ignores_the_border_style|attach::tests::every_render_path_agrees_on_the_pane_viewport|${ATTACH}|s.replace('    let viewport = shux_ui::pane_viewport(\\n        content,\\n        BorderStyle::parse(&config.current().appearance.border_style),\\n        false,\\n    );', '    let _ = config;\\n    let viewport = if cols >= 3 && content_h >= 3 {\\n        Rect::new(content.x + 1, content.y + 1, cols - 2, content_h - 2)\\n    } else {\\n        content\\n    };')"
+  # ── The wheel half of the coordinate-mode guard ───────────────────────────
+  # It was asymmetric: buttons refused under 1005/1015/1016, the wheel did not,
+  # so an app in 1016 got no clicks but did get wheel reports whose cell
+  # coordinates it decoded as pixels.
+  "the_wheel_forwards_under_an_unencodable_mode|attach::tests::the_wheel_stands_down_under_a_coordinate_mode_shux_cannot_encode|${ATTACH}|s.replace('m.mouse_tracking != shux_vt::MouseMode::None && coords_are_encodable(m),', 'm.mouse_tracking != shux_vt::MouseMode::None,')"
+
+  # ── The help overlay must still fit the smallest terminal it always has ───
+  # Raising the chrome allowance is the same observable defect as adding rows:
+  # the whole cheat sheet falls back to a one-line hint two sizes sooner.
+  "the_overlay_grows_past_the_smallest_terminal|help_overlay::tests::the_overlay_still_fits_the_smallest_terminal_it_always_has|${OVERLAY}|s.replace('box_h + 2 > rows', 'box_h + 4 > rows')"
+
   # ── The pane viewport shared with the compositor ───────────────────────────
   "the_hit_test_insets_even_without_an_outline|attach::tests::the_pane_hit_test_agrees_with_the_compositor_under_every_border_style|${ATTACH}|s.replace('    shux_ui::pane_viewport(current_content_rect(client_size).await, border_style, false)', '''    let _ = border_style;\n    let (cols, rows) = *client_size.lock().await;\n    let content_h = rows.saturating_sub(STATUS_BAR_ROWS);\n    if cols >= 3 && content_h >= 3 {\n        Rect::new(1, 1, cols - 2, content_h - 2)\n    } else {\n        Rect::new(0, 0, cols, content_h)\n    }''')"
   # The defect that actually shipped: not the arithmetic, but the plumbing --
@@ -97,6 +142,7 @@ run_suite() {
   case "$1" in
     "${HANDLE}") make -s test-mutation-suite CRATE=shux-pty TARGET= FILTER= 2>&1 || true ;;
     "${RPC}") make -s test-mutation-suite CRATE=shux-rpc TARGET=--lib FILTER=attach::tests 2>&1 || true ;;
+    "${OVERLAY}") make -s test-mutation-suite CRATE=shux-ui TARGET=--lib FILTER=help_overlay::tests 2>&1 || true ;;
     *) make -s test-mutation-suite CRATE=shux TARGET=--lib FILTER=attach::tests 2>&1 || true ;;
   esac
 }
@@ -109,7 +155,7 @@ has_run() { printf '%s\n' "$1" | grep -q '^test result:'; }
 
 declare -A BASELINE
 echo "Baseline (unmutated):"
-for f in "${HANDLE}" "${RPC}" "${ATTACH}"; do
+for f in "${HANDLE}" "${RPC}" "${OVERLAY}" "${ATTACH}"; do
   log="$(run_suite "${f}")"
   if ! has_run "${log}"; then
     echo "  ${f}: cargo never ran the tests — build or harness failure, not a result." >&2
