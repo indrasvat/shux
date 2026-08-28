@@ -29,6 +29,7 @@ ATTACH="crates/shux/src/attach.rs"
 HANDLE="crates/shux-pty/src/handle.rs"
 RPC="crates/shux-rpc/src/attach.rs"
 OVERLAY="crates/shux-ui/src/help_overlay.rs"
+SNAPSHOT="crates/shux/src/snapshot.rs"
 
 # This battery REWRITES TRACKED FILES in place, which CLAUDE.md says belongs in
 # its own worktree. An EXIT trap is the only thing putting them back, and a trap
@@ -39,9 +40,9 @@ OVERLAY="crates/shux-ui/src/help_overlay.rs"
 # a dirty tree (or a crashed earlier run gets baked into this run's backup and
 # silently "restored" as the mutated version), and assert on the way out that
 # the tree really is clean again.
-if ! git diff --quiet -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}"; then
+if ! git diff --quiet -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" "${SNAPSHOT}"; then
   echo "Refusing to run: these files already have uncommitted changes." >&2
-  git diff --stat -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" >&2
+  git diff --stat -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" "${SNAPSHOT}" >&2
   echo >&2
   echo "This battery mutates them in place. Commit or stash first, or run it" >&2
   echo "in its own worktree (CLAUDE.md: an agent that rewrites tracked files" >&2
@@ -54,20 +55,22 @@ cp "${ATTACH}" "${BACKUP_DIR}/attach.rs"
 cp "${HANDLE}" "${BACKUP_DIR}/handle.rs"
 cp "${RPC}" "${BACKUP_DIR}/rpc_attach.rs"
 cp "${OVERLAY}" "${BACKUP_DIR}/help_overlay.rs"
+cp "${SNAPSHOT}" "${BACKUP_DIR}/snapshot.rs"
 
 restore() {
   cp "${BACKUP_DIR}/attach.rs" "${ATTACH}"
   cp "${BACKUP_DIR}/handle.rs" "${HANDLE}"
   cp "${BACKUP_DIR}/rpc_attach.rs" "${RPC}"
   cp "${BACKUP_DIR}/help_overlay.rs" "${OVERLAY}"
+  cp "${BACKUP_DIR}/snapshot.rs" "${SNAPSHOT}"
 }
 finish() {
   local status=$?
   restore
   rm -rf "${BACKUP_DIR}"
-  if ! git diff --quiet -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}"; then
+  if ! git diff --quiet -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" "${SNAPSHOT}"; then
     echo "REFUSING TO EXIT CLEAN: restore did not put the tree back." >&2
-    git diff --stat -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" >&2
+    git diff --stat -- "${ATTACH}" "${HANDLE}" "${RPC}" "${OVERLAY}" "${SNAPSHOT}" >&2
     exit 90
   fi
   exit "${status}"
@@ -112,6 +115,13 @@ MUTATIONS=(
   "an_older_clients_mouse_frame_stops_parsing|attach::tests::a_mouse_frame_without_modifiers_still_deserializes|${RPC}|s.replace('        #[serde(default)]\n        shift: bool,', '        shift: bool,')"
 
   "the_resize_fan_out_ignores_the_border_style|attach::tests::every_render_path_agrees_on_the_pane_viewport|${ATTACH}|s.replace('    let viewport = shux_ui::pane_viewport(\\n        content,\\n        BorderStyle::parse(&config.current().appearance.border_style),\\n        false,\\n    );', '    let _ = config;\\n    let viewport = if cols >= 3 && content_h >= 3 {\\n        Rect::new(content.x + 1, content.y + 1, cols - 2, content_h - 2)\\n    } else {\\n        content\\n    };')"
+  # ── The snapshot composer's border style ──────────────────────────────────
+  # The VT gate's blocking P1. `snapshot.rs` is the ONLY production caller of
+  # the composer this diff changed, and it passed a constant -- so the unit test
+  # that compares `compose` against a style it parsed itself stayed green while
+  # production disagreed. This anchors on the daemon-backed test instead.
+  "the_snapshot_composer_ignores_the_configured_style|window_snapshot_honours_border_style_none|${SNAPSHOT}|s.replace('let border_style = shux_ui::BorderStyle::parse(&config.current().appearance.border_style);', 'let border_style = shux_ui::BorderStyle::Rounded;')"
+
   # ── The wheel half of the coordinate-mode guard ───────────────────────────
   # It was asymmetric: buttons refused under 1005/1015/1016, the wheel did not,
   # so an app in 1016 got no clicks but did get wheel reports whose cell
@@ -143,6 +153,7 @@ run_suite() {
     "${HANDLE}") make -s test-mutation-suite CRATE=shux-pty TARGET= FILTER= 2>&1 || true ;;
     "${RPC}") make -s test-mutation-suite CRATE=shux-rpc TARGET=--lib FILTER=attach::tests 2>&1 || true ;;
     "${OVERLAY}") make -s test-mutation-suite CRATE=shux-ui TARGET=--lib FILTER=help_overlay::tests 2>&1 || true ;;
+    "${SNAPSHOT}") make -s test-mutation-suite CRATE=shux TARGET="--test window_snapshot_border_style" FILTER= 2>&1 || true ;;
     *) make -s test-mutation-suite CRATE=shux TARGET=--lib FILTER=attach::tests 2>&1 || true ;;
   esac
 }
@@ -155,7 +166,7 @@ has_run() { printf '%s\n' "$1" | grep -q '^test result:'; }
 
 declare -A BASELINE
 echo "Baseline (unmutated):"
-for f in "${HANDLE}" "${RPC}" "${OVERLAY}" "${ATTACH}"; do
+for f in "${HANDLE}" "${RPC}" "${OVERLAY}" "${SNAPSHOT}" "${ATTACH}"; do
   log="$(run_suite "${f}")"
   if ! has_run "${log}"; then
     echo "  ${f}: cargo never ran the tests — build or harness failure, not a result." >&2

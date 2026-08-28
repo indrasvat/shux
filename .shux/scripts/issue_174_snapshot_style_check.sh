@@ -61,6 +61,10 @@ render() {
     printf "printf '\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\033[38;5;208mINDEXED\\033[0m \\033[34mBASIC\\033[0m\\n'\n"
     # Fill every column of every row, so a viewport that is two cells too small
     # crops visible content rather than blank space.
+    #
+    # shellcheck disable=SC2016  # `$i` and `$(...)` are for the PANE's shell to
+    # expand when it runs this generated script, not for this one. Only `%s`
+    # (the column count) is substituted here, which is why it is `printf`.
     printf 'i=1; while [ "$i" -le 20 ]; do printf "\\033[48;2;200;40;40m%%s\\033[0m\\n" "$(printf "X%%.0s" $(seq 1 %s))"; i=$((i+1)); done\n' "${cols}"
     printf "printf 'RENDERED\\n'\n"
     printf 'sleep 120\n'
