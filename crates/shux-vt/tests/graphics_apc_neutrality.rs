@@ -5,10 +5,10 @@
 //! is invisible: grid, cursor, title and replies must not depend on where the
 //! cuts fall or how the PTY chunked the read.
 //!
-//! The property currently holds structurally -- `dispatch_graphics` has no body
-//! -- which is why it needs pinning now: the first line added there that touches
-//! the grid, cursor or `responses` would break it while every other test stayed
-//! green.
+//! The property holds structurally -- `dispatch_graphics` takes no `&mut self`,
+//! so it cannot reach the grid, cursor or replies at all. It needs pinning
+//! because the renderer will have to widen that signature, and the first line
+//! it adds there would break neutrality while every other test stayed green.
 //!
 //! The alphabet is weighted toward bytes that make a naive splitter diverge:
 //! `ESC`, `CAN`, `SUB`, the string introducers `_ X ^ P ]`, and ST's `\`.
@@ -142,20 +142,6 @@ fn apc_payload_never_reaches_the_grid() {
     );
 }
 
-/// No graphics command is answered yet, deliberately. Replying `OK` before shux
-/// can draw turns an honest "cannot show images" into a silent blank screen: the
-/// client stops probing and starts transmitting. The answer ships with the
-/// renderer.
-#[test]
-fn graphics_queries_are_not_answered_yet() {
-    let observed = drive(&[b"\x1b_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\\x1b[c"]);
-    // The DA1 that follows it is still answered, in order, unchanged.
-    assert_eq!(
-        observed.responses,
-        vec![b"\x1b[?62;1;2;6;9;15;22c".to_vec()]
-    );
-}
-
 /// The scanner must not disturb an unterminated string sequence around it: vte
 /// leaves a string state on `ESC`-anything, and a splitter consuming that ESC
 /// would park vte inside the OSC forever and mute the pane.
@@ -270,10 +256,16 @@ fn nothing_is_answered() {
         b"\x1b_Ga=T,f=32,s=1,v=1,i=1;AAAA\x1b\\",
         b"\x1b_Ga=T,i=1,I=2;AAAA\x1b\\",
         b"\x1b_Ga=Z,i=1;AAAA\x1b\\",
+        // The support-detection idiom: a query and a device-attributes request
+        // in ONE read. An application that gets a graphics answer here concludes
+        // shux does graphics; it must get only the DA1 reply.
+        b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c",
     ] {
+        let replies = vt.process_with_responses(command);
+        let joined = String::from_utf8_lossy(&replies.concat()).into_owned();
         assert!(
-            vt.process_with_responses(command).is_empty(),
-            "shux answered a graphics command it cannot honour: {command:?}"
+            !joined.contains("\x1b_G"),
+            "shux answered a graphics command it cannot honour: {command:?} -> {joined:?}"
         );
     }
 

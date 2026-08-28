@@ -104,9 +104,7 @@ pub struct VirtualTerminal {
     apc_scanner: graphics::apc::ApcScanner,
     /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
     apc_cut_slicing: bool,
-    /// Everything the graphics path writes. Bundled so `dispatch_graphics` can
-    /// take one `&mut` argument and no `&mut self`, and so the test-only field
-    /// needs no `cfg` at the call site.
+    /// Everything the graphics path writes; see `dispatch_graphics`.
     graphics: graphics::GraphicsSink,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
     /// open. Shared by reference with every [`sync::Presented`] wrapper handed

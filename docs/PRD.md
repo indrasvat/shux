@@ -451,7 +451,7 @@ These are the features that make shux a usable daily-driver multiplexer AND a ca
 | **Modern keyboard** | Kitty keyboard protocol when available (crossterm 0.29 `PushKeyboardEnhancementFlags`), legacy fallback. |
 | **OSC 8 hyperlinks** | Passthrough when terminal supports (raw escape sequence emission, as crossterm lacks built-in OSC 8). |
 | **OSC 52 clipboard** | Supported via crossterm 0.29. |
-| **Image passthrough** | DCS passthrough for focused pane (like tmux `allow-passthrough`). Kitty graphics, Sixel, iTerm2 inline images pass through to host terminal. Images cleared on pane switch. |
+| **Inline images** | **Native emulation, not passthrough** — superseded, see `docs/designs/inline-images.md`. shux parses kitty graphics itself and re-emits under its own ids. tmux-style passthrough is `tty_add(); tty_invalidate();`: no clipping, no redraw, no detach survival, and nothing in it can reach `pane snapshot`. Sixel and iTerm2 inline images remain deferred. |
 | **Synchronized output** | Mode 2026 via crossterm `BeginSynchronizedUpdate`/`EndSynchronizedUpdate`. |
 
 #### Security

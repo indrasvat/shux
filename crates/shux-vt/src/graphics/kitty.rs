@@ -5,17 +5,24 @@
 //! pixel path lands with the image store.
 //!
 //! Key/value shape adapted from Zellij's `kitty_graphics/parser.rs` (MIT), which
-//! the design plan names as the precedent.
+//! `docs/designs/inline-images.md` names as the precedent.
 //!
 //! ## Why the file transports are refused
 //!
 //! `t=f`, `t=t` and `t=s` put a FILENAME in the payload and ask the terminal to
-//! read it as image data. kitty gates that behind a permission callback
-//! (`graphics.c:628`). Unimplemented, it is an arbitrary-file-read primitive: a
-//! process in any pane sends `a=T,f=32,t=f;` + base64(`~/.ssh/id_rsa`), and the
-//! bytes become an image that is re-emitted to every attaching client and
-//! composited into `pane.snapshot` -- a file on disk. Refusing the medium
-//! removes the class outright.
+//! read it as image data. Implemented without care that is an arbitrary-file-read
+//! primitive: a process in any pane would send `a=T,f=32,t=f;` +
+//! base64(`~/.ssh/id_rsa`) and get the bytes back as an image -- re-emitted to
+//! attaching clients and composited into `pane snapshot`, a file on disk.
+//!
+//! Nothing here reads a payload, so that pipeline does not exist yet and this
+//! refusal removes nothing today. It is here so the decision is made, tested and
+//! in place BEFORE the store lands, rather than added as a guard afterwards.
+//!
+//! kitty asks its own permission callback for `t=f`/`t=t`
+//! (`graphics.c:701-711`) -- but note the guard is `transmission_type != 's'`,
+//! so `t=s` is opened with no check at all (`graphics.c:698`). Refusing the
+//! medium outright is the only defence that covers all three.
 //!
 //! ## Where shux is deliberately laxer than kitty
 //!
@@ -45,8 +52,8 @@ pub(crate) enum Action {
     /// `a=q` -- ask whether a transmission would have succeeded.
     Query,
     /// `a=f` transmit animation frame data, `a=a` control animation, `a=c`
-    /// compose animation frames. Understood, refused: the design plan ships no
-    /// animation.
+    /// compose animation frames. Understood, refused: no animation ships until
+    /// there is a renderer to animate (`docs/designs/inline-images.md`).
     Animation,
 }
 
@@ -96,8 +103,9 @@ pub(crate) struct Command {
     pub(crate) action: Action,
 }
 
-/// Why a command was refused. No reply is built from it -- see the module docs
-/// -- so it carries the reason and nothing else.
+/// Why a command was refused. No reply is ever built from it -- see
+/// `nothing_is_answered` in `tests/graphics_apc_neutrality.rs` -- so it carries
+/// the reason and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Rejection {
     /// A transport shux will not implement.
@@ -106,7 +114,9 @@ pub(crate) enum Rejection {
     UnsupportedAnimation,
     /// `i=` and `I=` together. `graphics-protocol.rst:839` makes this an error
     /// the terminal must not act on, and kitty checks it before the action
-    /// switch and before any transport work (`graphics.c:2568`).
+    /// switch and before any transport work (`graphics.c:2569`). The next line,
+    /// rst:840, also requires an EINVAL reply; shux deliberately does not --
+    /// see `nothing_is_answered`.
     BothIdAndNumber,
     /// The control block is not one this protocol can express.
     Malformed,
@@ -193,11 +203,10 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
         }
     }
 
-    // Refuse the file-backed media FIRST, before any other verdict can claim
-    // the command. A rejection that does not name the transport leaves a caller
-    // unable to tell that the payload it holds is a path rather than image
-    // data, so this must not sit behind any check that could return a
-    // different reason.
+    // Refuse the file-backed media before any other verdict can claim the
+    // command, so the reason survives into whatever consumes it later. No
+    // consumer distinguishes the reasons today -- the one caller reads
+    // `.is_err()` -- so this is cheap insurance, not a requirement.
     if transport != Transport::Direct {
         return Err(Rejection::UnsupportedTransport(transport));
     }
@@ -247,10 +256,9 @@ mod tests {
     /// defaults to `t`, `t` defaults to `d`.
     #[test]
     fn the_protocol_defaults_are_transmit_and_direct() {
-        assert_eq!(ok(b"f=32,s=1,v=1;PAY").action, Action::Transmit);
-        // `t` defaulting to direct is observable only through what is NOT
+        // `t` defaulting to direct is observable only through NOT being
         // refused, now that `Command` no longer carries the transport.
-        assert!(parse(b"f=32,s=1,v=1;PAY").is_ok());
+        assert_eq!(ok(b"f=32,s=1,v=1;PAY").action, Action::Transmit);
     }
 
     /// The security case. All three file-backed media are refused, and the
@@ -278,7 +286,7 @@ mod tests {
     #[test]
     fn a_file_transport_is_refused_as_such_even_when_the_block_is_also_malformed() {
         for control in [
-            b"a=T,t=f,i=1,q=nope;L2V0Yy9wYXNzd2Q=".as_slice(),
+            b"a=T,t=f,i=1,I=abc;L2V0Yy9wYXNzd2Q=".as_slice(),
             b"a=T,t=f,i=1,I=99999999999;L2V0Yy9wYXNzd2Q=",
             b"a=T,t=f,i=99999999999;L2V0Yy9wYXNzd2Q=",
         ] {
@@ -328,7 +336,7 @@ mod tests {
     }
 
     /// `graphics-protocol.rst:839` -- "Specifying both `i` and `I` keys in any
-    /// command is an error." kitty checks it at `graphics.c:2568`, before the
+    /// command is an error." kitty checks it at `graphics.c:2569`, before the
     /// action switch and before any transport work.
     #[test]
     fn specifying_both_an_image_id_and_an_image_number_is_an_error() {

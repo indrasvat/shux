@@ -6,9 +6,7 @@ pub(crate) mod kitty;
 /// Everything the graphics path writes, in one place.
 ///
 /// Bundled so [`crate::VirtualTerminal::dispatch_graphics`] takes a single
-/// `&mut` argument and no `&mut self` -- it runs between slices, where the
-/// [`crate::sync::Presented`] wrappers that hold a synchronized-output frame
-/// still are not in scope.
+/// `&mut` argument; see that function for why it must not take `&mut self`.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct GraphicsSink {
     /// Commands declined: an unimplemented transport, animation, or a control
