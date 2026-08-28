@@ -572,3 +572,130 @@ async fn outer_terminal_geometry_does_not_reach_the_child() {
         );
     }
 }
+
+/// Issue #174 A: a pane child must be TOLD its pixel geometry, at spawn AND on
+/// every resize.
+///
+/// Asserts what the CHILD reads out of `TIOCGWINSZ`, not what the handle
+/// remembers -- `test_resize` above only ever checked `handle.size()`, so both
+/// call sites could have gone on writing zeros with every test green. The
+/// reader runs against its own tty, which is the same fd `vim`, `htop` and
+/// terminal-browser read.
+///
+/// Run against the tree before the fix, both lines report `0 0`.
+#[tokio::test]
+async fn winsize_declares_pixel_geometry_to_the_child_at_spawn_and_on_resize() {
+    let Some(python) = which_python() else {
+        eprintln!("skipping: no python3 on PATH");
+        return;
+    };
+    // Prints the four winsize fields, then polls until the cell geometry
+    // actually changes and prints again. Polling rather than sleeping: a fixed
+    // sleep races the parent's ioctl and would read the OLD size, manufacturing
+    // a failure that means nothing.
+    let program = r#"
+import fcntl, struct, sys, termios, time
+def ws():
+    return struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+r, c, x, y = ws()
+print("SPAWN %d %d %d %d" % (c, r, x, y), flush=True)
+r2, c2, x2, y2 = r, c, x, y
+deadline = time.time() + 10
+while time.time() < deadline:
+    r2, c2, x2, y2 = ws()
+    if (c2, r2) != (c, r):
+        break
+    time.sleep(0.02)
+print("RESIZED %d %d %d %d" % (c2, r2, x2, y2), flush=True)
+"#;
+    let mut config = PtyConfig::with_command(
+        vec![python, "-c".to_string(), program.to_string()],
+        test_cwd(),
+    );
+    config.size = PtySize::new(80, 24);
+    let (cell_w, cell_h) = shux_pty::DECLARED_CELL_PIXELS;
+
+    let mut handle = PtyHandle::spawn(&config).unwrap();
+    // Resize only AFTER the child has reported the spawn geometry. Resizing
+    // first would let the child's very first read return the NEW size, so it
+    // would never observe a change, and the test would time out rather than
+    // measure anything.
+    let mut output = read_pty_until(&mut handle, "SPAWN").await;
+    handle.resize(PtySize::new(120, 40)).unwrap();
+    output.push_str(&read_pty_until(&mut handle, "RESIZED").await);
+    handle.kill().ok();
+
+    let line = |tag: &str| -> (u16, u16, u16, u16) {
+        let l = output
+            .lines()
+            .find(|l| l.trim_start().starts_with(tag))
+            .unwrap_or_else(|| panic!("no {tag} line in child output: {output:?}"));
+        let n: Vec<u16> = l
+            .split_whitespace()
+            .skip(1)
+            .map(|v| v.parse().expect("winsize field"))
+            .collect();
+        assert_eq!(n.len(), 4, "malformed {tag} line: {l:?}");
+        (n[0], n[1], n[2], n[3])
+    };
+
+    let (cols, rows, xpixel, ypixel) = line("SPAWN");
+    assert_eq!((cols, rows), (80, 24), "child read the wrong cell geometry");
+    assert_eq!(
+        (xpixel, ypixel),
+        (80 * cell_w, 24 * cell_h),
+        "spawn declared no pixel geometry (0/0 is the pre-#174 defect)"
+    );
+
+    let (cols, rows, xpixel, ypixel) = line("RESIZED");
+    assert_eq!((cols, rows), (120, 40), "child never saw the resize");
+    assert_eq!(
+        (xpixel, ypixel),
+        (120 * cell_w, 40 * cell_h),
+        "resize dropped the pixel geometry the spawn declared"
+    );
+}
+
+/// Read the PTY until `needle` appears. Panics on timeout rather than returning
+/// what it has: a partial read that silently satisfies a later `find` is how a
+/// test ends up asserting nothing.
+async fn read_pty_until(handle: &mut PtyHandle, needle: &str) -> String {
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    let got = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match handle.read(&mut buf).await {
+                Ok(0) => return false,
+                Ok(n) => {
+                    output.extend_from_slice(&buf[..n]);
+                    if String::from_utf8_lossy(&output).contains(needle) {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+    let text = String::from_utf8_lossy(&output).to_string();
+    assert!(
+        matches!(got, Ok(true)),
+        "never saw {needle:?} in child output: {text:?}"
+    );
+    text
+}
+
+fn which_python() -> Option<String> {
+    for candidate in ["python3", "python"] {
+        if std::process::Command::new(candidate)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}

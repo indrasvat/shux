@@ -262,11 +262,19 @@ where
                             // ScrollLeft / ScrollRight: ignore for now.
                             _ => continue,
                         };
+                        // Modifiers travel with the event. crossterm parses
+                        // them for both the SGR and legacy encodings; dropping
+                        // them here is what made ctrl-click and alt-click
+                        // arrive at a pane app as plain clicks -- in nvim that
+                        // silently turns jump-to-tag into a cursor move.
                         let frame = AttachClientFrame::Mouse {
                             kind,
                             button,
                             col: m.column,
                             row: m.row,
+                            shift: m.modifiers.contains(KeyModifiers::SHIFT),
+                            alt: m.modifiers.contains(KeyModifiers::ALT),
+                            ctrl: m.modifiers.contains(KeyModifiers::CONTROL),
                         };
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();

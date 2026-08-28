@@ -472,6 +472,42 @@ pub(crate) fn snapshot_font_key(cfg: &shux_core::config::Config) -> SnapshotFont
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #174: `shux-pty` declares a cell box to every pane child in
+    /// `ws_xpixel`/`ws_ypixel`, and cannot depend on `shux-raster` to derive
+    /// it. This crate depends on both, so this is where the two can be held to
+    /// the same number.
+    ///
+    /// Built through `build_snapshot_rasterizer`, NOT `Rasterizer::new(14.0)`:
+    /// restating the font size here would make the test agree with itself while
+    /// the production path moved. As written it fails if the default snapshot
+    /// font size changes, if the bundled font changes, or if the declared box
+    /// is edited alone.
+    ///
+    /// If it fails: the promise shux makes to pane children no longer matches
+    /// what shux renders. Update `DECLARED_CELL_PIXELS` and re-bless the pixel
+    /// goldens -- do not delete this test.
+    ///
+    /// Scope, deliberately not asserted: the lens gate rasterizes at 16.0 and
+    /// `appearance.font` can change the box at runtime. The declaration tracks
+    /// neither; see `DECLARED_CELL_PIXELS`' own docs for why.
+    #[test]
+    fn declared_pty_cell_box_matches_the_default_snapshot_rasterizer() {
+        let rasterizer = build_snapshot_rasterizer(&Config::default())
+            .expect("default config must build a rasterizer");
+        let (w, h) = rasterizer.cell_size();
+        // `try_from`, not `as`: an `as` cast truncates 65545 to 9 and passes.
+        let measured = (
+            u16::try_from(w).expect("cell width fits u16"),
+            u16::try_from(h).expect("cell height fits u16"),
+        );
+        assert_eq!(
+            shux_pty::DECLARED_CELL_PIXELS,
+            measured,
+            "the cell box shux declares to pane children has drifted from the \
+             one the default snapshot rasterizer actually renders"
+        );
+    }
     use shux_core::config::{Config, ConfigHandle, SegmentDef, StatusBarConfig};
     use shux_core::graph::SessionGraphSnapshot;
     use shux_core::model::{Pane, Session, Window};

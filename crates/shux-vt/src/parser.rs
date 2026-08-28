@@ -34,6 +34,26 @@ pub struct TerminalModes {
     pub mouse_tracking: MouseMode,
     /// SGR mouse coordinate encoding (Mode 1006).
     pub sgr_mouse: bool,
+    /// UTF-8 mouse coordinate encoding (Mode 1005).
+    ///
+    /// Tracked but NOT emitted, and that is the whole point: a coordinate mode
+    /// shux does not encode must still be visible to the code that decides
+    /// whether to forward a mouse report, so it can stand down instead of
+    /// sending bytes the app will decode as something else. Under 1005 the two
+    /// encodings agree byte-for-byte up to column 95 and diverge silently after
+    /// it, which is the worst possible shape for a defect: correct on an
+    /// 80-column test pane, corrupt on a wide one.
+    pub utf8_mouse: bool,
+    /// urxvt mouse coordinate encoding (Mode 1015). Tracked, not emitted --
+    /// see [`TerminalModes::utf8_mouse`]. An app in 1015 ignores the X10-framed
+    /// reports shux writes, so forwarding under it looks like a dead mouse.
+    pub urxvt_mouse: bool,
+    /// SGR-pixel mouse coordinate encoding (Mode 1016). Tracked, not emitted --
+    /// see [`TerminalModes::utf8_mouse`]. Apps set 1016 *in addition to* 1006,
+    /// so `sgr_mouse` alone cannot tell the two apart, and an app in 1016 reads
+    /// forwarded CELL coordinates as PIXELS: every click collapses into the
+    /// top-left corner of the pane.
+    pub pixel_mouse: bool,
     /// Alternate-scroll mode (Mode 1007): while on the alternate screen and the
     /// app has NOT requested mouse tracking, the terminal translates wheel
     /// events into arrow-key presses so pagers/editors scroll. Defaults on
@@ -61,6 +81,9 @@ impl Default for TerminalModes {
             focus_events: false,
             mouse_tracking: MouseMode::None,
             sgr_mouse: false,
+            utf8_mouse: false,
+            urxvt_mouse: false,
+            pixel_mouse: false,
             alternate_scroll: true,
             synchronized_output: false,
             alternate_screen: false,
@@ -1050,8 +1073,16 @@ impl<'a> VtHandler<'a> {
             }
             // Focus in/out events.
             1004 => self.modes.focus_events = enable,
+            // UTF-8 mouse coordinate encoding. Recorded so a forwarder can
+            // refuse; `private_mode_report_value` still answers "not
+            // recognized" for it, which stays true -- shux never EMITS it.
+            1005 => self.modes.utf8_mouse = enable,
             // SGR mouse coordinate encoding.
             1006 => self.modes.sgr_mouse = enable,
+            // urxvt mouse coordinate encoding. Recorded, not emitted (1005).
+            1015 => self.modes.urxvt_mouse = enable,
+            // SGR-pixel mouse coordinate encoding. Recorded, not emitted (1005).
+            1016 => self.modes.pixel_mouse = enable,
             // Alternate-scroll: wheel -> arrow keys on the alternate screen.
             1007 => self.modes.alternate_scroll = enable,
             // Save cursor (1048).

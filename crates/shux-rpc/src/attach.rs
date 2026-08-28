@@ -95,6 +95,24 @@ pub enum AttachClientFrame {
         button: MouseButton,
         col: u16,
         row: u16,
+        /// Shift held. Reserved for shux: it is the escape that keeps shux's
+        /// own text selection reachable inside a pane whose app has taken the
+        /// mouse, so it is never encoded into a forwarded report.
+        ///
+        /// NOTE for anyone reading this as a feature promise: most host
+        /// terminals (xterm, VTE, kitty, WezTerm, iTerm2, Alacritty) treat
+        /// Shift+mouse as the *user's* override of application mouse reporting
+        /// and never emit an event at all, so on those hosts this arrives only
+        /// if the host chose to forward it. `Prefix [` copy mode is the
+        /// pane-accurate selection path that always works.
+        #[serde(default)]
+        shift: bool,
+        /// Alt/Meta held -- forwarded to the app as Cb bit 8.
+        #[serde(default)]
+        alt: bool,
+        /// Ctrl held -- forwarded to the app as Cb bit 16.
+        #[serde(default)]
+        ctrl: bool,
     },
     /// Client wants to detach.
     Detach,
