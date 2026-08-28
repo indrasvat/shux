@@ -77,6 +77,7 @@ MUTATIONS=(
   # ── The wire ──────────────────────────────────────────────────────────────
   "an_older_clients_mouse_frame_stops_parsing|attach::tests::a_mouse_frame_without_modifiers_still_deserializes|${RPC}|s.replace('        #[serde(default)]\n        shift: bool,', '        shift: bool,')"
 
+  "the_resize_fan_out_ignores_the_border_style|attach::tests::every_render_path_agrees_on_the_pane_viewport|${ATTACH}|s.replace('    let viewport = shux_ui::pane_viewport(\\n        content,\\n        BorderStyle::parse(&config.current().appearance.border_style),\\n        false,\\n    );', '    let _ = config;\\n    let viewport = if cols >= 3 && content_h >= 3 {\\n        Rect::new(content.x + 1, content.y + 1, cols - 2, content_h - 2)\\n    } else {\\n        content\\n    };')"
   # ── The pane viewport shared with the compositor ───────────────────────────
   "the_hit_test_insets_even_without_an_outline|attach::tests::the_pane_hit_test_agrees_with_the_compositor_under_every_border_style|${ATTACH}|s.replace('    shux_ui::pane_viewport(current_content_rect(client_size).await, border_style, false)', '''    let _ = border_style;\n    let (cols, rows) = *client_size.lock().await;\n    let content_h = rows.saturating_sub(STATUS_BAR_ROWS);\n    if cols >= 3 && content_h >= 3 {\n        Rect::new(1, 1, cols - 2, content_h - 2)\n    } else {\n        Rect::new(0, 0, cols, content_h)\n    }''')"
   # The defect that actually shipped: not the arithmetic, but the plumbing --

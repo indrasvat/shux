@@ -335,7 +335,7 @@ async fn handle_attach_connection(
     // the full client size. Multi-pane TUIs (vim, htop, less) read TIOCGWINSZ
     // and will lay themselves out wrong if every pane PTY pretends to be
     // the whole screen.
-    apply_resize_to_window(&graph, &io_state, &session, hello.cols, hello.rows).await;
+    apply_resize_to_window(&graph, &io_state, &session, &config, hello.cols, hello.rows).await;
 
     // Step 3: Send AttachReady::Ok.
     let ready = AttachReady::Ok {
@@ -518,13 +518,21 @@ async fn resolve_or_create_session(
 }
 
 /// Compute per-pane rects given the client size and dispatch each PTY its
-/// real winsize. The compositor's pane viewport is inset by 1 cell on each
-/// side for the border outline, and the bottom row is reserved for the
-/// status bar — apply the same arithmetic here.
+/// real winsize. Multi-pane TUIs read `TIOCGWINSZ` and lay themselves out from
+/// it, so a pane whose PTY thinks it is a different size than the rect it is
+/// drawn in renders into the wrong shape.
+///
+/// Goes through [`shux_ui::pane_viewport`], the compositor's own rule. This
+/// used to inset for the outline unconditionally, so under
+/// `appearance.border_style = "none"` every pane's VT grid came out two columns
+/// and two rows smaller than the rect the compositor drew it into: the last
+/// columns of each pane held nothing, and a mouse click on them named a cell
+/// the app did not have.
 async fn apply_resize_to_window(
     graph: &GraphHandle,
     io_state: &Arc<Mutex<PaneIoState>>,
     session: &AttachedSession,
+    config: &ConfigHandle,
     cols: u16,
     rows: u16,
 ) {
@@ -536,11 +544,11 @@ async fn apply_resize_to_window(
     };
     let content_h = rows.saturating_sub(STATUS_BAR_ROWS);
     let content = Rect::new(0, 0, cols, content_h);
-    let viewport = if cols >= 3 && content_h >= 3 {
-        Rect::new(content.x + 1, content.y + 1, cols - 2, content_h - 2)
-    } else {
-        content
-    };
+    let viewport = shux_ui::pane_viewport(
+        content,
+        BorderStyle::parse(&config.current().appearance.border_style),
+        false,
+    );
 
     // Drain the resizer senders out from under the lock so we never await
     // a channel send while still holding the PaneIoState mutex. Attach
@@ -904,7 +912,7 @@ async fn run_attach_loop(
                             *cs = (cols, rows);
                         }
                         let attached = render_session.lock().await.clone();
-                        apply_resize_to_window(&graph, &io_state, &attached, cols, rows).await;
+                        apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.notify_one();
                     }
@@ -950,7 +958,7 @@ async fn run_attach_loop(
                         if action_changes_layout(kind) {
                             let attached = render_session.lock().await.clone();
                             let (cols, rows) = *client_size.lock().await;
-                            apply_resize_to_window(&graph, &io_state, &attached, cols, rows).await;
+                            apply_resize_to_window(&graph, &io_state, &attached, &config, cols, rows).await;
                         }
                         let pulse = io_state.lock().await.render_pulse.clone();
                         pulse.notify_one();
@@ -4073,6 +4081,7 @@ mod tests {
             &fixture.graph,
             &fixture.io_state,
             &fixture.attached,
+            &test_config(),
             100,
             30,
         )
@@ -4104,6 +4113,7 @@ mod tests {
             &fixture.graph,
             &fixture.io_state,
             &fixture.attached,
+            &test_config(),
             100,
             30,
         )
@@ -4164,6 +4174,7 @@ mod tests {
                     &fixture.graph,
                     &fixture.io_state,
                     &fixture.attached,
+                    &test_config(),
                     cols,
                     rows,
                 )
@@ -6024,6 +6035,137 @@ mod tests {
             current_viewport(&client_size, &ConfigHandle::load_or_default(&rounded)).await,
             Rect::new(1, 1, 98, 27)
         );
+    }
+
+    /// Cross-path consistency: the places that decide where a pane's rect is
+    /// must agree, for every border style.
+    ///
+    /// They were three independent copies of the same arithmetic and two were
+    /// wrong: mouse hit-testing (`current_viewport`) and the PTY resize fan-out
+    /// (`apply_resize_to_window`) both inset for the outline unconditionally,
+    /// while the compositor and the snapshot composer inset only when the
+    /// outline is drawn. Under `border_style = "none"` that made every click
+    /// land a cell off AND gave each pane a VT grid two columns narrower than
+    /// the rect it was drawn into, so a click on the last column named a cell
+    /// the app did not have.
+    ///
+    /// Asserted through the real APIs on each path -- where `compose` actually
+    /// lands a pane's first cell, what the resize fan-out actually sends -- not
+    /// by re-deriving the arithmetic and comparing it to itself.
+    #[tokio::test]
+    async fn every_render_path_agrees_on_the_pane_viewport() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = attach_fixture().await;
+        let client_size: ClientSize = Arc::new(Mutex::new((100, 30)));
+        let content = current_content_rect(&client_size).await;
+
+        // Each pane's grid carries a distinct glyph in its own (0,0), so where
+        // that glyph lands in the composed frame IS the pane's origin.
+        let marks = [(fixture.first_pane, 'A'), (fixture.second_pane, 'B')];
+        let mut vts: HashMap<PaneId, shux_vt::VirtualTerminal> = HashMap::new();
+        for (pid, mark) in marks {
+            let mut vt = shux_vt::VirtualTerminal::new(30, 100);
+            vt.process(mark.to_string().repeat(200).as_bytes());
+            vts.insert(pid, vt);
+        }
+
+        for name in ["none", "rounded", "thick", "ascii"] {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&path, format!("[appearance]\nborder_style = \"{name}\"\n"))
+                .expect("write config");
+            let config = ConfigHandle::load_or_default(&path);
+            let style = BorderStyle::parse(name);
+            let expected = shux_ui::pane_viewport(content, style, false);
+
+            // 1. The live-attach hit-test.
+            assert_eq!(
+                current_viewport(&client_size, &config).await,
+                expected,
+                "{name}: hit-test viewport"
+            );
+
+            // 2. The snapshot / web-preview composer.
+            let snap = fixture.graph.snapshot();
+            let win = snap.windows.get(&fixture.first_window).expect("window");
+            let rects: HashMap<PaneId, Rect> = win
+                .layout
+                .tree
+                .compute_rects(expected)
+                .into_iter()
+                .collect();
+            let panes: HashMap<PaneId, (&shux_vt::Grid, &shux_vt::Cursor)> = vts
+                .iter()
+                .map(|(pid, vt)| (*pid, (vt.grid(), vt.cursor())))
+                .collect();
+            let composed = shux_ui::compose(
+                &shux_ui::ComposeInputs {
+                    layout: &win.layout.tree,
+                    zoom: None,
+                    focused: fixture.first_pane,
+                    panes: &panes,
+                    titles: None,
+                    status_bar: None,
+                },
+                100,
+                30,
+                style,
+                shux_ui::BorderColors::default(),
+                STATUS_BAR_ROWS,
+            );
+            for (pid, mark) in marks {
+                let rect = rects.get(&pid).expect("pane rect");
+                let cell = composed
+                    .grid
+                    .visible_row(rect.y as usize)
+                    .get(rect.x as usize)
+                    .expect("composed cell");
+                assert_eq!(
+                    cell.ch, mark,
+                    "{name}: pane {pid}'s first cell is not at the rect every \
+                     other path uses ({}, {})",
+                    rect.x, rect.y
+                );
+            }
+            drop(snap);
+
+            // 3. The PTY resize fan-out: each pane must be TOLD the size of the
+            //    rect it is DRAWN in, or a click on its last column names a
+            //    cell the app does not have.
+            let mut receivers = Vec::new();
+            {
+                let mut state = fixture.io_state.lock().await;
+                state.resizers.clear();
+                for (pid, _) in marks {
+                    let (tx, rx) = mpsc::channel(8);
+                    state.resizers.insert(pid, tx);
+                    receivers.push((pid, rx));
+                }
+            }
+            apply_resize_to_window(
+                &fixture.graph,
+                &fixture.io_state,
+                &fixture.attached,
+                &config,
+                100,
+                30,
+            )
+            .await;
+            for (pid, mut rx) in receivers {
+                let req = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("resize request")
+                    .expect("resize request");
+                let rect = rects.get(&pid).expect("pane rect");
+                assert_eq!(
+                    (req.size.cols, req.size.rows),
+                    (rect.width, rect.height),
+                    "{name}: pane {pid} was told a size that is not the rect it is drawn in"
+                );
+            }
+        }
+        fixture.stop();
     }
 
     // --- Task 086: mouse wheel behavioral regression tests ---

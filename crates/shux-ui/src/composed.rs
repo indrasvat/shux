@@ -63,18 +63,11 @@ pub fn compose(
     let content = Rect::new(0, 0, cols, content_height);
 
     let zoomed = inputs.zoom.is_some();
-    let borders_on =
-        !zoomed && border_style != BorderStyle::None && content.width >= 3 && content.height >= 3;
-    let pane_viewport = if borders_on {
-        Rect::new(
-            content.x + 1,
-            content.y + 1,
-            content.width - 2,
-            content.height - 2,
-        )
-    } else {
-        content
-    };
+    // The compositor's rule, not a third copy of it: this is the snapshot /
+    // web-preview render path, and it has to place panes exactly where the live
+    // attach places them or the two disagree about what a pane's rect is.
+    let borders_on = crate::compositor::borders_visible(content, border_style, zoomed);
+    let pane_viewport = crate::compositor::pane_viewport(content, border_style, zoomed);
 
     let pane_rects: Vec<(PaneId, Rect)> = if let Some(zoom) = inputs.zoom {
         vec![(zoom.zoomed_pane, content)]
