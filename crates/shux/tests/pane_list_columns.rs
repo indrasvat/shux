@@ -21,6 +21,21 @@ use std::time::{Duration, Instant};
 /// daemon-backed capture (CLAUDE.md).
 const COLOUR_PROBE: &str = "\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\033[38;5;208mINDEXED\\033[0m \\033[34mBASIC\\033[0m";
 
+/// The marker [`Env::run_line_and_wait`] waits for.
+const DONE_MARKER: &str = "RENDER-DONE";
+
+/// Build the line to type so the shell prints [`DONE_MARKER`] once `line` has
+/// finished writing.
+///
+/// The marker's spelling is SPLIT across a quote boundary: the shell
+/// concatenates the two adjacent quoted strings when it runs the line, but the
+/// line the terminal ECHOES never contains the marker. Spell it whole here and
+/// every caller silently returns on the echo instead of on the output —
+/// `the_completion_marker_cannot_be_satisfied_by_the_echoed_line` pins that.
+fn line_with_completion_marker(line: &str) -> String {
+    format!("{line}; printf 'RENDER''-DONE\\n'")
+}
+
 /// Keeps a pane's screen alive after the interesting part has run.
 const PARK: &str = "; exec sleep 900";
 
@@ -108,8 +123,7 @@ impl Env {
             .as_str()
             .expect("pane id")
             .to_string();
-        self.type_line(name, "1", &format!("printf '{COLOUR_PROBE}\\n'"));
-        self.wait_for(name, "1", "TRUECOLOR");
+        self.run_line_and_wait(name, "1", &format!("printf '{COLOUR_PROBE}\\n'"));
         pane
     }
 
@@ -148,6 +162,28 @@ impl Env {
             std::thread::sleep(Duration::from_millis(150));
         }
         panic!("{needle:?} never appeared in {session}:{window}:\n{last}");
+    }
+
+    /// Type `line` into a pane and wait until the command has FINISHED writing.
+    ///
+    /// Waiting on a needle taken from the command's own output races the
+    /// render. `pane list --format text` reaches the screen header-first, and
+    /// `wait_for` happily returns that partial frame: CI caught this under
+    /// llvm-cov, whose slower binary widens the split, with a captured screen
+    /// holding `ID TITLE CWD COMMAND` and not one row beneath it.
+    ///
+    /// A needle that also occurs in the typed line is worse: the shell ECHOES
+    /// the line, so the wait is satisfied before the command has run at all —
+    /// the #167 failure exactly, green while testing nothing.
+    ///
+    /// So wait on a marker the shell prints only once the command has exited.
+    /// Its spelling is split so that the echoed line cannot contain it, and
+    /// both halves reach the same fd in order, so the marker cannot outrun the
+    /// output it terminates.
+    #[track_caller]
+    fn run_line_and_wait(&self, session: &str, window: &str, line: &str) -> String {
+        self.type_line(session, window, &line_with_completion_marker(line));
+        self.wait_for(session, window, DONE_MARKER)
     }
 
     fn bin_str(&self) -> String {
@@ -304,6 +340,35 @@ fn a_shell_wrapped_cmd_pane_prints_its_script_as_one_argument() {
     assert!(row[2].ends_with('\''), "unterminated quote: {:?}", row[2]);
 }
 
+/// The completion marker must not survive into the line the shell ECHOES.
+///
+/// `run_line_and_wait` exists because a needle occurring in the typed line is
+/// satisfied by the terminal's echo before the command has run at all — #167's
+/// failure, stable and green while testing nothing. That safety rests entirely
+/// on the marker being split across a quote boundary, so pin BOTH halves of the
+/// property by execution rather than by eye: the echoed line must not contain
+/// it, and a real shell must still emit it.
+#[test]
+fn the_completion_marker_cannot_be_satisfied_by_the_echoed_line() {
+    let typed = line_with_completion_marker("shux pane list -s s -w 0 --format text");
+    assert!(
+        !typed.contains(DONE_MARKER),
+        "the echoed line contains {DONE_MARKER:?} verbatim, so the wait would \
+         return on the echo instead of the output: {typed}"
+    );
+
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(line_with_completion_marker("true"))
+        .output()
+        .expect("spawn sh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        DONE_MARKER,
+        "the shell no longer reassembles the marker, so the wait would time out"
+    );
+}
+
 // ── cross-path consistency ──────────────────────────────────────────────
 
 /// The three formats must agree about the same panes. They are three renderers
@@ -345,8 +410,7 @@ fn text_plain_and_json_agree_about_every_pane() {
         "24",
     ]);
     let cmd = format!("{} pane list -s {s} -w 0 --format text", env.bin_str());
-    env.type_line(&s, "viewer", &cmd);
-    let screen = env.wait_for(&s, "viewer", "COMMAND");
+    let screen = env.run_line_and_wait(&s, "viewer", &cmd);
 
     for pane in panes {
         let short = &pane["id"].as_str().expect("id")[..8];
@@ -620,12 +684,11 @@ fn the_box_frame_is_square_on_the_rendered_grid() {
     env.ok(&[
         "pane", "set-size", "-s", s, "-p", &target, "--cols", "100", "--rows", "20",
     ]);
-    env.type_line(
+    env.run_line_and_wait(
         s,
         "1",
         &format!("clear; {} --format text pane list -s {s}", env.bin_str()),
     );
-    env.wait_for(s, "1", "TITLE");
 
     let cells = env.json(&["pane", "glance", &target, "--cells"]);
     let rows = cells["result"]["cells"]["rows"]

@@ -229,6 +229,12 @@ test-pane-command: nextest-ready ## Run pane command / exited-pane e2e tests; op
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_command_e2e $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Pane command e2e tests passed$(COLOR_RESET)"
 
+.PHONY: test-pane-list-columns
+test-pane-list-columns: nextest-ready ## Run `pane list` column/cross-path tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running pane list column tests...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_list_columns $(FILTER)
+	@echo "$(COLOR_GREEN)✓ Pane list column tests passed$(COLOR_RESET)"
+
 .PHONY: test-exit-capture-evidence
 test-exit-capture-evidence: build ## Issue #162 exit-then-capture A/B; pass BASE_BIN=<macOS-arm binary> to also record the pre-fix arm
 	@echo "$(COLOR_BLUE)▶ issue-162 exit-then-capture (fixed binary)...$(COLOR_RESET)"
