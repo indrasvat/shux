@@ -95,8 +95,16 @@ const SECTIONS: &[Section] = &[
                 desc: "Scroll scrollback (or the focused app when it uses the mouse)",
             },
             Entry {
+                key: "Click / drag",
+                desc: "Goes to the app when the pane uses the mouse",
+            },
+            Entry {
                 key: "Drag text",
-                desc: "Select visible text and copy on release",
+                desc: "Otherwise: select and copy on release",
+            },
+            Entry {
+                key: "Shift + drag",
+                desc: "Take the mouse back (if your terminal allows)",
             },
             Entry {
                 key: "Right-click selection",
