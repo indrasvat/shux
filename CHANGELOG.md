@@ -1,3 +1,10 @@
+# [0.47.0](https://github.com/indrasvat/shux/compare/v0.46.24...v0.47.0) (2026-08-28)
+
+
+### Features
+
+* **pty,attach:** declare pixel geometry to panes and forward button events ([#176](https://github.com/indrasvat/shux/issues/176)) ([b17f046](https://github.com/indrasvat/shux/commit/b17f046c70ca9a007bf2ed70b62cc910b62cd9cd)), closes [#174](https://github.com/indrasvat/shux/issues/174) [#167](https://github.com/indrasvat/shux/issues/167) [#144](https://github.com/indrasvat/shux/issues/144) [#174](https://github.com/indrasvat/shux/issues/174)
+
 ## [0.46.24](https://github.com/indrasvat/shux/compare/v0.46.23...v0.46.24) (2026-08-26)
 
 
