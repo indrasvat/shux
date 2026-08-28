@@ -127,12 +127,18 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
   *required* by the process-hygiene rule above. Suppress with
   `# shellcheck disable=SCxxxx  # why`, never bare.
 - **A not-yet-started app is quiet.** `wait-settled` alone races slow starters and
-  captures blanks. Require content, then settle.
+  captures blanks. Require content, then settle. Two needles look like content and are
+  not: one that lands mid-output (a table header, before the rows you assert on) and one
+  the shell ECHOES back from the line you typed. Wait on a marker the command emits only
+  after it exits, spelled so the echo cannot contain it (#167, #174).
 - **Screenshot-diffing animated TUIs measures capture timing, not rendering.** For
   before/after proof, replay recorded PTY bytes through both versions and compare grids.
 - **Open the artifact.** A valid PNG of the right size can be blank. Assert on content,
   never on "file exists".
 - **Verify counts before reporting them.**
+- **A probe for a defect must not be subject to that defect.** On #174 the probe for
+  an echo-satisfied wait used a needle its own echo satisfied, and reported a good
+  fix broken.
 - **Batch changes while a gate is auditing** — each mid-audit edit costs a full re-run.
 
 ## Code conventions
@@ -146,6 +152,10 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
 - **All CLI output via `crates/shux/src/style.rs`** — never raw `println!`. Use
   `accent`/`success`/`warning`/`error`/`muted`/`bold` + `print_*` helpers; add a `print_*`
   per new command.
+- **Comments carry contract, not history.** The durable record is the commit message and
+  the PR description — don't restate defect history, how many copies there used to be, or
+  the comment's own rhetoric in rustdoc. `crates/*/src/*.rs` sits near 17% comment lines;
+  a diff well above that is the smell, not the goal.
 - External reviewer CLIs (Claude/Codex/DootSabha/agy) run through
   `.shux/scripts/agent_review_guard.sh`. No Gemini unless asked.
 
@@ -212,6 +222,9 @@ Every feature/fix PR.
    findings are addressed or explicitly declined in the PR; correctness findings fall
    under *Correctness is never a scope question* and cannot be declined. On #170 it
    found a shipping security defect that two bot reviews and a QA gate had passed.
+   **The threshold re-arms**: another ~200 added lines since the last pass → run it
+   again before the next push, and name the reviewed SHA in the PR. On #174 one pass
+   left 650 later lines — the reactive fix commits, the densest in the diff — unreviewed.
 
    **5, 6 and 7 run before the first push, before the PR exists.** A finding that
    lands after the push arrives as churn on an open PR.
@@ -260,7 +273,7 @@ Paste into every feature PR:
 ## Verification matrix
 - [ ] dootsabha council on design — converged
 - [ ] adversarial review — parallel agents drove the real system; findings fixed + regression-tested
-- [ ] simplification review (`shux-simplify-architect`) — diff >~200 added lines; findings addressed, or tidiness ones declined with reason
+- [ ] simplification review (`shux-simplify-architect`) — diff >~200 added lines; re-run if another ~200 landed since the last pass; reviewed SHA named; findings addressed, or tidiness ones declined with reason
 - [ ] implementation diff reviewed before push — `dootsabha council`, or parallel adversarial agents on disjoint surfaces; findings addressed
 - [ ] every render path touched
 - [ ] config states: default · init · feature-maxed · malformed · hot-reload
