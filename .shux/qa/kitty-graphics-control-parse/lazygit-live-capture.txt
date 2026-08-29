@@ -1,0 +1,40 @@
+╭─[1]─Status───────────────────────────╮╭─Diff─────────────────────────────────────────────────────────────────────────╮
+│✓ shux → claude/shux-image-support-s0u││No changed files                                                              │
+╰──────────────────────────────────────╯│                                                                              │
+╭─[2]─Files - Worktrees - Submodules───╮│                                                                              │
+│                                      ││                                                                              │
+│                                      ││                                                                              │
+│                                      ││                                                                              │
+│                                      ││                                                                              │
+│                                      ││                                                                              │
+│                                      ││                                                                              │
+│                                      ││                                                                              │
+│                   ╭───────────────────────────────────────────────────────────────────────────────╮                  │
+│                   │                                                                               ▐                  │
+╰───────────────────│Thanks for using lazygit! Seriously you rock. Three things to share with you:  ▐                  │
+╭─[3]─Local branches│                                                                               ▐                  │
+│  * claude/shux-ima│ 1) If you want to learn about lazygit's features, watch this vid:             ▐                  │
+│2d  main ↓5        │      https://youtu.be/CPLdltN7wgE                                             ▐                  │
+│    worktree-agent-│                                                                               ▐                  │
+│    worktree-agent-│ 2) Be sure to read the latest release notes at:                               ▐                  │
+│                   │      https://github.com/jesseduffield/lazygit/releases                        ▐                  │
+│                   │                                                                               ▐                  │
+│                   │ 3) If you're using git, that makes you a programmer! With your help we can    ▐                  │
+│                   │make                                                                           ▐                  │
+│                   │    lazygit better, so consider becoming a contributor and joining the fun at  ▐                  │
+╰───────────────────│      https://github.com/jesseduffield/lazygit                                 ▐                  │
+╭─[4]─Commits - Refl│    You can also sponsor me and tell me what to work on by clicking the donate ▐                  │
+│f1a6636f Cl ◯ test(│    button at the bottom right.                                                ▐                  │
+│51ae4c93 Cl ◯ test(│    Or even just star the repo to share the love!                              │                  │
+│3870b19e Cl ◯ fix(v╰───────────────────────────────────────────────────────────────────────────────╯──────────────────╯
+│bc75fc81 Cl ◯ refactor(vt): cut the gr│╭─Command log──────────────────────────────────────────────────────────────────╮
+│8f41bde8 Cl ◯ refactor(vt): drop the g││You can hide/focus this panel by pressing '@'                                 │
+│b8b7a265 Cl ◯ feat(vt): locate kitty-g││                                                                              │
+│7d1b7169 इन ◯ fix(guards): name the da││Random tip: If you ever want to experiment, it's easy to create a new branch  │
+│f31ddbf1 इन ◯ test(gui-terminal): phot││off your current one and go nuts, then delete it afterwards                   │
+│de790daf se ◯ chore(release): 0.47.0 [││                                                                              │
+╰──────────────────────────────1 of 56─╯│                                                                              │
+╭─[5]─Stash────────────────────────────╮│                                                                              │
+│                                      ││                                                                              │
+╰───────────────────────────────0 of 0─╯╰──────────────────────────────────────────────────────────────────────────────╯
+Confirm: <enter> | Close/Cancel: <esc> | Keybindings: ? | Cancel: <esc>                       Donate Ask Question 0.44.1

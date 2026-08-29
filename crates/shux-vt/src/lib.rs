@@ -10,6 +10,7 @@ mod cell;
 mod charset;
 mod cursor;
 mod diff;
+mod graphics;
 mod grid;
 mod parser;
 mod screen;
@@ -98,6 +99,13 @@ pub struct VirtualTerminal {
     parser: VtParser,
     /// In-progress DCS payload, preserved across partial PTY chunks.
     dcs_state: Option<DcsState>,
+    /// Locates kitty-graphics APC sequences, whose bytes vte consumes without
+    /// calling back. Carries state across PTY reads.
+    apc_scanner: graphics::apc::ApcScanner,
+    /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
+    apc_cut_slicing: bool,
+    /// Everything the graphics path writes; see `dispatch_graphics`.
+    graphics: graphics::GraphicsSink,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
     /// open. Shared by reference with every [`sync::Presented`] wrapper handed
     /// to the parser, which is why it is a cell rather than a plain `bool`;
@@ -235,6 +243,9 @@ impl VirtualTerminal {
             default_colors: TerminalDefaultColors::default(),
             parser: VtParser::new_with_size(),
             dcs_state: None,
+            apc_scanner: graphics::apc::ApcScanner::default(),
+            apc_cut_slicing: true,
+            graphics: graphics::GraphicsSink::default(),
             sync_armed: std::sync::atomic::AtomicBool::new(false),
             frozen_grid: None,
             frozen_cursor: None,
@@ -258,6 +269,29 @@ impl VirtualTerminal {
             palette_overridden: false,
             reuse_retired_grids: true,
         }
+    }
+
+    /// Turn APC cut-slicing off, so `process_with_responses` feeds vte one
+    /// unbroken call exactly as it did before graphics existed.
+    ///
+    /// The only oracle with teeth is a terminal that does not slice.
+    /// Chunking-invariance is not one: vte is itself chunk-sensitive (see
+    /// `c1_controls_are_chunk_sensitive_in_vte`), so comparing two chunkings
+    /// measures vte. Production never calls this.
+    #[doc(hidden)]
+    pub fn set_apc_cut_slicing(&mut self, enabled: bool) {
+        self.apc_cut_slicing = enabled;
+    }
+
+    /// How many graphics commands this terminal has declined.
+    ///
+    /// shux answers nothing on the wire, so without this a refusal is
+    /// indistinguishable from a command that was never located -- the gap that
+    /// let a whole neutrality suite pass against a scanner gutted to find
+    /// nothing.
+    #[doc(hidden)]
+    pub fn graphics_refusals(&self) -> u64 {
+        self.graphics.refusals
     }
 
     /// Turn retired-buffer recycling (issue #106) off or on.
@@ -409,6 +443,66 @@ impl VirtualTerminal {
         let _ = self.process_with_responses(bytes);
     }
 
+    /// Feed one slice of the batch to vte.
+    ///
+    /// Split out of [`Self::process_with_responses`] so a batch can be cut at
+    /// APC boundaries while vte still receives every byte.
+    fn advance_slice(&mut self, bytes: &[u8], responses: &mut Vec<Vec<u8>>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut handler = VtHandler {
+            grid: sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
+            cursor: sync::Presented::new(
+                &mut self.cursor,
+                &mut self.frozen_cursor,
+                &self.sync_armed,
+            ),
+            modes: &mut self.modes,
+            scroll_region: &mut self.scroll_region,
+            title: sync::Presented::new(&mut self.title, &mut self.frozen_title, &self.sync_armed),
+            default_colors: sync::Presented::new(
+                &mut self.default_colors,
+                &mut self.frozen_colors,
+                &self.sync_armed,
+            ),
+            alt_grid: &mut self.alt_grid,
+            alt_cursor: &mut self.alt_cursor,
+            dcs_state: &mut self.dcs_state,
+            sync_armed: &self.sync_armed,
+            frozen_alt: &mut self.frozen_alt,
+            eager_sync_freeze: self.eager_sync_freeze,
+            active_grapheme_cell: &mut self.active_grapheme_cell,
+            last_graphic: &mut self.last_graphic,
+            charsets: &mut self.charsets,
+            tab_stops: &mut self.tab_stops,
+            responses,
+            palette_overridden: &mut self.palette_overridden,
+            alt_spare: &mut self.alt_spare,
+            reuse_retired_grids: self.reuse_retired_grids,
+        };
+        self.parser.advance(&mut handler, bytes);
+    }
+
+    /// Act on one kitty graphics command. Non-`G` APCs are discarded, as vte
+    /// discards every APC today.
+    ///
+    /// Takes no `&mut self`: `advance_slice` routes writes through
+    /// [`sync::Presented`], which freezes the presented frame on the first
+    /// write inside a `CSI ?2026h` window, and this runs BETWEEN slices, so
+    /// unwrapped access here would leak into a frame held still.
+    fn dispatch_graphics(sink: &mut graphics::GraphicsSink, body: &[u8]) {
+        let Some(command) = body.strip_prefix(b"G") else {
+            return;
+        };
+        #[cfg(test)]
+        sink.dispatched.push(command.to_vec());
+
+        if graphics::kitty::parse(command).is_err() {
+            sink.refusals = sink.refusals.saturating_add(1);
+        }
+    }
+
     /// Process raw PTY output bytes and return terminal reply bytes.
     ///
     /// This is the request/response half of terminal emulation. Apps running
@@ -446,41 +540,31 @@ impl VirtualTerminal {
         let before_alt = self.modes.alternate_screen;
         let before_colors = self.default_colors();
 
-        // We need to create a VtHandler that borrows our fields mutably.
-        // The vte Parser is taken out temporarily so we can pass both
-        // the parser and the handler without conflicting borrows.
         let mut responses = Vec::new();
-        let mut handler = VtHandler {
-            grid: sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed),
-            cursor: sync::Presented::new(
-                &mut self.cursor,
-                &mut self.frozen_cursor,
-                &self.sync_armed,
-            ),
-            modes: &mut self.modes,
-            scroll_region: &mut self.scroll_region,
-            title: sync::Presented::new(&mut self.title, &mut self.frozen_title, &self.sync_armed),
-            default_colors: sync::Presented::new(
-                &mut self.default_colors,
-                &mut self.frozen_colors,
-                &self.sync_armed,
-            ),
-            alt_grid: &mut self.alt_grid,
-            alt_cursor: &mut self.alt_cursor,
-            dcs_state: &mut self.dcs_state,
-            sync_armed: &self.sync_armed,
-            frozen_alt: &mut self.frozen_alt,
-            eager_sync_freeze: self.eager_sync_freeze,
-            active_grapheme_cell: &mut self.active_grapheme_cell,
-            last_graphic: &mut self.last_graphic,
-            charsets: &mut self.charsets,
-            tab_stops: &mut self.tab_stops,
-            responses: &mut responses,
-            palette_overridden: &mut self.palette_overridden,
-            alt_spare: &mut self.alt_spare,
-            reuse_retired_grids: self.reuse_retired_grids,
+
+        // Locate APCs but never remove them: vte gets every byte and only its
+        // `advance` calls are cut. See the [`graphics::apc`] module docs for why
+        // stripping cannot be made correct, and for why cutting is neutral --
+        // which is a property of where the cuts land, NOT of vte being
+        // chunk-insensitive, because it is not. Cutting at the boundary places each
+        // command at its true stream position -- a placement anchors at the
+        // cursor as it stands there, and replies queue in request order.
+        let cuts = if self.apc_cut_slicing {
+            self.apc_scanner.scan(bytes)
+        } else {
+            Vec::new()
         };
-        self.parser.advance(&mut handler, bytes);
+        if cuts.is_empty() {
+            self.advance_slice(bytes, &mut responses);
+        } else {
+            let mut at = 0;
+            for cut in cuts {
+                self.advance_slice(&bytes[at..cut.end], &mut responses);
+                Self::dispatch_graphics(&mut self.graphics, &cut.body);
+                at = cut.end;
+            }
+            self.advance_slice(&bytes[at..], &mut responses);
+        }
 
         let after_alt = self.modes.alternate_screen;
         let after_cursor = (self.cursor.row, self.cursor.col, self.cursor.visible);
@@ -1004,6 +1088,64 @@ mod tests {
         vt.process(b"\x1b[5;10H");
         assert_eq!(vt.cursor().row, 4); // 0-indexed
         assert_eq!(vt.cursor().col, 9); // 0-indexed
+    }
+
+    /// A `RIS` earlier in the same read must not swallow an APC starting after
+    /// it. The scanner consumes a whole read before vte sees any of it, so a
+    /// reset at `ESC c` could only discard state for bytes AFTER the reset --
+    /// an APC cannot span a `RIS`, since the introducing ESC terminates the
+    /// string sequence first.
+    #[test]
+    fn a_ris_does_not_swallow_an_apc_that_starts_after_it_in_the_same_read() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        // RIS, then the opening half of a graphics command, in ONE read.
+        vt.process_with_responses(b"\x1bc\x1b_Ghalf");
+        // Its continuation and terminator arrive in the next read.
+        vt.process_with_responses(b"more\x1b\\");
+        assert_eq!(
+            vt.graphics.dispatched,
+            vec![b"halfmore".to_vec()],
+            "the APC opened after the RIS was dropped"
+        );
+    }
+
+    /// The scanner and vte must agree on what ends an APC string, and they do:
+    /// only `ESC \\` does. Neither the 8-bit ST `0x9C` nor `BEL` terminates one.
+    ///
+    /// Pinned rather than "fixed". Teaching the scanner to end a string at
+    /// `0x9C` would CREATE a divergence: it would cut where vte keeps consuming,
+    /// so the bytes after it would reach `dispatch_graphics` as a command while
+    /// vte still treated them as string content. The 7-bit arm is a positive
+    /// control -- without it a scanner that dispatched nothing at all would
+    /// satisfy every other row here.
+    #[test]
+    fn only_the_7bit_st_terminates_an_apc_and_vte_agrees() {
+        let observe = |bytes: &[u8]| {
+            let mut vt = VirtualTerminal::new(24, 80);
+            vt.process_with_responses(bytes);
+            let text = vt.capture_text(None);
+            (
+                vt.graphics.dispatched.clone(),
+                text.contains("AFTER"),
+                text.contains("PAYLOAD"),
+            )
+        };
+
+        // Control: the 7-bit ST both delivers the command and lets text resume.
+        assert_eq!(
+            observe(b"\x1b_Ga=T;PAYLOAD\x1b\\AFTER"),
+            (vec![b"a=T;PAYLOAD".to_vec()], true, false),
+        );
+
+        // `0x9C` and BEL end nothing. Text does NOT resume after either, which
+        // is what proves vte is still inside the string rather than past it --
+        // "the payload never reached the grid" alone cannot tell those apart.
+        for unterminated in [
+            b"\x1b_Ga=T;PAYLOAD\x9cAFTER".as_slice(),
+            b"\x1b_Ga=T;PAYLOAD\x07AFTER",
+        ] {
+            assert_eq!(observe(unterminated), (Vec::new(), false, false));
+        }
     }
 
     #[test]

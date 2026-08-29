@@ -1333,6 +1333,7 @@ dependencies = [
 name = "shux-vt"
 version = "0.47.1"
 dependencies = [
+ "memchr",
  "proptest",
  "serde",
  "serde_json",

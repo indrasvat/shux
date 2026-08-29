@@ -41,6 +41,7 @@ crossterm = "0.29"
 # `#[cfg(not(feature = "std"))]`). Under `std` the buffer is an unbounded Vec and
 # an unterminated OSC retains every byte streamed at it — see issue #102.
 vte = { version = "0.15", default-features = false, features = ["ansi"] }
+memchr = "2"
 
 
 # State
