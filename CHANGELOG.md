@@ -1,3 +1,10 @@
+# [0.48.0](https://github.com/indrasvat/shux/compare/v0.47.1...v0.48.0) (2026-08-29)
+
+
+### Features
+
+* **vt:** scan kitty-graphics APCs, read their control blocks, and refuse the file transports ([#181](https://github.com/indrasvat/shux/issues/181)) ([bff879a](https://github.com/indrasvat/shux/commit/bff879a283afcd8e083e95ff28cfc507de9a1a81)), closes [#170](https://github.com/indrasvat/shux/issues/170) [#173](https://github.com/indrasvat/shux/issues/173) [#176](https://github.com/indrasvat/shux/issues/176) [#167](https://github.com/indrasvat/shux/issues/167)
+
 ## [0.47.1](https://github.com/indrasvat/shux/compare/v0.47.0...v0.47.1) (2026-08-28)
 
 
