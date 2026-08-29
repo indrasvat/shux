@@ -207,14 +207,13 @@ Everything else in this report was measured at `51ae4c9` in this pass.
 - **shux cannot audit its own emit path here.** This change emits nothing to an
   outer terminal, so that limit is not exercised — but it becomes live for work
   item 6 (attach re-transmit), where `make test-gui-terminal` is the only witness.
-- **Live `vicaya` and `vivecaka` are not installed** in this environment and
-  could not be obtained. Only their committed raw replay fixtures were
-  exercised. This is an UNFILLABLE CELL, not a satisfied requirement: CLAUDE.md
-  says "real workloads over fixtures ... colour-probed `printf`/`cat` is the
-  letter, not the spirit", and a replay is a recording, not the application.
-  Closing it needs a host that has them.
-  (`lazygit` was in this bullet when the audit was issued; it has since been
-  installed and driven live — see the addendum.)
+- **`vivecaka` cannot reach its UI here.** It is built and runs, but it is a
+  GitHub PR triage TUI and every mode requires the `gh` CLI, which this session
+  explicitly does not have. Its replay fixture stands; its live render does not.
+  This is the one remaining unfillable cell, and it is now a MEASURED limit
+  rather than an assumed one.
+  (`lazygit` and `vicaya` were both in this bullet when the audit was issued.
+  Both have since been obtained and driven live — see the addendum.)
 
 ## Cleanup
 
@@ -268,3 +267,36 @@ REAL application renders correctly, which is the half a replay cannot show.
 
 **`vicaya` and `vivecaka` remain unfillable here** and are called out as such
 above rather than counted as passes.
+
+
+## Addendum 2 — live `vicaya`, and the correction that produced it
+
+Written by the change author. The first addendum, and the residual-risk bullet
+it amended, both asserted that `vicaya` and `vivecaka` "could not be obtained".
+**That was never tested.** It rested on `command -v` failing and the names not
+being in apt; the rest was assumption. A later `curl` probe was no better — it
+returned 403 for every host including one unrelated to these tools, so it
+measured the session's egress proxy, not availability.
+
+Both are public repositories. `add_repo` — the authoritative check, whose own
+documentation says not to pre-check with `curl` for exactly this reason —
+returns `read_available` for both.
+
+**`vicaya` 1.5.1, built from source and driven live** in a 120x36 pane with its
+daemon running (`rakshaka ok`, 91,869 documents indexed), against this branch's
+binary and against `origin/main`:
+
+```
+vicaya A/B: pass diff_ratio=0.0
+capture identical
+```
+
+Committed as `vicaya-live-capture.txt` and `pixel-live-vicaya.json`. Box
+drawing, panel frames, the Devanagari-derived UI vocabulary and the status glyphs
+all render correctly and identically on both builds.
+
+**`vivecaka` is built and runs**, but it is a GitHub PR triage TUI: `--repo`,
+`inbox` and the bare invocation all exit with `gh CLI not found`. This session
+has no `gh` and no CLI-level GitHub credential, so its live UI is unreachable
+here. That is a real limit, now measured rather than assumed, and it is the only
+rich TUI this audit could not drive live.
