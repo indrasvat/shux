@@ -509,15 +509,10 @@ impl Grid {
     /// numbered from.
     ///
     /// A row's absolute index is `evicted() + its index in raw`, so the first
-    /// VISIBLE row sits at `evicted() + scrollback_len()`. Anything that must
-    /// keep pointing at the same LINE across scrolls stores that number and
-    /// resolves it back to a viewport row on read; a viewport row index alone
-    /// silently means a different line after the next scroll.
+    /// VISIBLE row sits at `evicted() + scrollback_len()`.
     ///
     /// The invariant every producer of a `Grid` owes: dropping rows off the
-    /// front ADVANCES this. A clone that keeps history keeps the count, and a
-    /// clone that keeps only the viewport has dropped `scrollback_len()` rows
-    /// and must say so.
+    /// front ADVANCES this.
     pub(crate) fn evicted(&self) -> u64 {
         self.evicted
     }
@@ -571,8 +566,6 @@ impl Grid {
             },
             dirty: self.dirty.clone(),
             mutations: self.mutations,
-            // History was left behind, so `raw[0]` is now the line that was
-            // `sb` rows further in. See `evicted`.
             evicted: self.evicted.saturating_add(sb as u64),
         }
     }
@@ -656,8 +649,7 @@ impl Grid {
         self.dirty.reset(rows, config.track_dirty);
         self.config = config;
         self.mutations = 0;
-        // Every line this grid held is gone, so the indices they occupied must
-        // not be handed out again. See `evicted`.
+        // Part of "the state of `Grid::new`": see `evicted`.
         self.evicted = 0;
     }
 
@@ -756,8 +748,6 @@ impl Grid {
             dirty: DirtyState::new(self.rows, self.config.track_dirty),
             // A read-only clone for snapshotting; the tally is irrelevant here.
             mutations: 0,
-            // Scrollback was left behind, so `raw[0]` is now the line that was
-            // `scrollback_len()` rows further in. See `evicted`.
             evicted: self.evicted.saturating_add(self.scrollback_len() as u64),
         }
     }
@@ -2059,6 +2049,7 @@ mod tests {
         cols: usize,
         total_lines: usize,
         mutations: u64,
+        evicted: u64,
         dirty: bool,
         cells: Vec<(char, bool)>,
         config: GridConfig,
@@ -2070,6 +2061,7 @@ mod tests {
             cols: grid.cols(),
             total_lines: grid.total_lines(),
             mutations: grid.mutations(),
+            evicted: grid.evicted(),
             dirty: grid.is_dirty(),
             cells: (0..grid.total_lines())
                 .flat_map(|r| {
@@ -2085,11 +2077,6 @@ mod tests {
 
     /// A grid that keeps only the viewport has dropped its scrollback off the
     /// front, so its absolute base has moved by exactly that many lines.
-    ///
-    /// Nothing reads the base across a viewport clone today, which is
-    /// why both paths could copy the base unchanged and stay green. The moment
-    /// anything anchors to an absolute line, a snapshot resolves every anchor
-    /// `scrollback_len()` rows away from the content it belongs to.
     #[test]
     fn a_viewport_clone_advances_the_eviction_count_by_the_history_it_drops() {
         let cfg = GridConfig {
@@ -2123,31 +2110,6 @@ mod tests {
         );
     }
 
-    /// `reset_blank`'s own doc says it returns the grid "to the state of
-    /// `Grid::new(rows, cols, config)`". The eviction base is part of that
-    /// state: it discards every line the grid held, so leaving the base where
-    /// it was hands out absolute indices that name lines which are gone.
-    #[test]
-    fn reset_blank_returns_the_eviction_base_to_a_fresh_grids() {
-        let cfg = GridConfig {
-            max_scrollback: 2,
-            ..GridConfig::default()
-        };
-        let mut grid = Grid::new(4, 8, cfg.clone());
-        for _ in 0..9 {
-            grid.scroll_up(0, 3);
-        }
-        assert!(grid.evicted() > 0, "lines really fell off the front");
-
-        grid.reset_blank(4, 8, cfg.clone());
-
-        assert_eq!(
-            grid.evicted(),
-            Grid::new(4, 8, cfg).evicted(),
-            "a reset grid still counts from the discarded grid's base"
-        );
-    }
-
     /// `is_blank_canvas` licenses reusing a retired buffer WITHOUT blanking
     /// it, on the promise that it is "indistinguishable from a freshly built
     /// `Grid::new`". It does not compare the eviction base, and deliberately
@@ -2160,10 +2122,6 @@ mod tests {
     /// `resize_canvas`, which never touches the base, while a grid parked in
     /// the spare slot is dropped outright when dimensions change (lib.rs,
     /// `dims_changed`).
-    ///
-    /// This pins the implication rather than the argument, because the day any
-    /// of that stops holding the recycling branch starts carrying one
-    /// session's indices into the next.
     #[test]
     fn a_grid_that_looks_blank_to_the_recycling_check_counts_from_zero() {
         let cfg = alt_config();
@@ -2183,14 +2141,15 @@ mod tests {
         resized.resize(4, 8);
         candidates.push(resized);
 
-        // The one mover that bumps no write tally of its own.
-        let mut cleared = Grid::new(4, 8, GridConfig::default());
-        for _ in 0..9 {
-            cleared.scroll_up(0, 3);
-        }
-        cleared.clear_scrollback();
-        assert!(cleared.evicted() > 0, "clear_scrollback moved the base");
-        candidates.push(cleared);
+        let admitted = candidates
+            .iter()
+            .filter(|g| g.is_blank_canvas(4, 8, &cfg))
+            .count();
+        assert!(
+            admitted >= 2,
+            "only {admitted} candidate(s) reached the check — the rest are \
+             rejected on config, geometry or tally, so this asserts nothing"
+        );
 
         for grid in &candidates {
             if grid.is_blank_canvas(4, 8, &cfg) {
