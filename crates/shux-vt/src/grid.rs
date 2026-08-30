@@ -512,7 +512,20 @@ impl Grid {
     /// buffer takes over as the thing a live renderer is incrementally
     /// tracking, so it has to inherit the rows that renderer has not drawn yet
     /// or they are never drawn at all.
-    /// Lines that have fallen off the front of this grid over its lifetime.
+    /// Lines that have fallen off the front of this grid over its lifetime —
+    /// and so the absolute index of `raw[0]`, the coordinate every row here is
+    /// numbered from.
+    ///
+    /// A row's absolute index is `evicted() + its index in raw`, so the first
+    /// VISIBLE row sits at `evicted() + scrollback_len()`. Anything that must
+    /// keep pointing at the same LINE across scrolls stores that number and
+    /// resolves it back to a viewport row on read; a viewport row index alone
+    /// silently means a different line after the next scroll.
+    ///
+    /// The invariant every producer of a `Grid` owes: dropping rows off the
+    /// front ADVANCES this. A clone that keeps history keeps the count, and a
+    /// clone that keeps only the viewport has dropped `scrollback_len()` rows
+    /// and must say so.
     pub(crate) fn evicted(&self) -> u64 {
         self.evicted
     }
@@ -559,7 +572,9 @@ impl Grid {
             },
             dirty: self.dirty.clone(),
             mutations: self.mutations,
-            evicted: self.evicted,
+            // History was left behind, so `raw[0]` is now the line that was
+            // `sb` rows further in. See `evicted`.
+            evicted: self.evicted.saturating_add(sb as u64),
         }
     }
 }
@@ -739,7 +754,9 @@ impl Grid {
             dirty: DirtyState::new(self.rows, self.config.track_dirty),
             // A read-only clone for snapshotting; the tally is irrelevant here.
             mutations: 0,
-            evicted: self.evicted,
+            // Scrollback was left behind, so `raw[0]` is now the line that was
+            // `scrollback_len()` rows further in. See `evicted`.
+            evicted: self.evicted.saturating_add(self.scrollback_len() as u64),
         }
     }
 
@@ -2062,6 +2079,46 @@ mod tests {
                 .collect(),
             config: grid.config.clone(),
         }
+    }
+
+    /// A grid that keeps only the viewport has dropped its scrollback off the
+    /// front, so its absolute base has moved by exactly that many lines.
+    ///
+    /// Nothing reads the base across a viewport clone today, which is
+    /// why both paths could copy the base unchanged and stay green. The moment
+    /// anything anchors to an absolute line, a snapshot resolves every anchor
+    /// `scrollback_len()` rows away from the content it belongs to.
+    #[test]
+    fn a_viewport_clone_advances_the_eviction_count_by_the_history_it_drops() {
+        let cfg = GridConfig {
+            max_scrollback: 2,
+            ..GridConfig::default()
+        };
+        let mut grid = Grid::new(4, 8, cfg);
+        for _ in 0..10 {
+            grid.scroll_up(0, 3);
+        }
+        assert_eq!(grid.scrollback_len(), 2, "history is capped, not empty");
+        assert!(grid.evicted() > 0, "lines really fell off the front");
+
+        // The line the clone's first row IS, counted in the original.
+        let first_visible = grid.evicted() + grid.scrollback_len() as u64;
+
+        assert_eq!(
+            grid.clone_visible().evicted(),
+            first_visible,
+            "clone_visible kept the base of history it did not keep"
+        );
+        assert_eq!(
+            grid.clone_presented_viewport().evicted(),
+            first_visible,
+            "clone_presented_viewport kept the base of history it did not keep"
+        );
+        assert_eq!(
+            grid.clone().evicted(),
+            grid.evicted(),
+            "a full clone keeps history, so it keeps the base"
+        );
     }
 
     fn alt_config() -> GridConfig {
