@@ -130,11 +130,64 @@ faster than 150 ms; that scene was added and showed 0 torn frames on both trees,
 with the torn detector proven to fire on a synthetic half-frame. Recorded so
 nobody later "proves" frozen behaviour with a settled capture.
 
-## Follow-up still open at the time of writing
+## Agent B, second pass — against `15fd835`
 
-`15fd835` (the `reset_blank` fix) was authored after Agent B started and is not
-in its worktree. Unlike the clone fix it changes OBSERVABLE behaviour on the
-alternate-screen recycling path, and Agent A measured the reuse/no-reuse bases
-diverging (`[0,0,4]` vs `[0,0,0]`) before it. Agent B has been sent back to run
-its harness against that commit, including a real vim/nvim workload rather than
-synthetic alt-screen sequences.
+`15fd835` changes OBSERVABLE behaviour on the alternate-screen recycling path
+and was authored after Agent B's first pass, so it was sent back with the same
+harness.
+
+Verdict: clean. Agent B built the instrument the repo did not have — a
+deterministic differential (LCG, so both trees run identical programs) over the
+full observable set PLUS the eviction base:
+
+| tree | base divergences | other divergences |
+|---|---|---|
+| `9793961` | 712 | 0 |
+| `f01c954` | 712 | 0 |
+| `15fd835` | 0 | 0 |
+
+24,000 compared steps, 921 alternate-screen entries. Zero other divergences at
+all three points, across the frame digest, scrollback, `presented_total_lines`
+and every `presented_row` with full per-cell styles, revision, title, alt flag,
+cursor and dirty regions — so the fix moves exactly what it claims and nothing
+else. `f01c954` is identical to base here, confirming the clone fix does not
+touch this path.
+
+Also run: the 17-stage copy-mode probe byte-identical to base and to `f01c954`
+(same hash), and a daemon-backed A/B driving REAL `vim -u NONE` over four
+rounds — round 1 allocating the alt buffer, rounds 2-4 recycling it — 52/52
+artifact pairs identical, 24/24 PNGs opened and pixel-compared at 0.000000, ink
+7.8-18.9%.
+
+**What that vim scene does NOT prove.** Within each leg, including the UNFIXED
+binary, the fresh-buffer round and the recycled rounds are already
+byte-identical. The scene cannot see this fix at all; its agreement is a
+no-regression result, not evidence the fix works. An alt grid is built with
+`max_scrollback: 0`, so a freeze taken there has `history_len == 0` and
+`presented_history_len` saturates regardless of the base delta. The differential
+above is the only instrument that sees it. Recorded so the vim evidence is not
+later cited for something it cannot establish.
+
+Agent B also broke its own comparator and caught it: `set -euo pipefail` killed
+the script inside a failure branch whose last command was a pipeline, silently
+truncating the comparison at the first difference — the exact shape CLAUDE.md
+warns about. Fixed, then proven by mutating two artifacts and confirming both
+were reported.
+
+## Finding acted on — the recycling oracle was blind
+
+Both councils, independently and from disjoint surfaces, found that
+`recycling_a_retired_buffer_is_unobservable` could not see the eviction base:
+its `Observed` struct compares "everything a consumer of `VirtualTerminal` can
+see", and the base is `pub(crate)`. That is why the `reset_blank` defect
+survived — the suite written to catch exactly this class was blind to the field.
+
+Fixed in `fd3e1c8` by adding `#[doc(hidden)] pub fn eviction_base()`, following
+`graphics_refusals()` in the same file, which exists for the same reason after a
+neutrality suite passed against a gutted scanner. Proven to bite: with `15fd835`
+reverted the differential fails at step 4 on `?1049h` with identical frame
+digest, scrollback, cursor, revision and dirty regions, and `eviction_base: 1`
+against `0`.
+
+This is the *verification machinery* clause of CLAUDE.md's correctness rule, and
+was not declinable.
