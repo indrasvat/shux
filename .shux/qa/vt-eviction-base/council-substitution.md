@@ -87,5 +87,54 @@ eviction base, so serialized placements would not round-trip their absolute
 anchors; and absolute line identity is not preservable across a reflow in any
 scheme, so the anchor-invalidation contract needs stating when placements land.
 
-**Agent B — the consumer surface.** _Pending; this section is filled in when it
-reports, and the QA gate re-runs against the result._
+**Agent B — the consumer surface.** Verdict: no consumer affected. No P1, no P2.
+
+Enumerated the readers by machine rather than by grep: renamed `Grid::evicted()`
+and let `cargo check --workspace --all-targets` find every call. Exactly three,
+all inside `shux-vt` — `sync.rs:99` and `lib.rs:694`, both reading the LIVE grid,
+plus the diff's own test. The field is private to the `grid` module and the
+accessor is `pub(crate)`, so nothing outside the crate can reach it by
+construction. The author's argument was falsified rather than merely
+unchallenged.
+
+No wire or compatibility surface: `Grid` derives only `Debug`, and the capture
+schema (`FrameEnvelope`, schema 1) carries `alt_screen, cursor, defaults,
+palette_overridden, rows, schema, size` and nothing else — checked against the
+frozen fixture. (The RPC wire's `evicted_revision` is the lens checkpoint FIFO,
+an unrelated concept.)
+
+Copy mode driven for real: a 31-key script through `handle_key_with_vt` over 17
+stages including freeze with history partially and fully evicted, alt-screen
+entered and left inside the freeze, and a recycled alt buffer — every cell
+fingerprinted with its full `CellStyle`. 1177 lines, byte-identical base vs fix.
+Daemon-backed A/B over 6200+ coloured lines (past the 5000 cap, so `evicted > 0`)
+across all five capture/snapshot paths: 24/24 artifact pairs identical, 12/12
+PNGs opened and pixel-compared at `pixel_diff_ratio` 0.000000.
+
+**The probe was proven able to fail**, which is the part that makes the null
+result worth anything: wiring the clone's field into `presented_history_len`
+moved 687 diff lines while leaving base identical, and stripping colour while
+keeping text identical moved 1342. Sensitive, and not monochrome-blind.
+
+**Finding acted on — P3, the stated reason for leaving `is_blank_canvas` alone
+was inexact.** `clear_scrollback` moves the base and bumps no write tally, so
+"only moves on a path that also advances the tally, or on a resize" was wrong.
+The conclusion survives for a different reason: `clear_scrollback` cannot move a
+base FIRST, because a non-empty scrollback implies prior scrolling, which does
+bump. Commit message corrected and the state added to the pinning test.
+
+**P3 — a settled capture cannot see a freeze.** `SYNC_UPDATE_TIMEOUT_MS = 150`
+is swept by the daemon tick, so any `pane capture` after a `wait-settled` is past
+it. The only real-daemon route to a live freeze is a pane re-opening windows
+faster than 150 ms; that scene was added and showed 0 torn frames on both trees,
+with the torn detector proven to fire on a synthetic half-frame. Recorded so
+nobody later "proves" frozen behaviour with a settled capture.
+
+## Follow-up still open at the time of writing
+
+`15fd835` (the `reset_blank` fix) was authored after Agent B started and is not
+in its worktree. Unlike the clone fix it changes OBSERVABLE behaviour on the
+alternate-screen recycling path, and Agent A measured the reuse/no-reuse bases
+diverging (`[0,0,4]` vs `[0,0,0]`) before it. Agent B has been sent back to run
+its harness against that commit, including a real vim/nvim workload rather than
+synthetic alt-screen sequences.

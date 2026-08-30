@@ -294,6 +294,19 @@ impl VirtualTerminal {
         self.graphics.refusals
     }
 
+    /// Absolute index the live grid is numbering its rows from.
+    ///
+    /// Recycling is required to be unobservable, and the differential suite
+    /// that enforces that compares everything a consumer can see. This is the
+    /// one thing it could not reach: the base is `pub(crate)`, so a retired
+    /// buffer could be handed back still counting from the discarded grid and
+    /// every observable still agreed. Both implementation-diff councils found
+    /// the same blind spot independently.
+    #[doc(hidden)]
+    pub fn eviction_base(&self) -> u64 {
+        self.grid().evicted()
+    }
+
     /// Turn retired-buffer recycling (issue #106) off or on.
     ///
     /// Recycling is required to be UNOBSERVABLE: a terminal that reuses its
