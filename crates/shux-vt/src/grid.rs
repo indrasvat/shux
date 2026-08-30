@@ -504,14 +504,6 @@ impl Clone for Grid {
 }
 
 impl Grid {
-    /// Clone this grid AND its pending repaint state.
-    ///
-    /// The ordinary clone hands back a grid nothing is known to be stale in,
-    /// which is right for a snapshot that is about to be rendered once and
-    /// dropped. The synchronized-output freeze is the other case: the frozen
-    /// buffer takes over as the thing a live renderer is incrementally
-    /// tracking, so it has to inherit the rows that renderer has not drawn yet
-    /// or they are never drawn at all.
     /// Lines that have fallen off the front of this grid over its lifetime —
     /// and so the absolute index of `raw[0]`, the coordinate every row here is
     /// numbered from.
@@ -532,6 +524,13 @@ impl Grid {
 
     /// Clone JUST the visible viewport, and its pending repaint state, as a
     /// grid of its own.
+    ///
+    /// The pending state is the half that is easy to drop. The ordinary clone
+    /// hands back a grid nothing is known to be stale in, which is right for a
+    /// snapshot that is about to be rendered once and thrown away. A freeze is
+    /// the other case: the frozen buffer takes over as the thing a live
+    /// renderer is incrementally tracking, so it has to inherit the rows that
+    /// renderer has not drawn yet or they are never drawn at all.
     ///
     /// This is what a synchronized-output freeze keeps (issue #115). It
     /// deliberately does NOT keep history, for two reasons that are really the
