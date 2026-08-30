@@ -2151,13 +2151,15 @@ mod tests {
     /// `is_blank_canvas` licenses reusing a retired buffer WITHOUT blanking
     /// it, on the promise that it is "indistinguishable from a freshly built
     /// `Grid::new`". It does not compare the eviction base, and deliberately
-    /// so — but the reason is narrower than "everything that moves the base
-    /// bumps the tally". `clear_scrollback` moves the base and bumps nothing.
-    /// It cannot move it FIRST, because a non-empty scrollback implies prior
-    /// scrolling, which does bump. Resizes are the other mover, and
-    /// `VirtualTerminal` drops the spare outright when dimensions change
-    /// (lib.rs, `dims_changed`), so a resized grid never reaches the check at
-    /// all.
+    /// so. Three things move a base, and each is ruled out differently.
+    /// Scrolling bumps the write tally, which the check already compares.
+    /// `clear_scrollback` bumps nothing, but cannot move a base FIRST: a
+    /// non-empty scrollback implies prior scrolling, which does bump. Column
+    /// reflow bumps nothing either — and a resized grid DOES reach this check
+    /// — but the live alternate grid is only ever resized through
+    /// `resize_canvas`, which never touches the base, while a grid parked in
+    /// the spare slot is dropped outright when dimensions change (lib.rs,
+    /// `dims_changed`).
     ///
     /// This pins the implication rather than the argument, because the day any
     /// of that stops holding the recycling branch starts carrying one

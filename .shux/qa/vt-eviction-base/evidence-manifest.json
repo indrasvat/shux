@@ -1,0 +1,84 @@
+{
+  "scope": "vt-eviction-base",
+  "audited_commit": "e114e4c15c05ab0bfd5683a56a43c2672b09ebb3",
+  "base_commit": "9793961110c1c5f24717e304fd977f08eae5471c",
+  "diff_sha256": "987ff44fdf455ef0c486c28eb0e9e0bd4ed324274ee64e4e57b5167b2710ed27",
+  "verdict": "PASS",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-substitution.md",
+  "dootsabha_implementation": "council-substitution.md",
+  "council_tool": "dootsabha not installed; parallel adversarial agents on disjoint surfaces per CLAUDE.md Tooling fallbacks",
+  "screenshots": [
+    "corpus-rich-tui-btop-actual.png",
+    "corpus-rich-tui-nvim-actual.png",
+    "corpus-synthetic-alternate-screen-actual.png"
+  ],
+  "pixel_metrics": [
+    "pixel-ab-altback-120x40.json",
+    "pixel-ab-altback-200x60.json",
+    "pixel-ab-altback-80x24.json",
+    "pixel-ab-altlive-120x40.json",
+    "pixel-ab-altlive-200x60.json",
+    "pixel-ab-altlive-80x24.json",
+    "pixel-ab-copymode-top-120x40.json",
+    "pixel-ab-copymode-top-80x24.json",
+    "pixel-ab-history-120x40.json",
+    "pixel-ab-history-200x60.json",
+    "pixel-ab-history-80x24.json",
+    "pixel-ab-vim4-120x40.json",
+    "pixel-ab-vim4-200x60.json",
+    "pixel-ab-vim4-80x24.json",
+    "pixel-corpus-rich-tui-btop.json",
+    "pixel-corpus-rich-tui-lazygit.json",
+    "pixel-corpus-rich-tui-nvim.json",
+    "pixel-corpus-rich-tui-vicaya.json",
+    "pixel-corpus-rich-tui-vivecaka.json",
+    "pixel-corpus-synthetic-alternate-screen.json"
+  ],
+  "pixel_thresholds": {
+    "max_pixel_diff_ratio": 0,
+    "max_mean_channel_delta": 0
+  },
+  "breakpoints": [
+    "80x24",
+    "120x40",
+    "200x60"
+  ],
+  "binaries_compared": {
+    "base": "9793961 release",
+    "head": "e114e4c release",
+    "unfixed": "e114e4c with 15fd835's `self.evicted = 0;` reverted"
+  },
+  "commands_run": [
+    "make test  -> 2238 run, 2238 passed, 2 skipped",
+    "make lint  -> clean",
+    "make test-vt-corpus -> 3 replay tests + harness passed",
+    "cargo nextest run -p shux-vt --test alt_screen_differential (worktree, 15fd835 reverted) -> FAILED at step 4 on ESC[?1049h, eviction_base 1 vs 0",
+    "counterexample search: 194481 exhaustive depth-4 + 40000 random depth-24 programs, 1737924 steps, 0 hits"
+  ],
+  "real_tuis_driven": [
+    "vim",
+    "nvim",
+    "btop --utf-force",
+    "lazygit",
+    "vicaya-tui"
+  ],
+  "real_tuis_unavailable": {
+    "htop": "not installed",
+    "vivecaka": "launches but requires the gh CLI, which is not installed; covered by the committed raw replay fixture instead"
+  },
+  "raw_replay_fixtures": [
+    ".shux/fixtures/vt-corpus/rich-tui/btop.raw",
+    ".shux/fixtures/vt-corpus/rich-tui/lazygit.raw",
+    ".shux/fixtures/vt-corpus/rich-tui/nvim.raw",
+    ".shux/fixtures/vt-corpus/rich-tui/vicaya.raw",
+    ".shux/fixtures/vt-corpus/rich-tui/vivecaka.raw"
+  ],
+  "scrollback_evicted_lines": {
+    "80x24": 981,
+    "120x40": 982,
+    "200x60": 990
+  },
+  "scratch": ".shux/out/vt-eviction-base/ (gitignored)",
+  "leaked_daemons": 0
+}

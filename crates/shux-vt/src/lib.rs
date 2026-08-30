@@ -294,7 +294,13 @@ impl VirtualTerminal {
         self.graphics.refusals
     }
 
-    /// Absolute index the live grid is numbering its rows from.
+    /// Absolute index the PRESENTED grid is numbering its rows from.
+    ///
+    /// Presented, not live: this follows `grid()`, which hands back the frozen
+    /// buffer while a synchronized-output window is open. That keeps it
+    /// consistent with every other field the recycling differential compares —
+    /// they all read `vt.grid()` — and the differential's own alphabet emits
+    /// `?2026h`, so the two would diverge under it otherwise.
     ///
     /// Recycling is required to be unobservable, and the differential suite
     /// that enforces that compares everything a consumer can see. This is the
