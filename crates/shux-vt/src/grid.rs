@@ -656,6 +656,9 @@ impl Grid {
         self.dirty.reset(rows, config.track_dirty);
         self.config = config;
         self.mutations = 0;
+        // Every line this grid held is gone, so the indices they occupied must
+        // not be handed out again. See `evicted`.
+        self.evicted = 0;
     }
 
     /// Monotonic count of cell/scroll/clear write operations on this grid
@@ -2117,6 +2120,133 @@ mod tests {
             grid.clone().evicted(),
             grid.evicted(),
             "a full clone keeps history, so it keeps the base"
+        );
+    }
+
+    /// `reset_blank`'s own doc says it returns the grid "to the state of
+    /// `Grid::new(rows, cols, config)`". The eviction base is part of that
+    /// state: it discards every line the grid held, so leaving the base where
+    /// it was hands out absolute indices that name lines which are gone.
+    #[test]
+    fn reset_blank_returns_the_eviction_base_to_a_fresh_grids() {
+        let cfg = GridConfig {
+            max_scrollback: 2,
+            ..GridConfig::default()
+        };
+        let mut grid = Grid::new(4, 8, cfg.clone());
+        for _ in 0..9 {
+            grid.scroll_up(0, 3);
+        }
+        assert!(grid.evicted() > 0, "lines really fell off the front");
+
+        grid.reset_blank(4, 8, cfg.clone());
+
+        assert_eq!(
+            grid.evicted(),
+            Grid::new(4, 8, cfg).evicted(),
+            "a reset grid still counts from the discarded grid's base"
+        );
+    }
+
+    /// `is_blank_canvas` licenses reusing a retired buffer WITHOUT blanking
+    /// it, on the promise that it is "indistinguishable from a freshly built
+    /// `Grid::new`". It does not compare the eviction base, and deliberately
+    /// so — but the reason is narrower than "everything that moves the base
+    /// bumps the tally". `clear_scrollback` moves the base and bumps nothing.
+    /// It cannot move it FIRST, because a non-empty scrollback implies prior
+    /// scrolling, which does bump. Resizes are the other mover, and
+    /// `VirtualTerminal` drops the spare outright when dimensions change
+    /// (lib.rs, `dims_changed`), so a resized grid never reaches the check at
+    /// all.
+    ///
+    /// This pins the implication rather than the argument, because the day any
+    /// of that stops holding the recycling branch starts carrying one
+    /// session's indices into the next.
+    #[test]
+    fn a_grid_that_looks_blank_to_the_recycling_check_counts_from_zero() {
+        let cfg = alt_config();
+        let mut candidates = vec![Grid::new(4, 8, cfg.clone())];
+
+        let mut scrolled = Grid::new(4, 8, cfg.clone());
+        for _ in 0..9 {
+            scrolled.scroll_up(0, 3);
+        }
+        let mut reset = scrolled.clone();
+        reset.reset_blank(4, 8, cfg.clone());
+        candidates.push(scrolled);
+        candidates.push(reset);
+
+        let mut resized = Grid::new(8, 8, cfg.clone());
+        resized.resize(2, 8);
+        resized.resize(4, 8);
+        candidates.push(resized);
+
+        // The one mover that bumps no write tally of its own.
+        let mut cleared = Grid::new(4, 8, GridConfig::default());
+        for _ in 0..9 {
+            cleared.scroll_up(0, 3);
+        }
+        cleared.clear_scrollback();
+        assert!(cleared.evicted() > 0, "clear_scrollback moved the base");
+        candidates.push(cleared);
+
+        for grid in &candidates {
+            if grid.is_blank_canvas(4, 8, &cfg) {
+                assert_eq!(
+                    grid.evicted(),
+                    0,
+                    "a grid the recycling branch would reuse untouched is \
+                     still counting from a discarded grid's base"
+                );
+            }
+        }
+    }
+
+    /// What a caller actually sees. An absolute index taken in one
+    /// alternate-screen session must not resolve onto a live row of the next:
+    /// the recycled buffer discarded every line that index named.
+    #[test]
+    fn a_recycled_alternate_screen_buffer_does_not_alias_the_previous_session() {
+        use crate::cursor::Cursor;
+
+        let mut grid = Grid::new(4, 8, GridConfig::default());
+        let mut cursor = Cursor::default();
+        let (mut stashed_grid, mut stashed_cursor, mut spare) = (None, None, None);
+
+        macro_rules! swap {
+            ($m:ident) => {{
+                crate::screen::ScreenSwap {
+                    grid: &mut grid,
+                    cursor: &mut cursor,
+                    stashed_grid: &mut stashed_grid,
+                    stashed_cursor: &mut stashed_cursor,
+                    spare: &mut spare,
+                    reuse: true,
+                }
+                .$m(true);
+            }};
+        }
+
+        swap!(enter);
+        for _ in 0..4 {
+            grid.scroll_up(0, 3);
+        }
+        grid.visible_row_mut(1)[0].ch = 'X';
+        let anchor = grid.evicted() + (grid.scrollback_len() + 1) as u64;
+        swap!(leave);
+
+        // Session two gets the recycled buffer. Nothing session one wrote survives.
+        swap!(enter);
+        grid.visible_row_mut(1)[0].ch = 'Y';
+
+        let resolved = anchor
+            .checked_sub(grid.evicted())
+            .and_then(|local| grid.row(local as usize));
+        assert!(
+            resolved.is_none(),
+            "an anchor from the previous alternate-screen session resolved to \
+             a live row of this one: {:?}",
+            resolved.map(row_text),
         );
     }
 
