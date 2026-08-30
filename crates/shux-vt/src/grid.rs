@@ -2112,20 +2112,12 @@ mod tests {
 
     /// `is_blank_canvas` licenses reusing a retired buffer WITHOUT blanking
     /// it, on the promise that it is "indistinguishable from a freshly built
-    /// `Grid::new`". It does not compare the eviction base, and deliberately
-    /// so. Three things move a base, and each is ruled out differently.
-    /// Scrolling bumps the write tally, which the check already compares.
-    /// `clear_scrollback` bumps nothing, but cannot move a base FIRST: a
-    /// non-empty scrollback implies prior scrolling, which does bump. Column
-    /// reflow bumps nothing either — and a resized grid DOES reach this check
-    /// — but the live alternate grid is only ever resized through
-    /// `resize_canvas`, which never touches the base, while a grid parked in
-    /// the spare slot is dropped outright when dimensions change (lib.rs,
-    /// `dims_changed`).
+    /// `Grid::new`". It does not compare the eviction base, so what makes that
+    /// safe is a property, asserted here rather than argued: whatever the
+    /// check admits counts from zero.
     #[test]
     fn a_grid_that_looks_blank_to_the_recycling_check_counts_from_zero() {
         let cfg = alt_config();
-        let mut candidates = vec![Grid::new(4, 8, cfg.clone())];
 
         let mut scrolled = Grid::new(4, 8, cfg.clone());
         for _ in 0..9 {
@@ -2133,31 +2125,47 @@ mod tests {
         }
         let mut reset = scrolled.clone();
         reset.reset_blank(4, 8, cfg.clone());
-        candidates.push(scrolled);
-        candidates.push(reset);
 
         let mut resized = Grid::new(8, 8, cfg.clone());
         resized.resize(2, 8);
         resized.resize(4, 8);
-        candidates.push(resized);
 
-        let admitted = candidates
-            .iter()
-            .filter(|g| g.is_blank_canvas(4, 8, &cfg))
-            .count();
+        // A grid whose scrollback arrived without a single scroll: the shrink
+        // keeps non-blank rows, and `clear_scrollback` then moves the base.
+        let mut restructured = Grid::new(4, 8, cfg.clone());
+        for r in 0..4 {
+            restructured.visible_row_mut(r)[0].ch = 'X';
+        }
+        restructured.resize_canvas(2, 8);
+        restructured.clear_scrollback();
+        assert!(restructured.evicted() > 0, "the base really moved");
+
+        let candidates = [
+            ("fresh", Grid::new(4, 8, cfg.clone())),
+            ("scrolled", scrolled),
+            ("reset", reset),
+            ("resized", resized),
+            ("restructured", restructured),
+        ];
+
+        // The reset grid is the one that discriminates: it is the state the
+        // recycling branch actually hands back. A count alone stays green if
+        // this specific candidate stops being admitted.
         assert!(
-            admitted >= 2,
-            "only {admitted} candidate(s) reached the check — the rest are \
-             rejected on config, geometry or tally, so this asserts nothing"
+            candidates
+                .iter()
+                .any(|(name, g)| *name == "reset" && g.is_blank_canvas(4, 8, &cfg)),
+            "the reset candidate is no longer admitted, so this test would \
+             pass without exercising the recycling path at all"
         );
 
-        for grid in &candidates {
+        for (name, grid) in &candidates {
             if grid.is_blank_canvas(4, 8, &cfg) {
                 assert_eq!(
                     grid.evicted(),
                     0,
-                    "a grid the recycling branch would reuse untouched is \
-                     still counting from a discarded grid's base"
+                    "{name}: a grid the recycling branch would reuse untouched \
+                     is still counting from a discarded grid's base"
                 );
             }
         }
