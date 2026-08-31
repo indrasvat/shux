@@ -1,3 +1,10 @@
+# [0.49.0](https://github.com/indrasvat/shux/compare/v0.48.1...v0.49.0) (2026-08-31)
+
+
+### Features
+
+* **vt:** render kitty-graphics images into pane snapshots ([#183](https://github.com/indrasvat/shux/issues/183)) ([5ded72e](https://github.com/indrasvat/shux/commit/5ded72ed1180fad00923ddcc2155e872927e00d7)), closes [#115](https://github.com/indrasvat/shux/issues/115) [#181](https://github.com/indrasvat/shux/issues/181) [#182](https://github.com/indrasvat/shux/issues/182) [#115](https://github.com/indrasvat/shux/issues/115)
+
 ## [0.48.1](https://github.com/indrasvat/shux/compare/v0.48.0...v0.48.1) (2026-08-31)
 
 
