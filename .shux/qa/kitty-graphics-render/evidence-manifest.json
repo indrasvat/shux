@@ -1,14 +1,18 @@
 {
   "scope": "kitty-graphics-render",
   "base": "de1fadb",
-  "audited_head": "8d4cc8f",
-  "verdict": "FAIL",
+  "audited_head": "4238f6b",
+  "previously_audited_head": "8d4cc8f",
+  "verdict": "PASS",
   "solid_qa_report": "SOLID-QA.md",
   "dootsabha_design": "council-substitution.md",
   "dootsabha_implementation": "council-substitution.md",
   "screenshots": [],
   "pixel_metrics": [
     "pixel-icat-f100-80x24.json",
-    "pixel-icat-chunked-f24-oz-80x24.json"
-  ]
+    "pixel-icat-chunked-f24-oz-80x24.json",
+    "pixel-glance-vs-pane-snapshot-80x24.json"
+  ],
+  "scratch": ".shux/out/kitty-graphics-render/r2/",
+  "notes": "No screenshot is committed: no pixel metric compares against a baseline this repo tracks, so per .shux/qa/README.md the metric JSONs stand alone. Every pixel came from shux-raster; the outer-terminal emit path is not exercised by this change and was not photographed."
 }
