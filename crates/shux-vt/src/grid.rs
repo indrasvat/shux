@@ -504,21 +504,28 @@ impl Clone for Grid {
 }
 
 impl Grid {
-    /// Clone this grid AND its pending repaint state.
+    /// Lines that have fallen off the front of this grid over its lifetime —
+    /// and so the absolute index of `raw[0]`, the coordinate every row here is
+    /// numbered from.
     ///
-    /// The ordinary clone hands back a grid nothing is known to be stale in,
-    /// which is right for a snapshot that is about to be rendered once and
-    /// dropped. The synchronized-output freeze is the other case: the frozen
-    /// buffer takes over as the thing a live renderer is incrementally
-    /// tracking, so it has to inherit the rows that renderer has not drawn yet
-    /// or they are never drawn at all.
-    /// Lines that have fallen off the front of this grid over its lifetime.
+    /// A row's absolute index is `evicted() + its index in raw`, so the first
+    /// VISIBLE row sits at `evicted() + scrollback_len()`.
+    ///
+    /// The invariant every producer of a `Grid` owes: dropping rows off the
+    /// front ADVANCES this.
     pub(crate) fn evicted(&self) -> u64 {
         self.evicted
     }
 
     /// Clone JUST the visible viewport, and its pending repaint state, as a
     /// grid of its own.
+    ///
+    /// The pending state is the half that is easy to drop. The ordinary clone
+    /// hands back a grid nothing is known to be stale in, which is right for a
+    /// snapshot that is about to be rendered once and thrown away. A freeze is
+    /// the other case: the frozen buffer takes over as the thing a live
+    /// renderer is incrementally tracking, so it has to inherit the rows that
+    /// renderer has not drawn yet or they are never drawn at all.
     ///
     /// This is what a synchronized-output freeze keeps (issue #115). It
     /// deliberately does NOT keep history, for two reasons that are really the
@@ -559,7 +566,7 @@ impl Grid {
             },
             dirty: self.dirty.clone(),
             mutations: self.mutations,
-            evicted: self.evicted,
+            evicted: self.evicted.saturating_add(sb as u64),
         }
     }
 }
@@ -642,6 +649,8 @@ impl Grid {
         self.dirty.reset(rows, config.track_dirty);
         self.config = config;
         self.mutations = 0;
+        // Part of "the state of `Grid::new`": see `evicted`.
+        self.evicted = 0;
     }
 
     /// Monotonic count of cell/scroll/clear write operations on this grid
@@ -739,7 +748,7 @@ impl Grid {
             dirty: DirtyState::new(self.rows, self.config.track_dirty),
             // A read-only clone for snapshotting; the tally is irrelevant here.
             mutations: 0,
-            evicted: self.evicted,
+            evicted: self.evicted.saturating_add(self.scrollback_len() as u64),
         }
     }
 
@@ -2040,6 +2049,7 @@ mod tests {
         cols: usize,
         total_lines: usize,
         mutations: u64,
+        evicted: u64,
         dirty: bool,
         cells: Vec<(char, bool)>,
         config: GridConfig,
@@ -2051,6 +2061,7 @@ mod tests {
             cols: grid.cols(),
             total_lines: grid.total_lines(),
             mutations: grid.mutations(),
+            evicted: grid.evicted(),
             dirty: grid.is_dirty(),
             cells: (0..grid.total_lines())
                 .flat_map(|r| {
@@ -2062,6 +2073,150 @@ mod tests {
                 .collect(),
             config: grid.config.clone(),
         }
+    }
+
+    /// A grid that keeps only the viewport has dropped its scrollback off the
+    /// front, so its absolute base has moved by exactly that many lines.
+    #[test]
+    fn a_viewport_clone_advances_the_eviction_count_by_the_history_it_drops() {
+        let cfg = GridConfig {
+            max_scrollback: 2,
+            ..GridConfig::default()
+        };
+        let mut grid = Grid::new(4, 8, cfg);
+        for _ in 0..10 {
+            grid.scroll_up(0, 3);
+        }
+        assert_eq!(grid.scrollback_len(), 2, "history is capped, not empty");
+        assert!(grid.evicted() > 0, "lines really fell off the front");
+
+        // The line the clone's first row IS, counted in the original.
+        let first_visible = grid.evicted() + grid.scrollback_len() as u64;
+
+        assert_eq!(
+            grid.clone_visible().evicted(),
+            first_visible,
+            "clone_visible kept the base of history it did not keep"
+        );
+        assert_eq!(
+            grid.clone_presented_viewport().evicted(),
+            first_visible,
+            "clone_presented_viewport kept the base of history it did not keep"
+        );
+        assert_eq!(
+            grid.clone().evicted(),
+            grid.evicted(),
+            "a full clone keeps history, so it keeps the base"
+        );
+    }
+
+    /// `is_blank_canvas` licenses reusing a retired buffer WITHOUT blanking
+    /// it, on the promise that it is "indistinguishable from a freshly built
+    /// `Grid::new`". It does not compare the eviction base, so what makes that
+    /// safe is a property, asserted here rather than argued: whatever the
+    /// check admits counts from zero.
+    #[test]
+    fn a_grid_that_looks_blank_to_the_recycling_check_counts_from_zero() {
+        let cfg = alt_config();
+
+        let mut scrolled = Grid::new(4, 8, cfg.clone());
+        for _ in 0..9 {
+            scrolled.scroll_up(0, 3);
+        }
+        let mut reset = scrolled.clone();
+        reset.reset_blank(4, 8, cfg.clone());
+
+        let mut resized = Grid::new(8, 8, cfg.clone());
+        resized.resize(2, 8);
+        resized.resize(4, 8);
+
+        // A grid whose scrollback arrived without a single scroll: the shrink
+        // keeps non-blank rows, and `clear_scrollback` then moves the base.
+        let mut restructured = Grid::new(4, 8, cfg.clone());
+        for r in 0..4 {
+            restructured.visible_row_mut(r)[0].ch = 'X';
+        }
+        restructured.resize_canvas(2, 8);
+        restructured.clear_scrollback();
+        assert!(restructured.evicted() > 0, "the base really moved");
+
+        let candidates = [
+            ("fresh", Grid::new(4, 8, cfg.clone())),
+            ("scrolled", scrolled),
+            ("reset", reset),
+            ("resized", resized),
+            ("restructured", restructured),
+        ];
+
+        // The reset grid is the one that discriminates: it is the state the
+        // recycling branch actually hands back. A count alone stays green if
+        // this specific candidate stops being admitted.
+        assert!(
+            candidates
+                .iter()
+                .any(|(name, g)| *name == "reset" && g.is_blank_canvas(4, 8, &cfg)),
+            "the reset candidate is no longer admitted, so this test would \
+             pass without exercising the recycling path at all"
+        );
+
+        for (name, grid) in &candidates {
+            if grid.is_blank_canvas(4, 8, &cfg) {
+                assert_eq!(
+                    grid.evicted(),
+                    0,
+                    "{name}: a grid the recycling branch would reuse untouched \
+                     is still counting from a discarded grid's base"
+                );
+            }
+        }
+    }
+
+    /// What a caller actually sees. An absolute index taken in one
+    /// alternate-screen session must not resolve onto a live row of the next:
+    /// the recycled buffer discarded every line that index named.
+    #[test]
+    fn a_recycled_alternate_screen_buffer_does_not_alias_the_previous_session() {
+        use crate::cursor::Cursor;
+
+        let mut grid = Grid::new(4, 8, GridConfig::default());
+        let mut cursor = Cursor::default();
+        let (mut stashed_grid, mut stashed_cursor, mut spare) = (None, None, None);
+
+        macro_rules! swap {
+            ($m:ident) => {{
+                crate::screen::ScreenSwap {
+                    grid: &mut grid,
+                    cursor: &mut cursor,
+                    stashed_grid: &mut stashed_grid,
+                    stashed_cursor: &mut stashed_cursor,
+                    spare: &mut spare,
+                    reuse: true,
+                }
+                .$m(true);
+            }};
+        }
+
+        swap!(enter);
+        for _ in 0..4 {
+            grid.scroll_up(0, 3);
+        }
+        grid.visible_row_mut(1)[0].ch = 'X';
+        let anchor = grid.evicted() + (grid.scrollback_len() + 1) as u64;
+        swap!(leave);
+
+        // Session two gets the recycled buffer. Nothing session one wrote survives.
+        swap!(enter);
+        grid.visible_row_mut(1)[0].ch = 'Y';
+
+        let resolved = anchor
+            .checked_sub(grid.evicted())
+            .and_then(|local| grid.row(local as usize));
+        assert!(
+            resolved.is_none(),
+            "an anchor from the previous alternate-screen session resolved to \
+             a live row of this one: {:?}",
+            resolved.map(row_text),
+        );
     }
 
     fn alt_config() -> GridConfig {

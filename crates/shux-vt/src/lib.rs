@@ -294,6 +294,18 @@ impl VirtualTerminal {
         self.graphics.refusals
     }
 
+    /// Absolute index the LIVE grid is numbering its rows from.
+    ///
+    /// Exists so `tests/alt_screen_differential.rs` can compare a `pub(crate)`
+    /// field. Live rather than presented: a frozen viewport clone counts from
+    /// its own base (`Grid::evicted`), which is not the base `presented_row`
+    /// resolves against, and the recycling defect this observes lands on the
+    /// live grid at alternate-screen entry.
+    #[doc(hidden)]
+    pub fn eviction_base(&self) -> u64 {
+        self.grid.evicted()
+    }
+
     /// Turn retired-buffer recycling (issue #106) off or on.
     ///
     /// Recycling is required to be UNOBSERVABLE: a terminal that reuses its

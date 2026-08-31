@@ -74,6 +74,10 @@ struct Observed {
     /// Cursor presentation is drawn as an overlay, outside the frame hash's
     /// cell data, so it is compared explicitly too.
     cursor: (usize, usize, bool),
+    /// The absolute index rows are numbered from. Everything above can agree
+    /// while a recycled buffer counts from the grid it replaced, which is how
+    /// a stale anchor resolves onto a live row of the next session.
+    eviction_base: u64,
 }
 
 fn observe(vt: &mut VirtualTerminal) -> Observed {
@@ -95,6 +99,7 @@ fn observe(vt: &mut VirtualTerminal) -> Observed {
         alternate_screen: vt.is_alternate_screen(),
         cursor: (vt.cursor().row, vt.cursor().col, vt.cursor().visible),
         dirty: Vec::new(),
+        eviction_base: vt.eviction_base(),
     }
 }
 
