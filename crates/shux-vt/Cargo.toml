@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
 vte = { workspace = true }
 memchr = { workspace = true }
 unicode-width = "0.2"

@@ -698,7 +698,7 @@ fmt: ## Format all code
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
 .PHONY: check
-check: hooks-check lint shellcheck check-darwin test check-test-groups check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods ## Run lint + test + process/QA guards (what pre-commit runs)
+check: hooks-check lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods ## Run lint + test + process/QA guards (what pre-commit runs)
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""

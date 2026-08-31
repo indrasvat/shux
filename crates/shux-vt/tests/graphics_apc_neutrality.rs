@@ -1,14 +1,17 @@
 //! The APC scanner must be observationally neutral.
 //!
 //! `process_with_responses` cuts its `advance` calls at APC boundaries so a
-//! graphics command lands at its true stream position. That is only sound if it
-//! is invisible: grid, cursor, title and replies must not depend on where the
-//! cuts fall or how the PTY chunked the read.
+//! graphics command lands at its true stream position. That is only sound if
+//! the result does not depend on where the cuts fall or how the PTY chunked
+//! the read.
 //!
-//! The property holds structurally -- `dispatch_graphics` takes no `&mut self`,
-//! so it cannot reach the grid, cursor or replies at all. It needs pinning
-//! because the renderer will have to widen that signature, and the first line
-//! it adds there would break neutrality while every other test stayed green.
+//! The generated properties compare slicing on against slicing off on the
+//! SAME chunks. That comparison is only meaningful while the graphics path is
+//! inert, because slicing off never dispatches at all -- so `G` is absent from
+//! the generated alphabet and every generated APC is a non-kitty one, which
+//! exercises the cutting identically. A kitty command that really places is
+//! chunk-tested deterministically instead, by
+//! `a_chunked_command_places_the_same_however_it_is_delivered`.
 //!
 //! The alphabet is weighted toward bytes that make a naive splitter diverge:
 //! `ESC`, `CAN`, `SUB`, the string introducers `_ X ^ P ]`, and ST's `\`.
@@ -75,7 +78,6 @@ fn hostile_byte() -> impl Strategy<Value = u8> {
         1 => Just(b']'),                                        // OSC
         1 => Just(b'['),                                        // CSI
         2 => Just(b'\\'),                                       // ST tail
-        1 => Just(b'G'),                                        // kitty graphics
         1 => Just(b'\n'),
         1 => Just(0x07),                                        // BEL, the OSC terminator
         1 => Just(0x08),                                        // BS
@@ -252,7 +254,9 @@ fn nothing_is_answered() {
     let mut vt = VirtualTerminal::new(24, 80);
     for command in [
         b"\x1b_Ga=T,t=f,i=77;L2V0Yy9wYXNzd2Q=\x1b\\".as_slice(),
-        b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\",
+        b"\x1b_Ga=q,i=31,s=1,v=1,t=f,f=24;AAAA\x1b\\",
+        b"\x1b_Ga=q,i=31,s=1,v=1,t=t,f=24;AAAA\x1b\\",
+        b"\x1b_Ga=q,i=31,s=1,v=1,t=s,f=24;AAAA\x1b\\",
         b"\x1b_Ga=T,f=32,s=1,v=1,i=1;AAAA\x1b\\",
         b"\x1b_Ga=T,i=1,I=2;AAAA\x1b\\",
         b"\x1b_Ga=Z,i=1;AAAA\x1b\\",
@@ -262,22 +266,34 @@ fn nothing_is_answered() {
             "shux answered a graphics command it cannot honour: {command:?}"
         );
     }
+}
 
-    // The support-detection idiom: a graphics query and a device-attributes
-    // request in ONE read. An application that gets any graphics answer here
-    // concludes shux does graphics; it must get the DA1 answer and nothing
-    // else. Asserted as an exact equality rather than "contains no APC",
+/// The one command shux does answer, and the reason it must.
+///
+/// Measured against real `kitten icat`: it probes each transport and then
+/// sends a DA1 as the sentinel it waits on. With no `OK` before that DA1 it
+/// reports the terminal as unsupported and transmits zero image bytes, so
+/// without this reply the default invocation of the only real client renders
+/// nothing at all. Silence on the transports above is what makes it fall back
+/// to direct.
+#[test]
+fn a_direct_capability_probe_is_answered() {
+    let mut vt = VirtualTerminal::new(24, 80);
+    // The support-detection idiom: the probe and a device-attributes request
+    // in ONE read. Asserted as an exact equality rather than "contains an OK",
     // which would admit any other unexpected reply.
     let combined = vt.process_with_responses(b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c");
     assert_eq!(
         combined.concat(),
-        b"\x1b[?62;1;2;6;9;15;22c".to_vec(),
-        "the DA1 answer must be the whole of it"
+        b"\x1b_Gi=31;OK\x1b\\\x1b[?62;1;2;6;9;15;22c".to_vec(),
+        "the probe answer and the DA1 answer, in that order, and nothing else"
     );
 }
 
-/// An APC must not disturb the pen, and this must be checked on a stream that
-/// definitely contains one.
+/// A NON-PLACING APC must not disturb the pen, and this must be checked on a
+/// stream that definitely contains one. `a=t` transmits without placing, so
+/// everything the frame can see is unchanged; a placing command moves the
+/// cursor on purpose and is covered by `a_placement_advances_the_cursor`.
 ///
 /// The generated properties above cannot be relied on for this: their alphabet
 /// opens APCs readily but terminates them rarely, so the dispatch seam is
@@ -291,7 +307,7 @@ fn a_complete_apc_disturbs_neither_the_pen_nor_the_frame() {
     // the same attribute. Colour probes per CLAUDE.md: truecolor, indexed and
     // basic all cross the seam.
     let stream: &[u8] = b"\x1b[4m\x1b[38;2;10;200;30mUNDER\
-\x1b_Ga=T,f=32,s=1,v=1,i=1;AAAA\x1b\\AFTER\
+\x1b_Ga=t,f=32,s=1,v=1,i=1;AAAA\x1b\\AFTER\
 \x1b[38;5;93mINDEXED\x1b[31mBASIC";
 
     let sliced = drive(&[stream]);
@@ -308,5 +324,163 @@ fn a_complete_apc_disturbs_neither_the_pen_nor_the_frame() {
         "the compared frame carries no truecolor component; it cannot see a \
          pen change: {}",
         &sliced.frame[..sliced.frame.len().min(200)]
+    );
+}
+
+/// A placement moves the cursor: right by its cell width, down by its height
+/// less one. The `- 1` is what kitty and Zellij do against a spec that says
+/// otherwise, and `kitten icat`'s single trailing newline depends on it.
+#[test]
+fn a_placement_advances_the_cursor() {
+    // 18x38 px against the declared 9x19 cell box: 2 cells wide, 2 tall.
+    let payload = base64(&[0u8; 18 * 38 * 4]);
+    let mut vt = VirtualTerminal::new(24, 80);
+    vt.process(format!("\x1b_Ga=T,f=32,s=18,v=38;{payload}\x1b\\").as_bytes());
+
+    assert_eq!(vt.grid().placements().len(), 1, "the image was not placed");
+    let c = vt.cursor();
+    assert_eq!((c.row, c.col), (1, 2), "cursor advance");
+}
+
+/// The same placing command, delivered whole and one byte at a time, must
+/// place identically. This is the chunking property for a command the
+/// generated alphabet cannot reach, since it has to be a well-formed kitty
+/// transfer to place at all.
+#[test]
+fn a_chunked_command_places_the_same_however_it_is_delivered() {
+    let payload = base64(&[0u8; 9 * 19 * 4]);
+    let stream = format!("\x1b_Ga=T,f=32,s=9,v=19;{payload}\x1b\\").into_bytes();
+
+    let whole = drive(&[&stream]);
+    let singles: Vec<&[u8]> = stream.chunks(1).collect();
+    assert_eq!(whole, drive(&singles), "chunking changed the placement");
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+        for i in 0..4 {
+            out.push(if i <= c.len() {
+                A[(n >> (18 - 6 * i)) as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// A placement is a write. `Screen::enter` recycles a retired alternate-screen
+/// buffer whenever `is_blank_canvas` says nothing was drawn on it, and that
+/// verdict reads the write tally -- so a placement the tally never counted puts
+/// one application's picture on the next application's screen.
+#[test]
+fn an_alternate_screen_placement_does_not_reach_the_next_application() {
+    let payload = base64(&[0u8; 9 * 19 * 4]);
+    let place = format!("\x1b_Ga=T,f=32,s=9,v=19;{payload}\x1b\\");
+    let mut vt = VirtualTerminal::new(24, 80);
+
+    vt.process(b"\x1b[?1049h");
+    vt.process(place.as_bytes());
+    assert_eq!(vt.grid().placements().len(), 1, "nothing was placed in alt");
+    vt.process(b"\x1b[?1049l");
+    assert_eq!(
+        vt.grid().placements().len(),
+        0,
+        "the primary screen inherited the alternate screen's picture"
+    );
+
+    // The retired alt buffer goes back in the spare slot; the next application
+    // that opens an alternate screen gets it.
+    vt.process(b"\x1b[?1049h");
+    assert_eq!(
+        vt.grid().placements().len(),
+        0,
+        "a recycled alternate-screen buffer carried a dead application's picture"
+    );
+}
+
+/// `a=d` changes the presented frame, so inside a `CSI ?2026h` window it must
+/// take the freeze exactly as a placement does. Without it the picture vanishes
+/// from a frame the terminal promised to hold still (#115).
+#[test]
+fn a_delete_inside_synchronized_output_does_not_disturb_the_held_frame() {
+    let payload = base64(&[0u8; 9 * 19 * 4]);
+    let place = format!("\x1b_Ga=T,f=32,s=9,v=19;{payload}\x1b\\");
+    let mut vt = VirtualTerminal::new(24, 80);
+
+    vt.process(place.as_bytes());
+    assert_eq!(vt.grid().placements().len(), 1, "nothing was placed");
+
+    vt.process(b"\x1b[?2026h");
+    vt.process(b"\x1b_Ga=d,d=A\x1b\\");
+    assert_eq!(
+        vt.grid().placements().len(),
+        1,
+        "the delete reached the frame the terminal is holding still"
+    );
+
+    vt.process(b"\x1b[?2026l");
+    assert_eq!(
+        vt.grid().placements().len(),
+        0,
+        "the delete was lost when the window closed"
+    );
+}
+
+/// A long-lived pane must not exhaust the placement cap with images that have
+/// scrolled out of reach. Every default `kitten icat` run costs a slot, and
+/// without pruning the 257th shows nothing.
+#[test]
+fn scrolled_out_placements_do_not_exhaust_the_cap() {
+    let payload = base64(&[0u8; 9 * 19 * 4]);
+    let place = format!("\x1b_Ga=T,f=32,s=9,v=19;{payload}\x1b\\");
+    let mut vt = VirtualTerminal::new(24, 80);
+
+    // Far more images than the cap, each scrolled well past the scrollback.
+    for _ in 0..400 {
+        vt.process(place.as_bytes());
+        vt.process(&b"\n".repeat(80));
+    }
+    let live = vt.grid().placements().len();
+    assert!(live < 400, "nothing was pruned ({live} held)");
+
+    // The pane must still be able to show a NEW image after all that.
+    vt.process(place.as_bytes());
+    let visible = vt
+        .grid()
+        .placements()
+        .iter()
+        .filter(|p| p.viewport_row(vt.grid()) >= 0)
+        .count();
+    assert!(
+        visible >= 1,
+        "a fresh image was refused because scrolled-out ones held the cap"
+    );
+}
+
+/// A raw payload whose length disagrees with its declared size can never be
+/// decoded, so it must not spend a placement slot or move the cursor.
+#[test]
+fn a_truncated_raw_payload_is_refused_rather_than_placed() {
+    // `f=32` at 9x19 needs 9*19*4 bytes; send half.
+    let short = base64(&[0u8; 9 * 19 * 4 / 2]);
+    let mut vt = VirtualTerminal::new(24, 80);
+    let before = format!("{:?}", vt.cursor());
+
+    vt.process(format!("\x1b_Ga=T,f=32,s=9,v=19;{short}\x1b\\").as_bytes());
+
+    assert_eq!(
+        vt.grid().placements().len(),
+        0,
+        "a payload that cannot decode took a placement slot"
+    );
+    assert_eq!(
+        format!("{:?}", vt.cursor()),
+        before,
+        "a payload that cannot decode moved the cursor"
     );
 }

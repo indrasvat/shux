@@ -453,6 +453,32 @@ impl Default for GridConfig {
     }
 }
 
+/// Placements one grid may hold.
+const MAX_PLACEMENTS: usize = 256;
+
+/// A picture placed in this grid, anchored to an absolute line.
+///
+/// The anchor is `evicted() + index in raw`, so it names the same LINE after
+/// any scroll and needs no rebasing across `clone_visible` or a freeze: both
+/// advance `evicted` by the history they drop.
+#[derive(Debug, Clone)]
+pub struct Placement {
+    pub image: std::sync::Arc<crate::graphics::image::StoredImage>,
+    pub abs_row: u64,
+    pub col: usize,
+}
+
+impl Placement {
+    /// Viewport row this placement starts on, NEGATIVE once its anchor has
+    /// scrolled above the viewport. Signed rather than `Option`, because an
+    /// image taller than the pane is ordinary and most of it is still on
+    /// screen when its anchor line is not.
+    pub fn viewport_row(&self, grid: &Grid) -> i64 {
+        let first_visible = grid.evicted() + grid.scrollback_len() as u64;
+        self.abs_row as i64 - first_visible as i64
+    }
+}
+
 /// VecDeque-based terminal grid with scrollback.
 ///
 /// The grid is organized as:
@@ -479,6 +505,11 @@ pub struct Grid {
     /// never drained/coalesced, so a concurrently attached render client that
     /// drains dirty regions cannot make a lens reader miss a write (§4.4).
     mutations: u64,
+    /// Pictures placed in this grid. The pixels sit behind an `Arc`, so a
+    /// clone is a refcount bump, not a bitmap copy.
+    placements: Vec<Placement>,
+    /// Payload bytes the placements hold, to bound what one pane can retain.
+    placed_bytes: usize,
     /// Monotonic count of lines that have fallen off the FRONT of `raw` —
     /// scrolled past the scrollback cap, reflowed away, or cleared.
     ///
@@ -499,11 +530,67 @@ impl Clone for Grid {
             dirty: DirtyState::new(self.rows, self.config.track_dirty),
             mutations: self.mutations,
             evicted: self.evicted,
+            placements: self.placements.clone(),
+            placed_bytes: self.placed_bytes,
         }
     }
 }
 
 impl Grid {
+    /// Pictures placed in this grid.
+    pub fn placements(&self) -> &[Placement] {
+        &self.placements
+    }
+
+    /// Add a placement, refusing past either cap. A pane can emit unbounded
+    /// `a=T`, and a tiny image charges almost no bytes while still costing a
+    /// pass per snapshot, so neither cap alone suffices.
+    pub(crate) fn place(&mut self, p: Placement) -> bool {
+        self.prune_evicted_placements();
+        let cost = p.image.payload.len();
+        if self.placements.len() >= MAX_PLACEMENTS
+            || self.placed_bytes + cost > crate::graphics::image::MAX_IMAGE_BYTES
+        {
+            return false;
+        }
+        self.placed_bytes += cost;
+        self.placements.push(p);
+        self.bump_mutations();
+        true
+    }
+
+    /// Drop placements whose last row has fallen off the front of the grid.
+    ///
+    /// Scrolling advances `evicted` but never removed placements, so a
+    /// long-lived pane spent a slot per image forever: after 256 `kitten icat`
+    /// runs every further one was refused, none of them displayable. Pruning is
+    /// conservative -- a placement goes only once even its bottom row is out of
+    /// reach of scrollback.
+    fn prune_evicted_placements(&mut self) {
+        let evicted = self.evicted;
+        let cell_h = u64::from(crate::DECLARED_CELL_PIXELS.1.max(1));
+        let mut freed = 0usize;
+        self.placements.retain(|p| {
+            let rows = u64::from(p.image.height).div_ceil(cell_h).max(1);
+            let live = p.abs_row.saturating_add(rows) > evicted;
+            if !live {
+                freed += p.image.payload.len();
+            }
+            live
+        });
+        self.placed_bytes = self.placed_bytes.saturating_sub(freed);
+    }
+
+    /// Drop every placement -- `a=d,d=A`, the only target a real client sends.
+    pub(crate) fn unplace_all(&mut self) {
+        if self.placements.is_empty() {
+            return;
+        }
+        self.placements.clear();
+        self.placed_bytes = 0;
+        self.bump_mutations();
+    }
+
     /// Lines that have fallen off the front of this grid over its lifetime —
     /// and so the absolute index of `raw[0]`, the coordinate every row here is
     /// numbered from.
@@ -567,6 +654,8 @@ impl Grid {
             dirty: self.dirty.clone(),
             mutations: self.mutations,
             evicted: self.evicted.saturating_add(sb as u64),
+            placements: self.placements.clone(),
+            placed_bytes: self.placed_bytes,
         }
     }
 }
@@ -586,6 +675,8 @@ impl Grid {
             evicted: 0,
             config,
             mutations: 0,
+            placements: Vec::new(),
+            placed_bytes: 0,
         }
     }
 
@@ -624,9 +715,10 @@ impl Grid {
     /// skipping work, so the tests prove the two agree on every reuse instead
     /// of the invariant being argued in a comment.
     pub(crate) fn is_actually_blank(&self, cols: usize) -> bool {
-        self.raw.iter().all(|row| {
-            !row.wrapped && row.len() == cols && row.cells.iter().all(|c| *c == Cell::EMPTY)
-        })
+        self.placements.is_empty()
+            && self.raw.iter().all(|row| {
+                !row.wrapped && row.len() == cols && row.cells.iter().all(|c| *c == Cell::EMPTY)
+            })
     }
 
     /// Return this grid to the state of `Grid::new(rows, cols, config)`,
@@ -649,8 +741,13 @@ impl Grid {
         self.dirty.reset(rows, config.track_dirty);
         self.config = config;
         self.mutations = 0;
-        // Part of "the state of `Grid::new`": see `evicted`.
+        // Part of "the state of `Grid::new`": see `evicted`. This function
+        // assigns fields rather than building a literal, so the compiler does
+        // not check it -- every new field must be reset here by hand, and a
+        // recycled alt-screen buffer would otherwise carry placements across.
         self.evicted = 0;
+        self.placements.clear();
+        self.placed_bytes = 0;
     }
 
     /// Monotonic count of cell/scroll/clear write operations on this grid
@@ -749,6 +846,8 @@ impl Grid {
             // A read-only clone for snapshotting; the tally is irrelevant here.
             mutations: 0,
             evicted: self.evicted.saturating_add(self.scrollback_len() as u64),
+            placements: self.placements.clone(),
+            placed_bytes: self.placed_bytes,
         }
     }
 

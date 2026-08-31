@@ -724,3 +724,22 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod declared_cell_pixels_pin {
+    /// `shux-pty` DECLARES this box to pane children through
+    /// `ws_xpixel`/`ws_ypixel`; `shux-vt` derives an image's cell footprint
+    /// from it and `shux-raster` scales the pixels through it. Nothing in the
+    /// type system links the two declarations, and this crate is the only one
+    /// that sees both. Drift here mis-sizes every inline image with no other
+    /// test failing.
+    #[test]
+    fn shux_vt_and_shux_pty_declare_the_same_cell_box() {
+        let (pw, ph) = shux_pty::DECLARED_CELL_PIXELS;
+        assert_eq!(
+            (u32::from(pw), u32::from(ph)),
+            shux_vt::DECLARED_CELL_PIXELS,
+            "the declared cell box drifted between shux-pty and shux-vt"
+        );
+    }
+}

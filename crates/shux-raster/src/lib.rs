@@ -380,7 +380,73 @@ impl Rasterizer {
             self.draw_cursor(&mut img, grid, cr, cc, opts);
         }
 
+        self.composite_placements(&mut img, grid);
         img
+    }
+
+    /// Draw every placed picture over the text.
+    ///
+    /// The client sized its bitmap against the cell box shux DECLARES to pane
+    /// children, so convert through that rather than through the box actually
+    /// being drawn: `appearance.font` changes the drawn cell (measured 9x19
+    /// bundled, 9x17 DejaVu, 9x14 FreeMono, 7x14 CJK gothic) and without the
+    /// conversion an image overruns the rows it reserved and paints over the
+    /// next line of text. Degenerates to 1:1 when the two boxes agree.
+    ///
+    /// Always above the glyphs: `draw_cell` fills background and glyph in one
+    /// pass, so `z<0` ("under the text") would need that split in two. It is
+    /// accepted and unhonoured -- a refused client gets no picture at all.
+    fn composite_placements(&self, img: &mut RgbaImage, grid: &Grid) {
+        let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
+        let convert = |px: u32, cell: u32, declared: u32| {
+            (u64::from(px) * u64::from(cell) / u64::from(declared.max(1))).max(1) as u32
+        };
+        for p in grid.placements() {
+            let top = p.viewport_row(grid) * i64::from(self.cell_h);
+            if top >= i64::from(img.height()) {
+                continue;
+            }
+            // Both visibility tests run on the DECLARED height, before any
+            // decode: a scrolled-out placement is discarded without inflating
+            // its payload. `decode_placement` refuses a payload that does not
+            // match the declared size, so the two agree on anything drawn.
+            let skip = top.min(0).unsigned_abs() as u32;
+            if skip >= convert(p.image.height, self.cell_h, dh) {
+                continue;
+            }
+            let Some(src) = decode_placement(&p.image) else {
+                continue;
+            };
+            let dest_w = convert(src.width(), self.cell_w, dw);
+            let dest_h = convert(src.height(), self.cell_h, dh);
+            let src = if (dest_w, dest_h) == (src.width(), src.height()) {
+                src
+            } else {
+                image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
+            };
+            if skip >= src.height() {
+                continue;
+            }
+            let ox = p.col as u32 * self.cell_w;
+            let oy = top.max(0) as u32;
+            // Clip to the CANVAS only; the pane rect is a separate clip the
+            // multi-pane composer owns.
+            let rows = (src.height() - skip).min(img.height().saturating_sub(oy));
+            for y in 0..rows {
+                for x in 0..src.width().min(img.width().saturating_sub(ox)) {
+                    let s = src.get_pixel(x, y + skip).0;
+                    let a = s[3] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let d = img.get_pixel_mut(ox + x, oy + y);
+                    for c in 0..3 {
+                        d[c] = ((s[c] as u32 * a + d[c] as u32 * (255 - a)) / 255) as u8;
+                    }
+                    d[3] = 255;
+                }
+            }
+        }
     }
 
     fn draw_cell(
@@ -715,6 +781,96 @@ fn indexed_to_rgb(i: u8) -> Rgb {
             [g, g, g]
         }
     }
+}
+
+/// Decode a stored payload into RGBA: zlib and PNG are undone here, off the
+/// lock `process_with_responses` holds and in the crate that already carries
+/// an image decoder.
+fn decode_placement(stored: &shux_vt::StoredImage) -> Option<RgbaImage> {
+    use std::io::Read as _;
+    let raw = if stored.compressed {
+        // An exact-size buffer that must fill exactly: a 284 KiB payload can
+        // otherwise inflate to 381 MiB.
+        let want = expected_len(stored)?;
+        let mut out = vec![0u8; want];
+        let mut z = flate2::read::ZlibDecoder::new(&stored.payload[..]);
+        let mut filled = 0usize;
+        while filled < want {
+            match z.read(&mut out[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
+        }
+        if filled != want || z.read(&mut [0u8; 1]).ok()? != 0 {
+            return None;
+        }
+        out
+    } else {
+        stored.payload.clone()
+    };
+
+    match stored.format {
+        shux_vt::ImageFormat::Png => {
+            // The ceiling is applied BEFORE the decoder runs, and again as the
+            // decoder's own limit. Comparing sizes afterwards cannot prevent
+            // the allocation it is meant to bound: a few-KB PNG may honestly
+            // declare 20000x20000, and `image` would allocate to its 512 MiB
+            // default on every snapshot -- from a pane's own output.
+            let cap = declared_rgba_bytes(stored)?;
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(&raw));
+            reader.set_format(image::ImageFormat::Png);
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(cap as u64);
+            limits.max_image_width = Some(stored.width);
+            limits.max_image_height = Some(stored.height);
+            reader.limits(limits);
+            let img = reader.decode().ok()?;
+            // `s=`/`v=` are a claim, not a measurement; refuse a mismatch.
+            if (img.width(), img.height()) != (stored.width, stored.height) {
+                return None;
+            }
+            Some(img.to_rgba8())
+        }
+        shux_vt::ImageFormat::Rgba32 => RgbaImage::from_raw(stored.width, stored.height, raw),
+        shux_vt::ImageFormat::Rgb24 => {
+            let mut rgba = Vec::with_capacity(raw.len() / 3 * 4);
+            for px in raw.as_chunks::<3>().0 {
+                rgba.extend_from_slice(px);
+                rgba.push(255);
+            }
+            RgbaImage::from_raw(stored.width, stored.height, rgba)
+        }
+    }
+}
+
+/// Bytes the DECLARED dimensions would occupy as RGBA, or `None` past the
+/// ceiling. The bound every decoder is held to, whatever the payload claims.
+fn declared_rgba_bytes(stored: &shux_vt::StoredImage) -> Option<usize> {
+    let n = u64::from(stored.width)
+        .checked_mul(u64::from(stored.height))?
+        .checked_mul(4)?;
+    (n > 0 && n <= MAX_DECODED_BYTES).then_some(n as usize)
+}
+
+/// Ceiling on what one placement may decode to. A pane chooses `s=`/`v=`, so
+/// this is the only thing between its output and an unbounded allocation on
+/// every snapshot.
+const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes a raw payload must decompress to, from the declared dimensions.
+fn expected_len(stored: &shux_vt::StoredImage) -> Option<usize> {
+    let bpp = match stored.format {
+        shux_vt::ImageFormat::Rgba32 => 4u64,
+        shux_vt::ImageFormat::Rgb24 => 3,
+        // A compressed PNG has no derivable size; refuse rather than guess.
+        shux_vt::ImageFormat::Png => return None,
+    };
+    let n = (stored.width as u64)
+        .checked_mul(stored.height as u64)?
+        .checked_mul(bpp)?;
+    // Never allocate from a client's arithmetic without a ceiling.
+    (n <= MAX_DECODED_BYTES).then_some(n as usize)
 }
 
 #[cfg(test)]
