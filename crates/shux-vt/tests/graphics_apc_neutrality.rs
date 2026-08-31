@@ -250,11 +250,11 @@ fn a_located_command_reaches_the_parser_in_the_shipping_build() {
 /// abandons its text fallback and transmits into a pane shux cannot draw. With
 /// no reply path in the library this is structurally true, not a setting.
 #[test]
-fn only_a_direct_capability_probe_is_answered() {
+fn nothing_is_answered() {
     let mut vt = VirtualTerminal::new(24, 80);
     for command in [
         b"\x1b_Ga=T,t=f,i=77;L2V0Yy9wYXNzd2Q=\x1b\\".as_slice(),
-        b"\x1b_Gaq,i=31,t=f,s=1,v=1,f=24;AAAA\x1b\\",
+        b"\x1b_Ga=q,i=31,s=1,v=1,t=f,f=24;AAAA\x1b\\",
         b"\x1b_Ga=q,i=31,s=1,v=1,t=t,f=24;AAAA\x1b\\",
         b"\x1b_Ga=q,i=31,s=1,v=1,t=s,f=24;AAAA\x1b\\",
         b"\x1b_Ga=T,f=32,s=1,v=1,i=1;AAAA\x1b\\",
@@ -266,13 +266,22 @@ fn only_a_direct_capability_probe_is_answered() {
             "shux answered a graphics command it cannot honour: {command:?}"
         );
     }
+}
 
-    // The support-detection idiom: a graphics query and a device-attributes
-    // request in ONE read. Measured against real `kitten icat`, which sends
-    // exactly this and treats the DA1 answer as the sentinel: with no `OK`
-    // before it, it declares the terminal unsupported and transmits nothing.
-    // Asserted as an exact equality rather than "contains an OK", which would
-    // admit any other unexpected reply.
+/// The one command shux does answer, and the reason it must.
+///
+/// Measured against real `kitten icat`: it probes each transport and then
+/// sends a DA1 as the sentinel it waits on. With no `OK` before that DA1 it
+/// reports the terminal as unsupported and transmits zero image bytes, so
+/// without this reply the default invocation of the only real client renders
+/// nothing at all. Silence on the transports above is what makes it fall back
+/// to direct.
+#[test]
+fn a_direct_capability_probe_is_answered() {
+    let mut vt = VirtualTerminal::new(24, 80);
+    // The support-detection idiom: the probe and a device-attributes request
+    // in ONE read. Asserted as an exact equality rather than "contains an OK",
+    // which would admit any other unexpected reply.
     let combined = vt.process_with_responses(b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c");
     assert_eq!(
         combined.concat(),

@@ -812,14 +812,21 @@ fn decode_placement(stored: &shux_vt::StoredImage) -> Option<RgbaImage> {
 
     match stored.format {
         shux_vt::ImageFormat::Png => {
-            if stored.width == 0 || stored.height == 0 {
-                return None;
-            }
-            let img = image::load_from_memory_with_format(&raw, image::ImageFormat::Png).ok()?;
-            // `s=`/`v=` are a claim, not a measurement. Refusing a mismatch
-            // -- and a payload that declares nothing, which would skip the
-            // check -- is what stops a few-KB PNG bomb from allocating
-            // `image`'s 512 MiB ceiling on every snapshot.
+            // The ceiling is applied BEFORE the decoder runs, and again as the
+            // decoder's own limit. Comparing sizes afterwards cannot prevent
+            // the allocation it is meant to bound: a few-KB PNG may honestly
+            // declare 20000x20000, and `image` would allocate to its 512 MiB
+            // default on every snapshot -- from a pane's own output.
+            let cap = declared_rgba_bytes(stored)?;
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(&raw));
+            reader.set_format(image::ImageFormat::Png);
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(cap as u64);
+            limits.max_image_width = Some(stored.width);
+            limits.max_image_height = Some(stored.height);
+            reader.limits(limits);
+            let img = reader.decode().ok()?;
+            // `s=`/`v=` are a claim, not a measurement; refuse a mismatch.
             if (img.width(), img.height()) != (stored.width, stored.height) {
                 return None;
             }
@@ -837,6 +844,20 @@ fn decode_placement(stored: &shux_vt::StoredImage) -> Option<RgbaImage> {
     }
 }
 
+/// Bytes the DECLARED dimensions would occupy as RGBA, or `None` past the
+/// ceiling. The bound every decoder is held to, whatever the payload claims.
+fn declared_rgba_bytes(stored: &shux_vt::StoredImage) -> Option<usize> {
+    let n = u64::from(stored.width)
+        .checked_mul(u64::from(stored.height))?
+        .checked_mul(4)?;
+    (n > 0 && n <= MAX_DECODED_BYTES).then_some(n as usize)
+}
+
+/// Ceiling on what one placement may decode to. A pane chooses `s=`/`v=`, so
+/// this is the only thing between its output and an unbounded allocation on
+/// every snapshot.
+const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Bytes a raw payload must decompress to, from the declared dimensions.
 fn expected_len(stored: &shux_vt::StoredImage) -> Option<usize> {
     let bpp = match stored.format {
@@ -849,7 +870,7 @@ fn expected_len(stored: &shux_vt::StoredImage) -> Option<usize> {
         .checked_mul(stored.height as u64)?
         .checked_mul(bpp)?;
     // Never allocate from a client's arithmetic without a ceiling.
-    (n <= 64 * 1024 * 1024).then_some(n as usize)
+    (n <= MAX_DECODED_BYTES).then_some(n as usize)
 }
 
 #[cfg(test)]
