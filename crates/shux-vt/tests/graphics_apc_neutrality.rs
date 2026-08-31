@@ -430,3 +430,57 @@ fn a_delete_inside_synchronized_output_does_not_disturb_the_held_frame() {
         "the delete was lost when the window closed"
     );
 }
+
+/// A long-lived pane must not exhaust the placement cap with images that have
+/// scrolled out of reach. Every default `kitten icat` run costs a slot, and
+/// without pruning the 257th shows nothing.
+#[test]
+fn scrolled_out_placements_do_not_exhaust_the_cap() {
+    let payload = base64(&[0u8; 9 * 19 * 4]);
+    let place = format!("\x1b_Ga=T,f=32,s=9,v=19;{payload}\x1b\\");
+    let mut vt = VirtualTerminal::new(24, 80);
+
+    // Far more images than the cap, each scrolled well past the scrollback.
+    for _ in 0..400 {
+        vt.process(place.as_bytes());
+        vt.process(&b"\n".repeat(80));
+    }
+    let live = vt.grid().placements().len();
+    assert!(live < 400, "nothing was pruned ({live} held)");
+
+    // The pane must still be able to show a NEW image after all that.
+    vt.process(place.as_bytes());
+    let visible = vt
+        .grid()
+        .placements()
+        .iter()
+        .filter(|p| p.viewport_row(vt.grid()) >= 0)
+        .count();
+    assert!(
+        visible >= 1,
+        "a fresh image was refused because scrolled-out ones held the cap"
+    );
+}
+
+/// A raw payload whose length disagrees with its declared size can never be
+/// decoded, so it must not spend a placement slot or move the cursor.
+#[test]
+fn a_truncated_raw_payload_is_refused_rather_than_placed() {
+    // `f=32` at 9x19 needs 9*19*4 bytes; send half.
+    let short = base64(&[0u8; 9 * 19 * 4 / 2]);
+    let mut vt = VirtualTerminal::new(24, 80);
+    let before = format!("{:?}", vt.cursor());
+
+    vt.process(format!("\x1b_Ga=T,f=32,s=9,v=19;{short}\x1b\\").as_bytes());
+
+    assert_eq!(
+        vt.grid().placements().len(),
+        0,
+        "a payload that cannot decode took a placement slot"
+    );
+    assert_eq!(
+        format!("{:?}", vt.cursor()),
+        before,
+        "a payload that cannot decode moved the cursor"
+    );
+}

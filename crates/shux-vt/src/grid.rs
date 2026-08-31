@@ -546,6 +546,7 @@ impl Grid {
     /// `a=T`, and a tiny image charges almost no bytes while still costing a
     /// pass per snapshot, so neither cap alone suffices.
     pub(crate) fn place(&mut self, p: Placement) -> bool {
+        self.prune_evicted_placements();
         let cost = p.image.payload.len();
         if self.placements.len() >= MAX_PLACEMENTS
             || self.placed_bytes + cost > crate::graphics::image::MAX_IMAGE_BYTES
@@ -556,6 +557,28 @@ impl Grid {
         self.placements.push(p);
         self.bump_mutations();
         true
+    }
+
+    /// Drop placements whose last row has fallen off the front of the grid.
+    ///
+    /// Scrolling advances `evicted` but never removed placements, so a
+    /// long-lived pane spent a slot per image forever: after 256 `kitten icat`
+    /// runs every further one was refused, none of them displayable. Pruning is
+    /// conservative -- a placement goes only once even its bottom row is out of
+    /// reach of scrollback.
+    fn prune_evicted_placements(&mut self) {
+        let evicted = self.evicted;
+        let cell_h = u64::from(crate::DECLARED_CELL_PIXELS.1.max(1));
+        let mut freed = 0usize;
+        self.placements.retain(|p| {
+            let rows = u64::from(p.image.height).div_ceil(cell_h).max(1);
+            let live = p.abs_row.saturating_add(rows) > evicted;
+            if !live {
+                freed += p.image.payload.len();
+            }
+            live
+        });
+        self.placed_bytes = self.placed_bytes.saturating_sub(freed);
     }
 
     /// Drop every placement -- `a=d,d=A`, the only target a real client sends.

@@ -65,7 +65,24 @@ impl Assembler {
         if cmd.more {
             return None;
         }
-        self.open.take()
+        let done = self.open.take()?;
+        // A raw payload's length is derivable from the declared size, so a
+        // truncated one is knowable here -- without a decoder, which stays out
+        // of this crate. Placing it would spend a slot and move the cursor for
+        // something that can never be drawn. A PNG's length is not derivable;
+        // `shux-raster` refuses that one when it decodes.
+        let bpp = match done.format {
+            Format::Rgba32 => 4u64,
+            Format::Rgb24 => 3,
+            Format::Png => return Some(done),
+        };
+        if done.compressed {
+            return Some(done); // still deflated; length means nothing yet
+        }
+        let want = u64::from(done.width)
+            .checked_mul(u64::from(done.height))?
+            .checked_mul(bpp)?;
+        (done.payload.len() as u64 == want).then_some(done)
     }
 
     pub(crate) fn abort(&mut self) {
