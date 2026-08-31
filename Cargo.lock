@@ -1278,6 +1278,7 @@ dependencies = [
 name = "shux-raster"
 version = "0.48.1"
 dependencies = [
+ "flate2",
  "fontdue",
  "image",
  "serde",
@@ -1333,6 +1334,7 @@ dependencies = [
 name = "shux-vt"
 version = "0.48.1"
 dependencies = [
+ "base64",
  "memchr",
  "proptest",
  "serde",

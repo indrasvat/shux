@@ -39,9 +39,10 @@
 /// image ones and treats animation as a named refusal rather than a parse
 /// error, because telling a client "malformed" about a well-formed command it
 /// is entitled to send sends it looking for a bug it does not have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Action {
     /// `a=t` -- transmit image data, do not place it yet. The protocol default.
+    #[default]
     Transmit,
     /// `a=T` -- transmit and place at the cursor.
     TransmitAndPlace,
@@ -97,10 +98,31 @@ impl Transport {
     }
 }
 
+/// Pixel layout of a payload. `f=32` is the protocol default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    #[default]
+    Rgba32,
+    Rgb24,
+    Png,
+}
+
 /// A parsed control block. Payload bytes are deliberately not held here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Command {
     pub(crate) action: Action,
+    /// `i=`: read only to address an `a=q` reply back to the right probe.
+    pub(crate) image_id: u32,
+    pub(crate) format: Format,
+    /// `o=z`: the payload is zlib-deflated.
+    pub(crate) compressed: bool,
+    /// `m=1`: more chunks follow.
+    pub(crate) more: bool,
+    /// `s=`/`v=`: the payload's own pixel dimensions.
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// `C=1`: do not move the cursor after placing.
+    pub(crate) no_cursor_move: bool,
 }
 
 /// Why a command was refused. No reply is ever built from it -- see
@@ -178,9 +200,20 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
 
     let mut action = None;
     let mut transport = Transport::Direct;
-    let mut image_id = 0;
     let mut image_number = 0;
     let mut malformed = false;
+    let mut cmd = Command::default();
+
+    // Read an unsigned key into `slot`, discarding the whole command on a bad
+    // integer rather than defaulting the key -- see `number`.
+    macro_rules! uint {
+        ($slot:expr, $value:expr) => {
+            match number($value) {
+                Some(n) => $slot = n,
+                None => malformed = true,
+            }
+        };
+    }
 
     for (key, value) in pairs(control)? {
         match key {
@@ -189,16 +222,26 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
                 Some(t) => transport = t,
                 None => malformed = true,
             },
-            // A bad integer discards the command rather than defaulting the
-            // key -- see `number`.
-            b'i' => match number(value) {
-                Some(n) => image_id = n,
-                None => malformed = true,
+            b'i' => uint!(cmd.image_id, value),
+            b'I' => uint!(image_number, value),
+            b's' => uint!(cmd.width, value),
+            b'v' => uint!(cmd.height, value),
+            b'f' => match value {
+                b"32" => cmd.format = Format::Rgba32,
+                b"24" => cmd.format = Format::Rgb24,
+                b"100" => cmd.format = Format::Png,
+                _ => malformed = true,
             },
-            b'I' => match number(value) {
-                Some(n) => image_number = n,
-                None => malformed = true,
+            b'o' => match value {
+                b"z" => cmd.compressed = true,
+                _ => malformed = true,
             },
+            b'm' => match value {
+                b"0" => cmd.more = false,
+                b"1" => cmd.more = true,
+                _ => malformed = true,
+            },
+            b'C' => cmd.no_cursor_move = value == b"1",
             _ => {}
         }
     }
@@ -215,7 +258,7 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
         return Err(Rejection::Malformed);
     }
 
-    if image_id != 0 && image_number != 0 {
+    if cmd.image_id != 0 && image_number != 0 {
         return Err(Rejection::BothIdAndNumber);
     }
 
@@ -227,9 +270,8 @@ pub(crate) fn parse(command: &[u8]) -> Result<Command, Rejection> {
         _ => {}
     }
 
-    Ok(Command {
-        action: action.flatten().unwrap_or(Action::Transmit),
-    })
+    cmd.action = action.flatten().unwrap_or(Action::Transmit);
+    Ok(cmd)
 }
 
 #[cfg(test)]

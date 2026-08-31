@@ -380,7 +380,50 @@ impl Rasterizer {
             self.draw_cursor(&mut img, grid, cr, cc, opts);
         }
 
+        self.composite_placements(&mut img, grid);
         img
+    }
+
+    /// Draw every placed picture over the text, at its natural pixel size.
+    ///
+    /// Always above the glyphs: `draw_cell` fills background and glyph in one
+    /// pass, so `z<0` ("under the text") would need that split in two. It is
+    /// accepted and unhonoured -- a refused client gets no picture at all.
+    fn composite_placements(&self, img: &mut RgbaImage, grid: &Grid) {
+        for p in grid.placements() {
+            let top = p.viewport_row(grid) * i64::from(self.cell_h);
+            if top >= i64::from(img.height()) {
+                continue;
+            }
+            let Some(src) = decode_placement(&p.image) else {
+                continue;
+            };
+            // A negative top is an image whose anchor line has scrolled above
+            // the viewport; skip that many source rows instead of the image.
+            let skip = top.min(0).unsigned_abs() as u32;
+            if skip >= src.height() {
+                continue;
+            }
+            let ox = p.col as u32 * self.cell_w;
+            let oy = top.max(0) as u32;
+            // Clip to the CANVAS only; the pane rect is a separate clip the
+            // multi-pane composer owns.
+            let rows = (src.height() - skip).min(img.height().saturating_sub(oy));
+            for y in 0..rows {
+                for x in 0..src.width().min(img.width().saturating_sub(ox)) {
+                    let s = src.get_pixel(x, y + skip).0;
+                    let a = s[3] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let d = img.get_pixel_mut(ox + x, oy + y);
+                    for c in 0..3 {
+                        d[c] = ((s[c] as u32 * a + d[c] as u32 * (255 - a)) / 255) as u8;
+                    }
+                    d[3] = 255;
+                }
+            }
+        }
     }
 
     fn draw_cell(
@@ -715,6 +758,75 @@ fn indexed_to_rgb(i: u8) -> Rgb {
             [g, g, g]
         }
     }
+}
+
+/// Decode a stored payload into RGBA: zlib and PNG are undone here, off the
+/// lock `process_with_responses` holds and in the crate that already carries
+/// an image decoder.
+fn decode_placement(stored: &shux_vt::StoredImage) -> Option<RgbaImage> {
+    use std::io::Read as _;
+    let raw = if stored.compressed {
+        // An exact-size buffer that must fill exactly: a 284 KiB payload can
+        // otherwise inflate to 381 MiB.
+        let want = expected_len(stored)?;
+        let mut out = vec![0u8; want];
+        let mut z = flate2::read::ZlibDecoder::new(&stored.payload[..]);
+        let mut filled = 0usize;
+        while filled < want {
+            match z.read(&mut out[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
+        }
+        if filled != want || z.read(&mut [0u8; 1]).ok()? != 0 {
+            return None;
+        }
+        out
+    } else {
+        stored.payload.clone()
+    };
+
+    match stored.format {
+        shux_vt::ImageFormat::Png => {
+            if stored.width == 0 || stored.height == 0 {
+                return None;
+            }
+            let img = image::load_from_memory_with_format(&raw, image::ImageFormat::Png).ok()?;
+            // `s=`/`v=` are a claim, not a measurement. Refusing a mismatch
+            // -- and a payload that declares nothing, which would skip the
+            // check -- is what stops a few-KB PNG bomb from allocating
+            // `image`'s 512 MiB ceiling on every snapshot.
+            if (img.width(), img.height()) != (stored.width, stored.height) {
+                return None;
+            }
+            Some(img.to_rgba8())
+        }
+        shux_vt::ImageFormat::Rgba32 => RgbaImage::from_raw(stored.width, stored.height, raw),
+        shux_vt::ImageFormat::Rgb24 => {
+            let mut rgba = Vec::with_capacity(raw.len() / 3 * 4);
+            for px in raw.as_chunks::<3>().0 {
+                rgba.extend_from_slice(px);
+                rgba.push(255);
+            }
+            RgbaImage::from_raw(stored.width, stored.height, rgba)
+        }
+    }
+}
+
+/// Bytes a raw payload must decompress to, from the declared dimensions.
+fn expected_len(stored: &shux_vt::StoredImage) -> Option<usize> {
+    let bpp = match stored.format {
+        shux_vt::ImageFormat::Rgba32 => 4u64,
+        shux_vt::ImageFormat::Rgb24 => 3,
+        // A compressed PNG has no derivable size; refuse rather than guess.
+        shux_vt::ImageFormat::Png => return None,
+    };
+    let n = (stored.width as u64)
+        .checked_mul(stored.height as u64)?
+        .checked_mul(bpp)?;
+    // Never allocate from a client's arithmetic without a ceiling.
+    (n <= 64 * 1024 * 1024).then_some(n as usize)
 }
 
 #[cfg(test)]

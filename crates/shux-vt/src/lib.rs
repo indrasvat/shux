@@ -31,9 +31,17 @@ pub use cursor::{Cursor, CursorShape, SavedCursor};
 pub use diff::{
     CellGridView, CellRef, CursorState, FrameDiff, FrameView, GridFrame, LensRowSpan, diff_frames,
 };
+pub use graphics::image::StoredImage;
+pub use graphics::kitty::Format as ImageFormat;
 pub use grid::{DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 pub use settle::{FrameStability, frame_stability_hash};
+
+/// Pixel size of one cell as DECLARED to pane children through
+/// `ws_xpixel`/`ws_ypixel`. A client sizes its bitmap against this, so an
+/// image's cell footprint is derived from the same box. `shux-pty` declares
+/// it; `crates/shux` pins the two together.
+pub const DECLARED_CELL_PIXELS: (u32, u32) = (9, 19);
 pub use tabstops::TabStops;
 
 use crate::parser::VtParser;
@@ -503,15 +511,114 @@ impl VirtualTerminal {
     /// [`sync::Presented`], which freezes the presented frame on the first
     /// write inside a `CSI ?2026h` window, and this runs BETWEEN slices, so
     /// unwrapped access here would leak into a frame held still.
-    fn dispatch_graphics(sink: &mut graphics::GraphicsSink, body: &[u8]) {
+    fn dispatch_graphics(&mut self, body: &[u8], responses: &mut Vec<Vec<u8>>) {
         let Some(command) = body.strip_prefix(b"G") else {
             return;
         };
         #[cfg(test)]
-        sink.dispatched.push(command.to_vec());
+        self.graphics.dispatched.push(command.to_vec());
 
-        if graphics::kitty::parse(command).is_err() {
-            sink.refusals = sink.refusals.saturating_add(1);
+        let (control, payload) = match command.iter().position(|b| *b == b';') {
+            Some(i) => (&command[..i], &command[i + 1..]),
+            None => (command, &b""[..]),
+        };
+        let Ok(cmd) = graphics::kitty::parse(control) else {
+            self.graphics.refusals = self.graphics.refusals.saturating_add(1);
+            self.graphics.assembler.abort();
+            return;
+        };
+
+        use graphics::kitty::Action;
+        match cmd.action {
+            Action::Transmit | Action::TransmitAndPlace => {
+                let Some(image) = self.graphics.assembler.feed(&cmd, payload) else {
+                    return;
+                };
+                if cmd.action == Action::TransmitAndPlace {
+                    self.place_image(std::sync::Arc::new(image), &cmd);
+                }
+            }
+            // `a=d` clears every placement whatever the target: `d=A` is the
+            // only one a real client sends. `a=p` would need an image store to
+            // place from and is a stated gap, not a refusal.
+            Action::Delete => {
+                self.grid.unplace_all();
+                self.graphics.assembler.abort();
+            }
+            // Default `kitten icat` probes each transport and waits on a DA1
+            // sentinel; with no reply before it, it declares the terminal
+            // unsupported and sends no image bytes at all. Only a DIRECT probe
+            // reaches here -- `parse` refuses the others first -- and silence
+            // on those is what makes icat fall back to direct.
+            Action::Query => {
+                if cmd.image_id != 0 {
+                    responses.push(format!("\x1b_Gi={};OK\x1b\\", cmd.image_id).into_bytes());
+                }
+            }
+            Action::Put | Action::Animation => {}
+        }
+    }
+
+    /// Anchor a picture at the cursor and advance past it: right by `cols`,
+    /// down by `rows - 1`, wrapping hard at the pane width. The `- 1` is what
+    /// kitty (`graphics.c:1315`) and Zellij (`grid.rs:3772`) do against a spec
+    /// that says otherwise, and `kitten icat`'s single trailing newline only
+    /// lands correctly if the terminal stopped short.
+    fn place_image(
+        &mut self,
+        image: std::sync::Arc<graphics::image::StoredImage>,
+        cmd: &graphics::kitty::Command,
+    ) {
+        let (cell_w, cell_h) = DECLARED_CELL_PIXELS;
+        // `s=`/`v=` are unvalidated wire numbers; unclamped, `v=4294967295`
+        // is 226 million `scroll_up` calls inside the pane-IO lock.
+        let cols = image.width.div_ceil(cell_w);
+        let rows = image.height.div_ceil(cell_h);
+        let (cols, rows) = (
+            cols.min(self.grid.cols() as u32) as usize,
+            rows.min(self.grid.rows() as u32) as usize,
+        );
+        if cols == 0 || rows == 0 {
+            return;
+        }
+
+        let abs_row =
+            self.grid.evicted() + self.grid.scrollback_len() as u64 + self.cursor.row as u64;
+        // Through `Presented`, not the raw fields: a placement changes the
+        // presented frame, so inside a `CSI ?2026h` window it must freeze
+        // first or it tears the redraw it landed in (issue #115).
+        let mut grid =
+            sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed);
+        let placed = grid.place(grid::Placement {
+            image,
+            abs_row,
+            col: self.cursor.col,
+        });
+        if !placed {
+            self.graphics.refusals = self.graphics.refusals.saturating_add(1);
+            return;
+        }
+        if cmd.no_cursor_move {
+            return;
+        }
+
+        let (grid_rows, grid_cols) = (grid.rows(), grid.cols());
+        let mut cursor =
+            sync::Presented::new(&mut self.cursor, &mut self.frozen_cursor, &self.sync_armed);
+        let mut down = rows - 1;
+        let target = cursor.col + cols;
+        if target >= grid_cols {
+            cursor.col = 0;
+            down += 1;
+        } else {
+            cursor.col = target;
+        }
+        for _ in 0..down {
+            if cursor.row + 1 >= grid_rows {
+                grid.scroll_up(0, grid_rows - 1);
+            } else {
+                cursor.row += 1;
+            }
         }
     }
 
@@ -572,7 +679,7 @@ impl VirtualTerminal {
             let mut at = 0;
             for cut in cuts {
                 self.advance_slice(&bytes[at..cut.end], &mut responses);
-                Self::dispatch_graphics(&mut self.graphics, &cut.body);
+                self.dispatch_graphics(&cut.body, &mut responses);
                 at = cut.end;
             }
             self.advance_slice(&bytes[at..], &mut responses);
