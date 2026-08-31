@@ -397,27 +397,33 @@ impl Rasterizer {
     /// pass, so `z<0` ("under the text") would need that split in two. It is
     /// accepted and unhonoured -- a refused client gets no picture at all.
     fn composite_placements(&self, img: &mut RgbaImage, grid: &Grid) {
+        let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
+        let convert = |px: u32, cell: u32, declared: u32| {
+            (u64::from(px) * u64::from(cell) / u64::from(declared.max(1))).max(1) as u32
+        };
         for p in grid.placements() {
             let top = p.viewport_row(grid) * i64::from(self.cell_h);
             if top >= i64::from(img.height()) {
                 continue;
             }
+            // Both visibility tests run on the DECLARED height, before any
+            // decode: a scrolled-out placement is discarded without inflating
+            // its payload. `decode_placement` refuses a payload that does not
+            // match the declared size, so the two agree on anything drawn.
+            let skip = top.min(0).unsigned_abs() as u32;
+            if skip >= convert(p.image.height, self.cell_h, dh) {
+                continue;
+            }
             let Some(src) = decode_placement(&p.image) else {
                 continue;
             };
-            let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
-            let dest_w = (u64::from(src.width()) * u64::from(self.cell_w) / u64::from(dw.max(1)))
-                .max(1) as u32;
-            let dest_h = (u64::from(src.height()) * u64::from(self.cell_h) / u64::from(dh.max(1)))
-                .max(1) as u32;
+            let dest_w = convert(src.width(), self.cell_w, dw);
+            let dest_h = convert(src.height(), self.cell_h, dh);
             let src = if (dest_w, dest_h) == (src.width(), src.height()) {
                 src
             } else {
                 image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
             };
-            // A negative top is an image whose anchor line has scrolled above
-            // the viewport; skip that many source rows instead of the image.
-            let skip = top.min(0).unsigned_abs() as u32;
             if skip >= src.height() {
                 continue;
             }

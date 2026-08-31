@@ -11,6 +11,12 @@ VERDICT: PASS
 | Design | `docs/designs/inline-images.md`, work item 4 |
 | Scratch | `.shux/out/kitty-graphics-render/r2/` (gitignored) |
 
+The branch tip advanced to `b18ad26` while this audit was being written.
+`git show --stat b18ad26 -- crates/ Cargo.lock Cargo.toml` is empty — it commits
+this audit's own evidence and nothing else — so every measurement below still
+describes `4238f6b`'s code. The count corrections in the closing section were
+made after that commit and are still unstaged-for-commit at the time of writing.
+
 This is a re-audit. Every fix below was re-measured from scratch on `4238f6b`;
 nothing is carried over from the previous run's numbers. Where the previous run
 found a defect, the fix was A/B'd against a tree with that one hunk reverted, so
@@ -50,7 +56,7 @@ and `make test-gui-terminal` was not run.
 | 7 | alt-screen recycling clears placements | **PASS** | `?1049`, `?1047` and `RIS` arms all `0`; double recycle `0`; live `vim` clean |
 | 8 | tall image scrolls, and stops drawing when out | **PASS** | 36x190 image: 6840 → 4788 → 1368 → 0 px, `max_y` 189 → 132 → 37 → none. Repeated under the 7x14 cell box after the resize: 3920 → 2744 → 784 → 0, `max_y` 139 → 97 → 27 |
 | 9 | hostile input neither hangs nor explodes | **PASS** (re-confirmed) | 256-placement cap holds (400 attempts → 256); a 360x266 `f=32` APC exceeds the APC cap and is dropped, not buffered; worst measured render 38.9 ms (see P3-1) |
-| 10 | zero leaked daemons | **PASS** | 9 daemons, each pid read from `$XDG_RUNTIME_DIR/shux/shux.pid` **before** `shux daemon stop` and `/proc/<pid>` confirmed gone after. Final `/proc/*/exe` sweep over this checkout and every scratch build tree: **0**. No `pgrep -f` / `pkill -f` anywhere |
+| 10 | zero leaked daemons | **PASS** | 14 daemons, each pid read from `$XDG_RUNTIME_DIR/shux/shux.pid` **before** `shux daemon stop` and `/proc/<pid>` confirmed gone after. Final `/proc/*/exe` sweep over this checkout and every scratch build tree: **0**. No `pgrep -f` / `pkill -f` anywhere |
 | 11 | pane / glance / window / session snapshots agree | **PASS for the shipped paths** | `pane snapshot` == `pane glance`: md5-identical at 4 cells, and 0/328320 through `pixel_verify.py`. `window`/`session snapshot` 0 px — **declared work item 5**, see P2-1 |
 | 12 | config states | **PASS** | default · `config init` · feature-maxed (`appearance.font` x 6 faces) · malformed · hot-reload all render correctly and none overruns |
 
@@ -64,8 +70,8 @@ and `make test-gui-terminal` was not run.
 | Regression tests seen failing first | both new tests red on a one-hunk revert, in **release** mode so the debug assertion is not what catches it; the pin test red on a drifted constant (`left: (9, 19), right: (9, 20)`) |
 | Raw replay | 5 committed rich-TUI corpora x 3 chunkings, rendered-pixel hash: 15/15 identical `de1fadb` vs `4238f6b`; hash shown to discriminate a 10% truncation |
 | Real `kitten icat` wire capture | re-recorded on this run via `pane record`; control blocks parsed independently |
-| shux automation | 15 sessions across 2 isolated `XDG_RUNTIME_DIR`s, 80x24 / 120x40 / 200x60 |
-| Visual inspection | 9 PNGs opened at native resolution |
+| shux automation | 23 sessions across 2 isolated `XDG_RUNTIME_DIR`s, 80x24 / 120x40 / 200x60 |
+| Visual inspection | 11 PNGs opened at native resolution |
 | Pixel comparison | 3 exact metrics (0/0), all `"status": "pass"`; comparator shown to fail on a 1-px corruption (exit 1) and on a missing baseline (exit 2) |
 | DootSabha design | **absent** — design record is prose (`docs/designs/inline-images.md`), not a council. See P2-4 |
 | DootSabha implementation-diff | **absent** — substituted by two independent QA-gate runs. See P2-4 |
@@ -235,8 +241,10 @@ right; the sentence is wider than the measurement. Documentation note.
 ## Cleanup
 
 Two isolated runtime dirs (`/tmp/kg2`, `/tmp/kgf`) plus the base worktree at
-`/tmp/shux-base` and a throwaway head worktree at `/tmp/shux-head`. Nine daemons
-started, nine stopped: each pid read from `$XDG_RUNTIME_DIR/shux/shux.pid`
+`/tmp/shux-base` and a throwaway head worktree at `/tmp/shux-head`. 23 sessions
+and 14 daemons started, 14 stopped (pids 19915, 20127, 20326, 20388, 20453,
+20462, 20515, 20524, 22784, 22846, 23224, 23304, 23505, 26287): each read from
+`$XDG_RUNTIME_DIR/shux/shux.pid`
 **before** `shux daemon stop`, `/proc/<pid>` checked **after**. Neither runtime
 dir holds a pidfile now. The final sweep walked `/proc/*/exe` for anything
 resolving into `/home/user/shux/target/`, `/tmp/shux-head/target/`,
