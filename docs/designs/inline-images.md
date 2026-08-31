@@ -32,9 +32,10 @@ anchoring), Sixel, Unicode placeholder cells.
 |---|---|---|
 | [#174](https://github.com/indrasvat/shux/issues/174) | pane pixel geometry + button events | landed, [#176](https://github.com/indrasvat/shux/pull/176) |
 | [#175](https://github.com/indrasvat/shux/issues/175) | kitty-under-Xvfb verification rig | landed, [#178](https://github.com/indrasvat/shux/pull/178) |
-| 3 | APC scan, control parse, refusals and bounds | this change |
-| 4 | raster compositing — `pane snapshot`, `glance` | next |
-| 5 | multi-pane composers — `window` / `session snapshot` | |
+| 3 | APC scan, control parse, refusals and bounds | landed, [#181](https://github.com/indrasvat/shux/pull/181) |
+| — | absolute-line anchoring made sound | landed, [#182](https://github.com/indrasvat/shux/pull/182) |
+| 4 | raster compositing — `pane snapshot`, `glance` | this change |
+| 5 | multi-pane composers — `window` / `session snapshot` | next |
 | 6 | attach re-transmit — humans see images | |
 
 ## Decisions this change implements
@@ -48,3 +49,20 @@ anchoring), Sixel, Unicode placeholder cells.
   so in a reply; that half waits for the renderer, because the protocol treats
   any response as an advertisement of support and a client that believes it
   abandons its text fallback.
+
+## Decisions item 4 implements
+
+- **D11's reply half, now that the renderer exists.** Answering `a=q` was
+  deferred above for exactly one reason — a reply advertises support, and a
+  client that believes it drops its text fallback. Item 4 IS the renderer, so
+  the deferral ends here. Measured: default `kitten icat` probes each transport
+  and waits on a DA1 sentinel; with no `OK` before it, it reports the terminal
+  unsupported and transmits nothing at all. Only a DIRECT probe is answered —
+  silence on `t=t`/`t=s` is what makes icat fall back to direct, so D11's
+  refusal stays a refusal without needing a reply of its own.
+- **Placements mutate the grid, but only through `sync::Presented`.** A picture
+  moves the cursor, so the graphics path can no longer be write-free. It takes
+  the synchronized-output freeze like every other presented-frame write, or a
+  placement inside a `CSI ?2026h` window tears the redraw it landed in (#115).
+- **`z` is accepted and not honoured.** Refusing is worse: unlike a transport
+  refusal, a client told "no" here has no fallback and shows nothing.
