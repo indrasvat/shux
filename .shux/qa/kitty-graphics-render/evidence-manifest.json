@@ -1,0 +1,14 @@
+{
+  "scope": "kitty-graphics-render",
+  "base": "de1fadb",
+  "audited_head": "8d4cc8f",
+  "verdict": "FAIL",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-substitution.md",
+  "dootsabha_implementation": "council-substitution.md",
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-icat-f100-80x24.json",
+    "pixel-icat-chunked-f24-oz-80x24.json"
+  ]
+}

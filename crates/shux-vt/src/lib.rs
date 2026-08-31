@@ -507,10 +507,11 @@ impl VirtualTerminal {
     /// Act on one kitty graphics command. Non-`G` APCs are discarded, as vte
     /// discards every APC today.
     ///
-    /// Takes no `&mut self`: `advance_slice` routes writes through
-    /// [`sync::Presented`], which freezes the presented frame on the first
-    /// write inside a `CSI ?2026h` window, and this runs BETWEEN slices, so
-    /// unwrapped access here would leak into a frame held still.
+    /// Placing and deleting a picture change the presented frame, so this
+    /// takes `&mut self` -- and every write it makes goes through
+    /// [`sync::Presented`], which freezes that frame on the first write inside
+    /// a `CSI ?2026h` window. Reaching a raw field here would leak into a frame
+    /// held still.
     fn dispatch_graphics(&mut self, body: &[u8], responses: &mut Vec<Vec<u8>>) {
         let Some(command) = body.strip_prefix(b"G") else {
             return;
@@ -542,7 +543,10 @@ impl VirtualTerminal {
             // only one a real client sends. `a=p` would need an image store to
             // place from and is a stated gap, not a refusal.
             Action::Delete => {
-                self.grid.unplace_all();
+                // Through `Presented` for the same reason `place_image` is:
+                // dropping a picture changes the presented frame.
+                sync::Presented::new(&mut self.grid, &mut self.frozen_grid, &self.sync_armed)
+                    .unplace_all();
                 self.graphics.assembler.abort();
             }
             // Default `kitten icat` probes each transport and waits on a DA1

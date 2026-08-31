@@ -554,13 +554,18 @@ impl Grid {
         }
         self.placed_bytes += cost;
         self.placements.push(p);
+        self.bump_mutations();
         true
     }
 
     /// Drop every placement -- `a=d,d=A`, the only target a real client sends.
     pub(crate) fn unplace_all(&mut self) {
+        if self.placements.is_empty() {
+            return;
+        }
         self.placements.clear();
         self.placed_bytes = 0;
+        self.bump_mutations();
     }
 
     /// Lines that have fallen off the front of this grid over its lifetime —
@@ -687,9 +692,10 @@ impl Grid {
     /// skipping work, so the tests prove the two agree on every reuse instead
     /// of the invariant being argued in a comment.
     pub(crate) fn is_actually_blank(&self, cols: usize) -> bool {
-        self.raw.iter().all(|row| {
-            !row.wrapped && row.len() == cols && row.cells.iter().all(|c| *c == Cell::EMPTY)
-        })
+        self.placements.is_empty()
+            && self.raw.iter().all(|row| {
+                !row.wrapped && row.len() == cols && row.cells.iter().all(|c| *c == Cell::EMPTY)
+            })
     }
 
     /// Return this grid to the state of `Grid::new(rows, cols, config)`,

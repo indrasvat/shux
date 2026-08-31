@@ -363,3 +363,61 @@ fn base64(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// A placement is a write. `Screen::enter` recycles a retired alternate-screen
+/// buffer whenever `is_blank_canvas` says nothing was drawn on it, and that
+/// verdict reads the write tally -- so a placement the tally never counted puts
+/// one application's picture on the next application's screen.
+#[test]
+fn an_alternate_screen_placement_does_not_reach_the_next_application() {
+    let payload = base64(&[0u8; 9 * 19 * 4]);
+    let place = format!("\x1b_Ga=T,f=32,s=9,v=19;{payload}\x1b\\");
+    let mut vt = VirtualTerminal::new(24, 80);
+
+    vt.process(b"\x1b[?1049h");
+    vt.process(place.as_bytes());
+    assert_eq!(vt.grid().placements().len(), 1, "nothing was placed in alt");
+    vt.process(b"\x1b[?1049l");
+    assert_eq!(
+        vt.grid().placements().len(),
+        0,
+        "the primary screen inherited the alternate screen's picture"
+    );
+
+    // The retired alt buffer goes back in the spare slot; the next application
+    // that opens an alternate screen gets it.
+    vt.process(b"\x1b[?1049h");
+    assert_eq!(
+        vt.grid().placements().len(),
+        0,
+        "a recycled alternate-screen buffer carried a dead application's picture"
+    );
+}
+
+/// `a=d` changes the presented frame, so inside a `CSI ?2026h` window it must
+/// take the freeze exactly as a placement does. Without it the picture vanishes
+/// from a frame the terminal promised to hold still (#115).
+#[test]
+fn a_delete_inside_synchronized_output_does_not_disturb_the_held_frame() {
+    let payload = base64(&[0u8; 9 * 19 * 4]);
+    let place = format!("\x1b_Ga=T,f=32,s=9,v=19;{payload}\x1b\\");
+    let mut vt = VirtualTerminal::new(24, 80);
+
+    vt.process(place.as_bytes());
+    assert_eq!(vt.grid().placements().len(), 1, "nothing was placed");
+
+    vt.process(b"\x1b[?2026h");
+    vt.process(b"\x1b_Ga=d,d=A\x1b\\");
+    assert_eq!(
+        vt.grid().placements().len(),
+        1,
+        "the delete reached the frame the terminal is holding still"
+    );
+
+    vt.process(b"\x1b[?2026l");
+    assert_eq!(
+        vt.grid().placements().len(),
+        0,
+        "the delete was lost when the window closed"
+    );
+}

@@ -384,7 +384,14 @@ impl Rasterizer {
         img
     }
 
-    /// Draw every placed picture over the text, at its natural pixel size.
+    /// Draw every placed picture over the text.
+    ///
+    /// The client sized its bitmap against the cell box shux DECLARES to pane
+    /// children, so convert through that rather than through the box actually
+    /// being drawn: `appearance.font` changes the drawn cell (measured 9x19
+    /// bundled, 9x17 DejaVu, 9x14 FreeMono, 7x14 CJK gothic) and without the
+    /// conversion an image overruns the rows it reserved and paints over the
+    /// next line of text. Degenerates to 1:1 when the two boxes agree.
     ///
     /// Always above the glyphs: `draw_cell` fills background and glyph in one
     /// pass, so `z<0` ("under the text") would need that split in two. It is
@@ -397,6 +404,16 @@ impl Rasterizer {
             }
             let Some(src) = decode_placement(&p.image) else {
                 continue;
+            };
+            let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
+            let dest_w = (u64::from(src.width()) * u64::from(self.cell_w) / u64::from(dw.max(1)))
+                .max(1) as u32;
+            let dest_h = (u64::from(src.height()) * u64::from(self.cell_h) / u64::from(dh.max(1)))
+                .max(1) as u32;
+            let src = if (dest_w, dest_h) == (src.width(), src.height()) {
+                src
+            } else {
+                image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
             };
             // A negative top is an image whose anchor line has scrolled above
             // the viewport; skip that many source rows instead of the image.
