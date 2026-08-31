@@ -1,3 +1,10 @@
+## [0.48.1](https://github.com/indrasvat/shux/compare/v0.48.0...v0.48.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **vt:** make the absolute-line base sound in every producer of a Grid ([#182](https://github.com/indrasvat/shux/issues/182)) ([04c997c](https://github.com/indrasvat/shux/commit/04c997cad1a0ac7b3101e54cb5fc0eca4d6c5368))
+
 # [0.48.0](https://github.com/indrasvat/shux/compare/v0.47.1...v0.48.0) (2026-08-29)
 
 
