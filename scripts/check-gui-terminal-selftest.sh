@@ -327,6 +327,13 @@ expect 1 "an unclamped image overflows the pane and the rig sees it" \
     env SHUX_BIN="${shux_bin}" \
     bash "${rig}" --scenario image-overflow --frames 2 --out "${work}/overflow"
 
+# The branch's whole claim, and the pair that makes it: the SAME image payload,
+# contained only when shux is the one emitting it. Without this arm the claim is
+# a scenario a human has to remember to type.
+expect 0 "a pane-emitted image is clipped into its pane" "verdict: PASS" \
+    env SHUX_BIN="${shux_bin}" \
+    bash "${rig}" --scenario image-pane --frames 2 --out "${work}/pane"
+
 # ── The default scenario, all four window sizes ──────────────────────────
 #
 # The only case that drives `xdotool windowsize` and the wait for shux to resize

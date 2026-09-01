@@ -1317,7 +1317,6 @@ dependencies = [
  "bytes",
  "crossterm",
  "futures",
- "nix",
  "serde",
  "serde_json",
  "shux-core",

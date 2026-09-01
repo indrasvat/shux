@@ -367,6 +367,8 @@ test-gui-terminal-selftest: release ## Prove the GUI-terminal rig can FAIL (kitt
 test-gui-terminal: test-gui-terminal-selftest ## Photograph shux in a real GUI terminal (kitty + Xvfb)
 	@echo "$(COLOR_BLUE)▶ Running the GUI-terminal rig...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_check.sh --scenario plain
+	@echo "$(COLOR_BLUE)▶ ...and the emit path, which nothing shux renders can see...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh bash .shux/scripts/gui_terminal_check.sh --scenario image-pane
 	@echo "$(COLOR_GREEN)✓ GUI-terminal rig passed$(COLOR_RESET)"
 
 .PHONY: test-vt-dec-special-graphics

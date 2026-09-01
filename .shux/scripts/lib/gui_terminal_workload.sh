@@ -48,14 +48,23 @@ printf '%s\n' "${marker}"
 # cannot know until this pane exists. So wait for its receipt rather than for
 # the file: a half-written payload would be parsed as a truncated escape.
 if [ -n "${payload}" ]; then
-    for _ in $(seq 1 240); do
+    for _ in $(seq 1 960); do
         [ -e "${payload}.ready" ] && break
         sleep 0.25
     done
     if [ -e "${payload}.ready" ]; then
         cat "${payload}"
+        # The rig's receipt that the bytes are OUT. Without it its only
+        # synchronisation was `wait-settled`, which measures quiet since the
+        # last mutation -- and the pane's last mutation was the marker, tens of
+        # seconds earlier, so it returned settled before this ran.
+        : >"${payload}.emitted"
     else
-        printf 'workload: %s.ready never appeared\n' "${payload}" >&2
+        # NOT to stderr: this script's stderr is pane output, so the message
+        # would land in the photographed grid and shift the block the
+        # comparator measures, reporting a rig fault as a rendering one.
+        printf 'workload: %s.ready never appeared\n' "${payload}" \
+            >"${payload}.workload-error"
     fi
 fi
 

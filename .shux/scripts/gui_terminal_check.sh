@@ -603,7 +603,11 @@ phase_records="${runtime}/phases.jsonl"
 : >"${phase_records}"
 
 record_phase() {
-    local name="$1" require_image="$2"
+    # `image_min_px` is the floor the picture must actually cover. 0 for a phase
+    # that expects none; for one that does, well below the ~5100 px a clipped
+    # 320x240 payload measures, and far above the single pixel that used to
+    # satisfy `require_image`.
+    local name="$1" require_image="$2" image_min_px="${3:-0}"
     local geom state win_w win_h cols rows row0 row1 col0 col1
     wait_for_stable_chrome 40 0.3
     geom="$(window_geometry "${window_id}")"
@@ -630,7 +634,7 @@ record_phase() {
 
     python3 -c '
 import json, sys
-name, win_w, win_h, cols, rows, r0, r1, c0, c1, req = sys.argv[1:11]
+name, win_w, win_h, cols, rows, r0, r1, c0, c1, req, floor = sys.argv[1:12]
 print(json.dumps({
     "name": name,
     "window": {"w": int(win_w), "h": int(win_h)},
@@ -638,10 +642,12 @@ print(json.dumps({
     "status_rows": 1,
     "block": {"row0": int(r0), "row1": int(r1), "col0": int(c0), "col1": int(c1)},
     "require_image": req == "1",
-    "frames": sys.argv[11:],
+    "image_min_px": int(floor),
+    "frames": sys.argv[12:],
 }))
 ' "${name}" "${win_w}" "${win_h}" "${cols}" "${rows}" "${row0}" "${row1}" \
-        "${col0}" "${col1}" "${require_image}" "${frames[@]}" >>"${phase_records}"
+        "${col0}" "${col1}" "${require_image}" "${image_min_px}" "${frames[@]}" \
+        >>"${phase_records}"
 
     echo "    ${name}: window ${win_w}x${win_h}, pane ${cols}x${rows} cells, ${frames_per_phase} frames"
 }
@@ -687,10 +693,11 @@ else
         # this font 320x240 px is roughly 32x13 cells, so it runs off the right
         # border and down through the status bar — the #175 defect.
         #
-        # `image-pane` uses the SAME unbounded payload deliberately. Sent to the
+        # `image-pane` uses the SAME image payload deliberately. Sent to the
         # emulator it overflows; sent to a PANE it must not, because shux clips
-        # it into a source rectangle before re-emitting. Identical bytes, and
-        # the only difference is who emits them.
+        # it into a source rectangle before re-emitting. The leading cursor
+        # position resolves against kitty's window in one arm and the pane's
+        # grid in the other; the image bytes are identical.
         "${payload_py}" --rgb "${IMAGE_RGB}" --px 320x240 \
             --at "$((rows - 2)),$((cols - 8))" --out "${payload_file}"
     else
@@ -704,8 +711,25 @@ else
         # The workload is waiting on this receipt. From here the bytes are pane
         # OUTPUT, so everything that puts them on screen is shux's own emit.
         : >"${payload_file}.ready"
-        sx pane wait-settled "${pane_id}" --quiet 400 --timeout 15000 >/dev/null 2>&1 || true
-        record_phase "pane" 1
+        # Wait for the workload's OWN receipt, not for quiet: `wait-settled`
+        # measures time since the last mutation, and the pane's last mutation is
+        # the marker from tens of seconds ago, so it returns settled on its first
+        # iteration -- before the payload has been read at all. Requiring content
+        # and only then settling is the rule this arm was breaking.
+        for _ in $(seq 1 240); do
+            [ -e "${payload_file}.emitted" ] && break
+            sleep 0.25
+        done
+        if [ ! -e "${payload_file}.emitted" ]; then
+            if [ -e "${payload_file}.workload-error" ]; then
+                fail "the pane never emitted the payload: $(cat "${payload_file}.workload-error")"
+            fi
+            fail "the pane never emitted the payload (no receipt at ${payload_file}.emitted)"
+        fi
+        # Now quiet means something: the last mutation is the image itself.
+        sx pane wait-settled "${pane_id}" --quiet 400 --timeout 15000 >/dev/null ||
+            fail "the pane never settled after emitting the payload"
+        record_phase "pane" 1 2000
     else
         : >"${go_file}"
         for _ in $(seq 1 80); do
@@ -718,7 +742,7 @@ else
             fail "the injector never wrote its receipt (log: ${inject_log})"
         sleep 1
 
-        record_phase "inject" 1
+        record_phase "inject" 1 2000
     fi
 fi
 

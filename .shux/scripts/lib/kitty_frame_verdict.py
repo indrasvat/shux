@@ -96,6 +96,7 @@ class Phase:
     block: dict[str, int]
     frames: list[Path]
     require_image: bool
+    image_min_px: int
 
 
 @dataclass
@@ -185,6 +186,7 @@ def load_geometry(path: Path) -> GeometryFile:
                     block=block,
                     frames=[Path(str(f)) for f in frames],
                     require_image=bool(phase.get("require_image", False)),
+                    image_min_px=int(phase.get("image_min_px", 1)),
                 )
             )
 
@@ -492,8 +494,19 @@ class FrameVerdict:
                 f"bbox ({int(xs.min())},{int(ys.min())})-({int(xs.max())},{int(ys.max())}) "
                 f"vs interior ({int(ix0)},{int(iy0)})-({int(ix1)},{int(iy1)})",
             )
-        if self.phase.require_image and total == 0:
-            self.fail("content:image", "no image pixels anywhere in the frame")
+        if self.phase.require_image:
+            # A floor, not just "more than zero". Containment and presence pull
+            # against each other: a renderer that clipped the picture down to a
+            # sliver would satisfy both `containment:image` and `total > 0` and
+            # pass for entirely the wrong reason. The block landmark already
+            # gets an area floor (`check_block_area`); the image needs one too.
+            floor = self.phase.image_min_px
+            if total < floor:
+                self.fail(
+                    "content:image",
+                    f"{total} image pixel(s) in the frame, below the {floor} px floor — "
+                    "the picture is missing or clipped to a sliver",
+                )
 
         # The strict box: the same interior with the margin taken off the other
         # side. The two questions want opposite slack — "is this payload outside"
