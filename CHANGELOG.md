@@ -1,3 +1,10 @@
+# [0.50.0](https://github.com/indrasvat/shux/compare/v0.49.0...v0.50.0) (2026-09-01)
+
+
+### Features
+
+* **ui:** show inline images in split windows, clipped to their pane ([#184](https://github.com/indrasvat/shux/issues/184)) ([df55621](https://github.com/indrasvat/shux/commit/df55621996f9a68a81a32a6a060c518bf47fc993))
+
 # [0.49.0](https://github.com/indrasvat/shux/compare/v0.48.1...v0.49.0) (2026-08-31)
 
 
