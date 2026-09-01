@@ -1196,6 +1196,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "flate2",
  "futures",
  "image",
  "libc",

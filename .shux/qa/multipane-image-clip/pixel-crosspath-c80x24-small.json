@@ -1,0 +1,1 @@
+{"actual": "shots/c80x24-small-cropL.png", "changed_pixels": 0, "diff": "shots/c80x24-small-cropL-diff.png", "expected": "shots/c80x24-small-paneL.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [351, 399], "status": "pass", "total_pixels": 140049}

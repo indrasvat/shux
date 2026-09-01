@@ -221,6 +221,12 @@ test-window-snapshot: nextest-ready ## Run the window-snapshot oversize cross-pa
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test window_snapshot_oversize $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Window snapshot oversize tests passed$(COLOR_RESET)"
 
+.PHONY: test-window-snapshot-images
+test-window-snapshot-images: nextest-ready ## Inline images survive multi-pane composition and stay in their pane; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running multi-pane inline image tests...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test window_snapshot_images --test window_snapshot_image_rpc $(FILTER)
+	@echo "$(COLOR_GREEN)✓ Multi-pane inline image tests passed$(COLOR_RESET)"
+
 .PHONY: test-pane-io
 test-pane-io: nextest-ready ## Run pane I/O integration tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running pane I/O integration tests...$(COLOR_RESET)"

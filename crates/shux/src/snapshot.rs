@@ -294,7 +294,8 @@ pub(crate) async fn snapshot_window(
             cursor_color: focused_defaults.cursor,
             ..Default::default()
         };
-        let img = rasterizer.render(&composed.grid, &opts);
+        let mut img = rasterizer.render(&composed.grid, &opts);
+        rasterizer.composite_composed(&mut img, &composed.placements);
         let mut buf: Vec<u8> = Vec::with_capacity(128 * 1024);
         {
             use image::ImageEncoder;

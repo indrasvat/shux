@@ -1,0 +1,154 @@
+{
+  "scope": "multipane-image-clip",
+  "base": "0e97d24",
+  "audited_head": "76fc6e8",
+  "previously_audited_heads": [
+    "c836d8a",
+    "3d46d74"
+  ],
+  "branch": "claude/shux-image-support-s0u4uy",
+  "verdict": "PASS",
+  "audit_kind": "scoped re-audit of c836d8a..76fc6e8 (decode budget scoped per PANE)",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-substitution.md",
+  "dootsabha_implementation": "council-substitution.md",
+  "screenshots": [],
+  "screenshots_note": "No PNG is committed. This repo tracks no baseline for these scenes, so per CLAUDE.md's evidence-storage rule the pixel-metric JSONs stand alone rather than shipping a screenshot nothing can be diffed against. Every frame, crop and diff image referenced by the metrics below lives in .shux/out/multipane-image-clip/budget/r3/ and was opened as an image during the audit (SOLID-QA.md section 9).",
+  "pixel_metrics": [
+    "pixel-crosspath-c120x40-big.json",
+    "pixel-crosspath-c120x40-small.json",
+    "pixel-crosspath-c200x60-big.json",
+    "pixel-crosspath-c200x60-small.json",
+    "pixel-crosspath-c80x24-big.json",
+    "pixel-crosspath-c80x24-small.json",
+    "pixel-crosspath-cfg-init.json",
+    "pixel-crosspath-cfg-malformed.json",
+    "pixel-crosspath-cfg-maxed-cjk.json",
+    "pixel-crosspath-cfg-maxed-freemono.json",
+    "pixel-crosspath-cfg-maxed.json",
+    "pixel-crosspath-hr-after.json",
+    "pixel-crosspath-img-btop.json",
+    "pixel-noimage-ab-120x40.json",
+    "pixel-outside-pane-120x40-big.json",
+    "pixel-outside-pane-200x60-big.json",
+    "pixel-outside-pane-80x24-big.json",
+    "pixel-outside-pane-cfg-maxed-cjk.json",
+    "pixel-outside-pane-img-btop.json",
+    "pixel-r3-crosspath-attacker.json",
+    "pixel-r3-crosspath-victim.json",
+    "pixel-r3-resize-attacker.json",
+    "pixel-r3-resize-victim.json",
+    "pixel-r3-session-victim.json",
+    "pixel-r3-swap-attacker.json",
+    "pixel-r3-swap-session-victim.json",
+    "pixel-r3-swap-victim.json",
+    "pixel-r3-zoom-attacker.json",
+    "pixel-r3-zoom-victim.json",
+    "pixel-richtui-ab-btop.json",
+    "pixel-richtui-ab-lazygit.json",
+    "pixel-richtui-ab-nvim.json",
+    "pixel-richtui-ab-vicaya.json",
+    "pixel-richtui-ab-vivecaka.json",
+    "pixel-session-vs-window-c120x40-big.json"
+  ],
+  "pixel_metrics_new_at_this_head": {
+    "note": "Ten scenes proving cross-path identity survives a budget that genuinely truncates. All at --max-pixel-diff-ratio 0 --max-mean-channel-delta 0, all status=pass with changed_pixels=0. Each compares a crop of the composed frame against that pane's own pane.snapshot.",
+    "scenes": {
+      "pixel-r3-crosspath-attacker.json": "200x60, budget truncates in the attacker pane (5 maximal placements, 4 drawn); window crop vs pane.snapshot",
+      "pixel-r3-crosspath-victim.json": "same frame, victim pane; window crop vs pane.snapshot",
+      "pixel-r3-session-victim.json": "same frame via session.snapshot, victim pane",
+      "pixel-r3-swap-victim.json": "panes swapped so the victim composes FIRST; the c836d8a defect was order-dependent",
+      "pixel-r3-swap-attacker.json": "panes swapped, attacker pane",
+      "pixel-r3-swap-session-victim.json": "panes swapped, session.snapshot",
+      "pixel-r3-zoom-attacker.json": "attacker ZOOMED - pane_rects collapses to one clip key never seen before",
+      "pixel-r3-zoom-victim.json": "victim ZOOMED",
+      "pixel-r3-resize-attacker.json": "panes resized to 60x20 so the clip min()s with the grid dims",
+      "pixel-r3-resize-victim.json": "same, victim pane"
+    }
+  },
+  "pixel_metrics_reverified_at_head": {
+    "note": "Re-derived from scratch with the 76fc6e8 release binary via runall.sh + metric_case.sh and compared field-by-field against the committed JSONs. 9/9 numerically identical on status, changed_pixels, pixel_diff_ratio, mean_rgba_channel_delta, total_pixels, size and both thresholds.",
+    "reverified": [
+      "pixel-crosspath-c80x24-small.json",
+      "pixel-crosspath-c80x24-big.json",
+      "pixel-crosspath-c120x40-small.json",
+      "pixel-crosspath-c120x40-big.json",
+      "pixel-crosspath-c200x60-small.json",
+      "pixel-crosspath-c200x60-big.json",
+      "pixel-outside-pane-80x24-big.json",
+      "pixel-outside-pane-120x40-big.json",
+      "pixel-outside-pane-200x60-big.json"
+    ],
+    "fresh_copies": ".shux/out/multipane-image-clip/metrics/"
+  },
+  "comparator_falsifiability": {
+    "note": "The same comparator, the same crop geometry and the same exact 0/0 thresholds report a FAILURE on the pre-fix build, so a pass is informative. Kept in scratch because .shux/qa/ metrics must be exact 0/0 passes.",
+    "metric": ".shux/out/multipane-image-clip/budget/r3/NEGCTL-r3-prefix-crosspath.json",
+    "result": "status=fail, changed_pixels=17100, pixel_diff_ratio=0.0521, mean_rgba_channel_delta=6.23, pixel_verify exit 1",
+    "binary": "c836d8a, built by this audit in its own worktree /tmp/shux-c836"
+  },
+  "attack_evidence": {
+    "dir": ".shux/out/multipane-image-clip/budget/r3/",
+    "drivers": [
+      "../attack_r3.sh",
+      "../timing_r3.sh",
+      "../quad_r3.sh",
+      "../scope_r3.sh",
+      "../gen_r3.py",
+      "../count.py",
+      "../crop.py"
+    ],
+    "p1_closed": "victim 17100 px on pane.snapshot AND window.snapshot AND session.snapshot at 4 hostile placements, in both pane orders (was 17100/0/0 at c836d8a)",
+    "budget_still_fires": "five distinct-colour 4096x4096 placements: #4 (yellow) drawn and #5 (cyan) refused, at the SAME point on both the composed and the single-pane path",
+    "timings_idle_7reps_min_ms": {
+      "2pane_24placements": {
+        "3d46d74_no_budget": 1132,
+        "c836d8a_shared": 526,
+        "76fc6e8_per_pane": 537
+      },
+      "4pane_all_hostile": {
+        "3d46d74_no_budget": 2950,
+        "c836d8a_shared": 629,
+        "76fc6e8_per_pane": 2325
+      }
+    },
+    "hygiene": "budget/r3/hygiene.txt - 22 daemons started, 22 confirmed gone from /proc; drivers exit 90 on a survivor"
+  },
+  "mutations_rerun": {
+    "worktree": "/tmp/shux-mut3 (detached at 76fc6e8, own CARGO_TARGET_DIR, no file under /home/user/shux/crates modified)",
+    "M17_revert_per_pane_scoping": "CAUGHT - exit 100, 'victim second: the neighbouring pane's picture was starved by a greedy pane'; the other 3 tests in the file stayed green.",
+    "M8_snapshot_no_call": "CAUGHT - 'window.snapshot returned a frame with no picture (0 px); pane.snapshot has 10260'. The 3d46d74 P1 stays closed.",
+    "M19_budget_never_refuses": "SURVIVED - 926 tests green across shux + shux-raster. Nothing pins the refusal (finding P2-2).",
+    "skipped": "M0-M12 (clip geometry) and M16/M16b: the delta touches neither blit's clip arithmetic nor its charge point, and those scenes are covered by the 9 re-derived metrics. M16b is superseded by M19."
+  },
+  "findings": {
+    "P0": [],
+    "P1": [],
+    "P2": [
+      "P2-1 NEW: MAX_PANE_DECODE_BYTES's doc still cites the four-way-split 3.3 s stall as its motivation, but per-pane scoping leaves that case at 2325 ms against 2950 ms unmitigated (21%). Not a correctness defect and the trade is disclosed in the commit; the comment should state what it now bounds (one pane) instead.",
+      "P2-2 CARRIED: M19 shows the budget's refusal is pinned by zero tests; the new starvation test asserts survival, which an inert budget satisfies.",
+      "P2-3 PROCESS: council-substitution.md section 7 names c836d8a, not 76fc6e8; dootsabha is still absent so the adversarial-agent substitution must name this delta before push."
+    ],
+    "P3": [
+      "P3-1 composite_composed is pub and its budget key is caller-controlled; unreachable from compose, which emits one CellRect per pane.",
+      "P3-2 two panes cannot collide on a clip key, and a degenerate zero-size rect returns from blit before the charge.",
+      "P3-3 the Vec lookup cost is unmeasurable next to a 64 MiB decode.",
+      "P3-4 the per-clip lookup is behaviourally indistinguishable from reset-on-clip-change under compose's grouping; the stronger form is a defensive choice, not a tested property."
+    ]
+  },
+  "logs": {
+    "release_build": ".shux/out/multipane-image-clip/r3-release.log",
+    "make_test": ".shux/out/multipane-image-clip/r3-make-test.log",
+    "lint": ".shux/out/multipane-image-clip/r3-lint.log",
+    "mutation_M17": ".shux/out/multipane-image-clip/r3-mut-M17.log",
+    "mutation_M19": ".shux/out/multipane-image-clip/r3-mut-M19.log",
+    "mutation_M8": ".shux/out/multipane-image-clip/r3-mut-M8.log",
+    "mutation_baseline": ".shux/out/multipane-image-clip/r3-mut-baseline.log",
+    "prefix_build": ".shux/out/multipane-image-clip/r3-c836-build.log",
+    "runall_at_head": ".shux/out/multipane-image-clip/r3-runall.log",
+    "checkpoint": ".shux/out/multipane-image-clip/REAUDIT3-CHECKPOINT.md"
+  },
+  "tree_frozen": "Product source frozen: git status --porcelain was empty before the first command, and git diff 76fc6e8..70b3883 -- crates/ Makefile scripts/ Cargo.toml Cargo.lock .config/ is empty. Every measurement came from a 76fc6e8 binary or a detached worktree. The c836d8a regression (source patched mid-audit) did NOT recur. However, at 19:05:28 a commit 70b3883 landed on the branch carrying this report and ten of its metrics, authored by something other than this gate and missing this manifest. It touched only .shux/qa/multipane-image-clip/ and its content is byte-identical to what the gate wrote, so no finding changes. Recorded in SOLID-QA.md section 13 because the gate is contracted to commit its own terminal verdict.",
+  "scratch": ".shux/out/multipane-image-clip/",
+  "notes": "PASS. The c836d8a P1 (a greedy pane starving a neighbour's picture out of window.snapshot and session.snapshot while pane.snapshot still drew it, order-dependently) is closed by scoping the decode budget per pane. Verified by re-running the original dose-response attack in both pane orders on all three snapshot paths; by a discriminating five-distinct-colour scene proving the budget still refuses and truncates at the SAME placement on both paths; by ten pixel metrics at exact 0/0 covering truncation, both orders, zoom, resize and the session path; by a negative control on a self-built pre-fix binary that makes the same comparator fail with 17100 changed pixels; and by mutation M17, which reverts the scoping and produces the test's stated failure message. Three P2s remain, none blocking: the constant's doc cites a four-pane harm it now only reduces 21%, the refusal itself is pinned by no test (M19 survived), and the step-7 substitution record does not yet name this commit."
+}

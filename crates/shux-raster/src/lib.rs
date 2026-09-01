@@ -34,7 +34,9 @@
 
 use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
-use shux_vt::{Cell, CellFlags, CellStyle, Color, CursorShape, Grid, UnderlineStyle};
+use shux_vt::{
+    Cell, CellFlags, CellStyle, Color, ComposedPlacement, CursorShape, Grid, UnderlineStyle,
+};
 
 /// Embedded text font. JetBrains Mono Nerd Font Mono Regular, the
 /// upstream Nerd Fonts patched build (2.4 MB) under SIL Open Font
@@ -384,67 +386,125 @@ impl Rasterizer {
         img
     }
 
-    /// Draw every placed picture over the text.
-    ///
-    /// The client sized its bitmap against the cell box shux DECLARES to pane
-    /// children, so convert through that rather than through the box actually
-    /// being drawn: `appearance.font` changes the drawn cell (measured 9x19
-    /// bundled, 9x17 DejaVu, 9x14 FreeMono, 7x14 CJK gothic) and without the
-    /// conversion an image overruns the rows it reserved and paints over the
-    /// next line of text. Degenerates to 1:1 when the two boxes agree.
-    ///
-    /// Always above the glyphs: `draw_cell` fills background and glyph in one
-    /// pass, so `z<0` ("under the text") would need that split in two. It is
-    /// accepted and unhonoured -- a refused client gets no picture at all.
+    /// Draw the pictures a single-pane grid holds, clipped to the canvas.
     fn composite_placements(&self, img: &mut RgbaImage, grid: &Grid) {
+        let (w, h) = (img.width(), img.height());
+        let mut budget = MAX_PANE_DECODE_BYTES;
+        for p in grid.placements() {
+            let top = p.viewport_row(grid) * i64::from(self.cell_h);
+            self.blit(
+                img,
+                &p.image,
+                top,
+                p.col as u32 * self.cell_w,
+                (0, w, h),
+                &mut budget,
+            );
+        }
+    }
+
+    /// Draw placements a multi-pane composer resolved, each clipped to its own
+    /// pane. See [`shux_vt::ComposedPlacement`] for why they ride beside the
+    /// composed grid rather than inside it.
+    pub fn composite_composed(&self, img: &mut RgbaImage, placements: &[ComposedPlacement]) {
+        // One budget per pane, looked up by clip rather than reset on change:
+        // `compose` happens to emit placements grouped by pane, but this is
+        // `pub` and nothing asserts that, and an ordering assumption is exactly
+        // how the budget starved a neighbour the first time.
+        let mut budgets: Vec<(shux_vt::CellRect, u64)> = Vec::new();
+        for p in placements {
+            let c = p.clip;
+            let budget = match budgets.iter().position(|(r, _)| *r == c) {
+                Some(i) => &mut budgets[i].1,
+                None => {
+                    budgets.push((c, MAX_PANE_DECODE_BYTES));
+                    &mut budgets.last_mut().expect("just pushed").1
+                }
+            };
+            let clip = (
+                c.row as u32 * self.cell_h,
+                (c.col + c.cols) as u32 * self.cell_w,
+                (c.row + c.rows) as u32 * self.cell_h,
+            );
+            let top = p.row * i64::from(self.cell_h);
+            self.blit(img, &p.image, top, p.col as u32 * self.cell_w, clip, budget);
+        }
+    }
+
+    /// Draw one picture, clipped to a box given in PIXELS rather than cells --
+    /// which is what keeps a cell-stated clip exact under any `appearance.font`,
+    /// instead of dropping whole image rows.
+    ///
+    /// Has no left clip, and needs none: every producer derives `ox` and the
+    /// clip's left edge from the same pane origin, so a picture cannot start
+    /// left of its own clip.
+    ///
+    /// The client sized its bitmap against the DECLARED cell box, so the
+    /// conversion runs through that rather than the box being drawn --
+    /// `appearance.font` changes the latter and an unconverted image overruns
+    /// its rows.
+    fn blit(
+        &self,
+        img: &mut RgbaImage,
+        stored: &shux_vt::StoredImage,
+        top: i64,
+        ox: u32,
+        (y0, x1, y1): (u32, u32, u32),
+        budget: &mut u64,
+    ) {
+        let (x1, y1) = (x1.min(img.width()), y1.min(img.height()));
+        if y0 >= y1 || ox >= x1 || top >= i64::from(y1) {
+            return;
+        }
         let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
         let convert = |px: u32, cell: u32, declared: u32| {
             (u64::from(px) * u64::from(cell) / u64::from(declared.max(1))).max(1) as u32
         };
-        for p in grid.placements() {
-            let top = p.viewport_row(grid) * i64::from(self.cell_h);
-            if top >= i64::from(img.height()) {
-                continue;
-            }
-            // Both visibility tests run on the DECLARED height, before any
-            // decode: a scrolled-out placement is discarded without inflating
-            // its payload. `decode_placement` refuses a payload that does not
-            // match the declared size, so the two agree on anything drawn.
-            let skip = top.min(0).unsigned_abs() as u32;
-            if skip >= convert(p.image.height, self.cell_h, dh) {
-                continue;
-            }
-            let Some(src) = decode_placement(&p.image) else {
-                continue;
-            };
-            let dest_w = convert(src.width(), self.cell_w, dw);
-            let dest_h = convert(src.height(), self.cell_h, dh);
-            let src = if (dest_w, dest_h) == (src.width(), src.height()) {
-                src
-            } else {
-                image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
-            };
-            if skip >= src.height() {
-                continue;
-            }
-            let ox = p.col as u32 * self.cell_w;
-            let oy = top.max(0) as u32;
-            // Clip to the CANVAS only; the pane rect is a separate clip the
-            // multi-pane composer owns.
-            let rows = (src.height() - skip).min(img.height().saturating_sub(oy));
-            for y in 0..rows {
-                for x in 0..src.width().min(img.width().saturating_sub(ox)) {
-                    let s = src.get_pixel(x, y + skip).0;
-                    let a = s[3] as u32;
-                    if a == 0 {
-                        continue;
-                    }
-                    let d = img.get_pixel_mut(ox + x, oy + y);
-                    for c in 0..3 {
-                        d[c] = ((s[c] as u32 * a + d[c] as u32 * (255 - a)) / 255) as u8;
-                    }
-                    d[3] = 255;
+        // Both visibility tests run on the DECLARED height, before any decode:
+        // a placement outside the clip is discarded without inflating its
+        // payload. `decode_placement` refuses a payload that does not match the
+        // declared size, so the two agree on anything drawn.
+        let skip = (i64::from(y0) - top).max(0);
+        if skip >= i64::from(convert(stored.height, self.cell_h, dh)) {
+            return;
+        }
+        // Charged AFTER the cheap declared-size tests and BEFORE the decode, so
+        // a placement that is off-screen costs nothing and one that is drawn is
+        // paid for once.
+        let cost = declared_rgba_bytes(stored).unwrap_or(u64::MAX as usize) as u64;
+        match budget.checked_sub(cost) {
+            Some(left) => *budget = left,
+            None => return,
+        }
+        let Some(src) = decode_placement(stored) else {
+            return;
+        };
+        let dest_w = convert(src.width(), self.cell_w, dw);
+        let dest_h = convert(src.height(), self.cell_h, dh);
+        let src = if (dest_w, dest_h) == (src.width(), src.height()) {
+            src
+        } else {
+            image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
+        };
+        let skip = skip as u32;
+        if skip >= src.height() {
+            return;
+        }
+        let oy = top.max(i64::from(y0)) as u32;
+        let rows = (src.height() - skip).min(y1.saturating_sub(oy));
+        let cols = src.width().min(x1.saturating_sub(ox));
+        for y in 0..rows {
+            for x in 0..cols {
+                let s = src.get_pixel(x, y + skip).0;
+                let a = u32::from(s[3]);
+                if a == 0 {
+                    continue;
                 }
+                let d = img.get_pixel_mut(ox + x, oy + y);
+                for c in 0..3 {
+                    d[c] = ((u32::from(s[c]) * a + u32::from(d[c]) * (255 - a)) / 255) as u8;
+                }
+                d[3] = 255;
             }
         }
     }
@@ -857,6 +917,31 @@ fn declared_rgba_bytes(stored: &shux_vt::StoredImage) -> Option<usize> {
 /// this is the only thing between its output and an unbounded allocation on
 /// every snapshot.
 const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Ceiling on what ONE PANE may decode and rescale in one render.
+///
+/// The per-image ceiling above does not bound a pane: it may hold up to
+/// `MAX_PLACEMENTS` of them, so one pane could charge 16 GiB for a caller that
+/// did not ask. This caps that at 256 MiB.
+///
+/// PER PANE, not per frame, and the distinction is the point rather than a
+/// detail. A frame-wide budget is a better brake -- measured on four hostile
+/// panes, 2950 ms unmitigated, 629 ms frame-wide, 2325 ms per-pane, so this
+/// recovers only about a fifth of that stall. It is still the right one: a
+/// frame-wide budget is spent first-come-first-served, so a greedy pane
+/// silently deletes whichever pane composes after it and `window.snapshot`
+/// stops agreeing with `pane.snapshot` -- the exact property this crate's
+/// composed path exists to uphold. Measured at 4 hostile placements, the
+/// neighbour's picture went from 17100 px to 0, and swapping the panes
+/// reversed which one survived.
+///
+/// What this does deliver: composing N panes costs no more than snapshotting
+/// them one at a time, and both paths draw the same subset of the same pane.
+///
+/// Sized against a real `kitten icat` of a 4000x3000 photo into a 200x55 pane,
+/// which downscales to the pane and charges 9.27 MiB: about 27 such pictures
+/// fit, and normal use keeps one or two on screen.
+const MAX_PANE_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Bytes a raw payload must decompress to, from the declared dimensions.
 fn expected_len(stored: &shux_vt::StoredImage) -> Option<usize> {

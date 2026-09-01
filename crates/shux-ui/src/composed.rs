@@ -9,7 +9,9 @@ use std::collections::HashMap;
 
 use shux_core::layout::{LayoutNode, Rect, ZoomState};
 use shux_core::model::PaneId;
-use shux_vt::{Cell, CellFlags, CellStyle, Color, Cursor, Grid, GridConfig};
+use shux_vt::{
+    Cell, CellFlags, CellRect, CellStyle, Color, ComposedPlacement, Cursor, Grid, GridConfig,
+};
 
 use crate::borders::{BorderColors, BorderStyle, compute_borders};
 use crate::buffer::RenderCell;
@@ -21,6 +23,8 @@ use crate::vt_convert::crossterm_to_vt;
 pub struct ComposedFrame {
     /// Composed cells as a `shux_vt::Grid` (no scrollback).
     pub grid: Grid,
+    /// Pictures, resolved into this frame and each carrying its pane as a clip.
+    pub placements: Vec<ComposedPlacement>,
     /// Focused-pane cursor in `(row, col)` grid coordinates, or `None`
     /// when the focused pane's VT has the cursor hidden / out of bounds.
     pub cursor: Option<(usize, usize)>,
@@ -74,9 +78,28 @@ pub fn compose(
         inputs.layout.compute_rects(pane_viewport)
     };
 
+    let mut placements: Vec<ComposedPlacement> = Vec::new();
     for (pid, rect) in &pane_rects {
         if let Some((src_grid, src_cursor)) = inputs.panes.get(pid) {
-            compose_pane(&mut grid, *rect, src_grid, src_cursor);
+            let row_offset = compose_pane(&mut grid, *rect, src_grid, src_cursor);
+            // `min` with the source dims: `compose_pane` tolerates a grid
+            // smaller than its rect during a resize lag, and a picture must not
+            // paint area the grid does not own.
+            let clip = CellRect {
+                col: rect.x as usize,
+                row: rect.y as usize,
+                cols: (rect.width as usize).min(src_grid.cols()),
+                rows: (rect.height as usize).min(src_grid.rows()),
+            };
+            placements.extend(src_grid.placements().iter().map(|p| ComposedPlacement {
+                image: p.image.clone(),
+                // `viewport_row` undoes the source grid's own base, `row_offset`
+                // undoes the vertical clip `compose_pane` just applied to the
+                // cells, and `rect.y` rebases into this frame.
+                row: p.viewport_row(src_grid) - row_offset as i64 + i64::from(rect.y),
+                col: p.col + rect.x as usize,
+                clip,
+            }));
         } else {
             compose_placeholder(&mut grid, *rect, "(no output)");
         }
@@ -188,13 +211,14 @@ pub fn compose(
 
     ComposedFrame {
         grid,
+        placements,
         cursor,
         cols,
         rows,
     }
 }
 
-fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid, cursor: &Cursor) {
+fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid, cursor: &Cursor) -> usize {
     let total_rows = src.rows();
     let total_cols = src.cols();
     let visible_rows = rect.height as usize;
@@ -226,6 +250,7 @@ fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid, cursor: &Cursor) {
             dst_row[dst_col] = cell;
         }
     }
+    row_offset
 }
 
 fn compose_placeholder(grid: &mut Grid, rect: Rect, text: &str) {
