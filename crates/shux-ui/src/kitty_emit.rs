@@ -159,10 +159,19 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
 /// `C=1` so display never moves the host's cursor: kitty otherwise advances it
 /// and scrolls the whole screen for an image at the bottom margin. `q=2` so the
 /// host's `OK` never lands in the client's key decoder.
+///
+/// `z=-1` puts the picture UNDER text. The attach client writes copy mode, the
+/// copy menu, the help sheet and the welcome toast into the same frame buffer
+/// after the compositor has emitted images, and at the default z=0 kitty draws
+/// a placement above text -- measured in real kitty, 22 surviving glyph pixels
+/// against 1638 at z=-1. Those overlays were always legible before this path
+/// existed; they must not stop being legible wherever a picture happens to sit.
+/// Negative z still draws above the cell BACKGROUND, so a picture is not hidden
+/// by the blank cells it covers.
 fn keys(p: &Placed) -> String {
     let (y, w, h) = p.src;
     let (c, r) = p.cells;
-    format!("p=1,C=1,q=2,y={y},w={w},h={h},c={c},r={r}")
+    format!("p=1,C=1,q=2,z=-1,y={y},w={w},h={h},c={c},r={r}")
 }
 
 fn cup(out: &mut impl Write, p: &Placed) -> io::Result<()> {

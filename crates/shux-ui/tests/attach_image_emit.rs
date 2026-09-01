@@ -355,3 +355,62 @@ fn a_picture_that_is_not_a_whole_number_of_cells_still_claims_the_cells_it_owns(
     assert!(cmd.contains("w=16"), "{cmd}");
     assert!(cmd.contains("h=20"), "{cmd}");
 }
+
+#[test]
+fn a_picture_is_drawn_under_text_so_overlays_stay_legible() {
+    // `shux attach` writes copy mode, the copy menu, the help sheet and the
+    // welcome toast into the frame AFTER the compositor emits images. At the
+    // protocol's default z=0 a placement is drawn above text, so a picture
+    // would blank whichever overlay landed on it -- measured in real kitty as
+    // 22 surviving glyph pixels against 1638 at z=-1. Those overlays were
+    // always legible before this path existed.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    for cmd in graphics(&drain(&mut c)) {
+        assert!(cmd.contains("z=-1"), "drawn over the overlays: {cmd}");
+    }
+}
+
+#[test]
+fn a_full_repaint_re_places_without_re_sending_pixels() {
+    // A host that drops placements on a full repaint is the model this emitter
+    // defends against, so a repainted frame must re-issue each placement --
+    // with an `a=p`, never a re-transmit, which is what the first version of
+    // this behaviour was cut for.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    drain(&mut c);
+    // Unchanged frame: silence.
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    assert!(graphics(&drain(&mut c)).is_empty());
+
+    c.force_redraw();
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let out = drain(&mut c);
+    let cmds = graphics(&out);
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    assert!(
+        cmds[0].starts_with("a=p"),
+        "re-sent the pixels: {}",
+        cmds[0]
+    );
+    assert!(
+        out.len() < 4096,
+        "a re-place cost {} bytes; it should carry no payload",
+        out.len()
+    );
+}
