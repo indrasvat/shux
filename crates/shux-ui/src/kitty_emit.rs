@@ -52,10 +52,14 @@ pub(crate) struct KittyEmitter {
 
 impl KittyEmitter {
     /// Emit whatever this frame changed, and report whether it wrote anything.
+    /// `replace_all` re-issues every placement even when nothing moved, for a
+    /// frame that repainted the whole screen: the host may have dropped its
+    /// placements. It costs an `a=p` each and never re-sends pixels.
     pub(crate) fn emit(
         &mut self,
         out: &mut impl Write,
         placements: &[ComposedPlacement],
+        replace_all: bool,
     ) -> io::Result<bool> {
         let want: Vec<(&ComposedPlacement, Placed)> = placements
             .iter()
@@ -69,7 +73,7 @@ impl KittyEmitter {
         for (i, (p, placed)) in want.iter().enumerate() {
             match self.live.get(i) {
                 Some(live) if Arc::ptr_eq(&live.image, &p.image) => {
-                    if live.placed == *placed {
+                    if live.placed == *placed && !replace_all {
                         continue;
                     }
                     // Same pixels, new geometry. Re-putting under the same
@@ -125,7 +129,10 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     let nat_cols = p.image.width.div_ceil(cw).max(1) as i64;
 
     let top = p.row.max(clip_top);
-    let bottom = (p.row + nat_rows).min(clip_top + p.clip.rows as i64);
+    let bottom = p
+        .row
+        .saturating_add(nat_rows)
+        .min(clip_top + p.clip.rows as i64);
     let rows = (bottom - top).max(0);
     let right = ((p.col + nat_cols as usize).min(p.clip.col + p.clip.cols)) as i64;
     let cols = (right - p.col as i64).max(0);
@@ -178,18 +185,19 @@ fn transmit(out: &mut impl Write, id: u32, img: &StoredImage, placed: &Placed) -
     cup(out, placed)?;
     for (i, chunk) in bytes.chunks(CHUNK).enumerate() {
         let more = u8::from(i + 1 < chunks);
-        let payload = std::str::from_utf8(chunk).unwrap_or("");
         if i == 0 {
             write!(
                 out,
-                "\x1b_Ga=T,f={fmt}{zlib},t=d,i={id},s={},v={},{},m={more};{payload}\x1b\\",
+                "\x1b_Ga=T,f={fmt}{zlib},t=d,i={id},s={},v={},{},m={more};",
                 img.width,
                 img.height,
                 keys(placed)
             )?;
         } else {
-            write!(out, "\x1b_Gq=2,m={more};{payload}\x1b\\")?;
+            write!(out, "\x1b_Gq=2,m={more};")?;
         }
+        out.write_all(chunk)?;
+        out.write_all(b"\x1b\\")?;
     }
     Ok(())
 }

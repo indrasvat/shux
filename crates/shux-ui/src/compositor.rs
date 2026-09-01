@@ -582,6 +582,7 @@ impl<W: Write> RenderCompositor<W> {
 
         // 5. Diff + render.
         let diff_start = Instant::now();
+        let full_redraw = self.force_full_redraw;
         let dirty = if self.force_full_redraw {
             self.buffer.invalidate();
             self.force_full_redraw = false;
@@ -642,13 +643,17 @@ impl<W: Write> RenderCompositor<W> {
         self.render_dirty_and_cursor(&dirty, target_cursor)?;
         // Pictures go out AFTER the cells: a terminal that treats an image as a
         // cell attachment erases the slice under any later text write.
-        if self.images.emit(self.backend.inner_mut(), &placements)? {
+        if self
+            .images
+            .emit(self.backend.inner_mut(), &placements, full_redraw)?
+        {
             // The emit CUPs to each picture and leaves the cursor there, so put
             // it back rather than dropping the tracking -- forgetting it costs a
             // hide/show cycle on every frame that follows.
-            match target_cursor {
-                Some(t) => self.backend.set_cursor(t.x, t.y)?,
-                None => self.terminal_cursor = None,
+            // Only when there is somewhere to put it: with no target the
+            // cursor is already hidden and `terminal_cursor` already cleared.
+            if let Some(t) = target_cursor {
+                self.backend.set_cursor(t.x, t.y)?;
             }
         }
 

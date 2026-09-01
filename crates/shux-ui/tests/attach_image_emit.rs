@@ -321,3 +321,37 @@ fn the_cursor_ends_where_the_frame_wanted_it_not_on_the_picture() {
         "the frame did not leave the cursor where it wanted it"
     );
 }
+
+#[test]
+fn a_picture_that_is_not_a_whole_number_of_cells_still_claims_the_cells_it_owns() {
+    // Every other fixture here is 18x38 -- exactly 2x2 cells -- so none of them
+    // can see what happens when a dimension is not a multiple of the cell.
+    //
+    // The two render paths cannot agree on PIXELS: `shux-raster` draws into its
+    // own 9x19 cell, while the outer terminal has a cell size of its own, and an
+    // image sized for one is not the same number of pixels in the other. What
+    // they can and must agree on is the CELLS a picture occupies, which is what
+    // "the picture is in its pane, beside the right text" means. `c=`/`r=` are
+    // what buy that: the host scales into the cell box rather than laying the
+    // bitmap down at a pixel size that means something different on its grid.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(16, 20, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    let cmd = &cmds[0];
+
+    // 16px over a 9px cell is 2 cells; 20px over 19px is 2. The same ceiling
+    // `shux-vt`'s `place_image` uses to reserve them and `shux-raster` uses to
+    // lay them out, so all three paths agree on the footprint.
+    assert!(cmd.contains("c=2,r=2"), "{cmd}");
+    // …and the source rect is the whole bitmap, not a cell-rounded lie about it.
+    assert!(cmd.contains("w=16"), "{cmd}");
+    assert!(cmd.contains("h=20"), "{cmd}");
+}
