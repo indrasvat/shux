@@ -83,6 +83,7 @@ struct Split {
     left: PaneId,
     right: PaneId,
     left_rect: Rect,
+    right_rect: Rect,
     style: BorderStyle,
 }
 
@@ -101,12 +102,13 @@ fn split() -> Split {
         .compute_rects(pane_viewport(content, style, false))
         .into_iter()
         .collect();
-    let left_rect = rects[&left];
+    let (left_rect, right_rect) = (rects[&left], rects[&right]);
     Split {
         layout,
         left,
         right,
         left_rect,
+        right_rect,
         style,
     }
 }
@@ -177,6 +179,57 @@ fn picture(img: &image::RgbaImage, r: Rect, cw: u32, ch: u32) -> Vec<((u32, u32)
             continue;
         }
         out.push(((x - x0, y - y0), p.0));
+    }
+    out
+}
+
+/// A PNG placement: kilobytes on the wire, `w*h*4` bytes charged against the
+/// decode budget. The asymmetry a hostile pane exploits.
+fn kitty_png(w: u32, h: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (!(crc & 1)).wrapping_add(1));
+            }
+        }
+        !crc
+    }
+    fn chunk(kind: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = (data.len() as u32).to_be_bytes().to_vec();
+        let body: Vec<u8> = kind.iter().chain(data).copied().collect();
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+        out
+    }
+    use std::io::Write as _;
+    let mut ihdr = w.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]); // 8-bit greyscale
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    let row = vec![0u8; w as usize + 1];
+    for _ in 0..h {
+        z.write_all(&row).expect("deflate");
+    }
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend(chunk(b"IHDR", &ihdr));
+    png.extend(chunk(b"IDAT", &z.finish().expect("deflate")));
+    png.extend(chunk(b"IEND", b""));
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    let bytes = b64.as_bytes();
+    let total = bytes.len().div_ceil(4096).max(1);
+    let mut out = Vec::new();
+    for (i, c) in bytes.chunks(4096).enumerate() {
+        let more = u8::from(i + 1 < total);
+        let payload = std::str::from_utf8(c).expect("base64 is ascii");
+        let head = if i == 0 {
+            format!("a=T,f=100,t=d,s={w},v={h},i=9,C=1,m={more}")
+        } else {
+            format!("a=T,i=9,m={more}")
+        };
+        out.extend_from_slice(format!("\x1b_G{head};{payload}\x1b\\").as_bytes());
     }
     out
 }
@@ -372,4 +425,56 @@ fn the_image_tracks_the_cursor_following_viewport() {
         tops[1].0, 0,
         "the image stayed on screen after the viewport scrolled past it"
     );
+}
+
+/// A greedy pane must not delete its neighbour's picture.
+///
+/// The decode budget is per PANE. Shared across the window it was worse than
+/// the stall it bounds: four hostile placements in the pane that composes first
+/// took the whole budget, the neighbour's picture vanished from `window
+/// snapshot` while `pane snapshot` still drew it, and swapping the panes
+/// reversed which one survived.
+#[test]
+fn a_greedy_pane_does_not_starve_its_neighbours_picture() {
+    let s = split();
+    let mut lvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    let mut rvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    probe_text(&mut lvt);
+    probe_text(&mut rvt);
+
+    // Four maximal placements: each declares 4096x4096 -- the full per-image
+    // ceiling -- and `C=1` keeps them all on screen. They must be PNG: raw RGBA
+    // at that size is 89 MB of base64 and the assembler's 32 MiB cap refuses
+    // it, which is how the first version of this test passed on the defect.
+    let hostile = kitty_png(4096, 4096);
+    for _ in 0..4 {
+        lvt.process(b"\x1b[H");
+        lvt.process(&hostile);
+    }
+    // The victim: one ordinary picture in the OTHER pane.
+    rvt.process(b"\x1b[H");
+    rvt.process(&kitty_image(90, 190, MAGENTA, false));
+
+    let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
+    let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
+
+    // Both orders: the defect was order-dependent, so a single arrangement
+    // would have passed on the shared budget half the time.
+    for (name, l, r) in [
+        ("victim second", (&lg, &lc), (&rg, &rc)),
+        ("victim first", (&rg, &rc), (&lg, &lc)),
+    ] {
+        let (img, cw, ch) = window_png(&s, l, r, 14.0);
+        let victim = if name == "victim second" {
+            s.right_rect
+        } else {
+            s.left_rect
+        };
+        let m = magenta(&img, victim, cw, ch);
+        assert!(
+            m.inside > 0,
+            "{name}: the neighbouring pane's picture was starved by a greedy pane"
+        );
+        assert_eq!(m.outside, 0, "{name}: the picture escaped its pane");
+    }
 }

@@ -32,13 +32,51 @@ canvas-clip finding). The design step is satisfied.
 Commit `4da4e13` acts on a `shux-simplify-architect` pass; commit `3d46d74` is a
 second pruning pass. Advisory, no verdict owed.
 
-## Step 7 — council on the implementation diff (NOT COMPLETE AT AUDIT TIME)
+## Step 7 — council on the implementation diff (SUBSTITUTED, evidence present)
 
-At the audited HEAD (`3d46d74`) there is no implementation-diff council record
-in the repository, and none was available to this audit. The parent agent
-reported two adversarial agents running in their own worktrees under
-`.claude/worktrees/` while this audit ran; their output did not exist when the
-audit closed and was therefore not read, not reproduced, and not judged.
+Re-audited at `c836d8a`. The step is now evidenced and the `3d46d74` finding
+P2-1 is closed.
 
-This file does not attest to a completed implementation-diff review. It records
-that the step was in flight. See finding P2-1 in `SOLID-QA.md`.
+Two adversarial reviews of the implementation diff completed after `3d46d74`, on
+disjoint surfaces, and both landed measured findings that `c836d8a` applies:
+
+- **the production wiring surface** — `snapshot.rs`'s single
+  `composite_composed` call is what makes `window.snapshot` and
+  `session.snapshot` draw anything, and no test reached it; deleting the line
+  left the whole `shux` crate green at 896 tests. This is the same defect the
+  `3d46d74` gate raised as P1-1, found independently. Applied as
+  `crates/shux/tests/window_snapshot_image_rpc.rs`, a daemon-backed black-box
+  test on the real RPCs. **Re-verified by this gate**: the mutation is now caught
+  with `window.snapshot returned a frame with no picture (0 px); pane.snapshot
+  has 10260`, while the three in-process tests stay green.
+- **the decode-cost surface** — `blit` decodes and rescales a whole bitmap
+  before the clip narrows it, and the 64 MiB ceiling is per IMAGE while a
+  composed frame gathers every placement of every pane. Measured end to end on
+  the real binary: four panes each printing six 4096×4096 PNGs took 3.344 /
+  3.310 / 3.356 s per `window snapshot`, against 0.667 / 0.645 / 0.637 s with a
+  per-render budget. The commit records two earlier attempts at that measurement
+  that measured nothing, and why — an honest negative result, which is what a
+  real review round looks like.
+
+Applied as `MAX_RENDER_DECODE_BYTES`.
+
+**This gate's judgement on the second finding is that the review was right about
+the problem and the fix is wrong about its scope.** The budget is reset per
+render, so the composed path spends one 256 MiB across every pane while the
+single-pane path gives each pane its own — which lets one pane delete a
+neighbour's picture from `window.snapshot` while `pane.snapshot` still draws it.
+Reproduced, dose-responded and A/B'd against `3d46d74` in `SOLID-QA.md` §6 as
+P1-1. Neither review caught that, and no test can: mutation M16b shows the
+budget's accumulation branch is reached by zero tests (P2-1).
+
+So: the step is done, and its output is recorded here rather than asserted. What
+it did not catch is a finding of this audit, not a gap in the substitution.
+
+## Step 7 note on the substitution itself
+
+`dootsabha` remains uninstalled (`command -v dootsabha` → not found). Per
+CLAUDE.md *Tooling fallbacks*, parallel adversarial agents on disjoint surfaces
+serve the step, and the substitution is named in the PR rather than skipped. The
+two reviews above are that substitution; their findings were reproduced by this
+gate before being believed, per *Reproduce before believing — including your own
+findings*.

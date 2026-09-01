@@ -51,6 +51,7 @@ libc = "0.2"
 tempfile.workspace = true
 
 [dev-dependencies]
+flate2 = "1"
 tempfile.workspace = true
 base64 = "0.22"
 

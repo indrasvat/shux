@@ -1,9 +1,11 @@
 {
   "scope": "multipane-image-clip",
   "base": "0e97d24",
-  "audited_head": "3d46d74",
+  "audited_head": "c836d8a",
+  "previously_audited_head": "3d46d74",
   "branch": "claude/shux-image-support-s0u4uy",
   "verdict": "FAIL",
+  "audit_kind": "scoped re-audit of 3d46d74..c836d8a",
   "solid_qa_report": "SOLID-QA.md",
   "dootsabha_design": "council-substitution.md",
   "dootsabha_implementation": "council-substitution.md",
@@ -35,6 +37,57 @@
     "pixel-richtui-ab-vivecaka.json",
     "pixel-session-vs-window-c120x40-big.json"
   ],
+  "pixel_metrics_reverified_at_head": {
+    "note": "Re-derived from scratch with the c836d8a release binary and compared field-by-field against the committed JSONs above. 9/9 numerically identical on status, changed_pixels, pixel_diff_ratio, mean_rgba_channel_delta, total_pixels, size and both thresholds. Only the recorded file paths differ (the committed copies were relativized).",
+    "reverified": [
+      "pixel-crosspath-c80x24-small.json",
+      "pixel-crosspath-c80x24-big.json",
+      "pixel-crosspath-c120x40-small.json",
+      "pixel-crosspath-c120x40-big.json",
+      "pixel-crosspath-c200x60-small.json",
+      "pixel-crosspath-c200x60-big.json",
+      "pixel-outside-pane-80x24-big.json",
+      "pixel-outside-pane-120x40-big.json",
+      "pixel-outside-pane-200x60-big.json"
+    ],
+    "fresh_copies": ".shux/out/multipane-image-clip/metrics/"
+  },
+  "p1_evidence_scratch": {
+    "note": "P1-1 is a FAILING pixel metric, so it is deliberately NOT committed here: .shux/qa/ metrics must be exact 0/0 pass. The three arms share one crop geometry and one set of exact thresholds, which is what proves the comparator can both pass and fail.",
+    "dir": ".shux/out/multipane-image-clip/budget/",
+    "metrics": {
+      "pixel-budget-dose3.json": "control, c836d8a, 192 MiB charged - 0 changed px, pass",
+      "pixel-budget-prebudget4.json": "A/B, 3d46d74, identical 256 MiB scene - 0 changed px, pass",
+      "pixel-budget-dose4.json": "defect, c836d8a, 256 MiB charged - 17100 changed px, ratio 0.0521, FAIL"
+    },
+    "frames": [
+      "dose4-window.png", "dose4-paneR.png", "dose4-session.png",
+      "dose3-window.png", "dose3-paneR.png",
+      "prebudget4-window.png", "prebudget4-paneR.png",
+      "swap-window.png", "samepane-paneL.png",
+      "dose4-diff.png"
+    ],
+    "drivers": ["attack.sh", "count.py", "icat_probe.sh"],
+    "measurements": ["icat-declared-size.json", "attack-hygiene.txt", "*-timing.txt"]
+  },
+  "mutations_rerun": {
+    "worktree": "/tmp/shux-mut (detached at c836d8a, shared CARGO_TARGET_DIR, no file under /home/user/shux/crates modified)",
+    "M8_snapshot_no_call": "CAUGHT - exit 100, 'window.snapshot returned a frame with no picture (0 px); pane.snapshot has 10260'; the 3 in-process tests stayed green. Closes the 3d46d74 P1.",
+    "M16_panic_any_budget": "CAUGHT by shux-raster::png_bomb only, cost=u64::MAX - the pre-existing oversize refusal, behaviour-preserving.",
+    "M16b_panic_accumulation_only": "SURVIVED - 911 + 4 tests green. The budget's accumulation branch is reached by ZERO tests (P2-1)."
+  },
+  "logs": {
+    "release_build": ".shux/out/multipane-image-clip/reaudit-release-build.log",
+    "make_target": ".shux/out/multipane-image-clip/reaudit-make-target.log",
+    "unit_touched_crates": ".shux/out/multipane-image-clip/reaudit-unit-touched.log",
+    "mutation_M8": ".shux/out/multipane-image-clip/reaudit-mut-M8.log",
+    "mutation_M16": ".shux/out/multipane-image-clip/reaudit-mut-M16-panic.log",
+    "mutation_M16b": ".shux/out/multipane-image-clip/reaudit-mut-M16b-accum-panic.log",
+    "runall_at_head": ".shux/out/multipane-image-clip/reaudit-runall.log",
+    "prebudget_build": ".shux/out/multipane-image-clip/reaudit-prebudget-build.log",
+    "head_rebuild": ".shux/out/multipane-image-clip/reaudit-head-rebuild.log",
+    "checkpoint": ".shux/out/multipane-image-clip/REAUDIT-CHECKPOINT.md"
+  },
   "scratch": ".shux/out/multipane-image-clip/",
-  "notes": "FAIL on P1-1: crates/shux/src/snapshot.rs:298 is the only production caller of Rasterizer::composite_composed and no test reaches it - removing that line leaves all 896 shux-crate tests green (mut-M8-full-shux-crate.log). Behaviour itself could not be falsified: 25 exact 0/0 metrics across 3 viewports, 5 config states, a live hot reload, 5 committed rich-TUI raw replays, a zoomed pane and a real kitten icat workload. No screenshot is committed: no metric compares against a baseline this repo tracks, so per .shux/qa/README.md the metric JSONs stand alone. Comparators proven falsifiable against a clip-removed build of this HEAD, against the origin/main binary, and against empty and missing input (.shux/out/multipane-image-clip/metrics/NEGCTL-*). dootsabha is not installed; see council-substitution.md - the design step is substituted and evidenced, the implementation-diff step was still in flight at 3d46d74 (P2-1)."
+  "notes": "FAIL on P1-1, NEW in c836d8a and a regression against 3d46d74: MAX_RENDER_DECODE_BYTES is reset per RENDER, so composite_placements gives each pane 256 MiB while composite_composed spends one 256 MiB across every pane first-come-first-served. A pane that charges the budget - 4 solid 4096x4096 PNGs, 405 KB on the wire, charged by declared s=/v= rather than payload - silently deletes a NEIGHBOUR pane's picture from window.snapshot and session.snapshot while pane.snapshot still draws it. Dose response 1/2/3 hostile -> 17100 px, 4 -> 0; the identical scene on the 3d46d74 binary keeps 17100. Order dependent: swapping the panes reverses it. Also starves within one pane, so pane.snapshot / lens glance / pane diff --heat are affected too. This breaks claim 1 of the 3d46d74 audit, the cross-path identity that 18 of the 25 committed metrics assert. The stall mitigation itself is real and independently measured (802 ms -> 368 ms at 24 placements); the defect is the budget's SCOPE. Budgeting per pane inside composite_composed restores identity by construction. Secondary: P2-1 the budget's accumulation branch is reached by zero tests (M16b survived); P2-2 the 'kitten icat photo decodes to ~1 MB' figure in the source is ~10x optimistic - measured 9.27 MiB for a real icat into a 200x55 pane. CLOSED from 3d46d74: P1-1 unpinned production call site (M8 re-run, caught) and P2-1 implementation-diff council (council-substitution.md section 7). dootsabha is not installed; both council steps are substituted and evidenced."
 }
