@@ -209,7 +209,6 @@ impl AttachClient {
                     cols: 100,
                     rows: 30,
                     client_version: "p4-gating-test".into(),
-                    graphics: false,
                 };
                 let payload = serde_json::to_vec(&hello).expect("serialize hello");
                 if let Err(e) = framed.send(bytes::Bytes::from(payload)).await {

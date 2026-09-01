@@ -185,13 +185,13 @@ fn picture(img: &image::RgbaImage, r: Rect, cw: u32, ch: u32) -> Vec<((u32, u32)
 
 /// A PNG placement: kilobytes on the wire, `w*h*4` bytes charged against the
 /// decode budget. The asymmetry a hostile pane exploits.
-fn kitty_png(w: u32, h: u32) -> Vec<u8> {
-    kitty_png_rgb(w, h, [0, 0, 0])
+fn kitty_png(w: u32, h: u32, id: u32) -> Vec<u8> {
+    kitty_png_rgb(w, h, [0, 0, 0], id)
 }
 
 /// The same, in a nameable colour, so which placements reached the canvas is
 /// recoverable rather than merely counted.
-fn kitty_png_rgb(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+fn kitty_png_rgb(w: u32, h: u32, rgb: [u8; 3], id: u32) -> Vec<u8> {
     fn crc32(bytes: &[u8]) -> u32 {
         let mut crc = !0u32;
         for &b in bytes {
@@ -234,9 +234,9 @@ fn kitty_png_rgb(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
         let more = u8::from(i + 1 < total);
         let payload = std::str::from_utf8(c).expect("base64 is ascii");
         let head = if i == 0 {
-            format!("a=T,f=100,t=d,s={w},v={h},i=9,C=1,m={more}")
+            format!("a=T,f=100,t=d,s={w},v={h},i={id},C=1,m={more}")
         } else {
-            format!("a=T,i=9,m={more}")
+            format!("a=T,i={id},m={more}")
         };
         out.extend_from_slice(format!("\x1b_G{head};{payload}\x1b\\").as_bytes());
     }
@@ -455,10 +455,12 @@ fn a_greedy_pane_does_not_starve_its_neighbours_picture() {
     // ceiling -- and `C=1` keeps them all on screen. They must be PNG: raw RGBA
     // at that size is 89 MB of base64 and the assembler's 32 MiB cap refuses
     // it, which is how the first version of this test passed on the defect.
-    let hostile = kitty_png(4096, 4096);
-    for _ in 0..4 {
+    // A distinct id per placement: re-transmitting one id replaces that image
+    // and every placement of it, so a shared id would collapse these four into
+    // one and the budget would never be reached.
+    for id in 1..=4u32 {
         lvt.process(b"\x1b[H");
-        lvt.process(&hostile);
+        lvt.process(&kitty_png(4096, 4096, id));
     }
     // The victim: one ordinary picture in the OTHER pane.
     rvt.process(b"\x1b[H");
@@ -508,9 +510,9 @@ fn the_decode_budget_refuses_past_its_ceiling_identically_on_both_paths() {
     let s = split();
     let mut vt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
     probe_text(&mut vt);
-    for hue in HUES {
+    for (n, hue) in HUES.iter().enumerate() {
         vt.process(b"\x1b[H");
-        vt.process(&kitty_png_rgb(4096, 4096, hue));
+        vt.process(&kitty_png_rgb(4096, 4096, *hue, n as u32 + 1));
     }
 
     let count = |img: &image::RgbaImage, hue: [u8; 3]| {

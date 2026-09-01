@@ -105,9 +105,8 @@ fn workload() -> String {
     )
 }
 
-/// Collect the bytes the daemon would have written to a terminal, for a client
-/// that either did or did not answer the graphics probe.
-async fn render_bytes(h: &Harness, session: &str, graphics: bool) -> Vec<u8> {
+/// Collect the bytes the daemon would have written to a terminal.
+async fn render_bytes(h: &Harness, session: &str) -> Vec<u8> {
     let sock = h.runtime_dir().join("shux").join("attach.sock");
     let stream = UnixStream::connect(&sock).await.expect("connect attach");
     let mut framed = Framed::new(stream, shux_rpc::create_codec());
@@ -117,7 +116,6 @@ async fn render_bytes(h: &Harness, session: &str, graphics: bool) -> Vec<u8> {
         cols: 100,
         rows: 30,
         client_version: "image-retransmit-test".to_string(),
-        graphics,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
@@ -174,7 +172,7 @@ async fn a_real_attach_carries_a_panes_picture_to_the_terminal() {
         serde_json::json!({ "name": "img-attach", "command": workload() }),
     );
 
-    let bytes = render_bytes(&h, "img-attach", true).await;
+    let bytes = render_bytes(&h, "img-attach").await;
     assert!(
         find(&bytes, b"\x1b_Ga=T"),
         "the daemon sent an attached client no picture at all"
@@ -190,29 +188,4 @@ async fn a_real_attach_carries_a_panes_picture_to_the_terminal() {
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("38;2;120;220;180"), "truecolor probe missing");
     assert!(text.contains("38;5;208"), "indexed probe missing");
-}
-
-#[tokio::test]
-async fn a_client_that_never_answered_the_probe_is_sent_no_pictures() {
-    let h = Harness::new();
-    h.rpc(
-        "session.create",
-        serde_json::json!({ "name": "img-noprobe", "command": workload() }),
-    );
-
-    let bytes = render_bytes(&h, "img-noprobe", false).await;
-    assert!(
-        !find(&bytes, b"\x1b_G"),
-        "sent graphics to a client whose terminal never claimed to draw them"
-    );
-    // …but it is still a working attach. The compositor writes one CUP per
-    // cell, so the probe words are never contiguous in this stream — the SGR
-    // introducers are what survive, and they are what a monochrome regression
-    // would lose.
-    let text = String::from_utf8_lossy(&bytes);
-    assert!(
-        text.contains("38;2;120;220;180"),
-        "the pane's colour never arrived"
-    );
-    assert!(text.contains("38;5;208"), "indexed colour never arrived");
 }

@@ -13,12 +13,11 @@ pub mod client;
 pub mod composed;
 pub mod compositor;
 pub mod copy_mode;
-pub mod graphics_probe;
 pub mod help_overlay;
 pub mod input;
 pub mod keybinding;
 pub mod keys;
-pub mod kitty_emit;
+pub(crate) mod kitty_emit;
 pub mod render;
 pub mod statusbar;
 pub mod terminal;
@@ -29,7 +28,7 @@ pub mod vt_convert;
 pub use borders::{BorderChars, BorderColors, BorderSegment, BorderStyle, compute_borders};
 pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
 pub use client::{ClientConfig, ExitReason};
-pub use composed::{ComposeInputs, ComposedFrame, compose, resolve_placements};
+pub use composed::{ComposeInputs, ComposedFrame, compose};
 pub use compositor::{
     CompositorConfig, MultiPaneFrame, RenderCompositor, RenderStats, pane_viewport,
 };

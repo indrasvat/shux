@@ -491,6 +491,9 @@ pub struct Placement {
     pub image: std::sync::Arc<crate::graphics::image::StoredImage>,
     pub abs_row: u64,
     pub col: usize,
+    /// The client's `i=`, or 0 for none. Re-transmitting an id replaces that
+    /// image and its placements, so this is the identity `place` matches on.
+    pub image_id: u32,
 }
 
 impl Placement {
@@ -572,6 +575,20 @@ impl Grid {
     /// pass per snapshot, so neither cap alone suffices.
     pub(crate) fn place(&mut self, p: Placement) -> bool {
         self.prune_evicted_placements();
+        // "The existing image and all its placements are deleted; the new data
+        // replaces the old." An app that redraws under one id would otherwise
+        // spend a slot per frame -- terminal-browser sends `i=1` on every one.
+        if p.image_id != 0 {
+            let id = p.image_id;
+            let freed: usize = self
+                .placements
+                .iter()
+                .filter(|q| q.image_id == id)
+                .map(|q| q.image.payload.len())
+                .sum();
+            self.placements.retain(|q| q.image_id != id);
+            self.placed_bytes = self.placed_bytes.saturating_sub(freed);
+        }
         let cost = p.image.payload.len();
         if self.placements.len() >= MAX_PLACEMENTS
             || self.placed_bytes + cost > crate::graphics::image::MAX_IMAGE_BYTES

@@ -25,9 +25,7 @@ fn make_compositor(width: u16, height: u16) -> RenderCompositor<Cursor<Vec<u8>>>
         border_style: BorderStyle::None,
         ..Default::default()
     };
-    let mut c = RenderCompositor::new(width, height, Cursor::new(Vec::new()), cfg);
-    c.set_graphics(true);
-    c
+    RenderCompositor::new(width, height, Cursor::new(Vec::new()), cfg)
 }
 
 /// A real kitty transmit-and-display command, as a pane's application sends it:
@@ -109,28 +107,11 @@ fn an_image_in_a_pane_reaches_the_attached_terminal() {
     assert!(cmd.contains("s=18,v=38"), "{cmd}");
     // 18x38 at the declared 9x19 cell is exactly 2x2 cells.
     assert!(cmd.contains("c=2,r=2"), "{cmd}");
-}
-
-#[test]
-fn the_cursor_is_pinned_and_the_host_kept_quiet() {
-    let p = pane(1);
-    let layout = LayoutNode::leaf(p);
-    let mut vt = VirtualTerminal::new(10, 20);
-    vt.process(&kitty_rgb(9, 19, [10, 220, 10]));
-    let mut vts = HashMap::new();
-    vts.insert(p, &vt);
-
-    let mut c = make_compositor(20, 10);
-    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
-    let out = drain(&mut c);
-
-    for cmd in graphics(&out) {
-        // Without C=1 kitty advances the cursor and scrolls the user's whole
-        // screen when the image sits at the bottom margin; without q=2 its
-        // `OK` is decoded as keystrokes and typed into the pane.
-        assert!(cmd.contains("C=1"), "no C=1 in {cmd}");
-        assert!(cmd.contains("q=2"), "no q=2 in {cmd}");
-    }
+    // Without C=1 kitty advances the cursor and scrolls the user's whole
+    // screen for an image at the bottom margin; without q=2 its `OK` is
+    // decoded as keystrokes and typed into the pane.
+    assert!(cmd.contains("C=1"), "{cmd}");
+    assert!(cmd.contains("q=2"), "{cmd}");
 }
 
 #[test]
@@ -236,9 +217,7 @@ fn a_picture_scrolled_above_its_pane_is_drawn_from_where_it_enters() {
     let mut c = make_compositor(20, 6);
     c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
     let cmds = graphics(&drain(&mut c));
-    if cmds.is_empty() {
-        return; // scrolled clean off; nothing to draw is also correct
-    }
+    assert_eq!(cmds.len(), 1, "the fixture scrolled clean off: {cmds:?}");
     let cmd = &cmds[0];
     let y: u32 = cmd
         .split(',')
@@ -287,26 +266,6 @@ fn a_second_panes_picture_stays_out_of_its_neighbour() {
         left.width,
         cmds[0]
     );
-}
-
-#[test]
-fn a_terminal_that_cannot_draw_images_is_sent_none() {
-    let p = pane(1);
-    let layout = LayoutNode::leaf(p);
-    let mut vt = VirtualTerminal::new(10, 20);
-    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
-    let mut vts = HashMap::new();
-    vts.insert(p, &vt);
-
-    let mut c = make_compositor(20, 10);
-    c.set_graphics(false);
-    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
-    let out = drain(&mut c);
-    assert!(
-        !out.contains("\x1b_G"),
-        "emitted graphics to a terminal that never answered the probe"
-    );
-    assert!(out.contains('\x1b'), "wrote no cells either");
 }
 
 #[test]

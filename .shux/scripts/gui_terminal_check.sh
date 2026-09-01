@@ -47,6 +47,10 @@ gui_terminal_check.sh — photograph shux in a real GUI terminal (issue #175).
   --scenario S   plain            (default) shux alone, at four window sizes
                  image-contained  an injected image bounded by a cell box; must pass
                  image-overflow   the same image unbounded; MUST fail on containment
+                 image-pane       the SAME unbounded image, drawn by a PANE and
+                                  re-emitted by shux; must pass. Paired with
+                                  image-overflow that is the whole claim: identical
+                                  bytes, contained only when shux emits them
   --frames N     frames per phase (default 3)
   --out DIR      where frames and run.json go
                  (default .shux/out/gui-terminal/<scenario>)
@@ -85,10 +89,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "${scenario}" in
-    plain | image-contained | image-overflow) ;;
+    plain | image-contained | image-overflow | image-pane) ;;
     *)
         echo "gui_terminal_check: unknown scenario: ${scenario}" >&2
-        echo "  expected one of: plain, image-contained, image-overflow" >&2
+        echo "  expected one of: plain, image-contained, image-overflow, image-pane" >&2
         exit 2
         ;;
 esac
@@ -374,7 +378,7 @@ echo "    display: ${display} (Xvfb pid ${xvfb_pid})"
 sx session create "${session}" -d --title "shux-gui-rig" -- \
     env TERM=xterm-256color COLORTERM=truecolor LANG=C.utf8 LC_ALL=C.utf8 \
     HOME="${runtime}" bash "${workload_sh}" "${CONTENT_RGB//,/;}" \
-    "${BLOCK_COLS}" "${BLOCK_ROWS}" "${marker}" >/dev/null
+    "${BLOCK_COLS}" "${BLOCK_ROWS}" "${marker}" "${pane_payload}" >/dev/null
 
 # ONE pane, asserted rather than assumed. `find_rect` takes the outermost rules
 # of the border mask, so with two panes it measures the UNION of their outlines
@@ -397,10 +401,15 @@ sx pane wait-for -s "${session}" -p "${pane_id}" -t "${marker}" --timeout-ms 300
     fail "workload never reached its marker"
 
 # ── The real GUI terminal ───────────────────────────────────────────────────
+# The sidecar shares kitty's terminal to put bytes on screen that shux never
+# saw. `image-pane` is the opposite: the bytes go INTO a pane and must reach the
+# screen through shux's own emit, so it takes no sidecar.
 launch_payload="-"
-if [ "${scenario}" != "plain" ]; then
-    launch_payload="${payload_file}"
-fi
+pane_payload=""
+case "${scenario}" in
+    image-contained | image-overflow) launch_payload="${payload_file}" ;;
+    image-pane) pane_payload="${payload_file}" ;;
+esac
 
 # Mesa software GL: there is no GPU in CI or in the cloud container.
 # `--config NONE` so a developer's kitty.conf cannot move the geometry every
@@ -672,10 +681,15 @@ else
         fail "pane ${cols}x${rows} is too small to place an injection payload in"
     fi
 
-    if [ "${scenario}" = "image-overflow" ]; then
+    if [ "${scenario}" = "image-overflow" ] || [ "${scenario}" = "image-pane" ]; then
         # Natural pixel size from a cell near the bottom-right of the pane. At
         # this font 320x240 px is roughly 32x13 cells, so it runs off the right
         # border and down through the status bar — the #175 defect.
+        #
+        # `image-pane` uses the SAME unbounded payload deliberately. Sent to the
+        # emulator it overflows; sent to a PANE it must not, because shux clips
+        # it into a source rectangle before re-emitting. Identical bytes, and
+        # the only difference is who emits them.
         "${payload_py}" --rgb "${IMAGE_RGB}" --px 320x240 \
             --at "$((rows - 2)),$((cols - 8))" --out "${payload_file}"
     else
@@ -685,18 +699,26 @@ else
             --at "9,4" --cell-box 10x5 --out "${payload_file}"
     fi
 
-    : >"${go_file}"
-    for _ in $(seq 1 80); do
-        [ -e "${go_file}.done" ] && break
-        kill -0 "${kitty_pid}" 2>/dev/null ||
-            fail "kitty exited during injection: $(cat "${kitty_log}")"
-        sleep 0.25
-    done
-    [ -e "${go_file}.done" ] ||
-        fail "the injector never wrote its receipt (log: ${inject_log})"
-    sleep 1
+    if [ "${scenario}" = "image-pane" ]; then
+        # The workload is waiting on this receipt. From here the bytes are pane
+        # OUTPUT, so everything that puts them on screen is shux's own emit.
+        : >"${payload_file}.ready"
+        sx pane wait-settled "${pane_id}" --quiet 400 --timeout 15000 >/dev/null 2>&1 || true
+        record_phase "pane" 1
+    else
+        : >"${go_file}"
+        for _ in $(seq 1 80); do
+            [ -e "${go_file}.done" ] && break
+            kill -0 "${kitty_pid}" 2>/dev/null ||
+                fail "kitty exited during injection: $(cat "${kitty_log}")"
+            sleep 0.25
+        done
+        [ -e "${go_file}.done" ] ||
+            fail "the injector never wrote its receipt (log: ${inject_log})"
+        sleep 1
 
-    record_phase "inject" 1
+        record_phase "inject" 1
+    fi
 fi
 
 # ── Verdict ─────────────────────────────────────────────────────────────────

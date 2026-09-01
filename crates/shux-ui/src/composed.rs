@@ -201,12 +201,13 @@ pub fn compose(
     }
 }
 
-/// Rebase one pane's placements into the frame that shows it.
-///
-/// `row_offset` is the vertical clip the caller applied to the pane's cells;
-/// both composers here and in `compositor` derive it the same way, and a
-/// picture that did not undo it would sit `row_offset` rows off its text.
-pub fn resolve_placements(rect: Rect, src: &Grid, row_offset: usize) -> Vec<ComposedPlacement> {
+/// Rebase one pane's placements into the frame that shows it. `row_offset` is
+/// the vertical clip the caller applied to the pane's cells.
+pub(crate) fn resolve_placements(
+    rect: Rect,
+    src: &Grid,
+    row_offset: usize,
+) -> Vec<ComposedPlacement> {
     // `min` with the source dims: a pane grid can be smaller than its rect
     // during a resize lag, and a picture must not paint area it does not own.
     let clip = CellRect {

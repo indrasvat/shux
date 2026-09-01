@@ -4,10 +4,10 @@
 //! attached client renders every pane's text and none of its pictures.
 //!
 //! Payloads leave here exactly as they arrived — still deflated, still PNG —
-//! so nothing decodes on this path. The pane clip is a source rectangle
-//! (`x/y/w/h`) rather than a cropped bitmap, which is how zellij bounds a
-//! placement to its pane; `c=`/`r=` only ever STRETCH into a cell box, so a
-//! picture taller than its pane would otherwise paint over the status bar.
+//! and the pane clip is a source rectangle (`x/y/w/h`) rather than a cropped
+//! bitmap, which is how zellij bounds a placement to its pane. `c=`/`r=` only
+//! ever STRETCH into a cell box, so nothing else stops a picture taller than
+//! its pane painting over the status bar.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -15,13 +15,12 @@ use std::sync::Arc;
 use base64::Engine as _;
 use shux_vt::{ComposedPlacement, DECLARED_CELL_PIXELS, ImageFormat, StoredImage};
 
-/// Base64 bytes per chunk. The protocol's maximum, and konsole caps control
+/// Base64 bytes per chunk: the protocol's maximum, and konsole caps control
 /// data at 1024 so nothing larger is portable anyway.
 const CHUNK: usize = 4096;
 
 /// Host image ids start here so they cannot collide with the ids a pane's own
-/// application chose. Panes address the host only through shux, but the user's
-/// terminal may be shared with a sibling program.
+/// application chose for the same terminal.
 const HOST_ID_BASE: u32 = 2_000_000_000;
 
 /// Where one placement was put, in the terms the host was told.
@@ -29,7 +28,9 @@ const HOST_ID_BASE: u32 = 2_000_000_000;
 struct Placed {
     row: u16,
     col: u16,
-    src: (u32, u32, u32, u32),
+    /// Source rectangle as `y, w, h`. No `x`: a placement can never start left
+    /// of its own clip, the same invariant `shux-raster`'s `blit` relies on.
+    src: (u32, u32, u32),
     cells: (u16, u16),
 }
 
@@ -44,48 +45,26 @@ struct Live {
 
 /// What the user's terminal currently holds, for one attach.
 #[derive(Default)]
-pub struct KittyEmitter {
-    enabled: bool,
+pub(crate) struct KittyEmitter {
     live: Vec<Live>,
     next_id: u32,
 }
 
 impl KittyEmitter {
-    /// Gate every emission on the client's probe. A terminal that cannot draw
-    /// images must not be sent megabytes it will discard.
-    pub fn set_enabled(&mut self, enabled: bool) {
-        if !enabled {
-            self.live.clear();
-        }
-        self.enabled = enabled;
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    /// Forget what the host holds, forcing a full re-transmit.
-    ///
-    /// Every caller is a case where the host may have dropped the pixels, not
-    /// just the placements: `CSI 2J` frees images outright, and the alternate
-    /// screen keeps a separate store that is wiped on entry.
-    pub fn invalidate(&mut self) {
-        self.live.clear();
-    }
-
-    /// Emit whatever this frame changed. Nothing at all when it changed nothing.
-    ///
-    /// Only reached when [`Self::enabled`] holds: the caller checks it first to
-    /// skip resolving placements it would then throw away.
-    pub fn emit(
+    /// Emit whatever this frame changed, and report whether it wrote anything.
+    pub(crate) fn emit(
         &mut self,
         out: &mut impl Write,
         placements: &[ComposedPlacement],
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let want: Vec<(&ComposedPlacement, Placed)> = placements
             .iter()
             .filter_map(|p| resolve(p).map(|r| (p, r)))
             .collect();
+        if want.is_empty() && self.live.is_empty() {
+            return Ok(false);
+        }
+        let mut wrote = false;
 
         for (i, (p, placed)) in want.iter().enumerate() {
             match self.live.get(i) {
@@ -105,30 +84,29 @@ impl KittyEmitter {
                     let id = self.take_id();
                     transmit(out, id, &p.image, placed)?;
                     // Only now is the replacement up: re-transmitting under a
-                    // live id would have freed the old image and its placement
-                    // on the first chunk, blanking the pane for the transfer.
+                    // live id frees the old image and its placement on the
+                    // FIRST chunk, blanking the pane for the whole transfer.
+                    let fresh = Live {
+                        image: p.image.clone(),
+                        host_id: id,
+                        placed: *placed,
+                    };
                     if let Some(old) = self.live.get(i) {
                         delete(out, old.host_id)?;
-                        self.live[i] = Live {
-                            image: p.image.clone(),
-                            host_id: id,
-                            placed: *placed,
-                        };
+                        self.live[i] = fresh;
                     } else {
-                        self.live.push(Live {
-                            image: p.image.clone(),
-                            host_id: id,
-                            placed: *placed,
-                        });
+                        self.live.push(fresh);
                     }
                 }
             }
+            wrote = true;
         }
 
         for gone in self.live.drain(want.len()..) {
             delete(out, gone.host_id)?;
+            wrote = true;
         }
-        Ok(())
+        Ok(wrote)
     }
 
     fn take_id(&mut self) -> u32 {
@@ -138,20 +116,16 @@ impl KittyEmitter {
     }
 }
 
-/// Intersect a placement with its pane, in the host's terms.
-///
-/// `None` once nothing of it is left inside the pane. Rows can start above the
-/// clip — a picture taller than its pane anchors there — so the skipped rows
-/// become the source rectangle's `y`.
+/// Intersect a placement with its pane. `None` once nothing of it is left
+/// inside; rows above the clip become the source rectangle's `y`.
 fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     let (cw, ch) = DECLARED_CELL_PIXELS;
     let clip_top = p.clip.row as i64;
-    let clip_bottom = clip_top + p.clip.rows as i64;
     let nat_rows = p.image.height.div_ceil(ch).max(1) as i64;
     let nat_cols = p.image.width.div_ceil(cw).max(1) as i64;
 
     let top = p.row.max(clip_top);
-    let bottom = (p.row + nat_rows).min(clip_bottom);
+    let bottom = (p.row + nat_rows).min(clip_top + p.clip.rows as i64);
     let rows = (bottom - top).max(0);
     let right = ((p.col + nat_cols as usize).min(p.clip.col + p.clip.cols)) as i64;
     let cols = (right - p.col as i64).max(0);
@@ -170,18 +144,18 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
     Some(Placed {
         row: u16::try_from(top).ok()?,
         col: u16::try_from(p.col).ok()?,
-        src: (0, y, w, h),
+        src: (y, w, h),
         cells: (u16::try_from(cols).ok()?, u16::try_from(rows).ok()?),
     })
 }
 
 /// `C=1` so display never moves the host's cursor: kitty otherwise advances it
-/// and scrolls the whole screen when the image sits at the bottom margin.
-/// `q=2` so the host's `OK` never lands in the client's key decoder.
+/// and scrolls the whole screen for an image at the bottom margin. `q=2` so the
+/// host's `OK` never lands in the client's key decoder.
 fn keys(p: &Placed) -> String {
-    let (x, y, w, h) = p.src;
+    let (y, w, h) = p.src;
     let (c, r) = p.cells;
-    format!("p=1,C=1,q=2,x={x},y={y},w={w},h={h},c={c},r={r}")
+    format!("p=1,C=1,q=2,y={y},w={w},h={h},c={c},r={r}")
 }
 
 fn cup(out: &mut impl Write, p: &Placed) -> io::Result<()> {
@@ -197,13 +171,12 @@ fn transmit(out: &mut impl Write, id: u32, img: &StoredImage, placed: &Placed) -
     let zlib = if img.compressed { ",o=z" } else { "" };
     let b64 = base64::engine::general_purpose::STANDARD.encode(&img.payload);
     let bytes = b64.as_bytes();
-    let chunks = bytes.len().div_ceil(CHUNK).max(1);
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let chunks = bytes.len().div_ceil(CHUNK);
     cup(out, placed)?;
-    for (i, chunk) in bytes
-        .chunks(CHUNK)
-        .chain(std::iter::once(&b""[..]).take(usize::from(bytes.is_empty())))
-        .enumerate()
-    {
+    for (i, chunk) in bytes.chunks(CHUNK).enumerate() {
         let more = u8::from(i + 1 < chunks);
         let payload = std::str::from_utf8(chunk).unwrap_or("");
         if i == 0 {
@@ -222,7 +195,7 @@ fn transmit(out: &mut impl Write, id: u32, img: &StoredImage, placed: &Placed) -
 }
 
 /// `d=I` frees the pixels as well as the placement. Every id retired here has
-/// already been replaced by a fresh transmission, so nothing wants them back.
+/// already been replaced, so nothing wants them back.
 fn delete(out: &mut impl Write, id: u32) -> io::Result<()> {
     write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
 }
