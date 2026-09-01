@@ -375,6 +375,17 @@ echo "    display: ${display} (Xvfb pid ${xvfb_pid})"
 # A short, FIXED title. The pane title is drawn in the border colour on the top
 # border row, so a long or cwd-derived one eats into the rule the rectangle
 # detector measures. Twelve characters is under 15% of the narrowest phase.
+# Which payload goes where. Decided BEFORE the session exists, because the
+# workload is launched with it: the sidecar shares kitty's terminal to put bytes
+# on screen that shux never saw, while `image-pane` is the opposite -- the bytes
+# are the pane's own output and reach the screen only through shux's emit.
+launch_payload="-"
+pane_payload=""
+case "${scenario}" in
+    image-contained | image-overflow) launch_payload="${payload_file}" ;;
+    image-pane) pane_payload="${payload_file}" ;;
+esac
+
 sx session create "${session}" -d --title "shux-gui-rig" -- \
     env TERM=xterm-256color COLORTERM=truecolor LANG=C.utf8 LC_ALL=C.utf8 \
     HOME="${runtime}" bash "${workload_sh}" "${CONTENT_RGB//,/;}" \
@@ -401,16 +412,6 @@ sx pane wait-for -s "${session}" -p "${pane_id}" -t "${marker}" --timeout-ms 300
     fail "workload never reached its marker"
 
 # ── The real GUI terminal ───────────────────────────────────────────────────
-# The sidecar shares kitty's terminal to put bytes on screen that shux never
-# saw. `image-pane` is the opposite: the bytes go INTO a pane and must reach the
-# screen through shux's own emit, so it takes no sidecar.
-launch_payload="-"
-pane_payload=""
-case "${scenario}" in
-    image-contained | image-overflow) launch_payload="${payload_file}" ;;
-    image-pane) pane_payload="${payload_file}" ;;
-esac
-
 # Mesa software GL: there is no GPU in CI or in the cloud container.
 # `--config NONE` so a developer's kitty.conf cannot move the geometry every
 # measurement depends on — and HOME/XDG_CACHE_HOME/XDG_DATA_HOME isolated as

@@ -307,15 +307,17 @@ fn the_cursor_ends_where_the_frame_wanted_it_not_on_the_picture() {
     c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
     let out = drain(&mut c);
 
+    // The exact target, not merely "not on the picture": asserting only the
+    // negative half let a cursor put back at the WRONG place pass.
     let last_cup = out
         .rsplit("\x1b[")
-        .find(|s| s.starts_with(|ch: char| ch.is_ascii_digit()) && s.contains('H'))
+        .find(|t| t.starts_with(|ch: char| ch.is_ascii_digit()) && t.contains('H'))
         .unwrap_or_else(|| panic!("no cursor positioning at all in {out:?}"));
     let (row, col) = last_cup.split('H').next().unwrap().split_once(';').unwrap();
-    // The picture sits at row 1; the cursor belongs on the pane's row 9.
-    assert_ne!(
+    // `\x1b[9;7Hx` put the pane cursor on row 9, col 8; the frame is 1-based.
+    assert_eq!(
         (row, col),
-        ("1", "1"),
-        "the frame ended with the cursor parked on the picture"
+        ("9", "8"),
+        "the frame did not leave the cursor where it wanted it"
     );
 }
