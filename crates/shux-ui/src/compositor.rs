@@ -342,6 +342,13 @@ impl<W: Write> RenderCompositor<W> {
         }
     }
 
+    /// Turn image re-transmit on for this attach. Off unless the client's
+    /// terminal answered the graphics probe: emitting to one that did not is
+    /// not merely wasted bytes, it corrupts an outer multiplexer's state.
+    pub fn set_graphics(&mut self, enabled: bool) {
+        self.images.set_enabled(enabled);
+    }
+
     /// Force a full redraw on the next render pass. Call this after
     /// events that may have corrupted the terminal state (e.g., a
     /// child process writing directly to the terminal).
@@ -466,11 +473,13 @@ impl<W: Write> RenderCompositor<W> {
         for (pid, rect) in &pane_rects {
             if let Some(vt) = frame.vts.get(pid) {
                 let row_offset = self.compose_pane(*rect, vt);
-                placements.extend(crate::composed::resolve_placements(
-                    *rect,
-                    vt.grid(),
-                    row_offset,
-                ));
+                if self.images.enabled() {
+                    placements.extend(crate::composed::resolve_placements(
+                        *rect,
+                        vt.grid(),
+                        row_offset,
+                    ));
+                }
             } else {
                 // Missing VT: render an "(no output)" placeholder so the
                 // pane is visible.
@@ -643,9 +652,10 @@ impl<W: Write> RenderCompositor<W> {
         self.render_dirty_and_cursor(&dirty, target_cursor)?;
         // Pictures go out AFTER the cells: a terminal that treats an image as a
         // cell attachment erases the slice under any later text write.
-        if self
-            .images
-            .emit(self.backend.inner_mut(), &placements, full_redraw)?
+        if self.images.enabled()
+            && self
+                .images
+                .emit(self.backend.inner_mut(), &placements, full_redraw)?
         {
             // The emit CUPs to each picture and leaves the cursor there, so put
             // it back rather than dropping the tracking -- forgetting it costs a

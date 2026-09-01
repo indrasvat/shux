@@ -13,6 +13,7 @@ pub mod client;
 pub mod composed;
 pub mod compositor;
 pub mod copy_mode;
+pub mod graphics_probe;
 pub mod help_overlay;
 pub mod input;
 pub mod keybinding;

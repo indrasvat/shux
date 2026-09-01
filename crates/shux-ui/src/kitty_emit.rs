@@ -46,11 +46,26 @@ struct Live {
 /// What the user's terminal currently holds, for one attach.
 #[derive(Default)]
 pub(crate) struct KittyEmitter {
+    enabled: bool,
     live: Vec<Live>,
     next_id: u32,
 }
 
 impl KittyEmitter {
+    /// Gate every emission on the client's probe. A terminal that never
+    /// answered may not be a terminal at all: an outer tmux adopts the
+    /// emitter's continuation header as its window title.
+    pub(crate) fn set_enabled(&mut self, enabled: bool) {
+        if !enabled {
+            self.live.clear();
+        }
+        self.enabled = enabled;
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Emit whatever this frame changed, and report whether it wrote anything.
     /// `replace_all` re-issues every placement even when nothing moved, for a
     /// frame that repainted the whole screen: the host may have dropped its

@@ -41,10 +41,17 @@ use crate::terminal::{self, TerminalGuard};
 /// Public entry point: connect to the daemon's attach socket, do the
 /// handshake, and run the bidirectional loop until detach or session
 /// end. Restores the terminal automatically.
+/// How long to wait for the terminal to answer the graphics probe before
+/// giving up on images. Short: it is on the path to the first frame.
+const GRAPHICS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<ExitReason> {
     terminal::install_panic_hook();
 
     let (cols, rows) = TerminalGuard::size().context("terminal size")?;
+    // Before the connect and in its own raw-mode scope, so a stalled daemon can
+    // never strand the user in raw mode waiting on this.
+    let graphics = crate::graphics_probe::probe(GRAPHICS_PROBE_TIMEOUT);
 
     let stream = UnixStream::connect(socket_path)
         .await
@@ -58,6 +65,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         cols,
         rows,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
+        graphics,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello)?))
@@ -83,7 +91,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
             )));
         }
     };
-    tracing::info!(session = %session_name, %session_id, "attach: ready");
+    tracing::info!(session = %session_name, %session_id, graphics, "attach: ready");
 
     // From here on we MUST go through `guard.leave()` on any exit path (the
     // panic hook covers panics).

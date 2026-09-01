@@ -25,7 +25,9 @@ fn make_compositor(width: u16, height: u16) -> RenderCompositor<Cursor<Vec<u8>>>
         border_style: BorderStyle::None,
         ..Default::default()
     };
-    RenderCompositor::new(width, height, Cursor::new(Vec::new()), cfg)
+    let mut c = RenderCompositor::new(width, height, Cursor::new(Vec::new()), cfg);
+    c.set_graphics(true);
+    c
 }
 
 /// A real kitty transmit-and-display command, as a pane's application sends it:
@@ -413,4 +415,29 @@ fn a_full_repaint_re_places_without_re_sending_pixels() {
         "a re-place cost {} bytes; it should carry no payload",
         out.len()
     );
+}
+
+#[test]
+fn a_terminal_that_never_answered_the_probe_is_sent_no_graphics() {
+    // Not an optimisation. Measured with a shux attach running inside tmux 3.4:
+    // the emitter's own continuation header became the tmux window title --
+    // `Gq=2,m=0;AP+H...` where the base build showed `vm` -- rewritten once per
+    // frame by any pane that redraws. An outer multiplexer is not a terminal
+    // that quietly ignores an APC block.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.set_graphics(false);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let out = drain(&mut c);
+    assert!(
+        !out.contains("\x1b_G"),
+        "emitted graphics to a terminal that never claimed to draw them"
+    );
+    assert!(out.contains('\x1b'), "wrote no cells either");
 }

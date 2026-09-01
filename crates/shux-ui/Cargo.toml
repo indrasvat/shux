@@ -25,3 +25,6 @@ futures = "0.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
