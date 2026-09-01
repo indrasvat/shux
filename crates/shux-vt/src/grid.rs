@@ -456,6 +456,34 @@ impl Default for GridConfig {
 /// Placements one grid may hold.
 const MAX_PLACEMENTS: usize = 256;
 
+/// A rectangle in cells. The clip a composed placement is drawn against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellRect {
+    pub col: usize,
+    pub row: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// A placement resolved into a composed multi-pane frame.
+///
+/// Separate from [`Placement`] because a composed frame numbers rows from zero
+/// and cannot express an anchor above its own first row -- which is the
+/// ordinary case, since any picture taller than its pane scrolls its own anchor
+/// line into scrollback while most of it is still on screen. `row` is therefore
+/// SIGNED, and `clip` is carried rather than inferred: the rasterizer clips to
+/// the canvas, and in a composed frame the canvas is the whole window while the
+/// pane is a sub-rect.
+#[derive(Debug, Clone)]
+pub struct ComposedPlacement {
+    pub image: std::sync::Arc<crate::graphics::image::StoredImage>,
+    /// Composed-frame row of the image's top. Negative means the top is above
+    /// `clip`: draw from `clip.row`, skipping that many cell rows of bitmap.
+    pub row: i64,
+    pub col: usize,
+    pub clip: CellRect,
+}
+
 /// A picture placed in this grid, anchored to an absolute line.
 ///
 /// The anchor is `evicted() + index in raw`, so it names the same LINE after

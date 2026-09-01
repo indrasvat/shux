@@ -34,7 +34,9 @@
 
 use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
-use shux_vt::{Cell, CellFlags, CellStyle, Color, CursorShape, Grid, UnderlineStyle};
+use shux_vt::{
+    Cell, CellFlags, CellStyle, Color, ComposedPlacement, CursorShape, Grid, UnderlineStyle,
+};
 
 /// Embedded text font. JetBrains Mono Nerd Font Mono Regular, the
 /// upstream Nerd Fonts patched build (2.4 MB) under SIL Open Font
@@ -397,54 +399,93 @@ impl Rasterizer {
     /// pass, so `z<0` ("under the text") would need that split in two. It is
     /// accepted and unhonoured -- a refused client gets no picture at all.
     fn composite_placements(&self, img: &mut RgbaImage, grid: &Grid) {
+        let (w, h) = (img.width(), img.height());
+        for p in grid.placements() {
+            let top = p.viewport_row(grid) * i64::from(self.cell_h);
+            self.blit(img, &p.image, top, p.col as u32 * self.cell_w, (0, 0, w, h));
+        }
+    }
+
+    /// Draw placements that a multi-pane composer resolved, each clipped to its
+    /// own pane. The composed grid holds no placements of its own: a composed
+    /// frame numbers rows from zero and cannot express an anchor above its first
+    /// row, which any picture taller than its pane has.
+    pub fn composite_composed(&self, img: &mut RgbaImage, placements: &[ComposedPlacement]) {
+        for p in placements {
+            let c = p.clip;
+            let clip = (
+                c.col as u32 * self.cell_w,
+                c.row as u32 * self.cell_h,
+                ((c.col + c.cols) as u32 * self.cell_w).min(img.width()),
+                ((c.row + c.rows) as u32 * self.cell_h).min(img.height()),
+            );
+            let top = p.row * i64::from(self.cell_h);
+            self.blit(img, &p.image, top, p.col as u32 * self.cell_w, clip);
+        }
+    }
+
+    /// Draw one picture with its top-left at `(ox, top)`, clipped to the pixel
+    /// box `(x0, y0, x1, y1)`.
+    ///
+    /// `top` is signed: a picture whose top is above the clip is drawn from the
+    /// clip's first row with that many pixel rows of bitmap skipped. Clipping in
+    /// PIXEL space rather than by dropping whole image rows is what keeps a
+    /// cell-stated clip exact under any `appearance.font`.
+    fn blit(
+        &self,
+        img: &mut RgbaImage,
+        stored: &shux_vt::StoredImage,
+        top: i64,
+        ox: u32,
+        (x0, y0, x1, y1): (u32, u32, u32, u32),
+    ) {
+        if x0 >= x1 || y0 >= y1 || ox >= x1 {
+            return;
+        }
         let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
         let convert = |px: u32, cell: u32, declared: u32| {
             (u64::from(px) * u64::from(cell) / u64::from(declared.max(1))).max(1) as u32
         };
-        for p in grid.placements() {
-            let top = p.viewport_row(grid) * i64::from(self.cell_h);
-            if top >= i64::from(img.height()) {
-                continue;
-            }
-            // Both visibility tests run on the DECLARED height, before any
-            // decode: a scrolled-out placement is discarded without inflating
-            // its payload. `decode_placement` refuses a payload that does not
-            // match the declared size, so the two agree on anything drawn.
-            let skip = top.min(0).unsigned_abs() as u32;
-            if skip >= convert(p.image.height, self.cell_h, dh) {
-                continue;
-            }
-            let Some(src) = decode_placement(&p.image) else {
-                continue;
-            };
-            let dest_w = convert(src.width(), self.cell_w, dw);
-            let dest_h = convert(src.height(), self.cell_h, dh);
-            let src = if (dest_w, dest_h) == (src.width(), src.height()) {
-                src
-            } else {
-                image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
-            };
-            if skip >= src.height() {
-                continue;
-            }
-            let ox = p.col as u32 * self.cell_w;
-            let oy = top.max(0) as u32;
-            // Clip to the CANVAS only; the pane rect is a separate clip the
-            // multi-pane composer owns.
-            let rows = (src.height() - skip).min(img.height().saturating_sub(oy));
-            for y in 0..rows {
-                for x in 0..src.width().min(img.width().saturating_sub(ox)) {
-                    let s = src.get_pixel(x, y + skip).0;
-                    let a = s[3] as u32;
-                    if a == 0 {
-                        continue;
-                    }
-                    let d = img.get_pixel_mut(ox + x, oy + y);
-                    for c in 0..3 {
-                        d[c] = ((s[c] as u32 * a + d[c] as u32 * (255 - a)) / 255) as u8;
-                    }
-                    d[3] = 255;
+        if top >= i64::from(y1) {
+            return;
+        }
+        // Both visibility tests run on the DECLARED height, before any decode:
+        // a placement outside the clip is discarded without inflating its
+        // payload. `decode_placement` refuses a payload that does not match the
+        // declared size, so the two agree on anything drawn.
+        let skip = (i64::from(y0) - top).max(0);
+        if skip >= i64::from(convert(stored.height, self.cell_h, dh)) {
+            return;
+        }
+        let Some(src) = decode_placement(stored) else {
+            return;
+        };
+        let dest_w = convert(src.width(), self.cell_w, dw);
+        let dest_h = convert(src.height(), self.cell_h, dh);
+        let src = if (dest_w, dest_h) == (src.width(), src.height()) {
+            src
+        } else {
+            image::imageops::resize(&src, dest_w, dest_h, image::imageops::Triangle)
+        };
+        let skip = skip as u32;
+        if skip >= src.height() {
+            return;
+        }
+        let oy = top.max(i64::from(y0)) as u32;
+        let rows = (src.height() - skip).min(y1.saturating_sub(oy));
+        let cols = src.width().min(x1.saturating_sub(ox));
+        for y in 0..rows {
+            for x in 0..cols {
+                let s = src.get_pixel(x, y + skip).0;
+                let a = u32::from(s[3]);
+                if a == 0 {
+                    continue;
                 }
+                let d = img.get_pixel_mut(ox + x, oy + y);
+                for c in 0..3 {
+                    d[c] = ((u32::from(s[c]) * a + u32::from(d[c]) * (255 - a)) / 255) as u8;
+                }
+                d[3] = 255;
             }
         }
     }
