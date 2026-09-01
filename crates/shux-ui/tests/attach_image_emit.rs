@@ -1,0 +1,332 @@
+//! What the compositor writes to the terminal a user is attached from.
+//!
+//! shux cannot audit this by rendering it itself — `shux-raster` clips while
+//! compositing, so anything shux EMITS is never drawn by one in a shux-rendered
+//! check. These tests read the bytes; `make test-gui-terminal` photographs a
+//! real terminal drawing them.
+
+use std::collections::HashMap;
+use std::io::Cursor;
+
+use shux_core::layout::{Direction, LayoutNode, WindowLayout};
+use shux_core::model::PaneId;
+use shux_ui::{BorderStyle, CompositorConfig, MultiPaneFrame, RenderCompositor};
+use shux_vt::VirtualTerminal;
+use uuid::Uuid;
+
+fn pane(n: u128) -> PaneId {
+    PaneId::from_uuid(Uuid::from_u128(n))
+}
+
+fn make_compositor(width: u16, height: u16) -> RenderCompositor<Cursor<Vec<u8>>> {
+    let cfg = CompositorConfig {
+        show_border: false,
+        status_bar_height: 0,
+        border_style: BorderStyle::None,
+        ..Default::default()
+    };
+    let mut c = RenderCompositor::new(width, height, Cursor::new(Vec::new()), cfg);
+    c.set_graphics(true);
+    c
+}
+
+/// A real kitty transmit-and-display command, as a pane's application sends it:
+/// `f=24` raw RGB, chunked at the protocol's 4096, with `a=T` repeated on every
+/// continuation the way `kitten icat` does.
+fn kitty_rgb(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    use base64::Engine as _;
+    let mut px = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..w * h {
+        px.extend_from_slice(&rgb);
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+    let bytes = b64.as_bytes();
+    let total = bytes.len().div_ceil(4096).max(1);
+    let mut out = Vec::new();
+    for (i, chunk) in bytes.chunks(4096).enumerate() {
+        let more = u8::from(i + 1 < total);
+        out.extend_from_slice(
+            format!(
+                "\x1b_Ga=T,f=24,s={w},v={h},t=d,m={more};{}\x1b\\",
+                std::str::from_utf8(chunk).unwrap()
+            )
+            .as_bytes(),
+        );
+    }
+    out
+}
+
+fn frame<'a>(
+    layout: &'a LayoutNode,
+    vts: &'a HashMap<PaneId, &'a VirtualTerminal>,
+    focused: PaneId,
+) -> MultiPaneFrame<'a> {
+    MultiPaneFrame {
+        layout,
+        zoom: None,
+        focused,
+        vts,
+        titles: None,
+        status_bar: None,
+    }
+}
+
+/// Bytes written since the last call, and reset.
+fn drain(c: &mut RenderCompositor<Cursor<Vec<u8>>>) -> String {
+    let buf = std::mem::take(c.inner_mut().get_mut());
+    c.inner_mut().set_position(0);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The graphics COMMANDS written, in order. Continuation chunks carry only
+/// `m=`/`q=` and are not commands, so counting them would make every assertion
+/// here a function of the payload size.
+fn graphics(out: &str) -> Vec<String> {
+    out.split("\x1b_G")
+        .skip(1)
+        .map(|rest| rest.split(';').next().unwrap_or("").to_string())
+        .filter(|k| k.starts_with("a="))
+        .collect()
+}
+
+#[test]
+fn an_image_in_a_pane_reaches_the_attached_terminal() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let out = drain(&mut c);
+    let cmds = graphics(&out);
+
+    assert_eq!(cmds.len(), 1, "expected one transmit, got {cmds:?}");
+    let cmd = &cmds[0];
+    assert!(cmd.starts_with("a=T,f=24"), "{cmd}");
+    assert!(cmd.contains("s=18,v=38"), "{cmd}");
+    // 18x38 at the declared 9x19 cell is exactly 2x2 cells.
+    assert!(cmd.contains("c=2,r=2"), "{cmd}");
+}
+
+#[test]
+fn the_cursor_is_pinned_and_the_host_kept_quiet() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(9, 19, [10, 220, 10]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let out = drain(&mut c);
+
+    for cmd in graphics(&out) {
+        // Without C=1 kitty advances the cursor and scrolls the user's whole
+        // screen when the image sits at the bottom margin; without q=2 its
+        // `OK` is decoded as keystrokes and typed into the pane.
+        assert!(cmd.contains("C=1"), "no C=1 in {cmd}");
+        assert!(cmd.contains("q=2"), "no q=2 in {cmd}");
+    }
+}
+
+#[test]
+fn an_unchanged_picture_costs_nothing_on_the_next_frame() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let first = drain(&mut c);
+    assert_eq!(graphics(&first).len(), 1);
+
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let second = drain(&mut c);
+    assert!(
+        graphics(&second).is_empty(),
+        "re-sent an unchanged picture: {:?}",
+        graphics(&second)
+    );
+}
+
+#[test]
+fn new_pixels_under_the_same_image_id_are_re_transmitted() {
+    // The case a geometry-only signature cannot see, and the one that matters
+    // most in practice: terminal-browser redraws `i=1` at an unchanged
+    // `s=`/`v=` on every frame, so identical geometry is the steady state.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let first = graphics(&drain(&mut c));
+    assert_eq!(first.len(), 1);
+
+    let mut vt2 = VirtualTerminal::new(10, 20);
+    vt2.process(&kitty_rgb(18, 38, [40, 40, 200]));
+    let mut vts2 = HashMap::new();
+    vts2.insert(p, &vt2);
+    c.render_multi_pane(frame(&layout, &vts2, p)).unwrap();
+    let second = graphics(&drain(&mut c));
+
+    let transmits: Vec<_> = second.iter().filter(|k| k.starts_with("a=T")).collect();
+    assert_eq!(transmits.len(), 1, "new pixels were not sent: {second:?}");
+    // The replacement goes to a fresh id and the old one is retired only after
+    // it is up: re-transmitting under a live id frees the old image on the
+    // FIRST chunk and blanks the pane for the whole transfer.
+    let deletes: Vec<_> = second.iter().filter(|k| k.starts_with("a=d")).collect();
+    assert_eq!(deletes.len(), 1, "old id not retired: {second:?}");
+    let new_id = transmits[0]
+        .split(',')
+        .find_map(|k| k.strip_prefix("i="))
+        .unwrap();
+    assert!(
+        !deletes[0].contains(&format!("i={new_id},")),
+        "deleted the id it just transmitted: {second:?}"
+    );
+}
+
+#[test]
+fn a_picture_taller_than_its_pane_is_cropped_not_squashed() {
+    // `c=`/`r=` only ever STRETCH into a cell box; they never crop. Bounding a
+    // placement to its pane is the emitter's job, in the source rectangle.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(4, 20);
+    // 10 cells tall in a 4-row pane.
+    vt.process(&kitty_rgb(18, 190, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 4);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    let cmd = &cmds[0];
+
+    // Four rows of cells, and a source rectangle of exactly those four rows'
+    // worth of pixels — not the whole 190.
+    assert!(cmd.contains("r=4"), "{cmd}");
+    assert!(cmd.contains("h=76"), "expected h=4*19, got {cmd}");
+    assert!(!cmd.contains("h=190"), "sent the whole bitmap: {cmd}");
+}
+
+#[test]
+fn a_picture_scrolled_above_its_pane_is_drawn_from_where_it_enters() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(6, 20);
+    vt.process(&kitty_rgb(18, 190, [200, 40, 40]));
+    // Push the anchor above the viewport.
+    vt.process(b"\n\n\n\n\n\n\n\n");
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 6);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    if cmds.is_empty() {
+        return; // scrolled clean off; nothing to draw is also correct
+    }
+    let cmd = &cmds[0];
+    let y: u32 = cmd
+        .split(',')
+        .find_map(|k| k.strip_prefix("y="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no source y in {cmd}"));
+    assert!(y > 0, "top rows above the pane were not skipped: {cmd}");
+    assert_eq!(y % 19, 0, "source y is not a whole cell row: {cmd}");
+}
+
+#[test]
+fn a_second_panes_picture_stays_out_of_its_neighbour() {
+    let a = pane(1);
+    let b = pane(2);
+    let mut wl = WindowLayout::new(a);
+    wl.split_pane(a, b, Direction::Vertical, 0.5);
+    let layout = wl.tree.clone();
+    let mut va = VirtualTerminal::new(10, 40);
+    // 30 cells wide in a 20-cell pane. Sized to OVERFLOW: at exactly pane
+    // width the horizontal bound is a no-op and this test cannot fail.
+    va.process(&kitty_rgb(270, 190, [200, 40, 40]));
+    let vb = VirtualTerminal::new(10, 40);
+    let mut vts = HashMap::new();
+    vts.insert(a, &va);
+    vts.insert(b, &vb);
+
+    let mut c = make_compositor(40, 10);
+    c.render_multi_pane(frame(&layout, &vts, a)).unwrap();
+    let out = drain(&mut c);
+    let cmds = graphics(&out);
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+
+    let (_, left) = wl
+        .compute_rects(shux_core::layout::Rect::new(0, 0, 40, 10))
+        .into_iter()
+        .find(|(id, _)| *id == a)
+        .unwrap();
+    let cols: u16 = cmds[0]
+        .split(',')
+        .find_map(|f| f.strip_prefix("c="))
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    assert!(
+        cols <= left.width,
+        "picture spans {cols} cells in a {}-cell pane: {}",
+        left.width,
+        cmds[0]
+    );
+}
+
+#[test]
+fn a_terminal_that_cannot_draw_images_is_sent_none() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.set_graphics(false);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let out = drain(&mut c);
+    assert!(
+        !out.contains("\x1b_G"),
+        "emitted graphics to a terminal that never answered the probe"
+    );
+    assert!(out.contains('\x1b'), "wrote no cells either");
+}
+
+#[test]
+fn a_pane_that_loses_its_picture_has_it_removed_from_the_host() {
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    drain(&mut c);
+
+    let empty = VirtualTerminal::new(10, 20);
+    let mut vts2 = HashMap::new();
+    vts2.insert(p, &empty);
+    c.render_multi_pane(frame(&layout, &vts2, p)).unwrap();
+    let cmds = graphics(&drain(&mut c));
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    assert!(cmds[0].starts_with("a=d"), "{:?}", cmds[0]);
+}

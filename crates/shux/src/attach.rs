@@ -683,6 +683,7 @@ async fn run_attach_loop(
             render_client_size,
             render_tx,
             render_cancel,
+            hello.graphics,
         )
         .await;
     });
@@ -1194,6 +1195,7 @@ async fn run_render_loop(
     client_size: ClientSize,
     out_tx: mpsc::Sender<AttachServerFrame>,
     cancel: CancellationToken,
+    graphics: bool,
 ) {
     let (mut cols, mut rows) = *client_size.lock().await;
     let initial = config.current();
@@ -1206,6 +1208,7 @@ async fn run_render_loop(
     };
     let buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut compositor: RenderCompositor<Vec<u8>> = RenderCompositor::new(cols, rows, buf, cfg);
+    compositor.set_graphics(graphics);
 
     // Send a clear-screen ANSI prelude so the client terminal starts blank.
     let _ = out_tx
@@ -4852,6 +4855,7 @@ mod tests {
             cols: 90,
             rows: 24,
             client_version: "test".to_string(),
+            graphics: false,
         };
         framed
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))

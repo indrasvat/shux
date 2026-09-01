@@ -160,6 +160,7 @@ pub struct RenderCompositor<W: Write> {
     /// position so cursor-only movement can still emit just `MoveTo`.
     terminal_cursor_visual: Option<CursorVisual>,
     cursor_state_known: bool,
+    images: crate::kitty_emit::KittyEmitter,
 }
 
 impl<W: Write> RenderCompositor<W> {
@@ -173,6 +174,7 @@ impl<W: Write> RenderCompositor<W> {
             terminal_cursor: None,
             terminal_cursor_visual: None,
             cursor_state_known: false,
+            images: crate::kitty_emit::KittyEmitter::default(),
         }
     }
 
@@ -340,6 +342,12 @@ impl<W: Write> RenderCompositor<W> {
         }
     }
 
+    /// Turn image re-transmit on for this attach. Off unless the client's
+    /// terminal answered the graphics probe.
+    pub fn set_graphics(&mut self, enabled: bool) {
+        self.images.set_enabled(enabled);
+    }
+
     /// Force a full redraw on the next render pass. Call this after
     /// events that may have corrupted the terminal state (e.g., a
     /// child process writing directly to the terminal).
@@ -460,9 +468,17 @@ impl<W: Write> RenderCompositor<W> {
         };
 
         // 2. Render each pane's VT cells into the framebuffer.
+        let mut placements = Vec::new();
         for (pid, rect) in &pane_rects {
             if let Some(vt) = frame.vts.get(pid) {
-                self.compose_pane(*rect, vt);
+                let row_offset = self.compose_pane(*rect, vt);
+                if self.images.enabled() {
+                    placements.extend(crate::composed::resolve_placements(
+                        *rect,
+                        vt.grid(),
+                        row_offset,
+                    ));
+                }
             } else {
                 // Missing VT: render an "(no output)" placeholder so the
                 // pane is visible.
@@ -574,6 +590,7 @@ impl<W: Write> RenderCompositor<W> {
 
         // 5. Diff + render.
         let diff_start = Instant::now();
+        let full_redraw = self.force_full_redraw;
         let dirty = if self.force_full_redraw {
             self.buffer.invalidate();
             self.force_full_redraw = false;
@@ -632,6 +649,20 @@ impl<W: Write> RenderCompositor<W> {
                 None
             };
         self.render_dirty_and_cursor(&dirty, target_cursor)?;
+        // Pictures go out AFTER the cells: a terminal that treats an image as a
+        // cell attachment erases the slice under any later text write.
+        if self.images.enabled() {
+            if full_redraw {
+                // A full repaint may have cleared the host's image store, not
+                // just overpainted it, so re-place is not enough.
+                self.images.invalidate();
+            }
+            self.images.emit(self.backend.inner_mut(), &placements)?;
+            // The emit CUPs to each picture, and `render_dirty_and_cursor`
+            // skips `MoveTo` whenever it believes the cursor is already right.
+            self.terminal_cursor = None;
+            self.cursor_state_known = false;
+        }
 
         let render_time = render_start.elapsed();
         self.buffer.swap();
@@ -650,7 +681,9 @@ impl<W: Write> RenderCompositor<W> {
     }
 
     /// Compose a single pane's VT grid into the framebuffer at `rect`.
-    fn compose_pane(&mut self, rect: Rect, vt: &shux_vt::VirtualTerminal) {
+    /// Returns the vertical clip it applied, which the image path needs to
+    /// undo so a picture lands on the row its text did.
+    fn compose_pane(&mut self, rect: Rect, vt: &shux_vt::VirtualTerminal) -> usize {
         let grid = vt.grid();
         let defaults = vt.default_colors();
         let total_rows = grid.rows();
@@ -682,6 +715,7 @@ impl<W: Write> RenderCompositor<W> {
                     .set_cell(rect.x + c as u16, rect.y + r as u16, rcell);
             }
         }
+        row_offset
     }
 
     /// Render a placeholder string centered in the rect. Used when a pane
