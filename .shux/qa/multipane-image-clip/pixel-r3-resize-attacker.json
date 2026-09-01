@@ -1,0 +1,16 @@
+{
+  "actual": ".shux/out/multipane-image-clip/budget/r3/scope-E-cropL.png",
+  "changed_pixels": 0,
+  "diff": ".shux/out/multipane-image-clip/budget/r3/scope-E-diffL.png",
+  "expected": ".shux/out/multipane-image-clip/budget/r3/scope-E-paneL.png",
+  "max_mean_channel_delta": 0.0,
+  "max_pixel_diff_ratio": 0.0,
+  "mean_rgba_channel_delta": 0.0,
+  "pixel_diff_ratio": 0.0,
+  "size": [
+    540,
+    380
+  ],
+  "status": "pass",
+  "total_pixels": 205200
+}

@@ -1,315 +1,353 @@
-VERDICT: FAIL
+VERDICT: PASS
 
-# SOLID VT QA — multipane-image-clip (re-audit at `c836d8a`)
+# SOLID VT QA — multipane-image-clip
 
-## 1. Change under audit
+Scoped re-audit of `c836d8a..76fc6e8`. Third audit of this branch.
 
 | | |
 |---|---|
 | Branch | `claude/shux-image-support-s0u4uy` |
-| HEAD | `c836d8a` |
-| Previously audited HEAD | `3d46d74` (verdict FAIL, one P1) |
-| Base | `origin/main` = `0e97d24` (v0.49.0) |
-| Delta re-audited | `crates/shux-raster/src/lib.rs` (+40/-2), `crates/shux/tests/window_snapshot_image_rpc.rs` (new, 97), `Makefile` (+6), and this evidence directory |
-| Scratch | `.shux/out/multipane-image-clip/` (gitignored) |
+| HEAD audited | `76fc6e8` — *fix(raster): scope the decode budget per PANE, and prove it* |
+| Previously audited | `c836d8a` (FAIL, P1 starvation) · `3d46d74` (FAIL, unpinned call site) |
+| Merge base | `0e97d24` |
+| Scope | the `c836d8a..76fc6e8` delta only: `crates/shux-raster/src/lib.rs`, `crates/shux/tests/window_snapshot_images.rs`, `crates/shux/Cargo.toml`, `Cargo.lock` |
+| Working tree | clean at `git status --porcelain` before the first command and after the last |
 
-Scoped re-audit. The behaviour findings at `3d46d74` are carried forward, not
-re-derived; §4 marks each row `carried` or `re-run`.
+`dootsabha` is not installed (`command -v dootsabha` → not found). The substitution
+is recorded in `council-substitution.md`; see §3 row 8 and finding P2-3.
 
-## 2. Verdict
+---
 
-FAIL, on one new P1 introduced by `c836d8a` itself.
+## 1. What the delta claims, and what this audit found
 
-The old P1 is closed — verified independently, not accepted on report. What
-replaces it is a regression the same commit introduced: the new per-render
-decode budget lets **one pane silently delete a different pane's picture from
-`window.snapshot` and `session.snapshot` while that pane's own `pane.snapshot`
-still draws it.** That is exactly the cross-path identity this branch exists to
-establish and that 18 of the 25 committed metrics assert. It is reproducible for
-about 405 KB of ordinary pane output, it is pane-order dependent, it is silent,
-and it does not happen on `3d46d74`.
+The delta answers the P1 this gate raised at `c836d8a`: `MAX_RENDER_DECODE_BYTES`
+was reset per RENDER, so `composite_placements` gave each pane 256 MiB while
+`composite_composed` spent one 256 MiB across the whole window, first come first
+served — a greedy pane deleted a neighbour's picture from `window.snapshot` while
+`pane.snapshot` still drew it, order-dependently.
 
-## 3. Delta DoD matrix
+`76fc6e8` renames it `MAX_PANE_DECODE_BYTES` and keeps one budget per clip rect
+inside `composite_composed`, looked up rather than reset on change.
 
-| # | Claim made for `c836d8a` | Result | Evidence |
+Every claim the commit makes for itself was re-derived from scratch here. All five
+hold. Three P2s remain — one introduced by this delta, one carried, one process.
+
+---
+
+## 2. Stated DoD matrix
+
+| # | Claim made by `76fc6e8` | Result | Evidence |
 |---|---|---|---|
-| D1 | The new RPC test pins the production call site: removing `composite_composed` from `snapshot.rs` fails it while the three in-process tests stay green | **PASS** | Re-ran the mutation myself in `/tmp/shux-mut` @ `c836d8a`. Exit 100; 3 passed, 1 failed; `window.snapshot returned a frame with no picture (0 px); pane.snapshot has 10260`. Log `reaudit-mut-M8.log`. Baseline `make test-window-snapshot-images` → 4/4 (`reaudit-make-target.log`). |
-| D2 | The budget cannot fire on a plausible real frame | **PASS, with a corrected number** | Measured, not assumed: a real `kitten icat` of a 4000×3000 photo into a 200×55 pane transmits `a=T,q=2,f=24,o=z,s=1800,v=1350` — the client downscales to the pane. Charged cost = 1800·1350·4 = **9.27 MiB**, so ~27 full-pane photos fit in 256 MiB. Conclusion holds; the "~1 MB" in the source comment and commit message is ~10× optimistic (P2-2). Raw capture `/tmp/sxatk/icat.raw` (2349 APC chunks). |
-| D3 | The budget does not perturb the 25 recorded metrics | **PASS** | 9 of 25 re-derived from scratch with the `c836d8a` binary (6 cross-path + 3 outside-pane, 3 viewports): **numerically identical** to the committed JSONs on every field. Independently, mutation M16b proves the accumulation branch is unreachable at these scene sizes. |
-| D4 | `window.snapshot` and `pane.snapshot` cannot disagree by straddling the budget | **FAIL — P1-1** | They can, cheaply and deterministically. Dose-response + A/B against `3d46d74` + a `0/0` pixel metric that fails at exactly 17100 px. §6. |
-| D5 | The budget closes a measured pane-controlled stall | **PASS** | Independently measured: 24 declared-4096×4096 placements in one pane, one `window snapshot` — `3d46d74` **802 ms**, `c836d8a` **368 ms**. The mitigation is real. |
-| D6 | `make test-window-snapshot-images` exists and runs both files | **PASS** | 4 tests across 2 binaries, 2.883 s. |
-| D7 | Implementation-diff council step (protocol 7) evidenced | **PASS (substituted)** | `council-substitution.md` §7. Closes P2-1 from the `3d46d74` audit. |
-| — | Budget ships with a test seen failing first | **FAIL — P2-1** | Zero tests reach it. §6. |
+| 1 | The budget is scoped per PANE, not per render | **PASS** | §4, §5 |
+| 2 | Both paths spend the same budget on the same pane, so the drawn subset is identical by construction | **PASS** | §5 — 10 metrics, 0/0 exact, incl. a scene where the budget genuinely truncates |
+| 3 | `a_greedy_pane_does_not_starve_its_neighbours_picture` pins it in both pane orders, and fails when the scoping is reverted | **PASS** | §7 mutation M17 — caught, exit 100, exact stated message, other 3 tests green |
+| 4 | The constant's justification is corrected: 9.27 MiB per real `kitten icat`, ~27 pictures | **PASS** | §8 — arithmetic re-derived, backed by a real `kitten icat` APC header |
+| 5 | Bound is now panes × 256 MiB | **PASS (measured, and see P2-1)** | §6 — quantified at 4 panes |
 
-## 4. Testing matrix
+---
+
+## 3. Testing matrix
 
 | Layer | Result | Evidence |
 |---|---|---|
-| Unit (touched crates) | **re-run** PASS | `cargo nextest run -p shux-raster -p shux-vt -p shux-ui` on the pristine tree → **911 passed**. `reaudit-unit-touched.log`. |
-| Integration (new file) | **re-run** PASS | `make test-window-snapshot-images` → 4/4. `reaudit-make-target.log`. |
-| Integration (workspace) | carried from `3d46d74` | `make test` → 2251 passed. Not re-run; the delta is confined to `shux-raster` + one new test file, and both were re-run directly. |
-| Mutation / can-it-fail | **re-run, MIXED** | M8 now **CAUGHT** (was the sole survivor). M16 / M16b are new and expose P2-1. §5. |
-| Raw byte / replay | carried | 5 committed `.shux/fixtures/vt-corpus/rich-tui/*.raw` replays, `pixel-richtui-ab-*.json`. Unperturbed: M16b proves the budget never engages on them. |
-| Shux automation | **re-run** PASS | 9 `runall.sh` cases + 8 attack/A-B cases + 1 `kitten icat` probe = 18 fresh daemon-backed runs at `c836d8a`, isolated `XDG_RUNTIME_DIR` each. |
-| Colour probes | **re-run** PASS | truecolor `38;2;0;200;90`, indexed `38;5;208`, basic `34` in every pane of every fresh run, including both attack panes. Read back from the window PNG: `right_pane_probes [151,109,35]` in all 9 metric cases; visible in `dose4-window.png`. |
-| Visual inspection | **re-run** PASS/FAIL-as-found | Full-resolution PNGs opened as images: `dose4-window.png` (victim pane has probes + `RIGHTMARK` and **no picture**), `dose4-paneR.png` (same pane, same instant, picture present), `budget/dose4-diff.png` (one white rectangle, nothing else). No tofu, bleed, ghost cells or layout drift. |
-| Pixel comparison | **re-run** PASS on controls, FAIL on the defect | 9 re-derived metrics `0/0 pass`; `budget/pixel-budget-dose3.json` and `-prebudget4.json` `0/0 pass`; `budget/pixel-budget-dose4.json` **fail, 17100 changed px**. |
-| Comparator falsifiability | **re-run** PASS | The same comparator, same thresholds, same crop geometry passes `0/0` on dose3 and on the `3d46d74` binary and fails on dose4. That pair is the negative control. |
-| DootSabha design | carried, PASS (substituted) | `council-substitution.md` §1. |
-| DootSabha implementation diff | **re-run** PASS (substituted) | `council-substitution.md` §7 — now evidenced by two adversarial reviews with measured findings, both applied in `c836d8a`. |
-| Process hygiene | **re-run** PASS | 0 daemons, 0 leftover runtime dirs. §9. |
+| Unit | PASS | `make test` — 2253 run, 2253 passed, 2 skipped · `.shux/out/multipane-image-clip/r3-make-test.log` |
+| Integration | PASS | `shux` + `shux-raster` suites, 926 tests, incl. the daemon-backed `window_snapshot_image_rpc` |
+| Raw byte / replay | PASS | kitty APC `f=100` PNG fixtures driven through real PTYs; generator `budget/gen_r3.py`; real `kitten icat` capture `/tmp/sxatk/icat.raw`, 2349 APC chunks |
+| shux automation | PASS | 22 daemon-backed sessions across 6 drivers, isolated `XDG_RUNTIME_DIR` each, run serially |
+| Visual inspection | PASS | §9 — 5 full-resolution frames opened as images |
+| Pixel comparison | PASS | §5 — 10 new metrics at exact 0/0, plus 9 committed metrics re-derived at HEAD |
+| Comparator falsifiability | PASS | §5.3 negative control — same scene, same crop, pre-fix binary → `status: fail`, 17100 changed px, exit 1 |
+| DootSabha design | PASS (substituted) | `council-substitution.md` §1 |
+| DootSabha diff review | **P2-3** | `council-substitution.md` §7 records the branch, but names `c836d8a`, not `76fc6e8` |
+| Lint | PASS | `make lint` — clippy `-D warnings` + fmt · `r3-lint.log` |
+| Process hygiene | PASS | §10 — 22 daemons started, 22 confirmed gone from `/proc` |
 
-## 5. Mutation matrix for the delta
+---
 
-Run in a detached worktree `/tmp/shux-mut` at `c836d8a` with a shared
-`CARGO_TARGET_DIR`; no file in `/home/user/shux` was modified.
+## 4. The dose-response attack, re-run at `76fc6e8`
 
-| Mutation | Result | Meaning |
-|---|---|---|
-| `M8_snapshot_no_call` — `composite_composed(...)` → `let _ = &composed.placements;` | **CAUGHT** (exit 100) | The `3d46d74` P1 is closed. The three in-process tests stayed green, so `window_snapshot_image_rpc.rs` is the sole pin and it fails for the right reason. |
-| `M16_panic_any_budget` — `None => panic!(...)` | CAUGHT by 1 test | Only `shux-raster::png_bomb::a_png_that_decodes_to_gigabytes_is_refused_before_it_allocates`, with `cost=18446744073709551615` — the `declared_rgba_bytes → None` branch, i.e. the pre-existing oversize refusal that `decode_placement` also performs. Behaviour-preserving. |
-| `M16b_panic_accumulation_only` — panic only when `cost != u64::MAX` | **SURVIVED** — 911 + 4 tests green | **The accumulation branch, which is the entire point of the new budget, is reached by zero tests.** |
+Driver `.shux/out/multipane-image-clip/budget/attack_r3.sh`. Unlike the previous
+`attack.sh` it **exits 90** if a daemon survives, so a leak cannot be silently
+absorbed by a teardown `|| true`.
 
-Two consequences follow from M16b without further builds, and are stated as
-derivations rather than runs: (a) the prior audit's M0–M12 are unperturbed,
-because the budget never engages on any tested scene; (b) deleting the budget,
-or moving the charge *before* the visibility tests so off-screen placements are
-billed, must also survive — there is nothing to catch either.
+Scene: two panes at 200x60. Attacker holds four 4096x4096 kitty PNG placements —
+75 KB each on the wire, 64 MiB each charged from the declared `s=`/`v=`, so 4 ×
+64 MiB is exactly the budget. Victim holds one ordinary 180x95 magenta picture.
+Every pane also prints a truecolor + indexed + basic colour probe.
 
-## 6. Findings
-
-### P1-1 — one pane silently deletes another pane's picture from `window.snapshot`, while `pane.snapshot` still draws it (NEW in `c836d8a`, regression vs `3d46d74`)
-
-`MAX_RENDER_DECODE_BYTES` is a **per-render** budget, and the two render paths
-scope it differently:
-
-- `composite_placements` (the `pane.snapshot` path) resets 256 MiB **per pane**;
-- `composite_composed` (the `window`/`session.snapshot` path) resets 256 MiB
-  **once for the whole window**, then spends it first-come-first-served across
-  every pane's placements.
-
-So a pane that spends the budget starves whichever pane composes after it.
-
-**Cost of the attack.** The charge is `declared_rgba_bytes` — width × height × 4
-from the client's own `s=`/`v=` — not the payload. A solid 4096×4096 PNG is
-75 KB on the wire and charges the full 64 MiB. Four of them, 405 KB total, spend
-the entire per-render budget. `MAX_PLACEMENTS` is 256 and `MAX_IMAGE_BYTES` is
-32 MiB of payload, so a pane may charge up to 16 GiB against a 256 MiB budget.
-`C=1` keeps them all on screen, so none is discounted as off-screen.
-
-**Measured, on the real release binary, real daemon, real APC bytes.** Two panes,
-200×60 window; left pane = 4 hostile placements, right pane = one legitimate
-180×95 picture:
-
-| | `pane.snapshot` (victim) | `window.snapshot` | `session.snapshot` |
+| Arrangement | `pane.snapshot` victim | `window.snapshot` | `session.snapshot` |
 |---|---|---|---|
-| `c836d8a` | 17100 magenta px | **0** | **0** |
-| `3d46d74`, identical scene | 17100 | 17100 | 17100 |
+| `c836d8a`, victim in the pane that composes second | 17100 px | **0** | **0** |
+| `76fc6e8`, victim second (`dose4`, `trunc5`) | 17100 px | **17100 px** | **17100 px** |
+| `76fc6e8`, victim first (`swap5`) | 17100 px | **17100 px** | **17100 px** |
 
-**Dose-response at `c836d8a`,** one variable, monotone:
+The P1 is closed in both orders and on all three snapshot paths.
 
-| hostile placements | charged | `window.snapshot` magenta |
+### 4.1 A scene that proves the budget still fires
+
+Survival alone would also be explained by a budget that never refuses anything.
+`budget/gen_r3.py` therefore builds five 4096x4096 placements in **distinct
+colours**, drawn in order, so the visible colour names how many were drawn:
+
+- 256 MiB ÷ 64 MiB = 4, so #4 (yellow) must be the last drawn and #5 (cyan) refused.
+- `pane.snapshot(attacker)` → yellow, 328320 px. Cyan absent.
+- `window.snapshot` attacker region → yellow, 328320 px. Cyan absent.
+- Same truncation point on both paths, and the victim's 17100 px intact.
+
+---
+
+## 5. Pixel verification
+
+All metrics from `.claude/automations/pixel_verify.py` at
+`--max-pixel-diff-ratio 0 --max-mean-channel-delta 0`.
+
+### 5.1 Screenshot / metric matrix
+
+| Viewport | Scene | Actual (crop of composed frame) | Compared against | Metric | Status |
+|---|---|---|---|---|---|
+| 200x60 | budget truncates in attacker pane, victim second | `trunc5-cropL.png` | `trunc5-paneL.png` (`pane.snapshot`) | `pixel-r3-crosspath-attacker.json` | pass 0/328320 |
+| 200x60 | same frame, victim pane | `trunc5-cropR.png` | `trunc5-paneR.png` | `pixel-r3-crosspath-victim.json` | pass 0/328320 |
+| 200x60 | `session.snapshot`, victim pane | `trunc5-scropR.png` | `trunc5-paneR.png` | `pixel-r3-session-victim.json` | pass 0/328320 |
+| 200x60 | panes swapped, victim first | `swap5-cropL.png` | `swap5-paneL.png` | `pixel-r3-swap-victim.json` | pass 0/328320 |
+| 200x60 | panes swapped, attacker pane | `swap5-cropR.png` | `swap5-paneR.png` | `pixel-r3-swap-attacker.json` | pass 0/328320 |
+| 200x60 | panes swapped, `session.snapshot` | `swap5-scropL.png` | `swap5-paneL.png` | `pixel-r3-swap-session-victim.json` | pass 0/328320 |
+| 200x60 | attacker ZOOMED (rects collapse to one clip) | `scope-B-crop.png` | `scope-A-paneL.png` | `pixel-r3-zoom-attacker.json` | pass 0/328320 |
+| 200x60 | victim ZOOMED | `scope-C-crop.png` | `scope-A-paneR.png` | `pixel-r3-zoom-victim.json` | pass 0/328320 |
+| 200x60 | panes RESIZED to 60x20 (clip `min()`s with grid dims) | `scope-E-cropL.png` | `scope-E-paneL.png` | `pixel-r3-resize-attacker.json` | pass 0/205200 |
+| 200x60 | same, victim pane | `scope-E-cropR.png` | `scope-E-paneR.png` | `pixel-r3-resize-victim.json` | pass 0/205200 |
+
+No baseline PNG is tracked for these scenes, so per CLAUDE.md's evidence-storage
+rule the metric JSONs stand alone and no screenshot is committed. Frames and diffs
+live in `.shux/out/multipane-image-clip/budget/r3/`.
+
+### 5.2 Committed metrics re-derived at HEAD
+
+`runall.sh` + `metric_case.sh` re-run with the `76fc6e8` release binary across
+80x24 / 120x40 / 200x60 × small/big/none. Nine of the 25 committed metrics were
+re-derived from scratch and compared field by field on `status`,
+`changed_pixels`, `pixel_diff_ratio`, `mean_rgba_channel_delta`, `size`,
+`total_pixels` and both thresholds: **9/9 numerically identical**. The delta moves
+no pixel in any scene where the budget does not fire.
+
+### 5.3 The comparator is proven able to fail
+
+Same `trunc5` scene, same 720x456 crop at the same origin, run against a
+`c836d8a` binary **built by this audit** in its own worktree (`/tmp/shux-c836`,
+`git worktree add`), not against an artifact handed to it:
+
+```
+window magenta = 0        pane magenta = 17100
+pixel_verify exit = 1     status = fail     changed_pixels = 17100
+mean_rgba_channel_delta = 6.23   pixel_diff_ratio = 0.0521
+```
+
+`NEGCTL-r3-prefix-crosspath.json`, kept in scratch because `.shux/qa/` metrics
+must be exact 0/0 passes. The same comparator that reports 0 on ten scenes at
+`76fc6e8` reports 17100 on the pre-fix build — it can both pass and fail, and the
+defect is genuinely present at `c836d8a` and genuinely gone at `76fc6e8`.
+
+---
+
+## 6. Does the mitigation still hold?
+
+Idle machine, 7 reps, minimum reported. `budget/timing_r3.sh`, `budget/quad_r3.sh`.
+
+| Scene | `3d46d74` (no budget) | `c836d8a` (shared 256 MiB) | `76fc6e8` (per-pane) |
+|---|---|---|---|
+| 2 panes, 24 placements in one | 1132 ms | 526 ms | **537 ms** |
+| 4 panes, ALL hostile (5 placements each) | 2950 ms | 629 ms | **2325 ms** |
+
+The single-greedy-pane mitigation is intact: 1132 → 537 ms, and the ~2 % against
+`c836d8a` is one extra decode (`76fc6e8` still draws the victim's picture, which
+`c836d8a` had starved), not lookup overhead.
+
+The four-pane number is finding **P2-1**. Cost is exactly linear in decoded bytes
+— 20 / 4 / 16 decodes of 4096² respectively, and 2950/2325 = 1.27 ≈ 20/16 — so
+per-pane scoping recovers only 21 % of the four-way-split stall that the
+constant's own doc comment still cites as its motivation.
+
+---
+
+## 7. Mutation testing
+
+Worktree `/tmp/shux-mut3`, detached at `76fc6e8`, own `CARGO_TARGET_DIR`. No file
+under `/home/user/shux/crates` was modified by this audit.
+
+| Mutation | Result | Detail |
 |---|---|---|
-| 1 | 64 MiB | 17100 |
-| 2 | 128 MiB | 17100 |
-| 3 | 192 MiB | 17100 |
-| 4 | 256 MiB = the budget | **0** |
+| **M17** revert the per-clip lookup to one shared budget | **CAUGHT** | exit 100 — `victim second: the neighbouring pane's picture was starved by a greedy pane`. The other 3 tests in the file stayed green: the new test is the sole pin, and it fails for the right reason and on the order-dependent arm. |
+| **M8** delete the `composite_composed` call in `snapshot.rs` | **CAUGHT** | `window.snapshot returned a frame with no picture (0 px); pane.snapshot has 10260`. The `3d46d74` P1 stays closed. |
+| **M19** budget charges but never refuses (`None => *budget = 0`) | **SURVIVED** | 926 tests green across `shux` + `shux-raster`. Finding P2-2. |
 
-**Pixel metric,** identical crop geometry and identical exact thresholds for all
-three arms — the comparator is demonstrably able to pass and to fail:
+Skipped, with reason: M0–M12 (clip geometry, `3d46d74`) and M16/M16b
+(`c836d8a`) — the delta does not touch `blit`'s clip arithmetic, its visibility
+tests or its charge point, and their scenes were re-verified unchanged by the 9
+re-derived metrics in §5.2. M16b is superseded by M19, which is the same question
+asked of the shipping code.
 
-| arm | metric | changed px | ratio | status |
-|---|---|---|---|---|
-| dose3, `c836d8a` (control) | `budget/pixel-budget-dose3.json` | 0 | 0.0 | pass |
-| dose4 scene, `3d46d74` (A/B) | `budget/pixel-budget-prebudget4.json` | 0 | 0.0 | pass |
-| dose4, `c836d8a` | `budget/pixel-budget-dose4.json` | **17100** | 0.0521 | **fail** |
+One M17 run was lost to `ENOSPC` on the build filesystem, which surfaced as a
+`rustc` exit 101. That run was **retried after freeing space, not counted** — a
+build that could not run is not a mutation that survived.
 
-`budget/dose4-diff.png` shows a single white rectangle — the missing picture.
-Text, colour probes, borders and status bar are byte-identical, so the clip
-logic this branch added is still correct; only the picture is gone.
+---
 
-**Three properties make this a defect rather than a stated trade:**
+## 8. The constant's corrected justification
 
-1. **It breaks the branch's own headline acceptance criterion.** Claim 1 of the
-   `3d46d74` audit — *"a picture in one pane of a split appears in
-   `window`/`session snapshot`, same slice as `pane snapshot`"* — is exactly what
-   now fails. Eighteen committed metrics assert it.
-2. **It is order-dependent.** Swapping the two panes reverses the outcome: victim
-   in the left (composed first) pane survives with 17100 px; victim in the right
-   pane vanishes. The same two panes, same content, different composed frame.
-3. **It is silent.** No error, no warning, no truncation flag on the RPC
-   response. A consumer — `lens gate`, a plugin, an agent — cannot distinguish
-   "this pane has no picture" from "this pane's picture was dropped".
+Re-derived independently, not taken from the comment:
 
-The same starvation also applies within one pane: 4 hostile + 1 legitimate
-placement in a single pane loses the legitimate one from `pane.snapshot` itself
-(`samepane-paneL.png`, magenta 0). So `pane.snapshot`, `lens glance` and
-`pane diff --heat` are affected too, not only the composed path.
+```
+1800 × 1350 × 4 = 9 720 000 B = 9.27 MiB
+256 MiB ÷ 9.27 MiB = 27.6  →  "about 27"
+4096 × 4096 × 4 = 64 MiB   →  4 placements per pane
+```
 
-The commit message discloses *a* trade ("past the budget a picture is not
-drawn"), but as a within-one-scene pixel loss. It does not identify the
-cross-path divergence, the cross-pane starvation, or the order dependence.
+`1800×1350` is the real declared size, from a real `kitten icat` of a 4000x3000
+photo into a 200x55 pane: APC header `a=T,q=2,f=24,o=z,m=1,s=1800,v=1350` over
+2349 chunks (`budget/icat-declared-size.json`). The "4 placements" figure is
+confirmed empirically by §4.1 — yellow (#4) drawn, cyan (#5) refused. The doc and
+the binary agree.
 
-**The mitigation itself is sound and worth keeping** — I reproduced it: 24
-hostile placements, one `window snapshot`, 802 ms on `3d46d74` against 368 ms on
-`c836d8a`. The defect is in the budget's *scope*, not its existence. Budgeting
-**per pane** inside `composite_composed` — the same 256 MiB each pane already
-gets from `composite_placements`, spent in the same placement order — bounds the
-frame at `panes × 256 MiB` while making the drawn subset identical on both
-paths by construction, which restores claim 1 exactly. A pane could then only
-starve itself, and would starve itself identically in both verbs.
+---
 
-### P2-1 — the budget ships with no test; nothing in the repository can observe it working or stop it being removed
+## 9. Visual inspection
 
-`grep -rn MAX_RENDER_DECODE_BYTES crates/` returns three hits, all in
-`crates/shux-raster/src/lib.rs`. Mutation M16b — panic on genuine accumulation
-exhaustion — **survived** 911 unit tests and all 4 image tests. The accumulation
-branch is dead code as far as the suite is concerned.
+Frames opened as images at native resolution, not asserted on by size.
 
-CLAUDE.md: *"Every fix ships with a test seen failing first — failing for the
-RIGHT reason."* This fix has none. The commit's own numbers (3.34 s → 0.64 s)
-were measured by hand and are not defended by anything that runs in CI, and the
-same commit's `window_snapshot_image_rpc.rs` is precisely the argument for why
-that matters. A regression test here is cheap: the scene in P1-1 is 405 KB of
-deterministic bytes and takes ~2 s.
-
-### P2-2 — the stated safety margin is ~10× optimistic
-
-`crates/shux-raster/src/lib.rs` (and the commit message): *"a `kitten icat` photo
-decodes to ~1 MB."* Measured this audit with a real `kitten icat` of a 4000×3000
-photo into a 200×55 pane: the client downscales to the pane and transmits
-`s=1800,v=1350`, charging **9.27 MiB** — 9× the stated figure, and it scales with
-pane pixel area, so a large pane on a high-resolution terminal charges more. The
-*conclusion* survives (≈27 such pictures fit in 256 MiB, and normal `icat` usage
-keeps one or two on screen), but the margin quoted in the source is not the
-margin that exists. Worth correcting where it sits, since it is the only thing
-justifying the constant's value.
-
-### P3-1 — `shux daemon stop` can return 0 with the daemon still running (PRE-EXISTING, carried forward)
-
-`crates/shux/src/daemon_boot.rs:308-338` polls `kill(pid,0)` 40×50 ms and on
-timeout warns but exits 0. Reproduces on `origin/main`. Every harness in this
-audit reads the pid from the pidfile before `daemon stop` and polls `/proc/<pid>`
-to disappearance rather than trusting the exit status.
-
-### P3-2 — live attach still draws no pictures (SCOPED OUT, carried forward)
-
-`crates/shux-ui/src/compositor.rs` has no placement handling, so `shux attach`
-shows a split with text and no images while all three snapshot verbs now render
-them. Unchanged by `c836d8a`.
-
-### P3-3 — two rich-TUI replay arms are only conditionally deterministic (carried forward)
-
-`nvim.raw` and `lazygit.raw` carry terminal queries; `stty -echo` before replay
-makes both exactly reproducible, and the committed metrics are from those runs.
-
-### CLOSED — P1-1 of the `3d46d74` audit (unpinned production call site)
-
-Verified independently, not accepted on report. Mutation re-run, caught, correct
-failure message, in-process tests unaffected. `window_snapshot_image_rpc.rs` also
-guards itself against a vacuous pass by asserting `pane.snapshot` drew the
-picture before comparing the composed verbs, and it carries the three mandated
-colour probes.
-
-### CLOSED — P2-1 of the `3d46d74` audit (implementation-diff council)
-
-`council-substitution.md` §7.
-
-## 7. Passed evidence
-
-- Old P1 closed with a re-run mutation, not a claim.
-- 9 of 25 metrics re-derived at `c836d8a` and numerically identical to the
-  committed JSONs; magenta extents reproduce exactly (17100 / 140049 / 373293 /
-  540000) at 9×19 cells across three viewports.
-- The image clip itself is intact under the attack: in `dose4-window.png` the
-  attacker's 328320 blue px are exactly equal in `pane.snapshot` and
-  `window.snapshot`, and nothing paints a border, a neighbour or the status bar.
-- The stall mitigation is real and independently measured (802 ms → 368 ms).
-- `make test-window-snapshot-images` exists, runs both files, 4/4.
-- 911 unit tests green on the pristine tree.
-- Zero leaked daemons across 18 fresh daemon-backed runs.
-
-## 8. Residual risk
-
-- 16 of the 25 metrics (config states, hot reload, rich-TUI A/B, zoom,
-  session-vs-window) were not re-derived. They are covered by the M16b
-  derivation — the budget cannot engage at their scene sizes — not by a fresh
-  run.
-- `make test` (2251) was not re-run at `c836d8a`; the delta's crates were.
-- The exact threshold behaviour at `cost == budget` (draw) versus
-  `cost == budget + 1` (skip) was probed only at 64 MiB granularity.
-- Emit-path blindness is unchanged: everything here was drawn by `shux-raster`.
-  `make test-gui-terminal` was not run; the delta emits nothing new to an outer
-  terminal.
-
-## 9. Cleanup
-
-Zero leaked daemons and zero leftover runtime dirs at close:
-`ps -eo pid,args | grep -c "[s]hux __daemon"` → **0**; no `/tmp/sxq.*`,
-`/tmp/sxa.*`, `/tmp/sxi.*` remain. Every one of the 18 runs read its pid from
-`$XDG_RUNTIME_DIR/shux/shux.pid` **before** `daemon stop` and polled
-`/proc/<pid>` to disappearance, failing loud past 20 s; per-run log in
-`.shux/out/multipane-image-clip/daemon-hygiene.txt` and `/tmp/sxatk/out/hygiene.txt`.
-No `pgrep -f` / `pkill -f`. Mutations ran in a detached worktree
-`/tmp/shux-mut`, restored clean and left at `c836d8a`; no file under
-`/home/user/shux/crates/` was modified by this audit.
-
-Disk note: `target/debug/incremental` (regenerable cache) and
-`target/aarch64-apple-darwin` (a Linux-unusable cross-compile tree) were deleted
-to make room for the mutation worktree. No source, no tracked file and no
-non-regenerable artifact was touched. `target/release/shux` was rebuilt from
-`c836d8a` after the `3d46d74` A/B build and byte-compared to the stashed copy.
-
-## 10. Audit-integrity note — the tree did not stay frozen
-
-The tree was declared frozen for this audit. It was not.
-
-Two uncommitted edits appeared in the shared checkout `/home/user/shux` while
-this report was being written — `crates/shux-raster/src/lib.rs` at **07:09:44**
-and `crates/shux/tests/window_snapshot_images.rs` at **07:10:41**. The first renames `MAX_RENDER_DECODE_BYTES` to
-`MAX_PANE_DECODE_BYTES` and resets the budget per pane inside
-`composite_composed` — an attempted fix for P1-1 above, quoting this audit's own
-measured numbers ("17100 px to 0", "9.27 MiB", "200x55 pane"). It is not part of
-`c836d8a` and it is not committed. The second adds ~54 lines to the image test
-file, presumably the regression test P2-1 asks for. Neither was audited here.
-
-**No evidence in this report is contaminated.** Every measurement predates it:
-
-| artifact | mtime |
+| Frame | What was checked |
 |---|---|
-| `make test-window-snapshot-images` | 06:51:17 |
-| `3d46d74` A/B binary built | 06:58:38 |
-| `c836d8a` release binary rebuilt, `cmp`-verified, all attack runs | 06:59:29 |
-| `runall.sh` metric re-derivation finished | 07:03:36 |
-| 911 unit tests finished | 07:05:56 |
-| **`crates/shux-raster/src/lib.rs` modified** | **07:09:44** |
-| **`crates/shux/tests/window_snapshot_images.rs` modified** | **07:10:41** |
+| `trunc5-window.png` 1800x1140 | Attacker's yellow stops exactly at the separator; victim's magenta inside the right pane; probe row renders `TRUECOLOR` green, `INDEXED` orange, `BASIC` blue — three distinct colour classes; borders and status bar unpainted; no tofu, ghost cells, bleed or clipping artefacts. |
+| `c836trunc5-window.png` | The defect, visible: the victim's magenta is gone while its own shell output (`RIGHTMARK`, prompt, probe row) is still on screen — so the loss is the budget, not a capture race. |
+| `swap5-window.png` | Mirror image. Victim's magenta on the left survives; attacker's yellow ends at x=1629 = 909+720, inside its pane. |
+| `scope-D-80x24.png` 720x456 | Smallest breakpoint. Both pictures clipped to their panes at the separator and the bottom border; probes legible; status bar intact. |
+| `scope-C-zoomR.png` | Victim zoomed: borders correctly hidden, status bar reads `Z … 1 pane`, attacker's picture correctly absent. |
 
-Every binary used here was built from a clean tree — the attack and A/B binaries
-from a detached worktree at `c836d8a` and `3d46d74`, and the one used by
-`runall.sh` was `cmp`-verified byte-identical to it immediately before the run.
+---
 
-Two things follow.
+## 10. Findings
 
-1. **The verdict is on `c836d8a` and stands.** The uncommitted edits were not
-   audited, were not run by this gate, and cannot be evidence for anything.
-   P1-1 and P2-1 are findings against `c836d8a`; whether these edits close them
-   is a question for the next audit, on the commit that carries them. This gate
-   did not revert them; that is not this role's job.
-2. **Writing to the shared checkout is itself the violation.** CLAUDE.md: *"An
-   agent that rewrites tracked files runs in its own git worktree. Never point
-   one at the shared checkout: a `git add -A` during its run commits its
-   scratch."* Had this gate been committing evidence with a broad `git add`, those
-   edits would have ridden along inside a QA-evidence commit.
+No P0. No P1.
 
-Observation on the uncommitted patch, offered so it is not lost, not as a
-finding: the per-pane reset keys on *the clip changing since the previous
-placement*, so it bounds correctly only while placements are contiguous by pane.
-They are today — `crates/shux-ui/src/composed.rs:82-102` extends all of one
-pane's placements before moving to the next, with `clip` constant inside the
-loop — but `composite_composed` is `pub` and nothing states or asserts that
-precondition, which is the same unstated-precondition risk this gate recorded
-against it at `3d46d74`. If a future producer ever interleaves panes, the budget
-resets on every alternation and bounds nothing. Re-audit it on its own commit,
-with the regression test P2-1 asks for.
+### P2-1 (new in this delta) — the constant's doc cites a harm it no longer bounds
+
+`MAX_PANE_DECODE_BYTES`'s doc comment, rewritten by this commit, still leads with
+*"a four-way split whose panes printed 4096x4096 PNGs took 3.3 s for one
+`window snapshot` against 10 ms with no images — work a pane chooses for a caller
+that did not."* Measured at `76fc6e8` that scene now costs 2325 ms against
+2950 ms unmitigated: 21 %. The shared budget gave 629 ms.
+
+This is not a correctness defect and the trade is disclosed in the commit message
+("Bound is now panes × 256 MiB"). It is also **forced**: any frame-level cap
+reintroduces exactly the cross-path disagreement this commit exists to remove,
+because `pane.snapshot` renders one pane with a full budget and could not agree
+with a window that rationed it. The invariant the code now actually delivers is a
+good one — *composing N panes costs no more than snapshotting them individually*,
+each capped at 256 MiB, killing the 16 GiB single-pane worst case.
+
+The defect is that the comment carries a contract the code no longer honours, and
+CLAUDE.md is explicit that comments carry contract. It should state what it bounds
+(one pane, 64× down from 256 placements × 64 MiB) rather than cite a four-pane
+measurement as the harm it prevents. One comment edit; no code change.
+
+### P2-2 (carried from `c836d8a`, still open) — nothing pins the refusal
+
+M19 makes the budget charge and never refuse. 926 tests pass. The starvation test
+added by this commit asserts *survival*, which a budget that never fires satisfies
+trivially, so it does not cover this. §4.1 shows the refusal working on the real
+binary — but only this audit shows it. A future refactor can delete the bound and
+every gate stays green. The §4.1 scene is directly usable as that test: five
+distinct-colour 4096² placements, assert #4 drawn and #5 absent, on both paths.
+
+### P2-3 (process) — the step-7 record does not name `76fc6e8`
+
+`council-substitution.md` §7 documents the implementation-diff review for the
+branch but was written at `c836d8a`. `dootsabha` is still not installed, so
+CLAUDE.md's fallback (parallel adversarial agents on disjoint surfaces) applies to
+this delta too, and no such record exists for it. Mitigating: the delta is a
+minimal remedy to a defect this gate specified, and this gate independently
+attacked it on four disjoint surfaces — scoping semantics, cross-path identity,
+DoS timing, mutation coverage — reproducing every claim before believing it. A
+gate is not a substitute for the pre-push review, so the substitution note must
+name `76fc6e8` before push.
+
+### P3-1 — `composite_composed` is `pub` and its budget key is caller-controlled
+
+`compose` emits exactly one `CellRect` per pane rect, so `budgets` holds at most
+one entry per pane and a pane cannot mint extra budgets. An external caller
+passing many distinct clips for one logical pane would get one budget each. Not
+reachable from any RPC; noted because the signature permits it and the commit's
+own reasoning is that `pub` plus an unstated invariant is how the last defect
+happened.
+
+### P3-2 — two panes cannot collide on a clip key, and a degenerate rect cannot borrow one
+
+`clip = (rect.x, rect.y, min(rect.w, grid.cols), min(rect.h, grid.rows))`. Layout
+rects tile without overlap, so distinct panes have distinct origins and cannot
+share a budget. A zero-size rect would collide on origin, but `blit` returns on
+`ox >= x1` **before** the charge, so it spends nothing. Verified by reading
+`composed.rs` and `blit`, and consistent with §5's zoom and resize metrics.
+
+### P3-3 — the `Vec` lookup is not a measurable cost
+
+`budgets.len()` ≤ pane count; the scan is a handful of 4-`usize` comparisons per
+placement against a 64 MiB decode. At 24 placements `76fc6e8` runs 537 ms against
+`c836d8a`'s 526 ms while doing one more decode. Unmeasurable.
+
+### P3-4 — the per-clip lookup is untestable against its weaker sibling
+
+Resetting the budget when the clip changes behaves identically under `compose`'s
+grouping, so no test distinguishes it from the lookup. The stronger form is a
+defensive choice, correctly argued in the comment; recorded so it is not mistaken
+for a tested property.
+
+---
+
+## 11. Passed evidence
+
+- `make test` 2253/2253, 2 skipped; `make lint` clippy + fmt clean.
+- P1 closed: victim survives at 4 hostile placements in both pane orders, on
+  `pane.snapshot`, `window.snapshot` and `session.snapshot`.
+- Cross-path identity exact (0 changed px, 0 mean channel delta) in 10 scenes
+  including budget truncation, both pane orders, zoom in both directions, pane
+  resize, and the session path.
+- The budget still refuses: #5 of five distinct-colour maximal placements is
+  dropped, at the same point on both paths.
+- Comparator falsifiable: 17100 changed px, `status: fail`, exit 1 on a pre-fix
+  binary this audit built itself.
+- M17 and M8 caught; the new test fails with its stated message when reverted.
+- 9 committed metrics re-derived at HEAD, numerically identical.
+- Colour probes (truecolor + indexed + basic) present in every capture and
+  legible in every inspected frame.
+- Constant's 9.27 MiB / ~27 arithmetic re-derived and empirically confirmed.
+
+## 12. Residual risk
+
+- P2-2 is the live one: the decode bound has no regression test, so it can be
+  removed without any gate noticing.
+- The `panes × 256 MiB` bound grows with pane count and there is no pane-count
+  cap (`grep MAX_PANES` → none). Panes are user-created, so this is a
+  self-inflicted cost, not an external attack surface — but a 20-pane window of
+  image-heavy panes will make `window.snapshot` slow in a way no test measures.
+- Timing figures are wall-clock on one machine. Ratios are stable and the linear
+  bytes-decoded model predicts them exactly; absolute numbers are not portable.
+- The five distinct-colour placements are a synthetic kitty stream. Real-TUI
+  coverage for this branch is the committed `pixel-richtui-ab-*` metrics from the
+  `3d46d74` audit (btop, lazygit, nvim, vicaya, vivecaka); this delta moves no
+  pixel in those scenes, which §5.2 re-verifies for the breakpoint arms.
+
+## 13. Cleanup and tree status
+
+**The tree stayed frozen this time.** `git status --porcelain` was empty before
+the first command of this audit and empty at the end; no product source was
+edited by anyone during the run. The `c836d8a` regression that the previous audit
+recorded — the checkout being patched mid-audit — did not recur.
+
+- 22 daemon-backed sessions across 6 drivers. Every driver reads the pid from
+  `$XDG_RUNTIME_DIR/shux/shux.pid` **before** `daemon stop` and polls `/proc/<pid>`
+  after; `attack_r3.sh`, `timing_r3.sh` and `quad_r3.sh` exit 90 on a survivor.
+- 22/22 daemons confirmed gone (`budget/r3/hygiene.txt`, `daemon-hygiene.txt`).
+- No leftover runtime dirs (`/tmp/sxa.* /tmp/sxt.* /tmp/sxq.* /tmp/sxs.*` → none).
+- `ps -eo pid,args | grep '[s]hux'` → no processes.
+- Worktrees `/tmp/shux-c836` and `/tmp/shux-mut3` are read-only scratch, both
+  restored to a clean `git status` before teardown.
+- Audit-only: no file under `crates/` was modified. The only tracked files this
+  audit writes are in `.shux/qa/multipane-image-clip/`.
