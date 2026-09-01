@@ -1,0 +1,1 @@
+{"actual": "shots/mask-200x60-big.png", "changed_pixels": 0, "diff": "shots/mask-200x60-big-diff.png", "expected": "shots/mask-200x60-none.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [1800, 1140], "status": "pass", "total_pixels": 2052000}

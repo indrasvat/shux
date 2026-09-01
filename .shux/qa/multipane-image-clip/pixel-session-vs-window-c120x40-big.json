@@ -1,0 +1,1 @@
+{"actual": "shots/c120x40-big-session.png", "changed_pixels": 0, "diff": "shots/c120x40-big-sess-diff.png", "expected": "shots/c120x40-big-window.png", "max_mean_channel_delta": 0.0, "max_pixel_diff_ratio": 0.0, "mean_rgba_channel_delta": 0.0, "pixel_diff_ratio": 0.0, "size": [1080, 760], "status": "pass", "total_pixels": 820800}

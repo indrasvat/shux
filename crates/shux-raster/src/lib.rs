@@ -389,9 +389,17 @@ impl Rasterizer {
     /// Draw the pictures a single-pane grid holds, clipped to the canvas.
     fn composite_placements(&self, img: &mut RgbaImage, grid: &Grid) {
         let (w, h) = (img.width(), img.height());
+        let mut budget = MAX_RENDER_DECODE_BYTES;
         for p in grid.placements() {
             let top = p.viewport_row(grid) * i64::from(self.cell_h);
-            self.blit(img, &p.image, top, p.col as u32 * self.cell_w, (0, w, h));
+            self.blit(
+                img,
+                &p.image,
+                top,
+                p.col as u32 * self.cell_w,
+                (0, w, h),
+                &mut budget,
+            );
         }
     }
 
@@ -399,6 +407,7 @@ impl Rasterizer {
     /// pane. See [`shux_vt::ComposedPlacement`] for why they ride beside the
     /// composed grid rather than inside it.
     pub fn composite_composed(&self, img: &mut RgbaImage, placements: &[ComposedPlacement]) {
+        let mut budget = MAX_RENDER_DECODE_BYTES;
         for p in placements {
             let c = p.clip;
             let clip = (
@@ -407,7 +416,14 @@ impl Rasterizer {
                 (c.row + c.rows) as u32 * self.cell_h,
             );
             let top = p.row * i64::from(self.cell_h);
-            self.blit(img, &p.image, top, p.col as u32 * self.cell_w, clip);
+            self.blit(
+                img,
+                &p.image,
+                top,
+                p.col as u32 * self.cell_w,
+                clip,
+                &mut budget,
+            );
         }
     }
 
@@ -430,6 +446,7 @@ impl Rasterizer {
         top: i64,
         ox: u32,
         (y0, x1, y1): (u32, u32, u32),
+        budget: &mut u64,
     ) {
         let (x1, y1) = (x1.min(img.width()), y1.min(img.height()));
         if y0 >= y1 || ox >= x1 || top >= i64::from(y1) {
@@ -446,6 +463,14 @@ impl Rasterizer {
         let skip = (i64::from(y0) - top).max(0);
         if skip >= i64::from(convert(stored.height, self.cell_h, dh)) {
             return;
+        }
+        // Charged AFTER the cheap declared-size tests and BEFORE the decode, so
+        // a placement that is off-screen costs nothing and one that is drawn is
+        // paid for once.
+        let cost = declared_rgba_bytes(stored).unwrap_or(u64::MAX as usize) as u64;
+        match budget.checked_sub(cost) {
+            Some(left) => *budget = left,
+            None => return,
         }
         let Some(src) = decode_placement(stored) else {
             return;
@@ -888,6 +913,17 @@ fn declared_rgba_bytes(stored: &shux_vt::StoredImage) -> Option<usize> {
 /// this is the only thing between its output and an unbounded allocation on
 /// every snapshot.
 const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Ceiling on what ONE render may decode and rescale, across every placement.
+///
+/// The per-image ceiling above does not bound a frame: a pane may hold hundreds
+/// of placements, and a composed frame gathers every pane's. Measured before
+/// this existed, a four-way split whose panes printed 4096x4096 images took
+/// **3.3 s** for one `window snapshot` against 10 ms with no images, and 7.8 s
+/// at the library level -- work a pane chooses for a caller that did not.
+/// Sized so that any plausible real frame (a `kitten icat` photo decodes to
+/// ~1 MB) is far below it, and the pathological case stops early.
+const MAX_RENDER_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Bytes a raw payload must decompress to, from the declared dimensions.
 fn expected_len(stored: &shux_vt::StoredImage) -> Option<usize> {
