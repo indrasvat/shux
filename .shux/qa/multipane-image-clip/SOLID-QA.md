@@ -336,10 +336,26 @@ for a tested property.
 
 ## 13. Cleanup and tree status
 
-**The tree stayed frozen this time.** `git status --porcelain` was empty before
-the first command of this audit and empty at the end; no product source was
-edited by anyone during the run. The `c836d8a` regression that the previous audit
-recorded — the checkout being patched mid-audit — did not recur.
+**The product source stayed frozen. The repository did not.**
+
+`git status --porcelain` was empty before the first command of this audit and
+showed no change under `crates/`, `Makefile`, `scripts/`, `Cargo.toml`,
+`Cargo.lock` or `.config/` at any point. `git diff 76fc6e8 70b3883 -- crates/ …`
+is empty. Every measurement in this report was taken from a binary built at
+`76fc6e8` or from a detached worktree, so nothing here is contaminated. The
+`c836d8a` regression — product source patched mid-audit — did **not** recur.
+
+What did happen: at 19:05:28, while this gate was still writing its manifest, a
+commit `70b3883` *"test(qa): VT solid-QA evidence for multi-pane inline images"*
+landed on the branch containing this report and ten of its metric files —
+authored by something other than this gate, and one file short of the evidence
+set the gate was assembling. It touched **only** `.shux/qa/multipane-image-clip/`
+paths and its content is byte-identical to what this gate had written, so it
+changes no finding. It is recorded because the audit contract is that the gate
+commits its own terminal verdict: a PASS artifact reaching the branch before the
+gate has finished writing the manifest that `make check-vt-qa` validates is the
+same shape of mistake as the last round, one directory over. The manifest and
+this correction are committed by the gate.
 
 - 22 daemon-backed sessions across 6 drivers. Every driver reads the pid from
   `$XDG_RUNTIME_DIR/shux/shux.pid` **before** `daemon stop` and polls `/proc/<pid>`
