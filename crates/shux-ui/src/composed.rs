@@ -24,8 +24,6 @@ pub struct ComposedFrame {
     /// Composed cells as a `shux_vt::Grid` (no scrollback).
     pub grid: Grid,
     /// Pictures, resolved into this frame and each carrying its pane as a clip.
-    /// Beside the grid rather than in it: a composed grid numbers rows from
-    /// zero and cannot express the anchor of a picture taller than its pane.
     pub placements: Vec<ComposedPlacement>,
     /// Focused-pane cursor in `(row, col)` grid coordinates, or `None`
     /// when the focused pane's VT has the cursor hidden / out of bounds.
@@ -80,18 +78,19 @@ pub fn compose(
         inputs.layout.compute_rects(pane_viewport)
     };
 
-    // Iterate the RECTS, never `inputs.panes`: a zoomed window keeps every
-    // pane in `panes` while only the zoomed one has a rect, and a pane with no
-    // rect has nowhere for its pictures to go.
+    // Iterate the RECTS: a zoomed window keeps every pane in `panes`.
     let mut placements: Vec<ComposedPlacement> = Vec::new();
     for (pid, rect) in &pane_rects {
         if let Some((src_grid, src_cursor)) = inputs.panes.get(pid) {
             let row_offset = compose_pane(&mut grid, *rect, src_grid, src_cursor);
+            // `min` with the source dims: `compose_pane` tolerates a grid
+            // smaller than its rect during a resize lag, and a picture must not
+            // paint area the grid does not own.
             let clip = CellRect {
                 col: rect.x as usize,
                 row: rect.y as usize,
-                cols: rect.width as usize,
-                rows: rect.height as usize,
+                cols: (rect.width as usize).min(src_grid.cols()),
+                rows: (rect.height as usize).min(src_grid.rows()),
             };
             placements.extend(src_grid.placements().iter().map(|p| ComposedPlacement {
                 image: p.image.clone(),

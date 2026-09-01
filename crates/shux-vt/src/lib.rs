@@ -33,7 +33,7 @@ pub use diff::{
 };
 pub use graphics::image::StoredImage;
 pub use graphics::kitty::Format as ImageFormat;
-pub use grid::{CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, Placement, Row};
+pub use grid::{CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
 pub use settle::{FrameStability, frame_stability_hash};
 

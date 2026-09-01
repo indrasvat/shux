@@ -467,13 +467,10 @@ pub struct CellRect {
 
 /// A placement resolved into a composed multi-pane frame.
 ///
-/// Separate from [`Placement`] because a composed frame numbers rows from zero
-/// and cannot express an anchor above its own first row -- which is the
-/// ordinary case, since any picture taller than its pane scrolls its own anchor
-/// line into scrollback while most of it is still on screen. `row` is therefore
-/// SIGNED, and `clip` is carried rather than inferred: the rasterizer clips to
-/// the canvas, and in a composed frame the canvas is the whole window while the
-/// pane is a sub-rect.
+/// Separate from [`Placement`] because a composed frame numbers rows from zero,
+/// while any picture taller than its pane anchors above it. The clip is carried
+/// rather than inferred: the rasterizer clips to the canvas, which in a
+/// composed frame is the whole window rather than one pane.
 #[derive(Debug, Clone)]
 pub struct ComposedPlacement {
     pub image: std::sync::Arc<crate::graphics::image::StoredImage>,

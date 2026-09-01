@@ -386,18 +386,7 @@ impl Rasterizer {
         img
     }
 
-    /// Draw every placed picture over the text.
-    ///
-    /// The client sized its bitmap against the cell box shux DECLARES to pane
-    /// children, so convert through that rather than through the box actually
-    /// being drawn: `appearance.font` changes the drawn cell (measured 9x19
-    /// bundled, 9x17 DejaVu, 9x14 FreeMono, 7x14 CJK gothic) and without the
-    /// conversion an image overruns the rows it reserved and paints over the
-    /// next line of text. Degenerates to 1:1 when the two boxes agree.
-    ///
-    /// Always above the glyphs: `draw_cell` fills background and glyph in one
-    /// pass, so `z<0` ("under the text") would need that split in two. It is
-    /// accepted and unhonoured -- a refused client gets no picture at all.
+    /// Draw the pictures a single-pane grid holds, clipped to the canvas.
     fn composite_placements(&self, img: &mut RgbaImage, grid: &Grid) {
         let (w, h) = (img.width(), img.height());
         for p in grid.placements() {
@@ -406,18 +395,17 @@ impl Rasterizer {
         }
     }
 
-    /// Draw placements that a multi-pane composer resolved, each clipped to its
-    /// own pane. The composed grid holds no placements of its own: a composed
-    /// frame numbers rows from zero and cannot express an anchor above its first
-    /// row, which any picture taller than its pane has.
+    /// Draw placements a multi-pane composer resolved, each clipped to its own
+    /// pane. See [`shux_vt::ComposedPlacement`] for why they ride beside the
+    /// composed grid rather than inside it.
     pub fn composite_composed(&self, img: &mut RgbaImage, placements: &[ComposedPlacement]) {
         for p in placements {
             let c = p.clip;
             let clip = (
                 c.col as u32 * self.cell_w,
                 c.row as u32 * self.cell_h,
-                ((c.col + c.cols) as u32 * self.cell_w).min(img.width()),
-                ((c.row + c.rows) as u32 * self.cell_h).min(img.height()),
+                (c.col + c.cols) as u32 * self.cell_w,
+                (c.row + c.rows) as u32 * self.cell_h,
             );
             let top = p.row * i64::from(self.cell_h);
             self.blit(img, &p.image, top, p.col as u32 * self.cell_w, clip);
@@ -429,8 +417,14 @@ impl Rasterizer {
     ///
     /// `top` is signed: a picture whose top is above the clip is drawn from the
     /// clip's first row with that many pixel rows of bitmap skipped. Clipping in
-    /// PIXEL space rather than by dropping whole image rows is what keeps a
-    /// cell-stated clip exact under any `appearance.font`.
+    /// PIXEL space rather than by dropping whole image rows keeps a cell-stated
+    /// clip exact under any `appearance.font`.
+    ///
+    /// The client sized its bitmap against the DECLARED cell box, so the
+    /// conversion runs through that rather than the box being drawn --
+    /// `appearance.font` changes the latter and an unconverted image overruns
+    /// its rows. Pictures land above the glyphs: `draw_cell` fills background
+    /// and glyph in one pass, so `z<0` would need that split in two.
     fn blit(
         &self,
         img: &mut RgbaImage,
@@ -439,9 +433,15 @@ impl Rasterizer {
         ox: u32,
         (x0, y0, x1, y1): (u32, u32, u32, u32),
     ) {
+        // Clamped here, not by the caller: every index below is derived from
+        // these, so blit stays panic-free whatever a caller hands it.
+        let (x1, y1) = (x1.min(img.width()), y1.min(img.height()));
         if x0 >= x1 || y0 >= y1 || ox >= x1 {
             return;
         }
+        // No left clip: every producer derives `ox` and `x0` from the same pane
+        // origin, so a picture cannot start left of its own clip.
+        debug_assert!(ox >= x0, "blit has no left clip");
         let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
         let convert = |px: u32, cell: u32, declared: u32| {
             (u64::from(px) * u64::from(cell) / u64::from(declared.max(1))).max(1) as u32

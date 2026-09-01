@@ -22,6 +22,31 @@ const ROWS: u16 = 30;
 const STATUS_BAR_ROWS: u16 = 1;
 const MAGENTA: [u8; 3] = [255, 0, 255];
 
+/// The three probe colours must all reach the composed frame. Compositing runs
+/// AFTER every cell is drawn, so a picture that overpaints its pane's text shows
+/// up here as a missing probe.
+fn assert_probes_survived(img: &image::RgbaImage, what: &str) {
+    let mut truecolor = 0usize;
+    let mut indexed = 0usize;
+    let mut basic = 0usize;
+    for p in img.pixels() {
+        let [r, g, b, _] = p.0;
+        if r < 60 && g > 150 && b > 40 && b < 140 {
+            truecolor += 1;
+        }
+        if r > 200 && g > 90 && g < 180 && b < 60 {
+            indexed += 1;
+        }
+        if r < 60 && g < 90 && b > 150 {
+            basic += 1;
+        }
+    }
+    assert!(
+        truecolor > 0 && indexed > 0 && basic > 0,
+        "{what}: a colour probe vanished (truecolor={truecolor} indexed={indexed} basic={basic})"
+    );
+}
+
 /// A pixel from the BANDED picture, which blends toward magenta at every alpha
 /// so an exact triple will not do. Deliberately not used for the opaque cases:
 /// the focused border is magenta-ish too, and a hue test would count 6 of its
@@ -95,8 +120,26 @@ fn split() -> Split {
     }
 }
 
-/// Colour probes per CLAUDE.md: truecolor, indexed and basic must all be in the
-/// frame, so a monochrome regression cannot pass this file.
+fn composed(s: &Split, panes: &HashMap<PaneId, (&Grid, &Cursor)>) -> shux_ui::ComposedFrame {
+    compose(
+        &ComposeInputs {
+            layout: &s.layout,
+            zoom: None,
+            focused: s.left,
+            panes,
+            titles: None,
+            status_bar: None,
+        },
+        COLS,
+        ROWS,
+        s.style,
+        BorderColors::default(),
+        STATUS_BAR_ROWS,
+    )
+}
+
+/// Colour probes per CLAUDE.md. `assert_probes_survived` reads them back, so a
+/// monochrome regression fails rather than passing unnoticed.
 fn probe_text(vt: &mut VirtualTerminal) {
     vt.process(
         b"\x1b[38;2;0;200;90mTRUECOLOR\x1b[0m \x1b[38;5;208mIDX\x1b[0m \x1b[34mBASIC\x1b[0m\r\n",
@@ -177,21 +220,7 @@ fn an_image_larger_than_its_pane_is_drawn_and_stays_inside_it() {
     let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
     panes.insert(s.left, (&lg, &lc));
     panes.insert(s.right, (&rg, &rc));
-    let composed = compose(
-        &ComposeInputs {
-            layout: &s.layout,
-            zoom: None,
-            focused: s.left,
-            panes: &panes,
-            titles: None,
-            status_bar: None,
-        },
-        COLS,
-        ROWS,
-        s.style,
-        BorderColors::default(),
-        STATUS_BAR_ROWS,
-    );
+    let composed = composed(&s, &panes);
 
     // Several font sizes: `appearance.font` moves the drawn cell box, and the
     // clip is stated in cells while the blit is in pixels.
@@ -202,6 +231,9 @@ fn an_image_larger_than_its_pane_is_drawn_and_stays_inside_it() {
         boxes.insert((cw, ch));
         let mut img = r.render(&composed.grid, &shux_raster::RasterOptions::default());
         r.composite_composed(&mut img, &composed.placements);
+        // The neighbouring pane's text must survive: compositing runs after
+        // every cell is drawn, so an unclipped picture erases it.
+        assert_probes_survived(&img, &format!("font {font}"));
         let m = magenta(&img, s.left_rect, cw, ch);
         let pane_h = i64::from(s.left_rect.height) * i64::from(ch);
         println!(
@@ -267,38 +299,18 @@ fn a_window_snapshot_draws_the_same_image_pixels_as_a_pane_snapshot() {
     let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
     panes.insert(s.left, (&lg, &lc));
     panes.insert(s.right, (&rg, &rc));
-    let composed = compose(
-        &ComposeInputs {
-            layout: &s.layout,
-            zoom: None,
-            focused: s.left,
-            panes: &panes,
-            titles: None,
-            status_bar: None,
-        },
-        COLS,
-        ROWS,
-        s.style,
-        BorderColors::default(),
-        STATUS_BAR_ROWS,
-    );
+    let composed = composed(&s, &panes);
     let mut win_img = r.render(&composed.grid, &shux_raster::RasterOptions::default());
     r.composite_composed(&mut win_img, &composed.placements);
-    // Anything the picture drew outside the pane rect. The whole canvas minus
-    // the pane is the region it must never touch.
-    let whole = Rect::new(0, 0, COLS, ROWS);
-    let escaped = picture(&win_img, whole, cw, ch)
-        .into_iter()
-        .filter(|((x, y), _)| {
-            let (px0, py0) = (s.left_rect.x as u32 * cw, s.left_rect.y as u32 * ch);
-            let (px1, py1) = (
-                (s.left_rect.x + s.left_rect.width) as u32 * cw,
-                (s.left_rect.y + s.left_rect.height) as u32 * ch,
-            );
-            *x < px0 || *x >= px1 || *y < py0 || *y >= py1
-        })
-        .count();
-    assert_eq!(escaped, 0, "the composed image escaped its pane");
+    let win_px = picture(&win_img, s.left_rect, cw, ch);
+    // `picture` over the whole canvas is a superset of `picture` over the pane,
+    // so equal lengths is exactly "nothing was drawn outside it". This is the
+    // only check that can see a pixel drawn ABOVE the pane by a negative anchor.
+    assert_eq!(
+        picture(&win_img, Rect::new(0, 0, COLS, ROWS), cw, ch).len(),
+        win_px.len(),
+        "the composed image escaped its pane"
+    );
 
     // The real cross-path claim: the same slice of the same picture, pixel for
     // pixel, relative to the pane. Extent or a tally alone would miss a clamped
@@ -356,21 +368,7 @@ fn the_image_tracks_the_cursor_following_viewport() {
         let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
         panes.insert(s.left, (&lg, &lc));
         panes.insert(s.right, (&rg, &rc));
-        let composed = compose(
-            &ComposeInputs {
-                layout: &s.layout,
-                zoom: None,
-                focused: s.left,
-                panes: &panes,
-                titles: None,
-                status_bar: None,
-            },
-            COLS,
-            ROWS,
-            s.style,
-            BorderColors::default(),
-            STATUS_BAR_ROWS,
-        );
+        let composed = composed(&s, &panes);
         let mut img = r.render(&composed.grid, &shux_raster::RasterOptions::default());
         r.composite_composed(&mut img, &composed.placements);
         let m = magenta(&img, s.left_rect, cw, ch);
@@ -394,5 +392,56 @@ fn the_image_tracks_the_cursor_following_viewport() {
     assert_eq!(
         tops[1].0, 0,
         "the image stayed on screen after the viewport scrolled past it"
+    );
+}
+
+/// A pane rect can outrun its grid — a split resizes the rect before the PTY
+/// has resized the child, and `compose_pane` tolerates that by copying only the
+/// cells the grid owns. A picture must respect the same bound, or it paints
+/// area no grid owns and the two snapshot paths disagree there.
+#[test]
+fn a_picture_is_clipped_to_the_source_grid_not_just_the_pane_rect() {
+    let s = split();
+    // Narrower AND shorter than the rect, as during a resize lag.
+    let (gc, gr) = (
+        s.left_rect.width as usize - 12,
+        s.left_rect.height as usize - 4,
+    );
+    let mut lvt = VirtualTerminal::new(gr, gc);
+    let mut rvt = VirtualTerminal::new(gr, gc);
+    probe_text(&mut lvt);
+    probe_text(&mut rvt);
+    lvt.process(b"\x1b[H");
+    // Wider and taller than the grid, so an unclipped picture runs past it.
+    lvt.process(&kitty_image(
+        gc as u32 * 9 + 90,
+        gr as u32 * 19 + 190,
+        MAGENTA,
+        false,
+    ));
+
+    let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
+    let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
+    let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
+    panes.insert(s.left, (&lg, &lc));
+    panes.insert(s.right, (&rg, &rc));
+    let composed = composed(&s, &panes);
+
+    let r = shux_raster::Rasterizer::new(14.0).expect("rasterizer");
+    let (cw, ch) = r.cell_size();
+    let mut img = r.render(&composed.grid, &shux_raster::RasterOptions::default());
+    r.composite_composed(&mut img, &composed.placements);
+
+    // The area the grid actually owns, inside the pane.
+    let owned = Rect::new(s.left_rect.x, s.left_rect.y, gc as u16, gr as u16);
+    let m = magenta(&img, owned, cw, ch);
+    println!(
+        "owned {gc}x{gr} cells: inside={} OUTSIDE={}",
+        m.inside, m.outside
+    );
+    assert!(m.inside > 0, "the picture never reached the composed frame");
+    assert_eq!(
+        m.outside, 0,
+        "the picture painted area the source grid does not own"
     );
 }

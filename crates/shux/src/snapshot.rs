@@ -295,9 +295,6 @@ pub(crate) async fn snapshot_window(
             ..Default::default()
         };
         let mut img = rasterizer.render(&composed.grid, &opts);
-        // Pictures ride beside the composed grid, not in it, and each carries
-        // its pane as a clip -- `render` clips to the canvas, which here is the
-        // whole window rather than one pane.
         rasterizer.composite_composed(&mut img, &composed.placements);
         let mut buf: Vec<u8> = Vec::with_capacity(128 * 1024);
         {
