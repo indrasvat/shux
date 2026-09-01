@@ -289,3 +289,33 @@ fn a_pane_that_loses_its_picture_has_it_removed_from_the_host() {
     assert_eq!(cmds.len(), 1, "{cmds:?}");
     assert!(cmds[0].starts_with("a=d"), "{:?}", cmds[0]);
 }
+
+#[test]
+fn the_cursor_ends_where_the_frame_wanted_it_not_on_the_picture() {
+    // The emit CUPs to each picture. Leaving the cursor there parks the user's
+    // caret on the image; forgetting where it is instead costs a hide/show
+    // cycle on every frame that follows.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    vt.process(b"\x1b[9;7Hx");
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let out = drain(&mut c);
+
+    let last_cup = out
+        .rsplit("\x1b[")
+        .find(|s| s.starts_with(|ch: char| ch.is_ascii_digit()) && s.contains('H'))
+        .unwrap_or_else(|| panic!("no cursor positioning at all in {out:?}"));
+    let (row, col) = last_cup.split('H').next().unwrap().split_once(';').unwrap();
+    // The picture sits at row 1; the cursor belongs on the pane's row 9.
+    assert_ne!(
+        (row, col),
+        ("1", "1"),
+        "the frame ended with the cursor parked on the picture"
+    );
+}
