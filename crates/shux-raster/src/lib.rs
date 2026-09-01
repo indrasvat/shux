@@ -920,18 +920,23 @@ const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Ceiling on what ONE PANE may decode and rescale in one render.
 ///
-/// The per-image ceiling above does not bound a frame: a pane may hold up to
-/// `MAX_PLACEMENTS` of them, so it could charge 16 GiB. Measured before this
-/// existed, a four-way split whose panes printed 4096x4096 PNGs took **3.3 s**
-/// for one `window snapshot` against 10 ms with no images -- work a pane
-/// chooses for a caller that did not.
+/// The per-image ceiling above does not bound a pane: it may hold up to
+/// `MAX_PLACEMENTS` of them, so one pane could charge 16 GiB for a caller that
+/// did not ask. This caps that at 256 MiB.
 ///
-/// PER PANE, not per render, and that is the whole point: a shared budget lets
-/// a greedy pane starve whichever pane composes after it, which is silent,
-/// order-dependent, and makes `window.snapshot` disagree with `pane.snapshot`
-/// -- the exact property this crate's composed path exists to uphold. Measured
-/// at 4 hostile placements: the neighbour's picture went from 17100 px to 0.
-/// Per-pane keeps both paths spending the same budget on the same pane.
+/// PER PANE, not per frame, and the distinction is the point rather than a
+/// detail. A frame-wide budget is a better brake -- measured on four hostile
+/// panes, 2950 ms unmitigated, 629 ms frame-wide, 2325 ms per-pane, so this
+/// recovers only about a fifth of that stall. It is still the right one: a
+/// frame-wide budget is spent first-come-first-served, so a greedy pane
+/// silently deletes whichever pane composes after it and `window.snapshot`
+/// stops agreeing with `pane.snapshot` -- the exact property this crate's
+/// composed path exists to uphold. Measured at 4 hostile placements, the
+/// neighbour's picture went from 17100 px to 0, and swapping the panes
+/// reversed which one survived.
+///
+/// What this does deliver: composing N panes costs no more than snapshotting
+/// them one at a time, and both paths draw the same subset of the same pane.
 ///
 /// Sized against a real `kitten icat` of a 4000x3000 photo into a 200x55 pane,
 /// which downscales to the pane and charges 9.27 MiB: about 27 such pictures

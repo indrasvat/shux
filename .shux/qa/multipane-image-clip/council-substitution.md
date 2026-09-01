@@ -34,11 +34,11 @@ second pruning pass. Advisory, no verdict owed.
 
 ## Step 7 — council on the implementation diff (SUBSTITUTED, evidence present)
 
-Re-audited at `c836d8a`. The step is now evidenced and the `3d46d74` finding
+Re-audited at `76fc6e8`. The step is now evidenced and the `3d46d74` finding
 P2-1 is closed.
 
 Two adversarial reviews of the implementation diff completed after `3d46d74`, on
-disjoint surfaces, and both landed measured findings that `c836d8a` applies:
+disjoint surfaces, and both landed measured findings that `76fc6e8` applies:
 
 - **the production wiring surface** — `snapshot.rs`'s single
   `composite_composed` call is what makes `window.snapshot` and
@@ -80,3 +80,22 @@ serve the step, and the substitution is named in the PR rather than skipped. The
 two reviews above are that substitution; their findings were reproduced by this
 gate before being believed, per *Reproduce before believing — including your own
 findings*.
+
+## Addendum — delta after the PASS at `76fc6e8`
+
+The gate's PASS names `76fc6e8`. Two of its three P2 findings were then closed,
+and both are visible in this diff:
+
+* **P2-1** — `MAX_PANE_DECODE_BYTES`'s doc led with a stall figure the per-pane
+  scoping does not deliver. It now states what the gate measured (2950 ms
+  unmitigated / 629 ms frame-wide / 2325 ms per-pane) and why the weaker brake
+  is still the right one.
+* **P2-2** — mutation M19, a budget that charges but never refuses, survived 926
+  tests: the starvation test asserts a picture SURVIVES, which an inert budget
+  satisfies. `the_decode_budget_refuses_past_its_ceiling_identically_on_both_paths`
+  uses the gate's own §4.1 scene — five 4096x4096 placements in distinct
+  colours, ceiling 256 MiB, so the 4th is drawn and the 5th refused, on both
+  render paths. Verified failing against M19 and against M17.
+
+No production behaviour changed: one comment and one test. The gate's twelve
+mutations and twenty-five metrics are unaffected.

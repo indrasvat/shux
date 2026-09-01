@@ -186,6 +186,12 @@ fn picture(img: &image::RgbaImage, r: Rect, cw: u32, ch: u32) -> Vec<((u32, u32)
 /// A PNG placement: kilobytes on the wire, `w*h*4` bytes charged against the
 /// decode budget. The asymmetry a hostile pane exploits.
 fn kitty_png(w: u32, h: u32) -> Vec<u8> {
+    kitty_png_rgb(w, h, [0, 0, 0])
+}
+
+/// The same, in a nameable colour, so which placements reached the canvas is
+/// recoverable rather than merely counted.
+fn kitty_png_rgb(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
     fn crc32(bytes: &[u8]) -> u32 {
         let mut crc = !0u32;
         for &b in bytes {
@@ -206,9 +212,12 @@ fn kitty_png(w: u32, h: u32) -> Vec<u8> {
     use std::io::Write as _;
     let mut ihdr = w.to_be_bytes().to_vec();
     ihdr.extend_from_slice(&h.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]); // 8-bit greyscale
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit truecolour
     let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
-    let row = vec![0u8; w as usize + 1];
+    let mut row = vec![0u8; w as usize * 3 + 1];
+    for px in row[1..].as_chunks_mut::<3>().0 {
+        *px = rgb;
+    }
     for _ in 0..h {
         z.write_all(&row).expect("deflate");
     }
@@ -476,5 +485,66 @@ fn a_greedy_pane_does_not_starve_its_neighbours_picture() {
             "{name}: the neighbouring pane's picture was starved by a greedy pane"
         );
         assert_eq!(m.outside, 0, "{name}: the picture escaped its pane");
+    }
+}
+
+/// The budget must actually refuse, not merely be charged.
+///
+/// `a_greedy_pane_does_not_starve_its_neighbours_picture` asserts a picture
+/// SURVIVES, which is also what an inert budget looks like -- a version that
+/// counted bytes and never refused passed the whole suite. Five maximal
+/// placements in distinct colours, drawn in order: the ceiling is 256 MiB and
+/// each charges 64 MiB, so the fourth must be the last one drawn and the fifth
+/// must be refused, identically on both render paths.
+#[test]
+fn the_decode_budget_refuses_past_its_ceiling_identically_on_both_paths() {
+    const HUES: [[u8; 3]; 5] = [
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [255, 255, 0],
+        [0, 255, 255],
+    ];
+    let s = split();
+    let mut vt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    probe_text(&mut vt);
+    for hue in HUES {
+        vt.process(b"\x1b[H");
+        vt.process(&kitty_png_rgb(4096, 4096, hue));
+    }
+
+    let count = |img: &image::RgbaImage, hue: [u8; 3]| {
+        img.pixels()
+            .filter(|p| {
+                p.0[0].abs_diff(hue[0]) < 40
+                    && p.0[1].abs_diff(hue[1]) < 40
+                    && p.0[2].abs_diff(hue[2]) < 40
+            })
+            .count()
+    };
+
+    // Single-pane path.
+    let solo = vt.grid().clone_visible();
+    let r = shux_raster::Rasterizer::new(14.0).expect("rasterizer");
+    let pane_img = r.render(&solo, &shux_raster::RasterOptions::default());
+
+    // Composed path, same content.
+    let rvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    let (lg, rg) = (vt.grid().clone_visible(), rvt.grid().clone_visible());
+    let (lc, rc) = (vt.cursor().clone(), rvt.cursor().clone());
+    let (win_img, _, _) = window_png(&s, (&lg, &lc), (&rg, &rc), 14.0);
+
+    for (what, img) in [("pane", &pane_img), ("window", &win_img)] {
+        let fourth = count(img, HUES[3]);
+        let fifth = count(img, HUES[4]);
+        assert!(
+            fourth > 1000,
+            "{what}: the 4th placement is within the ceiling and must be drawn ({fourth} px)"
+        );
+        assert_eq!(
+            fifth, 0,
+            "{what}: the 5th placement is past the ceiling and was drawn anyway ({fifth} px) \
+             -- the budget is charged but never refuses"
+        );
     }
 }
