@@ -456,7 +456,7 @@ impl Default for GridConfig {
 /// Placements one grid may hold.
 const MAX_PLACEMENTS: usize = 256;
 
-/// A rectangle in cells. The clip a composed placement is drawn against.
+/// A rectangle in cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellRect {
     pub col: usize,

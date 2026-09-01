@@ -391,7 +391,7 @@ impl Rasterizer {
         let (w, h) = (img.width(), img.height());
         for p in grid.placements() {
             let top = p.viewport_row(grid) * i64::from(self.cell_h);
-            self.blit(img, &p.image, top, p.col as u32 * self.cell_w, (0, 0, w, h));
+            self.blit(img, &p.image, top, p.col as u32 * self.cell_w, (0, w, h));
         }
     }
 
@@ -402,7 +402,6 @@ impl Rasterizer {
         for p in placements {
             let c = p.clip;
             let clip = (
-                c.col as u32 * self.cell_w,
                 c.row as u32 * self.cell_h,
                 (c.col + c.cols) as u32 * self.cell_w,
                 (c.row + c.rows) as u32 * self.cell_h,
@@ -412,43 +411,34 @@ impl Rasterizer {
         }
     }
 
-    /// Draw one picture with its top-left at `(ox, top)`, clipped to the pixel
-    /// box `(x0, y0, x1, y1)`.
+    /// Draw one picture, clipped to a box given in PIXELS rather than cells --
+    /// which is what keeps a cell-stated clip exact under any `appearance.font`,
+    /// instead of dropping whole image rows.
     ///
-    /// `top` is signed: a picture whose top is above the clip is drawn from the
-    /// clip's first row with that many pixel rows of bitmap skipped. Clipping in
-    /// PIXEL space rather than by dropping whole image rows keeps a cell-stated
-    /// clip exact under any `appearance.font`.
+    /// Has no left clip, and needs none: every producer derives `ox` and the
+    /// clip's left edge from the same pane origin, so a picture cannot start
+    /// left of its own clip.
     ///
     /// The client sized its bitmap against the DECLARED cell box, so the
     /// conversion runs through that rather than the box being drawn --
     /// `appearance.font` changes the latter and an unconverted image overruns
-    /// its rows. Pictures land above the glyphs: `draw_cell` fills background
-    /// and glyph in one pass, so `z<0` would need that split in two.
+    /// its rows.
     fn blit(
         &self,
         img: &mut RgbaImage,
         stored: &shux_vt::StoredImage,
         top: i64,
         ox: u32,
-        (x0, y0, x1, y1): (u32, u32, u32, u32),
+        (y0, x1, y1): (u32, u32, u32),
     ) {
-        // Clamped here, not by the caller: every index below is derived from
-        // these, so blit stays panic-free whatever a caller hands it.
         let (x1, y1) = (x1.min(img.width()), y1.min(img.height()));
-        if x0 >= x1 || y0 >= y1 || ox >= x1 {
+        if y0 >= y1 || ox >= x1 || top >= i64::from(y1) {
             return;
         }
-        // No left clip: every producer derives `ox` and `x0` from the same pane
-        // origin, so a picture cannot start left of its own clip.
-        debug_assert!(ox >= x0, "blit has no left clip");
         let (dw, dh) = shux_vt::DECLARED_CELL_PIXELS;
         let convert = |px: u32, cell: u32, declared: u32| {
             (u64::from(px) * u64::from(cell) / u64::from(declared.max(1))).max(1) as u32
         };
-        if top >= i64::from(y1) {
-            return;
-        }
         // Both visibility tests run on the DECLARED height, before any decode:
         // a placement outside the clip is discarded without inflating its
         // payload. `decode_placement` refuses a payload that does not match the

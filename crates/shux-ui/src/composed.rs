@@ -78,7 +78,6 @@ pub fn compose(
         inputs.layout.compute_rects(pane_viewport)
     };
 
-    // Iterate the RECTS: a zoomed window keeps every pane in `panes`.
     let mut placements: Vec<ComposedPlacement> = Vec::new();
     for (pid, rect) in &pane_rects {
         if let Some((src_grid, src_cursor)) = inputs.panes.get(pid) {
@@ -96,8 +95,7 @@ pub fn compose(
                 image: p.image.clone(),
                 // `viewport_row` undoes the source grid's own base, `row_offset`
                 // undoes the vertical clip `compose_pane` just applied to the
-                // cells, and `rect.y` rebases into this frame. Signed, because
-                // a picture taller than its pane anchors above it.
+                // cells, and `rect.y` rebases into this frame.
                 row: p.viewport_row(src_grid) - row_offset as i64 + i64::from(rect.y),
                 col: p.col + rect.x as usize,
                 clip,

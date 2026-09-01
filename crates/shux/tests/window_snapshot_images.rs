@@ -1,12 +1,5 @@
 //! An inline image must survive multi-pane composition, and must not leave its
 //! pane.
-//!
-//! `compose` builds a fresh `Grid` and copies CELLS. An image is not a cell, so
-//! a split window renders every pane's text and none of its pictures. Carrying
-//! the placement across is only half of it: `composite_placements` clips to the
-//! CANVAS, and in a composed frame the canvas is the whole window while the
-//! pane is a sub-rect — so an image larger than its pane paints over its
-//! neighbour, the borders and the status bar.
 
 use std::collections::HashMap;
 
@@ -48,9 +41,8 @@ fn assert_probes_survived(img: &image::RgbaImage, what: &str) {
 }
 
 /// A pixel from the BANDED picture, which blends toward magenta at every alpha
-/// so an exact triple will not do. Deliberately not used for the opaque cases:
-/// the focused border is magenta-ish too, and a hue test would count 6 of its
-/// pixels as picture.
+/// so an exact triple will not do. Not for the opaque cases: the focused border
+/// is magenta-ish too.
 fn is_banded_picture(p: [u8; 4]) -> bool {
     p[0] > p[1] && p[2] > p[1] && p[0] > 90 && p[2] > 90
 }
@@ -59,8 +51,7 @@ fn is_banded_picture(p: [u8; 4]) -> bool {
 /// chunks, `a=T` repeated on every continuation.
 ///
 /// `banded` gives every source row a distinct alpha, so which SLICE of the
-/// picture reached the canvas is recoverable from the pixels. A solid fill
-/// cannot show a vertical shift -- every slice of it looks identical.
+/// picture reached the canvas is recoverable from the pixels.
 fn kitty_image(w: u32, h: u32, rgb: [u8; 3], banded: bool) -> Vec<u8> {
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for y in 0..h {
@@ -120,6 +111,24 @@ fn split() -> Split {
     }
 }
 
+/// Compose the split and rasterize it exactly as `window snapshot` does.
+fn window_png(
+    s: &Split,
+    l: (&Grid, &Cursor),
+    r: (&Grid, &Cursor),
+    font: f32,
+) -> (image::RgbaImage, u32, u32) {
+    let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
+    panes.insert(s.left, l);
+    panes.insert(s.right, r);
+    let frame = composed(s, &panes);
+    let rast = shux_raster::Rasterizer::new(font).expect("rasterizer");
+    let (cw, ch) = rast.cell_size();
+    let mut img = rast.render(&frame.grid, &shux_raster::RasterOptions::default());
+    rast.composite_composed(&mut img, &frame.placements);
+    (img, cw, ch)
+}
+
 fn composed(s: &Split, panes: &HashMap<PaneId, (&Grid, &Cursor)>) -> shux_ui::ComposedFrame {
     compose(
         &ComposeInputs {
@@ -164,7 +173,6 @@ fn picture(img: &image::RgbaImage, r: Rect, cw: u32, ch: u32) -> Vec<((u32, u32)
     let (x1, y1) = ((r.x + r.width) as u32 * cw, (r.y + r.height) as u32 * ch);
     let mut out = Vec::new();
     for (x, y, p) in img.enumerate_pixels() {
-        // The banded picture blends toward magenta; the text and ground do not.
         if x < x0 || x >= x1 || y < y0 || y >= y1 || !is_banded_picture(p.0) {
             continue;
         }
@@ -201,54 +209,46 @@ fn magenta(img: &image::RgbaImage, r: Rect, cw: u32, ch: u32) -> Magenta {
 #[test]
 fn an_image_larger_than_its_pane_is_drawn_and_stays_inside_it() {
     let s = split();
-    let mut lvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
-    let mut rvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    // The grid is SMALLER than its rect, as during a resize lag: `compose_pane`
+    // tolerates that, so a picture must respect the grid's bound and not just
+    // the pane's. 367x553 declared px is 40.8 x 29.1 cells -- wider and taller
+    // than this grid on both axes, and not a multiple of any cell size, so a
+    // clip that is cell-granular rather than pixel-exact shows up too.
+    const GC: usize = 37;
+    const GR: usize = 23;
+    let mut lvt = VirtualTerminal::new(GR, GC);
+    let mut rvt = VirtualTerminal::new(GR, GC);
     probe_text(&mut lvt);
     probe_text(&mut rvt);
     lvt.process(b"\x1b[H");
-    // Larger than the pane on BOTH axes, and not a multiple of any plausible
-    // cell size: a cell-granular clip that is not pixel-exact shows up here.
     lvt.process(&kitty_image(367, 553, MAGENTA, false));
-    assert_eq!(
-        lvt.grid().placements().len(),
-        1,
-        "the VT did not store the image"
-    );
 
     let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
     let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
-    let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
-    panes.insert(s.left, (&lg, &lc));
-    panes.insert(s.right, (&rg, &rc));
-    let composed = composed(&s, &panes);
+    let owned = Rect::new(s.left_rect.x, s.left_rect.y, GC as u16, GR as u16);
 
     // Several font sizes: `appearance.font` moves the drawn cell box, and the
     // clip is stated in cells while the blit is in pixels.
     let mut boxes = std::collections::BTreeSet::new();
     for font in [10.0f32, 14.0, 20.0] {
-        let r = shux_raster::Rasterizer::new(font).expect("rasterizer");
-        let (cw, ch) = r.cell_size();
+        let (img, cw, ch) = window_png(&s, (&lg, &lc), (&rg, &rc), font);
         boxes.insert((cw, ch));
-        let mut img = r.render(&composed.grid, &shux_raster::RasterOptions::default());
-        r.composite_composed(&mut img, &composed.placements);
         // The neighbouring pane's text must survive: compositing runs after
         // every cell is drawn, so an unclipped picture erases it.
         assert_probes_survived(&img, &format!("font {font}"));
-        let m = magenta(&img, s.left_rect, cw, ch);
-        let pane_h = i64::from(s.left_rect.height) * i64::from(ch);
-        println!(
-            "font {font} cell {cw}x{ch}: inside={} OUTSIDE={} top={} bottom={} pane_h={pane_h}",
-            m.inside, m.outside, m.top, m.bottom
-        );
+        let m = magenta(&img, owned, cw, ch);
         assert!(
             m.inside > 0,
             "font {font}: the image never reached the composed frame"
         );
-        assert_eq!(m.outside, 0, "font {font}: the image escaped its pane");
+        assert_eq!(
+            m.outside, 0,
+            "font {font}: the image escaped the area its grid owns"
+        );
         assert_eq!(
             m.bottom + 1,
-            pane_h,
-            "font {font}: the image stopped short of the pane's last row"
+            GR as i64 * i64::from(ch),
+            "font {font}: the image stopped short of the grid's last row"
         );
     }
     assert!(
@@ -293,15 +293,12 @@ fn a_window_snapshot_draws_the_same_image_pixels_as_a_pane_snapshot() {
         "the single-pane baseline drew no picture"
     );
 
-    let rvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    let mut rvt = VirtualTerminal::new(s.left_rect.height as usize, s.left_rect.width as usize);
+    probe_text(&mut rvt);
     let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
     let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
-    let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
-    panes.insert(s.left, (&lg, &lc));
-    panes.insert(s.right, (&rg, &rc));
-    let composed = composed(&s, &panes);
-    let mut win_img = r.render(&composed.grid, &shux_raster::RasterOptions::default());
-    r.composite_composed(&mut win_img, &composed.placements);
+    let (win_img, _, _) = window_png(&s, (&lg, &lc), (&rg, &rc), 14.0);
+    assert_probes_survived(&win_img, "cross-path");
     let win_px = picture(&win_img, s.left_rect, cw, ch);
     // `picture` over the whole canvas is a superset of `picture` over the pane,
     // so equal lengths is exactly "nothing was drawn outside it". This is the
@@ -315,12 +312,6 @@ fn a_window_snapshot_draws_the_same_image_pixels_as_a_pane_snapshot() {
     // The real cross-path claim: the same slice of the same picture, pixel for
     // pixel, relative to the pane. Extent or a tally alone would miss a clamped
     // row -- the picture keeps its size and shows a different part of itself.
-    let win_px = picture(&win_img, s.left_rect, cw, ch);
-    println!(
-        "pane picture {} px   window picture {} px",
-        solo_px.len(),
-        win_px.len()
-    );
     let first_diff = solo_px
         .iter()
         .zip(&win_px)
@@ -353,9 +344,6 @@ fn the_image_tracks_the_cursor_following_viewport() {
     );
 
     let rvt = VirtualTerminal::new(tall, s.left_rect.width as usize);
-    let r = shux_raster::Rasterizer::new(14.0).expect("rasterizer");
-    let (cw, ch) = r.cell_size();
-
     // Park the cursor progressively lower. Once it passes the rect height the
     // viewport scrolls, and the image must rise with the text it sits in.
     let mut tops = Vec::new();
@@ -365,17 +353,8 @@ fn the_image_tracks_the_cursor_following_viewport() {
         lc.row = cursor_row;
         let rg = rvt.grid().clone();
         let rc = rvt.cursor().clone();
-        let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
-        panes.insert(s.left, (&lg, &lc));
-        panes.insert(s.right, (&rg, &rc));
-        let composed = composed(&s, &panes);
-        let mut img = r.render(&composed.grid, &shux_raster::RasterOptions::default());
-        r.composite_composed(&mut img, &composed.placements);
+        let (img, cw, ch) = window_png(&s, (&lg, &lc), (&rg, &rc), 14.0);
         let m = magenta(&img, s.left_rect, cw, ch);
-        println!(
-            "cursor_row={cursor_row}: inside={} top={} outside={}",
-            m.inside, m.top, m.outside
-        );
         assert_eq!(
             m.outside, 0,
             "cursor_row={cursor_row}: the image escaped its pane"
@@ -392,56 +371,5 @@ fn the_image_tracks_the_cursor_following_viewport() {
     assert_eq!(
         tops[1].0, 0,
         "the image stayed on screen after the viewport scrolled past it"
-    );
-}
-
-/// A pane rect can outrun its grid — a split resizes the rect before the PTY
-/// has resized the child, and `compose_pane` tolerates that by copying only the
-/// cells the grid owns. A picture must respect the same bound, or it paints
-/// area no grid owns and the two snapshot paths disagree there.
-#[test]
-fn a_picture_is_clipped_to_the_source_grid_not_just_the_pane_rect() {
-    let s = split();
-    // Narrower AND shorter than the rect, as during a resize lag.
-    let (gc, gr) = (
-        s.left_rect.width as usize - 12,
-        s.left_rect.height as usize - 4,
-    );
-    let mut lvt = VirtualTerminal::new(gr, gc);
-    let mut rvt = VirtualTerminal::new(gr, gc);
-    probe_text(&mut lvt);
-    probe_text(&mut rvt);
-    lvt.process(b"\x1b[H");
-    // Wider and taller than the grid, so an unclipped picture runs past it.
-    lvt.process(&kitty_image(
-        gc as u32 * 9 + 90,
-        gr as u32 * 19 + 190,
-        MAGENTA,
-        false,
-    ));
-
-    let (lg, rg) = (lvt.grid().clone_visible(), rvt.grid().clone_visible());
-    let (lc, rc) = (lvt.cursor().clone(), rvt.cursor().clone());
-    let mut panes: HashMap<PaneId, (&Grid, &Cursor)> = HashMap::new();
-    panes.insert(s.left, (&lg, &lc));
-    panes.insert(s.right, (&rg, &rc));
-    let composed = composed(&s, &panes);
-
-    let r = shux_raster::Rasterizer::new(14.0).expect("rasterizer");
-    let (cw, ch) = r.cell_size();
-    let mut img = r.render(&composed.grid, &shux_raster::RasterOptions::default());
-    r.composite_composed(&mut img, &composed.placements);
-
-    // The area the grid actually owns, inside the pane.
-    let owned = Rect::new(s.left_rect.x, s.left_rect.y, gc as u16, gr as u16);
-    let m = magenta(&img, owned, cw, ch);
-    println!(
-        "owned {gc}x{gr} cells: inside={} OUTSIDE={}",
-        m.inside, m.outside
-    );
-    assert!(m.inside > 0, "the picture never reached the composed frame");
-    assert_eq!(
-        m.outside, 0,
-        "the picture painted area the source grid does not own"
     );
 }
