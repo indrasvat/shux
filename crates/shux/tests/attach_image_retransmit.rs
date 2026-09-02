@@ -294,3 +294,112 @@ async fn a_misspelled_graphics_override_says_so_where_a_person_can_see_it() {
         "a valid override warned anyway: {quiet:?}"
     );
 }
+
+/// A 1536x1024 picture plus dense per-cell truecolor -- the shape `chafa` puts
+/// on a screen. Written to a file and `cat`, because a multi-megabyte payload
+/// does not fit on a command line.
+fn dense_workload(dir: &Path, cols: usize, rows: usize, img: (u32, u32)) -> String {
+    let (w, h) = img;
+    let px: Vec<u8> = std::iter::repeat_n([200u8, 40, 40], (w * h) as usize)
+        .flatten()
+        .collect();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+    let bytes = b64.as_bytes();
+    let total = bytes.len().div_ceil(4096).max(1);
+    let mut out: Vec<u8> = Vec::new();
+    for (i, chunk) in bytes.chunks(4096).enumerate() {
+        let more = u8::from(i + 1 < total);
+        out.extend_from_slice(format!("\x1b_Ga=T,f=24,s={w},v={h},t=d,m={more};").as_bytes());
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
+    for r in 0..rows {
+        out.extend_from_slice(format!("\x1b[{};1H", r + 1).as_bytes());
+        for c in 0..cols {
+            let a = ((r * 7 + c * 13) % 255) as u8;
+            let b = ((r * 11 + c * 3) % 255) as u8;
+            out.extend_from_slice(
+                format!("\x1b[38;2;{a};{b};{};48;2;{};{a};{b}mX", 255 - a, 255 - b).as_bytes(),
+            );
+        }
+    }
+    out.extend_from_slice(
+        b"\x1b[1;1H\x1b[38;2;120;220;180mTRUECOLOR\x1b[0m \x1b[38;5;208mINDEXED\x1b[0m",
+    );
+    let path = dir.join("dense.bin");
+    std::fs::write(&path, &out).expect("write payload");
+    format!("cat {}; while :; do sleep 3600; done", path.display())
+}
+
+#[tokio::test]
+async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
+    // The 6 MiB image budget bounds IMAGE bytes; a frame also carries cells, and
+    // the sum is what the codec caps at MAX_FRAME_SIZE. The VT gate measured an
+    // 800x250 attach -- inside MAX_CLIENT_COLS/ROWS -- receiving one 39-byte
+    // prelude and then nothing for 45s: permanently blank, no error, socket
+    // still open. Frames are split now, so the cap bounds the message, not the
+    // screen.
+    let h = Harness::new();
+    let tmp = tempfile::tempdir().expect("payload dir");
+    h.rpc(
+        "session.create",
+        serde_json::json!({
+            "name": "img-big",
+            "command": ["/bin/sh", "-c", dense_workload(tmp.path(), 800, 250, (1536, 1024))],
+            "size": { "cols": 800, "rows": 250 },
+        }),
+    );
+    // The pane has to have CONSUMED the payload before the attach: the frame
+    // that overflows is the one carrying a full screen of cells plus a picture.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let sock = h.runtime_dir().join("shux").join("attach.sock");
+    let stream = UnixStream::connect(&sock).await.expect("connect attach");
+    let mut framed = Framed::new(stream, shux_rpc::create_codec());
+    framed
+        .send(Bytes::from(
+            serde_json::to_vec(&AttachHello {
+                protocol: ATTACH_PROTOCOL_VERSION,
+                session_name: Some("img-big".to_string()),
+                cols: 800,
+                rows: 250,
+                client_version: "image-big-frame-test".to_string(),
+                graphics: true,
+            })
+            .unwrap(),
+        ))
+        .await
+        .expect("send hello");
+    let ready = framed.next().await.expect("ready").expect("ready bytes");
+    match serde_json::from_slice::<AttachReady>(&ready).expect("parse ready") {
+        AttachReady::Ok { .. } => {}
+        AttachReady::Error { code, message } => panic!("attach denied: {code}: {message}"),
+    }
+
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(3), framed.next()).await
+        else {
+            continue;
+        };
+        if let Ok(AttachServerFrame::Render { data }) = serde_json::from_slice(&frame)
+            && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&data)
+        {
+            seen.extend_from_slice(&raw);
+        }
+        if find(&seen, b"\x1b_Ga=T") && find(&seen, b"38;2;120;220;180") {
+            break;
+        }
+    }
+
+    assert!(
+        find(&seen, b"\x1b_Ga=T"),
+        "an 800x250 client was sent no picture at all in {} bytes",
+        seen.len()
+    );
+    assert!(
+        find(&seen, b"38;2;120;220;180"),
+        "the truecolor probe never arrived either: the frame stream died"
+    );
+}

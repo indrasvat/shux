@@ -1548,15 +1548,35 @@ async fn run_render_loop(
         drop(state);
 
         if !bytes.is_empty() {
-            let frame = AttachServerFrame::Render {
-                data: BASE64.encode(&bytes),
-            };
-            if out_tx.send(frame).await.is_err() {
+            // Split rather than send whole: base64 inflates by 4/3 and the codec
+            // refuses a frame over MAX_FRAME_SIZE, so one composited frame that
+            // crosses the cap used to fail the send, break the writer task and
+            // leave the attach permanently blank with no error. A frame's cells
+            // alone reach it at the client sizes the daemon already permits.
+            // Splitting is invisible to the terminal: this is a byte stream, and
+            // the compositor wraps each frame in synchronized output, so the
+            // parts are held and applied together.
+            let mut sent_all = true;
+            for part in bytes.chunks(RENDER_PART_BYTES) {
+                let frame = AttachServerFrame::Render {
+                    data: BASE64.encode(part),
+                };
+                if out_tx.send(frame).await.is_err() {
+                    sent_all = false;
+                    break;
+                }
+            }
+            if !sent_all {
                 break;
             }
         }
     }
 }
+
+/// Bytes of one composited frame per `Render` message. Base64 takes this to
+/// ~10.7 MiB, comfortably inside the codec's 16 MiB frame cap with room for the
+/// JSON envelope.
+const RENDER_PART_BYTES: usize = 8 * 1024 * 1024;
 
 /// How long the first-attach welcome toast stays on screen before
 /// auto-dismissing. Tuned for "long enough to read, short enough to
