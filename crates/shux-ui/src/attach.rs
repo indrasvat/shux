@@ -48,24 +48,14 @@ const OUTER_MULTIPLEXER_VARS: &[&str] = &["TMUX", "STY", "ZELLIJ"];
 
 /// Overrides the automatic decision below. `1`/`true`/`yes`/`on` forces images
 /// on, `0`/`false`/`no`/`off` forces them off; anything else, including unset,
-/// leaves the decision automatic.
-///
-/// Compared case-insensitively and trimmed: this hatch fails OPEN, so a
-/// near-miss spelling would silently become the corruption it exists to
-/// prevent.
+/// leaves the decision automatic. Compared case-insensitively and trimmed.
 const GRAPHICS_OVERRIDE_VAR: &str = "SHUX_GRAPHICS";
 
-/// Whether this terminal can be sent kitty graphics.
-///
-/// Automatic answer: yes, unless an outer multiplexer announces itself.
-///
-/// This check reads the CLIENT's environment, while the corruption is a
-/// property of the BYTE STREAM. They decouple wherever the environment is reset
-/// without moving stdout -- `sudo`, `ssh`, `su`, `env -i`, a systemd unit,
-/// `docker exec` -- so a shux attached across one of those, inside a
-/// multiplexer, is not detected. That is what [`GRAPHICS_OVERRIDE_VAR`] is for,
-/// in both directions: the same gap strands a user whose stale `TMUX` outlived
-/// its tmux.
+/// Whether this terminal can be sent kitty graphics: yes, unless an outer
+/// multiplexer announces itself. The check reads the CLIENT's environment while
+/// the corruption is a property of the byte stream; the two decouple across
+/// `sudo`/`ssh`/`env -i`, which is what [`GRAPHICS_OVERRIDE_VAR`] is for.
+/// `docs/configuration.md` is the user-facing copy.
 fn terminal_can_draw_images() -> bool {
     if let Ok(raw) = std::env::var(GRAPHICS_OVERRIDE_VAR) {
         let value = raw.trim().to_ascii_lowercase();
@@ -73,12 +63,11 @@ fn terminal_can_draw_images() -> bool {
             "1" | "true" | "on" | "yes" => return true,
             "0" | "false" | "off" | "no" => return false,
             "" => {}
-            // A typo must not be silent -- but this runs before the alternate
-            // screen, which would cover anything printed here for the whole
-            // session, so it goes to the log rather than pretending to be seen.
-            _ => tracing::warn!(
-                value = %raw,
-                "ignoring {GRAPHICS_OVERRIDE_VAR}: expected on/off; deciding from the environment"
+            // stderr, not `warn!`: without `-v` the client's subscriber is
+            // ERROR-only, so a warn here reaches nobody. This runs before the
+            // alternate screen, so the line lands on the normal screen.
+            _ => eprintln!(
+                "shux: ignoring {GRAPHICS_OVERRIDE_VAR}={raw:?}: expected on/off; deciding from the environment"
             ),
         }
     }

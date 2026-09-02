@@ -20,13 +20,9 @@ const CHUNK: usize = 4096;
 /// application chose for the same terminal.
 const HOST_ID_BASE: u32 = 2_000_000_000;
 
-/// Image bytes one frame may emit. The daemon ships the whole composited frame
-/// as a single base64 `Render`, and the RPC codec refuses a frame over
-/// `MAX_FRAME_SIZE`; nothing between `Grid::place`'s 32 MiB ceiling and here
-/// bounded it, so one large pane picture killed the attach outright -- and a
-/// re-attach re-sends every live placement, leaving the session unattachable.
-/// 6 MiB of payload becomes 8 MiB of base64, and the outer encode of that plus
-/// a frame's cells stays well under the cap.
+/// Base64 image bytes one frame may emit. The daemon ships the whole composited
+/// frame as one base64 `Render` and the codec caps it at `MAX_FRAME_SIZE`; 6 MiB
+/// here leaves the outer encode of that, plus a frame's cells, inside the cap.
 const FRAME_IMAGE_BUDGET: usize = 6 * 1024 * 1024;
 
 /// Where one placement was put, in the terms the host was told.
@@ -81,9 +77,10 @@ impl KittyEmitter {
         let want: Vec<(&ComposedPlacement, Placed)> = placements
             .iter()
             .filter_map(|p| resolve(p).map(|r| (p, r)))
-            // Charged whether or not this frame re-transmits it: a picture that
-            // came and went with the budget would flicker, and the frame that
-            // does re-transmit is the one that has to fit.
+            // Charged whether or not this frame re-transmits it: `want[i]`
+            // pairs with `live[i]` positionally, so any resolved placement can
+            // be forced into a full re-transmit on any frame, and that frame is
+            // the one that has to fit.
             .filter(|(p, _)| {
                 let cost = p.image.payload.len().div_ceil(3) * 4;
                 if spent + cost > FRAME_IMAGE_BUDGET {

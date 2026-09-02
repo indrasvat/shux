@@ -453,6 +453,7 @@ fn one_frame_never_writes_more_bytes_than_the_attach_frame_can_carry() {
     let p = pane(1);
     let layout = LayoutNode::leaf(p);
     let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(b"KEEPTHISTEXT");
     // 12 MB of pixels: comfortably inside what shux-vt accepts and places.
     vt.process(&kitty_rgb(2000, 2000, [200, 40, 40]));
     let mut vts = HashMap::new();
@@ -471,8 +472,17 @@ fn one_frame_never_writes_more_bytes_than_the_attach_frame_can_carry() {
         render_frame,
         shux_rpc::codec::MAX_FRAME_SIZE
     );
-    assert!(
-        out.contains('\x1b'),
-        "dropped the cells along with the picture"
+
+    // The refusal costs the picture and nothing else. The control is the SAME
+    // pane rendered with graphics off, so the only thing that can differ is the
+    // emission -- an assertion that "some escape was written" is satisfied by
+    // the full redraw whether or not a single cell survived.
+    let mut c2 = make_compositor(20, 10);
+    c2.set_graphics(false);
+    c2.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    assert_eq!(
+        out,
+        drain(&mut c2),
+        "refusing the picture disturbed the cells"
     );
 }

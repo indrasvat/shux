@@ -219,3 +219,78 @@ async fn a_client_that_reports_no_graphics_is_sent_no_pictures() {
     );
     assert!(text.contains("38;5;208"), "indexed colour never arrived");
 }
+
+/// What the real binary writes to a terminal before the alternate screen takes
+/// over. `session attach` refuses a redirected stdin/stdout, so a pipe cannot
+/// reach this code at all -- the check has to own a pty.
+fn attach_pty_output(h: &Harness, session: &str, graphics: &str) -> String {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::process::Stdio;
+
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let slave: OwnedFd = pty.slave;
+    let dup = |fd: &OwnedFd| Stdio::from(fd.try_clone().expect("dup slave"));
+    let mut child = Command::new(&h.bin)
+        .env("XDG_RUNTIME_DIR", h.runtime_dir())
+        .env("NO_COLOR", "1")
+        .env("TERM", "xterm-256color")
+        .env("SHUX_GRAPHICS", graphics)
+        .args(["session", "attach", session])
+        .stdin(dup(&slave))
+        .stdout(dup(&slave))
+        .stderr(dup(&slave))
+        .spawn()
+        .expect("spawn attach");
+    drop(slave);
+
+    // Non-blocking, because the child stays alive holding the screen: the read
+    // has to end on a deadline rather than on EOF.
+    let master = pty.master;
+    nix::fcntl::fcntl(&master, nix::fcntl::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
+        .expect("set O_NONBLOCK");
+    let mut file = std::fs::File::from(master);
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let mut buf = [0u8; 4096];
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+        if seen.contains("SHUX_GRAPHICS") {
+            break;
+        }
+    }
+    // By recorded pid, and reaped, so the suite leaves nothing behind.
+    let _ = child.kill();
+    let _ = child.wait();
+    seen
+}
+
+#[tokio::test]
+async fn a_misspelled_graphics_override_says_so_where_a_person_can_see_it() {
+    // The hatch fails OPEN, so a near-miss spelling silently becomes the
+    // corruption it exists to prevent. The diagnostic must therefore reach the
+    // user, not a log: without `-v` the client's subscriber is ERROR-only, so a
+    // `warn!` here goes nowhere at all.
+    let h = Harness::new();
+    h.rpc(
+        "session.create",
+        serde_json::json!({ "name": "gfx-typo", "command": workload() }),
+    );
+
+    let seen = attach_pty_output(&h, "gfx-typo", "Onn");
+    assert!(
+        seen.contains("ignoring SHUX_GRAPHICS"),
+        "a near-miss override was accepted in silence; the terminal saw: {seen:?}"
+    );
+
+    // And a spelling that IS recognised says nothing.
+    let quiet = attach_pty_output(&h, "gfx-typo", "off");
+    assert!(
+        !quiet.contains("ignoring SHUX_GRAPHICS"),
+        "a valid override warned anyway: {quiet:?}"
+    );
+}
