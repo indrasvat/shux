@@ -1,3 +1,10 @@
+# [0.51.0](https://github.com/indrasvat/shux/compare/v0.50.0...v0.51.0) (2026-09-02)
+
+
+### Features
+
+* **ui:** draw pane images on the terminal you attach from ([#188](https://github.com/indrasvat/shux/issues/188)) ([b623470](https://github.com/indrasvat/shux/commit/b6234702e9c57c2ccda3fee411490b541ff9dd53))
+
 # [0.50.0](https://github.com/indrasvat/shux/compare/v0.49.0...v0.50.0) (2026-09-01)
 
 
