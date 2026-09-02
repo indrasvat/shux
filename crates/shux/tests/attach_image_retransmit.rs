@@ -106,7 +106,7 @@ fn workload() -> String {
 }
 
 /// Collect the bytes the daemon would have written to a terminal, for a client
-/// that either did or did not answer the graphics probe.
+/// that either can or cannot draw images.
 async fn render_bytes(h: &Harness, session: &str, graphics: bool) -> Vec<u8> {
     let sock = h.runtime_dir().join("shux").join("attach.sock");
     let stream = UnixStream::connect(&sock).await.expect("connect attach");
@@ -193,17 +193,17 @@ async fn a_real_attach_carries_a_panes_picture_to_the_terminal() {
 }
 
 #[tokio::test]
-async fn a_client_that_never_answered_the_probe_is_sent_no_pictures() {
+async fn a_client_that_reports_no_graphics_is_sent_no_pictures() {
     // The wire field, end to end. Without it a shux attach inside tmux 3.4 had
-    // the emitter's continuation header adopted as the tmux window title, once
+    // the emitter's continuation header adopted as the tmux pane title, once
     // per frame.
     let h = Harness::new();
     h.rpc(
         "session.create",
-        serde_json::json!({ "name": "img-noprobe", "command": workload() }),
+        serde_json::json!({ "name": "img-nographics", "command": workload() }),
     );
 
-    let bytes = render_bytes(&h, "img-noprobe", false).await;
+    let bytes = render_bytes(&h, "img-nographics", false).await;
     assert!(
         !find(&bytes, b"\x1b_G"),
         "sent graphics to a client whose terminal never claimed to draw them"

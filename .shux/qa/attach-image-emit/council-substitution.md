@@ -42,3 +42,18 @@ A council converges on a shared judgement; parallel agents produce independent
 reports that someone has to reconcile. Where the two disagreed — whether to
 drop `c=`/`r=` for cross-path consistency — the reconciliation was mine, and is
 recorded in the commit that made the call.
+
+## Step 7, second pass — the capability commits
+
+`2546cbc` and `89013c2` changed how shux decides whether a terminal can be
+drawn on, and shipped without a council record. Step 7 is explicitly not scaled
+down for small diffs, and `89013c2` is five lines that shipped a P1: the
+`SHUX_GRAPHICS` escape hatch matched exact lowercase bytes, so `OFF` fell
+through and produced the corruption the variable exists to prevent.
+
+The review that caught it was the QA gate, not a council, and the defect was
+one this repository had already paid for and written down — `shux gate`'s
+`is_ci` mis-read `CI=True` as "not CI" and let `--update` bless a regression.
+A reviewer holding the repo's own history would have matched the shape on
+sight. Recorded here because "the gate caught it" is not the same as "the step
+ran".

@@ -418,7 +418,7 @@ fn a_full_repaint_re_places_without_re_sending_pixels() {
 }
 
 #[test]
-fn a_terminal_that_never_answered_the_probe_is_sent_no_graphics() {
+fn a_terminal_that_cannot_draw_images_is_sent_none() {
     // Not an optimisation. Measured with a shux attach running inside tmux 3.4:
     // the emitter's own continuation header became the tmux window title --
     // `Gq=2,m=0;AP+H...` where the base build showed `vm` -- rewritten once per
@@ -437,7 +437,7 @@ fn a_terminal_that_never_answered_the_probe_is_sent_no_graphics() {
     let out = drain(&mut c);
     assert!(
         !out.contains("\x1b_G"),
-        "emitted graphics to a terminal that never claimed to draw them"
+        "emitted graphics to a terminal that cannot draw them"
     );
     assert!(out.contains('\x1b'), "wrote no cells either");
 }

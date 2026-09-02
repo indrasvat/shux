@@ -49,9 +49,16 @@ use crate::terminal::{self, TerminalGuard};
 /// short: only a program that rewrites the byte stream belongs here.
 const OUTER_MULTIPLEXER_VARS: &[&str] = &["TMUX", "STY", "ZELLIJ"];
 
-/// Overrides the automatic decision below. `1`/`true`/`on` forces images on,
-/// `0`/`false`/`off` forces them off; anything else, including unset, leaves
-/// the decision automatic.
+/// Overrides the automatic decision below. `1`/`true`/`yes`/`on` forces images
+/// on, `0`/`false`/`no`/`off` forces them off; anything else, including unset,
+/// leaves the decision automatic.
+///
+/// Compared case-insensitively and trimmed, because this is a safety valve and
+/// it fails OPEN: an unrecognised value silently falls through to the automatic
+/// check. `shux gate`'s `is_ci` already paid for this exact shape -- `CI=True`
+/// read as "not CI" and let `--update` bless a real regression -- and was fixed
+/// the same way. A user who reaches for this hatch to stop their tmux title
+/// being corrupted must not lose to a capital letter.
 const GRAPHICS_OVERRIDE_VAR: &str = "SHUX_GRAPHICS";
 
 /// Whether this terminal can be sent kitty graphics.
@@ -78,10 +85,19 @@ const GRAPHICS_OVERRIDE_VAR: &str = "SHUX_GRAPHICS";
 /// [`GRAPHICS_OVERRIDE_VAR`] is for, and why it exists in both directions: the
 /// same gap strands a user whose stale `TMUX` outlived its tmux.
 fn terminal_can_draw_images() -> bool {
-    match std::env::var(GRAPHICS_OVERRIDE_VAR).ok().as_deref() {
-        Some("1" | "true" | "on" | "yes") => return true,
-        Some("0" | "false" | "off" | "no") => return false,
-        _ => {}
+    if let Ok(raw) = std::env::var(GRAPHICS_OVERRIDE_VAR) {
+        let value = raw.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "1" | "true" | "on" | "yes" => return true,
+            "0" | "false" | "off" | "no" => return false,
+            // Silence here is how a typo becomes the corruption this exists to
+            // prevent, so say so once and fall through.
+            "" => {}
+            _ => eprintln!(
+                "shux: ignoring {GRAPHICS_OVERRIDE_VAR}={raw:?} \
+                 (expected on/off); deciding from the environment instead"
+            ),
+        }
     }
     !OUTER_MULTIPLEXER_VARS
         .iter()
@@ -731,5 +747,30 @@ mod tests {
                 "a junk value did not fall through to the automatic check"
             );
         });
+    }
+
+    /// The hatch fails OPEN, so an ordinary spelling that misses turns a
+    /// documented limitation with a working remedy back into silent
+    /// corruption. `is_ci` shipped this exact defect once already.
+    #[test]
+    fn the_override_is_case_insensitive_and_trimmed() {
+        for on in ["on", "ON", "On", "TRUE", "True", " yes ", "1"] {
+            without_multiplexers(|| {
+                unsafe { std::env::set_var("TMUX", "/tmp/x,1,0") };
+                unsafe { std::env::set_var("SHUX_GRAPHICS", on) };
+                let drew = super::terminal_can_draw_images();
+                unsafe { std::env::remove_var("SHUX_GRAPHICS") };
+                unsafe { std::env::remove_var("TMUX") };
+                assert!(drew, "{on:?} did not force images on");
+            });
+        }
+        for off in ["off", "OFF", "Off", " off ", "FALSE", "False", "No", "0"] {
+            without_multiplexers(|| {
+                unsafe { std::env::set_var("SHUX_GRAPHICS", off) };
+                let drew = super::terminal_can_draw_images();
+                unsafe { std::env::remove_var("SHUX_GRAPHICS") };
+                assert!(!drew, "{off:?} did not force images off");
+            });
+        }
     }
 }
