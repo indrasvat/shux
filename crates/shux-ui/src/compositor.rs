@@ -343,8 +343,7 @@ impl<W: Write> RenderCompositor<W> {
     }
 
     /// Turn image re-transmit on for this attach. Off unless the client says
-    /// its terminal can draw them: emitting to one that cannot is not merely
-    /// wasted bytes, it corrupts an outer multiplexer's state.
+    /// its terminal can draw them.
     pub fn set_graphics(&mut self, enabled: bool) {
         self.images.set_enabled(enabled);
     }
@@ -652,10 +651,9 @@ impl<W: Write> RenderCompositor<W> {
         self.render_dirty_and_cursor(&dirty, target_cursor)?;
         // Pictures go out AFTER the cells: a terminal that treats an image as a
         // cell attachment erases the slice under any later text write.
-        if self.images.enabled()
-            && self
-                .images
-                .emit(self.backend.inner_mut(), &placements, full_redraw)?
+        if self
+            .images
+            .emit(self.backend.inner_mut(), &placements, full_redraw)?
         {
             // The emit CUPs to each picture and leaves the cursor there, so put
             // it back rather than dropping the tracking -- forgetting it costs a

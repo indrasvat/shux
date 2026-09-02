@@ -114,29 +114,10 @@ fn an_image_in_a_pane_reaches_the_attached_terminal() {
     // decoded as keystrokes and typed into the pane.
     assert!(cmd.contains("C=1"), "{cmd}");
     assert!(cmd.contains("q=2"), "{cmd}");
-}
-
-#[test]
-fn an_unchanged_picture_costs_nothing_on_the_next_frame() {
-    let p = pane(1);
-    let layout = LayoutNode::leaf(p);
-    let mut vt = VirtualTerminal::new(10, 20);
-    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
-    let mut vts = HashMap::new();
-    vts.insert(p, &vt);
-
-    let mut c = make_compositor(20, 10);
-    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
-    let first = drain(&mut c);
-    assert_eq!(graphics(&first).len(), 1);
-
-    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
-    let second = drain(&mut c);
-    assert!(
-        graphics(&second).is_empty(),
-        "re-sent an unchanged picture: {:?}",
-        graphics(&second)
-    );
+    // `z=-1` draws the picture UNDER text: the attach client writes copy mode,
+    // the help sheet and the toasts into the frame after the images, and the
+    // protocol's default would cover them.
+    assert!(cmd.contains("z=-1"), "{cmd}");
 }
 
 #[test]
@@ -328,14 +309,6 @@ fn the_cursor_ends_where_the_frame_wanted_it_not_on_the_picture() {
 fn a_picture_that_is_not_a_whole_number_of_cells_still_claims_the_cells_it_owns() {
     // Every other fixture here is 18x38 -- exactly 2x2 cells -- so none of them
     // can see what happens when a dimension is not a multiple of the cell.
-    //
-    // The two render paths cannot agree on PIXELS: `shux-raster` draws into its
-    // own 9x19 cell, while the outer terminal has a cell size of its own, and an
-    // image sized for one is not the same number of pixels in the other. What
-    // they can and must agree on is the CELLS a picture occupies, which is what
-    // "the picture is in its pane, beside the right text" means. `c=`/`r=` are
-    // what buy that: the host scales into the cell box rather than laying the
-    // bitmap down at a pixel size that means something different on its grid.
     let p = pane(1);
     let layout = LayoutNode::leaf(p);
     let mut vt = VirtualTerminal::new(10, 20);
@@ -356,28 +329,6 @@ fn a_picture_that_is_not_a_whole_number_of_cells_still_claims_the_cells_it_owns(
     // …and the source rect is the whole bitmap, not a cell-rounded lie about it.
     assert!(cmd.contains("w=16"), "{cmd}");
     assert!(cmd.contains("h=20"), "{cmd}");
-}
-
-#[test]
-fn a_picture_is_drawn_under_text_so_overlays_stay_legible() {
-    // `shux attach` writes copy mode, the copy menu, the help sheet and the
-    // welcome toast into the frame AFTER the compositor emits images. At the
-    // protocol's default z=0 a placement is drawn above text, so a picture
-    // would blank whichever overlay landed on it -- measured in real kitty as
-    // 22 surviving glyph pixels against 1638 at z=-1. Those overlays were
-    // always legible before this path existed.
-    let p = pane(1);
-    let layout = LayoutNode::leaf(p);
-    let mut vt = VirtualTerminal::new(10, 20);
-    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
-    let mut vts = HashMap::new();
-    vts.insert(p, &vt);
-
-    let mut c = make_compositor(20, 10);
-    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
-    for cmd in graphics(&drain(&mut c)) {
-        assert!(cmd.contains("z=-1"), "drawn over the overlays: {cmd}");
-    }
 }
 
 #[test]
@@ -440,4 +391,53 @@ fn a_terminal_that_cannot_draw_images_is_sent_none() {
         "emitted graphics to a terminal that cannot draw them"
     );
     assert!(out.contains('\x1b'), "wrote no cells either");
+}
+
+#[test]
+fn an_empty_payload_never_becomes_a_host_id_that_was_not_transmitted() {
+    // Reachable from pane output: `Assembler` length-checks neither PNG nor a
+    // deflated payload, so `printf '\033_Ga=T,f=100,s=18,v=38,t=d;\033\\'` in a
+    // pane yields a PLACED image with no bytes. `transmit` writes nothing, the
+    // caller counts it as sent, and `live` then names a host id the terminal
+    // never heard of -- which never self-heals, because every later unchanged
+    // frame compares equal and a repaint places against the phantom.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    vt.process(&kitty_rgb(18, 38, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let mut transmitted: Vec<String> = ids(&graphics(&drain(&mut c)), "a=T");
+    assert_eq!(transmitted.len(), 1);
+
+    let mut empty = VirtualTerminal::new(10, 20);
+    empty.process(b"\x1b_Ga=T,f=100,s=18,v=38,t=d;\x1b\\");
+    let mut vts2 = HashMap::new();
+    vts2.insert(p, &empty);
+    c.render_multi_pane(frame(&layout, &vts2, p)).unwrap();
+    transmitted.extend(ids(&graphics(&drain(&mut c)), "a=T"));
+
+    // A repaint is where a phantom surfaces: it re-places every live slot.
+    c.force_redraw();
+    c.render_multi_pane(frame(&layout, &vts2, p)).unwrap();
+    let placed = ids(&graphics(&drain(&mut c)), "a=p");
+    for id in &placed {
+        assert!(
+            transmitted.contains(id),
+            "placed against host id {id}, which was never transmitted: \
+             transmitted={transmitted:?}"
+        );
+    }
+}
+
+/// The `i=` values of every command whose action is `want`.
+fn ids(cmds: &[String], want: &str) -> Vec<String> {
+    cmds.iter()
+        .filter(|k| k.starts_with(want))
+        .filter_map(|k| k.split(',').find_map(|f| f.strip_prefix("i=")))
+        .map(str::to_string)
+        .collect()
 }

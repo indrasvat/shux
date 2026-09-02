@@ -7,27 +7,31 @@
 
 use shux_vt::VirtualTerminal;
 
+/// Base64 bytes per chunk, the protocol's maximum -- the same split the
+/// emitter uses.
+const CHUNK: usize = 4096;
+
 /// `a=T` on the first chunk only, bare `m=` continuations after it — the shape
 /// `terminal-browser` emits, and the one the protocol specifies.
-fn chunked(w: u32, h: u32, chunk: usize, repeat_action: bool) -> Vec<u8> {
-    chunked_id(w, h, chunk, repeat_action, 0)
+fn chunked(w: u32, h: u32, repeat_action: bool) -> Vec<u8> {
+    chunked_id(w, h, repeat_action, 0)
 }
 
 /// Same, under an explicit image id. `id == 0` omits `i=` entirely.
 fn identified(w: u32, h: u32, id: u32) -> Vec<u8> {
-    chunked_id(w, h, 4096, false, id)
+    chunked_id(w, h, false, id)
 }
 
-fn chunked_id(w: u32, h: u32, chunk: usize, repeat_action: bool, id: u32) -> Vec<u8> {
+fn chunked_id(w: u32, h: u32, repeat_action: bool, id: u32) -> Vec<u8> {
     use base64::Engine as _;
     let px: Vec<u8> = std::iter::repeat_n([200u8, 40, 40], (w * h) as usize)
         .flatten()
         .collect();
     let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
     let bytes = b64.as_bytes();
-    let total = bytes.len().div_ceil(chunk).max(1);
+    let total = bytes.len().div_ceil(CHUNK).max(1);
     let mut out = Vec::new();
-    for (i, part) in bytes.chunks(chunk).enumerate() {
+    for (i, part) in bytes.chunks(CHUNK).enumerate() {
         let more = u8::from(i + 1 < total);
         let ident = if id == 0 {
             String::new()
@@ -49,7 +53,7 @@ fn chunked_id(w: u32, h: u32, chunk: usize, repeat_action: bool, id: u32) -> Vec
 #[test]
 fn an_image_whose_continuations_omit_the_action_is_still_placed() {
     let mut vt = VirtualTerminal::new(20, 40);
-    vt.process(&chunked(90, 190, 4096, false));
+    vt.process(&chunked(90, 190, false));
     assert_eq!(
         vt.grid().placements().len(),
         1,
@@ -61,7 +65,7 @@ fn an_image_whose_continuations_omit_the_action_is_still_placed() {
 fn repeating_the_action_on_every_chunk_still_works() {
     // `kitten icat` does this, and it must keep working.
     let mut vt = VirtualTerminal::new(20, 40);
-    vt.process(&chunked(90, 190, 4096, true));
+    vt.process(&chunked(90, 190, true));
     assert_eq!(vt.grid().placements().len(), 1);
 }
 
@@ -70,7 +74,7 @@ fn a_transfer_opened_with_a_plain_transmit_is_not_placed() {
     // `a=t` stores without displaying. The opening chunk decides, so this must
     // stay unplaced however many continuations follow.
     let mut vt = VirtualTerminal::new(20, 40);
-    let bytes = String::from_utf8(chunked(90, 190, 4096, false))
+    let bytes = String::from_utf8(chunked(90, 190, false))
         .unwrap()
         .replacen("a=T", "a=t", 1)
         .into_bytes();

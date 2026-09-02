@@ -52,13 +52,8 @@ pub(crate) struct KittyEmitter {
 }
 
 impl KittyEmitter {
-    /// Gate every emission on the client's own answer. What is on the other end
-    /// may not be a terminal at all: an outer tmux adopts the emitter's
-    /// continuation header as its pane title.
+    /// Gate every emission on the client's own answer.
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
-        if !enabled {
-            self.live.clear();
-        }
         self.enabled = enabled;
     }
 
@@ -138,6 +133,14 @@ impl KittyEmitter {
 /// Intersect a placement with its pane. `None` once nothing of it is left
 /// inside; rows above the clip become the source rectangle's `y`.
 fn resolve(p: &ComposedPlacement) -> Option<Placed> {
+    // A payload with no bytes is placeable -- `Assembler` length-checks neither
+    // PNG nor a deflated payload -- and transmitting it writes nothing while
+    // the caller counts it as sent, recording a host id the terminal never
+    // heard of. Judged here so it never enters `want` and the drain retires the
+    // previous id properly.
+    if p.image.payload.is_empty() {
+        return None;
+    }
     let (cw, ch) = DECLARED_CELL_PIXELS;
     let clip_top = p.clip.row as i64;
     let nat_rows = p.image.height.div_ceil(ch).max(1) as i64;
@@ -179,10 +182,8 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
 /// copy menu, the help sheet and the welcome toast into the same frame buffer
 /// after the compositor has emitted images, and at the default z=0 kitty draws
 /// a placement above text -- measured in real kitty, 22 surviving glyph pixels
-/// against 1638 at z=-1. Those overlays were always legible before this path
-/// existed; they must not stop being legible wherever a picture happens to sit.
-/// Negative z still draws above the cell BACKGROUND, so a picture is not hidden
-/// by the blank cells it covers.
+/// against 1638 at z=-1. Negative z still draws above the cell BACKGROUND, so
+/// a picture is not hidden by the blank cells it covers.
 fn keys(p: &Placed) -> String {
     let (y, w, h) = p.src;
     let (c, r) = p.cells;
@@ -202,9 +203,6 @@ fn transmit(out: &mut impl Write, id: u32, img: &StoredImage, placed: &Placed) -
     let zlib = if img.compressed { ",o=z" } else { "" };
     let b64 = base64::engine::general_purpose::STANDARD.encode(&img.payload);
     let bytes = b64.as_bytes();
-    if bytes.is_empty() {
-        return Ok(());
-    }
     let chunks = bytes.len().div_ceil(CHUNK);
     cup(out, placed)?;
     for (i, chunk) in bytes.chunks(CHUNK).enumerate() {

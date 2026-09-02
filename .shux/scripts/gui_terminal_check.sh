@@ -607,7 +607,7 @@ record_phase() {
     # that expects none; for one that does, well below the ~5100 px a clipped
     # 320x240 payload measures, and far above the single pixel that used to
     # satisfy `require_image`.
-    local name="$1" require_image="$2" image_min_px="${3:-0}"
+    local name="$1" require_image="$2" image_min_px="${3:-1}"
     local geom state win_w win_h cols rows row0 row1 col0 col1
     wait_for_stable_chrome 40 0.3
     geom="$(window_geometry "${window_id}")"

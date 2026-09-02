@@ -87,8 +87,7 @@ impl Drop for Harness {
 }
 
 /// A pane workload that draws a real image and the three colour classes, then
-/// holds the pane open. The marker is printed by this script rather than typed
-/// at a shell, so nothing can echo it back ahead of the content it gates.
+/// holds the pane open.
 fn workload() -> String {
     // 18x38 px of solid red as raw RGB: exactly 2x2 cells at the declared
     // 9x19, and small enough to need no chunking.
@@ -100,7 +99,6 @@ fn workload() -> String {
         "printf '\\033_Ga=T,f=24,s=18,v=38,t=d;{b64}\\033\\\\\\\\'; \
          printf '\\033[38;2;120;220;180mTRUECOLOR\\033[0m \
 \\033[38;5;208mINDEXED\\033[0m \\033[34mBASIC\\033[0m\\n'; \
-         printf 'PANE_IS_PAINTED\\n'; \
          while :; do sleep 3600; done"
     )
 }
@@ -194,9 +192,7 @@ async fn a_real_attach_carries_a_panes_picture_to_the_terminal() {
 
 #[tokio::test]
 async fn a_client_that_reports_no_graphics_is_sent_no_pictures() {
-    // The wire field, end to end. Without it a shux attach inside tmux 3.4 had
-    // the emitter's continuation header adopted as the tmux pane title, once
-    // per frame.
+    // The wire field, end to end.
     let h = Harness::new();
     h.rpc(
         "session.create",
