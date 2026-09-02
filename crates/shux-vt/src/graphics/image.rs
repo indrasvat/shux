@@ -29,10 +29,7 @@ pub struct StoredImage {
 #[derive(Debug, Default, Clone)]
 pub struct Assembler {
     open: Option<StoredImage>,
-    /// The command that OPENED the transfer. A continuation carries only `m=`,
-    /// so every other key -- the action, `i=`, `C=` -- is only ever stated
-    /// once, and reading them off the chunk that happened to finish the
-    /// transfer reads defaults.
+    /// The command that OPENED the transfer.
     opening: super::kitty::Command,
 }
 

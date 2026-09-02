@@ -441,3 +441,38 @@ fn ids(cmds: &[String], want: &str) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+
+#[test]
+fn one_frame_never_writes_more_bytes_than_the_attach_frame_can_carry() {
+    // The daemon ships a whole composited frame as ONE base64 `Render`, and the
+    // RPC codec refuses a frame over MAX_FRAME_SIZE. Between `Grid::place`'s
+    // 32 MiB ceiling and here, nothing bounded that: one big pane picture made
+    // the daemon's send fail, the writer task break, and the client exit -- and
+    // a re-attach re-sends every live placement, so the session stayed
+    // unattachable until the picture was gone.
+    let p = pane(1);
+    let layout = LayoutNode::leaf(p);
+    let mut vt = VirtualTerminal::new(10, 20);
+    // 12 MB of pixels: comfortably inside what shux-vt accepts and places.
+    vt.process(&kitty_rgb(2000, 2000, [200, 40, 40]));
+    let mut vts = HashMap::new();
+    vts.insert(p, &vt);
+
+    let mut c = make_compositor(20, 10);
+    c.render_multi_pane(frame(&layout, &vts, p)).unwrap();
+    let out = drain(&mut c);
+
+    let render_frame = out.len().div_ceil(3) * 4;
+    assert!(
+        render_frame < shux_rpc::codec::MAX_FRAME_SIZE,
+        "one frame emitted {} bytes, which the daemon base64s into a {} byte \
+         Render; the codec caps a frame at {}",
+        out.len(),
+        render_frame,
+        shux_rpc::codec::MAX_FRAME_SIZE
+    );
+    assert!(
+        out.contains('\x1b'),
+        "dropped the cells along with the picture"
+    );
+}

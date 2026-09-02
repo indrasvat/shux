@@ -12,17 +12,9 @@ use shux_vt::VirtualTerminal;
 const CHUNK: usize = 4096;
 
 /// `a=T` on the first chunk only, bare `m=` continuations after it — the shape
-/// `terminal-browser` emits, and the one the protocol specifies.
-fn chunked(w: u32, h: u32, repeat_action: bool) -> Vec<u8> {
-    chunked_id(w, h, repeat_action, 0)
-}
-
-/// Same, under an explicit image id. `id == 0` omits `i=` entirely.
-fn identified(w: u32, h: u32, id: u32) -> Vec<u8> {
-    chunked_id(w, h, false, id)
-}
-
-fn chunked_id(w: u32, h: u32, repeat_action: bool, id: u32) -> Vec<u8> {
+/// `terminal-browser` emits, and the one the protocol specifies. `id == 0`
+/// omits `i=` entirely.
+fn chunked(w: u32, h: u32, repeat_action: bool, id: u32) -> Vec<u8> {
     use base64::Engine as _;
     let px: Vec<u8> = std::iter::repeat_n([200u8, 40, 40], (w * h) as usize)
         .flatten()
@@ -53,7 +45,7 @@ fn chunked_id(w: u32, h: u32, repeat_action: bool, id: u32) -> Vec<u8> {
 #[test]
 fn an_image_whose_continuations_omit_the_action_is_still_placed() {
     let mut vt = VirtualTerminal::new(20, 40);
-    vt.process(&chunked(90, 190, false));
+    vt.process(&chunked(90, 190, false, 0));
     assert_eq!(
         vt.grid().placements().len(),
         1,
@@ -65,7 +57,7 @@ fn an_image_whose_continuations_omit_the_action_is_still_placed() {
 fn repeating_the_action_on_every_chunk_still_works() {
     // `kitten icat` does this, and it must keep working.
     let mut vt = VirtualTerminal::new(20, 40);
-    vt.process(&chunked(90, 190, true));
+    vt.process(&chunked(90, 190, true, 0));
     assert_eq!(vt.grid().placements().len(), 1);
 }
 
@@ -74,7 +66,7 @@ fn a_transfer_opened_with_a_plain_transmit_is_not_placed() {
     // `a=t` stores without displaying. The opening chunk decides, so this must
     // stay unplaced however many continuations follow.
     let mut vt = VirtualTerminal::new(20, 40);
-    let bytes = String::from_utf8(chunked(90, 190, false))
+    let bytes = String::from_utf8(chunked(90, 190, false, 0))
         .unwrap()
         .replacen("a=T", "a=t", 1)
         .into_bytes();
@@ -91,7 +83,7 @@ fn redrawing_under_one_image_id_replaces_rather_than_accumulates() {
     let mut vt = VirtualTerminal::new(20, 40);
     for _ in 0..8 {
         vt.process(b"\x1b[H");
-        vt.process(&identified(90, 190, 1));
+        vt.process(&chunked(90, 190, false, 1));
     }
     assert_eq!(
         vt.grid().placements().len(),
@@ -103,8 +95,8 @@ fn redrawing_under_one_image_id_replaces_rather_than_accumulates() {
 #[test]
 fn distinct_image_ids_coexist() {
     let mut vt = VirtualTerminal::new(20, 40);
-    vt.process(&identified(90, 190, 1));
-    vt.process(&identified(90, 190, 2));
+    vt.process(&chunked(90, 190, false, 1));
+    vt.process(&chunked(90, 190, false, 2));
     assert_eq!(vt.grid().placements().len(), 2);
 }
 
@@ -113,7 +105,7 @@ fn distinct_image_ids_coexist() {
 #[test]
 fn an_unidentified_image_still_accumulates() {
     let mut vt = VirtualTerminal::new(20, 40);
-    vt.process(&identified(90, 190, 0));
-    vt.process(&identified(90, 190, 0));
+    vt.process(&chunked(90, 190, false, 0));
+    vt.process(&chunked(90, 190, false, 0));
     assert_eq!(vt.grid().placements().len(), 2);
 }

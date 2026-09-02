@@ -655,11 +655,9 @@ impl<W: Write> RenderCompositor<W> {
             .images
             .emit(self.backend.inner_mut(), &placements, full_redraw)?
         {
-            // The emit CUPs to each picture and leaves the cursor there, so put
-            // it back rather than dropping the tracking -- forgetting it costs a
-            // hide/show cycle on every frame that follows.
-            // Only when there is somewhere to put it: with no target the
-            // cursor is already hidden and `terminal_cursor` already cleared.
+            // The emit CUPs to each picture and leaves the cursor there; put it
+            // back rather than dropping the tracking. Only when there is
+            // somewhere to put it: with no target the cursor is already hidden.
             if let Some(t) = target_cursor {
                 self.backend.set_cursor(t.x, t.y)?;
             }

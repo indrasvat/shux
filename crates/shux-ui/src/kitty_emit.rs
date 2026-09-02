@@ -4,10 +4,7 @@
 //! attached client renders every pane's text and none of its pictures.
 //!
 //! Payloads leave here exactly as they arrived — still deflated, still PNG —
-//! and the pane clip is a source rectangle (`x/y/w/h`) rather than a cropped
-//! bitmap, which is how zellij bounds a placement to its pane. `c=`/`r=` only
-//! ever STRETCH into a cell box, so nothing else stops a picture taller than
-//! its pane painting over the status bar.
+//! and the pane clip is a source rectangle, not a cropped bitmap.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -22,6 +19,15 @@ const CHUNK: usize = 4096;
 /// Host image ids start here so they cannot collide with the ids a pane's own
 /// application chose for the same terminal.
 const HOST_ID_BASE: u32 = 2_000_000_000;
+
+/// Image bytes one frame may emit. The daemon ships the whole composited frame
+/// as a single base64 `Render`, and the RPC codec refuses a frame over
+/// `MAX_FRAME_SIZE`; nothing between `Grid::place`'s 32 MiB ceiling and here
+/// bounded it, so one large pane picture killed the attach outright -- and a
+/// re-attach re-sends every live placement, leaving the session unattachable.
+/// 6 MiB of payload becomes 8 MiB of base64, and the outer encode of that plus
+/// a frame's cells stays well under the cap.
+const FRAME_IMAGE_BUDGET: usize = 6 * 1024 * 1024;
 
 /// Where one placement was put, in the terms the host was told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,9 +77,21 @@ impl KittyEmitter {
         placements: &[ComposedPlacement],
         replace_all: bool,
     ) -> io::Result<bool> {
+        let mut spent = 0usize;
         let want: Vec<(&ComposedPlacement, Placed)> = placements
             .iter()
             .filter_map(|p| resolve(p).map(|r| (p, r)))
+            // Charged whether or not this frame re-transmits it: a picture that
+            // came and went with the budget would flicker, and the frame that
+            // does re-transmit is the one that has to fit.
+            .filter(|(p, _)| {
+                let cost = p.image.payload.len().div_ceil(3) * 4;
+                if spent + cost > FRAME_IMAGE_BUDGET {
+                    return false;
+                }
+                spent += cost;
+                true
+            })
             .collect();
         if want.is_empty() && self.live.is_empty() {
             return Ok(false);
@@ -97,9 +115,8 @@ impl KittyEmitter {
                 _ => {
                     let id = self.take_id();
                     transmit(out, id, &p.image, placed)?;
-                    // Only now is the replacement up: re-transmitting under a
-                    // live id frees the old image and its placement on the
-                    // FIRST chunk, blanking the pane for the whole transfer.
+                    // Transmit first, then retire: the old id must stay live
+                    // until the replacement is up.
                     let fresh = Live {
                         image: p.image.clone(),
                         host_id: id,
@@ -133,11 +150,8 @@ impl KittyEmitter {
 /// Intersect a placement with its pane. `None` once nothing of it is left
 /// inside; rows above the clip become the source rectangle's `y`.
 fn resolve(p: &ComposedPlacement) -> Option<Placed> {
-    // A payload with no bytes is placeable -- `Assembler` length-checks neither
-    // PNG nor a deflated payload -- and transmitting it writes nothing while
-    // the caller counts it as sent, recording a host id the terminal never
-    // heard of. Judged here so it never enters `want` and the drain retires the
-    // previous id properly.
+    // An empty payload is placeable, and transmitting it would record a host id
+    // the terminal never heard of. Judged here, so it never enters `want`.
     if p.image.payload.is_empty() {
         return None;
     }
@@ -178,12 +192,11 @@ fn resolve(p: &ComposedPlacement) -> Option<Placed> {
 /// and scrolls the whole screen for an image at the bottom margin. `q=2` so the
 /// host's `OK` never lands in the client's key decoder.
 ///
-/// `z=-1` puts the picture UNDER text. The attach client writes copy mode, the
-/// copy menu, the help sheet and the welcome toast into the same frame buffer
-/// after the compositor has emitted images, and at the default z=0 kitty draws
-/// a placement above text -- measured in real kitty, 22 surviving glyph pixels
-/// against 1638 at z=-1. Negative z still draws above the cell BACKGROUND, so
-/// a picture is not hidden by the blank cells it covers.
+/// `z=-1` puts the picture UNDER text: the client writes copy mode, the help
+/// sheet and the welcome toast into the frame after the compositor has emitted
+/// images, and at the default z=0 kitty draws a placement above them. Negative
+/// z still draws above the cell BACKGROUND, so a picture is not hidden by the
+/// blank cells it covers.
 fn keys(p: &Placed) -> String {
     let (y, w, h) = p.src;
     let (c, r) = p.cells;

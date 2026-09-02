@@ -59,17 +59,13 @@ const GRAPHICS_OVERRIDE_VAR: &str = "SHUX_GRAPHICS";
 ///
 /// Automatic answer: yes, unless an outer multiplexer announces itself.
 ///
-/// Do not replace this with an `a=q` probe: the query is itself an APC block,
-/// which tmux adopts as the pane title, and reading the reply needs raw mode.
-///
 /// This check reads the CLIENT's environment, while the corruption is a
 /// property of the BYTE STREAM. They decouple wherever the environment is reset
 /// without moving stdout -- `sudo`, `ssh`, `su`, `env -i`, a systemd unit,
 /// `docker exec` -- so a shux attached across one of those, inside a
-/// multiplexer, is not detected. Measured: `sudo -n env … shux session attach`
-/// in a tmux 3.4 pane puts the emitter's header in the pane title. That is what
-/// [`GRAPHICS_OVERRIDE_VAR`] is for, and why it exists in both directions: the
-/// same gap strands a user whose stale `TMUX` outlived its tmux.
+/// multiplexer, is not detected. That is what [`GRAPHICS_OVERRIDE_VAR`] is for,
+/// in both directions: the same gap strands a user whose stale `TMUX` outlived
+/// its tmux.
 fn terminal_can_draw_images() -> bool {
     if let Ok(raw) = std::env::var(GRAPHICS_OVERRIDE_VAR) {
         let value = raw.trim().to_ascii_lowercase();

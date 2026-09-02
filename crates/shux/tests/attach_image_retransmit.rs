@@ -127,7 +127,8 @@ async fn render_bytes(h: &Harness, session: &str, graphics: bool) -> Vec<u8> {
         AttachReady::Error { code, message } => panic!("attach denied: {code}: {message}"),
     }
 
-    // Read render frames until the picture shows up or the budget runs out.
+    // Read render frames until everything the caller asserts on has arrived, or
+    // the budget runs out.
     // Bounded by a deadline rather than a frame count: the daemon coalesces,
     // so "how many frames" is not a stable quantity to wait on.
     let mut seen = Vec::new();
@@ -142,7 +143,11 @@ async fn render_bytes(h: &Harness, session: &str, graphics: bool) -> Vec<u8> {
         {
             seen.extend_from_slice(&raw);
         }
-        if find(&seen, b"\x1b_Ga=T") {
+        // Stop only when everything the assertions read is present. Breaking
+        // on the image alone stopped between the workload's two printfs, and
+        // failed on a colour probe the daemon had not written yet.
+        let probes = find(&seen, b"38;2;120;220;180") && find(&seen, b"38;5;208");
+        if probes && (!graphics || find(&seen, b"\x1b_Ga=T")) {
             break;
         }
     }
