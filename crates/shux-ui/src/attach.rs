@@ -41,17 +41,45 @@ use crate::terminal::{self, TerminalGuard};
 /// Public entry point: connect to the daemon's attach socket, do the
 /// handshake, and run the bidirectional loop until detach or session
 /// end. Restores the terminal automatically.
-/// How long to wait for the terminal to answer the graphics probe before
-/// giving up on images. Short: it is on the path to the first frame.
-const GRAPHICS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Environment set by an outer multiplexer that owns this terminal.
+///
+/// Overlaps `shux_pty::OUTER_TERMINAL_IDENTITY_VARS`, which scrubs the same
+/// names out of a pane's environment; that answers "what should a child
+/// believe", this answers "who owns our stdout". Kept apart deliberately, and
+/// short: only a program that rewrites the byte stream belongs here.
+const OUTER_MULTIPLEXER_VARS: &[&str] = &["TMUX", "STY", "ZELLIJ"];
+
+/// Whether this terminal can be sent kitty graphics.
+///
+/// Decided from the environment, and deliberately without asking. The obvious
+/// design is the handshake `kitten icat` and zellij use -- an `a=q` query with
+/// a DA1 sentinel -- and shux shipped it briefly. Measured, it was worse than
+/// the problem:
+///
+///   * the query is ITSELF an APC block, and tmux 3.4 adopts APC content as a
+///     pane title, so probing set the title to `Gi=4207,a=q,...` on every
+///     attach -- the same corruption it existed to prevent;
+///   * reading the reply needs raw mode, which clears `ISIG`, so Ctrl-C was
+///     dead for the first 500 ms of every attach, and a client killed in that
+///     window left the terminal with echo off;
+///   * a terminal that never answers cost the full timeout and swallowed
+///     everything typed into it -- measured at 10 bytes of 10.
+///
+/// The only harm ever demonstrated from emitting unasked is an outer
+/// multiplexer mangling the stream, and a multiplexer announces itself in the
+/// environment. A real terminal without graphics support ignores an APC block:
+/// that is what the escape was designed for, and what xterm documents.
+fn terminal_can_draw_images() -> bool {
+    !OUTER_MULTIPLEXER_VARS
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+}
 
 pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<ExitReason> {
     terminal::install_panic_hook();
 
     let (cols, rows) = TerminalGuard::size().context("terminal size")?;
-    // Before the connect and in its own raw-mode scope, so a stalled daemon can
-    // never strand the user in raw mode waiting on this.
-    let graphics = crate::graphics_probe::probe(GRAPHICS_PROBE_TIMEOUT);
+    let graphics = terminal_can_draw_images();
 
     let stream = UnixStream::connect(socket_path)
         .await
@@ -604,5 +632,54 @@ mod tests {
         let detach = rx.next().await.expect("detach frame");
         let parsed: AttachClientFrame = serde_json::from_slice(&detach).expect("detach json");
         assert!(matches!(parsed, AttachClientFrame::Detach));
+    }
+
+    /// These mutate the process environment, so they hold a lock: nextest's
+    /// process-per-test isolation does not extend to threads inside one binary.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn without_multiplexers(f: impl FnOnce()) {
+        const VARS: &[&str] = &["TMUX", "STY", "ZELLIJ"];
+        let _held = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = VARS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in VARS {
+            unsafe { std::env::remove_var(k) };
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_terminal_may_be_drawn_on() {
+        without_multiplexers(|| assert!(super::terminal_can_draw_images()));
+    }
+
+    #[test]
+    fn an_outer_multiplexer_is_never_drawn_on() {
+        // tmux 3.4 adopts APC content as a pane title, so anything shux emits
+        // lands there instead of on the screen -- measured, once per frame.
+        for var in ["TMUX", "STY", "ZELLIJ"] {
+            without_multiplexers(|| {
+                unsafe { std::env::set_var(var, "/tmp/whatever,123,0") };
+                let drew = super::terminal_can_draw_images();
+                unsafe { std::env::remove_var(var) };
+                assert!(!drew, "{var} was set, and shux would still have emitted");
+            });
+        }
+    }
+
+    #[test]
+    fn an_empty_value_does_not_count_as_a_multiplexer() {
+        without_multiplexers(|| {
+            unsafe { std::env::set_var("TMUX", "") };
+            let drew = super::terminal_can_draw_images();
+            unsafe { std::env::remove_var("TMUX") };
+            assert!(drew);
+        });
     }
 }

@@ -67,7 +67,7 @@ tempfile = "3"
 
 
 # Daemonization
-nix = { version = "0.31", features = ["process", "signal", "fs", "user", "term", "poll"] }
+nix = { version = "0.31", features = ["process", "signal", "fs", "user", "term"] }
 
 # Filesystem watching (for config hot reload)
 notify = "8"
