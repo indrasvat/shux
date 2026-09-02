@@ -17,6 +17,7 @@ pub mod help_overlay;
 pub mod input;
 pub mod keybinding;
 pub mod keys;
+pub(crate) mod kitty_emit;
 pub mod render;
 pub mod statusbar;
 pub mod terminal;

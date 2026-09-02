@@ -1,0 +1,18 @@
+{
+  "scope": "attach-image-emit",
+  "audit": "shux-vt-solid-qa, round 7 (confirmation pass on 2195884)",
+  "commit_under_audit": "219588489c70e713a433986f4b06bb558cbc2dfd",
+  "base": "ec62be0665b3fcef8b71cac5fda870d6647c5a47",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-substitution.md",
+  "dootsabha_implementation": "council-substitution.md",
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-base-vs-head-colour-80x24.json",
+    "pixel-base-vs-head-colour-120x40.json",
+    "pixel-base-vs-head-colour-200x60.json",
+    "pixel-crosspath-window-vs-session.json"
+  ],
+  "screenshots_note": "No PNG is committed: every metric here compares against a scratch render, not a baseline this repo tracks, so a committed *-actual.png would have nothing to be diffed against. Full-resolution frames were inspected as images during the audit and live in gitignored scratch under .shux/out/attach-image-emit-r7/ and .shux/out/gui-terminal/.",
+  "scratch_evidence_root": ".shux/out/attach-image-emit-r7/"
+}

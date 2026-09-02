@@ -491,6 +491,9 @@ pub struct Placement {
     pub image: std::sync::Arc<crate::graphics::image::StoredImage>,
     pub abs_row: u64,
     pub col: usize,
+    /// The client's `i=`, or 0 for none. Re-transmitting an id replaces that
+    /// image and its placements, so this is the identity `place` matches on.
+    pub image_id: u32,
 }
 
 impl Placement {
@@ -572,10 +575,34 @@ impl Grid {
     /// pass per snapshot, so neither cap alone suffices.
     pub(crate) fn place(&mut self, p: Placement) -> bool {
         self.prune_evicted_placements();
+        // "The existing image and all its placements are deleted; the new data
+        // replaces the old." An app that redraws under one id would otherwise
+        // spend a slot per frame -- terminal-browser sends `i=1` on every one.
+        let mut freed_a_placement = false;
+        if p.image_id != 0 {
+            let id = p.image_id;
+            let freed: usize = self
+                .placements
+                .iter()
+                .filter(|q| q.image_id == id)
+                .map(|q| q.image.payload.len())
+                .sum();
+            let before = self.placements.len();
+            self.placements.retain(|q| q.image_id != id);
+            freed_a_placement = self.placements.len() != before;
+            self.placed_bytes = self.placed_bytes.saturating_sub(freed);
+        }
         let cost = p.image.payload.len();
         if self.placements.len() >= MAX_PLACEMENTS
             || self.placed_bytes + cost > crate::graphics::image::MAX_IMAGE_BYTES
         {
+            // The old picture is gone either way, so a refused replacement is
+            // still a change to the grid. `content_revision` is what
+            // `wait-settled` and `pane diff --since` read to decide a pane is
+            // quiet, and it must not say nothing happened.
+            if freed_a_placement {
+                self.bump_mutations();
+            }
             return false;
         }
         self.placed_bytes += cost;
@@ -2577,5 +2604,65 @@ mod tests {
         assert!(!visible.is_dirty());
         assert!(cloned.take_dirty_regions().is_empty());
         assert!(visible.take_dirty_regions().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod placement_refusal_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::graphics::image::StoredImage;
+
+    fn img(bytes: usize) -> Arc<StoredImage> {
+        Arc::new(StoredImage {
+            payload: vec![7u8; bytes],
+            format: crate::graphics::kitty::Format::Rgb24,
+            compressed: false,
+            width: 1,
+            height: 1,
+        })
+    }
+
+    fn at(id: u32, bytes: usize) -> Placement {
+        Placement {
+            image: img(bytes),
+            abs_row: 0,
+            col: 0,
+            image_id: id,
+        }
+    }
+
+    /// A redraw under a live image id frees the old picture on its way in --
+    /// which is kitty's own rule -- so a replacement the caps then REFUSE still
+    /// changed the grid. Nothing recorded that, and `content_revision` is what
+    /// `wait-settled` and `pane diff --since` read to decide the pane is quiet:
+    /// the picture vanished while every reader was told nothing had happened.
+    #[test]
+    fn a_refused_replacement_still_records_that_the_old_picture_is_gone() {
+        const MIB: usize = 1024 * 1024;
+        let mut g = Grid::new(10, 20, GridConfig::default());
+        for id in 1..=7u32 {
+            assert!(g.place(at(id, 4 * MIB)), "setup placement {id} refused");
+        }
+        assert_eq!(g.placements().len(), 7);
+
+        let before = g.mutations();
+        // Frees id=7's 4 MiB, leaving 24 MiB, then asks for 10 more: past the
+        // 32 MiB ceiling, so the replacement is refused.
+        assert!(
+            !g.place(at(7, 10 * MIB)),
+            "the cap should have refused this"
+        );
+        assert_eq!(
+            g.placements().len(),
+            6,
+            "the old picture under id=7 should be gone: kitty frees it too"
+        );
+        assert_ne!(
+            g.mutations(),
+            before,
+            "a placement disappeared and the grid's revision did not move"
+        );
     }
 }

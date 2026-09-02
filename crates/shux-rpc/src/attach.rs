@@ -34,6 +34,11 @@ pub struct AttachHello {
     pub cols: u16,
     pub rows: u16,
     pub client_version: String,
+    /// The client believes its terminal can draw kitty graphics. Pane images
+    /// are re-transmitted only when this is true; `default` keeps an older
+    /// client, which never decided, silent.
+    #[serde(default)]
+    pub graphics: bool,
 }
 
 /// Daemon's reply to the hello.
@@ -258,11 +263,13 @@ mod tests {
             cols: 120,
             rows: 30,
             client_version: "0.1.0".into(),
+            graphics: true,
         };
         let s = serde_json::to_string(&hello).unwrap();
         let back: AttachHello = serde_json::from_str(&s).unwrap();
         assert_eq!(back.cols, 120);
         assert_eq!(back.rows, 30);
+        assert!(back.graphics);
         assert_eq!(back.session_name.as_deref(), Some("dev"));
     }
 

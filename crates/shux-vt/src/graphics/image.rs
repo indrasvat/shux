@@ -29,25 +29,31 @@ pub struct StoredImage {
 #[derive(Debug, Default, Clone)]
 pub struct Assembler {
     open: Option<StoredImage>,
+    /// The command that OPENED the transfer.
+    opening: super::kitty::Command,
 }
 
 impl Assembler {
-    /// Feed one command's payload, returning the image when it completes.
+    /// Feed one command's payload, returning the completed image and the
+    /// command that opened its transfer.
     ///
     /// An open transfer continues whatever the new command says, which is
     /// kitty's rule (`graphics.c:838`) and the only workable one: real
-    /// `kitten icat` repeats `a=T` on every continuation chunk. `abort` is how
-    /// a transfer ends early.
+    /// `kitten icat` repeats `a=T` on every continuation chunk while the
+    /// protocol says a continuation carries only `m=`. Both must work, so the
+    /// OPENING chunk is what the result is judged on. `abort` ends a transfer
+    /// early.
     pub(crate) fn feed(
         &mut self,
         cmd: &super::kitty::Command,
         payload: &[u8],
-    ) -> Option<StoredImage> {
+    ) -> Option<(StoredImage, super::kitty::Command)> {
         let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) else {
             self.open = None;
             return None;
         };
         if self.open.is_none() {
+            self.opening = cmd.clone();
             self.open = Some(StoredImage {
                 payload: Vec::new(),
                 format: cmd.format,
@@ -74,15 +80,15 @@ impl Assembler {
         let bpp = match done.format {
             Format::Rgba32 => 4u64,
             Format::Rgb24 => 3,
-            Format::Png => return Some(done),
+            Format::Png => return Some((done, self.opening.clone())),
         };
         if done.compressed {
-            return Some(done); // still deflated; length means nothing yet
+            return Some((done, self.opening.clone())); // still deflated; length means nothing yet
         }
         let want = u64::from(done.width)
             .checked_mul(u64::from(done.height))?
             .checked_mul(bpp)?;
-        (done.payload.len() as u64 == want).then_some(done)
+        (done.payload.len() as u64 == want).then_some((done, self.opening.clone()))
     }
 
     pub(crate) fn abort(&mut self) {

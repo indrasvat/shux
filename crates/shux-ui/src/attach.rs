@@ -38,6 +38,44 @@ use crate::client::{ClientConfig, ExitReason, encode_key_event};
 use crate::keybinding::{BindingTarget, KeybindingRegistry};
 use crate::terminal::{self, TerminalGuard};
 
+/// Environment set by an outer multiplexer that owns this terminal.
+///
+/// Overlaps `shux_pty::OUTER_TERMINAL_IDENTITY_VARS`, which scrubs the same
+/// names out of a pane's environment; that answers "what should a child
+/// believe", this answers "who owns our stdout". Kept apart deliberately, and
+/// short: only a program that rewrites the byte stream belongs here.
+const OUTER_MULTIPLEXER_VARS: &[&str] = &["TMUX", "STY", "ZELLIJ"];
+
+/// Overrides the automatic decision below. `1`/`true`/`yes`/`on` forces images
+/// on, `0`/`false`/`no`/`off` forces them off; anything else, including unset,
+/// leaves the decision automatic. Compared case-insensitively and trimmed.
+const GRAPHICS_OVERRIDE_VAR: &str = "SHUX_GRAPHICS";
+
+/// Whether this terminal can be sent kitty graphics: yes, unless an outer
+/// multiplexer announces itself. The check reads the CLIENT's environment while
+/// the corruption is a property of the byte stream; the two decouple across
+/// `sudo`/`ssh`/`env -i`, which is what [`GRAPHICS_OVERRIDE_VAR`] is for.
+/// `docs/configuration.md` is the user-facing copy.
+fn terminal_can_draw_images() -> bool {
+    if let Ok(raw) = std::env::var(GRAPHICS_OVERRIDE_VAR) {
+        let value = raw.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "1" | "true" | "on" | "yes" => return true,
+            "0" | "false" | "off" | "no" => return false,
+            "" => {}
+            // stderr, not `warn!`: without `-v` the client's subscriber is
+            // ERROR-only, so a warn here reaches nobody. This runs before the
+            // alternate screen, so the line lands on the normal screen.
+            _ => eprintln!(
+                "shux: ignoring {GRAPHICS_OVERRIDE_VAR}={raw:?}: expected on/off; deciding from the environment"
+            ),
+        }
+    }
+    !OUTER_MULTIPLEXER_VARS
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+}
+
 /// Public entry point: connect to the daemon's attach socket, do the
 /// handshake, and run the bidirectional loop until detach or session
 /// end. Restores the terminal automatically.
@@ -45,6 +83,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     terminal::install_panic_hook();
 
     let (cols, rows) = TerminalGuard::size().context("terminal size")?;
+    let graphics = terminal_can_draw_images();
 
     let stream = UnixStream::connect(socket_path)
         .await
@@ -58,6 +97,7 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
         cols,
         rows,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
+        graphics,
     };
     framed
         .send(Bytes::from(serde_json::to_vec(&hello)?))
@@ -83,14 +123,12 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
             )));
         }
     };
-    tracing::info!(session = %session_name, %session_id, "attach: ready");
+    tracing::info!(session = %session_name, %session_id, graphics, "attach: ready");
 
-    // 3. Enter raw mode. From here on we MUST go through `guard.leave()`
-    //    on any exit path (the panic hook covers panics).
+    // From here on we MUST go through `guard.leave()` on any exit path (the
+    // panic hook covers panics).
     let mut guard = TerminalGuard::enter().context("enter raw mode")?;
-
     let result = run_loop(&mut framed, &config).await;
-
     guard.leave().ok();
     result
 }
@@ -598,5 +636,103 @@ mod tests {
         let detach = rx.next().await.expect("detach frame");
         let parsed: AttachClientFrame = serde_json::from_slice(&detach).expect("detach json");
         assert!(matches!(parsed, AttachClientFrame::Detach));
+    }
+
+    /// These mutate the process environment, so they hold a lock: `cargo test`
+    /// shares one process across test threads, and only `cargo nextest` gives
+    /// each test its own.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const ENV_VARS: &[&str] = &["TMUX", "STY", "ZELLIJ", "SHUX_GRAPHICS"];
+
+    /// Restores on `Drop`, so a failing assertion cannot unwind past the
+    /// restore and leave every later test in this process reading a polluted
+    /// environment -- one real failure buried under a cascade of fake ones.
+    struct IsolatedEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _held: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for IsolatedEnv {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    fn isolated_env() -> IsolatedEnv {
+        let held = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = ENV_VARS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in ENV_VARS {
+            unsafe { std::env::remove_var(k) };
+        }
+        IsolatedEnv { saved, _held: held }
+    }
+
+    #[test]
+    fn a_bare_terminal_may_be_drawn_on() {
+        let _env = isolated_env();
+        assert!(super::terminal_can_draw_images());
+    }
+
+    #[test]
+    fn an_outer_multiplexer_is_never_drawn_on() {
+        // tmux 3.4 adopts APC content as a pane title, so anything shux emits
+        // lands there instead of on the screen -- measured, once per frame.
+        for var in ["TMUX", "STY", "ZELLIJ"] {
+            let _env = isolated_env();
+            unsafe { std::env::set_var(var, "/tmp/whatever,123,0") };
+            assert!(
+                !super::terminal_can_draw_images(),
+                "{var} was set, and shux would still have emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_value_does_not_count_as_a_multiplexer() {
+        let _env = isolated_env();
+        unsafe { std::env::set_var("TMUX", "") };
+        assert!(super::terminal_can_draw_images());
+    }
+
+    #[test]
+    fn an_unrecognised_override_leaves_the_decision_automatic() {
+        let _env = isolated_env();
+        unsafe { std::env::set_var("SHUX_GRAPHICS", "maybe") };
+        assert!(super::terminal_can_draw_images());
+        unsafe { std::env::set_var("TMUX", "/tmp/x,1,0") };
+        assert!(
+            !super::terminal_can_draw_images(),
+            "a junk value did not fall through to the automatic check"
+        );
+    }
+
+    /// The hatch fails OPEN, so an ordinary spelling that misses turns a
+    /// documented limitation with a working remedy back into silent
+    /// corruption. `is_ci` shipped this exact defect once already.
+    #[test]
+    fn the_override_is_case_insensitive_and_trimmed() {
+        for on in ["on", "ON", "On", "TRUE", "True", " yes ", "1"] {
+            let _env = isolated_env();
+            unsafe { std::env::set_var("TMUX", "/tmp/x,1,0") };
+            unsafe { std::env::set_var("SHUX_GRAPHICS", on) };
+            assert!(
+                super::terminal_can_draw_images(),
+                "{on:?} did not force images on"
+            );
+        }
+        for off in ["off", "OFF", "Off", " off ", "FALSE", "False", "No", "0"] {
+            let _env = isolated_env();
+            unsafe { std::env::set_var("SHUX_GRAPHICS", off) };
+            assert!(
+                !super::terminal_can_draw_images(),
+                "{off:?} did not force images off"
+            );
+        }
     }
 }

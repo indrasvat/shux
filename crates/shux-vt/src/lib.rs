@@ -532,11 +532,11 @@ impl VirtualTerminal {
         use graphics::kitty::Action;
         match cmd.action {
             Action::Transmit | Action::TransmitAndPlace => {
-                let Some(image) = self.graphics.assembler.feed(&cmd, payload) else {
+                let Some((image, opening)) = self.graphics.assembler.feed(&cmd, payload) else {
                     return;
                 };
-                if cmd.action == Action::TransmitAndPlace {
-                    self.place_image(std::sync::Arc::new(image), &cmd);
+                if opening.action == Action::TransmitAndPlace {
+                    self.place_image(std::sync::Arc::new(image), &opening);
                 }
             }
             // `a=d` clears every placement whatever the target: `d=A` is the
@@ -597,6 +597,7 @@ impl VirtualTerminal {
             image,
             abs_row,
             col: self.cursor.col,
+            image_id: cmd.image_id,
         });
         if !placed {
             self.graphics.refusals = self.graphics.refusals.saturating_add(1);

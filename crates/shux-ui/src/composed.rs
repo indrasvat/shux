@@ -82,24 +82,7 @@ pub fn compose(
     for (pid, rect) in &pane_rects {
         if let Some((src_grid, src_cursor)) = inputs.panes.get(pid) {
             let row_offset = compose_pane(&mut grid, *rect, src_grid, src_cursor);
-            // `min` with the source dims: `compose_pane` tolerates a grid
-            // smaller than its rect during a resize lag, and a picture must not
-            // paint area the grid does not own.
-            let clip = CellRect {
-                col: rect.x as usize,
-                row: rect.y as usize,
-                cols: (rect.width as usize).min(src_grid.cols()),
-                rows: (rect.height as usize).min(src_grid.rows()),
-            };
-            placements.extend(src_grid.placements().iter().map(|p| ComposedPlacement {
-                image: p.image.clone(),
-                // `viewport_row` undoes the source grid's own base, `row_offset`
-                // undoes the vertical clip `compose_pane` just applied to the
-                // cells, and `rect.y` rebases into this frame.
-                row: p.viewport_row(src_grid) - row_offset as i64 + i64::from(rect.y),
-                col: p.col + rect.x as usize,
-                clip,
-            }));
+            placements.extend(resolve_placements(*rect, src_grid, row_offset));
         } else {
             compose_placeholder(&mut grid, *rect, "(no output)");
         }
@@ -216,6 +199,35 @@ pub fn compose(
         cols,
         rows,
     }
+}
+
+/// Rebase one pane's placements into the frame that shows it. `row_offset` is
+/// the vertical clip the caller applied to the pane's cells.
+pub(crate) fn resolve_placements(
+    rect: Rect,
+    src: &Grid,
+    row_offset: usize,
+) -> Vec<ComposedPlacement> {
+    // `min` with the source dims: a pane grid can be smaller than its rect
+    // during a resize lag, and a picture must not paint area it does not own.
+    let clip = CellRect {
+        col: rect.x as usize,
+        row: rect.y as usize,
+        cols: (rect.width as usize).min(src.cols()),
+        rows: (rect.height as usize).min(src.rows()),
+    };
+    src.placements()
+        .iter()
+        .map(|p| ComposedPlacement {
+            image: p.image.clone(),
+            // `viewport_row` undoes the source grid's own base, `row_offset`
+            // undoes the vertical clip applied to the cells, and `rect.y`
+            // rebases into this frame.
+            row: p.viewport_row(src) - row_offset as i64 + i64::from(rect.y),
+            col: p.col + rect.x as usize,
+            clip,
+        })
+        .collect()
 }
 
 fn compose_pane(grid: &mut Grid, rect: Rect, src: &Grid, cursor: &Cursor) -> usize {

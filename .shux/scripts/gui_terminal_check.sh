@@ -47,6 +47,10 @@ gui_terminal_check.sh — photograph shux in a real GUI terminal (issue #175).
   --scenario S   plain            (default) shux alone, at four window sizes
                  image-contained  an injected image bounded by a cell box; must pass
                  image-overflow   the same image unbounded; MUST fail on containment
+                 image-pane       the SAME unbounded image, drawn by a PANE and
+                                  re-emitted by shux; must pass. Paired with
+                                  image-overflow that is the whole claim: identical
+                                  bytes, contained only when shux emits them
   --frames N     frames per phase (default 3)
   --out DIR      where frames and run.json go
                  (default .shux/out/gui-terminal/<scenario>)
@@ -85,10 +89,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "${scenario}" in
-    plain | image-contained | image-overflow) ;;
+    plain | image-contained | image-overflow | image-pane) ;;
     *)
         echo "gui_terminal_check: unknown scenario: ${scenario}" >&2
-        echo "  expected one of: plain, image-contained, image-overflow" >&2
+        echo "  expected one of: plain, image-contained, image-overflow, image-pane" >&2
         exit 2
         ;;
 esac
@@ -371,10 +375,21 @@ echo "    display: ${display} (Xvfb pid ${xvfb_pid})"
 # A short, FIXED title. The pane title is drawn in the border colour on the top
 # border row, so a long or cwd-derived one eats into the rule the rectangle
 # detector measures. Twelve characters is under 15% of the narrowest phase.
+# Which payload goes where. Decided BEFORE the session exists, because the
+# workload is launched with it: the sidecar shares kitty's terminal to put bytes
+# on screen that shux never saw, while `image-pane` is the opposite -- the bytes
+# are the pane's own output and reach the screen only through shux's emit.
+launch_payload="-"
+pane_payload=""
+case "${scenario}" in
+    image-contained | image-overflow) launch_payload="${payload_file}" ;;
+    image-pane) pane_payload="${payload_file}" ;;
+esac
+
 sx session create "${session}" -d --title "shux-gui-rig" -- \
     env TERM=xterm-256color COLORTERM=truecolor LANG=C.utf8 LC_ALL=C.utf8 \
     HOME="${runtime}" bash "${workload_sh}" "${CONTENT_RGB//,/;}" \
-    "${BLOCK_COLS}" "${BLOCK_ROWS}" "${marker}" >/dev/null
+    "${BLOCK_COLS}" "${BLOCK_ROWS}" "${marker}" "${pane_payload}" >/dev/null
 
 # ONE pane, asserted rather than assumed. `find_rect` takes the outermost rules
 # of the border mask, so with two panes it measures the UNION of their outlines
@@ -397,11 +412,6 @@ sx pane wait-for -s "${session}" -p "${pane_id}" -t "${marker}" --timeout-ms 300
     fail "workload never reached its marker"
 
 # ── The real GUI terminal ───────────────────────────────────────────────────
-launch_payload="-"
-if [ "${scenario}" != "plain" ]; then
-    launch_payload="${payload_file}"
-fi
-
 # Mesa software GL: there is no GPU in CI or in the cloud container.
 # `--config NONE` so a developer's kitty.conf cannot move the geometry every
 # measurement depends on — and HOME/XDG_CACHE_HOME/XDG_DATA_HOME isolated as
@@ -593,7 +603,11 @@ phase_records="${runtime}/phases.jsonl"
 : >"${phase_records}"
 
 record_phase() {
-    local name="$1" require_image="$2"
+    # `image_min_px` is the floor the picture must actually cover. 0 for a phase
+    # that expects none; for one that does, well below the ~5100 px a clipped
+    # 320x240 payload measures, and far above the single pixel that used to
+    # satisfy `require_image`.
+    local name="$1" require_image="$2" image_min_px="${3:-1}"
     local geom state win_w win_h cols rows row0 row1 col0 col1
     wait_for_stable_chrome 40 0.3
     geom="$(window_geometry "${window_id}")"
@@ -620,7 +634,7 @@ record_phase() {
 
     python3 -c '
 import json, sys
-name, win_w, win_h, cols, rows, r0, r1, c0, c1, req = sys.argv[1:11]
+name, win_w, win_h, cols, rows, r0, r1, c0, c1, req, floor = sys.argv[1:12]
 print(json.dumps({
     "name": name,
     "window": {"w": int(win_w), "h": int(win_h)},
@@ -628,10 +642,12 @@ print(json.dumps({
     "status_rows": 1,
     "block": {"row0": int(r0), "row1": int(r1), "col0": int(c0), "col1": int(c1)},
     "require_image": req == "1",
-    "frames": sys.argv[11:],
+    "image_min_px": int(floor),
+    "frames": sys.argv[12:],
 }))
 ' "${name}" "${win_w}" "${win_h}" "${cols}" "${rows}" "${row0}" "${row1}" \
-        "${col0}" "${col1}" "${require_image}" "${frames[@]}" >>"${phase_records}"
+        "${col0}" "${col1}" "${require_image}" "${image_min_px}" "${frames[@]}" \
+        >>"${phase_records}"
 
     echo "    ${name}: window ${win_w}x${win_h}, pane ${cols}x${rows} cells, ${frames_per_phase} frames"
 }
@@ -672,10 +688,16 @@ else
         fail "pane ${cols}x${rows} is too small to place an injection payload in"
     fi
 
-    if [ "${scenario}" = "image-overflow" ]; then
+    if [ "${scenario}" = "image-overflow" ] || [ "${scenario}" = "image-pane" ]; then
         # Natural pixel size from a cell near the bottom-right of the pane. At
         # this font 320x240 px is roughly 32x13 cells, so it runs off the right
         # border and down through the status bar — the #175 defect.
+        #
+        # `image-pane` uses the SAME image payload deliberately. Sent to the
+        # emulator it overflows; sent to a PANE it must not, because shux clips
+        # it into a source rectangle before re-emitting. The leading cursor
+        # position resolves against kitty's window in one arm and the pane's
+        # grid in the other; the image bytes are identical.
         "${payload_py}" --rgb "${IMAGE_RGB}" --px 320x240 \
             --at "$((rows - 2)),$((cols - 8))" --out "${payload_file}"
     else
@@ -685,18 +707,43 @@ else
             --at "9,4" --cell-box 10x5 --out "${payload_file}"
     fi
 
-    : >"${go_file}"
-    for _ in $(seq 1 80); do
-        [ -e "${go_file}.done" ] && break
-        kill -0 "${kitty_pid}" 2>/dev/null ||
-            fail "kitty exited during injection: $(cat "${kitty_log}")"
-        sleep 0.25
-    done
-    [ -e "${go_file}.done" ] ||
-        fail "the injector never wrote its receipt (log: ${inject_log})"
-    sleep 1
+    if [ "${scenario}" = "image-pane" ]; then
+        # The workload is waiting on this receipt. From here the bytes are pane
+        # OUTPUT, so everything that puts them on screen is shux's own emit.
+        : >"${payload_file}.ready"
+        # Wait for the workload's OWN receipt, not for quiet: `wait-settled`
+        # measures time since the last mutation, and the pane's last mutation is
+        # the marker from tens of seconds ago, so it returns settled on its first
+        # iteration -- before the payload has been read at all. Requiring content
+        # and only then settling is the rule this arm was breaking.
+        for _ in $(seq 1 240); do
+            [ -e "${payload_file}.emitted" ] && break
+            sleep 0.25
+        done
+        if [ ! -e "${payload_file}.emitted" ]; then
+            if [ -e "${payload_file}.workload-error" ]; then
+                fail "the pane never emitted the payload: $(cat "${payload_file}.workload-error")"
+            fi
+            fail "the pane never emitted the payload (no receipt at ${payload_file}.emitted)"
+        fi
+        # Now quiet means something: the last mutation is the image itself.
+        sx pane wait-settled "${pane_id}" --quiet 400 --timeout 15000 >/dev/null ||
+            fail "the pane never settled after emitting the payload"
+        record_phase "pane" 1 2000
+    else
+        : >"${go_file}"
+        for _ in $(seq 1 80); do
+            [ -e "${go_file}.done" ] && break
+            kill -0 "${kitty_pid}" 2>/dev/null ||
+                fail "kitty exited during injection: $(cat "${kitty_log}")"
+            sleep 0.25
+        done
+        [ -e "${go_file}.done" ] ||
+            fail "the injector never wrote its receipt (log: ${inject_log})"
+        sleep 1
 
-    record_phase "inject" 1
+        record_phase "inject" 1 2000
+    fi
 fi
 
 # ── Verdict ─────────────────────────────────────────────────────────────────
