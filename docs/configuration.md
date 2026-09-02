@@ -169,6 +169,26 @@ If you set a custom `font` and something inside a pane sizes itself from
 `ws_xpixel`, its idea of the pane's pixel size will not match a PNG snapshot of
 that pane. Nothing in shux depends on the two agreeing.
 
+## Inline images on attach
+
+Pane images are re-transmitted to the terminal you attach from, unless shux
+thinks that terminal is an outer multiplexer — `TMUX`, `STY` or `ZELLIJ` set to
+a non-empty value. A multiplexer does not draw them; tmux adopts the escape as
+a pane title instead.
+
+That check reads the environment of the attach client, while the thing that
+matters is where its output goes. The two come apart whenever the environment
+is reset without moving stdout — `sudo`, `ssh`, `su`, `env -i`, a systemd unit,
+`docker exec`. So:
+
+```bash
+SHUX_GRAPHICS=off shux session attach work   # attached across sudo/ssh, inside tmux
+SHUX_GRAPHICS=on  shux session attach work   # stale TMUX, real terminal
+```
+
+`on`/`1`/`true`/`yes` force images on, `off`/`0`/`false`/`no` force them off,
+and anything else leaves the automatic check in charge.
+
 ## Hot reload semantics
 
 The daemon watches the parent directory of the config file (because editors

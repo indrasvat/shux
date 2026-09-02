@@ -52,9 +52,9 @@ pub(crate) struct KittyEmitter {
 }
 
 impl KittyEmitter {
-    /// Gate every emission on the client's probe. A terminal that never
-    /// answered may not be a terminal at all: an outer tmux adopts the
-    /// emitter's continuation header as its window title.
+    /// Gate every emission on the client's own answer. What is on the other end
+    /// may not be a terminal at all: an outer tmux adopts the emitter's
+    /// continuation header as its pane title.
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         if !enabled {
             self.live.clear();

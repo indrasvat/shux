@@ -34,9 +34,9 @@ pub struct AttachHello {
     pub cols: u16,
     pub rows: u16,
     pub client_version: String,
-    /// The client's terminal answered the kitty graphics probe. Pane images are
-    /// re-transmitted only when this is true; `default` keeps an older client,
-    /// which never probed, silent.
+    /// The client believes its terminal can draw kitty graphics. Pane images
+    /// are re-transmitted only when this is true; `default` keeps an older
+    /// client, which never decided, silent.
     #[serde(default)]
     pub graphics: bool,
 }

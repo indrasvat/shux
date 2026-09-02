@@ -49,27 +49,40 @@ use crate::terminal::{self, TerminalGuard};
 /// short: only a program that rewrites the byte stream belongs here.
 const OUTER_MULTIPLEXER_VARS: &[&str] = &["TMUX", "STY", "ZELLIJ"];
 
+/// Overrides the automatic decision below. `1`/`true`/`on` forces images on,
+/// `0`/`false`/`off` forces them off; anything else, including unset, leaves
+/// the decision automatic.
+const GRAPHICS_OVERRIDE_VAR: &str = "SHUX_GRAPHICS";
+
 /// Whether this terminal can be sent kitty graphics.
 ///
-/// Decided from the environment, and deliberately without asking. The obvious
-/// design is the handshake `kitten icat` and zellij use -- an `a=q` query with
-/// a DA1 sentinel -- and shux shipped it briefly. Measured, it was worse than
-/// the problem:
+/// Automatic answer: yes, unless an outer multiplexer announces itself. That is
+/// a heuristic and it is worth being precise about what it can and cannot see,
+/// because both alternatives were built and measured.
 ///
-///   * the query is ITSELF an APC block, and tmux 3.4 adopts APC content as a
-///     pane title, so probing set the title to `Gi=4207,a=q,...` on every
-///     attach -- the same corruption it existed to prevent;
-///   * reading the reply needs raw mode, which clears `ISIG`, so Ctrl-C was
-///     dead for the first 500 ms of every attach, and a client killed in that
-///     window left the terminal with echo off;
-///   * a terminal that never answers cost the full timeout and swallowed
-///     everything typed into it -- measured at 10 bytes of 10.
+/// Asking the terminal is the obvious design -- an `a=q` query with a DA1
+/// sentinel, which is what `kitten icat` and zellij do -- and shux shipped it
+/// briefly. It was worse than the problem: the query is ITSELF an APC block,
+/// and tmux 3.4 adopts APC content as a pane title, so probing set the title to
+/// `Gi=4207,a=q,...` on every attach. Reading a reply also needs raw mode,
+/// which clears `ISIG`: Ctrl-C was dead for the first 500 ms of every attach, a
+/// client killed in that window left the terminal with echo off, and a terminal
+/// that never answered swallowed ten keystrokes out of ten.
 ///
-/// The only harm ever demonstrated from emitting unasked is an outer
-/// multiplexer mangling the stream, and a multiplexer announces itself in the
-/// environment. A real terminal without graphics support ignores an APC block:
-/// that is what the escape was designed for, and what xterm documents.
+/// This check reads the CLIENT's environment, while the corruption is a
+/// property of the BYTE STREAM. They decouple wherever the environment is reset
+/// without moving stdout -- `sudo`, `ssh`, `su`, `env -i`, a systemd unit,
+/// `docker exec` -- so a shux attached across one of those, inside a
+/// multiplexer, is not detected. Measured: `sudo -n env … shux session attach`
+/// in a tmux 3.4 pane puts the emitter's header in the pane title. That is what
+/// [`GRAPHICS_OVERRIDE_VAR`] is for, and why it exists in both directions: the
+/// same gap strands a user whose stale `TMUX` outlived its tmux.
 fn terminal_can_draw_images() -> bool {
+    match std::env::var(GRAPHICS_OVERRIDE_VAR).ok().as_deref() {
+        Some("1" | "true" | "on" | "yes") => return true,
+        Some("0" | "false" | "off" | "no") => return false,
+        _ => {}
+    }
     !OUTER_MULTIPLEXER_VARS
         .iter()
         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
@@ -639,7 +652,7 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn without_multiplexers(f: impl FnOnce()) {
-        const VARS: &[&str] = &["TMUX", "STY", "ZELLIJ"];
+        const VARS: &[&str] = &["TMUX", "STY", "ZELLIJ", "SHUX_GRAPHICS"];
         let _held = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved: Vec<_> = VARS.iter().map(|k| (*k, std::env::var_os(k))).collect();
         for k in VARS {
@@ -680,6 +693,43 @@ mod tests {
             let drew = super::terminal_can_draw_images();
             unsafe { std::env::remove_var("TMUX") };
             assert!(drew);
+        });
+    }
+
+    /// The escape hatch for the gap the automatic check cannot see: `sudo`,
+    /// `ssh`, `su` and friends strip `TMUX` while stdout still goes to tmux,
+    /// and a stale `TMUX` outliving its tmux strands the opposite user.
+    #[test]
+    fn the_override_wins_in_both_directions() {
+        without_multiplexers(|| {
+            unsafe { std::env::set_var("TMUX", "/tmp/x,1,0") };
+            unsafe { std::env::set_var("SHUX_GRAPHICS", "on") };
+            let forced_on = super::terminal_can_draw_images();
+            unsafe { std::env::set_var("SHUX_GRAPHICS", "off") };
+            unsafe { std::env::remove_var("TMUX") };
+            let forced_off = super::terminal_can_draw_images();
+            unsafe { std::env::remove_var("SHUX_GRAPHICS") };
+            assert!(forced_on, "a user inside tmux could not force images on");
+            assert!(
+                !forced_off,
+                "a user on a bare terminal could not force them off"
+            );
+        });
+    }
+
+    #[test]
+    fn an_unrecognised_override_leaves_the_decision_automatic() {
+        without_multiplexers(|| {
+            unsafe { std::env::set_var("SHUX_GRAPHICS", "maybe") };
+            let bare = super::terminal_can_draw_images();
+            unsafe { std::env::set_var("TMUX", "/tmp/x,1,0") };
+            let muxed = super::terminal_can_draw_images();
+            unsafe { std::env::remove_var("SHUX_GRAPHICS") };
+            unsafe { std::env::remove_var("TMUX") };
+            assert!(
+                bare && !muxed,
+                "a junk value did not fall through to the automatic check"
+            );
         });
     }
 }

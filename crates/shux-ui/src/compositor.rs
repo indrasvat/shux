@@ -342,9 +342,9 @@ impl<W: Write> RenderCompositor<W> {
         }
     }
 
-    /// Turn image re-transmit on for this attach. Off unless the client's
-    /// terminal answered the graphics probe: emitting to one that did not is
-    /// not merely wasted bytes, it corrupts an outer multiplexer's state.
+    /// Turn image re-transmit on for this attach. Off unless the client says
+    /// its terminal can draw them: emitting to one that cannot is not merely
+    /// wasted bytes, it corrupts an outer multiplexer's state.
     pub fn set_graphics(&mut self, enabled: bool) {
         self.images.set_enabled(enabled);
     }
