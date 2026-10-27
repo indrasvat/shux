@@ -409,6 +409,11 @@ pub(crate) async fn run_rpc_server(
     // Publish before the RPC server accepts connections, so the very first
     // pane spawn already sees `[shell]` (issue #132).
     publish_daemon_config(config_handle.clone());
+    tokio::spawn(crate::program_status::run_config_walker(
+        config_handle.clone(),
+        io_state.clone(),
+        cancel.clone(),
+    ));
     let cfg_watcher_handle = config_handle.clone();
     let cfg_watcher_path = config_path.clone();
     let cfg_watcher_cancel = cancel.clone();

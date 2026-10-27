@@ -315,6 +315,7 @@ pub enum GraphCommand {
         id: PaneId,
         exit_status: i32,
         incarnation: u64,
+        final_status: Option<PaneStatusUpdate>,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
     SplitPane {
@@ -1399,14 +1400,22 @@ impl SessionGraph {
 
     /// [`Self::set_pane_exit_status`] as reported by PTY incarnation
     /// `incarnation`; ignored unless that incarnation owns the pane.
+    /// A PTY task's exit, applied only if `incarnation` still owns the pane.
+    /// `final_status` (the terminal's status as the process left it) commits
+    /// first under the same check, so `pane.status_changed` precedes
+    /// `pane.exited` and a successor's state is never touched.
     pub fn set_pane_exit_status_owned(
         &self,
         id: PaneId,
         exit_status: i32,
         incarnation: u64,
+        final_status: Option<PaneStatusUpdate>,
     ) -> Result<(), GraphError> {
         if side_map(&self.pty_owners).get(&id) != Some(&incarnation) {
             return Ok(());
+        }
+        if let Some(status) = final_status {
+            self.set_pane_program_status(id, status)?;
         }
         self.set_pane_exit_status(id, exit_status)
     }
@@ -2380,8 +2389,8 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::ClaimPanePty { id, incarnation, reply }) => {
                         let _ = reply.send(graph.claim_pane_pty(id, incarnation));
                     }
-                    Some(GraphCommand::SetPaneExitStatusOwned { id, exit_status, incarnation, reply }) => {
-                        let _ = reply.send(graph.set_pane_exit_status_owned(id, exit_status, incarnation));
+                    Some(GraphCommand::SetPaneExitStatusOwned { id, exit_status, incarnation, final_status, reply }) => {
+                        let _ = reply.send(graph.set_pane_exit_status_owned(id, exit_status, incarnation, final_status));
                     }
                     Some(GraphCommand::SplitPane { target_pane, direction, ratio, command, reply }) => {
                         let _ = reply.send(graph.split_pane_with_command(target_pane, direction, ratio, command));
@@ -2802,6 +2811,7 @@ impl GraphHandle {
         id: PaneId,
         exit_status: i32,
         incarnation: u64,
+        final_status: Option<PaneStatusUpdate>,
     ) -> Result<(), GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
@@ -2809,6 +2819,7 @@ impl GraphHandle {
                 id,
                 exit_status,
                 incarnation,
+                final_status,
                 reply: tx,
             })
             .await
@@ -4547,13 +4558,13 @@ mod tests {
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
         graph.claim_pane_pty(pid, 1).unwrap();
         graph.claim_pane_pty(pid, 2).unwrap();
-        graph.set_pane_exit_status_owned(pid, -1, 1).unwrap();
+        graph.set_pane_exit_status_owned(pid, -1, 1, None).unwrap();
         assert_eq!(
             state.load().panes[&pid].exit_status,
             None,
             "stale exit applied"
         );
-        graph.set_pane_exit_status_owned(pid, 0, 2).unwrap();
+        graph.set_pane_exit_status_owned(pid, 0, 2, None).unwrap();
         assert_eq!(state.load().panes[&pid].exit_status, Some(0));
     }
 
@@ -4565,7 +4576,7 @@ mod tests {
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
         graph.claim_pane_pty(pid, 1).unwrap();
         // The old task's exit committed before the new task's claim.
-        graph.set_pane_exit_status_owned(pid, -1, 1).unwrap();
+        graph.set_pane_exit_status_owned(pid, -1, 1, None).unwrap();
         graph.claim_pane_pty(pid, 2).unwrap();
         assert_eq!(state.load().panes[&pid].exit_status, None);
         let respawned = bus
@@ -4586,7 +4597,7 @@ mod tests {
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
         let _ = graph.claim_pane_pty(pid, 2);
         let _ = graph.claim_pane_pty(pid, 1);
-        let _ = graph.set_pane_exit_status_owned(pid, 0, 2);
+        let _ = graph.set_pane_exit_status_owned(pid, 0, 2, None);
         assert_eq!(
             state.load().panes[&pid].exit_status,
             Some(0),
@@ -4610,8 +4621,49 @@ mod tests {
         let (graph, state) = SessionGraph::new_with_event_bus(None);
         let sid = graph.create_session("work".into(), home()).unwrap();
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
-        graph.set_pane_exit_status_owned(pid, 9, 99).unwrap();
+        graph.set_pane_exit_status_owned(pid, 9, 99, None).unwrap();
         assert_eq!(state.load().panes[&pid].exit_status, None);
+    }
+
+    #[test]
+    fn an_owned_exit_commits_its_final_status_first() {
+        use shux_program_status::State;
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph.claim_pane_pty(pid, 1).unwrap();
+        graph.claim_pane_pty(pid, 2).unwrap();
+
+        graph
+            .set_pane_exit_status_owned(pid, 3, 1, Some(upd(5, Some(status(State::Error)), true)))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            None,
+            "stale status applied"
+        );
+        assert_eq!(state.load().panes[&pid].exit_status, None);
+
+        graph
+            .set_pane_exit_status_owned(pid, 0, 2, Some(upd(6, Some(status(State::Done)), true)))
+            .unwrap();
+        let pane = &state.load().panes[&pid];
+        assert_eq!(
+            pane.program_status.as_ref().map(|s| s.state),
+            Some(State::Done)
+        );
+        assert_eq!(pane.exit_status, Some(0));
+        let order: Vec<&str> = bus
+            .history(50)
+            .iter()
+            .filter_map(|e| match e.data {
+                EventData::PaneStatusChanged { pane_id, .. } if pane_id == pid => Some("status"),
+                EventData::PaneExited { pane_id, .. } if pane_id == pid => Some("exited"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["status", "exited"]);
     }
 
     #[test]

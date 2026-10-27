@@ -75,6 +75,12 @@ prefix = "ctrl-space"
 # explicitly keeps its own value.
 #   env = { LC_ALL = "en_US.UTF-8" }
 
+[program_status]
+# Programs in a pane (Claude Code, Codex, ...) report idle / working /
+# done / blocked / error over OSC 7501; read it with `shux pane status`.
+# false: shux answers no probe, keeps no records and publishes nothing.
+enabled = true
+
 [keybindings]
 # Optional attach key overrides. Keys use the same notation as prefix:
 # "alt-h" targets the root table; "prefix h" targets the key pressed

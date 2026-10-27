@@ -165,6 +165,7 @@ filter = '''
     (package(shux) & kind(test) & !binary_id(=shux::scratch_reap_order))
   + (package(shux-pty) & kind(test))
   + (binary_id(=shux) & test(/^pane_spawn::tests::a_replaced_pty_task/))
+  + (binary_id(=shux) & test(/^program_status::tests::a_pane_/))
 '''
 test-group = 'daemon-pty'
 

@@ -46,6 +46,8 @@ pub struct Config {
     #[serde(default)]
     pub keybindings: std::collections::HashMap<String, String>,
     #[serde(default)]
+    pub program_status: ProgramStatusConfig,
+    #[serde(default)]
     pub shell: ShellConfig,
     #[serde(default)]
     pub statusbar: StatusBarConfig,
@@ -130,6 +132,26 @@ impl Default for KeysConfig {
 
 fn default_prefix() -> String {
     "ctrl-space".to_string()
+}
+
+/// OSC 7501 program status: programs in a pane report idle / working / done /
+/// blocked / error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramStatusConfig {
+    /// Off: no probe reply, no records, nothing published; the terminal
+    /// behaves as if the protocol did not exist.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for ProgramStatusConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

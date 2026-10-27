@@ -37,6 +37,7 @@ pub mod pane_command;
 pub mod pane_io;
 pub mod pane_record;
 pub mod pane_spawn;
+pub mod program_status;
 pub mod rpc;
 pub mod session_meta;
 pub mod session_persist;

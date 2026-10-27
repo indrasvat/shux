@@ -101,7 +101,7 @@ async fn run_pane_pty_task(
                                 task_exit = PtyTaskExit::RequestedTeardown;
                                 break;
                             }
-                            let (vt_title, terminal_responses, rev_state, alt_switched) =
+                            let (vt_title, terminal_responses, rev_state, alt_switched, status) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
                                     // LENS-R-032/DEC-4: detect an alt-screen
                                     // switch by comparing the PRESENTED alt flag
@@ -123,10 +123,14 @@ async fn run_pane_pty_task(
                                         responses,
                                         Some(rev),
                                         alt_before != alt_after,
+                                        Some(vt.program_status_publication()),
                                     )
                                 } else {
-                                    (None, Vec::new(), None, false)
+                                    (None, Vec::new(), None, false, None)
                                 };
+                            if let (Some(status), Some(channel)) = (status, state.status.get(&pane_id)) {
+                                channel.publish(status);
+                            }
                             // LENS-R-003: publish in the same critical section as
                             // the grid mutation, once per Class-A batch.
                             if let Some(rev) = rev_state {
@@ -426,8 +430,27 @@ async fn run_pane_pty_task(
     // The graph rejects an exit from an incarnation that no longer owns the
     // pane, at the moment it commits — no window between check and write.
     let exit_status = exit_code.unwrap_or(-1);
+    // The process is gone: end its live records and send the final status
+    // with the exit, so status_changed precedes exited. One lock hold decides
+    // ownership and reads the terminal; a successor's records are not ours.
+    let final_status = {
+        let mut guard = io_state.lock().await;
+        let state = &mut *guard;
+        match state.vts.get_mut(&pane_id) {
+            Some(vt) if state.incarnations.get(&pane_id) == Some(&incarnation) => {
+                vt.note_process_exit();
+                let publication = vt.program_status_publication();
+                let update = crate::program_status::update(&publication);
+                if let Some(channel) = state.status.get(&pane_id) {
+                    channel.publish(publication);
+                }
+                Some(update)
+            }
+            _ => None,
+        }
+    };
     if let Err(e) = graph
-        .set_pane_exit_status_owned(pane_id, exit_status, incarnation)
+        .set_pane_exit_status_owned(pane_id, exit_status, incarnation, final_status)
         .await
     {
         tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
@@ -607,7 +630,7 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>(16);
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let pane_shutdown = shutdown.child_token();
-    let vt = shux_vt::VirtualTerminal::new(size.rows as usize, size.cols as usize);
+    let mut vt = shux_vt::VirtualTerminal::new(size.rows as usize, size.cols as usize);
     // LENS-R-003: seed the per-pane revision watch with the VT's initial
     // (content_revision=1, last_mutation_ns=creation time). The initial
     // receiver is dropped; P3 subscribers call `subscribe()` on the stored
@@ -621,6 +644,7 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
 
     static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let incarnation = NEXT_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut status_flush = None;
     match graph.claim_pane_pty(pane_id, incarnation).await {
         Ok(true) => {}
         // A newer spawn owns the pane; it is the one that runs there.
@@ -654,13 +678,32 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
         if let Some(old) = state.shutdowns.insert(pane_id, pane_shutdown.clone()) {
             old.cancel();
         }
+        vt.set_program_status_enabled(state.program_status_enabled);
+        let status = vt.program_status_publication();
+        let status_generation = status.generation;
         state.incarnations.insert(pane_id, incarnation);
         state.writers.insert(pane_id, write_tx);
         state.resizers.insert(pane_id, resize_tx);
         state.pty_done.insert(pane_id, done_rx);
-        state.vts.insert(pane_id, vt);
+        let replaced = state.vts.insert(pane_id, vt).is_some();
         state.revisions.insert(pane_id, rev_tx);
         state.pty_pids.insert(pane_id, pid);
+        // The slot outlives a respawn: the new terminal's newer generation
+        // clears what the old program reported.
+        match state.status.get(&pane_id) {
+            Some(channel) => channel.publish(status),
+            None => {
+                let channel =
+                    crate::program_status::StatusChannel::start(pane_id, status, graph.clone());
+                state.status.insert(pane_id, channel);
+            }
+        }
+        if replaced {
+            status_flush = state
+                .status
+                .get(&pane_id)
+                .map(|c| (c.flusher(), status_generation));
+        }
         // Arm the cast recorder in the SAME lock, before the read task spawns, so no output can
         // race ahead of it (task 083).
         if let Some(rec) = cast_recorder {
@@ -668,6 +711,11 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
         }
     }
 
+    // Best-effort: consumers see the old program's status cleared before the
+    // new one can report.
+    if let Some((flusher, generation)) = status_flush {
+        flusher.flush(generation).await;
+    }
     tokio::spawn(run_pane_pty_task(
         pane_id,
         handle,

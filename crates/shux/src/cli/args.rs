@@ -1337,6 +1337,40 @@ pub enum PaneCommand {
         stable_frames: u32,
     },
 
+    /// Show what a pane's programs report about themselves over OSC 7501
+    /// (Claude Code, Codex, ...): the most urgent state, then every record
+    /// with its title and message. Mirrors `pane.status`.
+    Status {
+        /// Pane id — full UUID or any unambiguous prefix, such as the
+        /// 8-character short form `pane list` prints.
+        #[arg(value_name = "PANE")]
+        pane: String,
+    },
+
+    /// Block until a pane's program status reaches one of the given states,
+    /// or time out. Mirrors `pane.wait_status`. Exit 0 matched, 1 timeout,
+    /// 2 bad arguments, 3 the pane exited, program status is off, or another
+    /// error.
+    #[command(name = "wait-status")]
+    WaitStatus {
+        /// Pane id — full UUID or any unambiguous prefix.
+        #[arg(value_name = "PANE")]
+        pane: String,
+
+        /// States to wait for: idle, working, done, blocked, error.
+        /// Comma-separated or repeated.
+        #[arg(long = "state", value_delimiter = ',', required = true)]
+        states: Vec<String>,
+
+        /// `top`: the most urgent record is in the set. `any`: some record is.
+        #[arg(long = "match", default_value = "top", value_parser = ["top", "any"])]
+        matching: String,
+
+        /// Deadline. Human duration (`30s`, `500ms`); at most 600s.
+        #[arg(long, default_value = "30s", value_parser = parse_duration_ms)]
+        timeout: u64,
+    },
+
     /// Capture the pane's current visible frame as a checkpoint for a later
     /// `pane diff`. Mirrors `pane.checkpoint` RPC (lens PRD §7). At most 4
     /// checkpoints per pane; a 5th evicts the oldest by creation revision

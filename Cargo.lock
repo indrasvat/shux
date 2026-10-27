@@ -1207,6 +1207,7 @@ dependencies = [
  "sha2",
  "shux-core",
  "shux-plugin",
+ "shux-program-status",
  "shux-pty",
  "shux-raster",
  "shux-rpc",

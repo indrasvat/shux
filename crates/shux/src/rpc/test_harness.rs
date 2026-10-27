@@ -113,6 +113,12 @@ impl RpcHarness {
             scratch_registry.clone(),
         );
 
+        let builder = crate::rpc::program_status::register_program_status_methods(
+            builder,
+            graph.clone(),
+            io.clone(),
+            bus.clone(),
+        );
         let router =
             crate::rpc::events::register_events_methods(builder, bus.clone(), graph.clone())
                 .build();

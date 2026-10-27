@@ -125,6 +125,10 @@ pub struct PaneIoState {
     /// needing its own handle to the spawned `PtyHandle`. Same lifetime as
     /// `vts`: cleared on pane teardown.
     pub pty_pids: HashMap<shux_core::model::PaneId, u32>,
+    /// OSC 7501 status slot and publisher per pane. Same lifetime as `vts`.
+    pub(crate) status: HashMap<shux_core::model::PaneId, crate::program_status::StatusChannel>,
+    /// `[program_status] enabled`, applied to every VT under this lock.
+    pub(crate) program_status_enabled: bool,
 }
 
 impl Default for PaneIoState {
@@ -151,6 +155,8 @@ impl PaneIoState {
             event_bus: None,
             recorders: HashMap::new(),
             pty_pids: HashMap::new(),
+            status: HashMap::new(),
+            program_status_enabled: true,
         }
     }
 
@@ -207,6 +213,9 @@ impl PaneIoState {
                 self.invalidations.remove(pane_id);
                 self.pty_pids.remove(pane_id);
                 self.incarnations.remove(pane_id);
+                if let Some(channel) = self.status.remove(pane_id) {
+                    self.teardown_waiters.push(channel.stop());
+                }
             }
         }
         (self.render_pulse.clone(), done)

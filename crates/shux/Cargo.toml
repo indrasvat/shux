@@ -17,6 +17,7 @@ path = "src/main.rs"
 shux-core = { path = "../shux-core" }
 shux-pty = { path = "../shux-pty" }
 shux-vt = { path = "../shux-vt" }
+shux-program-status = { path = "../shux-program-status" }
 shux-rpc = { path = "../shux-rpc" }
 shux-plugin = { path = "../shux-plugin" }
 shux-ui = { path = "../shux-ui" }

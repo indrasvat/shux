@@ -745,6 +745,25 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                     )
                     .await
                 }
+                PaneCommand::Status { pane } => {
+                    cli::handle_pane_status(&mut stream, &pane, args.format).await
+                }
+                PaneCommand::WaitStatus {
+                    pane,
+                    states,
+                    matching,
+                    timeout,
+                } => {
+                    cli::handle_pane_wait_status(
+                        &mut stream,
+                        &pane,
+                        &states,
+                        &matching,
+                        timeout,
+                        args.format,
+                    )
+                    .await
+                }
                 PaneCommand::Checkpoint { pane } => {
                     cli::handle_pane_checkpoint(&mut stream, &pane, args.format).await
                 }

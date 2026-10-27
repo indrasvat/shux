@@ -44,11 +44,20 @@ mod strict {
         #[serde(default)]
         pub keybindings: HashMap<String, String>,
         #[serde(default)]
+        pub program_status: ProgramStatus,
+        #[serde(default)]
         pub shell: Shell,
         #[serde(default)]
         pub statusbar: StatusBar,
         #[serde(default)]
         pub theme: Theme,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProgramStatus {
+        #[serde(default)]
+        pub enabled: Option<bool>,
     }
 
     #[derive(Debug, Default, Deserialize)]
