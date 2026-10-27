@@ -175,12 +175,14 @@ assert_no_new_orphan_automation_processes "${orphan_baseline}"
 # tty matched neither branch of `orphan_candidate_pids`, so the guard reported
 # success while the server ran on, holding its display number for good.
 #
-# The leak is a COPY of `sleep` named `Xvfb`, not a real X server. `ps -o comm=`
-# reports the executable's basename, which is the whole of what the guard matches
-# on, so the copy exercises the real matching path — and this case then runs on a
-# machine with no X server installed, which is most of them.
+# The leak is `sleep` exec'd through a SYMLINK named `Xvfb`, not a real X server.
+# `ps -o comm=` reports the exec'd path's basename, which is the whole of what the
+# guard matches on, so the link exercises the real matching path — and this case
+# then runs on a machine with no X server installed, which is most of them. Not a
+# copy: macOS SIGKILLs a copied Apple platform binary at exec, so a copied
+# `sleep` died at once, left nothing behind, and this case failed on every Mac.
 xvfb_shim_dir="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-xvfb.XXXXXX")"
-cp "$(command -v sleep)" "${xvfb_shim_dir}/Xvfb"
+ln -s "$(command -v sleep)" "${xvfb_shim_dir}/Xvfb"
 
 set +e
 .shux/scripts/no_leak_guard.sh python3 - "${xvfb_shim_dir}/Xvfb" <<'XVFBLEAK'
@@ -372,16 +374,29 @@ if [ -z "$(shux_daemon_pids)" ]; then
   # A process this checkout orphans DURING the reap window, owned by nobody the reap
   # touched. Attribution by "appeared between two snapshots" killed it.
   #
-  # It reports its own pid: `setsid` forks, so `$!` is a process that has already exited,
-  # and killing that one leaves the real bystander — and its `sleep` — running. Cleanup
-  # signals the whole session `setsid` made, so nothing outlives this block.
-  bystander_pidfile="$(mktemp "${TMPDIR:-/tmp}/shux-leak-guard-bystander.XXXXXX")"
-  # Detached in a subshell so bash does not report our own deliberate kill as a job.
-  (setsid sh -c "echo \$\$ >'${bystander_pidfile}'; sleep 300; : ${bystander_needle}" \
-    >/dev/null 2>&1 &)
-  sleep 0.5
-  bystander_pid="$(cat "${bystander_pidfile}")"
-  rm -f "${bystander_pidfile}"
+  # A new session leader, orphaned as soon as its launcher exits. python3 rather than
+  # `setsid(1)`, which macOS does not ship — there the bystander was never created and
+  # this case failed with an empty pid. Cleanup signals the whole session, so nothing
+  # outlives this block.
+  bystander_pid="$(python3 - "${bystander_needle}" <<'BYSTANDER'
+import subprocess
+import sys
+
+p = subprocess.Popen(
+    ["sh", "-c", "sleep 300; : " + sys.argv[1]],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+    close_fds=True,
+)
+print(p.pid)
+BYSTANDER
+)"
+  if [ -z "${bystander_pid}" ] || pid_is_gone "${bystander_pid}"; then
+    echo "could not start the bystander process this case needs" >&2
+    exit 1
+  fi
 
   set +e
   .shux/scripts/reap_daemons.sh >/dev/null
