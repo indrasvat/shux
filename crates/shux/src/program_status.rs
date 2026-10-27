@@ -824,4 +824,43 @@ mod tests {
         assert!(b.is_err(), "the waiting spawn reported success");
         finish(h).await;
     }
+
+    /// Typing into a pane whose program has stopped reading its input must
+    /// not freeze the pane either: output keeps flowing and it tears down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_that_never_reads_its_input_survives_typing() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-typing").await;
+        spawn_sh(
+            &h,
+            pane,
+            r#"python3 -c "import os,tty,time; tty.setraw(0); os.write(1, b'\x1b]7501;?\x1b\\\\'*300)
+for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
+        )
+        .await;
+        let ticked = |text: &str, n: usize| text.contains(&format!("TICK{n}X"));
+        let wait_tick = |n: usize| {
+            let io = h.io.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                loop {
+                    let text = io.lock().await.vts[&pane].capture_text(None);
+                    if ticked(&text, n) {
+                        return true;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        assert!(wait_tick(5).await, "the program never started ticking");
+        let writer = h.io.lock().await.writers[&pane].clone();
+        for _ in 0..64 {
+            let _ = writer.try_send(vec![b'k'; 1024]); // a paste the program never reads
+        }
+        assert!(wait_tick(40).await, "the pane froze once typed into");
+        finish(h).await;
+    }
 }

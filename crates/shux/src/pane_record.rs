@@ -341,7 +341,15 @@ pub(crate) async fn finish_pane_recorders(
 ) {
     let senders: Vec<mpsc::Sender<PaneRecordChunk>> = {
         let state = io_state.lock().await;
-        if owner.is_some_and(|inc| !state.is_current(pane_id, inc)) {
+        // Only a successor's recorders are off limits. A pane torn down has
+        // no incarnation left, and its recordings must still finish.
+        let successor = owner.is_some_and(|inc| {
+            state
+                .incarnations
+                .get(&pane_id)
+                .is_some_and(|&current| current != inc)
+        });
+        if successor {
             return;
         }
         state

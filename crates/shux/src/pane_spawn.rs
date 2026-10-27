@@ -32,23 +32,40 @@ struct PtyTaskControl {
     done_tx: oneshot::Sender<()>,
 }
 
-/// Terminal replies (DA1, DSR, OSC 7501 probes) waiting for the program to read
-/// its input. Written without ever blocking, so a program that never reads
-/// cannot stall the PTY loop; bounded, and a reply that does not fit is
-/// dropped whole, so the program never sees half of one.
+/// Everything bound for the program's input — terminal replies (DA1, DSR,
+/// OSC 7501 probes) and user input — in order. Written without ever blocking,
+/// so a program that stops reading cannot stall the PTY loop. Bounded; a reply
+/// or input chunk that does not fit is dropped whole, never cut.
 #[derive(Default)]
-struct ReplyQueue {
+struct PtyInputQueue {
     pending: std::collections::VecDeque<u8>,
 }
 
-impl ReplyQueue {
+impl PtyInputQueue {
+    /// Replies stop queueing early: a program that ignores them gets none.
     const CAP: usize = 4096;
+    /// Input may queue up to a large paste.
+    const INPUT_CAP: usize = 1 << 20;
 
     fn push(&mut self, reply: &[u8]) -> bool {
-        if self.pending.len() + reply.len() > Self::CAP {
+        self.push_capped(reply, Self::CAP)
+    }
+
+    /// An empty queue takes any input, however large; the cap bounds only
+    /// input piling up behind a program that is not reading.
+    fn push_input(&mut self, data: &[u8]) -> bool {
+        if self.pending.is_empty() {
+            self.pending.extend(data);
+            return true;
+        }
+        self.push_capped(data, Self::INPUT_CAP)
+    }
+
+    fn push_capped(&mut self, bytes: &[u8], cap: usize) -> bool {
+        if self.pending.len() + bytes.len() > cap {
             return false;
         }
-        self.pending.extend(reply);
+        self.pending.extend(bytes);
         true
     }
 
@@ -114,7 +131,7 @@ async fn run_pane_pty_task(
         .unwrap_or_else(std::time::Instant::now);
     let mut output_dropped_any = false;
     let mut task_exit = PtyTaskExit::Natural;
-    let mut replies = ReplyQueue::default();
+    let mut replies = PtyInputQueue::default();
 
     loop {
         tokio::select! {
@@ -304,15 +321,12 @@ async fn run_pane_pty_task(
                         break;
                     }
                 };
-                // Queued replies first: input must not land inside one.
-                if !replies.is_empty() {
-                    let queued: Vec<u8> = replies.pending.drain(..).collect();
-                    if let Err(e) = handle.write(&queued).await {
-                        tracing::error!(%pane_id, error = %e, "PTY write error");
-                        break;
-                    }
+                // Behind any queued reply, never blocking: a program that
+                // stopped reading must not stop this loop.
+                if !replies.push_input(&data) {
+                    tracing::warn!(%pane_id, "program is not reading its input; dropping {} bytes", data.len());
                 }
-                if let Err(e) = handle.write(&data).await {
+                if let Err(e) = replies.drain(|b| handle.try_write(b)) {
                     tracing::error!(%pane_id, error = %e, "PTY write error");
                     break;
                 }
@@ -1223,11 +1237,48 @@ mod tests {
         h.stop().await;
     }
 
-    /// A pane id plus the pid file its shell writes, so a test can prove the
-    /// child of a refused spawn did not survive.
+    /// A pane killed while recording has no successor: its recording must
+    /// finish, or a recorder without a duration waits forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_torn_down_with_its_pane_finishes_its_recorder() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("kill-rec").await;
+        let dir = tempfile::tempdir().unwrap();
+        let rec = crate::pane_record::open_cast_recorder(dir.path().join("k.cast"), 80, 24)
+            .await
+            .unwrap();
+        let outcome = rec.outcome.clone();
+        spawn_pane_pty_with_recorder(
+            pane,
+            "/tmp".into(),
+            vec!["sleep".into(), "30".into()],
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            h.cancel.clone(),
+            h.graph.clone(),
+            Some(rec),
+        )
+        .await
+        .unwrap();
+        // What pane.kill does: tear the pane down, VT and all.
+        let (_pulse, done) = h.io.lock().await.teardown_panes_collecting(&[pane], true);
+        for rx in done {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            outcome.lock().unwrap().status,
+            crate::pane_record::PaneRecordStatus::Complete,
+            "a recording on a killed pane was never finished"
+        );
+        h.stop().await;
+    }
+
     #[test]
     fn a_reply_the_program_only_partly_took_finishes_before_anything_else() {
-        let mut q = ReplyQueue::default();
+        let mut q = PtyInputQueue::default();
         assert!(q.push(b"\x1b[?1;2c"));
         assert!(q.push(b"\x1b[0n"));
         let mut sent = Vec::new();
@@ -1252,14 +1303,25 @@ mod tests {
     }
 
     #[test]
+    fn a_large_paste_is_taken_whole_and_only_a_backlog_is_capped() {
+        let mut q = PtyInputQueue::default();
+        let paste = vec![b'p'; PtyInputQueue::INPUT_CAP + 10];
+        assert!(
+            q.push_input(&paste),
+            "a paste larger than the cap was dropped"
+        );
+        assert!(!q.push_input(b"more"), "input piled up past the cap");
+    }
+
+    #[test]
     fn a_reply_that_does_not_fit_is_dropped_whole() {
-        let mut q = ReplyQueue::default();
+        let mut q = PtyInputQueue::default();
         let reply = vec![b'x'; 1000];
         let mut accepted = 0;
         while q.push(&reply) {
             accepted += 1;
         }
-        assert_eq!(accepted, ReplyQueue::CAP / reply.len());
+        assert_eq!(accepted, PtyInputQueue::CAP / reply.len());
         assert_eq!(
             q.pending.len(),
             accepted * reply.len(),
@@ -1267,6 +1329,8 @@ mod tests {
         );
     }
 
+    /// A pane id plus the pid file its shell writes, so a test can prove the
+    /// child of a refused spawn did not survive.
     fn pid_probe(dir: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
         let pid_file = dir.join("pid");
         let cmd = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());

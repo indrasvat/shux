@@ -649,3 +649,38 @@ fn the_split_rpc_rejects_an_out_of_range_ratio() {
         "a valid RPC split must work"
     );
 }
+
+#[test]
+fn wait_status_exits_3_when_it_cannot_reach_the_daemon() {
+    let env = Env::new();
+    let not_a_dir = env.root.path().join("runtime-file");
+    std::fs::write(&not_a_dir, b"").expect("write file");
+    for format in ["json", "text"] {
+        let out = env
+            .shux()
+            .env("XDG_RUNTIME_DIR", &not_a_dir)
+            .args([
+                "--format",
+                format,
+                "pane",
+                "wait-status",
+                "abcd",
+                "--state",
+                "done",
+            ])
+            .output()
+            .expect("spawn shux");
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "--format {format}: an unreachable daemon must exit 3, not the timeout code:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if format == "json" {
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+                .expect("--format json prints a JSON error envelope");
+            assert_eq!(v["error"]["code"], -32603, "{v}");
+        }
+    }
+}

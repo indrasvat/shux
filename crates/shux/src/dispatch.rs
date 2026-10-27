@@ -425,7 +425,14 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
         }
 
         Some(Command::Pane { command }) => {
-            let mut stream = client::ensure_daemon_running_at(&socket_path).await?;
+            let mut stream = match client::ensure_daemon_running_at(&socket_path).await {
+                Ok(stream) => stream,
+                // wait-status keeps exit 1 for a timeout, so it reports this itself.
+                Err(e) if matches!(command, PaneCommand::WaitStatus { .. }) => {
+                    cli::wait_status_unreachable(&e, args.format)
+                }
+                Err(e) => return Err(e.into()),
+            };
             match command {
                 PaneCommand::List { session, window } => {
                     cli::handle_pane_list(&mut stream, &session, window.as_deref(), args.format)

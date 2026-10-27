@@ -3,7 +3,7 @@
 use shux_rpc::{Policy, Sensitivity};
 
 use crate::rpc::convert::event_to_json;
-use crate::rpc::params::{required_str, resolve_pane_ref};
+use crate::rpc::params::{required_str, resolve_pane_ref, resolve_session_ref, resolve_window_ref};
 
 /// Self-namespaced filters are Public — a plugin can always watch its own
 /// published events. Anything broader (firehose or other plugins'
@@ -15,6 +15,54 @@ fn watch_sensitivity(params: Option<&serde_json::Value>, plugin_id: &str) -> Sen
         Sensitivity::Public
     } else {
         Sensitivity::ContentRead
+    }
+}
+
+/// Entity a caller named with `pane_id` / `window_id` / `session_id`. The
+/// permission check authorizes a scoped grant against these ids, so the
+/// handlers must return only events about them, never the whole bus.
+struct EventScope {
+    pane: Option<String>,
+    window: Option<String>,
+    session: Option<String>,
+}
+
+impl EventScope {
+    fn from_params(
+        gh: &shux_core::graph::GraphHandle,
+        params: &serde_json::Value,
+    ) -> Result<Self, shux_rpc::RpcError> {
+        let id = |key: &str| params.get(key).and_then(|v| v.as_str());
+        Ok(Self {
+            pane: id("pane_id")
+                .map(|s| resolve_pane_ref(gh, s).map(|p| p.to_string()))
+                .transpose()?,
+            window: id("window_id")
+                .map(|s| resolve_window_ref(gh, s, "window_id").map(|w| w.to_string()))
+                .transpose()?,
+            session: id("session_id")
+                .map(|s| resolve_session_ref(gh, s, "session_id").map(|x| x.to_string()))
+                .transpose()?,
+        })
+    }
+
+    fn admits(&self, e: &shux_core::event::Event) -> bool {
+        if self.pane.is_none() && self.window.is_none() && self.session.is_none() {
+            return true;
+        }
+        let data = serde_json::to_value(&e.data).unwrap_or_default();
+        let field = |key: &str| {
+            data.pointer(&format!("/data/{key}"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        };
+        [
+            (&self.pane, "pane_id"),
+            (&self.window, "window_id"),
+            (&self.session, "session_id"),
+        ]
+        .into_iter()
+        .all(|(want, key)| want.is_none() || field(key) == *want)
     }
 }
 
@@ -58,6 +106,8 @@ pub(crate) fn register_events_methods(
     let bus_watch = bus.clone();
     let bus_hist = bus.clone();
     let bus_pane_output = bus;
+    let graph_watch = graph.clone();
+    let graph_hist = graph.clone();
     let graph_pane_output = graph;
 
     builder
@@ -65,9 +115,10 @@ pub(crate) fn register_events_methods(
             "events.watch",
             Policy::param_aware(watch_sensitivity),
             move |params: Option<serde_json::Value>| {
-                let bus = bus_watch.clone();
+                let (bus, gh) = (bus_watch.clone(), graph_watch.clone());
                 async move {
                     let params = params.unwrap_or_default();
+                    let scope = EventScope::from_params(&gh, &params)?;
 
                     let from_seq = params.get("from_seq").and_then(|v| v.as_u64());
                     let max_events = params
@@ -104,7 +155,8 @@ pub(crate) fn register_events_methods(
                         None => (Vec::new(), 0),
                     };
 
-                    let mut collected: Vec<shux_core::event::Event> = history;
+                    let mut collected: Vec<shux_core::event::Event> =
+                        history.into_iter().filter(|e| scope.admits(e)).collect();
                     let mut lagged = false;
 
                     // 3. Tail: drain up to (max_events - history_len) events from
@@ -122,7 +174,9 @@ pub(crate) fn register_events_methods(
                         let remaining = deadline - now;
                         match tokio::time::timeout(remaining, sub.recv()).await {
                             Ok(Some(shux_core::bus::SubscriptionEvent::Event(e))) => {
-                                collected.push(e)
+                                if scope.admits(&e) {
+                                    collected.push(e)
+                                }
                             }
                             Ok(Some(shux_core::bus::SubscriptionEvent::Lagged(_))) => {
                                 // Subscriber fell behind broadcast capacity. Surface
@@ -167,9 +221,10 @@ pub(crate) fn register_events_methods(
             "events.history",
             Policy::fixed(Sensitivity::ContentRead),
             move |params: Option<serde_json::Value>| {
-                let bus = bus_hist.clone();
+                let (bus, gh) = (bus_hist.clone(), graph_hist.clone());
                 async move {
                     let params = params.unwrap_or_default();
+                    let scope = EventScope::from_params(&gh, &params)?;
                     let count = params
                         .get("count")
                         .and_then(|v| v.as_u64())
@@ -179,7 +234,11 @@ pub(crate) fn register_events_methods(
                     let filters = event_filters(Some(&params));
 
                     let events = bus.history_filtered(count, &filters);
-                    let json: Vec<serde_json::Value> = events.iter().map(event_to_json).collect();
+                    let json: Vec<serde_json::Value> = events
+                        .iter()
+                        .filter(|e| scope.admits(e))
+                        .map(event_to_json)
+                        .collect();
 
                     Ok(serde_json::json!({
                         "events": json,
@@ -321,6 +380,66 @@ mod tests {
 
     use crate::rpc::test_harness::{RpcHarness, dispatch_err, dispatch_ok};
     use std::time::Duration;
+
+    /// A scoped grant authorizes events about its own pane only: naming a
+    /// pane must narrow the result, never return every pane's status.
+    #[tokio::test]
+    async fn events_named_for_a_pane_return_only_that_panes_events() {
+        let harness = RpcHarness::new();
+        let (_s, _w, a) = harness.seed_session("scope-a").await;
+        let (_s, _w, b) = harness.seed_session("scope-b").await;
+        let snap = harness.graph.snapshot();
+        for pane in [a, b] {
+            let p = &snap.panes[&pane];
+            harness
+                .bus
+                .publish(shux_core::event::EventData::PaneStatusChanged {
+                    pane_id: pane,
+                    window_id: p.window_id,
+                    session_id: snap.windows[&p.window_id].session_id,
+                    old: None,
+                    new: None,
+                    seen: true,
+                    enabled: true,
+                });
+        }
+        let panes = |v: &serde_json::Value| -> Vec<String> {
+            v["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    e["data"]["data"]["pane_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+        let history = dispatch_ok(
+            &harness.router,
+            "events.history",
+            serde_json::json!({"pane_id": a.to_string(), "filter": ["pane.status_changed"], "count": 50}),
+        )
+        .await;
+        assert_eq!(
+            panes(&history),
+            [a.to_string()],
+            "events.history leaked another pane"
+        );
+        let watched = dispatch_ok(
+            &harness.router,
+            "events.watch",
+            serde_json::json!({"pane_id": a.to_string(), "filter": ["pane.status_changed"], "from_seq": 1, "timeout_ms": 50}),
+        )
+        .await;
+        assert_eq!(
+            panes(&watched),
+            [a.to_string()],
+            "events.watch leaked another pane"
+        );
+        harness.stop().await;
+    }
 
     #[tokio::test]
     async fn production_events_routes_filter_history_and_live_data_plane() {
