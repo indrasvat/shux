@@ -2387,7 +2387,8 @@ fn parse_osc_color(bytes: &[u8]) -> Result<[u8; 3], ()> {
 }
 
 fn parse_hex_color(hex: &str) -> Result<[u8; 3], ()> {
-    if hex.len() != 6 {
+    // All ASCII hex digits before slicing: six *bytes* may be fewer chars.
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(());
     }
     let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| ())?;
@@ -2418,6 +2419,27 @@ fn parse_rgb_component(component: &str) -> Result<u8, ()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A `#rrggbb` colour whose six bytes hold a multi-byte character must be
+    /// rejected, not sliced mid-character: the slice panicked, and the pane
+    /// then stopped rendering (found by fuzzing `vt_program_status_stream`).
+    #[test]
+    fn hex_colours_with_multibyte_characters_are_rejected_not_sliced() {
+        for seq in [
+            "\x1b]11;#a\u{e9}\u{e9}b\x07",
+            "\x1b]10;#a\u{e9}\u{e9}b\x1b\\",
+            "\x1b]12;#\u{e9}\u{e9}\u{e9}\x07",
+            "\x1b]4;1;#a\u{e9}\u{e9}b\x07",
+        ] {
+            let mut vt = crate::VirtualTerminal::new(2, 20);
+            vt.process(seq.as_bytes());
+            vt.process(b"after");
+            assert!(
+                vt.capture_text(None).contains("after"),
+                "{seq:?} stopped the terminal"
+            );
+        }
+    }
 
     /// Tracking 1005/1015/1016 must not make DECRQM claim them: `0` ("not
     /// recognized") stays true because shux never emits these encodings, and an
