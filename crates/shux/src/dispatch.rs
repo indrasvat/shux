@@ -429,7 +429,7 @@ pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
                 Ok(stream) => stream,
                 // wait-status keeps exit 1 for a timeout, so it reports this itself.
                 Err(e) if matches!(command, PaneCommand::WaitStatus { .. }) => {
-                    cli::wait_status_unreachable(&e, args.format)
+                    cli::wait_status_unreachable(e.into(), args.format)
                 }
                 Err(e) => return Err(e.into()),
             };

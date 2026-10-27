@@ -46,8 +46,12 @@ impl EventScope {
         })
     }
 
+    fn is_all(&self) -> bool {
+        self.pane.is_none() && self.window.is_none() && self.session.is_none()
+    }
+
     fn admits(&self, e: &shux_core::event::Event) -> bool {
-        if self.pane.is_none() && self.window.is_none() && self.session.is_none() {
+        if self.is_all() {
             return true;
         }
         let data = serde_json::to_value(&e.data).unwrap_or_default();
@@ -233,12 +237,19 @@ pub(crate) fn register_events_methods(
                         .min(1000);
                     let filters = event_filters(Some(&params));
 
-                    let events = bus.history_filtered(count, &filters);
-                    let json: Vec<serde_json::Value> = events
-                        .iter()
-                        .filter(|e| scope.admits(e))
-                        .map(event_to_json)
-                        .collect();
+                    // Scope first, so `count` counts only the scope's events.
+                    let events: Vec<_> = if scope.is_all() {
+                        bus.history_filtered(count, &filters)
+                    } else {
+                        let mut scoped: Vec<_> = bus
+                            .history_filtered(usize::MAX, &filters)
+                            .into_iter()
+                            .filter(|e| scope.admits(e))
+                            .collect();
+                        scoped.drain(..scoped.len().saturating_sub(count));
+                        scoped
+                    };
+                    let json: Vec<serde_json::Value> = events.iter().map(event_to_json).collect();
 
                     Ok(serde_json::json!({
                         "events": json,
@@ -437,6 +448,42 @@ mod tests {
             panes(&watched),
             [a.to_string()],
             "events.watch leaked another pane"
+        );
+        harness.stop().await;
+    }
+
+    /// `count` is how many of the named pane's events come back, however many
+    /// newer events other panes have.
+    #[tokio::test]
+    async fn a_scoped_history_counts_only_the_scoped_events() {
+        let harness = RpcHarness::new();
+        let (_s, _w, a) = harness.seed_session("count-a").await;
+        let (_s, _w, b) = harness.seed_session("count-b").await;
+        let snap = harness.graph.snapshot();
+        for pane in [a, a, b, b, b, b, b] {
+            let p = &snap.panes[&pane];
+            harness
+                .bus
+                .publish(shux_core::event::EventData::PaneStatusChanged {
+                    pane_id: pane,
+                    window_id: p.window_id,
+                    session_id: snap.windows[&p.window_id].session_id,
+                    old: None,
+                    new: None,
+                    seen: true,
+                    enabled: true,
+                });
+        }
+        let history = dispatch_ok(
+            &harness.router,
+            "events.history",
+            serde_json::json!({"pane_id": a.to_string(), "filter": ["pane.status_changed"], "count": 2}),
+        )
+        .await;
+        assert_eq!(
+            history["events"].as_array().unwrap().len(),
+            2,
+            "the other pane's newer events used up the count: {history}"
         );
         harness.stop().await;
     }

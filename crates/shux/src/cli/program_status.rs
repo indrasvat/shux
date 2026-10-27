@@ -56,15 +56,15 @@ pub async fn handle_pane_wait_status(
 }
 
 /// Exits 3: the daemon could not be reached.
-pub fn wait_status_unreachable(err: &dyn std::fmt::Display, format: OutputFormat) -> ! {
+pub fn wait_status_unreachable(err: anyhow::Error, format: OutputFormat) -> ! {
     match format {
         OutputFormat::Json => {
-            if let Err(e) = print_json_error(&err.to_string()) {
+            if let Err(e) = print_json_error(&format!("{err:#}")) {
                 crate::style::print_error(&e.to_string());
             }
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_error(&format!("wait-status could not reach the daemon: {err}"))
+            crate::style::print_error(&format!("wait-status could not reach the daemon: {err:#}"))
         }
     }
     std::process::exit(3)
