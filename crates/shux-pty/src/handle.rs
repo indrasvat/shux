@@ -503,6 +503,23 @@ pub struct PtyHandle {
     size: PtySize,
 }
 
+/// A handle dropped before its child was reaped — the owning task panicked or
+/// was aborted — kills the child's process group and reaps it, so nothing is
+/// left running with no one to wait for it. A reaped child is never signalled:
+/// its pid may already belong to someone else.
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let _ = self.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while matches!(self.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
 fn nix_to_io(err: nix::Error) -> PtyError {
     PtyError::Open(std::io::Error::from(err))
 }

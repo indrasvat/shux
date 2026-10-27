@@ -690,3 +690,21 @@ fn which_python() -> Option<String> {
     }
     None
 }
+
+/// A handle dropped while its child still runs (a pane task that panicked,
+/// for one) must not leave the child behind with nobody to reap it.
+#[tokio::test]
+async fn dropping_a_live_handle_kills_and_reaps_its_child() {
+    let config = PtyConfig::with_command(vec!["sleep".into(), "30".into()], test_cwd());
+    let handle = PtyHandle::spawn(&config).unwrap();
+    let pid = nix::unistd::Pid::from_raw(handle.pid() as i32);
+    drop(handle);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while nix::sys::signal::kill(pid, None).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child outlived its dropped handle"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
