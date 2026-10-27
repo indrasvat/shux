@@ -621,11 +621,36 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
 
     static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let incarnation = NEXT_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Err(e) = graph.claim_pane_pty(pane_id, incarnation).await {
-        tracing::debug!(%pane_id, error = %e, "claim_pane_pty failed (pane may be gone)");
+    match graph.claim_pane_pty(pane_id, incarnation).await {
+        Ok(true) => {}
+        // A newer spawn owns the pane; it is the one that runs there.
+        Ok(false) => {
+            discard_child(handle);
+            return Ok(());
+        }
+        Err(e) => {
+            discard_child(handle);
+            return Err(pane_gone(pane_id, &e));
+        }
     }
     {
         let mut state = io_state.lock().await;
+        // Daemon shutdown cancels this token before it collects the panes to
+        // wait for, so an install after that would go unwaited.
+        if shutdown.is_cancelled() {
+            drop(state);
+            discard_child(handle);
+            return Err(pane_gone(pane_id, &"the daemon is shutting down"));
+        }
+        if state
+            .incarnations
+            .get(&pane_id)
+            .is_some_and(|&installed| installed > incarnation)
+        {
+            drop(state);
+            discard_child(handle);
+            return Ok(());
+        }
         if let Some(old) = state.shutdowns.insert(pane_id, pane_shutdown.clone()) {
             old.cancel();
         }
@@ -646,7 +671,7 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     tokio::spawn(run_pane_pty_task(
         pane_id,
         handle,
-        io_state,
+        io_state.clone(),
         PtyTaskControl {
             incarnation,
             write_rx,
@@ -654,10 +679,38 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
             shutdown: pane_shutdown,
             done_tx,
         },
-        graph,
+        graph.clone(),
     ));
 
+    // Destruction commits to the graph before it tears down IO: either the
+    // pane is still here, or that teardown ran before the install above.
+    if !graph.snapshot().panes.contains_key(&pane_id) {
+        let mut state = io_state.lock().await;
+        if state.is_current(pane_id, incarnation) {
+            let (pulse, _done) = state.teardown_panes_collecting(&[pane_id], true);
+            drop(state);
+            pulse.notify_waiters();
+        }
+        return Err(pane_gone(
+            pane_id,
+            &"it was destroyed while its PTY started",
+        ));
+    }
     Ok(())
+}
+
+/// Kill and reap the child of a spawn that will not be installed.
+fn discard_child(mut handle: shux_pty::handle::PtyHandle) {
+    let _ = handle.kill();
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait()).await;
+    });
+}
+
+fn pane_gone(pane_id: shux_core::model::PaneId, why: &dyn std::fmt::Display) -> shux_pty::PtyError {
+    shux_pty::PtyError::Spawn(std::io::Error::other(format!(
+        "pane {pane_id} cannot take a PTY: {why}"
+    )))
 }
 
 /// Turn a PTY spawn failure into an error whose hint matches the actual cause.
@@ -969,6 +1022,165 @@ mod tests {
             crate::pane_record::PaneRecordStatus::Recording,
             "the successor's recording was finished by its predecessor"
         );
+        h.stop().await;
+    }
+
+    /// A pane id plus the pid file its shell writes, so a test can prove the
+    /// child of a refused spawn did not survive.
+    fn pid_probe(dir: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
+        let pid_file = dir.join("pid");
+        let cmd = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        (pid_file, vec!["sh".into(), "-c".into(), cmd])
+    }
+
+    /// The child either never got far enough to write its pid, or is reaped.
+    async fn assert_child_gone(pid_file: &std::path::Path) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let alive = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .is_some_and(|pid| {
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                });
+            if !alive && (pid_file.exists() || tokio::time::Instant::now() >= deadline) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the refused spawn's child is still running"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn spawn_probe(
+        h: &crate::rpc::test_harness::RpcHarness,
+        pane: shux_core::model::PaneId,
+        argv: Vec<String>,
+    ) -> Result<(), shux_pty::PtyError> {
+        spawn_pane_pty(
+            pane,
+            "/tmp".into(),
+            argv,
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            h.cancel.clone(),
+            h.graph.clone(),
+        )
+        .await
+    }
+
+    /// A newer spawn already claimed the pane: the older one must not take
+    /// it back, install its handles, or leave its child running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_that_lost_the_claim_installs_nothing() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("lost-claim").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        let _ = h.graph.claim_pane_pty(pane, u64::MAX).await;
+        spawn_probe(&h, pane, argv).await.unwrap();
+        assert!(
+            !h.io.lock().await.writers.contains_key(&pane),
+            "a spawn older than the pane's owner installed its PTY"
+        );
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
+    }
+
+    /// Claims and installs are separate steps, so a newer spawn can install
+    /// first. The older one must then leave the pane to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_older_than_the_installed_one_installs_nothing() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("lost-install").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        h.io.lock().await.incarnations.insert(pane, u64::MAX);
+        spawn_probe(&h, pane, argv).await.unwrap();
+        let state = h.io.lock().await;
+        assert_eq!(state.incarnations.get(&pane), Some(&u64::MAX));
+        assert!(
+            !state.writers.contains_key(&pane),
+            "an older spawn replaced the newer installed PTY"
+        );
+        drop(state);
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_for_a_missing_pane_fails() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        let ghost = shux_core::model::PaneId::new();
+        assert!(
+            spawn_probe(&h, ghost, argv).await.is_err(),
+            "a spawn for a pane that does not exist reported success"
+        );
+        assert!(!h.io.lock().await.writers.contains_key(&ghost));
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
+    }
+
+    /// The pane is destroyed after the claim but before the install, and its
+    /// IO teardown has already run: the spawn must clean up after itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_whose_pane_died_mid_spawn_cleans_up() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (session, _w, pane) = h.seed_session("died-mid-spawn").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        // An exited pane makes the claim observable: it clears the exit.
+        h.graph.set_pane_exit_status(pane, 0).await.unwrap();
+        let guard = h.io.lock().await;
+        let task = {
+            let io = h.io.clone();
+            let cancel = h.cancel.clone();
+            let graph = h.graph.clone();
+            tokio::spawn(async move {
+                spawn_pane_pty(
+                    pane,
+                    "/tmp".into(),
+                    argv,
+                    shux_pty::handle::PtySize::default(),
+                    Vec::new(),
+                    false,
+                    io,
+                    cancel,
+                    graph,
+                )
+                .await
+            })
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.graph.snapshot().panes[&pane].exit_status.is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "spawn never claimed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        h.graph.destroy_session(session, None).await.unwrap();
+        drop(guard);
+        let result = task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "spawn for a destroyed pane reported success"
+        );
+        let state = h.io.lock().await;
+        assert!(
+            !state.writers.contains_key(&pane)
+                && !state.vts.contains_key(&pane)
+                && !state.incarnations.contains_key(&pane),
+            "a destroyed pane kept its PTY handles"
+        );
+        drop(state);
+        assert_child_gone(&pid_file).await;
         h.stop().await;
     }
 }

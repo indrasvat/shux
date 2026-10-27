@@ -1473,7 +1473,11 @@ async fn reap_scratch(
         return false;
     }
 
-    // 2. Close the PTY / free the VT. The group is already dead, so the
+    // 2. Remove the session from the graph — before IO teardown, like every
+    //    other destroy, so a spawn racing it cannot install after teardown.
+    let _ = graph.destroy_session(session_id, None).await;
+
+    // 3. Close the PTY / free the VT. The group is already dead, so the
     //    pane's PTY task sees EOF and exits promptly; teardown also clears
     //    writers/resizers/checkpoints.
     {
@@ -1482,9 +1486,6 @@ async fn reap_scratch(
         drop(state);
         pulse.notify_one();
     }
-
-    // 3. Remove the session from the graph.
-    let _ = graph.destroy_session(session_id, None).await;
 
     // 4. Audit (LENS-R-052).
     audit.append(json!({

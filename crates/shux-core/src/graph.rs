@@ -309,7 +309,7 @@ pub enum GraphCommand {
     ClaimPanePty {
         id: PaneId,
         incarnation: u64,
-        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+        reply: tokio::sync::oneshot::Sender<Result<bool, GraphError>>,
     },
     SetPaneExitStatusOwned {
         id: PaneId,
@@ -376,6 +376,13 @@ pub struct PaneStatusUpdate {
     pub enabled: bool,
     pub summary: Option<shux_program_status::StatusSummary>,
     pub seen: bool,
+}
+
+/// A poisoned side map only means a panic mid-insert; the map is still valid.
+fn side_map(
+    map: &std::sync::Mutex<HashMap<PaneId, u64>>,
+) -> std::sync::MutexGuard<'_, HashMap<PaneId, u64>> {
+    map.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub struct SessionGraph {
@@ -601,6 +608,10 @@ impl SessionGraph {
     /// `SessionGraph` mutations now also publish typed events to the bus, and having
     /// two unrelated `publish` methods on the same type is a recipe for confusion.
     fn commit_snapshot(&self, snapshot: SessionGraphSnapshot) {
+        // Per-pane side maps never outlive the pane.
+        for map in [&self.pty_owners, &self.status_generations] {
+            side_map(map).retain(|pid, _| snapshot.panes.contains_key(pid));
+        }
         self.state.store(Arc::new(snapshot));
     }
 
@@ -1346,20 +1357,22 @@ impl SessionGraph {
         Ok(())
     }
 
-    /// PTY incarnation `incarnation` now runs this pane. A pane already
+    /// PTY incarnation `incarnation` now runs this pane, unless a newer one
+    /// already claimed it (`Ok(false)`, nothing changes). A pane already
     /// marked exited by a task this one replaced is running again: its exit
     /// is cleared and `PaneRespawned` fires.
-    pub fn claim_pane_pty(&self, id: PaneId, incarnation: u64) -> Result<(), GraphError> {
+    pub fn claim_pane_pty(&self, id: PaneId, incarnation: u64) -> Result<bool, GraphError> {
         let current = self.current();
         let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
         {
-            // Poison only means a panic mid-insert; the map is still valid.
-            let mut owners = self.pty_owners.lock().unwrap_or_else(|e| e.into_inner());
-            owners.retain(|pid, _| current.panes.contains_key(pid));
+            let mut owners = side_map(&self.pty_owners);
+            if owners.get(&id).is_some_and(|&owner| owner > incarnation) {
+                return Ok(false);
+            }
             owners.insert(id, incarnation);
         }
         if pane.exit_status.is_none() {
-            return Ok(());
+            return Ok(true);
         }
         let window_id = pane.window_id;
         let session_id = current
@@ -1381,24 +1394,18 @@ impl SessionGraph {
             session_id,
             command,
         });
-        Ok(())
+        Ok(true)
     }
 
     /// [`Self::set_pane_exit_status`] as reported by PTY incarnation
-    /// `incarnation`; ignored when another incarnation owns the pane.
+    /// `incarnation`; ignored unless that incarnation owns the pane.
     pub fn set_pane_exit_status_owned(
         &self,
         id: PaneId,
         exit_status: i32,
         incarnation: u64,
     ) -> Result<(), GraphError> {
-        let owner = self
-            .pty_owners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&id)
-            .copied();
-        if owner.is_some_and(|o| o != incarnation) {
+        if side_map(&self.pty_owners).get(&id) != Some(&incarnation) {
             return Ok(());
         }
         self.set_pane_exit_status(id, exit_status)
@@ -1650,13 +1657,7 @@ impl SessionGraph {
             .map(|w| w.session_id)
             .ok_or(GraphError::WindowNotFound(window_id))?;
         {
-            // A poisoned lock only means a panic elsewhere mid-insert; the
-            // map is still a valid map.
-            let mut gens = self
-                .status_generations
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            gens.retain(|pid, _| current.panes.contains_key(pid));
+            let mut gens = side_map(&self.status_generations);
             let last = gens.entry(id).or_insert(0);
             if status.generation <= *last {
                 return Ok(());
@@ -2783,7 +2784,7 @@ impl GraphHandle {
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
-    pub async fn claim_pane_pty(&self, id: PaneId, incarnation: u64) -> Result<(), GraphError> {
+    pub async fn claim_pane_pty(&self, id: PaneId, incarnation: u64) -> Result<bool, GraphError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(GraphCommand::ClaimPanePty {
@@ -4575,6 +4576,63 @@ mod tests {
             respawned,
             "consumers that saw pane.exited must learn it runs again"
         );
+    }
+
+    #[test]
+    fn a_claim_older_than_the_owner_changes_nothing() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        let _ = graph.claim_pane_pty(pid, 2);
+        let _ = graph.claim_pane_pty(pid, 1);
+        let _ = graph.set_pane_exit_status_owned(pid, 0, 2);
+        assert_eq!(
+            state.load().panes[&pid].exit_status,
+            Some(0),
+            "the live owner's exit was dropped"
+        );
+        let _ = graph.claim_pane_pty(pid, 1);
+        assert_eq!(
+            state.load().panes[&pid].exit_status,
+            Some(0),
+            "an older claim revived an exited pane"
+        );
+        let respawned = bus
+            .history(50)
+            .into_iter()
+            .any(|e| matches!(e.data, EventData::PaneRespawned { .. }));
+        assert!(!respawned, "PaneRespawned fired for a dead pane");
+    }
+
+    #[test]
+    fn an_exit_from_an_unclaimed_pane_is_ignored() {
+        let (graph, state) = SessionGraph::new_with_event_bus(None);
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph.set_pane_exit_status_owned(pid, 9, 99).unwrap();
+        assert_eq!(state.load().panes[&pid].exit_status, None);
+    }
+
+    #[test]
+    fn destroying_a_pane_forgets_its_owner_and_generation() {
+        let (graph, state) = SessionGraph::new_with_event_bus(None);
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let first = state.load().windows[&wid].active_pane;
+        let second = graph.split_pane(first, Direction::Horizontal, 0.5).unwrap();
+        for pid in [first, second] {
+            let _ = graph.claim_pane_pty(pid, 1);
+            graph
+                .set_pane_program_status(pid, upd(1, None, true))
+                .unwrap();
+        }
+        graph.destroy_pane(second, None).unwrap();
+        let owners = graph.pty_owners.lock().unwrap().clone();
+        let gens = graph.status_generations.lock().unwrap().clone();
+        assert!(!owners.contains_key(&second), "owner kept: {owners:?}");
+        assert!(!gens.contains_key(&second), "generation kept: {gens:?}");
+        assert!(owners.contains_key(&first) && gens.contains_key(&first));
     }
 
     #[test]
