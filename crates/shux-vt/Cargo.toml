@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+shux-program-status = { path = "../shux-program-status" }
 base64 = "0.22"
 vte = { workspace = true }
 memchr = { workspace = true }

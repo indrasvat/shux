@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bd34f3f0c745c17b7b945f08c3be39ceef8f43f3a363e5f3a3011f061a3eefe1 # shrinks to frags = [[27, 93, 55, 53, 48, 49, 59], [24], [27, 92]], cut = Index(0)
+cc 57857f4fcea3b326612fbdd47d17156527141a930fa779be36392e5006e2cacb # shrinks to frags = [[27, 93, 55, 53, 48, 49, 59], [27, 91]], cut = Index(0)
+cc c8c5e460dc5e08111a8aa33423dcce5773777a77a3cf37e922d6ce79f11574e3 # shrinks to frags = [[27], [127], [93, 55, 53, 48, 49, 59], [27, 92]], cut = Index(0)
+cc d1e151aac2f27165626790c51509b476f39023da9db5eb3a0ad96d6dd9b02f2e # shrinks to frags = [[27, 91], [93, 55, 53, 48, 49, 59], [27, 92]], cut = Index(0)
+cc dfe1b9a7e89d6315eee3f95d14aa7e42d92c15e942bd6fdd52f856cd35fbe282 # shrinks to frags = [[27, 93, 55, 53, 48, 49, 59], [24], [27, 92]], cut = Index(0)
+cc 975c7c7db140279e2868aaf49b8eea00429c6201783437ca1cf0399e0290898d # shrinks to frags = [[27, 93, 55, 53, 48, 49, 59], [0], [27, 92]], cut = Index(0)

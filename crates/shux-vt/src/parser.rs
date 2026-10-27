@@ -260,6 +260,8 @@ pub struct VtHandler<'a> {
     /// Whether retired buffers may be recycled. Always `true` in production;
     /// the differential tests drive a second terminal with it off.
     pub(crate) reuse_retired_grids: bool,
+    /// OSC 7501 state; framing lives in `program_status`, RIS lives here.
+    pub(crate) program_status: &'a mut Option<crate::program_status::VtProgramStatus>,
 }
 
 impl<'a> VtHandler<'a> {
@@ -1777,6 +1779,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 // character, so a REP straight after one repeats nothing
                 // (issue #122).
                 *self.last_graphic = None;
+                if let Some(ps) = self.program_status.as_mut() {
+                    ps.on_full_reset();
+                }
                 // When the image/placement store lands, RIS must clear it here:
                 // the graphics protocol requires that "when resetting the
                 // terminal, all images that are visible on the screen must be
@@ -1805,6 +1810,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
         }
         let terminator = osc_terminator(bell_terminated);
         match params[0] {
+            // Program status and prompt marks are framed from raw bytes by
+            // `program_status::OscStatusScanner`; vte cannot tell ST from an
+            // aborted string.
+            b"7501" | b"133" => {}
             // OSC 0 -- Set Icon Name and Window Title.
             // OSC 2 -- Set Window Title.
             b"0" | b"2" => {
@@ -2523,6 +2532,7 @@ mod tests {
                 palette_overridden: &mut palette_overridden,
                 alt_spare: &mut self.alt_spare,
                 reuse_retired_grids: true,
+                program_status: &mut None,
             };
             self.parser.advance(&mut handler, bytes);
         }

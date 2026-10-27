@@ -13,6 +13,7 @@ mod diff;
 mod graphics;
 mod grid;
 mod parser;
+mod program_status;
 mod screen;
 mod settle;
 mod sync;
@@ -35,6 +36,7 @@ pub use graphics::image::StoredImage;
 pub use graphics::kitty::Format as ImageFormat;
 pub use grid::{CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
+pub use program_status::{StatusPublication, StatusRecords};
 pub use settle::{FrameStability, frame_stability_hash};
 
 /// Pixel size of one cell as DECLARED to pane children through
@@ -112,6 +114,13 @@ pub struct VirtualTerminal {
     apc_scanner: graphics::apc::ApcScanner,
     /// False only in the differential oracle; see [`Self::set_apc_cut_slicing`].
     apc_cut_slicing: bool,
+    /// Frames OSC 7501 / OSC 133;A from raw bytes. Runs even while program
+    /// status is disabled, so enabling mid-sequence cannot misparse.
+    status_scanner: program_status::OscStatusScanner,
+    /// `None` while program status is disabled.
+    program_status: Option<program_status::VtProgramStatus>,
+    /// Generation of the last disable, or of construction.
+    status_disabled_generation: u64,
     /// Everything the graphics path writes; see `dispatch_graphics`.
     graphics: graphics::GraphicsSink,
     /// Whether synchronized output (`CSI ?2026h`) is holding the presentation
@@ -253,6 +262,9 @@ impl VirtualTerminal {
             dcs_state: None,
             apc_scanner: graphics::apc::ApcScanner::default(),
             apc_cut_slicing: true,
+            status_scanner: program_status::OscStatusScanner::default(),
+            program_status: None,
+            status_disabled_generation: program_status::disabled_generation(),
             graphics: graphics::GraphicsSink::default(),
             sync_armed: std::sync::atomic::AtomicBool::new(false),
             frozen_grid: None,
@@ -500,8 +512,75 @@ impl VirtualTerminal {
             palette_overridden: &mut self.palette_overridden,
             alt_spare: &mut self.alt_spare,
             reuse_retired_grids: self.reuse_retired_grids,
+            program_status: &mut self.program_status,
         };
         self.parser.advance(&mut handler, bytes);
+    }
+
+    fn dispatch_program_status(
+        &mut self,
+        action: program_status::CutAction,
+        responses: &mut Vec<Vec<u8>>,
+    ) {
+        let Some(ps) = self.program_status.as_mut() else {
+            return;
+        };
+        match action {
+            program_status::CutAction::Report { payload, bel } => {
+                let terminator: &[u8] = if bel { b"\x07" } else { b"\x1b\\" };
+                if let Some(reply) = ps.on_report(&payload, terminator)
+                    && responses.len() < parser::MAX_RESPONSES_PER_BATCH
+                {
+                    responses.push(reply);
+                }
+            }
+            program_status::CutAction::PromptStart => ps.on_prompt_start(),
+        }
+    }
+
+    /// Turn OSC 7501 program status on or off. Off answers no probe and
+    /// keeps no records — the terminal behaves as if the protocol did not
+    /// exist. Turning it on starts empty.
+    pub fn set_program_status_enabled(&mut self, enabled: bool) {
+        match (enabled, self.program_status.is_some()) {
+            (true, false) => self.program_status = Some(program_status::VtProgramStatus::new()),
+            (false, true) => {
+                self.program_status = None;
+                self.status_disabled_generation = program_status::disabled_generation();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn program_status_enabled(&self) -> bool {
+        self.program_status.is_some()
+    }
+
+    /// The text-free view the daemon forwards to the session graph. Every
+    /// change, including enabling, disabling and replacing the terminal,
+    /// carries a newer `generation` than anything before it in the process.
+    pub fn program_status_publication(&self) -> StatusPublication {
+        match &self.program_status {
+            Some(ps) => ps.publication(),
+            None => StatusPublication {
+                generation: self.status_disabled_generation,
+                summary: None,
+                seen: false,
+            },
+        }
+    }
+
+    /// Every record, most urgent first. `None` while disabled.
+    pub fn program_status_records(&self) -> Option<StatusRecords> {
+        self.program_status.as_ref().map(|ps| ps.records())
+    }
+
+    /// The process attached to this terminal exited: `working`, `blocked`
+    /// and `idle` records end; `done` and `error` stay.
+    pub fn note_process_exit(&mut self) {
+        if let Some(ps) = self.program_status.as_mut() {
+            ps.on_process_exit();
+        }
     }
 
     /// Act on one kitty graphics command. Non-`G` APCs are discarded, as vte
@@ -673,19 +752,42 @@ impl VirtualTerminal {
         // chunk-insensitive, because it is not. Cutting at the boundary places each
         // command at its true stream position -- a placement anchors at the
         // cursor as it stands there, and replies queue in request order.
-        let cuts = if self.apc_cut_slicing {
+        let apc_cuts = if self.apc_cut_slicing {
             self.apc_scanner.scan(bytes)
         } else {
             Vec::new()
         };
-        if cuts.is_empty() {
+        // Program-status cuts slice the same way, so a reply queues at the
+        // query's stream position: before the DA1 that follows it.
+        let status_cuts = self.status_scanner.scan(bytes);
+        let status_cuts = if self.program_status.is_some() {
+            status_cuts
+        } else {
+            Vec::new()
+        };
+        if apc_cuts.is_empty() && status_cuts.is_empty() {
             self.advance_slice(bytes, &mut responses);
         } else {
             let mut at = 0;
-            for cut in cuts {
-                self.advance_slice(&bytes[at..cut.end], &mut responses);
-                self.dispatch_graphics(&cut.body, &mut responses);
-                at = cut.end;
+            let mut apc = apc_cuts.into_iter().peekable();
+            let mut status = status_cuts.into_iter().peekable();
+            loop {
+                let take_apc = match (apc.peek(), status.peek()) {
+                    (None, None) => break,
+                    (Some(a), Some(s)) => a.end <= s.end,
+                    (a, _) => a.is_some(),
+                };
+                if take_apc {
+                    let Some(cut) = apc.next() else { break };
+                    self.advance_slice(&bytes[at..cut.end], &mut responses);
+                    self.dispatch_graphics(&cut.body, &mut responses);
+                    at = cut.end;
+                } else {
+                    let Some(cut) = status.next() else { break };
+                    self.advance_slice(&bytes[at..cut.end], &mut responses);
+                    self.dispatch_program_status(cut.action, &mut responses);
+                    at = cut.end;
+                }
             }
             self.advance_slice(&bytes[at..], &mut responses);
         }

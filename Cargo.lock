@@ -1351,6 +1351,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shux-program-status",
  "thiserror",
  "tracing",
  "unicode-width",
