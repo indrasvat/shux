@@ -290,6 +290,19 @@ fn read_config(path: &Path) -> Config {
     })
 }
 
+/// How long a vanished config file may stay missing before it counts as
+/// deleted. Editors that save by delete-then-write leave a short gap.
+const DELETE_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// [`reload`], but a file that has vanished gets [`DELETE_GRACE`] to come
+/// back before its absence installs the defaults.
+async fn reload_settled(path: &Path, handle: &ConfigHandle) {
+    if !path.exists() {
+        tokio::time::sleep(DELETE_GRACE).await;
+    }
+    reload(path, handle);
+}
+
 /// One hot-reload step: re-read `path` and store the result behind `handle`.
 /// A file that no longer parses keeps the running config, so a half-saved
 /// edit cannot reset every other section to its default.
@@ -376,7 +389,7 @@ pub async fn run_hot_reload(
                 // Drain any extra events that arrived in the same burst.
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 while rx.try_recv().is_ok() {}
-                reload(&path, &handle);
+                reload_settled(&path, &handle).await;
             }
         }
     }
@@ -475,6 +488,32 @@ mod tests {
             "ctrl-space",
             "a valid file still replaces"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_recreated_inside_the_grace_window_never_reads_as_deleted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[keys]\nprefix = \"ctrl-b\"\n").unwrap();
+        let h = ConfigHandle::load_or_default(&path);
+
+        // An editor that saves by delete-then-write.
+        std::fs::remove_file(&path).unwrap();
+        let (p, hh) = (path.clone(), h.clone());
+        let task = tokio::spawn(async move { reload_settled(&p, &hh).await });
+        tokio::task::yield_now().await;
+        std::fs::write(&path, "[keys]\nprefix = \"ctrl-b\"\n").unwrap();
+        tokio::time::advance(DELETE_GRACE).await;
+        task.await.unwrap();
+        assert_eq!(h.current().keys.prefix, "ctrl-b", "defaults leaked in");
+
+        // Still gone after the grace window: that is a real deletion.
+        std::fs::remove_file(&path).unwrap();
+        let (p, hh) = (path.clone(), h.clone());
+        let task = tokio::spawn(async move { reload_settled(&p, &hh).await });
+        tokio::time::advance(DELETE_GRACE).await;
+        task.await.unwrap();
+        assert_eq!(h.current().keys.prefix, "ctrl-space");
     }
 
     #[test]
