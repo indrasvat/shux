@@ -453,9 +453,11 @@ async fn run_pane_pty_task(
         let state = &mut *guard;
         match state.vts.get_mut(&pane_id) {
             Some(vt) if state.incarnations.get(&pane_id) == Some(&incarnation) => {
-                // In this lock hold: the config walker publishes only for
-                // panes with a writer, so nothing can overtake the final status.
-                state.writers.remove(&pane_id);
+                // Sealed in this lock hold: the config walker leaves the pane
+                // alone, so nothing can overtake the final status. The writer
+                // stays until the exit commits, or attach would read the pane
+                // as never spawned and run its command again.
+                state.status_sealed.insert(pane_id);
                 vt.note_process_exit();
                 let publication = vt.program_status_publication();
                 let update = crate::program_status::update(&publication);
@@ -632,6 +634,52 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     graph: shux_core::graph::GraphHandle,
     cast_recorder: Option<PaneRecorder>,
 ) -> Result<(), shux_pty::PtyError> {
+    // One spawn per pane at a time, decided before anything forks: create's
+    // background spawn and an attach can both find a pane with no PTY, and
+    // both children used to run before one was discarded.
+    if !spawning().insert(pane_id) {
+        return Ok(());
+    }
+    let spawned = spawn_pane_pty_unshared(
+        pane_id,
+        cwd,
+        command,
+        size,
+        extra_env,
+        env_clear,
+        io_state.clone(),
+        shutdown,
+        graph,
+        cast_recorder,
+    )
+    .await;
+    spawning().remove(&pane_id);
+    spawned
+}
+
+/// Panes with a spawn in flight. Its own lock, never held across an await:
+/// spawns must not queue behind the io lock to learn they are redundant.
+fn spawning() -> std::sync::MutexGuard<'static, std::collections::HashSet<shux_core::model::PaneId>>
+{
+    static SPAWNING: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashSet<shux_core::model::PaneId>>,
+    > = std::sync::LazyLock::new(Default::default);
+    SPAWNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_pane_pty_unshared(
+    pane_id: shux_core::model::PaneId,
+    cwd: PathBuf,
+    command: Vec<String>,
+    size: shux_pty::handle::PtySize,
+    extra_env: Vec<(String, String)>,
+    env_clear: bool,
+    io_state: Arc<Mutex<PaneIoState>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    graph: shux_core::graph::GraphHandle,
+    cast_recorder: Option<PaneRecorder>,
+) -> Result<(), shux_pty::PtyError> {
     let (argv, env) = resolve_pane_spawn(command, &daemon_shell_config(), extra_env, env_clear);
     let mut config = if argv.is_empty() {
         shux_pty::handle::PtyConfig::default_shell(cwd)
@@ -711,6 +759,7 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
         state.resizers.insert(pane_id, resize_tx);
         state.pty_done.insert(pane_id, done_rx);
         let replaced = state.vts.insert(pane_id, vt).is_some();
+        state.status_sealed.remove(&pane_id);
         state.revisions.insert(pane_id, rev_tx);
         state.pty_pids.insert(pane_id, pid);
         // The slot outlives a respawn: the new terminal's newer generation

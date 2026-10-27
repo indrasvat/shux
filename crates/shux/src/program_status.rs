@@ -141,12 +141,12 @@ pub(crate) async fn apply_enabled(
     state.program_status_enabled = enabled;
     let mut flushes = Vec::new();
     for (pane_id, vt) in state.vts.iter_mut() {
-        vt.set_program_status_enabled(enabled);
         // An exited pane's final status went out with its exit; nothing may
-        // follow `pane.exited`. Its terminal still flips, for `pane.status`.
-        if !state.writers.contains_key(pane_id) {
+        // follow `pane.exited`, and its terminal keeps agreeing with the graph.
+        if state.status_sealed.contains(pane_id) {
             continue;
         }
+        vt.set_program_status_enabled(enabled);
         let publication = vt.program_status_publication();
         if let Some(channel) = state.status.get(pane_id) {
             let generation = publication.generation;
@@ -344,6 +344,25 @@ mod tests {
 
     use crate::rpc::test_harness::{RpcHarness, dispatch_ok};
     use serde_json::json;
+
+    async fn spawn_sh_result(
+        h: &RpcHarness,
+        pane: PaneId,
+        script: &str,
+    ) -> Result<(), shux_pty::PtyError> {
+        crate::pane_spawn::spawn_pane_pty(
+            pane,
+            "/tmp".into(),
+            vec!["sh".into(), "-c".into(), script.into()],
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            h.cancel.clone(),
+            h.graph.clone(),
+        )
+        .await
+    }
 
     async fn spawn_sh(h: &RpcHarness, pane: PaneId, script: &str) {
         crate::pane_spawn::spawn_pane_pty(
@@ -710,6 +729,60 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        finish(h).await;
+    }
+
+    /// Two spawns racing for a pane that has none (create's background spawn
+    /// and an attach) must run its command once, not twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_spawned_twice_concurrently_runs_its_command_once() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-double").await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("starts");
+        let script = format!("echo start >> '{}'; sleep 30", log.display());
+        let (a, b) = tokio::join!(
+            spawn_sh_result(&h, pane, &script),
+            spawn_sh_result(&h, pane, &script)
+        );
+        a.unwrap();
+        b.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let starts = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(starts, 1, "the pane's command ran {starts} times");
+        finish(h).await;
+    }
+
+    /// An exited pane keeps what it last reported, in the terminal and the
+    /// graph alike, whatever the config does afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_that_exited_keeps_its_final_records_across_a_disable() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-exited-off").await;
+        spawn_sh(&h, pane, r"printf '\033]7501;state=done\033\\'; sleep 0.3").await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = apply_enabled(&h.io, false).await;
+        let status = dispatch_ok(
+            &h.router,
+            "pane.status",
+            json!({"pane_id": pane.to_string()}),
+        )
+        .await;
+        assert_eq!(status["records"][0]["state"], "done", "{status}");
+        assert_eq!(
+            wait_status(&h, pane, "done", 1_000).await["outcome"],
+            "matched"
+        );
         finish(h).await;
     }
 }

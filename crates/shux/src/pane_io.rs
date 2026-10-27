@@ -129,6 +129,9 @@ pub struct PaneIoState {
     pub(crate) status: HashMap<shux_core::model::PaneId, crate::program_status::StatusChannel>,
     /// `[program_status] enabled`, applied to every VT under this lock.
     pub(crate) program_status_enabled: bool,
+    /// Panes whose process exited: their final status is sent and no later
+    /// change (a config reload) may follow it. Cleared by the next spawn.
+    pub(crate) status_sealed: std::collections::HashSet<shux_core::model::PaneId>,
 }
 
 impl Default for PaneIoState {
@@ -157,6 +160,7 @@ impl PaneIoState {
             pty_pids: HashMap::new(),
             status: HashMap::new(),
             program_status_enabled: true,
+            status_sealed: Default::default(),
         }
     }
 
@@ -216,6 +220,7 @@ impl PaneIoState {
                 if let Some(channel) = self.status.remove(pane_id) {
                     self.teardown_waiters.push(channel.stop());
                 }
+                self.status_sealed.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)
