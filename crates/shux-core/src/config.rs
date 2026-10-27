@@ -270,15 +270,34 @@ pub fn default_config_path() -> PathBuf {
 /// A file that exists but cannot be read or parsed.
 type LoadError = String;
 
+/// One look at the config file.
+enum ConfigFile {
+    /// Missing or empty: the defaults, unless an editor is mid-save.
+    Absent,
+    Present(Result<Box<Config>, LoadError>),
+}
+
+fn read_config_file(path: &Path) -> ConfigFile {
+    match std::fs::read_to_string(path) {
+        Ok(contents) if contents.is_empty() => ConfigFile::Absent,
+        Ok(contents) => ConfigFile::Present(
+            toml::from_str::<Config>(&contents)
+                .map(Box::new)
+                .map_err(|e| e.to_string()),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigFile::Absent,
+        Err(e) => ConfigFile::Present(Err(e.to_string())),
+    }
+}
+
 /// A missing file is the defaults; anything unreadable is an error.
 fn try_read_config(path: &Path) -> Result<Config, LoadError> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => toml::from_str::<Config>(&contents).map_err(|e| e.to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    match read_config_file(path) {
+        ConfigFile::Absent => {
             tracing::debug!(path = %path.display(), "config: not present, using defaults");
             Ok(Config::default())
         }
-        Err(e) => Err(e.to_string()),
+        ConfigFile::Present(read) => read.map(|c| *c),
     }
 }
 
@@ -290,24 +309,36 @@ fn read_config(path: &Path) -> Config {
     })
 }
 
-/// How long a vanished config file may stay missing before it counts as
-/// deleted. Editors that save by delete-then-write leave a short gap.
+/// How long a missing or empty config file may stay that way before it
+/// counts as deleted or emptied. Editors that save by delete-then-write or
+/// truncate-then-write leave a short gap.
 const DELETE_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// [`reload`], but a file that has vanished gets [`DELETE_GRACE`] to come
-/// back before its absence installs the defaults.
+/// [`reload`], but a missing or empty file gets [`DELETE_GRACE`] to be
+/// rewritten before it installs the defaults.
 async fn reload_settled(path: &Path, handle: &ConfigHandle) {
-    if !path.exists() {
+    let mut file = read_config_file(path);
+    if matches!(file, ConfigFile::Absent) {
         tokio::time::sleep(DELETE_GRACE).await;
+        file = read_config_file(path);
     }
-    reload(path, handle);
+    apply_reload(path, file, handle);
 }
 
 /// One hot-reload step: re-read `path` and store the result behind `handle`.
 /// A file that no longer parses keeps the running config, so a half-saved
 /// edit cannot reset every other section to its default.
+#[cfg(test)]
 fn reload(path: &Path, handle: &ConfigHandle) {
-    match try_read_config(path) {
+    apply_reload(path, read_config_file(path), handle);
+}
+
+fn apply_reload(path: &Path, file: ConfigFile, handle: &ConfigHandle) {
+    let read = match file {
+        ConfigFile::Absent => Ok(Config::default()),
+        ConfigFile::Present(read) => read.map(|c| *c),
+    };
+    match read {
         Ok(cfg) => {
             handle.replace(cfg);
             tracing::info!("config: reloaded");
@@ -502,13 +533,56 @@ mod tests {
         let (p, hh) = (path.clone(), h.clone());
         let task = tokio::spawn(async move { reload_settled(&p, &hh).await });
         tokio::task::yield_now().await;
-        std::fs::write(&path, "[keys]\nprefix = \"ctrl-b\"\n").unwrap();
+        assert_eq!(h.current().keys.prefix, "ctrl-b", "defaults leaked in");
+        std::fs::write(&path, "[keys]\nprefix = \"ctrl-a\"\n").unwrap();
         tokio::time::advance(DELETE_GRACE).await;
         task.await.unwrap();
-        assert_eq!(h.current().keys.prefix, "ctrl-b", "defaults leaked in");
+        assert_eq!(
+            h.current().keys.prefix,
+            "ctrl-a",
+            "the recreated file was not read"
+        );
 
         // Still gone after the grace window: that is a real deletion.
         std::fs::remove_file(&path).unwrap();
+        let (p, hh) = (path.clone(), h.clone());
+        let task = tokio::spawn(async move { reload_settled(&p, &hh).await });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            h.current().keys.prefix,
+            "ctrl-a",
+            "no grace before the defaults"
+        );
+        tokio::time::advance(DELETE_GRACE).await;
+        task.await.unwrap();
+        assert_eq!(h.current().keys.prefix, "ctrl-space");
+    }
+
+    /// An editor that saves by truncate-then-write leaves an empty file for a
+    /// moment. It parses as all defaults, so it gets the same grace.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_truncated_inside_the_grace_window_never_reads_as_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[keys]\nprefix = \"ctrl-b\"\n").unwrap();
+        let h = ConfigHandle::load_or_default(&path);
+
+        std::fs::write(&path, "").unwrap();
+        let (p, hh) = (path.clone(), h.clone());
+        let task = tokio::spawn(async move { reload_settled(&p, &hh).await });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            h.current().keys.prefix,
+            "ctrl-b",
+            "the truncated file installed defaults"
+        );
+        std::fs::write(&path, "[keys]\nprefix = \"ctrl-a\"\n").unwrap();
+        tokio::time::advance(DELETE_GRACE).await;
+        task.await.unwrap();
+        assert_eq!(h.current().keys.prefix, "ctrl-a");
+
+        // Still empty after the grace window: the user emptied it.
+        std::fs::write(&path, "").unwrap();
         let (p, hh) = (path.clone(), h.clone());
         let task = tokio::spawn(async move { reload_settled(&p, &hh).await });
         tokio::time::advance(DELETE_GRACE).await;
