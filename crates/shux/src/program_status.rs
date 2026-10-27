@@ -863,4 +863,53 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
         assert!(wait_tick(40).await, "the pane froze once typed into");
         finish(h).await;
     }
+
+    /// A program that reads its input gets every byte of a large paste, in
+    /// order, as fast as it reads: input is never dropped to protect the loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reading_program_gets_a_large_paste_whole_and_promptly() {
+        use sha2::Digest;
+        const TOTAL: usize = 2 << 20;
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-paste").await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("got");
+        spawn_sh(
+            &h,
+            pane,
+            &format!(
+                r#"python3 -c "import os,tty,hashlib; tty.setraw(0); n=0; d=hashlib.sha256()
+while n < {TOTAL}:
+    b = os.read(0, 65536); n += len(b); d.update(b)
+open('{}', 'w').write('%d %s' % (n, d.hexdigest()))""#,
+                out.display()
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let paste: Vec<u8> = (0..TOTAL).map(|i| b'a' + (i % 26) as u8).collect();
+        let writer = h.io.lock().await.writers[&pane].clone();
+        let started = std::time::Instant::now();
+        for chunk in paste.chunks(256 << 10) {
+            writer.send(chunk.to_vec()).await.unwrap();
+        }
+        let deadline = started + Duration::from_secs(15);
+        let got = loop {
+            if let Ok(got) = std::fs::read_to_string(&out) {
+                break got;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never got the whole paste in 15s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let digest: String = sha2::Sha256::digest(&paste)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let want = format!("{TOTAL} {digest}");
+        assert_eq!(got, want, "the paste arrived cut, reordered or padded");
+        finish(h).await;
+    }
 }

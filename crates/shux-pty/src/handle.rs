@@ -482,6 +482,25 @@ fn default_shell_argv(shell_env: Option<&str>) -> Vec<String> {
     vec![shell.to_string(), "-l".to_string(), "-i".to_string()]
 }
 
+/// Writes to a PTY child's input; see [`PtyHandle::input_writer`].
+pub struct PtyInputWriter {
+    fd: AsyncFd<OwnedFd>,
+}
+
+impl PtyInputWriter {
+    /// Waits until the child's input has room, then writes what fits.
+    /// Cancel-safe: nothing is written unless the future completes.
+    pub async fn write_some(&self, data: &[u8]) -> Result<usize, PtyError> {
+        loop {
+            let mut guard = self.fd.writable().await.map_err(PtyError::Write)?;
+            match guard.try_io(|inner| write_once(inner.get_ref().as_raw_fd(), data)) {
+                Ok(result) => return result.map_err(PtyError::Write),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
 /// A handle to a running PTY child process.
 pub struct PtyHandle {
     pty: AsyncFd<OwnedFd>,
@@ -885,14 +904,15 @@ impl PtyHandle {
         Ok(())
     }
 
-    /// One non-blocking write attempt: how many bytes the child's input took
-    /// (0 when it is full). Never waits, so it cannot be cut off mid-write.
-    pub fn try_write(&mut self, data: &[u8]) -> Result<usize, PtyError> {
-        match write_once(self.pty.get_ref().as_raw_fd(), data) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(PtyError::Write(e)),
-        }
+    /// A second handle on the master for the child's input, so a task can wait
+    /// for room to write while a read is in flight.
+    pub fn input_writer(&self) -> Result<PtyInputWriter, PtyError> {
+        let fd = self.pty.get_ref().try_clone().map_err(PtyError::Write)?;
+        // SAFETY: the dup'd `OwnedFd` moves into the AsyncFd, which owns it
+        // until it drops, so the fd stays valid, open and unchanged meanwhile.
+        let fd = unsafe { AsyncFd::register(fd) }
+            .map_err(|e| PtyError::Write(std::io::Error::from(e)))?;
+        Ok(PtyInputWriter { fd })
     }
 
     pub async fn write_str(&mut self, text: &str) -> Result<(), PtyError> {

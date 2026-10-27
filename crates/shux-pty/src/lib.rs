@@ -12,6 +12,6 @@ pub use capture::strip_ansi;
 pub use command::{CommandEngine, CommandResult, shell_escape_args, shell_quote_arg};
 pub use handle::{
     DECLARED_CELL_PIXELS, OUTER_TERMINAL_IDENTITY_PREFIXES, OUTER_TERMINAL_IDENTITY_VARS,
-    PtyConfig, PtyError, PtyHandle, PtySize,
+    PtyConfig, PtyError, PtyHandle, PtyInputWriter, PtySize,
 };
 pub use manager::{PaneId, PtyEvent, PtyManager};

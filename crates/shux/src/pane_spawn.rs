@@ -30,62 +30,76 @@ struct PtyTaskControl {
     resize_rx: mpsc::Receiver<ResizeRequest>,
     shutdown: tokio_util::sync::CancellationToken,
     done_tx: oneshot::Sender<()>,
+    input: shux_pty::PtyInputWriter,
 }
 
-/// Everything bound for the program's input — terminal replies (DA1, DSR,
-/// OSC 7501 probes) and user input — in order. Written without ever blocking,
-/// so a program that stops reading cannot stall the PTY loop. Bounded; a reply
-/// or input chunk that does not fit is dropped whole, never cut.
+/// Everything bound for the program's input, in order: terminal replies
+/// (DA1, DSR, OSC 7501 probes) and user input. Replies go between input
+/// chunks, never inside one. A reply that does not fit is dropped whole; input
+/// is never dropped — the loop stops taking more until the program reads.
 #[derive(Default)]
 struct PtyInputQueue {
-    pending: std::collections::VecDeque<u8>,
+    replies: std::collections::VecDeque<u8>,
+    input: std::collections::VecDeque<Vec<u8>>,
+    /// Bytes of `input.front()` already written.
+    written: usize,
+    input_len: usize,
 }
 
 impl PtyInputQueue {
     /// Replies stop queueing early: a program that ignores them gets none.
     const CAP: usize = 4096;
-    /// Input may queue up to a large paste.
+    /// Input queued past this waits in the pane's channel instead.
     const INPUT_CAP: usize = 1 << 20;
 
     fn push(&mut self, reply: &[u8]) -> bool {
-        self.push_capped(reply, Self::CAP)
-    }
-
-    /// An empty queue takes any input, however large; the cap bounds only
-    /// input piling up behind a program that is not reading.
-    fn push_input(&mut self, data: &[u8]) -> bool {
-        if self.pending.is_empty() {
-            self.pending.extend(data);
-            return true;
-        }
-        self.push_capped(data, Self::INPUT_CAP)
-    }
-
-    fn push_capped(&mut self, bytes: &[u8], cap: usize) -> bool {
-        if self.pending.len() + bytes.len() > cap {
+        if self.replies.len() + reply.len() > Self::CAP {
             return false;
         }
-        self.pending.extend(bytes);
+        self.replies.extend(reply);
         true
     }
 
-    fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+    fn push_input(&mut self, data: Vec<u8>) {
+        if !data.is_empty() {
+            self.input_len += data.len();
+            self.input.push_back(data);
+        }
     }
 
-    /// Hand the program as much as it takes now; the rest waits, in order.
-    fn drain(
-        &mut self,
-        mut try_write: impl FnMut(&[u8]) -> Result<usize, shux_pty::PtyError>,
-    ) -> Result<(), shux_pty::PtyError> {
-        while !self.pending.is_empty() {
-            let n = try_write(self.pending.make_contiguous())?;
-            if n == 0 {
-                break;
-            }
-            self.pending.drain(..n);
+    fn takes_input(&self) -> bool {
+        self.input_len < Self::INPUT_CAP
+    }
+
+    fn is_empty(&self) -> bool {
+        self.replies.is_empty() && self.input.is_empty()
+    }
+
+    fn replying(&self) -> bool {
+        self.written == 0 && !self.replies.is_empty()
+    }
+
+    /// The bytes to write next.
+    fn next(&mut self) -> &[u8] {
+        if self.replying() {
+            self.replies.make_contiguous()
+        } else {
+            self.input.front().map_or(&[], |c| &c[self.written..])
         }
-        Ok(())
+    }
+
+    /// `n` bytes of [`Self::next`] were written.
+    fn consume(&mut self, n: usize) {
+        if self.replying() {
+            self.replies.drain(..n);
+            return;
+        }
+        self.written += n;
+        self.input_len -= n;
+        if self.input.front().is_some_and(|c| c.len() == self.written) {
+            self.input.pop_front();
+            self.written = 0;
+        }
     }
 }
 
@@ -108,6 +122,7 @@ async fn run_pane_pty_task(
         mut resize_rx,
         shutdown,
         done_tx,
+        input,
     } = control;
     let mut buf = vec![0u8; 8192];
     // Track the last OSC title we forwarded to the graph so we only
@@ -131,7 +146,7 @@ async fn run_pane_pty_task(
         .unwrap_or_else(std::time::Instant::now);
     let mut output_dropped_any = false;
     let mut task_exit = PtyTaskExit::Natural;
-    let mut replies = PtyInputQueue::default();
+    let mut pending = PtyInputQueue::default();
 
     loop {
         tokio::select! {
@@ -214,13 +229,9 @@ async fn run_pane_pty_task(
                         // An unbounded write to a program that never reads
                         // would stop this loop reading output or seeing a cancel.
                         for response in &terminal_responses {
-                            if !replies.push(response) {
+                            if !pending.push(response) {
                                 tracing::warn!(%pane_id, "program is not reading its terminal replies; dropping one");
                             }
-                        }
-                        if let Err(e) = replies.drain(|b| handle.try_write(b)) {
-                            tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
-                            break;
                         }
 
                         // Stage these bytes for the next sampled publish.
@@ -310,33 +321,30 @@ async fn run_pane_pty_task(
                     }
                 }
             }
-            res = write_rx.recv() => {
-                let data = match res {
-                    Some(d) => d,
-                    None => {
-                        // Sender dropped -- the pane was destroyed.
-                        // Exit so we can kill() the child shell.
-                        tracing::debug!(%pane_id, "writer channel closed");
-                        task_exit = PtyTaskExit::RequestedTeardown;
+            // Bounded: past the cap, senders wait instead of input being lost.
+            res = write_rx.recv(), if pending.takes_input() => {
+                let Some(data) = res else {
+                    // Sender dropped -- the pane was destroyed.
+                    // Exit so we can kill() the child shell.
+                    tracing::debug!(%pane_id, "writer channel closed");
+                    task_exit = PtyTaskExit::RequestedTeardown;
+                    break;
+                };
+                pending.push_input(data);
+            }
+            // Waits for room, never blocks the loop: a program that stops
+            // reading cannot stop this loop reading output or seeing a cancel.
+            res = input.write_some(pending.next()), if !pending.is_empty() => {
+                match res {
+                    Ok(0) => {
+                        tracing::error!(%pane_id, "PTY write took nothing");
                         break;
                     }
-                };
-                // Behind any queued reply, never blocking: a program that
-                // stopped reading must not stop this loop.
-                if !replies.push_input(&data) {
-                    tracing::warn!(%pane_id, "program is not reading its input; dropping {} bytes", data.len());
-                }
-                if let Err(e) = replies.drain(|b| handle.try_write(b)) {
-                    tracing::error!(%pane_id, error = %e, "PTY write error");
-                    break;
-                }
-            }
-            // Retry queued replies; the read arm holds the handle, so this
-            // cannot wait on writability.
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if !replies.is_empty() => {
-                if let Err(e) = replies.drain(|b| handle.try_write(b)) {
-                    tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
-                    break;
+                    Ok(n) => pending.consume(n),
+                    Err(e) => {
+                        tracing::error!(%pane_id, error = %e, "PTY write error");
+                        break;
+                    }
                 }
             }
             res = resize_rx.recv() => {
@@ -780,6 +788,7 @@ async fn spawn_pane_pty_unshared(
     config.env = env;
     config.env_clear = env_clear;
     let handle = shux_pty::handle::PtyHandle::spawn(&config)?;
+    let input = handle.input_writer()?;
     let pid = handle.pid();
 
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -890,6 +899,7 @@ async fn spawn_pane_pty_unshared(
             resize_rx,
             shutdown: pane_shutdown,
             done_tx,
+            input,
         },
         graph.clone(),
     ));
@@ -1276,25 +1286,26 @@ mod tests {
         h.stop().await;
     }
 
+    /// What a program taking at most `limit` bytes per write receives.
+    fn write(q: &mut PtyInputQueue, limit: usize) -> Vec<u8> {
+        let mut sent = Vec::new();
+        while !q.is_empty() && sent.len() < limit {
+            let next = q.next();
+            let n = next.len().min(limit - sent.len());
+            sent.extend_from_slice(&next[..n]);
+            q.consume(n);
+        }
+        sent
+    }
+
     #[test]
     fn a_reply_the_program_only_partly_took_finishes_before_anything_else() {
         let mut q = PtyInputQueue::default();
         assert!(q.push(b"\x1b[?1;2c"));
         assert!(q.push(b"\x1b[0n"));
-        let mut sent = Vec::new();
-        // The program takes four bytes, then its input is full.
-        q.drain(|b| {
-            let n = if sent.is_empty() { 4.min(b.len()) } else { 0 };
-            sent.extend_from_slice(&b[..n]);
-            Ok(n)
-        })
-        .unwrap();
+        let mut sent = write(&mut q, 4);
         assert_eq!(sent, b"\x1b[?1");
-        q.drain(|b| {
-            sent.extend_from_slice(b);
-            Ok(b.len())
-        })
-        .unwrap();
+        sent.extend(write(&mut q, usize::MAX));
         assert_eq!(
             sent, b"\x1b[?1;2c\x1b[0n",
             "the tail went first, nothing was lost"
@@ -1303,14 +1314,25 @@ mod tests {
     }
 
     #[test]
-    fn a_large_paste_is_taken_whole_and_only_a_backlog_is_capped() {
+    fn a_reply_waits_for_the_input_chunk_being_written() {
         let mut q = PtyInputQueue::default();
-        let paste = vec![b'p'; PtyInputQueue::INPUT_CAP + 10];
-        assert!(
-            q.push_input(&paste),
-            "a paste larger than the cap was dropped"
-        );
-        assert!(!q.push_input(b"more"), "input piled up past the cap");
+        q.push_input(b"hello".to_vec());
+        q.push_input(b"world".to_vec());
+        let mut sent = write(&mut q, 2);
+        assert!(q.push(b"\x1b[0n"));
+        sent.extend(write(&mut q, usize::MAX));
+        assert_eq!(sent, b"hello\x1b[0nworld", "a reply landed inside a chunk");
+    }
+
+    #[test]
+    fn input_is_never_dropped_only_held_back_past_the_cap() {
+        let mut q = PtyInputQueue::default();
+        q.push_input(vec![b'p'; PtyInputQueue::INPUT_CAP + 10]);
+        assert!(!q.takes_input(), "input piled up past the cap");
+        let sent = write(&mut q, 20);
+        assert!(q.takes_input(), "room freed by the program reading");
+        let rest = write(&mut q, usize::MAX);
+        assert_eq!(sent.len() + rest.len(), PtyInputQueue::INPUT_CAP + 10);
     }
 
     #[test]
@@ -1323,7 +1345,7 @@ mod tests {
         }
         assert_eq!(accepted, PtyInputQueue::CAP / reply.len());
         assert_eq!(
-            q.pending.len(),
+            q.replies.len(),
             accepted * reply.len(),
             "no partial reply queued"
         );
