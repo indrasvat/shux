@@ -566,6 +566,7 @@ impl VirtualTerminal {
                 generation: self.status_disabled_generation,
                 summary: None,
                 seen: false,
+                enabled: false,
             },
         }
     }

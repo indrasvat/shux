@@ -214,6 +214,9 @@ pub struct Pane {
     /// The pane has sent OSC 7501 since its terminal was last reset.
     #[serde(skip)]
     pub program_status_seen: bool,
+    /// Program status is enabled for this pane's terminal.
+    #[serde(skip)]
+    pub program_status_enabled: bool,
 }
 
 impl Pane {
@@ -235,6 +238,7 @@ impl Pane {
             created_by_plugin: None,
             program_status: None,
             program_status_seen: false,
+            program_status_enabled: false,
         };
         pane.recalculate_title();
         pane

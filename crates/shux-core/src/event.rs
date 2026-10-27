@@ -327,6 +327,7 @@ pub enum EventData {
         old: Option<Box<shux_program_status::StatusSummary>>,
         new: Option<Box<shux_program_status::StatusSummary>>,
         seen: bool,
+        enabled: bool,
     },
 
     /// Bell character received in a pane.

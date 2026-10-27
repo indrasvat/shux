@@ -35,6 +35,9 @@ pub struct StatusPublication {
     pub summary: Option<StatusSummary>,
     /// The terminal has received at least one report since the last RIS.
     pub seen: bool,
+    /// Program status is on for this terminal. Lets a reader tell "disabled"
+    /// from "enabled, nothing reported".
+    pub enabled: bool,
 }
 
 /// Records plus the generation they were read at, for `pane.status`.
@@ -71,6 +74,7 @@ impl VtProgramStatus {
             generation: self.generation,
             summary: self.table.summary(),
             seen: self.seen,
+            enabled: true,
         }
     }
 
@@ -388,6 +392,14 @@ mod tests {
     }
 
     #[test]
+    fn del_and_8_bit_bytes_are_stored_like_vte_stores_them() {
+        assert_eq!(
+            cuts(&[b"\x1b]7501;a\x7fb\xc3\xa9\x07"]),
+            [report(b"a\x7fb\xc3\xa9", true)]
+        );
+    }
+
+    #[test]
     fn the_limit_is_the_whole_sequence_including_framing() {
         let fit = |extra: usize| {
             // ESC ] (2) + "7501;" (5) + body + ESC \ (2)
@@ -427,6 +439,8 @@ mod tests {
         // vte stays in Escape across C0, DEL and 8-bit bytes.
         assert_eq!(cuts(&[b"\x1b\n]7501;?\x07"]), [report(b"?", true)]);
         assert_eq!(cuts(&[b"\x1b\x7f]7501;?\x07"]), [report(b"?", true)]);
+        assert_eq!(cuts(&[b"\x1b\x1b]7501;?\x07"]), [report(b"?", true)]);
+        assert_eq!(cuts(&[b"\x1b\x80]7501;?\x07"]), [report(b"?", true)]);
     }
 
     #[test]
