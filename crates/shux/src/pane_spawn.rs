@@ -32,16 +32,51 @@ struct PtyTaskControl {
     done_tx: oneshot::Sender<()>,
 }
 
+/// Terminal replies (DA1, DSR, OSC 7501 probes) waiting for the program to read
+/// its input. Written without ever blocking, so a program that never reads
+/// cannot stall the PTY loop; bounded, and a reply that does not fit is
+/// dropped whole, so the program never sees half of one.
+#[derive(Default)]
+struct ReplyQueue {
+    pending: std::collections::VecDeque<u8>,
+}
+
+impl ReplyQueue {
+    const CAP: usize = 4096;
+
+    fn push(&mut self, reply: &[u8]) -> bool {
+        if self.pending.len() + reply.len() > Self::CAP {
+            return false;
+        }
+        self.pending.extend(reply);
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Hand the program as much as it takes now; the rest waits, in order.
+    fn drain(
+        &mut self,
+        mut try_write: impl FnMut(&[u8]) -> Result<usize, shux_pty::PtyError>,
+    ) -> Result<(), shux_pty::PtyError> {
+        while !self.pending.is_empty() {
+            let n = try_write(self.pending.make_contiguous())?;
+            if n == 0 {
+                break;
+            }
+            self.pending.drain(..n);
+        }
+        Ok(())
+    }
+}
+
 /// Per-pane async task that owns the PtyHandle and handles both reads and writes.
 ///
 /// Reads from the PTY and feeds VT + CommandEngine. Receives writes from the
 /// channel. Receives resize requests on a separate channel and applies them
 /// via TIOCSWINSZ + VT resize.
-/// How long terminal replies may take to reach a program's input.
-const REPLY_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
-/// How long replies are dropped after a program stopped draining them.
-const REPLY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
-
 async fn run_pane_pty_task(
     pane_id: shux_core::model::PaneId,
     mut handle: shux_pty::handle::PtyHandle,
@@ -79,7 +114,7 @@ async fn run_pane_pty_task(
         .unwrap_or_else(std::time::Instant::now);
     let mut output_dropped_any = false;
     let mut task_exit = PtyTaskExit::Natural;
-    let mut replies_stalled_until: Option<std::time::Instant> = None;
+    let mut replies = ReplyQueue::default();
 
     loop {
         tokio::select! {
@@ -159,33 +194,16 @@ async fn run_pane_pty_task(
                             )
                         };
 
-                        // Replies go to the program's input. One that never
-                        // reads it fills the queue; an unbounded write would
-                        // then stop this loop reading output or seeing a
-                        // cancel, wedging the pane. So replies get a budget,
-                        // and a program that does not drain them gets none
-                        // for a while.
-                        let replies_due = !terminal_responses.is_empty()
-                            && replies_stalled_until.is_none_or(|t| std::time::Instant::now() >= t);
-                        if replies_due {
-                            let write = async {
-                                for response in &terminal_responses {
-                                    handle.write(response).await?;
-                                }
-                                handle.flush().await
-                            };
-                            match tokio::time::timeout(REPLY_BUDGET, write).await {
-                                Ok(Ok(())) => replies_stalled_until = None,
-                                Ok(Err(e)) => {
-                                    tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
-                                    break;
-                                }
-                                Err(_) => {
-                                    tracing::warn!(%pane_id, "program is not reading its terminal replies; dropping them");
-                                    replies_stalled_until =
-                                        Some(std::time::Instant::now() + REPLY_BACKOFF);
-                                }
+                        // An unbounded write to a program that never reads
+                        // would stop this loop reading output or seeing a cancel.
+                        for response in &terminal_responses {
+                            if !replies.push(response) {
+                                tracing::warn!(%pane_id, "program is not reading its terminal replies; dropping one");
                             }
+                        }
+                        if let Err(e) = replies.drain(|b| handle.try_write(b)) {
+                            tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
+                            break;
                         }
 
                         // Stage these bytes for the next sampled publish.
@@ -286,12 +304,24 @@ async fn run_pane_pty_task(
                         break;
                     }
                 };
+                // Queued replies first: input must not land inside one.
+                if !replies.is_empty() {
+                    let queued: Vec<u8> = replies.pending.drain(..).collect();
+                    if let Err(e) = handle.write(&queued).await {
+                        tracing::error!(%pane_id, error = %e, "PTY write error");
+                        break;
+                    }
+                }
                 if let Err(e) = handle.write(&data).await {
                     tracing::error!(%pane_id, error = %e, "PTY write error");
                     break;
                 }
-                if let Err(e) = handle.flush().await {
-                    tracing::error!(%pane_id, error = %e, "PTY flush error");
+            }
+            // Retry queued replies; the read arm holds the handle, so this
+            // cannot wait on writability.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if !replies.is_empty() => {
+                if let Err(e) = replies.drain(|b| handle.try_write(b)) {
+                    tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
                     break;
                 }
             }
@@ -634,12 +664,40 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     graph: shux_core::graph::GraphHandle,
     cast_recorder: Option<PaneRecorder>,
 ) -> Result<(), shux_pty::PtyError> {
-    // One spawn per pane at a time, decided before anything forks: create's
-    // background spawn and an attach can both find a pane with no PTY, and
-    // both children used to run before one was discarded.
-    if !spawning().insert(pane_id) {
-        return Ok(());
-    }
+    // One spawn per pane at a time, decided before anything forks. A second
+    // spawn waits for the first and reports its outcome.
+    let ticket = {
+        let mut in_flight = spawning();
+        match in_flight.get(&pane_id) {
+            Some(first) => Err(first.clone()),
+            None => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                in_flight.insert(pane_id, rx);
+                Ok(SpawnTicket {
+                    pane_id,
+                    tx,
+                    ok: false,
+                })
+            }
+        }
+    };
+    let mut ticket = match ticket {
+        Ok(ticket) => ticket,
+        Err(mut first) => {
+            let ok = matches!(
+                first.wait_for(Option::is_some).await.as_deref(),
+                Ok(Some(true))
+            );
+            return if ok {
+                Ok(())
+            } else {
+                Err(pane_gone(
+                    pane_id,
+                    &"a concurrent spawn of this pane failed",
+                ))
+            };
+        }
+    };
     let spawned = spawn_pane_pty_unshared(
         pane_id,
         cwd,
@@ -653,18 +711,36 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
         cast_recorder,
     )
     .await;
-    spawning().remove(&pane_id);
+    ticket.ok = spawned.is_ok();
     spawned
 }
 
-/// Panes with a spawn in flight. Its own lock, never held across an await:
+type SpawnOutcome = tokio::sync::watch::Receiver<Option<bool>>;
+
+/// Spawns in flight, by pane. Its own lock, never held across an await:
 /// spawns must not queue behind the io lock to learn they are redundant.
-fn spawning() -> std::sync::MutexGuard<'static, std::collections::HashSet<shux_core::model::PaneId>>
+fn spawning()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<shux_core::model::PaneId, SpawnOutcome>>
 {
     static SPAWNING: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashSet<shux_core::model::PaneId>>,
+        std::sync::Mutex<std::collections::HashMap<shux_core::model::PaneId, SpawnOutcome>>,
     > = std::sync::LazyLock::new(Default::default);
     SPAWNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The in-flight mark for one spawn. Released however the spawn ends —
+/// returned, cancelled or panicked — and publishes its outcome to waiters.
+struct SpawnTicket {
+    pane_id: shux_core::model::PaneId,
+    tx: tokio::sync::watch::Sender<Option<bool>>,
+    ok: bool,
+}
+
+impl Drop for SpawnTicket {
+    fn drop(&mut self) {
+        spawning().remove(&self.pane_id);
+        let _ = self.tx.send(Some(self.ok));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1149,6 +1225,48 @@ mod tests {
 
     /// A pane id plus the pid file its shell writes, so a test can prove the
     /// child of a refused spawn did not survive.
+    #[test]
+    fn a_reply_the_program_only_partly_took_finishes_before_anything_else() {
+        let mut q = ReplyQueue::default();
+        assert!(q.push(b"\x1b[?1;2c"));
+        assert!(q.push(b"\x1b[0n"));
+        let mut sent = Vec::new();
+        // The program takes four bytes, then its input is full.
+        q.drain(|b| {
+            let n = if sent.is_empty() { 4.min(b.len()) } else { 0 };
+            sent.extend_from_slice(&b[..n]);
+            Ok(n)
+        })
+        .unwrap();
+        assert_eq!(sent, b"\x1b[?1");
+        q.drain(|b| {
+            sent.extend_from_slice(b);
+            Ok(b.len())
+        })
+        .unwrap();
+        assert_eq!(
+            sent, b"\x1b[?1;2c\x1b[0n",
+            "the tail went first, nothing was lost"
+        );
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn a_reply_that_does_not_fit_is_dropped_whole() {
+        let mut q = ReplyQueue::default();
+        let reply = vec![b'x'; 1000];
+        let mut accepted = 0;
+        while q.push(&reply) {
+            accepted += 1;
+        }
+        assert_eq!(accepted, ReplyQueue::CAP / reply.len());
+        assert_eq!(
+            q.pending.len(),
+            accepted * reply.len(),
+            "no partial reply queued"
+        );
+    }
+
     fn pid_probe(dir: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
         let pid_file = dir.join("pid");
         let cmd = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());

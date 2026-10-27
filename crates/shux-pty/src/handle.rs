@@ -882,6 +882,16 @@ impl PtyHandle {
         Ok(())
     }
 
+    /// One non-blocking write attempt: how many bytes the child's input took
+    /// (0 when it is full). Never waits, so it cannot be cut off mid-write.
+    pub fn try_write(&mut self, data: &[u8]) -> Result<usize, PtyError> {
+        match write_once(self.pty.get_ref().as_raw_fd(), data) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(PtyError::Write(e)),
+        }
+    }
+
     pub async fn write_str(&mut self, text: &str) -> Result<(), PtyError> {
         self.write(text.as_bytes()).await
     }

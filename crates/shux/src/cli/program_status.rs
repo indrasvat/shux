@@ -13,7 +13,7 @@ fn print_json(result: &serde_json::Value) -> anyhow::Result<()> {
 
 fn print_json_error(message: &str) -> anyhow::Result<()> {
     let envelope = serde_json::json!({
-        "error": { "code": "daemon_unreachable", "message": message }
+        "error": { "code": -32603, "message": message }
     });
     println!(
         "{}",

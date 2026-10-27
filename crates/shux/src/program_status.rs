@@ -785,4 +785,43 @@ mod tests {
         );
         finish(h).await;
     }
+
+    /// A spawn whose future is dropped mid-flight (an RPC client hung up)
+    /// must not leave the pane unspawnable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_whose_spawn_was_cancelled_can_still_spawn() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-cancelled").await;
+        let guard = h.io.lock().await; // park the first spawn inside its claim/install
+        let first = tokio::time::timeout(
+            Duration::from_millis(200),
+            spawn_sh_result(&h, pane, "sleep 30"),
+        );
+        let (_, guard) = tokio::join!(first, async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            guard
+        });
+        drop(guard);
+        spawn_sh_result(&h, pane, "sleep 30").await.unwrap();
+        assert!(
+            h.io.lock().await.writers.contains_key(&pane),
+            "the pane never spawned after a cancelled spawn"
+        );
+        finish(h).await;
+    }
+
+    /// When the spawn that got there first fails, the one that waited on it
+    /// must fail too, not report success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_spawn_that_waited_on_a_failed_one_fails() {
+        let h = RpcHarness::new();
+        let ghost = PaneId::new(); // not in the graph: the claim fails
+        let (a, b) = tokio::join!(
+            spawn_sh_result(&h, ghost, "sleep 30"),
+            spawn_sh_result(&h, ghost, "sleep 30")
+        );
+        assert!(a.is_err());
+        assert!(b.is_err(), "the waiting spawn reported success");
+        finish(h).await;
+    }
 }
