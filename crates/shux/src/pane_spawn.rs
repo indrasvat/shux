@@ -37,6 +37,11 @@ struct PtyTaskControl {
 /// Reads from the PTY and feeds VT + CommandEngine. Receives writes from the
 /// channel. Receives resize requests on a separate channel and applies them
 /// via TIOCSWINSZ + VT resize.
+/// How long terminal replies may take to reach a program's input.
+const REPLY_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+/// How long replies are dropped after a program stopped draining them.
+const REPLY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
 async fn run_pane_pty_task(
     pane_id: shux_core::model::PaneId,
     mut handle: shux_pty::handle::PtyHandle,
@@ -74,6 +79,7 @@ async fn run_pane_pty_task(
         .unwrap_or_else(std::time::Instant::now);
     let mut output_dropped_any = false;
     let mut task_exit = PtyTaskExit::Natural;
+    let mut replies_stalled_until: Option<std::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -153,22 +159,34 @@ async fn run_pane_pty_task(
                             )
                         };
 
-                        let mut response_write_failed = false;
-                        for response in &terminal_responses {
-                            if let Err(e) = handle.write(response).await {
-                                tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
-                                response_write_failed = true;
-                                break;
+                        // Replies go to the program's input. One that never
+                        // reads it fills the queue; an unbounded write would
+                        // then stop this loop reading output or seeing a
+                        // cancel, wedging the pane. So replies get a budget,
+                        // and a program that does not drain them gets none
+                        // for a while.
+                        let replies_due = !terminal_responses.is_empty()
+                            && replies_stalled_until.is_none_or(|t| std::time::Instant::now() >= t);
+                        if replies_due {
+                            let write = async {
+                                for response in &terminal_responses {
+                                    handle.write(response).await?;
+                                }
+                                handle.flush().await
+                            };
+                            match tokio::time::timeout(REPLY_BUDGET, write).await {
+                                Ok(Ok(())) => replies_stalled_until = None,
+                                Ok(Err(e)) => {
+                                    tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::warn!(%pane_id, "program is not reading its terminal replies; dropping them");
+                                    replies_stalled_until =
+                                        Some(std::time::Instant::now() + REPLY_BACKOFF);
+                                }
                             }
                         }
-                        if response_write_failed {
-                            break;
-                        }
-                        if !terminal_responses.is_empty()
-                            && let Err(e) = handle.flush().await {
-                                tracing::error!(%pane_id, error = %e, "PTY terminal response flush error");
-                                break;
-                            }
 
                         // Stage these bytes for the next sampled publish.
                         // We cap the buffered chunk at 64KB to avoid
