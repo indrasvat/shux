@@ -1,12 +1,13 @@
 # Program status (OSC 7501) — implementation plan
 
-Status: **r5**, revised after three council rounds (codex + grok). Every
+Status: **r6**, revised after four council rounds (codex + grok). Every
 finding and its disposition is in `council-review.md`.
 
 - **Round 1:** codex REJECT (22 findings), grok APPROVE-WITH-CHANGES (13).
 - **Round 2:** codex REJECT (12 new), grok APPROVE-WITH-CHANGES (16 new).
 - **Round 3:** codex REJECT (10 new, no P0), grok APPROVE-WITH-CHANGES (9
   new, no P0).
+- **Round 4:** codex REJECT (7 new, no P0), grok REJECT (6 new, no P0).
 
 Spec: Program Status Protocol v0.4 (2026-10-10),
 <https://superlogical.com/rex/docs/build/program-status>
@@ -27,7 +28,11 @@ mutation-checked oracle):
 | `bbbcc5c` | config: grace window for a vanished file |
 | `8275784` | tier-2 libFuzzer crate, `make fuzz` |
 | `53ce29d` | events.watch classified on the key it subscribes with (pre-existing permission bypass, codex r3 F1) |
-| *(next)* | incarnation guard completed: graph-side PTY ownership, owner-checked recorders, title re-check (codex r3 F2, grok r3 F1/F2) |
+| `7b5330b` | incarnation guard completed: graph-side PTY ownership, owner-checked recorders, title re-check (codex r3 F2, grok r3 F1/F2) |
+| `a9047f0` | leak-guard self-test runs on current macOS (pre-existing) |
+| *(next)* | ownership is monotonic on both sides; refused and orphaned spawns clean up; side maps pruned on every commit (codex r4 F1/F2/F7, grok r4 F1/F2/F6) |
+| *(next)* | config: one read decides, and an empty file gets the grace too (codex r4 F4, grok r4 F5) |
+| *(next)* | leak-guard self-test: fixture must be named by the guard; wedge cleanup on every exit (codex r4 F5/F6) |
 
 ## 1. Problem
 
@@ -253,7 +258,7 @@ never overwrites a newer one.
 
 ```
 publisher (receiver subscribed before the sender is published)
-  committed = 0; pending: Vec<Flush>
+  committed = 0; pending: Vec<Flush>; retry_at: Option<Instant>
   loop {
     publish_latest()        // ALWAYS first: the initial value is published (codex r3 F6)
     ack every pending flush with min_generation <= committed; keep the rest
@@ -261,6 +266,7 @@ publisher (receiver subscribed before the sender is published)
       _ = lifetime.cancelled()  => break
       r = rx.changed()          => if r.is_err() { break }
       Some(f) = flush_rx.recv() => pending.push(f)
+      _ = sleep_until(retry_at), if retry_at.is_some() => {}   // codex r4 F3
     }
     if pacing still running: sleep(remaining of 100 ms), interruptible by
       lifetime / flush (a flush pushes and skips the rest of the wait)
@@ -270,18 +276,32 @@ publisher (receiver subscribed before the sender is published)
 
 - **`publish_latest`** re-borrows the slot. It skips the call if
   `generation <= committed`. Otherwise it calls the graph inside
-  `tokio::time::timeout(500 ms, …)` *and* a `select!` on `lifetime`, so
-  shutdown is never stuck behind a graph await (codex r3 F7).
+  `tokio::time::timeout(250 ms, …)` and a `select!` on `lifetime` **and on
+  `flush_rx`**, so neither shutdown nor a flush is stuck behind a graph
+  await (codex r3 F7, grok r4 F4).
   - `PaneNotFound` or `GraphError::Shutdown` → exit the loop.
-  - Timeout → log, keep the value, and retry on the next turn.
+  - Timeout → log, keep the value, set `retry_at = now + 100 ms`. Without
+    that deadline nothing wakes the loop again once the watch notification
+    is consumed, and a graph that recovers would never see the value
+    (codex r4 F3). Any successful publish clears `retry_at`.
+  - A flush that arrives mid-call is pushed to `pending` and the in-flight
+    send is abandoned. The loop goes round, re-borrows the slot, and
+    publishes its **current** value, which is at least the flush's
+    `min_generation`. An older value can therefore never be the last thing
+    committed before an ack. An abandoned send that the actor had already
+    applied is harmless: the newer one supersedes it by generation.
+  - The 250 ms per-call budget sits under the flush's 500 ms, so one slow
+    call leaves room for the retry that acks.
 - **Flush** is for VT replacement and disable only: bounded 500 ms,
   best-effort. Natural exit does **not** use it (next item).
 - **Initial event.** Every pane's first publication flips `enabled` from the
   `Pane::new` default, so it fires one `pane.status_changed`. This follows
   from making `enabled` observable (codex r3 F6). Grok r3 F7 proposed seeding
-  the pane from config to suppress it. That was declined: `Pane::new` lives
-  in `shux-core`, which has no config, and one event per pane spawn is the
-  same cardinality as `pane.created`. Documented.
+  the pane from config to suppress it. That was declined: `Pane::new` takes
+  no config, threading it through every pane-creation path buys nothing a
+  consumer can use, and one event per pane spawn is the same cardinality as
+  `pane.created`. Documented. (r3 said "shux-core has no config", which is
+  wrong; codex and grok r4 both caught it. The decision stands.)
 
 ### 5.3 Lifecycle (codex r1 F7/F8, r2 F5/F6, r3 F2/F4; grok r1 F8, r2 F5/F6, r3 F1/F2)
 
@@ -289,12 +309,34 @@ publisher (receiver subscribed before the sender is published)
 - **Incarnation number.** Every spawn draws a process-global incarnation and
   claims the pane in **the graph** (`claim_pane_pty`) before installing
   handles.
+- **Monotonic on both sides** (codex r4 F1, grok r4 F1). A claim and an
+  install are separate steps, so two spawns can interleave them. Both sides
+  therefore refuse anything older than what they hold:
+  - `claim_pane_pty` returns `Ok(false)` and changes nothing for an
+    incarnation lower than the owner's. No exit is cleared and no
+    `pane.respawned` fires.
+  - The IO install refuses an incarnation lower than `incarnations[pane]`.
+  - Either refusal kills and reaps the child and returns `Ok`: a newer spawn
+    owns the pane and runs there.
+  Both sides converge on the highest incarnation that got that far.
+- **Pane gone or daemon stopping** (codex r4 F2, grok r4 F2).
+  - A claim error kills the child and fails the spawn; nothing is installed.
+  - Under the IO lock, a cancelled daemon token refuses the install. Daemon
+    shutdown cancels that token before it collects the panes it waits for.
+  - After installing, the spawn reads the graph snapshot. Every destroy path
+    commits to the graph **before** it tears down IO (`scratch_reap` was the
+    exception and now follows suit). So either the pane is still there, or
+    that teardown already ran and the spawn tears itself down.
 - **Exit commit.** Exit goes through `set_pane_exit_status_owned(pane,
-  status, incarnation)`. The graph actor ignores it when another incarnation
-  owns the pane, at the instant it commits, so no window opens between check
-  and write (grok r3 F2).
-- **Premature exit.** A claim that finds the pane already marked exited by a
-  replaced predecessor clears `exit_status` and fires `pane.respawned`.
+  status, incarnation)`. The graph actor applies it only when **that**
+  incarnation owns the pane, at the instant it commits, so no window opens
+  between check and write (grok r3 F2). An unclaimed pane ignores it.
+- **Premature exit.** A newer claim that finds the pane already marked
+  exited by a replaced predecessor clears `exit_status` and fires
+  `pane.respawned`.
+- **Side maps.** `pty_owners` and `status_generations` are pruned to the
+  live panes on every snapshot commit, so a destroyed pane leaves nothing
+  behind (codex r4 F7, grok r4 F6).
 - **What else checks the incarnation:**
   - recorder tee, resize tee and finish, all inside the lock that selects the
     sinks (codex r3 F2, grok r3 F1);
@@ -309,18 +351,33 @@ publisher (receiver subscribed before the sender is published)
 - **Tests, red first:**
   - `a_replaced_pty_task_leaves_its_successor_alone`;
   - `a_replaced_pty_task_does_not_finish_its_successors_recorder`;
+  - `a_replaced_pty_task_that_lost_the_claim_installs_nothing`;
+  - `a_replaced_pty_task_older_than_the_installed_one_installs_nothing`;
+  - `a_replaced_pty_task_for_a_missing_pane_fails`;
+  - `a_replaced_pty_task_whose_pane_died_mid_spawn_cleans_up`;
   - graph `an_exit_reported_by_a_replaced_pty_incarnation_is_ignored`;
-  - graph `claiming_an_exited_pane_brings_it_back`.
+  - graph `claiming_an_exited_pane_brings_it_back`;
+  - graph `a_claim_older_than_the_owner_changes_nothing`;
+  - graph `an_exit_from_an_unclaimed_pane_is_ignored`;
+  - graph `destroying_a_pane_forgets_its_owner_and_generation`.
 
-**Natural exit: final status and exit in one graph command** (codex r3 F4).
-- The epilogue, if still current, calls `note_process_exit()` and reads the
-  final `StatusPublication` under the io lock.
+**Natural exit: final status and exit in one graph command** (codex r3 F4,
+grok r4 F3).
+- In **one** io-lock hold, the epilogue checks `is_current(pane,
+  incarnation)`. If it is not current it touches no VT; the successor's
+  records are not the predecessor's to end. If it is current, it calls
+  `note_process_exit()` and reads the final `StatusPublication`. Check and
+  mutation are never split across an await.
 - It then sends `set_pane_exit_status_owned(pane, status, incarnation,
   Some(final_status))`.
-- The actor commits the status (if its generation is newer), then the exit,
-  firing `pane.status_changed` and then `pane.exited` from one command.
+- The actor does nothing unless `pty_owners[pane] == incarnation`. That
+  gate covers **both** halves: a successor's newer generation would drop
+  only the status half, so the exit half needs the owner check of its own.
+  If owned, it commits the status (if its generation is newer), then the
+  exit, firing `pane.status_changed` and then `pane.exited` from one
+  command.
 - The ordering therefore holds unconditionally. A later publisher send for
-  that generation is stale and dropped.
+  any generation up to the committed one is stale and dropped.
 - Nothing waits on the publisher, so a slow or dead publisher cannot delay
   `pane.exited`.
 
@@ -359,12 +416,18 @@ forward     = "auto"  # outer terminal: auto | off        (P4)
   config init` emits the block.
 - **Hot reload keeps the running config on a parse error.** This **landed in
   `7fa4d70`** and is no longer a P1 work item (grok r2 F12).
-  - A *missing* file still installs defaults, by design and tested.
-  - Grok r2 F12 notes that an editor that deletes and then recreates the file
-    can briefly install defaults inside one 150 ms debounce window.
-    Disposition: the reload re-checks a `NotFound` once more after the
-    debounce before installing defaults. This is a small change in the
-    config PR, with a test.
+  - A file that *stays* missing or empty still installs defaults, by design
+    and tested.
+  - **Grace window** (grok r2 F12; landed `bbbcc5c`, completed after codex
+    r4 F4 and grok r4 F5). Editors save by delete-then-write or
+    truncate-then-write, so the file can be briefly missing *or empty*.
+    - One read decides; there is no separate `exists()` check for an unlink
+      to slip past.
+    - A missing or zero-byte read waits 150 ms and reads again, and only
+      that second read can install defaults.
+    - Residual: a write still in progress that happens to parse (a valid
+      prefix of the new file) is applied. The debounce makes that rare, and
+      the next write event corrects it.
 
 ### 5.5 RPC and CLI (D13; codex r2 F7; grok r2 F8)
 

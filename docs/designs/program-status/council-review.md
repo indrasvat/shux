@@ -157,3 +157,37 @@ were reproduced and fixed before any plan text changed.
 | F7 | P2 | `enabled` fires an event for every new pane | **Declined** with reason: core has no config; one event per spawn, same cardinality as `pane.created`; documented (§5.2) |
 | F8 | P2 | Watermark test cannot catch the regression | `an_equal_publication_still_moves_the_watermark` (gen 10 → 15 equal → 12 stale); mutation-checked |
 | F9 | P3 | `status_generations` pruned only on publish | Every spawn's `claim_pane_pty` and every publication prune both side maps; bounded by panes since the last spawn |
+
+## Round 4 (plan r5 → r6), 2026-10-27
+
+Same reviewers and launchers, both under `agent_review_guard.sh`. No P0.
+Both rejected on the same two defects in `7b5330b`; grok executed its
+claim-order sequence against the built crate. Each landed-code finding was
+turned into a test that failed on the unfixed tree before the fix.
+
+### codex — REJECT (no P0)
+
+| # | Sev | Finding | Disposition |
+|---|---|---|---|
+| F1 | P1 | Concurrent spawns: graph owner and IO owner can disagree | **Reproduced, fixed**: claims and installs both refuse an older incarnation; the loser kills and reaps its child. Red first: `a_claim_older_than_the_owner_changes_nothing`, `a_replaced_pty_task_that_lost_the_claim_installs_nothing`, `a_replaced_pty_task_older_than_the_installed_one_installs_nothing` |
+| F2 | P1 | Spawn installs after the pane is destroyed | **Reproduced, fixed**: claim error fails the spawn; cancelled daemon token refuses the install; a post-install graph read tears down an orphaned install. `scratch_reap` reordered to destroy-before-teardown like every other path. Red first: `a_replaced_pty_task_for_a_missing_pane_fails`, `a_replaced_pty_task_whose_pane_died_mid_spawn_cleans_up` |
+| F3 | P1 | Timed-out publication never retried (plan) | §5.2: `retry_at` deadline in the select |
+| F4 | P2 | Unlink between `exists()` and read skips the grace | **Fixed**: one read decides (`read_config_file`); no separate existence check |
+| F5 | P2 | Xvfb self-test accepts a fixture that never launched | **Reproduced** (the committed script passed with the fixture pointed at a missing binary), **fixed**: fixture records its pid and the guard must name it. Both new checks shown failing under sabotage |
+| F6 | P2 | Wedge case leaks the stopped daemon, pane children and runtime on early exit | **Fixed**: `cleanup_wedge` runs from the EXIT trap; the case clears each part as it cleans it |
+| F7 | P3 | r3 F9 cross-map pruning absent | **Fixed**: both maps pruned on every snapshot commit. Red first: `destroying_a_pane_forgets_its_owner_and_generation` |
+
+### grok — REJECT (no P0)
+
+| # | Sev | Finding | Disposition |
+|---|---|---|---|
+| F1 | P1 | Lower claim steals ownership; exit on unclaimed pane commits | = codex F1; unclaimed exit now ignored. Red first: `an_exit_from_an_unclaimed_pane_is_ignored` |
+| F2 | P1 | Failed claim still installs; shutdown snapshot misses late installs | = codex F2 |
+| F3 | P1 | Combined exit command must gate both halves on ownership; check and `note_process_exit` in one lock hold (plan) | §5.3 rewritten: one io-lock hold; actor requires `pty_owners[pane] == incarnation` for status and exit alike |
+| F4 | P1 | Flush cannot preempt `publish_latest`; replacement clear lost (plan) | §5.2: `publish_latest` selects on `flush_rx`, abandons the stale send, republishes the slot's current value; per-call budget 250 ms under the 500 ms flush |
+| F5 | P2 | Truncated (empty) file installs defaults without grace; test second half vacuous | **Reproduced, fixed**: zero-byte reads get the grace. Red first: `a_file_truncated_inside_the_grace_window_never_reads_as_empty`. Existing test now asserts the old value holds *before* the clock advances and recreates with different content |
+| F6 | P3 | Side maps not pruned on destroy | = codex F7 |
+
+Both noted that r3's reason for declining grok r3 F7 ("shux-core has no
+config") is false. The decision stands on the remaining reason; §5.2
+corrected.
