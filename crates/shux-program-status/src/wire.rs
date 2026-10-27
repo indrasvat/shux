@@ -60,6 +60,50 @@ pub fn query_reply(terminator: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The payload (after `7501;`) that [`decode`] turns back into `report`.
+/// Text is emitted padded; callers keep within the limits.
+pub fn encode_payload(report: &Report) -> Vec<u8> {
+    let mut out = String::new();
+    let mut push = |key: &str, value: &str| {
+        if !out.is_empty() {
+            out.push(':');
+        }
+        out.push_str(key);
+        out.push('=');
+        out.push_str(value);
+    };
+    match report {
+        Report::Clear { id } => {
+            push("state", "clear");
+            if let Some(id) = id {
+                push("id", id.as_str());
+            }
+        }
+        Report::Set { id, record } => {
+            push("state", record.state.as_str());
+            if let Some(id) = id {
+                push("id", id.as_str());
+            }
+            if let Some(kind) = record.kind {
+                push("kind", kind.as_str());
+            }
+            if let Some(progress) = record.progress {
+                push("progress", &progress.to_string());
+            }
+            if let Some(app) = &record.app {
+                push("app", app);
+            }
+            if let Some(title) = &record.title {
+                push("title", &BASE64.encode(title));
+            }
+            if let Some(msg) = &record.msg {
+                push("msg", &BASE64.encode(msg));
+            }
+        }
+    }
+    out.into_bytes()
+}
+
 pub fn decode(payload: &[u8]) -> Result<Message, Reject> {
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(Reject::PayloadTooLong);
