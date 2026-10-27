@@ -377,10 +377,15 @@ pub(crate) fn register_pane_io_methods(
                         .cancel_command(command_id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
 
-                    // Send Ctrl-C to the pane
+                    // Ctrl-C, without waiting: a pane whose input is backed
+                    // up must not hold this lock.
                     let pane_id = shux_core::model::PaneId::from_uuid(pane_uuid);
-                    if let Some(writer) = state.writers.get(&pane_id) {
-                        let _ = writer.send(vec![0x03]).await; // ETX = Ctrl-C
+                    let writer = state.writers.get(&pane_id).cloned();
+                    drop(state);
+                    if let Some(writer) = writer
+                        && writer.try_send(vec![0x03]).is_err()
+                    {
+                        tracing::warn!(%pane_id, "pane input is backed up; Ctrl-C not delivered");
                     }
 
                     Ok(serde_json::json!({

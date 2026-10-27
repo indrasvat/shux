@@ -864,6 +864,60 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
         finish(h).await;
     }
 
+    /// Cancelling a command in a pane whose input is backed up must not hold
+    /// the shared pane I/O lock while it waits to send Ctrl-C.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_with_backed_up_input_does_not_wedge_command_cancel() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-cancel").await;
+        spawn_sh(
+            &h,
+            pane,
+            r#"python3 -c "import tty,time; tty.setraw(0); time.sleep(900)""#,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (command_id, _) = h.io.lock().await.cmd_engine.start_command(
+            pane.0,
+            "true",
+            &[],
+            Duration::from_secs(60),
+            None,
+        );
+        let writer = h.io.lock().await.writers[&pane].clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while writer.try_send(vec![b'k'; 64 << 10]).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "input never backed up"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let cancel = tokio::spawn({
+            let router = h.router.clone();
+            async move {
+                router
+                    .dispatch(
+                        "pane.command_cancel",
+                        Some(json!({ "command_id": command_id.to_string() })),
+                    )
+                    .await
+            }
+        });
+        let locked = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(h.io.lock().await);
+        })
+        .await;
+        assert!(
+            locked.is_ok(),
+            "command_cancel holds the pane I/O lock while input is backed up"
+        );
+        let cancelled = tokio::time::timeout(Duration::from_secs(3), cancel).await;
+        assert!(cancelled.is_ok(), "command_cancel never returned");
+        finish(h).await;
+    }
+
     /// A program that reads its input gets every byte of a large paste, in
     /// order, as fast as it reads: input is never dropped to protect the loop.
     #[tokio::test(flavor = "multi_thread")]
