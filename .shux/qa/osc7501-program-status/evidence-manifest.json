@@ -1,0 +1,48 @@
+{
+  "scope": "osc7501-program-status",
+  "audit": "shux-vt-solid-qa final run after the F4 fix (cafe577) and the PtyHandle drop fix (398a8ab); VERDICT PASS",
+  "commit_under_audit": "398a8abb51a4a669f1ff134ade7e6a740e13a37d",
+  "base": "45d6c5608820d398fedb27bafac478e7562eb711",
+  "previous_gate": "cfbe7ff (FAIL on F4 at cf96627)",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-record.md",
+  "dootsabha_implementation": "council-record.md",
+  "council_raw_outputs": [
+    "council-impl-codex.json",
+    "council-impl-grok.md"
+  ],
+  "screenshots": [
+    "replay-status-on-injected-120x36-btop-actual.png",
+    "replay-status-on-injected-120x36-lazygit-actual.png",
+    "replay-status-on-injected-120x36-nvim-actual.png",
+    "replay-status-on-injected-120x36-vicaya-actual.png",
+    "replay-status-on-injected-120x36-vivecaka-actual.png",
+    "replay-status-on-injected-120x36-btop-diff.png",
+    "replay-status-on-injected-120x36-lazygit-diff.png",
+    "replay-status-on-injected-120x36-nvim-diff.png",
+    "replay-status-on-injected-120x36-vicaya-diff.png",
+    "replay-status-on-injected-120x36-vivecaka-diff.png"
+  ],
+  "pixel_metrics": [
+    "pixel-replay-btop.json",
+    "pixel-replay-lazygit.json",
+    "pixel-replay-nvim.json",
+    "pixel-replay-vicaya.json",
+    "pixel-replay-vivecaka.json"
+  ],
+  "screenshots_note": "Regenerated on 398a8ab by this run. Each *-actual.png is a fresh render with program status ON and well-formed OSC 7501 / 133;A sequences injected before every 5th CSI of the committed raw recording (.shux/fixtures/vt-corpus/rich-tui/<app>.raw). Each is compared at exact 0/0 against the committed golden .shux/goldens/073-vt-corpus/rich-tui-<app>-expected.png, which this branch does not touch. The actuals are sha256-identical to their goldens. The live frames have no committed baseline, so their metrics (all 0/0) stay in gitignored scratch: valid-colour fix-vs-pre at 3 breakpoints, and pane/window on-vs-off plus hot reload (9 frames).",
+  "regression_inputs": [
+    "fuzz-crash-vt_program_status_stream-3a698c60.bin"
+  ],
+  "scratch_evidence_root": ".shux/out/osc7501-program-status/",
+  "scratch_evidence": {
+    "f4_vt_replay": "repro/run3.sh, repro/results3-r3{pre,fix}.txt, repro/valid-{pre,fix}.txt",
+    "f4_live": "run-live-f4.sh, live-f4-final.log, live-f4-final/",
+    "drop_ab": "build-pre.sh, live-f4-pre-final.log, live-drop-probe-2/",
+    "valid_colour_pixels": "pixel-valid.sh, live-f4-final/metric_valid-colours_*_fix-vs-pre.json",
+    "fuzz": "run-fuzz-600.sh, fuzz-600.log",
+    "neutrality": "run-neutral.sh, ps-neutral-run.log",
+    "live_on_off": "run-live-r2.sh, pixel-live-r2.sh, live-r2/",
+    "tests": "test-focus-shux-vt.log, test-focus-shux-pty.log, test-focus-{vt,pty}-new{,-PRE}.log"
+  }
+}
