@@ -368,7 +368,6 @@ pub enum GraphCommand {
     },
 }
 
-/// The authoritative session graph (single-writer owner of state).
 /// One program-status publication for a pane, as its terminal produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneStatusUpdate {
@@ -386,6 +385,7 @@ fn side_map(
     map.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The authoritative session graph (single-writer owner of state).
 pub struct SessionGraph {
     state: Arc<ArcSwap<SessionGraphSnapshot>>,
     /// Last accepted program-status generation per pane. Kept outside the
@@ -1398,8 +1398,6 @@ impl SessionGraph {
         Ok(true)
     }
 
-    /// [`Self::set_pane_exit_status`] as reported by PTY incarnation
-    /// `incarnation`; ignored unless that incarnation owns the pane.
     /// A PTY task's exit, applied only if `incarnation` still owns the pane.
     /// `final_status` (the terminal's status as the process left it) commits
     /// first under the same check, so `pane.status_changed` precedes

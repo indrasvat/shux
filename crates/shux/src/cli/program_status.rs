@@ -11,6 +11,15 @@ fn print_json(result: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_json_error(message: &str) -> anyhow::Result<()> {
+    let envelope = serde_json::json!({ "error": { "message": message } });
+    println!(
+        "{}",
+        crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
+    );
+    Ok(())
+}
+
 pub async fn handle_pane_status(
     stream: &mut tokio::net::UnixStream,
     pane: &str,
@@ -37,13 +46,28 @@ pub async fn handle_pane_wait_status(
     timeout_ms: u64,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
+    match wait_status_exit_code(stream, pane, states, matching, timeout_ms, format).await? {
+        0 => Ok(()),
+        code => std::process::exit(code),
+    }
+}
+
+/// Exit code: 0 matched, 1 timeout, 2 bad arguments, 3 anything else. Only a
+/// timeout may be 1: scripts branch on it.
+pub(crate) async fn wait_status_exit_code(
+    stream: &mut tokio::net::UnixStream,
+    pane: &str,
+    states: &[String],
+    matching: &str,
+    timeout_ms: u64,
+    format: OutputFormat,
+) -> anyhow::Result<i32> {
     let params = serde_json::json!({
         "pane_id": pane,
         "state": states,
         "match": matching,
         "timeout_ms": timeout_ms,
     });
-    // An error must not exit 1: that is the timeout code a script branches on.
     let result = match rpc_call(stream, "pane.wait_status", params).await {
         Ok(result) => result,
         Err(RpcClientError::Rpc {
@@ -58,7 +82,16 @@ pub async fn handle_pane_wait_status(
             data,
             super::lens::lens_checkpoint_exit_code(code),
         ),
-        Err(other) => return Err(other.into()),
+        // The daemon went away or the stream broke.
+        Err(other) => {
+            match format {
+                OutputFormat::Json => print_json_error(&other.to_string())?,
+                OutputFormat::Text | OutputFormat::Plain => {
+                    crate::style::print_error(&format!("wait-status failed: {other}"))
+                }
+            }
+            return Ok(3);
+        }
     };
     match format {
         OutputFormat::Json => print_json(&result)?,
@@ -66,9 +99,38 @@ pub async fn handle_pane_wait_status(
             crate::style::print_pane_wait_status(&result, states)
         }
     }
-    match result.get("outcome").and_then(|v| v.as_str()) {
-        Some("matched") => Ok(()),
-        Some("timeout") => std::process::exit(1),
-        _ => std::process::exit(3),
+    Ok(match result.get("outcome").and_then(|v| v.as_str()) {
+        Some("matched") => 0,
+        Some("timeout") => 1,
+        _ => 3,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn wait_status_exits_3_not_1_when_the_daemon_hangs_up() {
+        let (mut client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let mut len = [0u8; 4];
+            daemon.read_exact(&mut len).await.unwrap();
+            let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+            daemon.read_exact(&mut body).await.unwrap();
+            // Hang up without answering.
+        });
+        let code = wait_status_exit_code(
+            &mut client,
+            "abcd",
+            &["done".into()],
+            "top",
+            1_000,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 3, "a broken stream must not read as a timeout");
     }
 }

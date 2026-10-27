@@ -5,22 +5,6 @@ use shux_rpc::{Policy, Sensitivity};
 use crate::rpc::convert::event_to_json;
 use crate::rpc::params::{required_str, resolve_pane_ref};
 
-/// Register `events.watch` and `events.history` RPC methods.
-///
-/// `events.watch` is the agent-facing subscription: long-poll style, since
-/// the JSON-RPC Handler trait is single-response. The handler:
-///   1. Subscribes to the bus FIRST (so concurrent publishes can't slip
-///      between history snapshot and subscription start — the race that
-///      Codex and Gemini both flagged as the load-bearing correctness
-///      requirement).
-///   2. Snapshots history from `from_seq` SECOND.
-///   3. Drains the subscription with `timeout_ms` until either a matching
-///      event arrives or the deadline lapses.
-///   4. Returns history + tail, deduped by `seq` (the overlap between the
-///      two streams is real — an event published in step 2 might appear in
-///      both the history snapshot and the subscription receiver buffer).
-///
-/// `events.history` is a simple bus.history_filtered() wrapper.
 /// Self-namespaced filters are Public — a plugin can always watch its own
 /// published events. Anything broader (firehose or other plugins'
 /// namespaces) is ContentRead and needs an explicit grant.
@@ -48,6 +32,22 @@ fn event_filters(params: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Register `events.watch` and `events.history` RPC methods.
+///
+/// `events.watch` is the agent-facing subscription: long-poll style, since
+/// the JSON-RPC Handler trait is single-response. The handler:
+///   1. Subscribes to the bus FIRST (so concurrent publishes can't slip
+///      between history snapshot and subscription start — the race that
+///      Codex and Gemini both flagged as the load-bearing correctness
+///      requirement).
+///   2. Snapshots history from `from_seq` SECOND.
+///   3. Drains the subscription with `timeout_ms` until either a matching
+///      event arrives or the deadline lapses.
+///   4. Returns history + tail, deduped by `seq` (the overlap between the
+///      two streams is real — an event published in step 2 might appear in
+///      both the history snapshot and the subscription receiver buffer).
+///
+/// `events.history` is a simple bus.history_filtered() wrapper.
 pub(crate) fn register_events_methods(
     builder: shux_rpc::RouterBuilder,
     bus: shux_core::bus::EventBus,

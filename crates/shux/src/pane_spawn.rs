@@ -425,10 +425,7 @@ async fn run_pane_pty_task(
     // event would let the runner compare the crash frame instead of short-circuiting.
     // The reaper and `--wait` also key on this event, so a signalled child is now reaped
     // promptly rather than lingering to `max-runtime`.
-    // A replaced task leaves the pane to its successor: no exit status, no
-    // handle teardown, no recorder finish.
-    // The graph rejects an exit from an incarnation that no longer owns the
-    // pane, at the moment it commits — no window between check and write.
+    // The graph applies this only if `incarnation` still owns the pane.
     let exit_status = exit_code.unwrap_or(-1);
     // The process is gone: end its live records and send the final status
     // with the exit, so status_changed precedes exited. One lock hold decides
@@ -645,6 +642,13 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let incarnation = NEXT_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut status_flush = None;
+    // Before the claim: a claim clears an exited pane's exit and announces a
+    // respawn. The check under the io lock below still covers a shutdown that
+    // lands in between.
+    if shutdown.is_cancelled() {
+        discard_child(handle);
+        return Err(pane_gone(pane_id, &"the daemon is shutting down"));
+    }
     match graph.claim_pane_pty(pane_id, incarnation).await {
         Ok(true) => {}
         // A newer spawn owns the pane; it is the one that runs there.
@@ -1171,6 +1175,40 @@ mod tests {
             "a spawn for a pane that does not exist reported success"
         );
         assert!(!h.io.lock().await.writers.contains_key(&ghost));
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
+    }
+
+    /// A spawn refused because the daemon is stopping must not claim the pane
+    /// first: a claim clears an exited pane's exit and announces a respawn
+    /// that never happens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_refused_at_shutdown_leaves_the_exit_alone() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("refused-at-shutdown").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        h.graph.set_pane_exit_status(pane, 0).await.unwrap();
+        let stopping = tokio_util::sync::CancellationToken::new();
+        stopping.cancel();
+        let spawned = spawn_pane_pty(
+            pane,
+            "/tmp".into(),
+            argv,
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            stopping,
+            h.graph.clone(),
+        )
+        .await;
+        assert!(spawned.is_err(), "a spawn during shutdown reported success");
+        assert_eq!(h.graph.snapshot().panes[&pane].exit_status, Some(0));
+        let respawned = h.bus.history(50).into_iter().any(|e| {
+            matches!(e.data, shux_core::event::EventData::PaneRespawned { pane_id, .. } if pane_id == pane)
+        });
+        assert!(!respawned, "announced a respawn that never happened");
         assert_child_gone(&pid_file).await;
         h.stop().await;
     }

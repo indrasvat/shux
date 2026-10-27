@@ -18,6 +18,9 @@ use crate::rpc::params::resolve_pane_id_from_params;
 
 const WAIT_DEFAULT_MS: u64 = 30_000;
 const WAIT_MAX_MS: u64 = 600_000;
+/// Re-read even without an event: installing a VT that matches the graph's
+/// defaults (a disabled pane) changes nothing the graph would announce.
+const WAIT_REPOLL: Duration = Duration::from_millis(250);
 
 pub(crate) fn register_program_status_methods(
     builder: shux_rpc::RouterBuilder,
@@ -183,19 +186,19 @@ fn decide(
     let Some(pane) = snap.panes.get(&pane_id) else {
         return Some(json!({"outcome": "pane_gone", "pane_id": pane_id.to_string()}));
     };
+    let matched = pane.program_status.as_ref().filter(|s| wait.matches(s)).map(|summary| {
+        json!({"outcome": "matched", "pane_id": pane_id.to_string(), "summary": summary})
+    });
+    // An exited pane's last status was committed with its exit; that is final.
+    if let Some(code) = pane.exit_status {
+        return Some(matched.unwrap_or_else(
+            || json!({"outcome": "pane_gone", "pane_id": pane_id.to_string(), "exit_status": code}),
+        ));
+    }
     if terminal_enabled == Some(false) {
         return Some(json!({"outcome": "disabled", "pane_id": pane_id.to_string()}));
     }
-    if let Some(summary) = pane.program_status.as_ref().filter(|s| wait.matches(s)) {
-        return Some(json!({
-            "outcome": "matched",
-            "pane_id": pane_id.to_string(),
-            "summary": summary,
-        }));
-    }
-    pane.exit_status.map(
-        |code| json!({"outcome": "pane_gone", "pane_id": pane_id.to_string(), "exit_status": code}),
-    )
+    matched
 }
 
 async fn wait_status(
@@ -223,10 +226,12 @@ async fn wait_status(
         }
         // Wait for something about this pane (or a gap), then re-read.
         loop {
-            match tokio::time::timeout_at(deadline, events.recv()).await {
-                Err(_) => {
+            let wake = (tokio::time::Instant::now() + WAIT_REPOLL).min(deadline);
+            match tokio::time::timeout_at(wake, events.recv()).await {
+                Err(_) if wake >= deadline => {
                     return Ok(json!({"outcome": "timeout", "pane_id": pane_id.to_string()}));
                 }
+                Err(_) => break,
                 Ok(None) => return Err(RpcError::internal("event bus closed")),
                 Ok(Some(SubscriptionEvent::Lagged(_))) => break,
                 Ok(Some(SubscriptionEvent::Event(e))) => match e.data {

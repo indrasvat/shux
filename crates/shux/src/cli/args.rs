@@ -1350,7 +1350,7 @@ pub enum PaneCommand {
     /// Block until a pane's program status reaches one of the given states,
     /// or time out. Mirrors `pane.wait_status`. Exit 0 matched, 1 timeout,
     /// 2 bad arguments, 3 the pane exited, program status is off, or another
-    /// error.
+    /// error, 4 permission denied.
     #[command(name = "wait-status")]
     WaitStatus {
         /// Pane id — full UUID or any unambiguous prefix.

@@ -142,6 +142,11 @@ pub(crate) async fn apply_enabled(
     let mut flushes = Vec::new();
     for (pane_id, vt) in state.vts.iter_mut() {
         vt.set_program_status_enabled(enabled);
+        // An exited pane's final status went out with its exit; nothing may
+        // follow `pane.exited`. Its terminal still flips, for `pane.status`.
+        if !state.writers.contains_key(pane_id) {
+            continue;
+        }
         let publication = vt.program_status_publication();
         if let Some(channel) = state.status.get(pane_id) {
             let generation = publication.generation;
@@ -563,6 +568,93 @@ mod tests {
         assert_eq!(status["records"], json!([]), "re-enabling starts empty");
         h.cancel.cancel();
         let _ = walker.await;
+        finish(h).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_wait_started_before_a_disabled_terminal_exists_sees_disabled() {
+        let h = RpcHarness::new();
+        h.io.lock().await.program_status_enabled = false;
+        let (_s, _w, pane) = h.seed_session("status-late-off").await;
+        let router = h.router.clone();
+        let waiter = tokio::spawn(async move {
+            dispatch_ok(
+                &router,
+                "pane.wait_status",
+                json!({"pane_id": pane.to_string(), "state": "done", "timeout_ms": 5_000}),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        spawn_sh(&h, pane, "sleep 30").await;
+        let start = std::time::Instant::now();
+        let waited = waiter.await.unwrap();
+        assert_eq!(waited["outcome"], "disabled", "{waited}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "noticed only at the deadline"
+        );
+        finish(h).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_that_exited_publishes_nothing_after_its_exit() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-after-exit").await;
+        spawn_sh(&h, pane, r"printf '\033]7501;state=done\033\\'; sleep 0.3").await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for (flusher, generation) in apply_enabled(&h.io, false).await {
+            flusher.flush(generation).await;
+        }
+        tokio::time::sleep(FLUSH_BUDGET).await;
+        let last = h.bus.history(200).iter().rev().find_map(|e| match e.data {
+            shux_core::event::EventData::PaneStatusChanged { pane_id, .. } if pane_id == pane => {
+                Some("status")
+            }
+            shux_core::event::EventData::PaneExited { pane_id, .. } if pane_id == pane => {
+                Some("exited")
+            }
+            _ => None,
+        });
+        assert_eq!(last, Some("exited"), "a status event followed pane.exited");
+        finish(h).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_publisher_is_stopped_by_daemon_shutdown_even_after_exit() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-shutdown").await;
+        spawn_sh(&h, pane, "exit 0").await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            h.io.lock().await.status.contains_key(&pane),
+            "exit keeps the slot"
+        );
+        crate::daemon_boot::shutdown_all_pane_io(h.io.clone()).await;
+        let state = h.io.lock().await;
+        assert!(
+            state.status.is_empty(),
+            "shutdown left a status publisher running"
+        );
+        assert!(
+            state.teardown_waiters.is_empty(),
+            "shutdown left publisher joins unawaited"
+        );
+        drop(state);
         finish(h).await;
     }
 }
