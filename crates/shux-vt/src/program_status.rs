@@ -297,6 +297,105 @@ fn classify(body: &[u8], bel: bool) -> Option<CutAction> {
     (rest.is_empty() || rest.starts_with(b";")).then_some(CutAction::PromptStart)
 }
 
+/// The scanner and its vte reference, for the differential tests and the
+/// libFuzzer targets (`fuzz/`). Not part of the API.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::*;
+
+    /// Finished OSCs the scanner cuts from `chunks`, as debug strings.
+    pub fn scan(chunks: &[&[u8]]) -> Vec<String> {
+        let mut s = OscStatusScanner::default();
+        chunks
+            .iter()
+            .flat_map(|c| s.scan(c))
+            .map(|c| format!("{:?}", c.action))
+            .collect()
+    }
+
+    /// The same, decided by vte itself fed one byte at a time.
+    pub fn reference_strings(bytes: &[u8]) -> Vec<String> {
+        reference(bytes)
+            .into_iter()
+            .map(|a| format!("{a:?}"))
+            .collect()
+    }
+
+    // The byte that ended each OSC is known exactly: BEL, or ESC whose very
+    // next byte is `\` (seen as `esc_dispatch('\')` with no callback in
+    // between). Anything else ended the string malformed.
+    #[derive(Default)]
+    struct Recorder {
+        finished: Vec<CutAction>,
+        /// An OSC vte ended on ESC, waiting to see whether ST follows.
+        pending: Option<Vec<u8>>,
+        /// Set by any callback during the current byte.
+        other: bool,
+        dispatched: Option<(Vec<u8>, bool)>,
+        st: bool,
+    }
+
+    impl vte::Perform for Recorder {
+        fn print(&mut self, _: char) {
+            self.other = true;
+        }
+        fn execute(&mut self, _: u8) {
+            self.other = true;
+        }
+        fn hook(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {
+            self.other = true;
+        }
+        fn put(&mut self, _: u8) {
+            self.other = true;
+        }
+        fn unhook(&mut self) {
+            self.other = true;
+        }
+        fn osc_dispatch(&mut self, params: &[&[u8]], bell: bool) {
+            self.dispatched = Some((params.join(&b';'), bell));
+        }
+        fn csi_dispatch(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {
+            self.other = true;
+        }
+        fn esc_dispatch(&mut self, intermediates: &[u8], _: bool, byte: u8) {
+            if byte == b'\\' && intermediates.is_empty() {
+                self.st = true;
+            } else {
+                self.other = true;
+            }
+        }
+    }
+
+    pub(crate) fn reference(bytes: &[u8]) -> Vec<CutAction> {
+        let mut parser = crate::parser::VtParser::new_with_size();
+        let mut r = Recorder::default();
+        for &b in bytes {
+            r.other = false;
+            r.st = false;
+            r.dispatched = None;
+            parser.advance(&mut r, &[b]);
+            if let Some(body) = r.pending.take()
+                && r.st
+                && !r.other
+                && let Some(a) = classify(&body, false)
+            {
+                r.finished.push(a);
+            }
+            if let Some((body, bell)) = r.dispatched.take() {
+                if bell {
+                    if let Some(a) = classify(&body, true) {
+                        r.finished.push(a);
+                    }
+                } else if b == 0x1b {
+                    r.pending = Some(body);
+                }
+            }
+        }
+        r.finished
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,77 +571,8 @@ mod tests {
         //! callback in between). Anything else ended the string malformed.
 
         use super::super::*;
+        use crate::program_status::fuzzing::reference;
         use proptest::prelude::*;
-
-        #[derive(Default)]
-        struct Recorder {
-            finished: Vec<CutAction>,
-            /// An OSC vte ended on ESC, waiting to see whether ST follows.
-            pending: Option<Vec<u8>>,
-            /// Set by any callback during the current byte.
-            other: bool,
-            dispatched: Option<(Vec<u8>, bool)>,
-            st: bool,
-        }
-
-        impl vte::Perform for Recorder {
-            fn print(&mut self, _: char) {
-                self.other = true;
-            }
-            fn execute(&mut self, _: u8) {
-                self.other = true;
-            }
-            fn hook(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {
-                self.other = true;
-            }
-            fn put(&mut self, _: u8) {
-                self.other = true;
-            }
-            fn unhook(&mut self) {
-                self.other = true;
-            }
-            fn osc_dispatch(&mut self, params: &[&[u8]], bell: bool) {
-                self.dispatched = Some((params.join(&b';'), bell));
-            }
-            fn csi_dispatch(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {
-                self.other = true;
-            }
-            fn esc_dispatch(&mut self, intermediates: &[u8], _: bool, byte: u8) {
-                if byte == b'\\' && intermediates.is_empty() {
-                    self.st = true;
-                } else {
-                    self.other = true;
-                }
-            }
-        }
-
-        fn reference(bytes: &[u8]) -> Vec<CutAction> {
-            let mut parser = crate::parser::VtParser::new_with_size();
-            let mut r = Recorder::default();
-            for &b in bytes {
-                r.other = false;
-                r.st = false;
-                r.dispatched = None;
-                parser.advance(&mut r, &[b]);
-                if let Some(body) = r.pending.take()
-                    && r.st
-                    && !r.other
-                    && let Some(a) = classify(&body, false)
-                {
-                    r.finished.push(a);
-                }
-                if let Some((body, bell)) = r.dispatched.take() {
-                    if bell {
-                        if let Some(a) = classify(&body, true) {
-                            r.finished.push(a);
-                        }
-                    } else if b == 0x1b {
-                        r.pending = Some(body);
-                    }
-                }
-            }
-            r.finished
-        }
 
         fn scanned(chunks: &[&[u8]]) -> Vec<CutAction> {
             let mut s = OscStatusScanner::default();

@@ -1,0 +1,46 @@
+[package]
+name = "shux-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+shux-program-status = { path = "../crates/shux-program-status" }
+shux-vt = { path = "../crates/shux-vt" }
+
+# Its own workspace: the fuzz crate needs a nightly toolchain and must never
+# join the stable workspace build.
+[workspace]
+
+[[bin]]
+name = "program_status_decode"
+path = "fuzz_targets/program_status_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "program_status_table"
+path = "fuzz_targets/program_status_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scanner_vs_vte"
+path = "fuzz_targets/scanner_vs_vte.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vt_program_status_stream"
+path = "fuzz_targets/vt_program_status_stream.rs"
+test = false
+doc = false
+bench = false

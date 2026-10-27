@@ -28,6 +28,7 @@ make check-test-groups  # nextest groups still bound what they claim
 make shellcheck         # every tracked shell script (the guards live in shell)
 make test-gui-terminal  # what a REAL GUI terminal (kitty/Xvfb) draws from shux's output
 make reap               # stop daemons this checkout leaked when a run was interrupted
+make fuzz               # libFuzzer targets in fuzz/ (FUZZ_SECONDS each); crashes land in fuzz/artifacts/
 make install / hooks    # install binary / lefthook hooks
 ```
 

@@ -777,15 +777,15 @@ check-no-bin-mods: ## Assert crates/shux/src/main.rs declares no modules (lib/bi
 check-skill-docs: ## Verify agent-facing skill gotchas match shipped CLI shapes
 	@bash scripts/check-skill-docs.sh
 
+FUZZ_SECONDS ?= 60
+FUZZ_PROGRAM_STATUS := program_status_decode program_status_table scanner_vs_vte vt_program_status_stream
+
 .PHONY: fuzz
-fuzz: ## (not wired up) — there is no fuzz/ crate in this repo yet
-	@echo "$(COLOR_YELLOW)There is no fuzz/ crate in this repository.$(COLOR_RESET)"
-	@echo ""
-	@echo "This target used to print four ready-to-run 'cargo fuzz run ...' commands"
-	@echo "for targets that do not exist; every one of them failed with"
-	@echo "'fuzz directory not found'. Planned under M3 task 056, not yet built."
-	@echo ""
-	@echo "To start: cargo install cargo-fuzz && cargo fuzz init"
+fuzz: fuzz-program-status ## Run every libFuzzer target (FUZZ_SECONDS each, default 60)
+
+.PHONY: fuzz-program-status
+fuzz-program-status: ## OSC 7501 libFuzzer targets in fuzz/ (FUZZ_SECONDS each)
+	@bash scripts/fuzz.sh $(FUZZ_SECONDS) $(FUZZ_PROGRAM_STATUS)
 
 .PHONY: setup
 setup: ## Run full dev environment setup

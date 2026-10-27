@@ -36,6 +36,9 @@ pub use graphics::image::StoredImage;
 pub use graphics::kitty::Format as ImageFormat;
 pub use grid::{CellRect, ComposedPlacement, DirtyRegion, Grid, GridConfig, Row};
 pub use parser::{MouseMode, ScrollRegion, TerminalModes, VtHandler};
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub use program_status::fuzzing;
 pub use program_status::{StatusPublication, StatusRecords};
 pub use settle::{FrameStability, frame_stability_hash};
 
