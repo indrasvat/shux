@@ -435,6 +435,9 @@ async fn run_pane_pty_task(
         let state = &mut *guard;
         match state.vts.get_mut(&pane_id) {
             Some(vt) if state.incarnations.get(&pane_id) == Some(&incarnation) => {
+                // In this lock hold: the config walker publishes only for
+                // panes with a writer, so nothing can overtake the final status.
+                state.writers.remove(&pane_id);
                 vt.note_process_exit();
                 let publication = vt.program_status_publication();
                 let update = crate::program_status::update(&publication);

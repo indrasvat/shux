@@ -224,13 +224,15 @@ async fn wait_status(
         if let Some(outcome) = decide(graph, terminal_enabled, pane_id, wait) {
             return Ok(outcome);
         }
-        // Wait for something about this pane (or a gap), then re-read.
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(json!({"outcome": "timeout", "pane_id": pane_id.to_string()}));
+        }
+        // Wait for something about this pane, a gap, or the re-read instant,
+        // then re-read. The instant is fixed per pass: other panes' events
+        // must not push it out.
+        let wake = (tokio::time::Instant::now() + WAIT_REPOLL).min(deadline);
         loop {
-            let wake = (tokio::time::Instant::now() + WAIT_REPOLL).min(deadline);
             match tokio::time::timeout_at(wake, events.recv()).await {
-                Err(_) if wake >= deadline => {
-                    return Ok(json!({"outcome": "timeout", "pane_id": pane_id.to_string()}));
-                }
                 Err(_) => break,
                 Ok(None) => return Err(RpcError::internal("event bus closed")),
                 Ok(Some(SubscriptionEvent::Lagged(_))) => break,
@@ -241,6 +243,8 @@ async fn wait_status(
                     {
                         break;
                     }
+                    // A stream of other panes' events must not outlast `wake`.
+                    _ if tokio::time::Instant::now() >= wake => break,
                     _ => {}
                 },
             }

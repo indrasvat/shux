@@ -657,4 +657,31 @@ mod tests {
         drop(state);
         finish(h).await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_wait_times_out_on_time_while_another_pane_is_busy() {
+        let h = RpcHarness::new();
+        let (_s, _w, busy) = h.seed_session("status-busy").await;
+        let (_s, _w, quiet) = h.seed_session("status-quiet").await;
+        spawn_sh(
+            &h,
+            busy,
+            r"i=0; while [ $i -lt 2000 ]; do printf '\033]7501;state=working:progress=%d\033\\' $((i % 100)); i=$((i+1)); sleep 0.02; done",
+        )
+        .await;
+        spawn_sh(&h, quiet, "sleep 30").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let start = std::time::Instant::now();
+        let waited =
+            tokio::time::timeout(Duration::from_secs(5), wait_status(&h, quiet, "error", 600))
+                .await
+                .expect("wait_status ignored its deadline while another pane was busy");
+        assert_eq!(waited["outcome"], "timeout", "{waited}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+        finish(h).await;
+    }
 }

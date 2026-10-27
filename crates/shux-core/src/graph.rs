@@ -1657,6 +1657,11 @@ impl SessionGraph {
     ) -> Result<(), GraphError> {
         let current = self.current();
         let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+        // Sealed: an exit commits the final status first; nothing follows
+        // `pane.exited` until a respawn claim clears `exit_status`.
+        if pane.exit_status.is_some() {
+            return Ok(());
+        }
         let window_id = pane.window_id;
         let session_id = current
             .windows
@@ -4621,6 +4626,47 @@ mod tests {
         let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
         graph.set_pane_exit_status_owned(pid, 9, 99, None).unwrap();
         assert_eq!(state.load().panes[&pid].exit_status, None);
+    }
+
+    #[test]
+    fn an_exited_pane_takes_no_further_status() {
+        use shux_program_status::State;
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph.claim_pane_pty(pid, 1).unwrap();
+        graph
+            .set_pane_exit_status_owned(pid, 0, 1, Some(upd(5, Some(status(State::Done)), true)))
+            .unwrap();
+        // A publication racing the exit (e.g. a config reload) lands after it.
+        graph
+            .set_pane_program_status(pid, upd(9, None, true))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid]
+                .program_status
+                .as_ref()
+                .map(|s| s.state),
+            Some(State::Done),
+            "a status after pane.exited replaced the final one"
+        );
+        let last = bus
+            .history(50)
+            .into_iter()
+            .rev()
+            .find_map(|e| match e.data {
+                EventData::PaneStatusChanged { pane_id, .. } if pane_id == pid => Some("status"),
+                EventData::PaneExited { pane_id, .. } if pane_id == pid => Some("exited"),
+                _ => None,
+            });
+        assert_eq!(last, Some("exited"));
+        // A respawn reopens it.
+        graph.claim_pane_pty(pid, 2).unwrap();
+        graph
+            .set_pane_program_status(pid, upd(10, None, true))
+            .unwrap();
+        assert_eq!(state.load().panes[&pid].program_status, None);
     }
 
     #[test]

@@ -409,6 +409,9 @@ pub(crate) async fn run_rpc_server(
     // Publish before the RPC server accepts connections, so the very first
     // pane spawn already sees `[shell]` (issue #132).
     publish_daemon_config(config_handle.clone());
+    // Before any server accepts: a pane spawned before the walker's first
+    // pass must already follow the config.
+    io_state.lock().await.program_status_enabled = config_handle.current().program_status.enabled;
     tokio::spawn(crate::program_status::run_config_walker(
         config_handle.clone(),
         io_state.clone(),
