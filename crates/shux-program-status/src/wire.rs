@@ -249,6 +249,13 @@ fn decode_text(value: &[u8], max_decoded: usize) -> Result<Option<String>, Rejec
     if value.is_empty() {
         return Ok(None);
     }
+    // `Indifferent` also accepts partial padding such as `MA=`; padding is
+    // optional, but when present it must complete the final quantum.
+    if let Some(pad) = value.iter().position(|&b| b == b'=')
+        && (!value.len().is_multiple_of(4) || value.len() - pad > 2)
+    {
+        return Err(Reject::BadText);
+    }
     let bytes = BASE64.decode(value).map_err(|_| Reject::BadText)?;
     if bytes.len() > max_decoded {
         return Err(Reject::ValueTooLong);
@@ -442,6 +449,19 @@ mod tests {
                 report(&format!("state=done:title={}", b64(ctl))),
                 Err(Reject::BadText),
                 "{ctl:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn padding_is_optional_but_must_be_complete_when_present() {
+        assert_eq!(set("state=done:title=MA").1.title.as_deref(), Some("0"));
+        assert_eq!(set("state=done:title=MA==").1.title.as_deref(), Some("0"));
+        for bad in ["MA=", "MA===", "M=A=", "=MA", "b2s=="] {
+            assert_eq!(
+                report(&format!("state=done:title={bad}")),
+                Err(Reject::BadText),
+                "{bad}"
             );
         }
     }

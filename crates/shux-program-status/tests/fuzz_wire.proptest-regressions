@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 89d7c25e3e174ed9498f2eb4ca84795c2fbdf3c09241c4476ae2664a974d1f66 # shrinks to pairs = ["state=idle", "title=b2t"], m = None
+cc 18d9c4c4ba8003c43fe1ee7f0d70240fbaad730cf051c1d7dbf8fb5d0fb66261 # shrinks to pairs = ["id=@", "state=idle"], m = None
+cc 223473b2cc4d20eaad3954926c5896d659e32326fab95a9e8550451a233d21c4 # shrinks to pairs = ["state=aA", " state = working", "title=MA==", " state = Aaa"], m = Truncate(8562300154091552757)
