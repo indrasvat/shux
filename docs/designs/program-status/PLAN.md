@@ -1,10 +1,12 @@
 # Program status (OSC 7501) — implementation plan
 
-Status: **r4**, revised after two council rounds (codex + grok). Every
+Status: **r5**, revised after three council rounds (codex + grok). Every
 finding and its disposition is in `council-review.md`.
 
 - **Round 1:** codex REJECT (22 findings), grok APPROVE-WITH-CHANGES (13).
 - **Round 2:** codex REJECT (12 new), grok APPROVE-WITH-CHANGES (16 new).
+- **Round 3:** codex REJECT (10 new, no P0), grok APPROVE-WITH-CHANGES (9
+  new, no P0).
 
 Spec: Program Status Protocol v0.4 (2026-10-10),
 <https://superlogical.com/rex/docs/build/program-status>
@@ -20,7 +22,12 @@ mutation-checked oracle):
 | `7fa4d70` | hot reload keeps the running config on a parse error (pre-existing defect) |
 | `b7248d5` | VT seam: raw-byte scanner, probe, records |
 | `e0c816b` | graph seam |
-| *(next)* | PTY-task incarnation guard (pre-existing defect, codex r2 F6) |
+| `d132105` | PTY-task incarnation guard (pre-existing defect, codex r2 F6) |
+| `9ee5736` | `enabled` observable; watermark ordering |
+| `bbbcc5c` | config: grace window for a vanished file |
+| `8275784` | tier-2 libFuzzer crate, `make fuzz` |
+| `53ce29d` | events.watch classified on the key it subscribes with (pre-existing permission bypass, codex r3 F1) |
+| *(next)* | incarnation guard completed: graph-side PTY ownership, owner-checked recorders, title re-check (codex r3 F2, grok r3 F1/F2) |
 
 ## 1. Problem
 
@@ -227,105 +234,104 @@ now matches the code.
 - **Event.** `PaneStatusChanged { …, old, new, seen, enabled }`, wire name
   `pane.status_changed`. The summaries are boxed to keep `Event` small.
 
-### 5.2 Publication path (codex r1 F5/F6/F20, r2 F5; grok r1 F11, r2 F5/F7)
+### 5.2 Publication path (codex r1 F5/F6/F20, r2 F5, r3 F3/F5–F7; grok r1 F11, r2 F5/F7, r3 F3/F5/F7)
 
-There is **one** `watch::Sender<StatusPublication>` per pane, and it
-lives for the pane, not the VT. It is created when the pane first gets a
-PTY, and it is **reused** when the VT is replaced. A replacement therefore
-`send_replace`s into the same channel instead of dropping it, which fixes
-the dropped-clear defect in grok r2 F5.
+**Lifetime.** There is one `watch::Sender<StatusPublication>` and one
+publisher task per **pane**.
+- The task is created when the pane first gets a PTY, and it gets its own
+  **pane-lifetime** cancellation token. That token is distinct from the PTY
+  task's, which a replacement cancels. VT replacement therefore never stops
+  the publisher (codex r3 F5).
+- Teardown (`teardown_panes_collecting`) and daemon shutdown cancel the
+  pane-lifetime token, drop the sender, and `await` the publisher's join
+  handle, bounded at 500 ms.
+
+**Generation-ordered slot** (grok r3 F5). Writers use
+`send_if_modified(|cur| new.generation > cur.generation)`, under the same
+io-lock hold that read the publication from the VT. An older publication
+never overwrites a newer one.
 
 ```
-pane task / walker / VT replacement ──(io lock)──► status_tx.send_replace(pub)
-                                                         │
-lifecycle callers ──► flush_tx: mpsc<Flush { min_generation, ack: oneshot }>
-                                                         ▼
-publisher task (one per pane; receiver created and borrow_and_update()d
-                before the sender is published, so no send is "before subscribe")
+publisher (receiver subscribed before the sender is published)
+  committed = 0; pending: Vec<Flush>
   loop {
-    select! {
-      _ = shutdown.cancelled()     => { publish_latest(); break }
-      r = rx.changed()             => if r.is_err() { break }   // sender dropped
-      Some(f) = flush_rx.recv()    => pending_flushes.push(f)
+    publish_latest()        // ALWAYS first: the initial value is published (codex r3 F6)
+    ack every pending flush with min_generation <= committed; keep the rest
+    select! {               // one select; nothing waits in a second park (r3 F3)
+      _ = lifetime.cancelled()  => break
+      r = rx.changed()          => if r.is_err() { break }
+      Some(f) = flush_rx.recv() => pending.push(f)
     }
-    publish_latest();                       // re-borrow: always the newest value
-    ack every pending flush whose min_generation <= committed
-    select! {                               // interruptible pacing
-      _ = sleep(100 ms) => {}
-      Some(f) = flush_rx.recv() => pending_flushes.push(f)   // skip the wait
-      _ = shutdown.cancelled() => { publish_latest(); break }
-    }
+    if pacing still running: sleep(remaining of 100 ms), interruptible by
+      lifetime / flush (a flush pushes and skips the rest of the wait)
   }
-  on exit: every pending flush's ack is dropped, so waiters see Err and move on
+  on exit: drop every pending ack (callers see Err and proceed)
 ```
 
-- **`publish_latest`.**
-  - It re-borrows the watch, so the newest value always wins.
-  - It calls `graph.set_pane_program_status` and records the generation it
-    committed.
-  - `PaneNotFound` means the pane is gone; the task then exits.
-- **Flush (lifecycle barrier).** `Flush { min_generation, ack }` is acked
-  once `committed >= min_generation`.
-  - A flush that arrives during the pacing sleep cuts the sleep short.
-  - A flush that can never be satisfied (publisher gone) is answered by the
-    dropped `ack`.
-  - Callers always wait with a timeout (500 ms) and then proceed, so a
-    stuck publisher can delay `pane.exited` by at most that long and never
-    suppress it.
-- **Shutdown.**
-  - The publisher selects on the pane's shutdown token.
-  - `teardown_panes_collecting` drops `status_tx` alongside `revisions`.
-  - Daemon shutdown cancels the token.
-  - In every case the task publishes once more if the pane still exists,
-    then returns. No leak, no `PaneNotFound` loop.
-- **Sampled semantics** are unchanged: at most 10 commits/s/pane. Events are
-  the post-batch projection, and a state shorter than one interval may never
-  appear.
+- **`publish_latest`** re-borrows the slot. It skips the call if
+  `generation <= committed`. Otherwise it calls the graph inside
+  `tokio::time::timeout(500 ms, …)` *and* a `select!` on `lifetime`, so
+  shutdown is never stuck behind a graph await (codex r3 F7).
+  - `PaneNotFound` or `GraphError::Shutdown` → exit the loop.
+  - Timeout → log, keep the value, and retry on the next turn.
+- **Flush** is for VT replacement and disable only: bounded 500 ms,
+  best-effort. Natural exit does **not** use it (next item).
+- **Initial event.** Every pane's first publication flips `enabled` from the
+  `Pane::new` default, so it fires one `pane.status_changed`. This follows
+  from making `enabled` observable (codex r3 F6). Grok r3 F7 proposed seeding
+  the pane from config to suppress it. That was declined: `Pane::new` lives
+  in `shux-core`, which has no config, and one event per pane spawn is the
+  same cardinality as `pane.created`. Documented.
 
-### 5.3 Lifecycle (codex r1 F7/F8, r2 F5/F6; grok r1 F8, r2 F5/F6)
+### 5.3 Lifecycle (codex r1 F7/F8, r2 F5/F6, r3 F2/F4; grok r1 F8, r2 F5/F6, r3 F1/F2)
 
-- **Incarnation guard** (pre-existing defect, landing first, red-first test
-  `a_replaced_pty_task_leaves_its_successor_alone`).
-  - Every spawn takes a new incarnation number and records it in
-    `PaneIoState.incarnations` under the same lock that installs its
-    handles.
-  - The PTY task checks it:
-    - **(a)** in the read arm, before touching the VT, so a read already in
-      flight when the pane was replaced cannot write the new VT;
-    - **(b)** in the resize arm;
-    - **(c)** before `set_pane_exit_status`;
-    - **(d)** before removing writers, resizers, shutdowns and `pty_done`.
-  - A replaced task touches nothing.
-  - **Reproduced on `main`:** two attaches racing to start the same pane
-    leave the pane marked exited (`Some(-1)`) while its successor runs.
-  - **Residual window, documented.** Between (c) and (d) only an explicit
-    replacement can change ownership, because spawning checks for a live
-    writer, which the exiting task still holds.
-- **Natural termination** is any exit except `RequestedTeardown` — EOF, read
-  error, response-write failure, or flush failure. If still current, the task
-  does the following:
-  1. `note_process_exit()` (after the final batch has been parsed, D9), then
-     `send_replace` (both under the io lock);
-  2. drop the lock, then `Flush { min_generation }` with the 500 ms bounded
-     wait;
-  3. `set_pane_exit_status`.
+**PTY ownership.** These pre-existing defects are fixed and landed.
+- **Incarnation number.** Every spawn draws a process-global incarnation and
+  claims the pane in **the graph** (`claim_pane_pty`) before installing
+  handles.
+- **Exit commit.** Exit goes through `set_pane_exit_status_owned(pane,
+  status, incarnation)`. The graph actor ignores it when another incarnation
+  owns the pane, at the instant it commits, so no window opens between check
+  and write (grok r3 F2).
+- **Premature exit.** A claim that finds the pane already marked exited by a
+  replaced predecessor clears `exit_status` and fires `pane.respawned`.
+- **What else checks the incarnation:**
+  - recorder tee, resize tee and finish, all inside the lock that selects the
+    sinks (codex r3 F2, grok r3 F1);
+  - the read and resize arms;
+  - handle teardown;
+  - the OSC title forward, re-checked just before the graph send.
+- **Documented residuals.**
+  - One sampled `pane.output` broadcast from a read already past its check.
+    It is transient and never stored.
+  - A title already in flight to the graph. It is overwritten by the
+    successor's first title.
+- **Tests, red first:**
+  - `a_replaced_pty_task_leaves_its_successor_alone`;
+  - `a_replaced_pty_task_does_not_finish_its_successors_recorder`;
+  - graph `an_exit_reported_by_a_replaced_pty_incarnation_is_ignored`;
+  - graph `claiming_an_exited_pane_brings_it_back`.
 
-  Consequently `pane.status_changed` precedes `pane.exited` whenever the
-  publisher is alive.
-- **Requested teardown and destroy.**
-  - The graph removes the pane and fires `PaneExited` first, and that order
-    is unchanged.
-  - `pane.exited` ends the pane's status. Late publications hit
-    `PaneNotFound` and the publisher exits.
-- **VT replacement** (respawn of a pane whose previous task is gone).
-  - Under the io lock: insert the new VT, which draws a newer generation,
-    then `send_replace({gen, None, seen: false, enabled})` on the **existing**
-    sender.
-  - Drop the lock, then `Flush` (bounded) **before** the new PTY task is
-    spawned. The graph's clear is therefore committed before the new
-    program's first byte can be parsed (codex r2 F5).
-  - If the flush times out, a short window of stale summary beside an empty
-    `pane.status` is possible; this is documented.
+**Natural exit: final status and exit in one graph command** (codex r3 F4).
+- The epilogue, if still current, calls `note_process_exit()` and reads the
+  final `StatusPublication` under the io lock.
+- It then sends `set_pane_exit_status_owned(pane, status, incarnation,
+  Some(final_status))`.
+- The actor commits the status (if its generation is newer), then the exit,
+  firing `pane.status_changed` and then `pane.exited` from one command.
+- The ordering therefore holds unconditionally. A later publisher send for
+  that generation is stale and dropped.
+- Nothing waits on the publisher, so a slow or dead publisher cannot delay
+  `pane.exited`.
+
+**Requested teardown and destroy.** The graph removes the pane and fires
+`PaneExited` first, which is unchanged. `pane.exited` ends the pane's
+status; the publisher exits on `PaneNotFound` or cancellation.
+
+**VT replacement.**
+- Under the io lock: insert the new VT (which draws a newer generation), then
+  `send_if_modified` the clear on the pane's existing sender.
+- Drop the lock, `Flush` (best-effort, 500 ms), then spawn the new PTY task.
 
 ### 5.4 Config and reload (codex r1 F6; grok r1 F5, r2 F12)
 
@@ -434,79 +440,88 @@ forward     = "auto"  # outer terminal: auto | off        (P4)
 - A reported `blocked`, of any kind, only notifies and badges. It **never**
   goes through `AUTO_DISMISS`.
 
-### 5.8 Outer terminal (P4) (codex r1 F11–F14, r2 F9–F11; grok r1 F2/F10, r2 F10/F14)
+### 5.8 Outer terminal (P4) (codex r1 F11–F14, r2 F9–F11, r3 F8/F10; grok r1 F2/F10, r2 F10/F14, r3 F4)
 
-- **When the probe runs.** `forward = "auto"` probes only when **the attach
-  input source and stdout are the same tty**.
-  - crossterm reads `/dev/tty` when stdin is not a tty
-    (`crossterm-0.29/src/terminal/sys/file_descriptor.rs:123-153`), so the
-    probe resolves the same descriptor crossterm will use and writes to that
-    terminal.
-  - With piped stdin, redirected stdout, or SSH without a pty, the probe is
-    skipped and nothing is forwarded.
-- **Raw mode ownership.** One `TerminalGuard` owns raw mode from **before the
-  probe through the whole attach session**. It is entered before `connect`
-  and restored on connect failure, `AttachReady::Error`, handshake error,
-  panic (via the existing hook) and SIGINT/SIGTERM/SIGHUP (via the shutdown
-  future installed *before* raw mode). The probe never returns to cooked
-  mode mid-attach, so a late reply cannot echo.
-- **Reading replies.**
-  - The probe reads until DA1 or a 300 ms deadline.
-  - Bytes that are not part of the reply are injected at the head of the
-    input stream the attach input loop reads, not a side buffer.
-  - Late or partial replies are recognised and swallowed by the attach
-    input parser: `ESC ] 7501 ; ? …` up to ST/BEL, and a DA1 reply while a
-    probe is outstanding. They are never forwarded to a pane as keystrokes.
-- **Capability.** `AttachHello.program_status: bool`, `#[serde(default)]`.
-  The probe's bytes never touch the attach socket.
-- **Namespace.**
-  - `shux-<attach16>`: a 64-bit random token per attach connection, which
-    removes the round-2 birthday note.
-  - Pane records are `shux-<attach16>/<pane32>`.
-  - The session aggregate is the `shux-<attach16>` record itself.
-- **Record cap.** ≤ 64 records including the aggregate.
-  - When a 65th pane would be added, the least-recently-changed **pane
-    record** is evicted with `clear:id=shux-<attach16>/<pane32>`.
-  - The aggregate is **never** cleared to make room. Clearing it would remove
-    every child.
-- **No program text leaves shux.** Records carry state, kind, progress and
-  app. `title` is the shux pane display title after `sanitize_for_display`,
-  **truncated at a UTF-8 boundary to ≤ 192 bytes**. Every encoded report is
-  run back through `wire::decode` before emission, and is dropped (with a
-  debug log) if it does not round-trip. `msg` is never forwarded (codex r2
-  F11).
-- **Emission.**
-  - Changed records only, batched every 250 ms, per connection.
-  - Pane removal is learned from graph `PaneExited` events and clears that
-    pane's record.
-  - Detach or disable clears `shux-<attach16>`.
+**One owner of the tty.**
+- The attach client resolves crossterm's input descriptor exactly as
+  crossterm does: stdin if it is a tty, else `/dev/tty`. It compares
+  `st_dev`/`st_ino` with stdout.
+- The probe runs only when they are the same terminal and `forward = "auto"`.
+  Otherwise there is no probe and no forwarding.
 
-### 5.9 Stale guard (D8, P2, **opt-in**, documented false-deletion risk) (codex r1 F9/F10, r2 F8; grok r1 F3/F4, r2 F9)
+**Raw mode from probe to detach** (codex r3 F8, grok r3 F4).
+1. Signal handlers for SIGINT, SIGTERM and SIGHUP are registered
+   *synchronously* before raw mode, through `signal-hook`'s self-pipe.
+2. One `TerminalGuard` enters raw mode before the probe and is the only thing
+   that leaves it. That happens on connect failure, `AttachReady::Error`, a
+   handshake error, panic (the existing hook), a signal, or detach.
+3. The probe never re-enters cooked mode. `enable_raw_mode` is process-global,
+   so a nested guard would clear the session's raw mode.
 
-- **The heuristic.**
-  - **Origin tags.** The crate keeps an opaque per-entry `origin: u64` (added
-    in P2). `drop_origin(tag)` removes only working, blocked and idle entries
-    carrying that tag.
-  - **Sampling.** `tcgetpgrp(master)` is sampled **before and after** each
-    read batch is fed to the VT. If the two samples differ, or either call
-    errors, every report in that batch gets tag 0, which is never swept. This
-    closes "the job exited and the shell took the foreground before the read
-    returned" (grok r2 F9). pgid ≤ 1 → tag 0. The shell's own pgid → tag 0.
-  - **Sweep.** A separate 2 s task, off the io lock and off the biased
-    `select!`. Only `ESRCH` from `kill(-pgid, 0)` drops the tagged records.
-- **Why opt-in** (`stale_guard = false` by default, codex r2 F8). Even with
-  stability sampling, a **background** writer that reports while another job
-  holds the foreground gets that job's tag, and loses its live records when
-  that job exits. That is false deletion, not fail-safe, and the docs say
-  so.
-- **The stuck-badge cost of leaving it off is bounded.**
-  - Claude Code and Codex send `state=clear` on exit (measured).
-  - Shells with OSC 133 clear on the next prompt.
-  - What remains is a program killed hard in a shell without 133. Its badge
-    persists until the next report, clear, RIS or pane exit.
-- **Tests.** Background-writer and foreground-handoff cases exist to
-  *document* the false deletion with `stale_guard` on, and to prove nothing
-  is deleted with it off.
+**The probe itself.** It reads that fd *before* the crossterm event thread
+exists.
+- It writes `OSC 7501;? ST` and `CSI c`, then reads until the **DA1 reply**
+  or a 2 s deadline. Claude Code uses the same sentinel and deadline.
+- A terminal answers queries in order, so once DA1 arrives no 7501 reply can
+  follow. That removes "late replies" by construction.
+- If DA1 never arrives, forwarding is off for this attach. The residual risk,
+  that a terminal answering neither DA1 nor in order could later leak reply
+  bytes as keys, is documented.
+- Any byte that is not part of the two replies was typed by the user during
+  the probe. It is sent to the daemon **verbatim as `AttachClientFrame::Input
+  { data }`** (raw key bytes) right after `AttachReady`, before the crossterm
+  thread starts.
+  - No crossterm injection API is needed.
+  - Bytes typed in that window bypass client-side prefix handling, which is
+    documented.
+
+**Capability and namespace.**
+- `AttachHello.program_status: bool`, `#[serde(default)]`.
+- The namespace is `shux-<attach16>`, a 64-bit random token per attach.
+  Pane records are `shux-<attach16>/<pane32>`; the aggregate is
+  `shux-<attach16>`.
+
+**Record cap** (codex r3 F10). At most **63 pane records plus the aggregate**
+(64 total). Before inserting pane record 64, the least-recently-changed pane
+record is cleared by its own id. The aggregate is never cleared to make room.
+
+**No program text leaves shux.** Records carry state, kind, progress and app.
+`title` is the sanitized shux pane title, truncated at a UTF-8 boundary to
+≤ 192 bytes. Every report round-trips through `wire::decode` before
+emission. `msg` is never forwarded.
+
+**Emission.** Changed records only, batched every 250 ms per connection.
+Pane removal comes from graph `PaneExited`. Detach or disable clears
+`shux-<attach16>`.
+
+### 5.9 Stale guard (D8, P2, **opt-in**, documented false-deletion risk) (codex r1 F9/F10, r2 F8, r3 F9; grok r1 F3/F4, r2 F9, r3 F6)
+
+**Origin tags.** The crate keeps an opaque per-entry `origin: u64`.
+`drop_origin(tag)` removes only working, blocked and idle entries with that
+tag.
+
+**Provenance** (codex r3 F9, grok r3 F6).
+- The scanner records `tcgetpgrp(master)` when each OSC *opens* and again when
+  it *finishes*. Sequences can span reads, so the samples travel with the
+  scanner state.
+- The daemon samples once more before and once after the batch.
+- The report is tagged only if all those samples agree. Otherwise, or on any
+  error, it gets tag 0, which is never swept.
+- Retagging happens **before** the io lock is released, so no entry ever
+  carries an unconfirmed tag.
+- pgid ≤ 1 and the shell's own pgid → tag 0.
+
+**Sweep.** A separate 2 s task, off the io lock. Only `ESRCH` from
+`kill(-pgid, 0)` removes records.
+
+**What sampling cannot do.** It cannot establish authorship.
+- A background writer, or a foreground job's queued output read after
+  another job took the foreground, can be misattributed and later
+  **falsely deleted**.
+- r4's claim that sampling closes the handoff case is withdrawn.
+- That is why `stale_guard` is **off by default**.
+- Tests document the queued-output and background-writer misattribution
+  with the guard on, and prove no deletion with it off.
 
 ## 6. Phases → PRs
 
@@ -628,7 +643,7 @@ that touches the parser, the scanner or the table.
 **Tier 2 — deep, libFuzzer.**
 - **Crate.** A `fuzz/` cargo-fuzz crate. It wires up the `make fuzz`
   placeholder (`Makefile:780`) as `make fuzz-program-status
-  FUZZ_SECONDS=600`. Nightly is pinned for that crate only.
+  FUZZ_SECONDS=600` (landed, `8275784`). `-s none` gives libFuzzer coverage on the pinned stable toolchain; no nightly.
 - **Targets.** `program_status_decode`, `program_status_table`,
   `vt_program_status_stream` (the input chooses the chunk splits), and
   `scanner_vs_vte`.

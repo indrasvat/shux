@@ -123,3 +123,37 @@ was fixed.
 | F14 | P2 | 64-cap eviction could wipe all | Evict LRU pane record by its own id; never clear the aggregate; 64-bit attach token (§5.8) |
 | F15 | P3 | BEL payload off-by-one | Documented (spec permits lower limits) (§5.1) |
 | F16 | P2 | Plan said `serde(default)` | Plan says `serde(skip)`, matching code and test |
+
+## Round 3 (plan r4 → r5), 2026-10-27
+
+No P0 from either reviewer. Two pre-existing defects found by this round
+were reproduced and fixed before any plan text changed.
+
+### codex — REJECT (no P0)
+
+| # | Sev | Finding | Disposition |
+|---|---|---|---|
+| F1 | P1 | `events.watch` policy reads `filters`, handler reads `filter` → Public firehose | **Pre-existing, reproduced, fixed** (`53ce29d`): one parser shared by policy and handlers; surface pin corrected |
+| F2 | P1 | Incarnation guard gaps: tee before check, unconditional recorder finish, stale bool across graph await, OSC title | Graph-side PTY ownership (`claim_pane_pty`, `set_pane_exit_status_owned`), owner-checked tee/finish/resize-tee, title re-check; red-first recorder test |
+| F3 | P2 | Flush received during pacing never acked | Single-select loop: publish → ack → select; flush interrupts pacing (§5.2) |
+| F4 | P1 | Exit ordering vs 500 ms timeout | Final status + exit committed in one graph command; no wait on publisher (§5.3) |
+| F5 | P1 | Reused sender vs PTY-token-tied publisher | Pane-lifetime token for the publisher; replacement cancels only the PTY task (§5.2) |
+| F6 | P1 | Initial value consumed unpublished | Publisher publishes first, before any wait (§5.2) |
+| F7 | P2 | Publisher shutdown unbounded inside graph await | `publish_latest` bounded + cancellation-aware; `Shutdown` ends the loop; teardown awaits the join handle (§5.2) |
+| F8 | P1 | P4 has no raw-input seam in crossterm | Probe before the crossterm thread; DA1 sentinel removes late replies; probe-window bytes sent verbatim as `Input{data}`; synchronous signal registration (§5.8) |
+| F9 | P2 | D8 provenance across fragments; handoff claim too strong | Samples at OSC open + finish + batch edges; retag before unlock; claim withdrawn; stays opt-in (§5.9) |
+| F10 | P2 | 65th-pane eviction exceeds 64 | 63 pane records + aggregate (§5.8) |
+
+### grok — APPROVE-WITH-CHANGES (no P0)
+
+| # | Sev | Finding | Disposition |
+|---|---|---|---|
+| F1 | P1 | Replaced task tees/finishes recorders, publishes title | = codex F2 |
+| F2 | P1 | Exit-status check stale across graph await | = codex F2 (graph-side ownership; red-first graph tests) |
+| F3 | P1 | Flush ack / shutdown / `Shutdown` handling | = codex F3/F7 |
+| F4 | P1 | No stream to inject probe bytes into | = codex F8 |
+| F5 | P2 | `send_replace` last-write-wins | `send_if_modified` on generation, under the same io-lock hold (§5.2) |
+| F6 | P2 | D8 before/after sample cannot retag | = codex F9 |
+| F7 | P2 | `enabled` fires an event for every new pane | **Declined** with reason: core has no config; one event per spawn, same cardinality as `pane.created`; documented (§5.2) |
+| F8 | P2 | Watermark test cannot catch the regression | `an_equal_publication_still_moves_the_watermark` (gen 10 → 15 equal → 12 stale); mutation-checked |
+| F9 | P3 | `status_generations` pruned only on publish | Every spawn's `claim_pane_pty` and every publication prune both side maps; bounded by panes since the last spawn |
