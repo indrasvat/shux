@@ -143,6 +143,12 @@ setup-bench: ## Install hyperfine, the benchmark harness `make bench-test-suite`
 setup-deny: ## Install cargo-deny (pre-built binary; seconds, not minutes)
 	@bash scripts/ensure-deny.sh
 
+.PHONY: check-target-hygiene
+check-target-hygiene: ## Fail fast on build dirs that grow without bound (stale .o in deps); prove the bounded runner
+	@bash scripts/check-target-hygiene-selftest.sh
+	@bash scripts/run-bounded-selftest.sh
+	@bash scripts/check-target-hygiene.sh
+
 .PHONY: check-ci-parity
 check-ci-parity: nextest-ready ## Run the cargo-output parsers under CI's environment (colour on)
 	@bash scripts/check-ci-parity.sh
@@ -203,16 +209,16 @@ test-verbose: nextest-ready ## Run tests with output visible
 	@echo "$(COLOR_BLUE)▶ Running tests (verbose)...$(COLOR_RESET)"
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) --workspace --no-capture
 
+.PHONY: test-focus
+test-focus: nextest-ready ## Run one crate's tests matching a filter: PKG=<crate> FILTER=<nextest filter>
+	@test -n "$(PKG)" || { echo "test-focus: PKG=<crate> is required" >&2; exit 2; }
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p $(PKG) $(FILTER)
+
 .PHONY: test-lib
 test-lib: nextest-ready ## Run library tests only
 	@echo "$(COLOR_BLUE)▶ Running library tests...$(COLOR_RESET)"
 	@$(NEXTEST_RUN) --workspace --lib
 	@echo "$(COLOR_GREEN)✓ Library tests passed$(COLOR_RESET)"
-
-.PHONY: test-focus
-test-focus: nextest-ready ## Run one crate's tests matching a filter: PKG=<crate> FILTER=<nextest filter>
-	@test -n "$(PKG)" || { echo "test-focus: PKG=<crate> is required" >&2; exit 2; }
-	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p $(PKG) $(FILTER)
 
 .PHONY: test-vt
 test-vt: nextest-ready ## Run focused virtual terminal tests; optionally pass FILTER=<test-name>
@@ -710,8 +716,14 @@ fmt: ## Format all code
 	@cargo fmt --all
 	@echo "$(COLOR_GREEN)✓ Formatting complete$(COLOR_RESET)"
 
+.PHONY: check-after-hygiene
+check-after-hygiene: lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods
+
 .PHONY: check
-check: hooks-check lint shellcheck check-darwin test check-test-groups check-test-inventory check-ci-parity test-shux-leak-guard test-agent-review-guard check-tui-qa check-gate-docs check-skill-docs check-lens-frozen check-no-bin-mods ## Run lint + test + process/QA guards (what pre-commit runs)
+check: hooks-check check-target-hygiene ## Run lint + test + process/QA guards (what pre-commit runs)
+	@# A sub-make, not more prerequisites: under -j siblings start together, and
+	@# nothing may build before the hygiene guard has passed.
+	@$(MAKE) --no-print-directory check-after-hygiene
 	@echo ""
 	@echo "$(COLOR_GREEN)$(COLOR_BOLD)✓ All checks passed!$(COLOR_RESET)"
 	@echo ""
@@ -820,7 +832,7 @@ doc: ## Build documentation
 .PHONY: clean
 clean: ## Clean build artifacts
 	@echo "$(COLOR_BLUE)▶ Cleaning...$(COLOR_RESET)"
-	@cargo clean
+	@bash scripts/check-target-hygiene.sh --clean
 	@rm -rf $(COVERAGE_DIR) lcov.info artifacts staging
 	@echo "$(COLOR_GREEN)✓ Cleaned$(COLOR_RESET)"
 

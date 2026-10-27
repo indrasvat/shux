@@ -61,6 +61,13 @@ if ! command -v cargo-nextest >/dev/null 2>&1; then
   exit 2
 fi
 
+# Bounds `nextest list` after its untimed build; 0 or junk would disable it.
+LIST_TIMEOUT="${NEXTEST_LIST_TIMEOUT:-300}"
+if ! [[ "${LIST_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: NEXTEST_LIST_TIMEOUT='${LIST_TIMEOUT}' must be a positive integer" >&2
+  exit 2
+fi
+
 CACHE_DIR="${REPO_ROOT}/.shux/out/test-inventory"
 mkdir -p "${CACHE_DIR}"
 
@@ -112,7 +119,31 @@ list_tests() {
   # parser that only sees the uncoloured form is a guard that only fails locally.
   # stderr is left alone on purpose — a compile failure here must be readable,
   # not swallowed into an empty list.
-  cargo nextest list --workspace --color never | normalize
+  # Packed even for a base commit that predates the setting, or this cache dir
+  # keeps every stale .o (see scripts/check-target-hygiene.sh). Build untimed
+  # (a cold build is legitimately slow), then bound the listing. The listing
+  # reuses the build's metadata, so it never waits on cargo's build lock: a
+  # timeout there means a test binary stuck answering --list.
+  local meta raw rc=0
+  meta="$(mktemp -d "${TMPDIR:-/tmp}/shux-test-inventory-meta-XXXXXX")"
+  if ! CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=packed cargo nextest list --workspace --color never \
+      --list-type binaries-only --message-format json >"${meta}/binaries.json" \
+    || ! cargo metadata --format-version 1 --all-features --no-deps >"${meta}/cargo.json"; then
+    find "${meta}" -delete
+    echo "error: building the workspace for \`nextest list\` failed (see cargo's output above)" >&2
+    return 1
+  fi
+  raw="$(bash "${REPO_ROOT}/scripts/run-bounded.sh" "${LIST_TIMEOUT}" cargo nextest list \
+    --binaries-metadata "${meta}/binaries.json" --cargo-metadata "${meta}/cargo.json" \
+    --color never)" || rc=$?
+  find "${meta}" -delete
+  if [[ "${rc}" -eq 124 ]]; then
+    echo "error: a test binary is stuck answering --list (the build already ran)." >&2
+    echo "  Run \`make check-target-hygiene\`; if that passes, look for processes in disk wait." >&2
+    return 1
+  fi
+  [[ "${rc}" -eq 0 ]] || return "${rc}"
+  printf '%s\n' "${raw}" | normalize
 }
 
 # `--write-baseline`: publish THIS commit's list so later runs can compare

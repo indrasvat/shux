@@ -17,6 +17,15 @@ shux-vt = { path = "../crates/shux-vt" }
 # join the stable workspace build.
 [workspace]
 
+# cargo fuzz builds release with debug info; "packed" stops macOS keeping every
+# stale .o in deps (see scripts/check-target-hygiene.sh).
+[profile.dev]
+split-debuginfo = "packed"
+
+[profile.release]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+
 [[bin]]
 name = "program_status_decode"
 path = "fuzz_targets/program_status_decode.rs"

@@ -11,3 +11,7 @@ shux-raster = { path = "../../crates/shux-raster" }
 shux-vt = { path = "../../crates/shux-vt" }
 
 [workspace]
+
+# See scripts/check-target-hygiene.sh.
+[profile.dev]
+split-debuginfo = "packed"

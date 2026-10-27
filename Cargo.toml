@@ -82,6 +82,11 @@ sha2 = "0.11"
 # ── Build profiles ────────────────────────────────────────────────────────
 [profile.dev]
 debug = "line-tables-only"
+# macOS defaults to "unpacked", which keeps every codegen unit's .o in
+# target/*/deps and never prunes stale ones: ~25 per crate per rebuild, until
+# the directory holds ~900k files and every build, list and exec crawls.
+# "packed" keeps the backtrace line tables in a .dSYM and leaves no .o behind.
+split-debuginfo = "packed"
 
 [profile.dev.package."*"]
 opt-level = 2

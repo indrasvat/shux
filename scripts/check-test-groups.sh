@@ -67,10 +67,13 @@ export MAX_GROUP_PERCENT="${MAX_GROUP_PERCENT:-30}"
 # worst shape a guard can have. `make check-ci-parity` runs this under CI's
 # environment so that never regresses silently.
 exec python3 - "$@" <<'PY'
+import atexit
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from itertools import combinations
 
@@ -82,6 +85,17 @@ except ValueError:
     sys.exit(2)
 if not 0 < MAX_GROUP_PERCENT <= 100:
     print(f"error: MAX_GROUP_PERCENT={MAX_GROUP_PERCENT} must be in 1..100", file=sys.stderr)
+    sys.exit(2)
+
+# Bounds each `nextest list` AFTER the untimed build below: listing only execs
+# already-built binaries with --list, which takes seconds when healthy.
+_raw_timeout = os.environ.get("NEXTEST_LIST_TIMEOUT", "300")
+try:
+    LIST_TIMEOUT = int(_raw_timeout)
+except ValueError:
+    LIST_TIMEOUT = 0
+if LIST_TIMEOUT <= 0:
+    print(f"error: NEXTEST_LIST_TIMEOUT={_raw_timeout!r} must be a positive integer", file=sys.stderr)
     sys.exit(2)
 
 RED, GREEN, BLUE, OFF = "\033[31m", "\033[32m", "\033[34m", "\033[0m"
@@ -106,15 +120,24 @@ def matched_tests(filterset):
     resolved by first-match-wins — the very step that hides overlap. Each
     override is evaluated independently so a collision is visible.
     """
+    # run-bounded kills every descendant on expiry; a plain subprocess
+    # timeout would leave the stuck test binary behind.
     proc = subprocess.run(
         [
-            "cargo", "nextest", "list", "--workspace",
+            "bash", "scripts/run-bounded.sh", str(LIST_TIMEOUT),
+            "cargo", "nextest", "list",
+            "--binaries-metadata", BINARIES_METADATA, "--cargo-metadata", CARGO_METADATA,
             "--color", "never", "--message-format", "json",
             "-E", filterset,
         ],
         capture_output=True,
         text=True,
     )
+    if proc.returncode == 124:
+        err(f"`cargo nextest list -E` did not finish in {LIST_TIMEOUT}s; the build already ran, so a")
+        print("      test binary is stuck answering --list. Run `make check-target-hygiene`;", file=sys.stderr)
+        print("      if that passes, look for processes in disk wait (`ps -Ao stat,command | grep ' U'`).", file=sys.stderr)
+        sys.exit(1)
     if proc.returncode != 0:
         # nextest validates the WHOLE config before it evaluates `-E`, so a bad
         # filterset in any override fails every call here, including `all()`.
@@ -234,6 +257,27 @@ def union_operands(text):
 
 
 print(f"{BLUE}▶ nextest test-group membership{OFF}")
+
+# Build without executing any test binary, untimed: a cold build is legitimately
+# slow, and its errors must stay readable. The timed listings then reuse this
+# build's metadata, so they never take cargo's build lock: waiting on another
+# build is not a test binary stuck answering --list.
+_scratch = tempfile.mkdtemp(prefix="shux-test-groups-")
+atexit.register(shutil.rmtree, _scratch, True)
+BINARIES_METADATA = os.path.join(_scratch, "binaries-metadata.json")
+CARGO_METADATA = os.path.join(_scratch, "cargo-metadata.json")
+with open(BINARIES_METADATA, "w") as bm, open(CARGO_METADATA, "w") as cm:
+    built = subprocess.run(
+        ["cargo", "nextest", "list", "--workspace", "--color", "never",
+         "--list-type", "binaries-only", "--message-format", "json"],
+        stdout=bm,
+    ).returncode == 0 and subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--all-features", "--no-deps"],
+        stdout=cm,
+    ).returncode == 0
+if not built:
+    err("building the workspace for `nextest list` failed (see cargo's output above)")
+    sys.exit(1)
 
 try:
     with open(".config/nextest.toml", "rb") as fh:

@@ -11,5 +11,9 @@ publish = false
 
 [workspace]
 
+# See scripts/check-target-hygiene.sh.
+[profile.dev]
+split-debuginfo = "packed"
+
 [dependencies]
 ratatui = "0.30"
