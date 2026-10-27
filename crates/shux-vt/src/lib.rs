@@ -547,11 +547,14 @@ impl VirtualTerminal {
     pub fn set_program_status_enabled(&mut self, enabled: bool) {
         match (enabled, self.program_status.is_some()) {
             (true, false) => self.program_status = Some(program_status::VtProgramStatus::new()),
-            (false, true) => {
+            // Off (again or for the first time) always draws a fresh
+            // generation: a terminal turned off before an await must still
+            // outrank whatever its predecessor published meanwhile.
+            (false, _) => {
                 self.program_status = None;
                 self.status_disabled_generation = program_status::disabled_generation();
             }
-            _ => {}
+            (true, true) => {}
         }
     }
 

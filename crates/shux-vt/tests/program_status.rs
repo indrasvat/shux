@@ -254,3 +254,52 @@ fn toggling_always_moves_the_generation_forward() {
         "a replacement terminal outranks the old one"
     );
 }
+
+/// One `process()` call over output dense with OSC strings (hyperlinks) must
+/// cost linear time, status on or off: the scanner runs either way.
+#[test]
+fn osc_dense_output_scans_in_linear_time() {
+    fn cost_ns(repeats: usize) -> u128 {
+        let chunk = b"\x1b]8;;f\x07x\x1b]8;;\x07 ".repeat(repeats);
+        let mut vt = VirtualTerminal::new(24, 80);
+        let start = std::time::Instant::now();
+        vt.process(&chunk);
+        start.elapsed().as_nanos()
+    }
+    let (small, large) = (2_000usize, 16_000usize);
+    cost_ns(small);
+    cost_ns(large);
+    let (mut s, mut l) = (u128::MAX, u128::MAX);
+    for _ in 0..5 {
+        s = s.min(cost_ns(small));
+        l = l.min(cost_ns(large));
+    }
+    let ratio = l as f64 / s as f64;
+    let growth = (large / small) as f64;
+    eprintln!(
+        "OSC-dense scan grows {ratio:.1}x for {growth:.0}x input (linear ~{growth:.0}x, quadratic ~{:.0}x)",
+        growth * growth
+    );
+    assert!(
+        ratio < growth * 3.0,
+        "scan cost grew {ratio:.1}x for {growth:.0}x input: quadratic, not linear"
+    );
+}
+
+/// Re-asserting "off" draws a fresh generation, so a terminal made off before
+/// an await still outranks anything its predecessor published meanwhile.
+#[test]
+fn reasserting_off_moves_the_generation_forward() {
+    let mut vt = VirtualTerminal::new(4, 20);
+    let before = vt.program_status_publication().generation;
+    let mut other = VirtualTerminal::new(4, 20);
+    other.set_program_status_enabled(true); // the predecessor publishes meanwhile
+    let theirs = other.program_status_publication().generation;
+    vt.set_program_status_enabled(false);
+    let after = vt.program_status_publication().generation;
+    assert!(theirs > before);
+    assert!(
+        after > theirs,
+        "an already-off terminal kept its old generation"
+    );
+}

@@ -204,12 +204,13 @@ impl OscStatusScanner {
                     }
                 }
                 ScanState::Osc => {
-                    // Only BEL, CAN, SUB and ESC leave an OSC string.
-                    match memchr::memchr2(0x07, 0x1b, &chunk[i..])
-                        .into_iter()
-                        .chain(memchr::memchr2(0x18, 0x1a, &chunk[i..]))
-                        .min()
-                    {
+                    // Only BEL, CAN, SUB and ESC leave an OSC string. CAN/SUB
+                    // are sought only before the first BEL/ESC, so each byte
+                    // is examined at most twice per chunk.
+                    let rest = &chunk[i..];
+                    let stop = memchr::memchr2(0x07, 0x1b, rest);
+                    let window = &rest[..stop.unwrap_or(rest.len())];
+                    match memchr::memchr2(0x18, 0x1a, window).or(stop) {
                         Some(off) => {
                             self.take_body(&chunk[i..i + off]);
                             let b = chunk[i + off];

@@ -196,6 +196,7 @@ test-group = 'daemon-pty'
 filter = '''
   binary_id(=shux-vt::scroll_region_bounds) & test(=region_scroll_cost_is_linear_in_pane_height)
   + binary_id(=shux) & test(=rpc::pane_io::tests::pane_record_duration_stops_on_daemon_side)
+  + binary_id(=shux-vt::program_status) & test(=osc_dense_output_scans_in_linear_time)
 '''
 test-group = 'wall-clock'
 threads-required = "num-test-threads"
