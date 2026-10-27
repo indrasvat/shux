@@ -301,6 +301,13 @@ pub enum GraphCommand {
         title: String,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
+    SetPaneProgramStatus {
+        id: PaneId,
+        generation: u64,
+        summary: Option<shux_program_status::StatusSummary>,
+        seen: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
     SplitPane {
         target_pane: PaneId,
         direction: Direction,
@@ -354,6 +361,9 @@ pub enum GraphCommand {
 /// The authoritative session graph (single-writer owner of state).
 pub struct SessionGraph {
     state: Arc<ArcSwap<SessionGraphSnapshot>>,
+    /// Last accepted program-status generation per pane. Kept outside the
+    /// snapshot so recording one costs no snapshot clone.
+    status_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
     /// Optional event bus. When set, every successful mutation publishes a
     /// typed event to subscribers. Held as `Option` so legacy unit tests can
     /// continue to call `SessionGraph::new()` without setting up a bus.
@@ -376,6 +386,7 @@ impl SessionGraph {
         let state = Arc::new(ArcSwap::from(snapshot));
         let graph = Self {
             state: Arc::clone(&state),
+            status_generations: Default::default(),
             event_bus,
         };
         (graph, state)
@@ -1535,6 +1546,65 @@ impl SessionGraph {
         Ok(())
     }
 
+    /// Record a pane's OSC 7501 status as published by its terminal.
+    ///
+    /// Publications carry a process-global generation; one at or below the
+    /// last accepted for this pane is stale and ignored, so a summary read
+    /// before a disable or a terminal replacement can never come back.
+    /// Fires `PaneStatusChanged` only when the summary or `seen` changes.
+    pub fn set_pane_program_status(
+        &self,
+        id: PaneId,
+        generation: u64,
+        summary: Option<shux_program_status::StatusSummary>,
+        seen: bool,
+    ) -> Result<(), GraphError> {
+        let current = self.current();
+        let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+        {
+            // A poisoned lock only means a panic elsewhere mid-insert; the
+            // map is still a valid map.
+            let mut gens = self
+                .status_generations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            gens.retain(|pid, _| current.panes.contains_key(pid));
+            let last = gens.entry(id).or_insert(0);
+            if generation <= *last {
+                return Ok(());
+            }
+            *last = generation;
+        }
+        if pane.program_status == summary && pane.program_status_seen == seen {
+            return Ok(());
+        }
+        let window_id = pane.window_id;
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+        let old = pane.program_status.clone().map(Box::new);
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+        if let Some(p) = snapshot.panes.get_mut(&id) {
+            p.program_status = summary.clone();
+            p.program_status_seen = seen;
+            p.version += 1;
+        }
+        self.commit_snapshot(snapshot);
+        self.fire(EventData::PaneStatusChanged {
+            pane_id: id,
+            window_id,
+            session_id,
+            old,
+            new: summary.map(Box::new),
+            seen,
+        });
+        Ok(())
+    }
+
     /// Helper: find pane and its window_id.
     fn find_pane_window(
         &self,
@@ -2216,6 +2286,9 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::SetPaneOscTitle { id, title, reply }) => {
                         let _ = reply.send(graph.set_pane_osc_title(id, title));
                     }
+                    Some(GraphCommand::SetPaneProgramStatus { id, generation, summary, seen, reply }) => {
+                        let _ = reply.send(graph.set_pane_program_status(id, generation, summary, seen));
+                    }
                     Some(GraphCommand::SplitPane { target_pane, direction, ratio, command, reply }) => {
                         let _ = reply.send(graph.split_pane_with_command(target_pane, direction, ratio, command));
                     }
@@ -2610,6 +2683,27 @@ impl GraphHandle {
             .send(GraphCommand::SetPaneOscTitle {
                 id,
                 title,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn set_pane_program_status(
+        &self,
+        id: PaneId,
+        generation: u64,
+        summary: Option<shux_program_status::StatusSummary>,
+        seen: bool,
+    ) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::SetPaneProgramStatus {
+                id,
+                generation,
+                summary,
+                seen,
                 reply: tx,
             })
             .await
@@ -4297,6 +4391,127 @@ mod tests {
         }
         // Pane still in the graph since destroy was rejected.
         assert!(state.load().panes.contains_key(&pid));
+    }
+
+    fn status(state: shux_program_status::State) -> shux_program_status::StatusSummary {
+        shux_program_status::StatusSummary {
+            state,
+            kind: None,
+            progress: None,
+            app: Some("claude-code".into()),
+            id: None,
+            counts: Default::default(),
+        }
+    }
+
+    fn status_events(bus: &crate::bus::EventBus) -> Vec<EventData> {
+        bus.history(100)
+            .into_iter()
+            .map(|e| e.data)
+            .filter(|d| matches!(d, EventData::PaneStatusChanged { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn program_status_records_the_summary_and_fires_on_change_only() {
+        use shux_program_status::State;
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+
+        graph
+            .set_pane_program_status(pid, 10, Some(status(State::Working)), true)
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            Some(status(State::Working))
+        );
+        assert!(state.load().panes[&pid].program_status_seen);
+        // A newer generation with the same summary (a msg-only change) is
+        // accepted silently.
+        let version = state.load().version;
+        graph
+            .set_pane_program_status(pid, 11, Some(status(State::Working)), true)
+            .unwrap();
+        assert_eq!(
+            state.load().version,
+            version,
+            "no commit for an equal summary"
+        );
+        graph
+            .set_pane_program_status(pid, 12, Some(status(State::Done)), true)
+            .unwrap();
+
+        let events = status_events(&bus);
+        assert_eq!(events.len(), 2);
+        match &events[1] {
+            EventData::PaneStatusChanged { old, new, seen, .. } => {
+                assert_eq!(old.as_deref(), Some(&status(State::Working)));
+                assert_eq!(new.as_deref(), Some(&status(State::Done)));
+                assert!(*seen);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn program_status_ignores_stale_generations() {
+        use shux_program_status::State;
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+
+        graph.set_pane_program_status(pid, 20, None, false).unwrap();
+        // A summary read before the disable at generation 20 arrives late.
+        graph
+            .set_pane_program_status(pid, 19, Some(status(State::Blocked)), true)
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            None,
+            "stale must not resurrect"
+        );
+        graph
+            .set_pane_program_status(pid, 20, Some(status(State::Blocked)), true)
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            None,
+            "equal generation is stale too"
+        );
+        graph
+            .set_pane_program_status(pid, 21, Some(status(State::Blocked)), true)
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            Some(status(State::Blocked))
+        );
+    }
+
+    #[test]
+    fn program_status_for_a_missing_pane_is_not_found() {
+        let (graph, _state) = SessionGraph::new();
+        let err = graph
+            .set_pane_program_status(PaneId::new(), 1, None, false)
+            .unwrap_err();
+        assert!(matches!(err, GraphError::PaneNotFound(_)));
+    }
+
+    #[test]
+    fn program_status_is_never_serialized_with_the_pane() {
+        use shux_program_status::State;
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph
+            .set_pane_program_status(pid, 1, Some(status(State::Blocked)), true)
+            .unwrap();
+        let json = serde_json::to_string(&**state.load()).unwrap();
+        assert!(
+            !json.contains("program_status") && !json.contains("claude-code"),
+            "{json}"
+        );
     }
 
     #[test]

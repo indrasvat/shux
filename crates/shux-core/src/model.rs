@@ -207,6 +207,13 @@ pub struct Pane {
     /// Plugin that created this entity. See [`Session::created_by_plugin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_plugin: Option<PluginId>,
+    /// OSC 7501 status of the program in this pane; `None` when nothing is
+    /// reported. Never serialized: status is ContentRead (`pane.status`).
+    #[serde(skip)]
+    pub program_status: Option<shux_program_status::StatusSummary>,
+    /// The pane has sent OSC 7501 since its terminal was last reset.
+    #[serde(skip)]
+    pub program_status_seen: bool,
 }
 
 impl Pane {
@@ -226,6 +233,8 @@ impl Pane {
             tags: HashMap::new(),
             version: 1,
             created_by_plugin: None,
+            program_status: None,
+            program_status_seen: false,
         };
         pane.recalculate_title();
         pane

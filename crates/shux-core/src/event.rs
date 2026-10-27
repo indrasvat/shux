@@ -317,6 +317,18 @@ pub enum EventData {
         data: String,
     },
 
+    /// A pane's OSC 7501 program status changed. The summary carries no
+    /// program-authored text; `pane.status` has the full records. Sampled:
+    /// a state that lasts less than one publication interval may not appear.
+    PaneStatusChanged {
+        pane_id: PaneId,
+        window_id: WindowId,
+        session_id: SessionId,
+        old: Option<Box<shux_program_status::StatusSummary>>,
+        new: Option<Box<shux_program_status::StatusSummary>>,
+        seen: bool,
+    },
+
     /// Bell character received in a pane.
     PaneBell {
         pane_id: PaneId,
@@ -473,6 +485,7 @@ impl EventData {
             EventData::PaneCommandCompleted { .. } => "pane.command_completed",
             EventData::PaneOutput { .. } => "pane.output",
             EventData::PaneInput { .. } => "pane.input",
+            EventData::PaneStatusChanged { .. } => "pane.status_changed",
             EventData::PaneBell { .. } => "pane.bell",
             EventData::PaneTagChanged { .. } => "pane.tag_changed",
             EventData::ClientConnected { .. } => "client.connected",

@@ -1231,6 +1231,7 @@ dependencies = [
  "notify",
  "serde",
  "serde_json",
+ "shux-program-status",
  "tempfile",
  "thiserror",
  "tokio",
