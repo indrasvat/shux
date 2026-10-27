@@ -92,7 +92,7 @@ async fn run_pane_pty_task(
                     }
                     Ok(n) => {
                         let data = &buf[..n];
-                        tee_pane_recorders(&io_state, pane_id, data, &shutdown).await;
+                        tee_pane_recorders(&io_state, pane_id, Some(incarnation), data, &shutdown).await;
                         let (pulse, vt_title, bus_opt, terminal_responses) = {
                             let mut state = io_state.lock().await;
                             if !state.is_current(pane_id, incarnation) {
@@ -232,6 +232,9 @@ async fn run_pane_pty_task(
                         if vt_title != last_osc_title {
                             if let Some(t) = vt_title.clone()
                                 && !t.is_empty()
+                                // Re-checked: a replacement during this read
+                                // must not leave the old program's title.
+                                && io_state.lock().await.is_current(pane_id, incarnation)
                                     && let Err(e) =
                                         graph.set_pane_osc_title(pane_id, t).await
                                     {
@@ -345,6 +348,7 @@ async fn run_pane_pty_task(
                     tee_pane_resize_recorders(
                         &io_state,
                         pane_id,
+                        Some(incarnation),
                         req.size.cols,
                         req.size.rows,
                     )
@@ -354,7 +358,7 @@ async fn run_pane_pty_task(
         }
     }
 
-    finish_pane_recorders(&io_state, pane_id).await;
+    finish_pane_recorders(&io_state, pane_id, Some(incarnation)).await;
 
     // Reap the child cleanly so plugins and `events.history` see the
     // real exit code on `pane.exited`. The loop exits for several
@@ -418,12 +422,14 @@ async fn run_pane_pty_task(
     // The reaper and `--wait` also key on this event, so a signalled child is now reaped
     // promptly rather than lingering to `max-runtime`.
     // A replaced task leaves the pane to its successor: no exit status, no
-    // handle teardown. Spawning checks for a live writer first, which this
-    // task still holds, so ownership cannot change between here and the
-    // teardown below except by an explicit replacement — re-checked there.
-    let still_current = io_state.lock().await.is_current(pane_id, incarnation);
+    // handle teardown, no recorder finish.
+    // The graph rejects an exit from an incarnation that no longer owns the
+    // pane, at the moment it commits — no window between check and write.
     let exit_status = exit_code.unwrap_or(-1);
-    if still_current && let Err(e) = graph.set_pane_exit_status(pane_id, exit_status).await {
+    if let Err(e) = graph
+        .set_pane_exit_status_owned(pane_id, exit_status, incarnation)
+        .await
+    {
         tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
     }
 
@@ -615,6 +621,9 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
 
     static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let incarnation = NEXT_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = graph.claim_pane_pty(pane_id, incarnation).await {
+        tracing::debug!(%pane_id, error = %e, "claim_pane_pty failed (pane may be gone)");
+    }
     {
         let mut state = io_state.lock().await;
         if let Some(old) = state.shutdowns.insert(pane_id, pane_shutdown.clone()) {
@@ -919,6 +928,47 @@ mod tests {
             "successor shutdown removed"
         );
         drop(state);
+        h.stop().await;
+    }
+
+    /// A recorder the successor armed at spawn belongs to the successor; the
+    /// replaced task's exit must not finish it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_does_not_finish_its_successors_recorder() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("respawn-rec").await;
+        let dir = tempfile::tempdir().unwrap();
+        let spawn = |rec| {
+            spawn_pane_pty_with_recorder(
+                pane,
+                "/tmp".into(),
+                vec!["sleep".into(), "30".into()],
+                shux_pty::handle::PtySize::default(),
+                Vec::new(),
+                false,
+                h.io.clone(),
+                h.cancel.clone(),
+                h.graph.clone(),
+                rec,
+            )
+        };
+        spawn(None).await.unwrap();
+        let first_done = h.io.lock().await.pty_done.remove(&pane).unwrap();
+        let rec = crate::pane_record::open_cast_recorder(dir.path().join("s.cast"), 80, 24)
+            .await
+            .unwrap();
+        let outcome = rec.outcome.clone();
+        spawn(Some(rec)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_done)
+            .await
+            .expect("the replaced task finishes")
+            .ok();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            outcome.lock().unwrap().status,
+            crate::pane_record::PaneRecordStatus::Recording,
+            "the successor's recording was finished by its predecessor"
+        );
         h.stop().await;
     }
 }

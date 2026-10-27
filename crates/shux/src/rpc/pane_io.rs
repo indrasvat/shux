@@ -1959,7 +1959,7 @@ mod tests {
             payload.len() > 64 * 1024,
             "payload should exceed sampled pane.output pending cap"
         );
-        tee_pane_recorders(&harness.io, pane_id, &payload, &harness.cancel).await;
+        tee_pane_recorders(&harness.io, pane_id, None, &payload, &harness.cancel).await;
 
         let stopped = dispatch_ok(
             &harness.router,
@@ -2039,9 +2039,23 @@ mod tests {
         )
         .await;
         let recording_id = started["recording_id"].as_str().unwrap().to_string();
-        tee_pane_recorders(&harness.io, pane_id, b"before-deadline", &harness.cancel).await;
+        tee_pane_recorders(
+            &harness.io,
+            pane_id,
+            None,
+            b"before-deadline",
+            &harness.cancel,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-        tee_pane_recorders(&harness.io, pane_id, b"after-deadline", &harness.cancel).await;
+        tee_pane_recorders(
+            &harness.io,
+            pane_id,
+            None,
+            b"after-deadline",
+            &harness.cancel,
+        )
+        .await;
 
         let stopped = dispatch_ok(
             &harness.router,

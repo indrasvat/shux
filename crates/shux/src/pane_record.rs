@@ -274,9 +274,13 @@ pub(crate) async fn spawn_pane_recorder(
     Ok((tx, outcome, task))
 }
 
+/// On behalf of PTY incarnation `owner` (`None`: unconditionally), a task
+/// that no longer owns the pane tees nothing. Checked under the lock that picks
+/// the sinks, so a successor's recorders are never fed a predecessor's bytes.
 pub(crate) async fn tee_pane_recorders(
     io_state: &Arc<Mutex<PaneIoState>>,
     pane_id: shux_core::model::PaneId,
+    owner: Option<u64>,
     data: &[u8],
     shutdown: &tokio_util::sync::CancellationToken,
 ) {
@@ -285,6 +289,9 @@ pub(crate) async fn tee_pane_recorders(
         Arc<StdMutex<PaneRecordResult>>,
     )> = {
         let state = io_state.lock().await;
+        if owner.is_some_and(|inc| !state.is_current(pane_id, inc)) {
+            return;
+        }
         state
             .recorders
             .get(&pane_id)
@@ -330,9 +337,13 @@ pub(crate) async fn tee_pane_recorders(
 pub(crate) async fn finish_pane_recorders(
     io_state: &Arc<Mutex<PaneIoState>>,
     pane_id: shux_core::model::PaneId,
+    owner: Option<u64>,
 ) {
     let senders: Vec<mpsc::Sender<PaneRecordChunk>> = {
         let state = io_state.lock().await;
+        if owner.is_some_and(|inc| !state.is_current(pane_id, inc)) {
+            return;
+        }
         state
             .recorders
             .get(&pane_id)
@@ -358,11 +369,15 @@ pub(crate) async fn finish_pane_recorders(
 pub(crate) async fn tee_pane_resize_recorders(
     io_state: &Arc<Mutex<PaneIoState>>,
     pane_id: shux_core::model::PaneId,
+    owner: Option<u64>,
     cols: u16,
     rows: u16,
 ) {
     let senders: Vec<mpsc::Sender<PaneRecordChunk>> = {
         let state = io_state.lock().await;
+        if owner.is_some_and(|inc| !state.is_current(pane_id, inc)) {
+            return;
+        }
         state
             .recorders
             .get(&pane_id)
