@@ -9,6 +9,7 @@ members = [
     "crates/shux-plugin",
     "crates/shux-ui",
     "crates/shux-raster",
+    "crates/shux-program-status",
 ]
 # lens T-tier seeded-bug demo app is a standalone crate (its own Cargo.toml
 # carries an empty [workspace]); excluded so the shux workspace never builds it.
