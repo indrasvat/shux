@@ -21,6 +21,33 @@ use crate::rpc::params::{required_str, resolve_pane_ref};
 ///      both the history snapshot and the subscription receiver buffer).
 ///
 /// `events.history` is a simple bus.history_filtered() wrapper.
+/// Self-namespaced filters are Public — a plugin can always watch its own
+/// published events. Anything broader (firehose or other plugins'
+/// namespaces) is ContentRead and needs an explicit grant.
+fn watch_sensitivity(params: Option<&serde_json::Value>, plugin_id: &str) -> Sensitivity {
+    let prefix = format!("plugin.{plugin_id}.");
+    let filters = event_filters(params);
+    if !filters.is_empty() && filters.iter().all(|f| f.starts_with(&prefix)) {
+        Sensitivity::Public
+    } else {
+        Sensitivity::ContentRead
+    }
+}
+
+/// The `filter` list both the policy and the handlers act on. One parser,
+/// so the tier is always decided on what the subscription will deliver.
+fn event_filters(params: Option<&serde_json::Value>) -> Vec<String> {
+    params
+        .and_then(|p| p.get("filter"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn register_events_methods(
     builder: shux_rpc::RouterBuilder,
     bus: shux_core::bus::EventBus,
@@ -36,28 +63,7 @@ pub(crate) fn register_events_methods(
     builder
         .register_with_policy(
             "events.watch",
-            Policy::param_aware(|params, plugin_id| {
-                // Self-namespaced filters are Public — a plugin can
-                // always watch its own published events. Anything broader
-                // (firehose or other plugins' namespaces) is ContentRead
-                // and needs an explicit grant.
-                let prefix = format!("plugin.{plugin_id}.");
-                let filters = params
-                    .and_then(|p| p.get("filters"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|f| f.as_str())
-                            .map(|s| s.to_string())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                if !filters.is_empty() && filters.iter().all(|f| f.starts_with(&prefix)) {
-                    Sensitivity::Public
-                } else {
-                    Sensitivity::ContentRead
-                }
-            }),
+            Policy::param_aware(watch_sensitivity),
             move |params: Option<serde_json::Value>| {
                 let bus = bus_watch.clone();
                 async move {
@@ -75,15 +81,7 @@ pub(crate) fn register_events_methods(
                         .and_then(|v| v.as_u64())
                         .unwrap_or(5_000)
                         .min(30_000);
-                    let filters: Vec<String> = params
-                        .get("filter")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let filters = event_filters(Some(&params));
 
                     // 1. Subscribe FIRST so any publish during step 2 lands in the
                     //    receiver buffer, not the void.
@@ -178,15 +176,7 @@ pub(crate) fn register_events_methods(
                         .map(|n| n as usize)
                         .unwrap_or(50)
                         .min(1000);
-                    let filters: Vec<String> = params
-                        .get("filter")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let filters = event_filters(Some(&params));
 
                     let events = bus.history_filtered(count, &filters);
                     let json: Vec<serde_json::Value> = events.iter().map(event_to_json).collect();
@@ -304,6 +294,30 @@ pub(crate) fn register_events_methods(
 
 #[cfg(test)]
 mod tests {
+    /// The tier is decided from the same filters the subscription uses.
+    /// Classifying one key and subscribing on another let a plugin pass a
+    /// self-scoped `filters` and receive every event in the daemon.
+    #[test]
+    fn watch_is_classified_on_the_filter_it_subscribes_with() {
+        use serde_json::json;
+        use shux_rpc::Sensitivity;
+        let tier = |p: serde_json::Value| super::watch_sensitivity(Some(&p), "p");
+        assert_eq!(tier(json!({"filter": ["plugin.p."]})), Sensitivity::Public);
+        assert_eq!(
+            tier(json!({"filters": ["plugin.p."]})),
+            Sensitivity::ContentRead,
+            "an unknown key subscribes to the firehose"
+        );
+        assert_eq!(
+            tier(json!({"filters": ["plugin.p."], "filter": ["pane.status_changed"]})),
+            Sensitivity::ContentRead
+        );
+        assert_eq!(
+            tier(json!({"filter": ["plugin.p.", "pane."]})),
+            Sensitivity::ContentRead
+        );
+        assert_eq!(tier(json!({})), Sensitivity::ContentRead);
+    }
 
     use crate::rpc::test_harness::{RpcHarness, dispatch_err, dispatch_ok};
     use std::time::Duration;
