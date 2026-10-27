@@ -315,8 +315,12 @@ impl PeerDeathMonitor {
     /// support is lost for that one connection.
     fn try_new(stream: &impl std::os::fd::AsFd) -> Option<Self> {
         let owned = stream.as_fd().try_clone_to_owned().ok()?;
-        let fd =
-            tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::WRITABLE).ok()?;
+        // SAFETY: `owned` is a fresh dup the AsyncFd takes by value and owns
+        // until it drops, so the fd stays valid, open and unchanged meanwhile.
+        let fd = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(owned, tokio::io::Interest::WRITABLE)
+        }
+        .ok()?;
         Some(PeerDeathMonitor { fd })
     }
 
