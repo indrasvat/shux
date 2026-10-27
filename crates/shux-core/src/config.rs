@@ -267,27 +267,40 @@ pub fn default_config_path() -> PathBuf {
     PathBuf::from("config.toml")
 }
 
-fn read_config(path: &Path) -> Config {
+/// A file that exists but cannot be read or parsed.
+type LoadError = String;
+
+/// A missing file is the defaults; anything unreadable is an error.
+fn try_read_config(path: &Path) -> Result<Config, LoadError> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => match toml::from_str::<Config>(&contents) {
-            Ok(cfg) => {
-                tracing::info!(path = %path.display(), "config: loaded");
-                cfg
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(),
-                    "config: parse failed, using defaults");
-                Config::default()
-            }
-        },
+        Ok(contents) => toml::from_str::<Config>(&contents).map_err(|e| e.to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!(path = %path.display(), "config: not present, using defaults");
-            Config::default()
+            Ok(Config::default())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Startup read: with nothing loaded yet, a broken file means defaults.
+fn read_config(path: &Path) -> Config {
+    try_read_config(path).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %path.display(), "config: load failed, using defaults");
+        Config::default()
+    })
+}
+
+/// One hot-reload step: re-read `path` and store the result behind `handle`.
+/// A file that no longer parses keeps the running config, so a half-saved
+/// edit cannot reset every other section to its default.
+fn reload(path: &Path, handle: &ConfigHandle) {
+    match try_read_config(path) {
+        Ok(cfg) => {
+            handle.replace(cfg);
+            tracing::info!("config: reloaded");
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(),
-                "config: read failed, using defaults");
-            Config::default()
+            tracing::warn!(error = %e, path = %path.display(), "config: reload failed, keeping the running config");
         }
     }
 }
@@ -363,9 +376,7 @@ pub async fn run_hot_reload(
                 // Drain any extra events that arrived in the same burst.
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 while rx.try_recv().is_ok() {}
-                let new_cfg = read_config(&path);
-                handle.replace(new_cfg);
-                tracing::info!("config: reloaded");
+                reload(&path, &handle);
             }
         }
     }
@@ -432,6 +443,49 @@ mod tests {
         h.replace(new_cfg);
 
         assert_eq!(h.current().appearance.border_style, "thick");
+    }
+
+    #[test]
+    fn a_malformed_edit_during_hot_reload_keeps_the_running_config() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[keys]\nprefix = \"ctrl-b\"\n[appearance]\nborder_style = \"thin\"\n",
+        )
+        .unwrap();
+        let h = ConfigHandle::load_or_default(&path);
+        assert_eq!(h.current().keys.prefix, "ctrl-b");
+
+        // A save mid-edit: one bad key must not reset every other section.
+        std::fs::write(
+            &path,
+            "[keys]\nprefix = \"ctrl-b\"\n[appearance]\nborder_style = 7\n",
+        )
+        .unwrap();
+        reload(&path, &h);
+        assert_eq!(h.current().keys.prefix, "ctrl-b");
+        assert_eq!(h.current().appearance.border_style, "thin");
+
+        std::fs::write(&path, "[appearance]\nborder_style = \"double\"\n").unwrap();
+        reload(&path, &h);
+        assert_eq!(h.current().appearance.border_style, "double");
+        assert_eq!(
+            h.current().keys.prefix,
+            "ctrl-space",
+            "a valid file still replaces"
+        );
+    }
+
+    #[test]
+    fn deleting_the_config_during_hot_reload_restores_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[keys]\nprefix = \"ctrl-b\"\n").unwrap();
+        let h = ConfigHandle::load_or_default(&path);
+        std::fs::remove_file(&path).unwrap();
+        reload(&path, &h);
+        assert_eq!(h.current().keys.prefix, "ctrl-space");
     }
 
     #[tokio::test]
