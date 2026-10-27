@@ -209,6 +209,11 @@ test-lib: nextest-ready ## Run library tests only
 	@$(NEXTEST_RUN) --workspace --lib
 	@echo "$(COLOR_GREEN)✓ Library tests passed$(COLOR_RESET)"
 
+.PHONY: test-focus
+test-focus: nextest-ready ## Run one crate's tests matching a filter: PKG=<crate> FILTER=<nextest filter>
+	@test -n "$(PKG)" || { echo "test-focus: PKG=<crate> is required" >&2; exit 2; }
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p $(PKG) $(FILTER)
+
 .PHONY: test-vt
 test-vt: nextest-ready ## Run focused virtual terminal tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running virtual terminal tests...$(COLOR_RESET)"
