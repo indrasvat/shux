@@ -68,8 +68,21 @@ selftest_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-selftest.XXXXXX")
 # exactly the failure paths the trap exists for, and every run leaked its temp dirs even
 # when green. Each assert runs in a subshell (it kills what it reports either way, and
 # keeps no state), so a failure is recorded instead of fatal and cleanup always runs.
+# Everything the wedge case below creates, on every exit path: the stopped
+# daemon, its pane children's process groups, the bystander's session and the
+# runtime dir. The case clears each variable once it has cleaned that part up.
+cleanup_wedge() {
+  local pid
+  [ -z "${wedge_pid:-}" ] || kill -KILL "${wedge_pid}" >/dev/null 2>&1 || true
+  for pid in ${wedge_children:-}; do
+    kill -KILL -- "-${pid}" >/dev/null 2>&1 || kill -KILL "${pid}" >/dev/null 2>&1 || true
+  done
+  [ -z "${bystander_pid:-}" ] || kill -KILL -- "-${bystander_pid}" >/dev/null 2>&1 || true
+  rm -rf "${wedge_runtime}"
+}
 on_exit() {
   local rc=0
+  [ -z "${wedge_runtime:-}" ] || cleanup_wedge
   [ -z "${baseline_runtime:-}" ] || stop_baseline_daemon
   [ -z "${foreign_root:-}" ] || stop_foreign_daemon
   (assert_leaked_daemon_reaped "${selftest_runtime}") || rc=1
@@ -184,13 +197,16 @@ assert_no_new_orphan_automation_processes "${orphan_baseline}"
 xvfb_shim_dir="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-xvfb.XXXXXX")"
 ln -s "$(command -v sleep)" "${xvfb_shim_dir}/Xvfb"
 
+# The fixture records the pid it orphaned, and the guard has to NAME it: a
+# fixture that failed to launch also makes the guard exit non-zero, and that
+# is not detection.
 set +e
-.shux/scripts/no_leak_guard.sh python3 - "${xvfb_shim_dir}/Xvfb" <<'XVFBLEAK'
+xvfb_guard_err="$(.shux/scripts/no_leak_guard.sh python3 - "${xvfb_shim_dir}/Xvfb" "${xvfb_shim_dir}/pid" 2>&1 >/dev/null <<'XVFBLEAK'
 import subprocess
 import sys
 import time
 
-subprocess.Popen(
+p = subprocess.Popen(
     [sys.argv[1], "60"],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
@@ -198,15 +214,29 @@ subprocess.Popen(
     start_new_session=True,
     close_fds=True,
 )
+with open(sys.argv[2], "w") as f:
+    f.write(str(p.pid))
 time.sleep(0.25)
 sys.exit(0)
 XVFBLEAK
+)"
 xvfb_guard_status=$?
 set -e
+xvfb_pid="$(cat "${xvfb_shim_dir}/pid" 2>/dev/null || true)"
 rm -rf "${xvfb_shim_dir}"
+if [ -n "${xvfb_pid}" ]; then
+  kill -KILL -- "-${xvfb_pid}" >/dev/null 2>&1 || true
+fi
 
-if [ "${xvfb_guard_status}" -eq 0 ]; then
-  echo "no_leak_guard did not fail for an intentionally orphaned X server" >&2
+if [ -z "${xvfb_pid}" ]; then
+  echo "the orphaned-X-server fixture never started (guard status ${xvfb_guard_status}):" >&2
+  echo "${xvfb_guard_err}" >&2
+  exit 1
+fi
+if [ "${xvfb_guard_status}" -eq 0 ] \
+  || ! grep -Eq "orphan automation process\(es\):(.* )?${xvfb_pid}( |$)" <<<"${xvfb_guard_err}"; then
+  echo "no_leak_guard did not report the orphaned X server ${xvfb_pid} (status ${xvfb_guard_status}):" >&2
+  echo "${xvfb_guard_err}" >&2
   exit 1
 fi
 
@@ -364,8 +394,6 @@ if [ -z "$(shux_daemon_pids)" ]; then
   wedge_children="$(ps -axo pid=,ppid= | awk -v p="${wedge_pid}" '$2 == p { print $1 }')"
   if [ -z "${wedge_children}" ]; then
     echo "leak guard self-test: wedged daemon ${wedge_pid} had no pane child to strand" >&2
-    kill -KILL "${wedge_pid}" >/dev/null 2>&1 || true
-    rm -rf "${wedge_runtime}"
     exit 1
   fi
   # Too wedged to service SIGTERM, so the reaper must escalate to SIGKILL — the only path
@@ -405,7 +433,8 @@ BYSTANDER
   bystander_alive=1
   pid_is_gone "${bystander_pid}" && bystander_alive=0
   kill -KILL -- "-${bystander_pid}" >/dev/null 2>&1 || true
-  rm -rf "${wedge_runtime}"
+  bystander_pid=""
+  pid_is_gone "${wedge_pid}" && wedge_pid=""
 
   if [ "${wedge_reap_status}" -ne 0 ]; then
     echo "reap_daemons.sh failed on a wedged daemon (status ${wedge_reap_status})" >&2
@@ -419,9 +448,12 @@ BYSTANDER
     exit 1
   done
   if [ "${bystander_alive}" -ne 1 ]; then
-    echo "reap_daemons.sh killed a process it did not strand (${bystander_pid})" >&2
+    echo "reap_daemons.sh killed a process it did not strand" >&2
     exit 1
   fi
+  wedge_children=""
+  cleanup_wedge
+  wedge_runtime=""
 else
   echo "note: other daemons from this checkout are running; skipping the reap sweep case" >&2
 fi
