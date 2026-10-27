@@ -76,6 +76,10 @@ pub struct PaneIoState {
     /// Per-pane completion receivers used by daemon shutdown to wait until
     /// PTY tasks have actually signalled and reaped their children.
     pub pty_done: HashMap<shux_core::model::PaneId, oneshot::Receiver<()>>,
+    /// Which PTY task currently owns each pane. A pane spawned again while
+    /// its previous task is still winding down belongs to the newer task; the
+    /// older one must not touch its VT, handles or exit status.
+    pub incarnations: HashMap<shux_core::model::PaneId, u64>,
     /// Completion waiters for PTY tasks that were already explicitly torn
     /// down by pane/window/session kill. Daemon shutdown drains these too so
     /// it cannot exit while an earlier teardown is still in its reap/escalate
@@ -136,6 +140,7 @@ impl PaneIoState {
             resizers: HashMap::new(),
             shutdowns: HashMap::new(),
             pty_done: HashMap::new(),
+            incarnations: HashMap::new(),
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),
             revisions: HashMap::new(),
@@ -173,6 +178,11 @@ impl PaneIoState {
         }));
     }
 
+    /// Whether `incarnation` is still the PTY task that owns `pane_id`.
+    pub fn is_current(&self, pane_id: shux_core::model::PaneId, incarnation: u64) -> bool {
+        self.incarnations.get(&pane_id) == Some(&incarnation)
+    }
+
     pub fn teardown_panes_collecting(
         &mut self,
         pane_ids: &[shux_core::model::PaneId],
@@ -196,6 +206,7 @@ impl PaneIoState {
                 self.checkpoints.remove(pane_id);
                 self.invalidations.remove(pane_id);
                 self.pty_pids.remove(pane_id);
+                self.incarnations.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)

@@ -164,6 +164,7 @@ test-group = 'process-table'
 filter = '''
     (package(shux) & kind(test) & !binary_id(=shux::scratch_reap_order))
   + (package(shux-pty) & kind(test))
+  + (binary_id(=shux) & test(/^pane_spawn::tests::a_replaced_pty_task/))
 '''
 test-group = 'daemon-pty'
 

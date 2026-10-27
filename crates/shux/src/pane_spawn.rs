@@ -24,6 +24,8 @@ enum PtyTaskExit {
 }
 
 struct PtyTaskControl {
+    /// See [`PaneIoState::incarnations`].
+    incarnation: u64,
     write_rx: mpsc::Receiver<Vec<u8>>,
     resize_rx: mpsc::Receiver<ResizeRequest>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -44,6 +46,7 @@ async fn run_pane_pty_task(
 ) {
     use base64::Engine;
     let PtyTaskControl {
+        incarnation,
         mut write_rx,
         mut resize_rx,
         shutdown,
@@ -92,6 +95,12 @@ async fn run_pane_pty_task(
                         tee_pane_recorders(&io_state, pane_id, data, &shutdown).await;
                         let (pulse, vt_title, bus_opt, terminal_responses) = {
                             let mut state = io_state.lock().await;
+                            if !state.is_current(pane_id, incarnation) {
+                                // Replaced while this read was in flight: these
+                                // bytes belong to a process the pane no longer has.
+                                task_exit = PtyTaskExit::RequestedTeardown;
+                                break;
+                            }
                             let (vt_title, terminal_responses, rev_state, alt_switched) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
                                     // LENS-R-032/DEC-4: detect an alt-screen
@@ -275,7 +284,10 @@ async fn run_pane_pty_task(
                 }
                 let (pulse, dims_changed) = {
                     let mut state = io_state.lock().await;
-                    let rev_state = if let Some(vt) = state.vts.get_mut(&pane_id) {
+                    let current = state.is_current(pane_id, incarnation);
+                    let rev_state = if !current {
+                        None
+                    } else if let Some(vt) = state.vts.get_mut(&pane_id) {
                         // P4 convergence round 1 (claude blocker): gate the
                         // invalidation on an ACTUAL dimension change, exactly
                         // like the process branch gates on alt_switched. The
@@ -405,8 +417,13 @@ async fn run_pane_pty_task(
     // event would let the runner compare the crash frame instead of short-circuiting.
     // The reaper and `--wait` also key on this event, so a signalled child is now reaped
     // promptly rather than lingering to `max-runtime`.
+    // A replaced task leaves the pane to its successor: no exit status, no
+    // handle teardown. Spawning checks for a live writer first, which this
+    // task still holds, so ownership cannot change between here and the
+    // teardown below except by an explicit replacement — re-checked there.
+    let still_current = io_state.lock().await.is_current(pane_id, incarnation);
     let exit_status = exit_code.unwrap_or(-1);
-    if let Err(e) = graph.set_pane_exit_status(pane_id, exit_status).await {
+    if still_current && let Err(e) = graph.set_pane_exit_status(pane_id, exit_status).await {
         tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
     }
 
@@ -417,10 +434,12 @@ async fn run_pane_pty_task(
     // short-lived command. The Pane's exit_status is the "dead" flag;
     // tmux does the same with its `remain-on-exit` model.
     let mut state = io_state.lock().await;
-    state.writers.remove(&pane_id);
-    state.resizers.remove(&pane_id);
-    state.shutdowns.remove(&pane_id);
-    state.pty_done.remove(&pane_id);
+    if state.is_current(pane_id, incarnation) {
+        state.writers.remove(&pane_id);
+        state.resizers.remove(&pane_id);
+        state.shutdowns.remove(&pane_id);
+        state.pty_done.remove(&pane_id);
+    }
     let pulse = state.render_pulse.clone();
     drop(state);
     pulse.notify_one();
@@ -594,11 +613,14 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     };
     let (rev_tx, _rev_rx) = watch::channel(initial_rev);
 
+    static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let incarnation = NEXT_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     {
         let mut state = io_state.lock().await;
         if let Some(old) = state.shutdowns.insert(pane_id, pane_shutdown.clone()) {
             old.cancel();
         }
+        state.incarnations.insert(pane_id, incarnation);
         state.writers.insert(pane_id, write_tx);
         state.resizers.insert(pane_id, resize_tx);
         state.pty_done.insert(pane_id, done_rx);
@@ -617,6 +639,7 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
         handle,
         io_state,
         PtyTaskControl {
+            incarnation,
             write_rx,
             resize_rx,
             shutdown: pane_shutdown,
@@ -850,5 +873,52 @@ mod tests {
         let shell = daemon_shell_config();
         assert!(shell.command.is_empty());
         assert!(shell.env.is_empty());
+    }
+
+    /// A pane whose PTY is spawned again while its first task still runs —
+    /// two attaches racing to start a pane that has none — must end up owned
+    /// by the second task. The first, cancelled, must neither mark the pane
+    /// exited nor tear down the handles its successor just installed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_leaves_its_successor_alone() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("respawn").await;
+        let spawn = || {
+            spawn_pane_pty(
+                pane,
+                "/tmp".into(),
+                vec!["sleep".into(), "30".into()],
+                shux_pty::handle::PtySize::default(),
+                Vec::new(),
+                false,
+                h.io.clone(),
+                h.cancel.clone(),
+                h.graph.clone(),
+            )
+        };
+        spawn().await.unwrap();
+        let first_done = h.io.lock().await.pty_done.remove(&pane).unwrap();
+        spawn().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_done)
+            .await
+            .expect("the replaced task finishes")
+            .ok();
+
+        assert_eq!(
+            h.graph.snapshot().panes[&pane].exit_status,
+            None,
+            "the successor is still running"
+        );
+        let state = h.io.lock().await;
+        assert!(
+            state.writers.contains_key(&pane),
+            "successor writer removed"
+        );
+        assert!(
+            state.shutdowns.contains_key(&pane),
+            "successor shutdown removed"
+        );
+        drop(state);
+        h.stop().await;
     }
 }
