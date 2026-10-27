@@ -1142,7 +1142,7 @@ async fn run_plugin_io(
                 let _ = stdin.flush().await;
             }
 
-            ev = next_event(&mut sub) => {
+            ev = next_event(&mut sub, &perm_root) => {
                 let Some(ev) = ev else { continue };
                 let frame = serde_json::json!({
                     "jsonrpc": "2.0",
@@ -1206,19 +1206,38 @@ async fn run_plugin_io(
 /// `Event::to_wire_json()` so plugins see the same shape as
 /// `events.watch` / `events.history` consumers (top-level `type`,
 /// `seq`, `timestamp`, plus payload under `data`).
-async fn next_event(sub: &mut Option<Subscription>) -> Option<serde_json::Value> {
+async fn next_event(
+    sub: &mut Option<Subscription>,
+    perm_root: &std::path::Path,
+) -> Option<serde_json::Value> {
     let Some(s) = sub.as_mut() else {
         std::future::pending::<()>().await;
         return None;
     };
     match s.recv().await {
-        Some(SubscriptionEvent::Event(e)) => Some(e.to_wire_json()),
+        Some(SubscriptionEvent::Event(e)) => {
+            plugin_may_receive(&e.data, perm_root).then(|| e.to_wire_json())
+        }
         Some(SubscriptionEvent::Lagged(skipped)) => {
             warn!("plugin event subscription lagged: skipped {skipped}");
             None
         }
         None => None,
     }
+}
+
+/// An event carrying `ContentRead` data reaches a plugin only under the grant
+/// that would let it read the same thing over RPC; a manifest `subscribes`
+/// filter is no such grant. Grants are read per event, as per call, so a
+/// revoke takes effect at once.
+fn plugin_may_receive(data: &shux_core::event::EventData, perm_root: &std::path::Path) -> bool {
+    use shux_core::event::EventData;
+    let EventData::PaneStatusChanged { pane_id, .. } = data else {
+        return true;
+    };
+    Grants::load(&perm_root.join("grants.toml"))
+        .map(|g| g.allows("pane.status", Some(&pane_id.to_string())))
+        .unwrap_or(false)
 }
 
 /// Validate + publish a plugin-emitted event. Returns the sequence
@@ -1611,6 +1630,50 @@ mod tests {
     // goes through the shared reference resolver.
     use shux_core::model::PaneId;
     use shux_rpc::{Policy, Sensitivity};
+
+    /// A manifest `subscribes` filter is not a ContentRead grant: program
+    /// status reaches a plugin only under a `pane.status` grant for that pane.
+    #[test]
+    fn program_status_events_need_the_pane_status_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let pane = PaneId::new();
+        let other = PaneId::new();
+        let status = shux_core::event::EventData::PaneStatusChanged {
+            pane_id: pane,
+            window_id: shux_core::model::WindowId::new(),
+            session_id: shux_core::model::SessionId::new(),
+            old: None,
+            new: None,
+            seen: true,
+            enabled: true,
+        };
+        assert!(!plugin_may_receive(&status, dir.path()), "no grants at all");
+
+        let path = dir.path().join("grants.toml");
+        let mut grants = Grants::default();
+        grants.add_subscribe("pane.status_changed");
+        grants.add("pane.status", Some(&other.to_string()));
+        grants.save(&path).unwrap();
+        assert!(
+            !plugin_may_receive(&status, dir.path()),
+            "grant for another pane"
+        );
+
+        grants.add("pane.status", Some(&pane.to_string()));
+        grants.save(&path).unwrap();
+        assert!(plugin_may_receive(&status, dir.path()));
+
+        let created = shux_core::event::EventData::PaneCreated {
+            pane_id: pane,
+            window_id: shux_core::model::WindowId::new(),
+            session_id: shux_core::model::SessionId::new(),
+            command: Vec::new(),
+        };
+        assert!(plugin_may_receive(
+            &created,
+            tempfile::tempdir().unwrap().path()
+        ));
+    }
 
     #[test]
     fn manifest_parses() {
