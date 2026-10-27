@@ -684,4 +684,32 @@ mod tests {
         );
         finish(h).await;
     }
+
+    /// A raw-mode program that sends probes and never reads the replies must
+    /// not wedge its pane: the daemon keeps reading its output, and the pane
+    /// can still be torn down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_that_never_reads_its_replies_is_not_wedged() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-unread").await;
+        spawn_sh(
+            &h,
+            pane,
+            r#"python3 -c "import os,tty,time; tty.setraw(0); os.write(1, b'\x1b]7501;?\x1b\\\\'*300); os.write(1, b'MAR'+b'KER'); time.sleep(30)""#,
+        )
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let text = h.io.lock().await.vts[&pane].capture_text(None);
+            if text.contains("MARKER") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane stopped reading output once its replies went unread"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        finish(h).await;
+    }
 }

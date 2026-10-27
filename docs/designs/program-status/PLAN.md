@@ -126,6 +126,11 @@ Spec ambiguities, resolved:
 - **Reply terminator:** mirrors the query's.
 - **No reply when disabled.**
 - **Case:** lowercase only.
+- **Malformed values, two tiers.** A pair whose value has a byte outside the
+  value grammar is unparseable and skipped (`title=Q!` applies the rest). A
+  grammar-valid value that fails its own validation discards the report
+  (`title=QQ=`: strict base64, D3; `id`: D2). Both follow D1; the adversarial
+  pass flagged the split as surprising and it was kept deliberately.
 - **Empty text or app:** treated as absent.
 
 ## 4. vte 0.15 facts (verified in the vendored source)
@@ -436,11 +441,17 @@ forward     = "auto"  # outer terminal: auto | off        (P4)
   and "enabled, never reported" are therefore distinguishable, and disabling
   an empty pane *does* change `(summary, seen, enabled)`, so it fires an
   event.
+- **Plugins and the event.** A manifest `subscribes` filter is not a
+  `ContentRead` grant. `pane.status_changed` reaches a plugin only under a
+  `pane.status` grant covering that pane, read from the plugin's grants per
+  event (so a revoke takes effect at once). Found by the adversarial pass: a
+  grant-less plugin subscribed to `pane.` received `kind=auth`.
 - **`pane.status`** (`ContentRead`): full `RecordView`s plus `generation`,
   `seen` and `enabled`, read atomically from the VT under the io lock. It is
   the only RPC that returns `title` or `msg`.
 - **`pane.wait_status`** (`ContentRead`):
-  - **Params:** `pane`, `state: [..]`, `match: top|any`, `timeout_ms`.
+  - **Params:** `pane_id` (as every pane RPC), `state: [..]`,
+    `match: "top"|"any"` (any other value is INVALID_PARAMS), `timeout_ms`.
   - **Subscription:** `events.watch`-style, **filtered to
     `pane.status_changed` / `pane.exited` for that pane id**. It is taken
     *before* reading the graph's `(summary, seen, enabled)`. It re-reads on
@@ -448,13 +459,26 @@ forward     = "auto"  # outer terminal: auto | off        (P4)
   - **Outcomes:**
     - `matched {summary}`;
     - `timeout`;
-    - `pane_gone` (`pane.exited` or `PaneNotFound`);
+    - `pane_gone` (`pane.exited`, or the pane vanished mid-wait; a pane that
+      never existed is a NOT_FOUND error, as for every pane RPC);
     - `disabled`, returned only when `enabled == false`, never inferred from
       `None` + `!seen`.
 - **`pane.list` does not change** (D13).
 - **Surface pin.** Both methods are added to `EXPECTED_SURFACE`.
 - **CLI:** `shux pane status`, `shux pane wait-status`; output goes through
-  `style.rs` printers and `sanitize_for_display`.
+  `style.rs` printers and `sanitize_for_display`. `--format plain` is
+  tab-separated without colour. `wait-status` exits 0 matched, 1 timeout,
+  2 bad arguments, 3 otherwise (pane gone, disabled, daemon lost, any other
+  error).
+- **Terminal replies are bounded.** A program that sends probes without
+  reading its input used to wedge its pane (a pre-existing defect: replies
+  were written inside the read loop with no bound; 7501's longer reply made
+  it ~4x easier to hit). Replies now get 200 ms; a program that does not
+  drain them gets none for 1 s.
+- **Known residual.** A daemon shutdown that lands during a respawn's claim
+  await can still announce a respawn of an exited pane: in-memory, during
+  shutdown only. The common case (already stopping) is refused before the
+  claim.
 
 ### 5.6 Presentation (codex F18; grok F9, Q4)
 

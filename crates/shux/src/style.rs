@@ -1752,6 +1752,57 @@ pub fn print_pane_status(result: &serde_json::Value) {
     }
 }
 
+/// `pane status --format plain`: tab-separated, no colour. One `summary` line,
+/// then one `record` line per record:
+/// `record\tSTATE\tKIND\tAPP\tPROGRESS\tID\tTITLE\tMSG` (empty when absent).
+pub fn print_pane_status_plain(result: &serde_json::Value) {
+    let field = |v: &serde_json::Value, key: &str| -> String {
+        match v.get(key) {
+            Some(serde_json::Value::String(s)) => {
+                shux_program_status::display::sanitize_for_display(s).replace('\t', " ")
+            }
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        }
+    };
+    let enabled = result.get("enabled") != Some(&serde_json::Value::Bool(false));
+    let summary = result.get("summary").filter(|s| !s.is_null());
+    println!(
+        "summary\t{}\t{}\t{}",
+        field(result, "pane_id"),
+        if enabled { "on" } else { "off" },
+        summary.map(|s| field(s, "state")).unwrap_or_default(),
+    );
+    for record in result
+        .get("records")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        println!(
+            "record\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            field(record, "state"),
+            field(record, "kind"),
+            field(record, "app"),
+            field(record, "progress"),
+            field(record, "id"),
+            field(record, "title"),
+            field(record, "msg"),
+        );
+    }
+}
+
+/// `pane wait-status --format plain`: `OUTCOME\tPANE_ID\tSTATE`.
+pub fn print_pane_wait_status_plain(result: &serde_json::Value) {
+    let s = |p: &str| result.pointer(p).and_then(|v| v.as_str()).unwrap_or("");
+    println!(
+        "{}\t{}\t{}",
+        s("/outcome"),
+        s("/pane_id"),
+        s("/summary/state")
+    );
+}
+
 /// Print `pane wait-status`'s outcome.
 pub fn print_pane_wait_status(result: &serde_json::Value, states: &[String]) {
     let pane_id = short_id(result.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));

@@ -119,12 +119,13 @@ impl WaitParams {
                 "state must name at least one state",
             ));
         }
-        let matching = match params.get("match").and_then(Value::as_str) {
-            None | Some("top") => Match::Top,
-            Some("any") => Match::Any,
+        let matching = match params.get("match") {
+            None | Some(Value::Null) => Match::Top,
+            Some(Value::String(m)) if m == "top" => Match::Top,
+            Some(Value::String(m)) if m == "any" => Match::Any,
             Some(other) => {
                 return Err(RpcError::invalid_params(&format!(
-                    "match must be top or any, not {other:?}"
+                    "match must be \"top\" or \"any\", not {other}"
                 )));
             }
         };
@@ -267,6 +268,11 @@ mod tests {
         assert!(params(json!({"state": "sleeping"})).is_err());
         assert!(params(json!({"state": ["done", 3]})).is_err());
         assert!(params(json!({"state": "done", "match": "most"})).is_err());
+        assert!(
+            params(json!({"state": "done", "match": 5})).is_err(),
+            "non-string match read as top"
+        );
+        assert!(params(json!({"state": "done", "match": ["any"]})).is_err());
         assert!(params(json!({"state": "done", "timeout_ms": -1})).is_err());
         assert!(params(json!({"state": "done", "timeout_ms": WAIT_MAX_MS + 1})).is_err());
         let p = params(json!({"state": ["blocked", "error"], "match": "any", "timeout_ms": 5}))

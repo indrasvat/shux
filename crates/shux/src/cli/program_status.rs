@@ -12,7 +12,9 @@ fn print_json(result: &serde_json::Value) -> anyhow::Result<()> {
 }
 
 fn print_json_error(message: &str) -> anyhow::Result<()> {
-    let envelope = serde_json::json!({ "error": { "message": message } });
+    let envelope = serde_json::json!({
+        "error": { "code": "daemon_unreachable", "message": message }
+    });
     println!(
         "{}",
         crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
@@ -33,7 +35,8 @@ pub async fn handle_pane_status(
     .await?;
     match format {
         OutputFormat::Json => print_json(&result)?,
-        OutputFormat::Text | OutputFormat::Plain => crate::style::print_pane_status(&result),
+        OutputFormat::Text => crate::style::print_pane_status(&result),
+        OutputFormat::Plain => crate::style::print_pane_status_plain(&result),
     }
     Ok(())
 }
@@ -62,6 +65,14 @@ pub(crate) async fn wait_status_exit_code(
     timeout_ms: u64,
     format: OutputFormat,
 ) -> anyhow::Result<i32> {
+    let mut unique: Vec<&String> = Vec::new();
+    for s in states {
+        if !unique.contains(&s) {
+            unique.push(s);
+        }
+    }
+    let states: Vec<String> = unique.into_iter().cloned().collect();
+    let states = states.as_slice();
     let params = serde_json::json!({
         "pane_id": pane,
         "state": states,
@@ -86,18 +97,17 @@ pub(crate) async fn wait_status_exit_code(
         Err(other) => {
             match format {
                 OutputFormat::Json => print_json_error(&other.to_string())?,
-                OutputFormat::Text | OutputFormat::Plain => {
-                    crate::style::print_error(&format!("wait-status failed: {other}"))
-                }
+                OutputFormat::Text | OutputFormat::Plain => crate::style::print_error(&format!(
+                    "wait-status lost the daemon connection ({other}); is the daemon still running?"
+                )),
             }
             return Ok(3);
         }
     };
     match format {
         OutputFormat::Json => print_json(&result)?,
-        OutputFormat::Text | OutputFormat::Plain => {
-            crate::style::print_pane_wait_status(&result, states)
-        }
+        OutputFormat::Text => crate::style::print_pane_wait_status(&result, states),
+        OutputFormat::Plain => crate::style::print_pane_wait_status_plain(&result),
     }
     Ok(match result.get("outcome").and_then(|v| v.as_str()) {
         Some("matched") => 0,
