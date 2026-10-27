@@ -78,3 +78,48 @@ P2 measures it on both platforms.
   pre-existing (`config.rs:366`). It is fixed in P1 as a correctness defect.
 - **The fuzzer's first deep run** found the decoder accepting incomplete
   base64 padding (`MA=`). Fixed in `44f487b`, with a red-first test.
+
+## Round 2 (plan r3 → r4), 2026-10-27
+
+Same reviewers. Grok again had to be run directly (same sandbox
+refusal under dootsabha). Every cited line was checked before a finding
+was adopted. Codex F6 was reproduced as a pre-existing defect before it
+was fixed.
+
+### codex — REJECT
+
+| # | Sev | Finding | Disposition |
+|---|---|---|---|
+| F1 | P1 | Plan grammar omits Escape stay-set / reprocess | Plan text rewritten to the landed scanner (§5.1); positive `ESC ESC ]`, `ESC 0x80 ]` tests added (`9ee5736`) |
+| F2 | P2 | `133;A` prefix match | Code was already exact (`classify`); plan text fixed; `133;AB` pinned |
+| F3 | P1 | Differential oracle "every dispatch" | Plan states the landed byte-at-a-time oracle (§7); oracle self-test rejects `ESC [`, `ESC _`, CAN |
+| F4 | P1 | Equal-state dedupe must advance watermark | Already so in code; plan states it; window resolved first (`9ee5736`) |
+| F5 | P1 | Watch can't provide lifecycle barriers | §5.2: per-pane-lifetime sender, `Flush{min_generation, ack}` channel, interruptible pacing, bounded waits; replacement flushes before the new task spawns |
+| F6 | P1 | Stale task tears down successor | **Reproduced on main** (`exit_status = Some(-1)`); fixed with incarnation guard (`d132105`), standalone PR |
+| F7 | P1 | `disabled` not representable | `enabled` on publication/pane/event; disable is an event (`9ee5736`) |
+| F8 | P1 | D8 false deletion | D8 now **opt-in**, stability-sampled, false deletion documented, tests for both settings (§5.9) |
+| F9 | P1 | Probe reads stdin, crossterm reads /dev/tty | Probe resolves crossterm's input fd; requires same tty for in/out; skipped otherwise (§5.8) |
+| F10 | P2 | Raw restore / signals / late replies | Single raw owner from before probe through session; signal future before raw; late replies swallowed by input parser (§5.8) |
+| F11 | P2 | Forwarded title exceeds byte limits | Title truncated at UTF-8 boundary ≤192 B; every report round-trips through `decode` before emission (§5.8) |
+| F12 | P2 | P2 gate conditional; matrix cells missing | Every PR carries full protocol; P2 VT gate unconditional; feature-maxed in P1; P4 config states enumerated (§6) |
+
+### grok — APPROVE-WITH-CHANGES
+
+| # | Sev | Finding | Disposition |
+|---|---|---|---|
+| F1 | P1 | Plan grammar wrong (code right) | = codex F1 |
+| F2 | P1 | Oracle sentence wrong | = codex F3 |
+| F3 | P1 | `133;A` prefix | = codex F2 |
+| F4 | P1 | BEL-cut neutrality / tie rule | §5.1 states tie order and BEL-cut argument; enabled-vs-disabled neutrality property (hostile alphabet incl. BEL, APC, UTF-8) is the proof |
+| F5 | P1 | No ack channel; replacing sender drops clear | = codex F5 |
+| F6 | P1 | Read arm writes new VT | Incarnation checked in read and resize arms (`d132105`) |
+| F7 | P1 | Publisher shutdown; WindowNotFound consumes generation | Publisher selects on shutdown, teardown drops sender (§5.2); window resolved first (`9ee5736`) |
+| F8 | P1 | `disabled` unrepresentable; subscription not pane-filtered | = codex F7; subscription filtered by pane id (§5.5) |
+| F9 | P1 | Read-time pgrp sample tags the shell | Before/after stability sampling; unstable → tag 0 (§5.9) |
+| F10 | P1 | Raw guard restoration; non-tty stdin; pending bytes | = codex F9/F10; pending bytes injected into the real input stream |
+| F11 | P2 | P1 gates miss neutrality + rich-TUI corpus; reload test already green | Rich-TUI pass named in P1; neutrality property named; reload item struck |
+| F12 | P2 | Reload fix already landed; NotFound transient | §5.4 updated; NotFound re-checked once after debounce (config PR) |
+| F13 | P2 | 7501 reply dropped when 512 budget full | **Declined** with reason: shared budget is the anti-amplification bound; a missed reply means "unsupported", the safe fallback (§5.1) |
+| F14 | P2 | 64-cap eviction could wipe all | Evict LRU pane record by its own id; never clear the aggregate; 64-bit attach token (§5.8) |
+| F15 | P3 | BEL payload off-by-one | Documented (spec permits lower limits) (§5.1) |
+| F16 | P2 | Plan said `serde(default)` | Plan says `serde(skip)`, matching code and test |
