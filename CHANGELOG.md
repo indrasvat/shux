@@ -1,3 +1,10 @@
+## [0.53.1](https://github.com/indrasvat/shux/compare/v0.53.0...v0.53.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **daemon:** bind and connect at a socket path that fits; identity stays on the key ([#208](https://github.com/indrasvat/shux/issues/208)) ([bf37adf](https://github.com/indrasvat/shux/commit/bf37adf10f554cfb09945a9781784aea8a6bdfb6))
+
 # [0.53.0](https://github.com/indrasvat/shux/compare/v0.52.2...v0.53.0) (2026-10-28)
 
 
