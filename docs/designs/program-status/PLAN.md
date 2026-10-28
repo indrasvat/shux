@@ -637,6 +637,121 @@ conditional; an unfillable cell is called out explicitly.
 | **P3 agents** | conductor on `pane.status` with explicit grants, observe-only; skill docs | `shux-tui-qa` (agent workflows) | dogfood: Claude Code + Codex under conductor, × default · disabled |
 | **P4 forward** | probe (same tty), single raw owner, hello bit, namespaced emitter, eviction, title clamp | `shux-tui-qa` **and** `shux-vt-solid-qa` (terminal probing and replies) | outer Orca (supports) and Ghostty 1.3.1 (does not, must stay clean) × `forward = auto` · `off` · feature disabled · malformed; piped stdin; SSH with and without a pty; `make test-gui-terminal` for the unsupported receiver |
 
+### 6.1 P2 re-plan after P1 (2026-10-27)
+
+P1 shipped as #195 (v0.52.0), with the double-spawn follow-up #199 (v0.52.1).
+P2 is re-planned against that code before anything is written.
+
+**Split.** P2 becomes two PRs, because the stale guard has its own risk
+surface and its own gate.
+- **P2a, chrome:** `PaneChrome`, the border badge, the status-bar segment, and
+  the `border` / `status_bar` toggles. Gate: `shux-tui-qa`, plus
+  `shux-vt-solid-qa` only if the diff touches `shux-raster` (see `make
+  check-vt-qa`).
+- **P2b, D8:** the opt-in stale guard (§5.9). Gate: `shux-vt-solid-qa`
+  (scanner provenance) and `shux-tui-qa`.
+
+**Anchors re-checked against `main` @ 328e7c7.**
+- Title renderers: `shux-ui/src/compositor.rs` (pane-title loop, ~l.525),
+  `shux-ui/src/composed.rs` (~l.110).
+- Duplicated title maps: `shux/src/attach.rs` (~l.1368), `shux/src/snapshot.rs`
+  (~l.192).
+- Title budget: `MAX_TITLE_CHARS = 64` (`shux-core/src/model.rs`).
+- Status bar: `statusbar_build::build`.
+- Font set: `appearance.nerd_fonts`.
+
+**Data the chrome reads.** Every render path reads the graph snapshot.
+- `Pane.program_status: Option<StatusSummary>`, plus `program_status_enabled`.
+- The status is sealed at exit: an exited pane keeps its final summary even
+  across a later disable (tested in P1).
+- So the badge is gated on the **live** config, as well as on the pane:
+
+  `badge = enabled && border && pane.program_status_enabled && summary`
+
+  Without the live check, disabling the feature would leave badges on exited
+  panes.
+
+**P2a decisions proposed for the council.**
+1. The badge leads the title inside the border's title slot (`─ ◆ title ─`).
+   A pane with a badge but no title shows the badge alone.
+2. The badge is static, with no spinner for `working`, so snapshots stay
+   deterministic and equal to attach.
+3. Exited panes keep their final badge (`✓` done, `✕` error); it is what an
+   operator wants to see.
+4. The "N waiting" segment counts `blocked` panes in the attached session (the
+   bar is per-session), and is dropped first at narrow widths.
+5. `border` and `status_bar` take effect on hot reload, like `enabled`.
+   Malformed values fail `shux config validate`, and hot reload keeps the
+   previous config.
+
+**Matrix.**
+- Render paths: live attach · `pane.snapshot` · `window.snapshot` ·
+  `session.snapshot`.
+- Config states: default · `config init` · feature-maxed · disabled ·
+  `border = false` · `status_bar = false` · malformed · hot-reload.
+- Font sets: Unicode · Nerd Font.
+- The cross-path cell test compares attach against snapshot, colours included.
+- There is no web preview in the tree.
+
+**Council outcome (2026-10-27; agy, then codex confirming or refuting
+each claim against the code).** All five decisions are accepted, with these
+refinements.
+
+- **Seam.**
+  - One builder in `shux` makes `HashMap<PaneId, PaneChrome>` from one config
+    snapshot pinned for the frame. Attach and snapshot currently reread config
+    across awaits.
+  - One title-overlay layout in `shux-ui` produces laid-out cells that carry
+    grapheme payloads and wide continuations.
+  - Both renderers become thin loops over it. Today both truncate by scalar
+    and advance one cell per scalar, which breaks CJK and combining titles; a
+    pre-existing defect, fixed here because this code is being rewritten.
+- **Budget.** `MAX_TITLE_CHARS` counts scalars, not columns. The stored title
+  keeps that meaning. Layout fits grapheme runs into
+  `min(64, viewport_width − 4)` columns, minus the badge width and one space.
+  A pane too narrow for badge + space + one column of title shows the badge
+  alone.
+- **Colours.** `window.snapshot` / `session.snapshot` drew borders with
+  `BorderColors::default()` while attach used the theme. That pre-existing
+  defect is fixed, with a red-first cross-path test under a theme that changes
+  the border colours. Badge roles map to theme colours in one place.
+- **Glyphs.**
+  - Width follows the VT's narrow `UnicodeWidthChar::width`.
+  - `◐` (U+25D0) is not in the bundled JetBrains Mono, so `working` uses a
+    glyph the primary font has, chosen by a cmap check.
+  - Raster tests in `shux-raster/tests/` pin that every badge glyph is present
+    and renders within one cell.
+  - The outer-terminal behaviour of the ambiguous-width glyphs is evidenced
+    with `make test-gui-terminal`.
+- **Exited panes.** They keep the summary they actually reported. An exit
+  never makes a badge up: a program that reported only `working` exits with
+  none. The final summary and `exit_status` are separate ordered commits, so
+  tests do not assume one transaction.
+- **Status bar.**
+  - Counts `blocked` panes in the attached session's windows, walking the
+    session, not `snap.panes`.
+  - Gated on `enabled && status_bar` plus each pane's `program_status_enabled`.
+  - Admitted only after script segments are added, including the centre gaps,
+    so it never overwrites other segments.
+- **Config.**
+  - Only `border` and `status_bar` are added to runtime config, strict
+    validation and `config init`. `stale_guard` and `forward` stay rejected.
+  - The toggles are presentation only: they never clear VT or graph status.
+  - "Malformed" covers a wrong type (validate fails; hot reload keeps the
+    previous config) and an unknown key (validate fails; runtime ignores it).
+- **Matrix additions.**
+  - `pane.snapshot` and `pane.glance` are isolation checks (unchanged by
+    status).
+  - Independent toggle pairs and true→false→true round-trips.
+  - Empty title with a badge; zoomed panes, `border_style = "none"`, and
+    narrow viewports.
+  - A blocked pane in another session never counts.
+  - The whole-frame cross-path test normalizes focus, copy mode, action
+    feedback and uptime.
+- **Goldens.** Pane-level goldens (`.shux/goldens/lens/*`, the `073-vt-corpus`
+  set) must not change. Pane geometry never changes: the badge lives inside
+  the title slot.
+
 ## 7. Verification
 
 - **Crate** ✅: a unit test for every D-rule and limit, plus tier-1 fuzzing.

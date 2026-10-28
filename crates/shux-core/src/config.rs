@@ -142,11 +142,21 @@ pub struct ProgramStatusConfig {
     /// behaves as if the protocol did not exist.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// A status badge leading each pane's border title.
+    #[serde(default = "default_true")]
+    pub border: bool,
+    /// The "N waiting" status-bar segment: panes blocked on you.
+    #[serde(default = "default_true")]
+    pub status_bar: bool,
 }
 
 impl Default for ProgramStatusConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            border: true,
+            status_bar: true,
+        }
     }
 }
 

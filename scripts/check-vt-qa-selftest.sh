@@ -100,6 +100,7 @@ expect 0 "empty diff owes nothing"
 expect 2 "shux-vt/src owes evidence" crates/shux-vt/src/lib.rs
 expect 2 "shux-raster/src owes evidence" crates/shux-raster/src/lib.rs
 expect 2 "pty capture owes evidence" crates/shux-pty/src/capture.rs
+expect 2 "pane chrome layout owes evidence" crates/shux-ui/src/chrome.rs
 
 # The exemption under test: trees that ship no cells and no pixels.
 expect 0 "shux-vt/tests owes nothing" crates/shux-vt/tests/some_test.rs

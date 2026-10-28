@@ -33,16 +33,12 @@ pub(crate) async fn build_snapshot_status_bar(
     session_id: &shux_core::model::SessionId,
     window_id: shux_core::model::WindowId,
     cols: u16,
-    config: &shux_core::config::ConfigHandle,
+    live_cfg: &shux_core::config::Config,
     meta_cache: &session_meta::SessionMetaCache,
     onboarding: &onboarding::OnboardingHandle,
     segments: &statusbar_runner::SegmentCache,
 ) -> shux_ui::StatusBar {
-    let theme = {
-        let cfg = config.current();
-        shux_core::theme::Theme::resolve(&cfg.theme)
-    };
-    let live_cfg = config.current();
+    let theme = shux_core::theme::Theme::resolve(&live_cfg.theme);
     let nerd_fonts = live_cfg.appearance.nerd_fonts;
     let prefix_label = statusbar_build::prefix_display(&live_cfg.keys.prefix);
     let session_meta = meta_cache.get(*session_id).await;
@@ -97,7 +93,14 @@ pub(crate) async fn build_snapshot_status_bar(
     // way the attach render loop does. Without this, PNG snapshots
     // would only show the built-in OOTB segments and silently drop
     // every user-configured segment.
-    statusbar_runner::populate_bar(&mut bar, config, segments).await;
+    statusbar_runner::populate_bar(&mut bar, live_cfg, segments).await;
+    statusbar_build::append_waiting(
+        &mut bar,
+        crate::pane_chrome::waiting_count(snap, *session_id, &live_cfg.program_status),
+        &theme,
+        nerd_fonts,
+        cols,
+    );
     bar
 }
 
@@ -190,16 +193,16 @@ pub(crate) async fn snapshot_window(
         .get(&window_id)
         .ok_or_else(|| shux_rpc::RpcError::not_found("window", &window_id.to_string()))?;
 
-    // Build per-pane title map from the graph (priority-resolved values).
-    let mut titles: std::collections::HashMap<shux_core::model::PaneId, String> =
-        std::collections::HashMap::new();
-    for pid in window.layout.tree.pane_ids() {
-        if let Some(p) = snap.panes.get(&pid)
-            && !p.title.is_empty()
-        {
-            titles.insert(pid, p.title.clone());
-        }
-    }
+    // One config for the whole frame, as attach reads it.
+    let cfg = config.current();
+    let theme = shux_core::theme::Theme::resolve(&cfg.theme);
+    let chrome = crate::pane_chrome::pane_chrome(
+        snap,
+        window.layout.tree.pane_ids(),
+        &cfg.program_status,
+        cfg.appearance.nerd_fonts,
+        &theme,
+    );
 
     // Snapshot just the (Grid, Cursor, dynamic colors) per pane under the io
     // lock — VT itself isn't Clone and we want to release the lock before
@@ -244,7 +247,7 @@ pub(crate) async fn snapshot_window(
         &window.session_id,
         window_id,
         cols,
-        config,
+        &cfg,
         meta_cache,
         onboarding,
         segments,
@@ -255,7 +258,8 @@ pub(crate) async fn snapshot_window(
     // Compose with the user's outline style: `compose` derives the pane viewport
     // from it, so a hardcoded style crops panes under `border_style = "none"`.
     // Read here, before `spawn_blocking` takes the closure.
-    let border_style = shux_ui::BorderStyle::parse(&config.current().appearance.border_style);
+    let border_style = shux_ui::BorderStyle::parse(&cfg.appearance.border_style);
+    let border_colors = shux_ui::BorderColors::from_theme(&theme);
 
     let (img, png_buf) = tokio::task::spawn_blocking(move || {
         let panes: std::collections::HashMap<
@@ -277,7 +281,7 @@ pub(crate) async fn snapshot_window(
             zoom: zoom_state.as_ref(),
             focused,
             panes: &panes,
-            titles: Some(&titles),
+            chrome: Some(&chrome),
             status_bar: Some(&status_bar),
         };
         let composed = shux_ui::compose(
@@ -285,7 +289,7 @@ pub(crate) async fn snapshot_window(
             cols,
             rows,
             border_style,
-            shux_ui::BorderColors::default(),
+            border_colors,
             STATUS_BAR_ROWS,
         );
         let opts = shux_raster::RasterOptions {
@@ -710,7 +714,7 @@ mod tests {
             &session_id,
             window_id,
             120,
-            &config,
+            &config.current(),
             &meta,
             &onb,
             &segments,

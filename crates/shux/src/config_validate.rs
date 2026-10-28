@@ -58,6 +58,10 @@ mod strict {
     pub struct ProgramStatus {
         #[serde(default)]
         pub enabled: Option<bool>,
+        #[serde(default)]
+        pub border: Option<bool>,
+        #[serde(default)]
+        pub status_bar: Option<bool>,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -127,19 +131,41 @@ mod strict {
     #[serde(deny_unknown_fields)]
     pub struct Theme {
         #[serde(default)]
-        pub border_focused: Option<String>,
+        pub border_focused: Option<HexColor>,
         #[serde(default)]
-        pub border_unfocused: Option<String>,
+        pub border_unfocused: Option<HexColor>,
         #[serde(default)]
-        pub status_bg: Option<String>,
+        pub status_bg: Option<HexColor>,
         #[serde(default)]
-        pub status_fg: Option<String>,
+        pub status_fg: Option<HexColor>,
         #[serde(default)]
-        pub status_accent: Option<String>,
+        pub status_accent: Option<HexColor>,
         #[serde(default)]
-        pub status_muted: Option<String>,
+        pub status_muted: Option<HexColor>,
         #[serde(default)]
-        pub status_branch: Option<String>,
+        pub status_branch: Option<HexColor>,
+        #[serde(default)]
+        pub status_ok: Option<HexColor>,
+        #[serde(default)]
+        pub status_error: Option<HexColor>,
+        #[serde(default)]
+        pub status_attention: Option<HexColor>,
+    }
+
+    /// A `#rrggbb` colour. The daemon falls back to the default for anything
+    /// else, so this is where a typo has to be caught.
+    #[derive(Debug)]
+    pub struct HexColor;
+
+    impl<'de> Deserialize<'de> for HexColor {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let s = String::deserialize(d)?;
+            shux_core::theme::parse_hex(&s)
+                .map(|_| HexColor)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("{s:?} is not a hex colour like #74c7ec"))
+                })
+        }
     }
 }
 
@@ -583,6 +609,33 @@ font_fallbacks = ["/tmp/this-shux-font-fallback-does-not-exist.ttf"]
         );
     }
 
+    #[test]
+    fn validate_program_status_block() {
+        let ok = write_tmp("[program_status]\nenabled = true\nborder = false\nstatus_bar = true\n");
+        let diags = validate(ok.path()).unwrap();
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+        for bad in [
+            "[program_status]\nborder = \"yes\"\n",
+            "[program_status]\nstale_guard = true\n",
+        ] {
+            let f = write_tmp(bad);
+            assert!(!validate(f.path()).unwrap().is_empty(), "accepted: {bad}");
+        }
+    }
+
+    /// The daemon falls back to the default for a colour it cannot parse, so
+    /// validate is the only place a typo surfaces.
+    #[test]
+    fn validate_rejects_theme_colours_that_are_not_hex() {
+        for bad in ["#zz", "#12345", "red", "#74c7ecff"] {
+            for key in ["border_focused", "status_attention", "status_ok"] {
+                let f = write_tmp(&format!("[theme]\n{key} = \"{bad}\"\n"));
+                let diags = validate(f.path()).unwrap();
+                assert!(!diags.is_empty(), "accepted {key} = {bad:?}");
+            }
+        }
+    }
+
     /// Same audit for `[theme]`: `status_muted` and `status_branch`
     /// landed in the runtime schema after the strict mirror was
     /// written and silently drifted.
@@ -598,6 +651,9 @@ status_fg        = "#cad3f5"
 status_accent    = "#74c7ec"
 status_muted     = "#6e738d"
 status_branch    = "#c6a0f6"
+status_ok        = "#a6da95"
+status_error     = "#ed8796"
+status_attention = "#eed49f"
 "##,
         );
         let diags = validate(f.path()).unwrap();

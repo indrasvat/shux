@@ -1363,25 +1363,18 @@ async fn run_render_loop(
                 vt_refs.insert(pid, vt);
             }
         }
-        // Per-pane titles for the border overlay (PR 4). Read from
-        // the graph snapshot, NOT the VT — Pane.title is the
-        // priority-resolved value (manual > osc > auto-derived),
-        // and the VT only knows about the OSC layer. Skip empty
-        // titles so panes without a title get the clean border.
-        let mut pane_titles: HashMap<PaneId, String> = HashMap::new();
-        for pid in win.layout.tree.pane_ids() {
-            if let Some(p) = snap.panes.get(&pid)
-                && !p.title.is_empty()
-            {
-                pane_titles.insert(pid, p.title.clone());
-            }
-        }
         // Status bar text. Start from the built-in (always-good)
         // segments so OOTB looks the same even when no script segments
         // are configured. Then `populate_bar` appends any
         // `[[statusbar.segment]]` results from the runner cache.
-        let live_cfg = config.current();
         let nerd_fonts = live_cfg.appearance.nerd_fonts;
+        let pane_chrome = crate::pane_chrome::pane_chrome(
+            &snap,
+            win.layout.tree.pane_ids(),
+            &live_cfg.program_status,
+            nerd_fonts,
+            &live_theme,
+        );
         let prefix_label = prefix_display(&live_cfg.keys.prefix);
         let session_meta = meta_cache.get(attached.session_id).await;
         let onboarding_state = onboarding.current().await;
@@ -1402,7 +1395,14 @@ async fn run_render_loop(
             last_action: last_action_ref,
         };
         let mut bar = build_status_bar_shared(&snap, &live_theme, &render_ctx);
-        populate_bar(&mut bar, &config, &segments).await;
+        populate_bar(&mut bar, &live_cfg, &segments).await;
+        crate::statusbar_build::append_waiting(
+            &mut bar,
+            crate::pane_chrome::waiting_count(&snap, attached.session_id, &live_cfg.program_status),
+            &live_theme,
+            nerd_fonts,
+            cols,
+        );
 
         // Welcome-toast lifecycle: if it's still showing and the
         // first-render-tick has passed, mark seen on the daemon side.
@@ -1415,7 +1415,7 @@ async fn run_render_loop(
             zoom: win.layout.zoom.as_ref(),
             focused: attached.active_pane_id,
             vts: &vt_refs,
-            titles: Some(&pane_titles),
+            chrome: Some(&pane_chrome),
             status_bar: Some(&bar),
         };
         // Reset the buffer first so we only ship the new frame's bytes.
@@ -6138,7 +6138,7 @@ mod tests {
                     zoom: None,
                     focused: fixture.first_pane,
                     panes: &panes,
-                    titles: None,
+                    chrome: None,
                     status_bar: None,
                 },
                 100,

@@ -138,7 +138,7 @@ fn composed(s: &Split, panes: &HashMap<PaneId, (&Grid, &Cursor)>) -> shux_ui::Co
             zoom: None,
             focused: s.left,
             panes,
-            titles: None,
+            chrome: None,
             status_bar: None,
         },
         COLS,

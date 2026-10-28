@@ -111,13 +111,8 @@ pub struct MultiPaneFrame<'a> {
     pub focused: PaneId,
     /// Per-pane virtual terminals keyed by pane id.
     pub vts: &'a HashMap<PaneId, &'a shux_vt::VirtualTerminal>,
-    /// Per-pane titles (PR 4 / task 027). When `show_pane_titles` is
-    /// enabled and a pane has a non-empty title, the title is overlaid
-    /// onto the pane's top border. Caller passes whatever the
-    /// graph snapshot reports as `Pane.title` (priority-resolved from
-    /// manual > osc > auto-derived). Missing keys = no title overlay,
-    /// not a panic.
-    pub titles: Option<&'a HashMap<PaneId, String>>,
+    /// What each pane draws on its top border; a missing pane draws nothing.
+    pub chrome: Option<&'a HashMap<PaneId, crate::chrome::PaneChrome>>,
     /// Optional status bar (renders into the rows reserved by
     /// `CompositorConfig::status_bar_height`).
     pub status_bar: Option<&'a StatusBar>,
@@ -514,48 +509,49 @@ impl<W: Write> RenderCompositor<W> {
                 self.buffer.set_cell(seg.x, seg.y, cell);
             }
 
-            // PR 4 / task 027 — overlay pane titles on the top border.
-            //
-            // For each pane with a non-empty title, write " <title> "
-            // (space-padded so the corners stay visible) starting at
-            // x = rect.x + 2 on the pane's top border row. Skip if the
-            // pane's outer width is < 6: there's no room for the
-            // smallest meaningful overlay (` X ` plus two corner cells).
-            if let Some(titles) = frame.titles {
+            // Pane titles and status badges, on each pane's top border row.
+            if let Some(chrome) = frame.chrome {
                 for (pid, rect) in &pane_rects {
-                    let title = titles.get(pid).map(|s| s.as_str()).unwrap_or("");
-                    if title.is_empty() || rect.width < 6 {
+                    let Some(pane_chrome) = chrome.get(pid) else {
                         continue;
-                    }
-                    let is_focused = *pid == frame.focused;
-                    let fg = if is_focused {
+                    };
+                    let border = if *pid == frame.focused {
                         self.config.border_colors.focused
                     } else {
                         self.config.border_colors.unfocused
                     };
-                    // Available glyph cells between the two corners,
-                    // minus 4 chars of breathing room (corner + space
-                    // on each side).
-                    let max_chars = rect.width.saturating_sub(4) as usize;
-                    let truncated: String = title.chars().take(max_chars).collect();
-                    let label = format!(" {truncated} ");
-                    let mut x = rect.x.saturating_add(1);
-                    // Overlay on the pane's top border row, NOT its first content row.
                     let y = rect.y.saturating_sub(1);
-                    for ch in label.chars() {
-                        if x >= rect.x.saturating_add(rect.width).saturating_sub(1) {
-                            break;
-                        }
+                    for glyph in crate::chrome::title_overlay(pane_chrome, *rect, &segments) {
+                        let mut chars = glyph.text.chars();
+                        let Some(ch) = chars.next() else {
+                            continue;
+                        };
+                        let extended = chars.next().map(|_| {
+                            std::sync::Arc::new(shux_vt::ExtendedAttrs {
+                                grapheme: Some(glyph.text.clone()),
+                                ..Default::default()
+                            })
+                        });
                         let cell = RenderCell {
                             ch,
-                            fg: Some(fg),
+                            fg: Some(glyph.color.unwrap_or(border)),
                             bg: None,
                             attrs: RenderAttrs::default(),
-                            extended: None,
+                            extended,
                             wide_continuation: false,
                         };
-                        self.buffer.set_cell(x, y, cell);
-                        x = x.saturating_add(1);
+                        self.buffer.set_cell(glyph.x, y, cell);
+                        if glyph.width == 2 {
+                            self.buffer.set_cell(
+                                glyph.x + 1,
+                                y,
+                                RenderCell {
+                                    ch: ' ',
+                                    wide_continuation: true,
+                                    ..RenderCell::default()
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -1106,7 +1102,7 @@ mod tests {
             zoom: None,
             focused: pid,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         let mut compositor = RenderCompositor::new(10, 3, Vec::new(), CompositorConfig::default());
@@ -1143,7 +1139,7 @@ mod tests {
             zoom: None,
             focused: pid,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         let mut compositor = RenderCompositor::new(
@@ -1191,7 +1187,7 @@ mod tests {
             zoom: None,
             focused: pid,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         let mut compositor = RenderCompositor::new(10, 3, Vec::new(), CompositorConfig::default());
@@ -1247,7 +1243,7 @@ mod tests {
             zoom: None,
             focused: pid,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         // No border / status bar so the pane rect is the whole 200x36 buffer:

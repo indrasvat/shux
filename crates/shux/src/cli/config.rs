@@ -78,8 +78,16 @@ prefix = "ctrl-space"
 [program_status]
 # Programs in a pane (Claude Code, Codex, ...) report idle / working /
 # done / blocked / error over OSC 7501; read it with `shux pane status`.
-# false: shux answers no probe, keeps no records and publishes nothing.
+# false: shux answers no probe and keeps no new records; a pane that
+# already exited still reports its final status to `shux pane status`.
 enabled = true
+# A status badge leading each pane's border title: blocked, error, done,
+# working or idle. With appearance.nerd_fonts on (the default) these are
+# Nerd Font icons; with it off, ◆ ✕ ✓ ◔ ○. Not drawn with
+# appearance.border_style = "none".
+border = true
+# "N waiting", led by the blocked icon, while panes in the session are blocked.
+status_bar = true
 
 [keybindings]
 # Optional attach key overrides. Keys use the same notation as prefix:
@@ -103,6 +111,9 @@ enabled = true
 # status_bg        = "#1e2030"   # Catppuccin Crust
 # status_fg        = "#cad3f5"   # Catppuccin Text
 # status_accent    = "#74c7ec"   # Catppuccin Sapphire
+# status_ok        = "#a6da95"   # Catppuccin Green: done badge
+# status_error     = "#ed8796"   # Catppuccin Red: error badge
+# status_attention = "#eed49f"   # Catppuccin Yellow: blocked badge, "waiting"
 
 # ─────────────────────────────────────────────────────────────────────
 # Status-bar segments. Each entry runs `command` every `interval_ms`

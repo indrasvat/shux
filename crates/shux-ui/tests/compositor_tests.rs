@@ -47,7 +47,7 @@ fn test_single_pane_renders_grid_content() {
             zoom: None,
             focused: p,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         })
         .unwrap();
@@ -86,7 +86,7 @@ fn test_two_panes_split_vertical_have_borders() {
             zoom: wl.zoom.as_ref(),
             focused: a,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         })
         .unwrap();
@@ -125,7 +125,7 @@ fn test_zoom_renders_only_zoomed_pane() {
             zoom: wl.zoom.as_ref(),
             focused: a,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         })
         .unwrap();
@@ -164,7 +164,7 @@ fn test_status_bar_renders_at_bottom_row() {
             zoom: None,
             focused: p,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: Some(&bar),
         })
         .unwrap();
@@ -196,7 +196,7 @@ fn test_diff_render_skips_unchanged_cells() {
             zoom: None,
             focused: p,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         })
         .unwrap();
@@ -206,7 +206,7 @@ fn test_diff_render_skips_unchanged_cells() {
             zoom: None,
             focused: p,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         })
         .unwrap();
@@ -229,7 +229,7 @@ fn test_resize_invalidates_buffer() {
             zoom: None,
             focused: p,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         })
         .unwrap();
@@ -240,7 +240,7 @@ fn test_resize_invalidates_buffer() {
             zoom: None,
             focused: p,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         })
         .unwrap();
@@ -297,7 +297,7 @@ fn test_complex_layout_renders_under_budget() {
             zoom: None,
             focused: a,
             vts: &vts,
-            titles: None,
+            chrome: None,
             status_bar: None,
         })
         .unwrap();

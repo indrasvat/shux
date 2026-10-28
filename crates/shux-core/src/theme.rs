@@ -52,6 +52,15 @@ pub struct ThemeConfig {
     /// segment in the left zone.
     #[serde(default)]
     pub status_branch: Option<String>,
+    /// Program-status badges: done.
+    #[serde(default)]
+    pub status_ok: Option<String>,
+    /// Program-status badges: error.
+    #[serde(default)]
+    pub status_error: Option<String>,
+    /// Program-status badges and the "waiting" segment: blocked on you.
+    #[serde(default)]
+    pub status_attention: Option<String>,
 }
 
 /// A single RGB color, kept as a plain triple so renderers in
@@ -84,6 +93,9 @@ pub struct Theme {
     pub status_accent: Rgb,
     pub status_muted: Rgb,
     pub status_branch: Rgb,
+    pub status_ok: Rgb,
+    pub status_error: Rgb,
+    pub status_attention: Rgb,
 }
 
 impl Theme {
@@ -106,6 +118,12 @@ impl Theme {
         status_muted: Rgb::new(91, 96, 120),
         // Mauve #c6a0f6 — git-branch identity in the left zone.
         status_branch: Rgb::new(198, 160, 246),
+        // Green #a6da95
+        status_ok: Rgb::new(166, 218, 149),
+        // Red #ed8796
+        status_error: Rgb::new(237, 135, 150),
+        // Yellow #eed49f
+        status_attention: Rgb::new(238, 212, 159),
     };
 
     /// Resolve `cfg` against `Theme::DEFAULT`. Unparseable hex strings
@@ -122,6 +140,9 @@ impl Theme {
             status_accent: parse_or(cfg.status_accent.as_deref(), d.status_accent),
             status_muted: parse_or(cfg.status_muted.as_deref(), d.status_muted),
             status_branch: parse_or(cfg.status_branch.as_deref(), d.status_branch),
+            status_ok: parse_or(cfg.status_ok.as_deref(), d.status_ok),
+            status_error: parse_or(cfg.status_error.as_deref(), d.status_error),
+            status_attention: parse_or(cfg.status_attention.as_deref(), d.status_attention),
         }
     }
 }
@@ -196,6 +217,9 @@ mod tests {
             status_accent: Some("#abcdef".into()),
             status_muted: None,
             status_branch: None,
+            status_ok: None,
+            status_error: None,
+            status_attention: None,
         };
         let t = Theme::resolve(&cfg);
         assert_eq!(t.border_focused, Rgb::new(255, 0, 0));

@@ -33,6 +33,7 @@ pub mod gate;
 pub mod lens_render;
 pub mod lens_scratch;
 pub mod onboarding;
+pub mod pane_chrome;
 pub mod pane_command;
 pub mod pane_io;
 pub mod pane_record;

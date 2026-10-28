@@ -7,7 +7,6 @@
 //! immediately.
 
 use crossterm::style::Color;
-use unicode_width::UnicodeWidthStr;
 
 use crate::buffer::{RenderAttrs, RenderCell};
 
@@ -55,9 +54,11 @@ impl StatusBar {
     }
 
     /// Compute the width (in display columns) of a list of segments.
-    fn segments_width(segs: &[StatusSegment]) -> usize {
+    /// Columns `segs` take when painted.
+    pub fn segments_width(segs: &[StatusSegment]) -> usize {
         segs.iter()
-            .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+            .flat_map(|s| crate::chrome::text_cells(&s.text))
+            .map(|(_, w)| usize::from(w))
             .sum()
     }
 
@@ -118,26 +119,57 @@ fn paint_segments(
     let mut cursor = start;
     for seg in segs {
         let bg = seg.bg.or(fallback_bg);
-        for ch in seg.text.chars() {
-            if cursor >= row.len() {
+        let attrs = RenderAttrs {
+            bold: seg.bold,
+            ..Default::default()
+        };
+        for (text, width) in crate::chrome::text_cells(&seg.text) {
+            let width = usize::from(width);
+            if cursor + width > row.len() {
                 return;
             }
-            // Ignore chars that would produce 0 or 2 column width: we
-            // approximate width 1; the segments are always ASCII-ish in
-            // practice (icons + identifiers).
-            let cell = RenderCell {
+            let mut chars = text.chars();
+            let Some(ch) = chars.next() else {
+                continue;
+            };
+            // Painting over half of a wide glyph erases its other half, as a
+            // terminal does; otherwise a snapshot would keep the orphan.
+            if row[cursor].wide_continuation && cursor > 0 {
+                row[cursor - 1] = RenderCell {
+                    bg: row[cursor - 1].bg,
+                    ..RenderCell::default()
+                };
+            }
+            let last = cursor + width - 1;
+            if row.get(last + 1).is_some_and(|c| c.wide_continuation) {
+                row[last + 1] = RenderCell {
+                    bg: row[last + 1].bg,
+                    ..RenderCell::default()
+                };
+            }
+            let extended = chars.next().map(|_| {
+                std::sync::Arc::new(shux_vt::ExtendedAttrs {
+                    grapheme: Some(text.clone()),
+                    ..Default::default()
+                })
+            });
+            row[cursor] = RenderCell {
                 ch,
                 fg: seg.fg,
                 bg,
-                attrs: RenderAttrs {
-                    bold: seg.bold,
-                    ..Default::default()
-                },
-                extended: None,
+                attrs,
+                extended,
                 wide_continuation: false,
             };
-            row[cursor] = cell;
-            cursor += 1;
+            if width == 2 {
+                row[cursor + 1] = RenderCell {
+                    ch: ' ',
+                    bg,
+                    wide_continuation: true,
+                    ..RenderCell::default()
+                };
+            }
+            cursor += width;
         }
     }
 }
@@ -145,6 +177,35 @@ fn paint_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Overlapping zones never leave half a wide glyph: the half not painted
+    /// over is blanked, as a terminal does.
+    #[test]
+    fn a_zone_painted_over_half_a_wide_glyph_blanks_the_other_half() {
+        for left in ["ab日", "ab👩\u{200d}💻", "a日b"] {
+            let mut bar = StatusBar::new();
+            bar.left.push(StatusSegment::plain(left));
+            bar.center.push(StatusSegment::plain("XY"));
+            let row = bar.render_row(6);
+            for (i, cell) in row.iter().enumerate() {
+                let wide = crate::chrome::text_cells(&cell.display_text())
+                    .first()
+                    .is_some_and(|(_, w)| *w == 2);
+                let next_is_cont = row.get(i + 1).is_some_and(|c| c.wide_continuation);
+                assert!(
+                    cell.wide_continuation || wide == next_is_cont,
+                    "{left:?}: col {i} {:?} orphaned",
+                    cell.display_text()
+                );
+                if cell.wide_continuation {
+                    assert!(
+                        i > 0 && !row[i - 1].wide_continuation,
+                        "{left:?}: col {i} stray continuation"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_empty_bar_is_blank_row() {
