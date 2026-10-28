@@ -790,8 +790,23 @@ async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() 
     );
 }
 
+/// The terminal descriptors a child still holds once its exec has finished.
+/// The kernel wakes a spawning parent before it runs close-on-exec, so a
+/// first look can see descriptors that are about to close; an inherited one
+/// is still there a moment later.
 #[cfg(target_os = "linux")]
 fn terminal_descriptors_above_stdio(pid: u32) -> Vec<String> {
+    let first = terminal_descriptors_now(pid);
+    if first.is_empty() {
+        return first;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let later = terminal_descriptors_now(pid);
+    first.into_iter().filter(|fd| later.contains(fd)).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_descriptors_now(pid: u32) -> Vec<String> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("read child fd table") {
         let entry = entry.unwrap();
