@@ -684,3 +684,39 @@ fn wait_status_exits_3_when_it_cannot_reach_the_daemon() {
         }
     }
 }
+
+/// A long-lived client that started the daemon reaps the process it spawned.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_that_started_the_daemon_keeps_no_zombie() {
+    let env = Env::new();
+    let mut watch = env
+        .shux()
+        .args(["events", "watch"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn events watch");
+    let pidfile = env.root.path().join("runtime/shux/shux.pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !pidfile.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The watch is connected and parked well before this.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let parent = watch.id().to_string();
+    let zombies: Vec<String> = std::fs::read_dir("/proc")
+        .expect("read /proc")
+        .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("stat")).ok())
+        .filter(|stat| {
+            let fields: Vec<&str> = stat
+                .rsplit_once(')')
+                .map_or(vec![], |(_, rest)| rest.split_whitespace().collect());
+            fields.first() == Some(&"Z") && fields.get(1) == Some(&parent.as_str())
+        })
+        .collect();
+    let _ = watch.kill();
+    let _ = watch.wait();
+    assert!(pidfile.exists(), "events watch never started the daemon");
+    assert!(zombies.is_empty(), "unreaped children: {zombies:?}");
+}

@@ -56,7 +56,7 @@ const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_STALE_STOPS: u32 = 8;
 
 /// How long to wait for another client to finish starting the daemon. Covers
-/// the holder's stale-daemon stops, a drain, and its full connect deadline.
+/// the holder's drain and full connect deadline after a few stale-daemon stops.
 const START_LOCK_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +78,12 @@ pub enum ClientError {
         .0, STALE_EXIT_TIMEOUT.as_secs()
     )]
     DaemonNotServing(String),
+    #[error(
+        "the daemon for this socket{} started but did not serve it within {}s; \
+         run `shux daemon stop` and retry",
+        .0, CONNECT_BUDGET.deadline.as_secs()
+    )]
+    DaemonNotStarted(String),
     #[error(
         "the daemon serving {}{} did not answer within {}s; it may be stopped or \
          wedged -- run `shux daemon stop`, or kill it",
@@ -337,7 +343,10 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
         matches!(child.try_wait(), Ok(None))
             || crate::daemon_boot::our_live_daemon(socket_path).is_some()
     };
-    wait_for_daemon(socket_path, &CONNECT_BUDGET, starting).await
+    let connected = wait_for_daemon(socket_path, &CONNECT_BUDGET, starting).await;
+    // Reap it: a long-lived client would otherwise keep a zombie.
+    let _ = child.try_wait();
+    connected
 }
 
 /// Probe `socket_path` with backoff until the daemon accepts a connection.
@@ -365,10 +374,13 @@ async fn wait_for_daemon(
                     "Daemon not ready yet, retrying..."
                 );
                 backoff = (backoff * 2).min(budget.max_backoff);
-                if attempt >= budget.retries
-                    && (tokio::time::Instant::now() >= deadline || !starting())
-                {
-                    return Err(ClientError::ConnectionFailed(attempt));
+                if attempt >= budget.retries {
+                    if !starting() {
+                        return Err(ClientError::ConnectionFailed(attempt));
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ClientError::DaemonNotStarted(holder(socket_path)));
+                    }
                 }
             }
             Err(e) => return Err(ClientError::Io(e)),
@@ -508,6 +520,9 @@ mod tests {
             ..QUICK
         };
         let failed = wait_for_daemon(&socket, &budget, || true).await;
-        assert!(matches!(failed, Err(ClientError::ConnectionFailed(_))));
+        assert!(
+            matches!(failed, Err(ClientError::DaemonNotStarted(..))),
+            "a daemon still starting at the deadline is named: {failed:?}"
+        );
     }
 }

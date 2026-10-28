@@ -1335,13 +1335,14 @@ async fn a_kill_mid_frame_still_delivers_shutdown_on_its_own_line() {
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("stdin.log");
     // `cat` drains the pipe in large reads; a shell `read` loop takes a
-    // syscall per byte and can outlast the grace on a slow machine.
+    // syscall per byte and can outlast the grace on a slow machine. No
+    // `exec`: the shell keeps stdout open, which the host reads as alive.
     let body = format!(
         r#"#!/usr/bin/env bash
 IFS= read -r _ || exit 1
 printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"torn","version":"0.1.0","subscribes":["session.created"],"provides":[],"capabilities":[]}}}}'
-sleep 1
-exec cat > {log}
+sleep 1.5
+cat > {log}
 "#,
         log = log.display()
     );
