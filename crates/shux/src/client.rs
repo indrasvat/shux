@@ -368,11 +368,12 @@ fn start_daemon_process(socket_path: &Path) -> Result<(), ClientError> {
     cmd.arg("__daemon");
 
     // Tell the daemon which socket to serve, explicitly: `--socket` is a
-    // client-side flag and `SHUX_SOCKET` may be unset. Pass the key, not the
-    // spelling: identity checks on platforms with only a space-joined argv
-    // match it textually, and a relative path would resolve against the cwd
-    // of whoever checks.
-    cmd.arg("--socket").arg(daemon::socket_key(socket_path));
+    // client-side flag and `SHUX_SOCKET` may be unset. Pass the endpoint,
+    // not the spelling: identity checks on platforms with only a space-joined
+    // argv match it textually, and a relative path would resolve against the
+    // cwd of whoever checks.
+    cmd.arg("--socket")
+        .arg(daemon::socket_endpoint(socket_path));
 
     // Detach: don't inherit stdin/stdout/stderr
     cmd.stdin(std::process::Stdio::null());

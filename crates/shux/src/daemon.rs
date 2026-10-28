@@ -119,6 +119,37 @@ pub fn socket_key(socket: &Path) -> PathBuf {
     key
 }
 
+/// The path to bind or connect at for `socket`: its [`socket_key`] when that
+/// fits a socket address, otherwise the spelling made absolute without
+/// resolving links. Identity -- pidfile, locks -- stays on the key; only the
+/// syscall needs a path the kernel accepts, and resolving a symlinked runtime
+/// dir (`/var` → `/private/var` on macOS) can push it past the limit.
+pub fn socket_endpoint(socket: &Path) -> PathBuf {
+    let key = socket_key(socket);
+    if nix::sys::socket::UnixAddr::new(&key).is_ok() {
+        return key;
+    }
+    let mut lexical = if socket.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    for part in socket.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => lexical.push(other),
+        }
+    }
+    if nix::sys::socket::UnixAddr::new(&lexical).is_ok() {
+        lexical
+    } else {
+        key
+    }
+}
+
 /// The socket as the user spelled it, for [`pid_file_candidates`]: the CLI
 /// passes the key everywhere else.
 static TYPED_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();

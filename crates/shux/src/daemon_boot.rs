@@ -277,6 +277,7 @@ impl ProcessArgv {
             ProcessArgv::Joined(joined) => {
                 joined.contains(" __daemon")
                     && (joined_serves_socket(joined, &daemon::socket_key(socket))
+                        || joined_serves_socket(joined, &daemon::socket_endpoint(socket))
                         || joined_serves_socket(joined, socket))
             }
         }
