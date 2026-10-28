@@ -10,6 +10,7 @@ shux-core = { path = "../shux-core" }
 shux-rpc = { path = "../shux-rpc" }
 shux-vt = { path = "../shux-vt" }
 crossterm = { workspace = true }
+nix = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

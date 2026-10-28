@@ -80,24 +80,20 @@ impl TerminalGuard {
         if !std::mem::replace(&mut self.active, false) {
             return Ok(());
         }
+        // An exit can land between the parts of a frame, leaving an APC
+        // string or a synchronized update open; close both before restoring.
+        let _ = execute!(io::stdout(), CloseInterruptedFrame);
         if self.kitty_keyboard {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-            self.kitty_keyboard = false;
         }
-
         if self.mouse_capture {
             let _ = execute!(io::stdout(), DisableMouseCapture);
-            self.mouse_capture = false;
         }
-
         if self.alternate_screen {
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
-            self.alternate_screen = false;
         }
-
         if self.raw_mode_enabled {
             let _ = disable_raw_mode();
-            self.raw_mode_enabled = false;
         }
 
         // Restore cursor presentation in case a pane requested a custom
@@ -121,9 +117,6 @@ impl TerminalGuard {
         }
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // An interrupted frame may have left an APC string or a
-            // synchronized update open; close both before restoring.
-            let _ = execute!(io::stdout(), CloseInterruptedFrame);
             let _ = self.leave();
             let _ = done_tx.send(());
         });
@@ -217,38 +210,54 @@ pub fn install_panic_hook() {
 /// caller restores the terminal and then re-raises.
 ///
 /// Install BEFORE [`TerminalGuard::enter`], and keep [`ShutdownSignals::recv`]
-/// in the select for as long as the terminal is raw: once installed, the
-/// default action is gone for the life of the process.
+/// in the select for as long as the terminal is raw. Dropping it restores the
+/// default actions, so nothing after an attach can swallow a signal.
 pub struct ShutdownSignals {
-    term: tokio::signal::unix::Signal,
-    int: tokio::signal::unix::Signal,
-    hup: tokio::signal::unix::Signal,
-    quit: tokio::signal::unix::Signal,
+    streams: [tokio::signal::unix::Signal; 4],
 }
+
+const SHUTDOWN_SIGNALS: [nix::sys::signal::Signal; 4] = {
+    use nix::sys::signal::Signal;
+    [
+        Signal::SIGTERM,
+        Signal::SIGINT,
+        Signal::SIGHUP,
+        Signal::SIGQUIT,
+    ]
+};
 
 impl ShutdownSignals {
     pub fn install() -> io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
+        let [a, b, c, d] = SHUTDOWN_SIGNALS.map(|sig| signal(SignalKind::from_raw(sig as i32)));
         Ok(Self {
-            term: signal(SignalKind::terminate())?,
-            int: signal(SignalKind::interrupt())?,
-            hup: signal(SignalKind::hangup())?,
-            quit: signal(SignalKind::quit())?,
+            streams: [a?, b?, c?, d?],
         })
     }
 
     /// Resolves with the raw number of the first shutdown signal received.
     pub async fn recv(&mut self) -> i32 {
-        use tokio::signal::unix::SignalKind;
-        let kind = tokio::select! {
-            _ = self.term.recv() => SignalKind::terminate(),
-            _ = self.int.recv() => SignalKind::interrupt(),
-            _ = self.hup.recv() => SignalKind::hangup(),
-            _ = self.quit.recv() => SignalKind::quit(),
+        let [a, b, c, d] = &mut self.streams;
+        let index = tokio::select! {
+            _ = a.recv() => 0,
+            _ = b.recv() => 1,
+            _ = c.recv() => 2,
+            _ = d.recv() => 3,
         };
-        let signo = kind.as_raw_value();
+        let signo = SHUTDOWN_SIGNALS[index] as i32;
         tracing::info!(signo, "client: shutdown signal");
         signo
+    }
+}
+
+impl Drop for ShutdownSignals {
+    fn drop(&mut self) {
+        use nix::sys::signal::{SigHandler, signal};
+        for sig in SHUTDOWN_SIGNALS {
+            // SAFETY: SIG_DFL installs no handler, so no code of ours runs in
+            // signal context.
+            let _ = unsafe { signal(sig, SigHandler::SigDfl) };
+        }
     }
 }
 
@@ -282,5 +291,27 @@ mod tests {
             !ansi.contains("\x1b[?1003h"),
             "shux should not enable any-motion tracking"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_shutdown_signals_restores_the_default_actions() {
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, sigaction};
+        fn is_default(sig: nix::sys::signal::Signal) -> bool {
+            let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+            // SAFETY: SIG_DFL runs no code of ours, and the old action goes
+            // straight back.
+            let old = unsafe { sigaction(sig, &dfl) }.unwrap();
+            unsafe { sigaction(sig, &old) }.unwrap();
+            matches!(old.handler(), SigHandler::SigDfl)
+        }
+
+        let signals = ShutdownSignals::install().unwrap();
+        for sig in SHUTDOWN_SIGNALS {
+            assert!(!is_default(sig), "{sig} is not caught");
+        }
+        drop(signals);
+        for sig in SHUTDOWN_SIGNALS {
+            assert!(is_default(sig), "{sig} is still caught");
+        }
     }
 }

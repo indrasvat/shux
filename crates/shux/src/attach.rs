@@ -730,6 +730,8 @@ async fn run_attach_loop(
     // its own; otherwise it waits on the next keystroke or Pong.
     let mut alive_tick = tokio::time::interval(Duration::from_millis(200));
     alive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Sent at teardown, once nothing else can queue a frame behind it.
+    let mut final_frame = None;
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -1121,7 +1123,7 @@ async fn run_attach_loop(
                         // Detach implies the user found the prefix too.
                         onboarding.mark_prefix_discovered().await;
                         detached = true;
-                        let _ = out_tx.send(AttachServerFrame::DetachAck).await;
+                        final_frame = Some(AttachServerFrame::DetachAck);
                     }
                     AttachClientFrame::PrefixTapped => {
                         // Authoritative signal: user has discovered the
@@ -1158,11 +1160,9 @@ async fn run_attach_loop(
             live
         };
         if !still_alive {
-            let _ = out_tx
-                .send(AttachServerFrame::SessionEnded {
-                    reason: "session_destroyed".into(),
-                })
-                .await;
+            final_frame.get_or_insert(AttachServerFrame::SessionEnded {
+                reason: "session_destroyed".into(),
+            });
             break;
         }
     }
@@ -1173,13 +1173,16 @@ async fn run_attach_loop(
     // of the pane's life — visible next time anyone attaches.
     release_app_gesture(&io_state, &mut selection_drag).await;
 
-    // Stop every other holder of `out_tx` first: the writer drains what is
-    // queued (the final DetachAck / SessionEnded) and ends only once the last
+    // Stop every other holder of `out_tx` first, so the final frame is the
+    // last one queued: the writer drains it and ends only once the last
     // sender is gone, which is what hangs up on the client.
     renderer.abort();
     pinger.abort();
     let _ = renderer.await;
     let _ = pinger.await;
+    if let Some(frame) = final_frame {
+        let _ = out_tx.send(frame).await;
+    }
     drop(out_tx);
     let _ = writer.await;
     info!(session = %session.name, "attach session ended");

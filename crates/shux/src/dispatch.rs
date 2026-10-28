@@ -93,13 +93,6 @@ pub(crate) async fn run_attach(
     };
     match shux_ui::attach::run_attach(&attach_path, cfg).await {
         Ok(reason) => {
-            // Nothing listens for the client's signal handlers any more, and
-            // the lines below can block on a terminal that stopped reading.
-            if !matches!(reason, shux_ui::ExitReason::Signal(_)) {
-                for sig in SHUTDOWN_SIGNALS {
-                    default_signal_action(sig);
-                }
-            }
             match reason {
                 shux_ui::ExitReason::Detached => {
                     println!("[detached from session '{session_name}']");
@@ -124,32 +117,14 @@ pub(crate) async fn run_attach(
 /// Die by `signo` under its default action, as the process would have if the
 /// signal had not been caught so the terminal could be restored first. A parent
 /// shell then sees the real cause: `bash` aborts a script whose child died of
-/// SIGINT, but not one whose child exited 130.
+/// SIGINT, but not one whose child exited 130. The client has already restored
+/// the default action.
 fn die_by_signal(signo: i32) -> ! {
     use nix::sys::signal::{Signal, raise};
     if let Ok(sig) = Signal::try_from(signo) {
-        default_signal_action(sig);
         let _ = raise(sig);
     }
     std::process::exit(128 + signo)
-}
-
-/// The signals `shux_ui::terminal::ShutdownSignals` catches.
-const SHUTDOWN_SIGNALS: [nix::sys::signal::Signal; 4] = {
-    use nix::sys::signal::Signal;
-    [
-        Signal::SIGTERM,
-        Signal::SIGINT,
-        Signal::SIGHUP,
-        Signal::SIGQUIT,
-    ]
-};
-
-fn default_signal_action(sig: nix::sys::signal::Signal) {
-    use nix::sys::signal::{SigHandler, signal};
-    // SAFETY: SIG_DFL installs no handler, so no code of ours ever runs in
-    // signal context; this only undoes tokio's registration.
-    let _ = unsafe { signal(sig, SigHandler::SigDfl) };
 }
 
 /// Dispatch CLI subcommands.

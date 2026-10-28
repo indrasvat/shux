@@ -65,20 +65,6 @@ impl Harness {
         );
     }
 
-    fn send_keys(&self, session: &str, text: &str) {
-        let out = Command::new(&self.bin)
-            .env("XDG_RUNTIME_DIR", self.runtime_dir())
-            .env_remove("SHUX")
-            .args(["pane", "send-keys", "-s", session, "--text", text])
-            .output()
-            .expect("spawn shux pane send-keys");
-        assert!(
-            out.status.success(),
-            "send-keys failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
     fn kill_session(&self, name: &str) {
         let out = Command::new(&self.bin)
             .env("XDG_RUNTIME_DIR", self.runtime_dir())
@@ -218,11 +204,7 @@ impl AttachedClient {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             self.pump();
-            // The compositor re-encodes the basic SGR 34 as palette slot 4.
-            if [&b"38;2;120;220;180"[..], b"38;5;208", b"38;5;4m"]
-                .iter()
-                .all(|probe| find(&self.seen, probe))
-            {
+            if drew_every_probe(&self.seen) {
                 return;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
@@ -239,11 +221,18 @@ impl AttachedClient {
         );
     }
 
-    /// Wait for exit without reading the PTY, as a terminal that hung would.
-    fn wait_for_exit_unread(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+    /// Wait for exit, reading the PTY only with `pump`: without it, as a
+    /// terminal that hung would.
+    fn wait_exit(&mut self, within: Duration, pump: bool) -> Option<std::process::ExitStatus> {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
+            if pump {
+                self.pump();
+            }
             if let Ok(Some(status)) = self.child.try_wait() {
+                if pump {
+                    self.pump();
+                }
                 return Some(status);
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -252,14 +241,8 @@ impl AttachedClient {
     }
 
     fn wait_for_exit(&mut self) -> std::process::ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            self.pump();
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.pump();
-                return status;
-            }
-            std::thread::sleep(Duration::from_millis(25));
+        if let Some(status) = self.wait_exit(Duration::from_secs(10), true) {
+            return status;
         }
         let tail = &self.seen[self.seen.len().saturating_sub(400)..];
         panic!(
@@ -278,6 +261,31 @@ impl Drop for AttachedClient {
 
 fn find(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Every colour probe drawn: truecolor, indexed, and the basic SGR 34, which
+/// the compositor re-encodes as palette slot 4.
+fn drew_every_probe(seen: &[u8]) -> bool {
+    [&b"38;2;120;220;180"[..], b"38;5;208", b"38;5;4m"]
+        .iter()
+        .all(|probe| find(seen, probe))
+}
+
+/// Whether a thread of `pid` sits in a write to its stdout or stderr: the
+/// terminal stopped reading and the PTY is full.
+#[cfg(target_os = "linux")]
+fn blocked_writing_to_terminal(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        let syscall = std::fs::read_to_string(task.path().join("syscall")).unwrap_or_default();
+        let mut fields = syscall.split_whitespace();
+        let nr = fields.next().and_then(|n| n.parse::<i64>().ok());
+        let fd = fields.next();
+        matches!(nr, Some(n) if n == nix::libc::SYS_write || n == nix::libc::SYS_writev)
+            && matches!(fd, Some("0x1" | "0x2"))
+    })
 }
 
 fn assert_signal_restores_terminal(sig: Signal) {
@@ -430,8 +438,7 @@ async fn headless_attach(
     );
     let mut seen = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while !(find(&seen, b"38;2;120;220;180") && find(&seen, b"38;5;208") && find(&seen, b"38;5;4m"))
-    {
+    while !drew_every_probe(&seen) {
         assert!(tokio::time::Instant::now() < deadline, "pane never drawn");
         let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(2), framed.next()).await
         else {
@@ -475,7 +482,9 @@ async fn assert_hung_up_after(
 #[tokio::test]
 async fn a_detached_client_is_sent_nothing_more_and_hung_up_on() {
     let h = Harness::new();
-    h.create_session("teardown-detach");
+    // A pane that never stops printing keeps the renderer queueing frames
+    // right up to the detach; none may follow the DetachAck.
+    h.create_session_running("teardown-detach", &flood_workload());
     let mut framed = headless_attach(&h, "teardown-detach").await;
     framed
         .send(Bytes::from(
@@ -483,8 +492,6 @@ async fn a_detached_client_is_sent_nothing_more_and_hung_up_on() {
         ))
         .await
         .expect("send detach");
-    // Pane output after the detach must not be rendered to this client.
-    h.send_keys("teardown-detach", "echo AFTER\r");
     assert_hung_up_after(&mut framed, |f| matches!(f, AttachServerFrame::DetachAck)).await;
 }
 
@@ -502,7 +509,9 @@ async fn a_client_whose_session_ends_is_hung_up_on() {
 
 /// A terminal that stops reading (a stalled ssh, a hung emulator) leaves the
 /// client blocked mid-write. A signal must still end it and restore the modes:
-/// that is exactly when someone reaches for `kill`.
+/// that is exactly when someone reaches for `kill`. Linux only: proving the
+/// client really is blocked reads `/proc`.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
     let h = Harness::new();
@@ -512,9 +521,16 @@ fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
     client.wait_until_drawing();
 
     // Stop reading and let the client's output back up behind the PTY.
-    std::thread::sleep(Duration::from_secs(3));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !blocked_writing_to_terminal(client.child.id()) {
+        assert!(
+            Instant::now() < deadline,
+            "the client never blocked on its terminal; this test proves nothing"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     kill(Pid::from_raw(client.child.id() as i32), Signal::SIGTERM).expect("signal attach");
-    let status = client.wait_for_exit_unread(Duration::from_secs(5));
+    let status = client.wait_exit(Duration::from_secs(5), false);
     let after = client.termios();
     client.pump();
 
