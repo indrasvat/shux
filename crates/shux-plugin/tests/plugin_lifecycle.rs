@@ -5,11 +5,12 @@
 //! Bash is the lowest-common-denominator way to demonstrate the
 //! handshake without dragging in a runtime.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shux_core::bus::EventBus;
-use shux_plugin::{PluginManager, PluginSource};
+use shux_plugin::{HANDSHAKE_TIMEOUT, PluginManager, PluginSource};
+use shux_testkit::{BUDGET, wait_for_async, wait_until_async};
 
 /// How many processes on this machine have `needle` in their argv.
 ///
@@ -31,22 +32,106 @@ fn count_procs_containing(needle: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Wait (bounded) for every process matching `needle` to disappear.
+/// Wait for `count_procs_containing(needle)` to equal `want`; returns the
+/// count it last saw, so a caller asserts on it.
 ///
-/// Yields with `tokio::time::sleep`, never `std::thread::sleep`: these tests
-/// run on a current-thread runtime, and a blocking sleep would park the very
-/// executor that has to poll the plugin's I/O task before it can do the
-/// killing. Blocking here reports "the kill never happened" for every plugin,
-/// working or not.
-async fn wait_for_no_procs(needle: &str, budget: Duration) -> usize {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        let n = count_procs_containing(needle);
-        if n == 0 || std::time::Instant::now() >= deadline {
-            return n;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+/// Polls on the blocking pool, never on the runtime thread: these tests run on
+/// a current-thread runtime, whose I/O tasks must keep running to do the
+/// killing. A blocking task also holds tokio's paused clock still, so this is
+/// safe under `start_paused` too.
+async fn wait_for_procs(needle: &str, want: usize) -> usize {
+    let needle = needle.to_owned();
+    tokio::task::spawn_blocking(move || {
+        shux_testkit::poll_until(BUDGET, || count_procs_containing(&needle) == want);
+        count_procs_containing(&needle)
+    })
+    .await
+    .expect("the ps poll panicked")
+}
+
+async fn wait_for_no_procs(needle: &str) -> usize {
+    wait_for_procs(needle, 0).await
+}
+
+/// The text of `path` once it holds `lines` complete lines.
+async fn wait_for_lines(path: &Path, lines: usize) -> String {
+    let what = format!("{lines} complete line(s) in {}", path.display());
+    wait_for_async(&what, || async {
+        std::fs::read_to_string(path)
+            .ok()
+            .filter(|s| s.ends_with('\n') && s.lines().count() >= lines)
+    })
+    .await
+}
+
+/// A FIFO for a plugin to wait at (`read -r _ < gate`) until [`open_gate`].
+fn gate(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    path
+}
+
+/// Let one plugin waiting at `gate` through.
+async fn open_gate(gate: &Path) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let gate = gate.to_owned();
+    tokio::task::spawn_blocking(move || {
+        // Non-blocking: the open succeeds only once a plugin is at the gate,
+        // so a gate nobody reaches fails the wait instead of hanging the test.
+        let mut fifo = shux_testkit::wait_for("a plugin to wait at the gate", || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+                .open(&gate)
+                .ok()
+        });
+        fifo.write_all(b"go\n").expect("open the gate");
+    })
+    .await
+    .expect("the gate opener panicked");
+}
+
+/// Wait on the blocking pool for `path` to exist. Safe under a paused clock.
+async fn wait_for_path(path: &Path) {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        shux_testkit::wait_until(&format!("{} to exist", path.display()), || path.exists());
+    })
+    .await
+    .expect("the path wait panicked");
+}
+
+/// Keeps tokio's paused clock still until dropped.
+///
+/// While any blocking task runs, a paused runtime does not auto-advance its
+/// clock, so virtual time moves only on `tokio::time::advance`. A handshake
+/// budget then expires exactly when the test says so, however long the real
+/// plugin takes to be scheduled.
+struct ClockHold {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+fn hold_clock() -> ClockHold {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let _ = rx.recv();
+    });
+    ClockHold { _release: tx }
+}
+
+/// Await `task` for at most [`BUDGET`] of REAL time, also under a held clock
+/// where `tokio::time::timeout` would never fire.
+async fn within_budget<T: Send + 'static>(task: tokio::task::JoinHandle<T>) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(task.await);
+    });
+    tokio::task::spawn_blocking(move || rx.recv_timeout(BUDGET))
+        .await
+        .expect("the budget wait panicked")
+        .unwrap_or_else(|_| panic!("the task was still running after {BUDGET:?}"))
+        .expect("the task panicked")
 }
 
 fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -114,47 +199,48 @@ async fn install_rejects_duplicate_names() {
     mgr.kill("noop").await.unwrap();
 }
 
-#[tokio::test]
+/// The handshake budget fires on a plugin that never answers, and the plugin
+/// goes with it. On tokio's paused clock the budget expires when the test
+/// advances it, not when a loaded machine gets round to it.
+#[tokio::test(start_paused = true)]
 async fn install_times_out_on_silent_plugin() {
     let tmp = tempfile::tempdir().unwrap();
-    // Plugin reads init but never writes a manifest — should time
-    // out after HANDSHAKE_TIMEOUT (5s).
-    //
-    // The sleep carries a run-unique marker. It used to be a bare `sleep 30`,
-    // which is the exact string `shux`'s own daemon-lifecycle unit test scans
-    // the global process table for — two suites sharing one needle.
+    // A run-unique marker: `shux`'s own daemon-lifecycle unit test scans the
+    // global process table for a bare `sleep 30`.
     let marker = unique_marker("silent");
     let silent = format!(
         r#"#!/usr/bin/env bash
 IFS= read -r _ || exit 1
-exec -a {marker} sleep 30
+exec -a {marker} sleep 300
 "#
     );
     let script = write_script(tmp.path(), "silent.sh", &silent);
 
-    // An explicit short budget: this test is about the timeout FIRING, not
-    // about its production value, and inheriting the real one would make it
-    // sit out 30s to learn nothing extra (issue #160).
-    let budget = Duration::from_secs(2);
-    let mgr = PluginManager::new(EventBus::new()).with_handshake_timeout(budget);
-    let start = std::time::Instant::now();
-    let err = mgr
-        .install(PluginSource::from_path(&script))
-        .await
-        .unwrap_err();
-    let elapsed = start.elapsed();
-
-    assert!(matches!(err, shux_plugin::PluginError::HandshakeFailed(_)));
-    // Must hit at the budget, and must not return early.
-    assert!(elapsed >= budget, "returned early: {elapsed:?}");
-    assert!(
-        elapsed < budget + Duration::from_secs(3),
-        "overshot: {elapsed:?}"
-    );
-
-    let survivors = wait_for_no_procs(&marker, Duration::from_secs(5)).await;
+    let _hold = hold_clock();
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let start = tokio::time::Instant::now();
+    let install = tokio::spawn({
+        let mgr = mgr.clone();
+        async move { mgr.install(PluginSource::from_path(&script)).await }
+    });
+    // The plugin has read `plugin.init`, so its budget is running.
     assert_eq!(
-        survivors, 0,
+        wait_for_procs(&marker, 1).await,
+        1,
+        "the silent plugin never started"
+    );
+    tokio::time::advance(HANDSHAKE_TIMEOUT).await;
+    let err = within_budget(install).await.unwrap_err();
+
+    assert!(
+        matches!(&err, shux_plugin::PluginError::HandshakeFailed(m)
+            if m.contains("manifest not received")),
+        "want the handshake budget to fire, got: {err}"
+    );
+    assert_eq!(start.elapsed(), HANDSHAKE_TIMEOUT);
+    assert_eq!(
+        wait_for_no_procs(&marker).await,
+        0,
         "the timed-out plugin's own process survived the kill"
     );
 }
@@ -204,26 +290,26 @@ exec -a {own} sleep 45
     mgr.install(PluginSource::from_path(&script)).await.unwrap();
 
     // Both must actually be running, or the test proves nothing.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while count_procs_containing(&child) == 0 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     assert_eq!(
-        count_procs_containing(&child),
+        wait_for_procs(&child, 1).await,
         1,
         "the plugin never started its grandchild — the test would pass vacuously"
+    );
+    assert_eq!(
+        wait_for_procs(&own, 1).await,
+        1,
+        "the plugin never became its marked self — the test would pass vacuously"
     );
 
     mgr.kill("forker").await.unwrap();
 
-    // `kill` grants a shutdown grace before the signal; allow for it.
     assert_eq!(
-        wait_for_no_procs(&own, Duration::from_secs(10)).await,
+        wait_for_no_procs(&own).await,
         0,
         "the plugin process itself survived `kill`"
     );
     assert_eq!(
-        wait_for_no_procs(&child, Duration::from_secs(10)).await,
+        wait_for_no_procs(&child).await,
         0,
         "the plugin died but the process IT spawned was left running"
     );
@@ -245,7 +331,7 @@ async fn install_rejects_garbage_manifest() {
 IFS= read -r _ || exit 1
 ( exec -a {child} sleep 45 ) &
 printf 'not json at all\n'
-sleep 1
+IFS= read -r _
 "#
     );
     let script = write_script(tmp.path(), "bad.sh", &bad);
@@ -258,7 +344,7 @@ sleep 1
     assert!(matches!(err, shux_plugin::PluginError::HandshakeFailed(_)));
 
     assert_eq!(
-        wait_for_no_procs(&child, Duration::from_secs(10)).await,
+        wait_for_no_procs(&child).await,
         0,
         "the rejected plugin's grandchild outlived the failed install"
     );
@@ -351,19 +437,7 @@ done
         name: "alpha".into(),
     });
 
-    // Give the plugin a beat to read + flush its capture line.
-    for _ in 0..50 {
-        if out.exists()
-            && std::fs::metadata(&out)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let captured = std::fs::read_to_string(&out).expect("captured.jsonl");
+    let captured = wait_for_lines(&out, 1).await;
     let line = captured
         .lines()
         .next()
@@ -431,18 +505,12 @@ done
 
     mgr.kill("graceful").await.expect("kill");
 
-    // Wait briefly for the plugin to flush + exit (kill returns
-    // before the child reaps).
-    for _ in 0..50 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        marker.exists(),
-        "plugin never received plugin.shutdown before being killed"
-    );
+    // `kill` returns before the plugin has read the frame.
+    wait_until_async(
+        "the plugin to receive plugin.shutdown before being killed",
+        || async { marker.exists() },
+    )
+    .await;
 }
 
 /// `event.publish` from a plugin lands on the bus as a
@@ -479,19 +547,17 @@ done
         .await
         .expect("install");
 
-    // Wait for the namespaced event with a bounded poll.
-    let mut got = None;
-    for _ in 0..100 {
-        match tokio::time::timeout(Duration::from_millis(20), sub.recv()).await {
-            Ok(Some(shux_core::bus::SubscriptionEvent::Event(ev))) => {
-                got = Some(ev);
-                break;
+    let ev = tokio::time::timeout(BUDGET, async {
+        loop {
+            match sub.recv().await {
+                Some(shux_core::bus::SubscriptionEvent::Event(ev)) => break ev,
+                Some(shux_core::bus::SubscriptionEvent::Lagged(_)) => continue,
+                None => panic!("the bus closed before the plugin event landed"),
             }
-            _ => continue,
         }
-    }
-
-    let ev = got.expect("plugin event never landed on the bus");
+    })
+    .await
+    .expect("plugin event never landed on the bus");
     assert_eq!(
         ev.meta.event_type, "plugin.emitter.hello",
         "namespaced filterable type"
@@ -576,17 +642,7 @@ done
         .await
         .expect("install");
 
-    for _ in 0..80 {
-        let count = std::fs::read_to_string(&resp_capture)
-            .map(|s| s.lines().count())
-            .unwrap_or(0);
-        if count >= 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let body = std::fs::read_to_string(&resp_capture).expect("captured responses");
+    let body = wait_for_lines(&resp_capture, 3).await;
     let lines: Vec<&str> = body.lines().collect();
     assert!(
         lines.len() >= 3,
@@ -665,17 +721,9 @@ done
     mgr.install(PluginSource::from_path(&script_path))
         .await
         .expect("install phase 1");
-    for _ in 0..50 {
-        if std::fs::read_to_string(&resp_capture)
-            .map(|s| s.contains("\"id\":1"))
-            .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // The response to the set is written only after the state file is.
+    wait_for_lines(&resp_capture, 1).await;
     mgr.kill("reloader").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Phase 2: flip the phase marker, re-install, plugin should
     // now READ the value back.
@@ -683,17 +731,7 @@ done
     mgr.install(PluginSource::from_path(&script_path))
         .await
         .expect("install phase 2");
-    for _ in 0..80 {
-        if std::fs::read_to_string(&resp_capture)
-            .map(|s| s.contains("\"id\":2"))
-            .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let body = std::fs::read_to_string(&resp_capture).unwrap();
+    let body = wait_for_lines(&resp_capture, 2).await;
     let id2 = body
         .lines()
         .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -750,16 +788,7 @@ done
     source.state_root = Some(project_root.clone());
     mgr.install(source).await.expect("install");
 
-    for _ in 0..50 {
-        if resp_capture.exists()
-            && std::fs::metadata(&resp_capture)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_lines(&resp_capture, 1).await;
 
     // The file must live under PROJECT root, not the daemon default.
     let project_path = project_root.join("projscoped").join("state.json");
@@ -812,16 +841,7 @@ done
         .await
         .expect("install");
 
-    for _ in 0..50 {
-        if resp_capture.exists()
-            && std::fs::metadata(&resp_capture)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_lines(&resp_capture, 1).await;
 
     let body = std::fs::read_to_string(&resp_capture).expect("response captured");
     let resp: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
@@ -870,16 +890,7 @@ done
         .await
         .expect("install");
 
-    for _ in 0..50 {
-        if resp_capture.exists()
-            && std::fs::metadata(&resp_capture)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_lines(&resp_capture, 1).await;
 
     let body = std::fs::read_to_string(&resp_capture).expect("response captured");
     let resp: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
@@ -907,37 +918,57 @@ done
 /// `HandshakeFailed("manifest not received within 5s")` once the uncapped
 /// test pool got more expensive. Nothing was broken — the machine was busy.
 ///
-/// A sleep reproduces starvation exactly as the manager sees it: child alive,
-/// stdout open, no line yet. Deterministic, no contention harness needed.
-#[tokio::test]
+/// A plugin held at a gate reproduces starvation exactly as the manager sees
+/// it: child alive, stdout open, no line yet. On the paused clock it stays
+/// silent for exactly 8s, past the 5s budget that failed CI in #160.
+#[tokio::test(start_paused = true)]
 async fn install_survives_a_plugin_that_is_slow_to_hand_shake() {
     let tmp = tempfile::tempdir().unwrap();
-    let slow = r#"#!/usr/bin/env bash
+    let ready = tmp.path().join("ready");
+    let held = gate(tmp.path(), "gate");
+    let slow = format!(
+        r#"#!/usr/bin/env bash
 set -u
 IFS= read -r _ || exit 1
-sleep 8
-printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"slowpoke","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+: > {ready}
+IFS= read -r _ < {held}
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"slowpoke","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
 while IFS= read -r line; do
   case "$line" in
     *'"plugin.shutdown"'*) exit 0 ;;
   esac
 done
-"#;
-    let script = write_script(tmp.path(), "slow.sh", slow);
+"#,
+        ready = ready.display(),
+        held = held.display()
+    );
+    let script = write_script(tmp.path(), "slow.sh", &slow);
 
-    let mgr = PluginManager::new(EventBus::new());
-    let info = mgr
-        .install(PluginSource::from_path(&script))
+    let hold = hold_clock();
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let install = tokio::spawn({
+        let mgr = mgr.clone();
+        async move { mgr.install(PluginSource::from_path(&script)).await }
+    });
+    // The plugin has read `plugin.init`, so its budget is running.
+    wait_for_path(&ready).await;
+    tokio::time::advance(Duration::from_secs(8)).await;
+    open_gate(&held).await;
+    let info = within_budget(install)
         .await
         .expect("a plugin that is merely slow must not be mistaken for a broken one");
     assert_eq!(info.name, "slowpoke");
+
+    drop(hold);
     mgr.kill("slowpoke").await.unwrap();
+    mgr.shutdown().await;
 }
 
 /// The other half of #160: raising the budget must NOT slow down detection of
 /// a plugin that actually died. That case never depended on the timeout —
-/// stdout closes and the read returns EOF — so it must still fail promptly.
-#[tokio::test]
+/// stdout closes and the read returns EOF — so it fails with the paused clock
+/// never having moved.
+#[tokio::test(start_paused = true)]
 async fn install_still_fails_fast_when_the_plugin_exits_without_a_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     let dies = r#"#!/usr/bin/env bash
@@ -946,17 +977,18 @@ exit 3
 "#;
     let script = write_script(tmp.path(), "dies.sh", dies);
 
-    let mgr = PluginManager::new(EventBus::new());
-    let start = std::time::Instant::now();
-    let err = mgr
-        .install(PluginSource::from_path(&script))
-        .await
-        .expect_err("a plugin that exits without a manifest must fail");
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "a dead plugin must be detected by EOF, not by waiting out the handshake budget \
-         (took {elapsed:?}); error was: {err}"
+    let _hold = hold_clock();
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let start = tokio::time::Instant::now();
+    let err = within_budget(tokio::spawn(async move {
+        mgr.install(PluginSource::from_path(&script)).await
+    }))
+    .await
+    .expect_err("a plugin that exits without a manifest must fail");
+    assert_eq!(
+        start.elapsed(),
+        Duration::ZERO,
+        "a dead plugin must be detected by EOF, not by a timer; error was: {err}"
     );
 }
 
@@ -983,18 +1015,27 @@ sleep 120
     );
     let script = write_script(tmp.path(), "forker.sh", &forker);
 
-    let mgr = PluginManager::new(EventBus::new());
-    // Drop the install future mid-handshake, the way a disconnecting client does.
-    let cancelled = tokio::time::timeout(
-        Duration::from_millis(700),
-        mgr.install(PluginSource::from_path(&script)),
-    )
-    .await;
-    assert!(cancelled.is_err(), "the install should not have completed");
-
-    let survivors = wait_for_no_procs(&marker, Duration::from_secs(5)).await;
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let install = tokio::spawn({
+        let mgr = mgr.clone();
+        async move { mgr.install(PluginSource::from_path(&script)).await }
+    });
     assert_eq!(
-        survivors, 0,
+        wait_for_procs(&marker, 1).await,
+        1,
+        "the plugin never forked its grandchild — the test would pass vacuously"
+    );
+    // Drop the install future mid-handshake, the way a disconnecting client does.
+    install.abort();
+    let outcome = install.await;
+    assert!(
+        outcome.as_ref().is_err_and(|e| e.is_cancelled()),
+        "the install should not have completed: {outcome:?}"
+    );
+
+    assert_eq!(
+        wait_for_no_procs(&marker).await,
+        0,
         "a cancelled install leaked the plugin's forked child"
     );
 }
@@ -1012,14 +1053,11 @@ fn save_script(path: &std::path::Path, body: &str) {
 }
 
 async fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + budget;
-    while std::time::Instant::now() < deadline {
-        if done() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    done()
+    shux_testkit::poll_until_async(budget, || {
+        let held = done();
+        async move { held }
+    })
+    .await
 }
 
 /// A polite plugin named `name` that appends a line to `starts` each time it
@@ -1049,13 +1087,23 @@ fn line_count(path: &std::path::Path) -> usize {
 
 /// Wait for a save to unregister every plugin, as a reload does first.
 async fn wait_unlisted(mgr: &PluginManager) -> bool {
-    for _ in 0..400 {
-        if mgr.list().await.is_empty() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    false
+    shux_testkit::poll_until_async(BUDGET, || async { mgr.list().await.is_empty() }).await
+}
+
+/// Wait until every reload watcher `mgr` started has stopped. After that no
+/// save can reload or reinstall anything, so an absence asserted next is
+/// ordered after every reaction a save could have had.
+async fn wait_watchers_stopped(mgr: &PluginManager, what: &str) {
+    wait_until_async(what, || async {
+        let (started, stopped) = mgr.watcher_counts();
+        started == stopped
+    })
+    .await;
+}
+
+/// Wait until at least `n` reload watchers have stopped.
+async fn wait_watchers_stopped_at_least(mgr: &PluginManager, n: u64, what: &str) {
+    wait_until_async(what, || async { mgr.watcher_counts().1 >= n }).await;
 }
 
 /// A watcher re-armed after a failed reload must stop when the plugin it
@@ -1069,37 +1117,38 @@ async fn a_plugin_killed_after_recovering_from_a_bad_save_stays_killed() {
     let script = write_script(tmp.path(), "phoenix.sh", &good);
     let start_count = || line_count(&starts);
 
-    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"))
-        .with_handshake_timeout(Duration::from_secs(2));
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
     mgr.install(PluginSource::from_path(&script).with_watch(true))
         .await
         .expect("install");
-    assert!(wait_until(Duration::from_secs(5), || start_count() == 1).await);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_async("the plugin to start", || async { start_count() == 1 }).await;
 
-    // A bad save: the reload's install fails and the watcher re-arms.
+    // A bad save: the reload's install fails and the watcher re-arms. The
+    // first watcher stops only after that reload has returned, re-armed.
     save_script(&script, broken);
     assert!(
         wait_unlisted(&mgr).await,
         "the bad save never unregistered the plugin"
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_watchers_stopped_at_least(&mgr, 1, "the failed reload to re-arm its watcher").await;
 
     // The fix: the re-armed watcher installs it again.
     save_script(&script, &good);
-    assert!(
-        wait_until(Duration::from_secs(5), || start_count() == 2).await,
-        "the fixed save never brought the plugin back"
-    );
+    wait_until_async("the fixed save to bring the plugin back", || async {
+        !mgr.list().await.is_empty() && start_count() == 2
+    })
+    .await;
 
     mgr.kill("phoenix").await.expect("kill");
     save_script(&script, &good);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    wait_watchers_stopped(
+        &mgr,
+        "every watcher to stop after the kill (a live one would reinstall on the save)",
+    )
+    .await;
     let listed = mgr.list().await;
     let restarted = start_count();
-    for p in &listed {
-        let _ = mgr.kill(&p.name).await;
-    }
+    mgr.shutdown().await;
     assert!(
         listed.is_empty() && restarted == 2,
         "a killed plugin came back on the next save: listed {:?}, {restarted} starts",
@@ -1124,30 +1173,31 @@ async fn a_save_right_after_a_watched_install_reloads_the_plugin() {
         .expect("install");
     assert!(info.watching);
     save_script(&script, &body);
-    let reloaded = wait_until(Duration::from_secs(5), || start_count() == 2).await;
+    let reloaded = shux_testkit::poll_until_async(BUDGET, || async { start_count() == 2 }).await;
     let _ = mgr.kill("eager").await;
+    mgr.shutdown().await;
     assert!(reloaded, "a save made as `install` returned was never seen");
 }
 
 /// A plugin that exits on `plugin.shutdown` ends its grace at once: the
-/// leader it leaves unreaped is not a process still shutting down. Linux
-/// only: elsewhere the grace cannot tell that zombie from a live process.
+/// leader it leaves unreaped is not a process still shutting down. The grace
+/// here would never expire on its own, so `shutdown` returns only if the exit
+/// ended it. Linux only: elsewhere the grace cannot tell that zombie from a
+/// live process.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn shutdown_returns_as_soon_as_a_polite_plugin_has_exited() {
     let tmp = tempfile::tempdir().unwrap();
     let script = write_script(tmp.path(), "noop.sh", NOOP_PLUGIN);
-    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"))
+        .with_shutdown_grace(Duration::from_secs(3_600));
     mgr.install(PluginSource::from_path(&script))
         .await
         .expect("install");
 
-    let started = std::time::Instant::now();
-    mgr.shutdown().await;
-    let took = started.elapsed();
     assert!(
-        took < shux_plugin::SHUTDOWN_GRACE - Duration::from_millis(500),
-        "shutdown of a plugin that exits on request took {took:?}, the whole grace"
+        tokio::time::timeout(BUDGET, mgr.shutdown()).await.is_ok(),
+        "shutdown of a plugin that exits on request sat out its whole grace"
     );
 }
 
@@ -1157,11 +1207,16 @@ async fn shutdown_returns_as_soon_as_a_polite_plugin_has_exited() {
 async fn a_plugin_that_stopped_reading_is_still_killed_and_shut_down() {
     let tmp = tempfile::tempdir().unwrap();
     let marker = unique_marker("deaf");
+    // Reads one byte of the first event frame, says so, and stops reading.
+    // That frame alone outsizes any pipe buffer, so from that byte on the I/O
+    // task is parked mid-write for good.
     let body = format!(
         r#"#!/usr/bin/env bash
 set -u
 IFS= read -r _ || exit 1
 printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"deaf","version":"0.1.0","subscribes":["session.created"],"provides":[],"capabilities":[]}}}}'
+IFS= read -r -n 1 _
+: > "$1"
 exec -a {marker} sleep 300
 "#
     );
@@ -1169,32 +1224,30 @@ exec -a {marker} sleep 300
     let bus = EventBus::new();
     let mgr = PluginManager::with_state_root(bus.clone(), tmp.path().join("state"));
 
-    let flood = |bus: &EventBus| {
-        for _ in 0..2_000 {
-            bus.publish(shux_core::event::EventData::SessionCreated {
-                session_id: shux_core::model::SessionId::new(),
-                name: "x".repeat(200),
-            });
-        }
-    };
-
     for round in ["kill", "shutdown"] {
-        mgr.install(PluginSource::from_path(&script))
-            .await
-            .expect("install");
-        flood(&bus);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let parked = tmp.path().join(format!("parked-{round}"));
+        let mut source = PluginSource::from_path(&script);
+        source.args = vec![parked.display().to_string()];
+        mgr.install(source).await.expect("install");
+        bus.publish(shux_core::event::EventData::SessionCreated {
+            session_id: shux_core::model::SessionId::new(),
+            name: "x".repeat(1 << 20),
+        });
+        wait_until_async("the plugin's I/O task to park mid-frame", || async {
+            parked.exists()
+        })
+        .await;
         if round == "kill" {
             mgr.kill("deaf").await.expect("kill");
         } else {
-            let done = tokio::time::timeout(Duration::from_secs(10), mgr.shutdown()).await;
+            let done = tokio::time::timeout(BUDGET, mgr.shutdown()).await;
             assert!(
                 done.is_ok(),
                 "shutdown never returned for a plugin that stopped reading"
             );
         }
         assert_eq!(
-            wait_for_no_procs(&marker, Duration::from_secs(10)).await,
+            wait_for_no_procs(&marker).await,
             0,
             "a plugin that stopped reading survived `{round}`"
         );
@@ -1205,33 +1258,45 @@ exec -a {marker} sleep 300
 /// handshake then fails or succeeds: the next save does not bring it back.
 #[tokio::test]
 async fn a_kill_during_a_reload_handshake_is_not_undone_by_the_next_save() {
-    let tmp = tempfile::tempdir().unwrap();
-    let starts = tmp.path().join("starts.log");
-    let good = counting_plugin("lazarus", &starts);
-    let slow_bad = "#!/usr/bin/env bash\nIFS= read -r _\nsleep 1.5\nexit 1\n".to_string();
-    let slow_good = good.replacen("|| exit 1\n", "|| exit 1\nsleep 1.5\n", 1);
-    for (handshake, slow) in [("fails", slow_bad), ("succeeds", slow_good)] {
+    for handshake in ["fails", "succeeds"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let starts = tmp.path().join("starts.log");
+        let ready = tmp.path().join("ready");
+        let held = gate(tmp.path(), "gate");
+        let good = counting_plugin("lazarus", &starts);
+        // Mid-handshake until the test has killed it.
+        let wait_at_gate = format!(
+            ": > {}\nIFS= read -r _ < {}\n",
+            ready.display(),
+            held.display()
+        );
+        let slow = if handshake == "fails" {
+            format!("#!/usr/bin/env bash\nIFS= read -r _\n{wait_at_gate}exit 1\n")
+        } else {
+            good.replacen("|| exit 1\n", &format!("|| exit 1\n{wait_at_gate}"), 1)
+        };
         let script = write_script(tmp.path(), "lazarus.sh", &good);
         let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
         mgr.install(PluginSource::from_path(&script).with_watch(true))
             .await
             .expect("install");
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         save_script(&script, &slow);
         assert!(wait_unlisted(&mgr).await, "the save never started a reload");
+        wait_for_path(&ready).await;
         mgr.kill("lazarus")
             .await
             .expect("a plugin mid-reload is found");
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
-        let after_kill = mgr.list().await;
-
-        save_script(&script, &good);
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
-        let after_save = mgr.list().await;
+        open_gate(&held).await;
+        wait_watchers_stopped(
+            &mgr,
+            "every watcher to stop after the kill (a live one would bring the plugin back)",
+        )
+        .await;
+        let listed = mgr.list().await;
         mgr.shutdown().await;
         assert!(
-            after_kill.is_empty() && after_save.is_empty(),
+            listed.is_empty(),
             "a plugin killed mid-reload came back when its handshake {handshake}"
         );
     }
@@ -1265,20 +1330,17 @@ sleep 45
         mgr.install(PluginSource::from_path(&script))
             .await
             .expect("install");
-        let c = child.clone();
-        assert!(
-            wait_until(Duration::from_secs(5), move || count_procs_containing(&c)
-                == 1)
-            .await
+        assert_eq!(
+            wait_for_procs(&child, 1).await,
+            1,
+            "the plugin never started its child"
         );
         mgr.kill("stubborn").await.expect("kill");
         mgr.shutdown().await;
     });
     drop(rt);
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while count_procs_containing(&child) > 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // The child outlives the budget unless shutdown's SIGKILL reached it.
+    shux_testkit::poll_until(BUDGET, || count_procs_containing(&child) == 0);
     assert_eq!(
         count_procs_containing(&child),
         0,
@@ -1291,35 +1353,53 @@ sleep 45
 #[tokio::test]
 async fn a_kill_during_a_rearmed_watchers_install_sticks() {
     let tmp = tempfile::tempdir().unwrap();
-    let good = r#"#!/usr/bin/env bash
+    let readies = tmp.path().join("readies.log");
+    let held = gate(tmp.path(), "gate");
+    // Every start waits at the gate mid-handshake.
+    let good = format!(
+        r#"#!/usr/bin/env bash
 IFS= read -r _ || exit 1
-sleep 1
-printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"name":"revenant","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}'
+echo ready >> {readies}
+IFS= read -r _ < {held}
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"revenant","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
 while IFS= read -r line; do
   case "$line" in
     *'"plugin.shutdown"'*) exit 0 ;;
   esac
 done
-"#;
-    let script = write_script(tmp.path(), "revenant.sh", good);
-    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"))
-        .with_handshake_timeout(Duration::from_secs(3));
-    mgr.install(PluginSource::from_path(&script).with_watch(true))
-        .await
-        .expect("install");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+"#,
+        readies = readies.display(),
+        held = held.display()
+    );
+    let script = write_script(tmp.path(), "revenant.sh", &good);
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let install = tokio::spawn({
+        let mgr = mgr.clone();
+        let source = PluginSource::from_path(&script).with_watch(true);
+        async move { mgr.install(source).await }
+    });
+    open_gate(&held).await;
+    install.await.unwrap().expect("install");
 
     save_script(&script, "#!/usr/bin/env bash\nexit 1\n");
     assert!(
         wait_unlisted(&mgr).await,
         "the bad save never unregistered the plugin"
     );
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_watchers_stopped_at_least(&mgr, 1, "the failed reload to re-arm its watcher").await;
 
-    save_script(&script, good);
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    save_script(&script, &good);
+    wait_until_async("the re-armed watcher to start the plugin", || async {
+        line_count(&readies) == 2
+    })
+    .await;
     let killed = mgr.kill("revenant").await;
-    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    open_gate(&held).await;
+    wait_watchers_stopped(
+        &mgr,
+        "every watcher to stop after the kill (a live one would bring the plugin back)",
+    )
+    .await;
     let listed = mgr.list().await;
     mgr.shutdown().await;
     assert!(

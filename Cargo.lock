@@ -1265,6 +1265,7 @@ dependencies = [
  "sha2",
  "shux-core",
  "shux-rpc",
+ "shux-testkit",
  "tempfile",
  "thiserror",
  "tokio",
