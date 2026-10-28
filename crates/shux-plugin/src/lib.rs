@@ -177,7 +177,11 @@ fn stat_state_and_pgrp(stat: &str) -> Option<(&str, u32)> {
 async fn wait_for_group_exit(pid: Option<u32>, budget: Duration) {
     let deadline = tokio::time::Instant::now() + budget;
     while tokio::time::Instant::now() < deadline {
-        if !(plugin_group_alive(pid) && group_has_live_member(pid)) {
+        // `/proc` scans block, so they stay off the async workers.
+        let running = tokio::task::spawn_blocking(move || {
+            plugin_group_alive(pid) && group_has_live_member(pid)
+        });
+        if !running.await.unwrap_or(false) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1266,10 +1270,10 @@ async fn relay_stderr(name: String, stderr: ChildStderr) {
 /// How a [`write_frame`] ended.
 enum Written {
     Whole,
-    /// The kill signal arrived first. `torn`: part of the frame is already
-    /// in the pipe, unterminated.
+    /// The kill signal arrived first, with `sent` bytes of the frame in the
+    /// pipe.
     Killed {
-        torn: bool,
+        sent: usize,
     },
 }
 
@@ -1297,7 +1301,7 @@ async fn write_frame(
         written = write => { written?; false }
     };
     Ok(if killed {
-        Written::Killed { torn: sent > 0 }
+        Written::Killed { sent }
     } else {
         Written::Whole
     })
@@ -1335,7 +1339,8 @@ async fn run_plugin_io(
     let plugin_pgid = child.id();
 
     let mut killed = false;
-    let mut torn = false;
+    // The frame a kill interrupted, and how much of it was written.
+    let mut cut: Option<(String, usize)> = None;
     loop {
         let (frame, what) = tokio::select! {
             biased;
@@ -1397,8 +1402,8 @@ async fn run_plugin_io(
         };
         match write_frame(&mut stdin, frame.as_bytes(), &mut kill_rx).await {
             Ok(Written::Whole) => {}
-            Ok(Written::Killed { torn: t }) => {
-                (killed, torn) = (true, t);
+            Ok(Written::Killed { sent }) => {
+                (killed, cut) = (true, Some((frame, sent)));
                 break;
             }
             Err(e) => {
@@ -1415,9 +1420,10 @@ async fn run_plugin_io(
         // that stopped reading cannot stall the kill on a full pipe.
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         let drain = async {
-            // End a torn frame, so `plugin.shutdown` arrives as its own line.
-            if torn {
-                stdin.write_all(b"\n").await?;
+            // Finish the interrupted frame first: it may be `plugin.shutdown`
+            // itself, and a half-written one would swallow the next line.
+            if let Some((frame, sent)) = &cut {
+                stdin.write_all(&frame.as_bytes()[*sent..]).await?;
             }
             while let Ok(line) = inbox_rx.try_recv() {
                 stdin.write_all(line.as_bytes()).await?;

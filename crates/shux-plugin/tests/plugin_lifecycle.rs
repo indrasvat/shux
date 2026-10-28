@@ -1368,3 +1368,36 @@ done
     mgr.shutdown().await;
     assert!(delivered, "plugin.shutdown arrived glued to a torn frame");
 }
+
+/// `plugin.shutdown` taken off the queue just as the kill signal lands is
+/// still written: a polite plugin always gets the chance to exit itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_kill_delivers_plugin_shutdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = tmp.path().join("seen.log");
+    let body = format!(
+        r#"#!/usr/bin/env bash
+IFS= read -r _ || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"heed","version":"0.1.0","subscribes":[],"provides":[],"capabilities":[]}}}}'
+while IFS= read -r line; do
+  case "$line" in *'"plugin.shutdown"'*) echo seen >> {seen}; exit 0 ;; esac
+done
+"#,
+        seen = seen.display()
+    );
+    let script = write_script(tmp.path(), "heed.sh", &body);
+    let mgr = PluginManager::with_state_root(EventBus::new(), tmp.path().join("state"));
+    let rounds = 200;
+    for _ in 0..rounds {
+        mgr.install(PluginSource::from_path(&script))
+            .await
+            .expect("install");
+        mgr.kill("heed").await.expect("kill");
+    }
+    mgr.shutdown().await;
+    assert_eq!(
+        line_count(&seen),
+        rounds,
+        "some kills never delivered plugin.shutdown"
+    );
+}
