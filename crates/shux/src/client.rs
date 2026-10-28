@@ -344,8 +344,9 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
             || crate::daemon_boot::our_live_daemon(socket_path).is_some()
     };
     let connected = wait_for_daemon(socket_path, &CONNECT_BUDGET, starting).await;
-    // Reap it: a long-lived client would otherwise keep a zombie.
-    let _ = child.try_wait();
+    // Reap it: a long-lived client would otherwise keep a zombie. It may
+    // still be on its way out, since the daemon can bind before it exits.
+    std::thread::spawn(move || child.wait());
     connected
 }
 

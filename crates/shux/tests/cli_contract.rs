@@ -702,8 +702,10 @@ fn a_client_that_started_the_daemon_keeps_no_zombie() {
     while !pidfile.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    // The watch is connected and parked well before this.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // The watch holds the start lock until it connects, so a second client
+    // gets through only once the watch is connected.
+    env.ok(&["session", "list"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let parent = watch.id().to_string();
     let zombies: Vec<String> = std::fs::read_dir("/proc")
         .expect("read /proc")
