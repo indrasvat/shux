@@ -196,7 +196,8 @@ pub(crate) fn register_pane_io_methods(
                         ));
                     };
 
-                    let state = io.lock().await;
+                    let len = bytes.len();
+                    let mut state = io.lock().await;
                     let writer = state
                         .writers
                         .get(&pane_id)
@@ -204,9 +205,9 @@ pub(crate) fn register_pane_io_methods(
                             shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
                         })?
                         .clone();
+                    let bytes = state.outside_paste(pane_id, bytes);
                     drop(state);
 
-                    let len = bytes.len();
                     writer
                         .send(bytes)
                         .await
@@ -267,7 +268,7 @@ pub(crate) fn register_pane_io_methods(
 
                     // Write the PTY command
                     {
-                        let state = io.lock().await;
+                        let mut state = io.lock().await;
                         let writer = state
                             .writers
                             .get(&pane_id)
@@ -275,9 +276,10 @@ pub(crate) fn register_pane_io_methods(
                                 shux_rpc::RpcError::not_found("pane PTY", &pane_id.to_string())
                             })?
                             .clone();
+                        let bytes = state.outside_paste(pane_id, pty_command.into_bytes());
                         drop(state);
 
-                        writer.send(pty_command.into_bytes()).await.map_err(|_| {
+                        writer.send(bytes).await.map_err(|_| {
                             shux_rpc::RpcError::internal("PTY write channel closed")
                         })?;
                     }
@@ -380,13 +382,10 @@ pub(crate) fn register_pane_io_methods(
                     // Ctrl-C, without waiting: a pane whose input is backed
                     // up must not hold this lock.
                     let pane_id = shux_core::model::PaneId::from_uuid(pane_uuid);
-                    let writer = state.writers.get(&pane_id).cloned();
-                    drop(state);
-                    if let Some(writer) = writer
-                        && writer.try_send(vec![0x03]).is_err()
-                    {
+                    if let Some(Err(_)) = state.try_send_outside_paste(pane_id, vec![0x03]) {
                         tracing::warn!(%pane_id, "pane input is backed up; Ctrl-C not delivered");
                     }
+                    drop(state);
 
                     Ok(serde_json::json!({
                         "command_id": cmd_id_str,
@@ -2103,6 +2102,28 @@ mod tests {
         assert_eq!(err.code, shux_rpc::ErrorCode::InvalidParams.code());
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"keep");
 
+        harness.stop().await;
+    }
+
+    /// An attach client's paste left open in the pane is ended before keys
+    /// sent over RPC reach the program, or they would be read as pasted text.
+    #[tokio::test]
+    async fn send_keys_ends_a_paste_left_open() {
+        let harness = RpcHarness::new();
+        let (_, _, pane_id) = harness.seed_session("paste").await;
+        let mut writer_rx = harness.seed_io(pane_id, b"\x1b[?2004h").await;
+        harness.io.lock().await.open_pastes.insert(pane_id, 0);
+
+        for (text, want) in [("x", b"\x1b[201~x".as_slice()), ("y", b"y".as_slice())] {
+            let sent = dispatch_ok(
+                &harness.router,
+                "pane.send_keys",
+                serde_json::json!({"pane_id": pane_id.to_string(), "text": text}),
+            )
+            .await;
+            assert_eq!(sent["bytes_written"], 1);
+            assert_eq!(writer_rx.recv().await.unwrap(), want, "sending {text:?}");
+        }
         harness.stop().await;
     }
 

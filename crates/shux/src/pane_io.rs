@@ -132,7 +132,14 @@ pub struct PaneIoState {
     /// Panes whose process exited: their final status is sent and no later
     /// change (a config reload) may follow it. Cleared by the next spawn.
     pub(crate) status_sealed: std::collections::HashSet<shux_core::model::PaneId>,
+    /// Panes whose program a bracketed paste has started reaching and not yet
+    /// ended, with the incarnation it was opened for. Any input to the pane,
+    /// from any client or RPC, ends the paste before it reaches the program.
+    pub(crate) open_pastes: HashMap<shux_core::model::PaneId, u64>,
 }
+
+/// Ends a bracketed paste.
+pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
 
 impl Default for PaneIoState {
     fn default() -> Self {
@@ -161,6 +168,7 @@ impl PaneIoState {
             status: HashMap::new(),
             program_status_enabled: true,
             status_sealed: Default::default(),
+            open_pastes: HashMap::new(),
         }
     }
 
@@ -186,6 +194,61 @@ impl PaneIoState {
                 let _ = rx.await;
             })
         }));
+    }
+
+    /// The PTY task that owns `pane_id` now, and whether its program asked
+    /// for bracketed paste.
+    pub(crate) fn paste_target(&self, pane_id: shux_core::model::PaneId) -> (u64, bool) {
+        let program = self.incarnations.get(&pane_id).copied().unwrap_or_default();
+        let wants = self
+            .vts
+            .get(&pane_id)
+            .is_some_and(|vt| vt.modes().bracketed_paste);
+        (program, wants)
+    }
+
+    /// Whether a paste is open in the program running in `pane_id` now, and
+    /// that program is still in paste mode.
+    pub(crate) fn paste_open(&self, pane_id: shux_core::model::PaneId) -> bool {
+        let (program, wants) = self.paste_target(pane_id);
+        wants && self.open_pastes.get(&pane_id) == Some(&program)
+    }
+
+    /// `bytes` for `pane_id`, ending an open paste first so they cannot land
+    /// inside it. The paste counts as ended from here: send what this returns.
+    pub(crate) fn outside_paste(
+        &mut self,
+        pane_id: shux_core::model::PaneId,
+        bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        if self.paste_open(pane_id) {
+            self.open_pastes.remove(&pane_id);
+            [PASTE_END, &bytes].concat()
+        } else {
+            bytes
+        }
+    }
+
+    /// Sends `bytes` to `pane_id` without waiting, ending an open paste
+    /// first. An open paste stays open if nothing was sent. `None` when the
+    /// pane has no writer.
+    pub(crate) fn try_send_outside_paste(
+        &mut self,
+        pane_id: shux_core::model::PaneId,
+        bytes: Vec<u8>,
+    ) -> Option<Result<(), mpsc::error::TrySendError<Vec<u8>>>> {
+        let tx = self.writers.get(&pane_id)?;
+        let open = self.paste_open(pane_id);
+        let bytes = if open {
+            [PASTE_END, &bytes].concat()
+        } else {
+            bytes
+        };
+        let sent = tx.try_send(bytes);
+        if open && sent.is_ok() {
+            self.open_pastes.remove(&pane_id);
+        }
+        Some(sent)
     }
 
     /// Whether `incarnation` is still the PTY task that owns `pane_id`.
@@ -221,6 +284,7 @@ impl PaneIoState {
                     self.teardown_waiters.push(channel.stop());
                 }
                 self.status_sealed.remove(pane_id);
+                self.open_pastes.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)
