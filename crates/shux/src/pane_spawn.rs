@@ -691,7 +691,6 @@ pub(crate) async fn spawn_pane_pty(
 /// focuses the new pane and clears any zoom; destroying that pane focuses
 /// whichever pane the layout yields first and zooms nothing.
 pub(crate) struct SplitUndo {
-    session: shux_core::model::SessionId,
     window: shux_core::model::WindowId,
     active_pane: shux_core::model::PaneId,
     zoomed_pane: Option<shux_core::model::PaneId>,
@@ -708,7 +707,6 @@ impl SplitUndo {
         let window = snap.panes.get(&pane)?.window_id;
         let w = snap.windows.get(&window)?;
         Some(Self {
-            session: w.session_id,
             window,
             active_pane: w.active_pane,
             zoomed_pane: w.layout.zoom.as_ref().map(|z| z.zoomed_pane),
@@ -743,45 +741,23 @@ pub(crate) async fn undo_split(
     // meanwhile has to be read now and put back too.
     let operator_zoom = zoomed.flatten().filter(|z| *z != new_pane);
 
-    // The split pane is the window's last one when the operator killed the
-    // rest meanwhile. A window holding only a pane with no PTY is a phantom,
-    // so it goes, and the session with it if it was the last window.
-    if let Err(shux_core::graph::GraphError::LastPane) = graph.destroy_pane(new_pane, None).await {
-        if let Err(shux_core::graph::GraphError::LastWindow) =
-            graph.destroy_window(prior.window, None).await
-        {
-            let _ = graph.destroy_session(prior.session, None).await;
-        }
+    // With the rest of the window killed meanwhile, a window holding only a
+    // pane with no PTY is a phantom, so it goes, and its session if empty.
+    let _ = graph.destroy_pane_and_empty_parents(new_pane).await;
+    let Some((active, _)) = window() else {
         return;
-    }
-
+    };
     // `destroy_pane` may already have landed on the prior pane; focusing it
     // again fires a transition out of nowhere.
-    if focus_is_still_ours && window().map(|w| w.0) != Some(prior.active_pane) {
+    if focus_is_still_ours && active != prior.active_pane {
         let _ = graph.focus_pane(prior.active_pane).await;
     }
-    let snap = graph.snapshot();
-    let Some(w) = snap.windows.get(&prior.window) else {
-        return;
-    };
     let rezoom = match operator_zoom {
-        Some(z) => Some(z).filter(|z| w.active_pane == *z),
-        None => prior
-            .zoomed_pane
-            .filter(|_| w.active_pane == prior.active_pane),
+        Some(z) => Some((z, z)),
+        None => prior.zoomed_pane.map(|z| (z, prior.active_pane)),
     };
-    // `zoom_pane` toggles, so it is pinned to the version read here: a zoom
-    // that lands in between makes it fail rather than undo that zoom.
-    // A one-pane window cannot zoom; the toggle would only bump versions and
-    // announce an unzoom.
-    if let Some(z) = rezoom
-        && !w.layout.is_zoomed()
-        && w.layout.tree.pane_count() > 1
-        && let Some(pane) = snap.panes.get(&z)
-    {
-        let version = pane.version;
-        drop(snap);
-        let _ = graph.zoom_pane(z, Some(version)).await;
+    if let Some((z, focused)) = rezoom {
+        let _ = graph.zoom_pane_if_focused(z, focused).await;
     }
 }
 
