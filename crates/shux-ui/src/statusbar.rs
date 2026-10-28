@@ -65,6 +65,13 @@ impl StatusBar {
     /// Render the status bar into a flat row of `width` `RenderCell`s.
     /// The returned vec is exactly `width` cells long, padded with spaces
     /// (with the bar's bg color) where there is no text.
+    ///
+    /// Zones never share a cell. Left starts at column 0 and right ends at the
+    /// edge, and may touch; the centre is centred as near as they allow, one
+    /// blank column from each. When they do not fit, left wins, then right,
+    /// then centre: a zone short of columns first loses its trailing spaces,
+    /// then shows a prefix of its text ending in `…`, and is dropped when not
+    /// even one glyph and the `…` fit.
     pub fn render_row(&self, width: u16) -> Vec<RenderCell> {
         let w = width as usize;
         let blank = RenderCell {
@@ -75,47 +82,62 @@ impl StatusBar {
             extended: None,
             wide_continuation: false,
         };
-        let mut row = vec![blank.clone(); w];
+        let mut row = vec![blank; w];
 
-        let lw = Self::segments_width(&self.left);
-        let cw = Self::segments_width(&self.center);
+        let left_end = paint_zone(&mut row, 0, w, &self.left, self.bg).map_or(0, |(_, end)| end);
         let rw = Self::segments_width(&self.right);
+        let right_start = paint_zone(
+            &mut row,
+            w.saturating_sub(rw).max(left_end),
+            w,
+            &self.right,
+            self.bg,
+        )
+        .map(|(start, _)| start);
+        let after_left = left_end + usize::from(left_end > 0);
+        let before_right = right_start.map_or(w, |s| s.saturating_sub(1));
 
-        // Left at column 0.
-        if lw > 0 {
-            paint_segments(&mut row, 0, &self.left, self.bg);
-        }
-
-        // Right anchored to the right edge.
-        if rw > 0 {
-            let start = w.saturating_sub(rw);
-            paint_segments(&mut row, start, &self.right, self.bg);
-        }
-
-        // Center anchored as best we can without overlapping left/right.
-        if cw > 0 {
-            let mut start = (w.saturating_sub(cw)) / 2;
-            let left_end = lw + 1; // 1-cell gap.
-            let right_start = w.saturating_sub(rw + 1);
-            if start < left_end {
-                start = left_end.min(right_start.saturating_sub(cw));
-            }
-            if start + cw > right_start {
-                start = right_start.saturating_sub(cw);
-            }
-            paint_segments(&mut row, start, &self.center, self.bg);
-        }
+        let cw = Self::segments_width(&self.center);
+        let start = if after_left + cw <= before_right {
+            (w.saturating_sub(cw) / 2).clamp(after_left, before_right - cw)
+        } else {
+            after_left
+        };
+        paint_zone(&mut row, start, before_right, &self.center, self.bg);
 
         row
     }
 }
 
-fn paint_segments(
+/// Paint `segs` from `start`, within `start..end`. A zone wider than that
+/// drops its trailing spaces, or else is cut to a prefix and an `…`; with no
+/// room for one glyph and the `…` it is not painted. Returns the columns
+/// painted.
+fn paint_zone(
     row: &mut [RenderCell],
     start: usize,
+    end: usize,
     segs: &[StatusSegment],
     fallback_bg: Option<Color>,
-) {
+) -> Option<(usize, usize)> {
+    let avail = end.saturating_sub(start);
+    let zw = StatusBar::segments_width(segs);
+    if zw == 0 {
+        return None;
+    }
+    let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+    let padding = text.len() - text.trim_end_matches(' ').len();
+    let (limit, cut) = if zw <= avail {
+        (end, false)
+    } else if zw == padding {
+        return None;
+    } else if zw - padding <= avail {
+        (start + zw - padding, false)
+    } else if avail >= 2 {
+        (end - 1, true)
+    } else {
+        return None;
+    };
     let mut cursor = start;
     for seg in segs {
         let bg = seg.bg.or(fallback_bg);
@@ -125,28 +147,27 @@ fn paint_segments(
         };
         for (text, width) in crate::chrome::text_cells(&seg.text) {
             let width = usize::from(width);
-            if cursor + width > row.len() {
-                return;
+            if cursor + width > limit {
+                if !cut {
+                    return Some((start, cursor));
+                }
+                if cursor == start {
+                    return None;
+                }
+                row[cursor] = RenderCell {
+                    ch: '…',
+                    fg: seg.fg,
+                    bg,
+                    attrs,
+                    extended: None,
+                    wide_continuation: false,
+                };
+                return Some((start, cursor + 1));
             }
             let mut chars = text.chars();
             let Some(ch) = chars.next() else {
                 continue;
             };
-            // Painting over half of a wide glyph erases its other half, as a
-            // terminal does; otherwise a snapshot would keep the orphan.
-            if row[cursor].wide_continuation && cursor > 0 {
-                row[cursor - 1] = RenderCell {
-                    bg: row[cursor - 1].bg,
-                    ..RenderCell::default()
-                };
-            }
-            let last = cursor + width - 1;
-            if row.get(last + 1).is_some_and(|c| c.wide_continuation) {
-                row[last + 1] = RenderCell {
-                    bg: row[last + 1].bg,
-                    ..RenderCell::default()
-                };
-            }
             let extended = chars.next().map(|_| {
                 std::sync::Arc::new(shux_vt::ExtendedAttrs {
                     grapheme: Some(text.clone()),
@@ -172,21 +193,20 @@ fn paint_segments(
             cursor += width;
         }
     }
+    Some((start, cursor))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Overlapping zones never leave half a wide glyph: the half not painted
-    /// over is blanked, as a terminal does.
+    /// A bar too narrow for its zones never leaves half a wide glyph.
     #[test]
-    fn a_zone_painted_over_half_a_wide_glyph_blanks_the_other_half() {
-        for left in ["ab日", "ab👩\u{200d}💻", "a日b"] {
+    fn a_crowded_bar_never_leaves_half_a_wide_glyph() {
+        for left in ["ab日cd", "ab👩\u{200d}💻cd", "a日bcd", "abc日"] {
             let mut bar = StatusBar::new();
             bar.left.push(StatusSegment::plain(left));
-            bar.center.push(StatusSegment::plain("XY"));
-            let row = bar.render_row(6);
+            let row = bar.render_row(4);
             for (i, cell) in row.iter().enumerate() {
                 let wide = crate::chrome::text_cells(&cell.display_text())
                     .first()
