@@ -223,6 +223,49 @@ pub fn monotonic_now_ns() -> u64 {
     (start.elapsed().as_nanos() as u64).max(1)
 }
 
+/// The clock the synchronized-output deadline reads. Tests freeze and advance
+/// it with [`test_clock::Frozen`] so a deadline test never races the scheduler.
+fn sync_clock_ns() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = test_clock::now() {
+        return now;
+    }
+    monotonic_now_ns()
+}
+
+#[cfg(test)]
+mod test_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NOW: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn now() -> Option<u64> {
+        NOW.with(Cell::get)
+    }
+
+    /// Stops the deadline clock on this thread until dropped.
+    pub(super) struct Frozen;
+
+    impl Frozen {
+        pub(super) fn new() -> Self {
+            NOW.with(|now| now.set(Some(super::monotonic_now_ns())));
+            Frozen
+        }
+
+        pub(super) fn advance_ms(&self, ms: u64) {
+            NOW.with(|now| now.set(now.get().map(|t| t + ms * 1_000_000)));
+        }
+    }
+
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            NOW.with(|now| now.set(None));
+        }
+    }
+}
+
 /// A terminal with no rows or no columns has no cell to put anything in, and
 /// every addressing path in the parser assumes at least one of each: a bare
 /// printable character on a 0-row grid indexed row 0 and panicked, and
@@ -438,7 +481,7 @@ impl VirtualTerminal {
             return false;
         }
         self.sync_bytes >= SYNC_UPDATE_MAX_BYTES
-            || monotonic_now_ns().saturating_sub(self.sync_opened_ns)
+            || sync_clock_ns().saturating_sub(self.sync_opened_ns)
                 >= SYNC_UPDATE_TIMEOUT_MS * 1_000_000
     }
 
@@ -850,7 +893,7 @@ impl VirtualTerminal {
         // one that survives the batch is stamped exactly once.
         if self.sync_armed.load(std::sync::atomic::Ordering::Relaxed) {
             if self.sync_opened_ns == 0 {
-                self.sync_opened_ns = monotonic_now_ns();
+                self.sync_opened_ns = sync_clock_ns();
             }
             self.sync_bytes = self.sync_bytes.saturating_add(bytes.len() as u64);
         } else {
@@ -1991,14 +2034,13 @@ mod tests {
     /// frame for ever.
     #[test]
     fn a_sync_window_is_released_once_it_outlives_its_deadline() {
+        let clock = test_clock::Frozen::new();
         let mut vt = VirtualTerminal::new(3, 10);
         vt.process(b"before");
         vt.process(b"\x1b[?2026h\x1b[1;1Hafter   ");
         assert_eq!(compact_capture(&vt), "before");
 
-        std::thread::sleep(std::time::Duration::from_millis(
-            SYNC_UPDATE_TIMEOUT_MS + 40,
-        ));
+        clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS);
 
         // The next byte of pane output is enough: the deadline is enforced on
         // the way into every batch.
@@ -2011,6 +2053,7 @@ mod tests {
     /// catch, because nothing calls it. The daemon sweeps for it.
     #[test]
     fn a_silent_pane_holding_a_sync_window_is_swept() {
+        let clock = test_clock::Frozen::new();
         let mut vt = VirtualTerminal::new(3, 10);
         vt.process(b"before");
         vt.process(b"\x1b[?2026h\x1b[1;1Hafter   ");
@@ -2021,9 +2064,12 @@ mod tests {
         );
         assert_eq!(compact_capture(&vt), "before");
 
-        std::thread::sleep(std::time::Duration::from_millis(
-            SYNC_UPDATE_TIMEOUT_MS + 40,
-        ));
+        clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS - 1);
+        assert!(
+            !vt.release_expired_sync(),
+            "a window 1 ms short of its deadline must not be swept"
+        );
+        clock.advance_ms(1);
 
         let revision_before = vt.content_revision();
         assert!(vt.release_expired_sync(), "an expired window must be swept");
@@ -2043,6 +2089,7 @@ mod tests {
     /// were ever read wrong. The byte cap is the independent guard.
     #[test]
     fn a_sync_window_is_released_once_it_absorbs_too_much_output() {
+        let _clock = test_clock::Frozen::new();
         let mut vt = VirtualTerminal::new(3, 4_000);
         vt.process(b"before");
         vt.process(b"\x1b[?2026h");
@@ -2072,20 +2119,19 @@ mod tests {
     /// force-released, or every long-lived TUI would tear.
     #[test]
     fn the_deadline_resets_with_every_window() {
+        let clock = test_clock::Frozen::new();
         let mut vt = VirtualTerminal::new(3, 10);
-        let deadline = std::time::Duration::from_millis(SYNC_UPDATE_TIMEOUT_MS);
-        let start = std::time::Instant::now();
-
-        while start.elapsed() < deadline * 2 {
+        let step_ms = 10;
+        for step in 0..(SYNC_UPDATE_TIMEOUT_MS * 2 / step_ms) {
             vt.process(b"\x1b[?2026h");
             vt.process(b"\x1b[1;1Hframe   ");
             assert!(
                 vt.modes().synchronized_output,
-                "a window was force-released {} ms into its own life",
-                start.elapsed().as_millis()
+                "a window was force-released {} ms into the pane's life",
+                step * step_ms
             );
             vt.process(b"\x1b[?2026l");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            clock.advance_ms(step_ms);
         }
         assert_eq!(compact_capture(&vt), "frame");
     }
@@ -4010,14 +4056,13 @@ mod content_revision_tests {
     // nothing but whether `?2026l` arrived.
     #[test]
     fn class_b_osc_title_no_bump_when_a_window_times_out() {
+        let clock = test_clock::Frozen::new();
         let mut vt = vt();
         vt.process(b"\x1b[?2026h");
         vt.process(b"\x1b]2;set inside the window\x07");
         let r = vt.content_revision();
 
-        std::thread::sleep(std::time::Duration::from_millis(
-            SYNC_UPDATE_TIMEOUT_MS + 40,
-        ));
+        clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS);
         assert!(vt.release_expired_sync(), "the window must expire");
 
         assert_eq!(vt.title(), Some("set inside the window"));
@@ -4032,14 +4077,13 @@ mod content_revision_tests {
     // the deadline closes it, so the guard above cannot pass by doing nothing.
     #[test]
     fn a_timed_out_window_that_hid_a_write_does_bump() {
+        let clock = test_clock::Frozen::new();
         let mut vt = vt();
         vt.process(b"\x1b[?2026h");
         vt.process(b"\x1b[1;1Hhidden write");
         let r = vt.content_revision();
 
-        std::thread::sleep(std::time::Duration::from_millis(
-            SYNC_UPDATE_TIMEOUT_MS + 40,
-        ));
+        clock.advance_ms(SYNC_UPDATE_TIMEOUT_MS);
         assert!(vt.release_expired_sync());
 
         assert!(
