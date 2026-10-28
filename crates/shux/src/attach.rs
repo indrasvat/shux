@@ -4865,7 +4865,7 @@ mod tests {
             .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
             .await
             .expect("send hello");
-        let ready_buf = tokio::time::timeout(Duration::from_secs(1), framed.next())
+        let ready_buf = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
             .await
             .expect("ready timeout")
             .expect("ready frame")
@@ -4883,7 +4883,7 @@ mod tests {
             other => panic!("expected ready ok, got {other:?}"),
         }
 
-        let initial_resize = tokio::time::timeout(Duration::from_secs(1), resize_rx.recv())
+        let initial_resize = tokio::time::timeout(shux_testkit::BUDGET, resize_rx.recv())
             .await
             .expect("initial resize timeout")
             .expect("initial resize");
@@ -4908,8 +4908,8 @@ mod tests {
             ))
             .await
             .expect("send swallowed input");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(writer_rx.try_recv().is_err());
+        // The connection handles frames in order, so the first write below
+        // being `ls` proves `abc` was swallowed rather than late.
 
         framed
             .send(Bytes::from(
@@ -4929,7 +4929,7 @@ mod tests {
             ))
             .await
             .expect("send input");
-        let written = tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
+        let written = tokio::time::timeout(shux_testkit::BUDGET, writer_rx.recv())
             .await
             .expect("writer timeout")
             .expect("writer bytes");
@@ -4945,7 +4945,7 @@ mod tests {
             ))
             .await
             .expect("send resize");
-        let resized = tokio::time::timeout(Duration::from_secs(1), resize_rx.recv())
+        let resized = tokio::time::timeout(shux_testkit::BUDGET, resize_rx.recv())
             .await
             .expect("resize timeout")
             .expect("resize request");
@@ -4964,19 +4964,17 @@ mod tests {
             .await
             .expect("send detach");
 
-        let mut saw_detach = false;
-        for _ in 0..8 {
-            let Ok(next) = tokio::time::timeout(Duration::from_millis(100), framed.next()).await
-            else {
-                break;
-            };
-            let Some(frame) = next.transpose().expect("server frame bytes") else {
-                break;
-            };
+        // DetachAck follows PrefixTapped in frame order, so it also orders the
+        // onboarding write before the read below.
+        loop {
+            let frame = tokio::time::timeout(shux_testkit::BUDGET, framed.next())
+                .await
+                .expect("no DetachAck")
+                .expect("connection closed before DetachAck")
+                .expect("server frame bytes");
             let parsed: AttachServerFrame =
                 serde_json::from_slice(&frame).expect("server frame json");
             if matches!(parsed, AttachServerFrame::DetachAck) {
-                saw_detach = true;
                 break;
             }
         }
@@ -4984,8 +4982,8 @@ mod tests {
 
         drop(framed);
         server_cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
-        assert!(saw_detach || writer_rx.try_recv().is_err());
+        let _ = tokio::time::timeout(shux_testkit::BUDGET, server).await;
+        assert!(writer_rx.try_recv().is_err());
         fixture.stop();
     }
 
@@ -5441,13 +5439,11 @@ mod tests {
         }
     }
 
-    /// Nothing arrived on the pane's writer. Distinguished from "arrived late"
-    /// by draining with a real timeout rather than a `try_recv`.
+    /// Nothing arrived on the pane's writer. `handle_app_mouse` writes with
+    /// `try_send` before it returns, so nothing can arrive late.
     async fn assert_no_bytes(rx: &mut mpsc::Receiver<Vec<u8>>, why: &str) {
-        match tokio::time::timeout(Duration::from_millis(150), rx.recv()).await {
-            Err(_) => {}
-            Ok(None) => {}
-            Ok(Some(bytes)) => panic!("{why}: app received {:?}", String::from_utf8_lossy(&bytes)),
+        if let Ok(bytes) = rx.try_recv() {
+            panic!("{why}: app received {:?}", String::from_utf8_lossy(&bytes));
         }
     }
 

@@ -6,7 +6,6 @@
 //! audit log gets it here rather than reinventing it per test file.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use shux_core::config::ConfigHandle;
 use shux_core::graph::{GraphHandle, SessionGraph, run_graph_loop};
@@ -229,14 +228,11 @@ pub(crate) async fn kill_scratch_and_wait(harness: &RpcHarness, session_id: &str
     )
     .await;
     let sid: shux_core::model::SessionId = session_id.parse().unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while harness.scratch_registry.ids().contains(&sid) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "scratch {session_id} not reaped within 5s of explicit kill"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let what = format!("scratch {session_id} to be reaped after an explicit kill");
+    shux_testkit::wait_until_async(&what, || async {
+        !harness.scratch_registry.ids().contains(&sid)
+    })
+    .await;
 }
 
 /// Count live processes whose argv contains `needle` (unique per test

@@ -220,6 +220,11 @@ async fn run(
             let _ = f.ack.send(());
         }
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a failed publish retries after RETRY_AFTER"
+        )]
+        let retry = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now));
         tokio::select! {
             biased;
             _ = lifetime.cancelled() => break,
@@ -228,17 +233,19 @@ async fn run(
                 Some(f) => pending.push(f),
                 None => break,
             },
-            _ = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now)), if retry_at.is_some() => {}
+            _ = retry, if retry_at.is_some() => {}
         }
         // Pace writes; a flush cuts the wait short.
         if pending.is_empty()
             && let Some(at) = last_write
         {
+            #[expect(clippy::disallowed_methods, reason = "writes are paced PACING apart")]
+            let paced = tokio::time::sleep_until(at + PACING);
             tokio::select! {
                 biased;
                 _ = lifetime.cancelled() => break,
                 Some(f) = flush_rx.recv() => pending.push(f),
-                _ = tokio::time::sleep_until(at + PACING) => {}
+                _ = paced => {}
             }
         }
     }
@@ -309,13 +316,15 @@ mod tests {
         let _ = ch.stop().await;
     }
 
-    #[tokio::test]
+    /// Paused clock: only the flush's own budget can move it, so the elapsed
+    /// time is the budget exactly, however loaded the machine is.
+    #[tokio::test(start_paused = true)]
     async fn a_flush_returns_within_its_budget_when_nothing_can_commit() {
         let (graph, _state, pid) = graph_with_pane();
         let ch = StatusChannel::start(pid, publication(10, None), graph);
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         ch.flusher().flush(u64::MAX).await;
-        assert!(start.elapsed() < FLUSH_BUDGET + Duration::from_millis(200));
+        assert_eq!(start.elapsed(), FLUSH_BUDGET);
         let _ = ch.stop().await;
     }
 
@@ -323,7 +332,7 @@ mod tests {
     async fn the_publisher_exits_when_its_pane_is_gone() {
         let (graph, _state, _pid) = graph_with_pane();
         let ch = StatusChannel::start(PaneId::new(), publication(10, None), graph);
-        tokio::time::timeout(Duration::from_secs(2), ch.task)
+        tokio::time::timeout(shux_testkit::BUDGET, ch.task)
             .await
             .expect("publisher kept running for a pane the graph does not have")
             .unwrap();
@@ -333,7 +342,7 @@ mod tests {
     async fn stopping_ends_the_publisher_promptly() {
         let (graph, _state, pid) = graph_with_pane();
         let ch = StatusChannel::start(pid, publication(10, None), graph);
-        tokio::time::timeout(Duration::from_secs(1), ch.stop())
+        tokio::time::timeout(shux_testkit::BUDGET, ch.stop())
             .await
             .expect("publisher ignored its lifetime token")
             .unwrap();
@@ -410,6 +419,17 @@ mod tests {
         .await
     }
 
+    async fn wait_exited(h: &RpcHarness, pane: PaneId) {
+        shux_testkit::wait_until_async("the pane's command to exit", || async {
+            h.graph.snapshot().panes[&pane].exit_status.is_some()
+        })
+        .await;
+    }
+
+    async fn screen(h: &RpcHarness, pane: PaneId) -> String {
+        h.io.lock().await.vts[&pane].capture_text(None)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pane_reports_its_status_through_the_graph_and_the_rpcs() {
         let h = RpcHarness::new();
@@ -459,16 +479,11 @@ mod tests {
             r"printf '\033]7501;state=working:id=a\033\\\033]7501;state=done:id=b\033\\'; sleep 0.5",
         )
         .await;
-        let mut gone = None;
-        for _ in 0..100 {
-            let snap = h.graph.snapshot();
-            if snap.panes[&pane].exit_status.is_some() {
-                gone = snap.panes[&pane].program_status.clone();
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let summary = gone.expect("the pane exited with a status");
+        wait_exited(&h, pane).await;
+        let summary = h.graph.snapshot().panes[&pane]
+            .program_status
+            .clone()
+            .expect("the pane exited with a status");
         assert_eq!(summary.state, State::Done, "done survives the exit");
         assert_eq!(summary.counts.working, 0, "working ends with the process");
 
@@ -504,13 +519,7 @@ mod tests {
         let (_s, _w, off) = h.seed_session("status-off").await;
         h.io.lock().await.program_status_enabled = false;
         spawn_sh(&h, off, r"printf '\033]7501;state=error\033\\'; sleep 30").await;
-        let mut waited = json!(null);
-        for _ in 0..40 {
-            waited = wait_status(&h, off, "error", 100).await;
-            if waited["outcome"] == "disabled" {
-                break;
-            }
-        }
+        let waited = wait_status(&h, off, "error", 30_000).await;
         assert_eq!(waited["outcome"], "disabled", "{waited}");
         let status = dispatch_ok(
             &h.router,
@@ -549,41 +558,28 @@ mod tests {
         off.program_status.enabled = false;
         config.replace(off);
         // The walker applies a reload asynchronously; wait for the terminal.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while h.io.lock().await.vts[&pane].program_status_enabled() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the walker never applied the reload"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        shux_testkit::wait_until_async("the walker to apply the reload", || async {
+            !h.io.lock().await.vts[&pane].program_status_enabled()
+        })
+        .await;
         let waited = wait_status(&h, pane, "blocked", 5_000).await;
         assert_eq!(waited["outcome"], "disabled", "{waited}");
-        // The graph follows within the walker's flush budget.
-        let deadline = std::time::Instant::now() + FLUSH_BUDGET + Duration::from_millis(500);
-        while h.graph.snapshot().panes[&pane].program_status_enabled {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the graph never saw the disable"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        shux_testkit::wait_until_async("the graph to see the disable", || async {
+            !h.graph.snapshot().panes[&pane].program_status_enabled
+        })
+        .await;
 
         config.replace(shux_core::config::Config::default());
-        let mut status = json!(null);
-        for _ in 0..50 {
-            status = dispatch_ok(
+        let status = shux_testkit::wait_for_async("pane.status to read enabled again", || async {
+            let status = dispatch_ok(
                 &h.router,
                 "pane.status",
                 json!({"pane_id": pane.to_string()}),
             )
             .await;
-            if status["enabled"] == true {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(status["enabled"], true, "{status}");
+            (status["enabled"] == true).then_some(status)
+        })
+        .await;
         assert_eq!(status["records"], json!([]), "re-enabling starts empty");
         h.cancel.cancel();
         let _ = walker.await;
@@ -596,24 +592,48 @@ mod tests {
         h.io.lock().await.program_status_enabled = false;
         let (_s, _w, pane) = h.seed_session("status-late-off").await;
         let router = h.router.clone();
+        let subscribers = h.bus.subscriber_count();
+        // A deadline far past the test's budget: returning at all is noticing.
         let waiter = tokio::spawn(async move {
             dispatch_ok(
                 &router,
                 "pane.wait_status",
-                json!({"pane_id": pane.to_string(), "state": "done", "timeout_ms": 5_000}),
+                json!({"pane_id": pane.to_string(), "state": "done", "timeout_ms": 600_000}),
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        shux_testkit::wait_until_async("pane.wait_status to subscribe", || async {
+            h.bus.subscriber_count() > subscribers
+        })
+        .await;
         spawn_sh(&h, pane, "sleep 30").await;
-        let start = std::time::Instant::now();
-        let waited = waiter.await.unwrap();
+        let waited = tokio::time::timeout(shux_testkit::BUDGET, waiter)
+            .await
+            .expect("noticed only at the deadline")
+            .unwrap();
         assert_eq!(waited["outcome"], "disabled", "{waited}");
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "noticed only at the deadline"
-        );
         finish(h).await;
+    }
+
+    /// Order every status event the pane's publisher could still emit before
+    /// the caller's next read of the bus. A flush asking for nothing new is
+    /// acked only after the publisher's next pass, which writes whatever its
+    /// slot holds; a graph round-trip then lands any write that pass gave up
+    /// on, since the graph applies commands in order.
+    async fn publisher_fence(h: &RpcHarness, pane: PaneId) {
+        let flush_tx = h.io.lock().await.status[&pane].flush_tx.clone();
+        let (ack, done) = oneshot::channel();
+        let flush = Flush {
+            min_generation: 0,
+            ack,
+        };
+        // An Err either way is a publisher that has ended and emits nothing.
+        if flush_tx.send(flush).await.is_ok() {
+            let _ = tokio::time::timeout(shux_testkit::BUDGET, done)
+                .await
+                .expect("the publisher never answered a flush");
+        }
+        h.seed_session("publisher-fence").await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -621,18 +641,11 @@ mod tests {
         let h = RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("status-after-exit").await;
         spawn_sh(&h, pane, r"printf '\033]7501;state=done\033\\'; sleep 0.3").await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the pane never exited"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_exited(&h, pane).await;
         for (flusher, generation) in apply_enabled(&h.io, false).await {
             flusher.flush(generation).await;
         }
-        tokio::time::sleep(FLUSH_BUDGET).await;
+        publisher_fence(&h, pane).await;
         let last = h.bus.history(200).iter().rev().find_map(|e| match e.data {
             shux_core::event::EventData::PaneStatusChanged { pane_id, .. } if pane_id == pane => {
                 Some("status")
@@ -651,14 +664,7 @@ mod tests {
         let h = RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("status-shutdown").await;
         spawn_sh(&h, pane, "exit 0").await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the pane never exited"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_exited(&h, pane).await;
         assert!(
             h.io.lock().await.status.contains_key(&pane),
             "exit keeps the slot"
@@ -682,25 +688,22 @@ mod tests {
         let h = RpcHarness::new();
         let (_s, _w, busy) = h.seed_session("status-busy").await;
         let (_s, _w, quiet) = h.seed_session("status-quiet").await;
+        // Busy for as long as the test runs: a wait whose deadline this pane's
+        // events push out never returns.
         spawn_sh(
             &h,
             busy,
-            r"i=0; while [ $i -lt 2000 ]; do printf '\033]7501;state=working:progress=%d\033\\' $((i % 100)); i=$((i+1)); sleep 0.02; done",
+            r"i=0; while :; do printf '\033]7501;state=working:progress=%d\033\\' $((i % 100)); i=$((i+1)); sleep 0.02; done",
         )
         .await;
         spawn_sh(&h, quiet, "sleep 30").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let start = std::time::Instant::now();
+        let busy_now = wait_status(&h, busy, "working", 30_000).await;
+        assert_eq!(busy_now["outcome"], "matched", "{busy_now}");
         let waited =
-            tokio::time::timeout(Duration::from_secs(5), wait_status(&h, quiet, "error", 600))
+            tokio::time::timeout(shux_testkit::BUDGET, wait_status(&h, quiet, "error", 600))
                 .await
                 .expect("wait_status ignored its deadline while another pane was busy");
         assert_eq!(waited["outcome"], "timeout", "{waited}");
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "took {:?}",
-            start.elapsed()
-        );
         finish(h).await;
     }
 
@@ -717,34 +720,27 @@ mod tests {
             r#"python3 -c "import os,tty,time; tty.setraw(0); os.write(1, b'\x1b]7501;?\x1b\\\\'*300); os.write(1, b'MAR'+b'KER'); time.sleep(30)""#,
         )
         .await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        loop {
-            let text = h.io.lock().await.vts[&pane].capture_text(None);
-            if text.contains("MARKER") {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the pane stopped reading output once its replies went unread"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let read_on = shux_testkit::poll_until_async(shux_testkit::BUDGET, || async {
+            screen(&h, pane).await.contains("MARKER")
+        })
+        .await;
+        assert!(
+            read_on,
+            "the pane stopped reading output once its replies went unread"
+        );
         finish(h).await;
     }
 
-    /// Lines in `log` once it has at least one, waiting up to 5s for it.
+    /// Lines in `log` once it has at least one.
     async fn starts(log: &std::path::Path) -> usize {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
+        shux_testkit::wait_for_async("the pane's command to log its start", || async {
             let n = std::fs::read_to_string(log)
                 .unwrap_or_default()
                 .lines()
                 .count();
-            if n > 0 || std::time::Instant::now() > deadline {
-                return n;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+            (n > 0).then_some(n)
+        })
+        .await
     }
 
     async fn incarnation(h: &RpcHarness, pane: PaneId) -> Option<u64> {
@@ -759,16 +755,24 @@ mod tests {
         let (_s, _w, pane) = h.seed_session("status-double").await;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("starts");
-        let script = format!("echo start >> '{}'; sleep 30", log.display());
+        // The trailing `:` keeps `sh` from exec'ing `sleep`, so its argv,
+        // which names the unique log path, stays in the process table.
+        let script = format!("echo start >> '{}'; sleep 30; :", log.display());
         let (a, b) = tokio::join!(
             spawn_sh_result(&h, pane, &script),
             spawn_sh_result(&h, pane, &script)
         );
         a.unwrap();
         b.unwrap();
+        // A spawn returns once its child has exec'd, so every child either
+        // spawn started is visible now.
+        let needle = log.display().to_string();
+        assert_eq!(
+            crate::rpc::test_harness::count_procs_containing(&needle),
+            1,
+            "the pane's command ran more than once"
+        );
         assert_eq!(starts(&log).await, 1, "the pane's command did not run once");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(starts(&log).await, 1, "the pane's command ran again");
         finish(h).await;
     }
 
@@ -803,14 +807,7 @@ mod tests {
         let log = dir.path().join("starts");
         let script = format!("echo start >> '{}'", log.display());
         spawn_sh_result(&h, pane, &script).await.unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the command never exited"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_exited(&h, pane).await;
         let first = incarnation(&h, pane).await;
         spawn_sh_result(&h, pane, &script).await.unwrap();
         assert_eq!(
@@ -833,14 +830,7 @@ mod tests {
         let h = RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("status-exited-off").await;
         spawn_sh(&h, pane, r"printf '\033]7501;state=done\033\\'; sleep 0.3").await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the pane never exited"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_exited(&h, pane).await;
         let _ = apply_enabled(&h.io, false).await;
         let status = dispatch_ok(
             &h.router,
@@ -862,15 +852,15 @@ mod tests {
     async fn a_pane_whose_spawn_was_cancelled_can_still_spawn() {
         let h = RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("status-cancelled").await;
-        let guard = h.io.lock().await; // park the first spawn inside its claim/install
-        let first = tokio::time::timeout(
-            Duration::from_millis(200),
-            spawn_sh_result(&h, pane, "sleep 30"),
-        );
-        let (_, guard) = tokio::join!(first, async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            guard
-        });
+        let guard = h.io.lock().await;
+        {
+            // Its first poll takes the spawn ticket and parks on the io lock.
+            let mut first = std::pin::pin!(spawn_sh_result(&h, pane, "sleep 30"));
+            assert!(
+                futures::poll!(first.as_mut()).is_pending(),
+                "the spawn did not park on the held io lock"
+            );
+        }
         drop(guard);
         spawn_sh_result(&h, pane, "sleep 30").await.unwrap();
         assert!(
@@ -909,21 +899,11 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
         )
         .await;
         let ticked = |text: &str, n: usize| text.contains(&format!("TICK{n}X"));
+        let hr = &h;
         let wait_tick = |n: usize| {
-            let io = h.io.clone();
-            async move {
-                let deadline = std::time::Instant::now() + Duration::from_secs(8);
-                loop {
-                    let text = io.lock().await.vts[&pane].capture_text(None);
-                    if ticked(&text, n) {
-                        return true;
-                    }
-                    if std::time::Instant::now() > deadline {
-                        return false;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
+            shux_testkit::poll_until_async(shux_testkit::BUDGET, move || async move {
+                ticked(&screen(hr, pane).await, n)
+            })
         };
         assert!(wait_tick(5).await, "the program never started ticking");
         let writer = h.io.lock().await.writers[&pane].clone();
@@ -953,14 +933,10 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
             ),
         )
         .await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while !ready.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the program never put its terminal in raw mode in 20s"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        shux_testkit::wait_until_async("the program to put its terminal in raw mode", || async {
+            ready.exists()
+        })
+        .await;
         let (command_id, _) = h.io.lock().await.cmd_engine.start_command(
             pane.0,
             "true",
@@ -969,14 +945,10 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
             None,
         );
         let writer = h.io.lock().await.writers[&pane].clone();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while writer.try_send(vec![b'k'; 64 << 10]).is_ok() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "input never backed up"
-            );
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        shux_testkit::wait_until_async("the pane's input to back up", || async {
+            writer.try_send(vec![b'k'; 64 << 10]).is_err()
+        })
+        .await;
         let cancel = tokio::spawn({
             let router = h.router.clone();
             async move {
@@ -988,17 +960,16 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
                     .await
             }
         });
-        let locked = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            drop(h.io.lock().await);
-        })
-        .await;
+        // Waiting to send Ctrl-C into backed-up input never ends, so a cancel
+        // that waits for it never returns, holding the lock if it waits under it.
+        let cancelled = tokio::time::timeout(shux_testkit::BUDGET, cancel).await;
         assert!(
-            locked.is_ok(),
-            "command_cancel holds the pane I/O lock while input is backed up"
+            cancelled.is_ok(),
+            "command_cancel never returned while input was backed up"
         );
-        let cancelled = tokio::time::timeout(Duration::from_secs(3), cancel).await;
-        assert!(cancelled.is_ok(), "command_cancel never returned");
+        let locked = tokio::time::timeout(shux_testkit::BUDGET, h.io.lock()).await;
+        assert!(locked.is_ok(), "command_cancel left the pane I/O lock held");
+        drop(locked);
         finish(h).await;
     }
 
@@ -1034,45 +1005,42 @@ open('{out}.tmp', 'w').write('%d %s' % (n, d.hexdigest())); os.rename('{out}.tmp
             ),
         )
         .await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let screen = || async { h.io.lock().await.vts[&pane].capture_text(None) };
-        while !ready.exists() {
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "the reader never put its terminal in raw mode in 20s; the pane shows:\n{}",
-                    screen().await
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let raw =
+            shux_testkit::poll_until_async(shux_testkit::BUDGET, || async { ready.exists() }).await;
+        assert!(
+            raw,
+            "the reader never put its terminal in raw mode; the pane shows:\n{}",
+            screen(&h, pane).await
+        );
         let paste: Vec<u8> = (0..TOTAL).map(|i| b'a' + (i % 26) as u8).collect();
         let writer = h.io.lock().await.writers[&pane].clone();
-        let started = std::time::Instant::now();
         for chunk in paste.chunks(256 << 10) {
             writer.send(chunk.to_vec()).await.unwrap();
         }
-        let deadline = started + Duration::from_secs(15);
-        let got = loop {
-            if let Ok(got) = std::fs::read_to_string(&out) {
-                break got;
-            }
-            if std::time::Instant::now() >= deadline {
-                let count = || std::fs::read_to_string(&seen).unwrap_or_default();
-                let at_deadline = count();
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let later = count();
-                let verdict = if later == at_deadline {
-                    "stalled"
-                } else {
-                    "still arriving"
-                };
-                panic!(
-                    "the reader got {at_deadline:?} of {TOTAL} bytes in 15s and {later:?} \
-                     2s later ({verdict}); the pane shows:\n{}",
-                    screen().await
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let got = shux_testkit::poll_async(shux_testkit::BUDGET, || async {
+            std::fs::read_to_string(&out).ok()
+        })
+        .await;
+        let Some(got) = got else {
+            let count = || std::fs::read_to_string(&seen).unwrap_or_default();
+            let at_deadline = count();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "failure diagnosis only: sample again to tell a stall from a slow reader"
+            )]
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let later = count();
+            let verdict = if later == at_deadline {
+                "stalled"
+            } else {
+                "still arriving"
+            };
+            panic!(
+                "the reader got {at_deadline:?} of {TOTAL} bytes in {:?} and {later:?} \
+                 2s later ({verdict}); the pane shows:\n{}",
+                shux_testkit::BUDGET,
+                screen(&h, pane).await
+            );
         };
         let digest: String = sha2::Sha256::digest(&paste)
             .iter()

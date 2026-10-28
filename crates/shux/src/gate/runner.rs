@@ -144,6 +144,10 @@ impl ExitMonitor {
                         seq = v.get("next_seq").and_then(|s| s.as_u64()).unwrap_or(seq);
                     }
                     Err(_) => {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "backoff before re-polling events.watch after an RPC error"
+                        )]
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
@@ -766,13 +770,18 @@ async fn drive_step(
 
         Step::Wait { ms } => {
             let gone = *child_consumed;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a scenario `wait` step is a fixed pause the author asked for"
+            )]
+            let waited = tokio::time::sleep(Duration::from_millis(*ms));
             tokio::select! {
                 biased;
                 code = maybe_wait_exit(monitor, gone) => {
                     trace.emit(RunnerSignal::ChildExit { code });
                     StepFlow::Stop
                 }
-                _ = tokio::time::sleep(Duration::from_millis(*ms)) => StepFlow::Continue,
+                _ = waited => StepFlow::Continue,
             }
         }
 
@@ -1080,6 +1089,11 @@ async fn drive_step(
         }
 
         Step::ExpectExit { code, timeout_ms } => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "expect_exit fails once its step deadline passes"
+            )]
+            let deadline = tokio::time::sleep(Duration::from_millis(*timeout_ms));
             tokio::select! {
                 biased;
                 got = monitor.wait() => {
@@ -1099,7 +1113,7 @@ async fn drive_step(
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(*timeout_ms)) => {
+                _ = deadline => {
                     // The child did NOT exit within the step deadline.
                     trace.emit(RunnerSignal::Timeout {
                         class: TimeoutClass::Step,

@@ -87,6 +87,10 @@ impl SegmentCache {
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "polls the cache for the runners' first writes, up to `timeout`"
+            )]
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -843,24 +847,24 @@ mod tests {
             command: vec!["env".to_string()],
             env: HashMap::new(),
             starship_config: Some("add_newline = false".to_string()),
-            interval_ms: 10_000,
+            // Short, so a run that overshoots the runner's 1s command budget
+            // on a loaded machine is followed by another rather than failing.
+            interval_ms: 100,
             fallback: None,
         };
         let cache = SegmentCache::new();
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_one_segment(0, seg, cache.clone(), cancel.clone()));
 
-        assert!(
-            cache
-                .wait_for_first_outputs(1, Duration::from_secs(2))
-                .await,
-            "segment runner did not publish first output"
-        );
+        let output = shux_testkit::wait_for_async("the segment to publish env output", || async {
+            let output = String::from_utf8(cache.get(0).await).unwrap();
+            output.contains("STARSHIP_SHELL=").then_some(output)
+        })
+        .await;
 
         cancel.cancel();
         task.await.unwrap();
 
-        let output = String::from_utf8(cache.get(0).await).unwrap();
         assert!(output.contains("STARSHIP_SHELL=cmd"));
         assert!(output.contains("TERM=xterm-256color"));
         assert!(
@@ -916,12 +920,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// Paused clock: the write lands 50ms in, and the wait sees it on its
+    /// next 25ms poll, far inside its 500ms timeout, however loaded the host.
+    #[tokio::test(start_paused = true)]
     async fn wait_for_first_outputs_unblocks_on_late_write() {
         let cache = SegmentCache::new();
         let c2 = cache.clone();
-        // Background task writes the cache entry after a short delay.
         let writer = tokio::spawn(async move {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a write 50ms late, on a paused clock"
+            )]
             tokio::time::sleep(Duration::from_millis(50)).await;
             c2.set(0, b"late".to_vec()).await;
         });
@@ -931,7 +940,11 @@ mod tests {
                 .wait_for_first_outputs(1, Duration::from_millis(500))
                 .await
         );
-        assert!(start.elapsed() < Duration::from_millis(300));
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(50) && waited <= Duration::from_millis(75),
+            "returned after {waited:?}, not on the first poll after the write"
+        );
         writer.await.unwrap();
     }
 }

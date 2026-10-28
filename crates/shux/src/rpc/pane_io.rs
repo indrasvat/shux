@@ -533,6 +533,10 @@ pub(crate) fn register_pane_io_methods(
                                 }),
                             ));
                         }
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "pane.wait_for re-captures every poll_ms until its own timeout"
+                        )]
                         tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
                     }
                 }
@@ -664,6 +668,10 @@ pub(crate) fn register_pane_io_methods(
                     if let Some(ms) = duration_ms {
                         let io_for_deadline = io.clone();
                         tokio::spawn(async move {
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "duration_ms is the recording's requested length"
+                            )]
                             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                             let deadline_sender = {
                                 let state = io_for_deadline.lock().await;
@@ -689,6 +697,10 @@ pub(crate) fn register_pane_io_methods(
                                     })
                                     .await;
                             }
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "a finished recording stays queryable for its TTL"
+                            )]
                             tokio::time::sleep(PANE_RECORD_COMPLETED_TTL).await;
                             let mut state = io_for_deadline.lock().await;
                             for recorders in state.recorders.values_mut() {
@@ -1344,6 +1356,11 @@ pub(crate) fn register_pane_io_methods(
                         let quiet_deadline = tokio::time::Instant::now() + remaining;
                         let wake = quiet_deadline.min(timeout_deadline);
 
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "settling IS a quiet window: wake when it or the timeout ends"
+                        )]
+                        let woken = tokio::time::sleep_until(wake);
                         tokio::select! {
                             changed = rx.changed() => {
                                 if changed.is_err() {
@@ -1353,7 +1370,7 @@ pub(crate) fn register_pane_io_methods(
                                 }
                                 // Loop re-evaluates on the fresh value.
                             }
-                            _ = tokio::time::sleep_until(wake) => {
+                            _ = woken => {
                                 // Loop re-evaluates: quiet first, then
                                 // timeout (settle_decide precedence).
                             }
@@ -2025,7 +2042,9 @@ mod tests {
         harness.stop().await;
     }
 
-    #[tokio::test]
+    /// Paused clock: the duration deadline fires only once the test idles, so
+    /// "before" is teed strictly before it and "after" strictly after it.
+    #[tokio::test(start_paused = true)]
     async fn pane_record_duration_stops_on_daemon_side() {
         let harness = RpcHarness::new();
         let (_session_id, _window_id, pane_id) = harness.seed_session("record-duration").await;
@@ -2052,7 +2071,16 @@ mod tests {
             &harness.cancel,
         )
         .await;
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        let id: uuid::Uuid = recording_id.parse().unwrap();
+        shux_testkit::wait_until_async("the duration deadline to end the recording", || async {
+            let state = harness.io.lock().await;
+            state.recorders.values().flatten().any(|r| {
+                r.id == id
+                    && r.outcome.lock().expect("record outcome poisoned").status
+                        != PaneRecordStatus::Recording
+            })
+        })
+        .await;
         tee_pane_recorders(
             &harness.io,
             pane_id,
@@ -2260,24 +2288,17 @@ mod tests {
         pane_id: shux_core::model::PaneId,
         expected: usize,
     ) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let count = {
-                let state = io.lock().await;
-                state
-                    .revisions
-                    .get(&pane_id)
-                    .map(|tx| tx.receiver_count())
-                    .unwrap_or(0)
-            };
-            if count == expected {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("settle waiter count never reached {expected} (last saw {count})");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let what = format!("settle waiter count to reach {expected}");
+        shux_testkit::wait_until_async(&what, || async {
+            let state = io.lock().await;
+            state
+                .revisions
+                .get(&pane_id)
+                .map(|tx| tx.receiver_count())
+                .unwrap_or(0)
+                == expected
+        })
+        .await;
     }
 
     /// P3 codex B2 lens-side proof (in-process half): a client that
@@ -2324,21 +2345,11 @@ mod tests {
             server.run().await.unwrap();
         });
 
-        // Connect (bounded retry — no fixed bind sleep) and park a waiter.
-        let stream = {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match tokio::net::UnixStream::connect(&socket_path).await {
-                    Ok(s) => break s,
-                    Err(e) => {
-                        if tokio::time::Instant::now() >= deadline {
-                            panic!("settle-drop server never bound: {e}");
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
-                }
-            }
-        };
+        // Connect once the server has bound, then park a waiter.
+        let stream = shux_testkit::wait_for_async("the settle-drop server to bind", || async {
+            tokio::net::UnixStream::connect(&socket_path).await.ok()
+        })
+        .await;
         let mut framed = tokio_util::codec::Framed::new(stream, shux_rpc::create_codec());
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2432,9 +2443,9 @@ mod tests {
             let _ = state.teardown_panes(&[pane_id], true);
         }
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        let result = tokio::time::timeout(shux_testkit::BUDGET, waiter)
             .await
-            .expect("wait_settled must resolve promptly after pane teardown")
+            .expect("wait_settled must resolve after pane teardown, not park")
             .expect("waiter task must not panic");
         let err = result.expect_err("must error, not settle on a dead pane's frozen value");
         assert_eq!(

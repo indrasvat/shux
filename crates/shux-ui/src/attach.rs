@@ -195,6 +195,11 @@ where
     });
 
     loop {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the periodic resize check, in case the OS missed a resize event"
+        )]
+        let resize_check = tokio::time::sleep(Duration::from_secs(5));
         tokio::select! {
             // Server -> terminal.
             frame = stream.next() => {
@@ -346,7 +351,7 @@ where
             }
 
             // Periodic resize check (in case the OS missed the resize event).
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            _ = resize_check => {
                 if let Ok((c, r)) = TerminalGuard::size()
                     && (c, r) != last_size {
                         last_size = (c, r);
