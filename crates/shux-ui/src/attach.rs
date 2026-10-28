@@ -157,6 +157,10 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     }
 }
 
+/// Bytes of a bracketed paste per input frame: one key's frame overhead,
+/// amortised, and far under the frame size limit once base64-encoded.
+const PASTE_CHUNK: usize = 64 * 1024;
+
 async fn run_loop<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     config: &ClientConfig,
@@ -179,7 +183,10 @@ where
     let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<Event>(64);
     std::thread::spawn(move || {
         loop {
-            match crossterm::event::poll(Duration::from_millis(50)) {
+            // Long, because the wait ends in a busy loop over its last
+            // fraction of a millisecond; the timeout only bounds how long
+            // this thread outlives the attach.
+            match crossterm::event::poll(Duration::from_secs(1)) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(ev) => {
                         if key_tx.blocking_send(ev).is_err() {
@@ -188,6 +195,7 @@ where
                     }
                     Err(_) => break,
                 },
+                Ok(false) if key_tx.is_closed() => break,
                 Ok(false) => continue,
                 Err(_) => break,
             }
@@ -339,9 +347,17 @@ where
                         let bytes = serde_json::to_vec(&frame)?;
                         sink.send(Bytes::from(bytes)).await.ok();
                     }
-                    Event::Paste(_) | Event::FocusGained | Event::FocusLost => {
-                        // Ignore for now.
+                    // A terminal left in bracketed-paste mode wraps every paste;
+                    // the pane gets the text as if it had been typed.
+                    Event::Paste(text) => {
+                        for chunk in text.as_bytes().chunks(PASTE_CHUNK) {
+                            let frame = AttachClientFrame::Input {
+                                data: BASE64.encode(chunk),
+                            };
+                            sink.send(Bytes::from(serde_json::to_vec(&frame)?)).await.ok();
+                        }
                     }
+                    Event::FocusGained | Event::FocusLost => {}
                 }
             }
 

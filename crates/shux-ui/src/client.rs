@@ -133,41 +133,69 @@ pub fn encode_key_event(key: KeyEvent) -> Vec<u8> {
                 c.to_string().into_bytes()
             }
         }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::F(n) => encode_function_key(n),
+        KeyCode::Enter | KeyCode::Backspace | KeyCode::Tab | KeyCode::Esc => {
+            let byte = match key.code {
+                KeyCode::Enter => b'\r',
+                KeyCode::Backspace => 0x7f,
+                KeyCode::Tab => b'\t',
+                _ => 0x1b,
+            };
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                vec![0x1b, byte]
+            } else {
+                vec![byte]
+            }
+        }
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Up => csi_final(b'A', key.modifiers),
+        KeyCode::Down => csi_final(b'B', key.modifiers),
+        KeyCode::Right => csi_final(b'C', key.modifiers),
+        KeyCode::Left => csi_final(b'D', key.modifiers),
+        KeyCode::Home => csi_final(b'H', key.modifiers),
+        KeyCode::End => csi_final(b'F', key.modifiers),
+        KeyCode::PageUp => csi_tilde(5, key.modifiers),
+        KeyCode::PageDown => csi_tilde(6, key.modifiers),
+        KeyCode::Delete => csi_tilde(3, key.modifiers),
+        KeyCode::Insert => csi_tilde(2, key.modifiers),
+        KeyCode::F(n @ 1..=4) => {
+            let last = b"PQRS"[usize::from(n - 1)];
+            match modifier_param(key.modifiers) {
+                None => vec![0x1b, b'O', last],
+                Some(m) => format!("\x1b[1;{m}{}", char::from(last)).into_bytes(),
+            }
+        }
+        KeyCode::F(n) => match n {
+            5 => csi_tilde(15, key.modifiers),
+            6..=10 => csi_tilde(u16::from(n) + 11, key.modifiers),
+            11 | 12 => csi_tilde(u16::from(n) + 12, key.modifiers),
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
 
-/// Encode function key F1-F12 as ANSI escape sequences.
-fn encode_function_key(n: u8) -> Vec<u8> {
-    match n {
-        1 => b"\x1bOP".to_vec(),
-        2 => b"\x1bOQ".to_vec(),
-        3 => b"\x1bOR".to_vec(),
-        4 => b"\x1bOS".to_vec(),
-        5 => b"\x1b[15~".to_vec(),
-        6 => b"\x1b[17~".to_vec(),
-        7 => b"\x1b[18~".to_vec(),
-        8 => b"\x1b[19~".to_vec(),
-        9 => b"\x1b[20~".to_vec(),
-        10 => b"\x1b[21~".to_vec(),
-        11 => b"\x1b[23~".to_vec(),
-        12 => b"\x1b[24~".to_vec(),
-        _ => Vec::new(),
+/// xterm's modifier parameter: 1 + Shift(1) + Alt(2) + Ctrl(4), or `None`
+/// when no modifier is held.
+fn modifier_param(mods: KeyModifiers) -> Option<u8> {
+    let m = u8::from(mods.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(mods.contains(KeyModifiers::ALT))
+        + 4 * u8::from(mods.contains(KeyModifiers::CONTROL));
+    (m > 0).then_some(m + 1)
+}
+
+/// `CSI <final>`, or `CSI 1;<mods> <final>` with modifiers held.
+fn csi_final(last: u8, mods: KeyModifiers) -> Vec<u8> {
+    match modifier_param(mods) {
+        None => vec![0x1b, b'[', last],
+        Some(m) => format!("\x1b[1;{m}{}", char::from(last)).into_bytes(),
+    }
+}
+
+/// `CSI <n> ~`, or `CSI <n>;<mods> ~` with modifiers held.
+fn csi_tilde(n: u16, mods: KeyModifiers) -> Vec<u8> {
+    match modifier_param(mods) {
+        None => format!("\x1b[{n}~").into_bytes(),
+        Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
     }
 }
 
@@ -297,6 +325,42 @@ pub async fn run_client(config: ClientConfig) -> Result<ExitReason, anyhow::Erro
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// What xterm sends for a key with modifiers held: a pane program that
+    /// binds Alt+Backspace, Ctrl+Left or Shift+Tab must see that, not the
+    /// bare key.
+    #[test]
+    fn modified_keys_encode_as_xterm_sends_them() {
+        let (alt, ctrl, shift) = (
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT,
+        );
+        let cases: &[(KeyCode, KeyModifiers, &[u8])] = &[
+            (KeyCode::Backspace, alt, b"\x1b\x7f"),
+            (KeyCode::Enter, alt, b"\x1b\r"),
+            (KeyCode::Tab, alt, b"\x1b\t"),
+            (KeyCode::Esc, alt, b"\x1b\x1b"),
+            (KeyCode::BackTab, shift, b"\x1b[Z"),
+            (KeyCode::Left, ctrl, b"\x1b[1;5D"),
+            (KeyCode::Right, alt, b"\x1b[1;3C"),
+            (KeyCode::Up, shift, b"\x1b[1;2A"),
+            (KeyCode::End, ctrl | shift, b"\x1b[1;6F"),
+            (KeyCode::Delete, ctrl, b"\x1b[3;5~"),
+            (KeyCode::PageUp, alt, b"\x1b[5;3~"),
+            (KeyCode::F(1), shift, b"\x1b[1;2P"),
+            (KeyCode::F(5), ctrl, b"\x1b[15;5~"),
+            (KeyCode::Left, KeyModifiers::NONE, b"\x1b[D"),
+            (KeyCode::F(1), KeyModifiers::NONE, b"\x1bOP"),
+        ];
+        for &(code, mods, want) in cases {
+            assert_eq!(
+                encode_key_event(KeyEvent::new(code, mods)),
+                want,
+                "{mods:?}+{code:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_encode_regular_char() {

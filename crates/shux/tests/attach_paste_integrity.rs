@@ -1,10 +1,11 @@
-//! Issue #197: a large paste typed through a real `shux session attach` client
-//! reaches the pane's program whole.
+//! What a real `shux session attach` client delivers from its terminal to the
+//! pane's program (issue #197): a large paste whole and a bracketed paste,
+//! with nothing burned while idle.
 //!
 //! Everything is real: the daemon, the attach client on a PTY of its own, and a
-//! program in the pane that reads the paste and writes what it got to a file.
-//! The client turns a paste into one input frame per key, far more frames than
-//! a pane's channel holds, which is what this has to survive.
+//! program in the pane that reads what arrives and writes it to a file. The
+//! client turns a paste into one input frame per key, far more frames than a
+//! pane's channel holds.
 
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -119,139 +120,190 @@ fn wait_for(path: &Path, budget: Duration) -> bool {
     false
 }
 
-#[test]
-fn a_large_paste_through_a_real_attach_client_arrives_whole() {
-    let h = Harness::new();
-    let dir = h.work.path();
-    let (ready, got, done) = (dir.join("ready"), dir.join("got"), dir.join("done"));
+const PROBES: &str = "printf '\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\033[38;5;208mINDEXED\\033[0m \\033[34mBASIC\\033[0m\\r\\n'";
 
-    // Raw mode first, so the paste is neither line-edited nor capped at the
+/// A session whose pane prints the colour probes, enters raw mode, touches
+/// `ready` and then runs `then`.
+fn pane_session(h: &Harness, then: &str) {
+    let ready = h.work.path().join("ready");
+    // Raw mode first, so input is neither line-edited nor capped at the
     // canonical line limit; echo stays on, so the pane redraws as a real one
-    // does while it is pasted into. `ready` is written only once stty returned.
-    // The colour probes prove the pane renders colour classes intact.
-    let reader = format!(
-        "printf '\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\033[38;5;208mINDEXED\\033[0m \
-         \\033[34mBASIC\\033[0m\\r\\n'; stty raw; : > '{ready}'; \
-         head -c {PASTE_LEN} > '{got}'; : > '{done}'; while :; do sleep 3600; done",
-        ready = ready.display(),
-        got = got.display(),
-        done = done.display(),
+    // does while it is typed into. `ready` is written only once stty returned.
+    let command = format!(
+        "{PROBES}; stty raw; : > '{ready}'; {then}",
+        ready = ready.display()
     );
     h.rpc(
         "session.create",
-        serde_json::json!({ "name": "paste", "command": reader }),
+        serde_json::json!({ "name": "paste", "command": command }),
     );
     assert!(
         wait_for(&ready, Duration::from_secs(20)),
-        "the pane's reader never reached raw mode"
+        "the pane's program never reached raw mode"
     );
+}
 
-    let size = nix::pty::Winsize {
-        ws_row: 30,
-        ws_col: 100,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let pty = nix::pty::openpty(Some(&size), None).expect("openpty");
-    let slave: OwnedFd = pty.slave;
-    let dup = |fd: &OwnedFd| Stdio::from(fd.try_clone().expect("dup slave"));
-    let client = Command::new(&h.bin)
-        .env("XDG_RUNTIME_DIR", h.runtime_dir())
-        .env_remove("SHUX_SOCKET")
-        .env("TERM", "xterm-256color")
-        .env("COLORTERM", "truecolor")
-        .args(["session", "attach", "paste"])
-        .stdin(dup(&slave))
-        .stdout(dup(&slave))
-        .stderr(dup(&slave))
-        .spawn()
-        .expect("spawn attach client");
-    let client = KillOnDrop(client);
-    drop(slave);
+/// A real attach client on a PTY of its own.
+struct Client {
+    keys: std::fs::File,
+    screen: Arc<std::sync::Mutex<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    drain: Option<std::thread::JoinHandle<()>>,
+    process: KillOnDrop,
+}
 
-    // Drain the client's screen for as long as it runs: a terminal nobody
-    // reads stops the client writing, and with it reading keys.
-    let master = std::fs::File::from(pty.master);
-    let mut screen_side = master.try_clone().expect("clone master");
-    let stop = Arc::new(AtomicBool::new(false));
-    let screen = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let drain = {
-        let (stop, screen) = (stop.clone(), screen.clone());
+impl Client {
+    fn attach(h: &Harness) -> Self {
+        let size = nix::pty::Winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = nix::pty::openpty(Some(&size), None).expect("openpty");
+        let slave: OwnedFd = pty.slave;
+        let dup = |fd: &OwnedFd| Stdio::from(fd.try_clone().expect("dup slave"));
+        let process = Command::new(&h.bin)
+            .env("XDG_RUNTIME_DIR", h.runtime_dir())
+            .env_remove("SHUX_SOCKET")
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .args(["session", "attach", "paste"])
+            .stdin(dup(&slave))
+            .stdout(dup(&slave))
+            .stderr(dup(&slave))
+            .spawn()
+            .expect("spawn attach client");
+        let process = KillOnDrop(process);
+        drop(slave);
+
+        // Drain the client's screen for as long as it runs: a terminal nobody
+        // reads stops the client writing, and with it reading keys.
+        let keys = std::fs::File::from(pty.master);
+        let mut screen_side = keys.try_clone().expect("clone master");
         nix::fcntl::fcntl(
             &screen_side,
             nix::fcntl::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
         )
         .expect("set O_NONBLOCK");
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 16 * 1024];
-            while !stop.load(Ordering::Relaxed) {
-                match screen_side.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => screen
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .extend_from_slice(&buf[..n]),
-                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        let stop = Arc::new(AtomicBool::new(false));
+        let screen = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let drain = {
+            let (stop, screen) = (stop.clone(), screen.clone());
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 16 * 1024];
+                while !stop.load(Ordering::Relaxed) {
+                    match screen_side.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => screen
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&buf[..n]),
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
                 }
-            }
-        })
-    };
+            })
+        };
+        let client = Self {
+            keys,
+            screen,
+            stop,
+            drain: Some(drain),
+            process,
+        };
 
-    // The client draws its first frame only once raw mode is on and the
-    // attach is live; keys typed before that are cooked by its terminal.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while find_cell(&screen_of(&screen), "TRUECOLOR").is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the attach client never drew the pane"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+        // The client draws its first frame only once raw mode is on and the
+        // attach is live; keys typed before that are cooked by its terminal.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while find_cell(&client.screen(), "TRUECOLOR").is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the attach client never drew the pane"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        client.assert_colour_probes();
+        client
     }
 
-    // Before the paste scrolls them away: the pane's colour classes reach
-    // the client's terminal intact.
-    let vt = screen_of(&screen);
-    for (probe, want) in [
-        ("TRUECOLOR", Color::Rgb(120, 220, 180)),
-        ("INDEXED", Color::Indexed(208)),
-        ("BASIC", Color::Indexed(4)),
-    ] {
-        let (row, col) = find_cell(&vt, probe).unwrap_or_else(|| panic!("{probe} never drew"));
-        let fg = vt.grid().visible_row(row)[col].style.fg;
-        assert_eq!(fg, want, "{probe} drew in the wrong colour");
+    fn screen(&self) -> VirtualTerminal {
+        screen_of(&self.screen)
     }
 
-    let paste = paste_bytes();
-    // The master shares the drain's non-blocking file description, so a full
-    // terminal input queue answers WouldBlock: that is the client applying
-    // backpressure, and the typist waits for it like a real one would.
-    let mut keys = master;
-    let mut rest = &paste[..];
-    let typing_deadline = Instant::now() + Duration::from_secs(60);
-    while !rest.is_empty() {
-        match keys.write(rest) {
-            Ok(n) => rest = &rest[n..],
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    Instant::now() < typing_deadline,
-                    "the attach client stopped reading keys with {} left to type",
-                    rest.len()
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => panic!("type the paste: {e}"),
+    /// Before input scrolls them away: the pane's colour classes reach the
+    /// client's terminal intact.
+    fn assert_colour_probes(&self) {
+        let vt = self.screen();
+        for (probe, want) in [
+            ("TRUECOLOR", Color::Rgb(120, 220, 180)),
+            ("INDEXED", Color::Indexed(208)),
+            ("BASIC", Color::Indexed(4)),
+        ] {
+            let (row, col) = find_cell(&vt, probe).unwrap_or_else(|| panic!("{probe} never drew"));
+            let fg = vt.grid().visible_row(row)[col].style.fg;
+            assert_eq!(fg, want, "{probe} drew in the wrong colour");
         }
     }
+
+    /// The master shares the drain's non-blocking file description, so a full
+    /// terminal input queue answers WouldBlock: that is the client applying
+    /// backpressure, and the typist waits for it like a real one would.
+    fn type_bytes(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !rest.is_empty() {
+            match self.keys.write(rest) {
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the attach client stopped reading keys with {} left to type",
+                        rest.len()
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("type into the client: {e}"),
+            }
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.process.0.id()
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
+    }
+}
+
+#[test]
+fn a_large_paste_through_a_real_attach_client_arrives_whole() {
+    let h = Harness::new();
+    let (got, done) = (h.work.path().join("got"), h.work.path().join("done"));
+    pane_session(
+        &h,
+        &format!(
+            "head -c {PASTE_LEN} > '{got}'; : > '{done}'; while :; do sleep 3600; done",
+            got = got.display(),
+            done = done.display(),
+        ),
+    );
+    let mut client = Client::attach(&h);
+
+    let paste = paste_bytes();
+    client.type_bytes(&paste);
 
     // Nothing is typed after the paste: under an event source that stops
     // reading before the terminal is drained, the tail waits for a next key
     // that never comes.
     let arrived = wait_for(&done, Duration::from_secs(60));
     let received = std::fs::read(&got).unwrap_or_default();
-
-    stop.store(true, Ordering::Relaxed);
     drop(client);
-    let _ = drain.join();
 
     assert!(
         arrived,
@@ -262,6 +314,74 @@ fn a_large_paste_through_a_real_attach_client_arrives_whole() {
     if let Some(at) = received.iter().zip(&paste).position(|(a, b)| a != b) {
         panic!("the paste arrived whole in length but differs from byte {at}");
     }
+}
+
+/// A terminal left in bracketed-paste mode by an earlier program wraps every
+/// paste in `ESC[200~ … ESC[201~`. The paste is the user's text all the same.
+#[test]
+fn a_bracketed_paste_reaches_the_pane() {
+    let h = Harness::new();
+    let (got, done) = (h.work.path().join("got"), h.work.path().join("done"));
+    pane_session(
+        &h,
+        &format!(
+            "head -c 11 > '{got}'; : > '{done}'; while :; do sleep 3600; done",
+            got = got.display(),
+            done = done.display(),
+        ),
+    );
+    let mut client = Client::attach(&h);
+    client.type_bytes(b"\x1b[200~hello world\x1b[201~");
+    let arrived = wait_for(&done, Duration::from_secs(10));
+    let received = std::fs::read(&got).unwrap_or_default();
+    drop(client);
+    assert!(
+        arrived,
+        "the pane's program got {:?} of a bracketed paste",
+        String::from_utf8_lossy(&received)
+    );
+    assert_eq!(received, b"hello world");
+}
+
+/// An attach client with nothing to do must not spin: a multiplexer sits
+/// attached and idle for hours.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_idle_attach_client_sleeps() {
+    let h = Harness::new();
+    pane_session(&h, "while :; do sleep 3600; done");
+    let client = Client::attach(&h);
+    std::thread::sleep(Duration::from_secs(1));
+
+    // CPU time each of the client's threads has run, in nanoseconds.
+    let cpu = |pid: u32| -> std::collections::HashMap<String, u64> {
+        std::fs::read_dir(format!("/proc/{pid}/task"))
+            .expect("client tasks")
+            .filter_map(|t| {
+                let t = t.ok()?;
+                let stat = std::fs::read_to_string(t.path().join("schedstat")).ok()?;
+                let ns = stat.split_whitespace().next()?.parse().ok()?;
+                Some((t.file_name().to_string_lossy().into_owned(), ns))
+            })
+            .collect()
+    };
+    let window = Duration::from_secs(5);
+    let start = cpu(client.pid());
+    std::thread::sleep(window);
+    let end = cpu(client.pid());
+    drop(client);
+
+    let busiest_ms_per_s = end
+        .iter()
+        .map(|(tid, ns)| ns.saturating_sub(start.get(tid).copied().unwrap_or(0)))
+        .max()
+        .unwrap_or(0) as f64
+        / 1e6
+        / window.as_secs_f64();
+    assert!(
+        busiest_ms_per_s < 5.0,
+        "an idle attach client's busiest thread ran {busiest_ms_per_s:.1} ms per second"
+    );
 }
 
 /// What the client's terminal shows: its output replayed through a VT the

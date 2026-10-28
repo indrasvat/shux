@@ -997,7 +997,8 @@ async fn run_attach_loop(
                                 }
                                 Delivery::Dropped(waited) => {
                                     backlog.waited += waited;
-                                    if backlog.dropped == 0 {
+                                    // The drop that used up the wait: once per stall.
+                                    if !budget.is_zero() {
                                         warn!(pane = %target, "input dropped: pane not keeping up");
                                     }
                                     backlog.dropped += len;
@@ -1500,9 +1501,7 @@ async fn run_render_loop(
             nerd_fonts,
             cols,
         );
-        if attached
-            .last_action
-            .as_ref()
+        if last_action_ref
             .is_some_and(|(_, at)| at.elapsed() < crate::statusbar_build::ACTION_FEEDBACK_DWELL)
         {
             crate::statusbar_build::make_room_for_notice(&mut bar, cols);
