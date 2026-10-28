@@ -940,13 +940,27 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
     async fn a_pane_with_backed_up_input_does_not_wedge_command_cancel() {
         let h = RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("status-cancel").await;
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        // Before raw mode the terminal discards unread input instead of
+        // backing up, so filling it then would not exercise the wedge.
         spawn_sh(
             &h,
             pane,
-            r#"python3 -c "import tty,time; tty.setraw(0); time.sleep(900)""#,
+            &format!(
+                r#"python3 -c "import tty,time; tty.setraw(0); open('{}', 'w').close(); time.sleep(900)""#,
+                ready.display()
+            ),
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the program never put its terminal in raw mode in 20s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let (command_id, _) = h.io.lock().await.cmd_engine.start_command(
             pane.0,
             "true",
@@ -990,6 +1004,10 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
 
     /// A program that reads its input gets every byte of a large paste, in
     /// order, as fast as it reads: input is never dropped to protect the loop.
+    ///
+    /// The paste waits for the reader's `ready` file: `tty.setraw` flushes
+    /// input that reached the terminal before it (TCSAFLUSH), so pasting on a
+    /// timer loses bytes in the kernel whenever the reader starts late.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reading_program_gets_a_large_paste_whole_and_promptly() {
         use sha2::Digest;
@@ -997,20 +1015,36 @@ for i in range(600): os.write(1, b'TICK%dX ' % i); time.sleep(0.05)""#,
         let h = RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("status-paste").await;
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("got");
+        let (ready, seen, out) = (
+            dir.path().join("ready"),
+            dir.path().join("seen"),
+            dir.path().join("got"),
+        );
         spawn_sh(
             &h,
             pane,
             &format!(
-                r#"python3 -c "import os,tty,hashlib; tty.setraw(0); n=0; d=hashlib.sha256()
+                r#"python3 -c "import os,tty,hashlib; tty.setraw(0); open('{ready}', 'w').close(); n=0; d=hashlib.sha256(); s=os.open('{seen}', os.O_WRONLY|os.O_CREAT)
 while n < {TOTAL}:
-    b = os.read(0, 65536); n += len(b); d.update(b)
-open('{}', 'w').write('%d %s' % (n, d.hexdigest()))""#,
-                out.display()
+    b = os.read(0, 65536); n += len(b); d.update(b); os.pwrite(s, b'%d' % n, 0)
+open('{out}.tmp', 'w').write('%d %s' % (n, d.hexdigest())); os.rename('{out}.tmp', '{out}')""#,
+                ready = ready.display(),
+                seen = seen.display(),
+                out = out.display(),
             ),
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let screen = || async { h.io.lock().await.vts[&pane].capture_text(None) };
+        while !ready.exists() {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "the reader never put its terminal in raw mode in 20s; the pane shows:\n{}",
+                    screen().await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let paste: Vec<u8> = (0..TOTAL).map(|i| b'a' + (i % 26) as u8).collect();
         let writer = h.io.lock().await.writers[&pane].clone();
         let started = std::time::Instant::now();
@@ -1022,10 +1056,22 @@ open('{}', 'w').write('%d %s' % (n, d.hexdigest()))""#,
             if let Ok(got) = std::fs::read_to_string(&out) {
                 break got;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the reader never got the whole paste in 15s"
-            );
+            if std::time::Instant::now() >= deadline {
+                let count = || std::fs::read_to_string(&seen).unwrap_or_default();
+                let at_deadline = count();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let later = count();
+                let verdict = if later == at_deadline {
+                    "stalled"
+                } else {
+                    "still arriving"
+                };
+                panic!(
+                    "the reader got {at_deadline:?} of {TOTAL} bytes in 15s and {later:?} \
+                     2s later ({verdict}); the pane shows:\n{}",
+                    screen().await
+                );
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         let digest: String = sha2::Sha256::digest(&paste)
