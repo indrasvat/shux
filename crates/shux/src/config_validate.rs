@@ -162,7 +162,9 @@ mod strict {
             let s = String::deserialize(d)?;
             shux_core::theme::parse_hex(&s)
                 .map(|_| HexColor)
-                .ok_or_else(|| serde::de::Error::custom(format!("{s:?} is not a #rrggbb colour")))
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("{s:?} is not a hex colour like #74c7ec"))
+                })
         }
     }
 }

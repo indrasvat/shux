@@ -81,10 +81,12 @@ prefix = "ctrl-space"
 # false: shux answers no probe and keeps no new records; a pane that
 # already exited still reports its final status to `shux pane status`.
 enabled = true
-# A status badge (◆ blocked, ✕ error, ✓ done, ◔ working, ○ idle) leading
-# each pane's border title. Not drawn with appearance.border_style = "none".
+# A status badge leading each pane's border title: blocked, error, done,
+# working or idle. With appearance.nerd_fonts on (the default) these are
+# Nerd Font icons; with it off, ◆ ✕ ✓ ◔ ○. Not drawn with
+# appearance.border_style = "none".
 border = true
-# "◆ N waiting" in the status bar while panes in the session are blocked.
+# "N waiting", led by the blocked icon, while panes in the session are blocked.
 status_bar = true
 
 [keybindings]
