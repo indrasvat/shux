@@ -211,6 +211,17 @@ fn joined_serves_socket(joined: &str, socket: &Path) -> bool {
         .is_some_and(|(_, rest)| rest.is_empty() || rest.starts_with(' '))
 }
 
+/// Whether the absolute `--socket` a daemon was spawned with -- always its
+/// last argument, so it may contain spaces -- names the same socket as
+/// `socket`. Two aliases of one directory spell it differently but share a
+/// key. A relative one resolves against the daemon's cwd: `serves_relative`.
+fn joined_names_socket(joined: &str, socket: &Path) -> bool {
+    joined.rsplit_once(" --socket ").is_some_and(|(_, typed)| {
+        let typed = Path::new(typed);
+        typed.is_absolute() && same_socket(typed, socket)
+    })
+}
+
 /// The socket a daemon process is serving, read from its own argv.
 ///
 /// An argv without `--socket` names no socket and is nobody's daemon. Inferring
@@ -277,7 +288,7 @@ impl ProcessArgv {
             ProcessArgv::Joined(joined) => {
                 joined.contains(" __daemon")
                     && (joined_serves_socket(joined, &daemon::socket_key(socket))
-                        || joined_serves_socket(joined, &daemon::socket_endpoint(socket))
+                        || joined_names_socket(joined, socket)
                         || joined_serves_socket(joined, socket))
             }
         }
@@ -847,6 +858,22 @@ pub(crate) async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// From `ps` alone (macOS), a daemon started through one alias of a
+    /// directory too long for a socket address is still found through another.
+    #[test]
+    fn a_daemon_started_through_one_alias_is_found_through_another() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("r".repeat(120));
+        std::fs::create_dir(&real).unwrap();
+        let (a, b) = (root.path().join("a"), root.path().join("b"));
+        std::os::unix::fs::symlink(&real, &a).unwrap();
+        std::os::unix::fs::symlink(&real, &b).unwrap();
+        let started = super::daemon::socket_endpoint(&a.join("s.sock"));
+        let argv =
+            ProcessArgv::Joined(format!("/bin/shux __daemon --socket {}", started.display()));
+        assert!(argv.serves(&super::daemon::socket_endpoint(&b.join("s.sock"))));
+    }
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
 
