@@ -97,7 +97,7 @@ proptest! {
     /// Cutting `advance` at APC boundaries must change nothing. Both terminals
     /// get the SAME bytes in the SAME chunks; only one slices. Comparing two
     /// *chunkings* instead would measure vte, which is chunk-sensitive already
-    /// (it executes a UTF-8 C1 decoded in one read and prints a split one).
+    /// (see `c1_controls_are_chunk_sensitive_in_vte`).
     #[test]
     fn slicing_at_apc_boundaries_is_invisible(
         stream in prop::collection::vec(hostile_byte(), 0..400),
@@ -176,6 +176,33 @@ fn a_ris_does_not_swallow_an_apc_that_starts_after_it() {
         "APC body leaked onto the screen, so the sequence was not tracked \
          across the RIS: {text:?}"
     );
+}
+
+/// vte itself is chunk-sensitive for a C1 control written as two-byte UTF-8:
+/// decoded in one `advance` it is executed, split across two it is printed.
+/// The parser compensates in `print`; if a vte upgrade stops printing it, that
+/// compensation is dead and this test says so.
+#[test]
+fn c1_controls_are_chunk_sensitive_in_vte() {
+    #[derive(Default)]
+    struct Seen(Vec<String>);
+    impl vte::Perform for Seen {
+        fn print(&mut self, c: char) {
+            self.0.push(format!("print {:#x}", u32::from(c)));
+        }
+        fn execute(&mut self, byte: u8) {
+            self.0.push(format!("execute {byte:#x}"));
+        }
+    }
+    let run = |chunks: &[&[u8]]| {
+        let (mut parser, mut seen) = (vte::Parser::new(), Seen::default());
+        for chunk in chunks {
+            parser.advance(&mut seen, chunk);
+        }
+        seen.0
+    };
+    assert_eq!(run(&[b"\xc2\x80"]), ["execute 0x80"]);
+    assert_eq!(run(&[b"\xc2", b"\x80"]), ["print 0x80"]);
 }
 
 /// A C1 control written as two-byte UTF-8 renders the same however the PTY
