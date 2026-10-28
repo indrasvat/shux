@@ -136,27 +136,34 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 const ESC: u8 = 0x1b;
 
+/// A pane's open paste, as one piece of input sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Open {
+    Closed,
+    /// Open, and not the paste this piece belongs to.
+    Other,
+    /// Open, and this piece is its next.
+    Continued,
+}
+
 /// Input as the pane should receive it, and whether a bracketed paste is open
 /// once it has. `paste` is `Some(more)` for a piece of a paste, `more` set
-/// while pieces follow; `open` says a paste has reached the pane without its
-/// end, and `continues` that a piece is the next of that paste. Anything else
-/// ends an open paste first. A paste goes between the markers when the pane
-/// asked for them (mode 2004) or continues one. ESC is removed from bracketed
-/// text, so no
-/// part of it can end the paste.
+/// while pieces follow. Anything but the next piece of an open paste ends it
+/// first. A paste goes between the markers when the pane asked for them
+/// (mode 2004). ESC is removed from bracketed text, so no part of it can end
+/// the paste.
 fn frame_input(
     bytes: Vec<u8>,
     paste: Option<bool>,
-    open: bool,
-    continues: bool,
+    open: Open,
     wants_brackets: bool,
 ) -> (Vec<u8>, bool) {
-    let continues = open && continues && paste.is_some();
+    let continues = open == Open::Continued && paste.is_some();
     let mut out = Vec::with_capacity(bytes.len() + PASTE_START.len() + 2 * PASTE_END.len());
-    if open && !continues {
+    if open != Open::Closed && !continues {
         out.extend_from_slice(PASTE_END);
     }
-    let Some(more) = paste.filter(|_| continues || wants_brackets) else {
+    let Some(more) = paste.filter(|_| wants_brackets) else {
         out.extend(bytes);
         return (out, false);
     };
@@ -172,33 +179,39 @@ fn frame_input(
 
 /// Frames `bytes` against the pane's paste state as it stands under this
 /// lock, sends them through `permit` and records the paste they leave open.
+/// `paste` names the paste a piece belongs to.
 fn send_input(
     state: &mut PaneIoState,
     pane: PaneId,
     permit: mpsc::OwnedPermit<Vec<u8>>,
     bytes: Vec<u8>,
-    paste: Option<bool>,
-    mid_paste: bool,
+    paste: Option<(bool, u64)>,
     client: u64,
 ) {
-    if !state
-        .writers
-        .get(&pane)
-        .is_some_and(|tx| permit.same_channel_as_sender(tx))
-    {
+    if !state.is_current_writer(pane, &permit) {
+        permit.send(bytes);
         return;
     }
     let (program, wants_brackets) = state.paste_target(pane);
-    let open = state.open_paste(pane);
-    let continues = mid_paste && open.is_some_and(|open| open.client == client);
-    let (bytes, open_after) = frame_input(bytes, paste, open.is_some(), continues, wants_brackets);
+    let open = match (state.open_paste(pane), paste) {
+        (None, _) => Open::Closed,
+        (Some(open), Some((_, id))) if open.client == client && open.paste == id => Open::Continued,
+        (Some(_), _) => Open::Other,
+    };
+    let (bytes, open_after) = frame_input(bytes, paste.map(|(more, _)| more), open, wants_brackets);
     permit.send(bytes);
-    if open_after {
-        state
-            .open_pastes
-            .insert(pane, OpenPaste { program, client });
-    } else {
-        state.open_pastes.remove(&pane);
+    match paste {
+        Some((_, paste)) if open_after => {
+            let open = OpenPaste {
+                program,
+                client,
+                paste,
+            };
+            state.open_pastes.insert(pane, open);
+        }
+        _ => {
+            state.open_pastes.remove(&pane);
+        }
     }
 }
 
@@ -234,11 +247,13 @@ async fn close_open_pastes(io_state: &Arc<Mutex<PaneIoState>>, client: u64) {
                         return;
                     };
                     let mut state = io_state.lock().await;
-                    if state
-                        .open_paste(pane)
-                        .is_some_and(|open| open.client == client)
+                    if state.is_current_writer(pane, &permit)
+                        && state
+                            .open_paste(pane)
+                            .is_some_and(|open| open.client == client)
                     {
-                        state.send_outside_paste(pane, permit, Vec::new());
+                        state.open_pastes.remove(&pane);
+                        permit.send(PASTE_END.to_vec());
                     }
                 });
             }
@@ -281,8 +296,6 @@ enum Room {
 struct InputBacklog {
     waited: Duration,
     dropped: usize,
-    /// This client's last input here was a paste piece with more to follow.
-    mid_paste: bool,
 }
 
 /// Room in a pane's input channel, waiting at most `budget` for it.
@@ -910,6 +923,8 @@ async fn run_attach_loop(
     let mut final_frame = None;
     let mut input_backlogs: HashMap<PaneId, InputBacklog> = HashMap::new();
     let client_id = NEXT_CLIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The paste whose pieces are arriving, and how many this client has sent.
+    let (mut pasting, mut pastes): (Option<u64>, u64) = (None, 0);
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -1102,14 +1117,25 @@ async fn run_attach_loop(
                             }
                             continue;
                         }
+                        // Pieces of one paste share an id, however many reach a pane.
+                        let paste = paste.map(|more| {
+                            let id = *pasting.get_or_insert_with(|| {
+                                pastes += 1;
+                                pastes
+                            });
+                            if !more {
+                                pasting = None;
+                            }
+                            (more, id)
+                        });
+                        if paste.is_none() {
+                            pasting = None;
+                        }
                         let target = render_session.lock().await.active_pane_id;
-                        // Wait for room with the PaneIoState mutex released;
-                        // frame and send under it, so the paste state matches
-                        // the channel's order whoever else writes meanwhile.
+                        // Room first, with the PaneIoState mutex released.
                         let writer = io_state.lock().await.writers.get(&target).cloned();
                         if let Some(tx) = writer {
                             let backlog = input_backlogs.entry(target).or_default();
-                            let mid_paste = std::mem::replace(&mut backlog.mid_paste, paste == Some(true));
                             let budget = INPUT_STALL.saturating_sub(backlog.waited);
                             match reserve_input(&tx, budget, &cancel).await {
                                 // Room the moment it was asked for: caught up.
@@ -1120,7 +1146,7 @@ async fn run_attach_loop(
                                         backlog.waited + waited
                                     };
                                     let mut state = io_state.lock().await;
-                                    send_input(&mut state, target, permit, bytes, paste, mid_paste, client_id);
+                                    send_input(&mut state, target, permit, bytes, paste, client_id);
                                 }
                                 Room::Closed => {
                                     input_backlogs.remove(&target);
@@ -7258,46 +7284,45 @@ mod tests {
         let v = |b: &[u8]| b.to_vec();
         // Not asked for: as typed.
         assert_eq!(
-            frame_input(v(b"ls\r"), Some(false), false, false, false),
+            frame_input(v(b"ls\r"), Some(false), Open::Closed, false),
             (v(b"ls\r"), false)
         );
         // One piece.
         assert_eq!(
-            frame_input(v(b"ls\r"), Some(false), false, false, true),
+            frame_input(v(b"ls\r"), Some(false), Open::Closed, true),
             (v(b"\x1b[200~ls\r\x1b[201~"), false)
         );
-        // Pieces: markers once around the whole paste, even if the pane turns
-        // the mode off halfway.
+        // Pieces: markers once around the whole paste.
         assert_eq!(
-            frame_input(v(b"a"), Some(true), false, false, true),
+            frame_input(v(b"a"), Some(true), Open::Closed, true),
             (v(b"\x1b[200~a"), true)
         );
         assert_eq!(
-            frame_input(v(b"b"), Some(true), true, true, true),
+            frame_input(v(b"b"), Some(true), Open::Continued, true),
             (v(b"b"), true)
         );
         assert_eq!(
-            frame_input(v(b"c"), Some(false), true, true, false),
+            frame_input(v(b"c"), Some(false), Open::Continued, true),
             (v(b"c\x1b[201~"), false)
         );
-        // The end was dropped: the next key, or a new paste, closes it first.
-        for continues in [false, true] {
+        // The end was dropped: the next key, or another paste, closes it first.
+        for open in [Open::Other, Open::Continued] {
             assert_eq!(
-                frame_input(v(b"x"), None, true, continues, true),
+                frame_input(v(b"x"), None, open, true),
                 (v(b"\x1b[201~x"), false)
             );
         }
         assert_eq!(
-            frame_input(v(b"z"), Some(false), true, false, true),
+            frame_input(v(b"z"), Some(false), Open::Other, true),
             (v(b"\x1b[201~\x1b[200~z\x1b[201~"), false)
         );
         assert_eq!(
-            frame_input(v(b"x"), None, false, false, true),
+            frame_input(v(b"x"), None, Open::Closed, true),
             (v(b"x"), false)
         );
         // An end marker inside the text cannot end the paste.
         assert_eq!(
-            frame_input(v(b"a\x1b[201~rm -rf ~\r"), Some(false), false, false, true),
+            frame_input(v(b"a\x1b[201~rm -rf ~\r"), Some(false), Open::Closed, true),
             (v(b"\x1b[200~a[201~rm -rf ~\r\x1b[201~"), false)
         );
     }
@@ -7315,16 +7340,15 @@ mod tests {
         let (out, _) = frame_input(
             v(b"a\x1b[20\x1b[201~1~rm -rf ~\r"),
             Some(false),
-            false,
-            false,
+            Open::Closed,
             true,
         );
         assert_eq!(end_markers(&out), 1, "the paste ends itself: {out:?}");
         assert!(out.ends_with(PASTE_END));
 
         // The client splits a paste anywhere a character ends, marker or not.
-        let (first, open) = frame_input(v(b"aa\x1b[20"), Some(true), false, false, true);
-        let (second, _) = frame_input(v(b"1~rm -rf ~\r"), Some(false), open, open, true);
+        let (first, _) = frame_input(v(b"aa\x1b[20"), Some(true), Open::Closed, true);
+        let (second, _) = frame_input(v(b"1~rm -rf ~\r"), Some(false), Open::Continued, true);
         let joined = [first, second].concat();
         assert_eq!(end_markers(&joined), 1, "the paste ends itself: {joined:?}");
         assert!(joined.ends_with(PASTE_END));
@@ -7605,6 +7629,28 @@ mod tests {
             other.stop().await;
             h.stop().await;
         }
+    }
+
+    /// A paste whose first piece was dropped is still a new paste: its later
+    /// pieces do not continue the one an earlier paste left open.
+    #[tokio::test]
+    async fn a_paste_whose_start_was_dropped_does_not_join_one_left_open() {
+        let mut h = InputHarness::new(1).await;
+        paste_with_dropped_end(&mut h).await;
+        paste(&mut h, b"p1", true).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            pane_input(&mut h, Duration::from_millis(200)).await,
+            b"\x1b[200~a"
+        );
+        paste(&mut h, b"p2", false).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[201~\x1b[200~p2\x1b[201~",
+            "the paste joined the open one"
+        );
+        h.stop().await;
     }
 
     /// Detaching ends only the paste this client left open: one another

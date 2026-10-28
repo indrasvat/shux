@@ -29,8 +29,7 @@ use crate::snapshot::{
 };
 use crate::{lens_scratch, onboarding, pane_command, session_meta, statusbar_runner};
 
-/// Writes `bytes` to the pane's program, waiting for room with the lock
-/// released and ending an open paste first.
+/// Writes `bytes` to the pane's program, ending an open paste first.
 async fn send_to_pane(
     io: &Mutex<PaneIoState>,
     pane_id: shux_core::model::PaneId,
@@ -2109,6 +2108,7 @@ mod tests {
             let open = crate::pane_io::OpenPaste {
                 program: 0,
                 client: 0,
+                paste: 0,
             };
             harness.io.lock().await.open_pastes.insert(pane_id, open);
         };
