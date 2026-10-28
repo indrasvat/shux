@@ -1311,6 +1311,23 @@ pub fn print_success(action: &str, subject: &str, id: Option<&str>) {
     let _ = writeln!(out);
 }
 
+/// Write one item of a streaming command's output (`events watch`,
+/// `pane watch`) and flush it, so a pipe reader sees it now.
+///
+/// `Ok(false)` means the reader closed the pipe: the stream is over, and the
+/// caller ends successfully.
+pub fn print_stream(bytes: &[u8]) -> io::Result<bool> {
+    write_stream(&mut io::stdout().lock(), bytes)
+}
+
+fn write_stream(out: &mut impl Write, bytes: &[u8]) -> io::Result<bool> {
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Print an error with ✗ prefix.
 pub fn print_error(msg: &str) {
     let mut err = io::stderr().lock();
@@ -1923,6 +1940,26 @@ pub fn print_pane_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader that closed the pipe ends the stream; any other write error
+    /// is still an error.
+    #[test]
+    fn a_closed_pipe_ends_a_stream_and_other_errors_do_not() {
+        struct Fails(io::ErrorKind);
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut ok = Vec::new();
+        assert!(write_stream(&mut ok, b"line\n").unwrap());
+        assert_eq!(ok, b"line\n");
+        assert!(!write_stream(&mut Fails(io::ErrorKind::BrokenPipe), b"x").unwrap());
+        assert!(write_stream(&mut Fails(io::ErrorKind::StorageFull), b"x").is_err());
+    }
 
     // ── issue #104: egress guard ────────────────────────────────
 

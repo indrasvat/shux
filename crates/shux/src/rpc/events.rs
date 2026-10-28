@@ -94,7 +94,7 @@ fn event_filters(params: Option<&serde_json::Value>) -> Vec<String> {
 ///      requirement).
 ///   2. Snapshots history from `from_seq` SECOND.
 ///   3. Drains the subscription with `timeout_ms` until either a matching
-///      event arrives or the deadline lapses.
+///      event arrives or the deadline lapses, then takes only what is queued.
 ///   4. Returns history + tail, deduped by `seq` (the overlap between the
 ///      two streams is real — an event published in step 2 might appear in
 ///      both the history snapshot and the subscription receiver buffer).
@@ -163,20 +163,23 @@ pub(crate) fn register_events_methods(
                         history.into_iter().filter(|e| scope.admits(e)).collect();
                     let mut lagged = false;
 
-                    // 3. Tail: drain up to (max_events - history_len) events from
-                    //    the subscription with timeout. If from_seq was None and
-                    //    we have no history, block until at least one event or
-                    //    timeout. If we already have history, just opportunistically
-                    //    grab anything queued without blocking past the deadline.
+                    // 3. Tail: block until the first admitted event or the
+                    //    deadline. Once anything is collected, take only what is
+                    //    already queued and return; a caller that wants more
+                    //    calls again with `next_seq`.
                     let deadline =
                         tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
                     while collected.len() < max_events {
-                        let now = tokio::time::Instant::now();
-                        if now >= deadline {
-                            break;
-                        }
-                        let remaining = deadline - now;
-                        match tokio::time::timeout(remaining, sub.recv()).await {
+                        let wait = if collected.is_empty() {
+                            let now = tokio::time::Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            deadline - now
+                        } else {
+                            std::time::Duration::ZERO
+                        };
+                        match tokio::time::timeout(wait, sub.recv()).await {
                             Ok(Some(shux_core::bus::SubscriptionEvent::Event(e))) => {
                                 if scope.admits(&e) {
                                     collected.push(e)
@@ -189,7 +192,7 @@ pub(crate) fn register_events_methods(
                                 break;
                             }
                             Ok(None) => break, // bus shut down
-                            Err(_) => break,   // deadline reached
+                            Err(_) => break,   // deadline reached, or nothing queued
                         }
                     }
 
@@ -564,6 +567,94 @@ mod tests {
         .await;
         assert_eq!(missing_pane.code, shux_rpc::ErrorCode::InvalidParams.code());
 
+        harness.stop().await;
+    }
+
+    fn plugin_tick(harness: &RpcHarness) -> u64 {
+        harness
+            .bus
+            .publish(shux_core::event::EventData::PluginEvent {
+                plugin_id: "t".to_string(),
+                event_type: "tick".to_string(),
+                data: serde_json::json!({}),
+            })
+    }
+
+    async fn timed_watch(
+        harness: &RpcHarness,
+        params: serde_json::Value,
+    ) -> (serde_json::Value, Duration) {
+        let started = std::time::Instant::now();
+        let result = dispatch_ok(&harness.router, "events.watch", params).await;
+        (result, started.elapsed())
+    }
+
+    /// History already in hand is returned at once, not after `timeout_ms`.
+    #[tokio::test]
+    async fn watch_with_history_returns_without_waiting_for_the_deadline() {
+        let harness = RpcHarness::new();
+        let first = plugin_tick(&harness);
+        plugin_tick(&harness);
+        plugin_tick(&harness);
+        let (watched, elapsed) = timed_watch(
+            &harness,
+            serde_json::json!({"from_seq": first, "filter": ["plugin.t."], "timeout_ms": 5_000}),
+        )
+        .await;
+        assert_eq!(watched["events"].as_array().unwrap().len(), 3, "{watched}");
+        assert_eq!(watched["next_seq"], first + 3);
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "waited {elapsed:?} with 3 events of history already collected"
+        );
+        harness.stop().await;
+    }
+
+    /// With nothing to return the call still long-polls for the full timeout.
+    #[tokio::test]
+    async fn watch_without_history_waits_for_the_deadline() {
+        let harness = RpcHarness::new();
+        let next = plugin_tick(&harness) + 1;
+        let (watched, elapsed) = timed_watch(
+            &harness,
+            serde_json::json!({"from_seq": next, "filter": ["plugin.t."], "timeout_ms": 400}),
+        )
+        .await;
+        assert_eq!(watched["events"].as_array().unwrap().len(), 0, "{watched}");
+        assert_eq!(watched["next_seq"], next);
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "returned after {elapsed:?}, before the 400 ms deadline, with nothing to return"
+        );
+        harness.stop().await;
+    }
+
+    /// The first live event ends the long poll. `shux events watch` loops on
+    /// this call, so holding the event until the deadline left a watcher
+    /// printing nothing for `timeout_ms` at a time.
+    #[tokio::test]
+    async fn watch_returns_the_first_live_event_without_waiting_for_the_deadline() {
+        let harness = RpcHarness::new();
+        let router = harness.router.clone();
+        let watch = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = router
+                .dispatch(
+                    "events.watch",
+                    Some(serde_json::json!({"filter": ["plugin.t."], "timeout_ms": 5_000})),
+                )
+                .await
+                .unwrap();
+            (result, started.elapsed())
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seq = plugin_tick(&harness);
+        let (watched, elapsed) = watch.await.unwrap();
+        assert_eq!(watched["events"][0]["seq"], seq, "{watched}");
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "held a live event for {elapsed:?} waiting for more"
+        );
         harness.stop().await;
     }
 }
