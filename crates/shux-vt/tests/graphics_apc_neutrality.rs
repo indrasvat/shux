@@ -97,7 +97,7 @@ proptest! {
     /// Cutting `advance` at APC boundaries must change nothing. Both terminals
     /// get the SAME bytes in the SAME chunks; only one slices. Comparing two
     /// *chunkings* instead would measure vte, which is chunk-sensitive already
-    /// (see `c1_controls_are_chunk_sensitive_in_vte`).
+    /// (it executes a UTF-8 C1 decoded in one read and prints a split one).
     #[test]
     fn slicing_at_apc_boundaries_is_invisible(
         stream in prop::collection::vec(hostile_byte(), 0..400),
@@ -178,40 +178,22 @@ fn a_ris_does_not_swallow_an_apc_that_starts_after_it() {
     );
 }
 
-/// A C1 control written as two-byte UTF-8 renders differently depending on how
-/// the PTY happened to chunk the read. **This is a pre-existing shux defect and
-/// is NOT caused by the APC scanner.**
-///
-/// Reproduced against a build of the base commit `f071c89`, which has no
-/// graphics code at all: `" " C2 80 " "` delivered whole leaves the cursor at
-/// column 2 having printed nothing, and delivered byte-at-a-time prints U+0080
-/// and leaves it at column 3. vte executes the character on one decode path and
-/// prints it on the other.
-///
-/// The class is exactly U+0080..=U+009F: NBSP, e-acute, CJK, astral emoji, bare
-/// continuation bytes and truncated sequences were all measured chunk-invariant.
-///
-/// Pinned, not fixed: the fix means changing how shux drives vte's UTF-8
-/// decoding on the hottest path, which does not belong in a change about APC
-/// sequences. If a vte upgrade changes this, this test says so.
+/// A C1 control written as two-byte UTF-8 renders the same however the PTY
+/// chunked the read. vte executes it on one decode path and prints it on the
+/// other; the parser sends both to `execute`.
 #[test]
-fn c1_controls_are_chunk_sensitive_in_vte() {
+fn c1_controls_render_the_same_however_they_are_chunked() {
     let stream: &[u8] = b"\x20\xc2\x80\x20";
     let whole = drive(&[stream]);
     let singles: Vec<&[u8]> = stream.chunks(1).collect();
     let split = drive(&singles);
-    assert_ne!(
-        whole, split,
-        "vte's C1 chunk-sensitivity appears to be fixed -- delete this test, drop \
-         `encodes_a_c1_control`, and let the chunking properties cover the range"
-    );
+    assert_eq!(whole.frame, split.frame);
+    assert_eq!(whole.scrollback, split.scrollback);
+    assert_eq!(whole.cursor, split.cursor);
     assert!(
-        !whole.scrollback.contains('\u{80}'),
-        "whole-buffer decode executed it"
-    );
-    assert!(
-        split.scrollback.contains('\u{80}'),
-        "byte-at-a-time decode printed it"
+        !split.scrollback.contains('\u{80}'),
+        "{:?}",
+        split.scrollback
     );
 }
 
