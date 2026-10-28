@@ -134,6 +134,49 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the daemon pings the client to detect dead peers.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How long input waits for a pane's channel to make room before the pane
+/// counts as not reading. Bounds how long one stuck pane can hold the attach
+/// loop (and with it detach and pane switching).
+const INPUT_STALL: Duration = Duration::from_secs(1);
+
+/// What became of one chunk of input bound for a pane.
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    Sent,
+    /// The pane took nothing for [`INPUT_STALL`], or is already known stuck.
+    Dropped,
+    /// The pane is gone, or the attach is ending.
+    Closed,
+}
+
+/// Hand `bytes` to a pane's input channel, waiting for room while it drains.
+///
+/// A pane already known `stalled` gets no wait: the bytes are taken only if
+/// there is room now, so a stuck pane costs the attach loop one
+/// [`INPUT_STALL`], not one per key. The wait is the only place attach blocks
+/// on a pane, so a byte-bounded channel (issue #198) can bound it here too.
+async fn deliver_input(
+    tx: &mpsc::Sender<Vec<u8>>,
+    bytes: Vec<u8>,
+    stalled: bool,
+    cancel: &CancellationToken,
+) -> Delivery {
+    let bytes = match tx.try_send(bytes) {
+        Ok(()) => return Delivery::Sent,
+        Err(mpsc::error::TrySendError::Closed(_)) => return Delivery::Closed,
+        Err(mpsc::error::TrySendError::Full(_)) if stalled => return Delivery::Dropped,
+        Err(mpsc::error::TrySendError::Full(bytes)) => bytes,
+    };
+    tokio::select! {
+        _ = cancel.cancelled() => Delivery::Closed,
+        sent = tokio::time::timeout(INPUT_STALL, tx.send(bytes)) => match sent {
+            Ok(Ok(())) => Delivery::Sent,
+            Ok(Err(_)) => Delivery::Closed,
+            Err(_) => Delivery::Dropped,
+        },
+    }
+}
+
 /// Run the attach UDS listener. Each accepted connection spawns an
 /// independent attach session task. Runs until `cancel` fires.
 #[allow(clippy::too_many_arguments)]
@@ -732,6 +775,8 @@ async fn run_attach_loop(
     alive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Sent at teardown, once nothing else can queue a frame behind it.
     let mut final_frame = None;
+    // The pane input is being dropped for, and how many bytes so far.
+    let mut input_stall: Option<(PaneId, usize)> = None;
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -923,14 +968,32 @@ async fn run_attach_loop(
                             state.writers.get(&target).cloned()
                         };
                         if let Some(tx) = writer {
-                            // Use try_send rather than send().await: if the
-                            // pane's PTY writer is backpressured (e.g., the
-                            // child stopped reading), blocking the whole
-                            // attach loop would freeze the user out -- they
-                            // wouldn't be able to detach or switch panes.
-                            // Dropping the keystroke is the lesser evil.
-                            if let Err(e) = tx.try_send(bytes) {
-                                tracing::warn!(error = %e, "input dropped (pane backpressured)");
+                            let len = bytes.len();
+                            let was_stalled = matches!(input_stall, Some((p, _)) if p == target);
+                            match deliver_input(&tx, bytes, was_stalled, &cancel).await {
+                                Delivery::Sent | Delivery::Closed => {
+                                    if was_stalled {
+                                        input_stall = None;
+                                    }
+                                }
+                                Delivery::Dropped => {
+                                    let dropped = match input_stall {
+                                        Some((p, n)) if p == target => n + len,
+                                        _ => len,
+                                    };
+                                    if !was_stalled {
+                                        warn!(pane = %target, "input dropped: pane not reading");
+                                    }
+                                    input_stall = Some((target, dropped));
+                                    // Refreshed on every drop, so the notice
+                                    // stays up for as long as input is lost.
+                                    render_session.lock().await.last_action = Some((
+                                        format!("pane not reading: {dropped} B of input dropped"),
+                                        std::time::Instant::now(),
+                                    ));
+                                    let pulse = io_state.lock().await.render_pulse.clone();
+                                    pulse.notify_one();
+                                }
                             }
                         }
                     }
@@ -6731,5 +6794,205 @@ mod tests {
         );
         drop(s);
         fixture.stop();
+    }
+
+    /// The real attach connection, with a pane whose input channel the test
+    /// owns: the test decides how fast the "program" reads.
+    struct InputHarness {
+        fixture: AttachFixture,
+        framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+        writer_rx: mpsc::Receiver<Vec<u8>>,
+        server_cancel: CancellationToken,
+        server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl InputHarness {
+        async fn new(capacity: usize) -> Self {
+            let fixture = attach_fixture().await;
+            let (writer_tx, writer_rx) = mpsc::channel(capacity);
+            let (resize_tx, _resize_rx) = mpsc::channel(64);
+            {
+                let mut st = fixture.io_state.lock().await;
+                st.writers.insert(fixture.first_pane, writer_tx);
+                st.resizers.insert(fixture.first_pane, resize_tx);
+                st.shutdowns
+                    .insert(fixture.first_pane, CancellationToken::new());
+                st.vts
+                    .insert(fixture.first_pane, shux_vt::VirtualTerminal::new(6, 40));
+            }
+            let onboarding = crate::onboarding::OnboardingHandle::from_state_for_test(
+                crate::onboarding::OnboardingState {
+                    prefix_discovered: true,
+                    welcome_toast_seen: true,
+                },
+            );
+            let (server_stream, client_stream) = UnixStream::pair().expect("unix pair");
+            let server_cancel = fixture.cancel.child_token();
+            let server = tokio::spawn(handle_attach_connection(
+                server_stream,
+                fixture.graph.clone(),
+                fixture.io_state.clone(),
+                test_config(),
+                SegmentCache::new(),
+                crate::session_meta::SessionMetaCache::new(),
+                onboarding,
+                std::time::Instant::now(),
+                server_cancel.clone(),
+            ));
+            let mut framed = Framed::new(client_stream, create_codec());
+            let hello = AttachHello {
+                protocol: ATTACH_PROTOCOL_VERSION,
+                session_name: Some(fixture.attached.name.clone()),
+                cols: 90,
+                rows: 24,
+                client_version: "input-test".to_string(),
+                graphics: false,
+            };
+            framed
+                .send(Bytes::from(serde_json::to_vec(&hello).expect("hello json")))
+                .await
+                .expect("send hello");
+            let ready = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                .await
+                .expect("ready timeout")
+                .expect("ready frame")
+                .expect("ready bytes");
+            assert!(matches!(
+                serde_json::from_slice::<AttachReady>(&ready).expect("ready json"),
+                AttachReady::Ok { .. }
+            ));
+            Self {
+                fixture,
+                framed,
+                writer_rx,
+                server_cancel,
+                server,
+            }
+        }
+
+        async fn send(&mut self, frame: &AttachClientFrame) {
+            self.framed
+                .send(Bytes::from(serde_json::to_vec(frame).expect("frame json")))
+                .await
+                .expect("send frame");
+        }
+
+        async fn stop(self) {
+            drop(self.framed);
+            self.server_cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.server).await;
+            self.fixture.stop();
+        }
+    }
+
+    /// Server frames until `pred` matches one, or `budget` runs out. `pred`
+    /// also sees the client's screen so far: render frames position every
+    /// cell, so their raw bytes never hold a word contiguously.
+    async fn server_frames_until(
+        framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+        budget: Duration,
+        mut pred: impl FnMut(&AttachServerFrame, &str) -> bool,
+    ) -> bool {
+        let mut screen = shux_vt::VirtualTerminal::new(24, 90);
+        let deadline = tokio::time::Instant::now() + budget;
+        while let Ok(Some(Ok(buf))) = tokio::time::timeout_at(deadline, framed.next()).await {
+            let frame: AttachServerFrame = serde_json::from_slice(&buf).expect("server frame");
+            if let AttachServerFrame::Render { data } = &frame {
+                screen.process(&BASE64.decode(data.as_bytes()).expect("render base64"));
+            }
+            let grid = screen.grid();
+            let text: String = (0..grid.rows())
+                .flat_map(|r| {
+                    let row = grid.visible_row(r);
+                    (0..row.len()).map(|c| row[c].ch).chain(['\n'])
+                })
+                .collect();
+            if pred(&frame, &text) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Issue #197: a paste is one Input frame per key, far more frames than a
+    /// pane's channel holds. A pane that is reading, only slower than the
+    /// frames arrive, must receive every byte in order.
+    #[tokio::test]
+    async fn a_paste_into_a_pane_that_reads_slowly_arrives_whole() {
+        let mut h = InputHarness::new(8).await;
+        let paste: Vec<u8> = (0..2000u32).map(|i| b'a' + (i % 26) as u8).collect();
+
+        let mut rx = std::mem::replace(&mut h.writer_rx, mpsc::channel(1).1);
+        let want = paste.len();
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::with_capacity(want);
+            while got.len() < want {
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                    Ok(Some(chunk)) => got.extend_from_slice(&chunk),
+                    _ => break,
+                }
+                // A program busy drawing what it was just sent.
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+            got
+        });
+        for &b in &paste {
+            h.send(&AttachClientFrame::Input {
+                data: BASE64.encode([b]),
+            })
+            .await;
+        }
+        let got = reader.await.expect("reader");
+        assert_eq!(
+            got.len(),
+            paste.len(),
+            "{} of {} pasted bytes reached the pane",
+            got.len(),
+            paste.len()
+        );
+        assert!(got == paste, "the paste arrived reordered");
+        h.stop().await;
+    }
+
+    /// The other half of #197: a pane that stops reading altogether must not
+    /// freeze the attach. Input it cannot take is dropped only after a bounded
+    /// wait, the user is told on the status bar, and detach still works.
+    #[tokio::test]
+    async fn a_pane_that_stops_reading_drops_input_visibly_and_detach_still_works() {
+        let mut h = InputHarness::new(1).await;
+        for _ in 0..50 {
+            h.send(&AttachClientFrame::Input {
+                data: BASE64.encode(b"x"),
+            })
+            .await;
+        }
+        let told = server_frames_until(
+            &mut h.framed,
+            INPUT_STALL + Duration::from_secs(3),
+            |_, text| text.contains("not reading"),
+        )
+        .await;
+        assert!(told, "input was dropped without telling the user");
+
+        let started = tokio::time::Instant::now();
+        h.send(&AttachClientFrame::Detach).await;
+        let detached = server_frames_until(
+            &mut h.framed,
+            INPUT_STALL + Duration::from_secs(3),
+            |f, _| matches!(f, AttachServerFrame::DetachAck),
+        )
+        .await;
+        assert!(
+            detached,
+            "a stuck pane froze the attach: detach never landed"
+        );
+        assert!(
+            started.elapsed() < INPUT_STALL + Duration::from_secs(2),
+            "detach waited {:?} behind a pane that is not reading",
+            started.elapsed()
+        );
+        // The stuck pane still holds its first byte; nothing else was queued.
+        assert_eq!(h.writer_rx.try_recv().ok(), Some(b"x".to_vec()));
+        h.stop().await;
     }
 }
