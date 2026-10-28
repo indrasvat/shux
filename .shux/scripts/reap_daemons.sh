@@ -27,11 +27,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 pids=($(shux_daemon_pids))
-
-# When a pid started, which with the pid names one process: pids are reused.
-start_time() {
-  ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true
-}
+daemon_at=()
+for pid in "${pids[@]:-}"; do
+  [ -z "${pid}" ] || daemon_at+=("$(start_time "${pid}")")
+done
 
 # The live children of any pid in a space-padded set, not already in it.
 children_outside() {
@@ -64,22 +63,37 @@ fi
 # the walk nor exit and hand its children to init; stopped parents keep their children's
 # ppid pointing at them, so the walk reaches a fixpoint. The daemons themselves keep
 # running, so a responsive one still shuts down gracefully.
-members=" ${pids[*]} "
 frozen=()
 frozen_at=()
 resume_frozen() {
-  local pid
-  for pid in "${frozen[@]:-}"; do
-    if [ -n "${pid}" ]; then kill -CONT "${pid}" >/dev/null 2>&1 || true; fi
+  local i=0
+  while [ "${i}" -lt "${#frozen[@]}" ]; do
+    if is_process "${frozen[${i}]}" "${frozen_at[${i}]}"; then
+      kill -CONT "${frozen[${i}]}" >/dev/null 2>&1 || true
+    fi
+    i=$((i + 1))
   done
 }
 # Interrupted, the reap leaves what it froze running again rather than stopped for good.
 trap 'resume_frozen; exit 130' INT TERM HUP
-# Re-stopping what is already frozen matters: see the SIGCONT note below.
+# Re-stopping what is already frozen matters: see the SIGCONT note below. The tree is
+# rebuilt from the processes that are still the ones recorded, so a pid that died and was
+# reused names neither a process to stop nor a parent whose children are ours.
 freeze_tree() {
-  local pid
-  for pid in "${frozen[@]:-}"; do
-    if [ -n "${pid}" ]; then kill -STOP "${pid}" >/dev/null 2>&1 || true; fi
+  local pid i=0
+  members=" "
+  while [ "${i}" -lt "${#pids[@]}" ]; do
+    if is_process "${pids[${i}]}" "${daemon_at[${i}]}"; then members="${members}${pids[${i}]} "; fi
+    i=$((i + 1))
+  done
+  i=0
+  while [ "${i}" -lt "${#frozen[@]}" ]; do
+    pid="${frozen[${i}]}"
+    if is_process "${pid}" "${frozen_at[${i}]}"; then
+      kill -STOP "${pid}" >/dev/null 2>&1 || true
+      members="${members}${pid} "
+    fi
+    i=$((i + 1))
   done
   while :; do
     # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
@@ -107,14 +121,14 @@ sleep 1
 # it is frozen and still has a terminal that has not hung up.
 freeze_tree
 
-# Each still has the start time it had when frozen, so it is that process and not one
-# reusing its pid; a process it would be is frozen, so cannot have been replaced.
 stranded=()
+stranded_at=()
 i=0
 while [ "${i}" -lt "${#frozen[@]}" ]; do
   pid="${frozen[${i}]}"
-  if ! pid_is_gone "${pid}" && [ "$(start_time "${pid}")" = "${frozen_at[${i}]}" ]; then
+  if is_process "${pid}" "${frozen_at[${i}]}" && ! pid_is_gone "${pid}"; then
     stranded+=("${pid}")
+    stranded_at+=("${frozen_at[${i}]}")
   fi
   i=$((i + 1))
 done
@@ -127,15 +141,31 @@ if [ "${#stranded[@]}" -gt 0 ]; then
   terminate_pids "${stranded[@]}"
 fi
 
-terminate_pids "${pids[@]}"
+# Only the daemons that outlived their grace, by identity: a pid freed by a graceful exit
+# may be another process's by now.
+wedged=()
+wedged_at=()
+i=0
+while [ "${i}" -lt "${#pids[@]}" ]; do
+  if is_process "${pids[${i}]}" "${daemon_at[${i}]}" && ! pid_is_gone "${pids[${i}]}"; then
+    wedged+=("${pids[${i}]}")
+    wedged_at+=("${daemon_at[${i}]}")
+  fi
+  i=$((i + 1))
+done
+[ "${#wedged[@]}" -eq 0 ] || terminate_pids "${wedged[@]}"
 
 # Report on what is actually gone, and only about the pids we targeted. Re-scanning the
 # machine instead counted a daemon that STARTED during the reap — shux auto-starts one on
 # first use, so any concurrent command in this checkout did it — as one that "survived
 # TERM+KILL".
 survivors=()
-for pid in "${pids[@]}"; do
-  pid_is_gone "${pid}" || survivors+=("${pid}")
+i=0
+while [ "${i}" -lt "${#wedged[@]}" ]; do
+  if is_process "${wedged[${i}]}" "${wedged_at[${i}]}" && ! pid_is_gone "${wedged[${i}]}"; then
+    survivors+=("${wedged[${i}]}")
+  fi
+  i=$((i + 1))
 done
 if [ "${#survivors[@]}" -gt 0 ]; then
   echo "reap: ${#survivors[@]} daemon(s) survived TERM+KILL: ${survivors[*]}" >&2
@@ -147,8 +177,12 @@ if [ "${#survivors[@]}" -gt 0 ]; then
 fi
 
 left=()
-for pid in "${stranded[@]:-}"; do
-  if [ -n "${pid}" ] && ! pid_is_gone "${pid}"; then left+=("${pid}"); fi
+i=0
+while [ "${i}" -lt "${#stranded[@]}" ]; do
+  if is_process "${stranded[${i}]}" "${stranded_at[${i}]}" && ! pid_is_gone "${stranded[${i}]}"; then
+    left+=("${stranded[${i}]}")
+  fi
+  i=$((i + 1))
 done
 if [ "${#left[@]}" -gt 0 ]; then
   echo "reap: ${#left[@]} stranded process(es) survived KILL: ${left[*]}" >&2

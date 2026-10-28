@@ -579,5 +579,8 @@ else
   echo "note: other daemons from this checkout are running; skipping the quiet-baseline case" >&2
 fi
 
+# Pid reuse between the reaper's steps, forced in a pid namespace it cannot leak out of.
+.shux/scripts/reap_pid_reuse_selftest.sh
+
 assert_no_new_orphan_automation_processes "${orphan_baseline}"
 echo "shux leak guard self-test passed"
