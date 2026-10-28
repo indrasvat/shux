@@ -3,15 +3,20 @@
 //! when the reader closes the pipe.
 //!
 //! These drive the REAL `shux` binary against a REAL daemon, with stdout a
-//! real pipe — the case a terminal-attached run never exercises.
+//! real pipe — the case a terminal-attached run never exercises. Each watch
+//! runs with a 30 s long poll, so an item held until the deadline cannot land
+//! inside the 10 s the tests allow.
 
-use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Stdio};
+use std::io::Read;
+use std::process::{Child, ChildStdout, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod lens_common;
 use lens_common::*;
+
+const LONG_POLL_MS: &str = "30000";
+const PROMPT: Duration = Duration::from_secs(10);
 
 /// Kills the watcher if an assertion fails first, so no client outlives the test.
 struct Watcher(Child);
@@ -33,6 +38,23 @@ impl Watcher {
                 .spawn()
                 .unwrap_or_else(|e| panic!("spawn shux {args:?}: {e}")),
         )
+    }
+
+    /// The watcher's stdout as chunks read on another thread, so a test waits
+    /// on it with a timeout instead of blocking in `read`. Dropping the
+    /// receiver closes the pipe at the next chunk.
+    fn output(&mut self) -> mpsc::Receiver<Vec<u8>> {
+        let mut stdout: ChildStdout = self.0.stdout.take().expect("stdout");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
     }
 
     /// Wait for the watcher to exit on its own, nudging it with `poke` so it
@@ -58,6 +80,23 @@ impl Watcher {
     }
 }
 
+/// Collect output until it holds `needle`, failing after `PROMPT`.
+fn read_until(rx: &mpsc::Receiver<Vec<u8>>, needle: &str, what: &str) -> String {
+    let started = Instant::now();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains(needle) {
+        let left = PROMPT.saturating_sub(started.elapsed());
+        match rx.recv_timeout(left) {
+            Ok(chunk) => seen.extend_from_slice(&chunk),
+            Err(e) => panic!(
+                "{what}: no {needle:?} within {PROMPT:?} ({e}); saw {:?}",
+                String::from_utf8_lossy(&seen)
+            ),
+        }
+    }
+    String::from_utf8_lossy(&seen).into_owned()
+}
+
 /// The seq the next published event will carry.
 fn next_seq(h: &Harness) -> u64 {
     h.rpc_ok("events.history", serde_json::json!({"count": 1}))["current_seq"]
@@ -74,15 +113,11 @@ fn create_session(h: &Harness, name: &str) {
     );
 }
 
-/// Issue 134: a piped `events watch` must hand each event to its reader as it
-/// happens, not hold it until the 5 s long-poll deadline.
-#[test]
-fn piped_events_watch_delivers_an_event_without_waiting_out_the_long_poll() {
-    let h = Harness::new();
-    create_session(&h, "boot");
-    let from = next_seq(&h).to_string();
-    let mut w = Watcher::spawn(
-        &h,
+fn events_watch(h: &Harness) -> Watcher {
+    create_session(h, "boot");
+    let from = next_seq(h).to_string();
+    Watcher::spawn(
+        h,
         &[
             "events",
             "watch",
@@ -90,31 +125,25 @@ fn piped_events_watch_delivers_an_event_without_waiting_out_the_long_poll() {
             "session.created",
             "--from-seq",
             &from,
+            "--timeout-ms",
+            LONG_POLL_MS,
         ],
-    );
-    let (tx, rx) = mpsc::channel();
-    let stdout = w.0.stdout.take().expect("stdout");
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    )
+}
 
-    let created = Instant::now();
+/// Issue 134: a piped `events watch` hands each event to its reader as it
+/// happens, as one JSON line.
+#[test]
+fn piped_events_watch_delivers_an_event_without_waiting_out_the_long_poll() {
+    let h = Harness::new();
+    let mut w = events_watch(&h);
+    let rx = w.output();
     create_session(&h, "piped-134");
-    let line = rx.recv_timeout(Duration::from_secs(4)).unwrap_or_else(|_| {
-        panic!(
-            "no event reached the pipe within 4 s of creating a session \
-                 (it took {:?} so far); the default long-poll is 5 s",
-            created.elapsed()
-        )
-    });
-    let event: serde_json::Value = serde_json::from_str(&line).expect("JSON line");
-    assert_eq!(event["type"], "session.created", "{line}");
-    assert_eq!(event["data"]["data"]["name"], "piped-134", "{line}");
+    let out = read_until(&rx, "\n", "events watch");
+    let event: serde_json::Value =
+        serde_json::from_str(out.lines().next().unwrap()).expect("JSON line");
+    assert_eq!(event["type"], "session.created", "{out}");
+    assert_eq!(event["data"]["data"]["name"], "piped-134", "{out}");
 }
 
 /// Closing the read end (`| head -n 1`) ends the watch with status 0 — not a
@@ -122,15 +151,11 @@ fn piped_events_watch_delivers_an_event_without_waiting_out_the_long_poll() {
 #[test]
 fn events_watch_ends_cleanly_when_its_reader_closes_the_pipe() {
     let h = Harness::new();
-    create_session(&h, "boot");
-    let from = next_seq(&h).to_string();
-    let mut w = Watcher::spawn(&h, &["events", "watch", "--from-seq", &from]);
+    let mut w = events_watch(&h);
+    let rx = w.output();
     create_session(&h, "first");
-    let mut reader = BufReader::new(w.0.stdout.take().expect("stdout"));
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read the first event");
-    assert!(line.contains("session.created"), "{line}");
-    drop(reader);
+    read_until(&rx, "\n", "events watch");
+    drop(rx);
 
     let n = std::cell::Cell::new(0);
     let (status, stderr) = w.exit_after_reader_closed(|| {
@@ -143,10 +168,11 @@ fn events_watch_ends_cleanly_when_its_reader_closes_the_pipe() {
     );
 }
 
-/// The same for `pane watch`, which streams a pane's raw output. It used to
-/// discard the write error and poll forever for a reader that was gone.
+/// `pane watch` streams a pane's raw output, colour intact, as it is written,
+/// and stops once its reader is gone. The pane writes twice a second, so a
+/// poll that waited for its 50-chunk page would take 25 s.
 #[test]
-fn pane_watch_ends_cleanly_when_its_reader_closes_the_pipe() {
+fn pane_watch_streams_promptly_and_ends_cleanly_when_its_reader_closes_the_pipe() {
     let h = Harness::new();
     let out = h.cli(&[
         "session",
@@ -156,7 +182,7 @@ fn pane_watch_ends_cleanly_when_its_reader_closes_the_pipe() {
         "--",
         "sh",
         "-c",
-        "while :; do printf '\\033[38;2;255;0;128mTRUE\\033[0m \\033[38;5;208mIDX\\033[0m \\033[31mBASIC\\033[0m tick\\n'; sleep 0.05; done",
+        "while :; do printf '\\033[38;2;255;0;128mTRUE\\033[0m \\033[38;5;208mIDX\\033[0m \\033[31mBASIC\\033[0m tick\\n'; sleep 0.5; done",
     ]);
     assert!(
         out.status.success(),
@@ -181,27 +207,15 @@ fn pane_watch_ends_cleanly_when_its_reader_closes_the_pipe() {
             "-p",
             &pane,
             "--timeout-ms",
-            "500",
+            LONG_POLL_MS,
         ],
     );
-    let mut stdout = w.0.stdout.take().expect("stdout");
-    let mut seen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut buf = [0u8; 4096];
-    while !String::from_utf8_lossy(&seen).contains("tick") {
-        assert!(
-            Instant::now() < deadline,
-            "pane watch delivered nothing: {seen:?}"
-        );
-        let n = stdout.read(&mut buf).expect("read pane watch");
-        assert!(n > 0, "pane watch closed its stdout early");
-        seen.extend_from_slice(&buf[..n]);
-    }
-    let seen = String::from_utf8_lossy(&seen);
+    let rx = w.output();
+    let seen = read_until(&rx, "tick", "pane watch");
     for sgr in ["\x1b[38;2;255;0;128m", "\x1b[38;5;208m", "\x1b[31m"] {
         assert!(seen.contains(sgr), "colour {sgr:?} missing from {seen:?}");
     }
-    drop(stdout);
+    drop(rx);
 
     let (status, stderr) = w.exit_after_reader_closed(|| {});
     assert!(

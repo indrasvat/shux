@@ -70,6 +70,21 @@ impl EventScope {
     }
 }
 
+/// How long a long poll's next receive may block: until the deadline while it
+/// has nothing to return, not at all once it has something. `None` once the
+/// deadline has passed.
+fn next_wait(deadline: tokio::time::Instant, have_any: bool) -> Option<std::time::Duration> {
+    let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(if have_any {
+        std::time::Duration::ZERO
+    } else {
+        remaining
+    })
+}
+
 /// The `filter` list both the policy and the handlers act on. One parser,
 /// so the tier is always decided on what the subscription will deliver.
 fn event_filters(params: Option<&serde_json::Value>) -> Vec<String> {
@@ -170,14 +185,8 @@ pub(crate) fn register_events_methods(
                     let deadline =
                         tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
                     while collected.len() < max_events {
-                        let wait = if collected.is_empty() {
-                            let now = tokio::time::Instant::now();
-                            if now >= deadline {
-                                break;
-                            }
-                            deadline - now
-                        } else {
-                            std::time::Duration::ZERO
+                        let Some(wait) = next_wait(deadline, !collected.is_empty()) else {
+                            break;
                         };
                         match tokio::time::timeout(wait, sub.recv()).await {
                             Ok(Some(shux_core::bus::SubscriptionEvent::Event(e))) => {
@@ -304,12 +313,10 @@ pub(crate) fn register_events_methods(
                         tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
                     while collected.len() < limit {
-                        let now = tokio::time::Instant::now();
-                        if now >= deadline {
+                        let Some(wait) = next_wait(deadline, !collected.is_empty()) else {
                             break;
-                        }
-                        let remaining = deadline - now;
-                        match tokio::time::timeout(remaining, sub.recv()).await {
+                        };
+                        match tokio::time::timeout(wait, sub.recv()).await {
                             Ok(Some(shux_core::bus::PaneOutputSubscriptionEvent::Chunk(c))) => {
                                 if c.pane_id != pane_id {
                                     continue; // not for this subscriber
@@ -629,9 +636,7 @@ mod tests {
         harness.stop().await;
     }
 
-    /// The first live event ends the long poll. `shux events watch` loops on
-    /// this call, so holding the event until the deadline left a watcher
-    /// printing nothing for `timeout_ms` at a time.
+    /// The first live event ends the long poll.
     #[tokio::test]
     async fn watch_returns_the_first_live_event_without_waiting_for_the_deadline() {
         let harness = RpcHarness::new();
@@ -654,6 +659,42 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(2_000),
             "held a live event for {elapsed:?} waiting for more"
+        );
+        harness.stop().await;
+    }
+
+    /// `pane.output.watch` hands back the first chunk it gets rather than
+    /// holding it for `limit` chunks or the deadline.
+    #[tokio::test]
+    async fn pane_output_watch_returns_the_first_chunk_without_waiting_for_the_deadline() {
+        let harness = RpcHarness::new();
+        let (session_id, window_id, pane_id) = harness.seed_session("chunks").await;
+        let router = harness.router.clone();
+        let pane = pane_id.to_string();
+        let watch = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = router
+                .dispatch(
+                    "pane.output.watch",
+                    Some(serde_json::json!({"pane_id": pane, "timeout_ms": 5_000, "limit": 50})),
+                )
+                .await
+                .unwrap();
+            (result, started.elapsed())
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seq = harness.bus.publish_pane_output(
+            pane_id,
+            window_id,
+            session_id,
+            "aGk=".to_string(),
+            false,
+        );
+        let (watched, elapsed) = watch.await.unwrap();
+        assert_eq!(watched["chunks"][0]["seq"], seq, "{watched}");
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "held a chunk for {elapsed:?} waiting for more"
         );
         harness.stop().await;
     }

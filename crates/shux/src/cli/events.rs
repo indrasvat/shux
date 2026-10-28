@@ -249,8 +249,7 @@ mod tests {
         assert_eq!(apply["params"]["ops"][0]["op"], "create_session");
     }
 
-    /// `--timeout-ms` is documented as clamped to 100..=30000. Unclamped, `0`
-    /// made every poll return at once and the client spun on the daemon.
+    /// `--timeout-ms` is clamped to 100..=30000, as its help says.
     #[tokio::test]
     async fn events_watch_clamps_its_long_poll_timeout() {
         for (asked, sent) in [(0, 100), (99, 100), (5_000, 5_000), (60_000, 30_000)] {
