@@ -183,8 +183,17 @@ impl Env {
         self.first_pane(name)
     }
 
+    #[track_caller]
     fn send_keys(&self, session: &str, text: &str) {
-        let _ = self.run(&["pane", "send-keys", "-s", session, "-t", text]);
+        self.ok(&["pane", "send-keys", "-s", session, "-t", text]);
+    }
+
+    /// How many `kind` events the daemon's ring buffer holds.
+    fn event_count(&self, kind: &str) -> usize {
+        self.ok(&["events", "history", "-f", kind, "-n", "1000"])
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
     }
 
     /// Every (window, pane) in `session`, with whether the pane has a live PTY.
@@ -533,4 +542,121 @@ fn a_failed_attach_split_or_new_window_leaves_no_phantom() {
         2,
         "the rolled-back split and window should leave the graph as the control did: {after:?}"
     );
+}
+
+/// `(zoomed pane, focused pane)` in the session's active window.
+fn zoom_and_focus(env: &Env, session: &str) -> (Option<String>, Option<String>) {
+    let v: serde_json::Value =
+        serde_json::from_str(&env.ok(&["--format", "json", "pane", "list", "-s", session]))
+            .expect("pane list json");
+    let pick = |field: &str| {
+        v.as_array()
+            .expect("pane array")
+            .iter()
+            .find(|p| p[field] == true)
+            .map(|p| p["id"].as_str().unwrap_or_default().to_string())
+    };
+    (pick("is_zoomed"), pick("is_focused"))
+}
+
+/// Splitting unzooms, so the undo of a failed keyboard split has to zoom back,
+/// exactly as the `pane.split` RPC's undo does (issue #152).
+///
+/// Every step is a real keystroke typed into a real attach client: the zoom
+/// is `prefix z` and the split is `prefix v`, so the window is zoomed the way
+/// an operator zooms it, not through an RPC the attach path never sees.
+#[test]
+fn a_failed_attach_split_leaves_the_window_zoomed_on_the_same_pane() {
+    // Panes that fall back to the configured shell print the colour probe, so
+    // the attach UI drawing the zoomed pane is what the host screen shows.
+    let mut env = Env::new(
+        &format!(
+            "{ATTACH_KEYS}{}",
+            shell_command_config(&format!("{}; {PARK}", probe()))
+        ),
+        "/bin/sh",
+    );
+    // The host must read its input, so it gets an explicit interactive shell
+    // the config cannot replace; the target's first pane gets an explicit argv
+    // so the config flip below cannot kill it.
+    let host_pane = env.session_with_argv("host", &["/bin/sh"]);
+    env.session_with_argv("target", &["sleep", "900"]);
+
+    let bin = env.bin.display().to_string();
+    let root = env.root.path().display().to_string();
+    env.send_keys(
+        "host",
+        &format!(
+            "XDG_RUNTIME_DIR={root}/runtime XDG_CONFIG_HOME={root}/config \
+             {bin} session attach target\n"
+        ),
+    );
+    env.wait_for("host", &host_pane, "1 pane");
+
+    // CONTROL: a working split, then a keyboard zoom of the pane it made.
+    env.send_keys("host", "\x01v");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while env.panes_with_liveness("target").len() < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        env.panes_with_liveness("target").len(),
+        2,
+        "control split never happened, so this test cannot tell a lost zoom from lost keys"
+    );
+    env.send_keys("host", "\x01z");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while zoom_and_focus(&env, "target").0.is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    let (zoomed, focused) = zoom_and_focus(&env, "target");
+    let zoomed = zoomed.expect("control zoom never happened");
+    assert_eq!(
+        Some(&zoomed),
+        focused.as_ref(),
+        "prefix z zooms the focused pane"
+    );
+    env.expect_screen("host", &host_pane, "TRUECOLOR", &[]);
+
+    env.rewrite_config(&format!(
+        "{ATTACH_KEYS}[shell]\ncommand = [\"/usr/bin/shux-issue-152-typo\"]\n"
+    ));
+
+    // The failed split, then copy mode. The attach loop runs actions in order,
+    // so the copy-mode hint on screen proves the split, rollback included, has
+    // finished.
+    assert!(
+        !env.capture("host", &host_pane).contains("COPY"),
+        "the copy-mode marker is on screen before copy mode, so it proves nothing"
+    );
+    let (created, destroyed) = (
+        env.event_count("pane.created"),
+        env.event_count("pane.exited"),
+    );
+    env.send_keys("host", "\x01v");
+    env.send_keys("host", "\x01[");
+    env.wait_for("host", &host_pane, "COPY");
+
+    // Copy mode only proves `prefix [` ran. A split that never happened would
+    // leave the zoom alone too, so prove this one was made and undone.
+    assert_eq!(
+        (
+            env.event_count("pane.created") - created,
+            env.event_count("pane.exited") - destroyed
+        ),
+        (1, 1),
+        "expected one split made and undone (pane.created, then pane.exited)"
+    );
+    let after = env.panes_with_liveness("target");
+    assert!(
+        after.len() == 2 && after.iter().all(|(_, live)| *live),
+        "expected the 2 live panes from before the split: {after:?}"
+    );
+    let (zoomed_after, focused_after) = zoom_and_focus(&env, "target");
+    assert_eq!(
+        zoomed_after.as_ref(),
+        Some(&zoomed),
+        "a failed split left the window un-zoomed"
+    );
+    assert_eq!(focused_after.as_ref(), Some(&zoomed), "focus moved");
 }

@@ -350,6 +350,15 @@ pub enum GraphCommand {
         expected_version: Option<Version>,
         reply: tokio::sync::oneshot::Sender<Result<bool, GraphError>>,
     },
+    ZoomPaneIfFocused {
+        id: PaneId,
+        focused: PaneId,
+        reply: tokio::sync::oneshot::Sender<Result<bool, GraphError>>,
+    },
+    DestroyPaneAndEmptyParents {
+        id: PaneId,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
     SwapPanes {
         a: PaneId,
         b: PaneId,
@@ -1282,6 +1291,26 @@ impl SessionGraph {
         Ok(pane_id)
     }
 
+    /// Destroy `id`, then its window if that leaves it empty, then its
+    /// session if that leaves it empty. One step, so a pane or window created
+    /// meanwhile is never taken with them.
+    pub fn destroy_pane_and_empty_parents(&self, id: PaneId) -> Result<(), GraphError> {
+        match self.destroy_pane(id, None) {
+            Err(GraphError::LastPane) => {}
+            other => return other,
+        }
+        let (current, window_id) = self.find_pane_window(id)?;
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+        match self.destroy_window(window_id, None) {
+            Err(GraphError::LastWindow) => self.destroy_session(session_id, None),
+            other => other,
+        }
+    }
+
     pub fn destroy_pane(
         &self,
         id: PaneId,
@@ -2001,6 +2030,25 @@ impl SessionGraph {
         Ok(is_zoomed)
     }
 
+    /// Zoom `id` when `focused` is its window's focused pane and nothing there
+    /// is zoomed; otherwise change nothing. Unlike [`Self::zoom_pane`] this
+    /// never toggles a zoom off, and focus is checked in the same step as the
+    /// zoom. Returns whether the pane was zoomed.
+    pub fn zoom_pane_if_focused(&self, id: PaneId, focused: PaneId) -> Result<bool, GraphError> {
+        let (current, window_id) = self.find_pane_window(id)?;
+        let window = current
+            .windows
+            .get(&window_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+        if window.active_pane != focused
+            || window.layout.is_zoomed()
+            || window.layout.tree.pane_count() < 2
+        {
+            return Ok(false);
+        }
+        self.zoom_pane(id, None)
+    }
+
     /// Swap two panes in the layout tree. Both must be in the same window.
     ///
     /// `expected_version` is checked against pane `a` only — clients
@@ -2409,6 +2457,12 @@ pub async fn run_graph_loop(
                     }
                     Some(GraphCommand::ZoomPane { id, expected_version, reply }) => {
                         let _ = reply.send(graph.zoom_pane(id, expected_version));
+                    }
+                    Some(GraphCommand::ZoomPaneIfFocused { id, focused, reply }) => {
+                        let _ = reply.send(graph.zoom_pane_if_focused(id, focused));
+                    }
+                    Some(GraphCommand::DestroyPaneAndEmptyParents { id, reply }) => {
+                        let _ = reply.send(graph.destroy_pane_and_empty_parents(id));
                     }
                     Some(GraphCommand::SwapPanes { a, b, expected_version, reply }) => {
                         let _ = reply.send(graph.swap_panes(a, b, expected_version));
@@ -2946,6 +3000,34 @@ impl GraphHandle {
         rx.await.map_err(|_| GraphError::Shutdown)?
     }
 
+    /// See [`SessionGraph::zoom_pane_if_focused`].
+    pub async fn zoom_pane_if_focused(
+        &self,
+        id: PaneId,
+        focused: PaneId,
+    ) -> Result<bool, GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::ZoomPaneIfFocused {
+                id,
+                focused,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    /// See [`SessionGraph::destroy_pane_and_empty_parents`].
+    pub async fn destroy_pane_and_empty_parents(&self, id: PaneId) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::DestroyPaneAndEmptyParents { id, reply: tx })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
     pub async fn swap_panes(
         &self,
         a: PaneId,
@@ -3293,6 +3375,69 @@ mod tests {
         let snap = state.load();
         assert_eq!(snap.panes[&pid].command, vec!["vim"]);
         assert_eq!(snap.panes[&pid].window_id, wid);
+    }
+
+    #[test]
+    fn zoom_pane_if_focused_checks_focus_and_never_unzooms() {
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&wid].active_pane;
+        assert!(
+            !graph.zoom_pane_if_focused(a, a).unwrap(),
+            "a lone pane zoomed"
+        );
+        let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+        let zoomed = || {
+            state.load().windows[&wid]
+                .layout
+                .zoom
+                .as_ref()
+                .map(|z| z.zoomed_pane)
+        };
+
+        assert!(
+            !graph.zoom_pane_if_focused(a, a).unwrap(),
+            "zoomed with focus elsewhere"
+        );
+        assert_eq!(zoomed(), None);
+        assert!(graph.zoom_pane_if_focused(a, b).unwrap());
+        assert_eq!(zoomed(), Some(a));
+        assert!(!graph.zoom_pane_if_focused(a, b).unwrap(), "toggled off");
+        assert_eq!(zoomed(), Some(a));
+    }
+
+    #[test]
+    fn destroy_pane_and_empty_parents_takes_only_what_it_empties() {
+        let (graph, state) = SessionGraph::new();
+        let keep = graph.create_session("keep".into(), home()).unwrap();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let w1 = state.load().sessions[&sid].windows[0];
+        let a = state.load().windows[&w1].active_pane;
+        let b = graph.split_pane(a, Direction::Vertical, 0.5).unwrap();
+        let w2 = graph.create_window(sid, "2".into(), home()).unwrap();
+        let c = state.load().windows[&w2].active_pane;
+
+        graph.destroy_pane_and_empty_parents(b).unwrap();
+        let snap = state.load();
+        assert!(!snap.panes.contains_key(&b));
+        assert!(
+            snap.windows.contains_key(&w1),
+            "a window with panes left went"
+        );
+
+        graph.destroy_pane_and_empty_parents(a).unwrap();
+        let snap = state.load();
+        assert!(!snap.windows.contains_key(&w1));
+        assert!(
+            snap.sessions.contains_key(&sid),
+            "a session with windows left went"
+        );
+
+        graph.destroy_pane_and_empty_parents(c).unwrap();
+        let snap = state.load();
+        assert!(!snap.sessions.contains_key(&sid));
+        assert!(snap.sessions.contains_key(&keep));
     }
 
     #[test]

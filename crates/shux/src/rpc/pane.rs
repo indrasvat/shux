@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::pane_command;
 use crate::pane_io::PaneIoState;
-use crate::pane_spawn::{spawn_failure, spawn_pane_pty};
+use crate::pane_spawn::{SplitUndo, spawn_failure, spawn_pane_pty, undo_split};
 use crate::rpc::convert::{graph_error_to_rpc, pane_to_json};
 use crate::rpc::params::{
     parse_expected_version, required_str, resolve_pane_id_from_params, resolve_pane_ref,
@@ -107,22 +107,7 @@ pub(crate) fn register_pane_methods(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
                     });
 
-                // Splitting focuses the new pane, and destroying a pane hands
-                // focus to whichever pane the layout tree yields first — NOT the
-                // one that had it. So a rollback has to put focus back itself,
-                // or a failed split silently moves the operator's cursor to an
-                // unrelated pane and every later `-p`-less verb targets it.
-                let (prior_active_pane, prior_zoom) = {
-                    let snap = gh.snapshot();
-                    let w = snap
-                        .panes
-                        .get(&pane_id)
-                        .and_then(|p| snap.windows.get(&p.window_id));
-                    (
-                        w.map(|w| w.active_pane),
-                        w.and_then(|w| w.layout.zoom.as_ref().map(|z| z.zoomed_pane)),
-                    )
-                };
+                let prior = SplitUndo::capture(&gh, pane_id);
 
                 // `_with_command` persists the argv on the new pane, so
                 // `pane list` and the `PaneCreated` event report what is
@@ -150,48 +135,7 @@ pub(crate) fn register_pane_methods(
                 )
                 .await
                 {
-                    // Restore focus ONLY if it is still on the pane being undone.
-                    // Capturing before and writing after is a lost update: an
-                    // operator who moved focus while the PTY was starting had
-                    // their choice silently reverted, and measurably more often
-                    // than before the restore existed. Their choice wins.
-                    // One snapshot, read three times: `gh.snapshot()` hands back
-                    // a temporary, so chaining lookups across two calls borrows
-                    // from something already dropped.
-                    let active_pane_of = |snap: &shux_core::graph::SessionGraphSnapshot,
-                                          pane: shux_core::model::PaneId| {
-                        snap.panes
-                            .get(&pane)
-                            .and_then(|p| snap.windows.get(&p.window_id))
-                            .map(|w| w.active_pane)
-                    };
-                    let focus_is_still_ours =
-                        active_pane_of(&gh.snapshot(), new_pane_id) == Some(new_pane_id);
-
-                    let _ = gh.destroy_pane(new_pane_id, None).await;
-
-                    if focus_is_still_ours
-                        && let Some(prev) = prior_active_pane
-                        // `destroy_pane` may already have landed on `prev`;
-                        // focusing again fires a transition out of nowhere.
-                        && active_pane_of(&gh.snapshot(), prev) != Some(prev)
-                    {
-                        let _ = gh.focus_pane(prev).await;
-                    }
-                    // A successful split legitimately clears zoom; an undone one
-                    // must not leave the window un-zoomed.
-                    if let Some(z) = prior_zoom {
-                        let snap = gh.snapshot();
-                        let zoomed_now = snap
-                            .panes
-                            .get(&z)
-                            .and_then(|p| snap.windows.get(&p.window_id))
-                            .is_some_and(|w| w.layout.is_zoomed());
-                        drop(snap);
-                        if !zoomed_now {
-                            let _ = gh.zoom_pane(z, None).await;
-                        }
-                    }
+                    undo_split(&gh, new_pane_id, prior).await;
                     return Err(spawn_failure(&e));
                 }
 
