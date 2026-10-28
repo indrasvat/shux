@@ -137,12 +137,19 @@ for geo in ${geometries}; do
   metric="${out_dir}/pixel-scene-${geo}.json"
   shoot "ev126a-${geo}" "${cols}" "${rows}" "${actual}" "$(scene_body "${cols}" "${rows}" 1)"
   shoot "ev126e-${geo}" "${cols}" "${rows}" "${expected}" "$(scene_body "${cols}" "${rows}" 0)"
-  if uv run --script "${pixel_verify}" "${actual}" "${expected}" --diff "${diff_png}" \
-    --max-pixel-diff-ratio 0 --max-mean-channel-delta 0 >"${metric}"; then
-    verdict=pass
-  else
-    verdict=fail
-  fi
+  # pixel_verify exits 1 when the images differ; anything else non-zero means
+  # nothing was compared, which must never read as a reproduced defect.
+  status=0
+  uv run --script "${pixel_verify}" "${actual}" "${expected}" --diff "${diff_png}" \
+    --max-pixel-diff-ratio 0 --max-mean-channel-delta 0 >"${metric}" || status=$?
+  case "${status}" in
+    0) verdict=pass ;;
+    1) verdict=fail ;;
+    *)
+      echo "FATAL: pixel_verify could not compare ${geo} (exit ${status})" >&2
+      exit "${status}"
+      ;;
+  esac
   changed="$(jq -r '.changed_pixels // "n/a"' "${metric}")"
   printf '  %-8s %-4s changed_pixels=%s\n' "${geo}" "${verdict}" "${changed}"
   if [ "${expect_defect}" = 1 ]; then

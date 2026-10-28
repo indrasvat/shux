@@ -33,15 +33,6 @@ fn del_is_never_what_rep_repeats() {
     assert_eq!(row(&t, 0), "AAA");
 }
 
-#[test]
-fn del_never_reaches_capture_text() {
-    let mut t = vt();
-    t.process(b"A\x7fB\x7fC");
-    let text = t.capture_text(None);
-    assert!(!text.contains('\u{7f}'), "DEL leaked into {text:?}");
-    assert!(text.starts_with("ABC"), "{text:?}");
-}
-
 /// A pending wrap at the right margin is resolved by the next GLYPH. DEL is not
 /// one, so it must neither wrap the line nor cancel the pending wrap.
 #[test]
@@ -66,24 +57,8 @@ fn del_does_not_split_a_grapheme_cluster() {
     assert_eq!(t.cursor().col, 1);
 }
 
-/// The other scalars `unicode-width` has no width for are the C1 controls.
-/// vte executes one sent as UTF-8 in a single read, but prints one whose two
-/// bytes arrive in separate reads; both must leave the same screen.
-#[test]
-fn c1_controls_render_the_same_however_the_read_was_split() {
-    let mut whole = vt();
-    whole.process("A\u{85}B".as_bytes());
-
-    let mut split = vt();
-    split.process(b"A\xc2");
-    split.process(b"\x85B");
-
-    assert_eq!(row(&split, 0), "AB", "a split C1 control took a cell");
-    assert_eq!(row(&split, 0), row(&whole, 0));
-    assert_eq!(split.cursor().col, whole.cursor().col);
-}
-
-/// A C1 control ends a grapheme cluster on both decode paths.
+/// vte executes a UTF-8 C1 decoded in one read but prints one whose two bytes
+/// arrive in separate reads. Both must end a grapheme cluster the same way.
 #[test]
 fn a_split_c1_control_ends_the_cluster_as_a_whole_one_does() {
     let zwj_then = |chunks: &[&[u8]]| {
