@@ -212,6 +212,7 @@ async fn run_pane_pty_task(
     let mut staged = StagedOutput::new();
     let mut task_exit = PtyTaskExit::Natural;
     let mut pending = PtyInputQueue::default();
+    let mut paste_exits = 0;
 
     loop {
         let output_due = staged.due_at();
@@ -239,7 +240,7 @@ async fn run_pane_pty_task(
                     Ok(n) => {
                         let data = &buf[..n];
                         tee_pane_recorders(&io_state, pane_id, Some(incarnation), data, &shutdown).await;
-                        let (pulse, vt_title, bus_opt, terminal_responses, bracketed) = {
+                        let (pulse, vt_title, bus_opt, terminal_responses, left_paste) = {
                             let mut state = io_state.lock().await;
                             if !state.is_current(pane_id, incarnation) {
                                 // Replaced while this read was in flight: these
@@ -291,21 +292,25 @@ async fn run_pane_pty_task(
                             }
                             let output = String::from_utf8_lossy(data);
                             let _completed = state.cmd_engine.process_output(pane_id.0, &output);
-                            let bracketed = state
-                                .vts
-                                .get(&pane_id)
-                                .is_some_and(|vt| vt.modes().bracketed_paste);
+                            let (bracketed, exits) = state.vts.get(&pane_id).map_or((false, 0), |vt| {
+                                (vt.modes().bracketed_paste, vt.modes().bracketed_paste_exits)
+                            });
+                            let left_paste = !bracketed || exits != paste_exits;
+                            paste_exits = exits;
+                            if left_paste {
+                                state.open_pastes.remove(&pane_id);
+                            }
                             (
                                 state.render_pulse.clone(),
                                 vt_title,
                                 state.event_bus.clone(),
                                 terminal_responses,
-                                bracketed,
+                                left_paste,
                             )
                         };
 
-                        // A program out of paste mode is out of any paste.
-                        if !bracketed {
+                        // A program that left paste mode is out of any paste.
+                        if left_paste {
                             pending.in_paste = false;
                         }
                         // An unbounded write to a program that never reads
@@ -1326,53 +1331,75 @@ mod tests {
     }
 
     /// A program that leaves paste mode inside a paste whose end never came
-    /// has left the paste: replies to it are no longer held.
+    /// has left the paste, even when it sets the mode again in the same
+    /// write: replies to it are no longer held, and no end is owed to it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_program_that_left_paste_mode_gets_its_replies() {
-        let h = crate::rpc::test_harness::RpcHarness::new();
-        let (_s, _w, pane) = h.seed_session("replies").await;
-        let script = r#"stty raw -echo; printf '\033[?2004h'; sleep 1; printf '\033[?2004l\033[6n'; if IFS= read -r -t 3 -d R _; then echo GOT-REPLY; else echo NO-REPLY; fi; sleep 30"#;
-        spawn_pane_pty_unshared(
-            pane,
-            "/tmp".into(),
-            vec!["bash".into(), "-c".into(), script.into()],
-            shux_pty::handle::PtySize::default(),
-            Vec::new(),
-            false,
-            h.io.clone(),
-            h.cancel.clone(),
-            h.graph.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let writer = h.io.lock().await.writers[&pane].clone();
-        writer.send(PASTE_START.to_vec()).await.unwrap();
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-        let text = loop {
-            let text = {
-                let state = h.io.lock().await;
-                let grid = state.vts[&pane].grid();
-                (0..grid.rows())
-                    .flat_map(|r| {
-                        let row = grid.visible_row(r);
-                        (0..row.len()).map(|c| row[c].ch).collect::<Vec<_>>()
-                    })
-                    .collect::<String>()
+        for (left, mode) in [
+            ("left", r"\033[?2004l"),
+            ("left and set again", r"\033[?2004l\033[?2004h"),
+        ] {
+            let h = crate::rpc::test_harness::RpcHarness::new();
+            let (_s, _w, pane) = h.seed_session("replies").await;
+            let script = format!(
+                r#"stty raw -echo; printf '\033[?2004h'; sleep 1; printf '{mode}\033[6n'; if IFS= read -r -t 3 -d R _; then echo GOT-REPLY; else echo NO-REPLY; fi; sleep 30"#
+            );
+            spawn_pane_pty_unshared(
+                pane,
+                "/tmp".into(),
+                vec!["bash".into(), "-c".into(), script],
+                shux_pty::handle::PtySize::default(),
+                Vec::new(),
+                false,
+                h.io.clone(),
+                h.cancel.clone(),
+                h.graph.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let writer = {
+                let mut state = h.io.lock().await;
+                let program = state.incarnations[&pane];
+                state.open_pastes.insert(
+                    pane,
+                    crate::pane_io::OpenPaste {
+                        program,
+                        client: 1,
+                        paste: 1,
+                    },
+                );
+                state.writers[&pane].clone()
             };
-            if text.contains("-REPLY") || tokio::time::Instant::now() > deadline {
-                break text;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
-        assert!(
-            text.contains("GOT-REPLY"),
-            "the reply was held: {}",
-            text.trim()
-        );
-        h.stop().await;
+            writer.send(PASTE_START.to_vec()).await.unwrap();
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+            let text = loop {
+                let text = {
+                    let state = h.io.lock().await;
+                    let grid = state.vts[&pane].grid();
+                    (0..grid.rows())
+                        .flat_map(|r| {
+                            let row = grid.visible_row(r);
+                            (0..row.len()).map(|c| row[c].ch).collect::<Vec<_>>()
+                        })
+                        .collect::<String>()
+                };
+                if text.contains("-REPLY") || tokio::time::Instant::now() > deadline {
+                    break text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            assert!(
+                text.contains("GOT-REPLY"),
+                "{left}: the reply was held: {}",
+                text.trim()
+            );
+            let open = h.io.lock().await.open_paste(pane);
+            assert_eq!(open, None, "{left}: the program is still owed an end");
+            h.stop().await;
+        }
     }
 
     /// A recorder the successor armed at spawn belongs to the successor; the

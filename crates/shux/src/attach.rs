@@ -923,8 +923,9 @@ async fn run_attach_loop(
     let mut final_frame = None;
     let mut input_backlogs: HashMap<PaneId, InputBacklog> = HashMap::new();
     let client_id = NEXT_CLIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // The paste whose pieces are arriving, and how many this client has sent.
-    let (mut pasting, mut pastes): (Option<u64>, u64) = (None, 0);
+    // The paste whose pieces are arriving with its pane, and how many this
+    // client has sent.
+    let (mut pasting, mut pastes): (Option<(u64, PaneId)>, u64) = (None, 0);
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -1117,21 +1118,25 @@ async fn run_attach_loop(
                             }
                             continue;
                         }
-                        // Pieces of one paste share an id, however many reach a pane.
-                        let paste = paste.map(|more| {
-                            let id = *pasting.get_or_insert_with(|| {
-                                pastes += 1;
-                                pastes
-                            });
-                            if !more {
-                                pasting = None;
+                        let active = render_session.lock().await.active_pane_id;
+                        // Pieces of one paste share an id and go to the pane
+                        // the paste began in, wherever focus has moved since.
+                        let (paste, target) = match paste {
+                            Some(more) => {
+                                let (id, pane) = *pasting.get_or_insert_with(|| {
+                                    pastes += 1;
+                                    (pastes, active)
+                                });
+                                if !more {
+                                    pasting = None;
+                                }
+                                (Some((more, id)), pane)
                             }
-                            (more, id)
-                        });
-                        if paste.is_none() {
-                            pasting = None;
-                        }
-                        let target = render_session.lock().await.active_pane_id;
+                            None => {
+                                pasting = None;
+                                (None, active)
+                            }
+                        };
                         // Room first, with the PaneIoState mutex released.
                         let writer = io_state.lock().await.writers.get(&target).cloned();
                         if let Some(tx) = writer {
@@ -7649,6 +7654,36 @@ mod tests {
             String::from_utf8_lossy(&got),
             "\x1b[201~\x1b[200~p2\x1b[201~",
             "the paste joined the open one"
+        );
+        h.stop().await;
+    }
+
+    /// The rest of a paste goes where the paste began, not to a pane focused
+    /// while it was arriving, which would run it as typed lines.
+    #[tokio::test]
+    async fn a_paste_stays_with_the_pane_it_began_in() {
+        let mut h = InputHarness::new(8).await;
+        set_modes(&h, b"\x1b[?2004h").await;
+        let (mut second_rx, _resize, _shutdown) =
+            seed_io_for_pane(&h.fixture.io_state, h.fixture.second_pane).await;
+        paste(&mut h, b"p1", true).await;
+        h.send(&AttachClientFrame::Action {
+            kind: ActionKind::FocusNext,
+            args: shux_rpc::attach::ActionArgs::default(),
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        paste(&mut h, b"p2\r", false).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "\x1b[200~p1p2\r\x1b[201~",
+            "the paste did not finish where it began"
+        );
+        let stray = tokio::time::timeout(Duration::from_millis(200), second_rx.recv()).await;
+        assert!(
+            !matches!(stray, Ok(Some(_))),
+            "the newly focused pane got part of the paste: {stray:?}"
         );
         h.stop().await;
     }
