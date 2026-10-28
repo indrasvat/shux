@@ -634,7 +634,11 @@ async fn run_attach_loop(
         loop {
             tokio::select! {
                 _ = writer_cancel.cancelled() => break,
-                Some(frame) = out_rx.recv() => {
+                // Matched inside the arm, not in its pattern: a pattern that
+                // refuses `None` disables the arm and leaves `cancelled()`
+                // pending forever, so the writer never ends on its own.
+                frame = out_rx.recv() => {
+                    let Some(frame) = frame else { break };
                     let bytes = match serde_json::to_vec(&frame) {
                         Ok(b) => b,
                         Err(e) => {
@@ -647,7 +651,6 @@ async fn run_attach_loop(
                         break;
                     }
                 }
-                else => break,
             }
         }
     });
@@ -722,9 +725,17 @@ async fn run_attach_loop(
     let cfg_changed = config.change_notify();
     let mut cfg_listener = Box::pin(cfg_changed.notified());
     let mut last_border_style = config.current().appearance.border_style.clone();
+    // A session destroyed from outside this client (`shux session kill`, an
+    // RPC) sends no frame here, so the liveness check below needs a clock of
+    // its own; otherwise it waits on the next keystroke or Pong.
+    let mut alive_tick = tokio::time::interval(Duration::from_millis(200));
+    alive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Sent at teardown, once nothing else can queue a frame behind it.
+    let mut final_frame = None;
     while !detached {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            _ = alive_tick.tick() => {}
             () = &mut cfg_listener => {
                 cfg_listener = Box::pin(cfg_changed.notified());
                 let live = config.current().appearance.border_style.clone();
@@ -1112,7 +1123,7 @@ async fn run_attach_loop(
                         // Detach implies the user found the prefix too.
                         onboarding.mark_prefix_discovered().await;
                         detached = true;
-                        let _ = out_tx.send(AttachServerFrame::DetachAck).await;
+                        final_frame = Some(AttachServerFrame::DetachAck);
                     }
                     AttachClientFrame::PrefixTapped => {
                         // Authoritative signal: user has discovered the
@@ -1149,11 +1160,9 @@ async fn run_attach_loop(
             live
         };
         if !still_alive {
-            let _ = out_tx
-                .send(AttachServerFrame::SessionEnded {
-                    reason: "session_destroyed".into(),
-                })
-                .await;
+            final_frame.get_or_insert(AttachServerFrame::SessionEnded {
+                reason: "session_destroyed".into(),
+            });
             break;
         }
     }
@@ -1164,10 +1173,18 @@ async fn run_attach_loop(
     // of the pane's life — visible next time anyone attaches.
     release_app_gesture(&io_state, &mut selection_drag).await;
 
-    drop(out_tx); // closes the writer cleanly
-    let _ = writer.await;
+    // Stop every other holder of `out_tx` first, so the final frame is the
+    // last one queued: the writer drains it and ends only once the last
+    // sender is gone, which is what hangs up on the client.
     renderer.abort();
     pinger.abort();
+    let _ = renderer.await;
+    let _ = pinger.await;
+    if let Some(frame) = final_frame {
+        let _ = out_tx.send(frame).await;
+    }
+    drop(out_tx);
+    let _ = writer.await;
     info!(session = %session.name, "attach session ended");
     Ok(())
 }
@@ -3382,7 +3399,7 @@ async fn kill_pane(
     // clients that want pinned semantics); the human-interactive
     // Ctrl+Space x action cascades so the user can always kill what's
     // in front of them. When the cascade reaches destroy_session, the
-    // attach render loop notices the session is gone on its next tick
+    // attach frame loop notices the session is gone on its next tick
     // and sends SessionEnded — the client detaches naturally.
     match graph.destroy_pane(pane_id, None).await {
         Ok(()) => {

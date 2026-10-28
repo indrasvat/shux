@@ -10,7 +10,8 @@
 //!     `Action` frames; on resize emit a `Resize` frame.
 //!
 //! The TUI is wrapped in `TerminalGuard` so raw mode + alt screen +
-//! mouse are restored on any exit (panic, error, detach, session end).
+//! mouse are restored on any exit (panic, error, signal, detach, session
+//! end).
 
 use std::path::Path;
 use std::time::Duration;
@@ -50,6 +51,10 @@ const OUTER_MULTIPLEXER_VARS: &[&str] = &["TMUX", "STY", "ZELLIJ"];
 /// on, `0`/`false`/`no`/`off` forces them off; anything else, including unset,
 /// leaves the decision automatic. Compared case-insensitively and trimmed.
 const GRAPHICS_OVERRIDE_VAR: &str = "SHUX_GRAPHICS";
+
+/// How long a signalled client waits for its restore sequences to reach a
+/// terminal before dying anyway, termios already restored.
+const SIGNAL_RESTORE_BUDGET: Duration = Duration::from_millis(500);
 
 /// Whether this terminal can be sent kitty graphics: yes, unless an outer
 /// multiplexer announces itself. The check reads the CLIENT's environment while
@@ -125,12 +130,31 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     };
     tracing::info!(session = %session_name, %session_id, graphics, "attach: ready");
 
-    // From here on we MUST go through `guard.leave()` on any exit path (the
-    // panic hook covers panics).
+    // From here on we MUST go through `guard.leave()` on any exit path: the
+    // panic hook covers panics, `signals` covers kills.
+    let mut signals = terminal::ShutdownSignals::install().context("install signal handlers")?;
     let mut guard = TerminalGuard::enter().context("enter raw mode")?;
-    let result = run_loop(&mut framed, &config).await;
-    guard.leave().ok();
-    result
+    let result = tokio::select! {
+        r = run_loop(&mut framed, &config) => r,
+        signo = signals.recv() => Ok(ExitReason::Signal(signo)),
+    };
+    // A terminal that stopped reading blocks every write to it, so once a
+    // signal has arrived nothing may wait on stdout, and until then a stuck
+    // restore must not keep the signal from being honoured.
+    if let Ok(ExitReason::Signal(_)) = result {
+        guard.leave_bounded(SIGNAL_RESTORE_BUDGET);
+        return result;
+    }
+    let leaving = tokio::task::spawn_blocking(move || {
+        let _ = guard.leave();
+    });
+    tokio::select! {
+        _ = leaving => result,
+        signo = signals.recv() => {
+            let _ = crossterm::terminal::disable_raw_mode();
+            Ok(ExitReason::Signal(signo))
+        }
+    }
 }
 
 async fn run_loop<S>(

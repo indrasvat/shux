@@ -708,3 +708,114 @@ async fn dropping_a_live_handle_kills_and_reaps_its_child() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
+
+/// A pane's process must hold its own terminal on 0-2 and nothing else of the
+/// daemon's: an inherited master of ANOTHER pane lets it read and type into
+/// that pane, and an inherited master of its own keeps it from ever getting a
+/// hangup, so it outlives the daemon.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_pane_inherits_no_other_terminal_descriptors() {
+    let first = PtyHandle::spawn(&PtyConfig::with_command(
+        vec!["sleep".into(), "30".into()],
+        test_cwd(),
+    ))
+    .unwrap();
+    let mut second = PtyHandle::spawn(&PtyConfig::with_command(
+        vec!["sleep".into(), "30".into()],
+        test_cwd(),
+    ))
+    .unwrap();
+
+    let leaked = terminal_descriptors_above_stdio(second.pid());
+    let _ = second.kill();
+    drop(first);
+    assert!(
+        leaked.is_empty(),
+        "pane child inherited terminal descriptors: {leaked:?}"
+    );
+}
+
+/// A child forked by any other thread while a pane is being opened must not
+/// inherit that pane's terminal either.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Set on every exit, so a panic below cannot leave the opener forking.
+    struct Stop(Arc<AtomicBool>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopper = Stop(Arc::clone(&stop));
+    let opener = {
+        let stop = Arc::clone(&stop);
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            while !stop.load(Ordering::Relaxed) {
+                let mut pane =
+                    PtyHandle::spawn(&PtyConfig::with_command(vec!["true".into()], test_cwd()))
+                        .unwrap();
+                let _ = pane.kill();
+            }
+        })
+    };
+    // Bounded by attempts as well as time: the forks churn the machine's pid
+    // space, which every other test shares.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut leaked = Vec::new();
+    for _ in 0..2000 {
+        if !leaked.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        leaked = terminal_descriptors_above_stdio(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    drop(stopper);
+    opener.join().unwrap();
+    assert!(
+        leaked.is_empty(),
+        "a concurrently forked child inherited a pane's terminal: {leaked:?}"
+    );
+}
+
+/// The terminal descriptors a child still holds once its exec has finished.
+/// The kernel wakes a spawning parent before it runs close-on-exec, so a
+/// first look can see descriptors that are about to close; an inherited one
+/// is still there a moment later.
+#[cfg(target_os = "linux")]
+fn terminal_descriptors_above_stdio(pid: u32) -> Vec<String> {
+    let first = terminal_descriptors_now(pid);
+    if first.is_empty() {
+        return first;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let later = terminal_descriptors_now(pid);
+    first.into_iter().filter(|fd| later.contains(fd)).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_descriptors_now(pid: u32) -> Vec<String> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("read child fd table") {
+        let entry = entry.unwrap();
+        let fd: u32 = entry.file_name().to_string_lossy().parse().unwrap();
+        let target = std::fs::read_link(entry.path()).unwrap_or_default();
+        let target = target.to_string_lossy().into_owned();
+        if fd > 2 && (target == "/dev/ptmx" || target.starts_with("/dev/pts/")) {
+            found.push(format!("{fd} -> {target}"));
+        }
+    }
+    found
+}

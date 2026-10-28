@@ -952,7 +952,12 @@ fn daemon_stop_leaves_the_successors_files_alone() {
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn daemon stop");
-    thread::sleep(Duration::from_millis(50));
+    // The client comes once the daemon has exited and before `daemon stop` has
+    // noticed: a fixed head start could land before the stop had even begun.
+    assert!(
+        wait_for_pid_gone(old, Duration::from_secs(10)),
+        "daemon stop never ended the old daemon"
+    );
     let during = h
         .shux()
         .args(["session", "list"])
@@ -1181,7 +1186,8 @@ fn a_client_reports_a_daemon_that_does_not_answer() {
         !out.status.success()
             && stderr.contains("did not answer")
             && stderr.contains(&pid.to_string()),
-        "the error must name the daemon: {stderr}"
+        "the error must name the daemon ({}): {stderr}",
+        out.status
     );
 }
 

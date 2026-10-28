@@ -151,26 +151,57 @@ pid_in_list() {
   return 1
 }
 
+# When a pid started, which with the pid names one process: pids are reused. Empty once
+# it has exited. Linux gives clock ticks; elsewhere `ps` gives the second, so a pid reused
+# within one second there still reads as the same process.
+start_time() {
+  local stat
+  if [ -r /proc/self/stat ]; then
+    { IFS= read -r stat </proc/"$1"/stat; } 2>/dev/null || return 0
+    # shellcheck disable=SC2086  # split into stat(5) fields after the parenthesised comm
+    set -- ${stat##*) }
+    printf '%s\n' "${20}"
+  else
+    ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true
+  fi
+}
+
+# True while a pid is still the process that had start time `$2`.
+is_process() {
+  [ -n "$2" ] && [ "$(start_time "$1")" = "$2" ]
+}
+
 # TERM, then KILL what survives. Callers must have attributed every pid first —
-# this helper does no scoping of its own.
+# this helper does no scoping of its own. Past the TERM, a pid is touched only while it
+# is still the process it was on entry: one that TERM ended may be another's by then.
 terminate_pids() {
-  local pid waited
+  local pid i waited born
+  born=()
   for pid in "$@"; do
+    born+=("$(start_time "${pid}")")
     kill -TERM "${pid}" >/dev/null 2>&1 || true
   done
   sleep 1
+  i=0
   for pid in "$@"; do
-    if kill -0 "${pid}" >/dev/null 2>&1; then
+    if is_process "${pid}" "${born[${i}]}"; then
       kill -KILL "${pid}" >/dev/null 2>&1 || true
     fi
+    i=$((i + 1))
   done
   # KILL is asynchronous. Return before the kernel has torn the process down and a
   # survivor scan on the caller's next line still sees it, with its full argv — a
   # successful kill reported as "survived TERM+KILL".
   waited=0
   while [ "${waited}" -lt 50 ]; do
+    i=0
     for pid in "$@"; do
-      pid_is_gone "${pid}" || { waited=$((waited + 1)); sleep 0.1; continue 2; }
+      if is_process "${pid}" "${born[${i}]}" && ! pid_is_gone "${pid}"; then
+        waited=$((waited + 1))
+        sleep 0.1
+        continue 2
+      fi
+      i=$((i + 1))
     done
     return 0
   done

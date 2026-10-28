@@ -106,11 +106,25 @@ pub(crate) async fn run_attach(
                 shux_ui::ExitReason::Error(msg) => {
                     eprintln!("[attach error: {msg}]");
                 }
+                shux_ui::ExitReason::Signal(signo) => die_by_signal(signo),
             }
             Ok(())
         }
         Err(e) => Err(e),
     }
+}
+
+/// Die by `signo` under its default action, as the process would have if the
+/// signal had not been caught so the terminal could be restored first. A parent
+/// shell then sees the real cause: `bash` aborts a script whose child died of
+/// SIGINT, but not one whose child exited 130. The client has already restored
+/// the default action.
+fn die_by_signal(signo: i32) -> ! {
+    use nix::sys::signal::{Signal, raise};
+    if let Ok(sig) = Signal::try_from(signo) {
+        let _ = raise(sig);
+    }
+    std::process::exit(128 + signo)
 }
 
 /// Dispatch CLI subcommands.
