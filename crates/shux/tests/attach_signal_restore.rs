@@ -347,6 +347,7 @@ fn assert_signal_restores_terminal(sig: Signal) {
         ("left the alternate screen", &b"\x1b[?1049l"[..]),
         ("popped the kitty keyboard flags", b"\x1b[<1u"),
         ("turned mouse tracking off", b"\x1b[?1000l"),
+        ("turned bracketed paste off", b"\x1b[?2004l"),
         ("showed the cursor", b"\x1b[?25h"),
     ] {
         // The end only: CI logs cut a long line, and the end is what matters.

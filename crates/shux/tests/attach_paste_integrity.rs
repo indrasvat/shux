@@ -149,10 +149,6 @@ struct Client {
     screen: Arc<std::sync::Mutex<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     drain: Option<std::thread::JoinHandle<()>>,
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "held for its Drop; read by pid() on Linux")
-    )]
     process: KillOnDrop,
 }
 
@@ -165,6 +161,12 @@ impl Client {
             ws_ypixel: 0,
         };
         let pty = nix::pty::openpty(Some(&size), None).expect("openpty");
+        // Not inherited: a client holding the terminal's other end open would
+        // keep it from ever hanging up.
+        for fd in [&pty.master, &pty.slave] {
+            nix::fcntl::fcntl(fd, nix::fcntl::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))
+                .expect("set FD_CLOEXEC");
+        }
         let slave: OwnedFd = pty.slave;
         let dup = |fd: &OwnedFd| Stdio::from(fd.try_clone().expect("dup slave"));
         let process = Command::new(&h.bin)
@@ -256,6 +258,21 @@ impl Client {
     /// The master shares the drain's non-blocking file description, so a full
     /// terminal input queue answers WouldBlock: that is the client applying
     /// backpressure, and the typist waits for it like a real one would.
+    /// Pastes `text` as a terminal does: between the bracketed-paste markers
+    /// only while the client has mode 2004 turned on.
+    fn paste(&mut self, text: &[u8]) {
+        let asked = {
+            let seen = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+            let last = |seq: &[u8]| seen.windows(seq.len()).rposition(|w| w == seq);
+            last(b"\x1b[?2004h") > last(b"\x1b[?2004l")
+        };
+        assert!(
+            asked,
+            "the attach client never asked its terminal for bracketed paste"
+        );
+        self.type_bytes(&[b"\x1b[200~", text, b"\x1b[201~"].concat());
+    }
+
     fn type_bytes(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -273,6 +290,24 @@ impl Client {
                 Err(e) => panic!("type into the client: {e}"),
             }
         }
+    }
+
+    /// Closes the terminal, as closing its window does, and waits up to
+    /// `budget` for the client to exit.
+    fn hang_up(&mut self, budget: Duration) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
+        self.keys = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if matches!(self.process.0.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     #[cfg(target_os = "linux")]
@@ -340,7 +375,7 @@ fn a_bracketed_paste_reaches_the_pane() {
         ),
     );
     let mut client = Client::attach(&h);
-    client.type_bytes(b"\x1b[200~hello world\x1b[201~");
+    client.paste(b"hello world");
     let arrived = wait_for(&done, Duration::from_secs(10));
     let received = std::fs::read(&got).unwrap_or_default();
     drop(client);
@@ -373,7 +408,7 @@ fn a_paste_into_a_program_that_asked_for_brackets_keeps_them() {
     let mut client = Client::attach(&h);
     // Drawn after the mode switch, so the daemon has seen it.
     client.wait_for_text("ARMED");
-    client.type_bytes(b"\x1b[200~echo a\recho b\r\x1b[201~");
+    client.paste(b"echo a\recho b\r");
     let arrived = wait_for(&done, Duration::from_secs(10));
     let received = std::fs::read(&got).unwrap_or_default();
     drop(client);
@@ -408,7 +443,7 @@ fn a_paste_larger_than_a_frame_is_still_one_paste() {
     let mut client = Client::attach(&h);
     client.wait_for_text("ARMED");
     let text: Vec<u8> = paste_bytes().iter().copied().cycle().take(LEN).collect();
-    client.type_bytes(&[b"\x1b[200~", &text[..], b"\x1b[201~"].concat());
+    client.paste(&text);
     let arrived = wait_for(&done, Duration::from_secs(60));
     let received = std::fs::read(&got).unwrap_or_default();
     drop(client);
@@ -427,6 +462,20 @@ fn a_paste_larger_than_a_frame_is_still_one_paste() {
     assert!(
         received[6..received.len() - 6] == text[..],
         "the paste's text changed"
+    );
+}
+
+/// A terminal can go away without a SIGHUP reaching the client: under
+/// `nohup`, or when it is not the client's controlling terminal, as here.
+/// The client must notice and exit rather than poll a dead terminal forever.
+#[test]
+fn a_client_whose_terminal_hung_up_exits() {
+    let h = Harness::new();
+    pane_session(&h, "while :; do sleep 3600; done");
+    let mut client = Client::attach(&h);
+    assert!(
+        client.hang_up(Duration::from_secs(10)),
+        "the client still runs 10 s after its terminal hung up"
     );
 }
 

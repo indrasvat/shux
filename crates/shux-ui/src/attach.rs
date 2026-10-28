@@ -161,6 +161,20 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
 /// bytes, so this bounds what a pane that stopped reading can pile up.
 const PASTE_CHUNK: usize = 64 * 1024;
 
+/// Whether the terminal on stdin has hung up. crossterm never reports it: it
+/// polls a hung-up terminal to the end of every timeout, and with SIGHUP
+/// ignored nothing else would end the attach.
+fn terminal_hung_up() -> bool {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+    let stdin = std::io::stdin();
+    let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::empty())];
+    poll(&mut fds, PollTimeout::ZERO).is_ok_and(|n| n > 0)
+        && fds[0].revents().is_some_and(|r| {
+            r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+        })
+}
+
 async fn run_loop<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     config: &ClientConfig,
@@ -195,7 +209,7 @@ where
                     }
                     Err(_) => break,
                 },
-                Ok(false) if key_tx.is_closed() => break,
+                Ok(false) if key_tx.is_closed() || terminal_hung_up() => break,
                 Ok(false) => continue,
                 Err(_) => break,
             }

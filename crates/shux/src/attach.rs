@@ -172,8 +172,8 @@ fn frame_input(
 }
 
 /// Ends every paste a dropped piece left open, as a held button is released:
-/// no later key from this client will. Each end waits for room in the
-/// background, at most one [`INPUT_STALL`].
+/// no later key from this client will. Each end waits in the background until
+/// the pane reads again or closes, ahead of any later client's input.
 async fn close_open_pastes(
     io_state: &Arc<Mutex<PaneIoState>>,
     backlogs: &HashMap<PaneId, InputBacklog>,
@@ -186,7 +186,7 @@ async fn close_open_pastes(
     {
         if let Some(tx) = state.writers.get(pane).cloned() {
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(INPUT_STALL, tx.send(PASTE_END.to_vec())).await;
+                let _ = tx.send(PASTE_END.to_vec()).await;
             });
         }
     }
@@ -7368,7 +7368,9 @@ mod tests {
             })
             .await;
         assert!(detached, "detach never landed");
-        let got = pane_input(&mut h, INPUT_STALL + Duration::from_secs(1)).await;
+        // The program reads again only long after the client has gone.
+        tokio::time::sleep(INPUT_STALL * 3).await;
+        let got = pane_input(&mut h, Duration::from_millis(500)).await;
         assert_eq!(
             String::from_utf8_lossy(&got),
             "\x1b[200~a\x1b[201~",
