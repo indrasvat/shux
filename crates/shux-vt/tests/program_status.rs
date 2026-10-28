@@ -255,6 +255,14 @@ fn toggling_always_moves_the_generation_forward() {
     );
 }
 
+/// CPU time the calling thread has used. Unlike the wall clock, it does not
+/// advance while the thread is descheduled, so load elsewhere cannot skew a ratio.
+fn thread_cpu_ns() -> u128 {
+    let t = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+        .expect("CLOCK_THREAD_CPUTIME_ID is supported on every target shux builds for");
+    t.tv_sec() as u128 * 1_000_000_000 + t.tv_nsec() as u128
+}
+
 /// One `process()` call over output dense with OSC strings (hyperlinks) must
 /// cost linear time, status on or off: the scanner runs either way.
 #[test]
@@ -262,9 +270,9 @@ fn osc_dense_output_scans_in_linear_time() {
     fn cost_ns(repeats: usize) -> u128 {
         let chunk = b"\x1b]8;;f\x07x\x1b]8;;\x07 ".repeat(repeats);
         let mut vt = VirtualTerminal::new(24, 80);
-        let start = std::time::Instant::now();
+        let start = thread_cpu_ns();
         vt.process(&chunk);
-        start.elapsed().as_nanos()
+        thread_cpu_ns() - start
     }
     let (small, large) = (2_000usize, 16_000usize);
     cost_ns(small);

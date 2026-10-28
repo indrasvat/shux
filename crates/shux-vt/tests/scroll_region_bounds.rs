@@ -395,7 +395,15 @@ fn bulk_scroll_reports_one_mutation_per_scrolled_line() {
 // Cost: scrolling a region must be linear in the region, not quadratic.
 // ---------------------------------------------------------------------------
 
-/// Nanoseconds for `reps` full-region scrolls on a `rows`-tall pane with a
+/// CPU time the calling thread has used. Unlike the wall clock, it does not
+/// advance while the thread is descheduled, so load elsewhere cannot skew a ratio.
+fn thread_cpu_ns() -> u128 {
+    let t = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+        .expect("CLOCK_THREAD_CPUTIME_ID is supported on every target shux builds for");
+    t.tv_sec() as u128 * 1_000_000_000 + t.tv_nsec() as u128
+}
+
+/// CPU nanoseconds for `reps` full-region scrolls on a `rows`-tall pane with a
 /// full default scrollback behind it.
 fn scroll_cost_ns(rows: usize, reps: usize) -> u128 {
     let mut t = vt(rows);
@@ -404,12 +412,12 @@ fn scroll_cost_ns(rows: usize, reps: usize) -> u128 {
     }
     t.process(format!("\x1b[2;{}r", rows - 1).as_bytes());
     let payload = b"\x1b[999999S".repeat(reps);
-    let start = std::time::Instant::now();
+    let start = thread_cpu_ns();
     t.process(&payload);
-    start.elapsed().as_nanos().max(1)
+    (thread_cpu_ns() - start).max(1)
 }
 
-/// Nanoseconds for the SAME total scrolling done one line at a time.
+/// CPU nanoseconds for the SAME total scrolling done one line at a time.
 ///
 /// This models the defect. `Grid::scroll_up` rotates the region by one line,
 /// which is O(region height); doing that once per line is O(height^2) — exactly
@@ -425,9 +433,9 @@ fn per_line_scroll_cost_ns(rows: usize, reps: usize) -> u128 {
     // One line at a time, region height times, `reps` times over: the same
     // total displacement `\x1b[999999S` achieves in one bulk operation.
     let payload = b"\x1b[1S".repeat(reps * (rows - 2));
-    let start = std::time::Instant::now();
+    let start = thread_cpu_ns();
     t.process(&payload);
-    start.elapsed().as_nanos().max(1)
+    (thread_cpu_ns() - start).max(1)
 }
 
 /// Multiplying the pane height by 8 must multiply the cost of scrolling it by

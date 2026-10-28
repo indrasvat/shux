@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+# The cost-ratio tests time the calling thread's CPU, which a run of other
+# tests or a loaded runner cannot inflate by descheduling it.
+nix = { workspace = true, features = ["time"] }
 # Only the differential tests hash a frame, and only to get an exact identity to
 # compare two terminals on. The gate's `capture_sha256` used to live here and made
 # this a library dependency; it is the gate's now (#151), and the library itself

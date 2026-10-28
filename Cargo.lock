@@ -1368,6 +1368,7 @@ version = "0.54.9"
 dependencies = [
  "base64",
  "memchr",
+ "nix",
  "proptest",
  "serde",
  "serde_json",
