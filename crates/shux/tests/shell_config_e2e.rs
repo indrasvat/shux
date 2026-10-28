@@ -183,8 +183,17 @@ impl Env {
         self.first_pane(name)
     }
 
+    #[track_caller]
     fn send_keys(&self, session: &str, text: &str) {
-        let _ = self.run(&["pane", "send-keys", "-s", session, "-t", text]);
+        self.ok(&["pane", "send-keys", "-s", session, "-t", text]);
+    }
+
+    /// How many `kind` events the daemon's ring buffer holds.
+    fn event_count(&self, kind: &str) -> usize {
+        self.ok(&["events", "history", "-f", kind, "-n", "1000"])
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
     }
 
     /// Every (window, pane) in `session`, with whether the pane has a live PTY.
@@ -615,20 +624,33 @@ fn a_failed_attach_split_leaves_the_window_zoomed_on_the_same_pane() {
 
     // The failed split, then copy mode. The attach loop runs actions in order,
     // so the copy-mode hint on screen proves the split, rollback included, has
-    // finished — without it a split that never arrived would look like one
-    // that was undone correctly.
+    // finished.
     assert!(
         !env.capture("host", &host_pane).contains("COPY"),
         "the copy-mode marker is on screen before copy mode, so it proves nothing"
+    );
+    let (created, destroyed) = (
+        env.event_count("pane.created"),
+        env.event_count("pane.exited"),
     );
     env.send_keys("host", "\x01v");
     env.send_keys("host", "\x01[");
     env.wait_for("host", &host_pane, "COPY");
 
+    // Copy mode only proves `prefix [` ran. A split that never happened would
+    // leave the zoom alone too, so prove this one was made and undone.
+    assert_eq!(
+        (
+            env.event_count("pane.created") - created,
+            env.event_count("pane.exited") - destroyed
+        ),
+        (1, 1),
+        "expected one split made and undone (pane.created, then pane.exited)"
+    );
     let after = env.panes_with_liveness("target");
     assert!(
         after.len() == 2 && after.iter().all(|(_, live)| *live),
-        "the failed split was not undone: {after:?}"
+        "expected the 2 live panes from before the split: {after:?}"
     );
     let (zoomed_after, focused_after) = zoom_and_focus(&env, "target");
     assert_eq!(
