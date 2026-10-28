@@ -54,6 +54,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 flate2 = "1"
+shux-testkit = { path = "../shux-testkit" }
 tempfile.workspace = true
 base64 = "0.22"
 shux-testkit = { path = "../shux-testkit" }

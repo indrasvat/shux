@@ -16,6 +16,7 @@ use futures::{SinkExt, StreamExt};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use shux_rpc::attach::{ATTACH_PROTOCOL_VERSION, AttachHello, AttachReady, AttachServerFrame};
+use shux_testkit::BUDGET;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 
@@ -75,13 +76,11 @@ impl Drop for Harness {
         // line matches any needle broad enough to find the daemon.
         if let Some(pid) = pid {
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            for _ in 0..50 {
-                if kill(Pid::from_raw(pid as i32), None).is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+            let gone =
+                shux_testkit::poll_until(BUDGET, || kill(Pid::from_raw(pid as i32), None).is_err());
+            if !gone && !std::thread::panicking() {
+                panic!("daemon {pid} survived SIGTERM");
             }
-            panic!("daemon {pid} survived SIGTERM");
         }
     }
 }
@@ -127,28 +126,34 @@ async fn render_bytes(h: &Harness, session: &str, graphics: bool) -> Vec<u8> {
         AttachReady::Error { code, message } => panic!("attach denied: {code}: {message}"),
     }
 
-    // Read render frames until everything the caller asserts on has arrived, or
-    // the budget runs out.
-    // Bounded by a deadline rather than a frame count: the daemon coalesces,
-    // so "how many frames" is not a stable quantity to wait on.
+    // Stop only when everything the assertions read is present. Breaking on
+    // the image alone stopped between the workload's two printfs, and failed
+    // on a colour probe the daemon had not written yet. The workload draws
+    // the image first, so once its colours arrive any picture already has.
+    read_renders_until(&mut framed, |seen| {
+        let probes = find(seen, b"38;2;120;220;180") && find(seen, b"38;5;208");
+        probes && (!graphics || find(seen, b"\x1b_Ga=T"))
+    })
+    .await
+}
+
+/// Collect render bytes until `done` holds for them, the daemon hangs up, or
+/// [`BUDGET`] runs out; the caller's assertions say which. Not a frame count:
+/// the daemon coalesces, so "how many frames" is not stable.
+async fn read_renders_until(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    done: impl Fn(&[u8]) -> bool,
+) -> Vec<u8> {
     let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while tokio::time::Instant::now() < deadline {
-        let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(2), framed.next()).await
-        else {
-            continue;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while !done(&seen) {
+        let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, framed.next()).await else {
+            break;
         };
         if let Ok(AttachServerFrame::Render { data }) = serde_json::from_slice(&frame)
             && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&data)
         {
             seen.extend_from_slice(&raw);
-        }
-        // Stop only when everything the assertions read is present. Breaking
-        // on the image alone stopped between the workload's two printfs, and
-        // failed on a colour probe the daemon had not written yet.
-        let probes = find(&seen, b"38;2;120;220;180") && find(&seen, b"38;5;208");
-        if probes && (!graphics || find(&seen, b"\x1b_Ga=T")) {
-            break;
         }
     }
     seen
@@ -244,30 +249,32 @@ fn attach_pty_output(h: &Harness, session: &str, graphics: &str) -> String {
         .expect("spawn attach");
     drop(slave);
 
-    // Non-blocking, because the child stays alive holding the screen: the read
-    // has to end on a deadline rather than on EOF.
+    // The child stays alive holding the screen, so the read ends on the
+    // alternate screen opening: the client decides on graphics, and says so
+    // if it must, before it takes the screen over.
     let master = pty.master;
     nix::fcntl::fcntl(&master, nix::fcntl::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
         .expect("set O_NONBLOCK");
     let mut file = std::fs::File::from(master);
     let mut seen = String::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
+    let opened = shux_testkit::poll_until(BUDGET, || {
         let mut buf = [0u8; 4096];
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
-            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        while let Ok(n) = file.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
-        if seen.contains("SHUX_GRAPHICS") {
-            break;
-        }
-    }
+        seen.contains(ALT_SCREEN_ON)
+    });
     // By recorded pid, and reaped, so the suite leaves nothing behind.
     let _ = child.kill();
     let _ = child.wait();
+    assert!(opened, "attach never opened the alternate screen: {seen:?}");
     seen
 }
+
+const ALT_SCREEN_ON: &str = "\x1b[?1049h";
 
 #[tokio::test]
 async fn a_misspelled_graphics_override_says_so_where_a_person_can_see_it() {
@@ -356,17 +363,17 @@ async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
         .as_str()
         .expect("session.create returns a pane_id")
         .to_string();
-    let consumed_by = std::time::Instant::now() + Duration::from_secs(120);
-    while !h.rpc("pane.capture", serde_json::json!({ "pane_id": pane }))["result"]["text"]
-        .as_str()
-        .is_some_and(|t| t.contains("TRUECOLOR"))
-    {
-        assert!(
-            std::time::Instant::now() < consumed_by,
-            "the pane never drew the probe the payload ends with"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // Several megabytes through a PTY and the VT parser of a debug build: far
+    // slower than any other wait here, so it gets its own failure bound.
+    let consumed = shux_testkit::poll_until(Duration::from_secs(100), || {
+        h.rpc("pane.capture", serde_json::json!({ "pane_id": pane }))["result"]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("TRUECOLOR"))
+    });
+    assert!(
+        consumed,
+        "the pane never drew the probe the payload ends with"
+    );
 
     let sock = h.runtime_dir().join("shux").join("attach.sock");
     let stream = UnixStream::connect(&sock).await.expect("connect attach");
@@ -391,22 +398,10 @@ async fn a_large_client_still_receives_frames_when_its_pane_holds_a_picture() {
         AttachReady::Error { code, message } => panic!("attach denied: {code}: {message}"),
     }
 
-    let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while tokio::time::Instant::now() < deadline {
-        let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(3), framed.next()).await
-        else {
-            continue;
-        };
-        if let Ok(AttachServerFrame::Render { data }) = serde_json::from_slice(&frame)
-            && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&data)
-        {
-            seen.extend_from_slice(&raw);
-        }
-        if find(&seen, b"\x1b_Ga=T") && find(&seen, b"38;2;120;220;180") {
-            break;
-        }
-    }
+    let seen = read_renders_until(&mut framed, |seen| {
+        find(seen, b"\x1b_Ga=T") && find(seen, b"38;2;120;220;180")
+    })
+    .await;
 
     assert!(
         find(&seen, b"\x1b_Ga=T"),
