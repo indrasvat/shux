@@ -1,3 +1,10 @@
+## [0.54.6](https://github.com/indrasvat/shux/compare/v0.54.5...v0.54.6) (2026-10-28)
+
+
+### Bug Fixes
+
+* **attach:** a failed keyboard split restores the zoom it cleared ([#221](https://github.com/indrasvat/shux/issues/221)) ([fe85d56](https://github.com/indrasvat/shux/commit/fe85d56a7c4da70ebeb2676a55e36adb50e90a0e)), closes [#152](https://github.com/indrasvat/shux/issues/152)
+
 ## [0.54.5](https://github.com/indrasvat/shux/compare/v0.54.4...v0.54.5) (2026-10-28)
 
 
