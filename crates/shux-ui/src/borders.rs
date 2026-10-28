@@ -8,13 +8,11 @@
 //! The algorithm:
 //!   1. Compute per-pane rects via `LayoutNode::compute_rects` (already
 //!      separator-aware).
-//!   2. Build a sparse map of border cells: for each pane, mark its right
-//!      column (if not at viewport edge) as a vertical border, its bottom
-//!      row (if not at viewport edge) as a horizontal border.
-//!   3. Where verticals and horizontals coincide, emit a `cross` glyph.
-//!   4. At true corners (top-left, top-right, etc., relative to the
-//!      bounding viewport), emit corner glyphs.
-//!   5. Color each segment by whether either of its adjacent panes is
+//!   2. Draw the viewport outline and each pane's four edges as lines,
+//!      recording per cell which of up/down/left/right a line leaves it in.
+//!   3. Pick each cell's glyph from those arms: two opposite arms are a
+//!      line, two adjacent ones a corner, three a tee, four a cross.
+//!   4. Color each segment by whether either of its adjacent panes is
 //!      focused (focus "wins" so the focused pane's outline is fully
 //!      accented).
 
@@ -230,78 +228,75 @@ pub fn compute_borders(
     let h = viewport.height as usize;
     let ox = viewport.x as i32;
     let oy = viewport.y as i32;
+    let v_right = ox + viewport.width as i32 - 1;
+    let v_bottom = oy + viewport.height as i32 - 1;
 
-    // Sparse cell map: (rel_x, rel_y) -> (vert?, horiz?, focused?)
-    // We deduce the glyph from which segments meet at each cell.
+    // Which of the four directions a line leaves each cell in. A cell's glyph
+    // is read off its arms, so a junction draws exactly the lines that meet.
     #[derive(Default, Clone, Copy)]
     struct Mark {
+        up: bool,
+        down: bool,
+        left: bool,
+        right: bool,
         vert: bool,
         horiz: bool,
         focused: bool,
     }
 
     let mut grid: Vec<Mark> = vec![Mark::default(); w * h];
-    let idx = |x: i32, y: i32| -> Option<usize> {
-        let rx = x - ox;
-        let ry = y - oy;
-        if rx < 0 || ry < 0 {
-            return None;
+    let at = |x: i32, y: i32| ((y - oy) as usize) * w + (x - ox) as usize;
+
+    // A line runs from its first cell to its last, clipped to the viewport;
+    // only its interior cells point both ways along it.
+    let mut line_v = |x: i32, y0: i32, y1: i32, foc: bool| {
+        let (y0, y1) = (y0.max(oy), y1.min(v_bottom));
+        if x < ox || x > v_right || y0 > y1 {
+            return;
         }
-        let (rx, ry) = (rx as usize, ry as usize);
-        if rx >= w || ry >= h {
-            return None;
-        }
-        Some(ry * w + rx)
-    };
-    let mark_v = |g: &mut [Mark], x: i32, y: i32, foc: bool| {
-        if let Some(i) = idx(x, y) {
-            g[i].vert = true;
-            g[i].focused |= foc;
-        }
-    };
-    let mark_h = |g: &mut [Mark], x: i32, y: i32, foc: bool| {
-        if let Some(i) = idx(x, y) {
-            g[i].horiz = true;
-            g[i].focused |= foc;
+        for y in y0..=y1 {
+            let m = &mut grid[at(x, y)];
+            m.vert = true;
+            m.up |= y > y0;
+            m.down |= y < y1;
+            m.focused |= foc;
         }
     };
+    let mut horizontals: Vec<(i32, i32, i32, bool)> = Vec::new();
 
-    let v_right = (viewport.x as i32) + (viewport.width as i32) - 1;
-    let v_bottom = (viewport.y as i32) + (viewport.height as i32) - 1;
+    // Outline (always drawn so panes are framed). Focus comes from the panes
+    // whose edges coincide with it.
+    line_v(ox, oy, v_bottom, false);
+    line_v(v_right, oy, v_bottom, false);
+    horizontals.push((oy, ox, v_right, false));
+    horizontals.push((v_bottom, ox, v_right, false));
 
-    // Outline (always drawn so panes are framed).
-    for x in viewport.x..viewport.x + viewport.width {
-        // Top + bottom edges. Focused-ness of edge segments comes from
-        // adjacent panes (set later) — for now mark as unfocused.
-        mark_h(&mut grid, x as i32, viewport.y as i32, false);
-        mark_h(&mut grid, x as i32, v_bottom, false);
-    }
-    for y in viewport.y..viewport.y + viewport.height {
-        mark_v(&mut grid, viewport.x as i32, y as i32, false);
-        mark_v(&mut grid, v_right, y as i32, false);
-    }
-
-    // For each pane, mark the border cells that surround it. The 1-cell
-    // separator that `compute_rects` reserves between adjacent panes is
-    // exactly where these markers land.
+    // Each pane's edges run one cell past it on both ends, so they reach the
+    // lines framing its neighbours. The 1-cell separator that
+    // `compute_rects` reserves between adjacent panes is where they land.
     for (pid, rect) in pane_rects {
         let foc = *pid == focused;
         let left = rect.x as i32 - 1;
-        let right = (rect.x as i32) + (rect.width as i32);
+        let right = rect.x as i32 + rect.width as i32;
         let top = rect.y as i32 - 1;
-        let bottom = (rect.y as i32) + (rect.height as i32);
+        let bottom = rect.y as i32 + rect.height as i32;
+        line_v(left, top, bottom, foc);
+        line_v(right, top, bottom, foc);
+        horizontals.push((top, left, right, foc));
+        horizontals.push((bottom, left, right, foc));
+    }
 
-        // Vertical edges (left + right of pane) along the pane's height,
-        // extending one row above and below to seal corners.
-        for y in top..=bottom {
-            mark_v(&mut grid, left, y, foc);
-            mark_v(&mut grid, right, y, foc);
+    for (y, x0, x1, foc) in horizontals {
+        let (x0, x1) = (x0.max(ox), x1.min(v_right));
+        if y < oy || y > v_bottom || x0 > x1 {
+            continue;
         }
-        // Horizontal edges (top + bottom of pane) along the pane's width,
-        // extending one column left and right to seal corners.
-        for x in (left)..=(right) {
-            mark_h(&mut grid, x, top, foc);
-            mark_h(&mut grid, x, bottom, foc);
+        for x in x0..=x1 {
+            let m = &mut grid[at(x, y)];
+            m.horiz = true;
+            m.left |= x > x0;
+            m.right |= x < x1;
+            m.focused |= foc;
         }
     }
 
@@ -312,42 +307,25 @@ pub fn compute_borders(
             if !m.vert && !m.horiz {
                 continue;
             }
-            let x = (rx as i32 + ox) as u16;
-            let y = (ry as i32 + oy) as u16;
-
-            let on_top = y == viewport.y;
-            let on_bottom = y == viewport.y + viewport.height - 1;
-            let on_left = x == viewport.x;
-            let on_right = x == viewport.x + viewport.width - 1;
-
-            // Decide glyph: corner > tee > cross > line.
-            let ch = if on_top && on_left {
-                chars.top_left
-            } else if on_top && on_right {
-                chars.top_right
-            } else if on_bottom && on_left {
-                chars.bottom_left
-            } else if on_bottom && on_right {
-                chars.bottom_right
-            } else if on_top && m.vert {
-                chars.tee_top
-            } else if on_bottom && m.vert {
-                chars.tee_bottom
-            } else if on_left && m.horiz {
-                chars.tee_left
-            } else if on_right && m.horiz {
-                chars.tee_right
-            } else if m.vert && m.horiz {
-                chars.cross
-            } else if m.vert {
-                chars.vertical
-            } else {
-                chars.horizontal
+            let ch = match (m.up, m.down, m.left, m.right) {
+                (true, true, true, true) => chars.cross,
+                (true, true, false, true) => chars.tee_left,
+                (true, true, true, false) => chars.tee_right,
+                (false, true, true, true) => chars.tee_top,
+                (true, false, true, true) => chars.tee_bottom,
+                (false, true, false, true) => chars.top_left,
+                (false, true, true, false) => chars.top_right,
+                (true, false, false, true) => chars.bottom_left,
+                (true, false, true, false) => chars.bottom_right,
+                (_, _, false, false) if m.up || m.down => chars.vertical,
+                (false, false, _, _) if m.left || m.right => chars.horizontal,
+                // A line clipped to a single cell has no arms.
+                _ if m.vert => chars.vertical,
+                _ => chars.horizontal,
             };
-
             segments.push(BorderSegment {
-                x,
-                y,
+                x: (rx as i32 + ox) as u16,
+                y: (ry as i32 + oy) as u16,
                 ch,
                 focused: m.focused,
             });
