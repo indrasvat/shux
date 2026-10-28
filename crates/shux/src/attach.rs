@@ -1369,7 +1369,6 @@ async fn run_render_loop(
         // segments so OOTB looks the same even when no script segments
         // are configured. Then `populate_bar` appends any
         // `[[statusbar.segment]]` results from the runner cache.
-        // `live_cfg` is the one read at the top of this frame.
         let nerd_fonts = live_cfg.appearance.nerd_fonts;
         let pane_chrome = crate::pane_chrome::pane_chrome(
             &snap,

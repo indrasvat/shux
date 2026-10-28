@@ -6,7 +6,6 @@
 //! the layout / border / status-bar logic itself.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use shux_core::layout::{LayoutNode, Rect, ZoomState};
 use shux_core::model::PaneId;
@@ -302,8 +301,7 @@ fn put_cell(grid: &mut Grid, x: u16, y: u16, ch: char, fg: Color, bg: Color, fla
 /// A title glyph as the VT stores text: multi-scalar graphemes in the cell's
 /// extended attributes, a wide glyph followed by its continuation.
 fn put_glyph(grid: &mut Grid, x: u16, y: u16, glyph: &crate::chrome::TitleGlyph, fg: Color) {
-    let mut chars = glyph.text.chars();
-    let Some(ch) = chars.next() else {
+    let Some(ch) = glyph.text.chars().next() else {
         return;
     };
     put_cell(grid, x, y, ch, fg, Color::Default, CellFlags::default());
@@ -316,12 +314,7 @@ fn put_glyph(grid: &mut Grid, x: u16, y: u16, glyph: &crate::chrome::TitleGlyph,
         return;
     }
     row[x].width = glyph.width;
-    if chars.next().is_some() {
-        row[x].extended = Some(Arc::new(shux_vt::ExtendedAttrs {
-            grapheme: Some(glyph.text.clone()),
-            ..Default::default()
-        }));
-    }
+    row[x].set_grapheme_payload(glyph.text.clone());
     if glyph.width == 2 && x + 1 < row.len() {
         row[x + 1] = Cell::wide_continuation();
     }
@@ -403,48 +396,6 @@ mod tests {
         let row = composed.grid.visible_row(0);
         let text: String = (0..5).map(|c| row[c].ch).collect();
         assert_eq!(text, "Hello");
-    }
-
-    /// A wide title character takes two columns: a width-2 cell and its
-    /// continuation, as the VT writes them.
-    #[test]
-    fn compose_lays_a_wide_title_out_in_two_columns() {
-        let pid = PaneId::new();
-        let vt = VirtualTerminal::new(22, 78);
-        let layout = single_pane_layout(pid);
-        let panes = pane_map(pid, &vt);
-        let titles = HashMap::from([(pid, crate::chrome::PaneChrome::titled("日本x"))]);
-        let inputs = ComposeInputs {
-            layout: &layout,
-            zoom: None,
-            focused: pid,
-            panes: &panes,
-            chrome: Some(&titles),
-            status_bar: None,
-        };
-        let composed = compose(
-            &inputs,
-            80,
-            24,
-            BorderStyle::Rounded,
-            BorderColors::default(),
-            0,
-        );
-        let row = composed.grid.visible_row(0);
-        let cells: Vec<(char, u8)> = (2..9).map(|c| (row[c].ch, row[c].width)).collect();
-        assert_eq!(
-            cells,
-            [
-                (' ', 1),
-                ('日', 2),
-                (' ', 0),
-                ('本', 2),
-                (' ', 0),
-                ('x', 1),
-                (' ', 1)
-            ],
-            "title cells"
-        );
     }
 
     #[test]

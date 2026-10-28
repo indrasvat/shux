@@ -38,19 +38,16 @@ pub struct TitleGlyph {
     pub color: Option<Color>,
 }
 
-/// Columns a title takes at most, however wide the pane.
-const MAX_TITLE_COLUMNS: usize = 64;
-
 /// ` ◆ title ` for the pane whose viewport is `viewport`, starting one column
-/// in from its left border. Empty when the pane is narrower than six columns
-/// or has neither a title nor a badge. A badge with no room for a title cell
+/// in from its left border. Empty when the pane is narrower than six columns,
+/// has no rows, or has neither a title nor a badge. A badge with no room for a title cell
 /// after it is drawn alone; a wide grapheme that does not fit is dropped, not
 /// split.
 pub fn title_overlay(chrome: &PaneChrome, viewport: Rect) -> Vec<TitleGlyph> {
-    if viewport.width < 6 {
+    if viewport.width < 6 || viewport.height == 0 {
         return Vec::new();
     }
-    let avail = MAX_TITLE_COLUMNS.min(usize::from(viewport.width) - 4);
+    let avail = usize::from(viewport.width) - 4;
     let mut body: Vec<(String, u8, Option<Color>)> = Vec::new();
     let mut used = 0usize;
     if let Some(badge) = chrome.badge {
@@ -112,11 +109,11 @@ pub fn title_overlay(chrome: &PaneChrome, viewport: Rect) -> Vec<TitleGlyph> {
 /// so a title draws the way that text would in a pane.
 pub fn text_cells(s: &str) -> Vec<(String, u8)> {
     let text: String = s.chars().filter(|c| !c.is_control()).collect();
-    // Autowrap off: anything past the last column stays on the one row.
-    let mut vt = shux_vt::VirtualTerminal::new(1, 2 * MAX_TITLE_COLUMNS + 2);
-    vt.process(b"\x1b[?7l");
+    // Room for every scalar at width two, so nothing reaches the last column.
+    let cols = 2 * text.chars().count() + 2;
+    let mut vt = shux_vt::VirtualTerminal::new(1, cols);
     vt.process(text.as_bytes());
-    let end = vt.cursor().col.min(2 * MAX_TITLE_COLUMNS);
+    let end = vt.cursor().col;
     let row = vt.grid().visible_row(0);
     (0..end)
         .map(|col| &row[col])
@@ -186,17 +183,32 @@ mod tests {
     }
 
     #[test]
-    fn the_badge_comes_out_of_the_title_budget_in_columns() {
+    fn a_wide_pane_shows_the_whole_stored_title() {
+        // The model keeps up to 64 scalars; a pane with room shows them all.
         let chrome = PaneChrome {
-            title: "x".repeat(80),
+            title: "日".repeat(64),
             badge: Some(BLOCKED),
         };
         let glyphs = title_overlay(&chrome, viewport(200));
-        let columns: usize = glyphs[1..glyphs.len() - 1]
-            .iter()
-            .map(|g| usize::from(g.width))
-            .sum();
-        assert_eq!(columns, MAX_TITLE_COLUMNS);
+        assert_eq!(glyphs.iter().filter(|g| g.text == "日").count(), 64);
+        assert_eq!(
+            glyphs[4].x,
+            glyphs[3].x + 2,
+            "a wide glyph advances two columns"
+        );
+    }
+
+    #[test]
+    fn a_pane_with_no_rows_draws_no_title() {
+        let chrome = PaneChrome {
+            title: "build".into(),
+            badge: Some(BLOCKED),
+        };
+        let flat = Rect {
+            height: 0,
+            ..viewport(40)
+        };
+        assert!(title_overlay(&chrome, flat).is_empty());
     }
 
     #[test]

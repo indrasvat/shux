@@ -131,25 +131,39 @@ mod strict {
     #[serde(deny_unknown_fields)]
     pub struct Theme {
         #[serde(default)]
-        pub border_focused: Option<String>,
+        pub border_focused: Option<HexColor>,
         #[serde(default)]
-        pub border_unfocused: Option<String>,
+        pub border_unfocused: Option<HexColor>,
         #[serde(default)]
-        pub status_bg: Option<String>,
+        pub status_bg: Option<HexColor>,
         #[serde(default)]
-        pub status_fg: Option<String>,
+        pub status_fg: Option<HexColor>,
         #[serde(default)]
-        pub status_accent: Option<String>,
+        pub status_accent: Option<HexColor>,
         #[serde(default)]
-        pub status_muted: Option<String>,
+        pub status_muted: Option<HexColor>,
         #[serde(default)]
-        pub status_branch: Option<String>,
+        pub status_branch: Option<HexColor>,
         #[serde(default)]
-        pub status_ok: Option<String>,
+        pub status_ok: Option<HexColor>,
         #[serde(default)]
-        pub status_error: Option<String>,
+        pub status_error: Option<HexColor>,
         #[serde(default)]
-        pub status_attention: Option<String>,
+        pub status_attention: Option<HexColor>,
+    }
+
+    /// A `#rrggbb` colour. The daemon falls back to the default for anything
+    /// else, so this is where a typo has to be caught.
+    #[derive(Debug)]
+    pub struct HexColor;
+
+    impl<'de> Deserialize<'de> for HexColor {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let s = String::deserialize(d)?;
+            shux_core::theme::parse_hex(&s)
+                .map(|_| HexColor)
+                .ok_or_else(|| serde::de::Error::custom(format!("{s:?} is not a #rrggbb colour")))
+        }
     }
 }
 
@@ -604,6 +618,19 @@ font_fallbacks = ["/tmp/this-shux-font-fallback-does-not-exist.ttf"]
         ] {
             let f = write_tmp(bad);
             assert!(!validate(f.path()).unwrap().is_empty(), "accepted: {bad}");
+        }
+    }
+
+    /// The daemon falls back to the default for a colour it cannot parse, so
+    /// validate is the only place a typo surfaces.
+    #[test]
+    fn validate_rejects_theme_colours_that_are_not_hex() {
+        for bad in ["#zz", "#12345", "red", "#74c7ecff"] {
+            for key in ["border_focused", "status_attention", "status_ok"] {
+                let f = write_tmp(&format!("[theme]\n{key} = \"{bad}\"\n"));
+                let diags = validate(f.path()).unwrap();
+                assert!(!diags.is_empty(), "accepted {key} = {bad:?}");
+            }
         }
     }
 

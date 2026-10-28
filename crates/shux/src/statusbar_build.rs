@@ -266,7 +266,8 @@ pub fn append_waiting(
     if waiting == 0 {
         return;
     }
-    let glyph = if nerd_fonts { '\u{f071}' } else { '◆' };
+    let (unicode, nerd) = crate::pane_chrome::glyphs(shux_program_status::State::Blocked);
+    let glyph = if nerd_fonts { nerd } else { unicode };
     let Rgb { r, g, b } = theme.status_attention;
     let segment = StatusSegment::styled(
         format!("{glyph} {waiting} waiting "),

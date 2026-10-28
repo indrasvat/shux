@@ -13,7 +13,7 @@ use shux_ui::{PaneChrome, StatusBadge};
 
 /// Badge glyphs: (Unicode set, Nerd Font set). Every glyph is in the bundled
 /// font and one cell wide.
-fn glyphs(state: State) -> (char, char) {
+pub(crate) fn glyphs(state: State) -> (char, char) {
     match state {
         State::Blocked => ('◆', '\u{f071}'),
         State::Error => ('✕', '\u{f00d}'),
@@ -49,7 +49,7 @@ pub fn pane_chrome(
                 title: pane.title.clone(),
                 badge: badge(pane, status, nerd_fonts, theme),
             };
-            (!chrome.title.is_empty() || chrome.badge.is_some()).then_some((pid, chrome))
+            Some((pid, chrome))
         })
         .collect()
 }
@@ -245,22 +245,6 @@ mod tests {
         assert!(
             badge_of(&snap, panes[0], &on, false).is_none(),
             "pane reports off"
-        );
-    }
-
-    #[test]
-    fn a_pane_with_neither_title_nor_badge_has_no_chrome() {
-        let (mut snap, _, panes) = session(&[None]);
-        snap.panes.get_mut(&panes[0]).unwrap().title.clear();
-        assert!(
-            pane_chrome(
-                &snap,
-                [panes[0]],
-                &ProgramStatusConfig::default(),
-                false,
-                &Theme::DEFAULT
-            )
-            .is_empty()
         );
     }
 

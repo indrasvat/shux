@@ -111,12 +111,7 @@ pub struct MultiPaneFrame<'a> {
     pub focused: PaneId,
     /// Per-pane virtual terminals keyed by pane id.
     pub vts: &'a HashMap<PaneId, &'a shux_vt::VirtualTerminal>,
-    /// Per-pane titles (PR 4 / task 027). When `show_pane_titles` is
-    /// enabled and a pane has a non-empty title, the title is overlaid
-    /// onto the pane's top border. Caller passes whatever the
-    /// graph snapshot reports as `Pane.title` (priority-resolved from
-    /// manual > osc > auto-derived). Missing keys = no title overlay,
-    /// not a panic.
+    /// What each pane draws on its top border; a missing pane draws nothing.
     pub chrome: Option<&'a HashMap<PaneId, crate::chrome::PaneChrome>>,
     /// Optional status bar (renders into the rows reserved by
     /// `CompositorConfig::status_bar_height`).

@@ -78,10 +78,11 @@ prefix = "ctrl-space"
 [program_status]
 # Programs in a pane (Claude Code, Codex, ...) report idle / working /
 # done / blocked / error over OSC 7501; read it with `shux pane status`.
-# false: shux answers no probe, keeps no records and publishes nothing.
+# false: shux answers no probe and keeps no new records; a pane that
+# already exited still reports its final status to `shux pane status`.
 enabled = true
-# A status badge (◆ blocked, ✕ error, ✓ done, … working, ○ idle) leading
-# each pane's border title.
+# A status badge (◆ blocked, ✕ error, ✓ done, ◔ working, ○ idle) leading
+# each pane's border title. Not drawn with appearance.border_style = "none".
 border = true
 # "◆ N waiting" in the status bar while panes in the session are blocked.
 status_bar = true
