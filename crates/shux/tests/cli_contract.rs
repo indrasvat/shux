@@ -700,27 +700,30 @@ fn a_client_that_started_the_daemon_keeps_no_zombie() {
         .spawn()
         .expect("spawn events watch");
     let pidfile = env.root.path().join("runtime/shux/shux.pid");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !pidfile.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let started = shux_testkit::poll_until(shux_testkit::BUDGET, || pidfile.exists());
     // The watch holds the start lock until it connects, so a second client
     // gets through only once the watch is connected.
     env.ok(&["session", "list"]);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // The process the watch spawned forks the daemon away and exits, so the
+    // watch is left with no child at all once it has reaped it. Unreaped, it
+    // stays a zombie child and the wait times out.
     let parent = watch.id().to_string();
-    let zombies: Vec<String> = std::fs::read_dir("/proc")
-        .expect("read /proc")
-        .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("stat")).ok())
-        .filter(|stat| {
-            let fields: Vec<&str> = stat
-                .rsplit_once(')')
-                .map_or(vec![], |(_, rest)| rest.split_whitespace().collect());
-            fields.first() == Some(&"Z") && fields.get(1) == Some(&parent.as_str())
-        })
-        .collect();
+    let children = || -> Vec<String> {
+        std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("stat")).ok())
+            .filter(|stat| {
+                let fields: Vec<&str> = stat
+                    .rsplit_once(')')
+                    .map_or(vec![], |(_, rest)| rest.split_whitespace().collect());
+                fields.get(1) == Some(&parent.as_str())
+            })
+            .collect()
+    };
+    let reaped = shux_testkit::poll_until(shux_testkit::BUDGET, || children().is_empty());
+    let left = children();
     let _ = watch.kill();
     let _ = watch.wait();
-    assert!(pidfile.exists(), "events watch never started the daemon");
-    assert!(zombies.is_empty(), "unreaped children: {zombies:?}");
+    assert!(started, "events watch never started the daemon");
+    assert!(reaped, "unreaped children: {left:?}");
 }

@@ -37,7 +37,6 @@ toml.workspace = true
 uuid.workspace = true
 unicode-width = "0.2"
 base64 = "0.22"
-shux-testkit = { path = "../shux-testkit" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 bytes = "1"
 futures = "0.3"
@@ -57,7 +56,6 @@ flate2 = "1"
 shux-testkit = { path = "../shux-testkit" }
 tempfile.workspace = true
 base64 = "0.22"
-shux-testkit = { path = "../shux-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 
 # ── lens red suite (§12/§13) — SEPARATE TEST LANE ──────────────────────────
