@@ -510,6 +510,10 @@ fn ansi_to_segments(bytes: &[u8]) -> Vec<StatusSegment> {
 
     for i in 0..last_non_blank {
         let cell = &row[i];
+        // The second column of a wide glyph; the glyph's own cell spans it.
+        if cell.is_wide_continuation() {
+            continue;
+        }
         let seg = cell_to_seg(cell);
         match &mut current {
             Some(c) if styles_match(c, &seg) => {
@@ -556,6 +560,24 @@ fn vt_color(c: shux_vt::Color) -> Option<crossterm::style::Color> {
 
 #[cfg(test)]
 mod tests {
+    /// A script printing wide text keeps its spacing: the VT's continuation
+    /// cell after a wide glyph is not text.
+    #[test]
+    fn wide_script_text_gains_no_spaces() {
+        let segs = ansi_to_segments("日X 👩\u{200d}💻Y".as_bytes());
+        let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "日X 👩\u{200d}💻Y");
+        let mut bar = StatusBar::new();
+        bar.left = segs;
+        let row = bar.render_row(10);
+        let painted: String = row
+            .iter()
+            .filter(|c| !c.wide_continuation)
+            .map(|c| c.display_text().into_owned())
+            .collect();
+        assert_eq!(painted.trim_end(), "日X 👩\u{200d}💻Y");
+    }
+
     use super::*;
 
     // ── issue #105: secure materialisation of inline starship config ──────────
