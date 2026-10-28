@@ -157,9 +157,9 @@ pub async fn run_attach(socket_path: &Path, config: ClientConfig) -> Result<Exit
     }
 }
 
-/// Bytes of a paste per frame: well under the frame size limit once
-/// base64-encoded. Each frame reaches the pane as a paste of its own.
-const PASTE_CHUNK: usize = 4 * 1024 * 1024;
+/// Bytes of a paste per frame. A pane's input channel counts frames, not
+/// bytes, so this bounds what a pane that stopped reading can pile up.
+const PASTE_CHUNK: usize = 64 * 1024;
 
 async fn run_loop<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
@@ -348,11 +348,22 @@ where
                         sink.send(Bytes::from(bytes)).await.ok();
                     }
                     Event::Paste(text) => {
-                        for chunk in text.as_bytes().chunks(PASTE_CHUNK) {
+                        let mut rest = text.as_str();
+                        loop {
+                            let mut at = rest.len().min(PASTE_CHUNK);
+                            while !rest.is_char_boundary(at) {
+                                at -= 1;
+                            }
+                            let (piece, tail) = rest.split_at(at);
+                            rest = tail;
                             let frame = AttachClientFrame::Paste {
-                                data: BASE64.encode(chunk),
+                                data: BASE64.encode(piece),
+                                more: !rest.is_empty(),
                             };
                             sink.send(Bytes::from(serde_json::to_vec(&frame)?)).await.ok();
+                            if rest.is_empty() {
+                                break;
+                            }
                         }
                     }
                     Event::FocusGained | Event::FocusLost => {}

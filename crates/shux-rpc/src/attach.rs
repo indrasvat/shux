@@ -84,9 +84,14 @@ pub enum AttachServerFrame {
 pub enum AttachClientFrame {
     /// Raw key bytes (already encoded by the client) for the focused pane.
     Input { data: String },
-    /// Text the user pasted, for the focused pane. The daemon wraps it in
-    /// bracketed-paste markers when the pane's program asked for them.
-    Paste { data: String },
+    /// Text the user pasted, for the focused pane: one paste, sent in pieces,
+    /// `more` set on every piece but the last. The daemon wraps the whole
+    /// paste in bracketed-paste markers when the pane's program asked for them.
+    Paste {
+        data: String,
+        #[serde(default)]
+        more: bool,
+    },
     /// Host terminal was resized.
     Resize { cols: u16, rows: u16 },
     /// Client-handled keybinding.

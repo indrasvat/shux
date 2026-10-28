@@ -149,6 +149,10 @@ struct Client {
     screen: Arc<std::sync::Mutex<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     drain: Option<std::thread::JoinHandle<()>>,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "held for its Drop; read by pid() on Linux")
+    )]
     process: KillOnDrop,
 }
 
@@ -267,6 +271,7 @@ impl Client {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn pid(&self) -> u32 {
         self.process.0.id()
     }
@@ -374,6 +379,47 @@ fn a_paste_into_a_program_that_asked_for_brackets_keeps_them() {
     assert_eq!(
         String::from_utf8_lossy(&received),
         String::from_utf8_lossy(want)
+    );
+}
+
+/// A paste far larger than one frame still reaches the program as one
+/// paste: one start marker, one end marker, and the text whole between them.
+#[test]
+fn a_paste_larger_than_a_frame_is_still_one_paste() {
+    const LEN: usize = 5 << 20;
+    let h = Harness::new();
+    let (got, done) = (h.work.path().join("got"), h.work.path().join("done"));
+    pane_session(
+        &h,
+        &format!(
+            "printf '\\033[?2004h'; head -c {n} > '{got}'; : > '{done}'; \
+             while :; do sleep 3600; done",
+            n = LEN + 12,
+            got = got.display(),
+            done = done.display(),
+        ),
+    );
+    let mut client = Client::attach(&h);
+    let text: Vec<u8> = paste_bytes().iter().copied().cycle().take(LEN).collect();
+    client.type_bytes(&[b"\x1b[200~", &text[..], b"\x1b[201~"].concat());
+    let arrived = wait_for(&done, Duration::from_secs(60));
+    let received = std::fs::read(&got).unwrap_or_default();
+    drop(client);
+    assert!(arrived, "{} of {} bytes arrived", received.len(), LEN + 12);
+    let count = |marker: &[u8]| {
+        received
+            .windows(marker.len())
+            .filter(|w| *w == marker)
+            .count()
+    };
+    assert_eq!(
+        (count(b"\x1b[200~"), count(b"\x1b[201~")),
+        (1, 1),
+        "the paste reached the program as more than one"
+    );
+    assert!(
+        received[6..received.len() - 6] == text[..],
+        "the paste's text changed"
     );
 }
 

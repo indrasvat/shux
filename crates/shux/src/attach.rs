@@ -134,25 +134,45 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the daemon pings the client to detect dead peers.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
-/// A paste as the pane's program asked to receive it: between the
-/// bracketed-paste markers when it turned mode 2004 on. An end marker inside
-/// the text is removed, so a paste cannot end itself early.
-fn as_pasted(text: Vec<u8>, bracketed: bool) -> Vec<u8> {
-    const START: &[u8] = b"\x1b[200~";
-    const END: &[u8] = b"\x1b[201~";
-    if !bracketed {
-        return text;
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Input as the pane should receive it, and whether a bracketed paste is open
+/// once it has. `paste` is `Some(more)` for a piece of a paste, `more` set
+/// while pieces follow; `open` says a paste has reached the pane without its
+/// end. A paste goes between the markers when the pane asked for them (mode
+/// 2004) or one is already open; a key closes a paste whose end was dropped.
+/// An end marker inside pasted text is removed, so a paste cannot end itself.
+fn frame_input(
+    bytes: Vec<u8>,
+    paste: Option<bool>,
+    open: bool,
+    wants_brackets: bool,
+) -> (Vec<u8>, bool) {
+    let Some(more) = paste else {
+        return if open {
+            ([PASTE_END, &bytes].concat(), false)
+        } else {
+            (bytes, false)
+        };
+    };
+    if !(open || wants_brackets) {
+        return (bytes, false);
     }
-    let mut out = Vec::with_capacity(text.len() + START.len() + END.len());
-    out.extend_from_slice(START);
-    let mut rest = &text[..];
-    while let Some(at) = rest.windows(END.len()).position(|w| w == END) {
+    let mut out = Vec::with_capacity(bytes.len() + PASTE_START.len() + PASTE_END.len());
+    if !open {
+        out.extend_from_slice(PASTE_START);
+    }
+    let mut rest = &bytes[..];
+    while let Some(at) = rest.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
         out.extend_from_slice(&rest[..at]);
-        rest = &rest[at + END.len()..];
+        rest = &rest[at + PASTE_END.len()..];
     }
     out.extend_from_slice(rest);
-    out.extend_from_slice(END);
-    out
+    if !more {
+        out.extend_from_slice(PASTE_END);
+    }
+    (out, more)
 }
 
 fn byte_count(n: usize) -> String {
@@ -186,6 +206,8 @@ enum Delivery {
 struct InputBacklog {
     waited: Duration,
     dropped: usize,
+    /// A bracketed paste has started reaching the pane and not yet ended.
+    paste_open: bool,
 }
 
 /// Hand `bytes` to a pane's input channel, waiting at most `budget` for room.
@@ -854,8 +876,8 @@ async fn run_attach_loop(
                 match parsed {
                     frame @ (AttachClientFrame::Input { .. } | AttachClientFrame::Paste { .. }) => {
                         let (data, paste) = match frame {
-                            AttachClientFrame::Paste { data } => (data, true),
-                            AttachClientFrame::Input { data } => (data, false),
+                            AttachClientFrame::Paste { data, more } => (data, Some(more)),
+                            AttachClientFrame::Input { data } => (data, None),
                             _ => continue,
                         };
                         let bytes = match BASE64.decode(data.as_bytes()) {
@@ -1004,29 +1026,30 @@ async fn run_attach_loop(
                         let target = render_session.lock().await.active_pane_id;
                         // Clone the writer Sender out of the map and drop the
                         // PaneIoState mutex BEFORE touching the channel.
-                        let (writer, bracketed) = {
+                        let (writer, wants_brackets) = {
                             let state = io_state.lock().await;
-                            let bracketed = state
+                            let wants_brackets = state
                                 .vts
                                 .get(&target)
                                 .is_some_and(|vt| vt.modes().bracketed_paste);
-                            (state.writers.get(&target).cloned(), bracketed)
-                        };
-                        let bytes = if paste {
-                            as_pasted(bytes, bracketed)
-                        } else {
-                            bytes
+                            (state.writers.get(&target).cloned(), wants_brackets)
                         };
                         if let Some(tx) = writer {
-                            let len = bytes.len();
                             let backlog = input_backlogs.entry(target).or_default();
+                            let (bytes, open_after) =
+                                frame_input(bytes, paste, backlog.paste_open, wants_brackets);
+                            let len = bytes.len();
                             let budget = INPUT_STALL.saturating_sub(backlog.waited);
                             match deliver_input(&tx, bytes, budget, &cancel).await {
                                 // Room the moment it was asked for: caught up.
                                 Delivery::Sent(waited) if waited.is_zero() => {
                                     backlog.waited = Duration::ZERO;
+                                    backlog.paste_open = open_after;
                                 }
-                                Delivery::Sent(waited) => backlog.waited += waited,
+                                Delivery::Sent(waited) => {
+                                    backlog.waited += waited;
+                                    backlog.paste_open = open_after;
+                                }
                                 Delivery::Closed => {
                                     input_backlogs.remove(&target);
                                 }
@@ -7182,12 +7205,42 @@ mod tests {
     }
 
     #[test]
-    fn a_paste_is_bracketed_only_when_asked_and_cannot_end_itself() {
-        assert_eq!(as_pasted(b"ls\r".to_vec(), false), b"ls\r");
-        assert_eq!(as_pasted(b"ls\r".to_vec(), true), b"\x1b[200~ls\r\x1b[201~");
+    fn a_paste_is_bracketed_once_only_when_asked_and_cannot_end_itself() {
+        let v = |b: &[u8]| b.to_vec();
+        // Not asked for: as typed.
         assert_eq!(
-            as_pasted(b"a\x1b[201~rm -rf ~\r".to_vec(), true),
-            b"\x1b[200~arm -rf ~\r\x1b[201~"
+            frame_input(v(b"ls\r"), Some(false), false, false),
+            (v(b"ls\r"), false)
+        );
+        // One piece.
+        assert_eq!(
+            frame_input(v(b"ls\r"), Some(false), false, true),
+            (v(b"\x1b[200~ls\r\x1b[201~"), false)
+        );
+        // Pieces: markers once around the whole paste, even if the pane turns
+        // the mode off halfway.
+        assert_eq!(
+            frame_input(v(b"a"), Some(true), false, true),
+            (v(b"\x1b[200~a"), true)
+        );
+        assert_eq!(
+            frame_input(v(b"b"), Some(true), true, true),
+            (v(b"b"), true)
+        );
+        assert_eq!(
+            frame_input(v(b"c"), Some(false), true, false),
+            (v(b"c\x1b[201~"), false)
+        );
+        // The end was dropped: the next key closes the paste first.
+        assert_eq!(
+            frame_input(v(b"x"), None, true, true),
+            (v(b"\x1b[201~x"), false)
+        );
+        assert_eq!(frame_input(v(b"x"), None, false, true), (v(b"x"), false));
+        // An end marker inside the text cannot end the paste.
+        assert_eq!(
+            frame_input(v(b"a\x1b[201~rm -rf ~\r"), Some(false), false, true),
+            (v(b"\x1b[200~arm -rf ~\r\x1b[201~"), false)
         );
     }
 }
