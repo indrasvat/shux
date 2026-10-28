@@ -212,6 +212,13 @@ async fn run_pane_pty_task(
                 task_exit = PtyTaskExit::RequestedTeardown;
                 break;
             }
+            // Ahead of reads, and due at most once per interval, so it
+            // neither starves them nor waits behind a steady stream.
+            _ = tokio::time::sleep_until(output_due.unwrap_or_else(tokio::time::Instant::now)),
+                if output_due.is_some() =>
+            {
+                staged.publish(&graph, pane_id);
+            }
             result = handle.read(&mut buf) => {
                 match result {
                     Ok(0) => {
@@ -291,9 +298,6 @@ async fn run_pane_pty_task(
 
                         staged.bus = bus_opt;
                         staged.stage(data);
-                        if staged.due_at().is_some_and(|at| at <= tokio::time::Instant::now()) {
-                            staged.publish(&graph, pane_id);
-                        }
                         // Wake any attach-render loops outside the lock.
                         // notify_one queues a permit that survives even if
                         // the renderer happens to be mid-render and not
@@ -437,11 +441,6 @@ async fn run_pane_pty_task(
                     )
                     .await;
                 }
-            }
-            _ = tokio::time::sleep_until(output_due.unwrap_or_else(tokio::time::Instant::now)),
-                if output_due.is_some() =>
-            {
-                staged.publish(&graph, pane_id);
             }
         }
     }
@@ -1573,7 +1572,7 @@ mod tests {
 
     /// Every byte a pane writes reaches the data plane, including the last
     /// write of a burst when nothing follows it. Each script writes `first`,
-    /// then 20 ms later a colour-probed `LAST`, so `LAST` lands inside the
+    /// then 50 ms later a colour-probed `LAST`, so `LAST` lands inside the
     /// sampling window that `first` opened.
     async fn data_plane_output(script: &str) -> String {
         use base64::Engine;
@@ -1615,7 +1614,7 @@ mod tests {
         String::from_utf8_lossy(&seen).into_owned()
     }
 
-    const BURST: &str = "printf 'first\\n'; sleep 0.02; \
+    const BURST: &str = "printf 'first\\n'; sleep 0.05; \
         printf '\\033[38;2;255;0;128mT\\033[0m \\033[38;5;208mI\\033[0m \\033[31mB\\033[0m LAST\\n'";
 
     fn assert_burst_delivered(seen: &str) {

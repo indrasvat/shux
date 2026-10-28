@@ -123,8 +123,7 @@ fn pane_id_of(h: &Harness, session: &str) -> String {
         .to_string()
 }
 
-fn pane_watch(h: &Harness, session: &str) -> Watcher {
-    let pane = pane_id_of(h, session);
+fn pane_watch(h: &Harness, session: &str, pane: &str) -> Watcher {
     Watcher::spawn(
         h,
         &[
@@ -133,7 +132,7 @@ fn pane_watch(h: &Harness, session: &str) -> Watcher {
             "-s",
             session,
             "-p",
-            &pane,
+            pane,
             "--timeout-ms",
             LONG_POLL_MS,
         ],
@@ -216,7 +215,7 @@ fn pane_watch_streams_promptly_and_ends_cleanly_when_its_reader_closes_the_pipe(
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let mut w = pane_watch(&h, "talker");
+    let mut w = pane_watch(&h, "talker", &pane_id_of(&h, "talker"));
     let rx = w.output();
     let seen = read_until(&rx, "tick", "pane watch");
     for sgr in ["\x1b[38;2;255;0;128m", "\x1b[38;5;208m", "\x1b[31m"] {
@@ -232,7 +231,7 @@ fn pane_watch_streams_promptly_and_ends_cleanly_when_its_reader_closes_the_pipe(
 }
 
 /// A pane that answers a line and then goes quiet: its last write reaches the
-/// watcher though nothing follows it. The reply is two writes 20 ms apart, so
+/// watcher though nothing follows it. The reply is two writes 50 ms apart, so
 /// the second lands inside the 100 ms sampling window the first one opened.
 #[test]
 fn pane_watch_delivers_a_last_write_that_no_later_output_follows() {
@@ -246,7 +245,7 @@ fn pane_watch_delivers_a_last_write_that_no_later_output_follows() {
         "bash",
         "-c",
         "until read -r -t 0.3 x; do echo waiting; done; sleep 0.3; \
-         printf 'first %s\\n' \"$x\"; sleep 0.02; \
+         printf 'first %s\\n' \"$x\"; sleep 0.05; \
          printf '\\033[38;2;0;200;80mTRUE\\033[0m \\033[38;5;33mIDX\\033[0m \\033[32mBASIC\\033[0m last-%s\\n' \"$x\"; \
          exec sleep 300",
     ]);
@@ -255,10 +254,10 @@ fn pane_watch_delivers_a_last_write_that_no_later_output_follows() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let mut w = pane_watch(&h, "quiet");
+    let pane = pane_id_of(&h, "quiet");
+    let mut w = pane_watch(&h, "quiet", &pane);
     let rx = w.output();
     read_until(&rx, "waiting", "pane watch before input");
-    let pane = pane_id_of(&h, "quiet");
     h.send_line_token(&pane, "ping");
     // `last-ping` is printed only by the reply; the echoed line reads `ping`.
     let seen = read_until(&rx, "last-ping", "pane watch after its pane went quiet");
