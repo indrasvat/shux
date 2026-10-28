@@ -132,6 +132,44 @@ fn picture(segs: &[BorderSegment]) -> String {
         .join("\n")
 }
 
+/// The cells on the outline of `r`, the ring a pane's edges draw around it.
+fn on_ring(r: Rect, x: i32, y: i32) -> bool {
+    let (l, t) = (r.x as i32 - 1, r.y as i32 - 1);
+    let (rt, b) = (r.x as i32 + r.width as i32, r.y as i32 + r.height as i32);
+    (l..=rt).contains(&x) && (t..=b).contains(&y) && (x == l || x == rt || y == t || y == b)
+}
+
+/// Exactly the outline and every pane's ring are drawn, and a cell is
+/// focused exactly when it is on the focused pane's ring.
+fn assert_rings_drawn(layout: &LayoutNode, content: Rect, style: BorderStyle, what: &str) {
+    let rects = layout.compute_rects(pane_viewport(content, style, false));
+    let segs = borders(layout, content, style);
+    let drawn: HashMap<(i32, i32), bool> = segs
+        .iter()
+        .map(|s| ((s.x as i32, s.y as i32), s.focused))
+        .collect();
+    let (cx, cy) = (content.x as i32, content.y as i32);
+    let (cr, cb) = (
+        cx + content.width as i32 - 1,
+        cy + content.height as i32 - 1,
+    );
+    for y in cy..=cb {
+        for x in cx..=cr {
+            let outline = x == cx || x == cr || y == cy || y == cb;
+            let ring = outline || rects.iter().any(|(_, r)| on_ring(*r, x, y));
+            let focused = rects
+                .iter()
+                .any(|(p, r)| *p == pane(1) && on_ring(*r, x, y));
+            assert_eq!(
+                drawn.get(&(x, y)).copied(),
+                ring.then_some(focused),
+                "{what} {style:?}: cell ({x},{y}) drawn/focused wrong\n{}",
+                picture(&segs)
+            );
+        }
+    }
+}
+
 /// Two panes on top, one wide pane below — the layout from issue #203.
 fn two_over_one() -> LayoutNode {
     split(Stack, 0.5, split(Side, 0.5, leaf(1), leaf(2)), leaf(3))
@@ -289,7 +327,7 @@ fn random_layout(rng: &mut Lcg, next_id: &mut u128, depth: u32) -> LayoutNode {
 }
 
 #[test]
-fn every_arm_joins_a_neighbour_across_layouts_sizes_and_styles() {
+fn every_arm_joins_and_every_ring_is_drawn_across_layouts_sizes_and_styles() {
     let named = [
         ("single", leaf(1)),
         ("side", split(Side, 0.5, leaf(1), leaf(2))),
@@ -319,7 +357,9 @@ fn every_arm_joins_a_neighbour_across_layouts_sizes_and_styles() {
         for (w, h) in sizes {
             for style in STYLES {
                 let segs = borders(layout, Rect::new(0, 0, w, h), style);
-                assert_arms_join(&segs, style, &format!("{name} at {w}x{h}"));
+                let what = format!("{name} at {w}x{h}");
+                assert_arms_join(&segs, style, &what);
+                assert_rings_drawn(layout, Rect::new(0, 0, w, h), style, &what);
             }
         }
     }
@@ -331,7 +371,9 @@ fn every_arm_joins_a_neighbour_across_layouts_sizes_and_styles() {
         let (w, h) = (20 + rng.below(100) as u16, 10 + rng.below(40) as u16);
         let style = STYLES[rng.below(STYLES.len() as u64) as usize];
         let segs = borders(&layout, Rect::new(0, 0, w, h), style);
-        assert_arms_join(&segs, style, &format!("random layout {i} at {w}x{h}"));
+        let what = format!("random layout {i} at {w}x{h}");
+        assert_arms_join(&segs, style, &what);
+        assert_rings_drawn(&layout, Rect::new(0, 0, w, h), style, &what);
     }
 }
 

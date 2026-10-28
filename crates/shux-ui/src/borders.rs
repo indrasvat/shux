@@ -239,37 +239,34 @@ pub fn compute_borders(
         down: bool,
         left: bool,
         right: bool,
-        vert: bool,
-        horiz: bool,
         focused: bool,
     }
 
     let mut grid: Vec<Mark> = vec![Mark::default(); w * h];
-    let at = |x: i32, y: i32| ((y - oy) as usize) * w + (x - ox) as usize;
 
-    // A line runs from its first cell to its last, clipped to the viewport;
-    // only its interior cells point both ways along it.
-    let mut line_v = |x: i32, y0: i32, y1: i32, foc: bool| {
+    // An axis-aligned line from its first cell to its last, clipped to the
+    // viewport; only its interior cells point both ways along it.
+    let mut line = |x0: i32, y0: i32, x1: i32, y1: i32, foc: bool| {
+        let (x0, x1) = (x0.max(ox), x1.min(v_right));
         let (y0, y1) = (y0.max(oy), y1.min(v_bottom));
-        if x < ox || x > v_right || y0 > y1 {
-            return;
-        }
         for y in y0..=y1 {
-            let m = &mut grid[at(x, y)];
-            m.vert = true;
-            m.up |= y > y0;
-            m.down |= y < y1;
-            m.focused |= foc;
+            for x in x0..=x1 {
+                let m = &mut grid[((y - oy) as usize) * w + (x - ox) as usize];
+                m.up |= y > y0;
+                m.down |= y < y1;
+                m.left |= x > x0;
+                m.right |= x < x1;
+                m.focused |= foc;
+            }
         }
     };
-    let mut horizontals: Vec<(i32, i32, i32, bool)> = Vec::new();
 
     // Outline (always drawn so panes are framed). Focus comes from the panes
     // whose edges coincide with it.
-    line_v(ox, oy, v_bottom, false);
-    line_v(v_right, oy, v_bottom, false);
-    horizontals.push((oy, ox, v_right, false));
-    horizontals.push((v_bottom, ox, v_right, false));
+    line(ox, oy, ox, v_bottom, false);
+    line(v_right, oy, v_right, v_bottom, false);
+    line(ox, oy, v_right, oy, false);
+    line(ox, v_bottom, v_right, v_bottom, false);
 
     // Each pane's edges run one cell past it on both ends, so they reach the
     // lines framing its neighbours. The 1-cell separator that
@@ -280,34 +277,18 @@ pub fn compute_borders(
         let right = rect.x as i32 + rect.width as i32;
         let top = rect.y as i32 - 1;
         let bottom = rect.y as i32 + rect.height as i32;
-        line_v(left, top, bottom, foc);
-        line_v(right, top, bottom, foc);
-        horizontals.push((top, left, right, foc));
-        horizontals.push((bottom, left, right, foc));
-    }
-
-    for (y, x0, x1, foc) in horizontals {
-        let (x0, x1) = (x0.max(ox), x1.min(v_right));
-        if y < oy || y > v_bottom || x0 > x1 {
-            continue;
-        }
-        for x in x0..=x1 {
-            let m = &mut grid[at(x, y)];
-            m.horiz = true;
-            m.left |= x > x0;
-            m.right |= x < x1;
-            m.focused |= foc;
-        }
+        line(left, top, left, bottom, foc);
+        line(right, top, right, bottom, foc);
+        line(left, top, right, top, foc);
+        line(left, bottom, right, bottom, foc);
     }
 
     let mut segments = Vec::with_capacity(64);
     for ry in 0..h {
         for rx in 0..w {
             let m = grid[ry * w + rx];
-            if !m.vert && !m.horiz {
-                continue;
-            }
             let ch = match (m.up, m.down, m.left, m.right) {
+                (false, false, false, false) => continue,
                 (true, true, true, true) => chars.cross,
                 (true, true, false, true) => chars.tee_left,
                 (true, true, true, false) => chars.tee_right,
@@ -317,10 +298,7 @@ pub fn compute_borders(
                 (false, true, true, false) => chars.top_right,
                 (true, false, false, true) => chars.bottom_left,
                 (true, false, true, false) => chars.bottom_right,
-                (_, _, false, false) if m.up || m.down => chars.vertical,
-                (false, false, _, _) if m.left || m.right => chars.horizontal,
-                // A line clipped to a single cell has no arms.
-                _ if m.vert => chars.vertical,
+                (_, _, false, false) => chars.vertical,
                 _ => chars.horizontal,
             };
             segments.push(BorderSegment {
