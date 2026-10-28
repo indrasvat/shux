@@ -11,6 +11,7 @@ pub mod error;
 pub mod policy;
 pub mod router;
 pub mod server;
+pub mod uds;
 
 // Re-export key types.
 pub use attach::{

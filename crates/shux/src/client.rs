@@ -32,6 +32,23 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 /// Maximum backoff delay.
 const MAX_BACKOFF: Duration = Duration::from_millis(2000);
 
+/// How long a daemon gets to exit after it stops serving. It drains panes for
+/// up to 3s before it releases the instance lock.
+pub(crate) const STALE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a daemon gets to answer the version handshake. One that does not is
+/// stopped or wedged: it is reported, never replaced.
+const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many stale daemons one client stops before giving up: each stop ends an
+/// identified process, so only clients of another build racing to start their
+/// own could keep producing more.
+const MAX_STALE_STOPS: u32 = 8;
+
+/// How long to wait for another client to finish starting the daemon. Covers
+/// the holder's stale-daemon stops, a drain, and its full connect backoff.
+const START_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("daemon error")]
@@ -40,6 +57,36 @@ pub enum ClientError {
     ConnectionFailed(u32),
     #[error("I/O error")]
     Io(#[from] io::Error),
+    #[error(
+        "the running daemon (pid {0}) is from another shux build and did not exit after SIGTERM; \
+         it may be draining a session -- retry, or run `shux daemon stop`"
+    )]
+    StaleDaemonAlive(u32),
+    #[error(
+        "a daemon for this socket{} is still running but has not served it for {}s; \
+         run `shux daemon stop` and retry",
+        .0, STALE_EXIT_TIMEOUT.as_secs()
+    )]
+    DaemonNotServing(String),
+    #[error(
+        "the daemon serving {}{} did not answer within {}s; it may be stopped or \
+         wedged -- run `shux daemon stop`, or kill it",
+        .1.display(), .0, VERSION_CHECK_TIMEOUT.as_secs()
+    )]
+    DaemonUnresponsive(String, std::path::PathBuf),
+    #[error(
+        "stopped {MAX_STALE_STOPS} daemons from another shux build on this socket and \
+         another took over each time; stop the other build's clients and retry"
+    )]
+    StaleDaemonsKeepStarting,
+    #[error(
+        "{} is served by something other than a shux daemon of this build, and no \
+         shux daemon process serves it; stop that process and retry",
+        .0.display()
+    )]
+    StaleDaemonUnidentified(std::path::PathBuf),
+    #[error("timed out waiting for another shux client to start the daemon (lock {})", .0.display())]
+    StartLockTimeout(std::path::PathBuf),
 }
 
 /// Probe the daemon socket. Returns a connected `UnixStream` if successful.
@@ -90,93 +137,188 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> 
     Some(DaemonVersion { version, git_sha })
 }
 
-/// Kill the daemon serving `socket` by SIGTERM, if the pidfile names one of ours.
+/// Stop the stale daemon for `socket`, and wait for it to exit.
 ///
-/// Fires on a version mismatch -- an ordinary `session list` against an older
-/// daemon -- and used to SIGTERM whatever the pidfile held, unverified.
-fn kill_stale_daemon(socket: &Path) -> bool {
-    let Some(crate::daemon_boot::LiveDaemon { pid, pidfile }) =
-        crate::daemon_boot::our_live_daemon(socket)
-    else {
-        let _ = daemon::remove_pid_file_for(socket);
-        return false;
+/// Identity rather than bare liveness: a zombie under a non-reaping init still
+/// answers `kill(pid, 0)`. A server that is not one of our daemons is left
+/// alone: unlinking its socket would strand it running and unreachable.
+async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
+    if let Some(pid) = crate::daemon_boot::our_live_daemon(socket) {
+        // ESRCH means it is already gone, which the wait below sees too.
+        if nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .is_ok()
+        {
+            info!(pid, "Sent SIGTERM to stale daemon");
+        }
+        let deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+        while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClientError::StaleDaemonAlive(pid));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        return Ok(());
+    }
+    for _ in 0..20 {
+        if probe_socket(socket).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(ClientError::StaleDaemonUnidentified(socket.to_path_buf()))
+}
+
+/// `" (pid N)"` for our daemon on `socket`, for error messages.
+fn holder(socket: &Path) -> String {
+    crate::daemon_boot::our_live_daemon(socket)
+        .map_or_else(String::new, |pid| format!(" (pid {pid})"))
+}
+
+/// What a probe of the socket found.
+enum Probe {
+    /// A daemon of this build answered; the stream is fresh and unused.
+    Current(UnixStream),
+    /// A daemon answered, but it is another build or did not say which.
+    Stale,
+    /// Nothing is listening.
+    Absent,
+    /// Something accepted the connection and never answered.
+    Unresponsive,
+}
+
+async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
+    let mut stream = match probe_socket(socket_path).await {
+        Ok(stream) => stream,
+        Err(e) if is_connection_refused_or_not_found(&e) => return Ok(Probe::Absent),
+        Err(e) => return Err(ClientError::Io(e)),
     };
-
-    // Safety: sending SIGTERM to a known process
-    let result = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    );
-
-    if result.is_ok() {
-        info!(pid, "Sent SIGTERM to stale daemon");
-        true
-    } else {
-        debug!(pid, "Failed to send SIGTERM (process may already be gone)");
-        // Clean up stale files even if kill failed
-        let _ = std::fs::remove_file(&pidfile);
-        let _ = daemon::remove_socket_file_for(socket);
-        true
+    let Ok(answer) =
+        tokio::time::timeout(VERSION_CHECK_TIMEOUT, check_daemon_version(&mut stream)).await
+    else {
+        return Ok(Probe::Unresponsive);
+    };
+    match answer {
+        Some(dv) if dv.version == CLIENT_VERSION && dv.git_sha == CLIENT_GIT_SHA => {
+            debug!(
+                version = CLIENT_VERSION,
+                git_sha = CLIENT_GIT_SHA,
+                "Daemon version matches"
+            );
+            // Need a fresh connection since we consumed the first one for version check
+            drop(stream);
+            match probe_socket(socket_path).await {
+                Ok(stream) => Ok(Probe::Current(stream)),
+                // It stopped serving in between.
+                Err(e) if is_connection_refused_or_not_found(&e) => Ok(Probe::Absent),
+                Err(e) => Err(ClientError::Io(e)),
+            }
+        }
+        Some(dv) => {
+            warn!(
+                daemon_version = dv.version,
+                daemon_sha = dv.git_sha,
+                client_version = CLIENT_VERSION,
+                client_sha = CLIENT_GIT_SHA,
+                "Daemon version mismatch — restarting daemon"
+            );
+            Ok(Probe::Stale)
+        }
+        None => {
+            warn!("Could not check daemon version — restarting daemon");
+            Ok(Probe::Stale)
+        }
     }
 }
 
-/// Wait for the old daemon to exit by polling the socket until it disconnects.
-async fn wait_for_daemon_exit(socket_path: &Path) {
-    for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if probe_socket(socket_path).await.is_err() {
-            return;
+/// Under the start lock: the daemon serving `socket`, or `None` once nothing
+/// owns it and a new one may start.
+///
+/// A daemon that stopped serving owns its socket until it exits: it drains its
+/// panes first, and holds the instance lock until it has. One whose socket was
+/// unlinked rebinds it, and is found by the next probe.
+async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> {
+    let lock_path = daemon::instance_lock_path_for(socket)?;
+    let mut deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+    let mut stops = 0;
+    loop {
+        match probe_daemon(socket).await? {
+            Probe::Current(stream) => return Ok(Some(stream)),
+            Probe::Unresponsive => {
+                return Err(ClientError::DaemonUnresponsive(
+                    holder(socket),
+                    socket.to_path_buf(),
+                ));
+            }
+            Probe::Stale if stops == MAX_STALE_STOPS => {
+                return Err(ClientError::StaleDaemonsKeepStarting);
+            }
+            Probe::Stale => {
+                stops += 1;
+                stop_stale_daemon(socket).await?;
+                deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+                continue;
+            }
+            Probe::Absent => {
+                if daemon::try_lock_file(&lock_path)?.is_some() {
+                    return Ok(None);
+                }
+            }
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ClientError::DaemonNotServing(holder(socket)));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Force cleanup if daemon didn't exit
-    let _ = daemon::remove_socket_file_for(socket_path);
-    let _ = daemon::remove_pid_file_for(socket_path);
+}
+
+/// Take the start lock for `socket`, waiting for any client already holding it.
+///
+/// Polled rather than blocking so a wedged holder costs a bounded wait and a
+/// clear error, not a hung CLI.
+async fn acquire_start_lock(socket: &Path) -> Result<std::fs::File, ClientError> {
+    daemon::ensure_runtime_dir()?;
+    let path = daemon::start_lock_path_for(socket)?;
+    let deadline = tokio::time::Instant::now() + START_LOCK_TIMEOUT;
+    loop {
+        if let Some(lock) = daemon::try_lock_file(&path)? {
+            return Ok(lock);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ClientError::StartLockTimeout(path));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Ensure the daemon is running at the given socket path and return a connected socket.
 ///
-/// 1. Try to connect to the UDS
-/// 2. If connected, verify version matches this binary; if stale, restart
-/// 3. If ConnectionRefused or NotFound, fork the daemon
-/// 4. Retry with exponential backoff until connected or max retries
+/// 1. Try to connect to the UDS; a daemon of this build is used as is
+/// 2. Otherwise take the start lock, so concurrent clients start one daemon
+/// 3. Under the lock, use the daemon another client started, or stop a stale
+///    one and wait until nothing owns the socket
+/// 4. Spawn, and retry with exponential backoff until connected
 pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
-    // First attempt — maybe daemon is already running
-    match probe_socket(socket_path).await {
-        Ok(mut stream) => {
-            debug!("Connected to existing daemon, checking version...");
-
-            if let Some(dv) = check_daemon_version(&mut stream).await {
-                if dv.version == CLIENT_VERSION && dv.git_sha == CLIENT_GIT_SHA {
-                    debug!(
-                        version = CLIENT_VERSION,
-                        git_sha = CLIENT_GIT_SHA,
-                        "Daemon version matches"
-                    );
-                    // Need a fresh connection since we consumed the first one for version check
-                    drop(stream);
-                    return probe_socket(socket_path).await.map_err(ClientError::Io);
-                }
-                warn!(
-                    daemon_version = dv.version,
-                    daemon_sha = dv.git_sha,
-                    client_version = CLIENT_VERSION,
-                    client_sha = CLIENT_GIT_SHA,
-                    "Daemon version mismatch — restarting daemon"
-                );
-            } else {
-                warn!("Could not check daemon version — restarting daemon");
-            }
-
-            // Version mismatch or check failed: kill and restart
-            drop(stream);
-            kill_stale_daemon(socket_path);
-            wait_for_daemon_exit(socket_path).await;
+    match probe_daemon(socket_path).await? {
+        Probe::Current(stream) => return Ok(stream),
+        Probe::Unresponsive => {
+            return Err(ClientError::DaemonUnresponsive(
+                holder(socket_path),
+                socket_path.to_path_buf(),
+            ));
         }
-        Err(e) if is_connection_refused_or_not_found(&e) => {
-            info!("Daemon not running, starting...");
-        }
-        Err(e) => return Err(ClientError::Io(e)),
+        Probe::Stale | Probe::Absent => {}
     }
+
+    // Held until this function returns, i.e. until the daemon it started (or
+    // found) is accepting connections.
+    let _start_lock = acquire_start_lock(socket_path).await?;
+    if let Some(stream) = claim_socket(socket_path).await? {
+        return Ok(stream);
+    }
+    info!("Daemon not running, starting...");
 
     // Spawn the daemon process
     start_daemon_process(socket_path)?;
@@ -225,14 +367,12 @@ fn start_daemon_process(socket_path: &Path) -> Result<(), ClientError> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__daemon");
 
-    // Tell the daemon which socket to serve, explicitly. `--socket` is a
-    // client-side flag and the re-exec carried neither it nor a guarantee that
-    // `SHUX_SOCKET` was set, so the daemon fell back to the default path while
-    // the client went on probing the one it was asked for. The two never met:
-    // the client retried, gave up, and left a perfectly healthy daemon behind
-    // with nothing referencing it — once per invocation, each overwriting the
-    // pidfile so `daemon stop` could only reap the last.
-    cmd.arg("--socket").arg(socket_path);
+    // Tell the daemon which socket to serve, explicitly: `--socket` is a
+    // client-side flag and `SHUX_SOCKET` may be unset. Pass the key, not the
+    // spelling: identity checks on platforms with only a space-joined argv
+    // match it textually, and a relative path would resolve against the cwd
+    // of whoever checks.
+    cmd.arg("--socket").arg(daemon::socket_key(socket_path));
 
     // Detach: don't inherit stdin/stdout/stderr
     cmd.stdin(std::process::Stdio::null());
@@ -255,4 +395,41 @@ fn is_connection_refused_or_not_found(e: &io::Error) -> bool {
         e.kind(),
         io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A daemon that stops serving between the version check and the fresh
+    /// connection is absent, not an I/O error the user is shown.
+    #[tokio::test]
+    async fn a_daemon_gone_after_the_version_check_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let path = socket.clone();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 4];
+            conn.read_exact(&mut len).await.unwrap();
+            let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+            conn.read_exact(&mut req).await.unwrap();
+            // Stop serving before answering, as a departing daemon does.
+            drop(listener);
+            std::fs::remove_file(&path).unwrap();
+            let resp = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "version-check",
+                "result": {"version": CLIENT_VERSION, "git_sha": CLIENT_GIT_SHA},
+            }))
+            .unwrap();
+            conn.write_all(&(resp.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            conn.write_all(&resp).await.unwrap();
+        });
+        assert!(matches!(probe_daemon(&socket).await, Ok(Probe::Absent)));
+        server.await.unwrap();
+    }
 }

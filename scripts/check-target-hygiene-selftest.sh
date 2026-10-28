@@ -29,6 +29,20 @@ stale() { mkdir -p "$(dirname "$1")"; touch -t 202001010000 "$1"; }
 
 die() { echo "✗ target hygiene self-test: $*" >&2; exit 1; }
 
+# Whether a mode bit can stop this user: nothing stops root, so a case built on
+# chmod would pass or fail on the uid, not the guard. Those cases are skipped,
+# by name, wherever this says no.
+probe="${work}/mode-probe"; mkdir -p "${probe}"; chmod 000 "${probe}"
+modes_bind=1; ls "${probe}" >/dev/null 2>&1 && modes_bind=0
+chmod 755 "${probe}"
+skipped=()
+needs_modes() {
+  [[ "${modes_bind}" -eq 1 ]] && return 0
+  echo "note: skipping '$1': mode bits do not stop uid $(id -u)" >&2
+  skipped+=("$1")
+  return 1
+}
+
 # expect pass|fail <name> <root> [diagnostic substring] — runs the read-only check.
 expect() {
   local want="$1" name="$2" root="$3" needle="${4:-}" rc=0 out
@@ -205,10 +219,12 @@ t="${work}/inner-link"; tree "$t"; stale "${work}/hidden/x.rcgu.o"; mkdir -p "$t
 ln -s "${work}/hidden" "$t/target/debug/deps"
 expect fail "a directory symlink inside a target dir" "$t" "is a directory symlink inside a target dir"
 
-t="${work}/unreadable"; tree "$t"; mkdir -p "$t/target/debug/locked"
-stale "$t/target/debug/locked/deps/x.rcgu.o"; chmod 000 "$t/target/debug/locked"
-expect fail "an unreadable dir under target" "$t" "cannot read"
-chmod 755 "$t/target/debug/locked"
+if needs_modes "an unreadable dir under target"; then
+  t="${work}/unreadable"; tree "$t"; mkdir -p "$t/target/debug/locked"
+  stale "$t/target/debug/locked/deps/x.rcgu.o"; chmod 000 "$t/target/debug/locked"
+  expect fail "an unreadable dir under target" "$t" "cannot read"
+  chmod 755 "$t/target/debug/locked"
+fi
 
 # ── --clean ────────────────────────────────────────────────────────────────
 clean() { "${GUARD}" --clean "$@"; }
@@ -237,13 +253,21 @@ done
 [[ -e "$t/src/precious.rs" && -e "${work}/victim/sentinel" ]] \
   || die "--clean deleted inside a configured CARGO_TARGET_DIR"
 
-t="${work}/clean-readonly"; tree "$t"
-stale "$t/target/debug/deps/z.rlib"; chmod 555 "$t/target/debug/deps"
-if clean "$t" >/dev/null 2>&1; then die "--clean reported success on a dir it could not empty"; fi
-chmod 755 "$t/target/debug/deps"
+if needs_modes "--clean on a dir it cannot empty"; then
+  t="${work}/clean-readonly"; tree "$t"
+  stale "$t/target/debug/deps/z.rlib"; chmod 555 "$t/target/debug/deps"
+  if clean "$t" >/dev/null 2>&1; then die "--clean reported success on a dir it could not empty"; fi
+  chmod 755 "$t/target/debug/deps"
+fi
 
-t="${work}/clean-locked"; tree "$t"; mkdir -p "$t/target/secret"; chmod 000 "$t/target"
-if clean "$t" >/dev/null 2>&1; then die "--clean reported success on a target it could not read"; fi
-chmod 755 "$t/target"
+if needs_modes "--clean on a target it cannot read"; then
+  t="${work}/clean-locked"; tree "$t"; mkdir -p "$t/target/secret"; chmod 000 "$t/target"
+  if clean "$t" >/dev/null 2>&1; then die "--clean reported success on a target it could not read"; fi
+  chmod 755 "$t/target"
+fi
 
-echo "✓ target hygiene self-test: every defect caught for the right reason; --clean touches only owned build dirs"
+if [[ "${#skipped[@]}" -gt 0 ]]; then
+  echo "✓ target hygiene self-test: every other defect caught for the right reason; ${#skipped[@]} case(s) skipped, see notes above"
+else
+  echo "✓ target hygiene self-test: every defect caught for the right reason; --clean touches only owned build dirs"
+fi

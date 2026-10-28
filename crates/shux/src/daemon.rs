@@ -26,6 +26,8 @@ pub enum DaemonError {
     Setsid(nix::Error),
     #[error("signal handler registration failed: {0}")]
     Signal(io::Error),
+    #[error("failed to lock {}: {}", .0.display(), .1)]
+    Lock(PathBuf, io::Error),
 }
 
 /// Resolve the runtime directory for shux.
@@ -58,32 +60,147 @@ pub fn runtime_dir() -> Result<PathBuf, DaemonError> {
 /// `DefaultHasher` is explicitly unstable across releases, and a differently
 /// versioned client has to find this file.
 pub fn pid_file_path_for(socket: &Path) -> Result<PathBuf, DaemonError> {
-    let dir = runtime_dir()?;
-    if socket_path().is_ok_and(|default| default == socket) {
-        return Ok(dir.join("shux.pid"));
+    pid_file_for_spelling(&socket_key(socket))
+}
+
+fn pid_file_for_spelling(socket: &Path) -> Result<PathBuf, DaemonError> {
+    Ok(runtime_dir()?.join(format!("shux{}.pid", suffix_for_spelling(socket))))
+}
+
+/// Empty for the default socket, `-<hash>` otherwise.
+fn suffix_for_spelling(socket: &Path) -> String {
+    if socket_path().is_ok_and(|default| socket_key(&default) == socket) {
+        return String::new();
     }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in socket.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    Ok(dir.join(format!("shux-{hash:016x}.pid")))
+    format!("-{hash:016x}")
+}
+
+/// One spelling for every path naming the same socket, so `a//s.sock`,
+/// `a/./s.sock` and a symlinked parent share one pidfile and one pair of locks.
+///
+/// The deepest existing ancestor is canonicalised and the rest normalised
+/// lexically: the socket and its directory may not exist yet, and the key must
+/// not change when they come to.
+pub fn socket_key(socket: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut rest = Vec::new();
+    let mut base = socket;
+    let mut key = loop {
+        let dir = if base.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            base
+        };
+        if let Ok(real) = dir.canonicalize() {
+            break real;
+        }
+        match (base.parent(), base.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last);
+                base = parent;
+            }
+            _ => return socket.to_path_buf(),
+        }
+    };
+    for part in rest.into_iter().rev() {
+        match part {
+            Component::ParentDir => {
+                key.pop();
+            }
+            Component::Normal(name) => key.push(name),
+            _ => {}
+        }
+    }
+    key
+}
+
+/// The socket as the user spelled it, for [`pid_file_candidates`]: the CLI
+/// passes the key everywhere else.
+static TYPED_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the `--socket` / `SHUX_SOCKET` spelling this process was given.
+pub fn remember_typed_socket(typed: &Path) {
+    let _ = TYPED_SOCKET.set(typed.to_path_buf());
+}
+
+/// The spelling [`remember_typed_socket`] recorded, if any.
+pub fn typed_socket() -> Option<&'static Path> {
+    TYPED_SOCKET.get().map(PathBuf::as_path)
 }
 
 /// Pidfile paths to consult for `socket`, most specific first.
 ///
-/// The second is the pre-upgrade location: every shux before this change wrote
-/// `$RUNTIME_DIR/shux.pid` whatever socket it served, so skipping it would orphan
-/// the daemon being replaced at every upgrade. Safe because the caller
-/// identity-checks the pid it finds against the socket that process serves.
+/// The others are where earlier versions wrote: a hash of the socket as typed,
+/// and before that `$RUNTIME_DIR/shux.pid` whatever socket was served. Skipping
+/// them would orphan the daemon being replaced at every upgrade, and such a
+/// daemon holds no instance lock to be found by. Safe because the caller
+/// identity-checks the pid it finds against the socket it serves.
 pub fn pid_file_candidates(socket: &Path) -> Result<Vec<PathBuf>, DaemonError> {
-    let primary = pid_file_path_for(socket)?;
-    let legacy = runtime_dir()?.join("shux.pid");
-    Ok(if primary == legacy {
-        vec![primary]
-    } else {
-        vec![primary, legacy]
-    })
+    let mut candidates = vec![pid_file_path_for(socket)?];
+    let typed = TYPED_SOCKET
+        .get()
+        .filter(|typed| socket_key(typed) == socket_key(socket));
+    let mut older = vec![pid_file_for_spelling(socket)?];
+    if let Some(typed) = typed {
+        older.push(pid_file_for_spelling(typed)?);
+    }
+    older.push(runtime_dir()?.join("shux.pid"));
+    for older in older {
+        if !candidates.contains(&older) {
+            candidates.push(older);
+        }
+    }
+    Ok(candidates)
+}
+
+/// Lock file a live daemon for `socket` holds for its whole lifetime.
+///
+/// Never unlinked: a lock on an unlinked inode excludes nobody, so a daemon
+/// removing it on shutdown would let a successor lock a fresh file while the
+/// predecessor still owns the socket.
+pub fn instance_lock_path_for(socket: &Path) -> Result<PathBuf, DaemonError> {
+    Ok(pid_file_path_for(socket)?.with_extension("lock"))
+}
+
+/// Lock file clients hold while checking for, replacing or starting the daemon
+/// for `socket`. Distinct from the instance lock, which the daemon being
+/// started has to be able to take while its starter still holds this one.
+pub fn start_lock_path_for(socket: &Path) -> Result<PathBuf, DaemonError> {
+    Ok(pid_file_path_for(socket)?.with_extension("start.lock"))
+}
+
+/// Take an exclusive `flock` on `path` without blocking.
+///
+/// `Ok(None)` means another process holds it. The lock lives as long as the
+/// returned file, and std opens it `O_CLOEXEC`, so pane children never inherit
+/// it and outlive the daemon holding it.
+pub fn try_lock_file(path: &Path) -> Result<Option<fs::File>, DaemonError> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let fail = |e| DaemonError::Lock(path.to_path_buf(), e);
+    let file = opts.open(path).map_err(fail)?;
+    // A FIFO or device opens and locks fine, then fails the daemon's pid write.
+    if !file.metadata().map_err(fail)?.is_file() {
+        return Err(fail(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )));
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(fail(e)),
+    }
 }
 
 /// Read a pid from an explicit pidfile path.
@@ -96,11 +213,14 @@ pub fn socket_path() -> Result<PathBuf, DaemonError> {
     Ok(runtime_dir()?.join("shux.sock"))
 }
 
-/// Full path to the attach-session socket: `$RUNTIME_DIR/attach.sock`.
-/// Distinct from the JSON-RPC socket so the attach loop doesn't have to
-/// multiplex protocols on a single connection.
-pub fn attach_socket_path() -> Result<PathBuf, DaemonError> {
-    Ok(runtime_dir()?.join("attach.sock"))
+/// The attach-session socket of the daemon serving `socket`: `attach.sock` for
+/// the default socket, keyed like the pidfile otherwise, so daemons on other
+/// sockets in the same runtime dir do not take it over. Distinct from the
+/// JSON-RPC socket so the attach loop doesn't have to multiplex protocols on a
+/// single connection.
+pub fn attach_socket_path_for(socket: &Path) -> Result<PathBuf, DaemonError> {
+    let suffix = suffix_for_spelling(&socket_key(socket));
+    Ok(runtime_dir()?.join(format!("attach{suffix}.sock")))
 }
 
 /// Ensure the runtime directory exists with mode 0700.
@@ -187,9 +307,13 @@ pub fn write_pid_file(socket: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-/// Remove the PID file (called on shutdown).
-pub fn remove_pid_file_for(socket: &Path) -> Result<(), DaemonError> {
+/// Remove the PID file on shutdown, if it still names this process: a daemon of
+/// another build may have started on the socket since and written its own.
+pub fn remove_own_pid_file_for(socket: &Path) -> Result<(), DaemonError> {
     let path = pid_file_path_for(socket)?;
+    if read_pid_at(&path) != Some(std::process::id()) {
+        return Ok(());
+    }
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -197,12 +321,56 @@ pub fn remove_pid_file_for(socket: &Path) -> Result<(), DaemonError> {
     }
 }
 
-/// Remove the socket file (called before binding and on shutdown).
-pub fn remove_socket_file_for(socket: &Path) -> Result<(), DaemonError> {
-    match fs::remove_file(socket) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(DaemonError::RemovePidFile(e)),
+/// Whether this daemon still holds the instance lock at its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Custody {
+    Held,
+    /// Another process holds the lock now: it serves the socket, not us.
+    Lost,
+    /// Could not tell, e.g. the runtime dir cannot be recreated safely.
+    Unknown,
+}
+
+/// The instance lock a daemon holds for its lifetime.
+///
+/// A lock on an unlinked file excludes nobody: when the runtime dir or the lock
+/// file is deleted, a client sees no lock and starts a second daemon. So the
+/// path is re-checked, and a missing file is recreated, locked and repopulated.
+pub struct InstanceLock {
+    socket: PathBuf,
+    file: std::sync::Mutex<fs::File>,
+}
+
+impl InstanceLock {
+    pub fn check(&self) -> Custody {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(path) = instance_lock_path_for(&self.socket) else {
+            return Custody::Unknown;
+        };
+        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let id = |m: fs::Metadata| (m.dev(), m.ino());
+        if let (Ok(at_path), Ok(held)) = (fs::symlink_metadata(&path), file.metadata())
+            && id(at_path) == id(held)
+        {
+            return Custody::Held;
+        }
+        if ensure_runtime_dir().is_err() {
+            return Custody::Unknown;
+        }
+        match try_lock_file(&path) {
+            Ok(Some(mut fresh)) => {
+                use std::io::Write;
+                if write!(fresh, "{}", std::process::id()).is_err() {
+                    return Custody::Unknown;
+                }
+                *file = fresh;
+                let _ = write_pid_file(&self.socket);
+                tracing::warn!(lock = %path.display(), "instance lock was deleted; took it again");
+                Custody::Held
+            }
+            Ok(None) => Custody::Lost,
+            Err(_) => Custody::Unknown,
+        }
     }
 }
 
@@ -217,17 +385,20 @@ pub fn remove_socket_file_for(socket: &Path) -> Result<(), DaemonError> {
 /// 3. Second fork: session leader exits, grandchild continues
 ///    (grandchild cannot accidentally acquire a controlling terminal)
 /// 4. Redirect stdin/stdout/stderr to /dev/null
-/// 5. Write PID file
+/// 5. Take the instance lock and record our pid in it
+/// 6. Write PID file
 ///
-/// Returns `Ok(true)` in the daemon process, `Ok(false)` in the original parent.
-pub fn daemonize(socket: &Path) -> Result<bool, DaemonError> {
+/// Returns the instance lock in the daemon, and `None` in every other process:
+/// the original parent, and a daemon that found one already running for
+/// `socket`. Dropping the lock releases the socket to a successor.
+pub fn daemonize(socket: &Path) -> Result<Option<InstanceLock>, DaemonError> {
     use nix::unistd::{ForkResult, fork, setsid};
 
     // SAFETY: This is called before any tokio runtime is created, so the process
     // is single-threaded. fork() is safe in single-threaded processes.
     match unsafe { fork() }.map_err(DaemonError::Fork)? {
         ForkResult::Parent { .. } => {
-            return Ok(false);
+            return Ok(None);
         }
         ForkResult::Child => {}
     }
@@ -248,11 +419,27 @@ pub fn daemonize(socket: &Path) -> Result<bool, DaemonError> {
     // Redirect stdio to /dev/null
     redirect_stdio_to_devnull();
 
-    // Ensure runtime dir exists and write PID file
     ensure_runtime_dir()?;
+    // Both checks come before anything that names this process as the daemon:
+    // a loser that wrote the pidfile or unlinked the socket would strand the
+    // winner. The connect probe covers a daemon that predates the lock.
+    let Some(mut lock) = try_lock_file(&instance_lock_path_for(socket)?)? else {
+        return Ok(None);
+    };
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        return Ok(None);
+    }
+    {
+        use std::io::Write;
+        lock.set_len(0).map_err(DaemonError::PidFile)?;
+        write!(lock, "{}", std::process::id()).map_err(DaemonError::PidFile)?;
+    }
     write_pid_file(socket)?;
 
-    Ok(true)
+    Ok(Some(InstanceLock {
+        socket: socket.to_path_buf(),
+        file: std::sync::Mutex::new(lock),
+    }))
 }
 
 /// Redirect stdin, stdout, stderr to /dev/null.
@@ -491,9 +678,15 @@ mod tests {
         let pid = read_pid_at(&pid_file_path_for(&sock).unwrap());
         assert_eq!(pid, Some(std::process::id()));
 
-        remove_pid_file_for(&sock).unwrap();
+        remove_own_pid_file_for(&sock).unwrap();
         let pid = read_pid_at(&pid_file_path_for(&sock).unwrap());
         assert!(pid.is_none());
+
+        // A pidfile a successor wrote is left in place.
+        let path = pid_file_path_for(&sock).unwrap();
+        fs::write(&path, "1").unwrap();
+        remove_own_pid_file_for(&sock).unwrap();
+        assert_eq!(read_pid_at(&path), Some(1));
 
         unsafe { restore_xdg_runtime_dir(original) };
     }
@@ -540,6 +733,116 @@ mod tests {
     }
 
     #[test]
+    fn a_held_lock_file_excludes_a_second_holder_until_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("shux.lock");
+
+        let first = try_lock_file(&path).unwrap().expect("uncontended lock");
+        assert!(
+            try_lock_file(&path).unwrap().is_none(),
+            "a second open of a held lock must be refused"
+        );
+        drop(first);
+        assert!(
+            try_lock_file(&path).unwrap().is_some(),
+            "dropping the holder must release the lock"
+        );
+    }
+
+    #[test]
+    fn lock_files_are_private_and_refuse_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("shux.lock");
+        drop(try_lock_file(&path).unwrap());
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "lock file mode {mode:o}");
+
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"KEEP ME").unwrap();
+        let link = tmp.path().join("linked.lock");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(try_lock_file(&link).is_err(), "followed a planted symlink");
+        assert_eq!(fs::read(&victim).unwrap(), b"KEEP ME");
+    }
+
+    #[test]
+    fn a_lock_file_that_is_not_a_regular_file_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("shux.lock");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let err = try_lock_file(&fifo).expect_err("a FIFO must not pass as a lock file");
+        assert!(
+            err.to_string().contains(&fifo.display().to_string()),
+            "the error must name the file: {err}"
+        );
+    }
+
+    #[test]
+    fn every_spelling_of_a_socket_shares_one_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let want = real.canonicalize().unwrap().join("a.sock");
+
+        for spelling in [
+            real.join("a.sock"),
+            PathBuf::from(format!("{}//a.sock", real.display())),
+            real.join(".").join("a.sock"),
+            real.join("x").join("..").join("a.sock"),
+            link.join("a.sock"),
+        ] {
+            assert_eq!(socket_key(&spelling), want, "{}", spelling.display());
+        }
+        // A directory that does not exist yet keys the same before and after.
+        let later = real.join("later").join("a.sock");
+        let before = socket_key(&later);
+        fs::create_dir(real.join("later")).unwrap();
+        assert_eq!(before, socket_key(&later));
+        assert_eq!(socket_key(&link.join("later").join("a.sock")), before);
+        // Relative to the working directory, as the socket itself is.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(socket_key(Path::new("rel.sock")), cwd.join("rel.sock"));
+    }
+
+    #[test]
+    fn lock_paths_are_keyed_to_the_socket() {
+        let _guard = env_lock().lock().unwrap();
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let original = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: Guarded by ENV_LOCK and restored before releasing it.
+        unsafe { set_xdg_runtime_dir(tmpdir.path()) };
+
+        let default_sock = socket_path().unwrap();
+        let other = Path::new("/run/x/one.sock");
+        let dir = runtime_dir().unwrap();
+        assert_eq!(
+            instance_lock_path_for(&default_sock).unwrap(),
+            dir.join("shux.lock")
+        );
+        assert_eq!(
+            start_lock_path_for(&default_sock).unwrap(),
+            dir.join("shux.start.lock")
+        );
+        assert_eq!(
+            instance_lock_path_for(other).unwrap(),
+            dir.join("shux-36a9fb754e91bc3b.lock")
+        );
+        assert_eq!(
+            attach_socket_path_for(&default_sock).unwrap(),
+            dir.join("attach.sock")
+        );
+        assert_eq!(
+            attach_socket_path_for(other).unwrap(),
+            dir.join("attach-36a9fb754e91bc3b.sock")
+        );
+
+        unsafe { restore_xdg_runtime_dir(original) };
+    }
+
+    #[test]
     fn test_remove_nonexistent_pid_file_is_ok() {
         let _guard = env_lock().lock().unwrap();
         let tmpdir = tempfile::TempDir::new().unwrap();
@@ -548,21 +851,29 @@ mod tests {
         unsafe { set_xdg_runtime_dir(tmpdir.path()) };
 
         ensure_runtime_dir().unwrap();
-        remove_pid_file_for(&socket_path().unwrap()).unwrap();
+        remove_own_pid_file_for(&socket_path().unwrap()).unwrap();
 
         unsafe { restore_xdg_runtime_dir(original) };
     }
 
-    #[test]
-    fn test_remove_nonexistent_socket_file_is_ok() {
+    /// Startup binds over a missing socket file, replaces a stale one, and
+    /// never replaces one that is still served.
+    #[tokio::test]
+    async fn test_remove_nonexistent_socket_file_is_ok() {
         let tmpdir = tempfile::TempDir::new().unwrap();
-        let original = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: See above
-        unsafe { set_xdg_runtime_dir(tmpdir.path()) };
-
-        ensure_runtime_dir().unwrap();
-        remove_socket_file_for(&socket_path().unwrap()).unwrap();
-
-        unsafe { restore_xdg_runtime_dir(original) };
+        let path = tmpdir.path().join("shux.sock");
+        let served = shux_rpc::uds::OwnedSocket::bind(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        let again = shux_rpc::uds::OwnedSocket::bind(&path);
+        assert_eq!(
+            again.err().map(|e| e.kind()),
+            Some(io::ErrorKind::AddrInUse)
+        );
+        drop(served);
+        assert!(!path.exists(), "dropping the listener removes its own file");
+        std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // A stale file nobody serves is replaced.
+        let _rebound = shux_rpc::uds::OwnedSocket::bind(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
     }
 }

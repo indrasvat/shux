@@ -21,12 +21,16 @@ trap cleanup EXIT
 
 die() { echo "✗ run-bounded self-test: $*" >&2; exit 1; }
 
+# A zombie is dead: it was killed and only waits for its new parent to reap it,
+# which init in a container may do long after this looks.
 gone() {
-  local pid
+  local pid state
   pid="$(cat "$1")"
   [[ -n "${pid}" ]] || die "$2: the fixture never recorded its pid"
   sleep 0.3
-  ! kill -0 "${pid}" 2>/dev/null || die "$2: process ${pid} outlived the deadline"
+  kill -0 "${pid}" 2>/dev/null || return 0
+  state="$(ps -o stat= -p "${pid}" 2>/dev/null | tr -d '[:space:]')"
+  [[ -z "${state}" || "${state}" == Z* ]] || die "$2: process ${pid} outlived the deadline"
 }
 
 # capture.py <seconds> <stdout-file> <stderr-file> <command...>
