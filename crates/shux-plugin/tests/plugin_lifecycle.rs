@@ -1052,14 +1052,6 @@ fn save_script(path: &std::path::Path, body: &str) {
     std::fs::rename(&tmp, path).unwrap();
 }
 
-async fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
-    shux_testkit::poll_until_async(budget, || {
-        let held = done();
-        async move { held }
-    })
-    .await
-}
-
 /// A polite plugin named `name` that appends a line to `starts` each time it
 /// hands shake.
 fn counting_plugin(name: &str, starts: &std::path::Path) -> String {
@@ -1414,46 +1406,55 @@ done
 async fn a_kill_mid_frame_still_delivers_shutdown_on_its_own_line() {
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("stdin.log");
-    // `cat` drains the pipe in large reads; a shell `read` loop takes a
-    // syscall per byte and can outlast the grace on a slow machine. No
-    // `exec`: the shell keeps stdout open, which the host reads as alive.
+    let parked = tmp.path().join("parked");
+    let held = gate(tmp.path(), "gate");
+    // Reads one byte of a frame that outsizes any pipe buffer, so the I/O
+    // task is parked mid-write, and drains stdin only once the test has
+    // killed it. `<&0`: a background job's stdin is otherwise /dev/null.
+    // Exiting once the shutdown line is in ends the grace.
     let body = format!(
         r#"#!/usr/bin/env bash
 IFS= read -r _ || exit 1
 printf '%s\n' '{{"jsonrpc":"2.0","id":"init","result":{{"name":"torn","version":"0.1.0","subscribes":["session.created"],"provides":[],"capabilities":[]}}}}'
-sleep 1.5
-cat > {log}
+IFS= read -r -n 1 _
+: > {parked}
+IFS= read -r _ < {held}
+cat <&0 > {log} &
+until grep -q '^{{"jsonrpc":"2.0","method":"plugin.shutdown"' {log}; do sleep 0.05; done
+kill $!
 "#,
+        parked = parked.display(),
+        held = held.display(),
         log = log.display()
     );
     let script = write_script(tmp.path(), "torn.sh", &body);
     let bus = EventBus::new();
-    let mgr = PluginManager::with_state_root(bus.clone(), tmp.path().join("state"));
+    let mgr = PluginManager::with_state_root(bus.clone(), tmp.path().join("state"))
+        .with_shutdown_grace(Duration::from_secs(3_600));
     mgr.install(PluginSource::from_path(&script))
         .await
         .expect("install");
-    // Frames larger than PIPE_BUF are written in pieces, so the full pipe
-    // parks the writer part-way through one.
-    for _ in 0..40 {
-        bus.publish(shux_core::event::EventData::SessionCreated {
-            session_id: shux_core::model::SessionId::new(),
-            name: "x".repeat(10_000),
-        });
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    bus.publish(shux_core::event::EventData::SessionCreated {
+        session_id: shux_core::model::SessionId::new(),
+        name: "x".repeat(1 << 20),
+    });
+    wait_for_path(&parked).await;
+    // The kill is signalled before the plugin reads another byte, and the
+    // frame write polls the kill first, so the frame is cut, not finished.
     mgr.kill("torn").await.expect("kill");
+    open_gate(&held).await;
+    assert!(
+        tokio::time::timeout(BUDGET, mgr.shutdown()).await.is_ok(),
+        "the plugin never exited after reading plugin.shutdown"
+    );
+    let got = std::fs::read_to_string(&log).unwrap_or_default();
     let shutdown = r#"{"jsonrpc":"2.0","method":"plugin.shutdown""#;
-    let read = || std::fs::read_to_string(&log).unwrap_or_default();
-    let own_line = |s: &str| s.lines().any(|l| l.starts_with(shutdown));
-    wait_until(Duration::from_secs(5), || own_line(&read())).await;
-    mgr.shutdown().await;
-    let got = read();
     assert!(
         got.contains("plugin.shutdown"),
         "plugin.shutdown never arrived"
     );
     assert!(
-        own_line(&got),
+        got.lines().any(|l| l.starts_with(shutdown)),
         "plugin.shutdown arrived glued to a torn frame"
     );
 }
