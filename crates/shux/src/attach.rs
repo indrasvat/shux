@@ -634,7 +634,11 @@ async fn run_attach_loop(
         loop {
             tokio::select! {
                 _ = writer_cancel.cancelled() => break,
-                Some(frame) = out_rx.recv() => {
+                // Matched inside the arm, not in its pattern: a pattern that
+                // refuses `None` disables the arm and leaves `cancelled()`
+                // pending forever, so the writer never ends on its own.
+                frame = out_rx.recv() => {
+                    let Some(frame) = frame else { break };
                     let bytes = match serde_json::to_vec(&frame) {
                         Ok(b) => b,
                         Err(e) => {
@@ -647,7 +651,6 @@ async fn run_attach_loop(
                         break;
                     }
                 }
-                else => break,
             }
         }
     });
@@ -1170,10 +1173,15 @@ async fn run_attach_loop(
     // of the pane's life — visible next time anyone attaches.
     release_app_gesture(&io_state, &mut selection_drag).await;
 
-    drop(out_tx); // closes the writer cleanly
-    let _ = writer.await;
+    // Stop every other holder of `out_tx` first: the writer drains what is
+    // queued (the final DetachAck / SessionEnded) and ends only once the last
+    // sender is gone, which is what hangs up on the client.
     renderer.abort();
     pinger.abort();
+    let _ = renderer.await;
+    let _ = pinger.await;
+    drop(out_tx);
+    let _ = writer.await;
     info!(session = %session.name, "attach session ended");
     Ok(())
 }
@@ -3388,7 +3396,7 @@ async fn kill_pane(
     // clients that want pinned semantics); the human-interactive
     // Ctrl+Space x action cascades so the user can always kill what's
     // in front of them. When the cascade reaches destroy_session, the
-    // attach render loop notices the session is gone on its next tick
+    // attach frame loop notices the session is gone on its next tick
     // and sends SessionEnded — the client detaches naturally.
     match graph.destroy_pane(pane_id, None).await {
         Ok(()) => {

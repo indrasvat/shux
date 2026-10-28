@@ -14,9 +14,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::{LocalFlags, Termios, tcgetattr};
 use nix::unistd::Pid;
+use shux_rpc::attach::{
+    ATTACH_PROTOCOL_VERSION, AttachClientFrame, AttachHello, AttachReady, AttachServerFrame,
+};
+use tokio::net::UnixStream;
+use tokio_util::codec::Framed;
 
 struct Harness {
     bin: PathBuf,
@@ -36,7 +45,11 @@ impl Harness {
     }
 
     fn create_session(&self, name: &str) {
-        let params = serde_json::json!({ "name": name, "command": workload() });
+        self.create_session_running(name, &workload());
+    }
+
+    fn create_session_running(&self, name: &str, command: &str) {
+        let params = serde_json::json!({ "name": name, "command": command });
         let out = Command::new(&self.bin)
             .env("XDG_RUNTIME_DIR", self.runtime_dir())
             .env("SHELL", "/bin/sh")
@@ -48,6 +61,20 @@ impl Harness {
         assert!(
             out.status.success(),
             "session.create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn send_keys(&self, session: &str, text: &str) {
+        let out = Command::new(&self.bin)
+            .env("XDG_RUNTIME_DIR", self.runtime_dir())
+            .env_remove("SHUX")
+            .args(["pane", "send-keys", "-s", session, "--text", text])
+            .output()
+            .expect("spawn shux pane send-keys");
+        assert!(
+            out.status.success(),
+            "send-keys failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -90,6 +117,12 @@ impl Drop for Harness {
 fn workload() -> String {
     "printf '\\033[38;2;120;220;180mTRUECOLOR\\033[0m \\033[38;5;208mINDEXED\\033[0m \
      \\033[34mBASIC\\033[0m\\n'; while :; do sleep 3600; done"
+        .to_string()
+}
+
+/// The same three colours on every line, as fast as the shell can print.
+fn flood_workload() -> String {
+    "i=0; while :; do i=$((i+1)); printf '\\033[38;2;120;220;180mT\\033[38;5;208mI\\033[34mB\\033[0m flood %d\\n' \"$i\"; done"
         .to_string()
 }
 
@@ -183,7 +216,11 @@ impl AttachedClient {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             self.pump();
-            if find(&self.seen, b"38;2;120;220;180") && find(&self.seen, b"38;5;208") {
+            // The compositor re-encodes the basic SGR 34 as palette slot 4.
+            if [&b"38;2;120;220;180"[..], b"38;5;208", b"38;5;4m"]
+                .iter()
+                .all(|probe| find(&self.seen, probe))
+            {
                 return;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
@@ -198,6 +235,18 @@ impl AttachedClient {
             "attach never drew the pane: {:?}",
             String::from_utf8_lossy(&self.seen)
         );
+    }
+
+    /// Wait for exit without reading the PTY, as a terminal that hung would.
+    fn wait_for_exit_unread(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        None
     }
 
     fn wait_for_exit(&mut self) -> std::process::ExitStatus {
@@ -229,10 +278,6 @@ fn find(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).rposition(|w| w == needle)
-}
-
 fn assert_signal_restores_terminal(sig: Signal) {
     let h = Harness::new();
     let session = format!("sig-{}", sig.as_str().to_ascii_lowercase());
@@ -256,11 +301,6 @@ fn assert_signal_restores_terminal(sig: Signal) {
         "precondition: the client is not in raw mode, so this test proves nothing: {:?}",
         raw.local_flags
     );
-    let text = String::from_utf8_lossy(&client.seen).into_owned();
-    assert!(text.contains("38;2;120;220;180"), "truecolor probe missing");
-    assert!(text.contains("38;5;208"), "indexed probe missing");
-    // The compositor re-encodes SGR 34 as palette slot 4.
-    assert!(text.contains("38;5;4m"), "basic colour probe missing");
     let drawn = client.seen.len();
 
     kill(Pid::from_raw(client.child.id() as i32), sig).expect("signal attach");
@@ -283,7 +323,7 @@ fn assert_signal_restores_terminal(sig: Signal) {
 
     let tail = &client.seen[drawn..];
     assert!(
-        rfind(tail, b"\x1b[?1049l").is_some(),
+        find(tail, b"\x1b[?1049l"),
         "{sig}: never left the alternate screen after the signal: {:?}",
         String::from_utf8_lossy(tail)
     );
@@ -342,5 +382,135 @@ fn a_killed_session_ends_the_client_and_restores_the_terminal() {
     assert!(
         text.contains("[session 'sig-session-kill' ended]"),
         "the client never said why it left: {text:?}"
+    );
+}
+
+/// Connect a headless client and read until the pane's colours arrive.
+async fn headless_attach(
+    h: &Harness,
+    session: &str,
+) -> Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec> {
+    let sock = h.runtime_dir().join("shux").join("attach.sock");
+    let stream = UnixStream::connect(&sock).await.expect("connect attach");
+    let mut framed = Framed::new(stream, shux_rpc::create_codec());
+    let hello = AttachHello {
+        protocol: ATTACH_PROTOCOL_VERSION,
+        session_name: Some(session.to_string()),
+        cols: 100,
+        rows: 30,
+        client_version: "attach-teardown-test".to_string(),
+        graphics: false,
+    };
+    framed
+        .send(Bytes::from(serde_json::to_vec(&hello).unwrap()))
+        .await
+        .expect("send hello");
+    let ready = framed.next().await.expect("ready").expect("ready bytes");
+    assert!(
+        matches!(
+            serde_json::from_slice::<AttachReady>(&ready).expect("parse ready"),
+            AttachReady::Ok { .. }
+        ),
+        "attach denied"
+    );
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !(find(&seen, b"38;2;120;220;180") && find(&seen, b"38;5;208") && find(&seen, b"38;5;4m"))
+    {
+        assert!(tokio::time::Instant::now() < deadline, "pane never drawn");
+        let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(2), framed.next()).await
+        else {
+            continue;
+        };
+        if let Ok(AttachServerFrame::Render { data }) = serde_json::from_slice(&frame) {
+            seen.extend(BASE64.decode(&data).expect("render base64"));
+        }
+    }
+    framed
+}
+
+/// After the frame that ends an attach, the daemon sends nothing more and
+/// hangs up, rather than rendering into a socket nobody is reading.
+async fn assert_hung_up_after(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    is_last: fn(&AttachServerFrame) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = tokio::time::timeout_at(deadline, framed.next())
+            .await
+            .expect("no final frame within 5s");
+        let parsed: AttachServerFrame =
+            serde_json::from_slice(&frame.expect("closed before the final frame").unwrap())
+                .expect("parse frame");
+        if is_last(&parsed) {
+            break;
+        }
+    }
+    let after = tokio::time::timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("daemon kept the socket open 2s after the final frame");
+    assert!(
+        after.is_none(),
+        "daemon sent a frame after the final one: {:?}",
+        after.map(|r| r.map(|b| String::from_utf8_lossy(&b).into_owned()))
+    );
+}
+
+#[tokio::test]
+async fn a_detached_client_is_sent_nothing_more_and_hung_up_on() {
+    let h = Harness::new();
+    h.create_session("teardown-detach");
+    let mut framed = headless_attach(&h, "teardown-detach").await;
+    framed
+        .send(Bytes::from(
+            serde_json::to_vec(&AttachClientFrame::Detach).unwrap(),
+        ))
+        .await
+        .expect("send detach");
+    // Pane output after the detach must not be rendered to this client.
+    h.send_keys("teardown-detach", "echo AFTER\r");
+    assert_hung_up_after(&mut framed, |f| matches!(f, AttachServerFrame::DetachAck)).await;
+}
+
+#[tokio::test]
+async fn a_client_whose_session_ends_is_hung_up_on() {
+    let h = Harness::new();
+    h.create_session("teardown-ended");
+    let mut framed = headless_attach(&h, "teardown-ended").await;
+    h.kill_session("teardown-ended");
+    assert_hung_up_after(&mut framed, |f| {
+        matches!(f, AttachServerFrame::SessionEnded { .. })
+    })
+    .await;
+}
+
+/// A terminal that stops reading (a stalled ssh, a hung emulator) leaves the
+/// client blocked mid-write. A signal must still end it and restore the modes:
+/// that is exactly when someone reaches for `kill`.
+#[test]
+fn a_signal_ends_a_client_whose_terminal_stopped_reading() {
+    let h = Harness::new();
+    h.create_session_running("sig-stalled", &flood_workload());
+    let mut client = AttachedClient::spawn(&h, "sig-stalled");
+    let before = client.initial.clone();
+    client.wait_until_drawing();
+
+    // Stop reading and let the client's output back up behind the PTY.
+    std::thread::sleep(Duration::from_secs(3));
+    kill(Pid::from_raw(client.child.id() as i32), Signal::SIGTERM).expect("signal attach");
+    let status = client.wait_for_exit_unread(Duration::from_secs(5));
+    let after = client.termios();
+    client.pump();
+
+    let status = status.expect("a client blocked on its terminal ignored SIGTERM for 5s");
+    assert_eq!(
+        after.local_flags, before.local_flags,
+        "local flags not restored while the terminal was not reading"
+    );
+    assert_eq!(
+        status.signal(),
+        Some(Signal::SIGTERM as i32),
+        "got {status}"
     );
 }

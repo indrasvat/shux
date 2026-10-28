@@ -566,7 +566,6 @@ mod tests {
             ExitReason::SessionEnded,
             ExitReason::ConnectionLost,
             ExitReason::Error("test".to_string()),
-            ExitReason::Signal(15),
         ];
         for reason in reasons {
             let _ = format!("{reason:?}");
