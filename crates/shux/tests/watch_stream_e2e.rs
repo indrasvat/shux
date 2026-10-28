@@ -8,7 +8,7 @@
 //! inside the 10 s the tests allow.
 
 use std::io::Read;
-use std::process::{Child, ChildStdout, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -44,7 +44,7 @@ impl Watcher {
     /// on it with a timeout instead of blocking in `read`. Dropping the
     /// receiver closes the pipe at the next chunk.
     fn output(&mut self) -> mpsc::Receiver<Vec<u8>> {
-        let mut stdout: ChildStdout = self.0.stdout.take().expect("stdout");
+        let mut stdout = self.0.stdout.take().expect("stdout");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];

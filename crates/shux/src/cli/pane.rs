@@ -503,8 +503,7 @@ pub async fn handle_pane_watch(
         let mut params = serde_json::json!({
             "pane_id": pane_id,
             "timeout_ms": timeout_ms,
-            // 50 chunks per poll is plenty given the 10/s/pane source
-            // rate; smaller bounds just mean more RPC round-trips.
+            // A cap: the daemon answers as soon as it has a chunk.
             "limit": 50,
         });
         if let Some(s) = next_seq {
