@@ -223,11 +223,15 @@ impl EventBus {
     /// transaction (e.g. a `state.apply` call). Subscribers can group events
     /// by correlation_id to attribute a burst to a specific apply.
     pub fn publish_with_correlation(&self, data: EventData, correlation_id: Option<String>) -> u64 {
-        let seq = self.inner.seq_counter.fetch_add(1, Ordering::Relaxed);
         // Use the full (namespaced) form so PluginEvent variants land
         // under `plugin.<id>.<type>` and can be filtered per-plugin.
         let event_type = data.full_event_type();
 
+        // Seq assignment, the history push and the broadcast happen under one
+        // lock, so every reader sees seqs in order: whoever has seen seq N can
+        // already see every lower one.
+        let mut history = self.inner.history.write().expect("history lock poisoned");
+        let seq = self.inner.seq_counter.fetch_add(1, Ordering::Relaxed);
         let event = Event {
             meta: EventMetadata {
                 seq,
@@ -238,14 +242,12 @@ impl EventBus {
             data,
         };
 
-        // Record in history.
-        {
-            let mut history = self.inner.history.write().expect("history lock poisoned");
-            history.push(event.clone());
-        }
+        history.push(event.clone());
+        let sent = self.inner.sender.send(event);
+        drop(history);
 
-        // Broadcast to subscribers. If no receivers, that's fine.
-        match self.inner.sender.send(event) {
+        // No receivers is fine: the event is still in history.
+        match sent {
             Ok(n) => {
                 debug!(seq, receivers = n, "event published");
             }
@@ -304,7 +306,11 @@ impl EventBus {
     }
 
     /// Get the current sequence number (the next event will get this value).
+    ///
+    /// Read under the history lock, so every lower seq is already in history
+    /// and broadcast.
     pub fn current_seq(&self) -> u64 {
+        let _history = self.inner.history.read().expect("history lock poisoned");
         self.inner.seq_counter.load(Ordering::Relaxed)
     }
 
@@ -1091,5 +1097,56 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// Seqs reach history and subscribers in order however many threads
+    /// publish at once. A reader that has seen seq N relies on every lower seq
+    /// already being visible; `events.watch` paging loses events otherwise.
+    #[test]
+    fn concurrent_publishers_deliver_seqs_in_order() {
+        const THREADS: usize = 4;
+        const PER: usize = 5_000;
+        let bus = EventBus::with_config(EventBusConfig {
+            broadcast_capacity: THREADS * PER,
+            history_capacity: THREADS * PER,
+            ..EventBusConfig::default()
+        });
+        let mut sub = bus.subscribe();
+        let publishers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let bus = bus.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER {
+                        bus.publish(session_created(&format!("{t}-{i}")));
+                    }
+                })
+            })
+            .collect();
+        for p in publishers {
+            p.join().unwrap();
+        }
+        let history: Vec<u64> = bus
+            .history(THREADS * PER)
+            .iter()
+            .map(|e| e.meta.seq)
+            .collect();
+        let inversions = history.windows(2).filter(|w| w[0] >= w[1]).count();
+        assert_eq!(inversions, 0, "history out of seq order");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let received: Vec<u64> = rt.block_on(async {
+            let mut out = Vec::with_capacity(THREADS * PER);
+            while out.len() < THREADS * PER {
+                match sub.recv().await {
+                    Some(SubscriptionEvent::Event(e)) => out.push(e.meta.seq),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            out
+        });
+        let inversions = received.windows(2).filter(|w| w[0] >= w[1]).count();
+        assert_eq!(inversions, 0, "subscriber saw seqs out of order");
     }
 }

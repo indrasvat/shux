@@ -156,6 +156,9 @@ pub(crate) fn register_events_methods(
                     // 1. Subscribe FIRST so any publish during step 2 lands in the
                     //    receiver buffer, not the void.
                     let mut sub = bus.subscribe_filtered(filters.clone());
+                    // Every event from here on reaches `sub`, so this is where an
+                    // empty result resumes.
+                    let head = bus.current_seq();
 
                     // 2. Snapshot history from from_seq.
                     let (history, gap) = match from_seq {
@@ -219,7 +222,7 @@ pub(crate) fn register_events_methods(
                         .last()
                         .map(|e| e.meta.seq + 1)
                         .or(from_seq)
-                        .unwrap_or_else(|| bus.current_seq());
+                        .unwrap_or(head);
 
                     let events: Vec<serde_json::Value> =
                         collected.iter().map(event_to_json).collect();
@@ -697,5 +700,90 @@ mod tests {
             "held a chunk for {elapsed:?} waiting for more"
         );
         harness.stop().await;
+    }
+
+    /// Paging with `from_seq = next_seq` while two threads publish at once
+    /// delivers every event exactly once and never one below `from_seq`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn paging_under_concurrent_publishers_loses_and_duplicates_nothing() {
+        const PER: u64 = 2_500;
+        for round in 0..3 {
+            let harness = RpcHarness::new();
+            let start = harness.bus.current_seq();
+            let publishers: Vec<_> = (0..3)
+                .map(|t| {
+                    let bus = harness.bus.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..PER {
+                            bus.publish(shux_core::event::EventData::PluginEvent {
+                                plugin_id: "t".to_string(),
+                                event_type: "tick".to_string(),
+                                data: serde_json::json!({ "t": t, "i": i }),
+                            });
+                        }
+                    })
+                })
+                .collect();
+            // Other watchers snapshot history concurrently, as real pagers do.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (bus, stop) = (harness.bus.clone(), stop.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::hint::black_box(bus.events_from_seq(start));
+                        }
+                    })
+                })
+                .collect();
+            let (mut seq, mut seen, mut below, mut idle) = (start, Vec::new(), Vec::new(), 0);
+            loop {
+                let r = dispatch_ok(
+                    &harness.router,
+                    "events.watch",
+                    serde_json::json!({"from_seq": seq, "filter": ["plugin.t."], "timeout_ms": 50}),
+                )
+                .await;
+                let events = r["events"].as_array().unwrap();
+                for e in events {
+                    let s = e["seq"].as_u64().unwrap();
+                    if s < seq {
+                        below.push((s, seq));
+                    }
+                    seen.push(s);
+                }
+                seq = r["next_seq"].as_u64().unwrap();
+                if !events.is_empty() {
+                    idle = 0;
+                } else if publishers.iter().all(|p| p.is_finished()) {
+                    idle += 1;
+                    if idle >= 2 {
+                        break;
+                    }
+                }
+            }
+            for p in publishers {
+                p.join().unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for r in readers {
+                r.join().unwrap();
+            }
+            let mut unique = seen.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            let missing: Vec<u64> = (start..start + 3 * PER)
+                .filter(|s| unique.binary_search(s).is_err())
+                .collect();
+            assert!(
+                missing.is_empty() && unique.len() == seen.len() && below.is_empty(),
+                "round {round}: lost {} {:?}, duplicated {}, below from_seq {:?}",
+                missing.len(),
+                &missing[..missing.len().min(8)],
+                seen.len() - unique.len(),
+                &below[..below.len().min(8)],
+            );
+            harness.stop().await;
+        }
     }
 }
