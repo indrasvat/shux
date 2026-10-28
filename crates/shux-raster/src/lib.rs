@@ -560,11 +560,12 @@ impl Rasterizer {
                 style,
             };
             if cell.has_grapheme_payload() {
-                for ch in text.chars().filter(|ch| *ch != '\0' && *ch != '\u{200d}') {
-                    self.draw_scalar_glyph(img, ch, glyph_ctx);
+                let scalars = text.chars().filter(|ch| *ch != '\0' && *ch != '\u{200d}');
+                for (i, ch) in scalars.enumerate() {
+                    self.draw_scalar_glyph(img, ch, glyph_ctx, i > 0);
                 }
             } else {
-                self.draw_scalar_glyph(img, cell.ch, glyph_ctx);
+                self.draw_scalar_glyph(img, cell.ch, glyph_ctx, false);
             }
         }
 
@@ -590,7 +591,17 @@ impl Rasterizer {
         }
     }
 
-    fn draw_scalar_glyph(&self, img: &mut RgbaImage, ch: char, ctx: GlyphDrawContext) {
+    /// `after_base`: `ch` follows the cluster's base. A glyph there whose ink
+    /// is centred left of its origin is a mark designed to be drawn from the
+    /// pen AFTER a one-advance base. Its pen is set so that it centres over the
+    /// base's cell span, which for a narrow base is one primary-font advance on.
+    fn draw_scalar_glyph(
+        &self,
+        img: &mut RgbaImage,
+        ch: char,
+        ctx: GlyphDrawContext,
+        after_base: bool,
+    ) {
         if ch == ' ' || ch == '\0' {
             return;
         }
@@ -601,7 +612,12 @@ impl Rasterizer {
             // positioning aligns by construction.
             let (m, bmp) = font.rasterize(ch, self.font_size);
             let baseline_y = ctx.y as i32 + self.ascent.round() as i32;
-            let gx = ctx.x as i32 + m.xmin;
+            let pen = if after_base && 2 * m.xmin + (m.width as i32) < 0 {
+                (ctx.cell_pixels_w + self.cell_w) as i32 / 2
+            } else {
+                0
+            };
+            let gx = ctx.x as i32 + pen + m.xmin;
             let gy = baseline_y - m.height as i32 - m.ymin;
             (m, bmp, gx, gy)
         } else {
@@ -1048,6 +1064,55 @@ mod tests {
         assert_eq!(
             spillover_pixels, 0,
             "composed grapheme spilled into the following blank cell"
+        );
+    }
+
+    /// A combining mark is drawn over its own base, not over the cell before
+    /// it, and centred over a wide one. The primary font draws a mark's ink left
+    /// of its origin, because the mark is designed to follow the glyph it sits
+    /// on.
+    #[test]
+    fn combining_mark_lands_on_its_own_base_cell() {
+        let r = Rasterizer::new(14.0).unwrap();
+        let (cw, _ch) = r.cell_size();
+        let opts = RasterOptions {
+            fg_default: [255, 255, 255],
+            bg_default: [0, 0, 0],
+            cursor: None,
+            ..Default::default()
+        };
+        let ink_in = |text: &str, col: u32| {
+            let mut vt = VirtualTerminal::new(1, 4);
+            vt.process(text.as_bytes());
+            let img = r.render(vt.grid(), &opts);
+            let mut n = 0u32;
+            for y in 0..img.height() {
+                for x in col * cw..(col + 1) * cw {
+                    let p = img.get_pixel(x, y);
+                    if (p[0], p[1], p[2]) != (0, 0, 0) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        assert_eq!(
+            ink_in(" e\u{301}", 0),
+            0,
+            "the mark spilled into the previous cell"
+        );
+        assert!(
+            ink_in(" e\u{301}", 1) > ink_in(" e", 1),
+            "the mark was not drawn on its base"
+        );
+        assert_eq!(
+            ink_in(" i\u{336}", 0),
+            0,
+            "an overlay straddling its origin spilled into the previous cell"
+        );
+        assert!(
+            ink_in("\u{1F44D}\u{301}", 1) > ink_in("\u{1F44D}", 1),
+            "a mark on a wide base was not centred over both of its cells"
         );
     }
 
