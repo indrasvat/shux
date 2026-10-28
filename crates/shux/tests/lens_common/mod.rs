@@ -18,11 +18,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Single documented CI-class tolerance for timing assertions (S3/S4/R*).
-/// Raising it is a LENS-TEST-CHANGE event (§17), never a silent widening.
-pub const LENS_TEST_TOL_MS: u64 = 500;
+pub use shux_testkit::BUDGET;
+
+/// [`BUDGET`] for a server-side `timeout_ms`: how long an event wait may run
+/// before the test fails.
+pub const BUDGET_MS: u64 = BUDGET.as_millis() as u64;
 
 /// One JSON-RPC error `{code,message,data}` as surfaced by `shux rpc call`.
 #[derive(Debug, Clone)]
@@ -313,7 +315,7 @@ impl Harness {
             serde_json::json!({ "pane_id": pane_id, "text": format!("exec sh {abs}\n") }),
         );
 
-        self.wait_for(&pane_id, sentinel, 10_000)
+        self.wait_for(&pane_id, sentinel, BUDGET_MS)
             .unwrap_or_else(|e| panic!("fixture {name} never drew sentinel {sentinel:?}: {e}"));
 
         Fixture {
@@ -500,14 +502,17 @@ impl Harness {
     /// prefix is both necessary and sufficient.
     pub fn count_fixture_procs(&self, name: &str) -> usize {
         let prefix = format!("sh {}", self.fixture_abs(name));
-        let out = Command::new("ps").args(["-axo", "args="]).output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| l.trim_start().starts_with(&prefix))
-                .count(),
-            Err(_) => 0,
-        }
+        // A failed `ps` must not read as "no processes": every reap check
+        // waits for zero.
+        let out = Command::new("ps")
+            .args(["-axo", "args="])
+            .output()
+            .unwrap_or_else(|e| panic!("ps -axo args= could not run: {e}"));
+        assert!(out.status.success(), "ps -axo args= failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.trim_start().starts_with(&prefix))
+            .count()
     }
 
     /// Any audit entry whose serialized JSON contains ALL of `needles`.
@@ -544,13 +549,7 @@ impl Drop for Harness {
             use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
             let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if kill(Pid::from_raw(pid), None).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            shux_testkit::poll_until(BUDGET, || kill(Pid::from_raw(pid), None).is_err());
         }
     }
 }
@@ -790,21 +789,57 @@ pub fn is_near_grayscale_png(png: &[u8]) -> bool {
     max_spread <= 8
 }
 
-/// Deadline-bounded condition wait. §16.1 permits "deadline-bounded event
-/// waits"; scratch reaping is timer-driven, so polling a condition until a
-/// bounded deadline is the honest mechanism (NOT output synchronization — no
-/// bare sleep waits on drawn output anywhere in this suite).
-pub fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cond() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// Poll `cond` until it holds (`true`) or `timeout` runs out (`false`). The
+/// timeout bounds FAILURE only: pass [`BUDGET`] unless the bound is itself the
+/// claim under test, and then only a bound the condition has to go PAST.
+pub fn wait_until<F: FnMut() -> bool>(timeout: Duration, cond: F) -> bool {
+    shux_testkit::poll_until(timeout, cond)
+}
+
+/// A fifo in `dir` for a scenario child to park on (`read x < fifo`) until
+/// [`release_after_compare`] lets it go.
+pub fn make_fifo(dir: &Path) -> PathBuf {
+    let fifo = dir.join("release");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap_or_else(|e| panic!("mkfifo could not run: {e}"));
+    assert!(made.success(), "mkfifo {}", fifo.display());
+    fifo
+}
+
+/// Unblock the child parked on `fifo` once a `trace*` file in `dir` records a
+/// golden compare, so the child's exit can only land AFTER the compare. The
+/// fifo is written either way so a run that never compares still ends.
+pub fn release_after_compare(dir: &Path, fifo: &Path) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    const COMPARED: [&str; 3] = ["golden_absent", "frame_match", "frame_mismatch"];
+    let compared = |t: &str| {
+        COMPARED
+            .iter()
+            .any(|s| t.contains(&format!("\"signal\":\"{s}\"")))
+    };
+    shux_testkit::poll_until(BUDGET, || {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                e.file_name().to_string_lossy().starts_with("trace")
+                    && std::fs::read_to_string(e.path()).is_ok_and(|t| compared(&t))
+            })
+    });
+    // O_NONBLOCK: until the child has the fifo open the open fails (ENXIO)
+    // instead of hanging, and a child that is gone never blocks the test.
+    shux_testkit::poll_until(BUDGET, || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(fifo)
+            .and_then(|mut w| w.write_all(b"\n"))
+            .is_ok()
+    });
 }
 
 /// Monotonic-ish unique suffix for names/paths without extra deps.

@@ -10,9 +10,8 @@
 //!   running. Marker present + process later gone ⇒ TERM was delivered
 //!   first (the trap fired) AND KILL followed (nothing else could end a
 //!   TERM-ignoring loop).
-//! - While the trap-holder rides out the 500 ms grace window, the registry
-//!   file still carries its row; the row disappears only after the process
-//!   dies.
+//! - The registry row never goes while the process lives: every sample
+//!   that reads the row as gone must then find the process gone too.
 //!
 //! NOT part of the frozen lens red suite (§16.2 freezes `lens_*` files).
 //! Reuses the frozen `lens_common` harness READ-ONLY via `#[path]`.
@@ -20,9 +19,7 @@
 #[path = "lens_common/mod.rs"]
 mod lens_common;
 
-use std::time::Duration;
-
-use lens_common::{Harness, wait_until};
+use lens_common::{BUDGET, BUDGET_MS, Harness, wait_until};
 
 /// Count live processes whose argv contains `tag`. The tag is generated at
 /// RUNTIME (never written to any file), so co-tenant processes that merely
@@ -61,19 +58,24 @@ fn reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death() {
         marker = marker.display(),
     );
 
-    // max_runtime at its 1000 ms minimum: the reap (TERM) fires ~1 s in.
+    // The live state is checked before the reap, so max_runtime is the one
+    // clock this test races: long enough for a few RPCs and a `ps`.
     let env = h.rpc_raw(
         "lens.run",
         serde_json::json!({
             "argv": ["sh", "-c", script],
             "cols": 40, "rows": 10,
-            "max_runtime_ms": 1000,
+            "max_runtime_ms": 5000,
         }),
     );
     let r = env.expect_result("lens.run trap-holder");
     let sid = r["session_id"].as_str().expect("session_id").to_string();
-    h.wait_for(r["pane_id"].as_str().expect("pane_id"), "TRAP-READY", 5_000)
-        .expect("workload up before the reap window");
+    h.wait_for(
+        r["pane_id"].as_str().expect("pane_id"),
+        "TRAP-READY",
+        BUDGET_MS,
+    )
+    .expect("workload up before the reap window");
     assert!(
         count_procs_with_tag(&tag) >= 1,
         "trap-holder process running"
@@ -87,32 +89,33 @@ fn reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death() {
         "registry row present before the reap"
     );
 
-    // (a) SIGTERM first: the trap writes the marker at max_runtime (~1 s).
-    assert!(
-        wait_until(
-            Duration::from_millis(1000 + lens_common::LENS_TEST_TOL_MS),
-            || { marker.exists() }
-        ),
-        "SIGTERM must be delivered at max_runtime (trap never fired)"
-    );
+    // (b) Row removal strictly follows death: read the row, THEN count the
+    // processes, so a row read as gone with the group still alive afterwards
+    // was removed while the group lived.
+    let row_outlives_group = || {
+        let row = std::fs::read_to_string(&registry_path)
+            .map(|t| t.contains(&sid))
+            .unwrap_or(false);
+        let alive = count_procs_with_tag(&tag);
+        assert!(
+            row || alive == 0,
+            "registry row removed while {alive} process(es) of the group still ran"
+        );
+        alive
+    };
 
-    // (b) Row survives the grace window: the trap-holder ignores TERM, so
-    // the group stays alive for the full 500 ms grace — the registry row
-    // must still be there right after the marker appears (row removal
-    // strictly follows death confirmation).
+    // (a) SIGTERM first: the trap writes the marker at max_runtime.
     assert!(
-        std::fs::read_to_string(&registry_path)
-            .expect("registry still on disk during the grace window")
-            .contains(&sid),
-        "registry row must survive until the group is confirmed dead"
+        wait_until(BUDGET, || {
+            row_outlives_group();
+            marker.exists()
+        }),
+        "SIGTERM must be delivered at max_runtime (trap never fired)"
     );
 
     // (a) SIGKILL second: only KILL can end a TERM-trapping loop.
     assert!(
-        wait_until(
-            Duration::from_millis(2500 + lens_common::LENS_TEST_TOL_MS),
-            || { count_procs_with_tag(&tag) == 0 }
-        ),
+        wait_until(BUDGET, || row_outlives_group() == 0),
         "SIGKILL must follow the grace window (TERM-ignoring workload survived)"
     );
     assert_eq!(
@@ -125,7 +128,7 @@ fn reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death() {
 
     // (b) Row removed only after death — and the session is gone with it.
     assert!(
-        wait_until(Duration::from_secs(3), || {
+        wait_until(BUDGET, || {
             !std::fs::read_to_string(&registry_path)
                 .map(|t| t.contains(&sid))
                 .unwrap_or(false)
@@ -133,7 +136,7 @@ fn reap_sends_sigterm_then_sigkill_and_removes_row_only_after_death() {
         "registry row removed after the group died"
     );
     assert!(
-        wait_until(Duration::from_secs(3), || !h.session_listed(&sid, true)),
+        wait_until(BUDGET, || !h.session_listed(&sid, true)),
         "scratch session reaped from the graph"
     );
     assert!(

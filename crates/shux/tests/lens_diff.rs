@@ -37,7 +37,7 @@ fn checkpoint_revision(h: &Harness, pane: &str, ctx: &str) -> u64 {
 fn settle(h: &Harness, pane: &str, ctx: &str) {
     let env = h.rpc_raw(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": pane, "quiet_ms": 300, "timeout_ms": 5_000 }),
+        serde_json::json!({ "pane_id": pane, "quiet_ms": 300, "timeout_ms": BUDGET_MS }),
     );
     let s = env.expect_result(ctx);
     assert_eq!(
@@ -307,7 +307,7 @@ fn d5_checkpoint_fifo_eviction_and_noop() {
             h.wait_for(
                 &f.pane_id,
                 &format!("FRAME:{}", glyphs[i - 1] as char),
-                5_000,
+                BUDGET_MS,
             )
             .unwrap_or_else(|e| panic!("D5: repaint {i} never landed: {e}"));
         }
@@ -393,7 +393,7 @@ fn a1_altscreen_semantics() {
 
     // Enter the alternate screen.
     h.send_line_token(&f.pane_id, "E");
-    h.wait_for(&f.pane_id, "ALT-SCREEN", 5_000)
+    h.wait_for(&f.pane_id, "ALT-SCREEN", BUDGET_MS)
         .expect("A1 alt drawn");
 
     let env = h.rpc_raw("pane.glance", serde_json::json!({ "pane_id": f.pane_id }));
@@ -418,7 +418,7 @@ fn a1_altscreen_semantics() {
 
     // Leaving restores the normal-screen glance.
     h.send_line_token(&f.pane_id, "L");
-    h.wait_for(&f.pane_id, "NORMAL-SCREEN", 5_000)
+    h.wait_for(&f.pane_id, "NORMAL-SCREEN", BUDGET_MS)
         .expect("A1 normal restored");
     let env = h.rpc_raw("pane.glance", serde_json::json!({ "pane_id": f.pane_id }));
     let g = env.expect_result("A1 glance normal");

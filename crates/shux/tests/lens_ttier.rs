@@ -47,7 +47,7 @@ fn settle(h: &Harness, pane: &str, ctx: &str) {
     let s = h
         .rpc_raw(
             "pane.wait_settled",
-            serde_json::json!({ "pane_id": pane, "quiet_ms": 400, "timeout_ms": 10_000 }),
+            serde_json::json!({ "pane_id": pane, "quiet_ms": 400, "timeout_ms": BUDGET_MS }),
         )
         .expect_result(ctx);
     assert_eq!(
@@ -67,7 +67,7 @@ fn settle(h: &Harness, pane: &str, ctx: &str) {
 /// speculatively. The caller's original stash-list sentinel wait follows
 /// unchanged, so T1/T2/T3's assertions and purpose are untouched.
 fn dismiss_nidhi_welcome(h: &Harness, pane: &str, ctx: &str) {
-    h.wait_for(pane, "Press Enter to continue", 10_000)
+    h.wait_for(pane, "Press Enter to continue", BUDGET_MS)
         .unwrap_or_else(|e| panic!("{ctx}: nidhi welcome screen never appeared: {e}"));
     // Enter (0x0d), same byte as `pane send-keys --data DQ==`.
     h.send_raw(pane, "\r");
@@ -94,7 +94,7 @@ fn t1_nidhi_golden() {
     let pane = r["pane_id"].as_str().expect("pane_id").to_string();
 
     dismiss_nidhi_welcome(&h, &pane, "T1");
-    h.wait_for(&pane, "विवेचक", 10_000)
+    h.wait_for(&pane, "विवेचक", BUDGET_MS)
         .expect("T1: nidhi drew the stashes");
     settle(&h, &pane, "T1 settle");
     let png = glance_png(&h, &pane, "T1 glance");
@@ -131,7 +131,7 @@ fn t2_nidhi_keyboard_truth() {
         .expect_result("T2 lens.run nidhi");
     let pane = r["pane_id"].as_str().expect("pane_id").to_string();
     dismiss_nidhi_welcome(&h, &pane, "T2");
-    h.wait_for(&pane, "विवेचक", 10_000).expect("T2: nidhi up");
+    h.wait_for(&pane, "विवेचक", BUDGET_MS).expect("T2: nidhi up");
     settle(&h, &pane, "T2 settle initial");
 
     let c = h
@@ -237,7 +237,7 @@ fn t3_nidhi_matrix() {
             .expect_result("T3 lens.run nidhi");
         let pane = r["pane_id"].as_str().expect("pane_id").to_string();
         dismiss_nidhi_welcome(&h, &pane, "T3");
-        h.wait_for(&pane, "विवेचक", 10_000).expect("T3: nidhi up");
+        h.wait_for(&pane, "विवेचक", BUDGET_MS).expect("T3: nidhi up");
         settle(&h, &pane, "T3 settle");
         let png = glance_png(&h, &pane, "T3 glance");
         // p0-council-r1 major 2 + the approved near-grayscale

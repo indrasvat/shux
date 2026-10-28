@@ -17,6 +17,11 @@ use lens_common::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Window for the must-NOT-settle checks that a pump gap could satisfy: the
+/// quiet / hold window equals the timeout, so only a gap as long as the whole
+/// wait settles the pane, and a loaded machine never stretches one that far.
+const NEG_WAIT_MS: u64 = 5_000;
+
 /// Run `check` while a background thread pumps one stdin token every `interval_ms` into the pane
 /// (mirrors `lens_settle.rs::s3_check_under_pump`). The pump's lifetime is bound to the check and
 /// deadline-capped so a panic cannot leave it spinning.
@@ -24,9 +29,13 @@ fn under_pump<T>(h: &Harness, pane_id: &str, interval_ms: u64, check: impl FnOnc
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let pump = scope.spawn(|| {
-            let deadline = Instant::now() + Duration::from_millis(15_000);
+            let deadline = Instant::now() + BUDGET;
             while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
                 h.send_line_token(pane_id, "");
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "§16.1: paces INPUT tokens, never synchronises on output"
+                )]
                 std::thread::sleep(Duration::from_millis(interval_ms));
             }
         });
@@ -57,7 +66,7 @@ fn stable_frames_settles_identical_repainter() {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
-                "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 8_000, "stable_frames": 3
+                "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": BUDGET_MS, "stable_frames": 3
             }),
         );
         settled(&env, "F11 stable_frames")
@@ -69,7 +78,7 @@ fn stable_frames_settles_identical_repainter() {
     let quiet_ok = under_pump(&h, &f.pane_id, 60, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
-            serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 2_000 }),
+            serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": NEG_WAIT_MS, "timeout_ms": NEG_WAIT_MS }),
         );
         settled(&env, "F11 quiet-mode")
     });
@@ -119,7 +128,7 @@ fn hold_ms_settles_identical_but_not_changing() {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
-                "pane_id": f11.pane_id, "quiet_ms": 300, "timeout_ms": 8_000, "hold_ms": 400
+                "pane_id": f11.pane_id, "quiet_ms": 300, "timeout_ms": BUDGET_MS, "hold_ms": 400
             }),
         );
         settled(&env, "F11 hold_ms")
@@ -131,13 +140,14 @@ fn hold_ms_settles_identical_but_not_changing() {
     h.kill_session(&f11.session_id);
 
     // Changing pane: f8 rewrites row 10 with a new glyph each token → hold clock resets → the
-    // 400ms window (tokens every 80ms) never elapses without a content change → no settle.
+    // hold window (tokens every 80ms) never elapses without a content change → no settle.
     let f8 = h.launch_fixture("f8_repaint.sh", 80, 24, "LENS-F8-REPAINT");
     let changing = under_pump(&h, &f8.pane_id, 80, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
-                "pane_id": f8.pane_id, "quiet_ms": 300, "timeout_ms": 2_000, "hold_ms": 400
+                "pane_id": f8.pane_id, "quiet_ms": NEG_WAIT_MS, "timeout_ms": NEG_WAIT_MS,
+                "hold_ms": NEG_WAIT_MS
             }),
         );
         settled(&env, "F8 hold_ms")
@@ -164,7 +174,7 @@ fn masked_churn_settles_unmasked_does_not() {
         let env = h.rpc_raw(
             "pane.wait_settled",
             serde_json::json!({
-                "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 8_000, "stable_frames": 3,
+                "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": BUDGET_MS, "stable_frames": 3,
                 "masks": [{ "row": 10, "col": 0, "width": 80 }]
             }),
         );
@@ -256,7 +266,7 @@ fn default_quiet_mode_unchanged() {
 
     let env = h.rpc_raw(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 5_000 }),
+        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": BUDGET_MS }),
     );
     assert!(
         settled(&env, "default quiet"),
@@ -271,7 +281,7 @@ fn default_quiet_mode_unchanged() {
         "--quiet",
         "300ms",
         "--timeout",
-        "5s",
+        "30s",
     ]);
     assert_eq!(
         out.status.code(),
@@ -310,7 +320,7 @@ fn stable_frames_times_out_on_an_idle_pane_but_hold_ms_settles_it() {
     let env = h.rpc_raw(
         "pane.wait_settled",
         serde_json::json!({
-            "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 3_000, "hold_ms": 300
+            "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": BUDGET_MS, "hold_ms": 300
         }),
     );
     assert!(

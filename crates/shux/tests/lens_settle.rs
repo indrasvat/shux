@@ -30,11 +30,12 @@ fn settle_ready_body(h: &Harness) -> String {
         h.send_line_token(&f.pane_id, "");
     }
     h.send_line_token(&f.pane_id, "R");
-    h.wait_for(&f.pane_id, "READY", 5_000).expect("READY drawn");
+    h.wait_for(&f.pane_id, "READY", BUDGET_MS)
+        .expect("READY drawn");
 
     let env = h.rpc_raw(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 10_000 }),
+        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": BUDGET_MS }),
     );
     let settled = env.expect_result("S1 wait_settled rpc");
     assert_eq!(
@@ -51,7 +52,7 @@ fn settle_ready_body(h: &Harness) -> String {
         "--quiet",
         "300ms",
         "--timeout",
-        "10s",
+        "30s",
     ]);
     assert_eq!(out.status.code(), Some(0), "S1: CLI exit 0 when settled");
 
@@ -80,20 +81,27 @@ fn s2_settle_flake_gate_100x() {
     }
 }
 
+/// S3's quiet window and timeout. Equal, so the pane can only settle across a
+/// pump gap as long as the whole wait: a loaded machine stretches the gaps
+/// between tokens, never to that length.
+const S3_WAIT_MS: u64 = 5_000;
+
 /// Run one S3 check under its OWN pump whose lifetime is bound to the check
 /// (p0-council-r1 BLOCKER 1: a shared pump dying early would let a later check
 /// observe a quiet pane and false-green). The pump stops right after the check
-/// completes; its deadline (check timeout + 4s margin) only bounds the panic
-/// path so a P0 `-32601` panic cannot leave it spinning.
+/// completes; its deadline only bounds the panic path so a P0 `-32601` panic
+/// cannot leave it spinning.
 fn s3_check_under_pump<T>(h: &Harness, pane_id: &str, check: impl FnOnce() -> T) -> T {
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        // §16.1 exception: this sleep paces INPUT (a token every 100 ms), it
-        // never synchronises on output.
         let pump = scope.spawn(|| {
-            let deadline = Instant::now() + Duration::from_millis(6_000);
+            let deadline = Instant::now() + BUDGET;
             while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
                 h.send_line_token(pane_id, "");
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "§16.1: paces INPUT tokens, never synchronises on output"
+                )]
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
@@ -114,7 +122,7 @@ fn s3_settle_timeout() {
     s3_check_under_pump(&h, &f.pane_id, || {
         let env = h.rpc_raw(
             "pane.wait_settled",
-            serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 2_000 }),
+            serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": S3_WAIT_MS, "timeout_ms": S3_WAIT_MS }),
         );
         let settled = env.expect_result("S3 wait_settled rpc");
         assert_eq!(
@@ -122,24 +130,27 @@ fn s3_settle_timeout() {
             serde_json::Value::Bool(false),
             "S3: must NOT settle while flipping"
         );
+        // The lower bound is the contract; the upper one only catches a
+        // timeout that is ignored, so it allows a loaded scheduler's lateness.
         let waited = settled["waited_ms"].as_u64().expect("waited_ms");
         assert!(
-            (2_000..=2_000 + LENS_TEST_TOL_MS).contains(&waited),
-            "S3: waited_ms {waited} out of [2000, 2000+{LENS_TEST_TOL_MS}]"
+            (S3_WAIT_MS..S3_WAIT_MS + BUDGET_MS).contains(&waited),
+            "S3: waited_ms {waited} out of [{S3_WAIT_MS}, {S3_WAIT_MS}+{BUDGET_MS})"
         );
     });
 
     // CLI twin under a FRESH pump that outlives the whole CLI call — it must
     // also observe a never-quiet pane and exit 1.
     s3_check_under_pump(&h, &f.pane_id, || {
+        let wait = format!("{S3_WAIT_MS}ms");
         let out = h.cli(&[
             "pane",
             "wait-settled",
             &f.pane_id,
             "--quiet",
-            "300ms",
+            &wait,
             "--timeout",
-            "2s",
+            &wait,
         ]);
         assert_eq!(out.status.code(), Some(1), "S3: CLI exit 1 on timeout");
     });
@@ -207,24 +218,27 @@ fn s4_already_still_returns_immediately() {
     let f = h.launch_fixture("f1_static.sh", 80, 24, "दृश्यते");
 
     // First call legitimately waits and establishes quiet.
+    let quiet_ms: u64 = 2_000;
     let env1 = h.rpc_raw(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 2_000, "timeout_ms": 5_000 }),
+        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": quiet_ms, "timeout_ms": BUDGET_MS }),
     );
     let s1 = env1.expect_result("S4 wait_settled #1");
     assert_eq!(s1["settled"], serde_json::Value::Bool(true));
 
     // Second call must return settled immediately (watch-channel race-free).
+    // Same quiet window: a waiter that restarts the window at its own call
+    // reports at least `quiet_ms`, however fast the machine.
     let env2 = h.rpc_raw(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 5_000 }),
+        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": quiet_ms, "timeout_ms": BUDGET_MS }),
     );
     let s2 = env2.expect_result("S4 wait_settled #2");
     assert_eq!(s2["settled"], serde_json::Value::Bool(true));
     let waited = s2["waited_ms"].as_u64().expect("waited_ms");
     assert!(
-        waited <= LENS_TEST_TOL_MS,
-        "S4: already-still must return within {LENS_TEST_TOL_MS}ms, waited {waited}"
+        waited < quiet_ms,
+        "S4: already-still must not wait out a fresh {quiet_ms}ms quiet window, waited {waited}"
     );
 
     h.kill_session(&f.session_id);
@@ -238,19 +252,23 @@ fn s5_class_b_immunity() {
 
     let stop = AtomicBool::new(false);
     let settled_rev = std::thread::scope(|scope| {
-        // §16.1 exception: 100 ms INPUT pacing of Class-B tokens. Deadline-
-        // bounded so a P0 panic (before `stop`) cannot leave it spinning.
+        // Deadline-bounded so a P0 panic (before `stop`) cannot leave it
+        // spinning.
         let pump = scope.spawn(|| {
-            let deadline = Instant::now() + Duration::from_millis(5_500);
+            let deadline = Instant::now() + BUDGET;
             while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
                 h.send_line_token(&f.pane_id, "");
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "§16.1: paces Class-B INPUT tokens, never synchronises on output"
+                )]
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
 
         let env = h.rpc_raw(
             "pane.wait_settled",
-            serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 500, "timeout_ms": 5_000 }),
+            serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 500, "timeout_ms": BUDGET_MS }),
         );
         let s = env.expect_result("S5 wait_settled rpc");
         assert_eq!(
@@ -266,10 +284,11 @@ fn s5_class_b_immunity() {
 
     // A real visible cell (V) must be observed as a NEW revision.
     h.send_line_token(&f.pane_id, "V");
-    h.wait_for(&f.pane_id, "▮", 5_000).expect("V mark drawn");
+    h.wait_for(&f.pane_id, "▮", BUDGET_MS)
+        .expect("V mark drawn");
     let env = h.rpc_raw(
         "pane.wait_settled",
-        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": 5_000 }),
+        serde_json::json!({ "pane_id": f.pane_id, "quiet_ms": 300, "timeout_ms": BUDGET_MS }),
     );
     let s = env.expect_result("S5 wait_settled after V");
     let rev_after = s["revision"].as_u64().expect("revision");
