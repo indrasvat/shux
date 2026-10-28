@@ -75,17 +75,57 @@ resume_frozen() {
 }
 # Interrupted, the reap leaves what it froze running again rather than stopped for good.
 trap 'resume_frozen; exit 130' INT TERM HUP
-while :; do
-  # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
-  pending=($(children_outside "${members}"))
-  [ "${#pending[@]}" -gt 0 ] || break
-  for pid in "${pending[@]}"; do
-    kill -STOP "${pid}" >/dev/null 2>&1 || true
-    members="${members}${pid} "
-    frozen+=("${pid}")
-    frozen_at+=("$(start_time "${pid}")")
+# Re-stopping what is already frozen matters: see the SIGCONT note below.
+freeze_tree() {
+  local pid
+  for pid in "${frozen[@]:-}"; do
+    if [ -n "${pid}" ]; then kill -STOP "${pid}" >/dev/null 2>&1 || true; fi
   done
+  while :; do
+    # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
+    pending=($(children_outside "${members}"))
+    [ "${#pending[@]}" -gt 0 ] || break
+    for pid in "${pending[@]}"; do
+      kill -STOP "${pid}" >/dev/null 2>&1 || true
+      members="${members}${pid} "
+      frozen+=("${pid}")
+      frozen_at+=("$(start_time "${pid}")")
+    done
+  done
+}
+freeze_tree
+
+for pid in "${pids[@]}"; do
+  kill -TERM "${pid}" >/dev/null 2>&1 || true
 done
+sleep 1
+
+# Closing a pane's last PTY master hangs the terminal up, and the kernel then sends its
+# session leader SIGCONT: the freeze is undone. A daemon's graceful teardown closes its
+# masters, and SIGKILL closes them too. So the tree is frozen again here, and what a
+# daemon still running after the grace period strands is killed BEFORE that daemon, while
+# it is frozen and still has a terminal that has not hung up.
+freeze_tree
+
+# Each still has the start time it had when frozen, so it is that process and not one
+# reusing its pid; a process it would be is frozen, so cannot have been replaced.
+stranded=()
+i=0
+while [ "${i}" -lt "${#frozen[@]}" ]; do
+  pid="${frozen[${i}]}"
+  if ! pid_is_gone "${pid}" && [ "$(start_time "${pid}")" = "${frozen_at[${i}]}" ]; then
+    stranded+=("${pid}")
+  fi
+  i=$((i + 1))
+done
+
+if [ "${#stranded[@]}" -gt 0 ]; then
+  echo "reap: stopping ${#stranded[@]} process(es) stranded by the reaped daemon(s)"
+  for pid in "${stranded[@]}"; do
+    describe_pid "${pid}"
+  done
+  terminate_pids "${stranded[@]}"
+fi
 
 terminate_pids "${pids[@]}"
 
@@ -106,32 +146,13 @@ if [ "${#survivors[@]}" -gt 0 ]; then
   exit 1
 fi
 
-# Each still has the start time it had when frozen, so it is that process and not one
-# reusing its pid; a process it would be is frozen, so cannot have been replaced.
-stranded=()
-i=0
-while [ "${i}" -lt "${#frozen[@]}" ]; do
-  pid="${frozen[${i}]}"
-  if ! pid_is_gone "${pid}" && [ "$(start_time "${pid}")" = "${frozen_at[${i}]}" ]; then
-    stranded+=("${pid}")
-  fi
-  i=$((i + 1))
+left=()
+for pid in "${stranded[@]:-}"; do
+  if [ -n "${pid}" ] && ! pid_is_gone "${pid}"; then left+=("${pid}"); fi
 done
-
-if [ "${#stranded[@]}" -gt 0 ]; then
-  echo "reap: stopping ${#stranded[@]} process(es) stranded by the reaped daemon(s)"
-  for pid in "${stranded[@]}"; do
-    describe_pid "${pid}"
-  done
-  terminate_pids "${stranded[@]}"
-  left=()
-  for pid in "${stranded[@]}"; do
-    pid_is_gone "${pid}" || left+=("${pid}")
-  done
-  if [ "${#left[@]}" -gt 0 ]; then
-    echo "reap: ${#left[@]} stranded process(es) survived KILL: ${left[*]}" >&2
-    exit 1
-  fi
+if [ "${#left[@]}" -gt 0 ]; then
+  echo "reap: ${#left[@]} stranded process(es) survived KILL: ${left[*]}" >&2
+  exit 1
 fi
 trap - INT TERM HUP
 
