@@ -1,0 +1,25 @@
+{
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-record.md",
+  "dootsabha_implementation": "council-record.md",
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-fixbase-masked-double-120x40-w1.json",
+    "pixel-fixbase-masked-rounded-120x40-w1.json",
+    "pixel-fixbase-masked-thick-120x40-w1.json",
+    "pixel-fixbase-masked-thin-120x40-tee.json",
+    "pixel-fixbase-masked-thin-120x40-w1.json",
+    "pixel-fixbase-masked-tui-thin-120x40-tw1.json",
+    "pixel-fixbase-unmasked-ascii-120x40-w1.json",
+    "pixel-fixbase-unmasked-none-120x40-w1.json",
+    "pixel-fixbase-unmasked-thin-120x40-grid.json",
+    "pixel-xpath-ascii-120x40-w1.json",
+    "pixel-xpath-double-120x40-w1.json",
+    "pixel-xpath-rounded-120x40-w1.json",
+    "pixel-xpath-thick-120x40-w1.json",
+    "pixel-xpath-thin-120x40-w1.json",
+    "pixel-xpath-thin-200x60-w1.json",
+    "pixel-xpath-thin-80x24-w1.json",
+    "pixel-xpath-tui-thin-120x40-tw1.json"
+  ]
+}
