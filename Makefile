@@ -204,6 +204,10 @@ test: nextest-ready ## Run the whole workspace suite (same command CI runs)
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) --workspace
 	@echo "$(COLOR_GREEN)✓ Tests passed$(COLOR_RESET)"
 
+.PHONY: test-stress
+test-stress: nextest-ready ## Repeat tests to expose timing dependence (STRESS_COUNT, STRESS_FILTER, STRESS_LOAD)
+	@NEXTEST_JOBS=$(NEXTEST_JOBS) bash scripts/test-stress.sh
+
 .PHONY: test-verbose
 test-verbose: nextest-ready ## Run tests with output visible
 	@echo "$(COLOR_BLUE)▶ Running tests (verbose)...$(COLOR_RESET)"
@@ -719,6 +723,7 @@ check-lens-frozen: ## Enforce the lens frozen-path test-integrity trailer (§16.
 clippy: ## Run clippy linter
 	@echo "$(COLOR_BLUE)▶ Running clippy...$(COLOR_RESET)"
 	@cargo clippy --workspace --all-targets -- -D warnings
+	@bash scripts/clippy-lanes.sh
 	@echo "$(COLOR_GREEN)✓ Clippy passed$(COLOR_RESET)"
 
 .PHONY: clippy-beta
@@ -799,6 +804,11 @@ check-vt-qa: ## Require SOLID QA evidence from any diff that touches VT renderin
 	@bash scripts/check-vt-qa-selftest.sh
 	@bash scripts/check-vt-qa.sh
 	@bash scripts/check-vt-fixtures.sh
+
+.PHONY: check-test-sleeps
+check-test-sleeps: ## No raw sleeps in crates/*/tests (the hook's check; clippy covers the rest)
+	@bash scripts/check-test-sleeps-selftest.sh
+	@bash scripts/check-test-sleeps.sh
 
 .PHONY: shellcheck
 shellcheck: ## shellcheck every tracked shell script (the layer the guards live in)

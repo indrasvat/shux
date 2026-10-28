@@ -11,6 +11,7 @@ shux: terminal multiplexer in Rust. Tiny core, plugin system, typed API, pixel-p
 | API + crate notes | `docs/agents/api-notes.md` |
 | Releases | `docs/agents/releases.md` |
 | Visual testing | `docs/agents/visual-testing.md` |
+| Tests that wait | `docs/testing.md` |
 
 ## Commands
 
@@ -28,6 +29,7 @@ make check-test-groups  # nextest groups still bound what they claim
 make shellcheck         # every tracked shell script (the guards live in shell)
 make test-gui-terminal  # what a REAL GUI terminal (kitty/Xvfb) draws from shux's output
 make reap               # stop daemons this checkout leaked when a run was interrupted
+make test-stress        # repeat tests under CPU load (STRESS_COUNT/FILTER/LOAD) to expose timing
 make fuzz               # libFuzzer targets in fuzz/ (FUZZ_SECONDS each); crashes land in fuzz/artifacts/
 make install / hooks    # install binary / lefthook hooks
 ```
@@ -43,6 +45,7 @@ crates/shux-rpc/    JSON-RPC (UDS + TCP, length-prefixed framing)
 crates/shux-plugin/ Plugin host (process plugins over stdio JSON-RPC, permissions)
 crates/shux-ui/     TUI client (crossterm, hand-rolled chrome, compositor)
 crates/shux-raster/ Grid -> PNG rasterizer (headless snapshots, pixel goldens)
+crates/shux-testkit/ Event-based waits for tests (dev-dependency only)
 ```
 
 - Client/server: single binary, daemon auto-starts on first use.
@@ -108,6 +111,9 @@ Colour-probed `printf`/`cat` is the letter, not the spirit.
 
 ## Verification discipline
 
+- **No timing-based tests: wait for a condition, never for time.** Deadlines bound
+  failure, never success. Use `shux-testkit`; clippy bans raw sleeps. Patterns, the
+  exemption form and how to prove a de-flake: `docs/testing.md`.
 - **Prove a check can FAIL before trusting it to pass.** Run every gate/guard/comparator
   against a reintroduced defect AND empty input.
 - **Anything that parses cargo output pins `--color never` at the call site.** CI

@@ -46,6 +46,8 @@ target, add one before using it.
 | **L3** end-to-end | CLI binary against a real daemon | `crates/shux/tests/*_integration.rs` |
 | **L4** visual | iterm2-driver scripts that drive the actual TUI | `.claude/automations/test_*.py` |
 
+Tests wait for conditions, never for time: see [testing.md](testing.md).
+
 Run all four:
 
 ```bash

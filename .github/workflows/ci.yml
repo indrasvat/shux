@@ -94,7 +94,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: make clippy
+      - name: No raw sleeps in tests
+        run: make check-test-sleeps
       # The guards, leak checks and evidence harnesses are all shell. A defect
       # there does not fail loudly the way a test does — it makes a guard quietly
       # stop guarding, which is the failure mode this repo can least afford.
