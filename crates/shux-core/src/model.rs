@@ -89,6 +89,10 @@ pub struct Session {
     pub id: SessionId,
     pub name: String,
     pub created_at: SystemTime,
+    /// Creation order within this process. `created_at` is the wall clock,
+    /// which can step back or read the same instant for two sessions.
+    #[serde(default)]
+    pub created_seq: u64,
     /// Ordered list of window IDs. Order determines window index (1-based in UI).
     pub windows: Vec<WindowId>,
     pub active_window: WindowId,
@@ -104,12 +108,15 @@ pub struct Session {
     pub created_by_plugin: Option<PluginId>,
 }
 
+static NEXT_SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Session {
     pub fn new(name: impl Into<String>, initial_window_id: WindowId) -> Self {
         Self {
             id: SessionId::new(),
             name: name.into(),
             created_at: SystemTime::now(),
+            created_seq: NEXT_SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             windows: vec![initial_window_id],
             active_window: initial_window_id,
             env: HashMap::new(),

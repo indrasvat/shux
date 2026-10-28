@@ -69,9 +69,7 @@ pub(crate) fn register_session_methods(
                     let scratch_ids = registry.ids();
 
                     let snap = gh.snapshot();
-                    let mut sessions: Vec<_> = snap.sessions.values().collect();
-                    sessions.sort_by_key(|s| s.created_at);
-                    let sessions: Vec<serde_json::Value> = sessions
+                    let sessions: Vec<serde_json::Value> = by_creation(&snap)
                         .iter()
                         .filter(|s| include_scratch || !scratch_ids.contains(&s.id))
                         .map(|s| {
@@ -474,11 +472,46 @@ pub(crate) fn register_session_methods(
         )
 }
 
+/// Sessions in the order they were created.
+fn by_creation(snap: &shux_core::graph::SessionGraphSnapshot) -> Vec<&shux_core::model::Session> {
+    let mut sessions: Vec<_> = snap.sessions.values().collect();
+    sessions.sort_by_key(|s| (s.created_seq, s.created_at));
+    sessions
+}
+
 #[cfg(test)]
 mod tests {
 
     use crate::rpc::test_harness::{RpcHarness, dispatch_err, dispatch_ok};
     use shux_core::layout::Direction;
+
+    /// The listing follows creation even when the wall clock does not: it
+    /// stepped back between creates, or read the same instant for two.
+    #[test]
+    fn sessions_list_in_creation_order_whatever_the_wall_clock_says() {
+        use shux_core::model::{Session, WindowId};
+        let t = std::time::SystemTime::now();
+        let stepped_back = |i: u64| t - std::time::Duration::from_secs(i);
+        let same_instant = |_: u64| t;
+        let clocks: [(&str, &dyn Fn(u64) -> std::time::SystemTime); 2] = [
+            ("stepped back", &stepped_back),
+            ("same instant", &same_instant),
+        ];
+        for (name, stamp) in clocks {
+            let mut snap = shux_core::graph::SessionGraphSnapshot::default();
+            let names: Vec<String> = (0..16).map(|i| format!("s{i}")).collect();
+            for (i, n) in names.iter().enumerate() {
+                let mut s = Session::new(n.clone(), WindowId::new());
+                s.created_at = stamp(i as u64);
+                snap.sessions.insert(s.id, s);
+            }
+            let listed: Vec<&str> = super::by_creation(&snap)
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
+            assert_eq!(listed, names, "{name}");
+        }
+    }
 
     #[tokio::test]
     async fn production_router_session_window_pane_routes_mutate_graph_and_cleanup_io() {
