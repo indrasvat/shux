@@ -180,6 +180,12 @@ fn a_cut_zone_never_shows_a_bare_ellipsis() {
     assert_eq!(plain(&row), "L    R", "{:?}", plain(&row));
     let row = bar("L", "ab  cd", "R").render_row(9);
     assert_eq!(plain(&row), "L ab…   R");
+    let row = bar("\u{3000}日x", "", "").render_row(3);
+    assert_eq!(
+        plain(&row),
+        "   ",
+        "an ideographic space is no glyph to show"
+    );
 }
 
 /// Bars that fit keep their exact layout: the centre stays centred.

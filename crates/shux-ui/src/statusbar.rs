@@ -112,9 +112,10 @@ impl StatusBar {
 }
 
 /// Paint `segs` from `start`, within `start..end`. A zone wider than that
-/// drops its trailing spaces (ending flush at `end` when `flush_end`), or
-/// else shows the text that fits, less trailing spaces, and an `…`; with no
-/// room for one glyph other than a space and the `…` it is not painted.
+/// drops its trailing whitespace (ending flush at `end` when `flush_end`),
+/// or else shows the text that fits, less trailing whitespace, and an `…`;
+/// with no room for one glyph other than whitespace and the `…` it is not
+/// painted.
 /// Returns the columns painted.
 fn paint_zone(
     row: &mut [RenderCell],
@@ -130,7 +131,13 @@ fn paint_zone(
         return None;
     }
     let text: String = segs.iter().map(|s| s.text.as_str()).collect();
-    let padding = text.len() - text.trim_end_matches(' ').len();
+    let cols = |t: &str| -> usize {
+        crate::chrome::text_cells(t)
+            .iter()
+            .map(|(_, w)| usize::from(*w))
+            .sum()
+    };
+    let padding = cols(&text) - cols(text.trim_end());
     let (limit, cut) = if zw <= avail {
         (end, false)
     } else if zw == padding {
@@ -207,7 +214,7 @@ fn paint_zone(
                 };
             }
             cursor += width;
-            if ch != ' ' {
+            if !ch.is_whitespace() {
                 text_end = cursor;
                 text_style = (seg.fg, bg, attrs);
             }
@@ -219,6 +226,34 @@ fn paint_zone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zones that would overlap a wide glyph never leave half of it.
+    #[test]
+    fn a_zone_painted_over_half_a_wide_glyph_blanks_the_other_half() {
+        for left in ["ab日", "ab👩\u{200d}💻", "a日b"] {
+            let mut bar = StatusBar::new();
+            bar.left.push(StatusSegment::plain(left));
+            bar.center.push(StatusSegment::plain("XY"));
+            let row = bar.render_row(6);
+            for (i, cell) in row.iter().enumerate() {
+                let wide = crate::chrome::text_cells(&cell.display_text())
+                    .first()
+                    .is_some_and(|(_, w)| *w == 2);
+                let next_is_cont = row.get(i + 1).is_some_and(|c| c.wide_continuation);
+                assert!(
+                    cell.wide_continuation || wide == next_is_cont,
+                    "{left:?}: col {i} {:?} orphaned",
+                    cell.display_text()
+                );
+                if cell.wide_continuation {
+                    assert!(
+                        i > 0 && !row[i - 1].wide_continuation,
+                        "{left:?}: col {i} stray continuation"
+                    );
+                }
+            }
+        }
+    }
 
     /// A bar too narrow for its zones never leaves half a wide glyph.
     #[test]
