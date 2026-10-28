@@ -34,11 +34,17 @@ fn a_daemon_starts_where_only_the_unresolved_socket_path_fits() {
         ])
         .output()
         .expect("spawn shux");
-    let _ = shux(&link).args(["daemon", "stop"]).output();
+    let stop = shux(&link).args(["daemon", "stop"]).output().expect("stop");
     assert!(
         out.status.success(),
         "no daemon at a typed path that fits:\n{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stop.status.success() && String::from_utf8_lossy(&stop.stdout).contains("stopped"),
+        "the daemon did not stop:\n{}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
     );
 }
