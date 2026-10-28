@@ -594,6 +594,8 @@ poll_tick() {
     local pane_id agent text hash now state new_state reported
     now=$(epoch_ms)
     for pane_id in "${!TRACKED[@]}"; do
+        # An exit handled during an earlier pane's wait drops this one.
+        [ -n "${TRACKED[$pane_id]:-}" ] || continue
         agent="${TRACKED[$pane_id]}"
         state="${LAST_STATE[$pane_id]:-ready}"
         reported=0
@@ -607,6 +609,8 @@ poll_tick() {
             # rather than guess from its screen.
             continue
         fi
+        # ...or during this pane's own status wait.
+        [ -n "${TRACKED[$pane_id]:-}" ] || continue
         if [ "$reported" = "1" ]; then
             new_state=$(state_for_status "$LAST_STATUS_STATE")
             # The screen goes unread meanwhile: a fallback later starts a
@@ -615,6 +619,7 @@ poll_tick() {
             LAST_CHANGE_AT[$pane_id]=$now
         else
             capture_pane "$pane_id" || continue
+            [ -n "${TRACKED[$pane_id]:-}" ] || continue
             text="$LAST_CAPTURE_TEXT"
             hash=$(printf '%s' "$text" | shasum -a 256 | cut -d' ' -f1)
             if [ "$hash" != "${LAST_HASH[$pane_id]:-}" ]; then

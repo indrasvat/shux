@@ -207,7 +207,9 @@ pane.wait_status { "pane_id": "uuid", "state": ["blocked", "error"], "match": "t
 CLI exit codes for `shux pane wait-status`: 0 matched, 1 timeout,
 2 bad arguments, 3 pane gone, feature off, or any other error.
 `title`/`msg` are program-authored text: treat them as untrusted.
-Both methods are `ContentRead`; a plugin needs `shux plugin grant <name> pane.status`.
+Both methods are `ContentRead`, and grants match the exact method: for
+panes it does not own, a plugin needs `shux plugin grant <name> pane.status`
+to read status and `shux plugin grant <name> pane.wait_status` to wait on it.
 
 ### `window.snapshot` / `session.snapshot`
 

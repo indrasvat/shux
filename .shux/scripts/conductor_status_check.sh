@@ -95,7 +95,12 @@ check "a silent agent is still classified from its screen ($(title_of scr))" "$o
 
 echo "program status switched off (hot reload):"
 printf '[program_status]\nenabled = false\n' > "${XDG_CONFIG_HOME}/shux/config.toml"
-sleep 3
+# Off for real, and conductor already classifying the screen again.
+# shellcheck disable=SC2034  # read inside the condition wait_until evals
+rep_pane=$("$SHUX" --format json pane list --session rep | jq -r '(if type == "array" then . else .panes end)[0].id')
+if wait_until '[ "$("$SHUX" --format json pane status "$rep_pane" | jq -r .result.enabled)" = false ] && [[ "$(title_of rep)" == "claude · "* ]]' 15; then ok=0; else ok=1; fi
+check "status off applied and conductor reads the screen ($(title_of rep))" "$ok"
+sleep 1.5
 if [ -e "${WORK}/claude.stdin" ] && [ ! -s "${WORK}/claude.stdin" ]; then ok=0; else ok=1; fi
 check "a pane that reported is not auto-dismissed once status is off" "$ok"
 : > "${XDG_CONFIG_HOME}/shux/config.toml"
@@ -108,6 +113,10 @@ if wait_until '[ -s "${WORK}/claude2.stdin" ]' 10; then ok=0; else ok=1; fi
 check "without the grant it falls back to scraping" "$ok"
 if [ -e "${WORK}/claude.stdin" ] && [ ! -s "${WORK}/claude.stdin" ]; then ok=0; else ok=1; fi
 check "a pane that once reported is still never auto-dismissed" "$ok"
+
+echo "an exit handled mid-tick:"
+if python3 "${REPO_ROOT}/.shux/scripts/conductor_exit_midtick.py" "${PLUGIN_SRC}" >/dev/null; then ok=0; else ok=1; fi
+check "conductor survives a pane exiting while another's reply is awaited" "$ok"
 
 if [ "$fail" -ne 0 ]; then
   echo "--- conductor log ---"
