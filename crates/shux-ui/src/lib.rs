@@ -9,6 +9,7 @@
 pub mod attach;
 pub mod borders;
 pub mod buffer;
+pub mod chrome;
 pub mod client;
 pub mod composed;
 pub mod compositor;
@@ -27,6 +28,7 @@ pub mod vt_convert;
 // Re-export commonly used types.
 pub use borders::{BorderChars, BorderColors, BorderSegment, BorderStyle, compute_borders};
 pub use buffer::{DirtyCell, FrameBuffer, RenderAttrs, RenderCell};
+pub use chrome::{PaneChrome, StatusBadge, TitleGlyph, title_overlay};
 pub use client::{ClientConfig, ExitReason};
 pub use composed::{ComposeInputs, ComposedFrame, compose};
 pub use compositor::{

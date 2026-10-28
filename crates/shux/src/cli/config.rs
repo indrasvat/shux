@@ -80,6 +80,11 @@ prefix = "ctrl-space"
 # done / blocked / error over OSC 7501; read it with `shux pane status`.
 # false: shux answers no probe, keeps no records and publishes nothing.
 enabled = true
+# A status badge (◆ blocked, ✕ error, ✓ done, … working, ○ idle) leading
+# each pane's border title.
+border = true
+# "◆ N waiting" in the status bar while panes in the session are blocked.
+status_bar = true
 
 [keybindings]
 # Optional attach key overrides. Keys use the same notation as prefix:
@@ -103,6 +108,9 @@ enabled = true
 # status_bg        = "#1e2030"   # Catppuccin Crust
 # status_fg        = "#cad3f5"   # Catppuccin Text
 # status_accent    = "#74c7ec"   # Catppuccin Sapphire
+# status_ok        = "#a6da95"   # Catppuccin Green: done badge
+# status_error     = "#ed8796"   # Catppuccin Red: error badge
+# status_attention = "#eed49f"   # Catppuccin Yellow: blocked badge, "waiting"
 
 # ─────────────────────────────────────────────────────────────────────
 # Status-bar segments. Each entry runs `command` every `interval_ms`

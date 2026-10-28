@@ -58,6 +58,10 @@ mod strict {
     pub struct ProgramStatus {
         #[serde(default)]
         pub enabled: Option<bool>,
+        #[serde(default)]
+        pub border: Option<bool>,
+        #[serde(default)]
+        pub status_bar: Option<bool>,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -140,6 +144,12 @@ mod strict {
         pub status_muted: Option<String>,
         #[serde(default)]
         pub status_branch: Option<String>,
+        #[serde(default)]
+        pub status_ok: Option<String>,
+        #[serde(default)]
+        pub status_error: Option<String>,
+        #[serde(default)]
+        pub status_attention: Option<String>,
     }
 }
 
@@ -583,6 +593,20 @@ font_fallbacks = ["/tmp/this-shux-font-fallback-does-not-exist.ttf"]
         );
     }
 
+    #[test]
+    fn validate_program_status_block() {
+        let ok = write_tmp("[program_status]\nenabled = true\nborder = false\nstatus_bar = true\n");
+        let diags = validate(ok.path()).unwrap();
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+        for bad in [
+            "[program_status]\nborder = \"yes\"\n",
+            "[program_status]\nstale_guard = true\n",
+        ] {
+            let f = write_tmp(bad);
+            assert!(!validate(f.path()).unwrap().is_empty(), "accepted: {bad}");
+        }
+    }
+
     /// Same audit for `[theme]`: `status_muted` and `status_branch`
     /// landed in the runtime schema after the strict mirror was
     /// written and silently drifted.
@@ -598,6 +622,9 @@ status_fg        = "#cad3f5"
 status_accent    = "#74c7ec"
 status_muted     = "#6e738d"
 status_branch    = "#c6a0f6"
+status_ok        = "#a6da95"
+status_error     = "#ed8796"
+status_attention = "#eed49f"
 "##,
         );
         let diags = validate(f.path()).unwrap();

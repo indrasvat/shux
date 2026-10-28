@@ -66,7 +66,7 @@ fn frame<'a>(
         zoom: None,
         focused,
         vts,
-        titles: None,
+        chrome: None,
         status_bar: None,
     }
 }

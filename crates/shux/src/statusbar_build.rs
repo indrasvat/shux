@@ -252,8 +252,78 @@ pub fn build(snap: &SessionGraphSnapshot, theme: &Theme, ctx: &StatusBarCtx<'_>)
     bar
 }
 
+/// "◆ N waiting" at the head of the right zone, for `waiting` panes blocked
+/// on the user. Appended after every other segment, script ones included, so
+/// it is the first thing dropped when the bar is full rather than painting
+/// over another segment.
+pub fn append_waiting(
+    bar: &mut StatusBar,
+    waiting: usize,
+    theme: &Theme,
+    nerd_fonts: bool,
+    cols: u16,
+) {
+    if waiting == 0 {
+        return;
+    }
+    let glyph = if nerd_fonts { '\u{f071}' } else { '◆' };
+    let Rgb { r, g, b } = theme.status_attention;
+    let segment = StatusSegment::styled(
+        format!("{glyph} {waiting} waiting "),
+        Color::Rgb { r, g, b },
+        true,
+    );
+    let width = |segs: &[StatusSegment]| -> usize {
+        segs.iter()
+            .map(|s| unicode_width::UnicodeWidthStr::width(s.text.as_str()))
+            .sum()
+    };
+    let (lw, cw, rw) = (width(&bar.left), width(&bar.center), width(&bar.right));
+    // StatusBar::render_row keeps a one-column gap either side of the centre.
+    let gaps = if cw > 0 { 2 } else { 1 };
+    if lw + cw + rw + gaps + width(std::slice::from_ref(&segment)) <= usize::from(cols) {
+        bar.right.insert(0, segment);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn bar(left: &str, center: &str, right: &str) -> StatusBar {
+        let mut b = StatusBar::new();
+        for (zone, text) in [
+            (&mut b.left, left),
+            (&mut b.center, center),
+            (&mut b.right, right),
+        ] {
+            if !text.is_empty() {
+                zone.push(StatusSegment::plain(text));
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn waiting_leads_the_right_zone_when_it_fits() {
+        let mut b = bar("left", "", "right");
+        append_waiting(&mut b, 2, &Theme::DEFAULT, false, 40);
+        assert_eq!(b.right[0].text, "◆ 2 waiting ");
+        assert_eq!(b.right[1].text, "right");
+    }
+
+    #[test]
+    fn waiting_is_dropped_rather_than_overpaint_a_full_bar() {
+        // left 4 + centre 6 + right 5 + two gaps = 17; the segment is 12.
+        let full = bar("left", "centre", "right");
+        for (cols, fits) in [(29, true), (28, false)] {
+            let mut b = full.clone();
+            append_waiting(&mut b, 1, &Theme::DEFAULT, false, cols);
+            assert_eq!(b.right.len() == 2, fits, "{cols} columns");
+        }
+        let mut none = full.clone();
+        append_waiting(&mut none, 0, &Theme::DEFAULT, false, 200);
+        assert_eq!(none.right.len(), 1, "nothing waiting, no segment");
+    }
+
     use super::*;
 
     #[test]

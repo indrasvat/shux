@@ -6,6 +6,7 @@
 //! the layout / border / status-bar logic itself.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use shux_core::layout::{LayoutNode, Rect, ZoomState};
 use shux_core::model::PaneId;
@@ -40,7 +41,7 @@ pub struct ComposeInputs<'a> {
     pub focused: PaneId,
     /// Per-pane (grid, cursor) pairs.
     pub panes: &'a HashMap<PaneId, (&'a Grid, &'a Cursor)>,
-    pub titles: Option<&'a HashMap<PaneId, String>>,
+    pub chrome: Option<&'a HashMap<PaneId, crate::chrome::PaneChrome>>,
     pub status_bar: Option<&'a StatusBar>,
 }
 
@@ -107,37 +108,21 @@ pub fn compose(
             );
         }
 
-        if let Some(titles) = inputs.titles {
+        if let Some(chrome) = inputs.chrome {
             for (pid, rect) in &pane_rects {
-                let title = titles.get(pid).map(|s| s.as_str()).unwrap_or("");
-                if title.is_empty() || rect.width < 6 {
+                let Some(pane_chrome) = chrome.get(pid) else {
                     continue;
-                }
-                let fg = if *pid == inputs.focused {
+                };
+                let border = if *pid == inputs.focused {
                     crossterm_to_vt(border_colors.focused)
                 } else {
                     crossterm_to_vt(border_colors.unfocused)
                 };
-                let max_chars = rect.width.saturating_sub(4) as usize;
-                let truncated: String = title.chars().take(max_chars).collect();
-                let label = format!(" {truncated} ");
-                let mut x = rect.x.saturating_add(1);
                 // Overlay on the pane's top border row, NOT its first content row.
                 let y = rect.y.saturating_sub(1);
-                for ch in label.chars() {
-                    if x >= rect.x.saturating_add(rect.width).saturating_sub(1) {
-                        break;
-                    }
-                    put_cell(
-                        &mut grid,
-                        x,
-                        y,
-                        ch,
-                        fg,
-                        Color::Default,
-                        CellFlags::default(),
-                    );
-                    x = x.saturating_add(1);
+                for glyph in crate::chrome::title_overlay(pane_chrome, *rect) {
+                    let fg = glyph.color.map(crossterm_to_vt).unwrap_or(border);
+                    put_glyph(&mut grid, glyph.x, y, &glyph, fg);
                 }
             }
         }
@@ -305,6 +290,34 @@ fn put_cell(grid: &mut Grid, x: u16, y: u16, ch: char, fg: Color, bg: Color, fla
     };
 }
 
+/// A title glyph as the VT stores text: multi-scalar graphemes in the cell's
+/// extended attributes, a wide glyph followed by its continuation.
+fn put_glyph(grid: &mut Grid, x: u16, y: u16, glyph: &crate::chrome::TitleGlyph, fg: Color) {
+    let mut chars = glyph.text.chars();
+    let Some(ch) = chars.next() else {
+        return;
+    };
+    put_cell(grid, x, y, ch, fg, Color::Default, CellFlags::default());
+    if y as usize >= grid.rows() {
+        return;
+    }
+    let mut row = grid.visible_row_mut(y as usize);
+    let x = x as usize;
+    if x >= row.len() {
+        return;
+    }
+    row[x].width = glyph.width;
+    if chars.next().is_some() {
+        row[x].extended = Some(Arc::new(shux_vt::ExtendedAttrs {
+            grapheme: Some(glyph.text.clone()),
+            ..Default::default()
+        }));
+    }
+    if glyph.width == 2 && x + 1 < row.len() {
+        row[x + 1] = Cell::wide_continuation();
+    }
+}
+
 fn render_attrs_to_vt(rcell: &RenderCell) -> (Color, Color, CellFlags) {
     let fg = rcell.fg.map(crossterm_to_vt).unwrap_or(Color::Default);
     let bg = rcell.bg.map(crossterm_to_vt).unwrap_or(Color::Default);
@@ -365,7 +378,7 @@ mod tests {
             zoom: None,
             focused: pid,
             panes: &panes,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         let composed = compose(
@@ -383,6 +396,48 @@ mod tests {
         assert_eq!(text, "Hello");
     }
 
+    /// A wide title character takes two columns: a width-2 cell and its
+    /// continuation, as the VT writes them.
+    #[test]
+    fn compose_lays_a_wide_title_out_in_two_columns() {
+        let pid = PaneId::new();
+        let vt = VirtualTerminal::new(22, 78);
+        let layout = single_pane_layout(pid);
+        let panes = pane_map(pid, &vt);
+        let titles = HashMap::from([(pid, crate::chrome::PaneChrome::titled("日本x"))]);
+        let inputs = ComposeInputs {
+            layout: &layout,
+            zoom: None,
+            focused: pid,
+            panes: &panes,
+            chrome: Some(&titles),
+            status_bar: None,
+        };
+        let composed = compose(
+            &inputs,
+            80,
+            24,
+            BorderStyle::Rounded,
+            BorderColors::default(),
+            0,
+        );
+        let row = composed.grid.visible_row(0);
+        let cells: Vec<(char, u8)> = (2..9).map(|c| (row[c].ch, row[c].width)).collect();
+        assert_eq!(
+            cells,
+            [
+                (' ', 1),
+                ('日', 2),
+                (' ', 0),
+                ('本', 2),
+                (' ', 0),
+                ('x', 1),
+                (' ', 1)
+            ],
+            "title cells"
+        );
+    }
+
     #[test]
     fn compose_draws_border_when_enabled() {
         let pid = PaneId::new();
@@ -394,7 +449,7 @@ mod tests {
             zoom: None,
             focused: pid,
             panes: &panes,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         let composed = compose(
@@ -423,7 +478,7 @@ mod tests {
             zoom: None,
             focused: pid,
             panes: &panes,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         let composed = compose(
@@ -460,16 +515,16 @@ mod tests {
         panes.insert(left_pid, (left_vt.grid(), left_vt.cursor()));
         panes.insert(right_pid, (right_vt.grid(), right_vt.cursor()));
 
-        let mut titles: HashMap<PaneId, String> = HashMap::new();
-        titles.insert(left_pid, "lhs".into());
-        titles.insert(right_pid, "rhs".into());
+        let mut titles = HashMap::new();
+        titles.insert(left_pid, crate::chrome::PaneChrome::titled("lhs"));
+        titles.insert(right_pid, crate::chrome::PaneChrome::titled("rhs"));
 
         let inputs = ComposeInputs {
             layout: &layout,
             zoom: None,
             focused: left_pid,
             panes: &panes,
-            titles: Some(&titles),
+            chrome: Some(&titles),
             status_bar: None,
         };
         let composed = compose(
@@ -528,7 +583,7 @@ mod tests {
             zoom: None,
             focused: pid,
             panes: &panes,
-            titles: None,
+            chrome: None,
             status_bar: Some(&bar),
         };
         let composed = compose(
@@ -567,7 +622,7 @@ mod tests {
             zoom: None,
             focused: pid,
             panes: &panes,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         // Rounded border + 1 status row → pane viewport is (1,1,118,33): the
@@ -613,7 +668,7 @@ mod tests {
             zoom: None,
             focused: pid,
             panes: &panes,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         let composed = compose(
@@ -667,7 +722,7 @@ mod tests {
             zoom: None,
             focused: left,
             panes: &panes,
-            titles: None,
+            chrome: None,
             status_bar: None,
         };
         let composed = compose(
