@@ -10,20 +10,8 @@
 # PTY pool, wall-clock headroom — is bounded explicitly by the groups below.
 
 [profile.default]
-# Tests that spin up real PTYs are inherently timing-sensitive on
-# shared CI runners (macOS GitHub runners especially — the hypervisor
-# interleaves bursts of latency that look like normal jitter to wall-
-# clock sleeps). Two specific tests below have flaked across multiple
-# runs without any code change: `shux-pty::integration::test_spawn_echo`
-# and `shux::m0_integration::test_m0_pty_spawn_echo`. Both verify the
-# happy path (spawn a child, expect a marker in the PTY output) — a
-# single retry consistently passes.
-#
-# We deliberately scope retries to the PTY tests only via an override
-# rather than globally so a freshly-introduced flake elsewhere stays
-# loud instead of getting silently retried.
-
-# Default: no retries — make new flakes loud.
+# No retries anywhere: a flake is a timing-based test to fix (docs/testing.md),
+# never one to retry.
 retries = 0
 # Repeat every failure at the END of the run, not only inline where it happened.
 # GitHub's log API returns the TAIL of a job log, so an inline failure at test
@@ -183,34 +171,13 @@ test-group = 'daemon-pty'
 # core and 30.8x at four, against a 12x threshold, purely from contention.
 # `threads-required = "num-test-threads"` reserves the whole run's budget, so
 # it is the only thing on the machine while it measures.
-#
-# `pane_record_duration_stops_on_daemon_side` joined after it failed the macOS
-# job on PR #143 (1 of 2074). Its assertion is a deadline: the recorder is given
-# `duration_ms: 25`, the test sleeps 75ms and requires the write on the far side
-# to have been refused. That is a wall-clock measurement by this group's own
-# definition, but it was in no group and no retry override, so it raced ~2,000
-# concurrent tests for a 50ms margin on a hypervisor that delivers latency in
-# bursts. It costs ~0.4s of serialized run time, which is the correct price for
-# a deadline test.
 [[profile.default.overrides]]
 filter = '''
   binary_id(=shux-vt::scroll_region_bounds) & test(=region_scroll_cost_is_linear_in_pane_height)
-  + binary_id(=shux) & test(=rpc::pane_io::tests::pane_record_duration_stops_on_daemon_side)
   + binary_id(=shux-vt::program_status) & test(=osc_dense_output_scans_in_linear_time)
 '''
 test-group = 'wall-clock'
 threads-required = "num-test-threads"
-
-# Override: tests with known external timing dependencies (PTY
-# spawn jitter, TCP bind→drop→re-bind TOCTOU race) get up to 2
-# retries (3 total attempts). If a test in this list flakes more
-# than ~10% of CI runs, treat that as a signal to harden the test
-# rather than increase the retry budget. Each entry below has a
-# corresponding KNOWN FLAKE comment at the test site explaining why
-# retries are acceptable.
-[[profile.default.overrides]]
-filter = "test(test_spawn_echo) | test(test_m0_pty_spawn_echo) | test(test_tcp_auth_required)"
-retries = 2
 
 # ── CI profile ────────────────────────────────────────────────────────────
 # Same scheduling as local; only the reporting differs. Keeping the groups
