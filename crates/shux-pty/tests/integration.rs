@@ -758,9 +758,14 @@ async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() 
             }
         })
     };
+    // Bounded by attempts as well as time: the forks churn the machine's pid
+    // space, which every other test shares.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut leaked = Vec::new();
-    while leaked.is_empty() && std::time::Instant::now() < deadline {
+    for _ in 0..2000 {
+        if !leaked.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()

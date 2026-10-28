@@ -1181,7 +1181,8 @@ fn a_client_reports_a_daemon_that_does_not_answer() {
         !out.status.success()
             && stderr.contains("did not answer")
             && stderr.contains(&pid.to_string()),
-        "the error must name the daemon: {stderr}"
+        "the error must name the daemon ({}): {stderr}",
+        out.status
     );
 }
 
