@@ -99,6 +99,8 @@ struct AttachedClient {
     master: File,
     /// Held so the line discipline outlives the child and can be inspected.
     slave: OwnedFd,
+    /// The PTY's modes before the child ran: what "restored" means.
+    initial: Termios,
     seen: Vec<u8>,
 }
 
@@ -142,6 +144,8 @@ impl AttachedClient {
                 Ok(())
             });
         }
+        // Read before spawning: once the child runs it may be raw at any moment.
+        let initial = tcgetattr(pty.slave.as_fd()).expect("tcgetattr slave");
         let child = cmd.spawn().expect("spawn attach");
         nix::fcntl::fcntl(
             &pty.master,
@@ -152,6 +156,7 @@ impl AttachedClient {
             child,
             master: File::from(pty.master),
             slave: pty.slave,
+            initial,
             seen: Vec::new(),
         }
     }
@@ -234,7 +239,7 @@ fn assert_signal_restores_terminal(sig: Signal) {
     h.create_session(&session);
 
     let mut client = AttachedClient::spawn(&h, &session);
-    let before = client.termios();
+    let before = client.initial.clone();
     assert!(
         before
             .local_flags
@@ -318,7 +323,7 @@ fn a_killed_session_ends_the_client_and_restores_the_terminal() {
     let h = Harness::new();
     h.create_session("sig-session-kill");
     let mut client = AttachedClient::spawn(&h, "sig-session-kill");
-    let before = client.termios();
+    let before = client.initial.clone();
     client.wait_until_drawing();
 
     h.kill_session("sig-session-kill");
