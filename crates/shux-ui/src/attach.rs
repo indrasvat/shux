@@ -13,6 +13,7 @@
 //! mouse are restored on any exit (panic, error, signal, detach, session
 //! end).
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
@@ -163,16 +164,19 @@ const PASTE_CHUNK: usize = 64 * 1024;
 
 /// Whether the terminal on stdin has hung up. crossterm never reports it: it
 /// polls a hung-up terminal to the end of every timeout, and with SIGHUP
-/// ignored nothing else would end the attach.
+/// ignored nothing else would end the attach. Meaningful only when stdin was a
+/// terminal at attach: otherwise crossterm reads `/dev/tty`, not stdin.
 fn terminal_hung_up() -> bool {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::os::fd::AsFd;
     let stdin = std::io::stdin();
-    let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::empty())];
+    // POLLIN, though only the hangup is wanted: macOS reports POLLHUP only
+    // on an fd polled for an event.
+    let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
     poll(&mut fds, PollTimeout::ZERO).is_ok_and(|n| n > 0)
-        && fds[0].revents().is_some_and(|r| {
-            r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
-        })
+        && fds[0]
+            .revents()
+            .is_some_and(|r| r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR))
 }
 
 async fn run_loop<S>(
@@ -195,6 +199,8 @@ where
     // Spawn input reader: poll crossterm events on a blocking thread,
     // forward via channel.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<Event>(64);
+    // Decided once: a hung-up terminal can stop answering as a terminal.
+    let watch_stdin = std::io::stdin().is_terminal();
     std::thread::spawn(move || {
         loop {
             // Long, because the wait ends in a busy loop over its last
@@ -209,7 +215,7 @@ where
                     }
                     Err(_) => break,
                 },
-                Ok(false) if key_tx.is_closed() || terminal_hung_up() => break,
+                Ok(false) if key_tx.is_closed() || (watch_stdin && terminal_hung_up()) => break,
                 Ok(false) => continue,
                 Err(_) => break,
             }

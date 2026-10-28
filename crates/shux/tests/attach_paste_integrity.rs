@@ -154,6 +154,36 @@ struct Client {
 
 impl Client {
     fn attach(h: &Harness) -> Self {
+        let mut command = Command::new(&h.bin);
+        command.args(["session", "attach", "paste"]);
+        Self::run(h, command)
+    }
+
+    /// Attaches with the terminal as the client's controlling terminal and
+    /// its stdin a pipe already at end of file, as `true | shux session
+    /// create` leaves it: the client reads the terminal through `/dev/tty`.
+    #[cfg(target_os = "linux")]
+    fn attach_without_stdin(h: &Harness) -> Self {
+        use std::os::fd::AsRawFd;
+        let (read, write) = nix::unistd::pipe().expect("pipe");
+        drop(write);
+        // `setsid -c` takes the terminal from stdin, so the pipe replaces it
+        // only afterwards, in the shell that then becomes the client.
+        let fd = read.as_raw_fd();
+        let mut command = Command::new("setsid");
+        command.args([
+            "-c",
+            "sh",
+            "-c",
+            &format!(r#"exec "$0" session create paste --ensure 0<&{fd} {fd}<&-"#),
+        ]);
+        command.arg(&h.bin);
+        let client = Self::run(h, command);
+        drop(read);
+        client
+    }
+
+    fn run(h: &Harness, mut command: Command) -> Self {
         let size = nix::pty::Winsize {
             ws_row: 30,
             ws_col: 100,
@@ -169,12 +199,11 @@ impl Client {
         }
         let slave: OwnedFd = pty.slave;
         let dup = |fd: &OwnedFd| Stdio::from(fd.try_clone().expect("dup slave"));
-        let process = Command::new(&h.bin)
+        let process = command
             .env("XDG_RUNTIME_DIR", h.runtime_dir())
             .env_remove("SHUX_SOCKET")
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
-            .args(["session", "attach", "paste"])
             .stdin(dup(&slave))
             .stdout(dup(&slave))
             .stderr(dup(&slave))
@@ -255,9 +284,6 @@ impl Client {
         }
     }
 
-    /// The master shares the drain's non-blocking file description, so a full
-    /// terminal input queue answers WouldBlock: that is the client applying
-    /// backpressure, and the typist waits for it like a real one would.
     /// Pastes `text` as a terminal does: between the bracketed-paste markers
     /// only while the client has mode 2004 turned on.
     fn paste(&mut self, text: &[u8]) {
@@ -273,6 +299,9 @@ impl Client {
         self.type_bytes(&[b"\x1b[200~", text, b"\x1b[201~"].concat());
     }
 
+    /// The master shares the drain's non-blocking file description, so a full
+    /// terminal input queue answers WouldBlock: that is the client applying
+    /// backpressure, and the typist waits for it like a real one would.
     fn type_bytes(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -477,6 +506,23 @@ fn a_client_whose_terminal_hung_up_exits() {
         client.hang_up(Duration::from_secs(10)),
         "the client still runs 10 s after its terminal hung up"
     );
+}
+
+/// A client reading its terminal through `/dev/tty` has nothing to watch on
+/// stdin: an empty pipe there is no hangup, and the attach stays up.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_without_stdin_stays_attached() {
+    let h = Harness::new();
+    pane_session(&h, "head -c 3 > /dev/null; echo GOT-KEYS; sleep 3600");
+    let mut client = Client::attach_without_stdin(&h);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        matches!(client.process.0.try_wait(), Ok(None)),
+        "the client left an idle attach because its stdin was an empty pipe"
+    );
+    client.type_bytes(b"abc");
+    client.wait_for_text("GOT-KEYS");
 }
 
 /// An attach client with nothing to do must not spin: a multiplexer sits
