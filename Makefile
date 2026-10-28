@@ -244,6 +244,12 @@ test-pane-io: nextest-ready ## Run pane I/O integration tests; optionally pass F
 	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test pane_io_integration $(FILTER)
 	@echo "$(COLOR_GREEN)✓ Pane I/O integration tests passed$(COLOR_RESET)"
 
+.PHONY: test-daemon-lifecycle
+test-daemon-lifecycle: nextest-ready ## Run daemon start/stop/teardown integration tests; optionally pass FILTER=<test-name>
+	@echo "$(COLOR_BLUE)▶ Running daemon lifecycle integration tests...$(COLOR_RESET)"
+	@.shux/scripts/no_leak_guard.sh $(NEXTEST_RUN) -p shux --test daemon_lifecycle_integration $(FILTER)
+	@echo "$(COLOR_GREEN)✓ Daemon lifecycle integration tests passed$(COLOR_RESET)"
+
 .PHONY: test-pane-command
 test-pane-command: nextest-ready ## Run pane command / exited-pane e2e tests; optionally pass FILTER=<test-name>
 	@echo "$(COLOR_BLUE)▶ Running pane command e2e tests...$(COLOR_RESET)"

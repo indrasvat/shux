@@ -1,3 +1,10 @@
+## [0.52.2](https://github.com/indrasvat/shux/compare/v0.52.1...v0.52.2) (2026-10-28)
+
+
+### Bug Fixes
+
+* **daemon:** start exactly one daemon per socket under concurrent first use ([#201](https://github.com/indrasvat/shux/issues/201)) ([7834b5f](https://github.com/indrasvat/shux/commit/7834b5f89c996e57f04ebb4f9ad68f1bc5e78a6a)), closes [#193](https://github.com/indrasvat/shux/issues/193) [#193](https://github.com/indrasvat/shux/issues/193)
+
 ## [0.52.1](https://github.com/indrasvat/shux/compare/v0.52.0...v0.52.1) (2026-10-28)
 
 

@@ -16,7 +16,7 @@ members = [
 exclude = [".shux/fixtures/lens/t/demo-app"]
 
 [workspace.package]
-version = "0.52.1"
+version = "0.52.2"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -68,7 +68,7 @@ tempfile = "3"
 
 
 # Daemonization
-nix = { version = "0.31", features = ["process", "signal", "fs", "user", "term"] }
+nix = { version = "0.31", features = ["process", "signal", "fs", "user", "term", "socket"] }
 
 # Filesystem watching (for config hot reload)
 notify = "8"

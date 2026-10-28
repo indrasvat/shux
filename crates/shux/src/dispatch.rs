@@ -74,10 +74,10 @@ pub(crate) fn default_session_name() -> String {
 /// real keystrokes / ANSI bytes on the user's terminal. Restores the
 /// terminal on every exit path via `TerminalGuard`'s Drop.
 pub(crate) async fn run_attach(
-    _jsonrpc_socket: &std::path::Path,
+    jsonrpc_socket: &std::path::Path,
     session_name: String,
 ) -> anyhow::Result<()> {
-    let attach_path = daemon::attach_socket_path()?;
+    let attach_path = daemon::attach_socket_path_for(jsonrpc_socket)?;
     let cfg_snapshot =
         shux_core::config::ConfigHandle::load_or_default(&shux_core::config::default_config_path())
             .current();
@@ -115,6 +115,9 @@ pub(crate) async fn run_attach(
 
 /// Dispatch CLI subcommands.
 pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
+    if let Some(typed) = &args.socket {
+        crate::daemon::remember_typed_socket(typed);
+    }
     let socket_path = args.socket_path();
 
     match args.command {

@@ -68,15 +68,16 @@ selftest_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-selftest.XXXXXX")
 # exactly the failure paths the trap exists for, and every run leaked its temp dirs even
 # when green. Each assert runs in a subshell (it kills what it reports either way, and
 # keeps no state), so a failure is recorded instead of fatal and cleanup always runs.
-# Everything the wedge case below creates, on every exit path: the stopped
-# daemon, its pane children's process groups, the bystander's session and the
+# Everything a wedge case below creates, on every exit path: the stopped daemon,
+# its pane tree's process groups, the subreaper, the bystander's session and the
 # runtime dir. The case clears each variable once it has cleaned that part up.
 cleanup_wedge() {
   local pid
   [ -z "${wedge_pid:-}" ] || kill -KILL "${wedge_pid}" >/dev/null 2>&1 || true
-  for pid in ${wedge_children:-}; do
+  for pid in ${wedge_tree:-}; do
     kill -KILL -- "-${pid}" >/dev/null 2>&1 || kill -KILL "${pid}" >/dev/null 2>&1 || true
   done
+  [ -z "${holder:-}" ] || kill -KILL "${holder}" >/dev/null 2>&1 || true
   [ -z "${bystander_pid:-}" ] || kill -KILL -- "-${bystander_pid}" >/dev/null 2>&1 || true
   rm -rf "${wedge_runtime}"
 }
@@ -382,19 +383,96 @@ if names_pid "${baseline_pid}" "$(shux_daemon_pids)"; then
 fi
 stop_foreign_daemon
 
-# The stranded-child sweep is the most destructive code in the reaper, so it is exercised
-# for REAL — but only once the daemons this test made are gone and no other daemon of this
-# checkout is running, so a real reap cannot reach a concurrent session's work.
-if [ -z "$(shux_daemon_pids)" ]; then
+# Every descendant of a pid (mirrors reap_daemons.sh, which this must not trust).
+tree_pids() {
+  local pid
+  for pid in $(ps -axo pid=,ppid= | awk -v p="$1" '$2 == p { print $1 }'); do
+    printf '%s\n' "${pid}"
+    tree_pids "${pid}"
+  done
+}
+
+# One wedged daemon, reaped for real.
+#
+# The pane's shell backgrounds a `sleep` that ignores SIGHUP before it execs, so a
+# daemon's SIGKILL strands a grandchild that outlives the pane's own shell. With
+# `subreaper`, the daemon is started below a child subreaper, as under `systemd --user`
+# on a desktop: its orphans are adopted by that, not by init, and nothing reaps them.
+# With `forking`, the pane keeps forking children that ignore HUP and TERM, so some are
+# born after the reaper's first walk of the tree. With `handoff`, a pane process waits
+# for the daemon to die, then forks a child and exits: the child's parent is gone and
+# no lineage leads back to the daemon unless the tree was frozen before the kill.
+reap_wedged_daemon() {
+  local mode="$1" wedge_runtime wedge_pid wedge_tree="" bystander_needle
+  local bystander_pid="" wedge_reap_status bystander_alive pid holder="" ready
   wedge_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-wedge.XXXXXX")"
-  bystander_needle="leak-guard-bystander-$$"
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${wedge_runtime}" "${shux_bin}" --format json \
-    session create leak-guard-wedge-$$ -d -- sh -lc 'sleep 400' >/dev/null
-  wedge_pid="$(cat "${wedge_runtime}/shux/shux.pid")"
-  wedge_children="$(ps -axo pid=,ppid= | awk -v p="${wedge_pid}" '$2 == p { print $1 }')"
-  if [ -z "${wedge_children}" ]; then
-    echo "leak guard self-test: wedged daemon ${wedge_pid} had no pane child to strand" >&2
+  wedge_pid=""
+  # Every early exit goes through here, so a failed setup leaks nothing.
+  abort_wedge() {
+    echo "leak guard self-test: $1" >&2
+    local victim
+    for victim in ${wedge_pid:+$(tree_pids "${wedge_pid}")} ${wedge_pid} ${holder}; do
+      kill -KILL "${victim}" >/dev/null 2>&1 || true
+    done
+    [ -z "${holder}" ] || wait "${holder}" 2>/dev/null || true
+    wedge_pid="" holder=""
+    rm -rf "${wedge_runtime}"
     exit 1
+  }
+  bystander_needle="leak-guard-bystander-$$"
+  local pane="trap '' HUP; sleep 401 & exec sleep 400"
+  # Unique to this run, so the survivor scan below cannot count another suite's sleeps.
+  local fork_needle="7$$"
+  [ "${mode}" != forking ] ||
+    pane="trap '' HUP TERM; while :; do sleep ${fork_needle} & sleep 0.05; done"
+  if [ "${mode}" = handoff ]; then
+    # `read` is a builtin, so the daemon's death is seen before a reaper's next step.
+    cat >"${wedge_runtime}/handoff.sh" <<HANDOFF
+trap '' HUP TERM
+while read -r _ _ state _ </proc/\$1/stat 2>/dev/null && [ "\${state}" != Z ]; do sleep 0.01; done
+sleep ${fork_needle} &
+HANDOFF
+    pane="trap '' HUP TERM; sh '${wedge_runtime}/handoff.sh' \$PPID & exec sleep 400"
+  fi
+  set -- env -u SHUX_SOCKET XDG_RUNTIME_DIR="${wedge_runtime}" "${shux_bin}" --format json \
+    session create leak-guard-wedge-$$ -d -- sh -c "${pane}"
+  if [ "${mode}" = subreaper ]; then
+    ready="${wedge_runtime}/subreaper-ready"
+    python3 -c '
+import ctypes, subprocess, sys, time
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+subprocess.run(sys.argv[2:], check=True, stdout=subprocess.DEVNULL)
+open(sys.argv[1], "w").close()
+time.sleep(600)
+' "${ready}" "$@" &
+    holder=$!
+    for _ in $(seq 100); do
+      [ -e "${ready}" ] && break
+      sleep 0.1
+    done
+    if [ ! -e "${ready}" ]; then
+      wedge_pid="$(cat "${wedge_runtime}/shux/shux.pid" 2>/dev/null || true)"
+      abort_wedge "the subreaper ${holder} never reported its session created"
+    fi
+  else
+    "$@" >/dev/null || {
+      wedge_pid="$(cat "${wedge_runtime}/shux/shux.pid" 2>/dev/null || true)"
+      abort_wedge "could not create the wedged daemon's session"
+    }
+  fi
+  wedge_pid="$(cat "${wedge_runtime}/shux/shux.pid" 2>/dev/null || true)"
+  [ -n "${wedge_pid}" ] || abort_wedge "the wedged daemon wrote no pidfile"
+  if [ -n "${holder}" ] && [ "$(ps -p "${wedge_pid}" -o ppid= | tr -d '[:space:]')" != "${holder}" ]; then
+    abort_wedge "daemon ${wedge_pid} is not below the subreaper ${holder}"
+  fi
+  # The backgrounded sleep is forked after the session is created; wait for it.
+  for _ in $(seq 50); do
+    wedge_tree="$(tree_pids "${wedge_pid}")"
+    [ "$(printf '%s\n' "${wedge_tree}" | grep -c .)" -ge 2 ] && break
+    sleep 0.1
+  done
+  if [ "$(printf '%s\n' "${wedge_tree}" | grep -c .)" -lt 2 ]; then
+    abort_wedge "wedged daemon ${wedge_pid} had no pane tree to strand"
   fi
   # Too wedged to service SIGTERM, so the reaper must escalate to SIGKILL — the only path
   # that strands pane children, because SIGKILL runs none of the daemon's teardown.
@@ -435,25 +513,51 @@ BYSTANDER
   kill -KILL -- "-${bystander_pid}" >/dev/null 2>&1 || true
   bystander_pid=""
   pid_is_gone "${wedge_pid}" && wedge_pid=""
+  # Checked before the subreaper exits, which would hand its orphans to init.
+  local survivors=""
+  for pid in ${wedge_tree}; do
+    pid_is_gone "${pid}" || survivors="${survivors} ${pid}"
+  done
+  if [ "${mode}" = forking ] || [ "${mode}" = handoff ]; then
+    # shellcheck disable=SC2009  # ps|grep is required by the process-hygiene rule
+    for pid in $(ps -axo pid=,args= | grep -E "^ *[0-9]+ sleep ${fork_needle}\$" | awk '{ print $1 }'); do
+      case " ${survivors} " in *" ${pid} "*) ;; *) pid_is_gone "${pid}" || survivors="${survivors} ${pid}" ;; esac
+    done
+  fi
+  for pid in ${survivors}; do
+    echo "reap_daemons.sh left the wedged daemon's pane process running (${pid})" >&2
+    describe_pid "${pid}" >&2
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+  done
+  if [ -n "${holder}" ]; then
+    kill -TERM "${holder}" >/dev/null 2>&1 || true
+    wait "${holder}" 2>/dev/null || true
+  fi
+  rm -rf "${wedge_runtime}"
+  wedge_tree="" holder="" wedge_runtime=""
+  [ -z "${survivors}" ] || exit 1
 
   if [ "${wedge_reap_status}" -ne 0 ]; then
     echo "reap_daemons.sh failed on a wedged daemon (status ${wedge_reap_status})" >&2
     exit 1
   fi
-  for pid in ${wedge_children}; do
-    pid_is_gone "${pid}" && continue
-    echo "reap_daemons.sh left the wedged daemon's pane child running (${pid})" >&2
-    describe_pid "${pid}" >&2
-    kill -KILL "${pid}" >/dev/null 2>&1 || true
-    exit 1
-  done
   if [ "${bystander_alive}" -ne 1 ]; then
     echo "reap_daemons.sh killed a process it did not strand" >&2
     exit 1
   fi
-  wedge_children=""
-  cleanup_wedge
-  wedge_runtime=""
+}
+
+# The stranded-child sweep is the most destructive code in the reaper, so it is exercised
+# for REAL — but only once the daemons this test made are gone and no other daemon of this
+# checkout is running, so a real reap cannot reach a concurrent session's work.
+if [ -z "$(shux_daemon_pids)" ]; then
+  reap_wedged_daemon plain
+  reap_wedged_daemon forking
+  # PR_SET_CHILD_SUBREAPER is Linux-only, and `handoff` watches /proc.
+  if [ "$(uname -s)" = "Linux" ]; then
+    reap_wedged_daemon subreaper
+    reap_wedged_daemon handoff
+  fi
 else
   echo "note: other daemons from this checkout are running; skipping the reap sweep case" >&2
 fi

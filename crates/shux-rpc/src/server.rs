@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixStream};
 #[cfg(test)]
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
@@ -34,6 +34,7 @@ pub struct Server {
     config: ServerConfig,
     router: Router,
     cancel: tokio_util::sync::CancellationToken,
+    rebind_gate: Option<crate::uds::RebindGate>,
 }
 
 /// A JSON-RPC 2.0 request (parsed from incoming frames).
@@ -92,35 +93,24 @@ impl Server {
             config,
             router,
             cancel,
+            rebind_gate: None,
         }
+    }
+
+    /// Rebind an unlinked socket only while `gate` says this process may.
+    pub fn with_rebind_gate(mut self, gate: crate::uds::RebindGate) -> Self {
+        self.rebind_gate = Some(gate);
+        self
     }
 
     /// Start the server (UDS + optional TCP).
     ///
     /// This runs until the CancellationToken is triggered.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Clean up any stale socket file.
-        if self.config.socket_path.exists() {
-            std::fs::remove_file(&self.config.socket_path)?;
-        }
-
-        // Ensure the parent directory exists.
-        if let Some(parent) = self.config.socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Bind the Unix domain socket.
-        let uds_listener = UnixListener::bind(&self.config.socket_path)?;
+        let mut uds = crate::uds::OwnedSocket::bind(&self.config.socket_path)?;
         info!(path = %self.config.socket_path.display(), "UDS listener bound");
-
-        // Set socket permissions to 0700 (PRD §13.1).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&self.config.socket_path, perms)?;
-            info!("socket permissions set to 0700");
-        }
+        let mut socket_check = tokio::time::interval(crate::uds::CHECK_INTERVAL);
+        socket_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Optionally bind TCP listener.
         let tcp_listener = if !self.config.tcp_addr.is_empty() {
@@ -142,8 +132,9 @@ impl Server {
                     info!("server shutting down");
                     break;
                 }
+                _ = socket_check.tick() => uds.check(self.rebind_gate.as_ref())?,
                 // Accept UDS connections.
-                result = uds_listener.accept() => {
+                result = uds.listener().accept() => {
                     match result {
                         Ok((stream, _addr)) => {
                             debug!("accepted UDS connection");
@@ -189,8 +180,7 @@ impl Server {
             }
         }
 
-        // Cleanup socket file on shutdown.
-        let _ = std::fs::remove_file(&self.config.socket_path);
+        drop(uds);
         info!("server stopped");
 
         Ok(())
@@ -886,6 +876,66 @@ mod tests {
         // Shutdown.
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    fn spawn_builtin_server(
+        socket_path: &std::path::Path,
+    ) -> (
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let router = register_builtin_methods(Router::builder()).build();
+        let config = ServerConfig {
+            socket_path: socket_path.to_path_buf(),
+            tcp_addr: String::new(),
+            auth_token: None,
+        };
+        let server = Server::new(config, router, cancel.clone());
+        let handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+        (cancel, handle)
+    }
+
+    /// A server whose socket file was unlinked serves the path again.
+    #[tokio::test]
+    async fn an_unlinked_socket_is_rebound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("test.sock");
+        let (cancel, handle) = spawn_builtin_server(&socket_path);
+        drop(connect_with_retries(&socket_path).await);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        drop(connect_with_retries(&socket_path).await);
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    /// Shutdown removes the server's own socket and never one bound in its place.
+    #[tokio::test]
+    async fn shutdown_leaves_a_socket_bound_in_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("test.sock");
+        let (cancel, handle) = spawn_builtin_server(&socket_path);
+        drop(connect_with_retries(&socket_path).await);
+
+        // A rename replaces the path atomically, so the server never sees it missing.
+        let staged = dir.path().join("other.sock");
+        let other = std::os::unix::net::UnixListener::bind(&staged).unwrap();
+        std::fs::rename(&staged, &socket_path).unwrap();
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("server stops")
+            .unwrap();
+        assert!(
+            std::os::unix::net::UnixStream::connect(&socket_path).is_ok(),
+            "shutdown unlinked the socket that replaced its own"
+        );
+        drop(other);
     }
 
     /// Connect to a UDS server with a bounded retry loop (replaces a fixed
