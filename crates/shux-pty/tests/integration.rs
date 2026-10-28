@@ -744,7 +744,15 @@ async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    // Set on every exit, so a panic below cannot leave the opener forking.
+    struct Stop(Arc<AtomicBool>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let stop = Arc::new(AtomicBool::new(false));
+    let stopper = Stop(Arc::clone(&stop));
     let opener = {
         let stop = Arc::clone(&stop);
         let runtime = tokio::runtime::Handle::current();
@@ -774,7 +782,7 @@ async fn a_process_forked_while_a_pane_opens_inherits_no_terminal_descriptors() 
         let _ = child.kill();
         let _ = child.wait();
     }
-    stop.store(true, Ordering::Relaxed);
+    drop(stopper);
     opener.join().unwrap();
     assert!(
         leaked.is_empty(),

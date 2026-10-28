@@ -119,7 +119,7 @@ struct AttachedClient {
     child: Child,
     master: File,
     /// Held so the line discipline outlives the child and can be inspected.
-    slave: OwnedFd,
+    _slave: OwnedFd,
     /// The PTY's modes before the child ran: what "restored" means.
     initial: Termios,
     seen: Vec<u8>,
@@ -176,7 +176,7 @@ impl AttachedClient {
         Self {
             child,
             master: File::from(pty.master),
-            slave: pty.slave,
+            _slave: pty.slave,
             initial,
             seen: Vec::new(),
         }
@@ -194,8 +194,10 @@ impl AttachedClient {
         }
     }
 
+    /// Read through the master: macOS revokes the slave descriptors once the
+    /// session leader, the client, has exited.
     fn termios(&self) -> Termios {
-        tcgetattr(self.slave.as_fd()).expect("tcgetattr slave")
+        tcgetattr(self.master.as_fd()).expect("tcgetattr master")
     }
 
     /// Wait until the pane's colours have been drawn: the client is past the
@@ -279,7 +281,13 @@ fn blocked_writing_to_terminal(pid: u32) -> bool {
         return false;
     };
     tasks.flatten().any(|task| {
-        let syscall = std::fs::read_to_string(task.path().join("syscall")).unwrap_or_default();
+        let syscall = match std::fs::read_to_string(task.path().join("syscall")) {
+            Ok(syscall) => syscall,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                panic!("cannot see where pid {pid} is blocked (ptrace_scope?): {e}")
+            }
+            Err(_) => String::new(),
+        };
         let mut fields = syscall.split_whitespace();
         let nr = fields.next().and_then(|n| n.parse::<i64>().ok());
         let fd = fields.next();

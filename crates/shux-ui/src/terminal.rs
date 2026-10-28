@@ -4,7 +4,11 @@
 //! restored to its original state, even after a panic.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use nix::libc;
+use nix::sys::signal::Signal;
 
 use crossterm::{
     Command, cursor,
@@ -192,17 +196,21 @@ impl Drop for TerminalGuard {
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Best-effort terminal restore
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-        let _ = execute!(io::stdout(), cursor::SetCursorStyle::DefaultUserShape);
-        let _ = execute!(io::stdout(), ResetCursorColor);
-        let _ = execute!(io::stdout(), cursor::Show);
-
+        restore_after_panic(&mut io::stdout());
         // Now print the panic info on the restored terminal
         default_hook(info);
     }));
+}
+
+/// Best-effort, with no record of what was entered: a panic can land anywhere.
+fn restore_after_panic(out: &mut impl io::Write) {
+    let _ = execute!(out, CloseInterruptedFrame);
+    let _ = disable_raw_mode();
+    let _ = execute!(out, LeaveAlternateScreen);
+    let _ = execute!(out, DisableMouseCapture);
+    let _ = execute!(out, cursor::SetCursorStyle::DefaultUserShape);
+    let _ = execute!(out, ResetCursorColor);
+    let _ = execute!(out, cursor::Show);
 }
 
 /// The signals that end a TUI client. Their default action would kill the
@@ -210,54 +218,90 @@ pub fn install_panic_hook() {
 /// caller restores the terminal and then re-raises.
 ///
 /// Install BEFORE [`TerminalGuard::enter`], and keep [`ShutdownSignals::recv`]
-/// in the select for as long as the terminal is raw. Dropping it restores the
-/// default actions, so nothing after an attach can swallow a signal.
+/// in the select for as long as the terminal is raw. Dropping it hands back the
+/// actions the process had before, so nothing after an attach can swallow a
+/// signal. A signal the process inherited as ignored, as under `nohup`, is left
+/// ignored.
 pub struct ShutdownSignals {
-    streams: [tokio::signal::unix::Signal; 4],
+    streams: [Option<tokio::signal::unix::Signal>; 4],
+    _previous: PreviousActions,
 }
 
-const SHUTDOWN_SIGNALS: [nix::sys::signal::Signal; 4] = {
-    use nix::sys::signal::Signal;
-    [
-        Signal::SIGTERM,
-        Signal::SIGINT,
-        Signal::SIGHUP,
-        Signal::SIGQUIT,
-    ]
-};
+const SHUTDOWN_SIGNALS: [Signal; 4] = [
+    Signal::SIGTERM,
+    Signal::SIGINT,
+    Signal::SIGHUP,
+    Signal::SIGQUIT,
+];
+
+/// tokio claims a signal for the life of the process, so a second install,
+/// after the first handed the actions back, would catch nothing.
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Put back on drop, including when an install fails partway.
+struct PreviousActions([libc::sigaction; 4]);
+
+impl Drop for PreviousActions {
+    fn drop(&mut self) {
+        for (sig, action) in SHUTDOWN_SIGNALS.iter().zip(&self.0) {
+            // SAFETY: `action` is what the kernel reported for this signal.
+            unsafe { libc::sigaction(*sig as libc::c_int, action, std::ptr::null_mut()) };
+        }
+    }
+}
+
+fn current_action(sig: Signal) -> libc::sigaction {
+    // SAFETY: a null new action only reads the current one, and a zeroed
+    // sigaction is a valid SIG_DFL if the read fails.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(sig as libc::c_int, std::ptr::null(), &mut old);
+        old
+    }
+}
 
 impl ShutdownSignals {
+    /// Once per process; a second call is an error.
     pub fn install() -> io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
-        let [a, b, c, d] = SHUTDOWN_SIGNALS.map(|sig| signal(SignalKind::from_raw(sig as i32)));
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return Err(io::Error::other(
+                "shutdown signals can be installed once per process",
+            ));
+        }
+        let previous = PreviousActions(SHUTDOWN_SIGNALS.map(current_action));
+        let mut streams = [None, None, None, None];
+        for ((slot, sig), old) in streams.iter_mut().zip(SHUTDOWN_SIGNALS).zip(&previous.0) {
+            if old.sa_sigaction != libc::SIG_IGN {
+                *slot = Some(signal(SignalKind::from_raw(sig as i32))?);
+            }
+        }
         Ok(Self {
-            streams: [a?, b?, c?, d?],
+            streams,
+            _previous: previous,
         })
     }
 
     /// Resolves with the raw number of the first shutdown signal received.
     pub async fn recv(&mut self) -> i32 {
+        async fn next(stream: &mut Option<tokio::signal::unix::Signal>) {
+            match stream {
+                Some(stream) => {
+                    stream.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
         let [a, b, c, d] = &mut self.streams;
         let index = tokio::select! {
-            _ = a.recv() => 0,
-            _ = b.recv() => 1,
-            _ = c.recv() => 2,
-            _ = d.recv() => 3,
+            _ = next(a) => 0,
+            _ = next(b) => 1,
+            _ = next(c) => 2,
+            _ = next(d) => 3,
         };
         let signo = SHUTDOWN_SIGNALS[index] as i32;
         tracing::info!(signo, "client: shutdown signal");
         signo
-    }
-}
-
-impl Drop for ShutdownSignals {
-    fn drop(&mut self) {
-        use nix::sys::signal::{SigHandler, signal};
-        for sig in SHUTDOWN_SIGNALS {
-            // SAFETY: SIG_DFL installs no handler, so no code of ours runs in
-            // signal context.
-            let _ = unsafe { signal(sig, SigHandler::SigDfl) };
-        }
     }
 }
 
@@ -293,25 +337,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_panic_closes_an_interrupted_frame_before_restoring() {
+        let mut out = Vec::new();
+        restore_after_panic(&mut out);
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.starts_with("\x1b\\\x1b[?2026l"),
+            "the restore can land inside an open frame: {out:?}"
+        );
+    }
+
     #[tokio::test]
-    async fn dropping_the_shutdown_signals_restores_the_default_actions() {
-        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, sigaction};
-        fn is_default(sig: nix::sys::signal::Signal) -> bool {
-            let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
-            // SAFETY: SIG_DFL runs no code of ours, and the old action goes
-            // straight back.
-            let old = unsafe { sigaction(sig, &dfl) }.unwrap();
-            unsafe { sigaction(sig, &old) }.unwrap();
-            matches!(old.handler(), SigHandler::SigDfl)
-        }
+    async fn the_shutdown_signals_install_once_and_hand_back_the_actions_they_found() {
+        use nix::sys::signal::{SigHandler, signal};
+        let handler = |sig| current_action(sig).sa_sigaction;
+        // As under `nohup`. SAFETY: ignoring a signal runs no code of ours.
+        unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) }.unwrap();
+        let before = SHUTDOWN_SIGNALS.map(handler);
 
         let signals = ShutdownSignals::install().unwrap();
-        for sig in SHUTDOWN_SIGNALS {
-            assert!(!is_default(sig), "{sig} is not caught");
+        assert_eq!(
+            handler(Signal::SIGHUP),
+            libc::SIG_IGN,
+            "an ignored SIGHUP is caught"
+        );
+        for sig in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT] {
+            assert_ne!(handler(sig), libc::SIG_DFL, "{sig} is not caught");
         }
+        assert!(
+            ShutdownSignals::install().is_err(),
+            "a second install claimed to catch signals"
+        );
         drop(signals);
-        for sig in SHUTDOWN_SIGNALS {
-            assert!(is_default(sig), "{sig} is still caught");
-        }
+        assert_eq!(
+            SHUTDOWN_SIGNALS.map(handler),
+            before,
+            "dropping did not hand back the actions found at install"
+        );
+        assert!(
+            ShutdownSignals::install().is_err(),
+            "an install after the drop claimed to catch signals"
+        );
+        unsafe { signal(Signal::SIGHUP, SigHandler::SigDfl) }.unwrap();
     }
 }
