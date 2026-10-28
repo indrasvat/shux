@@ -1,0 +1,31 @@
+{
+  "scope": "osc7501-status-chrome",
+  "audit": "shux-vt-solid-qa final run at a4530be after F1 (bf22e26), F1b (a6280cc) and F7 (a4530be); VERDICT PASS",
+  "commit_under_audit": "a4530be",
+  "base": "origin/main (merged into the branch at 71697bd)",
+  "previous_gates": "9ee66ee FAIL (F1 junctions, F4 guard path); bf22e26 FAIL (F1b first-column junction); a6280cc FAIL (F7 status-bar wide-cell overlap)",
+  "solid_qa_report": "SOLID-QA.md",
+  "dootsabha_design": "council-record.md",
+  "dootsabha_implementation": "council-record.md",
+  "screenshots": [],
+  "pixel_metrics": [
+    "pixel-attach-vs-window-30x12-unicode.json",
+    "pixel-attach-vs-window-24x10-unicode.json",
+    "pixel-session-vs-window-30x12-unicode.json",
+    "pixel-attach-vs-window-80x24-unicode.json",
+    "pixel-attach-vs-window-30x12-nerd.json",
+    "pixel-attach-vs-window-24x10-nerd.json",
+    "pixel-session-vs-window-30x12-nerd.json",
+    "pixel-attach-vs-window-80x24-nerd.json"
+  ],
+  "pixel_metrics_note": "Live attach (an outer shux pane running `shux session attach`) vs window.snapshot and session.snapshot of the same inner session, at exact 0/0, with the trailing uptime cells masked (attach counts up; snapshots show `up 0s`). There is no committed baseline for live chrome frames, so the metric JSONs stand alone and no PNG is committed. The masked inputs live in gitignored scratch.",
+  "scratch_evidence_root": ".shux/out/osc7501-status-chrome/",
+  "scratch_evidence": {
+    "junction_probe": "probe/src/main.rs; probe-run6-a4530be-edges.txt (4032 cases, 0 overwrites, 0 cross-path cells); red at 9ee66ee (probe-run1.txt, 100) and bf22e26 (probe-run4-bf22e26-edges.txt, 60)",
+    "status_bar_sweep": "probe/src/bin/bar.rs; bar-sweep-a4530be-r2.txt (3803 cases, 0 diffs); red at a6280cc (bar-sweep-a6280cc-red.txt, 370 diffs)",
+    "narrow_live": "edge.sh, edge-seq.sh, run-a4530be-live.sh, compare-edge.sh, compare-seq.sh; live/edge-a4530be-{unicode,nerd}{,-seq}/",
+    "wide_live_bf22e26": "live.sh, run-bf-live.sh, run-bf-compare.sh; live/{unicode,nerd}-{L,grid}/",
+    "base_ab_9ee66ee": "ab.sh, compare-ab.sh, ab/",
+    "leaks": "leakcheck.sh"
+  }
+}
