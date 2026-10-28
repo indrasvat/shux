@@ -756,6 +756,54 @@ mod tests {
         finish(h).await;
     }
 
+    /// The second of two racing spawns can arrive after the first has
+    /// finished; it must still find the pane started and not run it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_spawned_again_after_its_first_spawn_finished_runs_once() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-late").await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("starts");
+        let script = format!("echo start >> '{}'; sleep 30", log.display());
+        spawn_sh_result(&h, pane, &script).await.unwrap();
+        spawn_sh_result(&h, pane, &script).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let starts = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(starts, 1, "the pane's command ran {starts} times");
+        finish(h).await;
+    }
+
+    /// A late spawn of a pane whose command already ran and exited must not
+    /// run it again: the pane is finished, not new.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_whose_command_exited_is_not_spawned_again() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-exited-late").await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("starts");
+        let script = format!("echo start >> '{}'", log.display());
+        spawn_sh_result(&h, pane, &script).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        spawn_sh_result(&h, pane, &script).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let starts = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(starts, 1, "the pane's command ran {starts} times");
+        finish(h).await;
+    }
+
     /// An exited pane keeps what it last reported, in the terminal and the
     /// graph alike, whatever the config does afterwards.
     #[tokio::test(flavor = "multi_thread")]

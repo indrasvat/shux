@@ -686,8 +686,9 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     graph: shux_core::graph::GraphHandle,
     cast_recorder: Option<PaneRecorder>,
 ) -> Result<(), shux_pty::PtyError> {
-    // One spawn per pane at a time, decided before anything forks. A second
-    // spawn waits for the first and reports its outcome.
+    // One spawn per pane, decided before anything forks. A second spawn
+    // waits for one in flight and reports its outcome, or finds the pane
+    // already ran and leaves it.
     let ticket = {
         let mut in_flight = spawning();
         match in_flight.get(&pane_id) {
@@ -720,6 +721,12 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
             };
         }
     };
+    // Under the ticket, so every earlier spawn has installed. An incarnation
+    // outlives the program's exit and goes only with the pane.
+    if io_state.lock().await.incarnations.contains_key(&pane_id) {
+        ticket.ok = true;
+        return Ok(());
+    }
     let spawned = spawn_pane_pty_unshared(
         pane_id,
         cwd,
@@ -1159,16 +1166,16 @@ mod tests {
         assert!(shell.env.is_empty());
     }
 
-    /// A pane whose PTY is spawned again while its first task still runs —
-    /// two attaches racing to start a pane that has none — must end up owned
-    /// by the second task. The first, cancelled, must neither mark the pane
-    /// exited nor tear down the handles its successor just installed.
+    /// A pane whose PTY is installed again while its first task still runs
+    /// must end up owned by the second task. The first, cancelled, must
+    /// neither mark the pane exited nor tear down its successor's handles.
+    /// (`spawn_pane_pty` leaves a started pane alone; this drives the install.)
     #[tokio::test(flavor = "multi_thread")]
     async fn a_replaced_pty_task_leaves_its_successor_alone() {
         let h = crate::rpc::test_harness::RpcHarness::new();
         let (_s, _w, pane) = h.seed_session("respawn").await;
         let spawn = || {
-            spawn_pane_pty(
+            spawn_pane_pty_unshared(
                 pane,
                 "/tmp".into(),
                 vec!["sleep".into(), "30".into()],
@@ -1178,6 +1185,7 @@ mod tests {
                 h.io.clone(),
                 h.cancel.clone(),
                 h.graph.clone(),
+                None,
             )
         };
         spawn().await.unwrap();
@@ -1214,7 +1222,7 @@ mod tests {
         let (_s, _w, pane) = h.seed_session("respawn-rec").await;
         let dir = tempfile::tempdir().unwrap();
         let spawn = |rec| {
-            spawn_pane_pty_with_recorder(
+            spawn_pane_pty_unshared(
                 pane,
                 "/tmp".into(),
                 vec!["sleep".into(), "30".into()],
@@ -1503,7 +1511,7 @@ mod tests {
             let cancel = h.cancel.clone();
             let graph = h.graph.clone();
             tokio::spawn(async move {
-                spawn_pane_pty(
+                spawn_pane_pty_unshared(
                     pane,
                     "/tmp".into(),
                     argv,
@@ -1513,6 +1521,7 @@ mod tests {
                     io,
                     cancel,
                     graph,
+                    None,
                 )
                 .await
             })
