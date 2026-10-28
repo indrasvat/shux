@@ -1,3 +1,10 @@
+## [0.54.4](https://github.com/indrasvat/shux/compare/v0.54.3...v0.54.4) (2026-10-28)
+
+
+### Bug Fixes
+
+* **events:** watches return as soon as they have events ([#218](https://github.com/indrasvat/shux/issues/218)) ([0b80dcd](https://github.com/indrasvat/shux/commit/0b80dcdfadbc258f8b19f1cd3612f74eff44b95a)), closes [#194](https://github.com/indrasvat/shux/issues/194) [#134](https://github.com/indrasvat/shux/issues/134)
+
 ## [0.54.3](https://github.com/indrasvat/shux/compare/v0.54.2...v0.54.3) (2026-10-28)
 
 
