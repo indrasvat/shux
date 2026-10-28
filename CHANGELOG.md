@@ -1,3 +1,10 @@
+## [0.54.9](https://github.com/indrasvat/shux/compare/v0.54.8...v0.54.9) (2026-10-28)
+
+
+### Bug Fixes
+
+* **client:** wait for a daemon still starting; harden the mid-frame kill test ([#227](https://github.com/indrasvat/shux/issues/227)) ([9d83615](https://github.com/indrasvat/shux/commit/9d8361598179f7cf093d5193aeac1fffdcd1ee26))
+
 ## [0.54.8](https://github.com/indrasvat/shux/compare/v0.54.7...v0.54.8) (2026-10-28)
 
 
