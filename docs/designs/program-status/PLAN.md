@@ -810,6 +810,61 @@ origin tags, no foreground-group sampling, no `stale_guard` key.
 5. Gate split: the VT gate for the scanner changes, the TUI gate for the
    config and user-visible behaviour.
 
+**Council outcome for P2b (2026-10-28; codex and agy, converged).**
+Ship an amended D8, opt-in, documented as a heuristic.
+
+- **Rejected: "the foreground returned to the shell" as a deletion trigger.**
+  `Ctrl-Z` returns the foreground while the stopped job lives, and
+  background reporters outlive prompts.
+- **Guarantee, stated honestly.**
+  - Sampling or probe errors retain records.
+  - Accepted misattribution can delete a live record: a background writer,
+    queued output drained after a foreground change, or a reporter that left
+    its group.
+  - A surviving group member or pgid reuse retains a stale record.
+- **Sampling.**
+  - Two `tcgetpgrp` samples bracket the actual non-blocking drain inside
+    `PtyHandle`, returned with the bytes. They are never taken across an
+    await, a recorder or the VT lock.
+  - The pair is passed into `process_with_responses`.
+  - A sequence gets a nonzero origin only if every batch it spans has
+    matching valid samples that all agree. Any mismatch or error makes it
+    sticky-unknown for that sequence.
+  - The pane's initial session-leader group is excluded.
+  - With the guard off there is no sampling and no probing.
+  - Lazy sampling is deferred until measured.
+- **Records.**
+  - Every accepted set refreshes its origin and report serial, identical
+    content and origin 0 included. Metadata-only changes do not bump the
+    public revision.
+- **Sweep.**
+  - Collect: incarnation, guard epoch, origin, report-serial watermark.
+  - Probe `kill(-pgid, 0)` outside the lock. Only `ESRCH` deletes; success,
+    `EPERM` and other errors retain.
+  - Commit only for the same incarnation and epoch, with both flags on and
+    the pane current and unsealed. Delete only working/blocked/idle records
+    reported at or before the watermark.
+- **Lifecycle.**
+  - Exit seals; respawn invalidates.
+  - RIS clears records, provenance and `seen`.
+  - 133;A keeps done/error.
+  - Disable discards records.
+  - A guard toggle invalidates pending work and forgets provenance without
+    clearing records. Reload detects guard changes even when `enabled` is
+    unchanged.
+- **Publication.**
+  - A deletion bumps the table revision and VT generation, keeps `seen`, and
+    publishes through `StatusChannel`.
+  - Render consumers are notified after the graph commit.
+  - The waiting count stays per pane.
+- **Acceptance.**
+  - Tests: off and hot-reloaded off (with an in-flight sweep); a foreground
+    reporter killed (deleted); a stopped job (kept); framing and split
+    agreement; lifecycle races between collect and commit; and the
+    background-writer and queued-output false deletions, documented.
+  - Barriers and bounded polling, never fixed sleeps.
+  - The VT and TUI gates, plus the affected fuzz targets.
+
 ## 7. Verification
 
 - **Crate** ✅: a unit test for every D-rule and limit, plus tier-1 fuzzing.
