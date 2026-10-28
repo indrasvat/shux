@@ -88,10 +88,13 @@ or wrap conductor in a tiny shell script that sets them before exec
 ## Try it
 
 ```bash
-# Spawn a claude pane and watch the title flip.
+# Spawn a claude pane and watch its state.
 shux session create demo -- claude
-# Switch to the demo session and observe the border title:
-#   claude · ○   →   claude · ●   →   claude · ✓
+# Claude Code reports its state, so the title stays `claude` and shux's
+# own border badge tracks it (working, blocked on you, done); a block
+# also sends a "waiting for you" notification. An agent that does not
+# report gets conductor's marker instead:
+#   opencode · ○   →   opencode · ●   →   opencode · ✓
 shux attach -s demo
 
 # Browse the settle-snapshot archive after the agent has been
@@ -107,7 +110,8 @@ shux rpc call state.apply --params '{"ops":[
   {"op":"split_pane","target":"<pane-uuid>","direction":"horizontal","ratio":0.5,"command":["opencode"]}
 ]}'
 shux attach -s dash
-# → 3 borders: claude · ✓ | codex · ✓ | opencode · ✓
+# → 3 borders: shux badges on claude and codex (they report their
+#   state), conductor's marker on opencode: opencode · ✓
 # → 1 OS notification: "window <uuid>: all agent panes idle"
 ```
 

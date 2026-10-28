@@ -93,6 +93,14 @@ check "the reporting pane's title carries no conductor marker ($(title_of rep))"
 if wait_until '[[ "$(title_of scr)" == "codex · ●" ]]' 10; then ok=0; else ok=1; fi
 check "a silent agent is still classified from its screen ($(title_of scr))" "$ok"
 
+echo "program status switched off (hot reload):"
+printf '[program_status]\nenabled = false\n' > "${XDG_CONFIG_HOME}/shux/config.toml"
+sleep 3
+if [ -e "${WORK}/claude.stdin" ] && [ ! -s "${WORK}/claude.stdin" ]; then ok=0; else ok=1; fi
+check "a pane that reported is not auto-dismissed once status is off" "$ok"
+: > "${XDG_CONFIG_HOME}/shux/config.toml"
+sleep 1
+
 echo "reporting agent, pane.status revoked:"
 "$SHUX" plugin revoke conductor pane.status >/dev/null
 "$SHUX" session create rep2 -d -- "${WORK}/bin/claude" "${WORK}/claude2.stdin" >/dev/null

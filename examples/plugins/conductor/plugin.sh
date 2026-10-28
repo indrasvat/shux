@@ -263,6 +263,7 @@ maybe_log_permission_hint() {
         echo "  shux plugin grant conductor pane.capture"
         echo "  shux plugin grant conductor pane.set_title"
         echo "  shux plugin grant conductor pane.send_keys"
+        echo "  shux plugin grant conductor pane.snapshot"
     } >&2
 }
 
