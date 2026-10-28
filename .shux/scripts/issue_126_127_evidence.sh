@@ -137,20 +137,24 @@ for geo in ${geometries}; do
   metric="${out_dir}/pixel-scene-${geo}.json"
   shoot "ev126a-${geo}" "${cols}" "${rows}" "${actual}" "$(scene_body "${cols}" "${rows}" 1)"
   shoot "ev126e-${geo}" "${cols}" "${rows}" "${expected}" "$(scene_body "${cols}" "${rows}" 0)"
-  # pixel_verify exits 1 when the images differ; anything else non-zero means
-  # nothing was compared, which must never read as a reproduced defect.
+  # A comparison counts only when pixel_verify wrote a complete metric whose
+  # status agrees with its exit code. A crash also exits 1, and must never read
+  # as a reproduced defect.
   status=0
   uv run --script "${pixel_verify}" "${actual}" "${expected}" --diff "${diff_png}" \
     --max-pixel-diff-ratio 0 --max-mean-channel-delta 0 >"${metric}" || status=$?
   case "${status}" in
     0) verdict=pass ;;
     1) verdict=fail ;;
-    *)
-      echo "FATAL: pixel_verify could not compare ${geo} (exit ${status})" >&2
-      exit "${status}"
-      ;;
+    *) verdict=none ;;
   esac
-  changed="$(jq -r '.changed_pixels // "n/a"' "${metric}")"
+  if [ "${verdict}" = none ] ||
+    ! jq -e --arg v "${verdict}" \
+      '.status == $v and (.changed_pixels | type == "number")' "${metric}" >/dev/null 2>&1; then
+    echo "FATAL: pixel_verify did not compare ${geo} (exit ${status})" >&2
+    exit 2
+  fi
+  changed="$(jq -r '.changed_pixels' "${metric}")"
   printf '  %-8s %-4s changed_pixels=%s\n' "${geo}" "${verdict}" "${changed}"
   if [ "${expect_defect}" = 1 ]; then
     [ "${verdict}" = fail ] || failures=$((failures + 1))

@@ -6,8 +6,8 @@
 //! and hands over whatever survived the overflow. shux discards such a
 //! sequence whole, as Alacritty does on the same `vte` release. Each test sends
 //! the sequence at the limit, where it must still work, and past it, where it
-//! must change nothing on screen. A discarded sequence still ends a grapheme
-//! cluster, exactly as an unrecognised one does.
+//! must change nothing on screen. A discarded sequence affects a grapheme
+//! cluster exactly as the same sequence does when it is not discarded.
 
 use shux_vt::{Color, VirtualTerminal};
 
@@ -222,4 +222,19 @@ fn a_discarded_csi_ends_the_cluster_like_an_unrecognised_one() {
 #[test]
 fn a_discarded_esc_ends_the_cluster_like_an_unrecognised_one() {
     assert_eq!(cluster_across(b"\x1b###9"), cluster_across(b"\x1b##9"));
+}
+
+/// SGR and REP keep a cluster open when valid, so an overflowed one must not
+/// close it either: discarding a sequence changes what it does, not where the
+/// cluster boundary falls.
+#[test]
+fn a_discarded_sgr_or_rep_keeps_the_cluster_open_like_a_valid_one() {
+    assert_eq!(
+        cluster_across(&csi("31", MAX_PARAMS + 1, "m")),
+        cluster_across(b"\x1b[31m")
+    );
+    assert_eq!(
+        cluster_across(&csi("3", MAX_PARAMS + 1, "b")),
+        cluster_across(b"")
+    );
 }

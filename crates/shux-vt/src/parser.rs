@@ -1297,8 +1297,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
         }
         // `vte` sets `ignore` when the sequence overflowed its parameter or
         // intermediate storage; what it hands over is truncated, so the
-        // sequence is discarded rather than executed with what survived. It
-        // still ended the cluster above, as any other control sequence does.
+        // sequence is discarded rather than executed with what survived. The
+        // cluster decision above reads only the final byte and intermediates,
+        // so a discarded sequence affects the cluster as its valid form does.
         if ignore {
             trace!(action = %action, "overflowed CSI sequence discarded");
             return;
