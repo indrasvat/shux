@@ -3215,25 +3215,16 @@ async fn split(
         }
     };
 
-    // Splitting focuses the new pane, so an undo has to put focus back itself
-    // or a failed split silently relocates the operator's cursor.
-    let prior_active_pane = graph
-        .snapshot()
-        .windows
-        .get(&attached.active_window_id)
-        .map(|w| w.active_pane);
+    let prior = crate::pane_spawn::SplitUndo::capture(graph, attached.active_pane_id);
 
     let new_pane = graph
         .split_pane(attached.active_pane_id, direction, 0.5)
         .await
         .map_err(|e| anyhow::anyhow!("split failed: {e}"))?;
 
-    // A PTY that never started is not a pane. Discarding this error left a
-    // phantom in the graph — focused, drawn, and answering "pane VT not found"
-    // to every later verb — while the keystroke looked like it worked. The RPC
-    // `pane.split` has rolled this back since issue #125; the attach path
-    // never did, and `[shell].command` (issue #132) makes a default-pane spawn
-    // newly able to fail, so the latent case became a reachable one.
+    // A PTY that never started is not a pane: left in the graph it is focused,
+    // drawn, and answers "pane VT not found" to every later verb. A default
+    // pane can fail to spawn because `[shell].command` names the program.
     if let Err(e) = crate::pane_spawn::spawn_pane_pty(
         new_pane,
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")),
@@ -3247,29 +3238,7 @@ async fn split(
     )
     .await
     {
-        // Compare-and-restore, not restore: an operator who moved focus while
-        // the PTY was starting keeps their choice (the lost-update lesson from
-        // #125's own rollback).
-        let focus_is_still_ours = graph
-            .snapshot()
-            .windows
-            .get(&attached.active_window_id)
-            .map(|w| w.active_pane)
-            == Some(new_pane);
-
-        let _ = graph.destroy_pane(new_pane, None).await;
-
-        if focus_is_still_ours
-            && let Some(prev) = prior_active_pane
-            && graph
-                .snapshot()
-                .windows
-                .get(&attached.active_window_id)
-                .map(|w| w.active_pane)
-                != Some(prev)
-        {
-            let _ = graph.focus_pane(prev).await;
-        }
+        crate::pane_spawn::undo_split(graph, new_pane, prior).await;
         return Err(anyhow::anyhow!(
             "{}",
             crate::pane_spawn::spawn_failure_message(&e)

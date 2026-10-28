@@ -687,6 +687,81 @@ pub(crate) async fn spawn_pane_pty(
     .await
 }
 
+/// What a split changes in its window that undoing it must put back. Splitting
+/// focuses the new pane and clears any zoom; destroying that pane focuses
+/// whichever pane the layout yields first and zooms nothing. Shared by every
+/// split path, so the keyboard and RPC undos cannot drift apart.
+pub(crate) struct SplitUndo {
+    window: shux_core::model::WindowId,
+    active_pane: shux_core::model::PaneId,
+    zoomed_pane: Option<shux_core::model::PaneId>,
+}
+
+impl SplitUndo {
+    /// Read the window of `pane` before it is split. `None` when the pane is
+    /// gone, in which case the split itself fails.
+    pub(crate) fn capture(
+        graph: &shux_core::graph::GraphHandle,
+        pane: shux_core::model::PaneId,
+    ) -> Option<Self> {
+        let snap = graph.snapshot();
+        let window = snap.panes.get(&pane)?.window_id;
+        let w = snap.windows.get(&window)?;
+        Some(Self {
+            window,
+            active_pane: w.active_pane,
+            zoomed_pane: w.layout.zoom.as_ref().map(|z| z.zoomed_pane),
+        })
+    }
+}
+
+/// Destroy `new_pane`, a split whose PTY never started, and restore what
+/// `prior` recorded. Compare-and-restore: an operator who changed focus or
+/// zoom while the PTY was starting keeps their choice. Prior zoom comes back
+/// only when focus is back on the pane that had it, so a re-zoom never hides
+/// the pane being typed into.
+pub(crate) async fn undo_split(
+    graph: &shux_core::graph::GraphHandle,
+    new_pane: shux_core::model::PaneId,
+    prior: Option<SplitUndo>,
+) {
+    let Some(prior) = prior else {
+        let _ = graph.destroy_pane(new_pane, None).await;
+        return;
+    };
+    let window = || {
+        graph
+            .snapshot()
+            .windows
+            .get(&prior.window)
+            .map(|w| (w.active_pane, w.layout.zoom.as_ref().map(|z| z.zoomed_pane)))
+    };
+    let (active, zoomed) = window().unzip();
+    let focus_is_still_ours = active == Some(new_pane);
+    // Destroying any pane unzooms its window, so a zoom the operator chose
+    // meanwhile has to be read now and put back too.
+    let operator_zoom = zoomed.flatten().filter(|z| *z != new_pane);
+
+    let _ = graph.destroy_pane(new_pane, None).await;
+
+    // `destroy_pane` may already have landed on the prior pane; focusing it
+    // again fires a transition out of nowhere.
+    if focus_is_still_ours && window().map(|w| w.0) != Some(prior.active_pane) {
+        let _ = graph.focus_pane(prior.active_pane).await;
+    }
+    let (active, zoomed) = window().unzip();
+    let rezoom = operator_zoom.or_else(|| {
+        prior
+            .zoomed_pane
+            .filter(|_| active == Some(prior.active_pane))
+    });
+    if let Some(z) = rezoom
+        && zoomed.flatten().is_none()
+    {
+        let _ = graph.zoom_pane(z, None).await;
+    }
+}
+
 /// Like [`spawn_pane_pty`] but arms `cast_recorder` (a pre-opened recorder) BEFORE the read loop
 /// starts, so the recording captures the child's very first bytes — alt-screen setup, initial
 /// geometry, early output — with no post-spawn race (task 083 cast; council: arm at spawn).
@@ -1636,5 +1711,98 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pane_that_exits_still_publishes_its_last_write() {
         assert_burst_delivered(&data_plane_output(BURST).await);
+    }
+
+    // ── undoing a failed split (issue #152) ───────────────────────────
+
+    use shux_core::layout::Direction;
+    use shux_core::model::{PaneId, WindowId};
+
+    /// A window with panes `a` and `b`, `a` zoomed and focused.
+    async fn zoomed_window() -> (
+        shux_core::graph::GraphHandle,
+        tokio_util::sync::CancellationToken,
+        WindowId,
+        PaneId,
+        PaneId,
+    ) {
+        let (graph, state) = shux_core::graph::SessionGraph::new();
+        let (tx, rx) = mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(shux_core::graph::run_graph_loop(graph, rx, cancel.clone()));
+        let gh = shux_core::graph::GraphHandle::new(tx, state);
+        let session = gh
+            .create_session_with_command("s".into(), PathBuf::from("/tmp"), vec!["true".into()])
+            .await
+            .expect("session");
+        let snap = gh.snapshot();
+        let window = snap.sessions[&session].active_window;
+        let a = snap.windows[&window].active_pane;
+        let b = gh.split_pane(a, Direction::Vertical, 0.5).await.expect("b");
+        gh.focus_pane(a).await.expect("focus a");
+        gh.zoom_pane(a, None).await.expect("zoom a");
+        (gh, cancel, window, a, b)
+    }
+
+    /// `(zoomed pane, focused pane)` of `window`.
+    fn zoom_focus(
+        gh: &shux_core::graph::GraphHandle,
+        window: WindowId,
+    ) -> (Option<PaneId>, PaneId) {
+        let snap = gh.snapshot();
+        let w = &snap.windows[&window];
+        (w.layout.zoom.as_ref().map(|z| z.zoomed_pane), w.active_pane)
+    }
+
+    #[tokio::test]
+    async fn undoing_a_split_restores_zoom_and_focus() {
+        let (gh, cancel, window, a, _) = zoomed_window().await;
+        let prior = SplitUndo::capture(&gh, a);
+        let new = gh
+            .split_pane(a, Direction::Vertical, 0.5)
+            .await
+            .expect("split");
+        assert_eq!(
+            zoom_focus(&gh, window),
+            (None, new),
+            "a split unzooms and focuses"
+        );
+
+        undo_split(&gh, new, prior).await;
+        assert!(!gh.snapshot().panes.contains_key(&new));
+        assert_eq!(zoom_focus(&gh, window), (Some(a), a));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn undoing_a_split_keeps_a_zoom_the_operator_chose_meanwhile() {
+        let (gh, cancel, window, a, b) = zoomed_window().await;
+        let prior = SplitUndo::capture(&gh, a);
+        let new = gh
+            .split_pane(a, Direction::Vertical, 0.5)
+            .await
+            .expect("split");
+        gh.focus_pane(b).await.expect("focus b");
+        gh.zoom_pane(b, None).await.expect("zoom b");
+
+        undo_split(&gh, new, prior).await;
+        assert_eq!(zoom_focus(&gh, window), (Some(b), b));
+        cancel.cancel();
+    }
+
+    /// Re-zooming `a` here would hide `b`, the pane the operator is typing in.
+    #[tokio::test]
+    async fn undoing_a_split_never_zooms_away_from_the_focused_pane() {
+        let (gh, cancel, window, a, b) = zoomed_window().await;
+        let prior = SplitUndo::capture(&gh, a);
+        let new = gh
+            .split_pane(a, Direction::Vertical, 0.5)
+            .await
+            .expect("split");
+        gh.focus_pane(b).await.expect("focus b");
+
+        undo_split(&gh, new, prior).await;
+        assert_eq!(zoom_focus(&gh, window), (None, b));
+        cancel.cancel();
     }
 }
