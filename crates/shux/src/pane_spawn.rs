@@ -212,7 +212,6 @@ async fn run_pane_pty_task(
     let mut staged = StagedOutput::new();
     let mut task_exit = PtyTaskExit::Natural;
     let mut pending = PtyInputQueue::default();
-    let mut paste_exits = 0;
 
     loop {
         let output_due = staged.due_at();
@@ -240,7 +239,7 @@ async fn run_pane_pty_task(
                     Ok(n) => {
                         let data = &buf[..n];
                         tee_pane_recorders(&io_state, pane_id, Some(incarnation), data, &shutdown).await;
-                        let (pulse, vt_title, bus_opt, terminal_responses, left_paste) = {
+                        let (pulse, vt_title, bus_opt, terminal_responses, bracketed) = {
                             let mut state = io_state.lock().await;
                             if !state.is_current(pane_id, incarnation) {
                                 // Replaced while this read was in flight: these
@@ -292,25 +291,21 @@ async fn run_pane_pty_task(
                             }
                             let output = String::from_utf8_lossy(data);
                             let _completed = state.cmd_engine.process_output(pane_id.0, &output);
-                            let (bracketed, exits) = state.vts.get(&pane_id).map_or((false, 0), |vt| {
-                                (vt.modes().bracketed_paste, vt.modes().bracketed_paste_exits)
-                            });
-                            let left_paste = !bracketed || exits != paste_exits;
-                            paste_exits = exits;
-                            if left_paste {
-                                state.open_pastes.remove(&pane_id);
-                            }
+                            let bracketed = state
+                                .vts
+                                .get(&pane_id)
+                                .is_some_and(|vt| vt.modes().bracketed_paste);
                             (
                                 state.render_pulse.clone(),
                                 vt_title,
                                 state.event_bus.clone(),
                                 terminal_responses,
-                                left_paste,
+                                bracketed,
                             )
                         };
 
-                        // A program that left paste mode is out of any paste.
-                        if left_paste {
+                        // A program out of paste mode is out of any paste.
+                        if !bracketed {
                             pending.in_paste = false;
                         }
                         // An unbounded write to a program that never reads
@@ -1330,15 +1325,13 @@ mod tests {
         h.stop().await;
     }
 
-    /// A program that leaves paste mode inside a paste whose end never came
-    /// has left the paste, even when it sets the mode again in the same
-    /// write: replies to it are no longer held, and no end is owed to it.
+    /// A program out of paste mode inside a paste whose end never came has
+    /// left the paste: replies to it are no longer held. One that set the
+    /// mode again in the same write may have done so before it read the
+    /// paste's start, so the paste stays open and is still owed its end.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_program_that_left_paste_mode_gets_its_replies() {
-        for (left, mode) in [
-            ("left", r"\033[?2004l"),
-            ("left and set again", r"\033[?2004l\033[?2004h"),
-        ] {
+        for (mode, owed) in [(r"\033[?2004l", false), (r"\033[?2004l\033[?2004h", true)] {
             let h = crate::rpc::test_harness::RpcHarness::new();
             let (_s, _w, pane) = h.seed_session("replies").await;
             let script = format!(
@@ -1376,28 +1369,16 @@ mod tests {
 
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
             let text = loop {
-                let text = {
-                    let state = h.io.lock().await;
-                    let grid = state.vts[&pane].grid();
-                    (0..grid.rows())
-                        .flat_map(|r| {
-                            let row = grid.visible_row(r);
-                            (0..row.len()).map(|c| row[c].ch).collect::<Vec<_>>()
-                        })
-                        .collect::<String>()
-                };
+                let text = h.io.lock().await.vts[&pane].capture_text(None);
                 if text.contains("-REPLY") || tokio::time::Instant::now() > deadline {
                     break text;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             };
-            assert!(
-                text.contains("GOT-REPLY"),
-                "{left}: the reply was held: {}",
-                text.trim()
-            );
+            let expected = if owed { "NO-REPLY" } else { "GOT-REPLY" };
+            assert!(text.contains(expected), "{mode}: {}", text.trim());
             let open = h.io.lock().await.open_paste(pane);
-            assert_eq!(open, None, "{left}: the program is still owed an end");
+            assert_eq!(open.is_some(), owed, "{mode}: owed an end");
             h.stop().await;
         }
     }

@@ -3541,19 +3541,6 @@ mod tests {
     }
 
     #[test]
-    fn leaving_bracketed_paste_is_counted_even_when_set_again() {
-        let mut vt = VirtualTerminal::new(24, 80);
-        vt.process(b"\x1b[?2004l\x1b[?2004l");
-        assert_eq!(vt.modes().bracketed_paste_exits, 0, "it was never on");
-        vt.process(b"\x1b[?2004h\x1b[?1049;2004l\x1b[?2004h");
-        assert_eq!(vt.modes().bracketed_paste_exits, 1);
-        vt.process(b"\x1bc");
-        assert_eq!(vt.modes().bracketed_paste_exits, 2, "RIS leaves paste mode");
-        vt.process(b"\x1bc");
-        assert_eq!(vt.modes().bracketed_paste_exits, 2);
-    }
-
-    #[test]
     fn test_alternate_scroll_mode() {
         let mut vt = VirtualTerminal::new(24, 80);
         // Defaults on (Debian-xterm / iTerm2 / kitty convention).

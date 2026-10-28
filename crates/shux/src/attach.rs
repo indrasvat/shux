@@ -150,7 +150,7 @@ enum Open {
 /// once it has. `paste` is `Some(more)` for a piece of a paste, `more` set
 /// while pieces follow. Anything but the next piece of an open paste ends it
 /// first. A paste goes between the markers when the pane asked for them
-/// (mode 2004). ESC is removed from bracketed text, so no part of it can end
+/// (mode 2004) as it began. ESC is removed from bracketed text, so no part of it can end
 /// the paste.
 fn frame_input(
     bytes: Vec<u8>,
@@ -158,12 +158,12 @@ fn frame_input(
     open: Open,
     wants_brackets: bool,
 ) -> (Vec<u8>, bool) {
-    let continues = open == Open::Continued && paste.is_some();
+    let continues = open == Open::Continued;
     let mut out = Vec::with_capacity(bytes.len() + PASTE_START.len() + 2 * PASTE_END.len());
     if open != Open::Closed && !continues {
         out.extend_from_slice(PASTE_END);
     }
-    let Some(more) = paste.filter(|_| wants_brackets) else {
+    let Some(more) = paste.filter(|_| continues || wants_brackets) else {
         out.extend(bytes);
         return (out, false);
     };
@@ -193,10 +193,16 @@ fn send_input(
         return;
     }
     let (program, wants_brackets) = state.paste_target(pane);
-    let open = match (state.open_paste(pane), paste) {
-        (None, _) => Open::Closed,
-        (Some(open), Some((_, id))) if open.client == client && open.paste == id => Open::Continued,
-        (Some(_), _) => Open::Other,
+    // The next piece of a paste continues it whatever mode the program shows
+    // now; anything else ends it only for a program still in paste mode.
+    let continued = state.open_pastes.get(&pane).is_some_and(|open| {
+        open.program == program
+            && paste.is_some_and(|(_, id)| (open.client, open.paste) == (client, id))
+    });
+    let open = match state.open_paste(pane) {
+        _ if continued => Open::Continued,
+        None => Open::Closed,
+        Some(_) => Open::Other,
     };
     let (bytes, open_after) = frame_input(bytes, paste.map(|(more, _)| more), open, wants_brackets);
     permit.send(bytes);
@@ -7310,13 +7316,16 @@ mod tests {
             frame_input(v(b"c"), Some(false), Open::Continued, true),
             (v(b"c\x1b[201~"), false)
         );
+        // Framed as it began, with the program out of paste mode since.
+        assert_eq!(
+            frame_input(v(b"c"), Some(false), Open::Continued, false),
+            (v(b"c\x1b[201~"), false)
+        );
         // The end was dropped: the next key, or another paste, closes it first.
-        for open in [Open::Other, Open::Continued] {
-            assert_eq!(
-                frame_input(v(b"x"), None, open, true),
-                (v(b"\x1b[201~x"), false)
-            );
-        }
+        assert_eq!(
+            frame_input(v(b"x"), None, Open::Other, true),
+            (v(b"\x1b[201~x"), false)
+        );
         assert_eq!(
             frame_input(v(b"z"), Some(false), Open::Other, true),
             (v(b"\x1b[201~\x1b[200~z\x1b[201~"), false)
@@ -7656,6 +7665,32 @@ mod tests {
             "the paste joined the open one"
         );
         h.stop().await;
+    }
+
+    /// A paste is framed as the program asked when it began: a mode change
+    /// seen while its pieces arrive may be from before the program read its
+    /// start, so the rest stays between the markers of one paste.
+    #[tokio::test]
+    async fn a_paste_keeps_the_framing_it_began_with() {
+        for change in [b"\x1b[?2004l".as_slice(), b"\x1b[?2004l\x1b[?2004h"] {
+            let mut h = InputHarness::new(8).await;
+            set_modes(&h, b"\x1b[?2004h").await;
+            paste(&mut h, b"p1", true).await;
+            assert_eq!(
+                pane_input(&mut h, Duration::from_millis(200)).await,
+                b"\x1b[200~p1"
+            );
+            set_modes(&h, change).await;
+            paste(&mut h, b"p2\r", false).await;
+            let got = pane_input(&mut h, Duration::from_millis(500)).await;
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "p2\r\x1b[201~",
+                "{}: the paste was split",
+                String::from_utf8_lossy(change).escape_debug()
+            );
+            h.stop().await;
+        }
     }
 
     /// The rest of a paste goes where the paste began, not to a pane focused

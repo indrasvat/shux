@@ -28,10 +28,6 @@ pub struct TerminalModes {
     pub cursor_visible: bool,
     /// Bracketed paste mode (Mode 2004).
     pub bracketed_paste: bool,
-    /// How many times bracketed paste mode has been turned off, by DECRST
-    /// 2004 or RIS. Survives RIS, so a program that left paste mode and set
-    /// it again within one write is still seen to have left it.
-    pub bracketed_paste_exits: u64,
     /// Send focus events mode (Mode 1004).
     pub focus_events: bool,
     /// Mouse tracking modes.
@@ -75,7 +71,6 @@ impl Default for TerminalModes {
             origin_mode: false,
             cursor_visible: true,
             bracketed_paste: false,
-            bracketed_paste_exits: 0,
             focus_events: false,
             mouse_tracking: MouseMode::None,
             sgr_mouse: false,
@@ -1136,13 +1131,7 @@ impl<'a> VtHandler<'a> {
                 }
             }
             // Bracketed paste mode (2004).
-            2004 => {
-                if self.modes.bracketed_paste && !enable {
-                    self.modes.bracketed_paste_exits =
-                        self.modes.bracketed_paste_exits.wrapping_add(1);
-                }
-                self.modes.bracketed_paste = enable;
-            }
+            2004 => self.modes.bracketed_paste = enable,
             // Synchronized output mode (2026).
             2026 => {
                 if enable {
@@ -1807,14 +1796,7 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 self.grid.clear_scrollback();
                 self.grid.mark_all_dirty();
                 *self.cursor = Cursor::new();
-                let exits = self
-                    .modes
-                    .bracketed_paste_exits
-                    .wrapping_add(u64::from(self.modes.bracketed_paste));
-                *self.modes = TerminalModes {
-                    bracketed_paste_exits: exits,
-                    ..TerminalModes::default()
-                };
+                *self.modes = TerminalModes::default();
                 *self.default_colors = TerminalDefaultColors::default();
                 // RIS ends the data stream as far as REP is concerned: a
                 // terminal that has just been switched on has no preceding
