@@ -108,7 +108,9 @@ impl Drop for Harness {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            panic!("daemon {pid} survived SIGTERM");
+            if !std::thread::panicking() {
+                panic!("daemon {pid} survived SIGTERM");
+            }
         }
     }
 }
@@ -322,11 +324,18 @@ fn assert_signal_restores_terminal(sig: Signal) {
     );
 
     let tail = &client.seen[drawn..];
-    assert!(
-        find(tail, b"\x1b[?1049l"),
-        "{sig}: never left the alternate screen after the signal: {:?}",
-        String::from_utf8_lossy(tail)
-    );
+    for (what, seq) in [
+        ("left the alternate screen", &b"\x1b[?1049l"[..]),
+        ("popped the kitty keyboard flags", b"\x1b[<1u"),
+        ("turned mouse tracking off", b"\x1b[?1000l"),
+        ("showed the cursor", b"\x1b[?25h"),
+    ] {
+        assert!(
+            find(tail, seq),
+            "{sig}: never {what} after the signal: {:?}",
+            String::from_utf8_lossy(tail)
+        );
+    }
 
     // The signal is re-raised once the terminal is restored, so a parent shell
     // sees the death it caused rather than a clean exit.
@@ -367,7 +376,13 @@ fn a_killed_session_ends_the_client_and_restores_the_terminal() {
     client.wait_until_drawing();
 
     h.kill_session("sig-session-kill");
+    let killed = Instant::now();
     let status = client.wait_for_exit();
+    assert!(
+        killed.elapsed() < Duration::from_secs(3),
+        "the client took {:?} to notice its session was killed",
+        killed.elapsed()
+    );
 
     assert!(
         status.success(),

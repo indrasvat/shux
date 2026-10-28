@@ -6,7 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{Winsize, openpty};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info};
@@ -550,8 +550,9 @@ fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
 }
 
 fn dup_stdio(fd: &OwnedFd) -> std::io::Result<Stdio> {
-    let duped = nix::unistd::dup(fd)?;
-    Ok(Stdio::from(File::from(duped)))
+    // `try_clone` dups close-on-exec; the child's own 0-2 come from `dup2`,
+    // which clears it, so only the descriptors a child should not see close.
+    Ok(Stdio::from(File::from(fd.try_clone()?)))
 }
 
 fn terminfo_roots() -> Vec<PathBuf> {
@@ -698,6 +699,11 @@ impl PtyHandle {
     pub fn spawn(config: &PtyConfig) -> Result<Self, PtyError> {
         let winsize = winsize_for(config.size);
         let pty_pair = openpty(Some(&winsize), None).map_err(nix_to_io)?;
+        // openpty(3) opens both ends inheritable; every later pane would hold
+        // this pane's terminal, able to read and type into it.
+        for fd in [&pty_pair.master, &pty_pair.slave] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(nix_to_io)?;
+        }
         set_nonblocking(&pty_pair.master).map_err(PtyError::Open)?;
 
         let cmd_parts = config.resolve_command();

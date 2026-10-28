@@ -708,3 +708,40 @@ async fn dropping_a_live_handle_kills_and_reaps_its_child() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
+
+/// A pane's process must hold its own terminal on 0-2 and nothing else of the
+/// daemon's: an inherited master of ANOTHER pane lets it read and type into
+/// that pane, and an inherited master of its own keeps it from ever getting a
+/// hangup, so it outlives the daemon.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_pane_inherits_no_other_terminal_descriptors() {
+    let first = PtyHandle::spawn(&PtyConfig::with_command(
+        vec!["sleep".into(), "30".into()],
+        test_cwd(),
+    ))
+    .unwrap();
+    let mut second = PtyHandle::spawn(&PtyConfig::with_command(
+        vec!["sleep".into(), "30".into()],
+        test_cwd(),
+    ))
+    .unwrap();
+
+    let dir = format!("/proc/{}/fd", second.pid());
+    let mut leaked = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("read child fd table") {
+        let entry = entry.unwrap();
+        let fd: u32 = entry.file_name().to_string_lossy().parse().unwrap();
+        let target = std::fs::read_link(entry.path()).unwrap_or_default();
+        let target = target.to_string_lossy().into_owned();
+        if fd > 2 && (target == "/dev/ptmx" || target.starts_with("/dev/pts/")) {
+            leaked.push(format!("{fd} -> {target}"));
+        }
+    }
+    let _ = second.kill();
+    drop(first);
+    assert!(
+        leaked.is_empty(),
+        "pane child inherited terminal descriptors: {leaked:?}"
+    );
+}
